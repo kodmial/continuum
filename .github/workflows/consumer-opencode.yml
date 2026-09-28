@@ -26,6 +26,26 @@ on:
         type: string
         required: false
         default: opencode/big-pickle
+      opencode_distribution:
+        description: "OpenCode binary source: upstream or github-release"
+        type: string
+        required: false
+        default: upstream
+      opencode_release_repo:
+        description: "Repository that publishes the optimized OpenCode release; empty means caller repository"
+        type: string
+        required: false
+        default: ""
+      opencode_release_tag_prefix:
+        description: "Release tag prefix used to select the newest optimized binary"
+        type: string
+        required: false
+        default: coding-v
+      opencode_release_asset:
+        description: "Release asset filename for the OpenCode executable"
+        type: string
+        required: false
+        default: opencode-coding-linux-x64
     secrets:
       OPENCODE_API_KEY:
         required: false
@@ -83,12 +103,74 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Install OpenCode
+      - name: Validate OpenCode distribution
+        shell: bash
+        env:
+          OPENCODE_DISTRIBUTION: ${{ inputs.opencode_distribution }}
+        run: |
+          set -euo pipefail
+          case "$OPENCODE_DISTRIBUTION" in
+            upstream|github-release) ;;
+            *)
+              echo "::error::Unsupported opencode_distribution: $OPENCODE_DISTRIBUTION"
+              exit 1
+              ;;
+          esac
+
+      - name: Install upstream OpenCode
+        if: inputs.opencode_distribution == 'upstream'
         shell: bash
         run: |
           set -euo pipefail
           curl -fsSL https://opencode.ai/install | bash
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+
+      - name: Install optimized OpenCode from GitHub Release
+        if: inputs.opencode_distribution == 'github-release'
+        id: optimized_opencode
+        shell: bash
+        env:
+          RELEASE_REPO: ${{ inputs.opencode_release_repo }}
+          TAG_PREFIX: ${{ inputs.opencode_release_tag_prefix }}
+          ASSET_NAME: ${{ inputs.opencode_release_asset }}
+        run: |
+          set -euo pipefail
+          REPO="${RELEASE_REPO:-$GITHUB_REPOSITORY}"
+          [[ "$TAG_PREFIX" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::invalid release tag prefix"; exit 1; }
+          [[ "$ASSET_NAME" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::invalid release asset name"; exit 1; }
+
+          TAG="$(gh api "repos/$REPO/releases?per_page=100" --jq             'map(select(.draft == false and (.tag_name | startswith("'"$TAG_PREFIX"'")))) | first | .tag_name // empty')"
+          if [[ -z "$TAG" ]]; then
+            echo "::error::No non-draft release with prefix '$TAG_PREFIX' found in $REPO."
+            exit 1
+          fi
+
+          DIR="$RUNNER_TEMP/continuum-opencode"
+          mkdir -p "$DIR"
+          gh release download "$TAG" --repo "$REPO" --dir "$DIR"             --pattern "$ASSET_NAME" --pattern "$ASSET_NAME.sha256"
+
+          test -f "$DIR/$ASSET_NAME"
+          test -f "$DIR/$ASSET_NAME.sha256"
+          (
+            cd "$DIR"
+            sha256sum -c "$ASSET_NAME.sha256"
+          )
+          chmod +x "$DIR/$ASSET_NAME"
+          ln -sf "$DIR/$ASSET_NAME" "$DIR/opencode"
+          "$DIR/opencode" --version
+          echo "$DIR" >> "$GITHUB_PATH"
+
+          BINARY_SHA256="$(sha256sum "$DIR/$ASSET_NAME" | awk '{print $1}')"
+          echo "release_tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "binary_sha256=$BINARY_SHA256" >> "$GITHUB_OUTPUT"
+          {
+            echo "### OpenCode runtime"
+            echo "- distribution: github-release"
+            echo "- repository: `$REPO`"
+            echo "- release: `$TAG`"
+            echo "- asset: `$ASSET_NAME`"
+            echo "- sha256: `$BINARY_SHA256`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Implement issue
         if: inputs.mode == 'issue'
