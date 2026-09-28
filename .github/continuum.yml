@@ -1,0 +1,9 @@
+# Continuum's own v0.1 consumer configuration.
+# See docs/continuum-mvp-contract.md.
+#
+# Continuum is not itself a consumer product, so both toggles are off: the
+# bootstrap control plane does not gate merges on a review provider and does
+# not orchestrate releases of Continuum. Adopting the contract without
+# declaring anything resolves to exactly these values.
+review: false
+release: false
