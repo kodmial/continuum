@@ -38,9 +38,10 @@ on:
   check_run:
     types: [completed, rerequested, created]
   check_suite:
-    types: [completed, rerequested]
+    types: [completed]
   workflow_run:
-    types: [completed, requested]
+    workflows: ["CI"]
+    types: [completed]
   schedule:
     - cron: "7,37 * * * *"
   workflow_dispatch: {}

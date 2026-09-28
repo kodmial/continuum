@@ -572,6 +572,32 @@ class SelfProtectionTests(WorkflowAuditBase):
         self.assertIn("unittest", text)
         self.assertIn(POLICY_PATH, text)
 
+    def test_action_inputs_never_contain_nested_mappings(self):
+        # GitHub Actions action inputs are scalar values. A nested mapping such
+        # as `with: { env: {...} }` is valid YAML but invalid workflow schema
+        # and produces a zero-job failure before runner assignment.
+        for workflow_name, document in self.workflows.items():
+            for job_name, job in (document.get("jobs") or {}).items():
+                for step in steps_of(job):
+                    values = step.get("with") or {}
+                    if not isinstance(values, dict):
+                        continue
+                    for input_name, value in values.items():
+                        self.assertNotIsInstance(
+                            value,
+                            (dict, list),
+                            "{}/{} action input {} is nested rather than scalar".format(
+                                workflow_name, job_name, input_name
+                            ),
+                        )
+
+    def test_ci_runs_pinned_semantic_workflow_validation(self):
+        text = self.raw["ci.yml"]
+        self.assertIn("actionlint", text)
+        self.assertIn("ACTIONLINT_VERSION", text)
+        self.assertIn("ACTIONLINT_SHA256", text)
+        self.assertIn("sha256sum -c", text)
+
     def test_ci_keeps_the_active_workflow_allowlist(self):
         # The allowlist is a control: an unreviewed new workflow must not be
         # able to arrive with write permissions unnoticed.

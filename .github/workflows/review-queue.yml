@@ -36,6 +36,8 @@ on:
     secrets:
       continuum_token:
         required: false
+      TAP_PAT:
+        required: false
 
   # The complete lifecycle surface of a candidate. `closed` and
   # `converted_to_draft` are the transitions whose absence used to stall a
@@ -71,11 +73,14 @@ on:
   check_run:
     types: [completed, rerequested, created]
   check_suite:
-    types: [completed, rerequested]
+    types: [completed]
 
-  # A completed review workflow settles the slot and starts the cooldown.
+  # GitHub requires an explicit workflow allowlist for workflow_run. CI is the
+  # generic self-dogfood wake-up; consumer entry workflows can call this
+  # reusable controller from their own provider-specific workflow_run events.
   workflow_run:
-    types: [completed, requested]
+    workflows: ["CI"]
+    types: [completed]
 
   # Recovery backstop only. Normal progression is event driven; this exists so a
   # deliberately or accidentally missed event cannot stall the queue forever.

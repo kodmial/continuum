@@ -35,8 +35,8 @@ REQUIRED_TRIGGERS = {
     "issue_comment": queue.ISSUE_COMMENT_ACTIONS,
     "status": (),
     "check_run": ("completed", "rerequested", "created"),
-    "check_suite": ("completed", "rerequested"),
-    "workflow_run": ("completed", "requested"),
+    "check_suite": ("completed",),
+    "workflow_run": ("completed",),
     "schedule": (),
     "workflow_dispatch": (),
 }
