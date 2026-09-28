@@ -346,6 +346,7 @@ class PermissionsTests(WorkflowAuditBase):
                 "issue-scheduler.yml/schedule",
                 "opencode-repair.yml/ci-repair",
                 "opencode-repair.yml/sync-current-pr",
+                "opencode-repair.yml/sync-stale-prs",
                 "opencode.yml/opencode",
             ],
         )
@@ -536,6 +537,36 @@ class RepairControllerTests(WorkflowAuditBase):
 
 
 class SelfProtectionTests(WorkflowAuditBase):
+    def test_stale_prs_can_never_restore_completed_bootstrap_policy(self):
+        self_merge = self.raw["auto-merge.yml"]
+        consumer_merge = self.raw["consumer-auto-merge.yml"]
+
+        # Regression for the 2026-09-28 #35 -> #32 incident: a stale PR
+        # restored this temporary guard after the bootstrap it protected had
+        # already completed.
+        self.assertNotIn("issue25", self_merge.lower())
+
+        # Both merge surfaces bind eligibility to the current base and bind the
+        # merge write to the exact head SHA. Green CI on an old base is not
+        # sufficient.
+        self.assertIn("compare/$base_sha...$head_sha", self_merge)
+        self.assertIn('-f "sha=$head_sha"', self_merge)
+        self.assertIn("compareCommitsWithBasehead", consumer_merge)
+        self.assertIn("sha:pr.head.sha", consumer_merge)
+
+    def test_main_advancement_reconciles_stale_agent_branches(self):
+        self_repair = self.raw["opencode-repair.yml"]
+        consumer_repair = self.raw["consumer-repair.yml"]
+
+        self.assertIn("sync-stale-prs", self_repair)
+        self.assertIn("update-branch", self_repair)
+        self.assertIn("base-sync", consumer_repair)
+        self.assertIn("update-branch", consumer_repair)
+
+    def test_merge_finalization_is_idempotent_after_source_issue_autoclose(self):
+        self.assertIn("already closed", self.raw["auto-merge.yml"])
+        self.assertIn("already closed", self.raw["consumer-auto-merge.yml"])
+
     def test_ci_runs_the_security_suite(self):
         text = self.raw["ci.yml"]
         self.assertIn("unittest", text)
