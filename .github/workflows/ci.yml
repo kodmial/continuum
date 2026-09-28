@@ -37,7 +37,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          allowed='^(auto-merge|ci|issue-scheduler|opencode|opencode-repair|consumer-scheduler|consumer-opencode|consumer-repair|consumer-auto-merge)\.ya?ml
+          allowed='^(auto-merge|ci|issue-scheduler|opencode|opencode-repair|consumer-scheduler|consumer-opencode|consumer-repair|consumer-auto-merge)\.ya?ml$'
           bad=0
           while IFS= read -r file; do
             base="$(basename "$file")"
@@ -58,40 +58,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          PYTHONPATH=src python3 -m continuum.cli config-check \
-            --config .continuum.yml
-
-      - name: Verify disabled NanoDictate snapshot is preserved
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -f reference/nanodictate-workflows/release.yml
-          test -f reference/nanodictate-workflows/coderabbit-retry.yml
-          test -f reference/nanodictate-workflows/auto-merge.yml
-          test -f reference/nanodictate-workflows/issue-scheduler.yml
-
-          bad=0
-          while IFS= read -r file; do
-            base="$(basename "$file")"
-            if ! grep -Eq "$allowed" <<<"$base"; then
-              echo "::error::Unexpected active workflow: $file"
-              bad=1
-            fi
-          done < <(find .github/workflows -maxdepth 1 -type f \( -name '*.yml' -o -name '*.yaml' \) | sort)
-          exit "$bad"
-
-      - name: Run Continuum unit tests
-        shell: bash
-        run: |
-          set -euo pipefail
-          PYTHONPATH=src python3 -m unittest discover -s tests -t . -v
-
-      - name: Validate repository configuration
-        shell: bash
-        run: |
-          set -euo pipefail
-          PYTHONPATH=src python3 -m continuum.cli config-check \
-            --config .continuum.yml
+          PYTHONPATH=src python3 -m continuum.cli config-check --config .continuum.yml
 
       - name: Verify disabled NanoDictate snapshot is preserved
         shell: bash
