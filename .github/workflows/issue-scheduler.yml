@@ -306,7 +306,7 @@ jobs:
             issues = issues.filter(issue =>
               !issue.pull_request &&
               issue.user?.login === owner &&
-              trustedIssueNumbers.has(issue.number)
+              trustedIssueNumbers.has(String(issue.number))
             );
             core.notice(
               'Public-repository bootstrap trust policy: ' + issues.length +
