@@ -1,0 +1,82 @@
+# PR-Agent standalone reviewer configuration.
+# CodeRabbit-equivalent manual reviewer. Isolated from CodeRabbit, OpenCode,
+# and auto-merge. Reviewer-only: never modifies source code.
+#
+# Provider selection is intentionally generic. The workflow maps these
+# repository settings to PR-Agent/LiteLLM internals:
+#   PR_AGENT_API_BASE  (variable) -> OpenAI-compatible base URL, e.g. https://provider.example/v1
+#   PR_AGENT_API_KEY   (secret)   -> API key
+#   PR_AGENT_MODEL     (variable) -> model identifier, routed as openai/<model>
+#   PR_AGENT_MAX_TOKENS (variable, optional) -> output/context limit override
+# No provider name, endpoint, model, or key is hard-coded here.
+
+[config]
+# Placeholder only. The workflow always overrides this via CONFIG.MODEL
+# derived from the PR_AGENT_MODEL repository variable.
+model = "openai/pr-agent-model-placeholder"
+fallback_models = []
+reasoning_effort = "medium"
+response_language = "en-US"
+ai_timeout = 180
+retry_same_model_on_timeout = false
+propagate_tool_errors = true
+repo_context_files = ["AGENTS.md"]
+# Review the complete PR diff, not only the latest commit.
+patch_policy = "chunk"
+large_patch_policy = "clip"
+output_run_details = true
+output_run_cost = false
+# Completion limit read by PR-Agent (config.max_output_tokens). The workflow
+# overrides this via CONFIG.MAX_OUTPUT_TOKENS, falling back to 16000 when the
+# optional PR_AGENT_MAX_TOKENS variable is unset.
+max_output_tokens = 16000
+
+[litellm]
+# No max_tokens here: the pinned completion path reads config.max_output_tokens.
+timeout = 180
+
+[pr_reviewer]
+require_score_review = false
+require_tests_review = true
+require_security_review = true
+require_risk_assessment = true
+require_priority_files = true
+require_merge_recommendation = false
+publish_error_details = true
+persistent_comment = true
+inline_key_issues = true
+num_max_findings = 8
+enable_review_coverage_footer = true
+# Chunk large diffs so the whole PR is covered instead of only a prefix.
+# Chunking is token-based and large_patch_policy=clip can still omit content
+# when max_number_of_calls=5 chunks are exhausted or a patch is oversized;
+# the review gate withholds a clean APPROVE verdict in that case instead of
+# reporting a complete review.
+enable_large_pr_chunking = true
+max_number_of_calls = 5
+extra_instructions = """\
+Review the complete current PR diff at the current HEAD, not only the latest commit.
+Find real correctness, regression, reliability, concurrency/race, security,
+performance, maintainability, and test-coverage problems. Avoid style-only or
+speculative findings without a concrete failure scenario.
+When the PR body links or closes a GitHub issue, verify the implementation
+actually satisfies that issue and call out meaningful omissions.
+Include security-sensitive review where applicable and report missing test
+coverage when a behavior change has no adequate test.
+Attach code-specific findings to the relevant file/line as inline comments.
+Produce a concise high-level summary plus a numbered list/count of actionable findings.
+"""
+
+[pr_code_suggestions]
+focus_only_on_problems = true
+persistent_comment = true
+suggestions_score_threshold = 7
+num_code_suggestions_per_chunk = 4
+max_number_of_calls = 5
+commitable_code_suggestions = false
+extra_instructions = """\
+Only suggest changes that fix a concrete bug, security issue, reliability problem,
+performance regression, or meaningful maintainability risk. Avoid formatting-only
+or subjective style suggestions. Never modify source code automatically; this
+reviewer is read-only.
+"""
