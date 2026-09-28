@@ -1,0 +1,98 @@
+name: Retry OpenCode on CodeRabbit unresolved
+
+on:
+  pull_request_review_comment:
+    types: [created]
+
+permissions: {}
+
+jobs:
+  dispatch-unresolved-fix:
+    if: >-
+      github.event.comment.user.login == 'coderabbitai[bot]' &&
+      github.event.comment.in_reply_to_id != null &&
+      contains(github.event.comment.body, '**UNRESOLVED**') &&
+      github.event.pull_request.state == 'open' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    permissions:
+      actions: write
+      contents: read
+      pull-requests: read
+
+    steps:
+      - name: Match unresolved reply to the current verification request
+        id: context
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          FINDING_ID: ${{ github.event.comment.in_reply_to_id }}
+          UNRESOLVED_COMMENT_ID: ${{ github.event.comment.id }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REPO_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+
+          # CodeRabbit replies to the original top-level finding, not to our
+          # verification comment. Locate the verification marker for the same
+          # finding and the *current* PR HEAD. This makes stale UNRESOLVED replies
+          # harmless if the branch has already advanced.
+          COMMENTS=$(gh api --paginate --slurp \
+            "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/comments?per_page=100")
+
+          VERIFICATION=$(jq -c \
+            --argjson finding "$FINDING_ID" \
+            --argjson unresolved "$UNRESOLVED_COMMENT_ID" \
+            --arg owner "$REPO_OWNER" \
+            --arg head "$HEAD_SHA" '
+              [ .[][]
+                | select(.in_reply_to_id == $finding)
+                | select(.id < $unresolved)
+                | select(.user.login == $owner)
+                | select(.body | contains("<!-- opencode-coderabbit-verification "))
+                | select(.body | contains("finding=" + ($finding | tostring)))
+                | select(.body | contains("head=" + $head))
+              ]
+              | sort_by(.id)
+              | last // empty
+            ' <<<"$COMMENTS")
+
+          if [[ -z "$VERIFICATION" ]]; then
+            echo "No matching verification request for finding $FINDING_ID at HEAD $HEAD_SHA; ignoring stale or unrelated UNRESOLVED reply."
+            echo "dispatch=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          BODY=$(jq -r '.body' <<<"$VERIFICATION")
+          REVIEW_ID=$(sed -nE \
+            's/.*opencode-coderabbit-verification review=([0-9]+) finding=.*/\1/p' \
+            <<<"$BODY" | head -n 1)
+
+          if [[ ! "$REVIEW_ID" =~ ^[0-9]+$ ]]; then
+            echo "::error::Could not extract source review id from the verification marker."
+            exit 1
+          fi
+
+          echo "dispatch=true" >> "$GITHUB_OUTPUT"
+          echo "review_id=$REVIEW_ID" >> "$GITHUB_OUTPUT"
+          echo "Matched UNRESOLVED comment $UNRESOLVED_COMMENT_ID to finding $FINDING_ID, review $REVIEW_ID, HEAD $HEAD_SHA."
+
+      - name: Dispatch OpenCode retry
+        if: steps.context.outputs.dispatch == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          REVIEW_ID: ${{ steps.context.outputs.review_id }}
+        run: |
+          set -euo pipefail
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/opencode.yml/dispatches" \
+            -f ref=main \
+            -f "inputs[mode]=coderabbit-fix" \
+            -f "inputs[pr_number]=${PR_NUMBER}" \
+            -f "inputs[head_ref]=${HEAD_REF}" \
+            -f "inputs[review_id]=${REVIEW_ID}"
