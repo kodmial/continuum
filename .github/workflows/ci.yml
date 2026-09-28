@@ -37,7 +37,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          allowed='^(auto-merge|ci|issue-scheduler|review-queue|opencode|opencode-repair|consumer-scheduler|consumer-opencode|consumer-repair|consumer-auto-merge)\.ya?ml$'
+          allowed='^(auto-merge|ci|issue-scheduler|review-queue|opencode|opencode-repair|consumer-scheduler|consumer-opencode|consumer-repair|consumer-auto-merge|release-bun-binary)\.ya?ml$'
           bad=0
           while IFS= read -r file; do
             base="$(basename "$file")"
