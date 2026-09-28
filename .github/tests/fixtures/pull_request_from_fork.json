@@ -1,0 +1,27 @@
+{
+  "_comment": "Regression fixture: a fork pull request whose branch is deliberately named like an agent branch. Denied: fork_pull_request. The branch name must never be what decides trust.",
+  "action": "opened",
+  "number": 45,
+  "pull_request": {
+    "number": 45,
+    "state": "open",
+    "draft": false,
+    "merged": false,
+    "title": "totally legitimate fix",
+    "user": { "login": "untrusted-stranger", "type": "User" },
+    "base": {
+      "ref": "main",
+      "repo": { "full_name": "kodmial/continuum" }
+    },
+    "head": {
+      "ref": "opencode/issue42-pwn",
+      "sha": "1111111111111111111111111111111111111111",
+      "repo": {
+        "full_name": "untrusted-stranger/continuum",
+        "fork": true
+      }
+    }
+  },
+  "sender": { "login": "untrusted-stranger", "type": "User" },
+  "repository": { "full_name": "kodmial/continuum" }
+}

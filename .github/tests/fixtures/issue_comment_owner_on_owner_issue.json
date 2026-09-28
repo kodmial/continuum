@@ -1,0 +1,21 @@
+{
+  "_comment": "Regression fixture: the trusted path. The owner opened the issue and commented the agent command on it. Allowed, checkout_ref is derived from the base branch rather than from the payload.",
+  "action": "created",
+  "issue": {
+    "number": 44,
+    "title": "Document the trust policy",
+    "body": "Add a short trust-boundary section to the README.",
+    "user": { "login": "kodmial", "type": "User" },
+    "author_association": "OWNER",
+    "state": "open"
+  },
+  "comment": {
+    "id": 900004,
+    "body": "/oc",
+    "user": { "login": "kodmial", "type": "User" },
+    "author_association": "OWNER",
+    "created_at": "2026-09-28T00:03:00Z"
+  },
+  "sender": { "login": "kodmial", "type": "User" },
+  "repository": { "full_name": "kodmial/continuum", "default_branch": "main" }
+}

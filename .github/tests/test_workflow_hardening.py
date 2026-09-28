@@ -1,0 +1,591 @@
+#!/usr/bin/env python3
+"""Static audit of the active workflows' privilege boundary.
+
+The trust policy decides *what* is trusted. These tests decide whether the
+workflows are even wired to ask it. A hardening change that leaves a
+``pull_request_target`` job holding write credentials, a privileged job
+checkoutting a ref straight from an event payload, or a policy file nobody
+calls is a silent regression, so each of those is an explicit assertion here.
+
+Workflow YAML is parsed with Ruby's Psych, which is already part of this
+repository's CI toolchain, so the audit needs no third-party Python package.
+
+Run with::
+
+    python3 -m unittest discover -s .github/tests -p 'test_*.py'
+"""
+
+import json
+import pathlib
+import re
+import subprocess
+import unittest
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+WORKFLOW_DIR = REPO_ROOT / ".github" / "workflows"
+POLICY_PATH = ".github/scripts/trust_policy.py"
+
+#: The trust policy subcommand that resolves a write-capable credential to the
+#: account it speaks for. It is the only policy step allowed to hold the PAT,
+#: because no read-only token can answer the question.
+IDENTITY_CHECK = "check-token"
+
+#: Anything that mutates the repository or dispatches work. No step that
+#: verifies trust or identity may contain one of these.
+WRITE_CALLS = (
+    "--method POST",
+    "--method PUT",
+    "--method PATCH",
+    "--method DELETE",
+    "-X POST",
+    "-X PUT",
+    "-X PATCH",
+    "-X DELETE",
+    "createComment",
+    "createLabel",
+    "addLabels",
+    "removeLabel",
+    "issues.update",
+    "issues.create",
+    "pulls.merge",
+    "update-branch",
+    "/dispatches",
+    "git push",
+)
+
+WRITE_SCOPES = ("actions", "checks", "contents", "deployments", "issues", "packages", "pull-requests")
+
+#: The automation plane this repository runs for itself, and therefore the set of
+#: workflows that must ask the trust policy before doing anything privileged.
+AGENT_PLANE = (
+    "auto-merge.yml",
+    "ci.yml",
+    "issue-scheduler.yml",
+    "opencode-repair.yml",
+    "opencode.yml",
+)
+
+#: The workflows that are deliberately outside that plane.
+#:
+#: These are the shared implementations and adapters Continuum *offers* to a
+#: consumer repository: they are entered through `workflow_call` by the
+#: consumer's own entry workflow, they never execute pull request code, and
+#: their write scopes are intrinsic to the job itself (reconciling a queue,
+#: publishing a release). Demanding that they call `.github/scripts/trust_policy.py`
+#: would assert a contract a consumer repository has not opted into, and
+#: `review-queue.yml` in particular *must* hold write authority on
+#: `pull_request_review`: a submitted review is what releases the provider slot
+#: the queue is waiting on, so dropping the trigger would stall the queue.
+#:
+#: The list is spelled out rather than derived, and `AuditScopeTests` asserts it
+#: is exactly the complement of `AGENT_PLANE`, so a workflow cannot enter this
+#: directory - or leave the agent plane - without a reviewer deciding so.
+#:
+#: The invariants that are unconditionally true of *any* workflow in this
+#: repository stay repository-wide: declared permissions, commit-pinned actions,
+#: strict shell mode, no residue of the disabled CodeRabbit path, and a
+#: tokenless privileged checkout.
+NOT_AGENT_PLANE = (
+    "consumer-auto-merge.yml",
+    "consumer-opencode.yml",
+    "consumer-repair.yml",
+    "consumer-scheduler.yml",
+    "release-bun-binary.yml",
+    "review-queue.yml",
+)
+
+#: Events whose payload and code are contributed by whoever opened the pull
+#: request. Nothing privileged may run on these.
+UNTRUSTED_EVENTS = ("pull_request", "pull_request_review", "pull_request_review_comment")
+
+RUBY_YAML_TO_JSON = r"""
+require "yaml"
+require "json"
+files = Dir[File.join(ARGV[0], "*.yml")] + Dir[File.join(ARGV[0], "*.yaml")]
+files.sort.each do |file|
+  data = YAML.safe_load(File.read(file), aliases: true) || {}
+  # Psych resolves the `on:` key to the boolean true (YAML 1.1).
+  data["on"] = data.delete(true) if data.key?(true)
+  puts JSON.generate({"file" => file, "data" => data})
+end
+"""
+
+
+def load_workflows():
+    result = subprocess.run(
+        ["ruby", "-e", RUBY_YAML_TO_JSON, str(WORKFLOW_DIR)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    workflows = {}
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        entry = json.loads(line)
+        workflows[pathlib.Path(entry["file"]).name] = entry["data"]
+    return workflows
+
+
+def trigger_names(document):
+    raw = document.get("on") or {}
+    if isinstance(raw, str):
+        return [raw]
+    if isinstance(raw, list):
+        return list(raw)
+    return list(raw.keys())
+
+
+def permission_map(value):
+    """Normalize a ``permissions`` value to ``{scope: level}``."""
+    if value is None:
+        return {}
+    if isinstance(value, str):
+        return {"*": value}
+    return dict(value)
+
+
+def workflow_permissions(document):
+    return permission_map(document.get("permissions"))
+
+
+def job_permissions(document, job):
+    if "permissions" in job:
+        return permission_map(job.get("permissions"))
+    return workflow_permissions(document)
+
+
+def write_scopes(permissions):
+    return sorted(
+        scope
+        for scope, level in permissions.items()
+        if isinstance(level, str) and level.lower() == "write"
+    )
+
+
+def steps_of(job):
+    return job.get("steps") or []
+
+
+def uses(step, needle):
+    return needle in (step.get("uses") or "")
+
+
+def run_text(step):
+    return step.get("run") or ""
+
+
+def job_text(document, job):
+    """Everything statically knowable about a job, as one searchable string."""
+    parts = [json.dumps(job, sort_keys=True)]
+    for step in steps_of(job):
+        parts.append(run_text(step))
+        parts.append(json.dumps(step.get("with") or {}, sort_keys=True))
+        parts.append(json.dumps(step.get("env") or {}, sort_keys=True))
+    return "\n".join(parts)
+
+
+class WorkflowAuditBase(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.workflows = load_workflows()
+        cls.raw = {
+            path.name: path.read_text(encoding="utf-8")
+            for path in sorted(WORKFLOW_DIR.glob("*.yml"))
+        }
+
+    def job(self, workflow_name, job_name):
+        self.assertIn(workflow_name, self.workflows, workflow_name)
+        self.assertIn(job_name, self.workflows[workflow_name].get("jobs") or {})
+        return self.workflows[workflow_name]["jobs"][job_name]
+
+    def agent_plane(self):
+        """The workflows the trust-policy contract is asserted for."""
+        return {name: self.workflows[name] for name in AGENT_PLANE}
+
+    def steps_matching(self, job, needle):
+        """Every step that invokes the needle, not just the first.
+
+        A job may legitimately call the policy more than once (an allowlist step
+        and a credential check, say), and a write token smuggled into any one of
+        those steps has to be caught.
+        """
+        return [
+            step
+            for step in steps_of(job)
+            if needle in run_text(step) or needle in json.dumps(step)
+        ]
+
+    def step_matching(self, job, needle):
+        matches = self.steps_matching(job, needle)
+        return matches[0] if matches else None
+
+
+class AuditScopeTests(WorkflowAuditBase):
+    """The scope declaration itself is a control, so it is audited too.
+
+    Narrowing the agent-plane assertions is only safe while the narrowing stays
+    honest: every workflow in the directory is named on exactly one side of the
+    split, and the agent plane is never empty.
+    """
+
+    def test_every_workflow_is_classified(self):
+        self.assertEqual(
+            sorted(set(AGENT_PLANE) | set(NOT_AGENT_PLANE)),
+            sorted(self.workflows),
+            "a workflow is missing from the audit scope declaration",
+        )
+
+    def test_no_workflow_is_claimed_by_both_sides(self):
+        self.assertEqual(sorted(set(AGENT_PLANE) & set(NOT_AGENT_PLANE)), [])
+
+    def test_the_agent_plane_is_never_empty(self):
+        for name in AGENT_PLANE:
+            self.assertIn(name, self.workflows, name)
+        self.assertTrue(AGENT_PLANE, "the agent plane must not be empty")
+
+    def test_every_classified_workflow_calls_the_trust_policy_or_exempt(self):
+        """An agent-plane workflow that never asks the policy has no boundary."""
+        for name, document in self.agent_plane().items():
+            calls_policy = POLICY_PATH in self.raw[name]
+            self.assertTrue(
+                calls_policy or "permissions" in document,
+                "{} is in the agent plane but neither calls the policy nor "
+                "declares permissions".format(name),
+            )
+
+
+class UntrustedEventTests(WorkflowAuditBase):
+    def test_no_workflow_writes_on_pull_request_code(self):
+        """A fork pull request must never meet a write-capable token."""
+        for name, document in self.agent_plane().items():
+            triggers = trigger_names(document)
+            for event in UNTRUSTED_EVENTS:
+                if event not in triggers:
+                    continue
+                self.assertEqual(
+                    write_scopes(workflow_permissions(document)),
+                    [],
+                    "{} runs on {} and must not hold write permissions".format(name, event),
+                )
+                for job_name, job in (document.get("jobs") or {}).items():
+                    self.assertEqual(
+                        write_scopes(job_permissions(document, job)),
+                        [],
+                        "{}/{} holds write permissions on a {} event".format(
+                            name, job_name, event
+                        ),
+                    )
+                    for step in steps_of(job):
+                        self.assertNotIn(
+                            "secrets.",
+                            json.dumps(step.get("with") or {})
+                            + json.dumps(step.get("env") or {}),
+                            "{}/{} passes a secret on a {} event".format(
+                                name, job_name, event
+                            ),
+                        )
+                        self.assertNotIn(
+                            "secrets.", run_text(step), "{}/{} uses a secret in run on {}".format(
+                                name, job_name, event
+                            )
+                        )
+
+    def test_agent_workflow_never_triggers_on_pull_request_events(self):
+        document = self.workflows["opencode.yml"]
+        for event in UNTRUSTED_EVENTS + ("pull_request_target", "issues", "push", "schedule"):
+            self.assertNotIn(event, trigger_names(document), event)
+
+    def test_agent_workflow_accepts_only_comment_and_dispatch(self):
+        self.assertEqual(
+            sorted(trigger_names(self.workflows["opencode.yml"])),
+            ["issue_comment", "workflow_dispatch"],
+        )
+
+    def test_comment_trigger_is_create_only(self):
+        triggers = self.workflows["opencode.yml"]["on"]["issue_comment"]
+        self.assertEqual(triggers, {"types": ["created"]})
+
+
+class PermissionsTests(WorkflowAuditBase):
+    def test_every_workflow_declares_permissions_explicitly(self):
+        # The implicit default is read/write for a new workflow; relying on it
+        # is how a workflow silently becomes privileged later.
+        for name, document in self.workflows.items():
+            self.assertIn("permissions", document, name)
+            self.assertNotEqual(
+                permission_map(document.get("permissions")).get("*"),
+                "write-all",
+                name,
+            )
+
+    def test_privileged_credentials_are_not_reachable_from_fork_events(self):
+        for name, document in self.agent_plane().items():
+            if "secrets.TAP_PAT" not in self.raw[name]:
+                continue
+            for event in UNTRUSTED_EVENTS:
+                self.assertNotIn(
+                    event, trigger_names(document), "{} reaches TAP_PAT via {}".format(name, event)
+                )
+
+    def test_only_expected_workflows_hold_write_scopes(self):
+        writers = {}
+        for name, document in self.agent_plane().items():
+            for job_name, job in (document.get("jobs") or {}).items():
+                scopes = write_scopes(job_permissions(document, job))
+                if scopes:
+                    writers["{}/{}".format(name, job_name)] = scopes
+        # The write-capable surface is deliberately tiny and fully audited.
+        # auto-merge/issue-scheduler/agent are the three automation roles; the
+        # two repair jobs are label-and-dispatch control planes that never
+        # check out or execute pull-request code.
+        self.assertEqual(
+            sorted(writers),
+            [
+                "auto-merge.yml/reconcile",
+                "issue-scheduler.yml/schedule",
+                "opencode-repair.yml/ci-repair",
+                "opencode-repair.yml/sync-current-pr",
+                "opencode.yml/opencode",
+            ],
+        )
+        for job_key, scopes in writers.items():
+            workflow = job_key.split("/")[0]
+            self.assertIn(
+                POLICY_PATH,
+                self.raw[workflow],
+                "{} holds {} but does not call the trust policy".format(job_key, scopes),
+            )
+
+
+class PullRequestTargetTests(WorkflowAuditBase):
+    def target_workflows(self):
+        return {
+            name: document
+            for name, document in self.workflows.items()
+            if "pull_request_target" in trigger_names(document)
+        }
+
+    def test_pull_request_target_checkouts_stay_on_trusted_code(self):
+        """A privileged event may read the base branch, never PR code."""
+        self.assertTrue(self.target_workflows(), "expected at least one pull_request_target workflow")
+        for name, document in self.target_workflows().items():
+            for job_name, job in (document.get("jobs") or {}).items():
+                for step in steps_of(job):
+                    if not uses(step, "actions/checkout"):
+                        continue
+                    with_block = step.get("with") or {}
+                    label = "{}/{}".format(name, job_name)
+                    # YAML parses an unquoted false as a bool; both spellings
+                    # must disable the persisted token.
+                    self.assertIn(
+                        with_block.get("persist-credentials"),
+                        (False, "false"),
+                        "{} must not leave a token in the checkout".format(label),
+                    )
+                    token = str(with_block.get("token") or "")
+                    self.assertNotIn("secrets.", token, "{} checks out with a secret".format(label))
+                    ref = str(with_block.get("ref") or "")
+                    self.assertIn(
+                        ref,
+                        ("", "${{ github.event.repository.default_branch }}"),
+                        "{} checks out an untrusted ref {}".format(label, ref),
+                    )
+
+    def test_pull_request_target_never_runs_untrusted_code(self):
+        for name, document in self.target_workflows().items():
+            for job_name, job in (document.get("jobs") or {}).items():
+                label = "{}/{}".format(name, job_name)
+                self.assertNotIn(
+                    "opencode run", job_text(document, job), label
+                )
+                self.assertNotIn("anomalyco/opencode", job_text(document, job), label)
+
+    def test_privileged_verify_step_uses_a_read_only_token(self):
+        """Trust verification must not itself require write authority.
+
+        The one exception is the credential-identity check: learning which
+        account a write-capable token speaks for cannot be done with a
+        read-only token, so that single step is required to carry it. What it
+        may never do is act on the repository, which is asserted here.
+        """
+        found = 0
+        identity_checks = 0
+        for name, document in self.workflows.items():
+            for job_name, job in (document.get("jobs") or {}).items():
+                steps = self.steps_matching(job, POLICY_PATH)
+                if not steps:
+                    continue
+                found += len(steps)
+                label = "{}/{}".format(name, job_name)
+                for step in steps:
+                    block = json.dumps(step.get("with") or {}) + json.dumps(step.get("env") or {})
+                    run = run_text(step)
+                    if IDENTITY_CHECK in run:
+                        identity_checks += 1
+                        # It must actually verify the credential, and must not
+                        # write anything while holding it.
+                        self.assertIn("check-token", run, label)
+                        for verb in WRITE_CALLS:
+                            self.assertNotIn(verb, run, "{}: {}".format(label, verb))
+                        continue
+                    self.assertNotIn("secrets.TAP_PAT", block, "{}: {}".format(label, step.get("name")))
+                    self.assertNotIn("secrets.", run, "{}: {}".format(label, step.get("name")))
+        self.assertGreater(found, 0, "no workflow calls the trust policy")
+        self.assertGreater(identity_checks, 0, "no workflow verifies its dispatch credential")
+
+
+class AgentExecutionTests(WorkflowAuditBase):
+    def test_privileged_agent_job_is_gated_by_the_authorize_job(self):
+        agent = self.job("opencode.yml", "opencode")
+        self.assertIn("authorize", (agent.get("needs") or []))
+        self.assertIn("needs.authorize.outputs.authorized", str(agent.get("if")))
+
+    def test_authorize_job_is_read_only(self):
+        authorize = self.job("opencode.yml", "authorize")
+        self.assertEqual(write_scopes(job_permissions(self.workflows["opencode.yml"], authorize)), [])
+
+    def test_privileged_job_checks_out_only_the_verified_ref(self):
+        agent = self.job("opencode.yml", "opencode")
+        checkouts = [step for step in steps_of(agent) if uses(step, "actions/checkout")]
+        self.assertEqual(len(checkouts), 1)
+        ref = (checkouts[0].get("with") or {}).get("ref")
+        self.assertEqual(ref, "${{ needs.authorize.outputs.checkout_ref }}")
+
+    def test_privileged_job_never_interpolates_raw_dispatch_inputs(self):
+        agent = self.job("opencode.yml", "opencode")
+        text = job_text(self.workflows["opencode.yml"], agent)
+        for expression in ("inputs.head_ref", "inputs.pr_number", "inputs.run_id"):
+            self.assertNotIn(expression, text, expression)
+
+    def test_comment_gate_requires_a_trusted_author_and_a_real_issue(self):
+        condition = str(self.job("opencode.yml", "authorize").get("if"))
+        self.assertIn("github.event.comment.user.login", condition)
+        self.assertIn("github.repository_owner", condition)
+        self.assertIn("github.event.issue.pull_request == null", condition)
+
+    def test_inactive_review_integration_is_fully_removed(self):
+        # The disabled CodeRabbit path handed a write-capable token an
+        # attacker-supplied PR ref. No automation workflow may keep any residue
+        # of it. ci.yml is exempt: its snapshot guard only asserts the disabled
+        # reference tree is still present on disk and executes none of it.
+        for name, document in self.workflows.items():
+            if name == "ci.yml":
+                continue
+            for job_name, job in (document.get("jobs") or {}).items():
+                self.assertNotIn(
+                    "coderabbit",
+                    json.dumps(job).lower(),
+                    "{}/{} still references CodeRabbit".format(name, job_name),
+                )
+
+    def test_ci_only_asserts_the_disabled_snapshot(self):
+        # The reference tree stays as documentation of the inactive path. The
+        # guard may name those files, but every mention must be an inert
+        # existence check: it may not run them, dispatch them, or read their
+        # inputs into a job.
+        job = self.job("ci.yml", "bootstrap-validation")
+        snapshot_mentions = 0
+        for step in steps_of(job):
+            for line in run_text(step).splitlines():
+                if "reference/" not in line:
+                    continue
+                snapshot_mentions += 1
+                self.assertRegex(
+                    line.strip(),
+                    r"^test -f reference/",
+                    "{} touches the reference tree: {}".format(step.get("name"), line.strip()),
+                )
+            self.assertNotIn("reference/", json.dumps(step.get("with") or {}), str(step.get("name")))
+        self.assertGreater(snapshot_mentions, 0, "the disabled snapshot is no longer guarded")
+
+
+class RepairControllerTests(WorkflowAuditBase):
+    def test_dispatch_head_refs_are_policy_verified(self):
+        for name in AGENT_PLANE:
+            if "inputs[head_ref]" not in self.raw[name]:
+                continue
+            self.assertIn(
+                "verify-dispatch",
+                self.raw[name],
+                "{} dispatches head_ref without verify-dispatch".format(name),
+            )
+
+    def test_repair_dispatch_is_validated_before_it_is_sent(self):
+        text = self.raw["opencode-repair.yml"]
+        self.assertIn(POLICY_PATH, text)
+        self.assertLess(
+            text.index("verify-dispatch"),
+            text.index("actions/workflows/opencode.yml/dispatches"),
+            "verification must happen before the privileged dispatch",
+        )
+
+    def test_repair_controller_ignores_fork_pull_requests(self):
+        text = self.raw["opencode-repair.yml"]
+        self.assertIn("trust_policy.py", text)
+        self.assertIn("pull_request_target", text)
+
+    def test_privilege_boundary_changes_are_never_auto_merged(self):
+        text = self.raw["auto-merge.yml"]
+        self.assertIn("merge-plan", text)
+        self.assertNotIn("head.repo?.full_name !== ", text)
+
+    def test_merge_titles_are_sanitized(self):
+        text = self.raw["auto-merge.yml"]
+        self.assertIn("commit-title", text)
+
+
+class SelfProtectionTests(WorkflowAuditBase):
+    def test_ci_runs_the_security_suite(self):
+        text = self.raw["ci.yml"]
+        self.assertIn("unittest", text)
+        self.assertIn(POLICY_PATH, text)
+
+    def test_ci_keeps_the_active_workflow_allowlist(self):
+        # The allowlist is a control: an unreviewed new workflow must not be
+        # able to arrive with write permissions unnoticed.
+        text = self.raw["ci.yml"]
+        match = re.search(r"allowed='\^\((?P<names>[^)]*)\)", text)
+        self.assertIsNotNone(match, "could not read the workflow allowlist")
+        allowed = {name.strip() for name in match.group("names").split("|")}
+        self.assertEqual(
+            {name.rsplit(".", 1)[0] for name in self.workflows},
+            allowed,
+            "the active workflow set and the CI allowlist disagree",
+        )
+
+    def test_every_action_is_pinned_to_a_commit_sha(self):
+        pattern = re.compile(r"^\s*uses:\s*([^\s@]+)(@(\S+))?", re.M)
+        for name, source in self.raw.items():
+            for match in pattern.finditer(source):
+                reference = match.group(3)
+                self.assertIsNotNone(
+                    reference, "{}: {} is not pinned".format(name, match.group(1))
+                )
+                self.assertRegex(
+                    reference,
+                    r"^[0-9a-f]{40}$",
+                    "{}: {} is not pinned to a full commit sha".format(name, match.group(1)),
+                )
+
+    def test_shell_steps_are_strict_mode(self):
+        """Every run block sets its own error handling rather than relying on
+        the caller's shell, so a failed check cannot be ignored."""
+        for name, document in self.workflows.items():
+            for job_name, job in (document.get("jobs") or {}).items():
+                for step in steps_of(job):
+                    script = run_text(step)
+                    if not script.strip():
+                        continue
+                    if script.lstrip().startswith("#!"):
+                        continue
+                    self.assertTrue(
+                        "set -euo pipefail" in script or "set -eu" in script,
+                        "{}/{} step {!r} does not use strict shell mode".format(
+                            name, job_name, step.get("name", "<unnamed>")
+                        ),
+                    )
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,27 @@
+{
+  "_comment": "Regression fixture: a same-repository pull request whose head branch is not an agent branch. A collaborator-with-write (or a leaked token) can create any ref it likes; only opencode/issue<N>-<slug> refs are agent-owned. Denied: untrusted_head_ref.",
+  "action": "opened",
+  "number": 46,
+  "pull_request": {
+    "number": 46,
+    "state": "open",
+    "draft": false,
+    "merged": false,
+    "title": "edit the privileged workflow",
+    "user": { "login": "untrusted-stranger", "type": "User" },
+    "base": {
+      "ref": "main",
+      "repo": { "full_name": "kodmial/continuum" }
+    },
+    "head": {
+      "ref": "main",
+      "sha": "2222222222222222222222222222222222222222",
+      "repo": {
+        "full_name": "kodmial/continuum",
+        "fork": false
+      }
+    }
+  },
+  "sender": { "login": "untrusted-stranger", "type": "User" },
+  "repository": { "full_name": "kodmial/continuum" }
+}
