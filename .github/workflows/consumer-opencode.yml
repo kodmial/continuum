@@ -1,0 +1,211 @@
+name: Continuum reusable OpenCode
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        type: string
+        required: true
+      issue_number:
+        type: string
+        required: false
+        default: ""
+      pr_number:
+        type: string
+        required: false
+        default: ""
+      head_ref:
+        type: string
+        required: false
+        default: ""
+      run_id:
+        type: string
+        required: false
+        default: ""
+      model:
+        type: string
+        required: false
+        default: opencode/big-pickle
+    secrets:
+      OPENCODE_API_KEY:
+        required: false
+
+permissions:
+  actions: read
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  opencode:
+    if: contains(fromJSON('["issue","resolve-conflict","ci-fix"]'), inputs.mode)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    concurrency:
+      group: continuum-opencode-${{ inputs.mode }}-${{ inputs.issue_number || inputs.pr_number || github.run_id }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GITHUB_TOKEN: ${{ github.token }}
+      OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+      OPENCODE_MODEL: ${{ inputs.model }}
+
+    steps:
+      - name: Require model credential
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${OPENCODE_API_KEY:-}" ]]; then
+            echo "::error::OPENCODE_API_KEY is not configured in the consumer repository."
+            exit 1
+          fi
+
+      - name: Checkout issue base
+        if: inputs.mode == 'issue'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          ref: main
+          persist-credentials: true
+
+      - name: Checkout PR branch
+        if: inputs.mode != 'issue'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.head_ref }}
+          persist-credentials: true
+
+      - name: Configure git
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Install OpenCode
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://opencode.ai/install | bash
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+
+      - name: Implement issue
+        if: inputs.mode == 'issue'
+        env:
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$ISSUE_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "::error::Invalid issue number."
+            exit 1
+          fi
+
+          BRANCH="opencode/issue${ISSUE_NUMBER}-${GITHUB_RUN_ID}"
+          git switch -c "$BRANCH"
+
+          gh issue view "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --json title,body > /tmp/continuum-issue.json
+          TITLE="$(jq -r '.title' /tmp/continuum-issue.json)"
+          BODY="$(jq -r '.body // ""' /tmp/continuum-issue.json)"
+
+          PROMPT="$(cat <<EOF
+          Implement GitHub issue #${ISSUE_NUMBER} in this repository.
+
+          Title:
+          ${TITLE}
+
+          Requirements:
+          ${BODY}
+
+          Rules:
+          - Work only on the current branch.
+          - Do not create, switch, delete, merge, rebase, or push git branches.
+          - Do not create a pull request; the workflow owns commit/push/PR lifecycle.
+          - Inspect the repository and preserve existing conventions.
+          - Keep the change scoped to this issue.
+          - Run relevant tests and validation before finishing.
+          - Do not expose secrets.
+          - Keep commit-worthy source and documentation changes in the working tree.
+          EOF
+          )"
+
+          opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
+
+          if [[ -n "$(git status --porcelain)" ]]; then
+            git add -A
+            git commit -m "feat: implement issue #${ISSUE_NUMBER}"
+          fi
+
+          git fetch origin main --quiet
+          AHEAD="$(git rev-list --count "origin/main..HEAD")"
+          if [[ "$AHEAD" -eq 0 ]]; then
+            gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY"               --body "Continuum OpenCode run completed without producing a commit."
+            gh api --method DELETE               "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/labels/automation:in-progress"               >/dev/null 2>&1 || true
+            exit 0
+          fi
+
+          git push -u origin "$BRANCH"
+          gh pr create             --repo "$GITHUB_REPOSITORY"             --base main             --head "$BRANCH"             --title "$TITLE"             --body "Implemented automatically by Continuum.\n\nCloses #${ISSUE_NUMBER}"
+
+      - name: Resolve merge conflict
+        if: inputs.mode == 'resolve-conflict'
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_REF: ${{ inputs.head_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main --quiet
+          PROMPT="$(cat <<EOF
+          Resolve every merge conflict between pull request #${PR_NUMBER} on branch
+          ${HEAD_REF} and current origin/main.
+
+          Requirements:
+          - Work only on the current checked-out PR branch.
+          - Merge origin/main into this branch; do not rebase or force-push.
+          - Preserve intended behavior from both sides.
+          - Run relevant tests after resolving conflicts.
+          - Do not create another branch or pull request.
+          - Commit the resolution if needed; do not push.
+          EOF
+          )"
+          opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
+          if [[ -n "$(git status --porcelain)" ]]; then
+            git add -A
+            git commit -m "chore: resolve conflict with main"
+          fi
+          git push origin "HEAD:${HEAD_REF}"
+
+      - name: Fix failed CI
+        if: inputs.mode == 'ci-fix'
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_REF: ${{ inputs.head_ref }}
+          RUN_ID: ${{ inputs.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BEFORE="$(git rev-parse HEAD)"
+          PROMPT="$(cat <<EOF
+          Fix the failed CI workflow run ${RUN_ID} for pull request #${PR_NUMBER}.
+
+          Requirements:
+          - Inspect the failed workflow and logs with GitHub CLI before changing code.
+          - Fix the root cause only; do not make speculative changes for transient infrastructure failures.
+          - Work only on the current branch ${HEAD_REF}.
+          - Do not create another branch or pull request.
+          - Run relevant tests.
+          - Commit fixes if needed; do not push.
+          EOF
+          )"
+          opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
+          if [[ -n "$(git status --porcelain)" ]]; then
+            git add -A
+            git commit -m "fix: repair failed CI for PR #${PR_NUMBER}"
+          fi
+          AFTER="$(git rev-parse HEAD)"
+          if [[ "$AFTER" != "$BEFORE" ]]; then
+            git push origin "HEAD:${HEAD_REF}"
+          else
+            echo "No source change was produced; leaving retry policy to the controller."
+          fi
