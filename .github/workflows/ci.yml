@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: continuum-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bootstrap-validation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Validate workflow YAML syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          ruby -e '
+            require "yaml"
+            Dir[".github/workflows/*.{yml,yaml}"].sort.each do |file|
+              YAML.parse_file(file)
+              puts "validated #{file}"
+            end
+          '
+
+      - name: Enforce bootstrap module boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          allowed='^(auto-merge|ci|issue-scheduler|opencode|opencode-repair)\.ya?ml$'
+          bad=0
+          while IFS= read -r file; do
+            base="$(basename "$file")"
+            if ! grep -Eq "$allowed" <<<"$base"; then
+              echo "::error::Unexpected active workflow during bootstrap: $file"
+              bad=1
+            fi
+          done < <(find .github/workflows -maxdepth 1 -type f \( -name '*.yml' -o -name '*.yaml' \) | sort)
+          exit "$bad"
+
+      - name: Verify disabled NanoDictate snapshot is preserved
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f reference/nanodictate-workflows/release.yml
+          test -f reference/nanodictate-workflows/coderabbit-retry.yml
+          test -f reference/nanodictate-workflows/auto-merge.yml
+          test -f reference/nanodictate-workflows/issue-scheduler.yml
