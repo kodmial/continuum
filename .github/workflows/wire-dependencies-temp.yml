@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   wire:
-    if: github.event.head_commit.message == 'chore: wire Continuum dependency DAG'
+    if: github.event.head_commit.message == 'wire-continuum-dependency-dag'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
