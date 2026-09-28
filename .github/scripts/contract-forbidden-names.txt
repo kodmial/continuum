@@ -1,0 +1,28 @@
+# Consumer, provider, and platform names that must never appear in the v0.1
+# contract core (.github/scripts/continuum_config.py).
+#
+# The two-toggle contract is the portability guarantee: one unchanged copy of
+# Continuum must resolve every consumer. A consumer, provider, or platform name
+# baked into the contract core would break that silently, so CI fails the build
+# here rather than at migration time.
+#
+# This list is data, not workflow logic. Keeping it out of the contract core is
+# required (the guard greps the core for exactly these tokens) and keeping it
+# out of the active workflows is required too: the MVP boundary asserts that no
+# active workflow names a consumer, so the guard reads the list from here
+# instead of hard-coding it inline.
+#
+# One extended regular expression per line; a match on any line fails the build.
+nanodictate
+kodmai
+coderabbit
+pr[-_]agent
+release-please
+homebrew
+macports
+gradle
+maven
+android
+xcode
+notariz
+codesign

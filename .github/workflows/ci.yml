@@ -37,7 +37,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          allowed='^(auto-merge|ci|issue-scheduler|review-queue|opencode|opencode-repair|consumer-scheduler|consumer-opencode|consumer-repair|consumer-auto-merge)\.ya?ml$'
+          allowed='^(auto-merge|ci|issue-scheduler|review-queue|opencode|opencode-repair|consumer-scheduler|consumer-opencode|consumer-repair|consumer-auto-merge|release-bun-binary)\.ya?ml$'
           bad=0
           while IFS= read -r file; do
             base="$(basename "$file")"
@@ -78,3 +78,38 @@ jobs:
           test -f reference/nanodictate-workflows/coderabbit-retry.yml
           test -f reference/nanodictate-workflows/auto-merge.yml
           test -f reference/nanodictate-workflows/issue-scheduler.yml
+
+      - name: Validate the two-toggle MVP contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/test_continuum_config.py
+
+      - name: Resolve the repository configuration as a consumer would
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Continuum must satisfy its own contract from its own checkout.
+          python3 .github/scripts/continuum_config.py
+
+      - name: Verify contract core stays consumer-agnostic
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The two-toggle contract is the portability guarantee: one unchanged
+          # copy of Continuum must resolve every consumer. A consumer, provider,
+          # or platform name in the contract core would break that silently, so
+          # it fails the build here rather than at migration time.
+          #
+          # The banned names live in a data file rather than inline: the MVP
+          # boundary asserts that no active workflow names a consumer, so the
+          # pattern list is read instead of hard-coded here.
+          core='.github/scripts/continuum_config.py'
+          # `grep -f` has no comment syntax, so '#' lines are stripped before
+          # they are used as patterns; otherwise a comment would match every
+          # commented line in the core.
+          if grep -Eino -f <(grep -v '^[[:space:]]*#' .github/scripts/contract-forbidden-names.txt) "$core"; then
+            echo "::error::Consumer/provider/platform name found in the contract core: $core"
+            exit 1
+          fi
+          echo "validated $core"

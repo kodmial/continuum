@@ -460,8 +460,49 @@ class BundleVersionTests(unittest.TestCase):
         argv = argv_for(plan_for(support.target()), "stamp-bundle-version")
         joined = " ".join(argv)
         self.assertIn(plan_module.env_slot(apple.VERSION_ENV), joined)
-        # Nothing is left for a shell to expand, because there is no shell.
-        self.assertEqual(joined.count("$"), 1)
+        # Nothing is left for a shell to expand, because there is no shell. Every
+        # `$` belongs to a declared slot, so the residue after removing them is
+        # empty rather than merely short.
+        residue = plan_module.SLOT_PATTERN.sub("", joined)
+        self.assertNotIn("$", residue)
+
+    def test_both_version_keys_are_stamped_from_the_one_declared_value(self):
+        # `CFBundleVersion` is the build number and `CFBundleShortVersionString`
+        # is the version the user sees and LaunchServices compares. Stamping
+        # only the first ships a bundle that claims to be a new release and
+        # reports itself as the old one.
+        argv = argv_for(plan_for(support.target()), "stamp-bundle-version")
+        for key in ("CFBundleVersion", "CFBundleShortVersionString"):
+            self.assertIn(f"Set :{key} {plan_module.env_slot(apple.VERSION_ENV)}", argv)
+        self.assertEqual(argv.count("-c"), 2)
+
+    def test_both_keys_are_stamped_by_one_step_in_order(self):
+        # Two steps would let the first write succeed and the second fail,
+        # leaving a half-stamped Info.plist on the runner; "stamped before the
+        # seal" would then be a property of two independently scheduled
+        # commands rather than one.
+        plan = plan_for(support.target())
+        step = plan.step("stamp-bundle-version")
+        self.assertEqual(list(step.argv)[0], apple.PLISTBUDDY)
+        self.assertEqual(len(step.argv), 1 + 2 * len(apple._BUNDLE_VERSION_KEYS) + 1)
+        joined = " ".join(step.argv)
+        self.assertLess(
+            joined.index("CFBundleVersion "), joined.index("CFBundleShortVersionString ")
+        )
+
+    def test_a_failed_version_stamp_is_not_reported_as_a_signing_failure(self):
+        # PlistBuddy failing here is a missing Info.plist key. Telling the
+        # reader to check the entitlements file sends them to the one file that
+        # is not at fault.
+        explained = adapters.explain_failure(
+            "apple",
+            "stamp-bundle-version",
+            'Set: Entry, ":CFBundleShortVersionString", Does Not Exist',
+        )
+        self.assertEqual(explained.code, "bundle-version-stamp-failed")
+        self.assertIn("Info.plist", explained.message)
+        self.assertIn("CFBundleShortVersionString", explained.remediation)
+        self.assertNotIn("entitlement", explained.remediation)
 
     def test_the_plist_inside_the_bundle_is_written_not_the_bundle(self):
         argv = argv_for(plan_for(support.target()), "stamp-bundle-version")

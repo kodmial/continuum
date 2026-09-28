@@ -27,6 +27,32 @@ Their implementations are preserved in the reference snapshot and will be
 reintroduced as optional adapters after the configuration/module boundaries are
 implemented.
 
+## Consumer contract (v0.1)
+
+The complete user-facing configuration for a Continuum consumer is two
+booleans in `.github/continuum.yml`:
+
+```yaml
+review: false
+release: false
+```
+
+A missing configuration resolves to exactly those values, so adopting
+Continuum requires declaring nothing. `review` controls whether merging waits
+for a normalized, consumer-adapter-provided review gate; `release` controls
+whether Continuum invokes the consumer's release entrypoint after merge. The
+review provider, platform, signing, and publication details are deliberately
+not settings — they stay in consumer-owned adapters and existing repository
+variables.
+
+The normative rules are in
+[docs/continuum-mvp-contract.md](docs/continuum-mvp-contract.md), and the
+reference resolver plus its test suite live in `.github/scripts/`.
+
+That contract file is distinct from the operational `.continuum.yml` this
+repository validates with `continuum cli config-check`; the sections below
+describe the implementation that sits behind the two toggles.
+
 ## Review gate
 
 The first reusable review adapter (`review.provider: pr-agent`) is, as of the
@@ -124,6 +150,10 @@ present in everything it signed:
 
 - binaries are signed first, then the bundle is sealed over them with the same
   identity, so the nested code is not re-signed by a different key;
+- the release version is written into the bundle's `Info.plist` *before* the
+  seal, in both `CFBundleVersion` and `CFBundleShortVersionString` — the build
+  number and the version Finder shows — because the signature covers the plist
+  and because a bundle that reports the old version is not an upgrade;
 - each product is checked for `Authority=<identity>`, and the job fails if it
   is absent — a signature from the wrong certificate is self-consistent and
   would otherwise pass;
