@@ -1,0 +1,121 @@
+name: Auto-merge bootstrap
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+  workflow_dispatch:
+  schedule:
+    - cron: "11,26,41,56 * * * *"
+
+permissions:
+  actions: write
+  contents: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: continuum-auto-merge-bootstrap
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Merge eligible OpenCode PRs
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+        with:
+          github-token: ${{ secrets.TAP_PAT || github.token }}
+          script: |
+            const {owner, repo} = context.repo;
+
+            async function ciGreen(headSha) {
+              const runs = await github.paginate(
+                github.rest.actions.listWorkflowRuns,
+                {
+                  owner,
+                  repo,
+                  workflow_id: 'ci.yml',
+                  head_sha: headSha,
+                  event: 'pull_request',
+                  per_page: 20,
+                }
+              );
+              const completed = runs
+                .filter(run => run.status === 'completed')
+                .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+              return completed[0]?.conclusion === 'success';
+            }
+
+            const prs = await github.paginate(github.rest.pulls.list, {
+              owner,
+              repo,
+              state: 'open',
+              base: 'main',
+              per_page: 100,
+            });
+
+            for (const listed of prs) {
+              if (listed.head.repo?.full_name !== `${owner}/${repo}`) continue;
+              if (!listed.head.ref.startsWith('opencode/')) continue;
+
+              const labels = new Set((listed.labels || []).map(x => x.name));
+              if (labels.has('no-auto-merge')) {
+                core.notice(`PR #${listed.number}: no-auto-merge is set.`);
+                continue;
+              }
+
+              if (!(await ciGreen(listed.head.sha))) {
+                core.notice(`PR #${listed.number}: current-head CI is not green.`);
+                continue;
+              }
+
+              const {data: pr} = await github.rest.pulls.get({
+                owner, repo, pull_number: listed.number,
+              });
+              if (pr.mergeable === false || pr.mergeable_state === 'dirty') {
+                core.notice(`PR #${listed.number}: merge conflict; repair controller owns it.`);
+                continue;
+              }
+              if (pr.mergeable == null) {
+                core.notice(`PR #${listed.number}: mergeability is still being computed.`);
+                continue;
+              }
+
+              const result = await github.rest.pulls.merge({
+                owner,
+                repo,
+                pull_number: listed.number,
+                merge_method: 'squash',
+                commit_title: pr.title,
+              });
+
+              if (!result.data.merged) {
+                core.warning(`PR #${listed.number}: merge refused: ${result.data.message}`);
+                continue;
+              }
+
+              const match = pr.head.ref.match(/^opencode\/issue(\d+)-/);
+              if (match) {
+                const issueNumber = Number(match[1]);
+                try {
+                  await github.rest.issues.update({
+                    owner, repo, issue_number: issueNumber,
+                    state: 'closed', state_reason: 'completed',
+                  });
+                } catch (err) {
+                  if (err.status !== 404) throw err;
+                }
+              }
+
+              core.notice(`PR #${listed.number}: merged at ${result.data.sha}.`);
+
+              try {
+                await github.rest.actions.createWorkflowDispatch({
+                  owner, repo, workflow_id: 'issue-scheduler.yml', ref: 'main',
+                });
+              } catch (err) {
+                core.warning(`Could not wake scheduler after merge: ${err.message}`);
+              }
+            }
