@@ -144,7 +144,7 @@ class ConfigTests(unittest.TestCase):
 
     def test_repository_configuration_is_valid(self):
         config = config_module.load_config(".continuum.yml")
-        self.assertEqual(config.review.provider, config_module.PROVIDER_PR_AGENT)
+        self.assertEqual(config.review.provider, config_module.PROVIDER_NONE)
         self.assertTrue(config.review.block_merge)
 
 
