@@ -3,7 +3,7 @@
 The NanoDictate PR-Agent implementation is preserved verbatim under
 `reference/nanodictate-workflows/pr-agent/` and must never become an active
 workflow. These tests keep the snapshot immutable, credential-free, and unwired
-while the Continuum adapter stays the only executable review surface.
+while PR-Agent remains post-MVP and non-executable from GitHub Actions.
 """
 
 from __future__ import annotations
@@ -69,13 +69,14 @@ class ReferenceNotWiredTests(unittest.TestCase):
                 self.assertIn("reference/nanodictate-workflows", line)
                 self.assertIn("test -f", line)
 
-    def test_active_pr_agent_workflow_is_a_rewrite_not_a_copy(self):
-        reference = (REFERENCE / "pr-agent.yml").read_bytes()
-        active = (WORKFLOWS / "pr-agent.yml").read_bytes()
-        self.assertNotEqual(active, reference)
-        text = (WORKFLOWS / "pr-agent.yml").read_text(encoding="utf-8")
-        self.assertNotIn(".github/scripts/pr_agent_review_gate.py", text)
-        self.assertNotIn("PRA-", text)
+    def test_pr_agent_is_not_an_active_mvp_workflow(self):
+        self.assertFalse((WORKFLOWS / "pr-agent.yml").exists())
+        self.assertFalse((WORKFLOWS / "pr-agent-comment.yml").exists())
+
+    def test_post_mvp_rewrite_is_archived_outside_actions(self):
+        archived = ROOT / "reference" / "post-mvp-pr-agent-workflows"
+        self.assertTrue((archived / "pr-agent.yml").is_file())
+        self.assertTrue((archived / "pr-agent-comment.yml").is_file())
 
 
 class AdapterParityTests(unittest.TestCase):
