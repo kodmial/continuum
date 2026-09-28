@@ -11,3 +11,64 @@ review:
   # MVP bootstrap: review is disabled until the CodeRabbit adapter (#11) lands.
   # PR-Agent is post-MVP and must not be selected by v0.1.
   provider: none
+
+# Release targets are declared here but not yet run: no release workflow is
+# active, and `.github/workflows/ci.yml` enforces an allowlist of workflow
+# names. The block below is the shape a repository writes once the macOS
+# signing job lands; it is commented out because this repository has no
+# artifacts to sign and because `config-check` validates it either way.
+#
+# Sign a target:
+#   continuum release plan --target macos            # what would happen
+#   continuum release sign --target macos --signing-material present
+#
+# The two secrets are repository secrets, named by configuration so this file
+# stays safe to review in public. The certificate is a self-signed code-signing
+# identity whose name is the thing that must stay constant across releases:
+# macOS keys microphone and accessibility permissions on the signing identity,
+# so a release signed by anything else makes every user re-grant them.
+#
+# release:
+#   targets:
+#     - id: macos
+#       adapter: apple
+#       platform: macos
+#       build_strategy: swiftpm
+#       distribution: direct
+#       architectures:
+#         - x86_64
+#         - arm64
+#       universal: false
+#       artifacts:
+#         - tar.gz
+#         - zip
+#       # Hardened runtime is the protection the entitlement set is only
+#       # meaningful under; it is not a free upgrade, so it is explicit.
+#       hardened_runtime: true
+#       publishers:
+#         - homebrew
+#         - macports
+#       binaries:
+#         - name: NanoDictateAgent
+#           identifier: com.nanodictate.agent
+#           entitlements: Resources/com.nanodictate.agent.entitlements
+#       app_bundle:
+#         name: NanoDictate.app
+#         identifier: com.nanodictate.agent
+#       signing:
+#         mode: self-signed-stable
+#         # The exact common name of the imported certificate. Continuum asserts
+#         # it is the `Authority=` of everything it signs, and fails the release
+#         # if it is not.
+#         identity: "NanoDictate CI Signing"
+#         p12_secret: NANODICTATE_SIGNING_P12
+#         password_secret: NANODICTATE_SIGNING_PASSWORD
+#         # No secure timestamp by default: a self-signed identity has no
+#         # timestamp authority, and adding one later invalidates the checksums
+#         # already published for the release.
+#         timestamp: false
+#         # A pull request from a fork has no access to the secrets. Set this
+#         # only if a degraded, ad-hoc build is acceptable there: it is signed
+#         # by nobody, so macOS will not preserve TCC permissions across the
+#         # upgrade, and the plan says so loudly.
+#         allow_adhoc_fallback: false
