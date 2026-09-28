@@ -1,0 +1,56 @@
+name: Rewire Continuum release DAG
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  wire:
+    if: github.event.head_commit.message == 'rewire-continuum-release-dag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Rewire native issue dependencies
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          H=(-H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2026-03-10")
+
+          add_dep() {
+            gh api --method POST "${H[@]}"               "repos/$GITHUB_REPOSITORY/issues/$1/dependencies/blocked_by"               -F "issue_id=$2" >/dev/null
+          }
+          del_dep() {
+            gh api --method DELETE "${H[@]}"               "repos/$GITHUB_REPOSITORY/issues/$1/dependencies/blocked_by/$2" >/dev/null
+          }
+
+          # Research runs immediately and independently.
+          del_dep 7 5614457679 || true
+          del_dep 7 5614458030 || true
+
+          # Release core is intentionally early: only the config contract blocks it.
+          for id in 5614458373 5614458878 5614459191 5614459607; do
+            del_dep 12 "$id" || true
+          done
+          add_dep 12 5614457679 || true
+
+          # Platform adapters fan out in parallel once the release contract exists.
+          add_dep 18 5614461245
+          add_dep 19 5614461245
+          add_dep 20 5614461245
+
+          # Secure reusable orchestration can be built in parallel with adapters,
+          # but requires both release contract and public-repo security boundary.
+          add_dep 21 5614461245
+          add_dep 21 5614458030
+
+          # NanoDictate is the first real release consumer; Android/JVM do not block it.
+          add_dep 22 5614936406
+          add_dep 22 5614937533
+
+          echo "Release DAG rewired."
