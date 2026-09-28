@@ -33,16 +33,16 @@ jobs:
             end
           '
 
-      - name: Enforce bootstrap module boundary
+      - name: Enforce MVP active workflow boundary
         shell: bash
         run: |
           set -euo pipefail
-          allowed='^(auto-merge|ci|issue-scheduler|opencode|opencode-repair)\.ya?ml$'
+          allowed='^(auto-merge|ci|issue-scheduler|review-queue|opencode|opencode-repair|consumer-scheduler|consumer-opencode|consumer-repair|consumer-auto-merge)\.ya?ml$'
           bad=0
           while IFS= read -r file; do
             base="$(basename "$file")"
             if ! grep -Eq "$allowed" <<<"$base"; then
-              echo "::error::Unexpected active workflow during bootstrap: $file"
+              echo "::error::Unexpected active workflow: $file"
               bad=1
             fi
           done < <(find .github/workflows -maxdepth 1 -type f \( -name '*.yml' -o -name '*.yaml' \) | sort)
@@ -57,6 +57,18 @@ jobs:
           # a change that weakens the boundary must fail here.
           test -f .github/scripts/trust_policy.py
           python3 -m unittest discover -s .github/tests -p 'test_*.py' -v
+
+      - name: Run Continuum unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=src python3 -m unittest discover -s tests -t . -v
+
+      - name: Validate repository configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=src python3 -m continuum.cli config-check --config .continuum.yml
 
       - name: Verify disabled NanoDictate snapshot is preserved
         shell: bash

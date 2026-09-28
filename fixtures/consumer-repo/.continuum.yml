@@ -1,0 +1,64 @@
+# Fixture consumer repository for the Continuum reusable workflows.
+#
+# This directory is a minimal consumer repository used by the deterministic
+# tests (test_fixture_consumer.py) to prove the adapter contracts:
+#   - a validated .continuum.yml that selects review.provider: pr-agent and
+#     configures the review queue's labels, ordering, and shared slot;
+#   - a thin workflow that calls kodmial/continuum/.github/workflows/pr-agent.yml
+#     and wires this repository's variables/secrets to the reusable inputs;
+#   - a thin queue entry workflow that declares the queue's event surface and
+#     calls kodmial/continuum/.github/workflows/review-queue.yml.
+# All values below are *names* of repository variables and secrets, never the
+# endpoint, model, or credential itself.
+
+version: 1
+
+review:
+  provider: pr-agent
+
+  block_merge: true
+
+  status_context: continuum/review
+
+  pr_agent:
+    api_base_var: PR_AGENT_API_BASE
+    api_key_secret: PR_AGENT_API_KEY
+    model_var: PR_AGENT_MODEL
+    max_tokens_var: PR_AGENT_MAX_TOKENS
+    bot_login: github-actions[bot]
+
+  queue:
+    ready_label: review-ready
+
+    block_labels:
+      - review-paused
+      - review-blocked
+      - no-review
+      - do-not-merge
+
+    priority_labels:
+      - priority:p0
+      - priority:p1
+      - priority:p2
+      - priority:p3
+
+    # Ordered: an explicit priority label wins, then this list breaks ties.
+    tie_breakers:
+      - source_issue
+      - pr_number
+
+    required_checks:
+      - ci
+
+    require_green_ci: true
+
+    # The provider's slot is shared, so one request holds it for a full window.
+    cooldown_minutes: 60
+    in_flight_timeout_minutes: 30
+    safety_margin_seconds: 30
+
+    # PR-Agent is dispatched as a workflow, so the queue's provider action is a
+    # workflow dispatch. The label pair is the eligibility contract this repository
+    # already uses.
+    dispatch_workflow: pr-agent.yml
+    max_candidates: 20

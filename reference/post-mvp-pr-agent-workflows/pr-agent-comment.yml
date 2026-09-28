@@ -1,0 +1,84 @@
+name: Continuum PR-Agent manual review commands
+
+# Repository-owner comment entry to the Continuum review gate. Trusted-actor
+# contract only: the actor must be the repository owner, and every command body
+# is parsed by the Continuum module (never by a shell or a GitHub expression).
+#
+#   /review         - full review of the current PR HEAD
+#   /verify <id>    - re-check one finding, e.g. /verify CRV-1A2B3C4D
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  parse:
+    if: github.event.issue.pull_request && github.actor == github.repository_owner
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      command: ${{ steps.route.outputs.command }}
+      finding: ${{ steps.route.outputs.finding }}
+      pr_number: ${{ steps.route.outputs.pr_number }}
+    steps:
+      - name: Checkout Continuum module
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          sparse-checkout: src/continuum
+          sparse-checkout-cone-mode: false
+
+      - id: route
+        env:
+          CONTINUUM_COMMENT_BODY: ${{ github.event.comment.body }}
+          CONTINUUM_ACTOR: ${{ github.actor }}
+          CONTINUUM_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          CONTINUUM_PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          PYTHONPATH=src python3 -m continuum.cli command
+
+  review:
+    needs: parse
+    if: needs.parse.outputs.command == 'review'
+    uses: ./.github/workflows/pr-agent.yml
+    with:
+      pr_number: ${{ needs.parse.outputs.pr_number }}
+      api_base: ${{ vars.PR_AGENT_API_BASE }}
+      model: ${{ vars.PR_AGENT_MODEL }}
+      max_tokens: ${{ vars.PR_AGENT_MAX_TOKENS }}
+    secrets:
+      continuum_token: ${{ secrets.GITHUB_TOKEN }}
+      pr_agent_api_key: ${{ secrets.PR_AGENT_API_KEY }}
+
+  verify:
+    needs: parse
+    if: needs.parse.outputs.command == 'verify'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
+      PR_NUMBER: ${{ needs.parse.outputs.pr_number }}
+      FINDING: ${{ needs.parse.outputs.finding }}
+      CONTINUUM_REVIEW_API_BASE: ${{ vars.PR_AGENT_API_BASE }}
+      CONTINUUM_REVIEW_API_KEY: ${{ secrets.PR_AGENT_API_KEY }}
+      CONTINUUM_REVIEW_MODEL: ${{ vars.PR_AGENT_MODEL }}
+      CONTINUUM_REVIEW_MAX_TOKENS: ${{ vars.PR_AGENT_MAX_TOKENS }}
+    steps:
+      - name: Checkout Continuum module
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          sparse-checkout: src/continuum
+          sparse-checkout-cone-mode: false
+
+      - name: Re-check one finding against current HEAD
+        run: |
+          set -euo pipefail
+          PYTHONPATH=src python3 -m continuum.cli verify \
+            --pr "$PR_NUMBER" \
+            --finding "$FINDING"

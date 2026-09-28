@@ -1,0 +1,144 @@
+# Continuum review queue reconciler: the single shared implementation.
+#
+# The queue is reconciled from GitHub state, never from event payloads. Any
+# state change that can change *who the next eligible review candidate is* is a
+# wake-up for this workflow, so a pull request that is closed, merged, converted
+# to draft, paused, reprioritized, or finishes CI immediately lets the next
+# candidate progress. Events are wake-ups; `continuum queue reconcile` recomputes
+# the entire queue and schedules at most one provider request.
+#
+# Nothing here checks out or executes pull request code: the job only reads
+# repository state through the API and posts a fixed provider command.
+#
+# A consumer repository copies a thin entry workflow (see
+# `fixtures/consumer-repo/.github/workflows/review-queue.yml`) that declares the
+# event set and calls this workflow. The entry workflow must grant `actions:
+# write`, because dispatching a provider gate run needs it.
+
+name: Review queue reconciler
+
+on:
+  workflow_call:
+    inputs:
+      config_path:
+        type: string
+        required: false
+        default: .continuum.yml
+        description: "Path to the validated Continuum configuration file."
+      wait_minutes:
+        type: number
+        required: false
+        default: 45
+        description: >-
+          How long one run may stay alive to re-reconcile while a provider
+          cooldown is the only thing holding the queue. Event coverage, not this
+          window, drives normal progression.
+    secrets:
+      continuum_token:
+        required: false
+
+  # The complete lifecycle surface of a candidate. `closed` and
+  # `converted_to_draft` are the transitions whose absence used to stall a
+  # queue: the head of the queue left the set and no controller run followed.
+  pull_request_target:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+      - converted_to_draft
+      - closed
+      - labeled
+      - unlabeled
+      - edited
+      - auto_merge_enabled
+      - auto_merge_disabled
+
+  # A submitted review consumes the provider's shared quota; a dismissal gives
+  # the slot back. Both must move the queue on.
+  pull_request_review:
+    types: [submitted, dismissed]
+
+  # Provider output and rate-limit notices arrive as comments, and a priority
+  # label on the source issue reorders the queue.
+  issue_comment:
+    types: [created, edited]
+  issues:
+    types: [labeled, unlabeled, reopened, closed, edited]
+
+  # Required CI reaching success, failure, or cancellation changes eligibility.
+  status: {}
+  check_run:
+    types: [completed, rerequested, created]
+  check_suite:
+    types: [completed, rerequested]
+
+  # A completed review workflow settles the slot and starts the cooldown.
+  workflow_run:
+    types: [completed, requested]
+
+  # Recovery backstop only. Normal progression is event driven; this exists so a
+  # deliberately or accidentally missed event cannot stall the queue forever.
+  schedule:
+    - cron: "7,37 * * * *"
+
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Why this reconciliation was requested (audit trail)."
+        required: false
+        default: "manual"
+
+permissions: {}
+
+# One controller at a time decides who gets the next shared provider slot. A new
+# wake-up supersedes a run that is only waiting out a cooldown.
+concurrency:
+  group: continuum-review-queue
+  cancel-in-progress: true
+
+jobs:
+  reconcile:
+    # A fork's pull request can never be a candidate: its HEAD is not reachable
+    # by the repository-scoped provider, and its event must not spend the slot.
+    if: >-
+      github.event_name != 'pull_request_target' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    permissions:
+      actions: write
+      contents: read
+      issues: write
+      pull-requests: write
+      statuses: read
+
+    steps:
+      - name: Checkout (module + configuration)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Read the queue contract from repository configuration
+        id: config
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.continuum_token || secrets.TAP_PAT || github.token }}
+        run: |
+          set -euo pipefail
+          PYTHONPATH=src python3 -m continuum.cli config-check \
+            --config "${{ inputs.config_path || '.continuum.yml' }}"
+
+      - name: Reconcile the review queue
+        id: queue
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.continuum_token || secrets.TAP_PAT || github.token }}
+          CONTINUUM_WAKE_EVENT: ${{ github.event_name }}
+          CONTINUUM_WAKE_ACTION: ${{ github.event.action }}
+          CONTINUUM_WAKE_PR: ${{ github.event.pull_request.number || github.event.issue.number }}
+          CONTINUUM_WAKE_REASON: ${{ inputs.reason || 'event' }}
+          CONTINUUM_WAIT_MINUTES: ${{ inputs.wait_minutes || vars.CONTINUUM_REVIEW_WAIT_MINUTES || '45' }}
+        run: |
+          set -euo pipefail
+          PYTHONPATH=src python3 -m continuum.cli queue reconcile \
+            --config "${{ inputs.config_path || '.continuum.yml' }}" \
+            --wait-minutes "${CONTINUUM_WAIT_MINUTES}"

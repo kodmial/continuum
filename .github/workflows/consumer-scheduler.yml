@@ -1,0 +1,166 @@
+name: Continuum reusable scheduler
+
+on:
+  workflow_call:
+    inputs:
+      opencode_workflow:
+        type: string
+        required: false
+        default: continuum-opencode.yml
+      wip_limit:
+        type: number
+        required: false
+        default: 2
+      lease_minutes:
+        type: number
+        required: false
+        default: 45
+      max_attempts:
+        type: number
+        required: false
+        default: 2
+
+permissions:
+  actions: write
+  contents: read
+  issues: write
+  pull-requests: read
+
+jobs:
+  schedule:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Reconcile and dispatch
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+        env:
+          OPENCODE_WORKFLOW: ${{ inputs.opencode_workflow }}
+          WIP_LIMIT: ${{ inputs.wip_limit }}
+          LEASE_MINUTES: ${{ inputs.lease_minutes }}
+          MAX_ATTEMPTS: ${{ inputs.max_attempts }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const {owner, repo} = context.repo;
+            const repoFullName = `${owner}/${repo}`;
+            const inProgress = 'automation:in-progress';
+            const paused = 'automation:paused';
+            const marker = '<!-- continuum-dispatch -->';
+            const wipLimit = Number(process.env.WIP_LIMIT || 2);
+            const leaseMs = Number(process.env.LEASE_MINUTES || 45) * 60 * 1000;
+            const maxAttempts = Number(process.env.MAX_ATTEMPTS || 2);
+            const priority = new Map([
+              ['priority:p0', 0], ['priority:p1', 1], ['priority:p2', 2],
+            ]);
+
+            async function ensureLabel(name, color, description) {
+              try {
+                await github.rest.issues.getLabel({owner, repo, name});
+              } catch (e) {
+                if (e.status !== 404) throw e;
+                await github.rest.issues.createLabel({owner, repo, name, color, description});
+              }
+            }
+            async function addLabel(number, name) {
+              await github.rest.issues.addLabels({owner, repo, issue_number:number, labels:[name]});
+            }
+            async function removeLabel(number, name) {
+              try { await github.rest.issues.removeLabel({owner, repo, issue_number:number, name}); }
+              catch (e) { if (e.status !== 404) throw e; }
+            }
+
+            await ensureLabel(inProgress, 'FBCA04', 'Continuum currently owns this issue');
+            await ensureLabel(paused, 'B60205', 'Continuum automation is paused');
+
+            const all = await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, state:'open', per_page:100
+            });
+            const issues = all.filter(i => !i.pull_request && i.user?.login === owner);
+            const labelsOf = i => new Set((i.labels || []).map(l => typeof l === 'string' ? l : l.name));
+
+            const prs = await github.paginate(github.rest.pulls.list, {
+              owner, repo, state:'open', per_page:100
+            });
+            const activeByPr = new Set();
+            for (const pr of prs) {
+              if (pr.head?.repo?.full_name !== repoFullName) continue;
+              const m = (pr.head.ref || '').match(/^opencode\/issue(\d+)-/);
+              if (m) activeByPr.add(Number(m[1]));
+            }
+
+            const active = new Set(activeByPr);
+            for (const issue of issues) {
+              const labels = labelsOf(issue);
+              if (!labels.has(inProgress) || activeByPr.has(issue.number)) continue;
+
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner, repo, issue_number:issue.number, per_page:100
+              });
+              const dispatches = comments.filter(c => (c.body || '').includes(marker))
+                .sort((a,b) => new Date(a.created_at) - new Date(b.created_at));
+              const last = dispatches.at(-1);
+              if (!last) {
+                await removeLabel(issue.number, inProgress);
+                continue;
+              }
+              const age = Date.now() - new Date(last.created_at).getTime();
+              if (age < leaseMs) {
+                active.add(issue.number);
+              } else {
+                await removeLabel(issue.number, inProgress);
+                if (dispatches.length >= maxAttempts) await addLabel(issue.number, paused);
+              }
+            }
+
+            const free = Math.max(0, wipLimit - active.size);
+            core.notice(`Continuum WIP ${active.size}/${wipLimit}; free=${free}.`);
+            if (!free) return;
+
+            const candidates = issues
+              .filter(i => !active.has(i.number))
+              .filter(i => !labelsOf(i).has(paused))
+              .map(i => {
+                const ranks = [...labelsOf(i)].filter(l => priority.has(l)).map(l => priority.get(l));
+                return {issue:i, rank:ranks.length ? Math.min(...ranks) : 3};
+              })
+              .sort((a,b) => a.rank - b.rank || a.issue.number - b.issue.number);
+
+            let dispatched = 0;
+            for (const item of candidates) {
+              if (dispatched >= free) break;
+              const issue = item.issue;
+
+              let blockers = [];
+              try {
+                blockers = await github.paginate(
+                  'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
+                  {
+                    owner, repo, issue_number:issue.number, per_page:100,
+                    headers:{'X-GitHub-Api-Version':'2026-03-10'}
+                  }
+                );
+              } catch (e) {
+                core.warning(`Could not read dependencies for #${issue.number}: ${e.message}`);
+                continue;
+              }
+              if (blockers.some(b => b.state === 'open')) continue;
+
+              await addLabel(issue.number, inProgress);
+              try {
+                await github.rest.actions.createWorkflowDispatch({
+                  owner, repo,
+                  workflow_id: process.env.OPENCODE_WORKFLOW,
+                  ref: 'main',
+                  inputs: {mode:'issue', issue_number:String(issue.number)}
+                });
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number:issue.number,
+                  body:[marker, 'Automatically dispatched by Continuum.'].join('\n')
+                });
+                dispatched++;
+                core.notice(`Dispatched #${issue.number} to ${process.env.OPENCODE_WORKFLOW}.`);
+              } catch (e) {
+                await removeLabel(issue.number, inProgress);
+                throw e;
+              }
+            }

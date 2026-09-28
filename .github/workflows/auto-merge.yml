@@ -1,13 +1,24 @@
-# Continuum bootstrap: derived from NanoDictate.
+name: Auto-merge controller
+
+# Merge gate for implementation pull requests. A PR only merges when:
+#   - its branch follows the opencode/<issue>- naming convention;
+#   - the current HEAD has a green, current-HEAD CI run;
+#   - the current HEAD carries a green Continuum review-gate status in the
+#     context named by .continuum.yml (failure closes the gate);
+#   - the merge is not blocked by labels or conflicts.
+# The review gate is consumed strictly through its normalized contract
+# (status context + verdict=... state=... provider=... head=<sha>), never by
+# parsing a provider comment. review.provider: none is a deliberate free pass.
 #
-# The merge controller is split so that deciding is never the same privilege as
+# The controller is split so that deciding is never the same privilege as
 # acting:
 #
 #   plan       read-only, no write scopes at all. Asks
 #              .github/scripts/trust_policy.py for a verdict on every open pull
 #              request, then re-checks each approved one against live state and
-#              sanitizes its commit title. Evaluating a pull request an attacker
-#              opened therefore cannot touch the repository.
+#              against the review-gate contract, and sanitizes its commit title.
+#              Evaluating a pull request an attacker opened therefore cannot
+#              touch the repository.
 #   reconcile  the only job with write scopes. It merges strictly the pull
 #              requests named in the plan, using the titles the plan already
 #              sanitized, and re-verifies each is still mergeable at merge time.
@@ -16,7 +27,6 @@
 # .github/actions, CODEOWNERS, action.yml) is blocked by the policy and requires
 # a human. Pull-request titles are attacker-controllable text, so they are
 # neutralized through the policy before reaching the merge API.
-name: Auto-merge bootstrap
 
 on:
   workflow_run:
@@ -29,7 +39,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: continuum-auto-merge-bootstrap
+  group: continuum-auto-merge
   cancel-in-progress: false
 
 jobs:
@@ -49,12 +59,20 @@ jobs:
 
     steps:
       - name: Checkout trusted policy
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # Default branch only, read-only token: the plan is computed from
-          # trusted policy code, never from pull-request code.
+          # trusted policy code and trusted configuration, never from
+          # pull-request code.
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
+
+      - name: Read the review-gate contract from repository configuration
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=src python3 -m continuum.cli config-check --config .continuum.yml
 
       - name: Compute the merge plan with the trust policy
         id: plan
@@ -82,11 +100,14 @@ jobs:
       - name: Build the executable merge plan
         id: build
         env:
-          # Read-only. Re-checking liveness, mergeability and the opt-out label
-          # is all inspection.
+          # Read-only. Re-checking liveness, mergeability, the opt-out label
+          # and the review gate is all inspection.
           GH_TOKEN: ${{ github.token }}
           APPROVED: ${{ steps.plan.outputs.approved }}
           CONTINUUM_BASE_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
+          STATUS_CONTEXT: ${{ steps.check.outputs.status_context }}
+          BLOCK_MERGE: ${{ steps.check.outputs.block_merge }}
+          PROVIDER_ENABLED: ${{ steps.check.outputs.enabled }}
         run: |
           set -euo pipefail
 
@@ -151,6 +172,35 @@ jobs:
               echo "PR #$number mergeability is still being computed."; continue
             fi
 
+            # The review gate is a commit status in the configured context. Only
+            # the normalized description contract counts: verdict=APPROVE on the
+            # exact current HEAD. Anything else closes the gate. A disabled
+            # provider (review.provider: none) is a deliberate free pass. The
+            # check lives in this read-only job, so a closed gate never reaches
+            # the write job below.
+            if [[ "$PROVIDER_ENABLED" == "true" && "$BLOCK_MERGE" == "true" ]]; then
+              gate=$(gh api "repos/$GITHUB_REPOSITORY/commits/$head_sha/status" \
+                | jq -c --arg context "$STATUS_CONTEXT" \
+                    '[.statuses[]? | select(.context == $context)] | .[0] // null')
+              if [[ "$gate" == "null" ]]; then
+                echo "PR #$number: no '$STATUS_CONTEXT' status for $head_sha."; continue
+              fi
+              if [[ "$(jq -r '.state' <<<"$gate")" != "success" ]]; then
+                echo "PR #$number: '$STATUS_CONTEXT' status is $(jq -r '.state' <<<"$gate")."; continue
+              fi
+              contract=$(jq -rc --arg head "$head_sha" \
+                '(.description // "")
+                 | capture("verdict=(?<verdict>[A-Z_]+) state=(?<state>[a-z_]+) provider=(?<provider>[a-z0-9-]+) head=(?<head>[0-9a-fA-F]+)")? // null' \
+                <<<"$gate")
+              if [[ "$contract" == "null" ]]; then
+                echo "PR #$number: '$STATUS_CONTEXT' description is not the normalized contract."; continue
+              fi
+              if [[ "$(jq -r '.verdict' <<<"$contract")" != "APPROVE" \
+                 || "$(jq -r '.head' <<<"$contract")" != "$head_sha" ]]; then
+                echo "PR #$number: review gate closed on current HEAD ($(jq -r '.verdict' <<<"$contract"), head=$(jq -r '.head' <<<"$contract"))."; continue
+              fi
+            fi
+
             # Sanitize the title here, while the job is still read-only, so the
             # write job has no opportunity to introduce untrusted text.
             commit_title=$(printf '%s' "$title" \
@@ -190,7 +240,7 @@ jobs:
 
     steps:
       - name: Checkout trusted policy
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
