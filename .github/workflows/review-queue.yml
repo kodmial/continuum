@@ -116,6 +116,11 @@ jobs:
     steps:
       - name: Checkout (module + configuration)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # This job is triggered by pull_request_target, so the persisted
+          # token would outlive the run in .git/config. Every API call below
+          # authenticates through GITHUB_TOKEN instead, so nothing needs it.
+          persist-credentials: false
 
       - name: Read the queue contract from repository configuration
         id: config

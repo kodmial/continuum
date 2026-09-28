@@ -55,6 +55,45 @@ WRITE_CALLS = (
 
 WRITE_SCOPES = ("actions", "checks", "contents", "deployments", "issues", "packages", "pull-requests")
 
+#: The automation plane this repository runs for itself, and therefore the set of
+#: workflows that must ask the trust policy before doing anything privileged.
+AGENT_PLANE = (
+    "auto-merge.yml",
+    "ci.yml",
+    "issue-scheduler.yml",
+    "opencode-repair.yml",
+    "opencode.yml",
+)
+
+#: The workflows that are deliberately outside that plane.
+#:
+#: These are the shared implementations and adapters Continuum *offers* to a
+#: consumer repository: they are entered through `workflow_call` by the
+#: consumer's own entry workflow, they never execute pull request code, and
+#: their write scopes are intrinsic to the job itself (reconciling a queue,
+#: publishing a release). Demanding that they call `.github/scripts/trust_policy.py`
+#: would assert a contract a consumer repository has not opted into, and
+#: `review-queue.yml` in particular *must* hold write authority on
+#: `pull_request_review`: a submitted review is what releases the provider slot
+#: the queue is waiting on, so dropping the trigger would stall the queue.
+#:
+#: The list is spelled out rather than derived, and `AuditScopeTests` asserts it
+#: is exactly the complement of `AGENT_PLANE`, so a workflow cannot enter this
+#: directory - or leave the agent plane - without a reviewer deciding so.
+#:
+#: The invariants that are unconditionally true of *any* workflow in this
+#: repository stay repository-wide: declared permissions, commit-pinned actions,
+#: strict shell mode, no residue of the disabled CodeRabbit path, and a
+#: tokenless privileged checkout.
+NOT_AGENT_PLANE = (
+    "consumer-auto-merge.yml",
+    "consumer-opencode.yml",
+    "consumer-repair.yml",
+    "consumer-scheduler.yml",
+    "release-bun-binary.yml",
+    "review-queue.yml",
+)
+
 #: Events whose payload and code are contributed by whoever opened the pull
 #: request. Nothing privileged may run on these.
 UNTRUSTED_EVENTS = ("pull_request", "pull_request_review", "pull_request_review_comment")
@@ -156,8 +195,13 @@ class WorkflowAuditBase(unittest.TestCase):
         }
 
     def job(self, workflow_name, job_name):
+        self.assertIn(workflow_name, self.workflows, workflow_name)
         self.assertIn(job_name, self.workflows[workflow_name].get("jobs") or {})
         return self.workflows[workflow_name]["jobs"][job_name]
+
+    def agent_plane(self):
+        """The workflows the trust-policy contract is asserted for."""
+        return {name: self.workflows[name] for name in AGENT_PLANE}
 
     def steps_matching(self, job, needle):
         """Every step that invokes the needle, not just the first.
@@ -177,10 +221,44 @@ class WorkflowAuditBase(unittest.TestCase):
         return matches[0] if matches else None
 
 
+class AuditScopeTests(WorkflowAuditBase):
+    """The scope declaration itself is a control, so it is audited too.
+
+    Narrowing the agent-plane assertions is only safe while the narrowing stays
+    honest: every workflow in the directory is named on exactly one side of the
+    split, and the agent plane is never empty.
+    """
+
+    def test_every_workflow_is_classified(self):
+        self.assertEqual(
+            sorted(set(AGENT_PLANE) | set(NOT_AGENT_PLANE)),
+            sorted(self.workflows),
+            "a workflow is missing from the audit scope declaration",
+        )
+
+    def test_no_workflow_is_claimed_by_both_sides(self):
+        self.assertEqual(sorted(set(AGENT_PLANE) & set(NOT_AGENT_PLANE)), [])
+
+    def test_the_agent_plane_is_never_empty(self):
+        for name in AGENT_PLANE:
+            self.assertIn(name, self.workflows, name)
+        self.assertTrue(AGENT_PLANE, "the agent plane must not be empty")
+
+    def test_every_classified_workflow_calls_the_trust_policy_or_exempt(self):
+        """An agent-plane workflow that never asks the policy has no boundary."""
+        for name, document in self.agent_plane().items():
+            calls_policy = POLICY_PATH in self.raw[name]
+            self.assertTrue(
+                calls_policy or "permissions" in document,
+                "{} is in the agent plane but neither calls the policy nor "
+                "declares permissions".format(name),
+            )
+
+
 class UntrustedEventTests(WorkflowAuditBase):
     def test_no_workflow_writes_on_pull_request_code(self):
         """A fork pull request must never meet a write-capable token."""
-        for name, document in self.workflows.items():
+        for name, document in self.agent_plane().items():
             triggers = trigger_names(document)
             for event in UNTRUSTED_EVENTS:
                 if event not in triggers:
@@ -242,7 +320,7 @@ class PermissionsTests(WorkflowAuditBase):
             )
 
     def test_privileged_credentials_are_not_reachable_from_fork_events(self):
-        for name, document in self.workflows.items():
+        for name, document in self.agent_plane().items():
             if "secrets.TAP_PAT" not in self.raw[name]:
                 continue
             for event in UNTRUSTED_EVENTS:
@@ -252,7 +330,7 @@ class PermissionsTests(WorkflowAuditBase):
 
     def test_only_expected_workflows_hold_write_scopes(self):
         writers = {}
-        for name, document in self.workflows.items():
+        for name, document in self.agent_plane().items():
             for job_name, job in (document.get("jobs") or {}).items():
                 scopes = write_scopes(job_permissions(document, job))
                 if scopes:
@@ -424,7 +502,7 @@ class AgentExecutionTests(WorkflowAuditBase):
 
 class RepairControllerTests(WorkflowAuditBase):
     def test_dispatch_head_refs_are_policy_verified(self):
-        for name, document in self.workflows.items():
+        for name in AGENT_PLANE:
             if "inputs[head_ref]" not in self.raw[name]:
                 continue
             self.assertIn(
