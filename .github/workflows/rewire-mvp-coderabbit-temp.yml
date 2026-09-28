@@ -1,0 +1,41 @@
+name: Rewire MVP CodeRabbit path
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  wire:
+    if: github.event.head_commit.message == 'rewire-mvp-coderabbit-path'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Rewire dependencies
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          H=(-H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2026-03-10")
+          add_dep() {
+            gh api --method POST "${H[@]}"               "repos/$GITHUB_REPOSITORY/issues/$1/dependencies/blocked_by"               -F "issue_id=$2" >/dev/null 2>&1 || true
+          }
+          del_dep() {
+            gh api --method DELETE "${H[@]}"               "repos/$GITHUB_REPOSITORY/issues/$1/dependencies/blocked_by/$2" >/dev/null 2>&1 || true
+          }
+
+          # CodeRabbit MVP adapter waits only for the minimal contract and trust boundary.
+          for old in 5614458373 5614458878 5614459191 5614459607; do
+            del_dep 11 "$old"
+          done
+          add_dep 11 5614457679
+          add_dep 11 5614458030
+
+          # Minimal reusable core includes the CodeRabbit adapter.
+          add_dep 27 5614460914
+
+          echo "MVP CodeRabbit path rewired."
