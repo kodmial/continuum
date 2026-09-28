@@ -124,6 +124,10 @@ present in everything it signed:
 
 - binaries are signed first, then the bundle is sealed over them with the same
   identity, so the nested code is not re-signed by a different key;
+- the release version is written into the bundle's `Info.plist` *before* the
+  seal, in both `CFBundleVersion` and `CFBundleShortVersionString` — the build
+  number and the version Finder shows — because the signature covers the plist
+  and because a bundle that reports the old version is not an upgrade;
 - each product is checked for `Authority=<identity>`, and the job fails if it
   is absent — a signature from the wrong certificate is self-consistent and
   would otherwise pass;

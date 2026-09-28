@@ -94,6 +94,20 @@ PLISTBUDDY = "/usr/libexec/PlistBuddy"
 # is the protection the entitlement set is only meaningful under.
 HARDENED_RUNTIME_FLAG = "runtime"
 
+# The plist keys a bundle's version is written to, and the order they are written
+# in. An `.app` carries two, and they are not interchangeable:
+# `CFBundleVersion` is the build number, and `CFBundleShortVersionString` is the
+# version Finder displays and LaunchServices compares when deciding whether an
+# installed bundle is an upgrade or a different application. Stamping only the
+# first ships a bundle that presents itself as the new release and identifies
+# itself as the old one, so the release flow this adapter replaces wrote both
+# from the same value and so does this.
+#
+# Both are written before the seal, so a bundle whose `Info.plist` is missing
+# either key fails the release with PlistBuddy's own message instead of shipping
+# a bundle that reports a stale version.
+_BUNDLE_VERSION_KEYS = ("CFBundleVersion", "CFBundleShortVersionString")
+
 # The key-partition list that lets a non-interactive job use an imported key.
 # Without it the key is present but unusable by `codesign` and the import
 # succeeds while the signature does not — a failure that looks like a signing
@@ -267,7 +281,20 @@ def classify_failure(step_name: str, detail: str) -> Tuple[str, str, str]:
 
     if step_name == "import-p12":
         return classify_import_failure(detail)
-    if step_name.startswith("sign-") or step_name == "stamp-bundle-version":
+    if step_name == "stamp-bundle-version":
+        # Deliberately not routed to the signing classifier. PlistBuddy failing
+        # here is a missing or malformed `Info.plist` key, and the "check the
+        # entitlements file" remediation a signing failure produces would send
+        # the reader to the one file that is not at fault.
+        return (
+            "bundle-version-stamp-failed",
+            "the release version could not be written into the bundle's Info.plist",
+            "the bundle's Info.plist must contain every key this target stamps "
+            f"({', '.join(_BUNDLE_VERSION_KEYS)}). The version is written before the "
+            "seal, so a missing key fails the release here rather than shipping a "
+            "bundle that reports a stale version.",
+        )
+    if step_name.startswith("sign-"):
         return classify_sign_failure(detail)
     if step_name.startswith("pin-"):
         return (
@@ -482,17 +509,26 @@ def _sign_steps(
         # The version is written into the bundle *before* it is sealed: the
         # signature covers Info.plist, so injecting a version afterwards would
         # invalidate the signature the next verification checks.
+        #
+        # PlistBuddy takes a sequence of `-c` commands against one file, so both
+        # version keys are stamped by a single step. That is not a convenience:
+        # two steps would let the first succeed and the second fail, leaving a
+        # half-stamped `Info.plist` on a runner, and it would also make the
+        # "stamped before the seal" ordering a property of two independently
+        # scheduled commands instead of one.
+        version_argv: List[str] = [PLISTBUDDY]
+        for key in _BUNDLE_VERSION_KEYS:
+            version_argv += ["-c", f"Set :{key} {_value_slot(VERSION_ENV)}"]
+        version_argv.append(info_plist_path(path))
         steps.append(
             PlanStep(
                 name="stamp-bundle-version",
-                argv=[
-                    PLISTBUDDY,
-                    "-c",
-                    f"Set :CFBundleVersion {_value_slot(VERSION_ENV)}",
-                    info_plist_path(path),
-                ],
+                argv=version_argv,
                 uses_env=(VERSION_ENV,),
-                purpose="record the release version inside the bundle before sealing",
+                purpose=(
+                    "record the release version inside the bundle before sealing, in "
+                    "both keys an app bundle is identified by"
+                ),
             )
         )
         steps.append(
