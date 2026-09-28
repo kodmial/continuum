@@ -1,0 +1,160 @@
+name: Continuum reusable auto-merge
+
+on:
+  workflow_call:
+    inputs:
+      review:
+        type: boolean
+        required: false
+        default: false
+      release:
+        type: boolean
+        required: false
+        default: false
+      ci_workflow:
+        type: string
+        required: false
+        default: CI
+      review_status_context:
+        type: string
+        required: false
+        default: continuum/review
+      scheduler_workflow:
+        type: string
+        required: false
+        default: continuum-scheduler.yml
+      release_workflow:
+        type: string
+        required: false
+        default: continuum-release.yml
+
+permissions:
+  actions: write
+  contents: write
+  issues: write
+  pull-requests: write
+  statuses: read
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Reconcile eligible PRs
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+        env:
+          REVIEW_ENABLED: ${{ inputs.review }}
+          RELEASE_ENABLED: ${{ inputs.release }}
+          CI_WORKFLOW: ${{ inputs.ci_workflow }}
+          REVIEW_CONTEXT: ${{ inputs.review_status_context }}
+          SCHEDULER_WORKFLOW: ${{ inputs.scheduler_workflow }}
+          RELEASE_WORKFLOW: ${{ inputs.release_workflow }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const {owner, repo} = context.repo;
+            const reviewEnabled = process.env.REVIEW_ENABLED === 'true';
+            const releaseEnabled = process.env.RELEASE_ENABLED === 'true';
+
+            async function currentHeadCiGreen(sha) {
+              const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
+                owner, repo,
+                workflow_id: process.env.CI_WORKFLOW,
+                head_sha: sha,
+                event: 'pull_request',
+                per_page: 20,
+              });
+              const completed = runs
+                .filter(r => r.status === 'completed')
+                .sort((a,b) => new Date(b.created_at) - new Date(a.created_at));
+              return completed[0]?.conclusion === 'success';
+            }
+
+            async function reviewGreen(sha) {
+              if (!reviewEnabled) return true;
+              const {data} = await github.rest.repos.getCombinedStatusForRef({owner, repo, ref: sha});
+              const status = (data.statuses || []).find(s => s.context === process.env.REVIEW_CONTEXT);
+              return Boolean(status && status.state === 'success');
+            }
+
+            const prs = await github.paginate(github.rest.pulls.list, {
+              owner, repo, state:'open', base:'main', per_page:100
+            });
+
+            for (const listed of prs) {
+              if (listed.head?.repo?.full_name !== `${owner}/${repo}`) continue;
+              if (!listed.head.ref.startsWith('opencode/')) continue;
+              const labels = new Set((listed.labels || []).map(x => x.name));
+              if (labels.has('no-auto-merge')) continue;
+
+              if (!(await currentHeadCiGreen(listed.head.sha))) {
+                core.info(`PR #${listed.number}: current-head CI is not green.`);
+                continue;
+              }
+              if (!(await reviewGreen(listed.head.sha))) {
+                core.info(`PR #${listed.number}: review gate is not green.`);
+                continue;
+              }
+
+              const {data: pr} = await github.rest.pulls.get({
+                owner, repo, pull_number:listed.number
+              });
+              if (pr.mergeable == null) {
+                core.info(`PR #${pr.number}: mergeability still computing.`);
+                continue;
+              }
+              if (pr.mergeable === false || pr.mergeable_state === 'dirty') {
+                core.info(`PR #${pr.number}: conflict; repair controller owns it.`);
+                continue;
+              }
+
+              const result = await github.rest.pulls.merge({
+                owner, repo, pull_number:pr.number,
+                merge_method:'squash',
+                commit_title:pr.title
+              });
+              if (!result.data.merged) {
+                core.warning(`PR #${pr.number}: merge refused: ${result.data.message}`);
+                continue;
+              }
+
+              const match = pr.head.ref.match(/^opencode\/issue(\d+)-/);
+              if (match) {
+                const issue = Number(match[1]);
+                await github.rest.issues.update({
+                  owner, repo, issue_number:issue,
+                  state:'closed', state_reason:'completed'
+                });
+              }
+
+              for (const label of ['automation:in-progress','opencode-ci-repair','opencode-conflict-repair']) {
+                try {
+                  await github.rest.issues.removeLabel({
+                    owner, repo, issue_number:pr.number, name:label
+                  });
+                } catch (e) {
+                  if (e.status !== 404) core.warning(`Could not remove ${label}: ${e.message}`);
+                }
+              }
+
+              core.notice(`Merged PR #${pr.number} at ${result.data.sha}.`);
+
+              try {
+                await github.rest.actions.createWorkflowDispatch({
+                  owner, repo,
+                  workflow_id:process.env.SCHEDULER_WORKFLOW,
+                  ref:'main'
+                });
+              } catch (e) {
+                core.warning(`Could not wake scheduler: ${e.message}`);
+              }
+
+              if (releaseEnabled) {
+                await github.rest.actions.createWorkflowDispatch({
+                  owner, repo,
+                  workflow_id:process.env.RELEASE_WORKFLOW,
+                  ref:'main',
+                  inputs:{source_sha:result.data.sha}
+                });
+              }
+            }
