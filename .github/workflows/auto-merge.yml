@@ -1,4 +1,14 @@
-name: Auto-merge bootstrap
+name: Auto-merge controller
+
+# Merge gate for implementation pull requests. A PR only merges when:
+#   - its branch follows the opencode/<issue>- naming convention;
+#   - the current HEAD has a green, current-HEAD CI run;
+#   - the current HEAD carries a green Continuum review-gate status in the
+#     context named by .continuum.yml (failure closes the gate);
+#   - the merge is not blocked by labels or conflicts.
+# The review gate is consumed strictly through its normalized contract
+# (status context + verdict=... state=... provider=... head=<sha>), never by
+# parsing a provider comment. review.provider: none is a deliberate free pass.
 
 on:
   workflow_run:
@@ -15,7 +25,7 @@ permissions:
   pull-requests: write
 
 concurrency:
-  group: continuum-auto-merge-bootstrap
+  group: continuum-auto-merge
   cancel-in-progress: false
 
 jobs:
@@ -23,23 +33,36 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Merge eligible OpenCode PRs
+      - name: Checkout (module + configuration)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Read the review-gate contract from repository configuration
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=src python3 -m continuum.cli config-check --config .continuum.yml
+
+      - name: Reconcile merges against the normalized review gate
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+        env:
+          STATUS_CONTEXT: ${{ steps.check.outputs.status_context }}
+          BLOCK_MERGE: ${{ steps.check.outputs.block_merge }}
+          PROVIDER_ENABLED: ${{ steps.check.outputs.enabled }}
         with:
           github-token: ${{ secrets.TAP_PAT || github.token }}
           script: |
             const {owner, repo} = context.repo;
+            const statusContext = process.env.STATUS_CONTEXT;
+            const blockMerge = process.env.BLOCK_MERGE === 'true';
+            const providerEnabled = process.env.PROVIDER_ENABLED === 'true';
 
             async function ciGreen(headSha) {
               const runs = await github.paginate(
                 github.rest.actions.listWorkflowRuns,
                 {
-                  owner,
-                  repo,
-                  workflow_id: 'ci.yml',
-                  head_sha: headSha,
-                  event: 'pull_request',
-                  per_page: 20,
+                  owner, repo, workflow_id: 'ci.yml', head_sha: headSha,
+                  event: 'pull_request', per_page: 20,
                 }
               );
               const completed = runs
@@ -48,29 +71,43 @@ jobs:
               return completed[0]?.conclusion === 'success';
             }
 
+            // The review gate is a commit status in the configured context. Only
+            // the normalized description contract counts: verdict=APPROVE on the
+            // exact current HEAD. Anything else closes the gate.
+            async function reviewGateGreen(headSha, contextName) {
+              if (!providerEnabled || !blockMerge) return true;
+              const {data} = await github.rest.repos.getCombinedStatusForRef({
+                owner, repo, ref: headSha,
+              });
+              const match = (data.statuses || []).find(s => s.context === contextName);
+              if (!match) {
+                core.notice(`PR gate: no '${contextName}' status for ${headSha}.`);
+                return false;
+              }
+              if (match.state !== 'success') {
+                core.notice(`PR gate: '${contextName}' status is ${match.state}.`);
+                return false;
+              }
+              const m = /verdict=([A-Z_]+) state=([a-z_]+) provider=([a-z0-9-]+) head=([0-9a-fA-F]+)/
+                .exec(match.description || '');
+              if (!m) {
+                core.notice(`PR gate: '${contextName}' description is not the normalized contract.`);
+                return false;
+              }
+              if (m[1] !== 'APPROVE' || m[4] !== headSha) {
+                core.notice(`PR gate: closed on current HEAD (${m[1]}, head=${m[4]}).`);
+                return false;
+              }
+              return true;
+            }
+
             const prs = await github.paginate(github.rest.pulls.list, {
-              owner,
-              repo,
-              state: 'open',
-              base: 'main',
-              per_page: 100,
+              owner, repo, state: 'open', base: 'main', per_page: 100,
             });
 
             for (const listed of prs) {
               if (listed.head.repo?.full_name !== `${owner}/${repo}`) continue;
               if (!listed.head.ref.startsWith('opencode/')) continue;
-
-              // Bootstrap safety: PR-Agent (#25) must become the first blocking
-              // review provider before unrelated implementation PRs may auto-merge.
-              // Allow #25 itself to bootstrap that gate; hold every other OpenCode
-              // PR until #25 replaces this temporary guard with the normalized
-              // review-gate check.
-              if (!listed.head.ref.startsWith('opencode/issue25-')) {
-                core.notice(
-                  `PR #${listed.number}: held until Continuum PR-Agent review gate (#25) is installed.`
-                );
-                continue;
-              }
 
               const labels = new Set((listed.labels || []).map(x => x.name));
               if (labels.has('no-auto-merge')) {
@@ -80,6 +117,11 @@ jobs:
 
               if (!(await ciGreen(listed.head.sha))) {
                 core.notice(`PR #${listed.number}: current-head CI is not green.`);
+                continue;
+              }
+
+              if (!(await reviewGateGreen(listed.head.sha, statusContext))) {
+                core.notice(`PR #${listed.number}: review gate is not green on the current HEAD.`);
                 continue;
               }
 
@@ -96,11 +138,8 @@ jobs:
               }
 
               const result = await github.rest.pulls.merge({
-                owner,
-                repo,
-                pull_number: listed.number,
-                merge_method: 'squash',
-                commit_title: pr.title,
+                owner, repo, pull_number: listed.number,
+                merge_method: 'squash', commit_title: pr.title,
               });
 
               if (!result.data.merged) {

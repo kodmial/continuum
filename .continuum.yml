@@ -1,0 +1,31 @@
+# Continuum repository configuration.
+#
+# Validated by `python3 -m continuum.cli config-check` before any workflow runs.
+# Values here are *names* of repository variables and secrets, never the
+# endpoint, model, or credential itself: those stay in repository settings, so
+# this file is safe to review in public and safe to log.
+
+version: 1
+
+review:
+  # none      -> no external review traffic at all (deliberate opt-out)
+  # pr-agent  -> Continuum's reusable PR-Agent review provider (blocking)
+  # coderabbit-> sibling adapter behind the same normalized review gate
+  provider: pr-agent
+
+  # Auto-merge refuses to merge while the configured provider has not published
+  # a green review gate for the current PR HEAD.
+  block_merge: true
+
+  # Normalized status contract consumed by the merge controller. The gate
+  # publishes `verdict=<V> state=<S> provider=<P> head=<sha>` here; merge logic
+  # reads only this contract and never a provider-specific comment.
+  status_context: continuum/review
+
+  pr_agent:
+    # OpenAI-compatible base URL, e.g. https://provider.example/v1
+    api_base_var: PR_AGENT_API_BASE
+    api_key_secret: PR_AGENT_API_KEY
+    model_var: PR_AGENT_MODEL
+    max_tokens_var: PR_AGENT_MAX_TOKENS
+    bot_login: github-actions[bot]

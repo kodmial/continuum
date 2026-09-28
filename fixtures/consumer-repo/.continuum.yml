@@ -1,0 +1,25 @@
+# Fixture consumer repository for the Continuum PR-Agent reusable workflow.
+#
+# This directory is a minimal consumer repository used by the deterministic
+# tests (test_fixture_consumer.py) to prove the provider adapter contract:
+#   - a validated .continuum.yml that selects review.provider: pr-agent;
+#   - a thin workflow that calls kodmial/continuum/.github/workflows/pr-agent.yml
+#     and wires this repository's variables/secrets to the reusable inputs.
+# All values below are *names* of repository variables and secrets, never the
+# endpoint, model, or credential itself.
+
+version: 1
+
+review:
+  provider: pr-agent
+
+  block_merge: true
+
+  status_context: continuum/review
+
+  pr_agent:
+    api_base_var: PR_AGENT_API_BASE
+    api_key_secret: PR_AGENT_API_KEY
+    model_var: PR_AGENT_MODEL
+    max_tokens_var: PR_AGENT_MAX_TOKENS
+    bot_login: github-actions[bot]
