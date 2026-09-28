@@ -29,6 +29,96 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  sync-stale-prs:
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.name == 'CI' &&
+      github.event.workflow_run.head_branch == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+
+    permissions:
+      actions: write
+      contents: write
+      issues: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout trusted policy
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Sync stale OpenCode branches after main advances
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          AUTOMATION_TRUSTED_ACTORS: ${{ vars.AUTOMATION_TRUSTED_ACTORS }}
+          CONTINUUM_BASE_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
+        run: |
+          set -euo pipefail
+          base_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$CONTINUUM_BASE_BRANCH" --jq '.object.sha')"
+
+          gh api --paginate "repos/$GITHUB_REPOSITORY/pulls?state=open&base=$CONTINUUM_BASE_BRANCH&per_page=100" \
+            --jq '.[] | select(.head.repo.full_name == .base.repo.full_name) | select(.head.ref | startswith("opencode/")) | "\(.number) \(.head.sha) \(.head.ref)"' |
+          while read -r pr_number head_sha head_ref; do
+            [[ -n "$pr_number" && -n "$head_sha" && -n "$head_ref" ]] || continue
+
+            status="$(gh api "repos/$GITHUB_REPOSITORY/compare/$base_sha...$head_sha" --jq '.status')"
+            if [[ "$status" == "ahead" || "$status" == "identical" ]]; then
+              echo "PR #$pr_number already contains current $CONTINUUM_BASE_BRANCH."
+              continue
+            fi
+
+            echo "PR #$pr_number is $status against $CONTINUUM_BASE_BRANCH; requesting native update-branch."
+            if gh api --method PUT "repos/$GITHUB_REPOSITORY/pulls/$pr_number/update-branch" \
+              -f "expected_head_sha=$head_sha" >/dev/null 2>&1; then
+              echo "PR #$pr_number updated; synchronize will trigger fresh CI."
+              continue
+            fi
+
+            mergeable_state="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr_number" --jq '.mergeable_state // ""')"
+            if [[ "$mergeable_state" != "dirty" ]]; then
+              echo "::warning::PR #$pr_number could not be updated mechanically (mergeable_state=$mergeable_state); retry will occur on the next reconciliation."
+              continue
+            fi
+
+            if ! python3 .github/scripts/trust_policy.py verify-dispatch \
+              --mode resolve-conflict \
+              --pr-number "$pr_number" \
+              --head-ref "$head_ref"; then
+              echo "::warning::Trust policy refused conflict repair for PR #$pr_number."
+              continue
+            fi
+
+            lock_label="opencode-conflict-repair"
+            gh label create "$lock_label" --repo "$GITHUB_REPOSITORY" --color B60205 \
+              --description "Automatic OpenCode conflict repair for the current stale head." \
+              --force >/dev/null
+            if gh api "repos/$GITHUB_REPOSITORY/issues/$pr_number/labels" \
+              --jq '.[].name' | grep -Fxq "$lock_label"; then
+              echo "PR #$pr_number conflict repair is already reserved."
+              continue
+            fi
+            gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$pr_number/labels" \
+              -f "labels[]=$lock_label" >/dev/null
+
+            if ! gh api --method POST \
+              "repos/$GITHUB_REPOSITORY/actions/workflows/opencode.yml/dispatches" \
+              -f ref=main \
+              -f "inputs[mode]=resolve-conflict" \
+              -f "inputs[pr_number]=$pr_number" \
+              -f "inputs[head_ref]=$head_ref"; then
+              gh api --method DELETE \
+                "repos/$GITHUB_REPOSITORY/issues/$pr_number/labels/$lock_label" \
+                >/dev/null 2>&1 || true
+              echo "::warning::Could not dispatch conflict repair for PR #$pr_number; lock released."
+            fi
+          done
+
   sync-current-pr:
     if: >-
       github.event_name == 'pull_request_target' &&

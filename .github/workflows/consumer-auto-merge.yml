@@ -56,6 +56,13 @@ jobs:
             const reviewEnabled = process.env.REVIEW_ENABLED === 'true';
             const releaseEnabled = process.env.RELEASE_ENABLED === 'true';
 
+            async function baseFresh(sha) {
+              const {data} = await github.rest.repos.compareCommitsWithBasehead({
+                owner, repo, basehead: `main...${sha}`,
+              });
+              return data.status === 'ahead' || data.status === 'identical';
+            }
+
             async function currentHeadCiGreen(sha) {
               const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
                 owner, repo,
@@ -87,6 +94,10 @@ jobs:
               const labels = new Set((listed.labels || []).map(x => x.name));
               if (labels.has('no-auto-merge')) continue;
 
+              if (!(await baseFresh(listed.head.sha))) {
+                core.info(`PR #${listed.number}: stale against current main; branch sync/repair must run first.`);
+                continue;
+              }
               if (!(await currentHeadCiGreen(listed.head.sha))) {
                 core.info(`PR #${listed.number}: current-head CI is not green.`);
                 continue;
@@ -108,10 +119,18 @@ jobs:
                 continue;
               }
 
+              // Re-check immediately before the write. If another PR merged
+              // earlier in this same run, every sibling branch is stale now.
+              if (!(await baseFresh(pr.head.sha))) {
+                core.info(`PR #${pr.number}: main advanced before merge; branch sync/repair must run first.`);
+                continue;
+              }
+
               const result = await github.rest.pulls.merge({
                 owner, repo, pull_number:pr.number,
                 merge_method:'squash',
-                commit_title:pr.title
+                commit_title:pr.title,
+                sha:pr.head.sha
               });
               if (!result.data.merged) {
                 core.warning(`PR #${pr.number}: merge refused: ${result.data.message}`);
@@ -121,10 +140,24 @@ jobs:
               const match = pr.head.ref.match(/^opencode\/issue(\d+)-/);
               if (match) {
                 const issue = Number(match[1]);
-                await github.rest.issues.update({
-                  owner, repo, issue_number:issue,
-                  state:'closed', state_reason:'completed'
-                });
+                try {
+                  const {data: sourceIssue} = await github.rest.issues.get({
+                    owner, repo, issue_number:issue
+                  });
+                  if (sourceIssue.state !== 'closed') {
+                    await github.rest.issues.update({
+                      owner, repo, issue_number:issue,
+                      state:'closed', state_reason:'completed'
+                    });
+                  } else {
+                    core.info(`Issue #${issue} is already closed; merge finalization is converged.`);
+                  }
+                } catch (e) {
+                  // The merge is already durable. Bookkeeping must be
+                  // retryable/observable, never rewrite a successful merge as
+                  // a failed controller outcome.
+                  core.warning(`Could not finalize source issue #${issue}: ${e.message}`);
+                }
               }
 
               for (const label of ['automation:in-progress','opencode-ci-repair','opencode-conflict-repair']) {

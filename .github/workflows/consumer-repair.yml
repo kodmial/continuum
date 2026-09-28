@@ -19,6 +19,47 @@ permissions:
   pull-requests: write
 
 jobs:
+  base-sync:
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.name == inputs.ci_workflow
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Sync stale OpenCode branches to current base
+        shell: bash
+        run: |
+          set -euo pipefail
+          base_branch="${{ github.event.repository.default_branch }}"
+          base_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$base_branch" --jq '.object.sha')"
+
+          gh api --paginate "repos/$GITHUB_REPOSITORY/pulls?state=open&base=$base_branch&per_page=100" \
+            --jq '.[] | select(.head.repo.full_name == .base.repo.full_name) | select(.head.ref | startswith("opencode/")) | "\(.number) \(.head.sha)"' |
+          while read -r pr_number head_sha; do
+            [[ -n "$pr_number" && -n "$head_sha" ]] || continue
+
+            status="$(gh api "repos/$GITHUB_REPOSITORY/compare/$base_sha...$head_sha" --jq '.status')"
+            if [[ "$status" == "ahead" || "$status" == "identical" ]]; then
+              echo "PR #$pr_number already contains current $base_branch."
+              continue
+            fi
+
+            echo "PR #$pr_number is $status against $base_branch; requesting native update-branch."
+            if gh api --method PUT "repos/$GITHUB_REPOSITORY/pulls/$pr_number/update-branch" \
+              -f "expected_head_sha=$head_sha" >/dev/null; then
+              echo "PR #$pr_number updated; synchronize will trigger fresh CI."
+            else
+              echo "::warning::PR #$pr_number could not be updated mechanically; conflict repair remains responsible."
+            fi
+          done
+
   conflict:
     if: github.event_name == 'pull_request_target' && github.event.pull_request.state == 'open'
     runs-on: ubuntu-latest
