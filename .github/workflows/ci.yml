@@ -33,7 +33,7 @@ jobs:
             end
           '
 
-      - name: Enforce module boundary (review adapters are now active)
+      - name: Enforce MVP active workflow boundary
         shell: bash
         run: |
           set -euo pipefail
