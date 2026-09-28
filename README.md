@@ -25,6 +25,28 @@ Their implementations are preserved in the reference snapshot and will be
 reintroduced as optional adapters after the configuration/module boundaries are
 implemented.
 
+## Consumer contract (v0.1)
+
+The complete user-facing configuration for a Continuum consumer is two
+booleans in `.github/continuum.yml`:
+
+```yaml
+review: false
+release: false
+```
+
+A missing configuration resolves to exactly those values, so adopting
+Continuum requires declaring nothing. `review` controls whether merging waits
+for a normalized, consumer-adapter-provided review gate; `release` controls
+whether Continuum invokes the consumer's release entrypoint after merge. The
+review provider, platform, signing, and publication details are deliberately
+not settings — they stay in consumer-owned adapters and existing repository
+variables.
+
+The normative rules are in
+[docs/continuum-mvp-contract.md](docs/continuum-mvp-contract.md), and the
+reference resolver plus its test suite live in `.github/scripts/`.
+
 ## Public-repository safety
 
 During bootstrap, automatic issue execution is limited to issues opened by the
