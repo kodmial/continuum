@@ -1,0 +1,28 @@
+name: Review
+
+# Thin fixture entry point: delegate to the Continuum PR-Agent reusable
+# workflow and expose its verdict as job outputs. Credentials are never
+# inherited; the only secrets requested are the caller's GITHUB_TOKEN and the
+# PR_AGENT_API_KEY repository secret.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    uses: kodmial/continuum/.github/workflows/pr-agent.yml@main
+    with:
+      pr_number: ${{ github.event.pull_request.number }}
+      head_sha: ${{ github.event.pull_request.head.sha }}
+      api_base: ${{ vars.PR_AGENT_API_BASE }}
+      model: ${{ vars.PR_AGENT_MODEL }}
+      max_tokens: ${{ vars.PR_AGENT_MAX_TOKENS }}
+    secrets:
+      continuum_token: ${{ secrets.GITHUB_TOKEN }}
+      pr_agent_api_key: ${{ secrets.PR_AGENT_API_KEY }}

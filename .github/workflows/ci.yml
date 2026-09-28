@@ -33,20 +33,32 @@ jobs:
             end
           '
 
-      - name: Enforce bootstrap module boundary
+      - name: Enforce MVP active workflow boundary
         shell: bash
         run: |
           set -euo pipefail
-          allowed='^(auto-merge|ci|issue-scheduler|opencode|opencode-repair)\.ya?ml$'
+          allowed='^(auto-merge|ci|issue-scheduler|review-queue|opencode|opencode-repair|consumer-scheduler|consumer-opencode|consumer-repair|consumer-auto-merge)\.ya?ml$'
           bad=0
           while IFS= read -r file; do
             base="$(basename "$file")"
             if ! grep -Eq "$allowed" <<<"$base"; then
-              echo "::error::Unexpected active workflow during bootstrap: $file"
+              echo "::error::Unexpected active workflow: $file"
               bad=1
             fi
           done < <(find .github/workflows -maxdepth 1 -type f \( -name '*.yml' -o -name '*.yaml' \) | sort)
           exit "$bad"
+
+      - name: Run Continuum unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=src python3 -m unittest discover -s tests -t . -v
+
+      - name: Validate repository configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=src python3 -m continuum.cli config-check --config .continuum.yml
 
       - name: Verify disabled NanoDictate snapshot is preserved
         shell: bash
@@ -78,8 +90,15 @@ jobs:
           # copy of Continuum must resolve every consumer. A consumer, provider,
           # or platform name in the contract core would break that silently, so
           # it fails the build here rather than at migration time.
+          #
+          # The banned names live in a data file rather than inline: the MVP
+          # boundary asserts that no active workflow names a consumer, so the
+          # pattern list is read instead of hard-coded here.
           core='.github/scripts/continuum_config.py'
-          if grep -Eino 'nanodictate|kodmai|coderabbit|pr[-_]agent|release-please|homebrew|macports|gradle|maven|android|xcode|notariz|codesign' "$core"; then
+          # `grep -f` has no comment syntax, so '#' lines are stripped before
+          # they are used as patterns; otherwise a comment would match every
+          # commented line in the core.
+          if grep -Eino -f <(grep -v '^[[:space:]]*#' .github/scripts/contract-forbidden-names.txt) "$core"; then
             echo "::error::Consumer/provider/platform name found in the contract core: $core"
             exit 1
           fi
