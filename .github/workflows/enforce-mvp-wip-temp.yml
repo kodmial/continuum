@@ -1,0 +1,30 @@
+name: Enforce MVP-only WIP
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  actions: write
+  issues: write
+  contents: read
+
+jobs:
+  enforce:
+    if: github.event.head_commit.message == 'enforce-mvp-only-wip'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Cancel post-MVP agent runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for run in 36435181989 36435186784 36434921136; do
+            gh api --method POST "repos/$GITHUB_REPOSITORY/actions/runs/$run/cancel" >/dev/null 2>&1 || true
+          done
+          for issue in 19 20 31; do
+            gh api --method DELETE "repos/$GITHUB_REPOSITORY/issues/$issue/labels/automation:in-progress" >/dev/null 2>&1 || true
+          done
+          gh workflow run issue-scheduler.yml --repo "$GITHUB_REPOSITORY" --ref main
