@@ -1,0 +1,53 @@
+name: Refocus Continuum MVP
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  actions: write
+  issues: write
+  contents: read
+
+jobs:
+  refocus:
+    if: github.event.head_commit.message == 'refocus-continuum-two-toggle-mvp'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Stop superseded work and rewire MVP
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          H=(-H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2026-03-10")
+
+          # Restart #2 against the new minimal two-toggle scope.
+          for run in 36431532022; do
+            gh api --method POST "repos/$GITHUB_REPOSITORY/actions/runs/$run/cancel" >/dev/null 2>&1 || true
+          done
+
+          # Stop release-extraction work that is no longer on the MVP path.
+          for run in 36431540560 36432082546; do
+            gh api --method POST "repos/$GITHUB_REPOSITORY/actions/runs/$run/cancel" >/dev/null 2>&1 || true
+          done
+
+          for issue in 2 18 23; do
+            gh api --method DELETE "repos/$GITHUB_REPOSITORY/issues/$issue/labels/automation:in-progress" >/dev/null 2>&1 || true
+          done
+
+          # #27 no longer depends on PR-Agent implementation; it only defines
+          # the generic boolean review hook. #25 remains required for final MVP.
+          gh api --method DELETE "${H[@]}"             "repos/$GITHUB_REPOSITORY/issues/27/dependencies/blocked_by/5615046811" >/dev/null 2>&1 || true
+
+          # NanoDictate MVP keeps its existing release implementation local.
+          for blocker in 5614461245 5614936406 5614937533 5614989614; do
+            gh api --method DELETE "${H[@]}"               "repos/$GITHUB_REPOSITORY/issues/28/dependencies/blocked_by/$blocker" >/dev/null 2>&1 || true
+          done
+
+          # Final MVP requires PR-Agent extraction plus both real consumers.
+          gh api --method POST "${H[@]}"             "repos/$GITHUB_REPOSITORY/issues/30/dependencies/blocked_by"             -F issue_id=5615046811 >/dev/null 2>&1 || true
+
+          gh workflow run issue-scheduler.yml --repo "$GITHUB_REPOSITORY" --ref main
+          echo "Continuum MVP refocused."
