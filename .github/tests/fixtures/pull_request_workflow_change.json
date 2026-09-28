@@ -1,0 +1,33 @@
+{
+  "_comment": "Regression fixture: a trusted agent pull request that edits the privilege boundary itself (.github/workflows/**, .github/scripts/trust_policy.py). Never auto-merged: a human must review it.",
+  "action": "synchronize",
+  "number": 4,
+  "pull_request": {
+    "number": 4,
+    "state": "open",
+    "draft": false,
+    "merged": false,
+    "title": "chore: relax the trust policy",
+    "body": "Closes #13",
+    "user": { "login": "kodmial", "type": "User" },
+    "base": {
+      "ref": "main",
+      "repo": { "full_name": "kodmial/continuum" }
+    },
+    "head": {
+      "ref": "opencode/issue13-20260928140000",
+      "sha": "4444444444444444444444444444444444444444",
+      "repo": {
+        "full_name": "kodmial/continuum",
+        "fork": false
+      }
+    }
+  },
+  "files": [
+    ".github/workflows/opencode.yml",
+    ".github/scripts/trust_policy.py",
+    "README.md"
+  ],
+  "sender": { "login": "kodmial", "type": "User" },
+  "repository": { "full_name": "kodmial/continuum" }
+}

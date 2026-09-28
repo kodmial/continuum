@@ -1,0 +1,29 @@
+{
+  "_comment": "Regression fixture: the trusted pull-request shape. Same repository, agent branch, open, full-length head sha, base main. Used by the repair controller, the dispatch verifier, and the merge planner.",
+  "action": "synchronize",
+  "number": 3,
+  "pull_request": {
+    "number": 3,
+    "state": "open",
+    "draft": false,
+    "merged": false,
+    "title": "chore: document the trust boundary",
+    "body": "Closes #12",
+    "user": { "login": "kodmial", "type": "User" },
+    "base": {
+      "ref": "main",
+      "repo": { "full_name": "kodmial/continuum" }
+    },
+    "head": {
+      "ref": "opencode/issue12-20260928135106",
+      "sha": "3333333333333333333333333333333333333333",
+      "repo": {
+        "full_name": "kodmial/continuum",
+        "fork": false
+      }
+    }
+  },
+  "files": ["README.md", "docs/trust-boundary.md"],
+  "sender": { "login": "kodmial", "type": "User" },
+  "repository": { "full_name": "kodmial/continuum" }
+}

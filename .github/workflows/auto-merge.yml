@@ -1,3 +1,21 @@
+# Continuum bootstrap: derived from NanoDictate.
+#
+# The merge controller is split so that deciding is never the same privilege as
+# acting:
+#
+#   plan       read-only, no write scopes at all. Asks
+#              .github/scripts/trust_policy.py for a verdict on every open pull
+#              request, then re-checks each approved one against live state and
+#              sanitizes its commit title. Evaluating a pull request an attacker
+#              opened therefore cannot touch the repository.
+#   reconcile  the only job with write scopes. It merges strictly the pull
+#              requests named in the plan, using the titles the plan already
+#              sanitized, and re-verifies each is still mergeable at merge time.
+#
+# Anything touching the privilege boundary (.github/workflows, .github/scripts,
+# .github/actions, CODEOWNERS, action.yml) is blocked by the policy and requires
+# a human. Pull-request titles are attacker-controllable text, so they are
+# neutralized through the policy before reaching the merge API.
 name: Auto-merge bootstrap
 
 on:
@@ -8,114 +26,235 @@ on:
   schedule:
     - cron: "11,26,41,56 * * * *"
 
-permissions:
-  actions: write
-  contents: write
-  issues: write
-  pull-requests: write
+permissions: {}
 
 concurrency:
   group: continuum-auto-merge-bootstrap
   cancel-in-progress: false
 
 jobs:
-  reconcile:
+  plan:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+
+    permissions:
+      actions: read
+      contents: read
+      issues: read
+      pull-requests: read
+
+    outputs:
+      merge_plan: ${{ steps.build.outputs.merge_plan }}
+      approved_count: ${{ steps.plan.outputs.approved_count }}
+
     steps:
-      - name: Merge eligible OpenCode PRs
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+      - name: Checkout trusted policy
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          github-token: ${{ secrets.TAP_PAT || github.token }}
-          script: |
-            const {owner, repo} = context.repo;
+          # Default branch only, read-only token: the plan is computed from
+          # trusted policy code, never from pull-request code.
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
 
-            async function ciGreen(headSha) {
-              const runs = await github.paginate(
-                github.rest.actions.listWorkflowRuns,
-                {
-                  owner,
-                  repo,
-                  workflow_id: 'ci.yml',
-                  head_sha: headSha,
-                  event: 'pull_request',
-                  per_page: 20,
-                }
-              );
-              const completed = runs
-                .filter(run => run.status === 'completed')
-                .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-              return completed[0]?.conclusion === 'success';
-            }
+      - name: Compute the merge plan with the trust policy
+        id: plan
+        env:
+          # Read-only on purpose. Planning must not be able to merge.
+          GITHUB_TOKEN: ${{ github.token }}
+          AUTOMATION_TRUSTED_ACTORS: ${{ vars.AUTOMATION_TRUSTED_ACTORS }}
+          CONTINUUM_BASE_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
+        run: |
+          set -euo pipefail
+          raw=$(python3 .github/scripts/trust_policy.py merge-plan)
+          printf '%s\n' "$raw"
 
-            const prs = await github.paginate(github.rest.pulls.list, {
-              owner,
-              repo,
-              state: 'open',
-              base: 'main',
-              per_page: 100,
-            });
+          approved=$(awk -F'\t' '$2 == "allow" {print $1}' <<<"$raw" | paste -sd, -)
+          count=$(grep -c $'^' <<<"$(awk -F'\t' '$2 == "allow"' <<<"$raw")" || true)
+          total=$(grep -c . <<<"$raw" || true)
 
-            for (const listed of prs) {
-              if (listed.head.repo?.full_name !== `${owner}/${repo}`) continue;
-              if (!listed.head.ref.startsWith('opencode/')) continue;
+          # The policy is the only thing that decides. This job reduces its
+          # verdict to a list of pull-request numbers; the write job below may
+          # act on nothing else.
+          echo "approved=$approved" >> "$GITHUB_OUTPUT"
+          echo "approved_count=$count" >> "$GITHUB_OUTPUT"
+          echo "Plan: ${approved:-none} approved of $total open pull requests."
 
-              const labels = new Set((listed.labels || []).map(x => x.name));
-              if (labels.has('no-auto-merge')) {
-                core.notice(`PR #${listed.number}: no-auto-merge is set.`);
-                continue;
-              }
+      - name: Build the executable merge plan
+        id: build
+        env:
+          # Read-only. Re-checking liveness, mergeability and the opt-out label
+          # is all inspection.
+          GH_TOKEN: ${{ github.token }}
+          APPROVED: ${{ steps.plan.outputs.approved }}
+          CONTINUUM_BASE_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
+        run: |
+          set -euo pipefail
 
-              if (!(await ciGreen(listed.head.sha))) {
-                core.notice(`PR #${listed.number}: current-head CI is not green.`);
-                continue;
-              }
+          if [[ -z "$APPROVED" ]]; then
+            echo "[]" > "$RUNNER_TEMP/merge-plan.json"
+            echo "merge_plan=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
-              const {data: pr} = await github.rest.pulls.get({
-                owner, repo, pull_number: listed.number,
-              });
-              if (pr.mergeable === false || pr.mergeable_state === 'dirty') {
-                core.notice(`PR #${listed.number}: merge conflict; repair controller owns it.`);
-                continue;
-              }
-              if (pr.mergeable == null) {
-                core.notice(`PR #${listed.number}: mergeability is still being computed.`);
-                continue;
-              }
+          entries="$RUNNER_TEMP/merge-plan.jsonl"
+          : > "$entries"
 
-              const result = await github.rest.pulls.merge({
-                owner,
-                repo,
-                pull_number: listed.number,
-                merge_method: 'squash',
-                commit_title: pr.title,
-              });
+          IFS=',' read -ra numbers <<<"$APPROVED"
+          for number in "${numbers[@]}"; do
+            [[ "$number" =~ ^[0-9]+$ ]] || { echo "::error::Malformed plan entry '$number'."; exit 1; }
 
-              if (!result.data.merged) {
-                core.warning(`PR #${listed.number}: merge refused: ${result.data.message}`);
-                continue;
-              }
+            pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$number")
+            state=$(jq -r '.state' <<<"$pr")
+            base_ref=$(jq -r '.base.ref' <<<"$pr")
+            head_repo=$(jq -r '.head.repo.full_name // ""' <<<"$pr")
+            head_ref=$(jq -r '.head.ref' <<<"$pr")
+            head_sha=$(jq -r '.head.sha' <<<"$pr")
+            draft=$(jq -r '.draft' <<<"$pr")
+            mergeable=$(jq -r '.mergeable' <<<"$pr")
+            mergeable_state=$(jq -r '.mergeable_state' <<<"$pr")
+            title=$(jq -r '.title' <<<"$pr")
 
-              const match = pr.head.ref.match(/^opencode\/issue(\d+)-/);
-              if (match) {
-                const issueNumber = Number(match[1]);
-                try {
-                  await github.rest.issues.update({
-                    owner, repo, issue_number: issueNumber,
-                    state: 'closed', state_reason: 'completed',
-                  });
-                } catch (err) {
-                  if (err.status !== 404) throw err;
-                }
-              }
+            # The plan is a snapshot; these re-checks close the window between
+            # planning and acting.
+            if [[ "$state" != "open" ]]; then
+              echo "PR #$number is no longer open."; continue
+            fi
+            if [[ "$base_ref" != "$CONTINUUM_BASE_BRANCH" ]]; then
+              echo "PR #$number no longer targets $CONTINUUM_BASE_BRANCH."; continue
+            fi
+            if [[ "$head_repo" != "$GITHUB_REPOSITORY" ]]; then
+              echo "PR #$number is no longer a same-repository pull request."; continue
+            fi
+            if [[ ! "$head_ref" =~ ^opencode/issue[0-9]+- ]]; then
+              echo "PR #$number head '$head_ref' is not an agent branch."; continue
+            fi
+            if [[ "$draft" == "true" ]]; then
+              echo "PR #$number became a draft."; continue
+            fi
+            if gh api "repos/$GITHUB_REPOSITORY/issues/$number/labels" \
+              --jq '.[].name' | grep -Fxq no-auto-merge; then
+              echo "PR #$number: no-auto-merge is set."; continue
+            fi
+            if [[ "$mergeable" == "false" || "$mergeable_state" == "dirty" ]]; then
+              echo "PR #$number has a merge conflict; the repair controller owns it."; continue
+            fi
+            if [[ "$mergeable" == "null" ]]; then
+              echo "PR #$number mergeability is still being computed."; continue
+            fi
 
-              core.notice(`PR #${listed.number}: merged at ${result.data.sha}.`);
+            # Sanitize the title here, while the job is still read-only, so the
+            # write job has no opportunity to introduce untrusted text.
+            commit_title=$(printf '%s' "$title" \
+              | python3 .github/scripts/trust_policy.py commit-title)
 
-              try {
-                await github.rest.actions.createWorkflowDispatch({
-                  owner, repo, workflow_id: 'issue-scheduler.yml', ref: 'main',
-                });
-              } catch (err) {
-                core.warning(`Could not wake scheduler after merge: ${err.message}`);
-              }
-            }
+            issue_number=""
+            if [[ "$head_ref" =~ ^opencode/issue([0-9]+)- ]]; then
+              issue_number="${BASH_REMATCH[1]}"
+            fi
+
+            jq -cn \
+              --argjson number "$number" \
+              --arg head_sha "$head_sha" \
+              --arg commit_title "$commit_title" \
+              --arg issue_number "$issue_number" \
+              '{number: $number, head_sha: $head_sha, commit_title: $commit_title,
+                issue_number: (if $issue_number == "" then null else ($issue_number | tonumber) end)}' \
+              >> "$entries"
+          done
+
+          plan=$(jq -s '.' < "$entries")
+          echo "$plan" > "$RUNNER_TEMP/merge-plan.json"
+          echo "Executable plan: $(jq -c '[.[].number]' <<<"$plan")"
+          echo "merge_plan=$(jq -c '.' <<<"$plan")" >> "$GITHUB_OUTPUT"
+
+  reconcile:
+    needs: plan
+    if: needs.plan.outputs.approved_count != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      actions: write
+      contents: write
+      issues: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout trusted policy
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Re-verify the planned pull requests
+        env:
+          # Write authority, but this step only reads. The point of the split
+          # is that the liveness re-check happens before any mutating call.
+          GH_TOKEN: ${{ secrets.TAP_PAT || github.token }}
+          MERGE_PLAN: ${{ needs.plan.outputs.merge_plan }}
+          CONTINUUM_BASE_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
+        run: |
+          set -euo pipefail
+
+          live_entries="$RUNNER_TEMP/live.jsonl"
+          : > "$live_entries"
+
+          for number in $(jq -r '.[].number' <<<"$MERGE_PLAN"); do
+            pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$number")
+            state=$(jq -r '.state' <<<"$pr")
+            head_sha=$(jq -r '.head.sha' <<<"$pr")
+            draft=$(jq -r '.draft' <<<"$pr")
+            mergeable=$(jq -r '.mergeable' <<<"$pr")
+
+            if [[ "$state" != "open" || "$draft" == "true" || "$mergeable" == "false" ]]; then
+              echo "PR #$number is no longer mergeable; skipping."
+              continue
+            fi
+            if [[ "$head_sha" != "$(jq -r --argjson n "$number" '.[] | select(.number == $n) | .head_sha' <<<"$MERGE_PLAN")" ]]; then
+              echo "PR #$number head moved since planning; skipping."
+              continue
+            fi
+            if gh api "repos/$GITHUB_REPOSITORY/issues/$number/labels" \
+              --jq '.[].name' | grep -Fxq no-auto-merge; then
+              echo "PR #$number: no-auto-merge is set."; continue
+            fi
+            jq -cn --argjson number "$number" '. + [$number]' >> "$live_entries"
+          done
+
+          live=$(jq -s 'add // []' < "$live_entries")
+          echo "$live" > "$RUNNER_TEMP/live.json"
+          echo "Still mergeable: $(jq -c '.' <<<"$live")"
+
+      - name: Merge the approved pull requests
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT || github.token }}
+          MERGE_PLAN: ${{ needs.plan.outputs.merge_plan }}
+        run: |
+          set -euo pipefail
+          live=$(cat "$RUNNER_TEMP/live.json")
+
+          for number in $(jq -r '.[]' <<<"$live"); do
+            entry=$(jq -c --argjson n "$number" '.[] | select(.number == $n)' <<<"$MERGE_PLAN")
+
+            if result=$(gh api --method PUT "repos/$GITHUB_REPOSITORY/pulls/$number/merge" \
+              -f merge_method=squash \
+              -f "commit_title=$(jq -r '.commit_title' <<<"$entry")"); then
+              echo "$result" | jq -r '"PR #'"$number"' merged at " + (.sha // "unknown") + "."'
+            else
+              echo "::warning::PR #$number merge refused: $(jq -r '.message // "unknown"' <<<"$result")"
+              continue
+            fi
+
+            issue_number=$(jq -r '.issue_number // ""' <<<"$entry")
+            if [[ -n "$issue_number" ]]; then
+              gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/$issue_number" \
+                -f state=closed -f state_reason=completed >/dev/null 2>&1 \
+                || echo "::warning::Could not close issue #$issue_number after merging PR #$number."
+            fi
+
+            if ! gh api --method POST \
+              "repos/$GITHUB_REPOSITORY/actions/workflows/issue-scheduler.yml/dispatches" \
+              -f ref=main >/dev/null 2>&1; then
+              echo "::warning::Could not wake the scheduler after merging PR #$number."
+            fi
+          done

@@ -1,4 +1,17 @@
 # Continuum bootstrap: derived from NanoDictate; review/release-specific paths are inactive.
+#
+# This is a control plane: it reacts to pull-request metadata and workflow-run
+# results, and its only side effects are labels and workflow dispatches. It
+# never checks out or executes pull-request code.
+#
+# Two rules keep it safe on a public repository:
+#   1. Every privileged action is taken with the write-capable PAT, but only
+#      after a *read-only* verification step has confirmed the pull request is a
+#      trusted same-repository agent PR. Verification must never need write
+#      authority, otherwise verifying an attacker's request would itself require
+#      the privilege the request is asking for.
+#   2. A dispatch is refused unless .github/scripts/trust_policy.py approves the
+#      exact (mode, PR, head ref) triple against the live pull request.
 name: OpenCode repair controller
 
 on:
@@ -25,16 +38,69 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+
     steps:
-      - name: Update branch or dispatch conflict repair
+      - name: Checkout trusted policy
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          # Base branch only, read-only token, no credentials persisted: this
+          # job runs on pull_request_target and must not touch PR code.
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Verify pull request with the trust policy
+        id: trust
         env:
-          GH_TOKEN: ${{ secrets.TAP_PAT || github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          HEAD_REF: ${{ github.event.pull_request.head.ref }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          PR_ACTION: ${{ github.event.action }}
+          # Read-only on purpose. This is the untrusted-input decision, and it
+          # must not be able to grant itself permission.
+          GITHUB_TOKEN: ${{ github.token }}
+          AUTOMATION_TRUSTED_ACTORS: ${{ vars.AUTOMATION_TRUSTED_ACTORS }}
         run: |
           set -euo pipefail
+          python3 - "$GITHUB_EVENT_PATH" <<'PY' > "$RUNNER_TEMP/trusted-pr.json"
+          import json, sys
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              payload = json.load(handle)
+          json.dump(payload.get("pull_request") or {}, sys.stdout)
+          PY
+          python3 - "$RUNNER_TEMP/trusted-pr.json" <<'PY' > "$GITHUB_OUTPUT"
+          import json, pathlib, sys
+          sys.path.insert(0, ".github/scripts")
+          import trust_policy
+
+          pull_request = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          repository = __import__("os").environ["GITHUB_REPOSITORY"]
+          trusted, code, reason = trust_policy.is_trusted_pull_request(
+              pull_request, repository
+          )
+          if not trusted:
+              print("trusted=false")
+              print("::error::Trust policy denied this pull request: " + trust_policy.one_line(reason))
+              raise SystemExit(1)
+          print("trusted=true")
+          print("head_ref=" + pull_request["head"]["ref"])
+          PY
+
+
+      - name: Decide the conflict repair action
+        id: decide
+        env:
+          # Read-only. The decision, including the dispatch verification, must
+          # not itself need the write authority it decides whether to request.
+          GH_TOKEN: ${{ github.token }}
+          AUTOMATION_TRUSTED_ACTORS: ${{ vars.AUTOMATION_TRUSTED_ACTORS }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_REF: ${{ steps.trust.outputs.head_ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_ACTION: ${{ github.event.action }}
+          CONTINUUM_BASE_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
+        run: |
+          set -euo pipefail
+          lock_label="opencode-conflict-repair"
 
           # Repair locks are one-attempt-per-HEAD, not one-attempt-per-PR.
           # A synchronize event means the PR has a new head commit, so any
@@ -42,52 +108,131 @@ jobs:
           # suppress repair of a fresh failure on this head. Reopened PRs also
           # get a clean repair budget.
           if [[ "$PR_ACTION" == "synchronize" || "$PR_ACTION" == "reopened" ]]; then
-            for label in opencode-ci-repair opencode-packaging-smoke-repair; do
-              gh api --method DELETE                 "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/$label"                 >/dev/null 2>&1 || true
-            done
-            echo "Reset per-head workflow-repair locks for PR #$PR_NUMBER ($PR_ACTION)."
+            echo "action=reset-head-locks" >> "$GITHUB_OUTPUT"
+            echo "The PR has a new head ($PR_ACTION); per-head repair locks are reset."
           fi
 
-          gh label create opencode-conflict-repair --repo "$GITHUB_REPOSITORY" --color B60205 \
-            --description "One automatic OpenCode conflict-repair attempt per conflict episode." \
-            --force >/dev/null
-
-          remove_lock() {
-            gh api --method DELETE \
-              "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/opencode-conflict-repair" \
-              >/dev/null 2>&1 || true
-          }
-
-          behind=$(gh api "repos/$GITHUB_REPOSITORY/compare/main...$HEAD_SHA" --jq '.behind_by')
+          behind=$(gh api "repos/$GITHUB_REPOSITORY/compare/$CONTINUUM_BASE_BRANCH...$HEAD_SHA" --jq '.behind_by')
           if [[ "$behind" -eq 0 ]]; then
-            remove_lock
-            echo "PR #$PR_NUMBER already contains the current main branch."
+            echo "action=clear-lock" >> "$GITHUB_OUTPUT"
+            echo "lock_label=$lock_label" >> "$GITHUB_OUTPUT"
+            echo "reason=up_to_date" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          echo "PR #$PR_NUMBER is $behind commit(s) behind main; requesting GitHub-native branch update."
+          # A pull request that edits the privilege boundary needs a human: an
+          # agent that then resolves a conflict in a workflow file would push
+          # unattended into the trust boundary itself.
+          sensitive=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" \
+            --jq '[.[] | select(.filename | startswith(".github/workflows/") or startswith(".github/scripts/") or startswith(".github/actions/") or . == "CODEOWNERS" or . == "action.yml") | .filename] | join(", ")')
+          if [[ -n "$sensitive" ]]; then
+            echo "action=flag-human" >> "$GITHUB_OUTPUT"
+            echo "sensitive_files=$sensitive" >> "$GITHUB_OUTPUT"
+            echo "reason=privilege_boundary_change" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels" \
+            --jq '.[].name' | grep -Fxq "$lock_label"; then
+            echo "action=none" >> "$GITHUB_OUTPUT"
+            echo "reason=repair_already_attempted" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Final gate on the exact dispatch triple, re-verified against the
+          # live pull request. A dispatch the policy would reject never leaves
+          # this job, and the verification is read-only.
+          if ! python3 .github/scripts/trust_policy.py verify-dispatch \
+            --mode resolve-conflict \
+            --pr-number "$PR_NUMBER" \
+            --head-ref "$HEAD_REF"; then
+            echo "action=none" >> "$GITHUB_OUTPUT"
+            echo "reason=policy_denied_dispatch" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "action=update-or-dispatch" >> "$GITHUB_OUTPUT"
+          echo "lock_label=$lock_label" >> "$GITHUB_OUTPUT"
+          echo "behind=$behind" >> "$GITHUB_OUTPUT"
+          echo "reason=behind_base_branch" >> "$GITHUB_OUTPUT"
+
+      # Execution phase: the write-capable token appears only here, and only for
+      # the action the read-only decision above approved.
+      - name: Apply the approved conflict repair action
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT || github.token }}
+          ACTION: ${{ steps.decide.outputs.action }}
+          REASON: ${{ steps.decide.outputs.reason }}
+          LOCK_LABEL: ${{ steps.decide.outputs.lock_label }}
+          SENSITIVE_FILES: ${{ steps.decide.outputs.sensitive_files }}
+          BEHIND: ${{ steps.decide.outputs.behind }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CONTINUUM_BASE_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
+        run: |
+          set -euo pipefail
+          lock_label="opencode-conflict-repair"
+
+          echo "Decision: $ACTION ($REASON)."
+
+          if [[ "$ACTION" == "reset-head-locks" ]]; then
+            for stale in opencode-ci-repair opencode-packaging-smoke-repair; do
+              gh api --method DELETE \
+                "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/$stale" \
+                >/dev/null 2>&1 || true
+            done
+            echo "Reset per-head workflow-repair locks on PR #$PR_NUMBER."
+          fi
+
+          case "$ACTION" in
+            none)
+              exit 0
+              ;;
+            clear-lock)
+              gh api --method DELETE \
+                "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/$lock_label" \
+                >/dev/null 2>&1 || true
+              echo "PR #$PR_NUMBER already contains the current base branch."
+              exit 0
+              ;;
+            flag-human)
+              gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels" \
+                -f 'labels[]=opencode-human-review-required' >/dev/null
+              echo "::warning::PR #$PR_NUMBER changes the privilege boundary ($SENSITIVE_FILES); conflict repair is not dispatched automatically."
+              exit 0
+              ;;
+          esac
+
+          if [[ "$ACTION" != "update-or-dispatch" ]]; then
+            echo "::error::Unknown repair action '$ACTION'; refusing to act."
+            exit 1
+          fi
+
+          gh label create "$lock_label" --repo "$GITHUB_REPOSITORY" --color B60205 \
+            --description "One automatic OpenCode conflict-repair attempt per conflict episode." \
+            --force >/dev/null
+
+          # Prefer GitHub's own merge: it re-runs the mergeability check server
+          # side and needs no agent token at all.
+          echo "PR #$PR_NUMBER is $BEHIND commit(s) behind $CONTINUUM_BASE_BRANCH; requesting a native branch update."
           if output=$(gh api --method PUT \
             "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/update-branch" \
             -f "expected_head_sha=$HEAD_SHA" 2>&1); then
-            remove_lock
+            gh api --method DELETE \
+              "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/$lock_label" \
+              >/dev/null 2>&1 || true
             echo "$output"
             exit 0
           fi
 
           echo "$output"
           if ! grep -Eqi 'conflict|cannot be performed|not updateable' <<<"$output"; then
-            echo "::warning::GitHub update-branch failed for a reason other than a merge conflict."
-            exit 0
-          fi
-
-          if gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels" \
-            --jq '.[].name' | grep -Fxq opencode-conflict-repair; then
-            echo "Conflict repair was already dispatched for this unresolved conflict."
+            echo "::warning::GitHub update-branch failed for a reason other than a merge conflict; no agent dispatch."
             exit 0
           fi
 
           gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels" \
-            -f 'labels[]=opencode-conflict-repair' >/dev/null
+            -f "labels[]=$lock_label" >/dev/null
 
           if ! gh api --method POST \
             "repos/$GITHUB_REPOSITORY/actions/workflows/opencode.yml/dispatches" \
@@ -95,7 +240,9 @@ jobs:
             -f "inputs[mode]=resolve-conflict" \
             -f "inputs[pr_number]=$PR_NUMBER" \
             -f "inputs[head_ref]=$HEAD_REF"; then
-            remove_lock
+            gh api --method DELETE \
+              "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/$lock_label" \
+              >/dev/null 2>&1 || true
             echo "::error::Failed to dispatch OpenCode conflict repair; lock cleared for retry."
             exit 1
           fi
@@ -110,86 +257,200 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+
     steps:
-      - name: Dispatch one automatic OpenCode fix for failed blocking workflow
+      - name: Checkout trusted policy
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      # Decision phase: every read and every trust check below runs with the
+      # read-only GITHUB_TOKEN. Nothing here can act on the trigger, so an
+      # attacker-controlled workflow_run conclusion cannot reach a write call
+      # without first being judged by the policy.
+      - name: Verify pull request with the trust policy
+        id: trust
         env:
-          GH_TOKEN: ${{ secrets.TAP_PAT || github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          AUTOMATION_TRUSTED_ACTORS: ${{ vars.AUTOMATION_TRUSTED_ACTORS }}
+          RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          # Find the open pull request for the failing head, then hand it to the
+          # same read-only policy gate the pull_request_target path uses.
+          pr=$(gh api "repos/$GITHUB_REPOSITORY/commits/$RUN_HEAD_SHA/pulls" \
+            -H "Accept: application/vnd.github+json" \
+            --jq '[.[] | select(.state == "open") | select(.base.ref == "main")][0].number // empty')
+          if [[ -z "$pr" ]]; then
+            echo "No open PR found for head $RUN_HEAD_SHA; nothing to repair."
+            echo "pr_number=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$pr" > "$RUNNER_TEMP/candidate-pr.json"
+          python3 - "$RUNNER_TEMP/candidate-pr.json" <<'PY' > "$GITHUB_OUTPUT"
+          import json, os, pathlib, sys
+          sys.path.insert(0, ".github/scripts")
+          import trust_policy
+
+          pull_request = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          trusted, code, reason = trust_policy.is_trusted_pull_request(
+              pull_request, os.environ["GITHUB_REPOSITORY"]
+          )
+          if not trusted:
+              print("trusted=false")
+              print("::error::Trust policy denied this pull request: " + trust_policy.one_line(reason))
+              raise SystemExit(1)
+          print("trusted=true")
+          print("pr_number=" + str(pull_request["number"]))
+          print("head_ref=" + pull_request["head"]["ref"])
+          print("head_sha=" + pull_request["head"]["sha"])
+          PY
+
+      - name: Decide the repair action
+        id: decide
+        env:
+          # Read-only: the decision must not be able to grant itself the
+          # authority it is deciding whether to request.
+          GH_TOKEN: ${{ github.token }}
+          AUTOMATION_TRUSTED_ACTORS: ${{ vars.AUTOMATION_TRUSTED_ACTORS }}
+          PR_NUMBER: ${{ steps.trust.outputs.pr_number }}
+          HEAD_REF: ${{ steps.trust.outputs.head_ref }}
+          HEAD_SHA: ${{ steps.trust.outputs.head_sha }}
           RUN_ID: ${{ github.event.workflow_run.id }}
           RUN_NAME: ${{ github.event.workflow_run.name }}
           RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           CONCLUSION: ${{ github.event.workflow_run.conclusion }}
         run: |
           set -euo pipefail
+          pr="$PR_NUMBER"
+
+          if [[ -z "$pr" ]]; then
+            echo "action=none" >> "$GITHUB_OUTPUT"
+            echo "reason=no_trusted_pull_request" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           case "$RUN_NAME" in
-            CI)
-              lock_label="opencode-ci-repair"
-              lock_description="One automatic OpenCode CI repair attempt per failing PR head."
-              ;;
-            "Packaging smoke")
-              lock_label="opencode-packaging-smoke-repair"
-              lock_description="One automatic OpenCode packaging-smoke repair attempt per failing PR head."
-              ;;
+            CI) lock_label="opencode-ci-repair" ;;
+            "Packaging smoke") lock_label="opencode-packaging-smoke-repair" ;;
             *)
-              echo "Unsupported workflow '$RUN_NAME'; nothing to repair."
+              echo "action=none" >> "$GITHUB_OUTPUT"
+              echo "reason=unsupported_workflow" >> "$GITHUB_OUTPUT"
               exit 0
               ;;
           esac
 
-          pr=$(gh api "repos/$GITHUB_REPOSITORY/commits/$RUN_HEAD_SHA/pulls" \
-            -H "Accept: application/vnd.github+json" \
-            --jq '[.[] | select(.state == "open") | select(.base.ref == "main")][0].number // empty')
-          [[ -n "$pr" ]] || {
-            echo "No open PR found for $RUN_NAME head $RUN_HEAD_SHA; nothing to repair."
-            exit 0
-          }
-
-          read -r head_ref head_sha head_repo < <(
-            gh api "repos/$GITHUB_REPOSITORY/pulls/$pr" \
-              --jq '[.head.ref, .head.sha, .head.repo.full_name] | @tsv'
-          )
-
-          if [[ "$head_repo" != "$GITHUB_REPOSITORY" || "$head_ref" != opencode/* ]]; then
-            echo "PR #$pr is not a same-repository OpenCode PR; ignoring."
-            exit 0
-          fi
-
-          if [[ "$head_sha" != "$RUN_HEAD_SHA" ]]; then
-            echo "$RUN_NAME run $RUN_ID is stale; PR #$pr has already advanced to $head_sha."
-            exit 0
-          fi
-
-          gh label create "$lock_label" --repo "$GITHUB_REPOSITORY" --color FBCA04 \
-            --description "$lock_description" \
-            --force >/dev/null
-
           if [[ "$CONCLUSION" == "success" ]]; then
-            gh api --method DELETE \
-              "repos/$GITHUB_REPOSITORY/issues/$pr/labels/$lock_label" \
-              >/dev/null 2>&1 || true
-            echo "$RUN_NAME passed; automatic repair lock '$lock_label' cleared."
+            echo "action=clear-lock" >> "$GITHUB_OUTPUT"
+            echo "lock_label=$lock_label" >> "$GITHUB_OUTPUT"
+            echo "reason=workflow_passed" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "$HEAD_SHA" != "$RUN_HEAD_SHA" ]]; then
+            echo "action=none" >> "$GITHUB_OUTPUT"
+            echo "reason=stale_run" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           if gh api "repos/$GITHUB_REPOSITORY/issues/$pr/labels" \
             --jq '.[].name' | grep -Fxq "$lock_label"; then
-            echo "An automatic $RUN_NAME repair was already attempted for this exact PR head; waiting for a new head or a successful rerun."
+            echo "action=none" >> "$GITHUB_OUTPUT"
+            echo "reason=repair_already_attempted" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$pr/labels" \
-            -f "labels[]=$lock_label" >/dev/null
+          # Same privilege-boundary rule as conflict repair: an agent that
+          # pushes into a pull request touching the trust boundary needs a human.
+          sensitive=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr/files?per_page=100" \
+            --jq '[.[] | select(.filename | startswith(".github/workflows/") or startswith(".github/scripts/") or startswith(".github/actions/") or . == "CODEOWNERS" or . == "action.yml") | .filename] | join(", ")')
+          if [[ -n "$sensitive" ]]; then
+            echo "action=flag-human" >> "$GITHUB_OUTPUT"
+            echo "sensitive_files=$sensitive" >> "$GITHUB_OUTPUT"
+            echo "reason=privilege_boundary_change" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Final gate on the exact dispatch triple, re-verified against the
+          # live pull request. A dispatch the policy would reject never leaves
+          # this job, and the verification itself is read-only.
+          if ! python3 .github/scripts/trust_policy.py verify-dispatch \
+            --mode ci-fix \
+            --pr-number "$pr" \
+            --head-ref "$HEAD_REF" \
+            --run-id "$RUN_ID"; then
+            echo "action=none" >> "$GITHUB_OUTPUT"
+            echo "reason=policy_denied_dispatch" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "action=dispatch" >> "$GITHUB_OUTPUT"
+          echo "lock_label=$lock_label" >> "$GITHUB_OUTPUT"
+          echo "reason=blocking_workflow_failed" >> "$GITHUB_OUTPUT"
+
+      # Execution phase: the write-capable token appears only here, only after
+      # the decision above, and only for the action the policy approved.
+      - name: Apply the approved repair action
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT || github.token }}
+          ACTION: ${{ steps.decide.outputs.action }}
+          REASON: ${{ steps.decide.outputs.reason }}
+          LOCK_LABEL: ${{ steps.decide.outputs.lock_label }}
+          SENSITIVE_FILES: ${{ steps.decide.outputs.sensitive_files }}
+          PR_NUMBER: ${{ steps.trust.outputs.pr_number }}
+          HEAD_REF: ${{ steps.trust.outputs.head_ref }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+
+          echo "Decision: $ACTION ($REASON)."
+
+          case "$ACTION" in
+            none)
+              exit 0
+              ;;
+            clear-lock)
+              gh api --method DELETE \
+                "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/$LOCK_LABEL" \
+                >/dev/null 2>&1 || true
+              echo "Cleared the automatic repair lock on PR #$PR_NUMBER."
+              exit 0
+              ;;
+            flag-human)
+              gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels" \
+                -f 'labels[]=opencode-human-review-required' >/dev/null
+              echo "::warning::PR #$PR_NUMBER changes the privilege boundary ($SENSITIVE_FILES); automatic repair is not dispatched."
+              exit 0
+              ;;
+          esac
+
+          if [[ "$ACTION" != "dispatch" ]]; then
+            echo "::error::Unknown repair action '$ACTION'; refusing to act."
+            exit 1
+          fi
+
+          gh label create "$LOCK_LABEL" --repo "$GITHUB_REPOSITORY" --color FBCA04 \
+            --description "One automatic OpenCode repair attempt per failing PR head." \
+            --force >/dev/null
+
+          gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels" \
+            -f "labels[]=$LOCK_LABEL" >/dev/null
 
           if ! gh api --method POST \
             "repos/$GITHUB_REPOSITORY/actions/workflows/opencode.yml/dispatches" \
             -f ref=main \
             -f "inputs[mode]=ci-fix" \
-            -f "inputs[pr_number]=$pr" \
-            -f "inputs[head_ref]=$head_ref" \
+            -f "inputs[pr_number]=$PR_NUMBER" \
+            -f "inputs[head_ref]=$HEAD_REF" \
             -f "inputs[run_id]=$RUN_ID"; then
             gh api --method DELETE \
-              "repos/$GITHUB_REPOSITORY/issues/$pr/labels/$lock_label" \
+              "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/$LOCK_LABEL" \
               >/dev/null 2>&1 || true
-            echo "::error::Failed to dispatch OpenCode repair for $RUN_NAME; lock cleared for retry."
+            echo "::error::Failed to dispatch OpenCode repair; lock cleared for retry."
             exit 1
           fi
