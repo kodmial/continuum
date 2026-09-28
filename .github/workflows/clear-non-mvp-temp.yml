@@ -1,0 +1,37 @@
+name: Clear non-MVP active work
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  actions: write
+  issues: write
+  contents: read
+
+jobs:
+  clear:
+    if: github.event.head_commit.message == 'clear-non-mvp-active-work'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Cancel and release non-MVP runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          H=(-H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2026-03-10")
+
+          for run in 36434923257 36434921136; do
+            gh api --method POST "repos/$GITHUB_REPOSITORY/actions/runs/$run/cancel" >/dev/null 2>&1 || true
+          done
+
+          for issue in 19 31; do
+            gh api --method DELETE "repos/$GITHUB_REPOSITORY/issues/$issue/labels/automation:in-progress" >/dev/null 2>&1 || true
+          done
+
+          # Dynamic endpoint discovery is post-MVP and depends on the reusable PR-Agent seam.
+          gh api --method POST "${H[@]}"             "repos/$GITHUB_REPOSITORY/issues/31/dependencies/blocked_by"             -F issue_id=5615046811 >/dev/null 2>&1 || true
+
+          gh workflow run issue-scheduler.yml --repo "$GITHUB_REPOSITORY" --ref main
