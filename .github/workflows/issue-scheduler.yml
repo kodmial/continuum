@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
-      WIP_LIMIT: ${{ vars.AUTOMATION_WIP_LIMIT || '4' }}
+      WIP_LIMIT: ${{ vars.AUTOMATION_WIP_LIMIT || '5' }}
       LEASE_MINUTES: ${{ vars.AUTOMATION_LEASE_MINUTES || '45' }}
       MAX_DISPATCH_ATTEMPTS: ${{ vars.AUTOMATION_MAX_DISPATCH_ATTEMPTS || '2' }}
       HAS_TAP_PAT: ${{ secrets.TAP_PAT != '' }}
