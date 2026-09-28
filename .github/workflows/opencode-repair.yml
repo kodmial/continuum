@@ -169,7 +169,11 @@ jobs:
           )
           if not trusted:
               print("trusted=false")
-              print("::error::Trust policy denied this pull request: " + trust_policy.one_line(reason))
+              print(
+                  "Trust policy denied this agent pull request: "
+                  + trust_policy.one_line(reason),
+                  file=sys.stderr,
+              )
               raise SystemExit(1)
           print("trusted=true")
           print("head_ref=" + pull_request["head"]["ref"])
