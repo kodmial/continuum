@@ -1,0 +1,95 @@
+name: Wire Continuum dependency DAG
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  wire:
+    if: github.event.head_commit.message == 'chore: wire Continuum dependency DAG'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Add native issue dependencies
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          add_dep() {
+            local target="$1"
+            local blocker_id="$2"
+            gh api --method POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              "repos/$GITHUB_REPOSITORY/issues/$target/dependencies/blocked_by" \
+              -F "issue_id=$blocker_id" >/dev/null
+          }
+
+          # Core sequencing.
+          add_dep 4 5614457679  # #4 <- #2
+          add_dep 4 5614458030  # #4 <- #3
+
+          add_dep 5 5614457679  # #5 <- #2
+          add_dep 5 5614458030  # #5 <- #3
+          add_dep 5 5614458373  # #5 <- #4
+
+          add_dep 6 5614458373  # #6 <- #4
+
+          add_dep 7 5614457679  # #7 <- #2
+          add_dep 7 5614458030  # #7 <- #3
+
+          # Hardening and architecture after the benchmark.
+          add_dep 8 5614459607  # #8 <- #7
+          add_dep 8 5614458030  # #8 <- #3
+
+          add_dep 9 5614459607  # #9 <- #7
+          add_dep 9 5614458373  # #9 <- #4
+
+          add_dep 10 5614459607 # #10 <- #7
+          add_dep 10 5614458030 # #10 <- #3
+          add_dep 10 5614459944 # #10 <- #8
+
+          # Optional adapters only after core boundaries exist.
+          add_dep 11 5614457679 # #11 <- #2
+          add_dep 11 5614458373 # #11 <- #4
+          add_dep 11 5614458878 # #11 <- #5
+          add_dep 11 5614459191 # #11 <- #6
+          add_dep 11 5614459607 # #11 <- #7
+
+          add_dep 12 5614457679 # #12 <- #2
+          add_dep 12 5614458373 # #12 <- #4
+          add_dep 12 5614458878 # #12 <- #5
+          add_dep 12 5614459191 # #12 <- #6
+          add_dep 12 5614459607 # #12 <- #7
+
+          # Validation, observability and rollout.
+          add_dep 13 5614458878 # #13 <- #5
+          add_dep 13 5614459191 # #13 <- #6
+          add_dep 13 5614460240 # #13 <- #9
+          add_dep 13 5614460535 # #13 <- #10
+
+          add_dep 14 5614458373 # #14 <- #4
+          add_dep 14 5614460240 # #14 <- #9
+
+          add_dep 15 5614458878 # #15 <- #5
+          add_dep 15 5614461548 # #15 <- #13
+
+          add_dep 16 5614458878 # #16 <- #5
+          add_dep 16 5614459191 # #16 <- #6
+          add_dep 16 5614461548 # #16 <- #13
+          add_dep 16 5614462328 # #16 <- #15
+
+          # Existing synthetic merge-queue design becomes a downstream capability.
+          add_dep 1 5614458878  # #1 <- #5
+          add_dep 1 5614459191  # #1 <- #6
+          add_dep 1 5614459607  # #1 <- #7
+          add_dep 1 5614460240  # #1 <- #9
+          add_dep 1 5614461548  # #1 <- #13
+
+          echo "Continuum dependency DAG wired."
