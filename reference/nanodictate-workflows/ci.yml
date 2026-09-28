@@ -1,0 +1,230 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    # A documentation-only merge does not need a macOS build on main.
+    paths-ignore:
+      - '*.md'
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE'
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+# Keep only the newest CI for each PR/branch. Automatic main synchronization can
+# create several short-lived heads in quick succession; stale macOS jobs must
+# not consume runner capacity ahead of the current head.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  classify-changes:
+    name: Classify changes
+    runs-on: ubuntu-latest
+    outputs:
+      build_required: ${{ steps.classify.outputs.build_required }}
+    steps:
+      - name: Decide whether macOS build is required
+        id: classify
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            // Pushes that reach this workflow already passed paths-ignore above.
+            if (context.eventName !== 'pull_request') {
+              core.setOutput('build_required', 'true');
+              return;
+            }
+
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+              per_page: 100,
+            });
+
+            const pr = context.payload.pull_request;
+            const repoFullName = `${context.repo.owner}/${context.repo.repo}`;
+            const filenames = files.map(({ filename }) => filename);
+            const sameRepo = pr.head.repo?.full_name === repoFullName;
+            const labelNames = new Set((pr.labels || []).map(label => label.name));
+
+            // Generated release PRs are data-only changes. Do not spend a macOS
+            // runner rebuilding application code that did not change. The fast
+            // path is deliberately strict: same-repository automation branch,
+            // expected lifecycle marker (for release-please), and no file
+            // outside the generator-owned allow-list. Anything unexpected falls
+            // back to the normal full build instead of being trusted.
+            const releaseFiles = new Set([
+              '.release-please-manifest.json',
+              'CHANGELOG.md',
+              'Sources/NanoDictateCore/Version.swift',
+            ]);
+            const manifestFiles = new Set([
+              'nanodictate.rb',
+              'packaging/homebrew/nanodictate.rb',
+              'packaging/homebrew/Casks/nanodictate.rb',
+              'packaging/macports/Portfile',
+              'scripts/install-macports.sh',
+            ]);
+            const onlyAllowed = (allowed) =>
+              filenames.length > 0 && filenames.every(path => allowed.has(path));
+
+            const trustedReleasePr =
+              sameRepo &&
+              pr.head.ref === 'release-please--branches--main' &&
+              labelNames.has('autorelease: pending') &&
+              onlyAllowed(releaseFiles);
+            const trustedManifestPr =
+              sameRepo &&
+              pr.head.ref.startsWith('chore/release-manifests-v') &&
+              onlyAllowed(manifestFiles);
+
+            if (trustedReleasePr || trustedManifestPr) {
+              core.notice(
+                `Trusted generated ${trustedReleasePr ? 'Release' : 'manifest'} PR: skipping macOS build/tests; lightweight policy jobs remain required.`
+              );
+              core.info(`Changed files: ${filenames.join(', ')}`);
+              core.setOutput('build_required', 'false');
+              return;
+            }
+
+            // Keep this intentionally conservative: only documentation-only PRs
+            // skip the expensive macOS runner. Any non-documentation file means
+            // the normal build, lint, and test job still runs.
+            const isDocumentationOnlyPath = (path) =>
+              path.startsWith('docs/') ||
+              path.endsWith('.md') ||
+              path === 'LICENSE';
+
+            const docsOnly = files.length > 0 && files.every(({ filename }) =>
+              isDocumentationOnlyPath(filename)
+            );
+
+            core.info(`Changed files: ${filenames.join(', ')}`);
+            core.info(docsOnly
+              ? 'Documentation-only PR: skipping macOS build and tests.'
+              : 'Code or non-documentation change detected: macOS build and tests are required.');
+            core.setOutput('build_required', docsOnly ? 'false' : 'true');
+
+  # The release policy that decides whether a merge into main needs a Release
+  # PR update lives in scripts/release-policy.sh (used by release-pr.yml). It is
+  # plain bash, so it is tested on Linux against real git diff output.
+  release-policy:
+    name: Release policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          # This job runs scripts/test-release-policy.sh from the checked-out PR on
+          # pull_request events, so the token must not stay in .git/config where
+          # that code could reuse it (CWE-522).
+          persist-credentials: false
+
+      - name: Test the release policy
+        run: bash scripts/test-release-policy.sh
+
+  # Version ownership: only the automated Release PR branch may touch
+  # Sources/NanoDictateCore/Version.swift or .release-please-manifest.json.
+  # Ordinary PRs never reserve the next version, so concurrent merges cannot
+  # race or pick duplicate versions — version selection is serialized in the
+  # Release PR at release time (issue #10). Runs on pull_request only: pushes
+  # to main are merges that already passed this gate as PRs.
+  version-ownership:
+    name: Version ownership
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          # The checked-out PR code is only diffed here, so the token must not
+          # stay in .git/config where that code could reuse it (CWE-522).
+          persist-credentials: false
+
+      - name: Reject hand-written version bumps
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          SAME_REPO: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          # shellcheck source=scripts/release-policy.sh
+          source scripts/release-policy.sh
+          CHANGED=$(git diff --name-only "$BASE_SHA...$HEAD_SHA")
+          echo "Changed files:"
+          printf '%s\n' "$CHANGED" | sed 's/^/  /'
+          # A fork can name its branch like the Release PR branch, so the
+          # branch name alone must not confer trust — only a same-repo head
+          # counts as the Release PR.
+          if [[ "$SAME_REPO" != "true" ]]; then HEAD_REF="fork:${HEAD_REF}"; fi
+          if policy_check_version_ownership "$HEAD_REF" "$CHANGED"; then
+            echo "Version ownership ok — no hand-written version bump."
+          elif policy_is_version_seeding \
+            "$(git show "$BASE_SHA:Sources/NanoDictateCore/Version.swift" 2>/dev/null || true)" \
+            "$(git show "$HEAD_SHA:Sources/NanoDictateCore/Version.swift" 2>/dev/null || true)" \
+            "$(git show "$BASE_SHA:.release-please-manifest.json" 2>/dev/null || true)" \
+            "$(git show "$HEAD_SHA:.release-please-manifest.json" 2>/dev/null || true)"; then
+            echo "Version ownership ok — one-time release-please bootstrap (manifest seeded at the current version, Version.swift version unchanged)."
+          else
+            echo "::error::PR '$HEAD_REF' touches Version.swift or .release-please-manifest.json. The next version is owned by the automated Release PR (release-pr.yml): remove the version bump from this PR and merge normally — the changes will ride along with the next Release PR."
+            exit 1
+          fi
+
+  build-and-test:
+    name: Build & Test (macOS)
+    needs: classify-changes
+    if: needs.classify-changes.outputs.build_required == 'true'
+    # macos-latest tracks macOS 26 (Xcode 26, SDK 26.5), too new for any
+    # current swift.org toolchain. macos-15 pins the macOS 15.5 SDK, which
+    # the Swift 6.1 toolchain parses cleanly.
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        # Pin actions/checkout@v4 to a full commit SHA (CWE-829: mutable tag
+        # could be swapped upstream; the job runs with a 'contents: read' token).
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install Swift
+        # Pin swift-actions/setup-swift@v2 to a full commit SHA (peeled from the
+        # annotated v2 tag; CWE-829: mutable tag could be swapped upstream).
+        uses: swift-actions/setup-swift@7ca6abe6b3b0e8b5421b88be48feee39cbf52c6a
+        with:
+          # swift.org toolchain Swift 6.1 runs in Swift 5 language mode: it
+          # compiles the tools-version 5.7 manifest and builds Swift 5 code
+          # (compiler 6.1 emits the same clang-generation as Xcode 16.4).
+          # 5.10.1 crashes its swift-frontend on the macOS 15.5 SDK.
+          swift-version: "6.1"
+
+      # swift-format (Apple) is installed from its standard Homebrew location,
+      # matching the local development setup. No source build or /tmp files.
+      - name: Install swift-format
+        run: brew install swift-format
+
+      - name: Run swift-format lint
+        run: swift-format lint --recursive --configuration .swift-format Sources
+
+      - name: Run SwiftLint
+        run: |
+          brew install swiftlint
+          swiftlint lint Sources
+
+      - name: Build
+        run: swift build
+
+      # The tests are a plain executable product (no .xctest bundle): without
+      # Xcode, `swift test` is unavailable, so `swift run` executes the custom
+      # runner (Tests/NanoDictateCoreTests/main.swift), which exits non-zero if
+      # any test fails.
+      - name: Run tests
+        run: swift run NanoDictateCoreTests
