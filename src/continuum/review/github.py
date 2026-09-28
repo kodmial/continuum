@@ -131,6 +131,21 @@ class GitHubClient:
     def get_pull(self, number: int) -> Dict[str, Any]:
         return self.request("GET", f"/repos/{self.owner}/{self.name}/pulls/{number}")
 
+    def list_pulls(self, *, state: str = "open", base: str = "") -> List[Dict[str, Any]]:
+        query = urllib.parse.urlencode({"state": state, "per_page": 100, **({"base": base} if base else {})})
+        return self.paginate(f"/repos/{self.owner}/{self.name}/pulls?{query}")
+
+    def get_issue(self, number: int) -> Dict[str, Any]:
+        return self.request("GET", f"/repos/{self.owner}/{self.name}/issues/{number}")
+
+    def list_check_runs(self, ref: str) -> List[Dict[str, Any]]:
+        quoted = urllib.parse.quote(str(ref), safe="")
+        payload = self.request(
+            "GET",
+            f"/repos/{self.owner}/{self.name}/commits/{quoted}/check-runs?per_page=100",
+        )
+        return list(payload.get("check_runs") or [])
+
     def list_pull_files(self, number: int) -> List[Dict[str, Any]]:
         return self.paginate(f"/repos/{self.owner}/{self.name}/pulls/{number}/files?per_page=100")
 
@@ -244,6 +259,34 @@ class GitHubClient:
             "POST",
             f"/repos/{self.owner}/{self.name}/issues/{issue_number}/comments",
             {"body": body},
+        )
+
+    def delete_issue_comment(self, comment_id: int) -> Dict[str, Any]:
+        return self.request(
+            "DELETE", f"/repos/{self.owner}/{self.name}/issues/comments/{int(comment_id)}"
+        )
+
+    def add_labels(self, issue_number: int, labels: Sequence[str]) -> Dict[str, Any]:
+        return self.request(
+            "POST",
+            f"/repos/{self.owner}/{self.name}/issues/{issue_number}/labels",
+            {"labels": list(labels)},
+        )
+
+    def remove_label(self, issue_number: int, name: str) -> Dict[str, Any]:
+        quoted = urllib.parse.quote(str(name), safe="")
+        return self.request(
+            "DELETE", f"/repos/{self.owner}/{self.name}/issues/{issue_number}/labels/{quoted}"
+        )
+
+    def dispatch_workflow(self, workflow: str, ref: str, inputs: Dict[str, str]) -> Dict[str, Any]:
+        quoted = urllib.parse.quote(str(workflow), safe="")
+        body: Dict[str, Any] = {"ref": ref}
+        body.update({f"inputs[{key}]": str(value) for key, value in (inputs or {}).items()})
+        return self.request(
+            "POST",
+            f"/repos/{self.owner}/{self.name}/actions/workflows/{quoted}/dispatches",
+            body,
         )
 
     def update_issue_comment(self, comment_id: int, body: str) -> Dict[str, Any]:

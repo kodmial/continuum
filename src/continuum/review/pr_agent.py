@@ -199,6 +199,34 @@ def profile_for(bot_login: str) -> Tuple[Sequence[str], Sequence[str], Sequence[
     return bot_logins, DEFAULT_REVIEW_BOT_LOGINS, OUTPUT_MARKERS
 
 
+def queue_request(
+    settings: Any,
+    *,
+    pr_number: int,
+    head_sha: str = "",
+    kind: str = "initial",
+    dispatch_workflow: str = "pr-agent.yml",
+) -> Any:
+    """PR-Agent is driven by a gate run, not by a bot mention.
+
+    A workflow dispatch keeps the request in Actions, where the gate already
+    normalizes the result; no provider command is posted to the PR.
+    """
+
+    from .providers import REQUEST_WORKFLOW_DISPATCH, QueueRequest
+
+    return QueueRequest(
+        kind=REQUEST_WORKFLOW_DISPATCH,
+        provider=PROVIDER_NAME,
+        workflow=dispatch_workflow,
+        inputs={
+            "pr_number": str(int(pr_number)),
+            "head_sha": str(head_sha or ""),
+            "mode": str(kind),
+        },
+    )
+
+
 def collect(
     client: Any,
     pr_number: int,

@@ -15,7 +15,9 @@ The repository currently dogfoods a deliberately small active control plane:
 - OpenCode execution/repair plumbing derived from NanoDictate;
 - generic bootstrap CI (unit tests + configuration validation);
 - conflict/CI repair;
-- a temporary review-free auto-merge controller.
+- a temporary review-free auto-merge controller;
+- a self-healing review queue reconciler (provider action disabled while
+  `review.provider: none`).
 
 The complete NanoDictate workflow set is preserved verbatim under
 `reference/nanodictate-workflows/`.
@@ -49,6 +51,52 @@ adapter:
 
 To enable in another repository, validate a `.continuum.yml`, then call the
 reusable workflow — see `fixtures/consumer-repo/` for the reference consumer.
+
+## Review queue
+
+A provider is a shared, rate-limited resource, so at most one review request may
+be in flight per repository. The queue decides who gets the next slot.
+
+**Events are wake-ups, not decisions.** Any state change that can change *who the
+next eligible candidate is* starts a reconciliation, and every reconciliation
+recomputes the whole queue from live GitHub state
+(`continuum review queue`, `src/continuum/review/queue.py`). Nothing trusts an
+event payload, so duplicate and out-of-order wake-ups are harmless, and a
+candidate that is closed, merged, converted to draft, paused, reprioritized, or
+whose CI finishes immediately releases its slot on the next wake-up instead of
+after a timeout. The schedule is a recovery backstop for missed events, not the
+progress mechanism.
+
+- **Wake-ups** (`review-queue.yml`): every `pull_request_target` action
+  including `closed` and `converted_to_draft`, submitted/dismissed reviews,
+  provider comments, source-issue label changes, commit status, check runs and
+  suites, workflow runs, manual dispatch, and a twice-hourly schedule.
+- **Ranking** is deterministic: the first matching `review.queue.priority_labels`
+  entry, then `review.queue.tie_breakers` (`source_issue`, `pr_number`,
+  `created_at`, `head_sha`). A pull request inherits its source issue's priority
+  label when it has none of its own.
+- **The in-flight slot is keyed to `PR number + HEAD SHA`**, recorded in an
+  issue comment (`<!-- continuum-review-request -->`,
+  `continuum.review-request/v1`) written *before* the provider request. A moved
+  HEAD, a closed owner, or a lock past `in_flight_timeout_minutes` with no
+  provider response frees it; a failed provider command deletes the record.
+- **The cooldown is global** and applies after ranking, so a replacement
+  candidate cannot spend a slot the provider is still rate-limiting. A published
+  rate-limit window is honoured even without a cooldown, and `safety_margin_seconds`
+  covers the gap between the response and the next request.
+- **Provider-independent**: the provider is a single configured action
+  (`coderabbit` comment, `pr-agent` workflow dispatch) and `review.provider: none`
+  is a zero-traffic opt-out. Eligibility, ordering, locking, and cooldown are
+  decided before any provider is chosen.
+
+Every run explains itself: candidates leaving the queue with a reason, the
+selected candidate, cooldown or retry waits, released slots, and the single
+scheduled action. `queue reconcile --no-apply` prints the same plan without
+acting on it.
+
+A consumer repository declares the event set in a thin entry workflow and calls
+the shared reconciler — see `fixtures/consumer-repo/.github/workflows/review-queue.yml`.
+`tests/test_queue_workflows.py` fails if the two event sets ever drift apart.
 
 ## Public-repository safety
 

@@ -153,7 +153,14 @@ def _unescape_double(inner: str, number: int) -> str:
     return "".join(out)
 
 
-def _split_key(text: str, number: int) -> Tuple[str, str]:
+def _mapping_key_index(text: str) -> int:
+    """Index of the colon that makes `text` a mapping entry, or -1.
+
+    A colon only separates a key from a value when it ends the key, so
+    `priority:p0` stays a plain scalar. Without this, a sequence item holding a
+    label like `- priority:p0` would be misread as a nested mapping.
+    """
+
     quote: Optional[str] = None
     for index, char in enumerate(text):
         if quote is not None:
@@ -164,10 +171,16 @@ def _split_key(text: str, number: int) -> Tuple[str, str]:
             quote = char
             continue
         if char == ":" and (index + 1 == len(text) or text[index + 1] in " \t"):
-            key = text[:index].strip()
-            if not key:
-                raise YamlSubsetError(f"line {number}: empty mapping key")
-            return key, text[index + 1 :].strip()
+            if not text[:index].strip():
+                raise YamlSubsetError("empty mapping key")
+            return index
+    return -1
+
+
+def _split_key(text: str, number: int) -> Tuple[str, str]:
+    index = _mapping_key_index(text)
+    if index >= 0:
+        return text[:index].strip(), text[index + 1 :].strip()
     if text.endswith(":"):
         return text[:-1].strip(), ""
     raise YamlSubsetError(f"line {number}: expected 'key: value' but found {text!r}")
@@ -207,7 +220,7 @@ def _parse_sequence(lines: List[_Line], start: int, indent: int) -> Tuple[List[A
             raise YamlSubsetError(
                 "line %d: %s" % (line.number, _UNSUPPORTED_PREFIXES[rest[0]])
             )
-        if ":" in rest and not _is_quoted_whole(rest):
+        if _mapping_key_index(rest) >= 0:
             # A mapping that starts on the sequence-item line. Its keys align
             # with the first character after "- ".
             key, value_text = _split_key(rest, line.number)
