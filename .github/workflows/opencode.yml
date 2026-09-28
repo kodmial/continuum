@@ -93,8 +93,10 @@ jobs:
           CONTINUUM_BASE_BRANCH: ${{ vars.AUTOMATION_BASE_BRANCH || 'main' }}
         run: |
           set -euo pipefail
+          # authorize-event writes the validated outputs, including
+          # authorized, directly to GITHUB_OUTPUT. A step cannot reference its
+          # own outputs while it is still executing.
           python3 .github/scripts/trust_policy.py authorize-event
-          echo "authorized=${{ steps.gate.outputs.authorized }}" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
   # Privileged execution. Gated on the control plane's verdict.
