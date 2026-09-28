@@ -149,15 +149,6 @@ jobs:
             if [[ ! "$head_ref" =~ ^opencode/issue[0-9]+- ]]; then
               echo "PR #$number head '$head_ref' is not an agent branch."; continue
             fi
-            # Bootstrap safety: PR-Agent (#25) must become the first blocking
-            # review provider before unrelated implementation PRs may auto-merge.
-            # Allow #25 itself to bootstrap that gate; hold every other OpenCode
-            # PR until #25 replaces this temporary guard with the normalized
-            # review-gate check. Filtering here keeps the write job below acting
-            # only on pull requests this read-only plan already approved.
-            if [[ ! "$head_ref" =~ ^opencode/issue25- ]]; then
-              echo "PR #$number: held until Continuum PR-Agent review gate (#25) is installed."; continue
-            fi
             if [[ "$draft" == "true" ]]; then
               echo "PR #$number became a draft."; continue
             fi
@@ -170,6 +161,17 @@ jobs:
             fi
             if [[ "$mergeable" == "null" ]]; then
               echo "PR #$number mergeability is still being computed."; continue
+            fi
+
+            # A green PR is not merge-safe unless it contains the exact current
+            # base. This is the regression guard for the #35 -> #32 incident:
+            # an older green branch must never be allowed to restore obsolete
+            # control-plane code after main has advanced.
+            base_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$CONTINUUM_BASE_BRANCH" --jq '.object.sha')
+            base_status=$(gh api "repos/$GITHUB_REPOSITORY/compare/$base_sha...$head_sha" --jq '.status')
+            if [[ "$base_status" != "ahead" && "$base_status" != "identical" ]]; then
+              echo "PR #$number is stale against $CONTINUUM_BASE_BRANCH ($base_status); waiting for branch sync/repair."
+              continue
             fi
 
             # The review gate is a commit status in the configured context. Only
@@ -273,6 +275,14 @@ jobs:
               echo "PR #$number head moved since planning; skipping."
               continue
             fi
+
+            base_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$CONTINUUM_BASE_BRANCH" --jq '.object.sha')
+            base_status=$(gh api "repos/$GITHUB_REPOSITORY/compare/$base_sha...$head_sha" --jq '.status')
+            if [[ "$base_status" != "ahead" && "$base_status" != "identical" ]]; then
+              echo "PR #$number became stale after planning ($base_status); skipping."
+              continue
+            fi
+
             if gh api "repos/$GITHUB_REPOSITORY/issues/$number/labels" \
               --jq '.[].name' | grep -Fxq no-auto-merge; then
               echo "PR #$number: no-auto-merge is set."; continue
@@ -288,6 +298,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT || github.token }}
           MERGE_PLAN: ${{ needs.plan.outputs.merge_plan }}
+          CONTINUUM_BASE_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
         run: |
           set -euo pipefail
           live=$(cat "$RUNNER_TEMP/live.json")
@@ -295,8 +306,20 @@ jobs:
           for number in $(jq -r '.[]' <<<"$live"); do
             entry=$(jq -c --argjson n "$number" '.[] | select(.number == $n)' <<<"$MERGE_PLAN")
 
+            # Re-check freshness immediately before the write. A previous PR
+            # merged by this same loop changes main and therefore makes every
+            # sibling PR stale until GitHub updates/retests it.
+            head_sha=$(jq -r '.head_sha' <<<"$entry")
+            base_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$CONTINUUM_BASE_BRANCH" --jq '.object.sha')
+            base_status=$(gh api "repos/$GITHUB_REPOSITORY/compare/$base_sha...$head_sha" --jq '.status')
+            if [[ "$base_status" != "ahead" && "$base_status" != "identical" ]]; then
+              echo "PR #$number became stale before merge ($base_status); leaving it for branch sync."
+              continue
+            fi
+
             if result=$(gh api --method PUT "repos/$GITHUB_REPOSITORY/pulls/$number/merge" \
               -f merge_method=squash \
+              -f "sha=$head_sha" \
               -f "commit_title=$(jq -r '.commit_title' <<<"$entry")"); then
               echo "$result" | jq -r '"PR #'"$number"' merged at " + (.sha // "unknown") + "."'
             else
@@ -306,9 +329,16 @@ jobs:
 
             issue_number=$(jq -r '.issue_number // ""' <<<"$entry")
             if [[ -n "$issue_number" ]]; then
-              gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/$issue_number" \
-                -f state=closed -f state_reason=completed >/dev/null 2>&1 \
-                || echo "::warning::Could not close issue #$issue_number after merging PR #$number."
+              issue_state=$(gh api "repos/$GITHUB_REPOSITORY/issues/$issue_number" --jq '.state' 2>/dev/null || true)
+              if [[ "$issue_state" == "open" ]]; then
+                gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/$issue_number" \
+                  -f state=closed -f state_reason=completed >/dev/null 2>&1 \
+                  || echo "::warning::Could not close issue #$issue_number after merging PR #$number."
+              elif [[ "$issue_state" == "closed" ]]; then
+                echo "Issue #$issue_number is already closed; merge finalization is already converged."
+              else
+                echo "::warning::Could not read issue #$issue_number after merging PR #$number."
+              fi
             fi
 
             if ! gh api --method POST \
