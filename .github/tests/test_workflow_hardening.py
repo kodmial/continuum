@@ -526,6 +526,17 @@ class RepairControllerTests(WorkflowAuditBase):
         self.assertIn("trust_policy.py", text)
         self.assertIn("pull_request_target", text)
 
+    def test_non_agent_ci_is_a_green_repair_noop(self):
+        text = self.raw["opencode-repair.yml"]
+        self.assertIn("Repair controller ignored non-agent PR", text)
+        self.assertIn('print("pr_number=")', text)
+        self.assertIn("raise SystemExit(0)", text)
+        self.assertNotIn(
+            'print("::error::Trust policy denied this pull request:',
+            text,
+            "workflow-command diagnostics must never be redirected to GITHUB_OUTPUT",
+        )
+
     def test_privilege_boundary_changes_are_never_auto_merged(self):
         text = self.raw["auto-merge.yml"]
         self.assertIn("merge-plan", text)
