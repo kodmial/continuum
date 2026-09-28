@@ -169,7 +169,11 @@ jobs:
           )
           if not trusted:
               print("trusted=false")
-              print("::error::Trust policy denied this pull request: " + trust_policy.one_line(reason))
+              print(
+                  "Trust policy denied this agent pull request: "
+                  + trust_policy.one_line(reason),
+                  file=sys.stderr,
+              )
               raise SystemExit(1)
           print("trusted=true")
           print("head_ref=" + pull_request["head"]["ref"])
@@ -392,9 +396,19 @@ jobs:
               pull_request, os.environ["GITHUB_REPOSITORY"]
           )
           if not trusted:
+              # This workflow observes every PR CI run, but owns only trusted
+              # OpenCode branches. A maintainer/fork/non-agent PR is therefore
+              # an expected green no-op, not a repair failure.
               print("trusted=false")
-              print("::error::Trust policy denied this pull request: " + trust_policy.one_line(reason))
-              raise SystemExit(1)
+              print("pr_number=")
+              print("head_ref=")
+              print("head_sha=")
+              print(
+                  "Repair controller ignored non-agent PR: "
+                  + trust_policy.one_line(reason),
+                  file=sys.stderr,
+              )
+              raise SystemExit(0)
           print("trusted=true")
           print("pr_number=" + str(pull_request["number"]))
           print("head_ref=" + pull_request["head"]["ref"])
