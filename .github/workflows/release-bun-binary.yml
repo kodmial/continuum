@@ -1,0 +1,186 @@
+name: Continuum release adapter - Bun binary
+
+on:
+  workflow_call:
+    inputs:
+      source_sha:
+        description: Exact consumer commit to release
+        required: true
+        type: string
+      package_dir:
+        description: Directory containing package.json
+        required: true
+        type: string
+      build_script:
+        description: Bun package script that produces the standalone binary
+        required: true
+        type: string
+      binary_path:
+        description: Repository-relative path to the produced binary
+        required: true
+        type: string
+      asset_name:
+        description: GitHub Release asset filename
+        required: true
+        type: string
+      tag_prefix:
+        description: Prefix for immutable release tags
+        required: false
+        default: bun-v
+        type: string
+      bun_version:
+        description: Bun version used to build the binary
+        required: false
+        default: 1.3.14
+        type: string
+      prerelease:
+        description: Publish the GitHub Release as a prerelease
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Validate adapter inputs
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          PACKAGE_DIR: ${{ inputs.package_dir }}
+          BUILD_SCRIPT: ${{ inputs.build_script }}
+          BINARY_PATH: ${{ inputs.binary_path }}
+          ASSET_NAME: ${{ inputs.asset_name }}
+          TAG_PREFIX: ${{ inputs.tag_prefix }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || { echo "::error::source_sha must be a full 40-character commit SHA"; exit 1; }
+          [[ "$PACKAGE_DIR" =~ ^[A-Za-z0-9._/-]+$ ]] && [[ "$PACKAGE_DIR" != /* ]] && [[ "$PACKAGE_DIR" != *..* ]] || { echo "::error::invalid package_dir"; exit 1; }
+          [[ "$BUILD_SCRIPT" =~ ^[A-Za-z0-9._:-]+$ ]] || { echo "::error::invalid build_script"; exit 1; }
+          [[ "$BINARY_PATH" =~ ^[A-Za-z0-9._/-]+$ ]] && [[ "$BINARY_PATH" != /* ]] && [[ "$BINARY_PATH" != *..* ]] || { echo "::error::invalid binary_path"; exit 1; }
+          [[ "$ASSET_NAME" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::invalid asset_name"; exit 1; }
+          [[ "$TAG_PREFIX" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::invalid tag_prefix"; exit 1; }
+
+      - name: Checkout exact consumer source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 0
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ inputs.bun_version }}
+
+      - name: Install dependencies
+        shell: bash
+        run: bun install --frozen-lockfile
+
+      - name: Build standalone binary
+        shell: bash
+        env:
+          PACKAGE_DIR: ${{ inputs.package_dir }}
+          BUILD_SCRIPT: ${{ inputs.build_script }}
+        run: bun run --cwd "$PACKAGE_DIR" "$BUILD_SCRIPT"
+
+      - name: Package immutable release assets
+        id: meta
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          PACKAGE_DIR: ${{ inputs.package_dir }}
+          BINARY_PATH: ${{ inputs.binary_path }}
+          ASSET_NAME: ${{ inputs.asset_name }}
+          TAG_PREFIX: ${{ inputs.tag_prefix }}
+        run: |
+          set -euo pipefail
+          test -f "$BINARY_PATH"
+          chmod +x "$BINARY_PATH"
+          "$BINARY_PATH" --version
+
+          VERSION="$(bun -e 'const p = await Bun.file(process.argv[1]).json(); process.stdout.write(String(p.version ?? "0.0.0"))' "$PACKAGE_DIR/package.json")"
+          [[ "$VERSION" =~ ^[0-9A-Za-z._+-]+$ ]] || { echo "::error::invalid package version: $VERSION"; exit 1; }
+          SHORT_SHA="${SOURCE_SHA:0:12}"
+          TAG="${TAG_PREFIX}${VERSION}-${SHORT_SHA}"
+
+          mkdir -p release
+          install -m 0755 "$BINARY_PATH" "release/$ASSET_NAME"
+          (
+            cd release
+            sha256sum "$ASSET_NAME" | tee "$ASSET_NAME.sha256"
+          )
+
+          BINARY_SHA256="$(sha256sum "release/$ASSET_NAME" | awk '{print $1}')"
+          BINARY_SIZE="$(stat -c '%s' "release/$ASSET_NAME")"
+          cat > "release/$ASSET_NAME.json" <<EOF
+          {
+            "adapter": "bun-binary",
+            "tag": "$TAG",
+            "source_sha": "$SOURCE_SHA",
+            "package_version": "$VERSION",
+            "bun_version": "$(bun --version)",
+            "asset": "$ASSET_NAME",
+            "sha256": "$BINARY_SHA256",
+            "size_bytes": $BINARY_SIZE
+          }
+          EOF
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "sha256=$BINARY_SHA256" >> "$GITHUB_OUTPUT"
+          echo "size=$BINARY_SIZE" >> "$GITHUB_OUTPUT"
+
+      - name: Preserve release payload as Actions artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.asset_name }}-${{ inputs.source_sha }}
+          path: |
+            release/${{ inputs.asset_name }}
+            release/${{ inputs.asset_name }}.sha256
+            release/${{ inputs.asset_name }}.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          ASSET_NAME: ${{ inputs.asset_name }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; treating the immutable release as complete."
+            exit 0
+          fi
+
+          EXTRA=()
+          [[ "$PRERELEASE" == "true" ]] && EXTRA+=(--prerelease)
+
+          gh release create "$TAG" \
+            "release/$ASSET_NAME" \
+            "release/$ASSET_NAME.sha256" \
+            "release/$ASSET_NAME.json" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SOURCE_SHA" \
+            --title "$ASSET_NAME $TAG" \
+            --generate-notes \
+            "${EXTRA[@]}"
+
+      - name: Release summary
+        shell: bash
+        run: |
+          {
+            echo "### Continuum bun-binary release"
+            echo "- tag: \`${{ steps.meta.outputs.tag }}\`"
+            echo "- source SHA: \`${{ inputs.source_sha }}\`"
+            echo "- asset: \`${{ inputs.asset_name }}\`"
+            echo "- SHA-256: \`${{ steps.meta.outputs.sha256 }}\`"
+            echo "- size: \`${{ steps.meta.outputs.size }} bytes\`"
+          } >> "$GITHUB_STEP_SUMMARY"
