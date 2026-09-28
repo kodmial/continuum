@@ -1,0 +1,211 @@
+name: PR-Agent standalone reviewer (manual)
+
+# Standalone CodeRabbit-equivalent reviewer. Owner-triggered only and fully
+# isolated: does not change CodeRabbit config, the CodeRabbit -> OpenCode
+# repair loop, auto-merge.yml gates, or CI behavior. Reviewer-only: never
+# modifies source code and its approval is not a merge gate.
+#
+# Required repository configuration (switch provider/model with these only):
+#   Variables: PR_AGENT_API_BASE, PR_AGENT_MODEL, PR_AGENT_MAX_TOKENS (optional)
+#   Secrets:   PR_AGENT_API_KEY
+#
+# Manual commands (comment on a pull request):
+#   /review [<ask args>]  - full review of the current PR HEAD
+#   /verify <finding-id>  - re-check one finding, e.g. /verify PRA-1A2B3C4D
+#   /ask ..., /describe . - secondary pass-through commands
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+# Concurrency is set per command job so unrelated comments never
+# enter the group and cancel a pending owner command.
+
+jobs:
+  parse:
+    if: >-
+      github.event.issue.pull_request &&
+      github.actor == github.repository_owner
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      command: ${{ steps.route.outputs.command }}
+      finding: ${{ steps.route.outputs.finding }}
+      pr_number: ${{ steps.route.outputs.pr_number }}
+    steps:
+      - id: route
+        env:
+          BODY: ${{ github.event.comment.body }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          body="$(printf '%s' "$BODY" | sed -e 's/^[[:space:]]*//' | head -n 1)"
+          command=""
+          finding=""
+          case "$body" in
+            /review*|/improve*|/describe*|/ask*)
+              if [[ "$body" == /verify* ]]; then
+                command="verify"
+                finding="$(printf '%s' "$body" | awk '{print $2}')"
+              elif [[ "$body" == /review* ]]; then
+                command="review"
+              elif [[ "$body" == /improve* ]]; then
+                command="improve"
+              elif [[ "$body" == /describe* ]]; then
+                command="describe"
+              elif [[ "$body" == /ask* ]]; then
+                command="ask"
+              fi
+              ;;
+            /verify*)
+              command="verify"
+              finding="$(printf '%s' "$body" | awk '{print $2}')"
+              ;;
+          esac
+          echo "command=$command" >> "$GITHUB_OUTPUT"
+          echo "finding=$finding" >> "$GITHUB_OUTPUT"
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          if [[ -z "$command" ]]; then
+            echo "No supported PR-Agent command found; skipping."
+          fi
+
+  review:
+    needs: parse
+    if: needs.parse.outputs.command == 'review' || needs.parse.outputs.command == 'improve' || needs.parse.outputs.command == 'describe' || needs.parse.outputs.command == 'ask'
+    concurrency:
+      group: pr-agent-standalone-${{ github.event.issue.number }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      PR_NUMBER: ${{ github.event.issue.number }}
+    steps:
+      - name: Checkout gate script
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          sparse-checkout: .github/scripts/pr_agent_review_gate.py
+          sparse-checkout-cone-mode: false
+
+      - name: Validate generic provider configuration
+        env:
+          PR_AGENT_API_BASE: ${{ vars.PR_AGENT_API_BASE }}
+          PR_AGENT_MODEL: ${{ vars.PR_AGENT_MODEL }}
+          PR_AGENT_API_KEY: ${{ secrets.PR_AGENT_API_KEY }}
+        run: |
+          set -euo pipefail
+          missing=0
+          if [[ -z "${PR_AGENT_API_BASE:-}" ]]; then
+            echo "::error::Missing repository variable PR_AGENT_API_BASE (OpenAI-compatible base URL, e.g. https://provider.example/v1)"
+            missing=1
+          fi
+          if [[ -z "${PR_AGENT_MODEL:-}" ]]; then
+            echo "::error::Missing repository variable PR_AGENT_MODEL (model identifier)"
+            missing=1
+          fi
+          if [[ -z "${PR_AGENT_API_KEY:-}" ]]; then
+            echo "::error::Missing repository secret PR_AGENT_API_KEY"
+            missing=1
+          fi
+          if [[ "$missing" -ne 0 ]]; then
+            echo "Configure under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+
+      - name: Resolve LiteLLM model routing
+        id: model
+        env:
+          PR_AGENT_MODEL: ${{ vars.PR_AGENT_MODEL }}
+        run: |
+          set -euo pipefail
+          raw="$PR_AGENT_MODEL"
+          if [[ "$raw" == openai/* || "$raw" == text-completion-openai/* ]]; then
+            routed="$raw"
+          else
+            routed="openai/$raw"
+          fi
+          echo "model=$routed" >> "$GITHUB_OUTPUT"
+          echo "Routing PR_AGENT_MODEL '$raw' as LiteLLM model '$routed'."
+
+      - name: Run PR-Agent (full current-HEAD review)
+        uses: docker://pragent/pr-agent:github_action@sha256:65e5b196e38cecd7df8a71fe29942052e081a0c6645132c2ac874df60b1760c7 # 0.46.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Generic OpenAI-compatible mapping. Switching providers/models only
+          # requires changing PR_AGENT_API_BASE / PR_AGENT_API_KEY /
+          # PR_AGENT_MODEL. Both dotted and double-underscore forms are set
+          # because PR-Agent/LiteLLM accept either spelling.
+          OPENAI.KEY: ${{ secrets.PR_AGENT_API_KEY }}
+          OPENAI.API_BASE: ${{ vars.PR_AGENT_API_BASE }}
+          OPENAI__KEY: ${{ secrets.PR_AGENT_API_KEY }}
+          OPENAI__API_BASE: ${{ vars.PR_AGENT_API_BASE }}
+          OPENAI_API_KEY: ${{ secrets.PR_AGENT_API_KEY }}
+          OPENAI_API_BASE: ${{ vars.PR_AGENT_API_BASE }}
+          CONFIG.MODEL: ${{ steps.model.outputs.model }}
+          CONFIG.FALLBACK_MODELS: "[]"
+          # Effective completion limit (PR-Agent reads config.max_output_tokens).
+          # Fall back to 16000 when the optional variable is unset so an empty
+          # value never overrides the TOML default with 0 (no limit).
+          CONFIG.MAX_OUTPUT_TOKENS: ${{ vars.PR_AGENT_MAX_TOKENS || '16000' }}
+
+      - name: Enforce review contract (tracker + verdict)
+        if: needs.parse.outputs.command == 'review'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/pr_agent_review_gate.py gate --pr "$PR_NUMBER"
+
+  verify:
+    needs: parse
+    if: needs.parse.outputs.command == 'verify'
+    concurrency:
+      group: pr-agent-standalone-${{ github.event.issue.number }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout verifier script
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          sparse-checkout: .github/scripts/pr_agent_review_gate.py
+          sparse-checkout-cone-mode: false
+
+      - name: Validate configuration
+        env:
+          PR_AGENT_API_BASE: ${{ vars.PR_AGENT_API_BASE }}
+          PR_AGENT_MODEL: ${{ vars.PR_AGENT_MODEL }}
+          PR_AGENT_API_KEY: ${{ secrets.PR_AGENT_API_KEY }}
+          FINDING: ${{ needs.parse.outputs.finding }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${PR_AGENT_API_BASE:-}" || -z "${PR_AGENT_MODEL:-}" || -z "${PR_AGENT_API_KEY:-}" ]]; then
+            echo "::error::PR-Agent provider is not configured. Set PR_AGENT_API_BASE, PR_AGENT_MODEL (variables) and PR_AGENT_API_KEY (secret)."
+            exit 1
+          fi
+          finding="$FINDING"
+          if [[ ! "$finding" =~ ^PRA-[0-9A-Fa-f]{8}$ ]]; then
+            echo "::error::Usage: /verify <finding-id> (e.g. /verify PRA-1A2B3C4D). Got: '$finding'"
+            exit 1
+          fi
+
+      - name: Re-check one finding against current HEAD
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_AGENT_API_BASE: ${{ vars.PR_AGENT_API_BASE }}
+          PR_AGENT_API_KEY: ${{ secrets.PR_AGENT_API_KEY }}
+          PR_AGENT_MODEL: ${{ vars.PR_AGENT_MODEL }}
+          PR_AGENT_MAX_TOKENS: ${{ vars.PR_AGENT_MAX_TOKENS }}
+          FINDING: ${{ needs.parse.outputs.finding }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/pr_agent_review_gate.py verify \
+            --pr "$PR_NUMBER" \
+            --finding "$FINDING"
