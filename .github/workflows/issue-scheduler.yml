@@ -104,16 +104,17 @@ jobs:
     steps:
       - name: Reconcile state and dispatch ready issues
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          # Both gates, as data from the control plane. Step environment belongs
+          # alongside `with`; nesting this map under action inputs makes the
+          # workflow invalid before any job can be scheduled.
+          TRUSTED_ISSUES: ${{ needs.authorize.outputs.trusted_issues }}
+          CREDENTIAL_LOGIN: ${{ needs.authorize.outputs.credential_login }}
         with:
           # TAP_PAT is required because the existing OpenCode workflow accepts
           # /oc only from the repository owner. It also makes issue-state
           # mutations and comments created here visible as normal owner actions.
           github-token: ${{ secrets.TAP_PAT }}
-          env:
-            # Both gates, as data from the control plane. The script fails
-            # closed if the identity is missing.
-            TRUSTED_ISSUES: ${{ needs.authorize.outputs.trusted_issues }}
-            CREDENTIAL_LOGIN: ${{ needs.authorize.outputs.credential_login }}
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
