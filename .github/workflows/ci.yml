@@ -46,6 +46,8 @@ jobs:
           printf '%s  %s\n' "$ACTIONLINT_SHA256" "$RUNNER_TEMP/$archive" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" actionlint
           "$RUNNER_TEMP/actionlint" -color -ignore 'shellcheck reported issue'
+          "$RUNNER_TEMP/actionlint" -color -ignore 'shellcheck reported issue' \
+            fixtures/consumer-repo/.github/workflows/*.yml
 
       - name: Enforce MVP active workflow boundary
         shell: bash
