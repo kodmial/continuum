@@ -20,6 +20,8 @@ from .review import gate as gate_module
 from .review import github as github_module
 from .review import llm as llm_module
 from .review import providers as providers_module
+from .review import queue as queue_module
+from .review import queue_controller as queue_controller_module
 from .review import verify as verify_module
 
 EXIT_OK = 0
@@ -266,6 +268,76 @@ def cmd_provider(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _wake_up() -> queue_module.WakeUp:
+    """The wake-up that started this run, read from the runner environment.
+
+    The event is advisory context for the log. The reconciliation itself always
+    recomputes the queue from GitHub state, so a mis-parsed or missing event
+    payload can never cause a wrong decision.
+    """
+
+    event = (os.environ.get("CONTINUUM_WAKE_EVENT") or "workflow_dispatch").strip()
+    action = (os.environ.get("CONTINUUM_WAKE_ACTION") or "").strip()
+    reason = (os.environ.get("CONTINUUM_WAKE_REASON") or "").strip()
+    return queue_module.WakeUp(
+        event=event,
+        action=action,
+        pr_number=_int_env("CONTINUUM_WAKE_PR"),
+        reason=reason,
+    )
+
+
+def cmd_queue(args: argparse.Namespace) -> int:
+    """Reconcile the review queue and schedule at most one provider request."""
+
+    try:
+        config = _load_config(args.config, required=not args.allow_missing)
+    except config_module.ConfigError as exc:
+        print(f"::error::{exc}")
+        return EXIT_ERROR
+
+    wake = _wake_up()
+    if not wake.is_queue_relevant:
+        print(f"::notice::{wake.describe()} cannot change queue eligibility; nothing to do.")
+        _write_output({"action": "ignored", "dispatched": "false", "selected_pr": ""})
+        return EXIT_OK
+
+    client = _client()
+    try:
+        plan = queue_controller_module.reconcile(
+            client,
+            config,
+            wake=wake,
+            apply=not args.no_apply,
+            wait_ms=int(args.wait_minutes) * 60_000,
+        )
+    except (queue_controller_module.QueueError, github_module.GitHubError) as exc:
+        print(f"::error::Review queue reconciliation failed: {exc}")
+        return EXIT_ERROR
+    except providers_module.UnsupportedProvider as exc:
+        print(f"::error::Review queue cannot run: {exc}")
+        return EXIT_ERROR
+
+    payload = plan.describe()
+    for line in plan.logs:
+        print(f"::notice::{line}")
+    _print_json(payload)
+    _write_output(
+        {
+            "action": plan.action,
+            "dispatched": str(plan.dispatched).lower(),
+            "selected_pr": str(plan.selected.pr_number) if plan.selected else "",
+            "queue_size": str(len(plan.queue)),
+            "cooldown_ms": str(plan.cooldown.remaining_ms(plan.now_ms)),
+        }
+    )
+    if getattr(args, "out", None):
+        with open(args.out, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+    return EXIT_OK
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="continuum", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -313,6 +385,38 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--head", default=None)
     verify.add_argument("--no-apply", action="store_true")
     verify.set_defaults(func=cmd_verify)
+
+    queue = sub.add_parser(
+        "queue",
+        help="Reconcile the review queue.",
+        description=(
+            "Recompute every eligible review candidate from current GitHub state and "
+            "schedule at most one provider request. Events are wake-ups: they are read "
+            "from CONTINUUM_WAKE_* and never trusted as state."
+        ),
+    )
+    queue_sub = queue.add_subparsers(dest="queue_command", required=True)
+
+    reconcile = queue_sub.add_parser(
+        "reconcile", help="Recompute the queue and dispatch one candidate."
+    )
+    add_common(reconcile)
+    reconcile.add_argument(
+        "--no-apply",
+        action="store_true",
+        help="Decide without sending a provider request or writing a lock.",
+    )
+    reconcile.add_argument(
+        "--wait-minutes",
+        type=int,
+        default=0,
+        help=(
+            "Stay alive this long to re-reconcile when only a provider cooldown is "
+            "holding the queue. Event coverage, not this window, drives progression."
+        ),
+    )
+    reconcile.add_argument("--out", default=None, help="Write the plan document here.")
+    reconcile.set_defaults(func=cmd_queue)
 
     return parser
 

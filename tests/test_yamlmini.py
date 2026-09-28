@@ -66,6 +66,28 @@ class YamlSubsetTests(unittest.TestCase):
         self.assertEqual(parsed["b"], "single 'quoted'")
         self.assertEqual(parsed["c"], "plain value")
 
+    def test_a_colon_inside_a_plain_scalar_is_not_a_key(self):
+        # A label such as `priority:p0` is a value, not a nested mapping. A
+        # repository's real priority labels look exactly like this.
+        parsed = yamlmini.loads(
+            textwrap.dedent(
+                """
+            queue:
+              priority_labels:
+                - priority:p0
+                - priority:p1
+                - "priority: p2"
+              records:
+                - name: a
+                  value: 1
+                """
+            )
+        )
+        self.assertEqual(
+            parsed["queue"]["priority_labels"], ["priority:p0", "priority:p1", "priority: p2"]
+        )
+        self.assertEqual(parsed["queue"]["records"], [{"name": "a", "value": 1}])
+
     def test_document_start_marker(self):
         self.assertEqual(yamlmini.loads("---\na: 1\n"), {"a": 1})
 

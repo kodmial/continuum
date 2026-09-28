@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from .findings import collect_summary_comments, sanitize_title
+from .findings import collect_summary_comments, parse_time, sanitize_title
 from .snapshot import ProviderSnapshot
 from .tracker import BOT_PREFIX, TRACKER_MARKER, VERDICT_MARKER
 
@@ -22,6 +22,108 @@ DEFAULT_STATUS_CONTEXT = "CodeRabbit"
 COMPLETED_RE = re.compile(r"review completed", re.I)
 
 OUTPUT_MARKERS = ("coderabbit", "walkthrough", "review details", "nitpick")
+
+# CodeRabbit's shared included-review quota is a repository-wide resource, so
+# the queue must serialize against it. A rate-limit notice is the provider
+# telling us when the next slot exists; the countdown is parsed here, once.
+RATE_LIMIT_RE = re.compile(r"review rate limited|review limit reached", re.I)
+FULL_REVIEW_COMMAND = "@coderabbitai full review"
+_RETRY_WINDOW_RES = (
+    re.compile(
+        r"next\s+(?:included\s+)?review\b[^\n<.]{0,120}?\bavailable\b[^\n<.]{0,40}?"
+        r"\b(?:in|after)\s+([^\n<.]+)",
+        re.I,
+    ),
+    re.compile(r"(?:try|retry)\s+again\b[^\n<.]{0,40}?\b(?:in|after)\s+([^\n<.]+)", re.I),
+)
+_DURATION_RE = re.compile(r"(\d+)\s*(hours?|hrs?|minutes?|mins?|seconds?|secs?)", re.I)
+
+
+def parse_duration_ms(text: str) -> Optional[int]:
+    """Milliseconds named by a provider countdown, or `None`."""
+
+    if re.search(r"less than\s+(?:a|one)\s+minute", text or "", re.I):
+        return 60_000
+    total = 0
+    found = False
+    for match in _DURATION_RE.finditer(text or ""):
+        found = True
+        value = int(match.group(1))
+        unit = match.group(2).lower()
+        if unit.startswith("hour") or unit.startswith("hr"):
+            total += value * 3_600_000
+        elif unit.startswith("minute") or unit.startswith("min"):
+            total += value * 60_000
+        else:
+            total += value * 1_000
+    return total if found else None
+
+
+def parse_retry_delay_ms(body: str) -> Optional[int]:
+    """Countdown published in a rate-limit notice, or `None` when absent."""
+
+    for pattern in _RETRY_WINDOW_RES:
+        match = pattern.search(body or "")
+        if match:
+            parsed = parse_duration_ms(match.group(1))
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def is_full_review(review: Dict[str, Any], bot_login: str = DEFAULT_BOT_LOGIN) -> bool:
+    """True when a CodeRabbit review consumed a full included review.
+
+    An empty COMMENTED review is a thread confirmation, not quota use.
+    """
+
+    if not _matches_bot(((review.get("user") or {}).get("login") or ""), bot_login):
+        return False
+    if review.get("state") in ("APPROVED", "CHANGES_REQUESTED"):
+        return True
+    return review.get("state") == "COMMENTED" and bool((review.get("body") or "").strip())
+
+
+def rate_limit_cooldown(
+    client: Any,
+    pr_number: int,
+    *,
+    bot_login: str = DEFAULT_BOT_LOGIN,
+) -> Tuple[int, str]:
+    """Newest published retry window for this pull request, as `(until_ms, reason)`."""
+
+    comments = client.list_issue_comments(int(pr_number))
+    windows: List[Tuple[int, int]] = []
+    for comment in comments or []:
+        if not _matches_bot(((comment.get("user") or {}).get("login") or ""), bot_login):
+            continue
+        if not RATE_LIMIT_RE.search(comment.get("body") or ""):
+            continue
+        delay = parse_retry_delay_ms(comment.get("body") or "")
+        published = parse_time(comment.get("updated_at") or comment.get("created_at"))
+        if delay is None or published is None:
+            continue
+        at = int(published.timestamp() * 1000)
+        windows.append((at + delay, at))
+    if not windows:
+        return 0, ""
+    until, _at = max(windows)
+    return until, "provider rate limit"
+
+
+def queue_request(
+    settings: Any,
+    *,
+    pr_number: int,
+    head_sha: str = "",
+    kind: str = "initial",
+) -> Any:
+    """CodeRabbit is asked for a full review with a fixed bot mention."""
+
+    from .providers import REQUEST_COMMENT, QueueRequest
+
+    del settings, pr_number, head_sha
+    return QueueRequest(kind=REQUEST_COMMENT, provider=PROVIDER_NAME, body=FULL_REVIEW_COMMAND)
 
 # Sections whose bullets can be actionable. The walkthrough and the file table
 # describe the diff; they never produce findings on their own.
