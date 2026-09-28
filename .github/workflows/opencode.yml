@@ -1,0 +1,455 @@
+# Continuum bootstrap: NanoDictate agent workflow with CodeRabbit triggers disabled.
+name: OpenCode agent
+
+on:
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Invocation mode"
+        required: true
+        type: string
+      pr_number:
+        description: "Pull request number"
+        required: false
+        type: string
+      head_ref:
+        description: "Pull request head branch"
+        required: false
+        type: string
+      review_id:
+        description: "Source CodeRabbit review id"
+        required: false
+        type: string
+      run_id:
+        description: "Source failed workflow run id"
+        required: false
+        type: string
+
+permissions: {}
+
+jobs:
+  dispatch-coderabbit-fix:
+    if: >-
+      github.event_name == 'pull_request_review' &&
+      github.event.action == 'submitted' &&
+      github.event.review.user.login == 'coderabbitai[bot]' &&
+      (github.event.review.state == 'changes_requested' ||
+       (github.event.review.state == 'commented' &&
+        contains(github.event.review.body, 'Nitpick comments'))) &&
+      github.event.pull_request.state == 'open' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    permissions:
+      actions: write
+      contents: read
+
+    steps:
+      - name: Dispatch OpenCode for all CodeRabbit findings
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          REVIEW_ID: ${{ github.event.review.id }}
+        run: |
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/opencode.yml/dispatches" \
+            -f ref=main \
+            -f "inputs[mode]=coderabbit-fix" \
+            -f "inputs[pr_number]=${PR_NUMBER}" \
+            -f "inputs[head_ref]=${HEAD_REF}" \
+            -f "inputs[review_id]=${REVIEW_ID}"
+
+  opencode:
+    # Manual invocations remain owner-only. Automated repair modes arrive via
+    # internal workflow_dispatch events from trusted workflows on main.
+    if: >-
+      (github.event_name == 'workflow_dispatch' &&
+       contains(fromJSON('["resolve-conflict","ci-fix"]'), inputs.mode)) ||
+      ((github.event_name == 'issue_comment' ||
+        github.event_name == 'pull_request_review_comment') &&
+       github.actor == github.repository_owner &&
+       (contains(github.event.comment.body, '/oc') ||
+        contains(github.event.comment.body, '/opencode')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      actions: read
+      contents: write
+      issues: write
+      pull-requests: write
+
+    concurrency:
+      group: opencode-${{ inputs.pr_number || github.event.issue.number || github.event.pull_request.number || github.run_id }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          # Full history is required for conflict-repair merges against main.
+          fetch-depth: 0
+          # Use the repository PAT rather than github.token. OpenCode may need
+          # to push changes under .github/workflows/**; the installation token
+          # is rejected by GitHub for those updates without workflows access.
+          # TAP_PAT must be a classic PAT with repo + workflow scopes.
+          token: ${{ secrets.TAP_PAT || github.token }}
+          persist-credentials: true
+          ref: ${{ inputs.head_ref || github.ref }}
+
+      - name: Configure Git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # workflow_dispatch repair modes must NOT use "opencode github run":
+      # that integration owns a branch/PR lifecycle and can open a new PR even
+      # when the prompt says not to. Plain "opencode run" works in this already
+      # checked-out PR branch and has no built-in PR-creation lifecycle.
+      - name: Install OpenCode CLI for automated repair
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          curl -fsSL https://opencode.ai/install | bash
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+
+      - name: Run OpenCode
+        if: github.event_name != 'workflow_dispatch'
+        uses: anomalyco/opencode/github@545f51d26cc39a907d2867492d498d9607ea5fa4
+        env:
+          # use_github_token=true below tells OpenCode to use this exact env
+          # credential for GitHub API operations. Keep it aligned with the
+          # checkout credential so both gh calls and git push use TAP_PAT.
+          GITHUB_TOKEN: ${{ secrets.TAP_PAT || github.token }}
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          # The GitHub integration owns the branch/commit/push/PR lifecycle for
+          # issue and PR-comment sessions. Prevent the LLM from changing Git
+          # state underneath that lifecycle. OpenCode evaluates explicit deny
+          # rules even in auto mode; read-only Git inspection remains allowed.
+          OPENCODE_CONFIG_CONTENT: >-
+            {"permission":{"bash":{"*":"allow","git *":"deny","git status":"allow","git status *":"allow","git diff":"allow","git diff *":"allow","git log":"allow","git log *":"allow","git show":"allow","git show *":"allow","git rev-parse *":"allow","git ls-files":"allow","git ls-files *":"allow","git grep *":"allow","git blame *":"allow","git branch --show-current":"allow","git remote -v":"allow","git tag":"allow","git tag --list *":"allow","git tag -l *":"allow","git describe *":"allow"}}}
+        with:
+          model: ${{ vars.OPENCODE_MODEL || 'opencode/big-pickle' }}
+          use_github_token: true
+          share: false
+
+      # Upstream OpenCode deliberately skips its infrastructure push/PR when
+      # the agent leaves the branch that OpenCode created for an issue. The
+      # permission guard above prevents normal Git writes from the LLM, but
+      # this recovery path makes the workflow lossless if a future OpenCode
+      # version, shell indirection, or tool bypass still changes branches.
+      - name: Recover agent-managed issue branch
+        if: >-
+          github.event_name == 'issue_comment' &&
+          !github.event.issue.pull_request &&
+          github.actor == github.repository_owner &&
+          (contains(github.event.comment.body, '/oc') ||
+           contains(github.event.comment.body, '/opencode'))
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT || github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+
+          CURRENT_BRANCH="$(git branch --show-current)"
+          if [[ "$CURRENT_BRANCH" != opencode/* ]]; then
+            echo "Current branch '$CURRENT_BRANCH' is not an OpenCode issue branch; nothing to recover."
+            exit 0
+          fi
+
+          # Normal OpenCode completion already created a PR for the current
+          # branch. In that case this step is intentionally a no-op.
+          EXISTING_PR="$(gh pr list             --repo "$GITHUB_REPOSITORY"             --head "$CURRENT_BRANCH"             --state all             --json number             --jq '.[0].number // empty')"
+          if [[ -n "$EXISTING_PR" ]]; then
+            echo "PR #$EXISTING_PR already exists for '$CURRENT_BRANCH'; nothing to recover."
+            exit 0
+          fi
+
+          # If the agent switched branches before committing, preserve those
+          # edits rather than letting the runner discard them.
+          if [[ -n "$(git status --porcelain)" ]]; then
+            git add -A
+            git commit -m "chore: recover OpenCode issue changes"
+          fi
+
+          git fetch origin main --quiet
+          AHEAD="$(git rev-list --count "origin/main..HEAD")"
+          if [[ "$AHEAD" -eq 0 ]]; then
+            echo "No commits ahead of main on '$CURRENT_BRANCH'; nothing to recover."
+            exit 0
+          fi
+
+          git push -u origin "HEAD:$CURRENT_BRANCH"
+
+          TITLE="$(git log -1 --format=%s)"
+          BODY="$(printf 'Recovered automatically after the OpenCode agent changed branches during issue #%s execution.\n\nCloses #%s' "$ISSUE_NUMBER" "$ISSUE_NUMBER")"
+          gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$CURRENT_BRANCH" --title "$TITLE" --body "$BODY"
+
+      - name: Fix CodeRabbit review findings
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'coderabbit-fix'
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/big-pickle' }}
+          GITHUB_TOKEN: ${{ secrets.TAP_PAT || github.token }}
+          GH_TOKEN: ${{ secrets.TAP_PAT || github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          REVIEW_ID: ${{ inputs.review_id }}
+          HEAD_REF: ${{ inputs.head_ref }}
+        run: |
+          set -euo pipefail
+          PROMPT=$(cat <<EOF
+          Fix every CodeRabbit review finding on pull request #${PR_NUMBER}.
+
+          Context:
+          - CodeRabbit submitted review id ${REVIEW_ID}.
+          - The current checkout is the existing PR head branch: ${HEAD_REF}.
+          - Inspect that CodeRabbit review body, its inline review comments, the PR
+            conversation, and the current diff using GitHub CLI/API as needed.
+
+          Requirements:
+          - Address every finding from that CodeRabbit review, including non-blocking
+            nitpick feedback that CodeRabbit may submit as COMMENTED while also approving.
+          - Keep fixes scoped to the review feedback; do not make unrelated refactors.
+          - Run the relevant tests, linters, or validation for the files you change.
+          - Work only in the current checked-out PR branch. Do not create or switch to
+            another branch and do not create a new pull request.
+          - Commit and push fixes to the current PR branch so the existing PR is updated.
+          - If a finding is incorrect or no longer applicable, do not make a speculative
+            code change; explain the reason in the existing PR conversation.
+          - Do not resolve or dismiss CodeRabbit review threads yourself. CodeRabbit will
+            independently verify every original finding after this repair step completes.
+          - If no actionable findings remain, leave the code unchanged.
+          - Keep all comments and commit messages in English.
+          EOF
+          )
+          opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
+
+      - name: Ask CodeRabbit to verify every original finding
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'coderabbit-fix'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+          REVIEW_ID: ${{ inputs.review_id }}
+        with:
+          github-token: ${{ secrets.TAP_PAT || github.token }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pullNumber = Number(process.env.PR_NUMBER);
+            const reviewId = Number(process.env.REVIEW_ID);
+
+            if (!Number.isInteger(pullNumber) || !Number.isInteger(reviewId)) {
+              core.setFailed('Invalid pull request number or CodeRabbit review id.');
+              return;
+            }
+
+            const sourceReview = await github.rest.pulls.getReview({
+              owner,
+              repo,
+              pull_number: pullNumber,
+              review_id: reviewId,
+            });
+            const reviewedSha = sourceReview.data.commit_id;
+
+            const pr = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number: pullNumber,
+            });
+            const headSha = pr.data.head.sha;
+
+            const comments = await github.paginate(
+              github.rest.pulls.listReviewComments,
+              {
+                owner,
+                repo,
+                pull_number: pullNumber,
+                per_page: 100,
+              }
+            );
+
+            const findings = comments.filter(
+              (comment) =>
+                comment.pull_request_review_id === reviewId &&
+                comment.user?.login === 'coderabbitai[bot]' &&
+                !comment.in_reply_to_id
+            );
+
+            let requested = 0;
+            if (findings.length === 0) {
+              core.notice(
+                `CodeRabbit review ${reviewId} has no inline threads; no thread replies are needed.`
+              );
+            } else {
+              for (const finding of findings) {
+                const marker =
+                  `<!-- opencode-coderabbit-verification review=${reviewId} finding=${finding.id} head=${headSha} -->`;
+
+                const duplicate = comments.some(
+                  (comment) =>
+                    comment.in_reply_to_id === finding.id &&
+                    comment.body?.includes(marker)
+                );
+                if (duplicate) {
+                  core.info(
+                    `Verification already requested for finding ${finding.id} at ${headSha}.`
+                  );
+                  continue;
+                }
+
+                const body = [
+                  marker,
+                  '@coderabbitai Re-check this exact original finding after the OpenCode fixes.',
+                  '',
+                  `Current PR HEAD: \`${headSha}\``,
+                  '',
+                  'Compare the original finding in this thread with the current code itself,',
+                  'not merely with the latest incremental diff or the OpenCode report.',
+                  '',
+                  'Reply with **RESOLVED** only if the underlying issue is fully fixed.',
+                  'Otherwise reply with **UNRESOLVED** and state exactly what remains.',
+                ].join('\n');
+
+                await github.request(
+                  'POST /repos/{owner}/{repo}/pulls/{pull_number}/comments/{comment_id}/replies',
+                  {
+                    owner,
+                    repo,
+                    pull_number: pullNumber,
+                    comment_id: finding.id,
+                    body,
+                  }
+                );
+                requested += 1;
+              }
+
+              core.notice(
+                `Requested CodeRabbit verification for ${requested}/${findings.length} findings from review ${reviewId} at HEAD ${headSha}.`
+              );
+            }
+
+            // If OpenCode intentionally made no commit, a synchronize event will
+            // not create a new CI/review cycle. Force an independent complete
+            // CodeRabbit pass over the same HEAD instead of trusting the agent's
+            // decision or leaving a body-only nitpick permanently blocked.
+            if (reviewedSha && headSha === reviewedSha) {
+              const marker =
+                `<!-- opencode-coderabbit-full-rereview review=${reviewId} head=${headSha} -->`;
+              const issueComments = await github.paginate(
+                github.rest.issues.listComments,
+                {
+                  owner,
+                  repo,
+                  issue_number: pullNumber,
+                  per_page: 100,
+                }
+              );
+              const duplicate = issueComments.some(comment =>
+                comment.body?.includes(marker)
+              );
+
+              if (!duplicate) {
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: pullNumber,
+                  body: `@coderabbitai full review\n\n${marker}`,
+                });
+                core.notice(
+                  `OpenCode left HEAD ${headSha} unchanged; requested a full CodeRabbit re-review.`
+                );
+              }
+            }
+
+      - name: Resolve merge conflict with main
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'resolve-conflict'
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/big-pickle' }}
+          GITHUB_TOKEN: ${{ secrets.TAP_PAT || github.token }}
+          GH_TOKEN: ${{ secrets.TAP_PAT || github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_REF: ${{ inputs.head_ref }}
+        run: |
+          set -euo pipefail
+          PROMPT=$(cat <<EOF
+          Resolve the merge conflict between pull request #${PR_NUMBER} and the current main branch.
+
+          Context:
+          - The current checkout is the existing PR head branch: ${HEAD_REF}.
+          - This workflow was dispatched only after GitHub reported that the PR cannot
+            be updated cleanly from main.
+
+          Requirements:
+          - Fetch the current origin/main and merge it into the current PR branch.
+          - Resolve every merge conflict while preserving the intended behavior from both
+            the PR and main; do not discard unrelated changes from either side.
+          - Work only in the current checked-out PR branch. Do not create or switch to
+            another branch and do not create a new pull request.
+          - Do not rebase, force-push, or reset away either side.
+          - Run the relevant tests, linters, or validation after resolving the conflicts.
+          - Commit the merge/conflict resolution and push it to the current PR branch.
+          - Keep all comments and commit messages in English.
+          EOF
+          )
+          opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
+
+      - name: Fix failed blocking workflow
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'ci-fix'
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/big-pickle' }}
+          GITHUB_TOKEN: ${{ secrets.TAP_PAT || github.token }}
+          GH_TOKEN: ${{ secrets.TAP_PAT || github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          RUN_ID: ${{ inputs.run_id }}
+          HEAD_REF: ${{ inputs.head_ref }}
+        run: |
+          set -euo pipefail
+          PROMPT=$(cat <<EOF
+          Fix the failed blocking workflow for pull request #${PR_NUMBER}.
+
+          Context:
+          - The current checkout is the existing PR head branch: ${HEAD_REF}.
+          - The failed workflow run id is ${RUN_ID}.
+          - Inspect that run, its workflow name, failed jobs and logs using GitHub CLI/API before changing code.
+
+          Requirements:
+          - Identify the concrete workflow failure from the logs and fix its root cause.
+          - Keep the change scoped to the failure; do not make unrelated refactors.
+          - If the failure is clearly transient or external infrastructure, do not make a
+            speculative code change; explain the reason in the existing PR conversation.
+          - Work only in the current checked-out PR branch. Do not create or switch to
+            another branch and do not create a new pull request.
+          - Run the relevant tests, linters, or validation locally in the runner when practical.
+          - Commit and push any required fix to the current PR branch so the existing PR updates.
+          - Keep all comments and commit messages in English.
+          EOF
+          )
+          BEFORE_SHA=$(git rev-parse HEAD)
+          opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
+          AFTER_SHA=$(git rev-parse HEAD)
+
+          # If the agent correctly decided there is no code fix to make (for
+          # example a transient runner/network failure), give the same CI head
+          # one trusted retry instead of leaving the PR stuck forever. The
+          # opencode-ci-repair lock remains set, so a repeatedly failing rerun
+          # cannot create an unbounded same-head loop.
+          if [[ "$AFTER_SHA" == "$BEFORE_SHA" ]]; then
+            echo "OpenCode produced no new commit; rerunning failed workflow jobs once."
+            gh run rerun "$RUN_ID" --failed
+          fi
+
+      - name: Clear conflict-repair lock
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.mode == 'resolve-conflict'
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT || github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          gh api --method DELETE \
+            "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/labels/opencode-conflict-repair" \
+            >/dev/null 2>&1 || true
