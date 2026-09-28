@@ -1,4 +1,4 @@
-name: Diagnose kodmaiadmin runners
+name: Diagnose kodmaiadmin billing
 
 on:
   push:
@@ -9,12 +9,19 @@ permissions:
 
 jobs:
   diagnose:
-    if: github.event.head_commit.message == 'diagnose-kodmaiadmin-runners'
+    if: github.event.head_commit.message == 'diagnose-kodmaiadmin-billing'
     runs-on: ubuntu-latest
     steps:
-      - name: List runner metadata
+      - name: Check Actions billing metadata
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
+        shell: bash
         run: |
           set -euo pipefail
-          gh api repos/kodmial/kodmaiadmin/actions/runners             --jq '{total_count, runners: [.runners[] | {name,status,busy,labels:[.labels[].name]}]}'
+          endpoint='users/kodmial/settings/billing/usage/summary?year=2026&month=9&product=Actions'
+          if out="$(gh api "$endpoint" 2>/tmp/billing.err)"; then
+            jq '{timePeriod, usageItems: [.usageItems[] | {product,sku,unitType,grossQuantity,discountQuantity,netQuantity,grossAmount,netAmount}]}' <<<"$out"
+          else
+            echo "Billing API unavailable to this token:"
+            sed -E 's/(token|authorization|bearer)[^ ]*/[redacted]/Ig' /tmp/billing.err
+          fi
