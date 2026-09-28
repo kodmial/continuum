@@ -36,6 +36,8 @@ on:
     secrets:
       continuum_token:
         required: false
+      TAP_PAT:
+        required: false
 
   # The complete lifecycle surface of a candidate. `closed` and
   # `converted_to_draft` are the transitions whose absence used to stall a
