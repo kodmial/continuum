@@ -15,6 +15,8 @@ import sys
 from typing import Any, Dict, Optional, Sequence
 
 from . import config as config_module
+from .release import adapters as release_adapters
+from .release import run as release_run
 from .review import commands as command_module
 from .review import gate as gate_module
 from .review import github as github_module
@@ -34,10 +36,54 @@ def _load_config(path: str, required: bool) -> config_module.ContinuumConfig:
     return config_module.load_optional_config(path)
 
 
-def _print_json(payload: Any, stream=sys.stdout) -> None:
-    json.dump(payload, stream, indent=2, sort_keys=True)
-    stream.write("\n")
-    stream.flush()
+def _select_target(config: config_module.ContinuumConfig, target_id: str) -> Any:
+    """Find the configured target a release command was asked about."""
+
+    target = config.release.target(target_id)
+    if target is None:
+        available = ", ".join(item.id for item in config.release.targets) or "none configured"
+        raise SystemExit(
+            f"CONTINUUM_ERROR: no release target {target_id!r} in {config.source}; "
+            f"available: {available}"
+        )
+    return target
+
+
+def _require_material(
+    target: Any, mode: str, environment: Dict[str, str]
+) -> None:
+    """Honour an explicit expectation about the signing material.
+
+    `present` is how a release job says "this must not degrade". Without it a
+    missing secret quietly turns a stable release into an ad-hoc one, and the
+    only symptom is a user being asked to grant microphone access again. Saying
+    it out loud turns that into a failed job.
+    """
+
+    present = release_adapters.has_material(target, environment)
+    if mode == "present" and not present:
+        raise SystemExit(
+            f"CONTINUUM_ERROR: target {target.id!r} signs with "
+            f"{target.signing.identity!r}, but "
+            + " and ".join(target.signing.secret_names())
+            + " are not available in this job. Refusing to sign ad-hoc."
+        )
+    if mode == "absent" and present:
+        raise SystemExit(
+            f"CONTINUUM_ERROR: target {target.id!r} was asked to run without its "
+            "signing material, but the material is present"
+        )
+
+
+def _print_json(payload: Any, stream=None) -> None:
+    # `sys.stdout` is resolved per call rather than bound as a default: a
+    # default would capture the stream that existed at import time, so anything
+    # that redirected output later would silently miss this document — and a
+    # release plan that is not printed is a release plan nobody reviewed.
+    target = stream if stream is not None else sys.stdout
+    json.dump(payload, target, indent=2, sort_keys=True)
+    target.write("\n")
+    target.flush()
 
 
 def _write_output(values: Dict[str, str]) -> None:
@@ -338,6 +384,154 @@ def cmd_queue(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _plan(args: argparse.Namespace) -> Tuple[Any, Any, Dict[str, str]]:
+    """Validate configuration and build the plan a target would run.
+
+    The bound environment comes back with the plan on purpose. The adapter joins
+    the configured secret names to the names its own steps read, and a plan run
+    against the pre-join environment would look for a variable that was never
+    configured — indistinguishable, from the job log, from a missing secret.
+    """
+
+    config = _load_config(args.config, required=not args.allow_missing)
+    target = _select_target(config, args.target)
+    environment = release_run.base_environment()
+    _require_material(target, args.signing_material, environment)
+    try:
+        bound = release_adapters.bind_material(target, environment)
+        plan = release_adapters.plan_for(target, environment=environment)
+    except release_adapters.SigningUnavailable as exc:
+        print(f"::error::{exc}")
+        raise SystemExit(f"CONTINUUM_ERROR: {exc}") from None
+    except release_adapters.TargetNotExecutable as exc:
+        print(f"::error::{exc}")
+        raise SystemExit(f"CONTINUUM_ERROR: {exc}") from None
+    except config_module.ConfigError as exc:
+        print(f"::error::{exc}")
+        raise SystemExit(f"CONTINUUM_ERROR: {exc}") from None
+    return target, plan, bound
+
+
+def _require_values(plan: Any, environment: Dict[str, str]) -> None:
+    """Refuse to start a plan that is missing an ordinary value it needs.
+
+    The runner would catch this too, but only at the step that reads it — which
+    for a bundle is after a keychain exists and a private key has been imported.
+    Checking first turns "the job failed somewhere in signing" into "the job
+    needs CONTINUUM_RELEASE_VERSION set".
+    """
+
+    missing = [name for name in plan.required_env if not (environment.get(name) or "").strip()]
+    if not missing:
+        return
+    raise SystemExit(
+        f"CONTINUUM_ERROR: target {plan.target!r} needs "
+        + " and ".join(missing)
+        + " in the environment; nothing was created and no signing tool was run"
+    )
+
+
+def _report_plan(plan: Any) -> None:
+    """Print the plan, and shout when the plan is a degraded one.
+
+    A degraded build has to be visible to a human reading the job, not only to
+    a machine reading the JSON: the whole point of the fallback is that it is
+    loud, and a field nobody reads is not loud.
+    """
+
+    if plan.degraded:
+        print(f"::warning::DEGRADED RELEASE {plan.target}: {plan.degradation_reason}")
+        for note in plan.notes:
+            print(f"::warning::{note}")
+    for step in plan.step_list:
+        marker = "  teardown" if step.is_teardown else "  step      "
+        print(f"{marker} {step.name}: {step.purpose}")
+    if plan.signature_pinned:
+        print(
+            f"Pinned signing identity: {plan.pinned_identity!r}. The plan asserts it "
+            "is present in what it signed."
+        )
+    else:
+        print(
+            "No signing identity is pinned: this plan cannot and does not preserve a "
+            "stable identity."
+        )
+
+
+def cmd_release_plan(args: argparse.Namespace) -> int:
+    """Show what a release target will do, without doing it."""
+
+    _target, plan, _environment = _plan(args)
+    payload = plan.describe()
+    _print_json(payload)
+    _write_output(
+        {
+            "target": plan.target,
+            "adapter": plan.adapter,
+            "signing_mode": plan.signing_mode,
+            "signature_pinned": str(plan.signature_pinned).lower(),
+            "degraded": str(plan.degraded).lower(),
+            "steps": str(len(plan.steps)),
+        }
+    )
+    if getattr(args, "out", None):
+        with open(args.out, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+    _report_plan(plan)
+    return EXIT_OK
+
+
+def cmd_release_sign(args: argparse.Namespace) -> int:
+    """Run a target's plan: sign, seal, verify, and always tear down."""
+
+    target, plan, environment = _plan(args)
+    _report_plan(plan)
+    if args.dry_run:
+        print("::notice::Dry run: no signing tool was executed.")
+        _print_json({"target": plan.target, "dry_run": True, "ok": True})
+        return EXIT_OK
+
+    _require_values(plan, environment)
+
+    # Ask for the toolchain before the first step rather than after: a plan that
+    # creates a keychain and then discovers `codesign` is missing has already
+    # touched the machine it was told it could not use.
+    try:
+        release_adapters.ensure_toolchain(release_adapters.get(plan.adapter))
+    except release_adapters.TargetNotExecutable as exc:
+        print(f"::error::{exc}")
+        raise SystemExit(f"CONTINUUM_ERROR: {exc}") from None
+
+    result = release_run.run_plan(plan, environment=environment, workdir=args.workdir or ".")
+    _print_json(result.describe())
+    _write_output(
+        {
+            "target": plan.target,
+            "signing_mode": plan.signing_mode,
+            "signature_pinned": str(result.ok and plan.signature_pinned).lower(),
+            "degraded": str(plan.degraded).lower(),
+            "signed": str(result.ok).lower(),
+        }
+    )
+    if result.ok:
+        print(f"::notice::Signed and verified {plan.summary}.")
+        return EXIT_OK
+
+    failure = result.failure
+    explained = release_adapters.explain_failure(
+        plan.adapter, failure.step if failure else "", failure.detail if failure else ""
+    )
+    print(f"::error::{plan.target}: {failure.message if failure else 'failed'}")
+    if explained.message:
+        print(f"::error::{explained.message}")
+    if explained.remediation:
+        print(f"::error::Try: {explained.remediation}")
+    if failure and failure.detail:
+        print(failure.detail)
+    return EXIT_ERROR
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="continuum", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -417,6 +611,69 @@ def build_parser() -> argparse.ArgumentParser:
     )
     reconcile.add_argument("--out", default=None, help="Write the plan document here.")
     reconcile.set_defaults(func=cmd_queue)
+
+    release = sub.add_parser(
+        "release",
+        help="Build, sign, and verify a release target.",
+        description=(
+            "Release automation is a target in .continuum.yml plus an adapter that "
+            "turns it into a plan. The plan is a value: it can be reviewed without a "
+            "signing tool anywhere in sight, and nothing it contains is ever handed "
+            "to a shell."
+        ),
+    )
+    release_sub = release.add_subparsers(dest="release_command", required=True)
+
+    plan = release_sub.add_parser(
+        "plan",
+        help="Show what a target will do.",
+        description=(
+            "Build the plan for one target and print it. Planning needs no signing "
+            "toolchain, so configuration and plan review can run anywhere."
+        ),
+    )
+    add_common(plan)
+    plan.add_argument("--target", required=True, help="Id of the configured release target.")
+    plan.add_argument(
+        "--signing-material",
+        choices=("auto", "present", "absent"),
+        default="auto",
+        help=(
+            "What this job expects of the signing secrets. 'present' fails the run "
+            "rather than degrading; 'absent' proves the fallback path."
+        ),
+    )
+    plan.add_argument("--out", default=None, help="Write the plan document here.")
+    plan.set_defaults(func=cmd_release_plan)
+
+    sign = release_sub.add_parser(
+        "sign",
+        help="Run a target's plan.",
+        description=(
+            "Sign the configured artifacts, assert that what was signed carries the "
+            "pinned identity, verify the signatures, and remove the signing material "
+            "whatever the outcome."
+        ),
+    )
+    add_common(sign)
+    sign.add_argument("--target", required=True, help="Id of the configured release target.")
+    sign.add_argument(
+        "--signing-material",
+        choices=("auto", "present", "absent"),
+        default="auto",
+        help="What this job expects of the signing secrets. See 'release plan'.",
+    )
+    sign.add_argument(
+        "--workdir",
+        default="",
+        help="Directory holding the built artifacts (default: the current directory).",
+    )
+    sign.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the plan without executing any signing tool.",
+    )
+    sign.set_defaults(func=cmd_release_sign)
 
     return parser
 

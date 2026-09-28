@@ -98,6 +98,83 @@ A consumer repository declares the event set in a thin entry workflow and calls
 the shared reconciler — see `fixtures/consumer-repo/.github/workflows/review-queue.yml`.
 `tests/test_queue_workflows.py` fails if the two event sets ever drift apart.
 
+## Release
+
+A release target is a typed declaration in `.continuum.yml`, not a workflow.
+`continuum release plan` turns it into a plan — an ordered list of argument
+vectors, each one stating what it is for — and `continuum release sign` runs
+it. The plan is the review surface: it is a value, so it can be printed,
+diffed, and asserted on without a Mac anywhere in sight.
+
+Only `apple` on `macos` with `swiftpm` is executable today. `ios`,
+`xcode-archive`, and `app-store` are valid configuration that no adapter builds
+yet, and asking for one fails with a refusal rather than a validation error, so
+a repository can declare the intent before the adapter exists.
+
+### Signing
+
+The MVP profile is `self-signed-stable`: a self-signed code-signing certificate
+held in repository secrets, imported into a keychain that exists only for the
+job. It is the smallest thing that produces an upgrade users do not have to
+re-authorize.
+
+macOS keys microphone and accessibility permissions to the *signing identity*,
+not to the bundle identifier. So the plan asserts the configured identity is
+present in everything it signed:
+
+- binaries are signed first, then the bundle is sealed over them with the same
+  identity, so the nested code is not re-signed by a different key;
+- each product is checked for `Authority=<identity>`, and the job fails if it
+  is absent — a signature from the wrong certificate is self-consistent and
+  would otherwise pass;
+- the result is then verified for integrity, which is a different claim;
+- the keychain is deleted in teardown, and teardown runs even when signing
+  failed, because a half-finished release has usually already put a private key
+  on disk.
+
+`developer-id` and notarization are schema-valid and unimplemented. They are
+not on the MVP path and do not block it.
+
+### Ad-hoc fallback
+
+A pull request from a fork never receives the secrets, so a stable target has
+nothing to sign with. There are two honest responses and one dishonest one.
+
+Declaring `allow_adhoc_fallback: true` permits an ad-hoc build, which is signed
+by nobody. The plan is then marked `degraded`, records why, and every field
+that would imply a stable identity is false. macOS will not preserve TCC
+permissions across such an upgrade, and the job says so in its output rather
+than only in a JSON field nobody reads.
+
+Passing `--signing-material present` turns a missing secret into a failed job
+instead. That is the right setting for a release job: silently downgrading to
+ad-hoc looks like success and costs every user their permissions.
+
+### What the runner guarantees
+
+`src/continuum/release/` is split so the platform lives in one file. `plan.py`
+and `run.py` know what an argument vector is and nothing about what signs
+anything — `tests/test_release_run.py` fails if either names `codesign`,
+`keychain`, or `macos` in code.
+
+- **No shell, ever.** There is no `shell=True` and no interpolation. A bundle
+  identifier taken from a repository is data, not a language.
+- **Secrets never printed.** Values arrive through a `${secret:NAME}` slot,
+  are substituted into the argument vector, and are redacted back out of
+  anything the runner records — a tool that echoes its own argv would otherwise
+  publish the password into the job log.
+- **Teardown always runs.** A failing job leaves nothing behind.
+- **Materialization is a step, not a redirection.** Writing key material to
+  disk is something the runner does deliberately and can clean up.
+
+`continuum release sign` checks for the toolchain and for the values the plan
+needs *before* the first step runs, so a job on the wrong runner fails with
+"this runner has no `codesign`" instead of after creating a keychain.
+
+No release workflow is active in this repository, and `.github/workflows/ci.yml`
+enforces an allowlist of workflow names. The module and the CLI are the
+deliverable; the macOS job is a follow-up.
+
 ## Public-repository safety
 
 During bootstrap, automatic issue execution is limited to issues opened by the
