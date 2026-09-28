@@ -60,6 +60,18 @@ jobs:
               if (listed.head.repo?.full_name !== `${owner}/${repo}`) continue;
               if (!listed.head.ref.startsWith('opencode/')) continue;
 
+              // Bootstrap safety: PR-Agent (#25) must become the first blocking
+              // review provider before unrelated implementation PRs may auto-merge.
+              // Allow #25 itself to bootstrap that gate; hold every other OpenCode
+              // PR until #25 replaces this temporary guard with the normalized
+              // review-gate check.
+              if (!listed.head.ref.startsWith('opencode/issue25-')) {
+                core.notice(
+                  `PR #${listed.number}: held until Continuum PR-Agent review gate (#25) is installed.`
+                );
+                continue;
+              }
+
               const labels = new Set((listed.labels || []).map(x => x.name));
               if (labels.has('no-auto-merge')) {
                 core.notice(`PR #${listed.number}: no-auto-merge is set.`);
