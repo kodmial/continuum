@@ -253,6 +253,47 @@ No release workflow is active in this repository, and `.github/workflows/ci.yml`
 enforces an allowlist of workflow names. The module and the CLI are the
 deliverable; the macOS job is a follow-up.
 
+### The release core
+
+The plan adapters above answer "what would this machine run". The release core
+answers the question above that one: *what does a release have to do, in what
+order, and what must it refuse to do twice*.
+
+`src/continuum/release/core.py` walks one event through one fixed chain —
+`eligibility → version → release-pr → validation → source → build → sign →
+verify → draft → publish → sync` — and records every transition in a journal
+keyed to the release rather than to the run. So a re-dispatch, a re-run of a
+failed job, and a second workflow watching the same tag are three runs and one
+release, and a key already recorded as complete is not run again. The key is
+computed at the start, because by the time anyone could ask "is this already
+published" the assets have been uploaded.
+
+The core knows nothing about platforms. Everything platform-specific arrives as
+a component satisfying a port in `contract.py` — an eligibility policy, a
+version strategy, a target adapter, a notes writer, a publisher, a downstream
+sync, a provenance attestor — so a new platform is an addition rather than a
+fork of the loop, and a release for a platform nobody has written yet can still
+be planned:
+
+```python
+outcome = core.plan(request)     # walks the whole chain, writes nothing
+outcome.status                    # "planned"
+outcome.planned                   # True — and nothing was published
+```
+
+A plan records itself in the journal like any other pass so a job can report
+what it would do, and is ignored for idempotency so that the first plan anybody
+runs cannot disable releases. `github.py` is the reference destination: a draft
+that is never published with a missing asset, an attached asset that is never
+replaced, a checksum file checked against the manifest, and a release that never
+points at a commit it was not approved for.
+
+The contract, the ports, and the reasoning behind each rule are in
+[docs/release-core-contract.md](docs/release-core-contract.md). The plan
+adapters and the release core are separate surfaces on purpose: the core is what
+a new platform should be written against, and the plan adapters keep working
+for the platforms that already have one.
+
 ## Public-repository safety
 
 This repository is public, so every input the automation reads is attacker-supplyable:
