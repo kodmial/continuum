@@ -23,6 +23,7 @@ import pathlib
 import re
 import sys
 import threading
+import tempfile
 import unittest
 import unittest.mock
 
@@ -643,6 +644,37 @@ class DispatchCredentialTests(unittest.TestCase):
         self.assertIn("/user", source)
         for verb in ("POST", "PUT", "PATCH", "DELETE"):
             self.assertNotIn(verb, source, verb)
+
+
+class GithubOutputEncodingTests(unittest.TestCase):
+    def test_multiline_output_uses_github_delimiter_syntax(self):
+        value = "70\tallow\tfirst\n69\tallow\tsecond"
+        with tempfile.NamedTemporaryFile(mode="w+", encoding="utf-8") as handle:
+            with unittest.mock.patch.dict(
+                os.environ, {"GITHUB_OUTPUT": handle.name}, clear=True
+            ):
+                trust_policy.write_outputs({"merge_plan": value, "approved_count": "2"})
+            handle.seek(0)
+            lines = handle.read().splitlines()
+
+        self.assertEqual(lines[0], "merge_plan<<__CONTINUUM_OUTPUT_EOF__")
+        self.assertEqual(lines[1], "70\tallow\tfirst")
+        self.assertEqual(lines[2], "69\tallow\tsecond")
+        self.assertEqual(lines[3], "__CONTINUUM_OUTPUT_EOF__")
+        self.assertEqual(lines[4], "approved_count=2")
+
+    def test_multiline_output_avoids_delimiter_collision(self):
+        value = "first\n__CONTINUUM_OUTPUT_EOF__\nlast"
+        with tempfile.NamedTemporaryFile(mode="w+", encoding="utf-8") as handle:
+            with unittest.mock.patch.dict(
+                os.environ, {"GITHUB_OUTPUT": handle.name}, clear=True
+            ):
+                trust_policy.write_outputs({"merge_plan": value})
+            handle.seek(0)
+            lines = handle.read().splitlines()
+
+        self.assertEqual(lines[0], "merge_plan<<__CONTINUUM_OUTPUT_EOF___")
+        self.assertEqual(lines[-1], "__CONTINUUM_OUTPUT_EOF___")
 
 
 class SchedulerIssueAllowlistTests(unittest.TestCase):
