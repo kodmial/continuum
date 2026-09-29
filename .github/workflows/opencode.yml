@@ -148,7 +148,7 @@ jobs:
           # wrote on the pull request, so the retry budget survives a runner
           # restart, a cancelled run, and a fresh process.
           attempts="$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100" \
-            --jq '.[].body // ""' \
+            --jq '.[] | select(.user.login == "'"$GITHUB_REPOSITORY_OWNER"'" or .user.login == "github-actions[bot]") | .body // ""' \
             | python3 .github/scripts/conflict_repair.py episode --pr-number "$PR_NUMBER" \
             | sed -n 's/^episode_attempts=//p')"
 
