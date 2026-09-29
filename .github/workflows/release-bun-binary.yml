@@ -64,6 +64,10 @@ on:
         required: false
         default: ""
         type: string
+    secrets:
+      RELEASE_TOKEN:
+        description: Optional token used to publish immutable GitHub Releases when github.token is read-only
+        required: false
 
 permissions:
   contents: write
@@ -242,7 +246,7 @@ jobs:
       - name: Publish GitHub Release
         shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
           TAG: ${{ steps.meta.outputs.tag }}
           ASSET_NAME: ${{ inputs.asset_name }}
           SOURCE_SHA: ${{ inputs.source_sha }}
