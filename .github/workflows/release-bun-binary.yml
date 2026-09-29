@@ -54,6 +54,16 @@ on:
         required: false
         default: ""
         type: string
+      expected_sha256:
+        description: Optional exact SHA-256 expected from the produced binary
+        required: false
+        default: ""
+        type: string
+      expected_size_bytes:
+        description: Optional exact byte size expected from the produced binary
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: write
@@ -76,6 +86,8 @@ jobs:
           ASSET_NAME: ${{ inputs.asset_name }}
           TAG_PREFIX: ${{ inputs.tag_prefix }}
           EXPECTED_VERSION: ${{ inputs.expected_version }}
+          EXPECTED_SHA256: ${{ inputs.expected_sha256 }}
+          EXPECTED_SIZE_BYTES: ${{ inputs.expected_size_bytes }}
         run: |
           set -euo pipefail
           [[ "$SOURCE_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || { echo "::error::source_sha must be a full 40-character commit SHA"; exit 1; }
@@ -104,6 +116,12 @@ jobs:
               raise SystemExit("provide build_script or build_argv_json")
           if "\n" in expected or "\r" in expected:
               raise SystemExit("expected_version must be one line")
+          expected_sha = os.environ.get("EXPECTED_SHA256", "")
+          if expected_sha and not re.fullmatch(r"[0-9a-fA-F]{64}", expected_sha):
+              raise SystemExit("expected_sha256 must be exactly 64 hexadecimal characters")
+          expected_size = os.environ.get("EXPECTED_SIZE_BYTES", "")
+          if expected_size and (not expected_size.isdigit() or int(expected_size) < 1):
+              raise SystemExit("expected_size_bytes must be a positive integer")
           PY
 
       - name: Checkout exact consumer source
@@ -154,6 +172,8 @@ jobs:
           ASSET_NAME: ${{ inputs.asset_name }}
           TAG_PREFIX: ${{ inputs.tag_prefix }}
           EXPECTED_VERSION: ${{ inputs.expected_version }}
+          EXPECTED_SHA256: ${{ inputs.expected_sha256 }}
+          EXPECTED_SIZE_BYTES: ${{ inputs.expected_size_bytes }}
           BUILD_ARGV_JSON: ${{ inputs.build_argv_json }}
         run: |
           set -euo pipefail
@@ -179,6 +199,14 @@ jobs:
 
           BINARY_SHA256="$(sha256sum "release/$ASSET_NAME" | awk '{print $1}')"
           BINARY_SIZE="$(stat -c '%s' "release/$ASSET_NAME")"
+          if [[ -n "$EXPECTED_SHA256" && "${BINARY_SHA256,,}" != "${EXPECTED_SHA256,,}" ]]; then
+            echo "::error::produced binary SHA-256 does not match expected_sha256"
+            exit 1
+          fi
+          if [[ -n "$EXPECTED_SIZE_BYTES" && "$BINARY_SIZE" != "$EXPECTED_SIZE_BYTES" ]]; then
+            echo "::error::produced binary size does not match expected_size_bytes"
+            exit 1
+          fi
           BUILD_MODE="$(python3 -c 'import json,os; print("argv" if json.loads(os.environ["BUILD_ARGV_JSON"]) else "script")')"
           cat > "release/$ASSET_NAME.json" <<EOF
           {
