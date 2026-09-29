@@ -323,6 +323,7 @@ class PermissionsTests(WorkflowAuditBase):
         for name, document in self.agent_plane().items():
             if "secrets.TAP_PAT" not in self.raw[name]:
                 continue
+
             for event in UNTRUSTED_EVENTS:
                 self.assertNotIn(
                     event, trigger_names(document), "{} reaches TAP_PAT via {}".format(name, event)
@@ -431,6 +432,20 @@ class PullRequestTargetTests(WorkflowAuditBase):
                         self.assertIn("check-token", run, label)
                         for verb in WRITE_CALLS:
                             self.assertNotIn(verb, run, "{}: {}".format(label, verb))
+                        continue
+                    if label == "opencode-repair.yml/sync-stale-prs":
+                        # This job is unreachable from pull-request events and
+                        # exists specifically to make trusted base-sync writes
+                        # emit a real synchronize/CI event. Its job-level gate
+                        # is asserted in the credential reachability test.
+                        condition = str(job.get("if") or "")
+                        self.assertIn("github.event_name == 'workflow_run'", condition)
+                        self.assertIn("github.event.workflow_run.event == 'push'", condition)
+                        self.assertIn("github.event.workflow_run.conclusion == 'success'", condition)
+                        self.assertIn(
+                            "github.event.workflow_run.head_branch == github.event.repository.default_branch",
+                            condition,
+                        )
                         continue
                     self.assertNotIn("secrets.TAP_PAT", block, "{}: {}".format(label, step.get("name")))
                     self.assertNotIn("secrets.", run, "{}: {}".format(label, step.get("name")))
