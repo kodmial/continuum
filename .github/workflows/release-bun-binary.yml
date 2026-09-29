@@ -89,6 +89,7 @@ jobs:
           import json, os, re
           argv = json.loads(os.environ["BUILD_ARGV_JSON"])
           env = json.loads(os.environ["BUILD_ENV_JSON"])
+          expected = os.environ.get("EXPECTED_VERSION", "")
           if not isinstance(argv, list) or not all(isinstance(v, str) and v for v in argv):
               raise SystemExit("build_argv_json must be a JSON array of non-empty strings")
           if not isinstance(env, dict):
@@ -101,9 +102,10 @@ jobs:
                   raise SystemExit("build environment values must be strings")
           if not argv and not os.environ.get("BUILD_SCRIPT"):
               raise SystemExit("provide build_script or build_argv_json")
+          if "\n" in expected or "\r" in expected:
+              raise SystemExit("expected_version must be one line")
           PY
 
-          if [[ "$EXPECTED_VERSION" == *
       - name: Checkout exact consumer source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -177,6 +179,7 @@ jobs:
 
           BINARY_SHA256="$(sha256sum "release/$ASSET_NAME" | awk '{print $1}')"
           BINARY_SIZE="$(stat -c '%s' "release/$ASSET_NAME")"
+          BUILD_MODE="$(python3 -c 'import json,os; print("argv" if json.loads(os.environ["BUILD_ARGV_JSON"]) else "script")')"
           cat > "release/$ASSET_NAME.json" <<EOF
           {
             "adapter": "bun-binary",
@@ -188,7 +191,7 @@ jobs:
             "asset": "$ASSET_NAME",
             "sha256": "$BINARY_SHA256",
             "size_bytes": $BINARY_SIZE,
-            "build_mode": "$(python3 -c 'import json,os; print("argv" if json.loads(os.environ["BUILD_ARGV_JSON"]) else "script")')"
+            "build_mode": "$BUILD_MODE"
           }
           EOF
 
@@ -247,257 +250,5 @@ jobs:
             echo "- asset: \`${{ inputs.asset_name }}\`"
             echo "- SHA-256: \`${{ steps.meta.outputs.sha256 }}\`"
             echo "- binary version: \`${{ steps.meta.outputs.binary_version }}\`"
-            echo "- size: \`${{ steps.meta.outputs.size }} bytes\`"
-          } >> "$GITHUB_STEP_SUMMARY"
-\n'* || "$EXPECTED_VERSION" == *
-      - name: Checkout exact consumer source
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          ref: ${{ inputs.source_sha }}
-          fetch-depth: 0
-
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version: ${{ inputs.bun_version }}
-
-      - name: Install dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          bun install --frozen-lockfile
-
-      - name: Build standalone binary
-        shell: bash
-        env:
-          PACKAGE_DIR: ${{ inputs.package_dir }}
-          BUILD_SCRIPT: ${{ inputs.build_script }}
-        run: |
-          set -euo pipefail
-          bun run --cwd "$PACKAGE_DIR" "$BUILD_SCRIPT"
-
-      - name: Package immutable release assets
-        id: meta
-        shell: bash
-        env:
-          SOURCE_SHA: ${{ inputs.source_sha }}
-          PACKAGE_DIR: ${{ inputs.package_dir }}
-          BINARY_PATH: ${{ inputs.binary_path }}
-          ASSET_NAME: ${{ inputs.asset_name }}
-          TAG_PREFIX: ${{ inputs.tag_prefix }}
-        run: |
-          set -euo pipefail
-          test -f "$BINARY_PATH"
-          chmod +x "$BINARY_PATH"
-          "$BINARY_PATH" --version
-
-          VERSION="$(bun -e 'const p = await Bun.file(process.argv[1]).json(); process.stdout.write(String(p.version ?? "0.0.0"))' "$PACKAGE_DIR/package.json")"
-          [[ "$VERSION" =~ ^[0-9A-Za-z._+-]+$ ]] || { echo "::error::invalid package version: $VERSION"; exit 1; }
-          SHORT_SHA="${SOURCE_SHA:0:12}"
-          TAG="${TAG_PREFIX}${VERSION}-${SHORT_SHA}"
-
-          mkdir -p release
-          install -m 0755 "$BINARY_PATH" "release/$ASSET_NAME"
-          (
-            cd release
-            sha256sum "$ASSET_NAME" | tee "$ASSET_NAME.sha256"
-          )
-
-          BINARY_SHA256="$(sha256sum "release/$ASSET_NAME" | awk '{print $1}')"
-          BINARY_SIZE="$(stat -c '%s' "release/$ASSET_NAME")"
-          cat > "release/$ASSET_NAME.json" <<EOF
-          {
-            "adapter": "bun-binary",
-            "tag": "$TAG",
-            "source_sha": "$SOURCE_SHA",
-            "package_version": "$VERSION",
-            "bun_version": "$(bun --version)",
-            "asset": "$ASSET_NAME",
-            "sha256": "$BINARY_SHA256",
-            "size_bytes": $BINARY_SIZE
-          }
-          EOF
-
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "sha256=$BINARY_SHA256" >> "$GITHUB_OUTPUT"
-          echo "size=$BINARY_SIZE" >> "$GITHUB_OUTPUT"
-
-      - name: Preserve release payload as Actions artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: ${{ inputs.asset_name }}-${{ inputs.source_sha }}
-          path: |
-            release/${{ inputs.asset_name }}
-            release/${{ inputs.asset_name }}.sha256
-            release/${{ inputs.asset_name }}.json
-          if-no-files-found: error
-          retention-days: 30
-
-      - name: Publish GitHub Release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.meta.outputs.tag }}
-          ASSET_NAME: ${{ inputs.asset_name }}
-          SOURCE_SHA: ${{ inputs.source_sha }}
-          PRERELEASE: ${{ inputs.prerelease }}
-        run: |
-          set -euo pipefail
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "Release $TAG already exists; treating the immutable release as complete."
-            exit 0
-          fi
-
-          EXTRA=()
-          [[ "$PRERELEASE" == "true" ]] && EXTRA+=(--prerelease)
-
-          gh release create "$TAG" \
-            "release/$ASSET_NAME" \
-            "release/$ASSET_NAME.sha256" \
-            "release/$ASSET_NAME.json" \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$SOURCE_SHA" \
-            --title "$ASSET_NAME $TAG" \
-            --generate-notes \
-            "${EXTRA[@]}"
-
-      - name: Release summary
-        shell: bash
-        run: |
-          set -euo pipefail
-          {
-            echo "### Continuum bun-binary release"
-            echo "- tag: \`${{ steps.meta.outputs.tag }}\`"
-            echo "- source SHA: \`${{ inputs.source_sha }}\`"
-            echo "- asset: \`${{ inputs.asset_name }}\`"
-            echo "- SHA-256: \`${{ steps.meta.outputs.sha256 }}\`"
-            echo "- size: \`${{ steps.meta.outputs.size }} bytes\`"
-          } >> "$GITHUB_STEP_SUMMARY"
-\r'* ]]; then
-            echo "::error::expected_version must be one line"
-            exit 1
-          fi
-
-      - name: Checkout exact consumer source
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          ref: ${{ inputs.source_sha }}
-          fetch-depth: 0
-
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version: ${{ inputs.bun_version }}
-
-      - name: Install dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          bun install --frozen-lockfile
-
-      - name: Build standalone binary
-        shell: bash
-        env:
-          PACKAGE_DIR: ${{ inputs.package_dir }}
-          BUILD_SCRIPT: ${{ inputs.build_script }}
-        run: |
-          set -euo pipefail
-          bun run --cwd "$PACKAGE_DIR" "$BUILD_SCRIPT"
-
-      - name: Package immutable release assets
-        id: meta
-        shell: bash
-        env:
-          SOURCE_SHA: ${{ inputs.source_sha }}
-          PACKAGE_DIR: ${{ inputs.package_dir }}
-          BINARY_PATH: ${{ inputs.binary_path }}
-          ASSET_NAME: ${{ inputs.asset_name }}
-          TAG_PREFIX: ${{ inputs.tag_prefix }}
-        run: |
-          set -euo pipefail
-          test -f "$BINARY_PATH"
-          chmod +x "$BINARY_PATH"
-          "$BINARY_PATH" --version
-
-          VERSION="$(bun -e 'const p = await Bun.file(process.argv[1]).json(); process.stdout.write(String(p.version ?? "0.0.0"))' "$PACKAGE_DIR/package.json")"
-          [[ "$VERSION" =~ ^[0-9A-Za-z._+-]+$ ]] || { echo "::error::invalid package version: $VERSION"; exit 1; }
-          SHORT_SHA="${SOURCE_SHA:0:12}"
-          TAG="${TAG_PREFIX}${VERSION}-${SHORT_SHA}"
-
-          mkdir -p release
-          install -m 0755 "$BINARY_PATH" "release/$ASSET_NAME"
-          (
-            cd release
-            sha256sum "$ASSET_NAME" | tee "$ASSET_NAME.sha256"
-          )
-
-          BINARY_SHA256="$(sha256sum "release/$ASSET_NAME" | awk '{print $1}')"
-          BINARY_SIZE="$(stat -c '%s' "release/$ASSET_NAME")"
-          cat > "release/$ASSET_NAME.json" <<EOF
-          {
-            "adapter": "bun-binary",
-            "tag": "$TAG",
-            "source_sha": "$SOURCE_SHA",
-            "package_version": "$VERSION",
-            "bun_version": "$(bun --version)",
-            "asset": "$ASSET_NAME",
-            "sha256": "$BINARY_SHA256",
-            "size_bytes": $BINARY_SIZE
-          }
-          EOF
-
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "sha256=$BINARY_SHA256" >> "$GITHUB_OUTPUT"
-          echo "size=$BINARY_SIZE" >> "$GITHUB_OUTPUT"
-
-      - name: Preserve release payload as Actions artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: ${{ inputs.asset_name }}-${{ inputs.source_sha }}
-          path: |
-            release/${{ inputs.asset_name }}
-            release/${{ inputs.asset_name }}.sha256
-            release/${{ inputs.asset_name }}.json
-          if-no-files-found: error
-          retention-days: 30
-
-      - name: Publish GitHub Release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.meta.outputs.tag }}
-          ASSET_NAME: ${{ inputs.asset_name }}
-          SOURCE_SHA: ${{ inputs.source_sha }}
-          PRERELEASE: ${{ inputs.prerelease }}
-        run: |
-          set -euo pipefail
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "Release $TAG already exists; treating the immutable release as complete."
-            exit 0
-          fi
-
-          EXTRA=()
-          [[ "$PRERELEASE" == "true" ]] && EXTRA+=(--prerelease)
-
-          gh release create "$TAG" \
-            "release/$ASSET_NAME" \
-            "release/$ASSET_NAME.sha256" \
-            "release/$ASSET_NAME.json" \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$SOURCE_SHA" \
-            --title "$ASSET_NAME $TAG" \
-            --generate-notes \
-            "${EXTRA[@]}"
-
-      - name: Release summary
-        shell: bash
-        run: |
-          set -euo pipefail
-          {
-            echo "### Continuum bun-binary release"
-            echo "- tag: \`${{ steps.meta.outputs.tag }}\`"
-            echo "- source SHA: \`${{ inputs.source_sha }}\`"
-            echo "- asset: \`${{ inputs.asset_name }}\`"
-            echo "- SHA-256: \`${{ steps.meta.outputs.sha256 }}\`"
             echo "- size: \`${{ steps.meta.outputs.size }} bytes\`"
           } >> "$GITHUB_STEP_SUMMARY"
