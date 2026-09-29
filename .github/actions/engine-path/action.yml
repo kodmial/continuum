@@ -1,0 +1,15 @@
+name: Continuum engine path
+description: Expose the checked-out Continuum action repository root to reusable consumer workflows
+
+runs:
+  using: composite
+  steps:
+    - name: Export Continuum engine root
+      shell: bash
+      run: |
+        set -euo pipefail
+        root="$(cd "$GITHUB_ACTION_PATH/../../.." && pwd)"
+        test -f "$root/.github/scripts/conflict_repair.py"
+        test -f "$root/.github/scripts/agent_workspace.py"
+        test -f "$root/.github/scripts/opencode_runtime.py"
+        echo "CONTINUUM_ENGINE_ROOT=$root" >> "$GITHUB_ENV"
