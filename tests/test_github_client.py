@@ -170,6 +170,137 @@ class ThreadStateTests(unittest.TestCase):
         }
         self.assertEqual(self._client(payload).unresolved_thread_comment_ids(7), set())
 
+    def test_threads_carry_the_identity_and_prose_a_normalization_needs(self):
+        payload = {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": {
+                            "nodes": [
+                                {
+                                    "id": "PRRT_a",
+                                    "isResolved": False,
+                                    "isOutdated": False,
+                                    "path": "app.py",
+                                    "comments": {
+                                        "nodes": [
+                                            {
+                                                "databaseId": 11,
+                                                "body": "Missing a null guard.",
+                                                "createdAt": "2026-09-01T00:00:00Z",
+                                                "author": {"login": "coderabbitai[bot]"},
+                                            },
+                                            {
+                                                "databaseId": 12,
+                                                "body": "RESOLVED",
+                                                "createdAt": "2026-09-01T01:00:00Z",
+                                                "author": {"login": "coderabbitai[bot]"},
+                                            },
+                                        ]
+                                    },
+                                }
+                            ],
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        }
+                    }
+                }
+            }
+        }
+        threads = self._client(payload).review_threads(7)
+        self.assertEqual(
+            threads,
+            [
+                {
+                    "id": "PRRT_a",
+                    "is_resolved": False,
+                    "is_outdated": False,
+                    "path": "app.py",
+                    "comments": [
+                        {
+                            "database_id": 11,
+                            "author": "coderabbitai[bot]",
+                            "body": "Missing a null guard.",
+                            "created_at": "2026-09-01T00:00:00Z",
+                        },
+                        {
+                            "database_id": 12,
+                            "author": "coderabbitai[bot]",
+                            "body": "RESOLVED",
+                            "created_at": "2026-09-01T01:00:00Z",
+                        },
+                    ],
+                }
+            ],
+        )
+
+    def test_a_null_comment_body_degrades_to_an_empty_reply(self):
+        payload = {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": {
+                            "nodes": [
+                                {
+                                    "id": "PRRT_a",
+                                    "isResolved": False,
+                                    "isOutdated": False,
+                                    "path": "app.py",
+                                    "comments": {"nodes": [{"databaseId": 11, "body": None, "author": None}]},
+                                }
+                            ],
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        }
+                    }
+                }
+            }
+        }
+        thread = self._client(payload).review_threads(7)[0]
+        self.assertEqual(
+            thread["comments"], [{"database_id": 11, "author": "", "body": "", "created_at": ""}]
+        )
+
+    def test_a_null_connection_degrades_to_an_unknown_state(self):
+        payload = {
+            "data": {"repository": {"pullRequest": {"reviewThreads": None}}}
+        }
+        self.assertIsNone(self._client(payload).review_threads(7))
+
+
+class ResolveReviewThreadTests(unittest.TestCase):
+    def _client(self, payload, recorded=None):
+        def opener(request, timeout):
+            if recorded is not None:
+                recorded.append(json.loads(request.data.decode("utf-8")))
+            return payload, ""
+
+        return GitHubClient("token", "o/r", opener=opener)
+
+    def test_the_mutation_sends_the_thread_id(self):
+        recorded = []
+        client = self._client(
+            {"data": {"resolveReviewThread": {"thread": {"id": "PRRT_a", "isResolved": True}}}},
+            recorded,
+        )
+        response = client.resolve_review_thread("PRRT_a")
+        self.assertTrue(response["data"]["resolveReviewThread"]["thread"]["isResolved"])
+        self.assertEqual(
+            recorded[0]["variables"], {"threadId": "PRRT_a"}
+        )
+        self.assertIn("resolveReviewThread", recorded[0]["query"])
+
+    def test_a_graphql_error_raises_so_the_caller_keeps_the_finding(self):
+        client = self._client({"errors": [{"message": "not authorized"}]})
+        with self.assertRaises(GitHubError) as caught:
+            client.resolve_review_thread("PRRT_a")
+        self.assertIn("not authorized", str(caught.exception))
+
+    def test_an_empty_thread_id_is_rejected_before_any_write(self):
+        recorded = []
+        client = self._client({}, recorded)
+        with self.assertRaises(GitHubError):
+            client.resolve_review_thread("  ")
+        self.assertEqual(recorded, [])
+
 
 class FileContentTests(unittest.TestCase):
     def test_base64_content_is_decoded(self):

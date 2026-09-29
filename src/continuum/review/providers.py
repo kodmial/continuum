@@ -8,7 +8,7 @@ unaware of it.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 from .. import config as config_module
 from . import coderabbit, pr_agent
@@ -145,8 +145,16 @@ def collect_snapshot(
     pr_number: int,
     head_sha: str,
     settings: Any,
+    *,
+    apply: bool = False,
 ) -> ProviderSnapshot:
-    """Read the provider's current output for a pull request."""
+    """Read the provider's current output for a pull request.
+
+    `apply=True` lets an adapter reconcile provider state it owns before the
+    snapshot is taken. The decision stays provider-independent: an adapter only
+    writes back what it already read, and anything it could not confirm stays
+    blocking.
+    """
 
     if name == PR_AGENT:
         return pr_agent.collect(client, pr_number, bot_login=settings.bot_login)
@@ -157,8 +165,37 @@ def collect_snapshot(
             head_sha,
             bot_login=settings.bot_login,
             status_context=settings.status_context,
+            apply=apply,
         )
     raise UnsupportedProvider(
         f"Unsupported review provider {name!r}; supported: {', '.join(supported_providers())}"
     )
 
+
+def provider_covers_head(
+    name: str,
+    settings: Any,
+    *,
+    reviews: Sequence[Dict[str, Any]],
+    statuses: Sequence[Dict[str, Any]],
+    head: str,
+) -> bool:
+    """Whether the provider already reported on this exact HEAD.
+
+    The queue uses this to decide whether a candidate still owes the shared
+    provider slot a full review. The answer is the adapter's, because only the
+    adapter knows which of the provider's surfaces carries that meaning.
+    """
+
+    if name == CODERABBIT:
+        return coderabbit.covers_head(
+            reviews,
+            statuses,
+            head,
+            bot_login=settings.bot_login,
+            status_context=settings.status_context,
+        )
+    return any(
+        (review.get("commit_id") or "").lower() == (head or "").lower()
+        for review in reviews or []
+    )

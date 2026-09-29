@@ -100,7 +100,24 @@ adapter:
   (repository owner only) and parse via the Continuum module, never a shell or
   a GitHub expression.
 - CodeRabbit is a sibling adapter behind the same normalized gate
-  (`review.provider: coderabbit`).
+  (`review.provider: coderabbit`). Its semantics live in the adapter, never in
+  merge logic, because three CodeRabbit surfaces disagree often enough to
+  deadlock a naive gate:
+  - **The commit status is operational state, never authorization.** A head is
+    mergeable on a durable exact-head `APPROVED` review. `Review skipped`,
+    pending, and rate-limited statuses block a head that was never approved, but
+    can never revoke an approval GitHub already stores for that exact head.
+  - **Reviews bind to the head SHA they were submitted against.** An approval
+    from an earlier commit does not authorize a new one, and no CI-versus-review
+    timestamp ordering is needed because both signals already name the same SHA.
+    Advisory nitpicks are superseded by a newer decisive verdict on that head;
+    nitpicks published after it still block.
+  - **A settled finding is stated in prose, then normalized.** When the newest
+    CodeRabbit reply in a CodeRabbit-authored thread explicitly resolves it,
+    the adapter resolves the thread in GitHub's own state so the repair stops
+    being re-requested. An explicit `UNRESOLVED`, a failed normalization, and an
+    unknown thread state all stay blocking: an unverifiable thread may
+    over-report a finding but may never silently drop one.
 
 To enable in another repository, validate a `.continuum.yml`, then call the
 reusable workflow — see `fixtures/consumer-repo/` for the reference consumer.

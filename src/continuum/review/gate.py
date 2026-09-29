@@ -226,7 +226,9 @@ def run_gate(
     issue_comments = client.list_issue_comments(int(pr_number))
     _existing, state = load_tracker(issue_comments, trusted_logins=_trusted_logins(config))
 
-    snapshot = registry.collect_snapshot(provider_name, client, pr_number, head, settings)
+    snapshot = registry.collect_snapshot(
+        provider_name, client, pr_number, head, settings, apply=apply
+    )
 
     since = parse_time(state["last_review_at"]) if state.get("last_review_at") else None
     marker, _selected = current_review_marker(

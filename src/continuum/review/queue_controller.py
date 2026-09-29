@@ -349,7 +349,13 @@ def _observe(
     elif rate_limit_until > now_ms:
         review_need = queue.REVIEW_RETRY
         due_at_ms = rate_limit_until
-    elif _provider_covered_head(reviews, statuses, head, status_context):
+    elif registry.provider_covers_head(
+        config.review.provider,
+        settings,
+        reviews=reviews,
+        statuses=statuses,
+        head=head,
+    ):
         review_need = queue.REVIEW_CURRENT
 
     return queue.Candidate(
@@ -376,25 +382,6 @@ def _statuses_for(client: Any, head: str) -> List[Dict[str, Any]]:
     except GitHubError:
         return []
     return list(payload.get("statuses") or [])
-
-
-def _provider_covered_head(
-    reviews: Sequence[Dict[str, Any]],
-    statuses: Sequence[Dict[str, Any]],
-    head: str,
-    status_context: str,
-) -> bool:
-    """True when the provider already reported on this exact HEAD."""
-
-    for review in reviews or []:
-        if (review.get("commit_id") or "").lower() == (head or "").lower():
-            return True
-    for status in statuses or []:
-        if str(status.get("context") or "").lower() != str(status_context).lower():
-            continue
-        if (status.get("sha") or "").lower() == (head or "").lower():
-            return True
-    return False
 
 
 def _cooldown_from_responses(
