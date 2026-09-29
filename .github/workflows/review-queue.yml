@@ -132,10 +132,12 @@ jobs:
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.continuum_token || secrets.TAP_PAT || github.token }}
+          CONFIG_PATH: ${{ inputs.config_path || '.continuum.yml' }}
         run: |
           set -euo pipefail
+          [[ "$CONFIG_PATH" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::Unusable config path."; exit 1; }
           PYTHONPATH=src python3 -m continuum.cli config-check \
-            --config "${{ inputs.config_path || '.continuum.yml' }}"
+            --config "$CONFIG_PATH"
 
       - name: Reconcile the review queue
         id: queue
@@ -147,8 +149,10 @@ jobs:
           CONTINUUM_WAKE_PR: ${{ github.event.pull_request.number || github.event.issue.number }}
           CONTINUUM_WAKE_REASON: ${{ inputs.reason || 'event' }}
           CONTINUUM_WAIT_MINUTES: ${{ inputs.wait_minutes || vars.CONTINUUM_REVIEW_WAIT_MINUTES || '45' }}
+          CONFIG_PATH: ${{ inputs.config_path || '.continuum.yml' }}
         run: |
           set -euo pipefail
+          [[ "$CONFIG_PATH" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::Unusable config path."; exit 1; }
           PYTHONPATH=src python3 -m continuum.cli queue reconcile \
-            --config "${{ inputs.config_path || '.continuum.yml' }}" \
+            --config "$CONFIG_PATH" \
             --wait-minutes "${CONTINUUM_WAIT_MINUTES}"

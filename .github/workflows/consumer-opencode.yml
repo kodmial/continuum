@@ -3,6 +3,11 @@ name: Continuum reusable OpenCode
 on:
   workflow_call:
     inputs:
+      base_branch:
+        type: string
+        required: false
+        default: main
+        description: Branch pull requests are opened against and changes are based on
       mode:
         type: string
         required: true
@@ -108,11 +113,15 @@ jobs:
     concurrency:
       group: continuum-opencode-${{ inputs.mode }}-${{ inputs.issue_number || inputs.pr_number || github.run_id }}
       cancel-in-progress: false
+    # One `env:` block per job, on purpose. Two blocks means the second silently
+    # replaces the first, so `BASE_BRANCH` was being dropped and every `$BASE_BRANCH`
+    # reference in this job expanded to nothing.
     env:
       GH_TOKEN: ${{ github.token }}
       GITHUB_TOKEN: ${{ github.token }}
       OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
       OPENCODE_MODEL: ${{ inputs.model }}
+      BASE_BRANCH: ${{ inputs.base_branch }}
 
     steps:
       - name: Record issue execution ownership
@@ -132,7 +141,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           fetch-depth: 0
-          ref: main
+          ref: ${{ inputs.base_branch }}
           persist-credentials: true
 
       - name: Checkout PR branch
@@ -165,6 +174,7 @@ jobs:
           esac
 
       - name: Install upstream OpenCode
+        id: upstream_opencode
         if: inputs.opencode_distribution == 'upstream'
         shell: bash
         run: |
@@ -182,6 +192,13 @@ jobs:
           done
           test -x "$HOME/.opencode/bin/opencode"
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+          # The upstream installer is a pipe, so there is no digest to check it
+          # against. The identity of whatever is on PATH is still recorded, and
+          # every later step re-checks it, so a swap between install and
+          # invocation is caught even though the install itself cannot be
+          # attested.
+          PATH="$HOME/.opencode/bin:$PATH" \
+            python3 .github/scripts/opencode_runtime.py install
 
       - name: Install optimized OpenCode from GitHub Release
         if: inputs.opencode_distribution == 'github-release'
@@ -265,7 +282,17 @@ jobs:
           fi
 
           ln -sf "$DIR/$ASSET_NAME" "$DIR/opencode"
+          # `$GITHUB_PATH` only ever appends, so this leaves the verified copy
+          # *last* on PATH: any earlier entry holding something called
+          # `opencode` still wins. Prepending is not available, so shadowing is
+          # made detectable instead of merely unlikely -- `install` resolves
+          # `opencode` the way the shell will and refuses to proceed unless the
+          # file it lands on is the binary whose digest was just verified.
+          # Ordering is best-effort; this comparison is the guarantee.
           echo "$DIR" >> "$GITHUB_PATH"
+          PATH="$DIR:$PATH" \
+            python3 .github/scripts/opencode_runtime.py install \
+              --verified-sha256 "$BINARY_SHA256"
 
           echo "release_tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "binary_sha256=$BINARY_SHA256" >> "$GITHUB_OUTPUT"
@@ -285,6 +312,7 @@ jobs:
         if: inputs.mode == 'issue'
         env:
           ISSUE_NUMBER: ${{ inputs.issue_number }}
+          OPENCODE_RUNTIME_SHA256: ${{ steps.upstream_opencode.outputs.runtime_sha256 || steps.optimized_opencode.outputs.runtime_sha256 }}
         shell: bash
         run: |
           set -euo pipefail
@@ -293,8 +321,16 @@ jobs:
             exit 1
           fi
 
-          BRANCH="opencode/issue${ISSUE_NUMBER}-${GITHUB_RUN_ID}"
-          git switch -c "$BRANCH"
+          # The workflow owns the branch. It is created here, before the model
+          # runs, so the ref the work is published to is decided by the workflow
+          # rather than by whatever the model leaves behind.
+          BRANCH="$(python3 .github/scripts/agent_workspace.py select-branch \
+            --candidates "opencode/issue${ISSUE_NUMBER}-continuum" | sed -n 's/^owned_branch=//p')"
+          if [[ -z "$BRANCH" ]]; then
+            echo "::error::Could not derive the owned branch for issue #$ISSUE_NUMBER."
+            exit 1
+          fi
+          git switch -C "$BRANCH" "origin/$BASE_BRANCH"
 
           gh issue view "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --json title,body > /tmp/continuum-issue.json
           TITLE="$(jq -r '.title' /tmp/continuum-issue.json)"
@@ -321,15 +357,115 @@ jobs:
           EOF
           )"
 
+          # Point of use. The digest recorded at install is re-read here, so
+          # the process about to start is the one that was verified rather than
+          # whatever PATH happens to resolve at this moment.
+          python3 .github/scripts/opencode_runtime.py verify --expected-sha256 "$OPENCODE_RUNTIME_SHA256"
           opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
 
-          if [[ -n "$(git status --porcelain)" ]]; then
-            git add -A
-            git commit -m "feat: implement issue #${ISSUE_NUMBER}"
-          fi
+          # The model edited the working tree; the workflow publishes it. The
+          # decision itself lives in agent_workspace.py so this plane and the
+          # self plane cannot drift apart, and so branch drift cannot be a
+          # silent exit 0 the way a hard-coded `git branch --show-current`
+          # comparison is.
+          CURRENT_BRANCH="$(git branch --show-current || true)"
+          git fetch origin "$BASE_BRANCH" --quiet
+          AHEAD="$(git rev-list --count "origin/$BASE_BRANCH..HEAD" 2>/dev/null || echo 0)"
+          DIRTY=false
+          [[ -n "$(git status --porcelain)" ]] && DIRTY=true
 
-          git fetch origin main --quiet
-          AHEAD="$(git rev-list --count "origin/main..HEAD")"
+          # Agent branches that hold commits the base does not have, most work
+          # first. Here the owned branch is derived rather than inferred, so
+          # this is not about identity -- it is the only way to notice a model
+          # that committed to a branch and then walked back to the owned one,
+          # leaving a clean workspace that is not actually empty.
+          WORK_BRANCHES="$(
+            while read -r ref; do
+              [[ -n "$ref" ]] || continue
+              ahead="$(git rev-list --count "origin/$BASE_BRANCH..$ref" 2>/dev/null || echo 0)"
+              [[ "$ahead" -gt 0 ]] && printf '%s %s\n' "$ahead" "$ref"
+            done < <(git for-each-ref --format='%(refname:short)' "refs/heads/opencode/issue${ISSUE_NUMBER}-*") \
+            | sort -rn -k1,1 | cut -d' ' -f2- | paste -sd, - || true
+          )"
+
+          # Open pull requests only. A merged or closed pull request for this
+          # branch is not a publication: counting it as one is how a re-dispatch
+          # left a branch permanently unrecoverable.
+          OPEN_PR="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --state open --json number --jq '.[0].number // empty' || true)"
+          OPEN_PR="${OPEN_PR:-0}"
+
+          PLAN_OUTPUTS="$(python3 .github/scripts/agent_workspace.py workspace-plan \
+            --owned-branch "$BRANCH" \
+            --current-branch "$CURRENT_BRANCH" \
+            --base-branch "$BASE_BRANCH" \
+            --dirty "$DIRTY" \
+            --commits-ahead "$AHEAD" \
+            --open-pull-request "$OPEN_PR" \
+            --work-branches "$WORK_BRANCHES" \
+            --head-sha "$(git rev-parse HEAD 2>/dev/null || true)")"
+          ACTION="$(printf '%s\n' "$PLAN_OUTPUTS" | sed -n 's/^workspace_action=//p')"
+
+          case "$ACTION" in
+            already-published)
+              echo "An open pull request already owns '$BRANCH'; not opening a second one."
+              exit 0
+              ;;
+            materialize)
+              # The model moved off the branch the workflow created. Its
+              # finished tree is rewritten as one commit on '$BRANCH' -- a tree
+              # copy rather than a merge, because a merge at the end of a run
+              # with no agent left would be a conflict nobody can resolve.
+              if [[ -n "$(git status --porcelain)" ]]; then
+                git add -A
+                git commit -m "chore: preserve agent work from $CURRENT_BRANCH" || true
+              fi
+              SALVAGE_TREE="$(git rev-parse 'HEAD^{tree}')"
+              if git show-ref --verify --quiet "refs/heads/$BRANCH"; then
+                git switch "$BRANCH"
+              else
+                git switch -c "$BRANCH" "origin/$BASE_BRANCH"
+              fi
+              MATERIALIZED="$(printf 'Materialized automatically after the agent left its branch during issue #%s execution.\n\nCloses #%s' \
+                "$ISSUE_NUMBER" "$ISSUE_NUMBER" | git commit-tree "$SALVAGE_TREE" -p HEAD)"
+              git reset --hard "$MATERIALIZED" >/dev/null
+              ;;
+            refuse)
+              # Refusing to publish is not the same decision as discarding. The
+              # work exists, so it is quarantined on a branch that is still a
+              # recognisable agent branch, and the run reports what it did
+              # instead of claiming a recovery it did not perform.
+              SALVAGE_SOURCE="$(printf '%s\n' "$PLAN_OUTPUTS" | sed -n 's/^workspace_salvage_source=//p')"
+              if [[ -n "$(git status --porcelain)" ]]; then
+                git add -A
+                git commit -m "chore: preserve agent work that could not be published" || true
+              fi
+              SOURCE_HEAD=HEAD
+              if [[ -n "$SALVAGE_SOURCE" && "$SALVAGE_SOURCE" != "$CURRENT_BRANCH" ]] \
+                && git show-ref --verify --quiet "refs/heads/$SALVAGE_SOURCE"; then
+                SOURCE_HEAD="$SALVAGE_SOURCE"
+              fi
+              SALVAGE="opencode/issue${ISSUE_NUMBER}-salvage-${GITHUB_RUN_ID}"
+              if git rev-list --count "origin/$BASE_BRANCH..$SOURCE_HEAD" >/dev/null 2>&1 \
+                && [[ "$(git rev-list --count "origin/$BASE_BRANCH..$SOURCE_HEAD")" -gt 0 ]]; then
+                SALVAGE_TREE="$(git rev-parse "${SOURCE_HEAD}^{tree}")"
+                git switch -C "$SALVAGE" "origin/$BASE_BRANCH"
+                SALVAGE_COMMIT="$(printf 'Preserved automatically: the agent left its branch during issue #%s and Continuum would not publish to a ref the model chose, so the finished tree is quarantined here rather than discarded.\n\nCloses #%s' \
+                  "$ISSUE_NUMBER" "$ISSUE_NUMBER" | git commit-tree "$SALVAGE_TREE" -p HEAD)"
+                git reset --hard "$SALVAGE_COMMIT" >/dev/null
+                HUSKY=0 git push -u origin "HEAD:$SALVAGE"
+                echo "::error::Preserved the agent workspace on '$SALVAGE' but did not open a pull request: $(printf '%s\n' "$PLAN_OUTPUTS" | sed -n 's/^workspace_reason=//p')"
+              fi
+              exit 1
+              ;;
+            publish)
+              if [[ -n "$(git status --porcelain)" ]]; then
+                git add -A
+                git commit -m "feat: implement issue #${ISSUE_NUMBER}"
+              fi
+              ;;
+          esac
+
+          AHEAD="$(git rev-list --count "origin/$BASE_BRANCH..HEAD")"
           if [[ "$AHEAD" -eq 0 ]]; then
             gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY"               --body "Continuum OpenCode run completed without producing a commit."
             gh api --method DELETE               "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/labels/automation:in-progress"               >/dev/null 2>&1 || true
@@ -337,7 +473,16 @@ jobs:
           fi
 
           HUSKY=0 git push -u origin "$BRANCH"
-          gh pr create             --repo "$GITHUB_REPOSITORY"             --base main             --head "$BRANCH"             --title "$TITLE"             --body "Implemented automatically by Continuum.\n\nCloses #${ISSUE_NUMBER}"
+
+          # Re-checked at the moment of creation, not only in the plan: a
+          # wrapper step that retried must not turn one task into two pull
+          # requests.
+          if gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --state open --json number --jq '.[0].number // empty' | grep -q '^[0-9]'; then
+            echo "An open pull request already owns '$BRANCH'; not opening a second one."
+            exit 0
+          fi
+
+          gh pr create             --repo "$GITHUB_REPOSITORY"             --base "$BASE_BRANCH"             --head "$BRANCH"             --title "$TITLE"             --body "Implemented automatically by Continuum.\n\nCloses #${ISSUE_NUMBER}"
 
       # Conflict repair repairs the change that already exists. It never
       # re-executes the source issue, and it never spends model time unless git
@@ -355,7 +500,7 @@ jobs:
             echo "::error::Invalid pull request number."
             exit 1
           fi
-          git fetch origin main --quiet
+          git fetch origin "$BASE_BRANCH" --quiet
           ORIGINAL_HEAD="$(git rev-parse HEAD)"
           echo "REPAIR_ORIGINAL_HEAD=$ORIGINAL_HEAD" >> "$GITHUB_ENV"
 
@@ -364,7 +509,7 @@ jobs:
           # against the exact head this run verified, so a concurrent push fails
           # the step instead of being silently overwritten. Nothing from either
           # side is discarded.
-          if git rebase --rebase-merges origin/main; then
+          if git rebase --rebase-merges "origin/$BASE_BRANCH"; then
             HUSKY=0 git push --force-with-lease="refs/heads/${HEAD_REF}:${ORIGINAL_HEAD}" origin "HEAD:${HEAD_REF}"
             echo "REPAIR_OUTCOME=replayed" >> "$GITHUB_ENV"
             echo "Replayed the existing commits onto main; no model was invoked."
@@ -391,6 +536,7 @@ jobs:
           PR_NUMBER: ${{ inputs.pr_number }}
           HEAD_REF: ${{ inputs.head_ref }}
           REPAIR_AGENT_TIMEOUT_SECONDS: ${{ inputs.repair_agent_timeout_seconds }}
+          OPENCODE_RUNTIME_SHA256: ${{ steps.upstream_opencode.outputs.runtime_sha256 || steps.optimized_opencode.outputs.runtime_sha256 }}
         shell: bash
         run: |
           set -euo pipefail
@@ -398,8 +544,8 @@ jobs:
             echo "::error::Invalid pull request number."
             exit 1
           fi
-          git fetch origin main --quiet
-          BASE_SHA="$(git rev-parse origin/main)"
+          git fetch origin "$BASE_BRANCH" --quiet
+          BASE_SHA="$(git rev-parse "origin/$BASE_BRANCH")"
           echo "REPAIR_ORIGINAL_HEAD=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
 
           # Rung 3 of the ladder, and the only rung that calls a model. A merge
@@ -413,7 +559,7 @@ jobs:
 
           echo "REPAIR_OUTCOME=hunks_delegated" >> "$GITHUB_ENV"
           PROMPT="$(cat <<EOF
-          Resolve the merge conflict between pull request #${PR_NUMBER} and current origin/main.
+          Resolve the merge conflict between pull request #${PR_NUMBER} and current ${BASE_BRANCH}.
 
           This is a repair of a change that is already finished, not a new task. The
           implementation this pull request carries is complete; only the merge is
@@ -435,6 +581,7 @@ jobs:
           - Keep all comments and commit messages in English.
           EOF
           )"
+          python3 .github/scripts/opencode_runtime.py verify --expected-sha256 "$OPENCODE_RUNTIME_SHA256"
           timeout --signal=TERM "$REPAIR_AGENT_TIMEOUT_SECONDS" \
             opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
           if [[ -n "$(git status --porcelain)" ]]; then
@@ -474,6 +621,7 @@ jobs:
           PR_NUMBER: ${{ inputs.pr_number }}
           HEAD_REF: ${{ inputs.head_ref }}
           RUN_ID: ${{ inputs.run_id }}
+          OPENCODE_RUNTIME_SHA256: ${{ steps.upstream_opencode.outputs.runtime_sha256 || steps.optimized_opencode.outputs.runtime_sha256 }}
         shell: bash
         run: |
           set -euo pipefail
@@ -490,6 +638,10 @@ jobs:
           - Commit fixes if needed; do not push.
           EOF
           )"
+          # Point of use. The digest recorded at install is re-read here, so
+          # the process about to start is the one that was verified rather than
+          # whatever PATH happens to resolve at this moment.
+          python3 .github/scripts/opencode_runtime.py verify --expected-sha256 "$OPENCODE_RUNTIME_SHA256"
           opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
           if [[ -n "$(git status --porcelain)" ]]; then
             git add -A
