@@ -1,0 +1,164 @@
+name: Continuum reusable child dispatcher
+
+on:
+  workflow_call:
+    inputs:
+      worker_workflow:
+        type: string
+        required: false
+        default: continuum-child-worker.yml
+      review_workflow:
+        type: string
+        required: false
+        default: continuum-child-review.yml
+    secrets:
+      CHILD_RUNTIME_TOKEN:
+        required: true
+      CHILD_RUNTIME_REPOSITORIES:
+        required: true
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      GH_TOKEN: ${{ secrets.CHILD_RUNTIME_TOKEN }}
+      GITHUB_TOKEN: ${{ secrets.CHILD_RUNTIME_TOKEN }}
+      CHILD_REPOSITORIES: ${{ secrets.CHILD_RUNTIME_REPOSITORIES }}
+      WORKER_WORKFLOW: ${{ inputs.worker_workflow }}
+      REVIEW_WORKFLOW: ${{ inputs.review_workflow }}
+    steps:
+      - name: Checkout parent control plane
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Load Continuum engine
+        uses: kodmial/continuum/.github/actions/engine-path@main
+
+      - name: Reconcile configured children
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$CONTINUUM_ENGINE_ROOT/src"
+          relation="$CONTINUUM_ENGINE_ROOT/.github/scripts/delegation_runtime.py"
+          plan="$(
+            python3 "$relation" parent-plan               --config .continuum.yml               --repository-map-json "$CHILD_REPOSITORIES"
+          )"
+
+          active_titles="$(
+            gh run list --repo "$GITHUB_REPOSITORY" --limit 100               --json status,displayTitle               --jq '.[] | select(.status == "queued" or .status == "in_progress" or .status == "waiting" or .status == "pending") | .displayTitle'               2>/dev/null || true
+          )"
+
+          task_active() {
+            local child_id="$1" kind="$2" task="$3"
+            grep -Fxq "Child $kind [$child_id] #$task" <<<"$active_titles"
+          }
+
+          invalid=0
+          dispatched=0
+
+          while IFS= read -r row; do
+            [[ -n "$row" ]] || continue
+            child_id="$(jq -r '.id' <<<"$row")"
+            child_repo="$(jq -r '.repository' <<<"$row")"
+
+            child_config="$RUNNER_TEMP/continuum-child-$child_id.yml"
+            if ! gh api "repos/$child_repo/contents/.continuum.yml" --jq '.content' 2>/dev/null               | tr -d '\n' | base64 -d >"$child_config" 2>/dev/null; then
+              echo "::error::Child '$child_id' configuration could not be read."
+              invalid=$((invalid + 1))
+              continue
+            fi
+            if ! python3 "$relation" verify-child               --config "$child_config"               --child-id "$child_id"               --parent-repository "$GITHUB_REPOSITORY"; then
+              invalid=$((invalid + 1))
+              continue
+            fi
+
+            open_prs="$(
+              gh pr list --repo "$child_repo" --state open --limit 100                 --json number,headRefName                 --jq '.[] | select(
+                    (.headRefName | startswith("continuum-child/task-")) or
+                    (.headRefName | startswith("runtime-worker/task-"))
+                  ) | [.number,.headRefName] | @tsv' 2>/dev/null || true
+            )"
+            open_pr_tasks="$(
+              cut -f2 <<<"$open_prs"                 | sed -nE 's#^(continuum-child|runtime-worker)/task-([0-9]+)-.*#\2#p'
+            )"
+
+            if [[ -n "$open_prs" ]]; then
+              while IFS=$'\t' read -r pr_number head_ref; do
+                [[ -n "$pr_number" ]] || continue
+                task_number="$(
+                  sed -nE 's#^(continuum-child|runtime-worker)/task-([0-9]+)-.*#\2#p' <<<"$head_ref"
+                )"
+                [[ -n "$task_number" ]] || continue
+                if task_active "$child_id" task "$task_number" ||
+                   task_active "$child_id" review "$task_number"; then
+                  continue
+                fi
+                gh workflow run "$REVIEW_WORKFLOW" --repo "$GITHUB_REPOSITORY"                   -f child_id="$child_id"                   -f task_number="$task_number"                   -f pr_number="$pr_number" >/dev/null
+                dispatched=$((dispatched + 1))
+              done <<<"$open_prs"
+            fi
+
+            issues_json="$(
+              gh api --paginate "repos/$child_repo/issues?state=open&per_page=100" 2>/dev/null
+            )"
+
+            for priority in priority:p0 priority:p1 priority:p2; do
+              while IFS= read -r encoded; do
+                [[ -n "$encoded" ]] || continue
+                decoded="$(base64 -d <<<"$encoded")"
+                task_number="$(jq -r '.[0]' <<<"$decoded")"
+                body="$(jq -r '.[1]' <<<"$decoded")"
+
+                task_active "$child_id" task "$task_number" && continue
+                task_active "$child_id" review "$task_number" && continue
+                grep -qx "$task_number" <<<"$open_pr_tasks" && continue
+
+                ready=true
+                deps="$(
+                  sed -nE 's/.*<!-- *automation-blocked-by: *([^>]*) *-->.*/\1/p'                     <<<"$body" | head -1 | tr ',' ' '
+                )"
+                for dep in $deps; do
+                  dep="${dep//#/}"
+                  dep="${dep//[[:space:]]/}"
+                  [[ "$dep" =~ ^[0-9]+$ ]] || continue
+                  state="$(
+                    gh api "repos/$child_repo/issues/$dep" --jq '.state' 2>/dev/null || echo open
+                  )"
+                  if [[ "$state" != "closed" ]]; then
+                    ready=false
+                    break
+                  fi
+                done
+                [[ "$ready" == true ]] || continue
+
+                gh workflow run "$WORKER_WORKFLOW" --repo "$GITHUB_REPOSITORY"                   -f child_id="$child_id"                   -f task_number="$task_number" >/dev/null
+                dispatched=$((dispatched + 1))
+              done < <(
+                jq -r --arg p "$priority" '
+                  .[]
+                  | select(.pull_request == null)
+                  | select(any(.labels[]?.name; . == $p))
+                  | select(all(.labels[]?.name; . != "automation:paused"))
+                  | select(
+                      ((.body // "") | contains("<!-- continuum-child-owned -->")) or
+                      ((.body // "") | contains("<!-- runtime-worker-owned -->"))
+                    )
+                  | [.number, (.body // "")]
+                  | @base64
+                ' <<<"$issues_json"
+              )
+            done
+          done < <(jq -c '.[]' <<<"$plan")
+
+          echo "Reconciled configured child relationships; dispatched $dispatched run(s)."
+          if [[ "$invalid" -gt 0 ]]; then
+            echo "::error::$invalid configured child relationship(s) failed bidirectional verification."
+            exit 2
+          fi
