@@ -120,6 +120,83 @@ jobs:
             const repo = context.repo.repo;
             const repoFullName = owner + '/' + repo;
 
+            // One-shot backlog DAG correction after full backlog review.
+            // Remove immediately after native GitHub dependencies are verified.
+            const dependencyAdds = [
+              [11, 37],
+              [16, 64],
+              [22, 59],
+              [29, 68],
+              [59, 37],
+              [62, 59],
+            ];
+            const dependencyRemovals = [
+              [1, 7],
+              [1, 13],
+              [8, 7],
+              [9, 7],
+              [10, 7],
+              [15, 13],
+              [16, 6],
+              [16, 13],
+            ];
+
+            for (const [issueNumber, blockerNumber] of dependencyRemovals) {
+              const current = await github.paginate(
+                'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
+                {
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                  per_page: 100,
+                  headers: { 'X-GitHub-Api-Version': '2026-03-10' },
+                }
+              );
+              const blocker = current.find(item => item.number === blockerNumber);
+              if (!blocker) continue;
+              await github.request(
+                'DELETE /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by/{issue_id}',
+                {
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                  issue_id: blocker.id,
+                  headers: { 'X-GitHub-Api-Version': '2026-03-10' },
+                }
+              );
+              core.notice('Removed native dependency: #' + issueNumber + ' blocked by #' + blockerNumber + '.');
+            }
+
+            for (const [issueNumber, blockerNumber] of dependencyAdds) {
+              const current = await github.paginate(
+                'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
+                {
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                  per_page: 100,
+                  headers: { 'X-GitHub-Api-Version': '2026-03-10' },
+                }
+              );
+              if (current.some(item => item.number === blockerNumber)) continue;
+              const blocker = await github.rest.issues.get({
+                owner,
+                repo,
+                issue_number: blockerNumber,
+              });
+              await github.request(
+                'POST /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
+                {
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                  issue_id: blocker.data.id,
+                  headers: { 'X-GitHub-Api-Version': '2026-03-10' },
+                }
+              );
+              core.notice('Added native dependency: #' + issueNumber + ' blocked by #' + blockerNumber + '.');
+            }
+
             // Both gates must have produced a result. An empty allowlist is a
             // legitimate outcome (nothing is trusted right now) and is not an
             // error, but a *missing* gate result is a failure: the job must not
