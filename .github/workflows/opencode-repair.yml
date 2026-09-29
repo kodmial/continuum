@@ -14,6 +14,14 @@
 #      exact (mode, PR, head ref) triple against the live pull request.
 name: OpenCode repair controller
 
+# Conflict repair repairs the change that already exists. It never re-executes
+# the source issue, and it is bounded by .github/scripts/conflict_repair.py
+# rather than by how long the source task took. The `repair-watchdog` job below
+# is the reason a repair episode can no longer strand a pull request: on
+# 2026-09-28 a frozen runtime-lab #66 was skipped by every later
+# reconciliation because its `no-auto-merge` and `opencode-conflict-repair`
+# labels were never cleared, and nothing looked for them.
+
 on:
   # This trusted metadata workflow never checks out or executes PR code.
   pull_request_target:
@@ -21,6 +29,12 @@ on:
   workflow_run:
     workflows: ["CI", "OpenCode agent"]
     types: [completed]
+  # The watchdog needs a trigger that fires with no pull-request activity at
+  # all: the failure it exists for is precisely the state where nothing else
+  # runs.
+  schedule:
+    - cron: "7,37 * * * *"
+  workflow_dispatch:
 
 permissions: {}
 
@@ -142,6 +156,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           AUTOMATION_TRUSTED_ACTORS: ${{ vars.AUTOMATION_TRUSTED_ACTORS }}
           CONTINUUM_BASE_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
+          CONTINUUM_REPAIR_MAX_ATTEMPTS: ${{ vars.AUTOMATION_REPAIR_MAX_ATTEMPTS || '3' }}
         run: |
           set -euo pipefail
           base_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$CONTINUUM_BASE_BRANCH" --jq '.object.sha')"
@@ -180,13 +195,71 @@ jobs:
 
             lock_label="opencode-conflict-repair"
             gh label create "$lock_label" --repo "$GITHUB_REPOSITORY" --color B60205 \
-              --description "Automatic OpenCode conflict repair for the current stale head." \
+              --description "One automatic conflict-repair attempt at a time; released when the attempt concludes." \
               --force >/dev/null
+
+            # A stuck label is not a finished repair. On runtime-lab #66 this
+            # `continue` was the whole incident: the label was left behind by a
+            # repair that died mid-flight, and from then on every sweep -- this
+            # one included -- declined the pull request forever, with nothing
+            # scheduled to contradict it. The attempt record and a live run are
+            # the evidence that a repair is actually happening.
+            attempts="$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$pr_number/comments?per_page=100" \
+              --jq '.[] | select(.user.login == "'"$GITHUB_REPOSITORY_OWNER"'" or .user.login == "github-actions[bot]") | .body // ""' \
+              | python3 .github/scripts/conflict_repair.py episode --pr-number "$pr_number" \
+              | sed -n 's/^episode_attempts=//p' | tail -n1)"
+            attempts="${attempts:-0}"
+
             if gh api "repos/$GITHUB_REPOSITORY/issues/$pr_number/labels" \
               --jq '.[].name' | grep -Fxq "$lock_label"; then
-              echo "PR #$pr_number conflict repair is already reserved."
+              in_flight="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/opencode.yml/runs?per_page=50" \
+                --jq "[.workflow_runs[] | select(.head_branch == \"$head_ref\") | select(.status != \"completed\")] | length")"
+              if [[ "${in_flight:-0}" -gt 0 ]]; then
+                echo "PR #$pr_number already has a conflict-repair run in flight."
+                continue
+              fi
+              echo "PR #$pr_number carries an abandoned $lock_label label; clearing it and re-planning the ladder."
+              gh api --method DELETE \
+                "repos/$GITHUB_REPOSITORY/issues/$pr_number/labels/$lock_label" \
+                >/dev/null 2>&1 || true
+            fi
+
+            # The ladder, not the label, decides. `update-branch` is already
+            # ruled out: this job tried it above and GitHub refused the merge.
+            plan="$RUNNER_TEMP/stale-plan-$pr_number.env"
+            {
+              echo "attempts=$attempts"
+            } > "$plan"
+            python3 .github/scripts/conflict_repair.py recovery-plan \
+              --behind 1 \
+              --ruled-out update-branch \
+              --attempts "$attempts" \
+              --max-attempts "${CONTINUUM_REPAIR_MAX_ATTEMPTS:-3}" >> "$plan"
+            action="$(sed -n 's/^action=//p' "$plan" | tail -n1)"
+            if [[ "$action" == "wait" || "$action" == "none" ]]; then
+              echo "PR #$pr_number conflict repair is backing off ($action)."
               continue
             fi
+            if [[ "$action" == "failed" ]]; then
+              echo "::warning::PR #$pr_number exhausted its conflict-repair budget; leaving it reconcilable."
+              continue
+            fi
+
+            # Record the attempt before the dispatch, so a run that never starts
+            # still counts and still leaves the watchdog something to act on.
+            next_attempt=$(( attempts + 1 ))
+            episode_marker="$(python3 .github/scripts/conflict_repair.py render-marker \
+              --episode "$next_attempt" \
+              --pr-number "$pr_number" \
+              --head-sha "$head_sha" \
+              --attempt "$next_attempt" \
+              --state open)"
+            if [[ -n "$episode_marker" ]]; then
+              gh pr comment "$pr_number" --repo "$GITHUB_REPOSITORY" \
+                --body "$episode_marker" >/dev/null 2>&1 \
+                || echo "::warning::Could not record the conflict-repair attempt for PR #$pr_number."
+            fi
+
             gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$pr_number/labels" \
               -f "labels[]=$lock_label" >/dev/null
 
@@ -195,7 +268,8 @@ jobs:
               -f ref=main \
               -f "inputs[mode]=resolve-conflict" \
               -f "inputs[pr_number]=$pr_number" \
-              -f "inputs[head_ref]=$head_ref"; then
+              -f "inputs[head_ref]=$head_ref" \
+              -f "inputs[rungs_ruled_out]=update-branch"; then
               gh api --method DELETE \
                 "repos/$GITHUB_REPOSITORY/issues/$pr_number/labels/$lock_label" \
                 >/dev/null 2>&1 || true
@@ -276,6 +350,7 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_ACTION: ${{ github.event.action }}
           CONTINUUM_BASE_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
+          CONTINUUM_REPAIR_MAX_ATTEMPTS: ${{ vars.AUTOMATION_REPAIR_MAX_ATTEMPTS || '3' }}
         run: |
           set -euo pipefail
           lock_label="opencode-conflict-repair"
@@ -286,44 +361,118 @@ jobs:
           # suppress repair of a fresh failure on this head. Reopened PRs also
           # get a clean repair budget.
           if [[ "$PR_ACTION" == "synchronize" || "$PR_ACTION" == "reopened" ]]; then
-            echo "action=reset-head-locks" >> "$GITHUB_OUTPUT"
+            # A flag rather than an action: `action` is written exactly once,
+            # further down, and a second write to the same key silently loses
+            # to the last one. As an action this reset was unreachable, so a new
+            # head could inherit a lock that belonged to the previous head.
+            echo "reset_head_locks=true" >> "$GITHUB_OUTPUT"
             echo "The PR has a new head ($PR_ACTION); per-head repair locks are reset."
           fi
 
           behind=$(gh api "repos/$GITHUB_REPOSITORY/compare/$CONTINUUM_BASE_BRANCH...$HEAD_SHA" --jq '.behind_by')
-          if [[ "$behind" -eq 0 ]]; then
-            echo "action=clear-lock" >> "$GITHUB_OUTPUT"
-            echo "lock_label=$lock_label" >> "$GITHUB_OUTPUT"
-            echo "reason=up_to_date" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
 
           # A pull request that edits the privilege boundary needs a human: an
           # agent that then resolves a conflict in a workflow file would push
           # unattended into the trust boundary itself.
           sensitive=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" \
             --jq '[.[] | select(.filename | startswith(".github/workflows/") or startswith(".github/scripts/") or startswith(".github/actions/") or . == "CODEOWNERS" or . == "action.yml") | .filename] | join(", ")')
-          if [[ -n "$sensitive" ]]; then
+          if [[ "$sensitive" ]]; then
             echo "action=flag-human" >> "$GITHUB_OUTPUT"
             echo "sensitive_files=$sensitive" >> "$GITHUB_OUTPUT"
             echo "reason=privilege_boundary_change" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
+          locked=false
           if gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels" \
             --jq '.[].name' | grep -Fxq "$lock_label"; then
+            locked=true
+          fi
+
+          # The attempt count is the durable record of how many repair attempts
+          # this episode has consumed. It lives in the pull request's own
+          # comments, so it survives a cancelled run, a new runner, and a
+          # controller restart. A lock label on its own is NOT a verdict: that
+          # is the mistake that left runtime-lab #66 frozen forever, because a
+          # label with no attempt record and no lock release is invisible to
+          # every later reconciliation.
+          attempts="$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100" \
+            --jq '.[] | select(.user.login == "'"$GITHUB_REPOSITORY_OWNER"'" or .user.login == "github-actions[bot]") | .body // ""' \
+            | python3 .github/scripts/conflict_repair.py episode --pr-number "$PR_NUMBER" \
+            | sed -n 's/^episode_attempts=//p')"
+          attempts="${attempts:-0}"
+
+          # Whether a repair run is actually in flight is the only thing that
+          # may justify holding the lock. A repair run announces itself with a
+          # freshly recorded attempt, so a lock with no newer attempt than the
+          # one already counted is a lock nobody is working behind.
+          running=false
+          if [[ "$locked" == "true" && "$attempts" -gt 0 ]]; then
+            in_flight="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/opencode.yml/runs?per_page=50" \
+              --jq "[.workflow_runs[] | select(.head_branch == \"$HEAD_REF\") | select(.status != \"completed\")] | length")"
+            if [[ "$in_flight" -gt 0 ]]; then running=true; fi
+          fi
+
+          # The ladder, not the label, decides. `update-branch` is always
+          # ruled out here because the execution step below has already tried
+          # it by the time a dispatch is considered.
+          plan="$RUNNER_TEMP/plan.env"
+          {
+            echo "attempts=$attempts"
+            echo "locked=$locked"
+            echo "running=$running"
+          } > "$plan"
+          python3 .github/scripts/conflict_repair.py recovery-plan \
+            --behind "$behind" \
+            --ruled-out update-branch \
+            --attempts "$attempts" \
+            --max-attempts "$CONTINUUM_REPAIR_MAX_ATTEMPTS" >> "$plan"
+
+          action="$(sed -n 's/^action=//p' "$plan" | tail -n1)"
+          code="$(sed -n 's/^repair_code=//p' "$plan" | tail -n1)"
+          echo "Recovery plan: $action ($code); attempts=$attempts locked=$locked running=$running."
+
+          case "$action" in
+            none)
+              echo "action=clear-lock" >> "$GITHUB_OUTPUT"
+              echo "lock_label=$lock_label" >> "$GITHUB_OUTPUT"
+              echo "reason=$code" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+            wait)
+              echo "action=none" >> "$GITHUB_OUTPUT"
+              echo "reason=$code" >> "$GITHUB_OUTPUT"
+              echo "attempts=$attempts" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+            failed)
+              # The budget is spent. Record the failure so the outcome is
+              # visible, and let the pull request stay reconcilable: the
+              # watchdog will find it and the episode stays recoverable.
+              echo "action=record-failure" >> "$GITHUB_OUTPUT"
+              echo "lock_label=$lock_label" >> "$GITHUB_OUTPUT"
+              echo "reason=$code" >> "$GITHUB_OUTPUT"
+              echo "attempts=$attempts" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+
+          if [[ "$running" == "true" ]]; then
             echo "action=none" >> "$GITHUB_OUTPUT"
-            echo "reason=repair_already_attempted" >> "$GITHUB_OUTPUT"
+            echo "reason=repair_run_in_flight" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           # Final gate on the exact dispatch triple, re-verified against the
           # live pull request. A dispatch the policy would reject never leaves
-          # this job, and the verification is read-only.
+          # this job, and the verification is read-only. `rungs-ruled-out` is
+          # the ladder position, and the policy restricts it to mechanical
+          # rungs so no payload can skip past conflict repair.
           if ! python3 .github/scripts/trust_policy.py verify-dispatch \
             --mode resolve-conflict \
             --pr-number "$PR_NUMBER" \
-            --head-ref "$HEAD_REF"; then
+            --head-ref "$HEAD_REF" \
+            --rungs-ruled-out update-branch; then
             echo "action=none" >> "$GITHUB_OUTPUT"
             echo "reason=policy_denied_dispatch" >> "$GITHUB_OUTPUT"
             exit 0
@@ -332,6 +481,8 @@ jobs:
           echo "action=update-or-dispatch" >> "$GITHUB_OUTPUT"
           echo "lock_label=$lock_label" >> "$GITHUB_OUTPUT"
           echo "behind=$behind" >> "$GITHUB_OUTPUT"
+          echo "attempts=$attempts" >> "$GITHUB_OUTPUT"
+          echo "repair_action=$action" >> "$GITHUB_OUTPUT"
           echo "reason=behind_base_branch" >> "$GITHUB_OUTPUT"
 
       # Execution phase: the write-capable token appears only here, and only for
@@ -341,9 +492,12 @@ jobs:
           GH_TOKEN: ${{ secrets.TAP_PAT || github.token }}
           ACTION: ${{ steps.decide.outputs.action }}
           REASON: ${{ steps.decide.outputs.reason }}
+          RESET_HEAD_LOCKS: ${{ steps.decide.outputs.reset_head_locks }}
           LOCK_LABEL: ${{ steps.decide.outputs.lock_label }}
           SENSITIVE_FILES: ${{ steps.decide.outputs.sensitive_files }}
           BEHIND: ${{ steps.decide.outputs.behind }}
+          ATTEMPTS: ${{ steps.decide.outputs.attempts }}
+          HEAD_REF: ${{ steps.trust.outputs.head_ref }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           CONTINUUM_BASE_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
@@ -353,8 +507,8 @@ jobs:
 
           echo "Decision: $ACTION ($REASON)."
 
-          if [[ "$ACTION" == "reset-head-locks" ]]; then
-            for stale in opencode-ci-repair; do
+          if [[ "${RESET_HEAD_LOCKS:-false}" == "true" ]]; then
+            for stale in opencode-ci-repair opencode-conflict-repair; do
               gh api --method DELETE \
                 "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/$stale" \
                 >/dev/null 2>&1 || true
@@ -373,6 +527,19 @@ jobs:
               echo "PR #$PR_NUMBER already contains the current base branch."
               exit 0
               ;;
+            record-failure)
+              # Release first, label second. The pull request must be
+              # reconcilable even if the label write fails.
+              gh api --method DELETE \
+                "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/$lock_label" \
+                >/dev/null 2>&1 || true
+              gh label create opencode-repair-failed --repo "$GITHUB_REPOSITORY" --color D93F0B \
+                --description "Continuum conflict repair exhausted its attempt budget" --force >/dev/null 2>&1 || true
+              gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels" \
+                -f 'labels[]=opencode-repair-failed' >/dev/null 2>&1 || true
+              echo "::warning::PR #$PR_NUMBER exhausted $ATTEMPTS conflict-repair attempt(s); the lock is released and the pull request stays reconcilable."
+              exit 0
+              ;;
             flag-human)
               gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels" \
                 -f 'labels[]=opencode-human-review-required' >/dev/null
@@ -387,11 +554,11 @@ jobs:
           fi
 
           gh label create "$lock_label" --repo "$GITHUB_REPOSITORY" --color B60205 \
-            --description "One automatic OpenCode conflict-repair attempt per conflict episode." \
+            --description "One automatic conflict-repair attempt at a time; released when the attempt concludes." \
             --force >/dev/null
 
-          # Prefer GitHub's own merge: it re-runs the mergeability check server
-          # side and needs no agent token at all.
+          # Rung 1 of the ladder: GitHub's own merge. It re-runs the
+          # mergeability check server side and needs no agent token at all.
           echo "PR #$PR_NUMBER is $BEHIND commit(s) behind $CONTINUUM_BASE_BRANCH; requesting a native branch update."
           if output=$(gh api --method PUT \
             "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/update-branch" \
@@ -409,6 +576,21 @@ jobs:
             exit 0
           fi
 
+          # Record the attempt before the dispatch, so a run that never starts
+          # still counts and still leaves a trace the watchdog can act on.
+          next_attempt=$(( ${ATTEMPTS:-0} + 1 ))
+          marker="$(python3 .github/scripts/conflict_repair.py render-marker \
+            --episode "$next_attempt" \
+            --pr-number "$PR_NUMBER" \
+            --head-sha "$HEAD_SHA" \
+            --attempt "$next_attempt" \
+            --state open)"
+          if [[ -n "$marker" ]]; then
+            gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+              --body "$marker" >/dev/null 2>&1 \
+              || echo "::warning::Could not record the conflict-repair attempt for PR #$PR_NUMBER."
+          fi
+
           gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels" \
             -f "labels[]=$lock_label" >/dev/null
 
@@ -417,7 +599,8 @@ jobs:
             -f ref=main \
             -f "inputs[mode]=resolve-conflict" \
             -f "inputs[pr_number]=$PR_NUMBER" \
-            -f "inputs[head_ref]=$HEAD_REF"; then
+            -f "inputs[head_ref]=$HEAD_REF" \
+            -f "inputs[rungs_ruled_out]=update-branch"; then
             gh api --method DELETE \
               "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/$lock_label" \
               >/dev/null 2>&1 || true
@@ -641,3 +824,190 @@ jobs:
             echo "::error::Failed to dispatch OpenCode repair; lock cleared for retry."
             exit 1
           fi
+
+  # ---------------------------------------------------------------------------
+  # Watchdog.
+  #
+  # The runtime-lab #66 incident had exactly one root cause that no job owned:
+  # a conflict-repair episode that ended badly left `opencode-conflict-repair`
+  # and `no-auto-merge` on a pull request, and every later reconciliation
+  # correctly declined to touch a pull request carrying those labels. Nothing
+  # ever asked whether the episode was still real.
+  #
+  # This job is that ask. It runs on a schedule and on demand, never checks out
+  # pull-request code, and only ever *releases* state -- it never dispatches an
+  # agent and never opens or closes a pull request. Releasing a stale lock or a
+  # stale opt-out cannot make anything worse than leaving a finished change
+  # stranded, and the trust policy still gates anything that follows.
+  # ---------------------------------------------------------------------------
+  repair-watchdog:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout trusted policy
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          # Base branch only, read-only token: this job reacts to pull-request
+          # metadata and never executes pull-request code.
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Find stale conflict-repair state
+        env:
+          # Read-only. Nothing in this phase can change the repository.
+          GH_TOKEN: ${{ github.token }}
+          CONTINUUM_BASE_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
+          CONTINUUM_REPAIR_MAX_ATTEMPTS: ${{ vars.AUTOMATION_REPAIR_MAX_ATTEMPTS || '3' }}
+        run: |
+          set -euo pipefail
+          candidates="$RUNNER_TEMP/stale.jsonl"
+          : > "$candidates"
+          now="$(date -u +%s)"
+
+          gh api --paginate "repos/$GITHUB_REPOSITORY/pulls?state=open&base=$CONTINUUM_BASE_BRANCH&per_page=100" \
+            --jq '.[] | select(.head.repo.full_name == .base.repo.full_name) | select(.head.ref | startswith("opencode/")) | [.number, .head.ref, .head.sha, ([.labels[]?.name] | join(","))] | @tsv' |
+          while IFS=$'\t' read -r pr_number head_ref head_sha labels; do
+            [[ -n "$pr_number" && -n "$head_ref" && -n "$head_sha" ]] || continue
+
+            # Only pull requests this controller could have frozen are
+            # candidates. Anything else is not its state to release.
+            case ",$labels," in
+              *,opencode-conflict-repair,*|*,no-auto-merge,*|*,opencode-repair-failed,*) ;;
+              *) continue ;;
+            esac
+
+            # The episode record this controller wrote, if any. It is the only
+            # evidence that distinguishes "a repair is running" from "a repair
+            # was abandoned", and the only evidence that a `no-auto-merge`
+            # label was set by this controller rather than by a human.
+            episodes="$RUNNER_TEMP/episodes-$pr_number.txt"
+            gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$pr_number/comments?per_page=100" \
+              --jq '.[] | select(.user.login == "'"$GITHUB_REPOSITORY_OWNER"'" or .user.login == "github-actions[bot]") | .body // ""' > "$episodes"
+            episode_state="$RUNNER_TEMP/episode-$pr_number.env"
+            python3 .github/scripts/conflict_repair.py episode \
+              --file "$episodes" --pr-number "$pr_number" > "$episode_state"
+            attempts="$(sed -n 's/^episode_attempts=//p' "$episode_state" | tail -n1)"
+            locked_head="$(sed -n 's/^episode_head=//p' "$episode_state" | tail -n1)"
+
+            # Age of the episode's last recorded attempt, taken from the marker
+            # comments' own timestamp. A lock nobody has refreshed in
+            # `CONTINUUM_REPAIR_STALE_MINUTES` is stale by definition.
+            last_marker_at="$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$pr_number/comments?per_page=100" \
+              --jq '[.[] | select(.user.login == "'"$GITHUB_REPOSITORY_OWNER"'" or .user.login == "github-actions[bot]") | select((.body // "") | contains("continuum-conflict-repair")) | .created_at] | last // ""')"
+            lock_age=0
+            if [[ -n "$last_marker_at" ]]; then
+              marker_epoch="$(date -u -d "$last_marker_at" +%s)"
+              lock_age=$(( now - marker_epoch ))
+            fi
+
+            # A repair run that is still going is not stale, no matter how old
+            # its marker is.
+            running=false
+            if [[ "$labels" == *opencode-conflict-repair* ]]; then
+              in_flight="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/opencode.yml/runs?per_page=50" \
+                --jq "[.workflow_runs[] | select(.head_branch == \"$head_ref\") | select(.status != \"completed\")] | length")"
+              if [[ "$in_flight" -gt 0 ]]; then running=true; fi
+            fi
+
+            mergeable_state="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr_number" --jq '.mergeable_state // ""')"
+            controller_marked=false
+            if grep -q 'continuum-conflict-repair' "$episodes"; then
+              controller_marked=true
+            fi
+
+            decision="$RUNNER_TEMP/watchdog-$pr_number.env"
+            python3 .github/scripts/conflict_repair.py watchdog \
+              --labels "$labels" \
+              --head-sha "$head_sha" \
+              --locked-head-sha "$locked_head" \
+              --attempts "${attempts:-0}" \
+              --max-attempts "$CONTINUUM_REPAIR_MAX_ATTEMPTS" \
+              --repair-run-in-flight "$running" \
+              --seconds-since-lock "$lock_age" \
+              --mergeable-state "$mergeable_state" \
+              --controller-marked-opt-out "$controller_marked" > "$decision"
+
+            action="$(sed -n 's/^action=//p' "$decision" | tail -n1)"
+            [[ -n "$action" && "$action" != "none" ]] || continue
+            reason="$(sed -n 's/^repair_reason=//p' "$decision" | tail -n1)"
+
+            echo "PR #$pr_number: $action -- $reason"
+            release_lock=false
+            if grep -qx 'release_lock=true' "$decision"; then release_lock=true; fi
+            record_failure=false
+            if grep -qx 'record_failure=true' "$decision"; then record_failure=true; fi
+            jq -cn \
+              --argjson pr "$pr_number" \
+              --arg action "$action" \
+              --arg reason "$reason" \
+              --arg release_lock "$release_lock" \
+              --arg record_failure "$record_failure" \
+              '{pr: $pr, action: $action, reason: $reason, release_lock: $release_lock, record_failure: $record_failure}' \
+              >> "$candidates"
+          done
+
+          count="$(grep -c . "$candidates" || true)"
+          echo "Watchdog found ${count:-0} pull request(s) in a stale conflict-repair state."
+
+      - name: Release the stale state
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT || github.token }}
+        run: |
+          set -euo pipefail
+          # The decision is already on disk from the read-only phase. This step
+          # only ever removes labels and records a failure state: it cannot
+          # dispatch an agent, push a ref, or change a pull request's content,
+          # so releasing a stale lock cannot be turned into a privileged act.
+          [[ -s "$RUNNER_TEMP/stale.jsonl" ]] || { echo "Nothing to release."; exit 0; }
+
+          while read -r row; do
+            pr="$(jq -r '.pr' <<<"$row")"
+            action="$(jq -r '.action' <<<"$row")"
+            reason="$(jq -r '.reason' <<<"$row")"
+            release_lock="$(jq -r '.release_lock' <<<"$row")"
+            record_failure="$(jq -r '.record_failure' <<<"$row")"
+
+            case "$action" in
+              release-stale-lock)
+                if [[ "$release_lock" == "true" ]]; then
+                  gh api --method DELETE \
+                    "repos/$GITHUB_REPOSITORY/issues/$pr/labels/opencode-conflict-repair" \
+                    >/dev/null 2>&1 || true
+                  echo "Released the stale conflict-repair lock on PR #$pr."
+                fi
+                ;;
+              release-stale-opt-out)
+                # Only ever removes an opt-out this controller set: the
+                # read-only phase proved a conflict-repair episode marker
+                # exists for this pull request. A human's own `no-auto-merge`
+                # has no such marker and is never touched.
+                gh api --method DELETE \
+                  "repos/$GITHUB_REPOSITORY/issues/$pr/labels/no-auto-merge" \
+                  >/dev/null 2>&1 || true
+                echo "Released the stale no-auto-merge opt-out on PR #$pr."
+                ;;
+              record-failure)
+                gh label create opencode-repair-failed --repo "$GITHUB_REPOSITORY" --color D93F0B \
+                  --description "Continuum conflict repair exhausted its attempt budget" --force >/dev/null 2>&1 || true
+                gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$pr/labels" \
+                  -f 'labels[]=opencode-repair-failed' >/dev/null 2>&1 || true
+                echo "Recorded the exhausted repair budget on PR #$pr."
+                ;;
+            esac
+
+            gh pr comment "$pr" --repo "$GITHUB_REPOSITORY" \
+              --body "Conflict-repair watchdog: ${reason} The change this pull request carries was not re-implemented; only its relationship with the base branch was in question." \
+              >/dev/null 2>&1 || echo "::warning::Could not comment on PR #$pr about the watchdog action."
+
+            if [[ "$record_failure" == "true" ]]; then
+              echo "::warning::PR #$pr: $reason"
+            fi
+          done < "$RUNNER_TEMP/stale.jsonl"

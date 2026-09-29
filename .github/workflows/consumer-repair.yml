@@ -24,6 +24,20 @@ on:
         type: number
         required: false
         default: 3
+      repair_timeout_minutes:
+        description: "Conflict-repair budget; repairs an existing change and stays independent of the task budget"
+        type: number
+        required: false
+        default: 25
+      repair_agent_timeout_seconds:
+        description: "Hard cap on the single model call inside a conflict repair"
+        type: number
+        required: false
+        default: 1200
+    outputs:
+      repair_budget_minutes:
+        description: "The budget a conflict repair of an existing change is given"
+        value: ${{ jobs.conflict-bounds.outputs.repair_budget_minutes }}
 
 permissions:
   actions: write
@@ -32,6 +46,31 @@ permissions:
   pull-requests: write
 
 jobs:
+  # The repair budget is a policy constant, not a copy of one. Resolving it
+  # through .github/scripts/conflict_repair.py keeps a single source of truth
+  # so the bound that protects a finished change can never drift upward in one
+  # workflow and not the other.
+  conflict-bounds:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      repair_budget_minutes: ${{ steps.bounds.outputs.task_timeout_minutes }}
+      repair_agent_timeout_seconds: ${{ steps.bounds.outputs.repair_agent_timeout_seconds }}
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout trusted policy
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Resolve the repair budget
+        id: bounds
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/conflict_repair.py plan --mode resolve-conflict
+
   issue-run-recovery:
     if: >-
       github.event_name == 'workflow_run' &&
@@ -149,16 +188,29 @@ jobs:
           done
 
   conflict:
+    needs: conflict-bounds
     if: github.event_name == 'pull_request_target' && github.event.pull_request.state == 'open'
     runs-on: ubuntu-latest
     timeout-minutes: 8
     env:
       GH_TOKEN: ${{ github.token }}
+      GITHUB_TOKEN: ${{ github.token }}
       OPENCODE_WORKFLOW: ${{ inputs.opencode_workflow }}
+      REPAIR_BUDGET_MINUTES: ${{ needs.conflict-bounds.outputs.repair_budget_minutes }}
+      REPAIR_AGENT_TIMEOUT_SECONDS: ${{ needs.conflict-bounds.outputs.repair_agent_timeout_seconds }}
+      MAX_ATTEMPTS: ${{ inputs.max_attempts }}
       PR_NUMBER: ${{ github.event.pull_request.number }}
       HEAD_REF: ${{ github.event.pull_request.head.ref }}
       HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
     steps:
+      - name: Checkout trusted policy
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          # Base branch only, read-only token: this is a pull_request_target job
+          # and must never touch pull-request code.
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
       - name: Dispatch conflict repair when needed
         shell: bash
         run: |
@@ -166,23 +218,27 @@ jobs:
           [[ "$HEAD_REPO" == "$GITHUB_REPOSITORY" ]] || exit 0
           [[ "$HEAD_REF" == opencode/* ]] || exit 0
 
-          gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" > /tmp/pr.json
-          MERGEABLE="$(jq -r '.mergeable_state // ""' /tmp/pr.json)"
-          if [[ "$MERGEABLE" != "dirty" ]]; then
-            echo "PR #$PR_NUMBER is not dirty; no conflict repair."
+          # Rung 1 of the ladder, attempted here because it needs no checkout
+          # and no agent credential. It is GitHub's own merge.
+          if gh api --method PUT "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/update-branch" \
+            -f "expected_head_sha=${{ github.event.pull_request.head.sha }}" >/dev/null 2>&1; then
+            echo "PR #$PR_NUMBER was updated mechanically; no repair dispatch is needed."
             exit 0
           fi
 
-          LABEL="opencode-conflict-repair"
-          gh label create "$LABEL" --repo "$GITHUB_REPOSITORY" --color B60205             --description "Continuum conflict repair in progress" 2>/dev/null || true
-
-          if gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER"               --jq '.labels[].name' | grep -Fxq "$LABEL"; then
-            echo "Conflict repair lock already exists."
-          else
-            gh issue edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --add-label "$LABEL"
-          fi
-
-          gh api --method POST             "repos/$GITHUB_REPOSITORY/actions/workflows/$OPENCODE_WORKFLOW/dispatches"             -f ref=main             -f "inputs[mode]=resolve-conflict"             -f "inputs[pr_number]=$PR_NUMBER"             -f "inputs[head_ref]=$HEAD_REF"
+          # Rung 2 and 3 live in the agent workflow, which is told which rungs
+          # are already exhausted. `rungs_ruled_out` is validated against a
+          # closed allowlist of mechanical rungs, so a payload can never make
+          # the repair re-execute the source issue.
+          gh api --method POST \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/$OPENCODE_WORKFLOW/dispatches" \
+            -f ref=main \
+            -f "inputs[mode]=resolve-conflict" \
+            -f "inputs[pr_number]=$PR_NUMBER" \
+            -f "inputs[head_ref]=$HEAD_REF" \
+            -f "inputs[rungs_ruled_out]=update-branch" \
+            -f "inputs[repair_timeout_minutes]=$REPAIR_BUDGET_MINUTES" \
+            -f "inputs[repair_agent_timeout_seconds]=$REPAIR_AGENT_TIMEOUT_SECONDS"
 
   ci:
     if: >-

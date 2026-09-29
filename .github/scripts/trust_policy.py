@@ -93,6 +93,13 @@ ALLOWED_DISPATCH_MODES = ("resolve-conflict", "ci-fix")
 #: Modes that need a run id to inspect.
 MODES_REQUIRING_RUN_ID = ("ci-fix",)
 
+#: Conflict-repair rungs the controller may declare as already tried. The list
+#: is a closed allowlist of *mechanical* rungs only: a payload can therefore
+#: skip straight past ``update-branch`` and ``replay-commits``, but it can never
+#: name anything else, and in particular it can never select a rung that
+#: re-executes the source issue. There is no such rung.
+RULABLE_OUT_RUNGS = ("update-branch", "replay-commits")
+
 #: A ref must be a plausible branch name: no option-like values (argument
 #: injection into ``gh``/``git``), no path traversal, no control characters.
 SAFE_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,180}$")
@@ -187,6 +194,10 @@ class Decision:
     run_id: int = 0
     head_ref: str = ""
     checkout_ref: str = ""
+    #: Conflict-repair rungs the dispatcher already tried. Carried through the
+    #: decision so the control plane can hand the ladder position to the
+    #: privileged job instead of the job re-deriving it from inputs.
+    ruled_out_rungs: tuple = ()
 
     def as_outputs(self) -> dict:
         return {
@@ -199,6 +210,7 @@ class Decision:
             "run_id": str(self.run_id),
             "head_ref": self.head_ref,
             "checkout_ref": self.checkout_ref,
+            "trust_ruled_out_rungs": ",".join(self.ruled_out_rungs),
         }
 
 
@@ -682,6 +694,12 @@ def validate_dispatch_shape(
             "Dispatch head_ref {!r} is not a safe agent branch.".format(head_ref),
         )
 
+    ruled_out, ruled_out_code, ruled_out_reason = validate_ruled_out_rungs(
+        inputs.get("rungs_ruled_out")
+    )
+    if ruled_out_code:
+        return deny(ruled_out_code, ruled_out_reason, mode=mode, pr_number=pr_number)
+
     return allow(
         "dispatch_shape_valid",
         "Dispatch {} names PR #{} on {}.".format(mode, pr_number, head_ref),
@@ -689,7 +707,58 @@ def validate_dispatch_shape(
         pr_number=pr_number,
         run_id=positive_int(inputs.get("run_id")),
         head_ref=head_ref,
+        ruled_out_rungs=ruled_out,
     )
+
+
+def validate_ruled_out_rungs(value) -> tuple:
+    """Validate the conflict-repair rungs a dispatch declares as already tried.
+
+    Returns ``(rungs, code, reason)`` where ``rungs`` is a de-duplicated tuple
+    in the ladder's own order. The allowlist is exactly the mechanical rungs, so
+    a dispatch can skip the free, no-model steps but can never reach a rung
+    that does something other than repair the existing change.
+
+    Anything unparseable denies. A value that is not a string at all denies too:
+    ``None`` is the legitimate "no rungs ruled out" case and is accepted, but a
+    list or mapping is not a value the workflow ever produces.
+    """
+    if value is None or value == "":
+        return (), "", ""
+    if not isinstance(value, str):
+        return (
+            (),
+            "untrusted_ruled_out_rungs",
+            "Dispatch rungs_ruled_out must be a comma-separated string, got "
+            "{!r}.".format(type(value).__name__),
+        )
+
+    tokens = [token.strip() for token in value.split(",")]
+    if any(token == "" for token in tokens):
+        return (
+            (),
+            "untrusted_ruled_out_rungs",
+            "Dispatch rungs_ruled_out {!r} contains an empty rung name.".format(value),
+        )
+
+    selected = []
+    for token in tokens:
+        if token not in RULABLE_OUT_RUNGS:
+            # Every deny returns the same 3-tuple shape: a caller that unpacks
+            # the success shape must never be handed a 2-tuple, because an
+            # exception here would crash the verification step instead of
+            # refusing the dispatch -- and a crash is not a refusal.
+            return (
+                (),
+                "untrusted_ruled_out_rungs",
+                "Dispatch rungs_ruled_out contains {!r}, which is not one of {}.".format(
+                    token, list(RULABLE_OUT_RUNGS)
+                ),
+            )
+        if token not in selected:
+            selected.append(token)
+
+    return tuple(rung for rung in RULABLE_OUT_RUNGS if rung in selected), "", ""
 
 
 def evaluate_dispatch_inputs(
@@ -744,6 +813,7 @@ def evaluate_dispatch_inputs(
         run_id=shape.run_id,
         head_ref=actual_ref,
         checkout_ref=actual_ref,
+        ruled_out_rungs=shape.ruled_out_rungs,
     )
 
 
@@ -1178,6 +1248,7 @@ def cmd_verify_dispatch(args) -> int:
         "pr_number": args.pr_number,
         "head_ref": args.head_ref,
         "run_id": args.run_id,
+        "rungs_ruled_out": getattr(args, "rungs_ruled_out", ""),
     }
     decision = validate_dispatch_shape(
         inputs, repository=repository, base_ref=args.base_ref or context["base_ref"]
@@ -1400,6 +1471,12 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--pr-number", dest="pr_number", default="")
     verify.add_argument("--head-ref", dest="head_ref", default="")
     verify.add_argument("--run-id", dest="run_id", default="")
+    verify.add_argument(
+        "--rungs-ruled-out",
+        dest="rungs_ruled_out",
+        default="",
+        help="Comma-separated mechanical repair rungs already tried",
+    )
     verify.add_argument("--actor", default="")
     verify.add_argument("--base-ref", dest="base_ref", default="")
     verify.add_argument("--repository", default="")
