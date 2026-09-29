@@ -605,6 +605,18 @@ class RepairControllerTests(WorkflowAuditBase):
         self.assertNotIn("Packaging smoke", repair)
         self.assertNotIn("Packaging smoke", self.raw["opencode-repair.yml"])
 
+    def test_retry_budget_resets_after_explicit_unpause(self):
+        for name in (
+            "issue-scheduler.yml",
+            "opencode-repair.yml",
+            "consumer-scheduler.yml",
+            "consumer-repair.yml",
+        ):
+            text = self.raw[name]
+            self.assertIn("/events", text, name)
+            self.assertIn("automation:paused", text, name)
+            self.assertIn("unlabeled", text, name)
+
     def test_privilege_boundary_changes_are_never_auto_merged(self):
         text = self.raw["auto-merge.yml"]
         self.assertIn("merge-plan", text)
