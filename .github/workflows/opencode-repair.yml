@@ -205,7 +205,7 @@ jobs:
             # scheduled to contradict it. The attempt record and a live run are
             # the evidence that a repair is actually happening.
             attempts="$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$pr_number/comments?per_page=100" \
-              --jq '.[].body // ""' \
+              --jq '.[] | select(.user.login == "'"$GITHUB_REPOSITORY_OWNER"'" or .user.login == "github-actions[bot]") | .body // ""' \
               | python3 .github/scripts/conflict_repair.py episode --pr-number "$pr_number" \
               | sed -n 's/^episode_attempts=//p' | tail -n1)"
             attempts="${attempts:-0}"
@@ -397,7 +397,7 @@ jobs:
           # label with no attempt record and no lock release is invisible to
           # every later reconciliation.
           attempts="$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100" \
-            --jq '.[].body // ""' \
+            --jq '.[] | select(.user.login == "'"$GITHUB_REPOSITORY_OWNER"'" or .user.login == "github-actions[bot]") | .body // ""' \
             | python3 .github/scripts/conflict_repair.py episode --pr-number "$PR_NUMBER" \
             | sed -n 's/^episode_attempts=//p')"
           attempts="${attempts:-0}"
@@ -890,7 +890,7 @@ jobs:
             # label was set by this controller rather than by a human.
             episodes="$RUNNER_TEMP/episodes-$pr_number.txt"
             gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$pr_number/comments?per_page=100" \
-              --jq '.[].body // ""' > "$episodes"
+              --jq '.[] | select(.user.login == "'"$GITHUB_REPOSITORY_OWNER"'" or .user.login == "github-actions[bot]") | .body // ""' > "$episodes"
             episode_state="$RUNNER_TEMP/episode-$pr_number.env"
             python3 .github/scripts/conflict_repair.py episode \
               --file "$episodes" --pr-number "$pr_number" > "$episode_state"
@@ -901,7 +901,7 @@ jobs:
             # comments' own timestamp. A lock nobody has refreshed in
             # `CONTINUUM_REPAIR_STALE_MINUTES` is stale by definition.
             last_marker_at="$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$pr_number/comments?per_page=100" \
-              --jq '[.[] | select((.body // "") | contains("continuum-conflict-repair")) | .created_at] | last // ""')"
+              --jq '[.[] | select(.user.login == "'"$GITHUB_REPOSITORY_OWNER"'" or .user.login == "github-actions[bot]") | select((.body // "") | contains("continuum-conflict-repair")) | .created_at] | last // ""')"
             lock_age=0
             if [[ -n "$last_marker_at" ]]; then
               marker_epoch="$(date -u -d "$last_marker_at" +%s)"
