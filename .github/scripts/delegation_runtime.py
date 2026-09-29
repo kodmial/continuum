@@ -123,6 +123,21 @@ def resolve_child(
     raise DelegationError("child id is not allowed by delegation.children")
 
 
+def parent_child_ids(config_path: str) -> List[str]:
+    config = load_config(config_path)
+    if config.delegation.role != DELEGATION_PARENT:
+        raise DelegationError(
+            "delegation.role must be 'parent' before child discovery"
+        )
+    return list(config.delegation.children)
+
+
+def assert_parent_allows_child(config_path: str, child_id: str) -> None:
+    children = parent_child_ids(config_path)
+    if child_id not in children:
+        raise DelegationError("child id is not allowed by delegation.children")
+
+
 def child_validation_script(config_path: str) -> str:
     config = load_config(config_path)
     if config.delegation.role != DELEGATION_CHILD:
@@ -158,6 +173,13 @@ def main(argv=None) -> int:
     validation = sub.add_parser("validation-script")
     validation.add_argument("--config", required=True)
 
+    child_ids = sub.add_parser("parent-child-ids")
+    child_ids.add_argument("--config", default=".continuum.yml")
+
+    allowed = sub.add_parser("parent-allows-child")
+    allowed.add_argument("--config", default=".continuum.yml")
+    allowed.add_argument("--child-id", required=True)
+
     args = parser.parse_args(argv)
     try:
         if args.command == "parent-plan":
@@ -182,6 +204,13 @@ def main(argv=None) -> int:
             return 0
         if args.command == "validation-script":
             sys.stdout.write(child_validation_script(args.config) + "\n")
+            return 0
+        if args.command == "parent-child-ids":
+            for child_id in parent_child_ids(args.config):
+                sys.stdout.write(child_id + "\n")
+            return 0
+        if args.command == "parent-allows-child":
+            assert_parent_allows_child(args.config, args.child_id)
             return 0
         verify_child(
             args.config,
