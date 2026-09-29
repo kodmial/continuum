@@ -176,6 +176,57 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.delegation.id, "kodmai")
         self.assertEqual(config.delegation.parent, "kodmial/runtime-lab")
         self.assertEqual(config.delegation.children, ())
+        self.assertEqual(config.delegation.validation_script, "")
+
+    def test_child_can_declare_trusted_validation_script(self):
+        config = config_module.parse_config(
+            document(
+                """
+                version: 1
+                delegation:
+                  role: child
+                  id: kodmai
+                  parent: kodmial/runtime-lab
+                  validation_script: automation/continuum-child-ci.sh
+                """
+            )
+        )
+        self.assertEqual(
+            config.delegation.validation_script,
+            "automation/continuum-child-ci.sh",
+        )
+
+    def test_validation_script_is_child_only_and_must_be_safe_shell_path(self):
+        bad = (
+            """
+            version: 1
+            delegation:
+              role: parent
+              children:
+                - kodmai
+              validation_script: automation/ci.sh
+            """,
+            """
+            version: 1
+            delegation:
+              role: child
+              id: kodmai
+              parent: kodmial/runtime-lab
+              validation_script: ../ci.sh
+            """,
+            """
+            version: 1
+            delegation:
+              role: child
+              id: kodmai
+              parent: kodmial/runtime-lab
+              validation_script: automation/ci.py
+            """,
+        )
+        for body in bad:
+            with self.subTest(body=body):
+                with self.assertRaises(config_module.ConfigError):
+                    config_module.parse_config(document(body))
 
     def test_delegation_is_disabled_by_default(self):
         config = config_module.parse_config(document("version: 1\n"))
