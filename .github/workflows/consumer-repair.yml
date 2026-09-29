@@ -59,17 +59,14 @@ jobs:
     env:
       GITHUB_TOKEN: ${{ github.token }}
     steps:
-      - name: Checkout trusted policy
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-          persist-credentials: false
+      - name: Load Continuum engine
+        uses: kodmial/continuum/.github/actions/engine-path@main
       - name: Resolve the repair budget
         id: bounds
         shell: bash
         run: |
           set -euo pipefail
-          python3 .github/scripts/conflict_repair.py plan --mode resolve-conflict
+          python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/conflict_repair.py" plan --mode resolve-conflict
 
   issue-run-recovery:
     if: >-
