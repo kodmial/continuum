@@ -881,7 +881,7 @@ class WorkflowWiringTests(unittest.TestCase):
     def test_the_agent_job_timeout_is_a_policy_output_not_a_literal(self):
         text = workflow_text(AGENT_WORKFLOW)
         self.assertIn(
-            "timeout-minutes: ${{ needs.authorize.outputs.task_timeout_minutes }}", text
+            "timeout-minutes: ${{ fromJSON(needs.authorize.outputs.task_timeout_minutes) }}", text
         )
         self.assertNotIn("timeout-minutes: 180", text)
 
