@@ -317,7 +317,7 @@ jobs:
             exit 0
           fi
 
-          git push -u origin "$BRANCH"
+          HUSKY=0 git push -u origin "$BRANCH"
           gh pr create             --repo "$GITHUB_REPOSITORY"             --base main             --head "$BRANCH"             --title "$TITLE"             --body "Implemented automatically by Continuum.\n\nCloses #${ISSUE_NUMBER}"
 
       - name: Resolve merge conflict
@@ -347,7 +347,7 @@ jobs:
             git add -A
             git commit -m "chore: resolve conflict with main"
           fi
-          git push origin "HEAD:${HEAD_REF}"
+          HUSKY=0 git push origin "HEAD:${HEAD_REF}"
 
       - name: Fix failed CI
         if: inputs.mode == 'ci-fix'
@@ -378,7 +378,7 @@ jobs:
           fi
           AFTER="$(git rev-parse HEAD)"
           if [[ "$AFTER" != "$BEFORE" ]]; then
-            git push origin "HEAD:${HEAD_REF}"
+            HUSKY=0 git push origin "HEAD:${HEAD_REF}"
             while read -r label; do
               [[ "$label" == opencode-gate-repair-* ]] || continue
               gh api --method DELETE \
