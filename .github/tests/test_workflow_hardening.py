@@ -346,6 +346,7 @@ class PermissionsTests(WorkflowAuditBase):
                 "issue-scheduler.yml/schedule",
                 "opencode-repair.yml/ci-repair",
                 "opencode-repair.yml/recover-failed-issue-run",
+                "opencode-repair.yml/repair-watchdog",
                 "opencode-repair.yml/sync-current-pr",
                 "opencode-repair.yml/sync-stale-prs",
                 "opencode.yml/opencode",
@@ -461,15 +462,35 @@ class AgentExecutionTests(WorkflowAuditBase):
             self.assertNotIn(expression, text, expression)
 
     def test_agent_tasks_have_a_substantial_bounded_runtime(self):
+        # Task execution and repair execution are different kinds of work and
+        # get different bounds. The agent job's own timeout is a policy output,
+        # not a literal, because conflict repair must not inherit the source
+        # task's runtime: that inheritance is what stranded runtime-lab #66,
+        # where a 35-minute re-run of a finished task hit the task timeout.
         self_agent = self.job("opencode.yml", "opencode")
+        self.assertEqual(
+            self_agent.get("timeout-minutes"),
+            "${{ needs.authorize.outputs.task_timeout_minutes }}",
+        )
+        self.assertIn("steps.plan.outputs.task_timeout_minutes", self.raw["opencode.yml"])
+
         consumer_agent = self.job("consumer-opencode.yml", "opencode")
-        self.assertGreaterEqual(int(self_agent.get("timeout-minutes")), 180)
         self.assertEqual(
             consumer_agent.get("timeout-minutes"),
-            "${{ inputs.task_timeout_minutes }}",
+            "${{ inputs.mode == 'issue' && inputs.task_timeout_minutes || inputs.repair_timeout_minutes }}",
         )
         consumer_inputs = self.workflows["consumer-opencode.yml"]["on"]["workflow_call"]["inputs"]
         self.assertEqual(consumer_inputs["task_timeout_minutes"]["default"], 180)
+        # The repair bound is a separate, much smaller input for the same
+        # reason: a conflict repair must not inherit the task's runtime.
+        self.assertLess(
+            consumer_inputs["repair_timeout_minutes"]["default"],
+            consumer_inputs["task_timeout_minutes"]["default"],
+        )
+        self.assertLess(
+            consumer_inputs["repair_agent_timeout_seconds"]["default"],
+            consumer_inputs["repair_timeout_minutes"]["default"] * 60,
+        )
 
     def test_issue_runs_record_durable_run_ownership_before_agent_execution(self):
         for name in ("opencode.yml", "consumer-opencode.yml"):

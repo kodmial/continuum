@@ -22,6 +22,11 @@ on:
         type: string
         required: false
         default: ""
+      rungs_ruled_out:
+        description: "Comma-separated mechanical conflict-repair rungs the controller already tried"
+        type: string
+        required: false
+        default: ""
       model:
         type: string
         required: false
@@ -31,6 +36,16 @@ on:
         type: number
         required: false
         default: 180
+      repair_timeout_minutes:
+        description: "Maximum runtime for one conflict repair; repairs an existing change, so this stays small and independent of task_timeout_minutes"
+        type: number
+        required: false
+        default: 25
+      repair_agent_timeout_seconds:
+        description: "Hard cap on the single model call inside a conflict repair"
+        type: number
+        required: false
+        default: 1200
       opencode_distribution:
         description: "OpenCode binary source: upstream or github-release"
         type: string
@@ -85,7 +100,11 @@ jobs:
   opencode:
     if: contains(fromJSON('["issue","resolve-conflict","ci-fix"]'), inputs.mode)
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ inputs.task_timeout_minutes }}
+    # Conflict repair repairs a change that already exists, so it is bounded by
+    # its own small constant rather than inheriting the source task's runtime.
+    # That separation is what keeps a long task from deciding how long
+    # repairing its own merge conflict may take.
+    timeout-minutes: ${{ inputs.mode == 'issue' && inputs.task_timeout_minutes || inputs.repair_timeout_minutes }}
     concurrency:
       group: continuum-opencode-${{ inputs.mode }}-${{ inputs.issue_number || inputs.pr_number || github.run_id }}
       cancel-in-progress: false
@@ -320,34 +339,134 @@ jobs:
           git push -u origin "$BRANCH"
           gh pr create             --repo "$GITHUB_REPOSITORY"             --base main             --head "$BRANCH"             --title "$TITLE"             --body "Implemented automatically by Continuum.\n\nCloses #${ISSUE_NUMBER}"
 
-      - name: Resolve merge conflict
-        if: inputs.mode == 'resolve-conflict'
+      # Conflict repair repairs the change that already exists. It never
+      # re-executes the source issue, and it never spends model time unless git
+      # itself cannot finish the job.
+      - name: Replay the pull request commits onto main
+        id: replay
+        if: inputs.mode == 'resolve-conflict' && !contains(inputs.rungs_ruled_out, 'replay-commits')
         env:
           PR_NUMBER: ${{ inputs.pr_number }}
           HEAD_REF: ${{ inputs.head_ref }}
         shell: bash
         run: |
           set -euo pipefail
+          if [[ ! "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "::error::Invalid pull request number."
+            exit 1
+          fi
           git fetch origin main --quiet
+          ORIGINAL_HEAD="$(git rev-parse HEAD)"
+          echo "REPAIR_ORIGINAL_HEAD=$ORIGINAL_HEAD" >> "$GITHUB_ENV"
+
+          # Rung 2 of the ladder: replay the existing commits onto the current
+          # base head. `--force-with-lease` makes the push a compare-and-swap
+          # against the exact head this run verified, so a concurrent push fails
+          # the step instead of being silently overwritten. Nothing from either
+          # side is discarded.
+          if git rebase --rebase-merges origin/main; then
+            git push --force-with-lease="refs/heads/${HEAD_REF}:${ORIGINAL_HEAD}" origin "HEAD:${HEAD_REF}"
+            echo "REPAIR_OUTCOME=replayed" >> "$GITHUB_ENV"
+            echo "Replayed the existing commits onto main; no model was invoked."
+            exit 0
+          fi
+
+          # A conflict here is this rung's expected result, not a step failure:
+          # the next rung handles it. Drop the half-finished rebase so the
+          # worktree is exactly the finished change again.
+          git rebase --abort || git rebase --quit || true
+          echo "REPAIR_OUTCOME=replay_conflicted" >> "$GITHUB_ENV"
+          # Published as a step output so the next rung can be gated on it. A
+          # dispatch that starts at rung 2 still reaches rung 3 when git cannot
+          # finish, instead of spending a dispatch to learn that.
+          echo "outcome=replay_conflicted" >> "$GITHUB_OUTPUT"
+          echo "::notice::Mechanical replay could not merge main; the remaining conflicting hunks are delegated."
+
+      - name: Resolve the conflicting hunks
+        if: >-
+          inputs.mode == 'resolve-conflict' &&
+          (contains(inputs.rungs_ruled_out, 'replay-commits') ||
+           steps.replay.outputs.outcome == 'replay_conflicted')
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_REF: ${{ inputs.head_ref }}
+          REPAIR_AGENT_TIMEOUT_SECONDS: ${{ inputs.repair_agent_timeout_seconds }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "::error::Invalid pull request number."
+            exit 1
+          fi
+          git fetch origin main --quiet
+          BASE_SHA="$(git rev-parse origin/main)"
+          echo "REPAIR_ORIGINAL_HEAD=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+          # Rung 3 of the ladder, and the only rung that calls a model. A merge
+          # git can complete unaided completes here with no model call at all.
+          if git merge --no-edit "$BASE_SHA"; then
+            git push origin "HEAD:${HEAD_REF}"
+            echo "REPAIR_OUTCOME=merged_automatically" >> "$GITHUB_ENV"
+            echo "Merged main into the pull request mechanically; no model was invoked."
+            exit 0
+          fi
+
+          echo "REPAIR_OUTCOME=hunks_delegated" >> "$GITHUB_ENV"
           PROMPT="$(cat <<EOF
-          Resolve every merge conflict between pull request #${PR_NUMBER} on branch
-          ${HEAD_REF} and current origin/main.
+          Resolve the merge conflict between pull request #${PR_NUMBER} and current origin/main.
+
+          This is a repair of a change that is already finished, not a new task. The
+          implementation this pull request carries is complete; only the merge is
+          unfinished. Do not redesign, extend, or re-implement anything, and do not
+          start over from the base branch.
 
           Requirements:
+          - Resolve the conflict markers so the merge completes, preserving the
+            intended behavior from both the pull request and the base branch.
+          - Keep the pull request's version where the conflict is only ordering or
+            formatting; take the base's version where the base changed the same
+            region for an unrelated reason.
+          - Do not discard unrelated changes from either side.
           - Work only on the current checked-out PR branch.
-          - Merge origin/main into this branch; do not rebase or force-push.
-          - Preserve intended behavior from both sides.
+          - Do not rebase, force-push, or reset away either side.
           - Run relevant tests after resolving conflicts.
-          - Do not create another branch or pull request.
-          - Commit the resolution if needed; do not push.
+          - Stage every file you resolved and complete the merge with
+            \`git commit --no-edit\`.
+          - Keep all comments and commit messages in English.
           EOF
           )"
-          opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
+          timeout --signal=TERM "$REPAIR_AGENT_TIMEOUT_SECONDS" \
+            opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
           if [[ -n "$(git status --porcelain)" ]]; then
             git add -A
-            git commit -m "chore: resolve conflict with main"
+            git commit --no-edit >/dev/null 2>&1 \
+              || git commit -m "chore: resolve merge conflict with main"
           fi
           git push origin "HEAD:${HEAD_REF}"
+          echo "REPAIR_OUTCOME=hunks_resolved" >> "$GITHUB_ENV"
+
+      # Runs on success and on failure. A repair that dies mid-flight must not
+      # leave the caller believing the pull request is still reserved, because
+      # a lock with nothing behind it is exactly what makes a finished change
+      # invisible to every later reconciliation.
+      - name: Record the conflict-repair outcome
+        if: always() && inputs.mode == 'resolve-conflict'
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+          REPAIR_OUTCOME: ${{ env.REPAIR_OUTCOME }}
+          REPAIR_ORIGINAL_HEAD: ${{ env.REPAIR_ORIGINAL_HEAD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          outcome="${REPAIR_OUTCOME:-not_started}"
+          case "$outcome" in
+            replayed|merged_automatically|hunks_resolved)
+              echo "Conflict repair finished with outcome '$outcome'; the pull request was repaired in place."
+              ;;
+            *)
+              echo "::error::Conflict repair of PR #$PR_NUMBER did not complete (outcome=$outcome). The pull request stays reconcilable; no replacement or opt-out was published."
+              ;;
+          esac
 
       - name: Fix failed CI
         if: inputs.mode == 'ci-fix'

@@ -1045,5 +1045,77 @@ class FixtureUsageTests(unittest.TestCase):
         self.assertEqual(required - on_disk, set())
 
 
+class RuledOutRungTests(unittest.TestCase):
+    """`rungs_ruled_out` tells the repair ladder where to start.
+
+    It is attacker-reachable input on a public repository, so the interesting
+    cases are the malformed ones. Each must be *refused*: a raised exception
+    here would abort the read-only verification step instead of declining the
+    dispatch, and a step that crashes is not a gate.
+    """
+
+    BASE = {
+        "mode": "resolve-conflict",
+        "pr_number": "66",
+        "head_ref": "opencode/issue56-research",
+    }
+
+    def test_a_refusal_returns_the_same_shape_as_an_allowance(self):
+        for value in (
+            "issue",
+            "re-run-the-issue",
+            "update-branch,issue",
+            "UPDATE-BRANCH",
+            "update-branch,",
+            ",update-branch",
+            "update-branch,,replay-commits",
+            ["update-branch"],
+            {"update-branch": True},
+            7,
+            "update-branch replay-commits",
+            "update-branch\nissue",
+        ):
+            with self.subTest(value=value):
+                result = trust_policy.validate_ruled_out_rungs(value)
+                self.assertEqual(
+                    len(result),
+                    3,
+                    "a refusal must unpack as (rungs, code, reason): {!r}".format(value),
+                )
+                rungs, code, reason = result
+                self.assertEqual(rungs, ())
+                self.assertEqual(code, "untrusted_ruled_out_rungs")
+                self.assertTrue(reason)
+
+    def test_nothing_to_declare_is_allowed(self):
+        for value in (None, ""):
+            self.assertEqual(trust_policy.validate_ruled_out_rungs(value), ((), "", ""))
+
+    def test_the_mechanical_rungs_are_allowed_in_any_order_and_deduplicated(self):
+        self.assertEqual(
+            trust_policy.validate_ruled_out_rungs("replay-commits,update-branch"),
+            (("update-branch", "replay-commits"), "", ""),
+        )
+        self.assertEqual(
+            trust_policy.validate_ruled_out_rungs("update-branch,update-branch"),
+            (("update-branch",), "", ""),
+        )
+
+    def test_the_allowlist_cannot_name_a_model_rung_or_a_task_rerun(self):
+        # `resolve-hunks` is a real rung but the controller is what chooses it:
+        # letting a payload pick it would skip the mechanical work for free.
+        self.assertNotIn("resolve-hunks", trust_policy.RULABLE_OUT_RUNGS)
+        _, code, _ = trust_policy.validate_ruled_out_rungs("resolve-hunks")
+        self.assertEqual(code, "untrusted_ruled_out_rungs")
+
+    def test_a_refused_value_propagates_through_the_dispatch_decision(self):
+        decision = trust_policy.validate_dispatch_shape(
+            dict(self.BASE, rungs_ruled_out="issue"), repository="kodmial/continuum"
+        )
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.code, "untrusted_ruled_out_rungs")
+        self.assertEqual(decision.ruled_out_rungs, ())
+
+
 if __name__ == "__main__":
     unittest.main()
