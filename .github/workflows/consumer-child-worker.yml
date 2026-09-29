@@ -193,7 +193,7 @@ jobs:
           <!-- continuum-child-accepted -->
           Closes #$TASK_NUMBER
           EOF
-)"
+          )"
           pr_url="$(
             gh pr create --repo "$child_repo" --base main --head "$branch"               --title "$issue_title" --body "$pr_body" 2>/dev/null
           )"
