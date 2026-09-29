@@ -137,28 +137,28 @@ Independent delegated review/repair for child task #$TASK_NUMBER started on PR #
           mkdir -p "$(dirname "$review_file")"
           prompt="$RUNNER_TEMP/continuum-child-review.txt"
           cat >"$prompt" <<EOF
-Independently review and, if necessary, repair delegated child task #$TASK_NUMBER.
-
-Rules:
-- Treat the full child issue body below as authoritative.
-- Do not trust the implementation summary or prior green-looking tests.
-- Compare the PR branch against origin/$base_ref and inspect every relevant behavioral change.
-- Re-run relevant tests and required live/integration acceptance checks.
-- Fix defects directly on this PR branch and rerun verification.
-- Never expose credentials or secret values.
-- Do not upload child source, diffs, issue text, logs, or transcripts to the parent repository.
-- You may make local commits. Do not push; the outer review job pushes the branch.
-- Before finishing, create or update exactly: $review_file
-- Record findings, repairs, verification executed, observed results, remaining risks.
-- End with a standalone line exactly: Review: PASS
-- Write Review: PASS only when the implementation satisfies the issue.
-
---- CHILD ISSUE TITLE ---
-$issue_title
-
---- CHILD ISSUE BODY ---
-$issue_body
-EOF
+          Independently review and, if necessary, repair delegated child task #$TASK_NUMBER.
+          
+          Rules:
+          - Treat the full child issue body below as authoritative.
+          - Do not trust the implementation summary or prior green-looking tests.
+          - Compare the PR branch against origin/$base_ref and inspect every relevant behavioral change.
+          - Re-run relevant tests and required live/integration acceptance checks.
+          - Fix defects directly on this PR branch and rerun verification.
+          - Never expose credentials or secret values.
+          - Do not upload child source, diffs, issue text, logs, or transcripts to the parent repository.
+          - You may make local commits. Do not push; the outer review job pushes the branch.
+          - Before finishing, create or update exactly: $review_file
+          - Record findings, repairs, verification executed, observed results, remaining risks.
+          - End with a standalone line exactly: Review: PASS
+          - Write Review: PASS only when the implementation satisfies the issue.
+          
+          --- CHILD ISSUE TITLE ---
+          $issue_title
+          
+          --- CHILD ISSUE BODY ---
+          $issue_body
+          EOF
 
           accepted=false
           for pass in $(seq 1 "$MAX_REVIEW_PASSES"); do
@@ -166,11 +166,11 @@ EOF
             cp "$prompt" "$pass_prompt"
             if [[ "$pass" -gt 1 ]]; then
               cat >>"$pass_prompt" <<EOF
-
-Continuation review pass $pass:
-- Continue from the existing working tree and prior transcript at $transcript.
-- Repair remaining blockers, rerun verification, and update $review_file.
-EOF
+          
+          Continuation review pass $pass:
+          - Continue from the existing working tree and prior transcript at $transcript.
+          - Repair remaining blockers, rerun verification, and update $review_file.
+          EOF
             fi
             set +e
             opencode run --auto --model "$OPENCODE_MODEL" "$(cat "$pass_prompt")" >"$transcript" 2>&1
