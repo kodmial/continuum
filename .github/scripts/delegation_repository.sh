@@ -13,21 +13,28 @@ parent_children="${PARENT_CHILDREN:-}"
 parent_child_ids() {
   if [[ -n "$parent_role" || -n "$parent_children" ]]; then
     python3 "$relation" parent-variable-ids       --role "$parent_role"       --children-json "$parent_children"
-  else
-    python3 "$relation" parent-child-ids --config "$parent_config"
+    return
   fi
+
+  local variables_json role children
+  variables_json="$(repository_variables "$GITHUB_REPOSITORY")"
+  role="$(variable_value "$variables_json" CONTINUUM_ROLE)"
+  children="$(variable_value "$variables_json" CONTINUUM_CHILDREN)"
+  if [[ -n "$role" || -n "$children" ]]; then
+    python3 "$relation" parent-variable-ids       --role "$role"       --children-json "$children"
+    return
+  fi
+
+  python3 "$relation" parent-child-ids --config "$parent_config"
 }
 
 assert_parent_allows_child() {
   local child_id="$1"
-  if [[ -n "$parent_role" || -n "$parent_children" ]]; then
-    parent_child_ids | grep -Fxq "$child_id" || {
-      echo "::error::Child id is not allowed by CONTINUUM_CHILDREN." >&2
-      return 2
-    }
-  else
-    python3 "$relation" parent-allows-child       --config "$parent_config"       --child-id "$child_id"
+  if parent_child_ids | grep -Fxq "$child_id"; then
+    return 0
   fi
+  echo "::error::Child id is not allowed by CONTINUUM_CHILDREN." >&2
+  return 2
 }
 
 repository_variables() {
