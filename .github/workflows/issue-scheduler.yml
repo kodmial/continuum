@@ -247,6 +247,22 @@ jobs:
               core.warning('Paused issue #' + issueNumber + ': ' + reason);
             }
 
+            async function retryEpochStartedAt(issueNumber) {
+              const events = await github.paginate(
+                'GET /repos/{owner}/{repo}/issues/{issue_number}/events',
+                {owner, repo, issue_number: issueNumber, per_page: 100}
+              );
+              const resets = events
+                .filter(event =>
+                  event.event === 'unlabeled' &&
+                  event.label?.name === pausedLabel &&
+                  event.created_at
+                )
+                .map(event => new Date(event.created_at).getTime())
+                .filter(Number.isFinite);
+              return resets.length ? Math.max(...resets) : 0;
+            }
+
             // A closed OpenCode PR is authoritative:
             // - merged means the implementation is done -> close the issue;
             // - closed without merge means the attempt was rejected/stopped ->
@@ -404,8 +420,12 @@ jobs:
                   per_page: 100,
                 }
               );
+              const epochStartedAt = await retryEpochStartedAt(issueNumber);
               const dispatches = comments
                 .filter(comment => (comment.body || '').includes(dispatchMarker))
+                .filter(comment =>
+                  new Date(comment.created_at).getTime() >= epochStartedAt
+                )
                 .sort(
                   (a, b) =>
                     new Date(a.created_at).getTime() -
