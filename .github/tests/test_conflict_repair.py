@@ -949,6 +949,27 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertIn("inputs[rungs_ruled_out]=update-branch", text)
         self.assertIn("--rungs-ruled-out update-branch", text)
 
+    def test_episode_accounting_ignores_untrusted_comment_authors(self):
+        trusted_filter = (
+            'select(.user.login == "'"$GITHUB_REPOSITORY_OWNER"'" '
+            'or .user.login == "github-actions[bot]")'
+        )
+        agent = workflow_text(AGENT_WORKFLOW)
+        repair = workflow_text(REPAIR_WORKFLOW)
+
+        # The privileged agent writes outcome markers with the owner's PAT;
+        # the metadata controller writes attempt markers with github.token.
+        # Public PR commenters are data, not repair state.
+        self.assertIn(trusted_filter, agent)
+        self.assertGreaterEqual(repair.count(trusted_filter), 4)
+        self.assertNotIn(
+            '--jq \' .[].body // "" \'',
+            repair.replace("'", " ' "),
+        )
+        watchdog = repair[repair.index("repair-watchdog:") :]
+        self.assertIn(trusted_filter, watchdog)
+        self.assertIn("continuum-conflict-repair", watchdog)
+
     def test_the_outcome_step_runs_even_when_the_repair_fails(self):
         text = workflow_text(AGENT_WORKFLOW)
         self.assertIn(
