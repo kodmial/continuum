@@ -331,7 +331,7 @@ class PermissionsTests(WorkflowAuditBase):
                 # reaches the pull_request-triggered jobs.
                 pat_jobs = []
                 for job_name, job in (document.get("jobs") or {}).items():
-                    if "secrets.TAP_PAT" in yaml.safe_dump(job):
+                    if "secrets.TAP_PAT" in json.dumps(job):
                         pat_jobs.append(job_name)
                 self.assertEqual(pat_jobs, ["sync-stale-prs"])
                 condition = str(document["jobs"]["sync-stale-prs"].get("if") or "")
@@ -452,6 +452,20 @@ class PullRequestTargetTests(WorkflowAuditBase):
                         self.assertIn("check-token", run, label)
                         for verb in WRITE_CALLS:
                             self.assertNotIn(verb, run, "{}: {}".format(label, verb))
+                        continue
+                    if label == "opencode-repair.yml/sync-stale-prs":
+                        # This job is unreachable from pull-request events and
+                        # exists specifically to make trusted base-sync writes
+                        # emit a real synchronize/CI event. Its job-level gate
+                        # is asserted in the credential reachability test.
+                        condition = str(job.get("if") or "")
+                        self.assertIn("github.event_name == 'workflow_run'", condition)
+                        self.assertIn("github.event.workflow_run.event == 'push'", condition)
+                        self.assertIn("github.event.workflow_run.conclusion == 'success'", condition)
+                        self.assertIn(
+                            "github.event.workflow_run.head_branch == github.event.repository.default_branch",
+                            condition,
+                        )
                         continue
                     self.assertNotIn("secrets.TAP_PAT", block, "{}: {}".format(label, step.get("name")))
                     self.assertNotIn("secrets.", run, "{}: {}".format(label, step.get("name")))
