@@ -60,7 +60,7 @@ jobs:
       GITHUB_TOKEN: ${{ github.token }}
     steps:
       - name: Load Continuum engine
-        uses: kodmial/continuum/.github/actions/engine-path@main
+        uses: kodmial/continuum/.github/actions/engine-path@39ca6dc798f2201390c8fdef0395157f588657ec
       - name: Resolve the repair budget
         id: bounds
         shell: bash
