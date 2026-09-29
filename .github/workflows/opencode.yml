@@ -258,6 +258,7 @@ jobs:
       # when the prompt says not to. Plain "opencode run" works in this already
       # checked-out PR branch and has no built-in PR-creation lifecycle.
       - name: Install OpenCode CLI for automated repair
+        id: repair_opencode_runtime
         if: github.event_name == 'workflow_dispatch'
         run: |
           set -euo pipefail
@@ -625,6 +626,7 @@ jobs:
           # controller releases the lock on timeout so a bounded retry can
           # happen.
           REPAIR_AGENT_TIMEOUT_SECONDS: ${{ needs.authorize.outputs.repair_agent_timeout_seconds }}
+          OPENCODE_RUNTIME_SHA256: ${{ steps.repair_opencode_runtime.outputs.runtime_sha256 }}
         run: |
           set -euo pipefail
           [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::Invalid pull request number."; exit 1; }
@@ -695,12 +697,9 @@ jobs:
           - Keep all comments and commit messages in English.
           EOF
           )
+          python3 .github/scripts/opencode_runtime.py verify --expected-sha256 "$OPENCODE_RUNTIME_SHA256"
           timeout --signal=TERM "$REPAIR_AGENT_TIMEOUT_SECONDS" \
-            # Point of use: re-read the digest recorded at install time, so
-          # the process about to start is the one that was verified rather
-          # than whatever PATH happens to resolve at this moment.
-          python3 .github/scripts/opencode_runtime.py verify
-          opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
+            opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
 
           if [[ -n "$(git status --porcelain)" ]]; then
             git add -A
@@ -725,6 +724,7 @@ jobs:
           PR_NUMBER: ${{ needs.authorize.outputs.pr_number }}
           RUN_ID: ${{ needs.authorize.outputs.run_id }}
           HEAD_REF: ${{ needs.authorize.outputs.head_ref }}
+          OPENCODE_RUNTIME_SHA256: ${{ steps.repair_opencode_runtime.outputs.runtime_sha256 }}
         run: |
           set -euo pipefail
           [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::Invalid pull request number."; exit 1; }
@@ -761,7 +761,7 @@ jobs:
           # Point of use: re-read the digest recorded at install time, so
           # the process about to start is the one that was verified rather
           # than whatever PATH happens to resolve at this moment.
-          python3 .github/scripts/opencode_runtime.py verify
+          python3 .github/scripts/opencode_runtime.py verify --expected-sha256 "$OPENCODE_RUNTIME_SHA256"
           opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
           AFTER_SHA=$(git rev-parse HEAD)
 
