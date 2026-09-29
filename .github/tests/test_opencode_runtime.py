@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Tests for OpenCode point-of-use executable identity."""
-import hashlib, os, pathlib, stat, subprocess, sys, tempfile, textwrap, unittest
+import hashlib, os, pathlib, re, stat, subprocess, sys, tempfile, textwrap, unittest
 import yaml
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -11,6 +11,10 @@ import opencode_runtime  # noqa: E402
 
 SCRIPT = SCRIPTS / "opencode_runtime.py"
 NAMES = ("opencode.yml", "consumer-opencode.yml")
+INSTALL_RE = re.compile(r'opencode_runtime\.py["\']?\s+install')
+VERIFY_RE = re.compile(
+    r'opencode_runtime\.py["\']?\s+verify\s+--expected-sha256\s+"\$OPENCODE_RUNTIME_SHA256"'
+)
 
 def digest(path):
     return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
@@ -102,7 +106,7 @@ def steps(name):
 class WorkflowTests(unittest.TestCase):
     def test_install_steps_are_named_output_producers(self):
         for name in NAMES:
-            found = [s for s in steps(name) if "opencode_runtime.py install" in (s.get("run") or "")]
+            found = [s for s in steps(name) if INSTALL_RE.search(s.get("run") or "")]
             self.assertTrue(found, name)
             for step in found:
                 self.assertTrue(step.get("id"), "{} {}".format(name, step.get("name")))
@@ -116,9 +120,9 @@ class WorkflowTests(unittest.TestCase):
                 identity = str((step.get("env") or {}).get("OPENCODE_RUNTIME_SHA256") or "")
                 self.assertIn("steps.", identity)
                 self.assertIn("outputs.runtime_sha256", identity)
-                guard = 'opencode_runtime.py verify --expected-sha256 "$OPENCODE_RUNTIME_SHA256"'
-                self.assertIn(guard, run)
-                self.assertLess(run.index(guard), run.index("opencode run"))
+                guard = VERIFY_RE.search(run)
+                self.assertIsNotNone(guard, name)
+                self.assertLess(guard.start(), run.index("opencode run"))
                 self.assertNotRegex(run, r"timeout[^\n]*\\\s*\n\s*#")
 
     def test_github_state_is_not_used_for_cross_step_identity(self):
