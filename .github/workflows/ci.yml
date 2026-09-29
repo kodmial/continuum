@@ -53,7 +53,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          allowed='^(auto-merge|ci|issue-scheduler|review-queue|opencode|opencode-repair|consumer-scheduler|consumer-opencode|consumer-repair|consumer-auto-merge|release-bun-binary)\.ya?ml$'
+          allowed='^(auto-merge|ci|issue-scheduler|review-queue|opencode|opencode-repair|consumer-scheduler|consumer-opencode|consumer-repair|consumer-auto-merge|consumer-child-dispatcher|consumer-child-worker|consumer-child-review|release-bun-binary)\.ya?ml$'
           bad=0
           while IFS= read -r file; do
             base="$(basename "$file")"
@@ -100,6 +100,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 .github/scripts/test_continuum_config.py
+          PYTHONPATH=.github/scripts python3 .github/scripts/test_delegation_runtime.py
 
       - name: Resolve the repository configuration as a consumer would
         shell: bash

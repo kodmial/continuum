@@ -162,7 +162,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
       - name: Load Continuum engine
-        uses: kodmial/continuum/.github/actions/engine-path@main
+        uses: kodmial/continuum/.github/actions/engine-path@39ca6dc798f2201390c8fdef0395157f588657ec
 
       - name: Validate OpenCode distribution
         shell: bash

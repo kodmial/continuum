@@ -87,6 +87,9 @@ AGENT_PLANE = (
 #: tokenless privileged checkout.
 NOT_AGENT_PLANE = (
     "consumer-auto-merge.yml",
+    "consumer-child-dispatcher.yml",
+    "consumer-child-review.yml",
+    "consumer-child-worker.yml",
     "consumer-opencode.yml",
     "consumer-repair.yml",
     "consumer-scheduler.yml",

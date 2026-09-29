@@ -1,0 +1,6 @@
+version: 1
+
+delegation:
+  role: child
+  id: child-a
+  parent: owner/parent-repository

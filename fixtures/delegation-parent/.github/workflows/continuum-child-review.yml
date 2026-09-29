@@ -1,0 +1,29 @@
+name: Child review
+run-name: "Child review [${{ inputs.child_id }}] #${{ inputs.task_number }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      child_id:
+        type: string
+        required: true
+      task_number:
+        type: string
+        required: true
+      pr_number:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    uses: kodmial/continuum/.github/workflows/consumer-child-review.yml@main
+    with:
+      child_id: ${{ inputs.child_id }}
+      task_number: ${{ inputs.task_number }}
+      pr_number: ${{ inputs.pr_number }}
+    secrets:
+      CHILD_RUNTIME_TOKEN: ${{ secrets.CONTINUUM_CHILD_TOKEN }}
+      CHILD_RUNTIME_REPOSITORIES: ${{ secrets.CONTINUUM_CHILD_REPOSITORIES }}

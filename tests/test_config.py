@@ -142,6 +142,95 @@ class ConfigTests(unittest.TestCase):
         fallback = config_module.load_optional_config("/nonexistent/.continuum.yml")
         self.assertEqual(fallback.review.provider, config_module.PROVIDER_NONE)
 
+    def test_parent_delegation_uses_opaque_child_ids(self):
+        config = config_module.parse_config(
+            document(
+                """
+                version: 1
+                delegation:
+                  role: parent
+                  children:
+                    - kodmai
+                    - docs
+                """
+            )
+        )
+        self.assertEqual(config.delegation.role, config_module.DELEGATION_PARENT)
+        self.assertEqual(config.delegation.children, ("kodmai", "docs"))
+        self.assertEqual(config.delegation.parent, "")
+        self.assertEqual(config.delegation.id, "")
+
+    def test_child_delegation_declares_parent_and_identity(self):
+        config = config_module.parse_config(
+            document(
+                """
+                version: 1
+                delegation:
+                  role: child
+                  id: kodmai
+                  parent: kodmial/runtime-lab
+                """
+            )
+        )
+        self.assertEqual(config.delegation.role, config_module.DELEGATION_CHILD)
+        self.assertEqual(config.delegation.id, "kodmai")
+        self.assertEqual(config.delegation.parent, "kodmial/runtime-lab")
+        self.assertEqual(config.delegation.children, ())
+
+    def test_delegation_is_disabled_by_default(self):
+        config = config_module.parse_config(document("version: 1\n"))
+        self.assertEqual(config.delegation.role, config_module.DELEGATION_NONE)
+        self.assertFalse(config.delegation.enabled)
+
+    def test_parent_requires_nonempty_unique_child_allowlist(self):
+        for body in (
+            "version: 1\ndelegation:\n  role: parent\n",
+            "version: 1\ndelegation:\n  role: parent\n  children: []\n",
+            "version: 1\ndelegation:\n  role: parent\n  children:\n    - kodmai\n    - kodmai\n",
+        ):
+            with self.subTest(body=body):
+                with self.assertRaises(config_module.ConfigError):
+                    config_module.parse_config(body)
+
+    def test_child_requires_exact_parent_repository(self):
+        for body in (
+            "version: 1\ndelegation:\n  role: child\n  id: kodmai\n",
+            "version: 1\ndelegation:\n  role: child\n  id: kodmai\n  parent: not-a-repo\n",
+            "version: 1\ndelegation:\n  role: child\n  id: bad/id\n  parent: owner/repo\n",
+        ):
+            with self.subTest(body=body):
+                with self.assertRaises(config_module.ConfigError):
+                    config_module.parse_config(body)
+
+    def test_roles_are_exclusive(self):
+        with self.assertRaises(config_module.ConfigError):
+            config_module.parse_config(
+                document(
+                    """
+                    version: 1
+                    delegation:
+                      role: parent
+                      children:
+                        - kodmai
+                      parent: owner/other
+                    """
+                )
+            )
+        with self.assertRaises(config_module.ConfigError):
+            config_module.parse_config(
+                document(
+                    """
+                    version: 1
+                    delegation:
+                      role: child
+                      id: kodmai
+                      parent: owner/parent
+                      children:
+                        - nested
+                    """
+                )
+            )
+
     def test_repository_configuration_is_valid(self):
         config = config_module.load_config(".continuum.yml")
         self.assertEqual(config.review.provider, config_module.PROVIDER_NONE)

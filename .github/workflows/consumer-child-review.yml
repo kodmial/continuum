@@ -1,0 +1,218 @@
+name: Continuum reusable child review
+
+on:
+  workflow_call:
+    inputs:
+      child_id:
+        type: string
+        required: true
+      task_number:
+        type: string
+        required: true
+      pr_number:
+        type: string
+        required: true
+      model:
+        type: string
+        required: false
+        default: opencode/big-pickle
+      max_review_passes:
+        type: number
+        required: false
+        default: 3
+      engine_ref:
+        type: string
+        required: false
+        default: main
+    secrets:
+      CHILD_RUNTIME_TOKEN:
+        required: true
+      CHILD_RUNTIME_REPOSITORIES:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    concurrency:
+      group: continuum-child-review-${{ inputs.child_id }}-${{ inputs.task_number }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ secrets.CHILD_RUNTIME_TOKEN }}
+      GITHUB_TOKEN: ${{ secrets.CHILD_RUNTIME_TOKEN }}
+      CHILD_REPOSITORIES: ${{ secrets.CHILD_RUNTIME_REPOSITORIES }}
+      CHILD_ID: ${{ inputs.child_id }}
+      TASK_NUMBER: ${{ inputs.task_number }}
+      PR_NUMBER: ${{ inputs.pr_number }}
+      OPENCODE_MODEL: ${{ inputs.model }}
+      MAX_REVIEW_PASSES: ${{ inputs.max_review_passes }}
+      OPENCODE_CONFIG_CONTENT: '{"permission":{"bash":{"*":"allow","git *":"allow","git push *":"deny"}}}'
+    steps:
+      - name: Checkout parent control plane
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout Continuum engine
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: kodmial/continuum
+          ref: ${{ inputs.engine_ref }}
+          path: .continuum-engine
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Export Continuum engine root
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "CONTINUUM_ENGINE_ROOT=$GITHUB_WORKSPACE/.continuum-engine" >> "$GITHUB_ENV"
+
+      - name: Review and repair child task
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$TASK_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::Invalid task number."; exit 2; }
+          [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::Invalid pull request number."; exit 2; }
+
+          export PYTHONPATH="$CONTINUUM_ENGINE_ROOT/src"
+          relation="$CONTINUUM_ENGINE_ROOT/.github/scripts/delegation_runtime.py"
+          child_repo="$(
+            python3 "$relation" resolve-child               --config .continuum.yml               --repository-map-json "$CHILD_REPOSITORIES"               --child-id "$CHILD_ID"
+          )"
+
+          child_config="$RUNNER_TEMP/continuum-child.yml"
+          gh api "repos/$child_repo/contents/.continuum.yml" --jq '.content' 2>/dev/null             | tr -d '\n' | base64 -d >"$child_config"
+          python3 "$relation" verify-child             --config "$child_config"             --child-id "$CHILD_ID"             --parent-repository "$GITHUB_REPOSITORY"
+
+          pr_state="$(gh pr view "$PR_NUMBER" --repo "$child_repo" --json state --jq '.state' 2>/dev/null || true)"
+          [[ "$pr_state" == "OPEN" ]] || exit 0
+
+          workdir="$RUNNER_TEMP/continuum-child-review"
+          transcript="$RUNNER_TEMP/continuum-child-review.log"
+          review_file="automation/runtime-results/task-${TASK_NUMBER}-review.md"
+
+          review_started="<!-- continuum-child-review-started --> Independent delegated review/repair for child task #$TASK_NUMBER started on PR #$PR_NUMBER."
+          gh issue comment "$TASK_NUMBER" --repo "$child_repo" --body "$review_started" >/dev/null 2>&1 || true
+
+          pr_json="$(gh pr view "$PR_NUMBER" --repo "$child_repo" --json headRefName,baseRefName 2>/dev/null)"
+          head_ref="$(jq -r '.headRefName' <<<"$pr_json")"
+          base_ref="$(jq -r '.baseRefName' <<<"$pr_json")"
+          if [[ "$head_ref" != continuum-child/task-"$TASK_NUMBER"-* &&
+                "$head_ref" != runtime-worker/task-"$TASK_NUMBER"-* ]]; then
+            echo "::error::PR does not belong to the delegated child worker."
+            exit 3
+          fi
+
+          gh auth setup-git >/dev/null 2>&1
+          rm -rf "$workdir"
+          gh repo clone "$child_repo" "$workdir" -- --quiet >/dev/null 2>&1
+          cd "$workdir"
+          git fetch origin "$base_ref" "$head_ref" --quiet >/dev/null 2>&1
+          git checkout -B "$head_ref" "origin/$head_ref" >/dev/null 2>&1
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          for attempt in 1 2 3; do
+            if curl -fsSL https://opencode.ai/install | bash >/dev/null 2>&1; then
+              break
+            fi
+            if [[ "$attempt" -eq 3 ]]; then
+              gh issue comment "$TASK_NUMBER" --repo "$child_repo"                 --body "<!-- continuum-child-review-infra --> Review for child task #$TASK_NUMBER could not install the agent runtime."                 >/dev/null 2>&1 || true
+              exit 4
+            fi
+            sleep $((attempt * 5))
+          done
+          export PATH="$HOME/.opencode/bin:$PATH"
+          test -x "$HOME/.opencode/bin/opencode"
+
+          issue_json="$(gh issue view "$TASK_NUMBER" --repo "$child_repo" --json title,body 2>/dev/null)"
+          issue_title="$(jq -r '.title' <<<"$issue_json")"
+          issue_body="$(jq -r '.body // ""' <<<"$issue_json")"
+
+          mkdir -p "$(dirname "$review_file")"
+          prompt="$RUNNER_TEMP/continuum-child-review.txt"
+          cat >"$prompt" <<EOF
+          Independently review and, if necessary, repair delegated child task #$TASK_NUMBER.
+          
+          Rules:
+          - Treat the full child issue body below as authoritative.
+          - Do not trust the implementation summary or prior green-looking tests.
+          - Compare the PR branch against origin/$base_ref and inspect every relevant behavioral change.
+          - Re-run relevant tests and required live/integration acceptance checks.
+          - Fix defects directly on this PR branch and rerun verification.
+          - Never expose credentials or secret values.
+          - Do not upload child source, diffs, issue text, logs, or transcripts to the parent repository.
+          - You may make local commits. Do not push; the outer review job pushes the branch.
+          - Before finishing, create or update exactly: $review_file
+          - Record findings, repairs, verification executed, observed results, remaining risks.
+          - End with a standalone line exactly: Review: PASS
+          - Write Review: PASS only when the implementation satisfies the issue.
+          
+          --- CHILD ISSUE TITLE ---
+          $issue_title
+          
+          --- CHILD ISSUE BODY ---
+          $issue_body
+          EOF
+
+          accepted=false
+          for pass in $(seq 1 "$MAX_REVIEW_PASSES"); do
+            pass_prompt="$RUNNER_TEMP/continuum-child-review-pass-$pass.txt"
+            cp "$prompt" "$pass_prompt"
+            if [[ "$pass" -gt 1 ]]; then
+              cat >>"$pass_prompt" <<EOF
+          
+          Continuation review pass $pass:
+          - Continue from the existing working tree and prior transcript at $transcript.
+          - Repair remaining blockers, rerun verification, and update $review_file.
+          EOF
+            fi
+            set +e
+            opencode run --auto --model "$OPENCODE_MODEL" "$(cat "$pass_prompt")" >"$transcript" 2>&1
+            rc=$?
+            set -e
+            if [[ -f "$review_file" ]] && grep -qx 'Review: PASS' "$review_file"; then
+              accepted=true
+              break
+            fi
+            echo "Child review [$CHILD_ID] #$TASK_NUMBER pass $pass incomplete (agent rc=$rc); continuing."
+          done
+
+          if [[ "$accepted" != true ]]; then
+            gh issue comment "$TASK_NUMBER" --repo "$child_repo"               --body "<!-- continuum-child-review-needs-retry --> Review for child task #$TASK_NUMBER did not reach verified acceptance."               >/dev/null 2>&1 || true
+            exit 30
+          fi
+
+          if git diff --no-ext-diff -- . | grep -Eiq '(github_pat_[A-Za-z0-9_]+|ghp_[A-Za-z0-9]+|rnd_[A-Za-z0-9]+)'; then
+            gh issue comment "$TASK_NUMBER" --repo "$child_repo"               --body "<!-- continuum-child-review-security --> Review detected token-like material; merge was blocked."               >/dev/null 2>&1 || true
+            exit 31
+          fi
+
+          if [[ -n "$(git status --porcelain)" ]]; then
+            git add -A
+            git commit -m "task #$TASK_NUMBER: delegated independent review" >/dev/null 2>&1
+          fi
+          if [[ "$(git rev-list --count "origin/$head_ref"..HEAD)" -gt 0 ]]; then
+            git push origin "HEAD:$head_ref" >/dev/null 2>&1
+          fi
+
+          set +e
+          gh pr merge "$PR_NUMBER" --repo "$child_repo" --squash --delete-branch >/dev/null 2>&1
+          merge_rc=$?
+          if [[ "$merge_rc" -ne 0 ]]; then
+            gh pr merge "$PR_NUMBER" --repo "$child_repo" --squash --delete-branch --admin >/dev/null 2>&1
+            merge_rc=$?
+          fi
+          set -e
+          if [[ "$merge_rc" -ne 0 ]]; then
+            gh issue comment "$TASK_NUMBER" --repo "$child_repo"               --body "<!-- continuum-child-review-merge-blocked --> Child task #$TASK_NUMBER passed review, but GitHub blocked the merge."               >/dev/null 2>&1 || true
+            exit 32
+          fi
+
+          gh issue comment "$TASK_NUMBER" --repo "$child_repo"             --body "<!-- continuum-child-review-merged --> Child task #$TASK_NUMBER passed delegated review and its PR was merged."             >/dev/null 2>&1 || true
+          echo "Child task [$CHILD_ID] #$TASK_NUMBER reviewed and merged."

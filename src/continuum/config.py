@@ -355,11 +355,50 @@ class ReleaseSettings:
         }
 
 
+DELEGATION_NONE = "none"
+DELEGATION_PARENT = "parent"
+DELEGATION_CHILD = "child"
+SUPPORTED_DELEGATION_ROLES = (DELEGATION_NONE, DELEGATION_PARENT, DELEGATION_CHILD)
+
+_REPOSITORY_RE = re.compile(
+    r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$"
+)
+
+
+@dataclass(frozen=True)
+class DelegationSettings:
+    """Cross-repository execution relationship.
+
+    A parent lists opaque child ids only. The id -> owner/repository binding is
+    runtime secret data, so a public donor repository does not disclose the
+    names of private child repositories. A child records its own id and parent;
+    execution is allowed only when both sides agree.
+    """
+
+    role: str = DELEGATION_NONE
+    children: tuple = ()
+    id: str = ""
+    parent: str = ""
+
+    @property
+    def enabled(self) -> bool:
+        return self.role != DELEGATION_NONE
+
+    def describe(self) -> Dict[str, Any]:
+        return {
+            "role": self.role,
+            "children": list(self.children),
+            "id": self.id or None,
+            "parent": self.parent or None,
+        }
+
+
 @dataclass(frozen=True)
 class ContinuumConfig:
     version: int = SCHEMA_VERSION
     review: ReviewSettings = field(default_factory=ReviewSettings)
     release: ReleaseSettings = field(default_factory=ReleaseSettings)
+    delegation: DelegationSettings = field(default_factory=DelegationSettings)
     source: str = "<defaults>"
 
     def describe(self) -> Dict[str, Any]:
@@ -377,10 +416,12 @@ class ContinuumConfig:
                 ),
             },
             "release": self.release.describe(),
+            "delegation": self.delegation.describe(),
         }
 
 
-_ALLOWED_TOP_LEVEL = ("version", "review", "release")
+_ALLOWED_TOP_LEVEL = ("version", "review", "release", "delegation")
+_ALLOWED_DELEGATION_KEYS = ("role", "children", "id", "parent")
 _ALLOWED_REVIEW_KEYS = (
     "provider",
     "block_merge",
@@ -1003,6 +1044,61 @@ def _parse_release(value: Any) -> ReleaseSettings:
     return ReleaseSettings(targets=targets)
 
 
+
+def _require_repository(value: Any, where: str) -> str:
+    if not isinstance(value, str) or not _REPOSITORY_RE.match(value.strip()):
+        raise ConfigError(
+            f"{where} must be an owner/repository name; got {value!r}"
+        )
+    return value.strip()
+
+
+def _parse_delegation(value: Any) -> DelegationSettings:
+    mapping = _require_mapping(value, "delegation")
+    _reject_unknown(mapping, _ALLOWED_DELEGATION_KEYS, "delegation")
+    role = _require_choice(
+        mapping.get("role"),
+        "delegation.role",
+        SUPPORTED_DELEGATION_ROLES,
+        DELEGATION_NONE,
+    )
+
+    children_value = mapping.get("children")
+    child_id_value = mapping.get("id")
+    parent_value = mapping.get("parent")
+
+    if role == DELEGATION_NONE:
+        stale = [key for key in ("children", "id", "parent") if mapping.get(key) is not None]
+        if stale:
+            raise ConfigError(
+                "delegation role 'none' cannot configure " + ", ".join(stale)
+            )
+        return DelegationSettings()
+
+    if role == DELEGATION_PARENT:
+        if child_id_value is not None or parent_value is not None:
+            raise ConfigError("delegation role 'parent' accepts children only")
+        if not isinstance(children_value, list) or not children_value:
+            raise ConfigError(
+                "delegation.children must be a non-empty list for role 'parent'"
+            )
+        children: List[str] = []
+        for index, item in enumerate(children_value):
+            child_id = _require_slug(item, f"delegation.children[{index}]")
+            if child_id in children:
+                raise ConfigError(
+                    f"delegation.children lists {child_id!r} twice"
+                )
+            children.append(child_id)
+        return DelegationSettings(role=role, children=tuple(children))
+
+    if children_value is not None:
+        raise ConfigError("delegation role 'child' does not accept children")
+    child_id = _require_slug(child_id_value, "delegation.id")
+    parent = _require_repository(parent_value, "delegation.parent")
+    return DelegationSettings(role=role, id=child_id, parent=parent)
+
+
 def parse_config(text: str, source: str = "<string>") -> ContinuumConfig:
     """Validate configuration text and return a `ContinuumConfig`."""
 
@@ -1061,6 +1157,7 @@ def parse_config(text: str, source: str = "<string>") -> ContinuumConfig:
             queue=_parse_queue(review.get("queue")),
         ),
         release=_parse_release(mapping.get("release")),
+        delegation=_parse_delegation(mapping.get("delegation")),
         source=source,
     )
 
