@@ -152,8 +152,12 @@ jobs:
 
       - name: Sync stale OpenCode branches after main advances
         env:
-          GH_TOKEN: ${{ github.token }}
-          GITHUB_TOKEN: ${{ github.token }}
+          # update-branch performed with github.token emits a synchronize event
+          # owned by github-actions[bot]; GitHub then records the pull-request
+          # CI as action_required with zero jobs. Use the existing trusted
+          # automation credential so the updated branch gets a real CI run.
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
           AUTOMATION_TRUSTED_ACTORS: ${{ vars.AUTOMATION_TRUSTED_ACTORS }}
           CONTINUUM_BASE_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
           CONTINUUM_REPAIR_MAX_ATTEMPTS: ${{ vars.AUTOMATION_REPAIR_MAX_ATTEMPTS || '3' }}
