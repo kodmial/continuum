@@ -32,8 +32,9 @@ version: 1
 ```
 
 This keeps concrete parent/child relationships out of the source tree. The thin
-parent workflows reference only variable names such as
-`${{ vars.CONTINUUM_ROLE }}` and `${{ vars.CONTINUUM_CHILDREN }}`.
+parent workflows do not pass relationship values as workflow inputs or job
+environment values. The Continuum runtime reads the caller repository's Actions
+variables directly through the GitHub API inside the runner.
 
 ## Discovery and bidirectional verification
 
@@ -64,9 +65,12 @@ Use the three thin entry workflows in
 - `consumer-child-worker.yml`
 - `consumer-child-review.yml`
 
-The wrapper passes `CONTINUUM_ROLE` and `CONTINUUM_CHILDREN` from the
-parent's GitHub repository variables. The child repository name is resolved only
-inside the runner and is not committed to the parent repository.
+The wrapper passes no parent/child relationship values. Continuum reads
+`CONTINUUM_ROLE` and `CONTINUUM_CHILDREN` directly from the parent repository
+through the GitHub API after the runner starts. This avoids exposing the child
+list in reusable-workflow inputs or job environment metadata. The child
+repository name is resolved only inside the runner and is not committed to the
+parent repository.
 
 A token with access to the child repositories is still required through the
 wrapper's child-runtime secret.
