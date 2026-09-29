@@ -100,6 +100,11 @@ jobs:
             });
             const issues = all.filter(i => !i.pull_request && i.user?.login === owner);
             const labelsOf = i => new Set((i.labels || []).map(l => typeof l === 'string' ? l : l.name));
+            const delegatedToParent = i => {
+              const body = i.body || '';
+              return body.includes('<!-- continuum-child-owned -->') ||
+                body.includes('<!-- runtime-worker-owned -->');
+            };
 
             const prs = await github.paginate(github.rest.pulls.list, {
               owner, repo, state:'open', per_page:100
@@ -138,6 +143,7 @@ jobs:
             const candidates = issues
               .filter(i => !active.has(i.number))
               .filter(i => !labelsOf(i).has(paused))
+              .filter(i => !delegatedToParent(i))
               .map(i => {
                 const ranks = [...labelsOf(i)].filter(l => priority.has(l)).map(l => priority.get(l));
                 return {issue:i, rank:ranks.length ? Math.min(...ranks) : 3};
