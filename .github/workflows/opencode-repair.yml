@@ -90,10 +90,25 @@ jobs:
             exit 0
           fi
 
+          open_pr="$(
+            gh api --paginate "repos/$GITHUB_REPOSITORY/pulls?state=open&per_page=100" \
+              --jq '.[] | select(.head.repo.full_name == .base.repo.full_name) | select(.head.ref | startswith("opencode/issue'"$issue_number"'-")) | .number' \
+              | head -n 1
+          )"
+          if [[ -n "$open_pr" ]]; then
+            echo "Usable open PR #$open_pr already owns issue #$issue_number; preserving its reservation."
+            exit 0
+          fi
+
+          epoch="$(
+            gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$issue_number/events?per_page=100" \
+              --jq '.[] | select(.event == "unlabeled" and .label.name == "automation:paused") | .created_at' \
+              | sort | tail -n 1
+          )"
           attempts="$(
             gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$issue_number/comments?per_page=100" \
-              --jq '[.[] | select((.body // "") | contains("<!-- issue-scheduler-dispatch -->"))] | length' \
-              | awk '{sum += $1} END {print sum + 0}'
+              --jq '.[] | select((.body // "") | contains("<!-- issue-scheduler-dispatch -->")) | .created_at' \
+              | awk -v epoch="$epoch" 'epoch == "" || $0 >= epoch {count++} END {print count + 0}'
           )"
 
           gh issue comment "$issue_number" --repo "$GITHUB_REPOSITORY" \
