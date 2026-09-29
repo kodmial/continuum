@@ -123,6 +123,15 @@ def resolve_child(
     raise DelegationError("child id is not allowed by delegation.children")
 
 
+def child_validation_script(config_path: str) -> str:
+    config = load_config(config_path)
+    if config.delegation.role != DELEGATION_CHILD:
+        raise DelegationError(
+            "delegation.role must be 'child' before reading validation_script"
+        )
+    return config.delegation.validation_script
+
+
 def _emit_error(error: Exception) -> int:
     print(f"::error::{error}", file=sys.stderr)
     return 2
@@ -145,6 +154,9 @@ def main(argv=None) -> int:
     verify.add_argument("--config", required=True)
     verify.add_argument("--child-id", required=True)
     verify.add_argument("--parent-repository", required=True)
+
+    validation = sub.add_parser("validation-script")
+    validation.add_argument("--config", required=True)
 
     args = parser.parse_args(argv)
     try:
