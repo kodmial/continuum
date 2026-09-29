@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import tempfile
@@ -115,6 +117,14 @@ class DelegationRuntimeTests(unittest.TestCase):
 
     def test_missing_validation_script_resolves_to_empty_string(self):
         self.assertEqual(runtime.child_validation_script(self.child()), "")
+
+    def test_validation_script_cli_returns_without_falling_into_verify(self):
+        path = self.child(validation_script="automation/validate.sh")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            rc = runtime.main(["validation-script", "--config", path])
+        self.assertEqual(rc, 0)
+        self.assertEqual(output.getvalue(), "automation/validate.sh\n")
 
     def test_parent_cannot_be_used_as_validation_source(self):
         with self.assertRaises(runtime.DelegationError):
