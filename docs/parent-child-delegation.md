@@ -7,8 +7,9 @@ routing signal.
 The relationship is explicit and bidirectional:
 
 - the parent enables delegation and allowlists opaque child ids;
-- the parent stores the real `id -> owner/repository` bindings in the
-  `CONTINUUM_CHILD_REPOSITORIES` secret;
+- the parent may store explicit `id -> owner/repository` bindings in the
+  optional `CONTINUUM_CHILD_REPOSITORIES` secret; without that secret it
+  discovers owned repositories by their declared Continuum roles;
 - each child declares its own id and exact parent repository;
 - every dispatcher, worker, and review run verifies both declarations before it
   reads a task or writes to the child.
@@ -29,17 +30,20 @@ delegation:
 ```
 
 The parent configuration intentionally contains no child repository names.
-Configure these repository secrets on the parent:
+Configure `CONTINUUM_CHILD_TOKEN` on the parent with access to the intended
+children. `CONTINUUM_CHILD_REPOSITORIES` is optional. When supplied, it is a
+JSON object whose keys exactly match `delegation.children`, for example
+`{"child-a":"owner/private-repo","child-b":"owner/public-repo"}`.
 
-- `CONTINUUM_CHILD_TOKEN`: a credential that can read/write the configured
-  child repositories and dispatch workflows in the parent;
-- `CONTINUUM_CHILD_REPOSITORIES`: a JSON object whose keys exactly match
-  `delegation.children`, for example
-  `{"child-a":"owner/private-repo","child-b":"owner/public-repo"}`.
+When the map is omitted, Continuum enumerates repositories owned by the token
+holder **without any visibility filter**, reads only their `.continuum.yml`,
+and selects the unique repository whose child id and parent declaration match
+the parent's allowlist. Zero or multiple matches fail closed. This means
+`private` is never a role or routing signal.
 
-The exact-key requirement is a safety property: a secret entry cannot silently
-turn an unconfigured repository into a child, and a configured child cannot
-silently disappear from the runtime binding.
+The exact-key requirement in explicit-map mode remains a safety property: a
+secret entry cannot silently turn an unconfigured repository into a child, and
+a configured child cannot silently disappear from the runtime binding.
 
 Use the three thin parent entry workflows in
 `fixtures/delegation-parent/.github/workflows/`. They call:

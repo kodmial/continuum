@@ -19,7 +19,7 @@ on:
       CHILD_RUNTIME_TOKEN:
         required: true
       CHILD_RUNTIME_REPOSITORIES:
-        required: true
+        required: false
 
 permissions:
   actions: write
@@ -63,9 +63,8 @@ jobs:
           set -euo pipefail
           export PYTHONPATH="$CONTINUUM_ENGINE_ROOT/src"
           relation="$CONTINUUM_ENGINE_ROOT/.github/scripts/delegation_runtime.py"
-          plan="$(
-            python3 "$relation" parent-plan               --config .continuum.yml               --repository-map-json "$CHILD_REPOSITORIES"
-          )"
+          resolver="$CONTINUUM_ENGINE_ROOT/.github/scripts/delegation_repository.sh"
+          plan="$(PARENT_CONFIG=.continuum.yml CHILD_REPOSITORIES="$CHILD_REPOSITORIES" bash "$resolver" plan)"
 
           active_titles="$(
             gh run list --repo "$GITHUB_REPOSITORY" --limit 100               --json status,displayTitle               --jq '.[] | select(.status == "queued" or .status == "in_progress" or .status == "waiting" or .status == "pending") | .displayTitle'               2>/dev/null || true
