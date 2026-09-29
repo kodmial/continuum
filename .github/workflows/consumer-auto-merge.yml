@@ -74,8 +74,14 @@ jobs:
                 github.rest.actions.listWorkflowRunsForRepo,
                 {owner, repo, event:'pull_request', per_page:100}
               );
+              const wanted = String(workflowName || '').trim();
               return runs
-                .filter(r => r.name === workflowName && r.head_sha === sha)
+                .filter(r => {
+                  if (r.head_sha !== sha) return false;
+                  const path = String(r.path || '');
+                  const basename = path.split('/').pop() || '';
+                  return r.name === wanted || path === wanted || basename === wanted;
+                })
                 .sort((a,b) => new Date(b.created_at) - new Date(a.created_at))[0] || null;
             }
 
