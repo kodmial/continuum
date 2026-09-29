@@ -11,7 +11,11 @@
 #   2. The dispatch credential must prove it acts as a trusted account. A
 #      github.token acts as github-actions[bot], whose comments the agent
 #      workflow's author gate refuses, so dispatching with it would consume an
-#      issue reservation and produce no work.
+#      issue reservation and produce no work. That is the one reason this
+#      workflow needs a credential other than its own: it is minted for the
+#      single `issue-write` capability (issues: write, everything else read)
+#      from the Continuum GitHub App, lives for one hour, and is scoped to this
+#      repository. See docs/credential-capabilities.md.
 #   3. Only then does the write-capable token appear, in the reconcile step.
 #
 # Failure at any gate stops the run. It never falls back to dispatching.
@@ -27,10 +31,11 @@ on:
     types: [closed]
 
 permissions:
-  actions: write
+  # Read-only. Both jobs write through the `issue-write` capability they mint,
+  # so the workflow's own token cannot comment, label, or dispatch.
   contents: read
-  issues: write
-  pull-requests: write
+  issues: read
+  pull-requests: read
 
 concurrency:
   group: issue-scheduler
@@ -73,15 +78,34 @@ jobs:
           set -euo pipefail
           python3 .github/scripts/trust_policy.py trusted-issues
 
+      # The single non-default credential in this workflow. It is minted here,
+      # in the job that decides, so no later step can reach a broader one, and
+      # it is scoped to the one capability the scheduler performs.
+      - name: Mint the issue-write credential
+        env:
+          CONTINUUM_APP_ID: ${{ vars.CONTINUUM_APP_ID }}
+          CONTINUUM_APP_PRIVATE_KEY: ${{ secrets.CONTINUUM_APP_PRIVATE_KEY }}
+          CONTINUUM_AUTOMATION_LOGIN: ${{ vars.CONTINUUM_AUTOMATION_LOGIN }}
+          CONTINUUM_ALLOW_PAT_FALLBACK: ${{ vars.CONTINUUM_ALLOW_PAT_FALLBACK }}
+          # Materialised only when the fallback is explicitly enabled, so a
+          # migrated repository's runner environment does not even contain the
+          # personal access token.
+          TAP_PAT: ${{ vars.CONTINUUM_ALLOW_PAT_FALLBACK == 'true' && secrets.TAP_PAT || '' }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/app_credentials.py mint --capability issue-write
+
       - name: Verify the dispatch credential
         id: credential
         env:
-          # The write-capable PAT, on purpose: no read-only token can report
+          # The capability credential, on purpose: no read-only token can report
           # which account a credential speaks for. check-token performs a single
-          # GET /user and no write, and this step fails the job when the identity
-          # is not trusted.
-          GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
+          # GET /user (or GET /app for an installation token) and no write, and
+          # this step fails the job when the identity is not the one this
+          # repository declares.
+          GITHUB_TOKEN: ${{ env.CONTINUUM_TOKEN_ISSUE_WRITE }}
           AUTOMATION_TRUSTED_ACTORS: ${{ vars.AUTOMATION_TRUSTED_ACTORS }}
+          CONTINUUM_AUTOMATION_LOGIN: ${{ vars.CONTINUUM_AUTOMATION_LOGIN }}
         run: |
           set -euo pipefail
           python3 .github/scripts/trust_policy.py check-token
@@ -102,6 +126,30 @@ jobs:
       MAX_DISPATCH_ATTEMPTS: ${{ vars.AUTOMATION_MAX_DISPATCH_ATTEMPTS || '3' }}
 
     steps:
+      # The credential resolver is trusted repository code, so it is checked
+      # out the same way every other gate in this repository is: default branch,
+      # no persisted credentials. This job runs on pull_request_target and must
+      # never be a place where pull-request code is available.
+      - name: Checkout trusted policy
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      # Minted per run rather than shared with the control plane: a credential
+      # that lives for one hour and one job cannot outlive the job that minted
+      # it, and the control plane keeps its read-only ambient token.
+      - name: Mint the issue-write credential
+        env:
+          CONTINUUM_APP_ID: ${{ vars.CONTINUUM_APP_ID }}
+          CONTINUUM_APP_PRIVATE_KEY: ${{ secrets.CONTINUUM_APP_PRIVATE_KEY }}
+          CONTINUUM_AUTOMATION_LOGIN: ${{ vars.CONTINUUM_AUTOMATION_LOGIN }}
+          CONTINUUM_ALLOW_PAT_FALLBACK: ${{ vars.CONTINUUM_ALLOW_PAT_FALLBACK }}
+          TAP_PAT: ${{ vars.CONTINUUM_ALLOW_PAT_FALLBACK == 'true' && secrets.TAP_PAT || '' }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/app_credentials.py mint --capability issue-write
+
       - name: Reconcile state and dispatch ready issues
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
@@ -111,10 +159,10 @@ jobs:
           TRUSTED_ISSUES: ${{ needs.authorize.outputs.trusted_issues }}
           CREDENTIAL_LOGIN: ${{ needs.authorize.outputs.credential_login }}
         with:
-          # TAP_PAT is required because the existing OpenCode workflow accepts
-          # /oc only from the repository owner. It also makes issue-state
-          # mutations and comments created here visible as normal owner actions.
-          github-token: ${{ secrets.TAP_PAT }}
+          # The issue-write capability, and only that: comments, labels, and
+          # issue state. It cannot push a branch, open a pull request, or move a
+          # workflow, so a compromised schedule cannot author code.
+          github-token: ${{ env.CONTINUUM_TOKEN_ISSUE_WRITE }}
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;

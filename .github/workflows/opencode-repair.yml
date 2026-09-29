@@ -5,13 +5,27 @@
 # never checks out or executes pull-request code.
 #
 # Two rules keep it safe on a public repository:
-#   1. Every privileged action is taken with the write-capable PAT, but only
-#      after a *read-only* verification step has confirmed the pull request is a
-#      trusted same-repository agent PR. Verification must never need write
+#   1. Every privileged action is taken with a write-capable credential, but
+#      only after a *read-only* verification step has confirmed the pull request
+#      is a trusted same-repository agent PR. Verification must never need write
 #      authority, otherwise verifying an attacker's request would itself require
 #      the privilege the request is asking for.
 #   2. A dispatch is refused unless .github/scripts/trust_policy.py approves the
 #      exact (mode, PR, head ref) triple against the live pull request.
+#
+# Credentials
+# -----------
+# No job here holds a repository-wide personal token. The two jobs that update
+# branches and wake the agent mint the `repair-control` capability -- contents,
+# issues, pull requests, and actions write, one hour, one repository -- because
+# github.token cannot do either of the things those jobs exist for: a branch
+# update made with it yields a pull_request run in approval-required state with
+# zero jobs, and a dispatch made with it arrives as `github-actions[bot]`, which
+# the agent workflow's author gate refuses.
+#
+# The two jobs that only comment, label, and wake the scheduler use their own
+# scoped `github.token`, and every read-only phase uses it too. See
+# docs/credential-capabilities.md.
 name: OpenCode repair controller
 
 # Conflict repair repairs the change that already exists. It never re-executes
@@ -60,7 +74,12 @@ jobs:
     steps:
       - name: Release failed issue reservation and retry safely
         env:
-          GH_TOKEN: ${{ secrets.TAP_PAT || github.token }}
+          # The job's own token. This job comments, relabels, and wakes the
+          # scheduler, and the scheduler's own control plane does not gate on who
+          # dispatched it -- so github.token is sufficient and nothing needs to
+          # be minted. The dispatch still runs, because workflow_dispatch is one
+          # of the two events github.token is documented to trigger normally.
+          GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ github.event.workflow_run.id }}
           CONCLUSION: ${{ github.event.workflow_run.conclusion }}
           MAX_ATTEMPTS: ${{ vars.AUTOMATION_MAX_DISPATCH_ATTEMPTS || '3' }}
@@ -138,10 +157,13 @@ jobs:
     timeout-minutes: 8
 
     permissions:
-      actions: write
-      contents: write
-      issues: write
-      pull-requests: write
+      # Read-only ambient authority. Every write below is made with the
+      # `repair-control` capability this job mints, so the job's own token cannot
+      # change the repository even if a later edit added a `gh` call to a phase
+      # that was meant to be read-only.
+      contents: read
+      issues: read
+      pull-requests: read
 
     steps:
       - name: Checkout trusted policy
@@ -150,15 +172,32 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
 
+      - name: Mint the repair-control credential
+        env:
+          CONTINUUM_APP_ID: ${{ vars.CONTINUUM_APP_ID }}
+          CONTINUUM_APP_PRIVATE_KEY: ${{ secrets.CONTINUUM_APP_PRIVATE_KEY }}
+          CONTINUUM_AUTOMATION_LOGIN: ${{ vars.CONTINUUM_AUTOMATION_LOGIN }}
+          CONTINUUM_ALLOW_PAT_FALLBACK: ${{ vars.CONTINUUM_ALLOW_PAT_FALLBACK }}
+          TAP_PAT: ${{ vars.CONTINUUM_ALLOW_PAT_FALLBACK == 'true' && secrets.TAP_PAT || '' }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/app_credentials.py mint --capability repair-control
+
       - name: Sync stale OpenCode branches after main advances
         env:
+          # GH_TOKEN is the capability the branch updates and the agent dispatch
+          # are made with. GITHUB_TOKEN stays read-only, because the trust
+          # policy's verify-dispatch below must not hold the credential it is
+          # verifying.
+          #
           # update-branch performed with github.token emits a synchronize event
           # owned by github-actions[bot]; GitHub then records the pull-request
-          # CI as action_required with zero jobs. Use the existing trusted
-          # automation credential so the updated branch gets a real CI run.
-          GH_TOKEN: ${{ secrets.TAP_PAT }}
-          GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
+          # CI as action_required with zero jobs. The installation token is what
+          # makes the updated branch get a real CI run.
+          GH_TOKEN: ${{ env.CONTINUUM_TOKEN_REPAIR_CONTROL }}
+          GITHUB_TOKEN: ${{ github.token }}
           AUTOMATION_TRUSTED_ACTORS: ${{ vars.AUTOMATION_TRUSTED_ACTORS }}
+          CONTINUUM_AUTOMATION_LOGIN: ${{ vars.CONTINUUM_AUTOMATION_LOGIN }}
           CONTINUUM_BASE_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
           CONTINUUM_REPAIR_MAX_ATTEMPTS: ${{ vars.AUTOMATION_REPAIR_MAX_ATTEMPTS || '3' }}
         run: |
@@ -291,9 +330,16 @@ jobs:
     timeout-minutes: 5
 
     permissions:
+      # Read-only ambient authority; the write phase below holds the
+      # `repair-control` capability instead. See the header note.
+      # `actions: read` is here because the decision step checks whether a
+      # repair run is already in flight, and that read must use the ambient
+      # token -- the decision cannot depend on the credential it is deciding
+      # whether to use.
+      actions: read
       contents: read
-      issues: write
-      pull-requests: write
+      issues: read
+      pull-requests: read
 
     steps:
       - name: Checkout trusted policy
@@ -303,6 +349,17 @@ jobs:
           # job runs on pull_request_target and must not touch PR code.
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
+
+      - name: Mint the repair-control credential
+        env:
+          CONTINUUM_APP_ID: ${{ vars.CONTINUUM_APP_ID }}
+          CONTINUUM_APP_PRIVATE_KEY: ${{ secrets.CONTINUUM_APP_PRIVATE_KEY }}
+          CONTINUUM_AUTOMATION_LOGIN: ${{ vars.CONTINUUM_AUTOMATION_LOGIN }}
+          CONTINUUM_ALLOW_PAT_FALLBACK: ${{ vars.CONTINUUM_ALLOW_PAT_FALLBACK }}
+          TAP_PAT: ${{ vars.CONTINUUM_ALLOW_PAT_FALLBACK == 'true' && secrets.TAP_PAT || '' }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/app_credentials.py mint --capability repair-control
 
       - name: Verify pull request with the trust policy
         id: trust
@@ -489,11 +546,16 @@ jobs:
           echo "repair_action=$action" >> "$GITHUB_OUTPUT"
           echo "reason=behind_base_branch" >> "$GITHUB_OUTPUT"
 
-      # Execution phase: the write-capable token appears only here, and only for
-      # the action the read-only decision above approved.
+      # Execution phase: the write-capable capability appears only here, and only
+      # for the action the read-only decision above approved.
       - name: Apply the approved conflict repair action
         env:
-          GH_TOKEN: ${{ secrets.TAP_PAT || github.token }}
+          # The `repair-control` capability, minted in this job and used only
+          # from this step. Its own `GITHUB_TOKEN` stays read-only so the
+          # decision steps above could not have been talking themselves into
+          # permission.
+          GH_TOKEN: ${{ env.CONTINUUM_TOKEN_REPAIR_CONTROL }}
+          GITHUB_TOKEN: ${{ github.token }}
           ACTION: ${{ steps.decide.outputs.action }}
           REASON: ${{ steps.decide.outputs.reason }}
           RESET_HEAD_LOCKS: ${{ steps.decide.outputs.reset_head_locks }}
@@ -623,9 +685,11 @@ jobs:
     timeout-minutes: 5
 
     permissions:
+      # Read-only ambient authority; the write phase below holds the
+      # `repair-control` capability instead. See the header note.
       contents: read
-      issues: write
-      pull-requests: write
+      issues: read
+      pull-requests: read
 
     steps:
       - name: Checkout trusted policy
@@ -633,6 +697,17 @@ jobs:
         with:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
+
+      - name: Mint the repair-control credential
+        env:
+          CONTINUUM_APP_ID: ${{ vars.CONTINUUM_APP_ID }}
+          CONTINUUM_APP_PRIVATE_KEY: ${{ secrets.CONTINUUM_APP_PRIVATE_KEY }}
+          CONTINUUM_AUTOMATION_LOGIN: ${{ vars.CONTINUUM_AUTOMATION_LOGIN }}
+          CONTINUUM_ALLOW_PAT_FALLBACK: ${{ vars.CONTINUUM_ALLOW_PAT_FALLBACK }}
+          TAP_PAT: ${{ vars.CONTINUUM_ALLOW_PAT_FALLBACK == 'true' && secrets.TAP_PAT || '' }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/app_credentials.py mint --capability repair-control
 
       # Decision phase: every read and every trust check below runs with the
       # read-only GITHUB_TOKEN. Nothing here can act on the trigger, so an
@@ -767,11 +842,15 @@ jobs:
           echo "lock_label=$lock_label" >> "$GITHUB_OUTPUT"
           echo "reason=blocking_workflow_failed" >> "$GITHUB_OUTPUT"
 
-      # Execution phase: the write-capable token appears only here, only after
-      # the decision above, and only for the action the policy approved.
+      # Execution phase: the write-capable capability appears only here, only
+      # after the decision above, and only for the action the policy approved.
       - name: Apply the approved repair action
         env:
-          GH_TOKEN: ${{ secrets.TAP_PAT || github.token }}
+          # The `repair-control` capability, and only for the dispatch and its
+          # lock labels. Nothing in this step can be reached from a workflow_run
+          # conclusion without the read-only policy gate above having approved
+          # the exact (mode, PR, head ref) triple first.
+          GH_TOKEN: ${{ env.CONTINUUM_TOKEN_REPAIR_CONTROL }}
           ACTION: ${{ steps.decide.outputs.action }}
           REASON: ${{ steps.decide.outputs.reason }}
           LOCK_LABEL: ${{ steps.decide.outputs.lock_label }}
@@ -963,7 +1042,11 @@ jobs:
 
       - name: Release the stale state
         env:
-          GH_TOKEN: ${{ secrets.TAP_PAT || github.token }}
+          # The job's own token. This step only ever removes labels and records a
+          # failure state: it cannot dispatch an agent, push a ref, or change a
+          # pull request's content, so it needs no minted capability and
+          # releasing a stale lock cannot be turned into a privileged act.
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           # The decision is already on disk from the read-only phase. This step

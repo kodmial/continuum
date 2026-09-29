@@ -387,9 +387,25 @@ same privilege as acting:
 | `issue-scheduler.yml` | `authorize` | `schedule` |
 
 A verification step never holds a write-capable credential, with one deliberate
-exception: `check-token` must carry the PAT, because no read-only token can report
-which account a credential speaks for. It performs a single `GET /user` and no
-write, and the audit asserts that.
+exception: `check-token` must carry the credential it is identifying, because no
+read-only token can report which account a credential speaks for. It performs a
+single `GET /user` (or `GET /app` for an installation token) and no write, and the
+audit asserts that. The trust decisions themselves always run with the read-only
+ambient token, including inside the jobs that hold a capability — there,
+`GITHUB_TOKEN` stays read-only and the capability is published under a separate
+name, so a verification can never be talking to the credential it verifies.
+
+**Credentials are capabilities, not one big token.** Most steps use the job's own
+`github.token` and nothing more. Three operations cannot be expressed as a
+`permissions` scope — a scheduler comment that the agent's own author gate must
+accept, a branch update or agent push that has to start a real CI run, and a
+dispatch whose sender the receiving workflow trusts — so those use a one-hour,
+repository-scoped GitHub App installation token minted per job for a named
+capability. `TAP_PAT` survives only as an opt-in migration fallback
+(`CONTINUUM_ALLOW_PAT_FALLBACK`) and is refused for any real failure, including a
+token that comes back with more authority than requested. The full inventory, the
+reasons, and the rotation and failure behaviour are in
+[`docs/credential-capabilities.md`](docs/credential-capabilities.md).
 
 **Human review is never optional for the trust boundary.** Any change to
 `.github/workflows/`, `.github/scripts/`, `.github/actions/`, `CODEOWNERS`, or
@@ -409,12 +425,16 @@ the input.
 
 | Name | Kind | Default | Purpose |
 | --- | --- | --- | --- |
-| `TAP_PAT` | secret | — | Required. Write-capable credential for the agent, repair, merge, and scheduler steps. |
-| `AUTOMATION_TRUSTED_ACTORS` | variable | repository owner | Comma-separated logins trusted in addition to the owner. |
+| `CONTINUUM_APP_ID` | variable | — | GitHub App ID used to mint capability credentials. |
+| `CONTINUUM_APP_PRIVATE_KEY` | secret | — | The App's `.pem`; used only to sign a nine-minute assertion. |
+| `CONTINUUM_AUTOMATION_LOGIN` | variable | — | The App's bot login, e.g. `continuum-automation[bot]`. The one trusted bot. |
+| `CONTINUUM_ALLOW_PAT_FALLBACK` | variable | unset | Migration only. `true` permits `TAP_PAT` while the App is being set up. Remove it afterwards. |
+| `TAP_PAT` | secret | — | Migration only, and only reachable when the variable above is `true`. A classic PAT with `repo` + `workflow`. |
+| `AUTOMATION_TRUSTED_ACTORS` | variable | repository owner | Comma-separated human logins trusted in addition to the owner. |
 | `AUTOMATION_WIP_LIMIT` | variable | `4` | Concurrent scheduled issues. |
 | `AUTOMATION_LEASE_MINUTES` | variable | `45` | Reservation lease before an issue is retried. |
 | `AUTOMATION_MAX_DISPATCH_ATTEMPTS` | variable | `2` | Dispatches before an issue is paused for a human. |
-| `AUTOMATION_TRUSTED_ACTORS` must not include bots: a bot-authored comment or dispatch can never satisfy the author gate. |
+| `AUTOMATION_TRUSTED_ACTORS` must not include bots: a bot-authored comment or dispatch can never satisfy the author gate, and bot logins are dropped when the list is parsed. |
 
 
 ## Roadmap

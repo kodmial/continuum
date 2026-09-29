@@ -2,11 +2,11 @@
 """Fail-closed trust policy for Continuum's privileged GitHub automation.
 
 Continuum runs a privileged coding agent in workflows that hold a
-write-capable credential (``TAP_PAT``): the agent can push branches, open pull
-requests, and change labels. On a public repository any anonymous user can open
-an issue, edit issue text, comment, and open a pull request, so every privileged
-path must decide *before* any write-capable step runs whether the request came
-from a trusted actor and refers to trusted content.
+write-capable credential: the agent can push branches, open pull requests, and
+change labels. On a public repository any anonymous user can open an issue, edit
+issue text, comment, and open a pull request, so every privileged path must
+decide *before* any write-capable step runs whether the request came from a
+trusted actor and refers to trusted content.
 
 This module is the single place that answers that question. The decision layer
 is pure and performs no I/O, so it is unit testable without a network. HTTP is
@@ -18,8 +18,19 @@ Trust model
 -----------
 * **Actors** are trusted only when their login is the repository owner or is
   listed in the ``AUTOMATION_TRUSTED_ACTORS`` repository variable (comma
-  separated). Nothing else is trusted: not bots, not collaborators discovered at
-  runtime, not "the author of the thing that triggered me".
+  separated). Nothing else is trusted: not collaborators, not "the author of the
+  thing that triggered me", and **not bots**. A bot's comment body is frequently
+  a verbatim echo of untrusted user content, so a bot login is rejected even if
+  somebody lists it.
+* **The automation identity** is the one exception, and it is an exception about
+  a *credential*, not about a login being nice to have. Continuum dispatches
+  agent work with a credential that is not the ambient ``github.token`` --
+  ``github.token`` acts as ``github-actions[bot]``, which the comment gate below
+  refuses by design. The repository names that credential's login in
+  ``CONTINUUM_AUTOMATION_LOGIN`` (for a GitHub App installation token,
+  ``<slug>[bot]``), and only that login may add to the set. Nothing else about it
+  is relaxed: the request still has to be a freshly created ``/oc`` comment, on
+  a real issue, whose *issue* author is a trusted human.
 * **Issues** are trusted when they are not pull requests and their author is a
   trusted actor. Issue titles and bodies are data, never instructions.
 * **Branches / pull requests** are trusted only when they live in this
@@ -33,6 +44,11 @@ Trust model
   the code-execution job consumes only that job's validated outputs. A
   privileged job never interpolates a ref, PR number, or run id that came
   straight from an event payload.
+* **Capability is separate from trust.** This module decides who is allowed to
+  ask. *What a credential is allowed to do* is declared once, as a named
+  capability, in :mod:`app_credentials`, and a capability can only be minted
+  for the operations that genuinely need it. Trust never widens a capability and
+  a capability never widens trust.
 
 Every check fails closed: a missing, empty, malformed, contradictory, or
 unverifiable field is treated as untrusted and denies the request.
@@ -54,7 +70,8 @@ CLI
 Environment:
     GITHUB_EVENT_NAME, GITHUB_EVENT_PATH, GITHUB_REPOSITORY, GITHUB_ACTOR,
     GITHUB_OUTPUT, GITHUB_API_URL, GITHUB_TOKEN (read-only),
-    AUTOMATION_TRUSTED_ACTORS, CONTINUUM_BASE_BRANCH (default ``main``),
+    AUTOMATION_TRUSTED_ACTORS, CONTINUUM_AUTOMATION_LOGIN,
+    CONTINUUM_BASE_BRANCH (default ``main``),
     CONTINUUM_AGENT_COMMANDS (default ``/oc,/opencode``).
 
 Standard library only, so it runs on stock ``ubuntu-latest`` runners without
@@ -238,7 +255,7 @@ def one_line(text: str, limit: int = 480) -> str:
 
 
 def normalize_login(value) -> str:
-    """Normalize a GitHub login for comparison.
+    """Normalize a human GitHub login for comparison.
 
     Returns ``""`` for anything that is not a plain login so a malformed value
     can never accidentally match a trusted actor.
@@ -251,12 +268,46 @@ def normalize_login(value) -> str:
     return login
 
 
+#: GitHub suffixes every App and machine account with this.
+BOT_SUFFIX = "[bot]"
+
+#: ``<login>[bot]``. Parsed separately from a human login because a bot login is
+#: never a trusted *actor*: only a credential that names itself as Continuum's
+#: own automation identity is trusted, and only for dispatch.
+BOT_LOGIN_RE = re.compile(
+    r"^(?P<login>[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?)\[bot\]$"
+)
+
+
+def normalize_bot_login(value) -> str:
+    """Return the canonical bot login, or ``""`` when the value is not one."""
+    if not isinstance(value, str):
+        return ""
+    match = BOT_LOGIN_RE.match(value.strip().lstrip("@").strip().lower())
+    return "{}{}".format(match.group("login"), BOT_SUFFIX) if match else ""
+
+
+def is_bot_login(value) -> bool:
+    return bool(normalize_bot_login(value))
+
+
 def parse_actor_list(value) -> frozenset:
-    """Parse a comma/space separated allowlist of logins."""
+    """Parse a comma/space separated allowlist of human logins.
+
+    Bot logins are dropped even when they are spelled out. A bot comment is
+    routinely a verbatim echo of whatever a stranger wrote, so listing
+    ``github-actions[bot]`` here would hand every workflow on the repository the
+    ability to drive the agent; the one bot identity that is trusted is named
+    separately by ``CONTINUUM_AUTOMATION_LOGIN`` and is only ever a credential.
+    """
     if not isinstance(value, str):
         return frozenset()
     parts = re.split(r"[,\s]+", value.strip())
-    return frozenset(login for login in (normalize_login(p) for p in parts) if login)
+    return frozenset(
+        login
+        for login in (normalize_login(part) for part in parts)
+        if login and not is_bot_login(login)
+    )
 
 
 def positive_int(value) -> int:
@@ -318,14 +369,78 @@ def is_trusted_actor(login, repository_owner, configured_actors="") -> bool:
     """Only the repository owner and explicitly configured logins are trusted.
 
     Bots are intentionally not trusted: a bot's comment body is frequently a
-    verbatim echo of untrusted user content.
+    verbatim echo of untrusted user content. The automation identity is a
+    separate concept and is not consulted here -- see
+    :func:`is_trusted_dispatch_identity`.
     """
     owner = normalize_login(repository_owner)
     candidate = normalize_login(login)
     if not owner or not candidate:
+        # `normalize_login` refuses anything that is not a plain login, which is
+        # what already makes `github-actions[bot]` and every other bot fail here:
+        # the brackets are not a legal login, so a bot can never normalize into
+        # a value that could match the owner or the allowlist.
         return False
     allowed = parse_actor_list(configured_actors) | {owner}
     return candidate in allowed
+
+
+def is_trusted_dispatch_identity(
+    login, repository_owner, configured_actors="", automation_identity=""
+) -> tuple:
+    """Return ``(trusted, code, reason)`` for the identity a credential speaks as.
+
+    Two kinds of identity may drive automation:
+
+    * a **human** the repository trusts, resolved with the same rule as every
+      other actor; and
+    * the **automation identity** the repository names in
+      ``CONTINUUM_AUTOMATION_LOGIN``, which is Continuum's own App bot. It
+      exists because the ambient ``github.token`` acts as ``github-actions[bot]``
+      and the comment gate refuses that, so a dispatch made with it would burn
+      an issue reservation and start no work.
+
+    The automation identity is trusted *only* as the author of the dispatch
+    itself. It never widens what the request may contain: the issue still has to
+    exist, still has to be owned by a trusted human, and the comment still has to
+    be a newly created ``/oc`` on the first non-empty line. An unconfigured
+    automation identity trusts nothing, so a bot login stays untrusted on a
+    repository that never migrated.
+    """
+    candidate = normalize_bot_login(login) or normalize_login(login)
+    if not candidate:
+        return False, "credential_unidentified", "The credential identifies no account."
+
+    if is_bot_login(candidate):
+        configured = normalize_bot_login(automation_identity)
+        if configured and candidate == configured:
+            return (
+                True,
+                "trusted_automation_identity",
+                "Credential acts as the configured automation identity @{}.".format(
+                    configured
+                ),
+            )
+        return (
+            False,
+            "untrusted_credential",
+            "Credential acts as untrusted bot account {!r}; a comment from that "
+            "account would be refused by the agent workflow.".format(candidate),
+        )
+
+    if is_trusted_actor(candidate, repository_owner, configured_actors):
+        return (
+            True,
+            "trusted_credential",
+            "Credential acts as trusted account @{}.".format(candidate),
+        )
+
+    return (
+        False,
+        "untrusted_credential",
+        "Credential acts as untrusted account {!r}; a comment from that account "
+        "would be refused by the agent workflow.".format(candidate),
+    )
 
 
 def is_trusted_issue(issue, repository_owner, configured_actors="") -> tuple:
@@ -589,6 +704,7 @@ def evaluate_issue_comment(
     repository_owner,
     configured_actors="",
     commands=DEFAULT_AGENT_COMMANDS,
+    automation_identity="",
 ) -> Decision:
     """Decide whether an ``issue_comment`` event may run privileged automation."""
     if not isinstance(payload, dict):
@@ -616,11 +732,14 @@ def evaluate_issue_comment(
         return deny("missing_comment", "Event payload has no comment object.")
 
     comment_author = (comment.get("user") or {}).get("login")
-    if not is_trusted_actor(comment_author, repository_owner, configured_actors):
+    author_ok, _author_code, author_reason = is_trusted_dispatch_identity(
+        comment_author, repository_owner, configured_actors, automation_identity
+    )
+    if not author_ok:
         return deny(
             "untrusted_comment_author",
-            "Comment on issue #{} was written by untrusted actor {!r}.".format(
-                (issue or {}).get("number", "?"), comment_author
+            "Comment on issue #{} was written by {}".format(
+                (issue or {}).get("number", "?"), author_reason
             ),
         )
 
@@ -638,7 +757,7 @@ def evaluate_issue_comment(
 
     return allow(
         "trusted_comment",
-        "{}: trusted actor {!r} requested work on their own issue #{}.".format(
+        "{}: {!r} requested work on their own issue #{}.".format(
             issue_code, comment_author, issue_number
         ),
         issue_number=issue_number,
@@ -823,6 +942,7 @@ def evaluate_event(
     *,
     repository,
     configured_actors="",
+    automation_identity="",
     base_ref: str = DEFAULT_BASE_BRANCH,
     commands=DEFAULT_AGENT_COMMANDS,
     actor: str = "",
@@ -845,15 +965,24 @@ def evaluate_event(
             payload,
             repository_owner=repository_owner,
             configured_actors=configured_actors,
+            automation_identity=automation_identity,
             commands=commands,
         )
 
     if event_name == "workflow_dispatch":
         sender = (payload.get("sender") or {}).get("login") or actor
-        if not is_trusted_actor(sender, repository_owner, configured_actors):
+        # The sender is an identity, not a capability, and exactly one bot is a
+        # trusted sender: the configured automation login. That is what lets the
+        # repair controller wake the agent with an App token while a
+        # `github.token` dispatch (which arrives as `github-actions[bot]`) is
+        # still refused.
+        sender_ok, _sender_code, sender_reason = is_trusted_dispatch_identity(
+            sender, repository_owner, configured_actors, automation_identity
+        )
+        if not sender_ok:
             return deny(
                 "untrusted_dispatcher",
-                "Dispatch was requested by untrusted actor {!r}.".format(sender),
+                "Dispatch was requested by {}".format(sender_reason),
             )
         inputs = payload.get("inputs")
         if not isinstance(inputs, dict):
@@ -942,7 +1071,17 @@ def evaluate_merge(
 
 
 class TrustPolicyError(RuntimeError):
-    pass
+    """A verification call that did not produce a usable answer.
+
+    ``status`` is the HTTP status when there was one, and ``0`` otherwise. The
+    credential-identity check needs it: an installation token answers ``/app``
+    and a user token answers ``/user``, so a 403 on one is a signal to try the
+    other rather than a failure to report.
+    """
+
+    def __init__(self, message: str, status: int = 0):
+        super().__init__(message)
+        self.status = status
 
 
 def api_request(path: str, token: str, *, api_url: str = "") -> dict:
@@ -968,7 +1107,8 @@ def api_request(path: str, token: str, *, api_url: str = "") -> dict:
         raise TrustPolicyError(
             "GitHub API verification failed: {} {} ({}): {}".format(
                 exc.code, path, exc.reason, detail
-            )
+            ),
+            status=exc.code,
         ) from exc
     except urllib.error.URLError as exc:
         raise TrustPolicyError("GitHub API verification failed: {}".format(exc.reason)) from exc
@@ -1010,18 +1150,48 @@ def fetch_open_issues(repository: str, token: str) -> list:
     return [item for item in data if isinstance(item, dict)]
 
 
-def resolve_token_login(token: str) -> str:
-    """Return the login that ``token`` authenticates as.
+def resolve_token_identity(token: str) -> tuple:
+    """Return ``(login, kind)`` for the account ``token`` authenticates as.
 
     This is the only place the policy inspects a write-capable credential, and
-    it performs a single authenticated ``GET /user``. It exists because a
+    it performs two authenticated ``GET``s at most. It exists because a
     scheduler holding a write token must prove *which* identity that token
-    speaks for: a ``github.token`` acting as ``github-actions[bot]`` cannot
-    satisfy the comment gate in the agent workflow, so dispatching with it
-    would burn a reservation and produce no work.
+    speaks for, and because the two credential kinds answer different endpoints:
+
+    * a **GitHub App installation token** cannot read ``/user``; it reads
+      ``/app`` and speaks as ``<slug>[bot]``.
+    * a **user token** (personal access token, OAuth token) reads ``/user``.
+
+    The fallback is tried only on a 401/403, which is exactly the signal that
+    the token is the other kind. Any other failure -- a network error, a 500 --
+    is raised rather than retried against a second endpoint, so a broken
+    verification cannot turn into a *different* verification.
     """
-    data = api_request("/user", token)
-    return normalize_login(data.get("login"))
+    if not token:
+        raise TrustPolicyError("No credential was supplied to identify.")
+
+    try:
+        data = api_request("/user", token)
+    except TrustPolicyError as exc:
+        if exc.status not in (401, 403):
+            raise
+        data = api_request("/app", token)
+        slug = data.get("slug")
+        if not isinstance(slug, str) or not slug.strip():
+            raise TrustPolicyError(
+                "The credential identifies neither a user nor a GitHub App."
+            ) from exc
+        return normalize_bot_login("{}{}".format(slug.strip(), BOT_SUFFIX)), "app-installation"
+
+    # A /user answer can still be a bot: `github-actions[bot]` and App bots that
+    # authenticate as users both land here. Report the identity it gives rather
+    # than dropping it to "unidentified", so the denial names the account that
+    # actually asked.
+    login = data.get("login")
+    bot_login = normalize_bot_login(login)
+    if bot_login:
+        return bot_login, "user"
+    return normalize_login(login), "user"
 
 
 def same_repository_run(run: dict, repository: str) -> bool:
@@ -1128,6 +1298,7 @@ def env_context() -> dict:
         "event_name": os.environ.get("GITHUB_EVENT_NAME", ""),
         "payload": read_event_payload(os.environ.get("GITHUB_EVENT_PATH", "")),
         "configured_actors": os.environ.get("AUTOMATION_TRUSTED_ACTORS", ""),
+        "automation_identity": os.environ.get("CONTINUUM_AUTOMATION_LOGIN", ""),
         "base_ref": os.environ.get("CONTINUUM_BASE_BRANCH", DEFAULT_BASE_BRANCH),
         "commands": os.environ.get("CONTINUUM_AGENT_COMMANDS", ",".join(DEFAULT_AGENT_COMMANDS)),
         "actor": os.environ.get("GITHUB_ACTOR", ""),
@@ -1194,12 +1365,16 @@ def cmd_authorize_event(args) -> int:
         # fetch the live pull request and make the final decision below.
         repository_owner = repository.split("/", 1)[0]
         sender = (payload.get("sender") or {}).get("login") or context["actor"]
-        if not is_trusted_actor(
-            sender, repository_owner, context["configured_actors"]
-        ):
+        sender_ok, _sender_code, sender_reason = is_trusted_dispatch_identity(
+            sender,
+            repository_owner,
+            context["configured_actors"],
+            context["automation_identity"],
+        )
+        if not sender_ok:
             decision = deny(
                 "untrusted_dispatcher",
-                "Dispatch was requested by untrusted actor {!r}.".format(sender),
+                "Dispatch was requested by {}".format(sender_reason),
             )
         else:
             inputs = payload.get("inputs")
@@ -1217,6 +1392,7 @@ def cmd_authorize_event(args) -> int:
             payload,
             repository=repository,
             configured_actors=context["configured_actors"],
+            automation_identity=context["automation_identity"],
             base_ref=context["base_ref"],
             commands=context["commands"],
             actor=context["actor"],
@@ -1246,6 +1422,7 @@ def cmd_authorize_event(args) -> int:
                     payload,
                     repository=repository,
                     configured_actors=context["configured_actors"],
+                    automation_identity=context["automation_identity"],
                     base_ref=context["base_ref"],
                     commands=context["commands"],
                     actor=context["actor"],
@@ -1274,14 +1451,13 @@ def cmd_verify_dispatch(args) -> int:
         return 1
 
     owner = repository.split("/", 1)[0]
-    if args.actor and not is_trusted_actor(args.actor, owner, context["configured_actors"]):
-        report(
-            deny(
-                "untrusted_dispatcher",
-                "Dispatch was requested by untrusted actor {!r}.".format(args.actor),
-            )
+    if args.actor:
+        actor_ok, _actor_code, actor_reason = is_trusted_dispatch_identity(
+            args.actor, owner, context["configured_actors"], context["automation_identity"]
         )
-        return 1
+        if not actor_ok:
+            report(deny("untrusted_dispatcher", "Dispatch was requested by {}".format(actor_reason)))
+            return 1
 
     inputs = {
         "mode": args.mode,
@@ -1321,9 +1497,14 @@ def cmd_verify_dispatch(args) -> int:
 def cmd_check_token(args) -> int:
     """Fail closed unless the supplied credential is a trusted automation actor.
 
-    Called with the write-capable PAT on purpose: the whole point is to learn
-    that credential's identity, which a read-only token cannot answer. It
-    performs no write, and the caller must run it before any mutating step.
+    Called with the capability credential on purpose: the whole point is to learn
+    that credential's identity, which the ambient read-only token cannot answer
+    in a way the comment gate would accept. It performs no write, and the caller
+    must run it before any mutating step.
+
+    A credential the repository does not name is refused even when it is a
+    perfectly good token: trust here is a property of the *configuration*, not
+    of the credential's power.
     """
     context = env_context()
     repository = args.repository or context["repository"]
@@ -1343,7 +1524,7 @@ def cmd_check_token(args) -> int:
         return 1
 
     try:
-        login = resolve_token_login(token)
+        login, kind = resolve_token_identity(token)
     except TrustPolicyError as exc:
         report(deny("credential_unverified", one_line(str(exc))))
         return 1
@@ -1357,22 +1538,23 @@ def cmd_check_token(args) -> int:
         )
         return 1
 
-    if not is_trusted_actor(login, owner, context["configured_actors"]):
-        report(
-            deny(
-                "untrusted_credential",
-                "Dispatch credential acts as untrusted account {!r}; a "
-                "comment from that account would be refused by the agent "
-                "workflow.".format(login),
-            )
-        )
+    trusted, code, reason = is_trusted_dispatch_identity(
+        login,
+        owner,
+        context["configured_actors"],
+        context["automation_identity"],
+    )
+    if not trusted:
+        report(deny(code, reason))
         return 1
 
     decision = allow(
         "trusted_credential",
-        "Dispatch credential acts as trusted account @{}.".format(login),
+        "{} ({} credential).".format(reason, kind),
     )
-    write_outputs({"credential_login": login, **decision.as_outputs()})
+    write_outputs(
+        {"credential_login": login, "credential_kind": kind, **decision.as_outputs()}
+    )
     report(decision)
     return 0
 

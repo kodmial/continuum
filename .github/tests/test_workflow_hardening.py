@@ -19,11 +19,28 @@ import json
 import pathlib
 import re
 import subprocess
+import sys
 import unittest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 WORKFLOW_DIR = REPO_ROOT / ".github" / "workflows"
 POLICY_PATH = ".github/scripts/trust_policy.py"
+CREDENTIALS_PATH = ".github/scripts/app_credentials.py"
+
+
+def load_credentials_module():
+    """The credential module, imported rather than parsed.
+
+    The workflows under audit mint credentials by name, and the least-privilege
+    property of each one is whatever the registry says it carries. Parsing that
+    declaration as text would let a formatting change pass a test that no longer
+    means anything, so the module is imported.
+    """
+    if str(REPO_ROOT / ".github" / "scripts") not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT / ".github" / "scripts"))
+    import app_credentials
+
+    return app_credentials
 
 #: The trust policy subcommand that resolves a write-capable credential to the
 #: account it speaks for. It is the only policy step allowed to hold the PAT,
@@ -349,19 +366,22 @@ class PermissionsTests(WorkflowAuditBase):
                 if scopes:
                     writers["{}/{}".format(name, job_name)] = scopes
         # The write-capable surface is deliberately tiny and fully audited.
-        # auto-merge/issue-scheduler/agent are the three automation roles; the
-        # repair jobs are label-and-dispatch/watchdog control planes that never
-        # check out or execute pull-request code.
+        #
+        # It used to be eight jobs, four of which held a repository-wide
+        # personal token because the capability they perform cannot be expressed
+        # as a job permission at all. Those four now write through a minted
+        # capability and hold read-only ambient authority instead:
+        # `issue-scheduler.yml/schedule` and the three repair jobs that update
+        # branches or wake the agent. What is left is exactly the work whose
+        # authority is the job's own `github.token` scope: queue and merge
+        # reconciliation, releasing failed issue reservations, releasing stale
+        # repair state, and the agent job's own tracker/ACTIONS bookkeeping.
         self.assertEqual(
             sorted(writers),
             [
                 "auto-merge.yml/reconcile",
-                "issue-scheduler.yml/schedule",
-                "opencode-repair.yml/ci-repair",
                 "opencode-repair.yml/recover-failed-issue-run",
                 "opencode-repair.yml/repair-watchdog",
-                "opencode-repair.yml/sync-current-pr",
-                "opencode-repair.yml/sync-stale-prs",
                 "opencode.yml/opencode",
             ],
         )
@@ -372,6 +392,174 @@ class PermissionsTests(WorkflowAuditBase):
                 self.raw[workflow],
                 "{} holds {} but does not call the trust policy".format(job_key, scopes),
             )
+
+    def test_capability_writes_are_minted_and_named(self):
+        """A job that mints a capability must say which one, and use the token
+        that capability produced rather than a personal token.
+
+        This is the assertion that replaced the old "these jobs hold write
+        scopes" surface for the four migrated jobs: their authority is now a
+        named, expiring, repository-scoped credential, and the thing worth
+        auditing is that every minted credential is one the registry declares and
+        that nothing reaches for the personal token directly.
+        """
+        minted = {
+            workflow: set(re.findall(r"app_credentials\.py mint --capability ([\w-]+)", source))
+            for workflow, source in self.raw.items()
+        }
+        actually_minted = {name: caps for name, caps in minted.items() if caps}
+        self.assertEqual(
+            actually_minted,
+            {
+                "issue-scheduler.yml": {"issue-write"},
+                "opencode-repair.yml": {"repair-control"},
+                "opencode.yml": {"agent-authoring"},
+            },
+            "the set of minted capabilities is not the reviewed one",
+        )
+        for workflow, capabilities in actually_minted.items():
+            for capability in capabilities:
+                published = "CONTINUUM_TOKEN_" + capability.replace("-", "_").upper()
+                self.assertIn(
+                    published,
+                    self.raw[workflow],
+                    "{} mints {} but never uses {}".format(workflow, capability, published),
+                )
+
+    def test_a_minted_credential_is_only_used_after_it_was_minted(self):
+        """A capability is published to ``$GITHUB_ENV``, so it only exists for
+        later steps of the job that minted it.
+
+        The failure this guards against is quiet: a step that reads
+        ``${{ env.CONTINUUM_TOKEN_* }}`` before the mint step, or in a different
+        job, expands to an empty string, and ``gh`` then runs unauthenticated --
+        or, worse, the step looks correct and simply cannot write. Both are
+        invisible in a workflow review and fatal at run time, so the ordering is
+        asserted here instead.
+        """
+        mint_pattern = re.compile(r"app_credentials\.py mint --capability ([\w-]+)")
+        published_pattern = re.compile(r"env\.CONTINUUM_TOKEN_([A-Z_]+)")
+
+        def capability_of(variable):
+            return variable.lower().replace("continuum_token_", "", 1).replace("_", "-")
+
+        for name, document in self.workflows.items():
+            for job_name, job in (document.get("jobs") or {}).items():
+                minted_at = {}
+                for index, step in enumerate(steps_of(job)):
+                    for capability in mint_pattern.findall(str(step.get("run") or "")):
+                        minted_at.setdefault(capability, index)
+                for index, step in enumerate(steps_of(job)):
+                    body = json.dumps(step)
+                    for variable in published_pattern.findall(body):
+                        capability = capability_of(variable)
+                        self.assertIn(
+                            capability,
+                            minted_at,
+                            "{}/{} reads {} but mints no such capability".format(
+                                name, job_name, variable
+                            ),
+                        )
+                        self.assertLess(
+                            minted_at[capability],
+                            index,
+                            "{}/{} reads {} in a step at or before its mint step".format(
+                                name, job_name, variable
+                            ),
+                        )
+
+    def test_the_registry_bounds_what_a_minted_credential_can_do(self):
+        """The registry is the single declaration of what a capability may do.
+
+        A workflow that mints a credential inherits whatever the registry says
+        that capability carries, so the registry is where least privilege is
+        actually enforced. It is imported here rather than parsed, and asserted
+        rather than trusted: every capability a workflow mints must exist, the
+        one credential that crosses into a model prompt must not carry issue or
+        actions authority, and no minted credential may outlive a job by more
+        than an hour.
+        """
+        module = load_credentials_module()
+        registry = module.CAPABILITIES
+        minted = {
+            capability
+            for source in self.raw.values()
+            for capability in re.findall(r"app_credentials\.py mint --capability ([\w-]+)", source)
+        }
+        self.assertTrue(minted, "expected the workflows to mint at least one capability")
+        for capability in sorted(minted):
+            self.assertIn(capability, registry, "{} is minted but not declared".format(capability))
+
+        # The bound the documentation quotes, asserted here so a longer lifetime
+        # cannot be introduced silently. Repository scoping of the minted token
+        # is asserted behaviourally in test_app_credentials.py.
+        self.assertLessEqual(
+            module.INSTALLATION_TOKEN_MAX_LIFETIME_SECONDS,
+            3600,
+            "a minted credential must not outlive an hour",
+        )
+
+        model_capabilities = sorted(
+            name for name, declared in registry.items() if declared.exposed_to_model
+        )
+        self.assertEqual(
+            model_capabilities,
+            ["agent-authoring"],
+            "the model-facing capability set changed; re-review what the model can reach",
+        )
+        for name in model_capabilities:
+            permissions = registry[name].permissions
+            for forbidden in ("issues", "actions", "administration"):
+                self.assertNotEqual(
+                    permissions.get(forbidden),
+                    "write",
+                    "{} is exposed to the model and must not grant {} write".format(
+                        name, forbidden
+                    ),
+                )
+            # A model-facing capability may be allowed to change workflow files
+            # -- without it, an agent fixing its own pipeline would have to stop
+            # and ask a human -- but only if the repository refuses to
+            # auto-repair or auto-merge a pull request that touches the
+            # privilege boundary. That is the other half of the grant, and it
+            # is asserted here rather than assumed.
+            if permissions.get("workflows") == "write":
+                self.assertIn(
+                    'startswith(".github/workflows/")',
+                    self.raw["opencode-repair.yml"],
+                    "{} can change workflows, so the repair controller must "
+                    "still refuse to auto-repair a pull request that does".format(name),
+                )
+                self.assertIn(
+                    "opencode-human-review-required",
+                    self.raw["opencode-repair.yml"],
+                )
+
+    def test_personal_token_is_only_reachable_through_the_explicit_fallback(self):
+        """`TAP_PAT` may appear only as the documented, opt-in fallback.
+
+        The expression is written so the secret is not even materialised in a
+        runner environment unless the repository variable turns the fallback on.
+        Any other spelling -- a bare `secrets.TAP_PAT`, a `|| github.token`
+        union, a PAT handed to a step by name -- is the coupling this repository
+        just removed.
+        """
+        allowed = (
+            "TAP_PAT: ${{ vars.CONTINUUM_ALLOW_PAT_FALLBACK == 'true' && secrets.TAP_PAT || '' }}"
+        )
+        for name, document in self.workflows.items():
+            text = self.raw[name]
+            for line in text.splitlines():
+                if "TAP_PAT" not in line:
+                    continue
+                stripped = line.strip()
+                if stripped.startswith("#"):
+                    continue
+                self.assertIn(
+                    allowed,
+                    stripped,
+                    "{} references TAP_PAT outside the opt-in fallback: {}".format(name, stripped),
+                )
 
 
 class PullRequestTargetTests(WorkflowAuditBase):

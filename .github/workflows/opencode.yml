@@ -2,8 +2,8 @@
 #
 # Trust boundary
 # --------------
-# This workflow spends a write-capable credential (TAP_PAT), so it is split in
-# two jobs that never share authority:
+# This workflow spends write-capable credentials, so it is split in two jobs that
+# never share authority:
 #
 #   authorize  read-only control plane. Decides whether the event is trusted,
 #              using .github/scripts/trust_policy.py and a read-only
@@ -15,6 +15,21 @@
 # event can influence the *decision*, never the *ref that is checked out with a
 # write-capable token*, because that value exists only as an output of a
 # read-only job. Everything here fails closed.
+#
+# Credentials
+# -----------
+# The privileged job holds no repository-wide personal token. It mints one App
+# installation token, for the single capability the agent performs:
+# `agent-authoring` (push its branch, open its pull request, comment on it, and
+# change workflow files). That is the one credential the model itself can see,
+# and it carries neither issues nor actions authority, so a compromised model can
+# push code to its own pull request and nothing else.
+#
+# Everything the *workflow* does around the model -- recording ownership,
+# publishing a repair outcome, re-running a failed run -- uses the job's own
+# scoped `github.token`, which the model cannot read: it is only ever referenced
+# from steps that do not run the model, and `printenv`/`env` are denied in the
+# model's bash allowlist. See docs/credential-capabilities.md.
 name: OpenCode agent
 
 on:
@@ -57,7 +72,8 @@ jobs:
        contains(fromJSON('["resolve-conflict","ci-fix"]'), inputs.mode)) ||
       (github.event_name == 'issue_comment' &&
        github.event.issue.pull_request == null &&
-       github.event.comment.user.login == github.repository_owner &&
+       (github.event.comment.user.login == github.repository_owner ||
+        github.event.comment.user.login == vars.CONTINUUM_AUTOMATION_LOGIN) &&
        (contains(github.event.comment.body, '/oc') ||
         contains(github.event.comment.body, '/opencode')))
     runs-on: ubuntu-latest
@@ -106,6 +122,12 @@ jobs:
           # never requires the privilege that request is asking for.
           GITHUB_TOKEN: ${{ github.token }}
           AUTOMATION_TRUSTED_ACTORS: ${{ vars.AUTOMATION_TRUSTED_ACTORS }}
+          # The one trusted bot. The scheduler posts the /oc comment with an
+          # installation token, which speaks as this login; without naming it
+          # here the gate below and the policy in `authorize-event` would both
+          # refuse the repository's own automation. Unset means unset: the
+          # comparison above then matches nobody.
+          CONTINUUM_AUTOMATION_LOGIN: ${{ vars.CONTINUUM_AUTOMATION_LOGIN }}
           CONTINUUM_BASE_BRANCH: ${{ vars.AUTOMATION_BASE_BRANCH || 'main' }}
         run: |
           set -euo pipefail
@@ -188,9 +210,13 @@ jobs:
     # long its own conflict repair is allowed to run.
     timeout-minutes: ${{ fromJSON(needs.authorize.outputs.task_timeout_minutes) }}
 
+    # The job's own token can talk to the issue tracker and to a workflow run,
+    # and can read code. It cannot push: every write to the repository goes
+    # through the `agent-authoring` capability, minted below, so the authority
+    # the model holds is a capability rather than the job's ambient scope.
     permissions:
-      actions: read
-      contents: write
+      actions: write
+      contents: read
       issues: write
       pull-requests: write
 
@@ -218,29 +244,33 @@ jobs:
           fi
           echo "Authorized by trust policy: $TRUST_CODE; checkout ref: $CHECKOUT_REF"
 
-      - name: Require a write-capable credential
+      # One credential for the whole job, for the one capability the agent
+      # performs. Minting fails closed: an unconfigured App stops the run before
+      # the checkout rather than halfway through with a branch and no pull
+      # request, which is what the old "is TAP_PAT present?" check was for.
+      - name: Mint the agent-authoring credential
         env:
-          HAS_TAP_PAT: ${{ secrets.TAP_PAT != '' }}
+          CONTINUUM_APP_ID: ${{ vars.CONTINUUM_APP_ID }}
+          CONTINUUM_APP_PRIVATE_KEY: ${{ secrets.CONTINUUM_APP_PRIVATE_KEY }}
+          CONTINUUM_AUTOMATION_LOGIN: ${{ vars.CONTINUUM_AUTOMATION_LOGIN }}
+          CONTINUUM_ALLOW_PAT_FALLBACK: ${{ vars.CONTINUUM_ALLOW_PAT_FALLBACK }}
+          # Only materialised when the fallback is explicitly enabled, so the
+          # runner environment does not contain a repository-wide token by
+          # default.
+          TAP_PAT: ${{ vars.CONTINUUM_ALLOW_PAT_FALLBACK == 'true' && secrets.TAP_PAT || '' }}
         run: |
           set -euo pipefail
-          # TAP_PAT is a classic PAT with repo + workflow scopes. Without it the
-          # agent cannot push workflow files, so the run would fail halfway with
-          # a pushed branch and no pull request. Fail closed before starting.
-          if [[ "$HAS_TAP_PAT" != "true" ]]; then
-            echo "::error::TAP_PAT is not configured; refusing to start a privileged agent run that cannot complete."
-            exit 1
-          fi
+          python3 .github/scripts/app_credentials.py mint --capability agent-authoring
 
       - name: Checkout verified ref
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           # Full history is required for conflict-repair merges against main.
           fetch-depth: 0
-          # Use the repository PAT rather than github.token. OpenCode may need
-          # to push changes under .github/workflows/**; the installation token
-          # is rejected by GitHub for those updates without workflows access.
-          # TAP_PAT must be a classic PAT with repo + workflow scopes.
-          token: ${{ secrets.TAP_PAT }}
+          # The `agent-authoring` capability, so the push and the pull request
+          # are made by the same identity that owns the branch. Persisting it
+          # lets the repair rungs below push without being handed anything new.
+          token: ${{ env.CONTINUUM_TOKEN_AGENT_AUTHORING }}
           persist-credentials: true
           # The only ref that reaches this checkout is the one the read-only
           # control plane validated against the live pull request. It is never
@@ -278,7 +308,11 @@ jobs:
       - name: Record issue execution ownership
         if: github.event_name == 'issue_comment'
         env:
-          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          # The job's own token, not the agent credential. This is workflow
+          # bookkeeping on the issue, it needs no repository write, and keeping
+          # it off the model-facing token means the model cannot narrate progress
+          # on the issue it is working.
+          GH_TOKEN: ${{ github.token }}
           ISSUE_NUMBER: ${{ needs.authorize.outputs.issue_number }}
         run: |
           set -euo pipefail
@@ -293,8 +327,10 @@ jobs:
         env:
           # use_github_token=true below tells OpenCode to use this exact env
           # credential for GitHub API operations. Keep it aligned with the
-          # checkout credential so both gh calls and git push use TAP_PAT.
-          GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
+          # checkout credential so both gh calls and git push use the same
+          # `agent-authoring` identity. It is a one-hour installation token
+          # scoped to this repository, not a repository-wide personal token.
+          GITHUB_TOKEN: ${{ env.CONTINUUM_TOKEN_AGENT_AUTHORING }}
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
           # The GitHub integration owns the branch/commit/push/PR lifecycle for
           # issue sessions. Prevent the LLM from changing Git state underneath
@@ -319,7 +355,8 @@ jobs:
       - name: Recover agent-managed issue branch
         if: github.event_name == 'issue_comment'
         env:
-          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          # The push and the pull request are the agent's own capability.
+          GH_TOKEN: ${{ env.CONTINUUM_TOKEN_AGENT_AUTHORING }}
           ISSUE_NUMBER: ${{ needs.authorize.outputs.issue_number }}
         run: |
           set -euo pipefail
@@ -368,7 +405,9 @@ jobs:
         id: replay
         if: needs.authorize.outputs.repair_action == 'replay-commits'
         env:
-          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          # The push is the agent's own branch, so this is the agent-authoring
+          # capability, not the job's ambient token.
+          GH_TOKEN: ${{ env.CONTINUUM_TOKEN_AGENT_AUTHORING }}
           # Validated against the live pull request by the read-only control
           # plane before this job was allowed to start.
           PR_NUMBER: ${{ needs.authorize.outputs.pr_number }}
@@ -442,8 +481,10 @@ jobs:
         env:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
           OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/big-pickle' }}
-          GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
-          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          # The agent-authoring capability, for the same reason as the rung
+          # above: the model resolves hunks by committing and pushing to the
+          # pull request's own branch, and gets no other authority.
+          AUTHORING_TOKEN: ${{ env.CONTINUUM_TOKEN_AGENT_AUTHORING }}
           # Both values were validated against the live pull request by the
           # read-only control plane before this job was allowed to start.
           PR_NUMBER: ${{ needs.authorize.outputs.pr_number }}
@@ -459,6 +500,13 @@ jobs:
           [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::Invalid pull request number."; exit 1; }
           [[ "$HEAD_REF" =~ ^opencode/issue[0-9]+-[A-Za-z0-9._-]+$ ]] || { echo "::error::Invalid head ref."; exit 1; }
           [[ "$REPAIR_AGENT_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || { echo "::error::Invalid repair agent timeout."; exit 1; }
+
+          # The replay is git work on the pull request's own branch, so it uses
+          # the agent-authoring capability. The model invoked below is the same
+          # untrusted surface as the main agent and gets nothing more: no issue
+          # authority, no actions authority.
+          AUTH_TOKEN="$CONTINUUM_TOKEN_AGENT_AUTHORING"
+          export GH_TOKEN="$AUTH_TOKEN" GITHUB_TOKEN="$AUTH_TOKEN"
 
           {
             echo "CONFLICT_PR_NUMBER=$PR_NUMBER"
@@ -545,8 +593,12 @@ jobs:
         env:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
           OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/big-pickle' }}
-          GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
-          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          # Three distinct authorities, kept apart inside one step because the
+          # step interleaves them. The model gets the authoring capability and
+          # nothing else; the re-run of a failed run and the label release below
+          # are the workflow's own actions, never the model's.
+          AUTHORING_TOKEN: ${{ env.CONTINUUM_TOKEN_AGENT_AUTHORING }}
+          ACTIONS_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ needs.authorize.outputs.pr_number }}
           RUN_ID: ${{ needs.authorize.outputs.run_id }}
           HEAD_REF: ${{ needs.authorize.outputs.head_ref }}
@@ -555,6 +607,10 @@ jobs:
           [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::Invalid pull request number."; exit 1; }
           [[ "$RUN_ID" =~ ^[0-9]+$ ]] || { echo "::error::Invalid run id."; exit 1; }
           [[ "$HEAD_REF" =~ ^opencode/issue[0-9]+-[A-Za-z0-9._-]+$ ]] || { echo "::error::Invalid head ref."; exit 1; }
+          # Bound to the model for the whole step, and released before the
+          # workflow's own calls below so a confused `gh` cannot reach actions
+          # authority through it.
+          export GH_TOKEN="$AUTHORING_TOKEN" GITHUB_TOKEN="$AUTHORING_TOKEN"
           PROMPT=$(cat <<EOF
           Fix the failed blocking workflow for pull request #${PR_NUMBER}.
 
@@ -586,6 +642,11 @@ jobs:
           opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
           AFTER_SHA=$(git rev-parse HEAD)
 
+          # The model is finished with the repository. Everything below is the
+          # workflow acting on its own authority, and the model-facing token is
+          # dropped from the environment first so no later `gh` inherits it.
+          unset GH_TOKEN GITHUB_TOKEN
+
           # If the agent correctly decided there is no code fix to make (for
           # example a transient runner/network failure), give the same CI head
           # one trusted retry instead of leaving the PR stuck forever. The
@@ -593,13 +654,13 @@ jobs:
           # cannot create an unbounded same-head loop.
           if [[ "$AFTER_SHA" == "$BEFORE_SHA" ]]; then
             echo "OpenCode produced no new commit; rerunning failed workflow jobs once."
-            gh run rerun "$RUN_ID" --failed
+            GH_TOKEN="$ACTIONS_TOKEN" gh run rerun "$RUN_ID" --failed
           else
             # A successful repair push starts a fresh HEAD/reconciliation
             # episode. Do not let a per-head lock from the failed run suppress
             # repair of a later failure on the new commit.
             for stale in opencode-ci-repair opencode-packaging-smoke-repair; do
-              gh api --method DELETE \
+              GH_TOKEN="$ACTIONS_TOKEN" gh api --method DELETE \
                 "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/$stale" \
                 >/dev/null 2>&1 || true
             done
@@ -616,7 +677,10 @@ jobs:
       - name: Publish the conflict-repair outcome
         if: always() && github.event_name == 'workflow_dispatch' && contains(fromJSON('["replay-commits","resolve-hunks"]'), needs.authorize.outputs.repair_action)
         env:
-          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          # The job's own token. Publication is workflow bookkeeping: a comment
+          # on the pull request and labels on the issue, none of which needs
+          # repository write, and none of which the model should be able to make.
+          GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ needs.authorize.outputs.pr_number }}
           HEAD_REF: ${{ needs.authorize.outputs.head_ref }}
           REPAIR_EPISODE: ${{ needs.authorize.outputs.repair_episode }}

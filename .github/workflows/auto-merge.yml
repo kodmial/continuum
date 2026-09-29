@@ -249,9 +249,11 @@ jobs:
 
       - name: Re-verify the planned pull requests
         env:
-          # Write authority, but this step only reads. The point of the split
-          # is that the liveness re-check happens before any mutating call.
-          GH_TOKEN: ${{ secrets.TAP_PAT || github.token }}
+          # The job's own token, and this step only reads. Merging an approved
+          # pull request is exactly the job's declared contents and
+          # pull-requests write scope, and the scheduler this job wakes does not
+          # gate on who dispatched it, so no minted capability is needed here.
+          GH_TOKEN: ${{ github.token }}
           MERGE_PLAN: ${{ needs.plan.outputs.merge_plan }}
           CONTINUUM_BASE_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
         run: |
@@ -296,7 +298,12 @@ jobs:
 
       - name: Merge the approved pull requests
         env:
-          GH_TOKEN: ${{ secrets.TAP_PAT || github.token }}
+          # The job's own token, which the capability registry records as
+          # satisfying `merge`: squash-merging a pull request this repository's
+          # own policy just approved needs nothing more than the contents and
+          # pull-requests write this job already declares, so no personal token
+          # and no minted capability are involved.
+          GH_TOKEN: ${{ github.token }}
           MERGE_PLAN: ${{ needs.plan.outputs.merge_plan }}
           CONTINUUM_BASE_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
         run: |

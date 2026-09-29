@@ -34,9 +34,11 @@ on:
           cooldown is the only thing holding the queue. Event coverage, not this
           window, drives normal progression.
     secrets:
+      # A consumer repository may pass a token with the write scope its own
+      # queue needs. Continuum's own repository passes `github.token`; there is
+      # no personal-access-token fallback here, because queue reconciliation
+      # needs nothing a scoped job token does not already have.
       continuum_token:
-        required: false
-      TAP_PAT:
         required: false
 
   # The complete lifecycle surface of a candidate. `closed` and
@@ -131,7 +133,7 @@ jobs:
         id: config
         shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.continuum_token || secrets.TAP_PAT || github.token }}
+          GITHUB_TOKEN: ${{ secrets.continuum_token || github.token }}
         run: |
           set -euo pipefail
           PYTHONPATH=src python3 -m continuum.cli config-check \
@@ -141,7 +143,7 @@ jobs:
         id: queue
         shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.continuum_token || secrets.TAP_PAT || github.token }}
+          GITHUB_TOKEN: ${{ secrets.continuum_token || github.token }}
           CONTINUUM_WAKE_EVENT: ${{ github.event_name }}
           CONTINUUM_WAKE_ACTION: ${{ github.event.action }}
           CONTINUUM_WAKE_PR: ${{ github.event.pull_request.number || github.event.issue.number }}

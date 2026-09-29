@@ -603,13 +603,15 @@ class DispatchCredentialTests(unittest.TestCase):
     produce work: it would consume an issue reservation and dispatch nothing.
     """
 
-    def run_check(self, login, **environ):
+    def run_check(self, login, api_request=None, **environ):
         captured = {}
 
         def fake_request(path, token, **kwargs):
             captured["path"] = path
             captured["token"] = token
-            return {"login": login}
+            return {"login": login} if login is not None else {}
+
+        request = api_request or fake_request
 
         env = {
             "GITHUB_REPOSITORY": REPOSITORY,
@@ -618,7 +620,7 @@ class DispatchCredentialTests(unittest.TestCase):
         env.update(environ)
         args = trust_policy.build_parser().parse_args(["check-token"])
         with unittest.mock.patch.dict(os.environ, env, clear=True), \
-                unittest.mock.patch.object(trust_policy, "api_request", fake_request):
+                unittest.mock.patch.object(trust_policy, "api_request", request):
             code = trust_policy.main(["check-token"])
         return code, captured
 
@@ -663,10 +665,74 @@ class DispatchCredentialTests(unittest.TestCase):
 
     def test_identity_lookup_never_writes(self):
         """The one step allowed to hold the write token must not act on it."""
-        source = inspect.getsource(trust_policy.resolve_token_login)
+        source = inspect.getsource(trust_policy.resolve_token_identity)
+        # Both credential kinds are identified, and both are identified by a
+        # read: a user token answers /user, an installation token answers /app.
         self.assertIn("/user", source)
+        self.assertIn("/app", source)
         for verb in ("POST", "PUT", "PATCH", "DELETE"):
             self.assertNotIn(verb, source, verb)
+
+    def test_an_installation_token_is_identified_as_the_automation_identity(self):
+        """The App token speaks as ``<slug>[bot]``, which the App identity names."""
+        seen = []
+
+        def fake_request(path, token, **kwargs):
+            seen.append(path)
+            if path == "/user":
+                raise trust_policy.TrustPolicyError("Bad credentials", status=401)
+            return {"slug": "continuum-automation"}
+
+        code, _ = self.run_check(
+            None,
+            CONTINUUM_AUTOMATION_LOGIN="continuum-automation[bot]",
+            api_request=fake_request,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(seen, ["/user", "/app"])
+
+    def test_a_forged_bot_identity_is_refused(self):
+        """Naming an App does not let any App in: the login must match exactly."""
+
+        def fake_request(path, token, **kwargs):
+            if path == "/user":
+                raise trust_policy.TrustPolicyError("Bad credentials", status=401)
+            return {"slug": "attacker-automation"}
+
+        code, _ = self.run_check(
+            None,
+            CONTINUUM_AUTOMATION_LOGIN="continuum-automation[bot]",
+            api_request=fake_request,
+        )
+        self.assertEqual(code, 1)
+
+    def test_a_transient_server_error_is_not_retried_against_a_second_endpoint(self):
+        """A broken verification must not become a *different* verification."""
+        seen = []
+
+        def fake_request(path, token, **kwargs):
+            seen.append(path)
+            raise trust_policy.TrustPolicyError("500 boom", status=500)
+
+        code, _ = self.run_check(None, api_request=fake_request)
+        self.assertEqual(code, 1)
+        self.assertEqual(seen, ["/user"])
+
+    def test_a_bot_cannot_be_trusted_through_the_actor_allowlist(self):
+        """`AUTOMATION_TRUSTED_ACTORS` stays a list of humans.
+
+        A bot's comment is routinely a verbatim echo of what a stranger wrote,
+        so an operator must not be able to arm the agent by listing
+        `github-actions[bot]` here. The one trusted bot is the credential
+        identity, which is configured separately and used only by
+        ``check-token``.
+        """
+        code, _ = self.run_check(
+            "github-actions[bot]",
+            AUTOMATION_TRUSTED_ACTORS="github-actions[bot], kodmial",
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(trust_policy.parse_actor_list("github-actions[bot]"), frozenset())
 
 
 class GithubOutputEncodingTests(unittest.TestCase):
