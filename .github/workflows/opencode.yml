@@ -109,7 +109,10 @@ jobs:
       needs.authorize.result == 'success' &&
       needs.authorize.outputs.authorized == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Substantial coding tasks regularly exceed 30 minutes. Keep one generous
+    # bounded execution window; failed/cancelled runs are recovered by the
+    # repair controller instead of relying on a short lease timer.
+    timeout-minutes: 180
 
     permissions:
       actions: read
@@ -184,8 +187,31 @@ jobs:
         if: github.event_name == 'workflow_dispatch'
         run: |
           set -euo pipefail
-          curl -fsSL https://opencode.ai/install | bash
+          for attempt in 1 2 3; do
+            echo "OpenCode install attempt $attempt/3"
+            if curl -fsSL https://opencode.ai/install | bash; then
+              break
+            fi
+            if [[ "$attempt" == "3" ]]; then
+              echo "::error::OpenCode installer failed after 3 attempts."
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
+          test -x "$HOME/.opencode/bin/opencode"
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+
+      - name: Record issue execution ownership
+        if: github.event_name == 'issue_comment'
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          ISSUE_NUMBER: ${{ needs.authorize.outputs.issue_number }}
+        run: |
+          set -euo pipefail
+          [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::Invalid issue number."; exit 1; }
+          marker="<!-- continuum-opencode-run:$GITHUB_RUN_ID -->"
+          gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+            --body "$(printf '%s\nOpenCode run %s started for issue #%s.' "$marker" "$GITHUB_RUN_ID" "$ISSUE_NUMBER")"
 
       - name: Run OpenCode
         if: github.event_name != 'workflow_dispatch'
@@ -355,6 +381,15 @@ jobs:
           if [[ "$AFTER_SHA" == "$BEFORE_SHA" ]]; then
             echo "OpenCode produced no new commit; rerunning failed workflow jobs once."
             gh run rerun "$RUN_ID" --failed
+          else
+            # A successful repair push starts a fresh HEAD/reconciliation
+            # episode. Do not let a per-head lock from the failed run suppress
+            # repair of a later failure on the new commit.
+            for stale in opencode-ci-repair opencode-packaging-smoke-repair; do
+              gh api --method DELETE \
+                "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/$stale" \
+                >/dev/null 2>&1 || true
+            done
           fi
 
       - name: Clear conflict-repair lock
