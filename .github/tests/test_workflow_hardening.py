@@ -593,6 +593,18 @@ class RepairControllerTests(WorkflowAuditBase):
         self.assertIn("continuum-dispatch", consumer)
         self.assertIn('gh workflow run "$SCHEDULER_WORKFLOW"', consumer)
 
+    def test_consumer_blocking_workflows_are_generic_and_repairable(self):
+        merge = self.raw["consumer-auto-merge.yml"]
+        repair = self.raw["consumer-repair.yml"]
+        self.assertIn("additional_blocking_workflows", merge)
+        self.assertIn("optionalBlockingWorkflowsGreen", merge)
+        self.assertIn("if (!run) continue", merge)
+        self.assertIn("additional_blocking_workflows", repair)
+        self.assertIn("opencode-gate-repair-", repair)
+        self.assertNotIn("Packaging smoke", merge)
+        self.assertNotIn("Packaging smoke", repair)
+        self.assertNotIn("Packaging smoke", self.raw["opencode-repair.yml"])
+
     def test_privilege_boundary_changes_are_never_auto_merged(self):
         text = self.raw["auto-merge.yml"]
         self.assertIn("merge-plan", text)
@@ -633,6 +645,31 @@ class SelfProtectionTests(WorkflowAuditBase):
     def test_merge_finalization_is_idempotent_after_source_issue_autoclose(self):
         self.assertIn("already closed", self.raw["auto-merge.yml"])
         self.assertIn("already closed", self.raw["consumer-auto-merge.yml"])
+
+    def test_custom_runtime_release_can_be_pinned_exactly(self):
+        runtime = self.raw["consumer-opencode.yml"]
+        for token in (
+            "opencode_release_tag",
+            "opencode_release_sha256",
+            "opencode_release_version",
+            "opencode_release_source_sha",
+        ):
+            self.assertIn(token, runtime)
+        self.assertIn("Exact source verification requires the release metadata sidecar", runtime)
+        self.assertIn("Release binary SHA-256 does not match the pinned identity", runtime)
+
+    def test_bun_release_adapter_supports_shell_free_exact_build_argv(self):
+        release = self.raw["release-bun-binary.yml"]
+        for token in (
+            "build_argv_json",
+            "build_env_json",
+            "expected_version",
+            "subprocess.run(argv, env=child_env, check=True)",
+            '"source_sha": "$SOURCE_SHA"',
+            '"binary_version": "$BINARY_VERSION"',
+        ):
+            self.assertIn(token, release)
+        self.assertNotIn("shell=True", release)
 
     def test_ci_runs_the_security_suite(self):
         text = self.raw["ci.yml"]

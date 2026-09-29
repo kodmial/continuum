@@ -15,6 +15,11 @@ on:
         type: string
         required: false
         default: CI
+      additional_blocking_workflows:
+        description: "Comma-separated optional workflow names; absent runs are treated as not applicable, present runs must succeed"
+        type: string
+        required: false
+        default: ""
       review_status_context:
         type: string
         required: false
@@ -46,6 +51,7 @@ jobs:
           REVIEW_ENABLED: ${{ inputs.review }}
           RELEASE_ENABLED: ${{ inputs.release }}
           CI_WORKFLOW: ${{ inputs.ci_workflow }}
+          ADDITIONAL_BLOCKING_WORKFLOWS: ${{ inputs.additional_blocking_workflows }}
           REVIEW_CONTEXT: ${{ inputs.review_status_context }}
           SCHEDULER_WORKFLOW: ${{ inputs.scheduler_workflow }}
           RELEASE_WORKFLOW: ${{ inputs.release_workflow }}
@@ -63,18 +69,47 @@ jobs:
               return data.status === 'ahead' || data.status === 'identical';
             }
 
+            async function latestWorkflowForHead(sha, workflowName) {
+              const runs = await github.paginate(
+                github.rest.actions.listWorkflowRunsForRepo,
+                {owner, repo, event:'pull_request', per_page:100}
+              );
+              return runs
+                .filter(r => r.name === workflowName && r.head_sha === sha)
+                .sort((a,b) => new Date(b.created_at) - new Date(a.created_at))[0] || null;
+            }
+
             async function currentHeadCiGreen(sha) {
-              const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
-                owner, repo,
-                workflow_id: process.env.CI_WORKFLOW,
-                head_sha: sha,
-                event: 'pull_request',
-                per_page: 20,
-              });
-              const completed = runs
-                .filter(r => r.status === 'completed')
-                .sort((a,b) => new Date(b.created_at) - new Date(a.created_at));
-              return completed[0]?.conclusion === 'success';
+              const run = await latestWorkflowForHead(sha, process.env.CI_WORKFLOW);
+              return Boolean(
+                run &&
+                run.status === 'completed' &&
+                run.conclusion === 'success'
+              );
+            }
+
+            function additionalBlockingWorkflowNames() {
+              return (process.env.ADDITIONAL_BLOCKING_WORKFLOWS || '')
+                .split(',')
+                .map(name => name.trim())
+                .filter(Boolean);
+            }
+
+            async function optionalBlockingWorkflowsGreen(sha) {
+              for (const workflowName of additionalBlockingWorkflowNames()) {
+                const run = await latestWorkflowForHead(sha, workflowName);
+                // Path-filtered / conditional gates are optional by presence:
+                // if no run exists for this exact head, the gate is not
+                // applicable. Once a run exists, it is blocking and must pass.
+                if (!run) continue;
+                if (run.status !== 'completed' || run.conclusion !== 'success') {
+                  core.info(
+                    `Head ${sha}: optional blocking workflow "${workflowName}" is ${run.status}/${run.conclusion || 'pending'}.`
+                  );
+                  return false;
+                }
+              }
+              return true;
             }
 
             async function reviewGreen(sha) {
@@ -102,6 +137,10 @@ jobs:
                 core.info(`PR #${listed.number}: current-head CI is not green.`);
                 continue;
               }
+              if (!(await optionalBlockingWorkflowsGreen(listed.head.sha))) {
+                core.info(`PR #${listed.number}: an applicable blocking workflow is not green.`);
+                continue;
+              }
               if (!(await reviewGreen(listed.head.sha))) {
                 core.info(`PR #${listed.number}: review gate is not green.`);
                 continue;
@@ -123,6 +162,12 @@ jobs:
               // earlier in this same run, every sibling branch is stale now.
               if (!(await baseFresh(pr.head.sha))) {
                 core.info(`PR #${pr.number}: main advanced before merge; branch sync/repair must run first.`);
+                continue;
+              }
+              if (!(await currentHeadCiGreen(pr.head.sha)) ||
+                  !(await optionalBlockingWorkflowsGreen(pr.head.sha)) ||
+                  !(await reviewGreen(pr.head.sha))) {
+                core.info(`PR #${pr.number}: a merge gate changed before the write; skipping.`);
                 continue;
               }
 

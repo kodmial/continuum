@@ -53,6 +53,33 @@ That contract file is distinct from the operational `.continuum.yml` this
 repository validates with `continuum cli config-check`; the sections below
 describe the implementation that sits behind the two toggles.
 
+## Agent execution and build gates
+
+Continuum owns the OpenCode lifecycle around the model: reservation, checkout,
+branch, commit, push, pull request, retries, and recovery. The model is allowed
+to edit the working tree; it is not the authority that decides which branch is
+published. A normal coding task has a bounded 180-minute default window, and a
+failed, cancelled, or timed-out issue run releases its reservation immediately
+and re-enters the scheduler up to the configured attempt limit. The lease timer
+is a missed-event backstop, not the primary progress mechanism.
+
+Consumer repositories may use anonymous OpenCode models; an API key is optional
+rather than a prerequisite. The upstream installer is retried with bounded
+backoff and the resulting executable is verified before work starts.
+
+`CI` is the required merge gate. Consumers can also name optional blocking
+workflows through `additional_blocking_workflows` on the reusable merge and
+repair controllers. These are conditional by presence: if a path-filtered build
+or packaging workflow did not run for the exact PR head, it is not applicable;
+if it did run, the same exact-head run must finish successfully before merge.
+A failed applicable gate enters the same one-repair-per-head controller as CI.
+
+GitHub requires `workflow_run.workflows` to be declared statically in the thin
+consumer entry workflow. Therefore a consumer that has, for example, a build or
+packaging smoke workflow lists that workflow in its caller trigger and passes
+the same name in `additional_blocking_workflows`; the reusable Continuum core
+contains no product-specific workflow names.
+
 ## Review gate
 
 The first reusable review adapter (`review.provider: pr-agent`) is, as of the
@@ -125,6 +152,24 @@ the shared reconciler — see `fixtures/consumer-repo/.github/workflows/review-q
 `tests/test_queue_workflows.py` fails if the two event sets ever drift apart.
 
 ## Release
+
+For standalone Bun-built tools, `.github/workflows/release-bun-binary.yml`
+provides a reusable immutable binary publisher. The simple contract remains
+`package_dir + build_script`; projects that need an exact compiler/build
+invocation can instead pass `build_argv_json` plus non-secret
+`build_env_json`. The argv is executed directly with Python `subprocess`,
+never through a shell, so flags and environment values remain data rather than
+code.
+
+Every published binary carries the exact source SHA, release tag, asset digest,
+binary version, size, and build mode in its sidecar metadata. A consumer using
+`consumer-opencode.yml` may select a release by prefix for convenience, or
+pin an exact immutable tag. Exact selection requires the expected SHA-256 and
+can additionally require the binary version and source SHA; Continuum verifies
+the downloaded asset, checksum file, and metadata sidecar before adding the
+binary to `PATH`. This is the portable form of runtime-lab's exact-artifact
+lesson: a qualified binary identity is never silently replaced by a newer
+"latest" artifact.
 
 A release target is a typed declaration in `.continuum.yml`, not a workflow.
 `continuum release plan` turns it into a plan — an ordered list of argument

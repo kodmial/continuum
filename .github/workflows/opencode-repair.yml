@@ -19,7 +19,7 @@ on:
   pull_request_target:
     types: [opened, reopened, synchronize]
   workflow_run:
-    workflows: ["CI", "Packaging smoke", "OpenCode agent"]
+    workflows: ["CI", "OpenCode agent"]
     types: [completed]
 
 permissions: {}
@@ -339,7 +339,7 @@ jobs:
           echo "Decision: $ACTION ($REASON)."
 
           if [[ "$ACTION" == "reset-head-locks" ]]; then
-            for stale in opencode-ci-repair opencode-packaging-smoke-repair; do
+            for stale in opencode-ci-repair; do
               gh api --method DELETE \
                 "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/$stale" \
                 >/dev/null 2>&1 || true
@@ -510,7 +510,6 @@ jobs:
 
           case "$RUN_NAME" in
             CI) lock_label="opencode-ci-repair" ;;
-            "Packaging smoke") lock_label="opencode-packaging-smoke-repair" ;;
             *)
               echo "action=none" >> "$GITHUB_OUTPUT"
               echo "reason=unsupported_workflow" >> "$GITHUB_OUTPUT"
