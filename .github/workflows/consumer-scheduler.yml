@@ -68,6 +68,17 @@ jobs:
               try { await github.rest.issues.removeLabel({owner, repo, issue_number:number, name}); }
               catch (e) { if (e.status !== 404) throw e; }
             }
+            async function retryEpochStartedAt(number) {
+              const events = await github.paginate(
+                'GET /repos/{owner}/{repo}/issues/{issue_number}/events',
+                {owner, repo, issue_number:number, per_page:100}
+              );
+              const resets = events
+                .filter(e => e.event === 'unlabeled' && e.label?.name === paused && e.created_at)
+                .map(e => new Date(e.created_at).getTime())
+                .filter(Number.isFinite);
+              return resets.length ? Math.max(...resets) : 0;
+            }
 
             await ensureLabel(inProgress, 'FBCA04', 'Continuum currently owns this issue');
             await ensureLabel(paused, 'B60205', 'Continuum automation is paused');
@@ -96,7 +107,10 @@ jobs:
               const comments = await github.paginate(github.rest.issues.listComments, {
                 owner, repo, issue_number:issue.number, per_page:100
               });
-              const dispatches = comments.filter(c => (c.body || '').includes(marker))
+              const epochStartedAt = await retryEpochStartedAt(issue.number);
+              const dispatches = comments
+                .filter(c => (c.body || '').includes(marker))
+                .filter(c => new Date(c.created_at).getTime() >= epochStartedAt)
                 .sort((a,b) => new Date(a.created_at) - new Date(b.created_at));
               const last = dispatches.at(-1);
               if (!last) {
