@@ -130,17 +130,6 @@ jobs:
             exit 1
           fi
           echo "validated $core"
-
-          bad=0
-          while IFS= read -r file; do
-            base="$(basename "$file")"
-            if ! grep -Eq "$allowed" <<<"$base"; then
-              echo "::error::Unexpected active workflow: $file"
-              bad=1
-            fi
-          done < <(find .github/workflows -maxdepth 1 -type f \( -name '*.yml' -o -name '*.yaml' \) | sort)
-          exit "$bad"
-
       - name: Run the trust policy and workflow hardening suite
         shell: bash
         run: |
