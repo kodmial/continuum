@@ -76,6 +76,7 @@ jobs:
       run_id: ${{ steps.gate.outputs.run_id }}
       head_ref: ${{ steps.gate.outputs.head_ref }}
       checkout_ref: ${{ steps.gate.outputs.checkout_ref }}
+      control_plane_sha: ${{ steps.control.outputs.sha }}
       # Repair and task executions get different, fixed budgets. A repair of a
       # finished change is bounded by conflict_repair.py, so a three-hour
       # source task can never set the deadline for repairing its own merge
@@ -97,6 +98,14 @@ jobs:
           # default branch so no payload field can select what runs here.
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
+
+      - name: Pin trusted control plane revision
+        id: control
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::Invalid trusted control-plane SHA."; exit 1; }
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
       - name: Enforce the trust policy
         id: gate
@@ -247,6 +256,36 @@ jobs:
           # interpolated from inputs.head_ref or from an event payload.
           ref: ${{ needs.authorize.outputs.checkout_ref }}
 
+      - name: Materialize trusted repair control plane
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          CONTROL_PLANE_SHA: ${{ needs.authorize.outputs.control_plane_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$CONTROL_PLANE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::Invalid trusted control-plane SHA."; exit 1; }
+
+          control_dir="$RUNNER_TEMP/continuum-control-plane"
+          rm -rf "$control_dir"
+          mkdir -p "$control_dir"
+
+          # Repair executes against an older PR checkout, but its controller
+          # helpers must always come from the exact trusted revision that
+          # authorized this run. Never execute helper code from the PR branch.
+          if ! git cat-file -e "$CONTROL_PLANE_SHA^{commit}" 2>/dev/null; then
+            git fetch --no-tags --depth=1 origin "$CONTROL_PLANE_SHA"
+          fi
+          for helper in opencode_runtime.py conflict_repair.py; do
+            git show "$CONTROL_PLANE_SHA:.github/scripts/$helper" > "$control_dir/$helper"
+            test -s "$control_dir/$helper"
+          done
+
+          python3 "$control_dir/opencode_runtime.py" --help >/dev/null
+          python3 "$control_dir/conflict_repair.py" --help >/dev/null
+          {
+            echo "CONTINUUM_OPENCODE_RUNTIME=$control_dir/opencode_runtime.py"
+            echo "CONTINUUM_CONFLICT_REPAIR=$control_dir/conflict_repair.py"
+          } >> "$GITHUB_ENV"
+
       - name: Configure Git identity
         run: |
           set -euo pipefail
@@ -281,7 +320,7 @@ jobs:
           # the agent re-checks it. A binary swapped between here and the
           # invocation is then a failed step rather than a trusted run.
           PATH="$HOME/.opencode/bin:$PATH" \
-            python3 .github/scripts/opencode_runtime.py install
+            python3 "$CONTINUUM_OPENCODE_RUNTIME" install
 
       - name: Record issue execution ownership
         if: github.event_name == 'issue_comment'
@@ -697,7 +736,7 @@ jobs:
           - Keep all comments and commit messages in English.
           EOF
           )
-          python3 .github/scripts/opencode_runtime.py verify --expected-sha256 "$OPENCODE_RUNTIME_SHA256"
+          python3 "$CONTINUUM_OPENCODE_RUNTIME" verify --expected-sha256 "$OPENCODE_RUNTIME_SHA256"
           timeout --signal=TERM "$REPAIR_AGENT_TIMEOUT_SECONDS" \
             opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
 
@@ -761,7 +800,7 @@ jobs:
           # Point of use: re-read the digest recorded at install time, so
           # the process about to start is the one that was verified rather
           # than whatever PATH happens to resolve at this moment.
-          python3 .github/scripts/opencode_runtime.py verify --expected-sha256 "$OPENCODE_RUNTIME_SHA256"
+          python3 "$CONTINUUM_OPENCODE_RUNTIME" verify --expected-sha256 "$OPENCODE_RUNTIME_SHA256"
           opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
           AFTER_SHA=$(git rev-parse HEAD)
 
@@ -837,14 +876,14 @@ jobs:
             # same branch, so the head has moved and the sha differs -- which,
             # read as "a replacement exists", would opt out a pull request that
             # is now perfectly mergeable.
-            python3 .github/scripts/conflict_repair.py publication-gate \
+            python3 "$CONTINUUM_CONFLICT_REPAIR" publication-gate \
               --original-head "$original_head" \
               --replacement-head "$repaired_head" \
               --repair-succeeded true \
               --repaired-in-place true \
               --attempts "$REPAIR_ATTEMPT" >> "$publication"
           else
-            python3 .github/scripts/conflict_repair.py publication-gate \
+            python3 "$CONTINUUM_CONFLICT_REPAIR" publication-gate \
               --original-head "$original_head" \
               --attempts "$REPAIR_ATTEMPT" >> "$publication"
           fi
@@ -862,7 +901,7 @@ jobs:
           else
             episode_state=failed
           fi
-          marker="$(python3 .github/scripts/conflict_repair.py render-marker \
+          marker="$(python3 "$CONTINUUM_CONFLICT_REPAIR" render-marker \
             --episode "$REPAIR_EPISODE" \
             --pr-number "$PR_NUMBER" \
             --head-sha "${repaired_head:-$original_head}" \
@@ -882,7 +921,7 @@ jobs:
           # is what made the pull request invisible to every later
           # reconciliation, so the attempt budget -- not the lock -- is what
           # bounds retries.
-          python3 .github/scripts/conflict_repair.py lock \
+          python3 "$CONTINUUM_CONFLICT_REPAIR" lock \
             --lock-present true \
             --attempts "$REPAIR_ATTEMPT" \
             --max-attempts "$MAX_ATTEMPTS" >> "$RUNNER_TEMP/lock.env"
