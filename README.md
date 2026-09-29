@@ -162,7 +162,10 @@ never through a shell, so flags and environment values remain data rather than
 code.
 
 Every published binary carries the exact source SHA, release tag, asset digest,
-binary version, size, and build mode in its sidecar metadata. A consumer using
+binary version, size, and build mode in its sidecar metadata. When a build is
+expected to reproduce an already-qualified artifact, the publisher can also
+require the exact SHA-256 and byte size and fails before upload on any mismatch.
+A consumer using
 `consumer-opencode.yml` may select a release by prefix for convenience, or
 pin an exact immutable tag. Exact selection requires the expected SHA-256 and
 can additionally require the binary version and source SHA; Continuum verifies
