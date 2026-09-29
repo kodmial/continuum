@@ -94,6 +94,9 @@ on:
     secrets:
       OPENCODE_API_KEY:
         required: false
+      AUTOMATION_TOKEN:
+        description: Optional PAT/App token used when the caller repository forbids GITHUB_TOKEN from creating pull requests
+        required: false
 
 permissions:
   actions: read
@@ -117,8 +120,8 @@ jobs:
     # replaces the first, so `BASE_BRANCH` was being dropped and every `$BASE_BRANCH`
     # reference in this job expanded to nothing.
     env:
-      GH_TOKEN: ${{ github.token }}
-      GITHUB_TOKEN: ${{ github.token }}
+      GH_TOKEN: ${{ secrets.AUTOMATION_TOKEN || github.token }}
+      GITHUB_TOKEN: ${{ secrets.AUTOMATION_TOKEN || github.token }}
       OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
       OPENCODE_MODEL: ${{ inputs.model }}
       BASE_BRANCH: ${{ inputs.base_branch }}
@@ -142,6 +145,7 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ inputs.base_branch }}
+          token: ${{ secrets.AUTOMATION_TOKEN || github.token }}
           persist-credentials: true
 
       - name: Checkout PR branch
@@ -150,6 +154,7 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ inputs.head_ref }}
+          token: ${{ secrets.AUTOMATION_TOKEN || github.token }}
           persist-credentials: true
 
       - name: Configure git
@@ -158,6 +163,9 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Load Continuum engine
+        uses: kodmial/continuum/.github/actions/engine-path@main
 
       - name: Validate OpenCode distribution
         shell: bash
@@ -198,7 +206,7 @@ jobs:
           # invocation is caught even though the install itself cannot be
           # attested.
           PATH="$HOME/.opencode/bin:$PATH" \
-            python3 .github/scripts/opencode_runtime.py install
+            python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/opencode_runtime.py" install
 
       - name: Install optimized OpenCode from GitHub Release
         if: inputs.opencode_distribution == 'github-release'
@@ -291,7 +299,7 @@ jobs:
           # Ordering is best-effort; this comparison is the guarantee.
           echo "$DIR" >> "$GITHUB_PATH"
           PATH="$DIR:$PATH" \
-            python3 .github/scripts/opencode_runtime.py install \
+            python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/opencode_runtime.py" install \
               --verified-sha256 "$BINARY_SHA256"
 
           echo "release_tag=$TAG" >> "$GITHUB_OUTPUT"
@@ -324,7 +332,7 @@ jobs:
           # The workflow owns the branch. It is created here, before the model
           # runs, so the ref the work is published to is decided by the workflow
           # rather than by whatever the model leaves behind.
-          BRANCH="$(python3 .github/scripts/agent_workspace.py select-branch \
+          BRANCH="$(python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/agent_workspace.py" select-branch \
             --candidates "opencode/issue${ISSUE_NUMBER}-continuum" | sed -n 's/^owned_branch=//p')"
           if [[ -z "$BRANCH" ]]; then
             echo "::error::Could not derive the owned branch for issue #$ISSUE_NUMBER."
@@ -360,7 +368,7 @@ jobs:
           # Point of use. The digest recorded at install is re-read here, so
           # the process about to start is the one that was verified rather than
           # whatever PATH happens to resolve at this moment.
-          python3 .github/scripts/opencode_runtime.py verify --expected-sha256 "$OPENCODE_RUNTIME_SHA256"
+          python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/opencode_runtime.py" verify --expected-sha256 "$OPENCODE_RUNTIME_SHA256"
           opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
 
           # The model edited the working tree; the workflow publishes it. The
@@ -394,7 +402,7 @@ jobs:
           OPEN_PR="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --state open --json number --jq '.[0].number // empty' || true)"
           OPEN_PR="${OPEN_PR:-0}"
 
-          PLAN_OUTPUTS="$(python3 .github/scripts/agent_workspace.py workspace-plan \
+          PLAN_OUTPUTS="$(python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/agent_workspace.py" workspace-plan \
             --owned-branch "$BRANCH" \
             --current-branch "$CURRENT_BRANCH" \
             --base-branch "$BASE_BRANCH" \
@@ -581,7 +589,7 @@ jobs:
           - Keep all comments and commit messages in English.
           EOF
           )"
-          python3 .github/scripts/opencode_runtime.py verify --expected-sha256 "$OPENCODE_RUNTIME_SHA256"
+          python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/opencode_runtime.py" verify --expected-sha256 "$OPENCODE_RUNTIME_SHA256"
           timeout --signal=TERM "$REPAIR_AGENT_TIMEOUT_SECONDS" \
             opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
           if [[ -n "$(git status --porcelain)" ]]; then
@@ -641,7 +649,7 @@ jobs:
           # Point of use. The digest recorded at install is re-read here, so
           # the process about to start is the one that was verified rather than
           # whatever PATH happens to resolve at this moment.
-          python3 .github/scripts/opencode_runtime.py verify --expected-sha256 "$OPENCODE_RUNTIME_SHA256"
+          python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/opencode_runtime.py" verify --expected-sha256 "$OPENCODE_RUNTIME_SHA256"
           opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
           if [[ -n "$(git status --porcelain)" ]]; then
             git add -A
