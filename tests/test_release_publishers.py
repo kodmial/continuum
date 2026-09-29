@@ -25,7 +25,15 @@ import shutil
 import tempfile
 import unittest
 
-from continuum.release.publishers import contract, get, homebrew, macports, names, parse_settings
+from continuum.release.publishers import (
+    contract,
+    get,
+    homebrew,
+    macports,
+    names,
+    parse_settings,
+    validation,
+)
 from continuum.release.publishers.assets import InMemoryAssetFetcher, verify_artifact
 from continuum.release.publishers.contract import (
     ALREADY_CURRENT,
@@ -584,6 +592,141 @@ class ValidationAuditTests(unittest.TestCase):
         report = audit(forged, manifest(item))
         self.assertFalse(report.ok)
         self.assertEqual(report.reason, contract.VALIDATION_FAILED)
+
+
+class VersionTokenBoundaryTests(unittest.TestCase):
+    """The version check is a token claim, not a substring claim.
+
+    The incident these pin: a generated manifest left pinned to the *previous*
+    release is a silent downgrade -- a package manager installs the old bytes
+    and reports success -- and the only automated signal is the version
+    assertion. A substring assertion cannot see that failure, because
+    `0.1.1` occurs inside `0.1.10`: the wrong release satisfies a check written
+    for the right one. Prefix, suffix, and embedded cases are all the same bug.
+    """
+
+    def test_a_longer_version_that_starts_with_the_release_is_not_a_match(self):
+        self.assertFalse(validation.names_version('version "0.1.10"\n', "0.1.1"))
+
+    def test_a_shorter_version_that_the_release_starts_with_is_not_a_match(self):
+        self.assertFalse(validation.names_version('version "0.1"\n', "0.1.1"))
+
+    def test_the_exact_version_matches(self):
+        self.assertTrue(validation.names_version('version "0.1.1"\n', "0.1.1"))
+
+    def test_a_version_is_matched_as_a_whole_token_anywhere_on_a_line(self):
+        for line in ('version "0.1.1"', "tag=v0.1.1", "# pinned 0.1.1", "0.1.1,"):
+            self.assertTrue(validation.names_version(line + "\n", "0.1.1"), line)
+
+    def test_an_adjacent_character_anywhere_breaks_the_match(self):
+        for line in ("version 10.1.1", "version 0.1.1a", "version x0.1.1", "version 0.1.1-rc1"):
+            self.assertFalse(validation.names_version(line + "\n", "0.1.1"), line)
+
+    def test_an_empty_version_never_matches(self):
+        self.assertFalse(validation.names_version("version ''\n", ""))
+
+    def test_a_manifest_pinned_to_a_longer_version_fails_the_audit(self):
+        # The end-to-end shape of the incident: the audit must refuse, not
+        # quietly pass, when only a longer version sharing the prefix is named.
+        item = artifact("widget-1.4.0.tar.gz")
+        stale = GeneratedFile(
+            path="Formula/widget.rb",
+            content=(
+                f'sha256 "{item.sha256}"\n'
+                f'version "{VERSION}0"\n'  # 1.4.00 shares 1.4.0 as a prefix
+            ),
+            surface="formula",
+            selected=(item,),
+        )
+        report = audit(stale, manifest(item))
+        self.assertFalse(report.ok)
+        self.assertIn(
+            "version-present",
+            [outcome.name for outcome in report.checks if outcome.status == "failed"],
+        )
+
+
+class CommentAwareTokenScanTests(unittest.TestCase):
+    """A comment cannot carry an unfilled token into a failure.
+
+    The incident these pin: the generated files explain themselves, so the
+    header of a formula legitimately spells out `__SHA256__`, `__VERSION__`, and
+    the rest of the tokens the template fills. A scan for unfilled tokens over
+    the whole file therefore reported the *documentation* of the placeholders as
+    the failure, which makes a correct manifest red and teaches everyone to
+    ignore the check -- at exactly the moment a manifest with a real hole in it
+    ships.
+    """
+
+    HEADER = (
+        "# Generated file. Replace __SHA256__ with the release digest and\n"
+        "# __VERSION__ with the release version; __URL__ points at the asset.\n"
+        "# __TOKEN__ is not a real token, and neither is __SHA__.\n"
+    )
+
+    def test_a_comment_line_does_not_supply_an_unfilled_token(self):
+        self.assertEqual(validation.unfilled_template_tokens(self.HEADER), ())
+
+    def test_a_comment_line_is_not_an_executed_line(self):
+        self.assertEqual(validation.active_lines(self.HEADER), [])
+
+    def test_a_live_line_with_a_hole_is_still_reported(self):
+        self.assertEqual(
+            validation.unfilled_template_tokens(f'sha256 "__SHA256__"\n'), ("SHA256",)
+        )
+
+    def test_a_hole_beside_documentation_is_still_reported(self):
+        content = self.HEADER + 'url "__URL__"\n'
+        self.assertEqual(validation.unfilled_template_tokens(content), ("URL",))
+
+    def test_every_documented_comment_style_is_ignored(self):
+        for prefix in ("#", "//", ";", "--"):
+            line = f"{prefix} documents __VERSION__\n"
+            self.assertTrue(validation.is_comment_line(line), prefix)
+            self.assertEqual(validation.unfilled_template_tokens(line), (), prefix)
+
+    def test_indentation_does_not_turn_a_comment_into_an_executed_line(self):
+        line = "    # indented, and still a comment: __VERSION__\n"
+        self.assertTrue(validation.is_comment_line(line))
+        self.assertEqual(validation.unfilled_template_tokens(line), ())
+
+    def test_a_generated_file_documenting_its_tokens_audits_clean(self):
+        item = artifact("widget-1.4.0.tar.gz")
+        documented = GeneratedFile(
+            path="Formula/widget.rb",
+            content=(
+                self.HEADER
+                + f'sha256 "{item.sha256}"\n'
+                + f'version "{VERSION}"\n'
+                + f'url "{item.name}"\n'
+            ),
+            surface="formula",
+            selected=(item,),
+        )
+        report = audit(documented, manifest(item))
+        self.assertTrue(
+            report.ok, [outcome for outcome in report.checks if outcome.status != "passed"]
+        )
+
+    def test_a_live_hole_fails_the_audit_even_when_comments_document_the_tokens(self):
+        item = artifact("widget-1.4.0.tar.gz")
+        holed = GeneratedFile(
+            path="Formula/widget.rb",
+            content=(
+                self.HEADER
+                + f'sha256 "{item.sha256}"\n'
+                + f'version "{VERSION}"\n'
+                + 'url "__URL__"\n'
+            ),
+            surface="formula",
+            selected=(item,),
+        )
+        report = audit(holed, manifest(item))
+        self.assertFalse(report.ok)
+        self.assertIn(
+            "template-tokens-filled",
+            [outcome.name for outcome in report.checks if outcome.status == "failed"],
+        )
 
 
 if __name__ == "__main__":

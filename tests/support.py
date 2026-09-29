@@ -236,6 +236,40 @@ class GraphQLFailure(RuntimeError):
     """Simulates an unusable reviewThreads response."""
 
 
+def workflow_run(
+    run_id: int,
+    *,
+    workflow: str,
+    head_sha: str = HEAD_A,
+    status: str = "completed",
+    conclusion: str = "success",
+    event: str = "push",
+    name: str = "",
+    started_at: str = "2026-09-20T10:00:00Z",
+) -> Dict[str, Any]:
+    """One workflow run, shaped as the Actions API returns it."""
+
+    return {
+        "id": run_id,
+        "name": name or workflow,
+        "path": f".github/workflows/{workflow}",
+        "head_sha": head_sha,
+        "status": status,
+        "conclusion": conclusion,
+        "event": event,
+        "run_started_at": started_at,
+        "created_at": started_at,
+    }
+
+
+def _run_matches(run: Dict[str, Any], head_sha: str, event: str) -> bool:
+    if head_sha and str(run.get("head_sha") or "").lower() != head_sha.strip().lower():
+        return False
+    if event and str(run.get("event") or "") != event:
+        return False
+    return True
+
+
 class FakeGitHub:
     """In-memory stand-in for `GitHubClient`."""
 
@@ -276,6 +310,10 @@ class FakeGitHub:
         self.statuses_created: List[Dict[str, Any]] = []
         self.comments_created: List[Dict[str, Any]] = []
         self.resolved_threads: List[str] = []
+        self.workflow_runs: Dict[str, List[List[Dict[str, Any]]]] = {}
+        self.workflow_run_reads = 0
+        self.run_jobs: Dict[int, List[Dict[str, Any]]] = {}
+        self.run_artifacts: Dict[int, List[Dict[str, Any]]] = {}
         self.fail_resolve_thread = False
         self.fail_approve_with_422 = False
         self._next_comment_id = 1000
@@ -371,6 +409,34 @@ class FakeGitHub:
     def file_at_ref(self, path: str, ref: str) -> Optional[str]:
         self._record("file_at_ref", path, ref)
         return self.file_contents.get(path)
+
+    # -- release verification ----------------------------------------------
+    #
+    # The gate reads workflow runs, not pull requests, so these mirror the
+    # client's signatures exactly. The events are queued rather than scripted so
+    # the bounded-wait path can be tested without a clock: `workflow_runs[wf]` is
+    # a queue of answers, one per read, so the first, second, ... read each see
+    # their own script.
+
+    def list_workflow_runs(
+        self, workflow: str, *, head_sha: str = "", event: str = ""
+    ) -> List[Dict[str, Any]]:
+        self._record("list_workflow_runs", workflow, head_sha, event)
+        runs = self.workflow_runs.get(workflow, [])
+        index = min(self.workflow_run_reads, len(runs) - 1) if runs else 0
+        self.workflow_run_reads += 1
+        found = runs[index] if runs else []
+        if isinstance(found, Exception):
+            raise found
+        return [run for run in found if _run_matches(run, head_sha, event)]
+
+    def list_run_jobs(self, run_id: int) -> List[Dict[str, Any]]:
+        self._record("list_run_jobs", run_id)
+        return list(self.run_jobs.get(int(run_id), []))
+
+    def list_run_artifacts(self, run_id: int) -> List[Dict[str, Any]]:
+        self._record("list_run_artifacts", run_id)
+        return list(self.run_artifacts.get(int(run_id), []))
 
     # -- writes ------------------------------------------------------------
     def create_review(self, pr_number: int, head_sha: str, body: str, event: str) -> Dict[str, Any]:

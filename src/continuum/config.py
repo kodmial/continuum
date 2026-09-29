@@ -328,8 +328,54 @@ class ReleaseTarget:
 
 
 @dataclass(frozen=True)
+class VerificationSettings:
+    """The optional exact-commit gate a consumer puts in front of publication.
+
+    Names, never behaviour: which workflow in *this* repository verifies the
+    release, which event creates it, which of its jobs must actually run, and
+    which artifact names must exist in it. Continuum knows how to insist that
+    such a run exists for the exact commit being released and is green; it has
+    no idea what the workflow does, and nothing here may name a product, a
+    package manager, or a platform.
+    """
+
+    workflow: str = ""
+    event: str = ""
+    jobs: tuple = ()
+    artifacts: tuple = ()
+
+    @property
+    def declared(self) -> bool:
+        return bool(self.workflow)
+
+    def requirement(self) -> Any:
+        """The release-core requirement this configuration states."""
+
+        from .release.provenance import VerificationRequirement
+
+        if not self.declared:
+            return None
+        return VerificationRequirement(
+            workflow=self.workflow,
+            event=self.event,
+            jobs=tuple(self.jobs),
+            artifacts=tuple(self.artifacts),
+        )
+
+    def describe(self) -> Dict[str, Any]:
+        return {
+            "declared": self.declared,
+            "workflow": self.workflow,
+            "event": self.event,
+            "jobs": list(self.jobs),
+            "artifacts": list(self.artifacts),
+        }
+
+
+@dataclass(frozen=True)
 class ReleaseSettings:
     targets: tuple = ()
+    verification: VerificationSettings = field(default_factory=VerificationSettings)
 
     @property
     def enabled(self) -> bool:
@@ -344,6 +390,7 @@ class ReleaseSettings:
     def describe(self) -> Dict[str, Any]:
         return {
             "enabled": self.enabled,
+            "verification": self.verification.describe(),
             "targets": [target.describe() for target in self.targets],
             "required_secrets": sorted(
                 {
@@ -397,7 +444,8 @@ _ALLOWED_PR_AGENT_KEYS = (
     "bot_login",
 )
 _ALLOWED_CODERABBIT_KEYS = ("bot_login", "status_context")
-_ALLOWED_RELEASE_KEYS = ("targets",)
+_ALLOWED_RELEASE_KEYS = ("targets", "verification")
+_ALLOWED_VERIFICATION_KEYS = ("workflow", "event", "jobs", "artifacts")
 _ALLOWED_TARGET_KEYS = (
     "id",
     "adapter",
@@ -983,12 +1031,72 @@ def _parse_target(value: Any, where: str) -> ReleaseTarget:
     )
 
 
+def _parse_verification(value: Any) -> VerificationSettings:
+    """Parse the optional exact-commit publication gate.
+
+    A gate that is present but names no workflow is rejected rather than ignored:
+    a typo in `workflow` would otherwise leave publication unconstrained while
+    the configuration still reads as though a gate was asked for.
+    """
+
+    if value is None:
+        return VerificationSettings()
+    mapping = _require_mapping(value, "release.verification")
+    _reject_unknown(mapping, _ALLOWED_VERIFICATION_KEYS, "release.verification")
+    workflow = str(mapping.get("workflow") or "").strip()
+    event = str(mapping.get("event") or "").strip()
+
+    def _names(key: str) -> tuple:
+        raw = mapping.get(key)
+        if raw is None:
+            return ()
+        if not isinstance(raw, list) or not raw:
+            raise ConfigError(
+                f"release.verification.{key} must be a non-empty list of names, or "
+                "omitted entirely"
+            )
+        names: List[str] = []
+        for index, item in enumerate(raw):
+            name = str(item or "").strip()
+            if not name:
+                raise ConfigError(
+                    f"release.verification.{key}[{index}] must be a non-empty name"
+                )
+            if name in names:
+                raise ConfigError(f"release.verification.{key}[{index}] duplicates {name!r}")
+            names.append(name)
+        return tuple(names)
+
+    jobs = _names("jobs")
+    artifacts = _names("artifacts")
+    if not workflow and (event or jobs or artifacts):
+        raise ConfigError(
+            "release.verification.event/jobs/artifacts require a workflow to verify; "
+            "omit the whole block to publish without a verification gate"
+        )
+    if workflow:
+        # The release core owns the rule; the configuration layer owns the error
+        # type, so a bad workflow file name is reported as a configuration
+        # problem naming its path rather than escaping as a bare ValueError the
+        # CLI has no handler for.
+        try:
+            VerificationSettings(
+                workflow=workflow, event=event, jobs=jobs, artifacts=artifacts
+            ).requirement()
+        except ValueError as exc:
+            raise ConfigError(f"release.verification.workflow: {exc}") from None
+    return VerificationSettings(
+        workflow=workflow, event=event, jobs=jobs, artifacts=artifacts
+    )
+
+
 def _parse_release(value: Any) -> ReleaseSettings:
     mapping = _require_mapping(value, "release")
     _reject_unknown(mapping, _ALLOWED_RELEASE_KEYS, "release")
+    verification = _parse_verification(mapping.get("verification"))
     targets_value = mapping.get("targets")
     if targets_value is None:
-        return ReleaseSettings()
+        return ReleaseSettings(verification=verification)
     if not isinstance(targets_value, list) or not targets_value:
         raise ConfigError("release.targets must be a non-empty list, or omitted entirely")
     targets = tuple(
@@ -1000,7 +1108,7 @@ def _parse_release(value: Any) -> ReleaseSettings:
         if target.id in seen:
             raise ConfigError(f"release.targets[{index}].id duplicates {target.id!r}")
         seen.append(target.id)
-    return ReleaseSettings(targets=targets)
+    return ReleaseSettings(targets=targets, verification=verification)
 
 
 def parse_config(text: str, source: str = "<string>") -> ContinuumConfig:

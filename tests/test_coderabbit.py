@@ -485,5 +485,66 @@ class QuotaBehaviourTests(unittest.TestCase):
         self.assertFalse(coderabbit.is_full_review(support.coderabbit_review(COMMENTED, body="")))
 
 
+class StatusOnlyHeadTests(unittest.TestCase):
+    """A commit status is not evidence that anything was reviewed.
+
+    The incident these pin: a queue that treated *any* success on the shared
+    provider's status context as "already reviewed" left every head CodeRabbit
+    had never actually reviewed sitting in the queue marked current. No request
+    was ever dispatched for those heads, so they were neither reviewed nor
+    unblocked -- and because a "skipped" review is a *success* status, the
+    starvation was self-inflicted by the exact signal meant to release the slot.
+
+    `covers_head` is therefore answered from submitted reviews alone. The status
+    arguments stay because the provider registry asks every adapter the same
+    question, and the other adapters use them.
+    """
+
+    def test_a_skipped_status_alone_does_not_settle_the_slot(self):
+        self.assertFalse(
+            coderabbit.covers_head([], [support.coderabbit_status(SKIPPED)], HEAD_A)
+        )
+
+    def test_no_status_and_no_review_does_not_settle_the_slot(self):
+        self.assertFalse(coderabbit.covers_head([], [], HEAD_A))
+
+    def test_an_empty_head_is_never_covered(self):
+        self.assertFalse(
+            coderabbit.covers_head([support.coderabbit_review(APPROVED)], [], "")
+        )
+
+    def test_a_stale_success_status_from_an_older_head_does_not_settle(self):
+        self.assertFalse(
+            coderabbit.covers_head(
+                [],
+                [support.coderabbit_status(SKIPPED, head_sha=HEAD_B)],
+                HEAD_A,
+            )
+        )
+
+    def test_a_submitted_review_settles_the_slot_despite_a_skipped_status(self):
+        # The other half of the incident: once a durable exact-head review
+        # exists, a later "skipped" status must not buy a second full review.
+        self.assertTrue(
+            coderabbit.covers_head(
+                [support.coderabbit_review(APPROVED)],
+                [support.coderabbit_status(SKIPPED)],
+                HEAD_A,
+            )
+        )
+
+    def test_the_queue_marks_a_status_only_head_as_still_unreviewed(self):
+        # The adapter alone is not the fix. What matters is the eligibility the
+        # controller derives from it: a head with only statuses must remain
+        # `unreviewed` so the queue dispatches a request for it.
+        self.assertFalse(
+            coderabbit.covers_head(
+                [support.coderabbit_review(APPROVED, head_sha=HEAD_B)],
+                [support.coderabbit_status(SKIPPED, head_sha=HEAD_B)],
+                HEAD_A,
+            )
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

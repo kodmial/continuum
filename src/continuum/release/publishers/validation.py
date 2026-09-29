@@ -16,7 +16,14 @@ way a generated manifest can be wrong while still looking complete:
   the moment a user runs it.
 * **The version is missing.** A formula whose `version` line was never filled in
   describes the previous release, which is a silent downgrade rather than an
-  error.
+  error. "Present" is a *token* claim, not a substring one: `0.1.1` occurs
+  inside `0.1.10`, and a manifest pinned to the wrong release satisfies a
+  substring check for the right one.
+* **A placeholder was left behind in a line nobody executes.** Generated files
+  explain themselves, so the comments that document the tokens a template fills
+  legitimately spell them out. Only a live line can carry an unfilled token, so
+  the scan ignores comment lines instead of failing on the documentation of its
+  own placeholders.
 * **It does not parse.** A syntax check through a real interpreter, because the
   structural audits read text and text does not care whether the file is
   loadable. It is reported as `unavailable` rather than `passed` when the
@@ -45,6 +52,7 @@ from .contract import (
     PublisherError,
 )
 from .repository import CommandResult, CommandRunner, subprocess_runner
+from .template import TOKEN_RE
 
 CHECK_PASSED = "passed"
 CHECK_FAILED = "failed"
@@ -52,6 +60,12 @@ CHECK_UNAVAILABLE = "unavailable"
 CHECK_SKIPPED = "skipped"
 
 _DIGEST_RE = re.compile(r"\b[0-9a-f]{64}\b")
+
+# A generated file explains its own tokens, so a comment line routinely spells
+# out `__SHA256__` and friends. Scanning the whole file for an unfilled token
+# would fail on the documentation of the placeholders rather than on an unfilled
+# one, which is how a correct file gets a red build.
+_COMMENT_PREFIXES = ("#", "//", ";", "--")
 
 # Where a generated file is written so a parser can read it. Under the system
 # temporary directory rather than the working tree, so validating a manifest
@@ -153,6 +167,64 @@ def raise_for(report: ValidationReport) -> None:
     )
 
 
+def is_comment_line(line: str) -> bool:
+    """Whether a line of a generated file says nothing executable."""
+
+    stripped = (line or "").lstrip()
+    return any(stripped.startswith(prefix) for prefix in _COMMENT_PREFIXES)
+
+
+def active_lines(content: str) -> List[str]:
+    """The lines of a generated file that a package manager would execute."""
+
+    return [line for line in (content or "").splitlines() if not is_comment_line(line)]
+
+
+def names_version(content: str, version: str) -> bool:
+    """Whether `content` names `version` as a complete token.
+
+    A substring test is not enough, and the failure it hides is a silent one:
+    `0.1.1` is a substring of `0.1.10`, so a manifest left pinned to the wrong
+    release satisfies a check written for the right one. Versions are therefore
+    compared on a boundary, so only the version itself -- and not a longer
+    version that starts or ends with it -- counts.
+
+    A leading `v` is accepted, because `v0.1.1` is the conventional way to write
+    a tag and is a real mention of `0.1.1`. Any other adjacent character is not:
+    the boundary is deliberately the same set of characters that can appear
+    inside a version, plus letters, so a match cannot be produced by
+    neighbouring text.
+    """
+
+    token = (version or "").strip()
+    if not token:
+        return False
+    text = content or ""
+    for candidate in (token, f"v{token}", f"V{token}"):
+        pattern = re.compile(
+            r"(?<![0-9A-Za-z._+-])" + re.escape(candidate) + r"(?![0-9A-Za-z._+-])"
+        )
+        if pattern.search(text) is not None:
+            return True
+    return False
+
+
+def unfilled_template_tokens(content: str) -> Tuple[str, ...]:
+    """Tokens left unfilled on a line that is actually executed.
+
+    Comment lines are excluded: a generated file is expected to document the
+    tokens it fills, and failing on that documentation would make the check
+    report the wrong thing.
+    """
+
+    found: List[str] = []
+    for line in active_lines(content):
+        for name in TOKEN_RE.findall(line):
+            if name not in found:
+                found.append(name)
+    return tuple(found)
+
+
 @dataclass(frozen=True)
 class GeneratedFile:
     """One file a publisher is about to write, and the facts that justify it."""
@@ -215,7 +287,9 @@ def audit(
     )
 
     if require_version:
-        versioned = release.version in generated.content or release.tag in generated.content
+        versioned = names_version(generated.content, release.version) or names_version(
+            generated.content, release.tag
+        )
         checks.append(
             CheckOutcome(
                 name="version-present",
@@ -223,11 +297,25 @@ def audit(
                 detail=(
                     f"the file names release {release.version}"
                     if versioned
-                    else f"the file never names release {release.version}, so it would "
-                    "describe whatever was published before it"
+                    else f"the file never names release {release.version} as a complete "
+                    "version, so it would describe whatever was published before it"
                 ),
             )
         )
+
+    leftover = unfilled_template_tokens(generated.content)
+    checks.append(
+        CheckOutcome(
+            name="template-tokens-filled",
+            status=CHECK_PASSED if not leftover else CHECK_FAILED,
+            detail=(
+                "every template token on an executed line was filled in"
+                if not leftover
+                else f"executable line(s) still contain unfilled template token(s) "
+                f"{', '.join(leftover)}"
+            ),
+        )
+    )
 
     for text in generated.required_text:
         present = text in generated.content
@@ -343,11 +431,15 @@ __all__ = [
     "CheckOutcome",
     "GeneratedFile",
     "ValidationReport",
+    "active_lines",
     "audit",
     "combine",
     "discard_scratch",
+    "is_comment_line",
+    "names_version",
     "raise_for",
     "scratch_directory",
     "syntax_check",
+    "unfilled_template_tokens",
     "write_for_check",
 ]

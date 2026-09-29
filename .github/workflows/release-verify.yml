@@ -1,0 +1,138 @@
+# Continuum reusable release verification gate.
+#
+# Answers one question and publishes it: is there a green run of the declared
+# verification workflow, on the exact commit about to be published, carrying the
+# declared jobs and artifacts?
+#
+# The gate is deliberately separate from the release job that would use it. That
+# separation is the point. A release job that builds and then publishes cannot
+# tell you whether anything verified its bytes -- it *is* the thing that produced
+# them. Here the verification is somebody else's run on an immutable commit, and
+# this job only reads the verdict. That is what makes the resulting publication
+# reproducible instead of merely green.
+#
+# `verdict` is the normalized contract any consumer may match on:
+#   verdict=PASS|BLOCK reason=<code> head=<sha> run=<id|none>
+#
+# Reason codes are stable, so a consumer can branch on them:
+#   not-configured | verification-missing | verification-incomplete
+#   verification-failed | verification-job-missing
+#   verification-artifact-missing | verification-head-required
+#
+# The wait is bounded on purpose. This gate and the workflow it waits for are
+# triggered by the same push, so on the first read the run often does not exist
+# yet. That race is handled by re-reading, not by sleeping forever: a run that
+# has already finished is never re-read, because a red run or a missing artifact
+# will answer identically every time and retrying only burns a runner.
+
+name: Continuum release verification
+
+on:
+  workflow_call:
+    inputs:
+      config_path:
+        type: string
+        required: false
+        default: .continuum.yml
+        description: "Path to the validated Continuum configuration file."
+      workflow:
+        type: string
+        required: false
+        default: ""
+        description: >-
+          Overrides the verification workflow named in configuration. Empty means
+          "use the configured one".
+      event:
+        type: string
+        required: false
+        default: ""
+        description: >-
+          Overrides the verification event named in configuration. Empty means
+          "use the configured one".
+      wait_attempts:
+        type: number
+        required: false
+        default: 30
+        description: >-
+          How many times to re-read an unfinished run. With the default interval
+          this bounds the gate at roughly ten minutes.
+      wait_seconds:
+        type: number
+        required: false
+        default: 20
+        description: "Seconds between those reads."
+      fail_on_block:
+        type: boolean
+        required: false
+        default: true
+        description: >-
+          Fail this job when the verdict is BLOCK. Turn it off only to report a
+          verdict a human is expected to read; never to publish.
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      verdict: ${{ steps.verify.outputs.verdict }}
+      reason: ${{ steps.verify.outputs.reason }}
+      run: ${{ steps.verify.outputs.run }}
+      contract: ${{ steps.verify.outputs.contract }}
+    steps:
+      - name: Checkout (module + configuration)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Decide whether this exact commit was verified
+        id: verify
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.continuum_token || secrets.TAP_PAT || github.token }}
+          # The commit being published is this run's commit. It is read from the
+          # environment rather than from a dispatch input on purpose: a caller
+          # that could pass the head could verify a different commit than it
+          # publishes, which is the failure this gate exists to prevent.
+          CONTINUUM_VERIFY_HEAD: ${{ github.sha }}
+          # Overrides are narrowed, never invented: an empty input means "use the
+          # configured value", and the shell expansion below turns that into the
+          # absence of a flag rather than into an empty argument.
+          CONTINUUM_VERIFY_WORKFLOW: ${{ inputs.workflow }}
+          CONTINUUM_VERIFY_EVENT: ${{ inputs.event }}
+        run: |
+          set -uo pipefail
+          # The command publishes `verdict`/`reason`/`run`/`contract` to
+          # GITHUB_OUTPUT itself, so a BLOCK verdict is still readable as step
+          # outputs. The exit code is therefore caught rather than allowed to
+          # abort the step, and the decision to fail is made explicitly below.
+          #
+          # `workflow` and `event` are conditional arguments rather than an
+          # interpolated string, so an unset input cannot produce an empty word
+          # where a file name belongs.
+          status=0
+          PYTHONPATH=src python3 -m continuum.cli release verify \
+            --config "${{ inputs.config_path || '.continuum.yml' }}" \
+            --head "$CONTINUUM_VERIFY_HEAD" \
+            --wait-attempts "${{ inputs.wait_attempts }}" \
+            --wait-seconds "${{ inputs.wait_seconds }}" \
+            ${CONTINUUM_VERIFY_WORKFLOW:+--workflow "$CONTINUUM_VERIFY_WORKFLOW"} \
+            ${CONTINUUM_VERIFY_EVENT:+--event "$CONTINUUM_VERIFY_EVENT"} \
+            || status=$?
+          if [ "$status" -ne 0 ]; then
+            if [ "${{ inputs.fail_on_block }}" = "true" ]; then
+              echo "::error::publication is blocked: this commit has no accepted verification run."
+              exit "$status"
+            fi
+            echo "::warning::verdict is BLOCK, reported without failing this job."
+          fi
+          {
+            echo "verdict=${{ steps.verify.outputs.verdict }}"
+            echo "reason=${{ steps.verify.outputs.reason }}"
+          } >>"$GITHUB_STEP_SUMMARY"

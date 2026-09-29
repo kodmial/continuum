@@ -96,11 +96,21 @@ on:
 
 permissions: {}
 
-# One controller at a time decides who gets the next shared provider slot. A new
-# wake-up supersedes a run that is only waiting out a cooldown.
+# One controller at a time decides who gets the next shared provider slot.
+#
+# This controller deliberately stays alive until the next shared quota slot:
+# `queue reconcile` sleeps out the cooldown inside one run so the queue does not
+# depend on a scheduled wake-up to make progress. Cancelling it on every wake-up
+# resets that wait, and status/check-run/review events arrive continuously, so
+# the queue starves: a PR that is owed the shared slot never receives a request.
+# That is the production incident this line is the regression guard for.
+#
+# GitHub concurrency keeps at most one pending successor behind the running job,
+# so a wake-up during the wait is not lost -- it runs next, against recomputed
+# state. `cancel-in-progress: false` therefore costs nothing and buys the wait.
 concurrency:
   group: continuum-review-queue
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   reconcile:

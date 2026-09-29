@@ -1,0 +1,628 @@
+{
+  "schema": "continuum.parity-ledger/v1",
+  "version": 1,
+  "updated": "2026-09-29",
+  "source": {
+    "repository": "kodmial/nanodictate",
+    "from": "64e89a3bcbab671513a933855e7495a07fac56bb",
+    "to": "54db335ea7c03d35ee3a32a9b5d12ed9a6ef01aa",
+    "commits": 18,
+    "files": [
+      ".github/workflows/auto-merge.yml",
+      ".github/workflows/coderabbit-retry.yml",
+      ".github/workflows/packaging-smoke.yml",
+      ".github/workflows/release-automation-merge.yml",
+      ".github/workflows/release-pr.yml",
+      ".github/workflows/release.yml"
+    ],
+    "diffstat": "948 insertions(+), 66 deletions(-)",
+    "hotfix": "e3c4206d8b0a775ed722284309a3c01ff7d9af35",
+    "commit_list": [
+      "e3c4206",
+      "7b4f3d7",
+      "213c098",
+      "9a183f5",
+      "8b8966f",
+      "bdc41f3",
+      "05ac023",
+      "a0ae005",
+      "1ab9e5d",
+      "18ad709",
+      "e5f9a84",
+      "bf3d449",
+      "640cb97",
+      "3ad1c63",
+      "210c848",
+      "c779afd",
+      "62b5700",
+      "54db335"
+    ],
+    "consumer_local_files": true
+  },
+  "classifications": [
+    "absorbed",
+    "must-port",
+    "consumer-local",
+    "superseded",
+    "not-applicable"
+  ],
+  "policy": {
+    "absorbed": "Continuum already holds the semantic, in a form at least as strong. No change; the evidence names where.",
+    "must-port": "A semantic Continuum did not hold. Ported generically, with regression coverage tied to the originating incident.",
+    "consumer-local": "Real, load-bearing behaviour that belongs to one consumer's own repository and toolchain. Deliberately not ported.",
+    "superseded": "The source fix is replaced by something Continuum now provides, so porting it would duplicate and eventually diverge.",
+    "not-applicable": "The semantic does not exist in Continuum's architecture. Recorded so the omission is a decision, not an oversight."
+  },
+  "summary": {
+    "total": 26,
+    "by_classification": {
+      "absorbed": 14,
+      "must-port": 5,
+      "consumer-local": 3,
+      "superseded": 1,
+      "not-applicable": 3
+    },
+    "must_port_landed": 5,
+    "must_port_outstanding": 0
+  },
+  "items": [
+    {
+      "id": "PR-01",
+      "surface": ".github/workflows/auto-merge.yml",
+      "source_commits": [
+        "e3c4206",
+        "bf3d449"
+      ],
+      "summary": "Only an exact-head provider verdict settles a head; merge must revalidate the whole set immediately before the write.",
+      "classification": "absorbed",
+      "rationale": "Continuum's gate computes the verdict from the reviewed head and re-runs immediately before applying it, so a head that moved is never merged on a stale approval.",
+      "evidence": {
+        "files": [
+          "src/continuum/review/gate.py",
+          "src/continuum/review/result.py"
+        ],
+        "tests": [
+          "tests/test_gate.py::DecisionTests::test_historical_summary_cannot_stand_in_for_current_head"
+        ],
+        "issues": [
+          "11"
+        ]
+      }
+    },
+    {
+      "id": "PR-02",
+      "surface": ".github/workflows/auto-merge.yml",
+      "source_commits": [
+        "e3c4206"
+      ],
+      "summary": "A durable exact-head approval must survive a later provider status that says the review was skipped.",
+      "classification": "absorbed",
+      "rationale": "Held before the audit: an approval is a submitted review, and the status description is never the verdict.",
+      "evidence": {
+        "files": [
+          "src/continuum/review/coderabbit.py"
+        ],
+        "tests": [
+          "tests/test_coderabbit.py::QuotaBehaviourTests::test_a_cleared_head_with_a_skipped_status_is_never_re_requested"
+        ],
+        "issues": [
+          "11"
+        ]
+      }
+    },
+    {
+      "id": "PR-03",
+      "surface": ".github/workflows/auto-merge.yml",
+      "source_commits": [
+        "bdc41f3"
+      ],
+      "summary": "A head carrying only provider statuses -- skipped, stale, or absent -- is still owed a review and must wake the shared controller.",
+      "classification": "must-port",
+      "rationale": "The incident is queue starvation with a green build: the head was marked current from a success status, so no request was ever dispatched, and the head was neither reviewed nor unblocked. Continuum's adapter previously counted any success on the provider's status context as coverage. `covers_head` is now answered from submitted reviews alone, and the status arguments are retained only because the provider registry asks every adapter the same question.",
+      "landed": {
+        "files": [
+          "src/continuum/review/coderabbit.py"
+        ],
+        "tests": [
+          "tests/test_coderabbit.py::StatusOnlyHeadTests::test_a_skipped_status_alone_does_not_settle_the_slot",
+          "tests/test_queue.py::ControllerTests::test_a_cleared_head_does_not_consume_the_slot_for_an_untouched_head"
+        ]
+      },
+      "incident": "kodmial/nanodictate#59 (queue starvation on skipped-status heads)",
+      "issues": [
+        "11",
+        "37"
+      ]
+    },
+    {
+      "id": "PR-04",
+      "surface": ".github/workflows/coderabbit-retry.yml",
+      "source_commits": [
+        "e5f9a84"
+      ],
+      "summary": "A controller that deliberately sleeps out a shared provider cooldown must not be cancelled by later wake-ups.",
+      "classification": "must-port",
+      "rationale": "Continuum's reconciler waits out the provider cooldown inside one run. Cancelling it on every wake-up reset that timer, and status, check-run, and review events arrive continuously, so the queue starved. Both the shared controller and the consumer entry workflow now declare `cancel-in-progress: false`.",
+      "landed": {
+        "files": [
+          ".github/workflows/review-queue.yml",
+          "fixtures/consumer-repo/.github/workflows/review-queue.yml"
+        ],
+        "tests": [
+          "tests/test_queue_workflows.py::WakeUpTriggerTests::test_the_reconciler_is_single_flight_and_never_cancelled"
+        ]
+      },
+      "incident": "kodmial/nanodictate#59 (starvation from continuous status events)",
+      "issues": [
+        "11",
+        "37"
+      ]
+    },
+    {
+      "id": "PR-05",
+      "surface": ".github/workflows/coderabbit-retry.yml",
+      "source_commits": [
+        "e5f9a84"
+      ],
+      "summary": "GitHub concurrency retains at most one pending successor behind a running job, so a non-cancelling controller loses nothing.",
+      "classification": "absorbed",
+      "rationale": "Stated as the justification for PR-04 in both workflow files rather than as code. The platform guarantee is identical in both repositories.",
+      "evidence": {
+        "files": [
+          ".github/workflows/review-queue.yml",
+          "fixtures/consumer-repo/.github/workflows/review-queue.yml"
+        ],
+        "issues": [
+          "11"
+        ]
+      }
+    },
+    {
+      "id": "PR-06",
+      "surface": ".github/workflows/coderabbit-retry.yml",
+      "source_commits": [
+        "8b8966f"
+      ],
+      "summary": "A stalled shared review slot must be released rather than blocking the queue forever.",
+      "classification": "absorbed",
+      "rationale": "Continuum releases a slot when the head moved or the pull request is no longer visible, and never waits out a lock timeout.",
+      "evidence": {
+        "files": [
+          "src/continuum/review/queue.py"
+        ],
+        "tests": [
+          "tests/test_queue.py::LockTests::test_lock_is_released_when_the_candidate_moved_to_a_new_head",
+          "tests/test_queue.py::LockTests::test_stale_lock_on_a_closed_pull_request_is_released_immediately"
+        ],
+        "issues": [
+          "11"
+        ]
+      }
+    },
+    {
+      "id": "PR-07",
+      "surface": ".github/workflows/coderabbit-retry.yml",
+      "source_commits": [
+        "bf3d449"
+      ],
+      "summary": "Priority ordering must stay strict, so a reordering cannot quietly promote a lower-priority candidate.",
+      "classification": "absorbed",
+      "rationale": "Continuum's reconciler sorts by explicit priority rank and re-derives the order on every pass.",
+      "evidence": {
+        "files": [
+          "src/continuum/review/queue.py",
+          "src/continuum/review/queue_controller.py"
+        ],
+        "tests": [
+          "tests/test_queue.py::EligibilityTests::test_already_reviewed_head_is_not_a_candidate"
+        ],
+        "issues": [
+          "11"
+        ]
+      }
+    },
+    {
+      "id": "PR-08",
+      "surface": ".github/workflows/auto-merge.yml",
+      "source_commits": [
+        "e3c4206"
+      ],
+      "summary": "A fork's event must never spend the repository-scoped shared provider slot.",
+      "classification": "absorbed",
+      "rationale": "The reconciler is triggered by `pull_request_target` and skips any candidate whose head repository is not this one.",
+      "evidence": {
+        "files": [
+          ".github/workflows/review-queue.yml"
+        ],
+        "tests": [
+          "tests/test_queue_workflows.py::WakeUpTriggerTests::test_a_forks_event_never_spends_the_shared_slot"
+        ],
+        "issues": [
+          "11"
+        ]
+      }
+    },
+    {
+      "id": "PR-09",
+      "surface": ".github/workflows/auto-merge.yml",
+      "source_commits": [
+        "e3c4206"
+      ],
+      "summary": "Cron is a recovery backstop only; normal progression must be event driven.",
+      "classification": "absorbed",
+      "rationale": "Both the shared reconciler and the consumer entry workflow carry a scheduled backstop beside a complete event set, and the reconciler recomputes the whole queue rather than trusting a payload.",
+      "evidence": {
+        "files": [
+          ".github/workflows/review-queue.yml"
+        ],
+        "tests": [
+          "tests/test_queue_workflows.py::WakeUpTriggerTests::test_provider_and_ci_transitions_are_wake_ups"
+        ],
+        "issues": [
+          "11"
+        ]
+      }
+    },
+    {
+      "id": "PR-10",
+      "surface": ".github/workflows/auto-merge.yml",
+      "source_commits": [
+        "e3c4206"
+      ],
+      "summary": "Cancellation is correct for a fast idempotent reconciler that holds no shared cooldown wait.",
+      "classification": "absorbed",
+      "rationale": "Recorded because the source repository reaches the opposite conclusion for a different controller, and the difference is the point: the rule is not 'never cancel' but 'never cancel a controller that is waiting on a shared quota'. Continuum's auto-merge reconciler has a ten-minute timeout and no in-run wait, so it is unaffected; only PR-04 needed changing.",
+      "evidence": {
+        "files": [
+          ".github/workflows/auto-merge.yml",
+          ".github/workflows/review-queue.yml"
+        ],
+        "issues": [
+          "11"
+        ]
+      }
+    },
+    {
+      "id": "PR-11",
+      "surface": ".github/workflows/release-automation-merge.yml",
+      "source_commits": [
+        "05ac023"
+      ],
+      "summary": "A version assertion must be a token claim, not a substring claim.",
+      "classification": "must-port",
+      "rationale": "The source fix anchors the check to the whole line after `includes` matched the wrong version. Continuum's audit used a raw substring test, so a manifest pinned to a longer version that merely started with the release version -- a silent downgrade -- satisfied the check. `names_version` compares on a boundary that admits an optional `v` and rejects any adjacent version character.",
+      "landed": {
+        "files": [
+          "src/continuum/release/publishers/validation.py"
+        ],
+        "tests": [
+          "tests/test_release_publishers.py::VersionTokenBoundaryTests::test_a_longer_version_that_starts_with_the_release_is_not_a_match"
+        ]
+      },
+      "incident": "kodmial/nanodictate#59 (manifest version check matched a different version)",
+      "issues": [
+        "37",
+        "60"
+      ]
+    },
+    {
+      "id": "PR-12",
+      "surface": ".github/workflows/release-automation-merge.yml",
+      "source_commits": [
+        "a0ae005"
+      ],
+      "summary": "An unfilled-placeholder scan must ignore comment lines.",
+      "classification": "must-port",
+      "rationale": "Generated manifests document the tokens they fill, so scanning every line reported the documentation of the placeholders as the failure. That makes a correct manifest red and trains everyone to ignore the check, which is exactly when a manifest with a real hole ships. `unfilled_template_tokens` scans only lines a package manager would execute.",
+      "landed": {
+        "files": [
+          "src/continuum/release/publishers/validation.py"
+        ],
+        "tests": [
+          "tests/test_release_publishers.py::CommentAwareTokenScanTests::test_a_comment_line_does_not_supply_an_unfilled_token"
+        ]
+      },
+      "incident": "kodmial/nanodictate#59 (false unfilled-placeholder failures on documented tokens)",
+      "issues": [
+        "37",
+        "60"
+      ]
+    },
+    {
+      "id": "PR-13",
+      "surface": ".github/workflows/release.yml",
+      "source_commits": [
+        "640cb97"
+      ],
+      "summary": "Publication must be gated on a green run of the declared verification workflow, for the exact commit, carrying the declared artifacts.",
+      "classification": "must-port",
+      "rationale": "The incident is that release artifacts were built and published in one job, so what shipped was exactly what nothing else had run. The source gate matches runs by `head_sha` rather than branch, waits a bounded window for the run to appear because both workflows are triggered by the same push, then requires each declared job and each declared artifact. Continuum now expresses that generically: a consumer names a workflow, an event, job names, and artifact names, and the core insists on an exact-commit green run. The run id in the verdict is what lets a publication consume the tested bytes instead of rebuilding them.",
+      "landed": {
+        "files": [
+          "src/continuum/release/provenance.py",
+          ".github/workflows/release-verify.yml"
+        ],
+        "tests": [
+          "tests/test_release_verification.py::ExactHeadTests::test_a_run_on_another_commit_is_not_selected",
+          "tests/test_release_verification.py::VerdictTests::test_a_green_run_missing_the_declared_artifact_blocks",
+          "tests/test_release_verification.py::CliGateTests::test_a_blocked_gate_exits_nonzero_and_names_the_reason"
+        ]
+      },
+      "incident": "kodmial/nanodictate#59 (release shipped untested bytes)",
+      "issues": [
+        "37",
+        "60"
+      ]
+    },
+    {
+      "id": "PR-14",
+      "surface": ".github/workflows/release.yml",
+      "source_commits": [
+        "640cb97"
+      ],
+      "summary": "A green verification run that produced none of the declared artifacts has verified nothing.",
+      "classification": "absorbed",
+      "rationale": "Held for PR-13: the artifact requirement is a distinct reason code from a failed run, because the two have different fixes -- one needs a re-run, the other needs the upload fixed.",
+      "evidence": {
+        "files": [
+          "src/continuum/release/provenance.py"
+        ],
+        "tests": [
+          "tests/test_release_verification.py::VerdictTests::test_a_green_run_missing_the_declared_artifact_blocks"
+        ],
+        "issues": [
+          "37"
+        ]
+      }
+    },
+    {
+      "id": "PR-15",
+      "surface": ".github/workflows/release.yml",
+      "source_commits": [
+        "640cb97"
+      ],
+      "summary": "A green run in which a declared job never ran is not the run that was required.",
+      "classification": "absorbed",
+      "rationale": "Held for PR-13 as its own reason code. Continuum reports it as blocked where the source used the job list for run discovery, because judging a specific run and reporting what was missing from it is one statement rather than two.",
+      "evidence": {
+        "files": [
+          "src/continuum/release/provenance.py"
+        ],
+        "tests": [
+          "tests/test_release_verification.py::VerdictTests::test_a_green_run_that_never_ran_the_declared_job_blocks"
+        ],
+        "issues": [
+          "37"
+        ]
+      }
+    },
+    {
+      "id": "PR-16",
+      "surface": ".github/workflows/packaging-smoke.yml",
+      "source_commits": [
+        "640cb97"
+      ],
+      "summary": "A manual or dry-run release must not enable production smoke, and must log the skip instead.",
+      "classification": "absorbed",
+      "rationale": "Continuum's dry run returns before any signing or publication step executes and reports itself as a dry run in the job summary.",
+      "evidence": {
+        "files": [
+          "src/continuum/cli.py"
+        ],
+        "tests": [
+          "tests/test_release_cli.py::ReleaseSignCommandTests::test_a_dry_run_reports_success_without_touching_a_tool"
+        ],
+        "issues": [
+          "37"
+        ]
+      }
+    },
+    {
+      "id": "PR-17",
+      "surface": ".github/workflows/packaging-smoke.yml",
+      "source_commits": [
+        "640cb97"
+      ],
+      "summary": "Install and uninstall each published surface on a clean machine, in a matrix, before it counts as a release.",
+      "classification": "consumer-local",
+      "rationale": "Load-bearing and correct, and entirely about one consumer's package managers. The generic form is PR-13: publish only what somebody else's run on the exact commit verified. The legs themselves stay in the consumer's repository.",
+      "evidence": {
+        "files": [
+          "kodmial/nanodictate@54db335:.github/workflows/packaging-smoke.yml"
+        ],
+        "issues": [
+          "37"
+        ]
+      }
+    },
+    {
+      "id": "PR-18",
+      "surface": ".github/workflows/packaging-smoke.yml",
+      "source_commits": [
+        "640cb97"
+      ],
+      "summary": "A shell command that is still on the hashed path reports it as present after the file is gone.",
+      "classification": "consumer-local",
+      "rationale": "A real false failure the consumer fixed by clearing the hash table before its cleanup check. It is a property of one consumer's shell script, not a semantic Continuum should carry.",
+      "evidence": {
+        "files": [
+          "kodmial/nanodictate@54db335:.github/workflows/packaging-smoke.yml"
+        ],
+        "issues": [
+          "37"
+        ]
+      }
+    },
+    {
+      "id": "PR-19",
+      "surface": ".github/workflows/packaging-smoke.yml",
+      "source_commits": [
+        "640cb97"
+      ],
+      "summary": "A privileged installer cannot read back into a locked-down runner home, so the candidate tree is staged world-readable elsewhere.",
+      "classification": "consumer-local",
+      "rationale": "The consumer stages its candidate tree under a temporary directory because its own installer drops privileges. Product-specific by construction.",
+      "evidence": {
+        "files": [
+          "kodmial/nanodictate@54db335:.github/workflows/packaging-smoke.yml"
+        ],
+        "issues": [
+          "37"
+        ]
+      }
+    },
+    {
+      "id": "PR-20",
+      "surface": ".github/workflows/release.yml",
+      "source_commits": [
+        "54db335"
+      ],
+      "summary": "A release must not be able to re-enter the merge reconciler as a workflow run and loop.",
+      "classification": "absorbed",
+      "rationale": "Continuum's release adapter is `workflow_call`-only, so no run of it appears in the `workflow_run` event stream at all, and the reconciler's allowlist is restricted to CI. The recursion is structurally impossible rather than guarded against.",
+      "evidence": {
+        "files": [
+          ".github/workflows/release-bun-binary.yml",
+          ".github/workflows/auto-merge.yml"
+        ],
+        "tests": [
+          "tests/test_queue_workflows.py::WakeUpTriggerTests::test_the_workflow_run_allowlist_cannot_include_a_release",
+          "tests/test_release_bun_workflow.py::BunReleaseWorkflowContractTests::test_the_adapter_is_reachable_only_by_an_explicit_call"
+        ],
+        "issues": [
+          "37"
+        ]
+      }
+    },
+    {
+      "id": "PR-21",
+      "surface": ".github/workflows/release.yml",
+      "source_commits": [
+        "54db335"
+      ],
+      "summary": "A trigger that does not change anything should be a green no-op, not a red failure.",
+      "classification": "absorbed",
+      "rationale": "Continuum's release preflight computes skip flags and the dependent steps are guarded by them, so a redundant trigger neither publishes nor fails.",
+      "evidence": {
+        "files": [
+          ".github/workflows/release-bun-binary.yml",
+          "src/continuum/release/run.py"
+        ],
+        "issues": [
+          "37"
+        ],
+        "tests": [
+          "tests/test_release_run.py::PinEnforcementTests::test_an_assert_step_fails_when_its_pin_is_absent"
+        ]
+      }
+    },
+    {
+      "id": "PR-22",
+      "surface": ".github/workflows/release.yml",
+      "source_commits": [
+        "54db335"
+      ],
+      "summary": "Teardown must run whatever happened to the steps before it.",
+      "classification": "absorbed",
+      "rationale": "The release runner guarantees teardown on every path, which is why a skipped or failed step cannot leave signing material behind.",
+      "evidence": {
+        "files": [
+          "src/continuum/release/run.py",
+          "src/continuum/release/plan.py"
+        ],
+        "tests": [
+          "tests/test_release_run.py::RunnerBehaviourTests::test_teardown_runs_after_a_failure_so_material_never_outlives_the_job"
+        ],
+        "issues": [
+          "37"
+        ]
+      }
+    },
+    {
+      "id": "PR-23",
+      "surface": ".github/workflows/release-automation-merge.yml",
+      "source_commits": [
+        "05ac023"
+      ],
+      "summary": "A separate manifest reconciler needs a `push` trigger to catch a merge it was not awake for.",
+      "classification": "not-applicable",
+      "rationale": "Continuum has no standalone manifest reconciler. Manifests are a `needs`-gated step inside the release workflow, so there is no window in which a merge can be missed. Would become applicable only if manifest publication were split into its own event-driven workflow.",
+      "evidence": {
+        "files": [
+          ".github/workflows/release-bun-binary.yml"
+        ],
+        "issues": [
+          "37"
+        ]
+      }
+    },
+    {
+      "id": "PR-24",
+      "surface": ".github/workflows/release-pr.yml",
+      "source_commits": [
+        "18ad709"
+      ],
+      "summary": "Work deferred while another controller was running must be woken when that controller finishes, or it is stranded forever.",
+      "classification": "not-applicable",
+      "rationale": "Continuum defers nothing on an in-flight release: the review queue's only pending states belong to CI, and its wake-up set already includes that controller's completion event. Recorded as a decision because the gap is architectural -- if release-time deferral is ever introduced, PR-09's event set must gain the publishing workflow's `workflow_run` completion, or this row must be reclassified.",
+      "evidence": {
+        "files": [
+          ".github/workflows/review-queue.yml",
+          "src/continuum/review/queue.py"
+        ],
+        "tests": [
+          "tests/test_queue_workflows.py::WakeUpTriggerTests::test_provider_and_ci_transitions_are_wake_ups"
+        ],
+        "issues": [
+          "37",
+          "59"
+        ]
+      }
+    },
+    {
+      "id": "PR-25",
+      "surface": ".github/workflows/release.yml",
+      "source_commits": [
+        "54db335"
+      ],
+      "summary": "The `secrets` context is unavailable in an `if:` condition, so a secret-gated step must be guarded through `env:`.",
+      "classification": "not-applicable",
+      "rationale": "A platform constraint rather than a portable semantic: the fact is the same in every repository and Continuum has no behaviour that depends on it. Recorded so the classification set is complete, not because anything was ported.",
+      "evidence": {
+        "files": [
+          "kodmial/nanodictate@54db335:.github/workflows/release.yml"
+        ],
+        "issues": [
+          "37"
+        ]
+      }
+    },
+    {
+      "id": "PR-26",
+      "surface": ".github/workflows/release.yml",
+      "source_commits": [
+        "54db335"
+      ],
+      "summary": "A release adapter must be reachable only by explicit call, never by an event a run it created could retrigger.",
+      "classification": "superseded",
+      "rationale": "The source repository's release workflow reaches itself through `push` on tags and `main`, and reasons at length about why that does not loop. Continuum's adapter is `workflow_call`-only and has no push trigger at all, so the question does not arise. Porting the source design would add triggers Continuum deliberately does not have.",
+      "evidence": {
+        "files": [
+          ".github/workflows/release-bun-binary.yml"
+        ],
+        "tests": [
+          "tests/test_release_bun_workflow.py::BunReleaseWorkflowContractTests::test_the_adapter_is_reachable_only_by_an_explicit_call",
+          "tests/test_release_bun_workflow.py::BunReleaseWorkflowContractTests::test_a_run_of_the_adapter_cannot_appear_in_a_workflow_run_event"
+        ],
+        "issues": [
+          "37"
+        ]
+      }
+    }
+  ],
+  "cutover": {
+    "review": false,
+    "release": false,
+    "note": "The parent issue forbids enabling either toggle until every must-port lands. All five are landed, so these are eligible for a separate, explicitly requested decision. Nothing in this change enables them."
+  }
+}

@@ -64,6 +64,71 @@ class PaginationTests(unittest.TestCase):
             client.list_issue_comments(1)
         self.assertEqual(caught.exception.status, 502)
 
+    def test_paginate_over_an_object_page_would_collect_nothing(self):
+        # The reason `paginate_key` exists. A bare-array pager pointed at an
+        # object payload returns an empty list without complaining, so a caller
+        # cannot tell "nothing matched" from "wrong endpoint shape".
+        seen = []
+
+        def opener(request, timeout):
+            seen.append(request.full_url)
+            return {"total_count": 1, "workflow_runs": [{"id": 501}]}, ""
+
+        client = GitHubClient("token", "o/r", opener=opener)
+        self.assertEqual(client.paginate("/repos/o/r/actions/workflows/w.yml/runs"), [])
+
+
+class ObjectPagePaginationTests(unittest.TestCase):
+    """The Actions endpoints answer an object, so they need the keyed pager."""
+
+    def test_workflow_runs_are_read_out_of_the_object_page(self):
+        seen = []
+
+        def opener(request, timeout):
+            seen.append(request.full_url)
+            if len(seen) == 1:
+                return (
+                    {"total_count": 2, "workflow_runs": [{"id": 501}, {"id": 500}]},
+                    '<https://api.github.com/page2>; rel="next"',
+                )
+            return {"total_count": 1, "workflow_runs": [{"id": 499}]}, ""
+
+        client = GitHubClient("token", "o/r", opener=opener)
+        runs = client.list_workflow_runs("verification.yml", head_sha="abc", event="push")
+        self.assertEqual([run["id"] for run in runs], [501, 500, 499])
+        self.assertIn("head_sha=abc", seen[0])
+        self.assertIn("event=push", seen[0])
+
+    def test_jobs_and_artifacts_are_read_from_their_own_keys(self):
+        def opener(request, timeout):
+            if "/jobs" in request.full_url:
+                return {"total_count": 1, "jobs": [{"name": "build"}]}, ""
+            return {"total_count": 1, "artifacts": [{"name": "dist"}]}, ""
+
+        client = GitHubClient("token", "o/r", opener=opener)
+        self.assertEqual(client.list_run_jobs(501), [{"name": "build"}])
+        self.assertEqual(client.list_run_artifacts(501), [{"name": "dist"}])
+
+    def test_a_changed_response_shape_is_an_error_not_an_empty_result(self):
+        # The failure this guards: silently returning nothing would make the gate
+        # report "no verification run exists" for a repository that has one, and
+        # block every publication for a reason that is not true.
+        def opener(request, timeout):
+            return {"message": "Not Found"}, ""
+
+        client = GitHubClient("token", "o/r", opener=opener)
+        with self.assertRaises(GitHubError) as caught:
+            client.list_workflow_runs("verification.yml")
+        self.assertIn("workflow_runs", str(caught.exception))
+
+    def test_a_bare_array_where_an_object_was_expected_is_an_error(self):
+        def opener(request, timeout):
+            return [{"id": 1}], ""
+
+        client = GitHubClient("token", "o/r", opener=opener)
+        with self.assertRaises(GitHubError):
+            client.list_run_artifacts(501)
+
 
 class ThreadStateTests(unittest.TestCase):
     def _client(self, payload):

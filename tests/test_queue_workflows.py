@@ -23,6 +23,15 @@ CONSUMER = (
 )
 CI = ROOT / ".github" / "workflows" / "ci.yml"
 
+
+def _workflow_name(path: pathlib.Path) -> str:
+    """The `name:` a workflow file declares, which is how `workflow_run` names it."""
+
+    match = re.search(r"^name:\s*(.+?)\s*$", path.read_text(encoding="utf-8"), re.MULTILINE)
+    assert match, f"{path} declares no workflow name"
+    return match.group(1).strip().strip("\"'")
+
+
 # The reconciler is triggered by `pull_request_target` (trusted metadata, no
 # pull request code is ever checked out) but reasons about a pull request event.
 PLATFORM_TO_QUEUE_EVENT = {"pull_request_target": queue.EVENT_PULL_REQUEST}
@@ -131,16 +140,44 @@ class WakeUpTriggerTests(unittest.TestCase):
                 continue
             declared_types(self.shared, trigger)
 
+    def test_the_workflow_run_allowlist_cannot_include_a_release(self):
+        # A `workflow_run` subscription is the only way a workflow can be
+        # retriggered by a run it caused. Continuum's release adapter is
+        # `workflow_call`-only and therefore never appears in the event stream,
+        # but the allowlist is the load-bearing part of that guarantee: naming
+        # any other workflow here would let a merge reconciliation re-enter
+        # itself. This is the guard behind the parity ledger's
+        # "a release must not re-enter the merge reconciler" row.
+        match = re.search(r"^\s*workflows:\s*\[(.*)\]\s*$", self.shared, re.MULTILINE)
+        self.assertIsNotNone(match, "the shared reconciler must declare a workflow_run allowlist")
+        allowed = {name.strip().strip("\"'") for name in match.group(1).split(",")}
+        self.assertNotIn("", allowed)
+        self.assertTrue(allowed)
+        for name in allowed:
+            self.assertIn(
+                name,
+                {_workflow_name(CI)},
+                f"the reconciler must not be woken by {name!r}, which it can cause",
+            )
+
     def test_a_forks_event_never_spends_the_shared_slot(self):
         # A fork's HEAD is unreachable by a repository-scoped provider, so the
         # job must be skipped rather than reconcile a candidate it cannot review.
         self.assertIn("head.repo.full_name == github.repository", self.shared)
         self.assertIn("pull_request_target", self.consumer)
 
-    def test_the_reconciler_is_single_flight(self):
+    def test_the_reconciler_is_single_flight_and_never_cancelled(self):
+        # One controller decides who gets the next shared provider slot. It must
+        # also survive the wait it deliberately performs: cancelling a run that
+        # is sleeping out the shared cooldown resets that timer, and status /
+        # check-run / review events arrive continuously, so the queue starves and
+        # a PR that is owed the shared slot never receives a request. That is the
+        # production incident kodmial/nanodictate@e5f9a84 fixed in its own
+        # controller, and the rule is provider independent.
         for name, text in (("shared", self.shared), ("consumer", self.consumer)):
             self.assertIn("group: continuum-review-queue", text, name)
-            self.assertIn("cancel-in-progress: true", text, name)
+            self.assertIn("cancel-in-progress: false", text, name)
+            self.assertNotIn("cancel-in-progress: true", text, name)
 
     def test_the_job_runs_the_reconciler_and_its_config_gate(self):
         self.assertIn("continuum.cli config-check", self.shared)

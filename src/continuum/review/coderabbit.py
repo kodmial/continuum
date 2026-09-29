@@ -9,8 +9,10 @@ Three surfaces CodeRabbit owns disagree with each other often enough to
 deadlock a naive gate, so this adapter is where they are reconciled:
 
 * the commit status is *operational* state (reviewing, rate limited, skipped),
-  never merge authorization. A later `Review skipped` success must not erase an
-  approval GitHub already stores as a durable review;
+  never merge authorization and never proof of a review. A later
+  `Review skipped` success must not erase an approval GitHub already stores as
+  a durable review, and a status on its own must not excuse the queue from
+  asking for one;
 * review records are bound to the immutable head SHA they were submitted
   against, and a later decisive verdict supersedes earlier nitpick-only
   COMMENTED reviews on that same head;
@@ -564,27 +566,34 @@ def covers_head(
     bot_login: str = DEFAULT_BOT_LOGIN,
     status_context: str = DEFAULT_STATUS_CONTEXT,
 ) -> bool:
-    """Whether CodeRabbit has already reported on this exact HEAD.
+    """Whether CodeRabbit has already spent the shared slot on this exact HEAD.
 
-    The shared included-review slot is only owed to a head the provider has
-    never looked at. A durable exact-head APPROVED review answers that on its
-    own, so a later `Review skipped` status cannot make the queue spend another
-    full review on a head it already cleared. Reviews by other identities do not
-    count: a human approving a pull request says nothing about CodeRabbit's
-    quota.
+    Only a submitted review settles the obligation, and the commit status never
+    does. The two rules are the same rule seen from opposite ends, and the
+    production incident needed both:
+
+    * a durable exact-head review means the slot is spent, so a later
+      `Review skipped` success must not make the queue buy another full review
+      for a head CodeRabbit already answered;
+    * a status on its own means nothing at all was reviewed. `Review skipped`,
+      a stale success, or no status are exactly what a head that still owes a
+      review looks like, so treating any of them as coverage strands that head
+      in the queue with no request ever sent for it.
+
+    Reviews by other identities do not count: a human approving a pull request
+    says nothing about CodeRabbit's quota. `statuses` and `status_context` stay
+    in the signature because the provider registry asks every adapter the same
+    question, but this adapter answers it from review records alone.
     """
 
+    del statuses, status_context
     if not head:
         return False
-    for review in reviews or []:
-        if not _matches_bot(((review.get("user") or {}).get("login") or ""), bot_login):
-            continue
-        if (review.get("commit_id") or "").lower() == head.lower():
-            return True
-    status = latest_status(statuses or [], status_context)
-    if status is None:
-        return False
-    return (status.get("sha") or "").lower() == head.lower()
+    return any(
+        _matches_bot(((review.get("user") or {}).get("login") or ""), bot_login)
+        and (review.get("commit_id") or "").lower() == head.lower()
+        for review in reviews or []
+    )
 
 
 def profile_for(bot_login: str, status_context: str) -> Tuple[Tuple[str, ...], Tuple[str, ...], Tuple[str, ...]]:

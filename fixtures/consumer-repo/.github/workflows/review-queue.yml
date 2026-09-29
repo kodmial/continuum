@@ -54,8 +54,12 @@ permissions:
   statuses: read
 
 concurrency:
+  # Same rule as the shared reconciler this entry point calls: a run that is
+  # sleeping out the provider's shared cooldown must not be cancelled by the
+  # next wake-up, or a repository with continuous status/check-run events
+  # starves its own queue. GitHub keeps one pending successor behind it.
   group: continuum-review-queue
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   reconcile:

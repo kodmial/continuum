@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from typing import Any, Dict, Optional, Sequence
 
 from . import config as config_module
@@ -465,6 +466,145 @@ def _report_plan(plan: Any) -> None:
         )
 
 
+def _verification_requirement(
+    args: argparse.Namespace, config: config_module.ContinuumConfig
+) -> Any:
+    """The gate to apply: the configured one, or a narrowed override.
+
+    An override may narrow the workflow or the event but never *invent* the
+    artifacts or jobs. Those are the declaration that the verification means
+    something, and a caller that could replace them could pass the gate without
+    anything having been verified at all.
+    """
+
+    from .release import provenance as provenance_module
+
+    requirement = config.release.verification.requirement()
+    if requirement is None:
+        return None
+    workflow = str(getattr(args, "workflow", "") or "").strip()
+    event = str(getattr(args, "event", "") or "").strip()
+    if not workflow and not event:
+        return requirement
+    return provenance_module.VerificationRequirement(
+        workflow=workflow or requirement.workflow,
+        event=event or requirement.event,
+        jobs=requirement.jobs,
+        artifacts=requirement.artifacts,
+    )
+
+
+def cmd_release_verify(args: argparse.Namespace) -> int:
+    """Report whether the exact commit being released passed a declared gate.
+
+    This never publishes. It answers one question — *is there a green run of the
+    declared workflow, on this exact commit, that produced the declared
+    artifacts?* — and reports it in a normalized form plus a reason code, so a
+    workflow can branch on the answer instead of on prose.
+
+    Exiting non-zero on a blocked verdict is deliberate: the point of a gate is
+    to fail the job that depends on it. `--wait-attempts` exists because the
+    gate and the workflow it waits for are triggered by the same push, so the
+    run may not exist yet on the first look; a bounded wait handles that race
+    without any workflow having to sleep indefinitely.
+    """
+
+    from .release import provenance as provenance_module
+
+    config = _load_config(args.config, args.allow_missing)
+    requirement = _verification_requirement(args, config)
+    head = (args.head or os.environ.get("GITHUB_SHA") or "").strip()
+
+    if requirement is None:
+        # Nothing is declared, so nothing is gated. Report that rather than
+        # implying a verification happened.
+        verdict = provenance_module.evaluate(None, head)
+        _emit_verdict(verdict, args)
+        return EXIT_OK
+
+    client = _client()
+    runs, selected = _find_run(client, requirement, head, args)
+    run_id = int((selected or {}).get("id") or 0)
+    # Nothing is read for a run that was not selected: a job or artifact list
+    # belonging to some other run would make the verdict a statement about the
+    # wrong run.
+    jobs = client.list_run_jobs(run_id) if run_id and not args.skip_job_check else None
+    artifacts = (
+        client.list_run_artifacts(run_id) if run_id and not args.skip_artifact_check else None
+    )
+    verdict = provenance_module.evaluate(
+        requirement,
+        head,
+        runs=runs,
+        jobs=jobs,
+        artifacts=artifacts,
+        check_jobs=not args.skip_job_check,
+        check_artifacts=not args.skip_artifact_check,
+    )
+    _emit_verdict(verdict, args)
+    return EXIT_OK if verdict.ok else EXIT_ERROR
+
+
+def _find_run(
+    client: Any, requirement: Any, head: str, args: argparse.Namespace
+) -> tuple:
+    """Read the runs, re-reading while the answer is still provisional.
+
+    Two provisional answers, and both are the *expected* first answer rather
+    than a verdict:
+
+    * **no run yet.** The gate and the workflow it waits for are triggered by
+      the same push, so the run may not exist on the first read. This is the
+      race the bounded wait exists for.
+    * **a run that has not finished.** Waiting is correct; publishing is not.
+
+    A run that has finished is never re-read. A red run, or a green one missing
+    a declared artifact, will answer identically every time it is looked at, and
+    retrying it only burns a runner while the same wrong answer comes back.
+    """
+
+    from .release import provenance as provenance_module
+
+    budget = 0 if args.no_wait else max(0, int(args.wait_attempts))
+    interval = max(0, int(args.wait_seconds))
+    while True:
+        runs = client.list_workflow_runs(requirement.workflow, head_sha=head)
+        selected = provenance_module.select_run(runs, requirement, head)
+        provisional = selected is None or str(selected.get("status") or "") != "completed"
+        if not provisional or budget <= 0:
+            return runs, selected
+        budget -= 1
+        time.sleep(interval)
+
+
+def _emit_verdict(verdict: Any, args: argparse.Namespace) -> None:
+    """Publish a verdict everywhere a consumer might read it.
+
+    stdout, a result document, and `GITHUB_OUTPUT` at once, because a gate is
+    read by three different things: a human reading the log, a branch-protection
+    rule matching a text check, and the next job in the same workflow.
+    """
+
+    payload = verdict.describe()
+    _print_json(payload)
+    _write_output(
+        {
+            "verdict": "PASS" if verdict.ok else "BLOCK",
+            "reason": verdict.reason,
+            "contract": verdict.contract(),
+            "head": verdict.head_sha,
+            "run": str(verdict.run_id or 0),
+        }
+    )
+    out = getattr(args, "out", None)
+    if out:
+        with open(out, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+    if not verdict.ok:
+        print(f"::error::{verdict.reason}: {verdict.detail}")
+
+
 def cmd_release_plan(args: argparse.Namespace) -> int:
     """Show what a release target will do, without doing it."""
 
@@ -681,6 +821,76 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print the plan without executing any signing tool.",
     )
     sign.set_defaults(func=cmd_release_sign)
+
+    verify = release_sub.add_parser(
+        "verify",
+        help=(
+            "Report whether the exact commit being released passed the configured "
+            "verification workflow."
+        ),
+        description=(
+            "Decide whether a declared verification workflow has a green run on the "
+            "exact commit that is about to be published, carrying the declared jobs "
+            "and artifacts. Publishes nothing: it is the gate a release job asks "
+            "before it publishes."
+        ),
+    )
+    add_common(verify)
+    verify.add_argument(
+        "--head",
+        default="",
+        help="Exact commit being released (default: GITHUB_SHA).",
+    )
+    verify.add_argument(
+        "--workflow",
+        default="",
+        help=(
+            "Override the configured verification workflow file name. Declared jobs "
+            "and artifacts are never overridden."
+        ),
+    )
+    verify.add_argument(
+        "--event",
+        default="",
+        help="Override the configured verification event name.",
+    )
+    verify.add_argument(
+        "--out",
+        default=None,
+        help="Write the normalized verdict document here.",
+    )
+    verify.add_argument(
+        "--wait-attempts",
+        type=int,
+        default=0,
+        help=(
+            "How many times to re-read an unfinished run before giving up. The gate "
+            "and the workflow it waits for are triggered by the same push, so the run "
+            "may not exist yet on the first read."
+        ),
+    )
+    verify.add_argument(
+        "--wait-seconds",
+        type=int,
+        default=20,
+        help="Seconds between those reads.",
+    )
+    verify.add_argument(
+        "--no-wait",
+        action="store_true",
+        help="Read once and report; do not re-read an unfinished run.",
+    )
+    verify.add_argument(
+        "--skip-job-check",
+        action="store_true",
+        help="Do not require the declared jobs (used when the run is still in flight).",
+    )
+    verify.add_argument(
+        "--skip-artifact-check",
+        action="store_true",
+        help="Do not require the declared artifacts.",
+    )
+    verify.set_defaults(func=cmd_release_verify)
 
     return parser
 

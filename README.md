@@ -312,6 +312,82 @@ No release workflow is active in this repository, and `.github/workflows/ci.yml`
 enforces an allowlist of workflow names. The module and the CLI are the
 deliverable; the macOS job is a follow-up.
 
+### Publication is bound to one exact commit
+
+A release job that builds and then publishes cannot tell you whether anything
+verified its bytes, because it *is* the thing that produced them. Re-running the
+build at publication time does not fix that; it makes it worse, because the
+shipped bytes are then a second build and the verification that did happen
+applied to a first build that no longer exists anywhere. The observable symptom
+is a package that installs everywhere except on the machine that verified it.
+
+`release/provenance.py` is the answer, and it is narrow on purpose. A consumer
+declares which workflow in *its own* repository verifies the release, which event
+creates that run, which of its jobs must actually run, and which artifact names
+must exist in it:
+
+```yaml
+release:
+  verification:
+    workflow: packaging-smoke.yml
+    event: push
+    jobs:
+      - Candidate build (x86_64)
+    artifacts:
+      - candidate-dist-x86_64
+```
+
+```console
+$ continuum release verify --head "$GITHUB_SHA"
+```
+
+Three rules, each of which exists because breaking it is invisible:
+
+- **The commit is exact, never a branch.** A run on `main` says nothing about the
+  commit being released, because `main` may have moved. Only a run whose head SHA
+  *is* the released SHA counts.
+- **Green is necessary and not sufficient.** A run can be green and have produced
+  nothing — a path-filtered job, a matrix leg that did not run, an upload that
+  found no files. Every declared artifact must be present in that run, by name.
+- **The verdict is a reason code, not prose.** A caller that decides whether to
+  wait, retry, or stop branches on a stable code: `verification-missing` and
+  `verification-incomplete` are worth another look; `verification-failed`,
+  `verification-job-missing`, and `verification-artifact-missing` will answer
+  identically forever, and retrying them only burns a runner.
+
+The command publishes a normalized contract —
+`verdict=PASS|BLOCK reason=<code> head=<sha> run=<id|none>` — to stdout, to
+`GITHUB_OUTPUT`, and to `--out`, so a branch-protection rule, the next job, and a
+human reading the log all read the same answer. The run id is what lets a
+publication consume the *tested* bytes rather than rebuilding them.
+
+The wait is bounded and asymmetric on purpose. The gate and the workflow it
+waits for are triggered by the same push, so on the first read the run often does
+not exist yet; a run that has already finished is never re-read. Nothing here
+names a product, a package manager, or a platform — a consumer's verification is
+the consumer's business; what is not the consumer's business is publishing
+untested bytes.
+
+`.github/workflows/release-verify.yml` wraps the command for a consumer that
+wants it as a job, with the verdict exposed as step outputs so a blocked verdict
+is still readable.
+
+### Parity with the audited source repository
+
+`docs/parity-ledger.json` records, for every semantic the audited source
+repository gained across 18 commits, what Continuum did about it: `absorbed`,
+`must-port`, `consumer-local`, `superseded`, or `not-applicable`, with a rationale
+and evidence for each. `docs/parity-ledger.md` is rendered from it and is the one
+to read. `tests/test_parity_ledger.py` refuses a stale render, a summary that
+disagrees with its own items, a `must-port` without regression coverage, a
+citation to a test that no longer exists, and any ledger that claims a cutover.
+
+Regenerate the Markdown after editing the JSON:
+
+```console
+$ PYTHONPATH=src python3 -m continuum.tools.parity_ledger
+```
+
 ## Public-repository safety
 
 This repository is public, so every input the automation reads is attacker-supplyable:

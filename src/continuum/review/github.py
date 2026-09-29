@@ -127,6 +127,37 @@ class GitHubClient:
             url = _next_link(link)
         return items
 
+    def paginate_key(self, path: str, key: str) -> List[Any]:
+        """Page through an endpoint whose payload is an object, not a list.
+
+        The Actions endpoints answer `{"total_count": n, "workflow_runs": [...]}`
+        rather than a bare array. `paginate` on such a page collects nothing and
+        returns an empty list without complaining, which for a verification gate
+        is the worst possible failure: it reports "no verification run exists"
+        for a repository that has one, and the publication is blocked for a
+        reason that is not true. A key that is absent or of the wrong type is an
+        error here, not an empty result.
+        """
+
+        items: List[Any] = []
+        url = self.api_base + path
+        while url:
+            request = urllib.request.Request(url, headers=self._headers(), method="GET")
+            try:
+                page, link = self._opener(request, self.timeout)
+            except urllib.error.HTTPError as exc:
+                raise GitHubError(
+                    f"GitHub API GET {url} failed with status {exc.code}", status=exc.code
+                ) from None
+            if not isinstance(page, dict) or not isinstance(page.get(key), list):
+                raise GitHubError(
+                    f"GitHub API GET {url} returned no {key!r} array; the response shape "
+                    "changed and the caller would otherwise read it as an empty result"
+                )
+            items.extend(page[key])
+            url = _next_link(link)
+        return items
+
     def graphql(self, query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
         payload = self.request("POST", "/graphql", {"query": query, "variables": variables})
         if not isinstance(payload, dict):
@@ -339,6 +370,45 @@ class GitHubClient:
             "POST",
             f"/repos/{self.owner}/{self.name}/actions/workflows/{quoted}/dispatches",
             body,
+        )
+
+    # -- release verification ------------------------------------------------
+    #
+    # Reading a workflow run is the same read the review side does, on a
+    # different subject. These stay here rather than in a second client so there
+    # is one place that knows how this repository is addressed and authenticated.
+
+    def list_workflow_runs(
+        self, workflow: str, *, head_sha: str = "", event: str = ""
+    ) -> List[Dict[str, Any]]:
+        """Runs of one workflow file, optionally narrowed to a commit and event.
+
+        `head_sha` is a filter, not a search: asking for runs of a commit is
+        what makes "verified exactly this commit" expressible. An empty filter
+        returns the newest runs, which is only useful for a local diagnostic.
+        """
+
+        quoted = urllib.parse.quote(str(workflow), safe="")
+        path = f"/repos/{self.owner}/{self.name}/actions/workflows/{quoted}/runs"
+        query = []
+        if head_sha:
+            query.append(("head_sha", str(head_sha)))
+        if event:
+            query.append(("event", str(event)))
+        return self.paginate_key(
+            f"{path}?{urllib.parse.urlencode(query)}" if query else path, "workflow_runs"
+        )
+
+    def list_run_jobs(self, run_id: int) -> List[Dict[str, Any]]:
+        return self.paginate_key(
+            f"/repos/{self.owner}/{self.name}/actions/runs/{int(run_id)}/jobs?per_page=100",
+            "jobs",
+        )
+
+    def list_run_artifacts(self, run_id: int) -> List[Dict[str, Any]]:
+        return self.paginate_key(
+            f"/repos/{self.owner}/{self.name}/actions/runs/{int(run_id)}/artifacts?per_page=100",
+            "artifacts",
         )
 
     def update_issue_comment(self, comment_id: int, body: str) -> Dict[str, Any]:
