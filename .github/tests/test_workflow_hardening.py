@@ -541,6 +541,46 @@ class AgentExecutionTests(WorkflowAuditBase):
             self.assertIn('test -x "$HOME/.opencode/bin/opencode"', text)
             self.assertIn("sleep $((attempt * 5))", text)
 
+    def test_repair_helpers_are_pinned_to_trusted_control_plane(self):
+        """Old PR branches must never supply the controller code that repairs them."""
+        authorize = self.job("opencode.yml", "authorize")
+        self.assertEqual(
+            (authorize.get("outputs") or {}).get("control_plane_sha"),
+            "${{ steps.control.outputs.sha }}",
+        )
+
+        workflow_text = self.raw["opencode.yml"]
+        agent = self.job("opencode.yml", "opencode")
+        agent_text = job_text(self.workflows["opencode.yml"], agent)
+
+        self.assertIn("Pin trusted control plane revision", workflow_text)
+        self.assertIn("Materialize trusted repair control plane", agent_text)
+        self.assertIn(
+            'git show "$CONTROL_PLANE_SHA:.github/scripts/$helper"',
+            agent_text,
+        )
+        self.assertIn(
+            "CONTINUUM_OPENCODE_RUNTIME=$control_dir/opencode_runtime.py",
+            agent_text,
+        )
+        self.assertIn(
+            "CONTINUUM_CONFLICT_REPAIR=$control_dir/conflict_repair.py",
+            agent_text,
+        )
+        self.assertIn('python3 "$CONTINUUM_OPENCODE_RUNTIME" install', agent_text)
+        self.assertIn('python3 "$CONTINUUM_OPENCODE_RUNTIME" verify', agent_text)
+        self.assertIn('python3 "$CONTINUUM_CONFLICT_REPAIR" publication-gate', agent_text)
+        self.assertNotIn("python3 .github/scripts/opencode_runtime.py", agent_text)
+        self.assertNotIn("python3 .github/scripts/conflict_repair.py", agent_text)
+
+        # The trusted helpers must exist before any repair-specific install or
+        # invocation. This is the regression for old PR branches created before
+        # opencode_runtime.py existed.
+        self.assertLess(
+            workflow_text.index("Materialize trusted repair control plane"),
+            workflow_text.index("Install OpenCode CLI for automated repair"),
+        )
+
     def test_consumer_allows_anonymous_models_without_api_key(self):
         text = self.raw["consumer-opencode.yml"]
         self.assertNotIn("Require model credential", text)
