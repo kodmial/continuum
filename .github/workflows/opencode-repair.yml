@@ -49,7 +49,7 @@ jobs:
           GH_TOKEN: ${{ secrets.TAP_PAT || github.token }}
           RUN_ID: ${{ github.event.workflow_run.id }}
           CONCLUSION: ${{ github.event.workflow_run.conclusion }}
-          MAX_ATTEMPTS: ${{ vars.AUTOMATION_MAX_DISPATCH_ATTEMPTS || '2' }}
+          MAX_ATTEMPTS: ${{ vars.AUTOMATION_MAX_DISPATCH_ATTEMPTS || '3' }}
         run: |
           set -euo pipefail
           [[ "$RUN_ID" =~ ^[0-9]+$ ]] || { echo "::error::Invalid workflow run id."; exit 1; }
