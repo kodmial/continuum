@@ -1102,7 +1102,23 @@ def write_outputs(outputs: dict) -> None:
         return
     with open(destination, "a", encoding="utf-8") as handle:
         for key, value in outputs.items():
-            handle.write("{}={}\n".format(key, value))
+            text = str(value)
+            if "\n" not in text:
+                handle.write("{}={}\n".format(key, text))
+                continue
+
+            # GitHub Actions requires delimiter syntax for multiline outputs.
+            # A plain key=value followed by raw lines corrupts $GITHUB_OUTPUT
+            # and makes the whole step fail after otherwise successful work.
+            delimiter = "__CONTINUUM_OUTPUT_EOF__"
+            value_lines = set(text.splitlines())
+            while delimiter in value_lines:
+                delimiter += "_"
+            handle.write("{}<<{}\n".format(key, delimiter))
+            handle.write(text)
+            if not text.endswith("\n"):
+                handle.write("\n")
+            handle.write("{}\n".format(delimiter))
 
 
 def env_context() -> dict:
