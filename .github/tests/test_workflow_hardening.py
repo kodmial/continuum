@@ -476,9 +476,14 @@ class AgentExecutionTests(WorkflowAuditBase):
             text = self.raw[name]
             self.assertIn("continuum-opencode-run:$GITHUB_RUN_ID", text)
             self.assertIn("Record issue execution ownership", text)
+            execution_token = (
+                "uses: anomalyco/opencode"
+                if name == "opencode.yml"
+                else "opencode run --auto"
+            )
             self.assertLess(
                 text.index("Record issue execution ownership"),
-                text.index("opencode run") if "opencode run" in text else text.index("uses: anomalyco/opencode"),
+                text.index(execution_token),
             )
 
     def test_upstream_installer_is_bounded_and_verified(self):
