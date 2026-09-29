@@ -336,7 +336,7 @@ jobs:
             exit 0
           fi
 
-          git push -u origin "$BRANCH"
+          HUSKY=0 git push -u origin "$BRANCH"
           gh pr create             --repo "$GITHUB_REPOSITORY"             --base main             --head "$BRANCH"             --title "$TITLE"             --body "Implemented automatically by Continuum.\n\nCloses #${ISSUE_NUMBER}"
 
       # Conflict repair repairs the change that already exists. It never
@@ -365,7 +365,7 @@ jobs:
           # the step instead of being silently overwritten. Nothing from either
           # side is discarded.
           if git rebase --rebase-merges origin/main; then
-            git push --force-with-lease="refs/heads/${HEAD_REF}:${ORIGINAL_HEAD}" origin "HEAD:${HEAD_REF}"
+            HUSKY=0 git push --force-with-lease="refs/heads/${HEAD_REF}:${ORIGINAL_HEAD}" origin "HEAD:${HEAD_REF}"
             echo "REPAIR_OUTCOME=replayed" >> "$GITHUB_ENV"
             echo "Replayed the existing commits onto main; no model was invoked."
             exit 0
@@ -405,7 +405,7 @@ jobs:
           # Rung 3 of the ladder, and the only rung that calls a model. A merge
           # git can complete unaided completes here with no model call at all.
           if git merge --no-edit "$BASE_SHA"; then
-            git push origin "HEAD:${HEAD_REF}"
+            HUSKY=0 git push origin "HEAD:${HEAD_REF}"
             echo "REPAIR_OUTCOME=merged_automatically" >> "$GITHUB_ENV"
             echo "Merged main into the pull request mechanically; no model was invoked."
             exit 0
@@ -442,7 +442,7 @@ jobs:
             git commit --no-edit >/dev/null 2>&1 \
               || git commit -m "chore: resolve merge conflict with main"
           fi
-          git push origin "HEAD:${HEAD_REF}"
+          HUSKY=0 git push origin "HEAD:${HEAD_REF}"
           echo "REPAIR_OUTCOME=hunks_resolved" >> "$GITHUB_ENV"
 
       # Runs on success and on failure. A repair that dies mid-flight must not
@@ -497,7 +497,7 @@ jobs:
           fi
           AFTER="$(git rev-parse HEAD)"
           if [[ "$AFTER" != "$BEFORE" ]]; then
-            git push origin "HEAD:${HEAD_REF}"
+            HUSKY=0 git push origin "HEAD:${HEAD_REF}"
             while read -r label; do
               [[ "$label" == opencode-gate-repair-* ]] || continue
               gh api --method DELETE \
