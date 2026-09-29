@@ -79,6 +79,18 @@ jobs:
                 .filter(Number.isFinite);
               return resets.length ? Math.max(...resets) : 0;
             }
+            async function dispatchHistory(number) {
+              const [comments, epochStartedAt] = await Promise.all([
+                github.paginate(github.rest.issues.listComments, {
+                  owner, repo, issue_number:number, per_page:100
+                }),
+                retryEpochStartedAt(number),
+              ]);
+              return comments
+                .filter(c => (c.body || '').includes(marker))
+                .filter(c => new Date(c.created_at).getTime() >= epochStartedAt)
+                .sort((a,b) => new Date(a.created_at) - new Date(b.created_at));
+            }
 
             await ensureLabel(inProgress, 'FBCA04', 'Continuum currently owns this issue');
             await ensureLabel(paused, 'B60205', 'Continuum automation is paused');
@@ -104,14 +116,7 @@ jobs:
               const labels = labelsOf(issue);
               if (!labels.has(inProgress) || activeByPr.has(issue.number)) continue;
 
-              const comments = await github.paginate(github.rest.issues.listComments, {
-                owner, repo, issue_number:issue.number, per_page:100
-              });
-              const epochStartedAt = await retryEpochStartedAt(issue.number);
-              const dispatches = comments
-                .filter(c => (c.body || '').includes(marker))
-                .filter(c => new Date(c.created_at).getTime() >= epochStartedAt)
-                .sort((a,b) => new Date(a.created_at) - new Date(b.created_at));
+              const dispatches = await dispatchHistory(issue.number);
               const last = dispatches.at(-1);
               if (!last) {
                 await removeLabel(issue.number, inProgress);
@@ -143,6 +148,18 @@ jobs:
             for (const item of candidates) {
               if (dispatched >= free) break;
               const issue = item.issue;
+
+              // Enforce the retry budget before every dispatch, not only when
+              // an in-progress lease expires. Fast deterministic failures can
+              // clear the ownership label immediately; without this guard each
+              // scheduler reconciliation would dispatch the same broken task
+              // forever.
+              const dispatches = await dispatchHistory(issue.number);
+              if (dispatches.length >= maxAttempts) {
+                await addLabel(issue.number, paused);
+                core.warning(`Issue #${issue.number}: automatic attempt budget ${maxAttempts} exhausted; pausing further dispatches.`);
+                continue;
+              }
 
               let blockers = [];
               try {
