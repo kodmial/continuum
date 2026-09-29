@@ -120,6 +120,45 @@ jobs:
             const repo = context.repo.repo;
             const repoFullName = owner + '/' + repo;
 
+            // One-shot backlog dependency reconciliation. This block is removed
+            // immediately after the native GitHub issue relationships are verified.
+            const dependencyEdges = [
+              [59, 60],
+              [59, 61],
+              [11, 60],
+              [27, 59],
+              [64, 8],
+            ];
+            for (const [issueNumber, blockerNumber] of dependencyEdges) {
+              const current = await github.paginate(
+                'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
+                {
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                  per_page: 100,
+                  headers: { 'X-GitHub-Api-Version': '2026-03-10' },
+                }
+              );
+              if (current.some(item => item.number === blockerNumber)) continue;
+              const blocker = await github.rest.issues.get({
+                owner,
+                repo,
+                issue_number: blockerNumber,
+              });
+              await github.request(
+                'POST /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
+                {
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                  issue_id: blocker.data.id,
+                  headers: { 'X-GitHub-Api-Version': '2026-03-10' },
+                }
+              );
+              core.notice('Added native dependency: #' + issueNumber + ' blocked by #' + blockerNumber + '.');
+            }
+
             // Both gates must have produced a result. An empty allowlist is a
             // legitimate outcome (nothing is trusted right now) and is not an
             // error, but a *missing* gate result is a failure: the job must not
