@@ -658,8 +658,8 @@ class GithubOutputEncodingTests(unittest.TestCase):
             lines = handle.read().splitlines()
 
         self.assertEqual(lines[0], "merge_plan<<__CONTINUUM_OUTPUT_EOF__")
-        self.assertEqual(lines[1], "70\\tallow\\tfirst")
-        self.assertEqual(lines[2], "69\\tallow\\tsecond")
+        self.assertEqual(lines[1], "70\tallow\tfirst")
+        self.assertEqual(lines[2], "69\tallow\tsecond")
         self.assertEqual(lines[3], "__CONTINUUM_OUTPUT_EOF__")
         self.assertEqual(lines[4], "approved_count=2")
 
