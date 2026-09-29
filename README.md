@@ -122,6 +122,27 @@ adapter:
 To enable in another repository, validate a `.continuum.yml`, then call the
 reusable workflow — see `fixtures/consumer-repo/` for the reference consumer.
 
+
+## Parent/child delegated execution
+
+Continuum also supports explicit cross-repository execution. A repository may
+declare `delegation.role: parent` and allowlist opaque child ids, or declare
+`delegation.role: child` with its id and exact parent. Repositories that omit
+the block have role `none` and do not participate.
+
+The parent keeps the actual child repository bindings in the
+`CONTINUUM_CHILD_REPOSITORIES` secret rather than in public git. Every
+dispatcher/worker/review run then verifies the child's own `.continuum.yml`
+points back to the calling parent before doing any work. Repository visibility
+is never used to discover or authorize a child.
+
+Delegated issues opt in with `<!-- continuum-child-owned -->`; the local
+consumer scheduler ignores them so delegated and local execution cannot race.
+The legacy `runtime-worker-owned` marker is accepted for migration.
+
+See [docs/parent-child-delegation.md](docs/parent-child-delegation.md) and the
+`fixtures/delegation-parent/` / `fixtures/delegation-child/` examples.
+
 ## Review queue
 
 A provider is a shared, rate-limited resource, so at most one review request may
