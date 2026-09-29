@@ -93,10 +93,115 @@ def clean_pr_agent_report(head: str, *, at: str = "2026-09-01T00:00:00Z") -> str
         f"## PR Reviewer Guide\n\n"
         f"HEAD `{head}`\n\n"
         f"<details><summary>Recommended focus areas for review</summary>\n"
-        f"<ul>\n<strong>No actionable issues were found in the reviewed changes.</strong>\n</ul>\n"
+        f"<ul>\n<strong>No actionable issues were found in the reviewed changes.</strong></ul>\n"
         f"</details>\n\n"
         f"## Review completed\n"
     )
+
+
+# -- CodeRabbit fixtures ------------------------------------------------------
+
+CODERABBIT_LOGIN = "coderabbitai[bot]"
+
+# CodeRabbit marks an advisory nitpick review with the count of outstanding
+# comments, which is what separates a nitpick from the empty review shell it
+# leaves behind when it confirms a single thread.
+NITPICK_BODY = (
+    "The changes look good. I reviewed 2 extra nitpick comments before approving.\n\n"
+    "## Review details\n\nNitpick comments (2) raised outside the review scope.\n"
+)
+
+
+def coderabbit_summary(head: str, *, at: str = "2026-09-01T00:00:00Z", comment_id: int = 90) -> Dict[str, Any]:
+    """A CodeRabbit walkthrough that names the current HEAD and finds nothing."""
+
+    return issue_comment(
+        "CodeRabbit walkthrough\n\n"
+        f"Review of `{head}`.\n\n"
+        "## Walkthrough\n\nDescribes the diff.\n\n"
+        "## Review details\n\nNo issues found.\n",
+        login=CODERABBIT_LOGIN,
+        created_at=at,
+        comment_id=comment_id,
+    )
+
+
+def coderabbit_review(
+    state: str,
+    *,
+    head_sha: str = HEAD_A,
+    at: str = "2026-09-01T00:00:00Z",
+    body: str = "",
+    review_id: int = 1,
+) -> Dict[str, Any]:
+    """One CodeRabbit review record bound to a specific head SHA."""
+
+    return {
+        "id": review_id,
+        "state": state,
+        "body": body,
+        "user": {"login": CODERABBIT_LOGIN},
+        "commit_id": head_sha,
+        "submitted_at": at,
+    }
+
+
+def coderabbit_status(
+    description: str,
+    *,
+    state: str = "success",
+    head_sha: str = HEAD_A,
+    context: str = "CodeRabbit",
+    at: str = "2026-09-02T00:00:00Z",
+) -> Dict[str, Any]:
+    return {
+        "id": 7,
+        "context": context,
+        "state": state,
+        "description": description,
+        "sha": head_sha,
+        "created_at": at,
+        "updated_at": at,
+    }
+
+
+def coderabbit_thread(
+    thread_id: str,
+    *,
+    body: str = "This misses the null guard around the parsed payload.",
+    replies: Sequence[str] = (),
+    is_resolved: bool = False,
+    is_outdated: bool = False,
+    path: str = "app.py",
+    comment_id: int = 500,
+) -> Dict[str, Any]:
+    """A CodeRabbit-authored review thread in the shape the client returns."""
+
+    comments = [
+        {
+            "database_id": comment_id,
+            "author": CODERABBIT_LOGIN,
+            "body": body,
+            "created_at": "2026-09-01T00:00:00Z",
+        }
+    ]
+    for index, reply in enumerate(replies):
+        comments.append(
+            {
+                "database_id": comment_id + 1 + index,
+                "author": CODERABBIT_LOGIN,
+                "body": reply,
+                "created_at": "2026-09-01T01:00:00Z",
+            }
+        )
+    return {
+        "id": thread_id,
+        "is_resolved": is_resolved,
+        "is_outdated": is_outdated,
+        "path": path,
+        "comments": comments,
+    }
+
 
 
 def snapshot(
@@ -148,6 +253,7 @@ class FakeGitHub:
         file_contents: Optional[Dict[str, str]] = None,
         unresolved_ids: Optional[Set[int]] = None,
         thread_state: str = "ok",
+        threads: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         self.repository = repository
         self.head = head
@@ -164,10 +270,13 @@ class FakeGitHub:
         self.file_contents = dict(file_contents or {})
         self._unresolved_ids = set() if unresolved_ids is None else set(unresolved_ids)
         self.thread_state = thread_state
+        self.threads: Optional[List[Dict[str, Any]]] = threads
         self.calls: List[Any] = []
         self.reviews_created: List[Dict[str, Any]] = []
         self.statuses_created: List[Dict[str, Any]] = []
         self.comments_created: List[Dict[str, Any]] = []
+        self.resolved_threads: List[str] = []
+        self.fail_resolve_thread = False
         self.fail_approve_with_422 = False
         self._next_comment_id = 1000
 
@@ -207,7 +316,57 @@ class FakeGitHub:
             return None
         if self.thread_state == "graphql-exception":
             raise GraphQLFailure("reviewThreads lookup failed")
+        if self.threads is not None:
+            return {
+                int(comment["database_id"])
+                for thread in self.threads
+                if not thread.get("is_resolved") and not thread.get("is_outdated")
+                for comment in thread.get("comments") or []
+                if comment.get("database_id") is not None
+            }
         return set(self._unresolved_ids)
+
+    def review_threads(self, pr_number: int) -> Optional[List[Dict[str, Any]]]:
+        self._record("review_threads", pr_number)
+        if self.thread_state == "graphql-error":
+            return None
+        if self.thread_state == "graphql-exception":
+            raise GraphQLFailure("reviewThreads lookup failed")
+        if self.threads is not None:
+            return [thread for thread in self.threads]
+        if not self._unresolved_ids:
+            return []
+        return [
+            {
+                "id": "PRRT_legacy",
+                "is_resolved": False,
+                "is_outdated": False,
+                "path": "app.py",
+                "comments": [
+                    {
+                        "database_id": comment_id,
+                        "author": "coderabbitai[bot]",
+                        "body": "An actionable inline finding.",
+                        "created_at": "2026-09-01T00:00:00Z",
+                    }
+                    for comment_id in sorted(self._unresolved_ids)
+                ],
+            }
+        ]
+
+    def resolve_review_thread(self, thread_id: str) -> Dict[str, Any]:
+        from continuum.review.github import GitHubError
+
+        self._record("resolve_review_thread", thread_id)
+        if self.fail_resolve_thread:
+            raise GitHubError(
+                f"GitHub API resolveReviewThread failed for {thread_id}: boom", status=502
+            )
+        self.resolved_threads.append(str(thread_id))
+        for thread in self.threads or []:
+            if thread.get("id") == thread_id:
+                thread["is_resolved"] = True
+        return {"data": {"resolveReviewThread": {"thread": {"id": thread_id, "isResolved": True}}}}
 
     def file_at_ref(self, path: str, ref: str) -> Optional[str]:
         self._record("file_at_ref", path, ref)

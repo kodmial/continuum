@@ -778,6 +778,87 @@ class ControllerTests(unittest.TestCase):
         self.assertIn("Review provider cooldown still active for 1h 0m 30s.", logs(after))
         self.assertEqual(len(client.provider_commands()), 1)
 
+    def _cleared_head(self, client, number: int) -> None:
+        """Give a pull request a durable exact-head approval plus a later skip."""
+
+        client.reviews[number] = [
+            {
+                "id": 1,
+                "state": "APPROVED",
+                "body": "",
+                "user": {"login": "coderabbitai[bot]"},
+                "commit_id": f"{number:040d}",
+                "submitted_at": iso(NOW - 120_000),
+            }
+        ]
+        client.statuses[f"{number:040d}"] = [
+            {
+                "id": 3,
+                "context": "CodeRabbit",
+                "state": "success",
+                "description": "Review skipped",
+                "sha": f"{number:040d}",
+                "created_at": iso(NOW - 60_000),
+                "updated_at": iso(NOW - 60_000),
+            }
+        ]
+
+    def test_a_cleared_head_under_a_skipped_status_is_never_re_requested(self):
+        # CodeRabbit answers a second request about an already-cleared head with
+        # `Review skipped` instead of reviewing it again. Treating that as
+        # "still owed a full review" burned the shared included-review quota on
+        # every wake-up of a repaired pull request.
+        client = self._repository(pulls=[self._ready_pull(57)])
+        self._green(client, 57)
+        self._cleared_head(client, 57)
+
+        plan = controller.reconcile_once(
+            client,
+            support.queue_config(),
+            wake=queue.WakeUp(event="status"),
+            now=NOW,
+        )
+        self.assertEqual(plan.action, queue.ACTION_IDLE)
+        self.assertEqual(client.provider_commands(), [])
+        self.assertEqual(client.lock_records(), [])
+
+    def test_a_cleared_head_does_not_consume_the_slot_for_an_untouched_head(self):
+        client = self._repository(pulls=[self._ready_pull(57), self._ready_pull(59)])
+        self._green(client, 57, 59)
+        self._cleared_head(client, 57)
+
+        plan = controller.reconcile_once(
+            client,
+            support.queue_config(),
+            wake=queue.WakeUp(event="status"),
+            now=NOW,
+        )
+        self.assertEqual(plan.action, queue.ACTION_DISPATCH)
+        self.assertEqual(plan.selected.pr_number, 59)
+        self.assertEqual([record["pr"] for record in client.lock_records()], [59])
+        self.assertEqual(client.provider_commands(), ["@coderabbitai full review"])
+
+    def test_a_human_review_does_not_settle_the_shared_slot(self):
+        client = self._repository(pulls=[self._ready_pull(57)])
+        self._green(client, 57)
+        client.reviews[57] = [
+            {
+                "id": 1,
+                "state": "APPROVED",
+                "body": "LGTM",
+                "user": {"login": "some-human"},
+                "commit_id": f"{57:040d}",
+                "submitted_at": iso(NOW - 60_000),
+            }
+        ]
+
+        plan = controller.reconcile_once(
+            client, support.queue_config(), wake=queue.WakeUp(event="schedule"), now=NOW
+        )
+        self.assertEqual(plan.action, queue.ACTION_DISPATCH)
+        self.assertEqual(plan.selected.pr_number, 57)
+        self.assertEqual(client.provider_commands(), ["@coderabbitai full review"])
+
     def test_an_ineligible_in_flight_owner_is_released_and_the_next_candidate_runs(self):
         client = self._repository(
             pulls=[self._ready_pull(58, "priority:p0"), self._ready_pull(57)]
