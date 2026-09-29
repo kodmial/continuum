@@ -648,7 +648,7 @@ class DispatchCredentialTests(unittest.TestCase):
 
 class GithubOutputEncodingTests(unittest.TestCase):
     def test_multiline_output_uses_github_delimiter_syntax(self):
-        value = "70\\tallow\\tfirst\\n69\\tallow\\tsecond"
+        value = "70\tallow\tfirst\n69\tallow\tsecond"
         with tempfile.NamedTemporaryFile(mode="w+", encoding="utf-8") as handle:
             with unittest.mock.patch.dict(
                 os.environ, {"GITHUB_OUTPUT": handle.name}, clear=True
@@ -664,7 +664,7 @@ class GithubOutputEncodingTests(unittest.TestCase):
         self.assertEqual(lines[4], "approved_count=2")
 
     def test_multiline_output_avoids_delimiter_collision(self):
-        value = "first\\n__CONTINUUM_OUTPUT_EOF__\\nlast"
+        value = "first\n__CONTINUUM_OUTPUT_EOF__\nlast"
         with tempfile.NamedTemporaryFile(mode="w+", encoding="utf-8") as handle:
             with unittest.mock.patch.dict(
                 os.environ, {"GITHUB_OUTPUT": handle.name}, clear=True
