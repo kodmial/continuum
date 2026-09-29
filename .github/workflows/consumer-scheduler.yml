@@ -18,7 +18,7 @@ on:
       max_attempts:
         type: number
         required: false
-        default: 2
+        default: 3
 
 permissions:
   actions: write
@@ -48,7 +48,7 @@ jobs:
             const marker = '<!-- continuum-dispatch -->';
             const wipLimit = Number(process.env.WIP_LIMIT || 2);
             const leaseMs = Number(process.env.LEASE_MINUTES || 45) * 60 * 1000;
-            const maxAttempts = Number(process.env.MAX_ATTEMPTS || 2);
+            const maxAttempts = Number(process.env.MAX_ATTEMPTS || 3);
             const priority = new Map([
               ['priority:p0', 0], ['priority:p1', 1], ['priority:p2', 2],
             ]);

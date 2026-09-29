@@ -11,6 +11,14 @@ on:
         type: string
         required: false
         default: CI
+      scheduler_workflow:
+        type: string
+        required: false
+        default: continuum-scheduler.yml
+      max_attempts:
+        type: number
+        required: false
+        default: 3
 
 permissions:
   actions: write
@@ -19,6 +27,66 @@ permissions:
   pull-requests: write
 
 jobs:
+  issue-run-recovery:
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.event == 'workflow_dispatch' &&
+      github.event.workflow_run.conclusion != 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RUN_ID: ${{ github.event.workflow_run.id }}
+      CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+      SCHEDULER_WORKFLOW: ${{ inputs.scheduler_workflow }}
+      MAX_ATTEMPTS: ${{ inputs.max_attempts }}
+    steps:
+      - name: Recover failed issue-mode OpenCode run
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RUN_ID" =~ ^[0-9]+$ ]] || exit 0
+          [[ "$MAX_ATTEMPTS" =~ ^[1-9][0-9]*$ ]] || { echo "::error::Invalid max_attempts."; exit 1; }
+
+          run_marker="<!-- continuum-opencode-run:$RUN_ID -->"
+          dispatch_marker="<!-- continuum-dispatch -->"
+          issue_number=""
+
+          while read -r candidate; do
+            [[ -n "$candidate" ]] || continue
+            if gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$candidate/comments?per_page=100" \
+              --jq '.[].body // ""' | grep -Fq "$run_marker"; then
+              issue_number="$candidate"
+              break
+            fi
+          done < <(
+            gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+              --label "automation:in-progress" --limit 100 --json number --jq '.[].number'
+          )
+
+          # Repair-mode workflow_dispatch runs have no issue-run marker.
+          [[ -n "$issue_number" ]] || exit 0
+
+          attempts="$(
+            gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$issue_number/comments?per_page=100" \
+              --jq '[.[] | select((.body // "") | contains("<!-- continuum-dispatch -->"))] | length' \
+              | awk '{sum += $1} END {print sum + 0}'
+          )"
+
+          gh issue comment "$issue_number" --repo "$GITHUB_REPOSITORY" \
+            --body "Continuum OpenCode run $RUN_ID ended with '$CONCLUSION' before a usable PR completed. Dispatch attempts recorded: $attempts."
+
+          if (( attempts >= MAX_ATTEMPTS )); then
+            gh issue edit "$issue_number" --repo "$GITHUB_REPOSITORY" \
+              --add-label "automation:paused" \
+              --remove-label "automation:in-progress" >/dev/null
+            exit 0
+          fi
+
+          gh issue edit "$issue_number" --repo "$GITHUB_REPOSITORY" \
+            --remove-label "automation:in-progress" >/dev/null
+          gh workflow run "$SCHEDULER_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref main
+
   base-sync:
     if: >-
       github.event_name == 'workflow_run' &&

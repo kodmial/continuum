@@ -99,7 +99,7 @@ jobs:
     env:
       WIP_LIMIT: ${{ vars.AUTOMATION_WIP_LIMIT || '3' }}
       LEASE_MINUTES: ${{ vars.AUTOMATION_LEASE_MINUTES || '45' }}
-      MAX_DISPATCH_ATTEMPTS: ${{ vars.AUTOMATION_MAX_DISPATCH_ATTEMPTS || '2' }}
+      MAX_DISPATCH_ATTEMPTS: ${{ vars.AUTOMATION_MAX_DISPATCH_ATTEMPTS || '3' }}
 
     steps:
       - name: Reconcile state and dispatch ready issues
@@ -149,7 +149,7 @@ jobs:
 
             const wipLimit = positiveInt('WIP_LIMIT', 2);
             const leaseMinutes = positiveInt('LEASE_MINUTES', 45);
-            const maxDispatchAttempts = positiveInt('MAX_DISPATCH_ATTEMPTS', 2);
+            const maxDispatchAttempts = positiveInt('MAX_DISPATCH_ATTEMPTS', 3);
             const leaseMs = leaseMinutes * 60 * 1000;
 
             const priorityOrder = [

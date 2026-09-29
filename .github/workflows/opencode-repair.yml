@@ -19,7 +19,7 @@ on:
   pull_request_target:
     types: [opened, reopened, synchronize]
   workflow_run:
-    workflows: ["CI", "Packaging smoke"]
+    workflows: ["CI", "Packaging smoke", "OpenCode agent"]
     types: [completed]
 
 permissions: {}
@@ -29,6 +29,75 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  recover-failed-issue-run:
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.name == 'OpenCode agent' &&
+      github.event.workflow_run.event == 'issue_comment' &&
+      github.event.workflow_run.conclusion != 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+
+    permissions:
+      actions: write
+      contents: read
+      issues: write
+
+    steps:
+      - name: Release failed issue reservation and retry safely
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT || github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          MAX_ATTEMPTS: ${{ vars.AUTOMATION_MAX_DISPATCH_ATTEMPTS || '3' }}
+        run: |
+          set -euo pipefail
+          [[ "$RUN_ID" =~ ^[0-9]+$ ]] || { echo "::error::Invalid workflow run id."; exit 1; }
+          [[ "$MAX_ATTEMPTS" =~ ^[1-9][0-9]*$ ]] || { echo "::error::Invalid retry limit."; exit 1; }
+
+          run_marker="<!-- continuum-opencode-run:$RUN_ID -->"
+          dispatch_marker="<!-- issue-scheduler-dispatch -->"
+          issue_number=""
+
+          while read -r candidate; do
+            [[ -n "$candidate" ]] || continue
+            if gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$candidate/comments?per_page=100" \
+              --jq '.[].body // ""' | grep -Fq "$run_marker"; then
+              issue_number="$candidate"
+              break
+            fi
+          done < <(
+            gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+              --label "automation:in-progress" --limit 100 --json number --jq '.[].number'
+          )
+
+          if [[ -z "$issue_number" ]]; then
+            echo "No reserved issue owns OpenCode run $RUN_ID; nothing to recover."
+            exit 0
+          fi
+
+          attempts="$(
+            gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$issue_number/comments?per_page=100" \
+              --jq '[.[] | select((.body // "") | contains("<!-- issue-scheduler-dispatch -->"))] | length' \
+              | awk '{sum += $1} END {print sum + 0}'
+          )"
+
+          gh issue comment "$issue_number" --repo "$GITHUB_REPOSITORY" \
+            --body "OpenCode run $RUN_ID ended with '$CONCLUSION' before a usable PR completed. Dispatch attempts recorded: $attempts."
+
+          if (( attempts >= MAX_ATTEMPTS )); then
+            gh issue edit "$issue_number" --repo "$GITHUB_REPOSITORY" \
+              --add-label "automation:paused" \
+              --remove-label "automation:in-progress" >/dev/null
+            echo "Issue #$issue_number paused after $attempts failed dispatch attempt(s)."
+            exit 0
+          fi
+
+          gh issue edit "$issue_number" --repo "$GITHUB_REPOSITORY" \
+            --remove-label "automation:in-progress" >/dev/null
+          gh workflow run issue-scheduler.yml --repo "$GITHUB_REPOSITORY" --ref main
+          echo "Released issue #$issue_number and requested immediate scheduler retry."
+
   sync-stale-prs:
     if: >-
       github.event_name == 'workflow_run' &&
