@@ -180,6 +180,9 @@ def main(argv=None) -> int:
                 + "\n"
             )
             return 0
+        if args.command == "validation-script":
+            sys.stdout.write(child_validation_script(args.config) + "\n")
+            return 0
         verify_child(
             args.config,
             child_id=args.child_id,
