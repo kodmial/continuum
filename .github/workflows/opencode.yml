@@ -715,7 +715,7 @@ jobs:
 
 
       - name: Fix failed blocking workflow
-        if: github.event_name == 'workflow_dispatch' && needs.authorize.outputs.trust_code == 'trusted_dispatch'
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'ci-fix' && needs.authorize.outputs.trust_code == 'trusted_dispatch'
         env:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
           OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/big-pickle' }}

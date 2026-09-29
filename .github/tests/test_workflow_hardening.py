@@ -319,6 +319,18 @@ class PermissionsTests(WorkflowAuditBase):
                 name,
             )
 
+    def test_ci_fix_step_never_runs_for_conflict_repair_dispatch(self):
+        document = self.agent_plane()["opencode.yml"]
+        step = next(
+            step
+            for step in document["jobs"]["opencode"]["steps"]
+            if step.get("name") == "Fix failed blocking workflow"
+        )
+        condition = str(step.get("if") or "")
+        self.assertIn("github.event_name == 'workflow_dispatch'", condition)
+        self.assertIn("inputs.mode == 'ci-fix'", condition)
+        self.assertIn("needs.authorize.outputs.trust_code == 'trusted_dispatch'", condition)
+
     def test_privileged_credentials_are_not_reachable_from_fork_events(self):
         for name, document in self.agent_plane().items():
             if "secrets.TAP_PAT" not in self.raw[name]:
