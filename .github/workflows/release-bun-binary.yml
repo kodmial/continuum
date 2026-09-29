@@ -269,14 +269,24 @@ jobs:
 
       - name: Release summary
         shell: bash
+        env:
+          # Through the environment rather than spliced into the script. These
+          # are dispatch inputs, so they are caller-controlled text that the
+          # runner would substitute before the shell ever parsed it.
+          SUMMARY_TAG: ${{ steps.meta.outputs.tag }}
+          SUMMARY_SOURCE_SHA: ${{ inputs.source_sha }}
+          SUMMARY_ASSET: ${{ inputs.asset_name }}
+          SUMMARY_SHA256: ${{ steps.meta.outputs.sha256 }}
+          SUMMARY_BINARY_VERSION: ${{ steps.meta.outputs.binary_version }}
+          SUMMARY_SIZE: ${{ steps.meta.outputs.size }}
         run: |
           set -euo pipefail
           {
             echo "### Continuum bun-binary release"
-            echo "- tag: \`${{ steps.meta.outputs.tag }}\`"
-            echo "- source SHA: \`${{ inputs.source_sha }}\`"
-            echo "- asset: \`${{ inputs.asset_name }}\`"
-            echo "- SHA-256: \`${{ steps.meta.outputs.sha256 }}\`"
-            echo "- binary version: \`${{ steps.meta.outputs.binary_version }}\`"
-            echo "- size: \`${{ steps.meta.outputs.size }} bytes\`"
+            echo "- tag: \`$SUMMARY_TAG\`"
+            echo "- source SHA: \`$SUMMARY_SOURCE_SHA\`"
+            echo "- asset: \`$SUMMARY_ASSET\`"
+            echo "- SHA-256: \`$SUMMARY_SHA256\`"
+            echo "- binary version: \`$SUMMARY_BINARY_VERSION\`"
+            echo "- size: \`$SUMMARY_SIZE bytes\`"
           } >> "$GITHUB_STEP_SUMMARY"

@@ -162,9 +162,16 @@ jobs:
     steps:
       - name: Sync stale OpenCode branches to current base
         shell: bash
+        env:
+          # An env var, not an expression spliced into the script. The runner
+          # substitutes `${{ }}` before the shell parses anything, so a value
+          # carrying a quote is a syntax error at best and command injection at
+          # worst -- in a step that already holds a write-capable token.
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
-          base_branch="${{ github.event.repository.default_branch }}"
+          [[ "$DEFAULT_BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::Unusable default branch."; exit 1; }
+          base_branch="$DEFAULT_BRANCH"
           base_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$base_branch" --jq '.object.sha')"
 
           gh api --paginate "repos/$GITHUB_REPOSITORY/pulls?state=open&base=$base_branch&per_page=100" \
@@ -213,6 +220,8 @@ jobs:
 
       - name: Dispatch conflict repair when needed
         shell: bash
+        env:
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           [[ "$HEAD_REPO" == "$GITHUB_REPOSITORY" ]] || exit 0
@@ -221,7 +230,7 @@ jobs:
           # Rung 1 of the ladder, attempted here because it needs no checkout
           # and no agent credential. It is GitHub's own merge.
           if gh api --method PUT "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/update-branch" \
-            -f "expected_head_sha=${{ github.event.pull_request.head.sha }}" >/dev/null 2>&1; then
+            -f "expected_head_sha=$EXPECTED_HEAD_SHA" >/dev/null 2>&1; then
             echo "PR #$PR_NUMBER was updated mechanically; no repair dispatch is needed."
             exit 0
           fi
@@ -241,6 +250,11 @@ jobs:
             -f "inputs[repair_agent_timeout_seconds]=$REPAIR_AGENT_TIMEOUT_SECONDS"
 
   ci:
+    # The lock released below is age-checked against the repair budget, so this
+    # job needs the resolved budget. It is a policy constant, so it comes from
+    # conflict-bounds rather than being spelled out again here -- a second copy
+    # is a second number, and a second number drifts.
+    needs: conflict-bounds
     if: >-
       github.event_name == 'workflow_run' &&
       github.event.workflow_run.event == 'pull_request' &&
@@ -250,11 +264,13 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       OPENCODE_WORKFLOW: ${{ inputs.opencode_workflow }}
+      REPAIR_BUDGET_MINUTES: ${{ needs.conflict-bounds.outputs.repair_budget_minutes }}
       CI_WORKFLOW: ${{ inputs.ci_workflow }}
       ADDITIONAL_BLOCKING_WORKFLOWS: ${{ inputs.additional_blocking_workflows }}
       RUN_ID: ${{ github.event.workflow_run.id }}
       RUN_NAME: ${{ github.event.workflow_run.name }}
       HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+      RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
     steps:
       - name: Dispatch CI repair
         shell: bash
@@ -283,15 +299,67 @@ jobs:
           LABEL="opencode-gate-repair-$gate_hash"
           gh label create "$LABEL" --repo "$GITHUB_REPOSITORY" --color D93F0B             --description "Continuum blocking-workflow repair in progress" 2>/dev/null || true
 
-          if [[ "${{ github.event.workflow_run.conclusion }}" == "success" ]]; then
+          if [[ "$RUN_CONCLUSION" == "success" ]]; then
             gh issue edit "$pr" --repo "$GITHUB_REPOSITORY" --remove-label "$LABEL" >/dev/null 2>&1 || true
             echo "$RUN_NAME passed; repair lock cleared."
             exit 0
           fi
 
+          # The label is a lock, and a lock with no release is a wedge. It was
+          # cleared on success and on a successful repair push, but neither of
+          # those happens when the dispatched repair is cancelled, times out, or
+          # wedges itself: the label survives, every later failure re-enters
+          # this step, sees the label, and exits. CI repair for that pull
+          # request stops for good while the label sits there.
+          #
+          # So the lock carries an age. A repair that produced no new head
+          # within the repair budget is not going to, and its absence of
+          # progress is not evidence that it is still working. The attempt
+          # budget bounds how often this can happen; the age is what stops one
+          # abandoned attempt from suppressing every later one.
+          LOCK_STALE=false
           if gh api "repos/$GITHUB_REPOSITORY/issues/$pr" --jq '.labels[].name' | grep -Fxq "$LABEL"; then
-            echo "$RUN_NAME repair already dispatched for PR #$pr."
-            exit 0
+          # `gh api` has no `--arg`, so the label cannot be bound as a jq
+          # variable. Splicing it into the filter instead would be the exact
+          # expression-injection problem this file exists to avoid, so the
+          # filter stays constant and the matching happens in the shell, where
+          # the value is a literal operand rather than program text.
+          # The loop reads from a redirect rather than a pipe so it runs in this
+          # shell: a pipeline would put it in a subshell, and `LOCK_AT` set in
+          # there would be gone by the time it is used.
+          LOCK_AT=""
+          while IFS=$'\t' read -r name at || [[ -n "$name$at" ]]; do
+            # `read` returns non-zero on a final line with no terminator; the
+            # `||` is what keeps that last record.
+            [[ "$name" == "$LABEL" && -n "$at" ]] || continue
+            LOCK_AT="$at"
+          done < <(
+            gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$pr/timeline?per_page=100" \
+              --jq '.[] | select(.event == "labeled") | [.label.name, (.created_at // "")] | @tsv'
+          )
+          AGE_MINUTES=""
+          if [[ -n "$LOCK_AT" ]]; then
+            AGE_MINUTES=$(( ( $(date -u +%s) - $(date -u -d "$LOCK_AT" +%s) ) / 60 ))
+          fi
+          AGE_MINUTES="${AGE_MINUTES:-0}"
+          # An unreadable age reads as a held lock, not as a stale one: the
+          # label is still there, and releasing a lock on no evidence would let
+          # two repairs of one pull request run at once.
+          echo "$RUN_NAME repair lock on PR #$pr is ${AGE_MINUTES}m old (budget ${REPAIR_BUDGET_MINUTES}m)."
+            if [[ "$AGE_MINUTES" -ge "$REPAIR_BUDGET_MINUTES" ]]; then
+              LOCK_STALE=true
+              echo "::warning::Repair lock for $RUN_NAME on PR #$pr is stale; releasing it so a later failure can be repaired."
+              gh issue edit "$pr" --repo "$GITHUB_REPOSITORY" --remove-label "$LABEL" >/dev/null 2>&1 || true
+            else
+              echo "$RUN_NAME repair already dispatched for PR #$pr."
+              exit 0
+            fi
+          fi
+          if [[ "$LOCK_STALE" == "true" ]]; then
+            gh label create "opencode-repair-failed" --repo "$GITHUB_REPOSITORY" --color D93F0B \
+              --description "Continuum repair made no progress within its budget" --force >/dev/null 2>&1 || true
+            gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$pr/labels" \
+              -f 'labels[]=opencode-repair-failed' >/dev/null 2>&1 || true
           fi
           gh issue edit "$pr" --repo "$GITHUB_REPOSITORY" --add-label "$LABEL"
 

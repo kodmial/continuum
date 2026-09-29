@@ -274,6 +274,13 @@ jobs:
           done
           test -x "$HOME/.opencode/bin/opencode"
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+          # runtime-lab #136. The installer is a pipe, so the install itself
+          # cannot be attested against a pinned digest -- but the identity of
+          # whatever is on PATH can be recorded, and every step that later runs
+          # the agent re-checks it. A binary swapped between here and the
+          # invocation is then a failed step rather than a trusted run.
+          PATH="$HOME/.opencode/bin:$PATH" \
+            python3 .github/scripts/opencode_runtime.py install
 
       - name: Record issue execution ownership
         if: github.event_name == 'issue_comment'
@@ -316,47 +323,211 @@ jobs:
       # permission guard above prevents normal Git writes from the LLM, but
       # this recovery path makes the workflow lossless if a future OpenCode
       # version, shell indirection, or tool bypass still changes branches.
-      - name: Recover agent-managed issue branch
+      #
+      # The decision is in .github/scripts/agent_workspace.py, not here, because
+      # this step is the one place a finished implementation can be destroyed:
+      # the runner workspace disappears when the job ends. There is no "skip"
+      # outcome in the policy, only publish, materialize, already-published, and
+      # refuse -- and refuse still preserves the work on a salvage branch.
+      - name: Plan the agent workspace recovery
+        id: workspace
         if: github.event_name == 'issue_comment'
+        env:
+          # `gh pr list` needs a credential. Without this the plan step fails on
+          # a 401, and a failed plan step is a failed recovery: the finished
+          # implementation is discarded with the runner exactly as it was before
+          # this step existed.
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          ISSUE_NUMBER: ${{ needs.authorize.outputs.issue_number }}
+          BASE_BRANCH: ${{ needs.authorize.outputs.base_branch }}
+        run: |
+          set -euo pipefail
+          [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::Invalid issue number."; exit 1; }
+
+          CURRENT_BRANCH="$(git branch --show-current || true)"
+          # The upstream action names the branch it created, so the workflow has
+          # to learn it. `select_owned_branch` refuses to guess when more than
+          # one candidate is plausible, which is what keeps publication off a
+          # ref the workflow does not own.
+          #
+          # The trailing `*` is load-bearing. `for-each-ref` matches a pattern
+          # component by component, so `refs/heads/opencode/issue23-` is a
+          # *directory* named `issue23-` and matches nothing at all: the
+          # candidate list came back empty on every run and recovery refused
+          # every time. Only a glob can express "refs under this prefix".
+          CANDIDATES="$(git for-each-ref --format='%(refname:short)' "refs/heads/opencode/issue${ISSUE_NUMBER}-*" | paste -sd, - || true)"
+          OWNED_BRANCH="$(python3 .github/scripts/agent_workspace.py select-branch \
+            --candidates "$CANDIDATES" \
+            --current-branch "$CURRENT_BRANCH" | sed -n 's/^owned_branch=//p')"
+
+          git fetch origin "$BASE_BRANCH" --quiet
+          AHEAD="$(git rev-list --count "origin/$BASE_BRANCH..HEAD" 2>/dev/null || echo 0)"
+          DIRTY=false
+          [[ -n "$(git status --porcelain)" ]] && DIRTY=true
+
+          # Which agent branches hold commits the base does not have, most work
+          # first. A model that commits to a branch and then switches back
+          # leaves commits that the current tree, the current head, and
+          # `status --porcelain` all agree do not exist -- and those three are
+          # exactly what the original recovery step consulted. Without this the
+          # finished work would be reported as "nothing to publish" and
+          # destroyed with the runner.
+          WORK_BRANCHES="$(
+            while read -r ref; do
+              [[ -n "$ref" ]] || continue
+              ahead="$(git rev-list --count "origin/$BASE_BRANCH..$ref" 2>/dev/null || echo 0)"
+              [[ "$ahead" -gt 0 ]] && printf '%s %s\n' "$ahead" "$ref"
+            done < <(git for-each-ref --format='%(refname:short)' "refs/heads/opencode/issue${ISSUE_NUMBER}-*") \
+            | sort -rn -k1,1 | cut -d' ' -f2- | paste -sd, - || true
+          )"
+
+          # Open pull requests only. `--state all` counts a merged or closed
+          # pull request as published, which permanently suppressed recovery for
+          # that branch: work sat in the runner workspace and was discarded.
+          OPEN_PR=0
+          if [[ -n "$OWNED_BRANCH" ]]; then
+            OPEN_PR="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$OWNED_BRANCH" --state open --json number --jq '.[0].number // empty')"
+            OPEN_PR="${OPEN_PR:-0}"
+          fi
+
+          python3 .github/scripts/agent_workspace.py workspace-plan \
+            --owned-branch "$OWNED_BRANCH" \
+            --current-branch "$CURRENT_BRANCH" \
+            --base-branch "$BASE_BRANCH" \
+            --dirty "$DIRTY" \
+            --commits-ahead "$AHEAD" \
+            --open-pull-request "$OPEN_PR" \
+            --work-branches "$WORK_BRANCHES" \
+            --head-sha "$(git rev-parse HEAD 2>/dev/null || true)"
+
+      - name: Materialize the agent workspace
+        if: github.event_name == 'issue_comment' && steps.workspace.outputs.workspace_action != 'refuse'
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           ISSUE_NUMBER: ${{ needs.authorize.outputs.issue_number }}
+          BASE_BRANCH: ${{ needs.authorize.outputs.base_branch }}
+          OWNED_BRANCH: ${{ steps.workspace.outputs.workspace_publish_branch }}
+          SALVAGED_HEAD: ${{ steps.workspace.outputs.workspace_salvaged_head }}
+          # Through the environment, not into the shell text. An expression
+          # spliced into a `run:` body is parsed by the shell before anything
+          # validates it, and shellcheck rejects it outright; an env var is a
+          # value the shell quotes instead of code.
+          WORKSPACE_ACTION: ${{ steps.workspace.outputs.workspace_action }}
         run: |
           set -euo pipefail
+          [[ "$OWNED_BRANCH" =~ ^opencode/issue[0-9]+-[A-Za-z0-9._-]+$ ]] \
+            || { printf '::error::Refusing to publish to %q.\n' "$OWNED_BRANCH"; exit 1; }
+          CURRENT_BRANCH="$(git branch --show-current || true)"
 
-          CURRENT_BRANCH="$(git branch --show-current)"
-          if [[ "$CURRENT_BRANCH" != opencode/* ]]; then
-            echo "Current branch '$CURRENT_BRANCH' is not an OpenCode issue branch; nothing to recover."
-            exit 0
-          fi
+          case "$WORKSPACE_ACTION" in
+            already-published)
+              echo "An open pull request already owns '$OWNED_BRANCH'; nothing to publish."
+              exit 0
+              ;;
+            materialize)
+              # The agent drifted. Its finished tree is rebuilt as one commit on
+              # the branch the workflow owns. This is deliberately not a merge:
+              # a merge here would be a conflict at the end of a long run with
+              # no agent left to resolve it, and the work is the tree, not the
+              # history. `commit-tree` writes that tree verbatim onto the owned
+              # branch's current head, so it cannot conflict and cannot drop
+              # bytes.
+              if [[ -n "$(git status --porcelain)" ]]; then
+                git add -A
+                git commit -m "chore: preserve agent work from $CURRENT_BRANCH" || true
+              fi
+              SALVAGE_TREE="$(git rev-parse 'HEAD^{tree}')"
+              # The owned branch exists locally unless the drift destroyed it, in
+              # which case it is recreated from the base. Either way the ref the
+              # push targets is one the workflow created.
+              if git show-ref --verify --quiet "refs/heads/$OWNED_BRANCH"; then
+                git switch "$OWNED_BRANCH"
+              else
+                git switch -c "$OWNED_BRANCH" "origin/$BASE_BRANCH"
+              fi
+              MATERIALIZED="$(printf 'Materialized automatically after the OpenCode agent left its branch during issue #%s execution.\n\nThe finished tree from the branch the agent left behind is preserved verbatim as a single commit. The original commits remain reachable in the run log at %s.\n\nCloses #%s' \
+                "$ISSUE_NUMBER" "${SALVAGED_HEAD:-unknown}" "$ISSUE_NUMBER" | git commit-tree "$SALVAGE_TREE" -p HEAD)"
+              git reset --hard "$MATERIALIZED" >/dev/null
+              ;;
+            publish)
+              if [[ -n "$(git status --porcelain)" ]]; then
+                git add -A
+                git commit -m "chore: recover OpenCode issue changes"
+              fi
+              ;;
+          esac
 
-          # Normal OpenCode completion already created a PR for the current
-          # branch. In that case this step is intentionally a no-op.
-          EXISTING_PR="$(gh pr list             --repo "$GITHUB_REPOSITORY"             --head "$CURRENT_BRANCH"             --state all             --json number             --jq '.[0].number // empty')"
-          if [[ -n "$EXISTING_PR" ]]; then
-            echo "PR #$EXISTING_PR already exists for '$CURRENT_BRANCH'; nothing to recover."
-            exit 0
-          fi
-
-          # If the agent switched branches before committing, preserve those
-          # edits rather than letting the runner discard them.
-          if [[ -n "$(git status --porcelain)" ]]; then
-            git add -A
-            git commit -m "chore: recover OpenCode issue changes"
-          fi
-
-          git fetch origin main --quiet
-          AHEAD="$(git rev-list --count "origin/main..HEAD")"
+          AHEAD="$(git rev-list --count "origin/$BASE_BRANCH..HEAD")"
           if [[ "$AHEAD" -eq 0 ]]; then
-            echo "No commits ahead of main on '$CURRENT_BRANCH'; nothing to recover."
+            echo "Nothing to publish for '$OWNED_BRANCH'."
             exit 0
           fi
 
-          git push -u origin "HEAD:$CURRENT_BRANCH"
+          # A plain push, never a force: the branch is the workflow's own, and
+          # if something else moved it the push must fail rather than win.
+          HUSKY=0 git push -u origin "HEAD:$OWNED_BRANCH"
+
+          # Belt and braces: the plan step already checked, but publication
+          # must be idempotent at the moment it happens too.
+          if gh pr list --repo "$GITHUB_REPOSITORY" --head "$OWNED_BRANCH" --state open --json number --jq '.[0].number // empty' | grep -q '^[0-9]'; then
+            echo "An open pull request already owns '$OWNED_BRANCH'; not opening a second one."
+            exit 0
+          fi
 
           TITLE="$(git log -1 --format=%s)"
           BODY="$(printf 'Recovered automatically after the OpenCode agent changed branches during issue #%s execution.\n\nCloses #%s' "$ISSUE_NUMBER" "$ISSUE_NUMBER")"
-          gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$CURRENT_BRANCH" --title "$TITLE" --body "$BODY"
+          gh pr create --repo "$GITHUB_REPOSITORY" --base "$BASE_BRANCH" --head "$OWNED_BRANCH" --title "$TITLE" --body "$BODY"
+
+      - name: Preserve an unpublishable agent workspace
+        if: github.event_name == 'issue_comment' && steps.workspace.outputs.workspace_action == 'refuse'
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          ISSUE_NUMBER: ${{ needs.authorize.outputs.issue_number }}
+          BASE_BRANCH: ${{ needs.authorize.outputs.base_branch }}
+          SALVAGE_SOURCE: ${{ steps.workspace.outputs.workspace_salvage_source }}
+          WORKSPACE_REASON: ${{ steps.workspace.outputs.workspace_reason }}
+        run: |
+          set -euo pipefail
+          [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::Invalid issue number."; exit 1; }
+          # `refuse` means there is no ref the workflow will publish to. The
+          # work still exists, so it is pushed to a branch that *is* in the
+          # agent shape: something downstream can find, reconcile, and merge
+          # it. Refusing to publish and discarding the work are not the same
+          # decision, and this step is the line between them.
+          if [[ -n "$(git status --porcelain)" ]]; then
+            git add -A
+            git commit -m "chore: preserve agent work that could not be published" || true
+          fi
+
+          # The tree to preserve is not always the tree the workspace is on. A
+          # model can commit to a branch, walk back to its own branch, and leave
+          # the working tree clean: then HEAD has nothing and the work is on the
+          # branch it left. The plan step names the ref that actually holds the
+          # work, and this step preserves that ref's tree rather than whatever
+          # happens to be checked out.
+          SOURCE_HEAD=HEAD
+          CURRENT_BRANCH="$(git branch --show-current || true)"
+          if [[ -n "$SALVAGE_SOURCE" && "$SALVAGE_SOURCE" != "$CURRENT_BRANCH" ]] \
+            && git show-ref --verify --quiet "refs/heads/$SALVAGE_SOURCE"; then
+            SOURCE_HEAD="$SALVAGE_SOURCE"
+          fi
+
+          AHEAD="$(git rev-list --count "origin/$BASE_BRANCH..$SOURCE_HEAD" 2>/dev/null || echo 0)"
+          if [[ "$AHEAD" -eq 0 ]]; then
+            echo "::notice::The agent produced no work to preserve."
+            exit 0
+          fi
+
+          SALVAGE="opencode/issue${ISSUE_NUMBER}-salvage-${GITHUB_RUN_ID}"
+          SALVAGE_TREE="$(git rev-parse "${SOURCE_HEAD}^{tree}")"
+          git switch -C "$SALVAGE" "origin/$BASE_BRANCH"
+          SALVAGE_COMMIT="$(printf "Preserved automatically: the OpenCode agent left its branch during issue #%s and Continuum could not determine which branch it owned, so the finished tree from \`%s\` is quarantined here rather than discarded.\n\nCloses #%s" \
+            "$ISSUE_NUMBER" "$SOURCE_HEAD" "$ISSUE_NUMBER" | git commit-tree "$SALVAGE_TREE" -p HEAD)"
+          git reset --hard "$SALVAGE_COMMIT" >/dev/null
+
+          HUSKY=0 git push -u origin "HEAD:$SALVAGE"
+          echo "::error::Preserved the agent workspace on '$SALVAGE' but did not open a pull request: $WORKSPACE_REASON"
+          exit 1
 
       # Conflict repair repairs the change that already exists. It never
       # re-executes the source issue, and it never spends model time unless git
@@ -525,7 +696,11 @@ jobs:
           EOF
           )
           timeout --signal=TERM "$REPAIR_AGENT_TIMEOUT_SECONDS" \
-            opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
+            # Point of use: re-read the digest recorded at install time, so
+          # the process about to start is the one that was verified rather
+          # than whatever PATH happens to resolve at this moment.
+          python3 .github/scripts/opencode_runtime.py verify
+          opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
 
           if [[ -n "$(git status --porcelain)" ]]; then
             git add -A
@@ -583,6 +758,10 @@ jobs:
           EOF
           )
           BEFORE_SHA=$(git rev-parse HEAD)
+          # Point of use: re-read the digest recorded at install time, so
+          # the process about to start is the one that was verified rather
+          # than whatever PATH happens to resolve at this moment.
+          python3 .github/scripts/opencode_runtime.py verify
           opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
           AFTER_SHA=$(git rev-parse HEAD)
 

@@ -30,6 +30,8 @@ Run with::
     python3 -m unittest discover -s .github/tests -p 'test_*.py'
 """
 
+import datetime
+import hashlib
 import json
 import os
 import re
@@ -1423,6 +1425,278 @@ class RuntimeLab66RegressionTests(unittest.TestCase):
                     self.assertFalse(publication.freeze_original)
                 else:
                     self.assertFalse(publication.freeze_original)
+
+
+# --------------------------------------------------------------------------- #
+# The gate-repair lock, run as the runner would run it
+# --------------------------------------------------------------------------- #
+
+
+class _FakeGateGh:
+    """A `gh` stand-in for the `Dispatch CI repair` step, driven by env.
+
+    The step decides whether to dispatch a repair by looking at whether a lock
+    label is present, and now also at how old that label is. Asserting on the
+    shell source would only prove the text mentions an age; the property that
+    matters is that a lock past its budget *stops suppressing* the dispatch.
+    That is only observable by running the step and reading which calls it made.
+    """
+
+    def __init__(self, directory, lock_labels, labeled_at=()):
+        self.log = pathlib.Path(directory) / "gh-calls.log"
+        self.log.write_text("", encoding="utf-8")
+        timeline = "".join(
+            '[{{"event":"labeled","label":{{"name":"{}"}},"created_at":"{}"}}]'.format(
+                label, when
+            )
+            for label, when in labeled_at
+        )
+        timeline_path = pathlib.Path(directory) / "timeline.json"
+        timeline_path.write_text(timeline, encoding="utf-8")
+        script = pathlib.Path(directory) / "gh"
+        script.write_text(
+            textwrap.dedent(
+                """\
+                #!/bin/bash
+                # A stand-in that answers the four reads the step makes and logs
+                # every write, so a test can tell a suppressed dispatch from a
+                # released one. The answers come from the environment so each
+                # test can state the world it is describing.
+                #
+                # `--jq` is honoured by piping through the real `jq`, not by
+                # printing a pre-baked string. A fake that ignored the filter
+                # would hand the step raw JSON, the step would fail to parse a
+                # timestamp, and the age would read as zero -- so the test would
+                # pass for a reason that has nothing to do with the step. It
+                # also rejects flags the real `gh` does not have, because a fake
+                # that accepts `--arg` would let a workflow get away with a
+                # filter the runner would reject.
+                filter=""
+                previous=""
+                for argument in "$@"; do
+                  case "$argument" in
+                    --arg)
+                      echo "::error::gh api has no --arg; the step is using a flag that does not exist." >&2
+                      exit 2 ;;
+                  esac
+                  [[ "$previous" == "--jq" ]] && filter="$argument"
+                  previous="$argument"
+                done
+                joined=" $* "
+                case "$joined" in
+                  *"/commits/"*"/pulls"*)
+                    payload='[{"state":"open","head":{"ref":"opencode/issue7-continuum"},"number":'"$FAKE_PR"'}]' ;;
+                  *"/pulls/$FAKE_PR --jq"*) payload='{"head":{"ref":"opencode/issue7-continuum"}}' ;;
+                  *"/issues/$FAKE_PR --jq"*) payload="$FAKE_ISSUE_JSON" ;;
+                  *"/issues/$FAKE_PR/timeline"*) payload="$(cat "$FAKE_TIMELINE_FILE")" ;;
+                  *) payload="" ;;
+                esac
+                printf '%s' "$payload" > "$FAKE_STDIN"
+                filtered="$(jq -r "$filter" < "$FAKE_STDIN" 2>/dev/null || true)"
+                if [[ "${FAKE_NO_TRAILING_NEWLINE:-0}" == "1" ]]; then
+                  printf '%s' "$filtered"
+                else
+                  printf '%s\\n' "$filtered"
+                fi
+                printf '%s\\n' "$*" >> "$GH_CALL_LOG"
+                exit 0
+                """
+            ),
+            encoding="utf-8",
+        )
+        script.chmod(0o755)
+        self.timeline_file = timeline_path
+
+    def calls(self):
+        return [
+            line
+            for line in self.log.read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+
+
+class GateRepairLockTests(unittest.TestCase):
+    """runtime-lab #59 / kodmai -- a repair lock that cannot be wedged.
+
+    The gate-repair label was a one-way switch: added on dispatch, removed on a
+    passing run or a successful repair push. A dispatched repair that was
+    cancelled, timed out, or wedged produced neither, so the label survived,
+    and every later failure re-entered the step, saw the label, and exited. CI
+    repair for that pull request was then over for good -- while the pull
+    request stayed open and blocking, so the failure it was failing on stayed
+    too.
+    """
+
+    LOCK_RE = re.compile(r"opencode-gate-repair-[0-9a-f]{12}")
+
+    def _run_step(
+        self,
+        conclusion="failure",
+        lock_labels=(),
+        labeled_at=(),
+        budget="25",
+        run_name="ci",
+        ci_workflow="ci",
+        unterminated_timeline=False,
+    ):
+        """Run the real `Dispatch CI repair` step and return (result, gh calls)."""
+        run, step = _step_run_block(CONSUMER_REPAIR_WORKFLOW, "Dispatch CI repair")
+        with tempfile.TemporaryDirectory() as directory:
+            gh = _FakeGateGh(directory, lock_labels, labeled_at=labeled_at)
+            environment = dict(os.environ)
+            environment.update(
+                {
+                    "PATH": directory + os.pathsep + os.environ["PATH"],
+                    "GH_CALL_LOG": str(gh.log),
+                    "GITHUB_REPOSITORY": "kodmial/continuum",
+                    "GH_TOKEN": "not-a-real-token",
+                    "RUN_ID": "99",
+                    "RUN_NAME": run_name,
+                    "CI_WORKFLOW": ci_workflow,
+                    "ADDITIONAL_BLOCKING_WORKFLOWS": "",
+                    "HEAD_SHA": HEAD_A,
+                    "RUN_CONCLUSION": conclusion,
+                    "OPENCODE_WORKFLOW": "opencode.yml",
+                    "REPAIR_BUDGET_MINUTES": budget,
+                    "FAKE_PR": "66",
+                    # An issue payload, because the step reads `.labels[].name`
+                    # out of it; a bare array would make the filter return
+                    # nothing and the lock would look absent when it is held.
+                    "FAKE_ISSUE_JSON": json.dumps(
+                        {"labels": [{"name": name} for name in lock_labels]}
+                    ),
+                    "FAKE_TIMELINE_FILE": str(gh.timeline_file),
+                    "FAKE_STDIN": str(pathlib.Path(directory) / "payload.json"),
+                    "FAKE_NO_TRAILING_NEWLINE": "1" if unterminated_timeline else "0",
+                }
+            )
+            for name, value in (step.get("env") or {}).items():
+                environment.setdefault(name, "")
+            result = subprocess.run(
+                ["bash", "-c", run],
+                cwd=str(REPO_ROOT),
+                env=environment,
+                capture_output=True,
+                text=True,
+            )
+            return result, gh.calls()
+
+    def _dispatched(self, calls):
+        return any("actions/workflows/opencode.yml/dispatches" in call for call in calls)
+
+    def _label_of(self, run_name="ci"):
+        digest = hashlib.sha256(run_name.encode("utf-8")).hexdigest()[:12]
+        return "opencode-gate-repair-{}".format(digest)
+
+    def test_the_lock_name_is_derived_from_the_workflow_name(self):
+        # Two blocking workflows failing on one pull request must not share a
+        # lock, or the first one's repair would silence the second's.
+        result, calls = self._run_step(
+            lock_labels=[], run_name="release", ci_workflow="release"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--add-label {}".format(self._label_of("release")), "\n".join(calls))
+        self.assertNotIn(
+            "--add-label {}".format(self._label_of("ci")), "\n".join(calls)
+        )
+
+    def test_an_unlocked_failure_dispatches_a_repair_and_takes_the_lock(self):
+        result, calls = self._run_step()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self._dispatched(calls), calls)
+        self.assertIn("--add-label {}".format(self._label_of()), "\n".join(calls))
+
+    def test_a_lock_within_its_budget_still_suppresses_a_second_repair(self):
+        # Two concurrent repairs for one pull request is the thing the lock is
+        # there to prevent, so a fresh lock must keep holding.
+        label = self._label_of()
+        recent = (
+            datetime.datetime.now(datetime.timezone.utc)
+            - datetime.timedelta(minutes=2)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        result, calls = self._run_step(
+            lock_labels=[label], labeled_at=[(label, recent)]
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self._dispatched(calls), "a live lock must hold")
+        self.assertIn("already dispatched", result.stdout)
+
+    def test_a_lock_past_the_budget_is_released_so_a_later_failure_is_repairable(self):
+        # The wedge. A repair that was cancelled or timed out leaves the label
+        # behind and produces no new head, so the label's age is the only
+        # remaining evidence that nothing is working on it. Without an age
+        # check this pull request is never repaired again.
+        label = self._label_of()
+        abandoned = (
+            datetime.datetime.now(datetime.timezone.utc)
+            - datetime.timedelta(minutes=90)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        result, calls = self._run_step(
+            lock_labels=[label], labeled_at=[(label, abandoned)]
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        joined = "\n".join(calls)
+        self.assertTrue(self._dispatched(calls), "a stale lock must not suppress repair")
+        self.assertIn("--remove-label {}".format(label), joined)
+        self.assertIn("labels[]=opencode-repair-failed", joined)
+
+    def test_a_stale_lock_is_released_even_without_a_trailing_newline(self):
+        # `read` returns non-zero for a final line with no terminator, so a
+        # plain `while read` drops the only timestamp it was given and the
+        # abandoned repair goes back to suppressing every later one.
+        label = self._label_of()
+        abandoned = (
+            datetime.datetime.now(datetime.timezone.utc)
+            - datetime.timedelta(minutes=90)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        result, calls = self._run_step(
+            lock_labels=[label],
+            labeled_at=[(label, abandoned)],
+            unterminated_timeline=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self._dispatched(calls), "an unterminated read must not hide a stale lock")
+
+    def test_a_lock_with_no_recorded_age_is_treated_as_held_not_as_stale(self):
+        # A label applied by a human, or by a version of the workflow that
+        # predates the timeline query, has no `labeled` event to read. That is
+        # an unknown age, not an old one -- and an unknown age must not be used
+        # to release someone else's lock.
+        label = self._label_of()
+        result, calls = self._run_step(lock_labels=[label])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self._dispatched(calls))
+        self.assertNotIn(
+            "--remove-label {}".format(label),
+            "\n".join(calls),
+            "an unknown age must not release a lock",
+        )
+
+    def test_a_green_run_clears_the_lock_without_dispatching(self):
+        label = self._label_of()
+        result, calls = self._run_step(conclusion="success", lock_labels=[label])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self._dispatched(calls))
+        self.assertIn("--remove-label {}".format(label), "\n".join(calls))
+
+    def test_a_non_blocking_workflow_conclusion_is_ignored_entirely(self):
+        # Not every workflow run against a pull request is a blocking one. A
+        # failing job that does not gate merging must not take the repair lock,
+        # or it would spend the lock on repairs nothing is waiting for.
+        result, calls = self._run_step(run_name="nightly", ci_workflow="ci")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls, [], "a non-blocking workflow must not touch the PR")
+
+    def test_the_repair_budget_comes_from_the_policy_not_a_second_constant(self):
+        doc = yaml.safe_load(
+            (WORKFLOW_DIR / CONSUMER_REPAIR_WORKFLOW).read_text(encoding="utf-8")
+        )
+        job = doc["jobs"]["ci"]
+        self.assertIn("conflict-bounds", job.get("needs") or [])
+        self.assertEqual(
+            job["env"]["REPAIR_BUDGET_MINUTES"],
+            "${{ needs.conflict-bounds.outputs.repair_budget_minutes }}",
+        )
 
 
 def lock_label_of(lock_decision):
