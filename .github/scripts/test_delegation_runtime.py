@@ -50,6 +50,15 @@ class DelegationRuntimeTests(unittest.TestCase):
             + validation,
         )
 
+    def test_parent_child_ids_exposes_only_allowlisted_aliases(self):
+        self.assertEqual(
+            runtime.parent_child_ids(self.parent(("alpha", "beta"))),
+            ["alpha", "beta"],
+        )
+        runtime.assert_parent_allows_child(self.parent(("alpha",)), "alpha")
+        with self.assertRaises(runtime.DelegationError):
+            runtime.assert_parent_allows_child(self.parent(("alpha",)), "beta")
+
     def test_parent_plan_resolves_only_explicit_children(self):
         result = runtime.parent_plan(
             self.parent(),
