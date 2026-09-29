@@ -260,6 +260,29 @@ class DispatchTests(unittest.TestCase):
         # The only ref a privileged job may use comes from the verified PR.
         self.assertEqual(decision.checkout_ref, "opencode/issue12-20260928135106")
 
+    def test_authorize_event_fetches_dispatch_pr_before_final_verdict(self):
+        payload = load_fixture("workflow_dispatch_trusted_repair")
+        pr = load_fixture("pull_request_agent_branch")["pull_request"]
+        with tempfile.NamedTemporaryFile(mode="w+", encoding="utf-8") as event:
+            json.dump(payload, event)
+            event.flush()
+            env = {
+                "GITHUB_EVENT_NAME": "workflow_dispatch",
+                "GITHUB_EVENT_PATH": event.name,
+                "GITHUB_REPOSITORY": REPOSITORY,
+                "GITHUB_TOKEN": "ghs_readonly",
+                "GITHUB_ACTOR": OWNER,
+                "GITHUB_DEFAULT_BRANCH": BASE_REF,
+            }
+            with unittest.mock.patch.dict(os.environ, env, clear=True), \
+                    unittest.mock.patch.object(
+                        trust_policy, "fetch_pull_request", return_value=pr
+                    ) as fetch_pr, \
+                    unittest.mock.patch.object(trust_policy, "write_outputs"):
+                self.assertEqual(trust_policy.main(["authorize-event"]), 0)
+
+        fetch_pr.assert_called_once_with(REPOSITORY, 3, "ghs_readonly")
+
     def test_forged_head_ref_is_denied_before_any_lookup(self):
         decision = trust_policy.validate_dispatch_shape(
             load_fixture("workflow_dispatch_forged_head_ref")["inputs"],
