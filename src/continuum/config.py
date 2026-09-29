@@ -379,6 +379,7 @@ class DelegationSettings:
     children: tuple = ()
     id: str = ""
     parent: str = ""
+    validation_script: str = ""
 
     @property
     def enabled(self) -> bool:
@@ -390,6 +391,7 @@ class DelegationSettings:
             "children": list(self.children),
             "id": self.id or None,
             "parent": self.parent or None,
+            "validation_script": self.validation_script or None,
         }
 
 
@@ -421,7 +423,7 @@ class ContinuumConfig:
 
 
 _ALLOWED_TOP_LEVEL = ("version", "review", "release", "delegation")
-_ALLOWED_DELEGATION_KEYS = ("role", "children", "id", "parent")
+_ALLOWED_DELEGATION_KEYS = ("role", "children", "id", "parent", "validation_script")
 _ALLOWED_REVIEW_KEYS = (
     "provider",
     "block_merge",
@@ -1066,9 +1068,13 @@ def _parse_delegation(value: Any) -> DelegationSettings:
     children_value = mapping.get("children")
     child_id_value = mapping.get("id")
     parent_value = mapping.get("parent")
+    validation_script_value = mapping.get("validation_script")
 
     if role == DELEGATION_NONE:
-        stale = [key for key in ("children", "id", "parent") if mapping.get(key) is not None]
+        stale = [
+            key for key in ("children", "id", "parent", "validation_script")
+            if mapping.get(key) is not None
+        ]
         if stale:
             raise ConfigError(
                 "delegation role 'none' cannot configure " + ", ".join(stale)
@@ -1076,7 +1082,7 @@ def _parse_delegation(value: Any) -> DelegationSettings:
         return DelegationSettings()
 
     if role == DELEGATION_PARENT:
-        if child_id_value is not None or parent_value is not None:
+        if child_id_value is not None or parent_value is not None or validation_script_value is not None:
             raise ConfigError("delegation role 'parent' accepts children only")
         if not isinstance(children_value, list) or not children_value:
             raise ConfigError(
@@ -1096,7 +1102,22 @@ def _parse_delegation(value: Any) -> DelegationSettings:
         raise ConfigError("delegation role 'child' does not accept children")
     child_id = _require_slug(child_id_value, "delegation.id")
     parent = _require_repository(parent_value, "delegation.parent")
-    return DelegationSettings(role=role, id=child_id, parent=parent)
+    validation_script = ""
+    if validation_script_value is not None:
+        validation_script = _require_relative_path(
+            validation_script_value,
+            "delegation.validation_script",
+        )
+        if not validation_script.endswith(".sh"):
+            raise ConfigError(
+                "delegation.validation_script must name a .sh file executed by bash"
+            )
+    return DelegationSettings(
+        role=role,
+        id=child_id,
+        parent=parent,
+        validation_script=validation_script,
+    )
 
 
 def parse_config(text: str, source: str = "<string>") -> ContinuumConfig:

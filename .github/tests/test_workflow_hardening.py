@@ -724,6 +724,15 @@ class SelfProtectionTests(WorkflowAuditBase):
         self.assertIn("already closed", self.raw["auto-merge.yml"])
         self.assertIn("already closed", self.raw["consumer-auto-merge.yml"])
 
+    def test_child_validation_gate_uses_base_script_without_secrets(self):
+        text = self.raw["consumer-child-review.yml"]
+        self.assertIn('git show "origin/$base_ref:$validation_script"', text)
+        self.assertIn("env -i", text)
+        self.assertIn('run_validation', text)
+        self.assertIn('validation gate failed', text)
+        self.assertNotIn('cat "$validation_log"', text)
+        self.assertNotIn('tail "$validation_log"', text)
+
     def test_custom_runtime_release_can_be_pinned_exactly(self):
         runtime = self.raw["consumer-opencode.yml"]
         for token in (
