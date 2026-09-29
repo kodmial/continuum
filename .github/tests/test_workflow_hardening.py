@@ -337,7 +337,7 @@ class PermissionsTests(WorkflowAuditBase):
                     writers["{}/{}".format(name, job_name)] = scopes
         # The write-capable surface is deliberately tiny and fully audited.
         # auto-merge/issue-scheduler/agent are the three automation roles; the
-        # two repair jobs are label-and-dispatch control planes that never
+        # repair jobs are label-and-dispatch/watchdog control planes that never
         # check out or execute pull-request code.
         self.assertEqual(
             sorted(writers),
@@ -345,6 +345,7 @@ class PermissionsTests(WorkflowAuditBase):
                 "auto-merge.yml/reconcile",
                 "issue-scheduler.yml/schedule",
                 "opencode-repair.yml/ci-repair",
+                "opencode-repair.yml/recover-failed-issue-run",
                 "opencode-repair.yml/sync-current-pr",
                 "opencode-repair.yml/sync-stale-prs",
                 "opencode.yml/opencode",
@@ -459,6 +460,40 @@ class AgentExecutionTests(WorkflowAuditBase):
         for expression in ("inputs.head_ref", "inputs.pr_number", "inputs.run_id"):
             self.assertNotIn(expression, text, expression)
 
+    def test_agent_tasks_have_a_substantial_bounded_runtime(self):
+        self_agent = self.job("opencode.yml", "opencode")
+        consumer_agent = self.job("consumer-opencode.yml", "opencode")
+        self.assertGreaterEqual(int(self_agent.get("timeout-minutes")), 180)
+        self.assertEqual(
+            consumer_agent.get("timeout-minutes"),
+            "${{ inputs.task_timeout_minutes }}",
+        )
+        consumer_inputs = self.workflows["consumer-opencode.yml"]["on"]["workflow_call"]["inputs"]
+        self.assertEqual(consumer_inputs["task_timeout_minutes"]["default"], 180)
+
+    def test_issue_runs_record_durable_run_ownership_before_agent_execution(self):
+        for name in ("opencode.yml", "consumer-opencode.yml"):
+            text = self.raw[name]
+            self.assertIn("continuum-opencode-run:$GITHUB_RUN_ID", text)
+            self.assertIn("Record issue execution ownership", text)
+            self.assertLess(
+                text.index("Record issue execution ownership"),
+                text.index("opencode run") if "opencode run" in text else text.index("uses: anomalyco/opencode"),
+            )
+
+    def test_upstream_installer_is_bounded_and_verified(self):
+        for name in ("opencode.yml", "consumer-opencode.yml"):
+            text = self.raw[name]
+            self.assertIn("OpenCode install attempt $attempt/3", text)
+            self.assertIn('test -x "$HOME/.opencode/bin/opencode"', text)
+            self.assertIn("sleep $((attempt * 5))", text)
+
+    def test_consumer_allows_anonymous_models_without_api_key(self):
+        text = self.raw["consumer-opencode.yml"]
+        self.assertNotIn("Require model credential", text)
+        self.assertNotIn("OPENCODE_API_KEY is not configured", text)
+        self.assertIn("OPENCODE_MODEL", text)
+
     def test_comment_gate_requires_a_trusted_author_and_a_real_issue(self):
         condition = str(self.job("opencode.yml", "authorize").get("if"))
         self.assertIn("github.event.comment.user.login", condition)
@@ -536,6 +571,22 @@ class RepairControllerTests(WorkflowAuditBase):
             text,
             "workflow-command diagnostics must never be redirected to GITHUB_OUTPUT",
         )
+
+    def test_failed_issue_runs_release_reservations_by_event_not_only_lease(self):
+        text = self.raw["opencode-repair.yml"]
+        self.assertIn('"OpenCode agent"', text)
+        self.assertIn("recover-failed-issue-run", text)
+        self.assertIn("continuum-opencode-run:$RUN_ID", text)
+        self.assertIn("automation:in-progress", text)
+        self.assertIn("automation:paused", text)
+        self.assertIn("gh workflow run issue-scheduler.yml", text)
+        self.assertIn("MAX_ATTEMPTS", text)
+
+        consumer = self.raw["consumer-repair.yml"]
+        self.assertIn("issue-run-recovery", consumer)
+        self.assertIn("continuum-opencode-run:$RUN_ID", consumer)
+        self.assertIn("continuum-dispatch", consumer)
+        self.assertIn('gh workflow run "$SCHEDULER_WORKFLOW"', consumer)
 
     def test_privilege_boundary_changes_are_never_auto_merged(self):
         text = self.raw["auto-merge.yml"]
