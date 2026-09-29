@@ -11,6 +11,11 @@ on:
         type: string
         required: false
         default: CI
+      additional_blocking_workflows:
+        description: "Comma-separated optional workflow names that are repairable when they run"
+        type: string
+        required: false
+        default: ""
       scheduler_workflow:
         type: string
         required: false
@@ -168,13 +173,14 @@ jobs:
     if: >-
       github.event_name == 'workflow_run' &&
       github.event.workflow_run.event == 'pull_request' &&
-      contains(fromJSON('["failure","timed_out"]'), github.event.workflow_run.conclusion)
+      contains(fromJSON('["success","failure","timed_out","cancelled"]'), github.event.workflow_run.conclusion)
     runs-on: ubuntu-latest
     timeout-minutes: 8
     env:
       GH_TOKEN: ${{ github.token }}
       OPENCODE_WORKFLOW: ${{ inputs.opencode_workflow }}
       CI_WORKFLOW: ${{ inputs.ci_workflow }}
+      ADDITIONAL_BLOCKING_WORKFLOWS: ${{ inputs.additional_blocking_workflows }}
       RUN_ID: ${{ github.event.workflow_run.id }}
       RUN_NAME: ${{ github.event.workflow_run.name }}
       HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
@@ -183,17 +189,37 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          [[ "$RUN_NAME" == "$CI_WORKFLOW" ]] || exit 0
+          supported=false
+          if [[ "$RUN_NAME" == "$CI_WORKFLOW" ]]; then
+            supported=true
+          else
+            IFS=',' read -ra extra_workflows <<< "${ADDITIONAL_BLOCKING_WORKFLOWS:-}"
+            for workflow in "${extra_workflows[@]}"; do
+              workflow="$(xargs <<<"$workflow")"
+              if [[ -n "$workflow" && "$RUN_NAME" == "$workflow" ]]; then
+                supported=true
+                break
+              fi
+            done
+          fi
+          [[ "$supported" == "true" ]] || exit 0
 
           pr="$(gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/pulls"             -H "Accept: application/vnd.github+json"             --jq '[.[] | select(.state=="open" and (.head.ref|startswith("opencode/")))] | .[0].number // empty')"
           [[ -n "$pr" ]] || exit 0
 
           head_ref="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr" --jq '.head.ref')"
-          LABEL="opencode-ci-repair"
-          gh label create "$LABEL" --repo "$GITHUB_REPOSITORY" --color D93F0B             --description "Continuum CI repair in progress" 2>/dev/null || true
+          gate_hash="$(printf '%s' "$RUN_NAME" | sha256sum | awk '{print substr($1,1,12)}')"
+          LABEL="opencode-gate-repair-$gate_hash"
+          gh label create "$LABEL" --repo "$GITHUB_REPOSITORY" --color D93F0B             --description "Continuum blocking-workflow repair in progress" 2>/dev/null || true
+
+          if [[ "${{ github.event.workflow_run.conclusion }}" == "success" ]]; then
+            gh issue edit "$pr" --repo "$GITHUB_REPOSITORY" --remove-label "$LABEL" >/dev/null 2>&1 || true
+            echo "$RUN_NAME passed; repair lock cleared."
+            exit 0
+          fi
 
           if gh api "repos/$GITHUB_REPOSITORY/issues/$pr" --jq '.labels[].name' | grep -Fxq "$LABEL"; then
-            echo "CI repair already dispatched for PR #$pr."
+            echo "$RUN_NAME repair already dispatched for PR #$pr."
             exit 0
           fi
           gh issue edit "$pr" --repo "$GITHUB_REPOSITORY" --add-label "$LABEL"
