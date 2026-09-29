@@ -68,6 +68,25 @@ the parent's secret map to the repository containing this configuration.
 The child must name the calling parent exactly. If either side disagrees, that
 child fails closed and no task is executed.
 
+
+A child may also declare a deterministic validation gate:
+
+```yaml
+delegation:
+  role: child
+  id: child-a
+  parent: owner/parent-repository
+  validation_script: automation/continuum-child-ci.sh
+```
+
+The delegated review loads that script from the child's **base branch**, not
+from the pull-request head, then executes it against the candidate worktree
+with a minimal environment created by `env -i`. GitHub tokens, child repository
+bindings, and model credentials are therefore not inherited by project tests.
+Validation stdout/stderr stays in a runner-local file and is never copied to the
+public parent logs. A review cannot merge until both the independent agent review
+and this deterministic gate pass.
+
 A child task is opt-in per issue. Add:
 
 ```html
