@@ -28,6 +28,7 @@ already have one.
 
 from __future__ import annotations
 
+from .android import AndroidAdapter, AndroidError
 from .contract import (
     PORT_ATTRIBUTES,
     PORT_SURFACES,
@@ -69,6 +70,7 @@ from .plan import (
     SigningUnavailable,
     TargetNotExecutable,
 )
+from .play import GooglePlayPublisher, PlayError, PlaySettings
 from .state import (
     BLOCKED,
     COMPLETED,
@@ -97,6 +99,8 @@ from .version import (
 )
 
 __all__ = [
+    "AndroidAdapter",
+    "AndroidError",
     "Artifact",
     "ArtifactManifest",
     "BLOCKED",
@@ -110,6 +114,7 @@ __all__ = [
     "ExplicitVersion",
     "FAILED",
     "GitHubReleasePublisher",
+    "GooglePlayPublisher",
     "Journal",
     "ManifestBuilder",
     "NOOP",
@@ -118,6 +123,8 @@ __all__ = [
     "PORT_ATTRIBUTES",
     "PORT_SURFACES",
     "PlanStep",
+    "PlayError",
+    "PlaySettings",
     "ProjectFileVersion",
     "PublishRequest",
     "PublisherResult",
