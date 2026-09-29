@@ -27,14 +27,25 @@ class DelegationRuntimeTests(unittest.TestCase):
         body += "".join(f"    - {child}\n" for child in children)
         return write(self.tmp, "parent.yml", body)
 
-    def child(self, child_id="alpha", parent="owner/parent") -> str:
+    def child(
+        self,
+        child_id="alpha",
+        parent="owner/parent",
+        validation_script="",
+    ) -> str:
+        validation = (
+            f"  validation_script: {validation_script}\n"
+            if validation_script
+            else ""
+        )
         return write(
             self.tmp,
             "child.yml",
             "version: 1\ndelegation:\n"
             "  role: child\n"
             f"  id: {child_id}\n"
-            f"  parent: {parent}\n",
+            f"  parent: {parent}\n"
+            + validation,
         )
 
     def test_parent_plan_resolves_only_explicit_children(self):
@@ -94,6 +105,20 @@ class DelegationRuntimeTests(unittest.TestCase):
                 child_id="alpha",
                 parent_repository="owner/parent",
             )
+
+    def test_validation_script_is_read_from_verified_child_config(self):
+        path = self.child(validation_script="automation/validate.sh")
+        self.assertEqual(
+            runtime.child_validation_script(path),
+            "automation/validate.sh",
+        )
+
+    def test_missing_validation_script_resolves_to_empty_string(self):
+        self.assertEqual(runtime.child_validation_script(self.child()), "")
+
+    def test_parent_cannot_be_used_as_validation_source(self):
+        with self.assertRaises(runtime.DelegationError):
+            runtime.child_validation_script(self.parent(("alpha",)))
 
     def test_resolve_child_cannot_escape_allowlist(self):
         with self.assertRaises(runtime.DelegationError):
