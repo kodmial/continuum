@@ -186,7 +186,7 @@ jobs:
     # a repair of an already-finished change gets the small repair budget.
     # Splitting them here is what stops a long source task from deciding how
     # long its own conflict repair is allowed to run.
-    timeout-minutes: ${{ needs.authorize.outputs.task_timeout_minutes }}
+    timeout-minutes: ${{ fromJSON(needs.authorize.outputs.task_timeout_minutes) }}
 
     permissions:
       actions: read
