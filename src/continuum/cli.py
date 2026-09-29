@@ -264,7 +264,14 @@ def cmd_verify(args: argparse.Namespace) -> int:
         head = args.head or (client.get_pull(int(args.pr)).get("head") or {}).get("sha", "")
         settings = config.review.provider_settings()
         snapshot = providers_module.collect_snapshot(
-            config.review.provider, client, int(args.pr), head, settings
+            config.review.provider,
+            client,
+            int(args.pr),
+            head,
+            settings,
+            # Honor the same toggle the verdict write honors, so `--no-apply`
+            # stays a true dry run of the whole command.
+            apply=not args.no_apply,
         )
         llm_client = llm_module.client_from_environment()
         outcome = verify_module.verify_finding(

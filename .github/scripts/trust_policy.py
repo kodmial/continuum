@@ -1188,15 +1188,39 @@ def cmd_authorize_event(args) -> int:
         write_outputs(decision.as_outputs())
         return 1
 
-    decision = evaluate_event(
-        event_name,
-        payload,
-        repository=repository,
-        configured_actors=context["configured_actors"],
-        base_ref=context["base_ref"],
-        commands=context["commands"],
-        actor=context["actor"],
-    )
+    if event_name == "workflow_dispatch":
+        # Dispatch trust is a two-phase decision. First validate the caller and
+        # input shape without trusting any PR fields from the event; only then
+        # fetch the live pull request and make the final decision below.
+        repository_owner = repository.split("/", 1)[0]
+        sender = (payload.get("sender") or {}).get("login") or context["actor"]
+        if not is_trusted_actor(
+            sender, repository_owner, context["configured_actors"]
+        ):
+            decision = deny(
+                "untrusted_dispatcher",
+                "Dispatch was requested by untrusted actor {!r}.".format(sender),
+            )
+        else:
+            inputs = payload.get("inputs")
+            if not isinstance(inputs, dict):
+                decision = deny("missing_inputs", "Dispatch payload has no inputs.")
+            else:
+                decision = validate_dispatch_shape(
+                    inputs,
+                    repository=repository,
+                    base_ref=context["base_ref"],
+                )
+    else:
+        decision = evaluate_event(
+            event_name,
+            payload,
+            repository=repository,
+            configured_actors=context["configured_actors"],
+            base_ref=context["base_ref"],
+            commands=context["commands"],
+            actor=context["actor"],
+        )
 
     if decision.allowed and decision.mode:
         # Re-verify against the live API before any write-capable step is

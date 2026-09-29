@@ -100,7 +100,24 @@ adapter:
   (repository owner only) and parse via the Continuum module, never a shell or
   a GitHub expression.
 - CodeRabbit is a sibling adapter behind the same normalized gate
-  (`review.provider: coderabbit`).
+  (`review.provider: coderabbit`). Its semantics live in the adapter, never in
+  merge logic, because three CodeRabbit surfaces disagree often enough to
+  deadlock a naive gate:
+  - **The commit status is operational state, never authorization.** A head is
+    mergeable on a durable exact-head `APPROVED` review. `Review skipped`,
+    pending, and rate-limited statuses block a head that was never approved, but
+    can never revoke an approval GitHub already stores for that exact head.
+  - **Reviews bind to the head SHA they were submitted against.** An approval
+    from an earlier commit does not authorize a new one, and no CI-versus-review
+    timestamp ordering is needed because both signals already name the same SHA.
+    Advisory nitpicks are superseded by a newer decisive verdict on that head;
+    nitpicks published after it still block.
+  - **A settled finding is stated in prose, then normalized.** When the newest
+    CodeRabbit reply in a CodeRabbit-authored thread explicitly resolves it,
+    the adapter resolves the thread in GitHub's own state so the repair stops
+    being re-requested. An explicit `UNRESOLVED`, a failed normalization, and an
+    unknown thread state all stay blocking: an unverifiable thread may
+    over-report a finding but may never silently drop one.
 
 To enable in another repository, validate a `.continuum.yml`, then call the
 reusable workflow — see `fixtures/consumer-repo/` for the reference consumer.
@@ -248,6 +265,48 @@ anything — `tests/test_release_run.py` fails if either names `codesign`,
 `continuum release sign` checks for the toolchain and for the values the plan
 needs *before* the first step runs, so a job on the wrong runner fails with
 "this runner has no `codesign`" instead of after creating a keychain.
+
+### Downstream package publishers
+
+Homebrew and MacPorts are not release adapters. They run *after* a release
+exists, when they are handed the release's identity, the immutable URLs its
+assets were published at, and the digests those URLs must serve. A publisher
+turns those into the package manager's own description of the release; it never
+builds, re-signs, or uploads anything, and it never asks the release pipeline
+for a favour.
+
+They live in `src/continuum/release/publishers/`, deliberately separate from
+`release/plan.py` and `release/run.py`. Those two own the release state machine
+and must not learn the name of a package manager; the publishers own everything
+a package manager needs and know nothing about how the release was cut. The
+seam is `contract.PublishRequest` and `contract.PublishResult` — immutable
+value types that describe the *generic* contract — plus a `PackageRepository`
+for the cross-repository write and an `AssetFetcher` for verification. A caller
+assembles those and hands them to a publisher; the publisher returns a result
+and nothing else happens outside it. `tests/test_release_run.py` fails if the
+release core names a package manager, and `tests/test_release_publishers.py`
+fails the other way if a publisher imports the release state machine.
+
+A publisher is reached through `publishers.get(name)` rather than imported by
+name, so adding a package manager is adding a module and a registry entry.
+`homebrew` and `macports` are registered today:
+
+- **Homebrew** renders a formula and/or a cask from the release's assets, with
+  per-architecture blocks when the manifest carries them, then validates the
+  Ruby syntax before writing. A cask that clears quarantine is refused for a
+  signed or notarized artifact, and otherwise must carry evidence that is
+  audited in the generated file.
+- **MacPorts** writes the `Portfile`, its tree, and a separate installer script
+  whose pinned revision is reconciled to the tree HEAD, so a moved pin is
+  repaired rather than duplicated.
+
+Every publisher is idempotent: a re-run against the same release with a
+destination already at the new content returns `already-current` instead of
+writing again, and a destination that moved under it is reconciled against the
+new head. Updates either open a pull request or push the configured branch,
+chosen by the destination's mode; secrets are checked for presence but never
+read. Project data and templates are consumer-owned; the publisher only knows
+the generic shape.
 
 No release workflow is active in this repository, and `.github/workflows/ci.yml`
 enforces an allowlist of workflow names. The module and the CLI are the
