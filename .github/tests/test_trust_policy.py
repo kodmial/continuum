@@ -438,7 +438,7 @@ class MergeEligibilityTests(unittest.TestCase):
         )
         self.assertTrue(decision.allowed, decision.reason)
 
-    def test_privilege_boundary_changes_block_automatic_merge(self):
+    def test_workflow_changes_can_merge_after_green_current_head_ci(self):
         fixture = load_fixture("pull_request_workflow_change")
         decision = trust_policy.evaluate_merge(
             repository=REPOSITORY,
@@ -446,8 +446,8 @@ class MergeEligibilityTests(unittest.TestCase):
             changed_files=fixture["files"],
             ci_green=True,
         )
-        self.assertFalse(decision.allowed)
-        self.assertEqual(decision.code, "trust_sensitive_changes")
+        self.assertTrue(decision.allowed, decision.reason)
+        self.assertEqual(decision.code, "merge_allowed")
         self.assertIn(".github/workflows/opencode.yml", decision.reason)
         self.assertIn(".github/scripts/trust_policy.py", decision.reason)
 

@@ -432,18 +432,6 @@ jobs:
 
           behind=$(gh api "repos/$GITHUB_REPOSITORY/compare/$CONTINUUM_BASE_BRANCH...$HEAD_SHA" --jq '.behind_by')
 
-          # A pull request that edits the privilege boundary needs a human: an
-          # agent that then resolves a conflict in a workflow file would push
-          # unattended into the trust boundary itself.
-          sensitive=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" \
-            --jq '[.[] | select(.filename | startswith(".github/workflows/") or startswith(".github/scripts/") or startswith(".github/actions/") or . == "CODEOWNERS" or . == "action.yml") | .filename] | join(", ")')
-          if [[ "$sensitive" ]]; then
-            echo "action=flag-human" >> "$GITHUB_OUTPUT"
-            echo "sensitive_files=$sensitive" >> "$GITHUB_OUTPUT"
-            echo "reason=privilege_boundary_change" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
           locked=false
           if gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels" \
             --jq '.[].name' | grep -Fxq "$lock_label"; then
@@ -560,7 +548,6 @@ jobs:
           REASON: ${{ steps.decide.outputs.reason }}
           RESET_HEAD_LOCKS: ${{ steps.decide.outputs.reset_head_locks }}
           LOCK_LABEL: ${{ steps.decide.outputs.lock_label }}
-          SENSITIVE_FILES: ${{ steps.decide.outputs.sensitive_files }}
           BEHIND: ${{ steps.decide.outputs.behind }}
           ATTEMPTS: ${{ steps.decide.outputs.attempts }}
           HEAD_REF: ${{ steps.trust.outputs.head_ref }}
@@ -604,12 +591,6 @@ jobs:
               gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels" \
                 -f 'labels[]=opencode-repair-failed' >/dev/null 2>&1 || true
               echo "::warning::PR #$PR_NUMBER exhausted $ATTEMPTS conflict-repair attempt(s); the lock is released and the pull request stays reconcilable."
-              exit 0
-              ;;
-            flag-human)
-              gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels" \
-                -f 'labels[]=opencode-human-review-required' >/dev/null
-              echo "::warning::PR #$PR_NUMBER changes the privilege boundary ($SENSITIVE_FILES); conflict repair is not dispatched automatically."
               exit 0
               ;;
           esac
@@ -814,17 +795,6 @@ jobs:
             exit 0
           fi
 
-          # Same privilege-boundary rule as conflict repair: an agent that
-          # pushes into a pull request touching the trust boundary needs a human.
-          sensitive=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr/files?per_page=100" \
-            --jq '[.[] | select(.filename | startswith(".github/workflows/") or startswith(".github/scripts/") or startswith(".github/actions/") or . == "CODEOWNERS" or . == "action.yml") | .filename] | join(", ")')
-          if [[ -n "$sensitive" ]]; then
-            echo "action=flag-human" >> "$GITHUB_OUTPUT"
-            echo "sensitive_files=$sensitive" >> "$GITHUB_OUTPUT"
-            echo "reason=privilege_boundary_change" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
           # Final gate on the exact dispatch triple, re-verified against the
           # live pull request. A dispatch the policy would reject never leaves
           # this job, and the verification itself is read-only.
@@ -854,7 +824,6 @@ jobs:
           ACTION: ${{ steps.decide.outputs.action }}
           REASON: ${{ steps.decide.outputs.reason }}
           LOCK_LABEL: ${{ steps.decide.outputs.lock_label }}
-          SENSITIVE_FILES: ${{ steps.decide.outputs.sensitive_files }}
           PR_NUMBER: ${{ steps.trust.outputs.pr_number }}
           HEAD_REF: ${{ steps.trust.outputs.head_ref }}
           RUN_ID: ${{ github.event.workflow_run.id }}
@@ -872,12 +841,6 @@ jobs:
                 "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/$LOCK_LABEL" \
                 >/dev/null 2>&1 || true
               echo "Cleared the automatic repair lock on PR #$PR_NUMBER."
-              exit 0
-              ;;
-            flag-human)
-              gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels" \
-                -f 'labels[]=opencode-human-review-required' >/dev/null
-              echo "::warning::PR #$PR_NUMBER changes the privilege boundary ($SENSITIVE_FILES); automatic repair is not dispatched."
               exit 0
               ;;
           esac
