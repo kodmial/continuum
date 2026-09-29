@@ -23,10 +23,7 @@ jobs:
     with:
       child_id: ${{ inputs.child_id }}
       task_number: ${{ inputs.task_number }}
-      parent_role: ${{ vars.CONTINUUM_ROLE }}
-      parent_children: ${{ vars.CONTINUUM_CHILDREN }}
       pr_number: ${{ inputs.pr_number }}
-    with:
       parent_role: ${{ vars.CONTINUUM_ROLE }}
       parent_children: ${{ vars.CONTINUUM_CHILDREN }}
     secrets:
