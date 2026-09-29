@@ -28,7 +28,7 @@ on:
       CHILD_RUNTIME_TOKEN:
         required: true
       CHILD_RUNTIME_REPOSITORIES:
-        required: true
+        required: false
 
 permissions:
   contents: read
@@ -81,8 +81,9 @@ jobs:
 
           export PYTHONPATH="$CONTINUUM_ENGINE_ROOT/src"
           relation="$CONTINUUM_ENGINE_ROOT/.github/scripts/delegation_runtime.py"
+          resolver="$CONTINUUM_ENGINE_ROOT/.github/scripts/delegation_repository.sh"
           child_repo="$(
-            python3 "$relation" resolve-child               --config .continuum.yml               --repository-map-json "$CHILD_REPOSITORIES"               --child-id "$CHILD_ID"
+            PARENT_CONFIG=.continuum.yml CHILD_REPOSITORIES="$CHILD_REPOSITORIES"               bash "$resolver" resolve "$CHILD_ID"
           )"
 
           child_config="$RUNNER_TEMP/continuum-child.yml"
