@@ -17,14 +17,6 @@ on:
         type: number
         required: false
         default: 4
-      parent_role:
-        type: string
-        required: false
-        default: ""
-      parent_children:
-        type: string
-        required: false
-        default: ""
       engine_ref:
         type: string
         required: false
@@ -49,8 +41,6 @@ jobs:
       GH_TOKEN: ${{ secrets.CHILD_RUNTIME_TOKEN }}
       GITHUB_TOKEN: ${{ secrets.CHILD_RUNTIME_TOKEN }}
       CHILD_REPOSITORIES: ${{ secrets.CHILD_RUNTIME_REPOSITORIES }}
-      PARENT_ROLE: ${{ inputs.parent_role }}
-      PARENT_CHILDREN: ${{ inputs.parent_children }}
       CHILD_ID: ${{ inputs.child_id }}
       TASK_NUMBER: ${{ inputs.task_number }}
       OPENCODE_MODEL: ${{ inputs.model }}
@@ -89,7 +79,7 @@ jobs:
             PARENT_CONFIG=.continuum.yml CHILD_REPOSITORIES="$CHILD_REPOSITORIES"               bash "$resolver" resolve "$CHILD_ID"
           )"
 
-          PARENT_CONFIG=.continuum.yml PARENT_ROLE="$PARENT_ROLE" PARENT_CHILDREN="$PARENT_CHILDREN" CHILD_REPOSITORIES="$CHILD_REPOSITORIES" \
+          PARENT_CONFIG=.continuum.yml CHILD_REPOSITORIES="$CHILD_REPOSITORIES" \
             bash "$resolver" verify "$CHILD_ID" "$child_repo" >/dev/null
 
           issue_state="$(gh api "repos/$child_repo/issues/$TASK_NUMBER" --jq '.state' 2>/dev/null || true)"
