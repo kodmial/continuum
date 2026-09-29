@@ -107,7 +107,7 @@ jobs:
           CONTINUUM_VERIFY_WORKFLOW: ${{ inputs.workflow }}
           CONTINUUM_VERIFY_EVENT: ${{ inputs.event }}
         run: |
-          set -uo pipefail
+          set -euo pipefail
           # The command publishes `verdict`/`reason`/`run`/`contract` to
           # GITHUB_OUTPUT itself, so a BLOCK verdict is still readable as step
           # outputs. The exit code is therefore caught rather than allowed to

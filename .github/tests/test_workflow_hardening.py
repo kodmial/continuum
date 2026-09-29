@@ -91,6 +91,7 @@ NOT_AGENT_PLANE = (
     "consumer-repair.yml",
     "consumer-scheduler.yml",
     "release-bun-binary.yml",
+    "release-verify.yml",
     "review-queue.yml",
 )
 
@@ -318,6 +319,18 @@ class PermissionsTests(WorkflowAuditBase):
                 "write-all",
                 name,
             )
+
+    def test_ci_fix_step_never_runs_for_conflict_repair_dispatch(self):
+        document = self.agent_plane()["opencode.yml"]
+        step = next(
+            step
+            for step in document["jobs"]["opencode"]["steps"]
+            if step.get("name") == "Fix failed blocking workflow"
+        )
+        condition = str(step.get("if") or "")
+        self.assertIn("github.event_name == 'workflow_dispatch'", condition)
+        self.assertIn("inputs.mode == 'ci-fix'", condition)
+        self.assertIn("needs.authorize.outputs.trust_code == 'trusted_dispatch'", condition)
 
     def test_privileged_credentials_are_not_reachable_from_fork_events(self):
         for name, document in self.agent_plane().items():
@@ -660,10 +673,18 @@ class RepairControllerTests(WorkflowAuditBase):
             self.assertIn('pulls?state=open&per_page=100', text, name)
             self.assertIn('startswith("opencode/issue', text, name)
 
-    def test_privilege_boundary_changes_are_never_auto_merged(self):
+    def test_merge_controller_uses_the_trusted_merge_plan(self):
         text = self.raw["auto-merge.yml"]
         self.assertIn("merge-plan", text)
         self.assertNotIn("head.repo?.full_name !== ", text)
+
+    def test_repair_controller_has_no_human_stop_for_agent_repairs(self):
+        text = self.raw["opencode-repair.yml"]
+        self.assertNotIn("flag-human", text)
+        self.assertNotIn("opencode-human-review-required", text)
+        self.assertNotIn("privilege_boundary_change", text)
+        self.assertIn("--mode resolve-conflict", text)
+        self.assertIn("--mode ci-fix", text)
 
     def test_merge_titles_are_sanitized(self):
         text = self.raw["auto-merge.yml"]
