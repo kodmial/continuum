@@ -470,7 +470,7 @@ class AgentExecutionTests(WorkflowAuditBase):
         self_agent = self.job("opencode.yml", "opencode")
         self.assertEqual(
             self_agent.get("timeout-minutes"),
-            "${{ needs.authorize.outputs.task_timeout_minutes }}",
+            "${{ fromJSON(needs.authorize.outputs.task_timeout_minutes) }}",
         )
         self.assertIn("steps.plan.outputs.task_timeout_minutes", self.raw["opencode.yml"])
 
