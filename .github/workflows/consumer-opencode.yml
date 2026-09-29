@@ -86,6 +86,15 @@ on:
         type: string
         required: false
         default: ""
+      ci_workflow:
+        description: >-
+          Blocking CI workflow to dispatch after this run opens a pull request.
+          GitHub suppresses pull_request events for actions taken with
+          GITHUB_TOKEN, so an explicit dispatch is the only way a freshly
+          created PR gets its required check.
+        type: string
+        required: false
+        default: "ci.yml"
     secrets:
       OPENCODE_API_KEY:
         required: false
@@ -149,6 +158,39 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # A reusable workflow receives the caller's repository, not Continuum's, so
+      # the module that owns the branch lifecycle has to be fetched explicitly at
+      # the exact ref this workflow was called from. Deriving the ref from
+      # `github.workflow_ref` is what keeps the two in lockstep: a consumer pinned
+      # to a Continuum tag gets that tag's rule, and no workflow can enforce a
+      # different version of itself than the one it was invoked as.
+      - name: Fetch the Continuum module for this workflow ref
+        id: continuum
+        if: inputs.mode == 'issue'
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORKFLOW_REF="$GITHUB_WORKFLOW_REF"
+          CONTINUUM_REF="${WORKFLOW_REF##*@}"
+          CONTINUUM_REPO="${WORKFLOW_REF%%/.github/*}"
+          [[ -n "$CONTINUUM_REPO" && "$CONTINUUM_REPO" == */* ]] || {
+            echo "::error::Could not derive the Continuum repository from GITHUB_WORKFLOW_REF='$WORKFLOW_REF'."
+            exit 1
+          }
+          echo "repo=$CONTINUUM_REPO" >> "$GITHUB_OUTPUT"
+          echo "ref=$CONTINUUM_REF" >> "$GITHUB_OUTPUT"
+          echo "Using the Continuum module from $CONTINUUM_REPO@$CONTINUUM_REF"
+
+      - name: Checkout the Continuum module
+        if: inputs.mode == 'issue'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ${{ steps.continuum.outputs.repo }}
+          ref: ${{ steps.continuum.outputs.ref }}
+          path: ${{ runner.temp }}/continuum-module
+          sparse-checkout: src/continuum
+          persist-credentials: false
 
       - name: Validate OpenCode distribution
         shell: bash
@@ -285,6 +327,8 @@ jobs:
         if: inputs.mode == 'issue'
         env:
           ISSUE_NUMBER: ${{ inputs.issue_number }}
+          CI_WORKFLOW: ${{ inputs.ci_workflow }}
+          CONTINUUM_MODULE_ROOT: ${{ runner.temp }}/continuum-module/src
         shell: bash
         run: |
           set -euo pipefail
@@ -292,6 +336,10 @@ jobs:
             echo "::error::Invalid issue number."
             exit 1
           fi
+          [[ -d "$CONTINUUM_MODULE_ROOT/continuum" ]] || {
+            echo "::error::The Continuum module was not fetched at this workflow's own ref; refusing to push under a different lifecycle rule."
+            exit 1
+          }
 
           BRANCH="opencode/issue${ISSUE_NUMBER}-${GITHUB_RUN_ID}"
           git switch -c "$BRANCH"
@@ -328,6 +376,18 @@ jobs:
             git commit -m "feat: implement issue #${ISSUE_NUMBER}"
           fi
 
+          # The task is told not to switch branches; this is where that is
+          # enforced. Checking only after the model ran is deliberate: the
+          # decision must be made from state, and a switched HEAD must never
+          # reach the push below.
+          # The module under test is the one fetched at this workflow's own ref, not
+          # the consumer's copy in `src/`, which may be any older version. The
+          # lifecycle rule that protects this push is exactly the reviewed one.
+          PYTHONPATH="$CONTINUUM_MODULE_ROOT" python3 -m continuum.git_lifecycle \
+            --expected "$BRANCH" \
+            --issue "$ISSUE_NUMBER" \
+            --run-id "$GITHUB_RUN_ID"
+
           git fetch origin main --quiet
           AHEAD="$(git rev-list --count "origin/main..HEAD")"
           if [[ "$AHEAD" -eq 0 ]]; then
@@ -337,7 +397,31 @@ jobs:
           fi
 
           HUSKY=0 git push -u origin "$BRANCH"
-          gh pr create             --repo "$GITHUB_REPOSITORY"             --base main             --head "$BRANCH"             --title "$TITLE"             --body "Implemented automatically by Continuum.\n\nCloses #${ISSUE_NUMBER}"
+          PR_URL="$(gh pr create               --repo "$GITHUB_REPOSITORY"               --base main               --head "$BRANCH"               --title "$TITLE"               --body "Implemented automatically by Continuum.\n\nCloses #${ISSUE_NUMBER}")"
+          echo "$PR_URL"
+
+          # GitHub deliberately does not start `pull_request` workflows for
+          # events created with GITHUB_TOKEN, so the PR this run just opened has
+          # no CI run and no review-gate check. Every downstream controller keys
+          # on required CI for the exact head, so the pull request would sit
+          # unreviewable and unmergeable until some unrelated event woke it.
+          # Dispatching the required workflow explicitly is the documented way
+          # to get that first check. A dispatch failure is fatal on purpose: an
+          # opened PR without CI is exactly the invisible state to avoid.
+          if [[ -n "$CI_WORKFLOW" ]]; then
+            [[ "$CI_WORKFLOW" =~ ^[A-Za-z0-9._/-]+$ ]] || {
+              echo "::error::Invalid ci_workflow: $CI_WORKFLOW"
+              exit 1
+            }
+            gh api --method POST \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/${CI_WORKFLOW}/dispatches" \
+              -f ref="$BRANCH" >/dev/null ||
+              {
+                echo "::error::Opened $PR_URL but could not dispatch $CI_WORKFLOW on $BRANCH; the pull request has no required CI check."
+                exit 1
+              }
+            echo "Dispatched $CI_WORKFLOW on $BRANCH for $PR_URL."
+          fi
 
       # Conflict repair repairs the change that already exists. It never
       # re-executes the source issue, and it never spends model time unless git

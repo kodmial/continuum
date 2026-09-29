@@ -1,0 +1,191 @@
+"""A generated workflow can ship a broken credential.
+
+The failure is silent in the workflow definition and total at runtime: a
+provisioning layer writes `GH_TOKEN: \\${{ secrets.X }}`, the escape survives
+into the file the runner reads, and every authenticated API call answers 401
+Bad credentials. Nothing in the workflow looks wrong, and nothing in a log names
+the cause.
+
+These are deterministic tests. No network call and no secret is involved; the
+value under test is a string that looks like a token and must never be logged.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import pathlib
+import tempfile
+import unittest
+
+from continuum import credentials
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+
+
+class ResolveTests(unittest.TestCase):
+    """The value that is actually sent, and the two ways it must never be sent.
+
+    An empty credential and an unexpanded `${{ ... }}` both produce a bare 401 at
+    the call site, which reads exactly like a revoked token. Failing here names
+    the real cause instead of sending the operator to the wrong place.
+    """
+
+    def test_a_clean_credential_is_returned_unchanged(self):
+        self.assertEqual(
+            credentials.resolve_credential("ghp_0123456789abcdefABCDEF"),
+            "ghp_0123456789abcdefABCDEF",
+        )
+
+    def test_the_envelope_escape_is_stripped_before_use(self):
+        self.assertEqual(
+            credentials.resolve_credential("\\ghp_0123456789abcdefABCDEF"),
+            "ghp_0123456789abcdefABCDEF",
+        )
+
+    def test_an_empty_credential_is_refused(self):
+        for value in ("", None):
+            with self.subTest(value=value):
+                with self.assertRaises(credentials.CredentialError) as caught:
+                    credentials.resolve_credential(value)
+                self.assertIn("is required", str(caught.exception))
+
+    def test_an_unexpanded_expression_is_refused(self):
+        with self.assertRaises(credentials.CredentialError) as caught:
+            credentials.resolve_credential("${{ secrets.TAP_PAT }}")
+        self.assertIn("unexpanded", str(caught.exception))
+
+    def test_a_refused_credential_names_its_field(self):
+        with self.assertRaises(credentials.CredentialError) as caught:
+            credentials.resolve_credential("", name="GITHUB_TOKEN")
+        self.assertIn("GITHUB_TOKEN", str(caught.exception))
+
+
+class SanitizeTests(unittest.TestCase):
+    def test_the_envelope_escape_is_removed(self):
+        # The exact production shape: the evaluated secret with one stray
+        # backslash in front of it.
+        self.assertEqual(
+            credentials.sanitize_credential("\\ghp_0123456789abcdefABCDEF"),
+            "ghp_0123456789abcdefABCDEF",
+        )
+
+    def test_a_real_token_is_untouched(self):
+        token = "ghp_0123456789abcdefABCDEF0123456789abcdef"
+        self.assertEqual(credentials.sanitize_credential(token), token)
+
+    def test_only_one_backslash_is_removed(self):
+        # A double escape is two independent defects. Normalizing both away here
+        # would authenticate a workflow that is still wrong on disk.
+        self.assertEqual(
+            credentials.sanitize_credential("\\\\ghp_token"), "\\ghp_token"
+        )
+
+    def test_falsy_input_is_the_empty_credential(self):
+        for value in (None, "", 0):
+            self.assertEqual(credentials.sanitize_credential(value), "")
+
+    def test_an_interior_backslash_is_not_a_credential_defect(self):
+        # Only a *leading* backslash is the envelope artifact.
+        self.assertEqual(
+            credentials.sanitize_credential("ghp_ab\\cd"), "ghp_ab\\cd"
+        )
+
+
+class LineClassificationTests(unittest.TestCase):
+    def test_every_credential_key_is_scanned(self):
+        for key in credentials.CREDENTIAL_KEYS:
+            line = f"{key}: \\${{{{ secrets.TOKEN }}}}"
+            self.assertTrue(credentials.is_escaped_credential_line(line), key)
+
+    def test_a_non_credential_field_is_out_of_scope(self):
+        # Failing the build on an escaped expression in an artifact name would
+        # train people to ignore a check whose real defect looks identical.
+        self.assertFalse(
+            credentials.is_escaped_credential_line("name: \\${{ github.sha }}")
+        )
+
+    def test_a_correct_credential_binding_is_clean(self):
+        self.assertFalse(
+            credentials.is_escaped_credential_line("GH_TOKEN: ${{ secrets.GH_PAT }}")
+        )
+
+    def test_an_unrelated_line_is_clean(self):
+        self.assertFalse(credentials.is_escaped_credential_line("runs-on: ubuntu-latest"))
+
+
+class ScanTests(unittest.TestCase):
+    def test_line_numbers_are_one_based(self):
+        text = "runs-on: ubuntu-latest\nGH_TOKEN: \\${{ secrets.X }}\n"
+        self.assertEqual(credentials.scan_text(text), [2])
+
+    def test_this_repository_is_clean(self):
+        # Continuum's own workflows are generated by the same tooling that
+        # produced the production incident, so the repository is the regression.
+        self.assertEqual(credentials.scan_workflows(ROOT), [])
+
+    def test_the_scan_covers_the_consumer_fixture(self):
+        # A consumer that copies the envelope carries the same defect, and the
+        # fixture is where a regression is most likely to persist unnoticed.
+        with temporary_repository() as root:
+            path = root / "fixtures" / "consumer-repo" / ".github" / "workflows"
+            path.mkdir(parents=True)
+            (path / "ci.yml").write_text("GH_TOKEN: \\${{ secrets.GH_PAT }}\n", encoding="utf-8")
+            self.assertEqual(len(credentials.scan_workflows(root)), 1)
+
+    def test_a_missing_workflow_directory_is_not_a_failure(self):
+        with temporary_repository() as root:
+            self.assertEqual(credentials.scan_workflows(root), [])
+
+    def test_findings_report_the_path_line_and_text(self):
+        with temporary_repository() as root:
+            path = root / ".github" / "workflows"
+            path.mkdir(parents=True)
+            (path / "broken.yml").write_text(
+                "env:\n  GITHUB_TOKEN: \\${{ secrets.TAP_PAT }}\n", encoding="utf-8"
+            )
+            findings = credentials.scan_workflows(root)
+        self.assertEqual(len(findings), 1)
+        found_path, line, text = findings[0]
+        self.assertTrue(found_path.endswith("broken.yml"))
+        self.assertEqual(line, 2)
+        self.assertIn("GITHUB_TOKEN", text)
+
+    def test_the_scan_is_sorted_by_path(self):
+        with temporary_repository() as root:
+            path = root / ".github" / "workflows"
+            path.mkdir(parents=True)
+            for name in ("c.yml", "a.yml", "b.yml"):
+                (path / name).write_text("GH_TOKEN: \\${{ secrets.X }}\n", encoding="utf-8")
+            findings = credentials.scan_workflows(root)
+        self.assertEqual(
+            [path.rsplit("/", 1)[-1] for path, _line, _text in findings],
+            ["a.yml", "b.yml", "c.yml"],
+        )
+
+
+class ReportingTests(unittest.TestCase):
+    def test_a_clean_scan_says_ok(self):
+        self.assertIn("OK:", credentials.describe([]))
+
+    def test_findings_are_annotated_at_their_line(self):
+        lines = credentials.render([(".github/workflows/ci.yml", 7, "GH_TOKEN: x")])
+        self.assertEqual(len(lines), 1)
+        self.assertIn("file=.github/workflows/ci.yml,line=7", lines[0])
+
+    def test_the_failure_count_is_singular_for_one_finding(self):
+        self.assertIn("1 escaped GitHub expression", credentials.describe([("a", 1, "b")]))
+
+    def test_the_failure_count_is_plural_for_several(self):
+        self.assertIn("2 escaped GitHub expressions", credentials.describe([("a", 1, "b"), ("c", 2, "d")]))
+
+
+@contextlib.contextmanager
+def temporary_repository():
+    """A throwaway repository root that cleans itself up."""
+
+    with tempfile.TemporaryDirectory() as name:
+        yield pathlib.Path(name)
+
+
+if __name__ == "__main__":
+    unittest.main()

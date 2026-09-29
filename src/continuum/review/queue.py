@@ -154,6 +154,13 @@ REVIEW_CURRENT = "current"
 
 UNPRIORITIZED = "unprioritized"
 
+#: What counts as a *generation* of review, for ordering. A pull request that has
+#: never had a full review is worth a provider slot more than a second or later
+#: pass over one that has. The count is kept rather than a boolean so that, within
+#: one priority class, an earlier rereview still beats a later one.
+REVIEW_COUNT_UNREVIEWED = 0
+REVIEW_COUNT_REREVIEWED = 1
+
 SUPPORTED_TIE_BREAKERS: Tuple[str, ...] = (
     "source_issue",
     "pr_number",
@@ -248,6 +255,7 @@ class Candidate:
     source_issue: Optional[int] = None
     ci: str = CI_SUCCESS
     review: str = REVIEW_UNREVIEWED
+    full_reviews: int = 0
     due_at_ms: int = 0
     created_at_ms: int = 0
     request: Optional[ReviewRequest] = None
@@ -367,15 +375,34 @@ def ineligibility_reason(candidate: Candidate, policy: QueuePolicy) -> Optional[
     return None
 
 
-def rank_key(candidate: Candidate, policy: QueuePolicy) -> Tuple:
-    """Deterministic ordering: priority, then configured tie-breakers.
+def review_count(candidate: Candidate) -> int:
+    """Full reviews the provider has already spent on this pull request.
 
-    `priority:p0` beats `priority:p1` beats `priority:p2` beats unprioritized;
-    every tie is broken by the configured tie-breakers and finally by the PR
-    number, so two runs over the same state always agree.
+    Counted over the pull request's whole review history, not just the current
+    head: a pull request that has already been reviewed three times and then
+    pushed a fourth commit has still consumed the shared quota three times, so it
+    is not a starved first review no matter how new the head is.
+
+    A count of zero is a first review, which is what keeps an unknown or
+    unreported count from being treated as an already-reviewed pull request.
     """
 
-    key: List[Any] = [policy.priority_rank(candidate.priority)]
+    return max(REVIEW_COUNT_UNREVIEWED, int(candidate.full_reviews))
+
+
+def rank_key(candidate: Candidate, policy: QueuePolicy) -> Tuple:
+    """Deterministic ordering: priority, then review generation, then tie-breakers.
+
+    Priority is the hard primary key and is never bypassed: `priority:p0` beats
+    `priority:p1` beats `priority:p2` beats unprioritized, for first reviews and
+    again for rereviews. Fairness is allowed only *within* one priority class, so
+    a lower-priority first review can never jump ahead of a higher-priority
+    rereview, while repeated rereviews of one pull request cannot starve the
+    queue. Every remaining tie is broken by the configured tie-breakers and
+    finally by the PR number, so two runs over the same state always agree.
+    """
+
+    key: List[Any] = [policy.priority_rank(candidate.priority), review_count(candidate)]
     for tie_breaker in policy.tie_breakers:
         if tie_breaker == "source_issue":
             key.append(candidate.source_issue if candidate.source_issue is not None else 1 << 30)
@@ -554,8 +581,12 @@ def reconcile(state: QueueState, policy: QueuePolicy) -> Plan:
 
     if ranked:
         head = ranked[0]
+        # The generation is in the log because "why was that one chosen" is the
+        # question a starved queue raises, and a priority label alone cannot
+        # answer it.
         logs.append(
-            f"Next eligible review candidate: PR #{head.pr_number} ({head.priority})."
+            f"Next eligible review candidate: PR #{head.pr_number} "
+            f"({head.priority}, reviews={review_count(head)})."
         )
     else:
         summary = _summary_reasons(excluded)

@@ -264,6 +264,7 @@ def extract_findings(
     current_head: Optional[str] = None,
     since: Optional[datetime] = None,
     unresolved_ids: Optional[Set[int]] = None,
+    superseded_ids: Optional[Set[int]] = None,
     review_bots: Sequence[str] = DEFAULT_REVIEW_BOT_LOGINS,
     is_boilerplate: Optional[Callable[[str], bool]] = None,
 ) -> List[Dict[str, Any]]:
@@ -273,9 +274,16 @@ def extract_findings(
     unresolved and non-outdated. `None` means the state could not be
     determined; every inline thread is then kept, because failing closed may
     over-report a finding but must never silently drop one.
+
+    `superseded_ids` names threads the provider has explicitly declared
+    resolved. GitHub's own flag lags behind such an answer, and treating it as
+    authoritative is what turns a fixed finding into a permanent blocker
+    (continuum#37). Only an explicit resolution may appear here; an explicit
+    `unresolved` never does.
     """
 
     findings: Dict[str, Dict[str, Any]] = {}
+    superseded = set(superseded_ids or ())
 
     def add(finding: Dict[str, Any]) -> None:
         findings.setdefault(finding["id"], finding)
@@ -325,6 +333,8 @@ def extract_findings(
             continue
         if unresolved_ids is not None and comment.get("id") is not None:
             if comment["id"] not in unresolved_ids:
+                continue
+            if comment["id"] in superseded:
                 continue
         if current_head:
             head = current_head.lower()

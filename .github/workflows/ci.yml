@@ -86,6 +86,28 @@ jobs:
           set -euo pipefail
           PYTHONPATH=src python3 -m continuum.cli config-check --config .continuum.yml
 
+      - name: Validate the parity ledger
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The parity claim from #59 is only worth what this check is worth. It
+          # runs on every pull request so a disposition cannot be invented, a
+          # source reference cannot start moving, and an `absorbed` entry cannot
+          # name a module that is not there.
+          PYTHONPATH=src python3 -m continuum.cli parity-check --ledger parity/ledger.v1.json
+
+      - name: Fail closed on escaped workflow credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A generated workflow can write an escaped expression into the
+          # credential field, where the escape survives into the file the runner
+          # reads and every authenticated call answers 401 with nothing in the
+          # log naming the cause. The pattern is documented in
+          # src/continuum/credentials.py rather than repeated here, because a
+          # literal expression in a run block would itself be evaluated.
+          PYTHONPATH=src python3 -m continuum.cli credentials-check --root .
+
       - name: Verify disabled NanoDictate snapshot is preserved
         shell: bash
         run: |

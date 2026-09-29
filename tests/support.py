@@ -147,6 +147,7 @@ class FakeGitHub:
         statuses: Optional[List[Dict[str, Any]]] = None,
         file_contents: Optional[Dict[str, str]] = None,
         unresolved_ids: Optional[Set[int]] = None,
+        threads: Optional[List[Dict[str, Any]]] = None,
         thread_state: str = "ok",
     ) -> None:
         self.repository = repository
@@ -163,7 +164,10 @@ class FakeGitHub:
         self.statuses: List[Dict[str, Any]] = list(statuses or [])
         self.file_contents = dict(file_contents or {})
         self._unresolved_ids = set() if unresolved_ids is None else set(unresolved_ids)
+        self.threads = [dict(thread) for thread in (threads or [])]
         self.thread_state = thread_state
+        self.resolve_failures: Set[str] = set()
+        self.threads_resolved: List[str] = []
         self.calls: List[Any] = []
         self.reviews_created: List[Dict[str, Any]] = []
         self.statuses_created: List[Dict[str, Any]] = []
@@ -208,6 +212,34 @@ class FakeGitHub:
         if self.thread_state == "graphql-exception":
             raise GraphQLFailure("reviewThreads lookup failed")
         return set(self._unresolved_ids)
+
+    def review_threads(self, pr_number: int) -> Optional[List[Dict[str, Any]]]:
+        self._record("review_threads", pr_number)
+        if self.thread_state in ("graphql-error", "graphql-exception"):
+            return None
+        return [dict(thread) for thread in self.threads]
+
+    def resolve_review_thread(self, thread_id: str) -> None:
+        from continuum.review.github import GitHubError
+
+        self._record("resolve_review_thread", thread_id)
+        if thread_id in self.resolve_failures:
+            raise GitHubError(
+                f"GitHub refused to resolve review thread {thread_id}", status=500
+            )
+        self.threads_resolved.append(thread_id)
+        for thread in self.threads:
+            if thread.get("id") == thread_id:
+                thread["is_resolved"] = True
+        self._unresolved_ids = {
+            comment_id
+            for comment_id in self._unresolved_ids
+            if all(
+                comment_id not in {c.get("databaseId") for c in thread.get("comments") or []}
+                for thread in self.threads
+                if thread.get("id") == thread_id
+            )
+        }
 
     def file_at_ref(self, path: str, ref: str) -> Optional[str]:
         self._record("file_at_ref", path, ref)
@@ -364,6 +396,27 @@ def pull(
         },
     }
     return payload
+
+
+def coderabbit_review(
+    state: str,
+    *,
+    review_id: int = 1,
+    body: str = "Reviewed the diff.",
+    at: str = "2026-09-20T00:00:00Z",
+    login: str = "coderabbitai[bot]",
+    commit_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """A provider review record, as `list_reviews` returns it."""
+
+    return {
+        "id": review_id,
+        "state": state,
+        "body": body,
+        "submitted_at": at,
+        "commit_id": commit_id,
+        "user": {"login": login},
+    }
 
 
 def check_run(

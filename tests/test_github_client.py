@@ -8,6 +8,7 @@ import unittest
 import urllib.error
 import urllib.request
 
+from continuum.review import coderabbit
 from continuum.review import github as github_module
 from continuum.review.github import GitHubClient, GitHubError
 
@@ -169,6 +170,137 @@ class ThreadStateTests(unittest.TestCase):
             }
         }
         self.assertEqual(self._client(payload).unresolved_thread_comment_ids(7), set())
+
+
+class ReviewThreadBodyTests(unittest.TestCase):
+    """`review_threads` must carry comment bodies in the real GraphQL shape.
+
+    The whole point is comparing GitHub's flag against what the provider wrote in
+    the thread, and that text only exists in the body. A camelCase-only response
+    is what the API really sends, so a snake_case-only parser would silently read
+    every thread as silent and every fixed finding as still open.
+    """
+
+    def _client(self, payload):
+        def opener(request, timeout):
+            return payload, ""
+
+        return GitHubClient("token", "o/r", opener=opener)
+
+    def _payload(self, node):
+        return {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": {
+                            "nodes": [node],
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        }
+                    }
+                }
+            }
+        }
+
+    def test_graphql_thread_comments_keep_their_author_and_timestamp(self):
+        payload = self._payload(
+            {
+                "id": "PRRT_kwDOAbCdE12AbCdE",
+                "isResolved": False,
+                "isOutdated": False,
+                "comments": {
+                    "nodes": [
+                        {
+                            "databaseId": 41,
+                            "body": "This handle leaks on timeout",
+                            "createdAt": "2026-09-28T09:00:00Z",
+                            "author": {"login": "coderabbitai[bot]"},
+                        },
+                        {
+                            "databaseId": 42,
+                            "body": "✅ Addressed in the follow-up commit.",
+                            "createdAt": "2026-09-28T10:00:00Z",
+                            "author": {"login": "coderabbitai[bot]"},
+                        },
+                    ]
+                },
+            }
+        )
+        threads = self._client(payload).review_threads(7)
+        self.assertEqual(len(threads), 1)
+        self.assertEqual(threads[0]["id"], "PRRT_kwDOAbCdE12AbCdE")
+        self.assertEqual(threads[0]["comments"][1]["author"], {"login": "coderabbitai[bot]"})
+
+    def test_camel_case_authoring_actually_resolves_a_thread(self):
+        payload = self._payload(
+            {
+                "id": "T1",
+                "isResolved": False,
+                "isOutdated": False,
+                "comments": {
+                    "nodes": [
+                        {"databaseId": 41, "body": "leak", "createdAt": "2026-09-28T09:00:00Z", "author": {"login": "coderabbitai[bot]"}},
+                        {"databaseId": 42, "body": "✅ Review thread resolved.", "createdAt": "2026-09-28T10:00:00Z", "author": {"login": "coderabbitai[bot]"}},
+                    ]
+                },
+            }
+        )
+        threads = self._client(payload).review_threads(7)
+        self.assertEqual(
+            coderabbit.thread_resolution(threads[0]["comments"], "coderabbitai[bot]"),
+            "resolved",
+        )
+        self.assertEqual(
+            [item["id"] for item in coderabbit.pending_thread_normalizations(threads, "coderabbitai[bot]")],
+            ["T1"],
+        )
+
+    def test_a_human_reply_does_not_claim_a_provider_verdict(self):
+        payload = self._payload(
+            {
+                "id": "T1",
+                "isResolved": False,
+                "isOutdated": False,
+                "comments": {
+                    "nodes": [
+                        {"databaseId": 41, "body": "leak", "createdAt": "2026-09-28T09:00:00Z", "author": {"login": "coderabbitai[bot]"}},
+                        {"databaseId": 42, "body": "✅ resolved", "createdAt": "2026-09-28T10:00:00Z", "author": {"login": "a-human"}},
+                    ]
+                },
+            }
+        )
+        threads = self._client(payload).review_threads(7)
+        self.assertEqual(coderabbit.thread_resolution(threads[0]["comments"], "coderabbitai[bot]"), "")
+
+    def test_unknown_thread_state_is_none(self):
+        self.assertIsNone(self._client({"errors": [{"message": "boom"}]}).review_threads(7))
+
+
+class ResolveReviewThreadTests(unittest.TestCase):
+    def _client(self, payload):
+        def opener(request, timeout):
+            return payload, ""
+
+        return GitHubClient("token", "o/r", opener=opener)
+
+    def test_a_confirmed_resolution_is_accepted(self):
+        payload = {"data": {"resolveReviewThread": {"thread": {"isResolved": True}}}}
+        self._client(payload).resolve_review_thread("T1")
+
+    def test_a_silent_failure_is_an_error(self):
+        """A 200 that does not confirm resolution must not read as success."""
+
+        payload = {"data": {"resolveReviewThread": {"thread": {"isResolved": False}}}}
+        with self.assertRaises(GitHubError):
+            self._client(payload).resolve_review_thread("T1")
+
+    def test_an_error_payload_raises(self):
+        with self.assertRaises(GitHubError):
+            self._client({"errors": [{"message": "not allowed"}]}).resolve_review_thread("T1")
+
+    def test_a_missing_thread_id_is_rejected_before_the_call(self):
+        client = self._client({"data": {}})
+        with self.assertRaises(GitHubError):
+            client.resolve_review_thread("")
 
 
 class FileContentTests(unittest.TestCase):

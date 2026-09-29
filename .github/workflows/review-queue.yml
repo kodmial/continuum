@@ -96,11 +96,18 @@ on:
 
 permissions: {}
 
-# One controller at a time decides who gets the next shared provider slot. A new
-# wake-up supersedes a run that is only waiting out a cooldown.
+# One controller at a time decides who gets the next shared provider slot.
+#
+# This controller deliberately stays alive to wait out a provider cooldown, and
+# `cancel-in-progress` must stay false. A status, check, or comment event fires
+# constantly, so cancelling on every wake-up restarts the in-run wait each time:
+# the cooldown is never actually waited out, the queue never advances, and
+# frequent events starve it permanently. Keeping one runner alive lets it sleep
+# through the cooldown; GitHub concurrency holds at most one pending successor
+# behind it, so the group still guarantees a single controller.
 concurrency:
   group: continuum-review-queue
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   reconcile:

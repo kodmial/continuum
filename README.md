@@ -49,6 +49,28 @@ The normative rules are in
 [docs/continuum-mvp-contract.md](docs/continuum-mvp-contract.md), and the
 reference resolver plus its test suite live in `.github/scripts/`.
 
+## Parity ledger
+
+Every capability Continuum was extracted from has a recorded disposition:
+`absorbed`, `must-port`, `consumer-local`, `superseded`, or
+`not-applicable`. The machine-readable ledger is
+[`parity/ledger.v1.json`](parity/ledger.v1.json); the rules, the audited
+repositories, and how to add an entry are in
+[docs/parity-ledger.md](docs/parity-ledger.md).
+
+```console
+$ continuum parity-check
+Parity ledger ledger.v1: 26 entries audited at 64e89a3b.
+  absorbed         11
+  must-port        0
+  ...
+```
+
+CI validates it on every pull request. An invented disposition, a reference
+that is not a full commit sha, or an `absorbed` entry naming a module that is
+not in the tree all fail the build, because a parity claim nobody can check is
+just a comment.
+
 That contract file is distinct from the operational `.continuum.yml` this
 repository validates with `continuum cli config-check`; the sections below
 describe the implementation that sits behind the two toggles.

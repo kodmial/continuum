@@ -335,6 +335,96 @@ class LockTests(unittest.TestCase):
         self.assertEqual(plan.selected.pr_number, 57)
 
 
+class ReviewGenerationTests(unittest.TestCase):
+    """A pull request that keeps asking for rereviews must not starve the rest.
+
+    The production failure was a single pull request that drew a rereview every
+    time it became eligible: it was re-selected each cycle, and every unreviewed
+    pull request behind it never reached the provider at all.
+    """
+
+    def test_a_first_review_outranks_a_rereview_of_an_older_pull_request(self):
+        plan = queue.reconcile(
+            state(
+                candidate(57, review=queue.REVIEW_RETRY, full_reviews=1, due_at_ms=NOW),
+                candidate(59, review=queue.REVIEW_UNREVIEWED, full_reviews=0),
+            ),
+            policy(),
+        )
+        self.assertEqual(plan.action, queue.ACTION_DISPATCH)
+        self.assertEqual(plan.selected.pr_number, 59)
+
+    def test_repeated_rereviews_of_one_pull_request_cannot_hold_the_slot(self):
+        # The lower PR number would win every tie-break if generation were ignored.
+        for cycle in range(3):
+            plan = queue.reconcile(
+                state(
+                    candidate(10, review=queue.REVIEW_RETRY, full_reviews=cycle + 1, due_at_ms=NOW),
+                    candidate(20, review=queue.REVIEW_UNREVIEWED, full_reviews=0),
+                ),
+                policy(),
+            )
+            self.assertEqual(plan.selected.pr_number, 20, "cycle {}".format(cycle))
+            # The rereview is not lost, it is second in the queue.
+            self.assertEqual(plan.queue[1].pr_number, 10, "cycle {}".format(cycle))
+
+    def test_priority_still_outranks_review_generation(self):
+        plan = queue.reconcile(
+            state(
+                candidate(
+                    57,
+                    priority="priority:p1",
+                    review=queue.REVIEW_RETRY,
+                    full_reviews=5,
+                    due_at_ms=NOW,
+                ),
+                candidate(59, priority="priority:p2", review=queue.REVIEW_UNREVIEWED, full_reviews=0),
+            ),
+            policy(),
+        )
+        self.assertEqual(plan.selected.pr_number, 57)
+
+    def test_the_count_is_taken_over_the_whole_pull_request_history(self):
+        # A fourth push onto an already-reviewed pull request has not reset its
+        # quota consumption, so it is still a rereview, not a first review.
+        plan = queue.reconcile(
+            state(
+                candidate(57, review=queue.REVIEW_UNREVIEWED, full_reviews=3, due_at_ms=NOW),
+                candidate(59, review=queue.REVIEW_UNREVIEWED, full_reviews=0, due_at_ms=NOW),
+            ),
+            policy(),
+        )
+        self.assertEqual(plan.selected.pr_number, 59)
+        self.assertEqual(plan.queue[1].pr_number, 57)
+
+    def test_within_one_class_an_earlier_rereview_still_beats_a_later_one(self):
+        plan = queue.reconcile(
+            state(
+                candidate(57, review=queue.REVIEW_RETRY, full_reviews=4, due_at_ms=NOW),
+                candidate(59, review=queue.REVIEW_RETRY, full_reviews=1, due_at_ms=NOW),
+            ),
+            policy(),
+        )
+        self.assertEqual(plan.selected.pr_number, 59)
+
+    def test_the_reported_queue_shows_the_generation_that_decided_the_order(self):
+        # The log is how an operator tells starvation from a quiet queue, so the
+        # count that drove the ordering has to be visible in it.
+        plan = queue.reconcile(
+            state(
+                candidate(57, review=queue.REVIEW_RETRY, full_reviews=3, due_at_ms=NOW),
+                candidate(59, review=queue.REVIEW_UNREVIEWED),
+            ),
+            policy(),
+        )
+        self.assertIn("reviews=", logs(plan))
+
+    def test_ordering_is_deterministic_for_identical_candidates(self):
+        first = queue.rank_key(candidate(57), policy())
+        second = queue.rank_key(candidate(57), policy())
+        self.assertEqual(first, second)
+
+
 class CooldownTests(unittest.TestCase):
     def test_cooldown_is_respected_after_a_candidate_is_replaced(self):
         cooldown = queue.Cooldown(
@@ -352,7 +442,7 @@ class CooldownTests(unittest.TestCase):
         self.assertEqual(plan.action, queue.ACTION_WAIT)
         self.assertFalse(plan.dispatched)
         self.assertIn("PR #58 left queue: state=closed.", logs(plan))
-        self.assertIn("Next eligible review candidate: PR #57 (priority:p0).", logs(plan))
+        self.assertIn("Next eligible review candidate: PR #57 (priority:p0, reviews=0).", logs(plan))
         self.assertIn("Review provider cooldown still active for 18m 42s.", logs(plan))
 
     def test_cooldown_does_not_reorder_the_queue(self):
@@ -372,7 +462,9 @@ class CooldownTests(unittest.TestCase):
         plan = queue.reconcile(
             state(
                 candidate(57, review=queue.REVIEW_RETRY, due_at_ms=NOW + 5 * 60_000),
-                candidate(59),
+                # Draft, so the only thing the queue can act on is the not-due
+                # retry. An eligible first review would be dispatched instead.
+                candidate(59, draft=True),
             ),
             policy(),
         )
@@ -537,6 +629,32 @@ class ControllerTests(unittest.TestCase):
         # Every later wake-up is a no-op that names the held slot.
         self.assertEqual(plans[-1].action, queue.ACTION_WAIT)
         self.assertIn("no second review request will be sent", logs(plans[-1]))
+
+    def test_reviews_already_spent_are_counted_from_live_provider_state(self):
+        # The starvation fix is only real if the generation comes from what the
+        # provider actually did. #57 has two full reviews behind it and the lower
+        # PR number, so without the count it would win every tie-break forever.
+        client = self._repository(
+            pulls=[self._ready_pull(57), self._ready_pull(59)],
+            reviews={
+                57: [
+                    support.coderabbit_review("CHANGES_REQUESTED", review_id=1),
+                    support.coderabbit_review("COMMENTED", review_id=2),
+                ],
+                59: [],
+            },
+        )
+        self._green(client, 57, 59)
+
+        plan = controller.reconcile_once(
+            client,
+            support.queue_config(),
+            wake=queue.WakeUp(event="schedule"),
+            now=NOW,
+        )
+        self.assertEqual(plan.action, queue.ACTION_DISPATCH)
+        self.assertEqual(plan.selected.pr_number, 59)
+        self.assertIn("reviews=0", logs(plan))
 
     def test_a_restarted_controller_recovers_the_same_candidate_from_state(self):
         client = self._repository(pulls=[self._ready_pull(57), self._ready_pull(59)])

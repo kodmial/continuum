@@ -23,6 +23,18 @@ COMPLETED_RE = re.compile(r"review completed", re.I)
 
 OUTPUT_MARKERS = ("coderabbit", "walkthrough", "review details", "nitpick")
 
+# The verdict states that decide a pull request. COMMENTED is advisory: a
+# nitpick-only review is not a verdict and must never outlive a later decisive
+# review on the same head.
+DECISIVE_STATES = ("APPROVED", "CHANGES_REQUESTED")
+
+# CodeRabbit re-checks a fixed finding and answers in prose (`RESOLVED`,
+# "Review thread resolved") while the GitHub review thread keeps reporting
+# `isResolved: false`. Trusting only the flag is deadlock #37 root cause 1. An
+# explicit answer in either direction is authoritative; silence is not.
+RESOLVED_RE = re.compile(r"(?:^|\W)(?:review\s+thread\s+)?resolved\b", re.I)
+UNRESOLVED_RE = re.compile(r"(?:^|\W)unresolved\b", re.I)
+
 # CodeRabbit's shared included-review quota is a repository-wide resource, so
 # the queue must serialize against it. A rate-limit notice is the provider
 # telling us when the next slot exists; the countdown is parsed here, once.
@@ -192,6 +204,45 @@ def _matches_bot(login: str, bot_login: str) -> bool:
     return left == right or left.startswith(right.split("[", 1)[0])
 
 
+def _comment_login(comment: Dict[str, Any]) -> str:
+    """The comment author, across the REST and GraphQL field names."""
+
+    for key in ("user", "author"):
+        login = (comment.get(key) or {}).get("login")
+        if login:
+            return str(login)
+    return str(comment.get("login") or comment.get("user") or "")
+
+
+def _comment_ms(comment: Dict[str, Any]) -> int:
+    """Publication time of a comment, in epoch ms; 0 when unparseable.
+
+    Zero sorts first, which keeps an unparseable timestamp in the older bucket.
+    Failing that way is deliberate: output the adapter cannot place in time is
+    treated as predating the approval rather than silently escaping it.
+    """
+
+    published = parse_time(
+        comment.get("created_at")
+        or comment.get("createdAt")
+        or comment.get("updated_at")
+        or comment.get("updatedAt")
+    )
+    return int(published.timestamp() * 1000) if published else 0
+
+
+def _review_threads(client: Any, pr_number: int) -> Optional[List[Dict[str, Any]]]:
+    """Full thread state, or None when the client cannot read it."""
+
+    reader = getattr(client, "review_threads", None)
+    if reader is None:
+        return None
+    try:
+        return reader(pr_number)
+    except Exception:  # noqa: BLE001 - unknown thread state must fail closed
+        return None
+
+
 def latest_status(statuses: Sequence[Dict[str, Any]], context: str) -> Optional[Dict[str, Any]]:
     matching = [
         status
@@ -224,6 +275,126 @@ def latest_review(
     return sorted(candidates, key=lambda review: int(review.get("id") or 0))[-1]
 
 
+def latest_decisive_review(
+    reviews: Sequence[Dict[str, Any]], bot_login: str, head_sha: str
+) -> Optional[Dict[str, Any]]:
+    """Newest APPROVED/CHANGES_REQUESTED review bound to the exact head.
+
+    A `Review skipped` status can overwrite the status surface for a head that
+    already carries a durable GitHub review, so the review record, not the
+    status, is the acceptance basis. That only works if the review is bound to
+    the same immutable SHA CI is bound to.
+    """
+
+    candidates = [
+        review
+        for review in reviews or []
+        if _matches_bot(((review.get("user") or {}).get("login") or ""), bot_login)
+        and (review.get("commit_id") or "").lower() == (head_sha or "").lower()
+        and review.get("state") in DECISIVE_STATES
+    ]
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda review: int(review.get("id") or 0))[-1]
+
+
+def approved_at_ms(
+    reviews: Sequence[Dict[str, Any]], bot_login: str, head_sha: str
+) -> int:
+    """Publication time of the newest exact-head APPROVED review, in ms.
+
+    Provider output published strictly before this instant on the same head was
+    advisory and has been adjudicated: a later APPROVED supersedes it. Output
+    published after it has not, and still blocks.
+    """
+
+    approved = latest_decisive_review(reviews, bot_login, head_sha)
+    if approved is None or approved.get("state") != "APPROVED":
+        return 0
+    published = parse_time(approved.get("submitted_at"))
+    return int(published.timestamp() * 1000) if published else 0
+
+
+def thread_resolution(comments: Sequence[Dict[str, Any]], bot_login: str) -> str:
+    """What the provider's newest reply in one thread says about it.
+
+    `"resolved"`, `"unresolved"`, or `""` when the provider said nothing. Silence
+    is not a resolution: an unanswered thread keeps whatever GitHub's flag says.
+    """
+
+    # GraphQL review threads name the author `author` and the time `createdAt`;
+    # REST review comments name them `user` and `created_at`. Both reach here.
+    replies = [
+        comment
+        for comment in comments or []
+        if _matches_bot(_comment_login(comment), bot_login)
+        and str(comment.get("body") or "").strip()
+    ]
+    if not replies:
+        return ""
+    newest = max(
+        replies,
+        key=lambda comment: (
+            str(comment.get("created_at") or comment.get("createdAt") or ""),
+            int(comment.get("databaseId") or comment.get("id") or 0),
+        ),
+    )
+    body = str(newest.get("body") or "")
+    # Unresolved is checked first: "not resolved" and "unresolved" both contain
+    # "resolved", so a naive order would read an explicit refusal as agreement.
+    if UNRESOLVED_RE.search(body):
+        return "unresolved"
+    if RESOLVED_RE.search(body):
+        return "resolved"
+    return ""
+
+
+def thread_resolution_by_comment(
+    threads: Optional[Sequence[Dict[str, Any]]], bot_login: str
+) -> Dict[int, str]:
+    """Explicit provider resolution per comment id, keyed by comment id.
+
+    Empty when thread state is unknown, so a caller can keep every thread.
+    """
+
+    if threads is None:
+        return {}
+    verdicts: Dict[int, str] = {}
+    for thread in threads:
+        if thread.get("is_outdated"):
+            continue
+        verdict = thread_resolution(thread.get("comments") or [], bot_login)
+        if not verdict:
+            continue
+        for comment in thread.get("comments") or []:
+            database_id = comment.get("databaseId")
+            if database_id is not None:
+                verdicts[int(database_id)] = verdict
+    return verdicts
+
+
+def pending_thread_normalizations(
+    threads: Optional[Sequence[Dict[str, Any]]], bot_login: str
+) -> List[Dict[str, Any]]:
+    """Threads GitHub still calls unresolved that the provider declared resolved.
+
+    These are the #37 deadlock: a fixed finding whose textual resolution never
+    reached GitHub's own state. Normalizing them is what stops the gate from
+    re-requesting verification of a finding that is already fixed.
+    """
+
+    if threads is None:
+        return []
+    pending: List[Dict[str, Any]] = []
+    for thread in threads:
+        if thread.get("is_resolved") or thread.get("is_outdated"):
+            continue
+        if thread_resolution(thread.get("comments") or [], bot_login) != "resolved":
+            continue
+        pending.append({"id": str(thread.get("id") or ""), "comments": thread.get("comments") or []})
+    return pending
+
+
 def collect(
     client: Any,
     pr_number: int,
@@ -232,7 +403,13 @@ def collect(
     bot_login: str = DEFAULT_BOT_LOGIN,
     status_context: str = DEFAULT_STATUS_CONTEXT,
 ) -> ProviderSnapshot:
-    """Read CodeRabbit's status, verdict, threads, and summary for this PR."""
+    """Read CodeRabbit's status, verdict, threads, and summary for this PR.
+
+    Both deadlock surfaces are resolved here rather than in the generic gate,
+    because both are facts about how this provider publishes: only this adapter
+    knows which of its own records are decisive and which of its own replies
+    claim a thread is resolved.
+    """
 
     issue_comments = client.list_issue_comments(int(pr_number))
     review_comments = client.list_review_comments(int(pr_number))
@@ -246,29 +423,49 @@ def collect(
     provider_review_comments = [
         comment
         for comment in review_comments
-        if _matches_bot(((comment.get("user") or {}).get("login") or ""), bot_login)
+        if _matches_bot(_comment_login(comment), bot_login)
     ]
 
-    extra_reason: Optional[str] = None
+    reviews = client.list_reviews(int(pr_number))
+    approval_ms = approved_at_ms(reviews, bot_login, head_sha)
+    # A provider can overwrite the status surface for a head it already reviewed
+    # (`Review skipped`), so a durable exact-head approval outranks the status:
+    # the review is the acceptance basis, and the status is kept for pending and
+    # rate-limit state only. Without an approval the status is all there is, and
+    # an unusable one fails closed.
+    status = None
     try:
         status_payload = client.combined_status_for_ref(head_sha)
         status = latest_status(status_payload.get("statuses") or [], status_context)
     except Exception:  # noqa: BLE001 - unknown status must fail closed
         status = None
+    status_problem = ""
     if status is None:
-        extra_reason = (
+        status_problem = (
             f"the review provider reported no {status_context!r} status for this HEAD, "
             "so the diff is unverified"
         )
     elif status.get("state") != "success" or not COMPLETED_RE.search(
         str(status.get("description") or "")
     ):
-        extra_reason = (
+        status_problem = (
             f"the {status_context!r} status for this HEAD is "
             f"{status.get('state') or 'unknown'}: {str(status.get('description') or '')[:200]}"
         )
+    extra_reason = status_problem if not approval_ms else None
 
-    reviews = client.list_reviews(int(pr_number))
+    # Output the provider published before its own approval was advisory and has
+    # been adjudicated. Anything newer has not been reviewed yet and still blocks.
+    if approval_ms:
+        provider_review_comments = [
+            comment
+            for comment in provider_review_comments
+            if _comment_ms(comment) >= approval_ms
+        ]
+        summary_comments = [
+            comment for comment in summary_comments if _comment_ms(comment) >= approval_ms
+        ]
+
     decision = latest_review(reviews, bot_login, head_sha)
     decision_state = (decision or {}).get("state")
     forced_titles: List[str] = []
@@ -279,6 +476,22 @@ def collect(
         if not forced_titles:
             forced_titles = ["CodeRabbit requested changes on this HEAD without an inline finding."]
 
+    threads = _review_threads(client, int(pr_number))
+    verdicts = thread_resolution_by_comment(threads, bot_login)
+    superseded = {
+        comment_id for comment_id, verdict in verdicts.items() if verdict == "resolved"
+    }
+    # A thread the provider called unresolved blocks even when GitHub's own flag
+    # says it is closed, so those ids are added back to the unresolved set. Only an
+    # unknown thread state is left alone: a null answer is not permission to guess.
+    unresolved = client.unresolved_thread_comment_ids(int(pr_number))
+    if unresolved is not None:
+        unresolved = set(unresolved) | {
+            comment_id
+            for comment_id, verdict in verdicts.items()
+            if verdict == "unresolved"
+        }
+
     return ProviderSnapshot(
         provider=PROVIDER_NAME,
         bot_logins=(bot_login,),
@@ -286,13 +499,21 @@ def collect(
         output_markers=OUTPUT_MARKERS,
         summary_comments=summary_comments,
         review_comments=provider_review_comments,
-        unresolved_ids=client.unresolved_thread_comment_ids(int(pr_number)),
+        unresolved_ids=unresolved,
         summary_parser=parse_summary,
         is_boilerplate=is_boilerplate_title,
         extra_reason=extra_reason,
         forced_open_titles=forced_titles,
         provider_decision=decision_state,
-        metadata={"status_context": status_context, "review_id": (decision or {}).get("id")},
+        superseded_thread_ids=superseded,
+        approved_at_ms=approval_ms,
+        metadata={
+            "status_context": status_context,
+            "review_id": (decision or {}).get("id"),
+            "status_only": bool(approval_ms),
+            "thread_state_known": threads is not None,
+            "threads_to_normalize": len(pending_thread_normalizations(threads, bot_login)),
+        },
     )
 
 

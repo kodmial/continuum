@@ -22,13 +22,19 @@ REVIEW_THREADS_QUERY = (
     " repository(owner: $owner, name: $name) {"
     "  pullRequest(number: $pr) {"
     "   reviewThreads(first: 100, after: $after) {"
-    "    nodes { isResolved isOutdated"
-    "     comments(first: 100) { nodes { databaseId } }"
+    "    nodes { id isResolved isOutdated"
+    "     comments(first: 100) { nodes { databaseId body createdAt author { login } } }"
     "    }"
     "    pageInfo { hasNextPage endCursor }"
     "   }"
     "  }"
     " }"
+    "}"
+)
+
+RESOLVE_REVIEW_THREAD_MUTATION = (
+    "mutation($threadId: ID!) {"
+    " resolveReviewThread(input: {threadId: $threadId}) { thread { isResolved } }"
     "}"
 )
 
@@ -181,15 +187,20 @@ class GitHubClient:
             return None
 
     # -- review thread state ----------------------------------------------
-    def unresolved_thread_comment_ids(self, pr_number: int) -> Optional[Set[int]]:
-        """Comment ids in unresolved, non-outdated threads.
+    def review_threads(self, pr_number: int) -> Optional[List[Dict[str, Any]]]:
+        """Every review thread with its comment bodies, newest last.
 
-        Returns None when the state cannot be determined. Callers must keep
-        every inline thread in that case: an unknown thread state may never be
-        treated as "no findings".
+        The comment bodies are part of the result because a provider can state a
+        resolution in prose that GitHub's own `isResolved` flag does not reflect.
+        That divergence is the deadlock #37 describes, and a caller cannot detect
+        it from the flag alone.
+
+        Returns None when the state cannot be determined. Callers must keep every
+        inline thread in that case: an unknown thread state may never be treated
+        as "no findings".
         """
 
-        unresolved: Set[int] = set()
+        threads: List[Dict[str, Any]] = []
         after: Optional[str] = None
         try:
             while True:
@@ -209,15 +220,26 @@ class GitHubClient:
                 )
                 if not pull_request:
                     return None
-                threads = pull_request.get("reviewThreads") or {}
-                for node in threads.get("nodes") or []:
-                    if node.get("isResolved") or node.get("isOutdated"):
-                        continue
-                    for comment in (node.get("comments") or {}).get("nodes") or []:
-                        database_id = comment.get("databaseId")
-                        if database_id is not None:
-                            unresolved.add(int(database_id))
-                page = threads.get("pageInfo") or {}
+                for node in (pull_request.get("reviewThreads") or {}).get("nodes") or []:
+                    comments = [
+                        dict(comment)
+                        for comment in (node.get("comments") or {}).get("nodes") or []
+                    ]
+                    comments.sort(
+                        key=lambda comment: (
+                            str(comment.get("createdAt") or ""),
+                            int(comment.get("databaseId") or 0),
+                        )
+                    )
+                    threads.append(
+                        {
+                            "id": node.get("id") or "",
+                            "is_resolved": bool(node.get("isResolved")),
+                            "is_outdated": bool(node.get("isOutdated")),
+                            "comments": comments,
+                        }
+                    )
+                page = (pull_request.get("reviewThreads") or {}).get("pageInfo") or {}
                 if not page.get("hasNextPage"):
                     break
                 after = page.get("endCursor")
@@ -225,7 +247,46 @@ class GitHubClient:
                     break
         except GitHubError:
             return None
+        return threads
+
+    def unresolved_thread_comment_ids(self, pr_number: int) -> Optional[Set[int]]:
+        """Comment ids in unresolved, non-outdated threads.
+
+        Returns None when the state cannot be determined. Callers must keep
+        every inline thread in that case: an unknown thread state may never be
+        treated as "no findings".
+        """
+
+        threads = self.review_threads(pr_number)
+        if threads is None:
+            return None
+        unresolved: Set[int] = set()
+        for thread in threads:
+            if thread.get("is_resolved") or thread.get("is_outdated"):
+                continue
+            for comment in thread.get("comments") or []:
+                database_id = comment.get("databaseId")
+                if database_id is not None:
+                    unresolved.add(int(database_id))
         return unresolved
+
+    def resolve_review_thread(self, thread_id: str) -> None:
+        """Mark a review thread resolved in GitHub's own state.
+
+        Raises `GitHubError` when GitHub refuses. A caller must treat that as
+        blocking rather than proceeding: a thread that reads as unresolved in
+        GitHub while the provider declared it resolved is exactly the state that
+        would otherwise leave a fixed finding open forever.
+        """
+
+        if not thread_id:
+            raise GitHubError("Cannot resolve a review thread without its id")
+        response = self.graphql(RESOLVE_REVIEW_THREAD_MUTATION, {"threadId": str(thread_id)})
+        if response.get("errors"):
+            raise GitHubError(f"GitHub refused to resolve review thread: {response['errors']}")
+        thread = ((response.get("data") or {}).get("resolveReviewThread") or {}).get("thread")
+        if not thread or not thread.get("isResolved"):
+            raise GitHubError(f"GitHub did not report thread {thread_id} as resolved")
 
     # -- review gate writes -----------------------------------------------
     def create_review(self, pr_number: int, head_sha: str, body: str, event: str) -> Dict[str, Any]:

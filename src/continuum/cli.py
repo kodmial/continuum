@@ -15,6 +15,8 @@ import sys
 from typing import Any, Dict, Optional, Sequence
 
 from . import config as config_module
+from . import credentials as credentials_module
+from . import parity as parity_module
 from .release import adapters as release_adapters
 from .release import run as release_run
 from .review import commands as command_module
@@ -288,6 +290,63 @@ def cmd_verify(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_credentials_check(args: argparse.Namespace) -> int:
+    """Fail closed if a workflow credential field uses escaped expression syntax."""
+
+    findings = credentials_module.scan_workflows(args.root)
+    for line in credentials_module.render(findings):
+        print(line)
+    print(credentials_module.describe(findings))
+    _write_output({"findings": str(len(findings))})
+    return EXIT_ERROR if findings else EXIT_OK
+
+
+def cmd_parity_check(args: argparse.Namespace) -> int:
+    """Validate the parity ledger, and report what it claims.
+
+    The claim is the output, not a side effect: `parity check` prints the
+    disposition counts and the outstanding questions so the ledger can be read in
+    a pull request diff, and it exits non-zero on any of them.
+    """
+
+    try:
+        ledger = parity_module.load(args.ledger)
+    except parity_module.LedgerError as exc:
+        print(f"::error::{exc}")
+        _write_output({"entries": "0", "problems": ""})
+        return EXIT_ERROR
+
+    problems = parity_module.check(ledger)
+    described = ledger.describe()
+    if args.json:
+        _print_json({"ledger": described, "problems": problems})
+    else:
+        print(
+            "Parity ledger {version}: {count} entries audited at {audited_at}.".format(
+                version=described["version"],
+                count=len(ledger.entries),
+                audited_at=ledger.audited_at,
+            )
+        )
+        for disposition in parity_module.DISPOSITIONS:
+            print("  {:<16} {}".format(disposition, described["counts"][disposition]))
+        for entry in ledger.entries:
+            evidence = entry.module or ", ".join(entry.paths) or entry.rationale
+            print("  {} [{}] {}".format(entry.id, entry.disposition, entry.capability))
+            print("      evidence: {}".format(evidence))
+        for problem in problems:
+            print(f"::error::{problem}")
+
+    _write_output(
+        {
+            "entries": str(len(ledger.entries)),
+            "problems": str(len(problems)),
+            "must_port": str(len(ledger.by_disposition("must-port"))),
+        }
+    )
+    return EXIT_ERROR if problems else EXIT_OK
+
+
 def cmd_provider(args: argparse.Namespace) -> int:
     """Report the configured provider and its non-sensitive requirements."""
 
@@ -551,6 +610,43 @@ def build_parser() -> argparse.ArgumentParser:
     config_check = sub.add_parser("config-check", help="Validate .continuum.yml.")
     add_common(config_check)
     config_check.set_defaults(func=cmd_config_check)
+
+    credentials_check = sub.add_parser(
+        "credentials-check",
+        help="Fail closed on escaped GitHub expressions in workflow credential fields.",
+        description=(
+            "A generated workflow can carry GH_TOKEN: \\\\${{ secrets.X }} into the file "
+            "the runner reads, and every authenticated call then fails with 401. This "
+            "scans .github/workflows credential fields and fails closed."
+        ),
+    )
+    credentials_check.add_argument(
+        "--root",
+        default=".",
+        help="Repository root containing .github/workflows (default: .).",
+    )
+    credentials_check.set_defaults(func=cmd_credentials_check)
+
+    parity_check = sub.add_parser(
+        "parity-check",
+        help="Validate the cross-repository parity ledger.",
+        description=(
+            "Every audited source capability carries one disposition and one full "
+            "commit sha, and every absorbed capability names the Continuum module or "
+            "path that carries it. Anything that cannot be checked fails the command."
+        ),
+    )
+    parity_check.add_argument(
+        "--ledger",
+        default=str(parity_module.DEFAULT_LEDGER_PATH),
+        help="Ledger document to validate (default: parity/ledger.v1.json).",
+    )
+    parity_check.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the whole ledger as JSON instead of a summary.",
+    )
+    parity_check.set_defaults(func=cmd_parity_check)
 
     provider = sub.add_parser("provider", help="Report the configured review provider.")
     add_common(provider)

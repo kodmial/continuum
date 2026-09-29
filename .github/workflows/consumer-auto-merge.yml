@@ -24,6 +24,11 @@ on:
         type: string
         required: false
         default: continuum/review
+      review_queue_workflow:
+        description: "The consumer's review queue entry workflow, woken when a green pull request's review gate is closed"
+        type: string
+        required: false
+        default: review-queue.yml
       scheduler_workflow:
         type: string
         required: false
@@ -53,6 +58,7 @@ jobs:
           CI_WORKFLOW: ${{ inputs.ci_workflow }}
           ADDITIONAL_BLOCKING_WORKFLOWS: ${{ inputs.additional_blocking_workflows }}
           REVIEW_CONTEXT: ${{ inputs.review_status_context }}
+          REVIEW_QUEUE_WORKFLOW: ${{ inputs.review_queue_workflow }}
           SCHEDULER_WORKFLOW: ${{ inputs.scheduler_workflow }}
           RELEASE_WORKFLOW: ${{ inputs.release_workflow }}
         with:
@@ -119,6 +125,37 @@ jobs:
               return Boolean(status && status.state === 'success');
             }
 
+            // A green pull request with a closed review gate is exactly the case
+            // where nothing merges, and a head with no approval and no further
+            // change emits no event that would otherwise start the serialized
+            // review queue. This reconciliation is the only place that sees the
+            // state, so it wakes the queue once. It is a wake-up and not an
+            // authorization: the queue recomputes eligibility from live state
+            // before spending shared quota.
+            let queueWoken = false;
+            async function wakeReviewQueue(number) {
+              const workflow = process.env.REVIEW_QUEUE_WORKFLOW;
+              if (queueWoken || !workflow) return;
+              if (!/^[A-Za-z0-9._/-]+$/.test(workflow)) {
+                core.warning(`Ignoring an invalid review queue workflow name: ${workflow}`);
+                return;
+              }
+              queueWoken = true;
+              try {
+                await github.rest.actions.createWorkflowDispatch({
+                  owner, repo,
+                  workflow_id: workflow,
+                  ref: context.payload.repository?.default_branch || 'main',
+                  inputs: {reason: `auto-merge found a green pull request with a closed review gate: ${number}`}
+                });
+                core.info(`PR #${number}: review gate is closed; woke ${workflow}.`);
+              } catch (err) {
+                // The queue's own event coverage and schedule remain able to
+                // make progress, so a refused dispatch must not fail this run.
+                core.warning(`Could not wake ${workflow}: ${err.message}`);
+              }
+            }
+
             const prs = await github.paginate(github.rest.pulls.list, {
               owner, repo, state:'open', base:'main', per_page:100
             });
@@ -143,6 +180,7 @@ jobs:
               }
               if (!(await reviewGreen(listed.head.sha))) {
                 core.info(`PR #${listed.number}: review gate is not green.`);
+                await wakeReviewQueue(listed.number);
                 continue;
               }
 

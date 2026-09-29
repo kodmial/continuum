@@ -56,6 +56,7 @@ jobs:
     outputs:
       merge_plan: ${{ steps.build.outputs.merge_plan }}
       approved_count: ${{ steps.plan.outputs.approved_count }}
+      review_wake: ${{ steps.build.outputs.review_wake }}
 
     steps:
       - name: Checkout trusted policy
@@ -114,11 +115,14 @@ jobs:
           if [[ -z "$APPROVED" ]]; then
             echo "[]" > "$RUNNER_TEMP/merge-plan.json"
             echo "merge_plan=" >> "$GITHUB_OUTPUT"
+            echo "review_wake=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           entries="$RUNNER_TEMP/merge-plan.jsonl"
           : > "$entries"
+          review_wake="$RUNNER_TEMP/review-wake.txt"
+          : > "$review_wake"
 
           IFS=',' read -ra numbers <<<"$APPROVED"
           for number in "${numbers[@]}"; do
@@ -184,22 +188,37 @@ jobs:
               gate=$(gh api "repos/$GITHUB_REPOSITORY/commits/$head_sha/status" \
                 | jq -c --arg context "$STATUS_CONTEXT" \
                     '[.statuses[]? | select(.context == $context)] | .[0] // null')
+              # A closed gate on a PR that is otherwise ready is the one case
+              # this controller cannot fix by waiting: the provider request is
+              # owned by the serialized review queue, and a green head with no
+              # approval produces no event that would otherwise start it. Record
+              # the number so the write job can wake that controller once. This
+              # is a wake-up, not an authorization: the queue recomputes
+              # eligibility from state and may decide nothing is due.
               if [[ "$gate" == "null" ]]; then
-                echo "PR #$number: no '$STATUS_CONTEXT' status for $head_sha."; continue
+                echo "PR #$number: no '$STATUS_CONTEXT' status for $head_sha."
+                echo "$number" >> "$review_wake"
+                continue
               fi
               if [[ "$(jq -r '.state' <<<"$gate")" != "success" ]]; then
-                echo "PR #$number: '$STATUS_CONTEXT' status is $(jq -r '.state' <<<"$gate")."; continue
+                echo "PR #$number: '$STATUS_CONTEXT' status is $(jq -r '.state' <<<"$gate")."
+                echo "$number" >> "$review_wake"
+                continue
               fi
               contract=$(jq -rc --arg head "$head_sha" \
                 '(.description // "")
                  | capture("verdict=(?<verdict>[A-Z_]+) state=(?<state>[a-z_]+) provider=(?<provider>[a-z0-9-]+) head=(?<head>[0-9a-fA-F]+)")? // null' \
                 <<<"$gate")
               if [[ "$contract" == "null" ]]; then
-                echo "PR #$number: '$STATUS_CONTEXT' description is not the normalized contract."; continue
+                echo "PR #$number: '$STATUS_CONTEXT' description is not the normalized contract."
+                echo "$number" >> "$review_wake"
+                continue
               fi
               if [[ "$(jq -r '.verdict' <<<"$contract")" != "APPROVE" \
                  || "$(jq -r '.head' <<<"$contract")" != "$head_sha" ]]; then
-                echo "PR #$number: review gate closed on current HEAD ($(jq -r '.verdict' <<<"$contract"), head=$(jq -r '.head' <<<"$contract"))."; continue
+                echo "PR #$number: review gate closed on current HEAD ($(jq -r '.verdict' <<<"$contract"), head=$(jq -r '.head' <<<"$contract"))."
+                echo "$number" >> "$review_wake"
+                continue
               fi
             fi
 
@@ -227,6 +246,50 @@ jobs:
           echo "$plan" > "$RUNNER_TEMP/merge-plan.json"
           echo "Executable plan: $(jq -c '[.[].number]' <<<"$plan")"
           echo "merge_plan=$(jq -c '.' <<<"$plan")" >> "$GITHUB_OUTPUT"
+          # One dispatch per run, not per pull request: the queue is a single
+          # serialized controller, and a candidate it selects is chosen from
+          # live state anyway.
+          review_wake_numbers="$(paste -sd, - < "$review_wake")"
+          echo "Review-gate-blocked candidates: ${review_wake_numbers:-none}"
+          echo "review_wake=$review_wake_numbers" >> "$GITHUB_OUTPUT"
+
+  # A green pull request whose review gate is closed cannot be fixed by
+  # merging, and it is exactly the case where nothing is approved: a head with
+  # no approval and no further change produces no event that would otherwise
+  # start the serialized review queue. This job therefore depends on `plan`
+  # alone, not on the merge controller, or the wake-up would only ever fire when
+  # there was nothing to wake. It is a wake-up, not an authorization: the queue
+  # recomputes eligibility from live state before spending shared quota. A failed
+  # dispatch is a warning, because the queue's own event coverage and schedule
+  # remain able to make progress.
+  wake-review-queue:
+    needs: plan
+    if: needs.plan.outputs.review_wake != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    permissions:
+      actions: write
+      contents: read
+
+    steps:
+      - name: Wake the review queue for review-gate-blocked pull requests
+        env:
+          REVIEW_WAKE: ${{ needs.plan.outputs.review_wake }}
+          CONTINUUM_BASE_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
+          GH_TOKEN: ${{ secrets.TAP_PAT || github.token }}
+        run: |
+          set -euo pipefail
+          echo "Review-gate-blocked candidates: $REVIEW_WAKE"
+          if gh api --method POST \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/review-queue.yml/dispatches" \
+            -f ref="$CONTINUUM_BASE_BRANCH" \
+            -f "inputs[reason]=auto-merge found a green pull request with a closed review gate: $REVIEW_WAKE" \
+            >/dev/null 2>&1; then
+            echo "::notice::Woke the review queue for: $REVIEW_WAKE"
+          else
+            echo "::warning::Could not wake the review queue; its own event coverage and schedule still apply."
+          fi
 
   reconcile:
     needs: plan

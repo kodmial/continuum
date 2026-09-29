@@ -14,6 +14,8 @@ import pathlib
 import re
 import unittest
 
+import yaml
+
 from continuum.review import queue
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -22,6 +24,8 @@ CONSUMER = (
     ROOT / "fixtures" / "consumer-repo" / ".github" / "workflows" / "review-queue.yml"
 )
 CI = ROOT / ".github" / "workflows" / "ci.yml"
+AUTO_MERGE = ROOT / ".github" / "workflows" / "auto-merge.yml"
+CONSUMER_MERGE = ROOT / ".github" / "workflows" / "consumer-auto-merge.yml"
 
 # The reconciler is triggered by `pull_request_target` (trusted metadata, no
 # pull request code is ever checked out) but reasons about a pull request event.
@@ -140,7 +144,23 @@ class WakeUpTriggerTests(unittest.TestCase):
     def test_the_reconciler_is_single_flight(self):
         for name, text in (("shared", self.shared), ("consumer", self.consumer)):
             self.assertIn("group: continuum-review-queue", text, name)
-            self.assertIn("cancel-in-progress: true", text, name)
+            # One group and a queued successor bound the controller to a single
+            # runner without cancelling the run that is waiting out a cooldown.
+            self.assertIn("cancel-in-progress: false", text, name)
+            self.assertNotIn("cancel-in-progress: true", text, name)
+
+    def test_a_cooldown_wait_is_never_cancelled_by_a_new_event(self):
+        # The starvation fix. This controller sleeps through a shared provider
+        # cooldown, so `cancel-in-progress: true` would restart the sleep on
+        # every status/check/comment event and the queue would never advance.
+        self.assertIn("--wait-minutes", self.shared)
+        # The consumer entry declares the same wait window it passes down.
+        self.assertIn("wait_minutes:", self.consumer)
+        for name, text in (("shared", self.shared), ("consumer", self.consumer)):
+            self.assertIn("cancel-in-progress: false", text, name)
+        # The bound that replaces cancellation: an in-run wait cannot outlive
+        # the job, and the group's single pending successor bounds backlog.
+        self.assertIn("timeout-minutes: 75", self.shared)
 
     def test_the_job_runs_the_reconciler_and_its_config_gate(self):
         self.assertIn("continuum.cli config-check", self.shared)
@@ -176,6 +196,78 @@ class WakeUpTriggerTests(unittest.TestCase):
                 declared_types(self.shared, trigger),
                 trigger,
             )
+
+
+class ReviewGateWakeUpTests(unittest.TestCase):
+    """A green pull request with a closed gate has to wake the queue anyway.
+
+    The case that produced the stall is the one where nothing merges: no
+    approval means no merge controller work, and a head with no approval and no
+    further change emits no event that would otherwise start the serialized
+    review queue. If the wake-up rides on the merge controller it can therefore
+    only fire when there was nothing to wake.
+    """
+
+    def setUp(self):
+        self.auto_merge = AUTO_MERGE.read_text(encoding="utf-8")
+        self.document = yaml.safe_load(AUTO_MERGE.read_text(encoding="utf-8"))
+        self.jobs = self.document["jobs"]
+
+    def _step(self, job_name: str) -> str:
+        for step in self.jobs[job_name]["steps"]:
+            if "review-queue.yml/dispatches" in (step.get("run") or ""):
+                return step["run"]
+        raise AssertionError(f"{job_name} does not wake the review queue")
+
+    def test_the_wake_up_does_not_depend_on_an_approval(self):
+        wake = self.jobs["wake-review-queue"]
+        self.assertEqual(wake["needs"], "plan")
+        self.assertIn("review_wake", wake["if"])
+        # The merge controller is gated on an approval; depending on it here
+        # would make the wake-up unreachable exactly when it is needed.
+        self.assertEqual(self.jobs["reconcile"]["if"], "needs.plan.outputs.approved_count != '0'")
+
+    def test_the_wake_up_runs_only_when_something_is_blocked(self):
+        self.assertEqual(
+            self.jobs["wake-review-queue"]["if"], "needs.plan.outputs.review_wake != ''"
+        )
+
+    def test_the_wake_up_holds_only_what_dispatching_needs(self):
+        self.assertEqual(self.jobs["wake-review-queue"]["permissions"], {"actions": "write", "contents": "read"})
+
+    def test_the_dispatch_names_the_queue_and_records_why(self):
+        script = self._step("wake-review-queue")
+        self.assertIn("actions/workflows/review-queue.yml/dispatches", script)
+        self.assertIn("--method POST", script)
+        self.assertIn("inputs[reason]=", script)
+
+    def test_a_failed_wake_up_is_a_warning_not_a_failed_run(self):
+        # The queue has its own event coverage and schedule, so a dispatch that
+        # GitHub refuses must not fail a merge controller over it.
+        script = self._step("wake-review-queue")
+        self.assertIn("::warning::", script)
+        self.assertNotIn("exit 1", script)
+
+    def test_the_consumer_merge_path_wakes_the_queue_too(self):
+        # The consumer entry workflow is a separate implementation, so the shared
+        # wake-up does not reach consumers through it. Same rule, same reason.
+        text = CONSUMER_MERGE.read_text(encoding="utf-8")
+        self.assertIn("createWorkflowDispatch", text)
+        self.assertIn("REVIEW_QUEUE_WORKFLOW", text)
+        self.assertIn("review gate is not green", text)
+        # One dispatch per run, and never a reason to fail the merge controller.
+        self.assertIn("let queueWoken = false;", text)
+        self.assertIn("core.warning", text)
+
+    def test_the_consumer_queue_workflow_name_is_validated_before_dispatch(self):
+        text = CONSUMER_MERGE.read_text(encoding="utf-8")
+        self.assertIn("^[A-Za-z0-9._/-]+$", text)
+
+    def test_the_wake_up_is_not_also_inside_the_merge_controller(self):
+        # One dispatch per run, from one place, so the queue is not woken twice
+        # for the same state.
+        with self.assertRaises(AssertionError):
+            self._step("reconcile")
 
 
 class BoundaryTests(unittest.TestCase):

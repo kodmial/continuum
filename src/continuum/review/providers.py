@@ -8,7 +8,7 @@ unaware of it.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 from .. import config as config_module
 from . import coderabbit, pr_agent
@@ -117,6 +117,28 @@ def rate_limit_cooldown(
     if name == CODERABBIT:
         return coderabbit.rate_limit_cooldown(client, pr_number, bot_login=settings.bot_login)
     return 0, ""
+
+
+def full_review_count(name: str, reviews: Sequence[Any], settings: Any) -> int:
+    """How many full reviews the provider has already spent on this pull request.
+
+    The queue orders by this count so that one pull request cannot consume every
+    shared slot with repeated rereviews, so the count has to be the number of
+    reviews that actually consumed quota and not the number of review records:
+    a thread confirmation is a record and not a full review.
+
+    An unrecognized provider reports zero. A wrong count in the permissive
+    direction would let a first review be ordered behind a rereview, and a wrong
+    count in the strict direction would only reorder against a later
+    development of this function.
+    """
+
+    if name == CODERABBIT:
+        bot_login = getattr(settings, "bot_login", None) or coderabbit.DEFAULT_BOT_LOGIN
+        return sum(
+            1 for review in reviews or [] if coderabbit.is_full_review(review, bot_login)
+        )
+    return 0
 
 
 def provider_status_context(config: Any) -> str:

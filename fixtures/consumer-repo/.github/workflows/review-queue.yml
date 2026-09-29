@@ -53,9 +53,13 @@ permissions:
   pull-requests: write
   statuses: read
 
+# `cancel-in-progress` must stay false for the same reason as the shared
+# reconciler: this controller sleeps through a shared provider cooldown, and
+# cancelling on each wake-up would restart that sleep forever. See the shared
+# workflow's concurrency block.
 concurrency:
   group: continuum-review-queue
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   reconcile:

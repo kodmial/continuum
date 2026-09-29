@@ -340,6 +340,9 @@ def _observe(
     rate_limit_until, _reason = registry.rate_limit_cooldown(
         config.review.provider, client, settings, pr_number=number
     )
+    # Reviews already spent on this pull request. The queue orders on this so a
+    # pull request that keeps drawing rereviews cannot take every shared slot.
+    full_reviews = registry.full_review_count(config.review.provider, reviews, settings)
 
     review_need = queue.REVIEW_UNREVIEWED
     due_at_ms = 0
@@ -362,6 +365,7 @@ def _observe(
         source_issue=source_issue,
         ci=ci,
         review=review_need,
+        full_reviews=full_reviews,
         due_at_ms=due_at_ms,
         created_at_ms=_epoch_ms(pull.get("created_at")),
         request=request,

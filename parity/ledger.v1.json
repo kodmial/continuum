@@ -1,0 +1,247 @@
+{
+  "version": "ledger.v1",
+  "audited_at": "64e89a3bcbab671513a933855e7495a07fac56bb",
+  "issue": 59,
+  "entries": [
+    {
+      "id": "ND-01",
+      "capability": "A later decisive CodeRabbit review supersedes an earlier advisory nitpick review on the same head",
+      "repository": "nanodictate",
+      "disposition": "absorbed",
+      "source_ref": "e3c4206d8b0a775ed722284309a3c01ff7d9af35",
+      "module": "continuum.review.coderabbit",
+      "rationale": "coderabbit.collect() drops provider output published before the exact-head approval and keeps everything published after it, so a historical COMMENTED nitpick review can no longer outlive a later APPROVED on the same head."
+    },
+    {
+      "id": "ND-02",
+      "capability": "A durable exact-head approval outranks a later `Review skipped` status for the same head",
+      "repository": "nanodictate",
+      "disposition": "absorbed",
+      "source_ref": "e3c4206d8b0a775ed722284309a3c01ff7d9af35",
+      "module": "continuum.review.coderabbit",
+      "rationale": "The status surface is operational state, not merge authorization. Without an exact-head approval a missing or unusable status still fails closed."
+    },
+    {
+      "id": "ND-03",
+      "capability": "A requested review label is a lock, not a terminal state; a lock with no provider response is retried, and an orphan lock with no command is recovered",
+      "repository": "nanodictate",
+      "disposition": "absorbed",
+      "source_ref": "8b8966f92dafb8329c4a3cdad5cf31391ea1e23e",
+      "module": "continuum.review.queue_controller",
+      "rationale": "The controller validates the recorded slot against live pull request state and releases it when the head moved, the candidate is ineligible, or the in-flight timeout elapsed with no response."
+    },
+    {
+      "id": "ND-04",
+      "capability": "Wake the global review controller whenever a green HEAD still lacks a valid provider approval, including a skipped, stale, or absent status",
+      "repository": "nanodictate",
+      "disposition": "absorbed",
+      "source_ref": "bdc41f313b5c19add1b614661725be63c11b7735",
+      "module": "continuum.review.queue",
+      "paths": [
+        ".github/workflows/auto-merge.yml",
+        ".github/workflows/consumer-auto-merge.yml"
+      ],
+      "rationale": "The queue re-reconciles on every provider signal, and both merge controllers wake it once for a pull request the normalized gate still blocks, so an unusable or absent status no longer hides a mergeable change."
+    },
+    {
+      "id": "ND-05",
+      "capability": "The serialized review controller is never cancelled by a new wake-up, so its shared-quota timer survives",
+      "repository": "nanodictate",
+      "disposition": "absorbed",
+      "source_ref": "e5f9a84aa595d24d51b0900a0a2c8eadf5a2c66b",
+      "paths": [
+        ".github/workflows/review-queue.yml",
+        "fixtures/consumer-repo/.github/workflows/review-queue.yml"
+      ],
+      "rationale": "Both the Continuum and the consumer fixture controllers use cancel-in-progress: false. Cancelling on every status event reset the timer and starved the queue indefinitely."
+    },
+    {
+      "id": "ND-06",
+      "capability": "Every review-ready pull request gets its first full review before another pull request consumes a second shared quota slot",
+      "repository": "nanodictate",
+      "disposition": "absorbed",
+      "source_ref": "e5f9a84aa595d24d51b0900a0a2c8eadf5a2c66b",
+      "module": "continuum.review.queue",
+      "rationale": "rank_key() orders by priority and then by the number of full reviews the provider already spent on the pull request, counted over its whole history, and the queue log reports that count."
+    },
+    {
+      "id": "ND-07",
+      "capability": "Priority is the hard primary ordering key; fairness is allowed only within one priority class",
+      "repository": "nanodictate",
+      "disposition": "absorbed",
+      "source_ref": "bf3d4499e5410194a3474bd0d2658549d2cc4bf3",
+      "module": "continuum.review.queue",
+      "rationale": "The first version of the generation rule promoted a lower-priority first review above a higher-priority rereview; the corrected rule keeps priority primary and this port has the corrected shape."
+    },
+    {
+      "id": "ND-08",
+      "capability": "Refuse to auto-merge a release manifest that still contains an unfilled template placeholder, ignoring comment lines",
+      "repository": "nanodictate",
+      "disposition": "not-applicable",
+      "source_ref": "a0ae0057afc839290a651f7ac80261b97cb1ff95",
+      "rationale": "The files this check guards are Homebrew casks, MacPorts Portfiles, and an installer script that live in the consumer's packaging repositories, and Continuum ships no release-manifest auto-merge workflow that could merge them. Revisit when a consumer release plane is added; the check itself is a regex over active lines and is a small port at that point."
+    },
+    {
+      "id": "ND-09",
+      "capability": "Validate that a MacPorts Portfile pins the release version as a whole line rather than by substring",
+      "repository": "nanodictate",
+      "disposition": "not-applicable",
+      "source_ref": "05ac023b5ff5be42f2c2f955e8618d4b0f4c4439",
+      "rationale": "Same surface as ND-08: the Portfile and its pinning rule belong to the packaging repository that owns the file, and Continuum does not merge them."
+    },
+    {
+      "id": "ND-10",
+      "capability": "Reconcile deferred release work when the publish workflow completes, so code merged during a release is not stranded",
+      "repository": "nanodictate",
+      "disposition": "not-applicable",
+      "source_ref": "18ad70932989a885878a46178dcea3cdcb2539ac",
+      "rationale": "This is the release-publication plane: a Release workflow that publishes and a Release PR workflow that defers while one is in flight. Continuum ships a release plan and sign library and its own pinned custom-runtime build, and has neither of those two workflows, so there is no implemented surface to lose a wake-up on."
+    },
+    {
+      "id": "ND-11",
+      "capability": "A macOS packaging smoke CI job for the shipped application bundle",
+      "repository": "nanodictate",
+      "disposition": "consumer-local",
+      "source_ref": "640cb97cce452b86fe35839662fa9ad35a460d0a",
+      "rationale": "The smoke test validates a macOS application bundle that Continuum does not build. The portable half of the same idea, verifying the produced artifact against its recorded identity, is in continuum.release."
+    },
+    {
+      "id": "RL-01",
+      "capability": "Materialize a temporary runner's result into a branch and a pull request",
+      "repository": "runtime-lab",
+      "disposition": "absorbed",
+      "source_ref": "d047ad2b02bcc9be4c84d02696d2b4cdd3776327",
+      "paths": [
+        ".github/workflows/consumer-opencode.yml",
+        "fixtures/consumer-repo/.github/workflows/review-queue.yml"
+      ],
+      "module": "continuum.git_lifecycle",
+      "rationale": "The consumer flow owns the branch, commits, pushes, and opens the pull request, and the run-owned branch rule is asserted from state by continuum.git_lifecycle before anything is pushed."
+    },
+    {
+      "id": "RL-02",
+      "capability": "A static guard that fails closed on escaped credential expressions in workflow credential fields only",
+      "repository": "runtime-lab",
+      "disposition": "absorbed",
+      "source_ref": "cfa3ed559ee1e3f4aa92f922b021c7e4cb5358ca",
+      "module": "continuum.credentials",
+      "rationale": "The scan is scoped to credential fields, so an escaped expression in an artifact name is not a defect, and resolve_credential() fails closed on an empty or unexpanded value instead of sending it and reporting a bare 401."
+    },
+    {
+      "id": "RL-03",
+      "capability": "Cross-repository task execution and write-back for a private OpenCode fork",
+      "repository": "runtime-lab",
+      "disposition": "consumer-local",
+      "source_ref": "5bbacf4aa46ecf01e2f0b4cfe4a7cc01ad11b0f3",
+      "rationale": "This is a write-back contract with a fork of the agent runtime. Continuum drives a released OpenCode distribution, and a consumer that maintains a fork owns how that fork is driven."
+    },
+    {
+      "id": "RL-04",
+      "capability": "An autonomous qualification and memory-optimization loop across the agent runtime and its host",
+      "repository": "runtime-lab",
+      "disposition": "not-applicable",
+      "source_ref": "d9da9ae192fb470c1da32e8bcfc3a869a168b9ad",
+      "rationale": "A self-improving qualification loop is a research program in the source repository, not a capability of the automation contract Continuum extracts. It depends on RL-03's fork, which Continuum does not have."
+    },
+    {
+      "id": "RL-05",
+      "capability": "Exact artifact delivery identified by a process-level identity, for a Render deployment",
+      "repository": "runtime-lab",
+      "disposition": "consumer-local",
+      "source_ref": "d77c37ebaea6985c8f3ad2204877ea0f590a1258",
+      "rationale": "The exact-artifact identity a deployment needs belongs to the deployment. Continuum's own equivalent is the release identity, where a plan records how it was produced and a signature binds it to the artifact."
+    },
+    {
+      "id": "RL-06",
+      "capability": "Publish an exact pull request artifact and immediately qualify it on deployment",
+      "repository": "runtime-lab",
+      "disposition": "consumer-local",
+      "source_ref": "877a9df8acd35498761eccc3639afcf75723e490",
+      "rationale": "Same deployment surface as RL-05, triggered by a Render qualification webhook. A consumer that deploys owns its own qualification trigger."
+    },
+    {
+      "id": "KM-01",
+      "capability": "Recover a failed issue run from the agent workflow's completion event and release its reservation",
+      "repository": "kodmai",
+      "disposition": "superseded",
+      "source_ref": "3c64731ec888f8eb90395a3b24fd8f44d23cae50",
+      "module": "continuum.review.queue_controller",
+      "paths": [
+        ".github/workflows/opencode-repair.yml",
+        ".github/workflows/consumer-repair.yml"
+      ],
+      "rationale": "The watchdog identifies the run by parsing its display title, with a title-match fallback for older runs. Continuum keys recovery to an explicit per-run marker comment instead, which cannot be misattributed when two runs share a title."
+    },
+    {
+      "id": "KM-02",
+      "capability": "Map a run that predates the marker convention back to its issue by exact unique title",
+      "repository": "kodmai",
+      "disposition": "not-applicable",
+      "source_ref": "3c64731ec888f8eb90395a3b24fd8f44d23cae50",
+      "rationale": "This exists only to recover runs that were started before a marker convention existed. Continuum has written the marker on every run since its first one, so it has no pre-marker history to map."
+    },
+    {
+      "id": "KM-03",
+      "capability": "An explicit pause always wins over automatic recovery",
+      "repository": "kodmai",
+      "disposition": "absorbed",
+      "source_ref": "3c64731ec888f8eb90395a3b24fd8f44d23cae50",
+      "paths": [
+        ".github/workflows/issue-scheduler.yml",
+        ".github/workflows/consumer-scheduler.yml"
+      ],
+      "rationale": "The division of labor differs: the repair job releases the reservation and asks the scheduler to retry, and the scheduler is the component that refuses a paused issue, so a retry budget is also reset by an explicit unpause."
+    },
+    {
+      "id": "OC-01",
+      "capability": "Enter Continuum through a thin consumer entry workflow that calls the reusable workflow",
+      "repository": "opencode",
+      "disposition": "absorbed",
+      "source_ref": "8b9fc17f820dd01ed6c919a738615f5240b6bbe8",
+      "paths": [
+        ".github/workflows/consumer-opencode.yml"
+      ],
+      "rationale": "The consumer repository's entry workflow holds no automation of its own; it routes to Continuum's reusable workflow. The reusable workflow is the shipped implementation, and the entry workflows are documented as the consumer-owned half."
+    },
+    {
+      "id": "OC-02",
+      "capability": "A local validation lane selected by a marker in the issue body, publishing a structured result artifact",
+      "repository": "opencode",
+      "disposition": "consumer-local",
+      "source_ref": "8b9fc17f820dd01ed6c919a738615f5240b6bbe8",
+      "rationale": "The anonymous Zen end-to-end validation harness, its result schema, and the issue-comment format are that repository's own acceptance evidence for its fork."
+    },
+    {
+      "id": "OC-03",
+      "capability": "Reference a released Continuum ref from the consumer entry workflow",
+      "repository": "opencode",
+      "disposition": "consumer-local",
+      "source_ref": "8b9fc17f820dd01ed6c919a738615f5240b6bbe8",
+      "rationale": "Which ref a consumer pins is the consumer's release decision, tracked in #28. Continuum's obligation is the guarantee that makes pinning meaningful: a workflow invoked from a pinned ref enforces that ref's own branch-lifecycle module, which is asserted for the consumer path."
+    },
+    {
+      "id": "HB-01",
+      "capability": "Pin the published version, checksum, and revision in the Homebrew cask",
+      "repository": "homebrew-nanodictate",
+      "disposition": "consumer-local",
+      "source_ref": "29bb895f8142249d817f2a60f5743f78a9b6ac35",
+      "rationale": "The cask is the packaging repository's file and its pin format is Homebrew's, not Continuum's. Continuum supplies the release identity a consumer pins; it does not own the manifest that records it."
+    },
+    {
+      "id": "MP-01",
+      "capability": "Pin the published version and revision in the MacPorts Portfile",
+      "repository": "macports-nanodictate",
+      "disposition": "consumer-local",
+      "source_ref": "74ee768a6cc9dc0211c34e1dee912e7e35343c50",
+      "rationale": "Same surface as HB-01, in MacPorts' own file format."
+    },
+    {
+      "id": "KB-01",
+      "capability": "A disabled TAP_PAT scope probe kept as a one-line no-op for auditability",
+      "repository": "kodmai",
+      "disposition": "not-applicable",
+      "source_ref": "3c64731ec888f8eb90395a3b24fd8f44d23cae50",
+      "rationale": "A permanently disabled workflow that exists to document a decision taken in that repository. Continuum enforces credential scope by granting the least privilege it needs, so it carries no disabled probe."
+    }
+  ]
+}

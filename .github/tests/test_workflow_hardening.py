@@ -338,11 +338,14 @@ class PermissionsTests(WorkflowAuditBase):
         # The write-capable surface is deliberately tiny and fully audited.
         # auto-merge/issue-scheduler/agent are the three automation roles; the
         # repair jobs are label-and-dispatch/watchdog control planes that never
-        # check out or execute pull-request code.
+        # check out or execute pull-request code. The queue wake-up holds
+        # `actions: write` and nothing else: it dispatches the serialized review
+        # controller and never reads or writes repository content.
         self.assertEqual(
             sorted(writers),
             [
                 "auto-merge.yml/reconcile",
+                "auto-merge.yml/wake-review-queue",
                 "issue-scheduler.yml/schedule",
                 "opencode-repair.yml/ci-repair",
                 "opencode-repair.yml/recover-failed-issue-run",
@@ -716,6 +719,32 @@ class SelfProtectionTests(WorkflowAuditBase):
         self.assertIn("unittest", text)
         self.assertIn(POLICY_PATH, text)
 
+    def test_ci_enforces_the_parity_claim_and_the_credential_guard(self):
+        # Both are claims the rest of the repository depends on. A parity ledger
+        # nobody checks is a comment, and a credential escape nobody scans for is
+        # a 401 that arrives with no explanation in any log.
+        text = self.raw["ci.yml"]
+        self.assertIn("continuum.cli parity-check", text)
+        self.assertIn("continuum.cli credentials-check", text)
+
+    def test_no_run_block_carries_an_escaped_expression(self):
+        # A credential-escape check in CI is only meaningful if CI's own
+        # workflows cannot be the source of the defect. An unescaped expression in
+        # a run block is normal and is evaluated on purpose; an escaped one
+        # survives to the shell as a backslash followed by template text, which is
+        # the shape that produced the 401s in #145.
+        for name, document in self.workflows.items():
+            for job_name, job in (document.get("jobs") or {}).items():
+                for step in steps_of(job):
+                    script = run_text(step)
+                    if re.search(r"\\\$\{\{", script):
+                        self.fail(
+                            "{}/{} step {!r} contains an escaped expression in its "
+                            "run block".format(
+                                name, job_name, step.get("name", "<unnamed>")
+                            )
+                        )
+
     def test_action_inputs_never_contain_nested_mappings(self):
         # GitHub Actions action inputs are scalar values. A nested mapping such
         # as `with: { env: {...} }` is valid YAML but invalid workflow schema
@@ -786,6 +815,94 @@ class SelfProtectionTests(WorkflowAuditBase):
                             name, job_name, step.get("name", "<unnamed>")
                         ),
                     )
+
+
+class ConsumerModuleLifecycleTests(WorkflowAuditBase):
+    """The branch-lifecycle rule is Continuum's, so Continuum's copy must run.
+
+    A reusable workflow executes in the consumer's checkout. Reading
+    `continuum.git_lifecycle` out of the consumer's `src/` would enforce whatever
+    version the consumer happens to have checked out, which for a pinned
+    reference-only consumer is the oldest one, or none. The rule that stops a
+    switched HEAD from being pushed has to be the reviewed one fetched at the ref
+    this workflow was actually invoked as.
+    """
+
+    def _issue_step(self):
+        return self.step_matching(self.job("consumer-opencode.yml", "opencode"), "continuum.git_lifecycle")
+
+    def test_the_pushed_branch_is_checked_by_the_fetched_module(self):
+        step = self._issue_step()
+        self.assertIsNotNone(step, "the branch lifecycle check is not wired in")
+        self.assertIn('PYTHONPATH="$CONTINUUM_MODULE_ROOT"', run_text(step))
+        self.assertNotIn(
+            "PYTHONPATH=src",
+            run_text(step),
+            "the consumer's own src/ must not decide whether this push is allowed",
+        )
+
+    def test_a_missing_module_fails_the_run_instead_of_falling_back(self):
+        script = run_text(self._issue_step())
+        self.assertIn('[[ -d "$CONTINUUM_MODULE_ROOT/continuum" ]]', script)
+        self.assertIn("refusing to push", script)
+
+    def test_the_module_is_fetched_at_this_workflows_own_ref(self):
+        text = self.raw["consumer-opencode.yml"]
+        self.assertIn("GITHUB_WORKFLOW_REF", text)
+        self.assertIn('CONTINUUM_REF="${WORKFLOW_REF##*@}"', text)
+        self.assertIn("sparse-checkout: src/continuum", text)
+        self.assertIn("persist-credentials: false", text)
+
+    def test_the_module_is_only_fetched_for_issue_mode(self):
+        # The other modes are repair, conflict, and CI-fix passes that never push
+        # a run-owned branch, so the checkout would be an unexplained write.
+        job = self.job("consumer-opencode.yml", "opencode")
+        for name in (
+            "Fetch the Continuum module for this workflow ref",
+            "Checkout the Continuum module",
+        ):
+            step = next(s for s in steps_of(job) if s.get("name") == name)
+            self.assertEqual(step.get("if"), "inputs.mode == 'issue'", name)
+
+
+class ConsumerCiDispatchTests(WorkflowAuditBase):
+    """A pull request with no CI check can never be merged, so CI is started.
+
+    `pull_request` does not fire for the pull request the consumer workflow
+    itself opened, so an explicit dispatch is the only way the required check
+    exists. Its name comes from configuration, so it is validated before use
+    rather than interpolated into a path.
+    """
+
+    def _step(self):
+        job = self.job("consumer-opencode.yml", "opencode")
+        return self.step_matching(job, "actions/workflows/${CI_WORKFLOW}/dispatches")
+
+    def test_ci_is_dispatched_through_the_api_with_a_validated_name(self):
+        script = run_text(self._step())
+        self.assertIn('--method POST', script)
+        # `workflow_dispatch` on the branch produces the check that
+        # `pull_request` would have produced, for the same ref.
+        self.assertIn('-f ref="$BRANCH"', script)
+        self.assertIn('[[ "$CI_WORKFLOW" =~ ^[A-Za-z0-9._/-]+$ ]]', script)
+        self.assertLess(
+            script.index("=~"),
+            script.index("actions/workflows/${CI_WORKFLOW}/dispatches"),
+            "the workflow name must be validated before it reaches a URL",
+        )
+
+    def test_a_missing_ci_dispatch_is_reported_rather_than_hidden(self):
+        script = run_text(self._step())
+        self.assertIn("no required CI check", script)
+
+    def test_the_dispatch_is_opt_in_through_a_declared_input(self):
+        inputs = (self.workflows["consumer-opencode.yml"].get("on", {}).get("workflow_call") or {}).get(
+            "inputs"
+        ) or {}
+        self.assertIn("ci_workflow", inputs)
+        # The default is what every existing caller gets, so it has to name a
+        # workflow every consumer repository actually has.
+        self.assertEqual(inputs["ci_workflow"].get("default"), "ci.yml")
 
 
 if __name__ == "__main__":
