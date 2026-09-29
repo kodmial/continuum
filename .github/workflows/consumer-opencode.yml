@@ -51,6 +51,26 @@ on:
         type: string
         required: false
         default: opencode-coding-linux-x64
+      opencode_release_tag:
+        description: "Exact immutable release tag; when set, SHA-256 is required and prefix selection is disabled"
+        type: string
+        required: false
+        default: ""
+      opencode_release_sha256:
+        description: "Expected SHA-256 for the exact release asset"
+        type: string
+        required: false
+        default: ""
+      opencode_release_version:
+        description: "Expected output of opencode --version for the exact release"
+        type: string
+        required: false
+        default: ""
+      opencode_release_source_sha:
+        description: "Expected source SHA from the release metadata sidecar"
+        type: string
+        required: false
+        default: ""
     secrets:
       OPENCODE_API_KEY:
         required: false
@@ -152,21 +172,40 @@ jobs:
           RELEASE_REPO: ${{ inputs.opencode_release_repo }}
           TAG_PREFIX: ${{ inputs.opencode_release_tag_prefix }}
           ASSET_NAME: ${{ inputs.opencode_release_asset }}
+          EXACT_TAG: ${{ inputs.opencode_release_tag }}
+          EXPECTED_SHA256: ${{ inputs.opencode_release_sha256 }}
+          EXPECTED_VERSION: ${{ inputs.opencode_release_version }}
+          EXPECTED_SOURCE_SHA: ${{ inputs.opencode_release_source_sha }}
         run: |
           set -euo pipefail
           REPO="${RELEASE_REPO:-$GITHUB_REPOSITORY}"
           [[ "$TAG_PREFIX" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::invalid release tag prefix"; exit 1; }
           [[ "$ASSET_NAME" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::invalid release asset name"; exit 1; }
 
-          TAG="$(gh api "repos/$REPO/releases?per_page=100" --jq             'map(select(.draft == false and (.tag_name | startswith("'"$TAG_PREFIX"'")))) | first | .tag_name // empty')"
-          if [[ -z "$TAG" ]]; then
-            echo "::error::No non-draft release with prefix '$TAG_PREFIX' found in $REPO."
-            exit 1
+          if [[ -n "$EXACT_TAG" ]]; then
+            [[ "$EXACT_TAG" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::invalid exact release tag"; exit 1; }
+            [[ "$EXPECTED_SHA256" =~ ^[0-9a-fA-F]{64}$ ]] || {
+              echo "::error::opencode_release_sha256 is required with an exact release tag."
+              exit 1
+            }
+            TAG="$EXACT_TAG"
+            gh release view "$TAG" --repo "$REPO" >/dev/null
+            selection="exact"
+          else
+            TAG="$(gh api "repos/$REPO/releases?per_page=100" --jq             'map(select(.draft == false and (.tag_name | startswith("'"$TAG_PREFIX"'")))) | first | .tag_name // empty')"
+            if [[ -z "$TAG" ]]; then
+              echo "::error::No non-draft release with prefix '$TAG_PREFIX' found in $REPO."
+              exit 1
+            fi
+            selection="latest-prefix"
           fi
 
           DIR="$RUNNER_TEMP/continuum-opencode"
           mkdir -p "$DIR"
-          gh release download "$TAG" --repo "$REPO" --dir "$DIR"             --pattern "$ASSET_NAME" --pattern "$ASSET_NAME.sha256"
+          gh release download "$TAG" --repo "$REPO" --dir "$DIR" \
+            --pattern "$ASSET_NAME" --pattern "$ASSET_NAME.sha256"
+          gh release download "$TAG" --repo "$REPO" --dir "$DIR" \
+            --pattern "$ASSET_NAME.json" >/dev/null 2>&1 || true
 
           test -f "$DIR/$ASSET_NAME"
           test -f "$DIR/$ASSET_NAME.sha256"
@@ -175,20 +214,52 @@ jobs:
             sha256sum -c "$ASSET_NAME.sha256"
           )
           chmod +x "$DIR/$ASSET_NAME"
+          BINARY_SHA256="$(sha256sum "$DIR/$ASSET_NAME" | awk '{print $1}')"
+          ACTUAL_VERSION="$("$DIR/$ASSET_NAME" --version | tr -d '\r\n')"
+
+          if [[ -n "$EXPECTED_SHA256" && "${BINARY_SHA256,,}" != "${EXPECTED_SHA256,,}" ]]; then
+            echo "::error::Release binary SHA-256 does not match the pinned identity."
+            exit 1
+          fi
+          if [[ -n "$EXPECTED_VERSION" && "$ACTUAL_VERSION" != "$EXPECTED_VERSION" ]]; then
+            echo "::error::Release binary version '$ACTUAL_VERSION' does not match '$EXPECTED_VERSION'."
+            exit 1
+          fi
+
+          META="$DIR/$ASSET_NAME.json"
+          if [[ -f "$META" ]]; then
+            jq -e --arg tag "$TAG" --arg asset "$ASSET_NAME" --arg sha "$BINARY_SHA256" \
+              '.tag == $tag and .asset == $asset and ((.sha256 | ascii_downcase) == ($sha | ascii_downcase))' \
+              "$META" >/dev/null || {
+                echo "::error::Release metadata sidecar does not match the downloaded binary."
+                exit 1
+              }
+          fi
+          if [[ -n "$EXPECTED_SOURCE_SHA" ]]; then
+            [[ "$EXPECTED_SOURCE_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || { echo "::error::invalid expected source SHA"; exit 1; }
+            test -f "$META" || { echo "::error::Exact source verification requires the release metadata sidecar."; exit 1; }
+            jq -e --arg source "${EXPECTED_SOURCE_SHA,,}" \
+              '(.source_sha | ascii_downcase) == $source' "$META" >/dev/null || {
+                echo "::error::Release metadata source SHA does not match the pinned identity."
+                exit 1
+              }
+          fi
+
           ln -sf "$DIR/$ASSET_NAME" "$DIR/opencode"
-          "$DIR/opencode" --version
           echo "$DIR" >> "$GITHUB_PATH"
 
-          BINARY_SHA256="$(sha256sum "$DIR/$ASSET_NAME" | awk '{print $1}')"
           echo "release_tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "binary_sha256=$BINARY_SHA256" >> "$GITHUB_OUTPUT"
+          echo "version=$ACTUAL_VERSION" >> "$GITHUB_OUTPUT"
           {
             echo "### OpenCode runtime"
             echo "- distribution: github-release"
+            echo "- selection: `$selection`"
             echo "- repository: `$REPO`"
             echo "- release: `$TAG`"
             echo "- asset: `$ASSET_NAME`"
             echo "- sha256: `$BINARY_SHA256`"
+            echo "- version: `$ACTUAL_VERSION`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Implement issue
@@ -308,6 +379,12 @@ jobs:
           AFTER="$(git rev-parse HEAD)"
           if [[ "$AFTER" != "$BEFORE" ]]; then
             git push origin "HEAD:${HEAD_REF}"
+            while read -r label; do
+              [[ "$label" == opencode-gate-repair-* ]] || continue
+              gh api --method DELETE \
+                "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/$label" \
+                >/dev/null 2>&1 || true
+            done < <(gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels" --jq '.[].name')
           else
             echo "No source change was produced; leaving retry policy to the controller."
           fi
