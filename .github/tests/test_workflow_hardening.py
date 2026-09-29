@@ -324,26 +324,6 @@ class PermissionsTests(WorkflowAuditBase):
             if "secrets.TAP_PAT" not in self.raw[name]:
                 continue
 
-            if name == "opencode-repair.yml":
-                # This workflow also handles pull_request events, but its only
-                # PAT-holding job is gated exclusively to a successful CI push
-                # on the trusted default branch. The secret therefore never
-                # reaches the pull_request-triggered jobs.
-                pat_jobs = []
-                for job_name, job in (document.get("jobs") or {}).items():
-                    if "secrets.TAP_PAT" in json.dumps(job):
-                        pat_jobs.append(job_name)
-                self.assertEqual(pat_jobs, ["sync-stale-prs"])
-                condition = str(document["jobs"]["sync-stale-prs"].get("if") or "")
-                self.assertIn("github.event_name == 'workflow_run'", condition)
-                self.assertIn("github.event.workflow_run.event == 'push'", condition)
-                self.assertIn("github.event.workflow_run.conclusion == 'success'", condition)
-                self.assertIn(
-                    "github.event.workflow_run.head_branch == github.event.repository.default_branch",
-                    condition,
-                )
-                continue
-
             for event in UNTRUSTED_EVENTS:
                 self.assertNotIn(
                     event, trigger_names(document), "{} reaches TAP_PAT via {}".format(name, event)
