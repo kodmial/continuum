@@ -72,10 +72,15 @@ jobs:
           # Repair-mode workflow_dispatch runs have no issue-run marker.
           [[ -n "$issue_number" ]] || exit 0
 
+          epoch="$(
+            gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$issue_number/events?per_page=100" \
+              --jq '.[] | select(.event == "unlabeled" and .label.name == "automation:paused") | .created_at' \
+              | sort | tail -n 1
+          )"
           attempts="$(
             gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$issue_number/comments?per_page=100" \
-              --jq '[.[] | select((.body // "") | contains("<!-- continuum-dispatch -->"))] | length' \
-              | awk '{sum += $1} END {print sum + 0}'
+              --jq '.[] | select((.body // "") | contains("<!-- continuum-dispatch -->")) | .created_at' \
+              | awk -v epoch="$epoch" 'epoch == "" || $0 >= epoch {count++} END {print count + 0}'
           )"
 
           gh issue comment "$issue_number" --repo "$GITHUB_REPOSITORY" \
