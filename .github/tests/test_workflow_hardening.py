@@ -617,6 +617,13 @@ class RepairControllerTests(WorkflowAuditBase):
             self.assertIn("automation:paused", text, name)
             self.assertIn("unlabeled", text, name)
 
+    def test_failed_agent_run_does_not_retry_when_open_pr_exists(self):
+        for name in ("opencode-repair.yml", "consumer-repair.yml"):
+            text = self.raw[name]
+            self.assertIn("Usable open PR #$open_pr already owns issue", text, name)
+            self.assertIn('pulls?state=open&per_page=100', text, name)
+            self.assertIn('startswith("opencode/issue', text, name)
+
     def test_privilege_boundary_changes_are_never_auto_merged(self):
         text = self.raw["auto-merge.yml"]
         self.assertIn("merge-plan", text)
