@@ -122,28 +122,28 @@ jobs:
           mkdir -p "$(dirname "$result_file")"
           prompt="$RUNNER_TEMP/continuum-child-task.txt"
           cat >"$prompt" <<EOF
-Execute delegated child repository task #$TASK_NUMBER to completion.
-
-Rules:
-- Work only in the child repository in the current directory.
-- Treat the full child issue body below as the authoritative specification.
-- Inspect current main before changing anything.
-- Continue through diagnose -> implement -> test -> repair until acceptance is genuinely satisfied.
-- Run relevant tests and any live/integration verification required by the issue.
-- Never print, persist, or expose credentials or secret values.
-- Do not upload child source, diffs, issue text, logs, or agent transcripts to the parent repository.
-- You may use local git operations, including commits. Do not push; the outer worker publishes the branch.
-- Before finishing, create or update exactly: $result_file
-- Record scope, files/areas changed, verification executed, observed results, remaining risks.
-- End with a standalone line exactly: Acceptance: PASS
-- Write Acceptance: PASS only when mandatory acceptance conditions are satisfied.
-
---- CHILD ISSUE TITLE ---
-$issue_title
-
---- CHILD ISSUE BODY ---
-$issue_body
-EOF
+          Execute delegated child repository task #$TASK_NUMBER to completion.
+          
+          Rules:
+          - Work only in the child repository in the current directory.
+          - Treat the full child issue body below as the authoritative specification.
+          - Inspect current main before changing anything.
+          - Continue through diagnose -> implement -> test -> repair until acceptance is genuinely satisfied.
+          - Run relevant tests and any live/integration verification required by the issue.
+          - Never print, persist, or expose credentials or secret values.
+          - Do not upload child source, diffs, issue text, logs, or agent transcripts to the parent repository.
+          - You may use local git operations, including commits. Do not push; the outer worker publishes the branch.
+          - Before finishing, create or update exactly: $result_file
+          - Record scope, files/areas changed, verification executed, observed results, remaining risks.
+          - End with a standalone line exactly: Acceptance: PASS
+          - Write Acceptance: PASS only when mandatory acceptance conditions are satisfied.
+          
+          --- CHILD ISSUE TITLE ---
+          $issue_title
+          
+          --- CHILD ISSUE BODY ---
+          $issue_body
+          EOF
 
           accepted=false
           for pass in $(seq 1 "$MAX_AGENT_PASSES"); do
@@ -151,11 +151,11 @@ EOF
             cp "$prompt" "$pass_prompt"
             if [[ "$pass" -gt 1 ]]; then
               cat >>"$pass_prompt" <<EOF
-
-Continuation pass $pass:
-- Continue from the existing working tree and prior transcript at $transcript.
-- Resolve the concrete remaining blocker, rerun verification, and update $result_file.
-EOF
+          
+          Continuation pass $pass:
+          - Continue from the existing working tree and prior transcript at $transcript.
+          - Resolve the concrete remaining blocker, rerun verification, and update $result_file.
+          EOF
             fi
             set +e
             opencode run --auto --model "$OPENCODE_MODEL" "$(cat "$pass_prompt")" >"$transcript" 2>&1
@@ -186,13 +186,13 @@ EOF
 
           git push -u origin "HEAD:$branch" >/dev/null 2>&1
           pr_body="$(cat <<EOF
-Delegated implementation for #$TASK_NUMBER executed by the configured Continuum parent.
-
-Child source, issue text, test logs, and agent transcript were not uploaded to the parent repository.
-
-<!-- continuum-child-accepted -->
-Closes #$TASK_NUMBER
-EOF
+          Delegated implementation for #$TASK_NUMBER executed by the configured Continuum parent.
+          
+          Child source, issue text, test logs, and agent transcript were not uploaded to the parent repository.
+          
+          <!-- continuum-child-accepted -->
+          Closes #$TASK_NUMBER
+          EOF
 )"
           pr_url="$(
             gh pr create --repo "$child_repo" --base main --head "$branch"               --title "$issue_title" --body "$pr_body" 2>/dev/null
