@@ -88,6 +88,9 @@ jobs:
           child_config="$RUNNER_TEMP/continuum-child.yml"
           gh api "repos/$child_repo/contents/.continuum.yml" --jq '.content' 2>/dev/null             | tr -d '\n' | base64 -d >"$child_config"
           python3 "$relation" verify-child             --config "$child_config"             --child-id "$CHILD_ID"             --parent-repository "$GITHUB_REPOSITORY"
+          validation_script="$(
+            python3 "$relation" validation-script --config "$child_config"
+          )"
 
           pr_state="$(gh pr view "$PR_NUMBER" --repo "$child_repo" --json state --jq '.state' 2>/dev/null || true)"
           [[ "$pr_state" == "OPEN" ]] || exit 0
@@ -116,6 +119,33 @@ jobs:
           git checkout -B "$head_ref" "origin/$head_ref" >/dev/null 2>&1
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          validation_log="$RUNNER_TEMP/continuum-child-validation.log"
+          trusted_validation=""
+          run_validation() {
+            [[ -n "$trusted_validation" ]] || return 0
+            env -i               PATH="$PATH"               HOME="$HOME"               TMPDIR="${TMPDIR:-/tmp}"               LANG="${LANG:-C.UTF-8}"               CI=true               bash "$trusted_validation" >"$validation_log" 2>&1
+          }
+
+          initial_validation="not configured"
+          if [[ -n "$validation_script" ]]; then
+            if ! git cat-file -e "origin/$base_ref:$validation_script" 2>/dev/null; then
+              gh issue comment "$TASK_NUMBER" --repo "$child_repo"                 --body "<!-- continuum-child-validation-missing --> The configured delegated validation gate is missing from the base branch."                 >/dev/null 2>&1 || true
+              exit 5
+            fi
+            trusted_validation="$RUNNER_TEMP/continuum-child-validation.sh"
+            git show "origin/$base_ref:$validation_script" >"$trusted_validation"
+            chmod 700 "$trusted_validation"
+            set +e
+            run_validation
+            validation_rc=$?
+            set -e
+            if [[ "$validation_rc" -eq 0 ]]; then
+              initial_validation="passed"
+            else
+              initial_validation="failed; diagnostics are available only in the local runner file $validation_log"
+            fi
+          fi
 
           for attempt in 1 2 3; do
             if curl -fsSL https://opencode.ai/install | bash >/dev/null 2>&1; then
@@ -152,6 +182,10 @@ jobs:
           - Record findings, repairs, verification executed, observed results, remaining risks.
           - End with a standalone line exactly: Review: PASS
           - Write Review: PASS only when the implementation satisfies the issue.
+          - A deterministic validation gate from the child base branch is part of acceptance.
+          - Its initial state is: $initial_validation
+          - If it failed, inspect the local runner diagnostics at: $validation_log
+          - Do not weaken, replace, or edit the validation gate to make it pass; it is loaded from origin/$base_ref.
           
           --- CHILD ISSUE TITLE ---
           $issue_title
@@ -177,14 +211,22 @@ jobs:
             rc=$?
             set -e
             if [[ -f "$review_file" ]] && grep -qx 'Review: PASS' "$review_file"; then
-              accepted=true
-              break
+              set +e
+              run_validation
+              validation_rc=$?
+              set -e
+              if [[ "$validation_rc" -eq 0 ]]; then
+                accepted=true
+                break
+              fi
+              echo "Child review [$CHILD_ID] #$TASK_NUMBER validation gate failed after pass $pass; continuing repair."
+            else
+              echo "Child review [$CHILD_ID] #$TASK_NUMBER pass $pass incomplete (agent rc=$rc); continuing."
             fi
-            echo "Child review [$CHILD_ID] #$TASK_NUMBER pass $pass incomplete (agent rc=$rc); continuing."
           done
 
           if [[ "$accepted" != true ]]; then
-            gh issue comment "$TASK_NUMBER" --repo "$child_repo"               --body "<!-- continuum-child-review-needs-retry --> Review for child task #$TASK_NUMBER did not reach verified acceptance."               >/dev/null 2>&1 || true
+            gh issue comment "$TASK_NUMBER" --repo "$child_repo"               --body "<!-- continuum-child-review-needs-retry --> Review for child task #$TASK_NUMBER did not reach verified acceptance, including its delegated validation gate."               >/dev/null 2>&1 || true
             exit 30
           fi
 
