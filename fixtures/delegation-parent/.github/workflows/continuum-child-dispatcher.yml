@@ -27,6 +27,8 @@ concurrency:
 jobs:
   dispatch:
     uses: kodmial/continuum/.github/workflows/consumer-child-dispatcher.yml@main
+    with:
+      parent_role: ${{ vars.CONTINUUM_ROLE }}
+      parent_children: ${{ vars.CONTINUUM_CHILDREN }}
     secrets:
       CHILD_RUNTIME_TOKEN: ${{ secrets.CONTINUUM_CHILD_TOKEN }}
-      CHILD_RUNTIME_REPOSITORIES: ${{ secrets.CONTINUUM_CHILD_REPOSITORIES }}
