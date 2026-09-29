@@ -1191,6 +1191,14 @@ class RepairRunShellTests(unittest.TestCase):
                     "REPAIR_HEAD": head,
                     "CONFLICT_ORIGINAL_HEAD": original_head,
                     "CONFLICT_PRESERVED_COMMITS": "2",
+                    # The real workflow materializes this helper from the pinned
+                    # trusted control-plane SHA before the publish step. Point
+                    # the shell harness at the repository's trusted fixture so
+                    # it exercises the same contract without depending on the
+                    # repair checkout.
+                    "CONTINUUM_CONFLICT_REPAIR": str(
+                        REPO_ROOT / ".github/scripts/conflict_repair.py"
+                    ),
                 }
             )
             for name, value in (step.get("env") or {}).items():
