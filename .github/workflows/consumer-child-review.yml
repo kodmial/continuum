@@ -96,8 +96,8 @@ jobs:
           transcript="$RUNNER_TEMP/continuum-child-review.log"
           review_file="automation/runtime-results/task-${TASK_NUMBER}-review.md"
 
-          gh issue comment "$TASK_NUMBER" --repo "$child_repo"             --body "<!-- continuum-child-review-started -->
-Independent delegated review/repair for child task #$TASK_NUMBER started on PR #$PR_NUMBER."             >/dev/null 2>&1 || true
+          review_started="<!-- continuum-child-review-started --> Independent delegated review/repair for child task #$TASK_NUMBER started on PR #$PR_NUMBER."
+          gh issue comment "$TASK_NUMBER" --repo "$child_repo" --body "$review_started" >/dev/null 2>&1 || true
 
           pr_json="$(gh pr view "$PR_NUMBER" --repo "$child_repo" --json headRefName,baseRefName 2>/dev/null)"
           head_ref="$(jq -r '.headRefName' <<<"$pr_json")"
