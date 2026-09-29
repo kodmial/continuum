@@ -1,7 +1,1 @@
 version: 1
-
-delegation:
-  role: child
-  id: child-a
-  parent: owner/parent-repository
-  validation_script: automation/continuum-child-ci.sh

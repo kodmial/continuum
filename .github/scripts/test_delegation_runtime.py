@@ -59,6 +59,55 @@ class DelegationRuntimeTests(unittest.TestCase):
         with self.assertRaises(runtime.DelegationError):
             runtime.assert_parent_allows_child(self.parent(("alpha",)), "beta")
 
+    def test_parent_variables_are_validated(self):
+        self.assertEqual(
+            runtime.parent_variable_ids("parent", '["alpha","beta"]'),
+            ["alpha", "beta"],
+        )
+        for role, value in (
+            ("child", '["alpha"]'),
+            ("parent", "not-json"),
+            ("parent", "[]"),
+            ("parent", '["alpha","alpha"]'),
+            ("parent", '["bad/id"]'),
+        ):
+            with self.subTest(role=role, value=value), self.assertRaises(runtime.DelegationError):
+                runtime.parent_variable_ids(role, value)
+
+    def test_child_variables_are_bidirectionally_verified(self):
+        runtime.verify_child_variables(
+            role="child",
+            declared_id="alpha",
+            declared_parent="owner/parent",
+            child_id="alpha",
+            parent_repository="owner/parent",
+        )
+        for kwargs in (
+            {"role": "parent"},
+            {"declared_id": "beta"},
+            {"declared_parent": "owner/other"},
+        ):
+            values = {
+                "role": "child",
+                "declared_id": "alpha",
+                "declared_parent": "owner/parent",
+                "child_id": "alpha",
+                "parent_repository": "owner/parent",
+            }
+            values.update(kwargs)
+            with self.subTest(values=values), self.assertRaises(runtime.DelegationError):
+                runtime.verify_child_variables(**values)
+
+    def test_validation_script_variable_is_safe(self):
+        self.assertEqual(
+            runtime.validation_script_value("automation/continuum-child-ci.sh"),
+            "automation/continuum-child-ci.sh",
+        )
+        self.assertEqual(runtime.validation_script_value(""), "")
+        for value in ("/tmp/a.sh", "../a.sh", "automation/../a.sh", "ci.py"):
+            with self.subTest(value=value), self.assertRaises(runtime.DelegationError):
+                runtime.validation_script_value(value)
+
     def test_parent_plan_resolves_only_explicit_children(self):
         result = runtime.parent_plan(
             self.parent(),

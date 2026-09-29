@@ -724,6 +724,19 @@ class SelfProtectionTests(WorkflowAuditBase):
         self.assertIn("already closed", self.raw["auto-merge.yml"])
         self.assertIn("already closed", self.raw["consumer-auto-merge.yml"])
 
+    def test_child_relationships_are_supplied_by_repository_variables(self):
+        for name in (
+            "consumer-child-dispatcher.yml",
+            "consumer-child-worker.yml",
+            "consumer-child-review.yml",
+        ):
+            text = self.raw[name]
+            self.assertIn("parent_role", text)
+            self.assertIn("parent_children", text)
+            self.assertIn("PARENT_ROLE", text)
+            self.assertIn("PARENT_CHILDREN", text)
+            self.assertNotIn("contents/.continuum.yml", text)
+
     def test_child_validation_gate_uses_base_script_without_secrets(self):
         text = self.raw["consumer-child-review.yml"]
         self.assertIn('git show "origin/$base_ref:$validation_script"', text)

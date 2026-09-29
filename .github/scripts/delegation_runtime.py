@@ -29,6 +29,7 @@ from continuum.config import (  # noqa: E402
 )
 
 _REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
+_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$")
 
 
 class DelegationError(ValueError):
@@ -39,6 +40,63 @@ def _repository(value: object, where: str) -> str:
     if not isinstance(value, str) or not _REPOSITORY_RE.match(value.strip()):
         raise DelegationError(f"{where} must be an owner/repository name")
     return value.strip()
+
+
+def _slug(value: object, where: str) -> str:
+    if not isinstance(value, str) or not _SLUG_RE.match(value.strip()):
+        raise DelegationError(f"{where} must be a simple child id")
+    return value.strip()
+
+
+def parent_variable_ids(role: str, children_json: str) -> List[str]:
+    if role != DELEGATION_PARENT:
+        raise DelegationError("CONTINUUM_ROLE must be 'parent'")
+    try:
+        value = json.loads(children_json)
+    except json.JSONDecodeError as exc:
+        raise DelegationError(
+            f"CONTINUUM_CHILDREN must be a JSON array: {exc.msg}"
+        ) from None
+    if not isinstance(value, list) or not value:
+        raise DelegationError("CONTINUUM_CHILDREN must be a non-empty JSON array")
+    children = [_slug(item, "CONTINUUM_CHILDREN entry") for item in value]
+    if len(set(children)) != len(children):
+        raise DelegationError("CONTINUUM_CHILDREN must contain unique child ids")
+    return children
+
+
+def verify_child_variables(
+    *,
+    role: str,
+    declared_id: str,
+    declared_parent: str,
+    child_id: str,
+    parent_repository: str,
+) -> None:
+    if role != DELEGATION_CHILD:
+        raise DelegationError("child CONTINUUM_ROLE must be 'child'")
+    expected_id = _slug(child_id, "expected child id")
+    actual_id = _slug(declared_id, "CONTINUUM_CHILD_ID")
+    if actual_id != expected_id:
+        raise DelegationError("child id does not match the parent allowlist id")
+    expected_parent = _repository(parent_repository, "parent repository")
+    actual_parent = _repository(declared_parent, "CONTINUUM_PARENT")
+    if actual_parent != expected_parent:
+        raise DelegationError("child parent does not match the calling repository")
+
+
+def validation_script_value(value: str) -> str:
+    value = value.strip()
+    if not value:
+        return ""
+    if value.startswith("/") or "\x00" in value:
+        raise DelegationError("CONTINUUM_VALIDATION_SCRIPT must be repository-relative")
+    parts = value.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        raise DelegationError("CONTINUUM_VALIDATION_SCRIPT contains an unsafe path segment")
+    if not value.endswith(".sh"):
+        raise DelegationError("CONTINUUM_VALIDATION_SCRIPT must name a .sh file")
+    return value
 
 
 def load_repository_map(raw: str, allowed_ids: Iterable[str]) -> Dict[str, str]:
@@ -180,6 +238,20 @@ def main(argv=None) -> int:
     allowed.add_argument("--config", default=".continuum.yml")
     allowed.add_argument("--child-id", required=True)
 
+    variable_ids = sub.add_parser("parent-variable-ids")
+    variable_ids.add_argument("--role", required=True)
+    variable_ids.add_argument("--children-json", required=True)
+
+    variable_child = sub.add_parser("verify-child-variables")
+    variable_child.add_argument("--role", required=True)
+    variable_child.add_argument("--declared-id", required=True)
+    variable_child.add_argument("--declared-parent", required=True)
+    variable_child.add_argument("--child-id", required=True)
+    variable_child.add_argument("--parent-repository", required=True)
+
+    validation_value = sub.add_parser("validation-script-value")
+    validation_value.add_argument("--value", default="")
+
     args = parser.parse_args(argv)
     try:
         if args.command == "parent-plan":
@@ -211,6 +283,22 @@ def main(argv=None) -> int:
             return 0
         if args.command == "parent-allows-child":
             assert_parent_allows_child(args.config, args.child_id)
+            return 0
+        if args.command == "parent-variable-ids":
+            for child_id in parent_variable_ids(args.role, args.children_json):
+                sys.stdout.write(child_id + "\n")
+            return 0
+        if args.command == "verify-child-variables":
+            verify_child_variables(
+                role=args.role,
+                declared_id=args.declared_id,
+                declared_parent=args.declared_parent,
+                child_id=args.child_id,
+                parent_repository=args.parent_repository,
+            )
+            return 0
+        if args.command == "validation-script-value":
+            sys.stdout.write(validation_script_value(args.value) + "\n")
             return 0
         verify_child(
             args.config,

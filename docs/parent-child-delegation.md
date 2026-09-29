@@ -1,95 +1,89 @@
 # Parent/child delegated execution
 
-Continuum can delegate issue execution from one repository (the **parent**) to
-another repository (the **child**) without using repository visibility as a
-routing signal.
+Continuum can execute work for a child repository from a parent repository
+without treating public/private visibility as a role.
 
-The relationship is explicit and bidirectional:
+## Relationship storage
 
-- the parent enables delegation and allowlists opaque child ids;
-- the parent may store explicit `id -> owner/repository` bindings in the
-  optional `CONTINUUM_CHILD_REPOSITORIES` secret; without that secret it
-  discovers owned repositories by their declared Continuum roles;
-- each child declares its own id and exact parent repository;
-- every dispatcher, worker, and review run verifies both declarations before it
-  reads a task or writes to the child.
+Concrete relationship values live in GitHub Actions **repository variables**,
+not in tracked repository files.
 
-A repository with no `delegation` block has role `none`. It neither donates
-Actions capacity nor delegates tasks.
+Parent repository variables:
 
-## Parent configuration
+- `CONTINUUM_ROLE=parent`
+- `CONTINUUM_CHILDREN` — JSON array of opaque child ids, for example
+  `["child-a","child-b"]`
+
+Child repository variables:
+
+- `CONTINUUM_ROLE=child`
+- `CONTINUUM_CHILD_ID` — the id present in the parent's
+  `CONTINUUM_CHILDREN`
+- `CONTINUUM_PARENT` — exact `owner/repository` name of the parent
+- `CONTINUUM_VALIDATION_SCRIPT` — optional repository-relative `.sh` path
+  for deterministic validation
+
+The repository's tracked `.continuum.yml` does not need to contain a role,
+child list, child id, or parent name. A neutral file such as the following is
+sufficient:
 
 ```yaml
 version: 1
-
-delegation:
-  role: parent
-  children:
-    - child-a
-    - child-b
 ```
 
-The parent configuration intentionally contains no child repository names.
-Configure `CONTINUUM_CHILD_TOKEN` on the parent with access to the intended
-children. `CONTINUUM_CHILD_REPOSITORIES` is optional. When supplied, it is a
-JSON object whose keys exactly match `delegation.children`, for example
-`{"child-a":"owner/private-repo","child-b":"owner/public-repo"}`.
+This keeps concrete parent/child relationships out of the source tree. The thin
+parent workflows reference only variable names such as
+`${{ vars.CONTINUUM_ROLE }}` and `${{ vars.CONTINUUM_CHILDREN }}`.
 
-When the map is omitted, Continuum enumerates repositories owned by the token
-holder **without any visibility filter**, reads only their `.continuum.yml`,
-and selects the unique repository whose child id and parent declaration match
-the parent's allowlist. Zero or multiple matches fail closed. This means
-`private` is never a role or routing signal.
+## Discovery and bidirectional verification
 
-The exact-key requirement in explicit-map mode remains a safety property: a
-secret entry cannot silently turn an unconfigured repository into a child, and
-a configured child cannot silently disappear from the runtime binding.
+The parent uses its runtime token to enumerate repositories owned by the token
+holder **without any visibility filter**. For each candidate it reads the
+candidate's GitHub Actions repository variables and accepts the repository only
+when all of these conditions hold:
 
-Use the three thin parent entry workflows in
+1. the requested child id is present in the parent's `CONTINUUM_CHILDREN`;
+2. the candidate has `CONTINUUM_ROLE=child`;
+3. its `CONTINUUM_CHILD_ID` equals that requested id;
+4. its `CONTINUUM_PARENT` equals the calling parent repository exactly.
+
+Zero matches or multiple matches fail closed. Repository visibility is never a
+routing signal.
+
+The old `.continuum.yml` relationship declaration and optional
+`CONTINUUM_CHILD_REPOSITORIES` secret remain readable only as a compatibility
+path while existing consumers migrate. New integrations should use repository
+variables.
+
+## Parent workflows
+
+Use the three thin entry workflows in
 `fixtures/delegation-parent/.github/workflows/`. They call:
 
 - `consumer-child-dispatcher.yml`
 - `consumer-child-worker.yml`
 - `consumer-child-review.yml`
 
-The visible workflow identity contains only the child id, never the repository
-binding. A public parent can therefore donate Actions to a private child
-without publishing the private repository name in workflow inputs or run names.
+The wrapper passes `CONTINUUM_ROLE` and `CONTINUUM_CHILDREN` from the
+parent's GitHub repository variables. The child repository name is resolved only
+inside the runner and is not committed to the parent repository.
 
-## Child configuration
+A token with access to the child repositories is still required through the
+wrapper's child-runtime secret.
 
-```yaml
-version: 1
+## Deterministic child validation
 
-delegation:
-  role: child
-  id: child-a
-  parent: owner/parent-repository
-```
+When `CONTINUUM_VALIDATION_SCRIPT` is set on the child, delegated review loads
+that script from the child's **base branch**, never from the pull-request head,
+and executes it against the candidate worktree with a minimal `env -i`
+environment.
 
-The child id must be present in the parent's allowlist and must resolve through
-the parent's secret map to the repository containing this configuration.
-The child must name the calling parent exactly. If either side disagrees, that
-child fails closed and no task is executed.
+GitHub tokens, repository bindings, and model credentials are not inherited by
+the project validation process. Validation output remains runner-local. Merge
+requires both independent review acceptance and successful deterministic
+validation.
 
-
-A child may also declare a deterministic validation gate:
-
-```yaml
-delegation:
-  role: child
-  id: child-a
-  parent: owner/parent-repository
-  validation_script: automation/continuum-child-ci.sh
-```
-
-The delegated review loads that script from the child's **base branch**, not
-from the pull-request head, then executes it against the candidate worktree
-with a minimal environment created by `env -i`. GitHub tokens, child repository
-bindings, and model credentials are therefore not inherited by project tests.
-Validation stdout/stderr stays in a runner-local file and is never copied to the
-public parent logs. A review cannot merge until both the independent agent review
-and this deterministic gate pass.
+## Task opt-in
 
 A child task is opt-in per issue. Add:
 
@@ -97,15 +91,13 @@ A child task is opt-in per issue. Add:
 <!-- continuum-child-owned -->
 ```
 
-to the issue body. The legacy `<!-- runtime-worker-owned -->` marker remains
-accepted during migration. The reusable local scheduler skips both markers, so
-a delegated issue cannot race with the child's ordinary OpenCode scheduler.
+The legacy `<!-- runtime-worker-owned -->` marker remains accepted during
+migration. The local scheduler skips both markers so local private Actions do
+not race the parent execution path.
 
 ## Visibility is not routing
 
-Continuum does not enumerate repositories by `visibility=private` and does
-not infer relationships from public/private state. These are all valid when the
-credential can access both repositories:
+All of these relationships are valid when the credential has access:
 
 - public parent -> private child
 - public parent -> public child
@@ -113,26 +105,13 @@ credential can access both repositories:
 - private parent -> public child
 
 Being private does not make a repository a child. Being public does not make a
-repository a parent. Only the explicit, bidirectionally verified delegation
-contract does.
+repository a parent. Only the explicit repository-variable relationship does.
 
 ## Multiple children
 
-One parent may list multiple child ids. Each child has an independent
-repository binding and independent task/review concurrency key. Issue numbers
-may overlap across children because active runs are keyed by
-`child id + task number`.
+One parent may configure multiple opaque child ids in
+`CONTINUUM_CHILDREN`. Each child has an independent repository binding and
+task/review concurrency key. Issue numbers may overlap between children.
 
-The initial contract intentionally allows one parent per child. A repository
-cannot be both parent and child under the same configuration. Supporting chains
-or bridges is a separate role and must not be inferred implicitly.
-
-## Migration
-
-The worker/review path accepts legacy `runtime-worker/task-...` pull-request
-branches and the legacy issue ownership marker. New work uses
-`continuum-child/task-...` and `continuum-child-owned`.
-
-Repository visibility checks are not part of the new mechanism. Existing
-systems should migrate relationship declaration first, verify the bidirectional
-handshake, then remove their old discovery-by-visibility code.
+The current contract allows one parent per child. A repository is not
+simultaneously parent and child under this contract.
