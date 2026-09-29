@@ -249,6 +249,48 @@ anything — `tests/test_release_run.py` fails if either names `codesign`,
 needs *before* the first step runs, so a job on the wrong runner fails with
 "this runner has no `codesign`" instead of after creating a keychain.
 
+### Downstream package publishers
+
+Homebrew and MacPorts are not release adapters. They run *after* a release
+exists, when they are handed the release's identity, the immutable URLs its
+assets were published at, and the digests those URLs must serve. A publisher
+turns those into the package manager's own description of the release; it never
+builds, re-signs, or uploads anything, and it never asks the release pipeline
+for a favour.
+
+They live in `src/continuum/release/publishers/`, deliberately separate from
+`release/plan.py` and `release/run.py`. Those two own the release state machine
+and must not learn the name of a package manager; the publishers own everything
+a package manager needs and know nothing about how the release was cut. The
+seam is `contract.PublishRequest` and `contract.PublishResult` — immutable
+value types that describe the *generic* contract — plus a `PackageRepository`
+for the cross-repository write and an `AssetFetcher` for verification. A caller
+assembles those and hands them to a publisher; the publisher returns a result
+and nothing else happens outside it. `tests/test_release_run.py` fails if the
+release core names a package manager, and `tests/test_release_publishers.py`
+fails the other way if a publisher imports the release state machine.
+
+A publisher is reached through `publishers.get(name)` rather than imported by
+name, so adding a package manager is adding a module and a registry entry.
+`homebrew` and `macports` are registered today:
+
+- **Homebrew** renders a formula and/or a cask from the release's assets, with
+  per-architecture blocks when the manifest carries them, then validates the
+  Ruby syntax before writing. A cask that clears quarantine is refused for a
+  signed or notarized artifact, and otherwise must carry evidence that is
+  audited in the generated file.
+- **MacPorts** writes the `Portfile`, its tree, and a separate installer script
+  whose pinned revision is reconciled to the tree HEAD, so a moved pin is
+  repaired rather than duplicated.
+
+Every publisher is idempotent: a re-run against the same release with a
+destination already at the new content returns `already-current` instead of
+writing again, and a destination that moved under it is reconciled against the
+new head. Updates either open a pull request or push the configured branch,
+chosen by the destination's mode; secrets are checked for presence but never
+read. Project data and templates are consumer-owned; the publisher only knows
+the generic shape.
+
 No release workflow is active in this repository, and `.github/workflows/ci.yml`
 enforces an allowlist of workflow names. The module and the CLI are the
 deliverable; the macOS job is a follow-up.
