@@ -17,6 +17,10 @@ on:
         type: number
         required: false
         default: 4
+      engine_ref:
+        type: string
+        required: false
+        default: main
     secrets:
       CHILD_RUNTIME_TOKEN:
         required: true
@@ -49,8 +53,20 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Load Continuum engine
-        uses: kodmial/continuum/.github/actions/engine-path@main
+      - name: Checkout Continuum engine
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: kodmial/continuum
+          ref: ${{ inputs.engine_ref }}
+          path: .continuum-engine
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Export Continuum engine root
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "CONTINUUM_ENGINE_ROOT=$GITHUB_WORKSPACE/.continuum-engine" >> "$GITHUB_ENV"
 
       - name: Execute child task
         shell: bash
