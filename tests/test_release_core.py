@@ -308,6 +308,24 @@ class DryRunTests(ReleaseTestCase):
             self.assertTrue(item.startswith("find:"), item)
         self.assertEqual(self.repository.releases, {})
 
+    def test_a_plan_without_a_downstream_sync_is_still_a_plan(self):
+        """A release that has only one destination still plans.
+
+        The downstream sync is optional, so the walk of a single-destination
+        release stops there having done nothing. Reporting `no-op` there would
+        tell a caller that the release had nothing to do when the plan just
+        named every artifact it would ship — and a single-destination release
+        is the common case, not the corner one.
+        """
+
+        core = ReleaseCore(self.components(syncs=()))
+        outcome = core.plan(self.request())
+        self.assertEqual(outcome.status, PLANNED)
+        self.assertFalse(outcome.no_op)
+        self.assertTrue(outcome.ok)
+        self.assertStages(outcome, *stage_names())
+        self.assertEqual(self.repository.releases, {})
+
     def test_a_plan_describes_artifacts_it_has_not_built(self):
         outcome = self.core.plan(self.request())
         artifact = outcome.manifests[0].artifacts[0]

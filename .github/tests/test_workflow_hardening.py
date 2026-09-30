@@ -1472,6 +1472,29 @@ class ReleaseWorkflowTests(WorkflowAuditBase):
         needs = self.jobs["transaction"]["needs"]
         self.assertEqual(sorted(needs), ["resolve", "target"])
 
+    def test_a_dry_run_is_resolved_once_and_travels_in_the_matrix(self):
+        """The caller asks for a plan once, and every job reads that decision.
+
+        A `--dry-run` added to the build job's command line instead would be a
+        plan that the transaction does not know about: the build would describe
+        artifacts it never produced and the transaction would publish the gap.
+        The flag belongs to the single resolve the caller can see, and from there
+        it is matrix state like every other resolved fact.
+        """
+
+        inputs = self.document["on"]["workflow_call"]["inputs"]
+        self.assertIn("dry_run", inputs)
+        self.assertEqual(inputs["dry_run"]["type"], "boolean")
+        self.assertIs(inputs["dry_run"]["required"], False)
+        self.assertIs(inputs["dry_run"]["default"], False)
+
+        resolve = job_text(self.document, self.jobs["resolve"])
+        self.assertIn("inputs.dry_run", resolve)
+        self.assertIn("--dry-run", resolve)
+        for name in ("target", "transaction"):
+            text = job_text(self.document, self.jobs[name])
+            self.assertNotIn("--dry-run", text, f"the {name} job decides for itself")
+
     def test_publishing_is_behind_an_environment(self):
         """The approval gate is a required input, not a literal in the file."""
 

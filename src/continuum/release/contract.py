@@ -1227,6 +1227,31 @@ class TargetSpec:
     def options_as_dict(self) -> Dict[str, Any]:
         return {key: value for key, value in self.options}
 
+    @classmethod
+    def from_release_target(cls, target: Any) -> "TargetSpec":
+        """Read a validated `config.ReleaseTarget` as a spec, options and all.
+
+        The one place a configured target becomes something the core walks. It
+        is a classmethod rather than a snippet repeated per caller because the
+        options are not decoration: an adapter rehydrates its settings by
+        re-parsing `options` through the same schema the file went through, so a
+        spec built without them is a target whose adapter has nothing to build.
+        The build job and the transaction therefore have to agree on how a spec
+        is written, and a second spelling of this would be a way for them to stop
+        agreeing.
+
+        Sorted by key so the same target always produces the same spec, in this
+        process and the next one: a request that reorders its own options
+        between the job that built a release and the job that publishes it is a
+        request whose two halves are not obviously the same release.
+        """
+
+        return cls(
+            id=target.id,
+            adapter=target.adapter,
+            options=tuple(sorted(target.describe().items(), key=lambda pair: pair[0])),
+        )
+
     def describe(self) -> Dict[str, Any]:
         return {"id": self.id, "adapter": self.adapter}
 

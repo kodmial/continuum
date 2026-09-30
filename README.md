@@ -446,6 +446,13 @@ that is never published with a missing asset, an attached asset that is never
 replaced, a checksum file checked against the manifest, and a release that never
 points at a commit it was not approved for.
 
+The Apple adapter is registered as a core adapter, so a `.continuum.yml` that
+declares `adapter: apple` builds through `continuum release target` and
+publishes through `continuum release transaction` — the three jobs the reusable
+workflow runs, with no platform branch in the core and no Apple knowledge in the
+transaction. Pass `dry_run: true` to that workflow to plan a release end to end
+without writing a release, a tag, or an asset.
+
 The contract, the ports, and the reasoning behind each rule are in
 [docs/release-core-contract.md](docs/release-core-contract.md). The plan
 adapters and the release core are separate surfaces on purpose: the core is what

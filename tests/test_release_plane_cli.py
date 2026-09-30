@@ -20,13 +20,16 @@ import os
 import pathlib
 import tempfile
 import unittest
+import unittest.mock
 from typing import Any, Dict, List, Optional
 
 from continuum import cli
 from continuum import config as config_module
-from continuum.release import commands, entrypoints
+from continuum.release import apple, commands, entrypoints
+from continuum.release.core import ReleaseRequest
 from continuum.release.transaction import TargetFragment
 
+from . import apple_toolchain_support as toolchain_support
 from . import release_core_support as core_support
 
 SHA = core_support.SHA
@@ -246,16 +249,19 @@ class ResolveCommandTests(ReleasePlaneTestCase):
 
 
 class TargetCommandTests(ReleasePlaneTestCase):
-    def test_refuses_a_target_with_no_release_adapter(self):
-        """Apple has a complete signing plan and no release adapter.
+    def test_never_refuses_an_apple_target_for_walkability(self):
+        """Apple has a release adapter, so a declared macOS target can be built.
 
-        The refusal names both halves, because the natural next question is
-        "so use the plan then" and the answer is that a plan produces no
-        manifest for the transaction to merge.
+        The property worth pinning is the absence of a refusal, not the presence
+        of a success: whether this job then builds or stops at the toolchain
+        check depends on the machine the tests run on, and both answers are
+        correct. What must never come back is `adapter-not-walkable`, which is
+        the release plane saying it has no adapter at all for the platform its
+        own configuration validates.
         """
 
         self.resolve()
-        code, out, _err = self.run_cli(
+        _code, out, _err = self.run_cli(
             [
                 "release", "target",
                 "--config", self.config_path,
@@ -265,9 +271,7 @@ class TargetCommandTests(ReleasePlaneTestCase):
             ],
             SECRETS,
         )
-        self.assertEqual(code, 1)
-        self.assertIn("adapter-not-walkable", out)
-        self.assertIn("no manifest", out)
+        self.assertNotIn("adapter-not-walkable", out)
 
     def test_refuses_a_target_the_policy_does_not_declare(self):
         self.resolve()
@@ -357,9 +361,285 @@ class TransactionCommandTests(ReleasePlaneTestCase):
 
 
 def _apple_config():
-    from continuum import config as config_module
-
     return config_module.parse_config(APPLE_TARGET, source="test")
+
+
+def _event():
+    """The event the target job builds from, assembled the way the command does."""
+
+    return commands.load_event(
+        repository=REPOSITORY, source_sha=SHA, version=VERSION, name="tag-push"
+    )
+
+
+class AppleTargetWalkTests(ReleasePlaneTestCase):
+    """A declared macOS target through all three jobs.
+
+    The release plane's proof that Apple is walkable: the three commands the
+    reusable workflow runs, against the same policy a NanoDictate-shaped
+    repository declares and the same `AppleAdapter` a macOS runner would hold.
+    Nothing about the platform is faked except the process boundary, because
+    these tests do not run on macOS — the plans, their ordering, the manifest
+    building, and the packaging are the real ones.
+
+    The transaction's destination is the one other substitution, and it is
+    substituted for the same reason: nothing here may reach an API.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.config = _apple_config()
+        self.target = self.config.release.target("macos-app")
+        self.toolchain = toolchain_support.FakeToolchain(
+            binaries=[item.name for item in self.target.binaries]
+        )
+        self.checkout = os.path.realpath(self.workdir)
+        os.environ.update(SECRETS)
+        self.write_checkout()
+
+    def write_checkout(self) -> None:
+        """The files the build plans were written against."""
+
+        path = os.path.join(self.checkout, "Resources")
+        os.makedirs(path, exist_ok=True)
+        with open(os.path.join(path, "DemoAgent.entitlements"), "w", encoding="utf-8") as handle:
+            handle.write("com.apple.security.app-sandbox\n")
+
+    def dist_names(self) -> List[str]:
+        directory = os.path.join(self.checkout, apple.DIST_ROOT)
+        return sorted(os.listdir(directory)) if os.path.isdir(directory) else []
+
+    def writes(self) -> List[str]:
+        """Every call the destination saw that changed something.
+
+        A read is not a write: the publisher asks the destination whether it
+        already holds the release, and a dry run is entitled to ask. Drafting,
+        uploading, and publishing are not.
+        """
+
+        return [
+            call
+            for call in self.repository.calls
+            if call.split(":")[0] in ("draft", "upload", "publish")
+        ]
+
+    def on_this_machine(self, components, *, revision: str = SHA):
+        """Point the components' Apple adapter at a toolchain this host lacks.
+
+        `AppleAdapter` takes both seams as constructor arguments precisely so a
+        whole plan can run where `swift`, `codesign`, and `security` are not
+        installed. The release plane constructs the adapter itself, so the walk
+        sets them afterwards — the same two attributes, for the same reason.
+        """
+
+        adapter = components.adapter_for("apple")
+        adapter.is_available = True
+        adapter.command_runner = self.toolchain
+        adapter.workdir = self.checkout
+        adapter.git_revision = lambda root: revision
+        return adapter
+
+    def build_job(self, *, dry_run: bool = False, revision: str = SHA):
+        """Resolve, then build and sign the target the way the target job does."""
+
+        from continuum.release.transaction import build_target, resolve_release, write_fragment
+
+        # `--dry-run` is a flag rather than a `--name value` pair: the release
+        # helper builds the latter, and a dry run asked for as a value would
+        # resolve in the mode the caller did not ask for.
+        argv = [
+            "release", "resolve",
+            "--config", self.config_path,
+            "--fragment-root", self.runs,
+            "--version", VERSION,
+            "--source-sha", SHA,
+        ]
+        if dry_run:
+            argv.append("--dry-run")
+        code, out, err = self.run_cli(argv, SECRETS)
+        self.assertEqual(code, 0, out + err)
+        matrix = self.matrix()
+        event = _event()
+        request = resolve_release(
+            self.config,
+            event=event,
+            version=VERSION,
+            source_sha=SHA,
+            matrix=matrix,
+            workdir=self.checkout,
+            version_checks=commands.version_checks_for(matrix, event),
+        )
+        components = commands.build_components(self.config, "macos-app")
+        self.on_this_machine(components, revision=revision)
+        fragment = build_target(request, matrix, "macos-app", components=components)
+        write_fragment(self.runs, fragment)
+        return matrix, fragment
+
+    def transaction_args(self, **overrides) -> argparse.Namespace:
+        values = {
+            "config": self.config_path,
+            "fragment_root": self.runs,
+            "matrix": "",
+            "repository": REPOSITORY,
+            "event": "tag-push",
+            "tag": f"v{VERSION}",
+            "journal": "",
+            "workdir": self.checkout,
+            "prerelease": False,
+            "immutable": False,
+            "allow_unknown_digests": False,
+            "attest": False,
+            "source_sha": SHA,
+        }
+        values.update(overrides)
+        return argparse.Namespace(**values)
+
+    def transaction_job(self, args=None, *, journal: str = ""):
+        """The privileged command, against a destination held in this process.
+
+        The wiring is the real one — `transaction_components` is what registers
+        the adapters and requires the token — and only the destination is
+        replaced, because a test may not reach an API.
+        """
+
+        import dataclasses
+
+        os.environ["GITHUB_TOKEN"] = "not-a-real-token"
+        args = args or self.transaction_args(journal=journal)
+        components = commands.transaction_components(self.config, args)
+        self.on_this_machine(components)
+        components = dataclasses.replace(
+            components, publishers=(core_support.github_publisher(self.repository),)
+        )
+        with unittest.mock.patch.object(commands, "transaction_components", return_value=components):
+            return commands.cmd_transaction(args, config=self.config)
+
+    def test_a_declared_macos_target_reaches_the_transaction_as_a_manifest(self):
+        """The build half: bytes, digests, and a signature, into one fragment.
+
+        Named artifacts rather than counts, because a manifest that described a
+        different release than the one that ran would still have the right
+        number of rows in it.
+        """
+
+        _matrix, fragment = self.build_job()
+        self.assertEqual(fragment.target, "macos-app")
+        manifest = fragment.manifests[0]
+        self.assertEqual(
+            sorted(artifact.name for artifact in manifest.artifacts),
+            sorted([f"DemoAgent-{VERSION}-macos-arm64.tar.gz", "macos-app-SHA256SUMS.txt"]),
+        )
+        for artifact in manifest.artifacts:
+            self.assertTrue(artifact.verified, artifact.name)
+        archives = [
+            artifact for artifact in manifest.artifacts if artifact.classifier == "tar.gz"
+        ]
+        self.assertEqual(archives[0].signing, "signed")
+        self.assertEqual(archives[0].signing_identity, self.target.signing.identity)
+        self.assertEqual(
+            self.repository.calls, [], "a build job has no destination to call"
+        )
+
+    def test_the_transaction_publishes_the_merged_manifest_exactly_once(self):
+        self.build_job()
+        code, outputs = self.transaction_job()
+        self.assertEqual(code, 0, outputs.get("summary", ""))
+        self.assertEqual(outputs["status"], "released")
+        self.assertEqual(outputs["tag"], f"v{VERSION}")
+        self.assertEqual(outputs["targets"], "macos-app")
+        self.assertEqual(outputs["declared"], "")
+        uploads = [call for call in self.repository.calls if call.startswith("upload:")]
+        self.assertEqual(
+            sorted(call.split(":")[-1] for call in uploads),
+            sorted([f"DemoAgent-{VERSION}-macos-arm64.tar.gz", "macos-app-SHA256SUMS.txt"]),
+        )
+        self.assertEqual(self.repository.calls.count(f"draft:v{VERSION}"), 1)
+        self.assertEqual(self.repository.calls.count(f"publish:v{VERSION}"), 1)
+        self.assertTrue(os.path.isfile(os.path.join(self.runs, commands.RESULT_NAME)))
+        self.assertTrue(os.path.isfile(os.path.join(self.runs, commands.JOURNAL_NAME)))
+
+    def test_a_resumed_transaction_does_not_publish_a_second_time(self):
+        """The journal is what makes a retry a retry rather than a second release.
+
+        The status is deliberately not asserted to `released`: nothing was
+        published on this run, so reporting that would be the summary the core
+        calls the one a caller cannot act on. What has to hold is that the
+        release is still public, still one release, and that the destination was
+        not written to a second time.
+        """
+
+        self.build_job()
+        code, outputs = self.transaction_job()
+        self.assertEqual(code, 0, outputs.get("summary", ""))
+        self.assertEqual(outputs["status"], "released")
+        before = list(self.repository.calls)
+        journal = os.path.join(self.runs, commands.JOURNAL_NAME)
+        code, outputs = self.transaction_job(self.transaction_args(journal=journal))
+        self.assertEqual(code, 0, outputs.get("summary", ""))
+        self.assertNotEqual(
+            outputs["status"], "failed", "an already-published release is not a failure"
+        )
+        self.assertEqual(
+            self.repository.calls,
+            before,
+            "a release already public must not be drafted or uploaded again",
+        )
+        self.assertEqual(sorted(self.repository.releases), [f"v{VERSION}"])
+
+    def test_a_dry_run_declares_the_release_and_writes_nothing(self):
+        """What a thin consumer entrypoint can ask for before anything is cut.
+
+        The plan names the same artifacts a real run records, and leaves the
+        checkout, the destination, and the release itself untouched — a dry run
+        that dirtied a checkout it promised not to touch would hand the next
+        release an artifact it did not build.
+        """
+
+        matrix, fragment = self.build_job(dry_run=True)
+        self.assertTrue(matrix.dry_run)
+        self.assertEqual(
+            sorted(artifact.name for artifact in fragment.manifests[0].artifacts),
+            sorted([f"DemoAgent-{VERSION}-macos-arm64.tar.gz", "macos-app-SHA256SUMS.txt"]),
+        )
+        self.assertEqual(self.toolchain.calls, [], "a dry run starts no tool")
+        self.assertEqual(
+            self.repository.calls, [], "a build job has no destination to call"
+        )
+        self.assertEqual(self.dist_names(), [], "a dry run wrote no archive")
+        code, outputs = self.transaction_job()
+        self.assertEqual(code, 0, outputs.get("summary", ""))
+        self.assertEqual(
+            outputs["status"], "planned", "a walk that published nothing is a plan, not a no-op"
+        )
+        self.assertEqual(self.writes(), [], "a dry run creates no draft and uploads nothing")
+
+    def test_a_checkout_that_is_not_the_pinned_commit_builds_nothing(self):
+        from continuum.release.transaction import TargetFailure
+
+        with self.assertRaises(TargetFailure) as caught:
+            self.build_job(revision=core_support.OTHER_SHA)
+        self.assertEqual(caught.exception.code, "source-mismatch")
+        self.assertEqual(self.toolchain.calls, [], "no compiler was started")
+        self.assertEqual(self.dist_names(), [], "a build that refused its checkout wrote nothing")
+
+    def test_the_published_release_is_bound_to_the_pinned_commit(self):
+        """The commit the tag points at is the commit the policy was approved for.
+
+        Checked on the record the destination ended up holding rather than on
+        what the run said it would do: a release whose assets are public and
+        whose tag names a different commit is the failure no later stage can
+        catch.
+        """
+
+        self.build_job()
+        self.transaction_job()
+        record = self.repository.releases[f"v{VERSION}"]
+        self.assertFalse(record.draft)
+        self.assertEqual(record.target_sha, SHA)
+        self.assertEqual(
+            sorted(self.repository.held[f"v{VERSION}"]),
+            sorted([f"DemoAgent-{VERSION}-macos-arm64.tar.gz", "macos-app-SHA256SUMS.txt"]),
+        )
 
 
 class DispatchedReleaseTests(ReleasePlaneTestCase):
@@ -730,20 +1010,87 @@ class WiringTests(ReleasePlaneTestCase):
     def test_the_build_table_is_explicit_about_what_it_has(self):
         """A discovered registry would drift as adapters are added.
 
-        The property worth pinning is that Apple is *absent*: it is the adapter
-        the config supports, so a table that quietly included it would dispatch a
-        build job that cannot produce a manifest.
+        The property worth pinning is coverage, in one direction: every adapter
+        the configuration validates has to be walkable, because a policy that
+        validates a target the plane cannot build is a repository told its
+        target is legal and then refused for it at the build job.
         """
 
         self.assertIn("apple", entrypoints.supported())
         self.assertNotIn(ADAPTER, commands.CORE_ADAPTERS)
-        self.assertNotIn("apple", commands.CORE_ADAPTERS)
+        self.assertLessEqual(
+            set(config_module.SUPPORTED_RELEASE_ADAPTERS),
+            set(commands.CORE_ADAPTERS),
+            "an adapter configuration accepts but the release plane cannot walk",
+        )
 
-    def test_names_an_adapter_with_no_release_adapter(self):
+    def test_a_declared_apple_target_gets_its_own_release_adapter(self):
         config = _apple_config()
-        with self.assertRaises(commands.ReleasePlaneError) as caught:
-            commands.build_components(config, "macos-app")
-        self.assertEqual(caught.exception.code, "adapter-not-walkable")
+        components = commands.build_components(config, "macos-app")
+        adapter = components.adapter_for("apple")
+        self.assertIsInstance(adapter, apple.AppleAdapter)
+        self.assertEqual(
+            sorted(components.adapters), ["apple"], "a build job holds the one target it builds"
+        )
+        self.assertEqual(components.publisher_names(), ())
+
+    def test_the_build_job_binds_the_certificate_the_policy_names(self):
+        """The join between the policy's secret name and the plan's own.
+
+        A plan built from an unbound environment fails to find the secret it was
+        planned around, which looks exactly like a certificate that was never
+        configured — so the binding is asserted here rather than discovered at
+        the sign step.
+        """
+
+        config = _apple_config()
+        os.environ.update(SECRETS)
+        self.addCleanup(lambda: [os.environ.pop(name, None) for name in SECRETS])
+        adapter = commands.build_components(config, "macos-app").adapter_for("apple")
+        target = config.release.target("macos-app")
+        self.assertEqual(adapter.environment[apple.P12_ENV], SECRETS[apple.P12_ENV])
+        self.assertTrue(apple.material_present(target.signing, adapter.environment))
+
+    def test_the_transaction_can_read_the_manifest_an_apple_build_produced(self):
+        """The other half of walkable: the privileged job must resolve it too.
+
+        A transaction that cannot find the adapter would refuse the release
+        after every target had already built and signed it, which is the most
+        expensive place for this to be discovered.
+        """
+
+        os.environ.update(SECRETS)
+        os.environ["GITHUB_TOKEN"] = "t" * 40
+        self.addCleanup(
+            lambda: [os.environ.pop(name, None) for name in (*SECRETS, "GITHUB_TOKEN")]
+        )
+        args = argparse.Namespace(
+            repository=REPOSITORY, prerelease=False, immutable=False, attest=False
+        )
+        components = commands.transaction_components(_apple_config(), args)
+        self.assertIsInstance(components.adapter_for("apple"), apple.AppleAdapter)
+        self.assertEqual(components.publisher_names(), ("github-release",))
+
+    def test_a_target_the_policy_declares_keeps_its_options_into_the_transaction(self):
+        """The spec the transaction builds must be the spec the build job built.
+
+        An adapter rehydrates its settings by re-parsing `TargetSpec.options`
+        through the schema the file went through, so a spec assembled without
+        them is a target whose adapter refuses an empty mapping — reported as a
+        malformed policy rather than as the missing half of a spec.
+        """
+
+        config = _apple_config()
+        built = commands.build_components(config, "macos-app")
+        request_spec = ReleaseRequest.from_config(config, _event()).targets[0]
+        self.assertEqual(request_spec, commands._spec_for(config, "macos-app"))
+        self.assertEqual(
+            request_spec.options_as_dict().get("signing"),
+            config.release.target("macos-app").describe()["signing"],
+        )
+        # And the adapter it is handed can read them back as its own settings.
+        adapter = built.adapter_for("apple")
+        self.assertEqual(apple.settings_from(request_spec).id, "macos-app")
 
     def test_a_build_job_holds_no_destination(self):
         """The privilege boundary, asserted on the wiring rather than the run.

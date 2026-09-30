@@ -347,14 +347,7 @@ class ReleaseRequest:
         """
 
         targets = tuple(
-            TargetSpec(
-                id=target.id,
-                adapter=target.adapter,
-                options=tuple(
-                    sorted(target.describe().items(), key=lambda pair: pair[0])
-                ),
-            )
-            for target in config.release.targets
+            TargetSpec.from_release_target(target) for target in config.release.targets
         )
         return cls(
             event=event,
@@ -689,6 +682,14 @@ class ReleaseCore:
                     # do, which is the common case for a single-destination
                     # release.
                     return self._finish(run, status=RELEASED)
+                if run.dry_run and run.publications:
+                    # A plan that reached a destination and wrote nothing has
+                    # finished planning. `no-op` would claim the release had
+                    # nothing to do, which is the opposite of what walking every
+                    # stage in plan mode just proved. A plan with no destination
+                    # to decline is still a no-op: there was nowhere to publish
+                    # to, and that is true of the real run too.
+                    return self._finish(run, status=PLANNED)
                 return self._finish(run, status=NO_OP, no_op_reason=outcome.summary)
             previous = name
         if run.dry_run:

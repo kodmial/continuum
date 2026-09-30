@@ -84,6 +84,11 @@ on:
         required: false
         default: false
         type: boolean
+      dry_run:
+        description: Plan the release end to end without writing a release, a tag, or an asset
+        required: false
+        default: false
+        type: boolean
     secrets:
       # Every secret is declared by name. Inheriting the caller's secrets
       # wholesale would hand each job whatever the caller happened to have,
@@ -160,6 +165,7 @@ jobs:
           FRAGMENT_ROOT: ${{ inputs.fragment_root }}
           SIGNING_MATERIAL: ${{ inputs.signing_material }}
           INCLUDE_DECLARED: ${{ inputs.include_declared }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
           # Built as an array and executed without a shell. These are
@@ -181,6 +187,10 @@ jobs:
           # set and `false` as a stray positional, and the release would resolve
           # in the mode the caller asked it not to.
           if [[ "$INCLUDE_DECLARED" == "true" ]]; then args+=(--include-declared); fi
+          # The dry run is resolved once, here, and travels in the matrix every
+          # other job reads. A build job cannot decide for itself that it is a
+          # plan: it is handed the flag from the one resolve the caller can see.
+          if [[ "$DRY_RUN" == "true" ]]; then args+=(--dry-run); fi
           PYTHONPATH=src python3 -m continuum.cli "${args[@]}"
 
       - name: Preserve the matrix for the build jobs

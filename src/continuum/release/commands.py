@@ -23,6 +23,7 @@ from typing import Any, Dict, Optional, Tuple
 from .. import config as config_module
 from . import adapters as release_adapters
 from . import android as android_module
+from . import apple as apple_module
 from . import entrypoints
 from . import github_api
 from . import jvm as jvm_module
@@ -31,17 +32,18 @@ from . import provenance as provenance_module
 from .contract import EVENT_DISPATCH, EVENT_TAG_PUSH, ContractError, ReleaseEvent
 from .core import ReleaseComponents, ReleaseRequest
 from .entrypoints import ReleaseMatrix
-from .transaction import classify, write_fragment
+from .transaction import build_target, classify, resolve_release, write_fragment
 from .version import ExplicitVersion, TagVersion, VersionPolicy
 
 #: The adapters that have a release adapter — a `build`/`sign`/`verify` object
 #: the chain can walk — rather than only a plan. Named explicitly rather than
 #: discovered, because "has a plan" and "can produce a manifest" are different
-#: properties and only this table knows which is which: Apple has a complete
-#: signing plan and no adapter, so a target naming it is refused by name here
-#: instead of being attempted through a path that cannot produce a manifest.
+#: properties and only this table knows which is which. An adapter that is
+#: missing here is refused by name, at resolve and build time, instead of being
+#: attempted through a path that cannot produce a manifest.
 CORE_ADAPTERS = {
     android_module.ADAPTER_NAME: android_module.AndroidAdapter,
+    apple_module.ADAPTER_NAME: apple_module.AppleAdapter,
     jvm_module.ADAPTER_NAME: jvm_module.JvmAdapter,
 }
 
@@ -556,6 +558,10 @@ def cmd_transaction(
         requested_version=matrix.version,
         channel=matrix.channel,
         workdir=args.workdir or ".",
+        # From the matrix, for the same reason the build job reads it there: a
+        # transaction that resolved as a dry run and published anyway is the
+        # whole failure a dry run is for.
+        dry_run=matrix.dry_run,
     )
     if not request.targets:
         raise ReleasePlaneError(
@@ -598,7 +604,12 @@ def _spec_for(config: config_module.ContinuumConfig, target_id: str) -> Any:
 
     target = config.release.target(target_id)
     assert target is not None
-    return TargetSpec(id=target.id, adapter=target.adapter)
+    # Through the same normalizer the build job used, options included. A spec
+    # carrying only an id and an adapter is a target whose adapter re-parses an
+    # empty mapping and refuses it as malformed, which reads like a broken
+    # policy rather than the missing half of a spec the transaction assembled by
+    # hand.
+    return TargetSpec.from_release_target(target)
 
 
 def _read_journal(args: Any) -> Any:

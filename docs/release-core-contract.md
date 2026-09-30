@@ -253,8 +253,14 @@ declared in `.continuum.yml`. The command reads the configuration, builds the
 continuum release run --target macos --tag v1.4.0 --sha "$GITHUB_SHA"
 ```
 
-Three things about that command are worth stating, because each is a way the
-integration could have been less honest:
+The three-job workflow is the same integration split across privilege levels:
+`release resolve` names the matrix, `release target` builds one fragment per
+adapter, and `release transaction` merges the fragments and publishes. The Apple
+adapter is registered in `commands.CORE_ADAPTERS`, so a `.continuum.yml` that
+declares `adapter: apple` walks that chain like any other target.
+
+Three things about that integration are worth stating, because each is a way it
+could have been less honest:
 
 - **It names no platform.** There is no Apple branch in it. The target's own
   configuration supplies the bundle, the binaries, the architectures, the
@@ -264,7 +270,9 @@ integration could have been less honest:
 - **A dry run walks the same chain.** `release run --dry-run` executes no tool
   and writes no file — not even a checksum file — and declares the same
   artifacts, by name, that the real run records. A plan that described a
-  different release than the one that ran would not be a plan.
+  different release than the one that ran would not be a plan. The reusable
+  workflow takes the same decision as one `dry_run` input, resolves it once,
+  and carries it in the matrix, so a build job cannot plan itself.
 - **Publication is not wired here.** With no publisher configured, a completed
   release ends as a verified no-op. That is the contract's answer for "nothing
   to publish to", not a success that skipped a step.
@@ -384,6 +392,12 @@ outcome.resumable   # could running this again succeed without doubling anything
 
 `ok` and `published` are different claims: a plan is green, a release with no
 destination configured is green, and neither has published anything.
+
+A dry run that reached a destination and published nothing is `planned`, never
+`no-op`. `no-op` says there was correctly nothing to do, and a plan that just
+named every artifact it would ship is the opposite of that. The distinction is
+reachable in practice: the downstream sync is optional, so the walk of a
+single-destination release — the common case — stops there having done nothing.
 
 ## Tests
 

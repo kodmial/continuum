@@ -90,6 +90,7 @@ FAILURE_TAXONOMY: Dict[str, Tuple[bool, str]] = {
     "provider-unavailable": (True, "the destination or a registry did not answer; retry the same version"),
     "provider-rate-limited": (True, "GitHub rate limited the run; retry later without changing the version"),
     "build-failed": (True, "a toolchain, compiler, or test failed; fix the tree and retry"),
+    "toolchain-unavailable": (True, "this runner does not have the toolchain the matrix names; re-dispatch the row on the runner the matrix said it runs on"),
     "transient-attestation": (True, "attestation signing could not be completed; retry the same release"),
     # A human has to look at this one.
     "validation-failed": (False, "the release policy, version, or source pin refused the release"),
@@ -536,6 +537,12 @@ def resolve_release(
     building it here is what makes the two agree about the release. Nothing is
     derived from the runner: a request that depended on which machine it was
     built on would be a different release per runner.
+
+    The matrix, not the caller, decides whether this is a dry run. It is the one
+    file every job shares, so it is the only place that can answer for both —
+    a resolve job that recorded a dry run and a target job that did not read it
+    would build and sign for real behind a matrix that says otherwise, which is
+    the one outcome a dry run exists to prevent.
     """
 
     request = ReleaseRequest.from_config(
@@ -546,6 +553,7 @@ def resolve_release(
         release_pr_number=release_pr_number,
         workdir=workdir or os.environ.get("CONTINUUM_WORKDIR", "") or ".",
         channel=channel or "default",
+        dry_run=matrix.dry_run,
     )
     if matrix.version != version:
         raise TransactionError(
