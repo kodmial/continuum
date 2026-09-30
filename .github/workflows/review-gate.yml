@@ -265,7 +265,7 @@ jobs:
           HEAD_REF: ${{ needs.authorize.outputs.head_ref }}
         run: |
           set -euo pipefail
-          python3 .github/scripts/trust_policy.py verify \
+          python3 .github/scripts/trust_policy.py verify-dispatch \
             --mode review-fix \
             --pr-number "$PR_NUMBER" \
             --head-ref "$HEAD_REF"
