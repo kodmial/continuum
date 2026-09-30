@@ -99,10 +99,35 @@ jobs:
                 sed -nE 's#^(continuum-child|runtime-worker)/task-([0-9]+)-.*#\2#p' <<<"$stale_head"
               )"
               [[ -n "$stale_task" ]] || continue
-              stale_issue_state="$(
-                gh api "repos/$child_repo/issues/$stale_task" --jq '.state' 2>/dev/null || echo closed
+              stale_issue_json="$(
+                gh api "repos/$child_repo/issues/$stale_task" 2>/dev/null || true
               )"
+              stale_issue_state="$(jq -r '.state // "closed"' <<<"$stale_issue_json")"
               [[ "$stale_issue_state" == "open" ]] || continue
+
+              # A closed delegated PR is recoverable only when the task is
+              # actually ready. Never resurrect a superseded implementation
+              # whose issue is still dependency-blocked.
+              stale_body="$(jq -r '.body // ""' <<<"$stale_issue_json")"
+              stale_ready=true
+              stale_deps="$(
+                sed -nE 's/.*<!-- *automation-blocked-by: *([^>]*) *-->.*/\1/p' \
+                  <<<"$stale_body" | head -1 | tr ',' ' '
+              )"
+              for stale_dep in $stale_deps; do
+                stale_dep="${stale_dep//#/}"
+                stale_dep="${stale_dep//[[:space:]]/}"
+                [[ "$stale_dep" =~ ^[0-9]+$ ]] || continue
+                stale_dep_state="$(
+                  gh api "repos/$child_repo/issues/$stale_dep" --jq '.state' 2>/dev/null || echo open
+                )"
+                if [[ "$stale_dep_state" != "closed" ]]; then
+                  stale_ready=false
+                  break
+                fi
+              done
+              [[ "$stale_ready" == true ]] || continue
+
               if gh pr reopen "$stale_pr" --repo "$child_repo" >/dev/null 2>&1; then
                 echo "Reopened stale delegated PR #$stale_pr for child task #$stale_task."
               fi
