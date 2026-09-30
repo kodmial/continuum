@@ -53,9 +53,11 @@ permissions:
   pull-requests: write
   statuses: read
 
+# A run waiting out a provider cooldown must finish rather than be superseded
+# by each wake-up; otherwise a busy repository can starve the queued head.
 concurrency:
   group: continuum-review-queue
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   reconcile:
