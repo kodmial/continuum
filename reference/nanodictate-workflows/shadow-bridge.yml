@@ -257,11 +257,9 @@ jobs:
       actions: read
     # Pinned to a commit, like every other Continuum entry point: a branch here
     # would mean the evidence in the window was produced by code nobody reviewed.
-    # PLACEHOLDER PIN: this commit predates the shadow workflow on default
-    # branch. Keep the bridge non-production until this PR merges, then replace
-    # the SHA below with the actual merged Continuum commit and delete this
-    # paragraph. Consumer rollout must always use an immutable full SHA.
-    uses: kodmial/continuum/.github/workflows/continuum-shadow.yml@9446b1a7ce31aebe8676e721c831b5c1c3698a1f
+    # Pinned to the validated merged shadow implementation. Consumer rollout
+    # may advance this only through an explicitly validated immutable SHA.
+    uses: kodmial/continuum/.github/workflows/continuum-shadow.yml@dfffb3c1384f569c4a789e839bc413742b051e26
     with:
       mode: run
       repository: ${{ github.repository }}
