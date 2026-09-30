@@ -1,0 +1,271 @@
+name: Continuum shadow bridge
+
+# The production-side half of Continuum's validation plane.
+#
+# This file is the *only* thing Continuum asks a production repository to add, and
+# it is deliberately thin. It does two things:
+#
+#   1. Names the lifecycle event that just happened in Continuum's vocabulary, and
+#      projects the webhook payload into a small immutable document: the
+#      repository, the event type and action, the issue or pull request number,
+#      the head and base commits, the scheduling-relevant labels, the CI, review
+#      and release facts the webhook already carried, and a correlation id with
+#      the instant it was observed.
+#   2. Hands that document to Continuum's reusable shadow workflow.
+#
+# What it must never do is why it is this small. There is no decision, no queue,
+# no retry, no policy, and no write of any kind here. Every judgement about what
+# should happen belongs to the production controller that already exists, and
+# every judgement about whether Continuum agrees belongs to the shadow plane. A
+# bridge that grew logic would be a second orchestration surface that could drift
+# from the first, and the entire value of the exercise is that the two surfaces
+# being compared are the *same* decision.
+#
+# Lifecycle state is not forwarded. The shadow plane reads it from GitHub through
+# a read-only token at the moment it decides, because a snapshot taken here would
+# already be stale by the time the run starts, and a stale capture would compare
+# two different moments and call the difference a divergence.
+#
+# This copy lives under `reference/` so GitHub Actions cannot execute it from the
+# Continuum repository. Install it in the production repository as
+# `.github/workflows/continuum-shadow-bridge.yml`.
+
+on:
+  # Only the actions the projection below can name. A trigger the projection
+  # cannot name is a run that produces no evidence and a log line explaining
+  # why, which is noise pretending to be coverage: the trigger list says the
+  # event is handled, and the absence of a record later reads as a decision that
+  # was never taken. Every action here appears in the mapping, and tests assert
+  # that it stays true.
+  issues:
+    types: [opened, closed, labeled]
+  pull_request:
+    types: [opened, synchronize]
+  pull_request_review:
+    types: [submitted]
+  pull_request_review_comment:
+    types: [created]
+  check_suite:
+    types: [completed]
+  workflow_run:
+    types: [completed]
+  release:
+    types: [published]
+  schedule:
+    # The merge-decision path has no webhook to forward: whether a queued pull
+    # request may merge is a periodic question, so its evidence arrives on a
+    # schedule like the decision it exercises.
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+    inputs:
+      event_type:
+        description: the shadow event type to forward by hand
+        type: string
+        default: schedule.tick
+      action:
+        description: the action to forward
+        type: string
+        default: tick
+      number:
+        description: the issue or pull request number
+        type: string
+        default: ""
+
+# No token of its own. Everything the bridge reads arrives in the event payload,
+# and the only thing it does with it is hand it to the shadow plane.
+permissions: {}
+
+concurrency:
+  group: continuum-shadow-bridge-${{ github.repository }}-${{ github.event_name }}-${{ github.event_id || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  context:
+    name: Shape the event
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Project the payload
+        id: context
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action || inputs.action || 'tick' }}
+          EVENT_ID: ${{ github.event_id || github.run_id }}
+          DEFAULT_EVENT_TYPE: ${{ inputs.event_type }}
+          DEFAULT_NUMBER: ${{ inputs.number }}
+          # Every fact below is read from the webhook payload GitHub already
+          # delivered, not from a second API call: a second source is a second
+          # thing to keep correct, and this file exists to be small enough to
+          # audit.
+          NUMBER: ${{ github.event.issue.number || github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || inputs.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.check_suite.head_sha || github.event.workflow_run.head_sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          ACTOR: ${{ github.event.sender.login }}
+          ISSUE_STATE: ${{ github.event.issue.state }}
+          LINKED_PR: ${{ github.event.issue.pull_request.url }}
+          DRAFT: ${{ github.event.pull_request.draft }}
+          MERGEABLE_STATE: ${{ github.event.pull_request.mergeable_state }}
+          REVIEW_STATE: ${{ github.event.review.state }}
+          REVIEW_AUTHOR: ${{ github.event.review.user.login }}
+          REVIEW_URL: ${{ github.event.review.html_url || github.event.comment.html_url }}
+          CHECK_CONCLUSION: ${{ github.event.check_suite.conclusion || github.event.workflow_run.conclusion }}
+          CHECK_URL: ${{ github.event.check_suite.url || github.event.workflow_run.html_url }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_DRAFT: ${{ github.event.release.draft }}
+        run: |
+          set -euo pipefail
+          # The mapping from GitHub's event name to Continuum's is stated once,
+          # here, and nowhere else. An event this bridge cannot name is not
+          # forwarded at all: guessing would put a record in the evidence window
+          # that no planner can act on, which is worse than a missing one.
+          case "$EVENT_NAME" in
+            issues)
+              case "$EVENT_ACTION" in
+                opened) event_type="issue.opened" ;;
+                closed) event_type="issue.closed" ;;
+                labeled) event_type="issue.labelled" ;;
+                *) echo "::notice::no shadow event for issues.$EVENT_ACTION"; exit 0 ;;
+              esac
+              ;;
+            pull_request)
+              case "$EVENT_ACTION" in
+                opened) event_type="pull_request.opened" ;;
+                synchronize) event_type="pull_request.synchronize" ;;
+                *) echo "::notice::no shadow event for pull_request.$EVENT_ACTION"; exit 0 ;;
+              esac
+              ;;
+            pull_request_review) event_type="pull_request.review" ;;
+            pull_request_review_comment) event_type="pull_request.review_comment" ;;
+            # The engine names these two separately, because a completed
+            # check_suite and a completed workflow_run are not the same fact and
+            # the repair ladder reads them differently. Both were one name here
+            # once, which the event normalizer refused outright.
+            check_suite) event_type="check_suite.completed" ;;
+            workflow_run) event_type="workflow_run.completed" ;;
+            release) event_type="release.event" ;;
+            schedule) event_type="schedule.tick" ;;
+            workflow_dispatch)
+              event_type="$DEFAULT_EVENT_TYPE"
+              EVENT_ACTION="${EVENT_ACTION:-tick}"
+              ;;
+            *)
+              echo "::notice::no shadow event for $EVENT_NAME"
+              exit 0
+              ;;
+          esac
+          # A projection, not a copy: only the fields the engine acts on, or that
+          # a reviewer needs to place the record, are forwarded. A copy of the
+          # webhook would carry fields the engine does not understand and would
+          # not fit through a workflow input.
+          # Two instants, because they are different facts and conflating them
+          # makes a record unplaceable: when the event happened, which is the
+          # payload's own timestamp and never changes, and when this run observed
+          # it, which is now. `github.event.repository.updated_at` is neither --
+          # it moves whenever anything in the repository is touched.
+          observed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          document="$(
+            jq -c \
+              --arg event_type "$event_type" \
+              --arg observed_at "$observed_at" \
+              --arg action "$EVENT_ACTION" \
+              --arg event_id "${GITHUB_REPOSITORY}/$EVENT_NAME/$EVENT_ID" \
+              --arg delivery "$GITHUB_RUN_ID" \
+              --arg repository "$GITHUB_REPOSITORY" \
+              --arg number "${NUMBER:-${DEFAULT_NUMBER:-}}" \
+              --arg head_sha "${HEAD_SHA:-}" \
+              --arg base_sha "${BASE_SHA:-}" \
+              --arg base_ref "${BASE_REF:-}" \
+              --arg head_ref "${HEAD_REF:-}" \
+              --arg actor "${ACTOR:-}" \
+              --arg review_state "${REVIEW_STATE:-}" \
+              --arg review_author "${REVIEW_AUTHOR:-}" \
+              --arg review_url "${REVIEW_URL:-}" \
+              --arg check_conclusion "${CHECK_CONCLUSION:-}" \
+              --arg check_url "${CHECK_URL:-}" \
+              --arg release_tag "${RELEASE_TAG:-}" \
+              --arg release_draft "${RELEASE_DRAFT:-}" \
+              --arg issue_state "${ISSUE_STATE:-}" \
+              --arg linked_pr "${LINKED_PR:-}" \
+              --arg draft "${DRAFT:-}" \
+              --arg mergeable_state "${MERGEABLE_STATE:-}" \
+              '{
+                 event_type: $event_type,
+                 action: $action,
+                 event_id: $event_id,
+                 delivery_id: $delivery,
+                 repository: $repository,
+                 number: (if $number == "" then null else ($number | tonumber) end),
+                 head_sha: (if $head_sha == "" then null else $head_sha end),
+                 base_sha: (if $base_sha == "" then null else $base_sha end),
+                 base_ref: (if $base_ref == "" then "main" else $base_ref end),
+                 head_ref: (if $head_ref == "" then null else $head_ref end),
+                 # Labels live under the issue or the pull request, never at the
+                 # root of the payload, and they are what the queue dispatches
+                 # on. Reading them from the root -- as this did -- forwarded an
+                 # empty list for every real event, which looks exactly like a
+                 # repository with nothing labelled and nothing queued.
+                 labels: [((.issue.labels // .pull_request.labels // [])[])
+                          | (.name // empty)],
+                 actor: (if $actor == "" then null else $actor end),
+                 release: (if $release_tag == "" then null
+                           else {tag: $release_tag, source_sha: (if $head_sha == "" then null else $head_sha end)}
+                           end),
+                 context: {
+                   event_at: (.issue.updated_at // .pull_request.updated_at
+                              // .review.submitted_at // .comment.created_at
+                              // .check_suite.updated_at // .workflow_run.updated_at
+                              // .release.published_at // .head_commit.timestamp
+                              // null),
+                   observed_at: $observed_at,
+                   issue_state: (if $issue_state == "" then null else $issue_state end),
+                   pull_request_draft: (if $draft == "" then null else ($draft == "true") end),
+                   mergeable_state: (if $mergeable_state == "" then null else $mergeable_state end),
+                   linked_pull_request: (if $linked_pr == "" then null else $linked_pr end),
+                   review_state: (if $review_state == "" then null else $review_state end),
+                   review_author: (if $review_author == "" then null else $review_author end),
+                   review_url: (if $review_url == "" then null else $review_url end),
+                   check_conclusion: (if $check_conclusion == "" then null else $check_conclusion end),
+                   check_url: (if $check_url == "" then null else $check_url end),
+                   release_draft: (if $release_draft == "" then null else ($release_draft == "true") end)
+                 }
+               }' "$GITHUB_EVENT_PATH"
+          )"
+          echo "event=$document" >>"$GITHUB_OUTPUT"
+          echo "forwarded $document"
+      - name: Refuse a document that is not an event
+        if: steps.context.outputs.event == ''
+        run: |
+          set -euo pipefail
+          echo "::error::no event was forwarded; nothing to validate"
+          exit 1
+
+  shadow:
+    name: Ask Continuum what it would have done
+    needs: context
+    # The called workflow receives the caller repository's GITHUB_TOKEN.
+    # Grant exactly the read surfaces live capture needs; reusable workflows
+    # cannot elevate beyond these caller permissions.
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      checks: read
+      statuses: read
+      actions: read
+    # Pinned to a commit, like every other Continuum entry point: a branch here
+    # would mean the evidence in the window was produced by code nobody reviewed.
+    # This reference is deliberately pinned to the first validated commit that
+    # contains the corrected reusable shadow workflow. Consumer rollout may
+    # advance this pin only through the validated Continuum repin path.
+    uses: kodmial/continuum/.github/workflows/continuum-shadow.yml@9446b1a7ce31aebe8676e721c831b5c1c3698a1f
+    with:
+      mode: run
+      repository: ${{ github.repository }}
+      event_json: ${{ needs.context.outputs.event }}
+      capture_live: true
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      trusted_actors: ${{ vars.AUTOMATION_TRUSTED_ACTORS || '' }}
+      save_case: true
