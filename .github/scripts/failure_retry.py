@@ -24,7 +24,7 @@ INFRA_RETRY_MARKER_RE = re.compile(
     r"<!--\s*continuum-infra-retry:\s*attempt=(\d+)\s+"
     r"next_retry_at=([^\s]+)\s+code=([A-Za-z0-9_.-]+)\s+run=(\d+)\s*-->"
 )
-INFRA_RETRY_EXHAUSTED_MARKER = "<!-- continuum-infra-retry-exhausted -->"
+INFRA_RETRY_EXHAUSTED_MARKER = "<!-- continuum-infra-retry-exhausted -->"\nINFRA_RETRY_RESET_MARKER = "<!-- continuum-infra-retry-reset -->"
 
 _INFRA_SIGNATURES = (
     ("dns_resolution_failed", re.compile(r"(could not resolve host|temporary failure in name resolution|name or service not known)", re.I)),
@@ -120,7 +120,12 @@ def cmd_schedule(args: argparse.Namespace) -> int:
 
 def retry_state(text: str, now: dt.datetime | None = None) -> dict:
     current = (now or dt.datetime.now(dt.timezone.utc)).astimezone(dt.timezone.utc)
-    markers = list(INFRA_RETRY_MARKER_RE.finditer(text or ""))
+    source = text or ""
+    reset_at = source.rfind(INFRA_RETRY_RESET_MARKER)
+    if reset_at >= 0:
+        source = source[reset_at + len(INFRA_RETRY_RESET_MARKER):]
+
+    markers = list(INFRA_RETRY_MARKER_RE.finditer(source))
     latest = markers[-1] if markers else None
     attempt = max((int(match.group(1)) for match in markers), default=0)
     next_retry_at = latest.group(2) if latest else ""
@@ -131,7 +136,7 @@ def retry_state(text: str, now: dt.datetime | None = None) -> dict:
         "infra_retry_attempts": attempt,
         "next_retry_at": next_retry_at,
         "retry_due": due,
-        "infra_retry_exhausted": INFRA_RETRY_EXHAUSTED_MARKER in (text or ""),
+        "infra_retry_exhausted": INFRA_RETRY_EXHAUSTED_MARKER in source,
     }
 
 
