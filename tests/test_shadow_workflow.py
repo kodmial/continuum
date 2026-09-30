@@ -359,10 +359,18 @@ class ShadowWorkflowTests(unittest.TestCase):
         self.assertIn("workflow_call", triggers)
         self.assertIn("workflow_dispatch", triggers)
         # A reusable workflow that is also dispatchable is one place for the
-        # engine, so a replay and a live run cannot disagree about how to start.
+        # engine. Live event/state documents enter only through the read-only
+        # consumer bridge; manual dispatch is reserved for recorded replay/cutover.
         called = set(triggers["workflow_call"]["inputs"])
         dispatched = set(triggers["workflow_dispatch"]["inputs"])
-        bridge_only = {"run_url", "delivery_id", "token"}
+        bridge_only = {
+            "run_url",
+            "delivery_id",
+            "token",
+            "event_json",
+            "observed_json",
+            "state_json",
+        }
         self.assertTrue(
             (called - bridge_only) <= dispatched,
             "a dispatch cannot reach a non-bridge-only input: {}".format(
