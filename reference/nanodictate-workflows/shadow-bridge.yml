@@ -245,6 +245,16 @@ jobs:
   shadow:
     name: Ask Continuum what it would have done
     needs: context
+    # The called workflow receives the caller repository's GITHUB_TOKEN.
+    # Grant exactly the read surfaces live capture needs; reusable workflows
+    # cannot elevate beyond these caller permissions.
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      checks: read
+      statuses: read
+      actions: read
     # Pinned to a commit, like every other Continuum entry point: a branch here
     # would mean the evidence in the window was produced by code nobody reviewed.
     # This reference is deliberately pinned to the first validated commit that
@@ -259,8 +269,3 @@ jobs:
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       trusted_actors: ${{ vars.AUTOMATION_TRUSTED_ACTORS || '' }}
       save_case: true
-      # A read-only token, and the only credential this plane ever holds. The
-      # shadow workflow needs it because a reusable workflow called across
-      # repositories receives no GITHUB_TOKEN of its own; this one must have
-      # read scopes and no write scopes, or the read-only claim is false.
-      token: ${{ secrets.SHADOW_READ_TOKEN }}
