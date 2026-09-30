@@ -339,5 +339,34 @@ jobs:
             exit 0
           fi
 
+          # A successful delegated merge is authoritative completion. Close the
+          # child issue explicitly instead of relying on GitHub's "Closes #N"
+          # parsing: multiple runtime retries can otherwise leave the issue open
+          # and cause the dispatcher to review/merge a second stale PR.
+          gh api --method PATCH "repos/$child_repo/issues/$TASK_NUMBER" \
+            -f state=closed -f state_reason=completed >/dev/null
+          for label in automation:in-progress automation:paused; do
+            gh api --method DELETE \
+              "repos/$child_repo/issues/$TASK_NUMBER/labels/${label//:/%3A}" \
+              >/dev/null 2>&1 || true
+          done
+
+          # Close any other automation-owned PRs for the same completed task.
+          # They are stale retries, not independent work, and must never be
+          # picked up by a later dispatcher cycle.
+          gh pr list --repo "$child_repo" --state open --limit 100 \
+            --json number,headRefName \
+            --jq '.[] | select(
+              (.headRefName | startswith("continuum-child/task-'"$TASK_NUMBER"'-")) or
+              (.headRefName | startswith("runtime-worker/task-'"$TASK_NUMBER"'-"))
+            ) | .number' |
+          while IFS= read -r stale_pr; do
+            [[ -n "$stale_pr" && "$stale_pr" != "$PR_NUMBER" ]] || continue
+            gh pr comment "$stale_pr" --repo "$child_repo" \
+              --body "Closed automatically: task #$TASK_NUMBER completed via PR #$PR_NUMBER." \
+              >/dev/null 2>&1 || true
+            gh pr close "$stale_pr" --repo "$child_repo" >/dev/null 2>&1 || true
+          done
+
           gh issue comment "$TASK_NUMBER" --repo "$child_repo"             --body "<!-- continuum-child-review-merged --> Child task #$TASK_NUMBER passed delegated review and its PR was merged."             >/dev/null 2>&1 || true
-          echo "Child task [$CHILD_ID] #$TASK_NUMBER reviewed and merged."
+          echo "Child task [$CHILD_ID] #$TASK_NUMBER reviewed, merged, and closed."
