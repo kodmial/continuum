@@ -75,7 +75,6 @@ PRODUCTION_CONSUMER_WORKFLOWS = (
     "consumer-review-gate.yml",
     "consumer-scheduler.yml",
     "release.yml",
-    "publish-continuum.yml",
 )
 
 #: Continuum dogfooding the same control plane in this repository, held to the
@@ -90,13 +89,15 @@ OWN_CONTROL_PLANE = (
     "review-queue.yml",
 )
 
-#: Continuum's own build and verification. These run against *this* repository
-#: at its own commit and never resolve Continuum code from another revision, so
-#: the release-selection rules do not bind them; they are listed so that a new
-#: workflow cannot appear without a reviewer deciding which side it is on.
+#: Continuum's own build, verification, and publication. These run against
+#: *this* repository at its own commit and never resolve Continuum code from
+#: another revision, so the release-selection rules do not bind them; they are
+#: listed so that a new workflow cannot appear without a reviewer deciding which
+#: side it is on.
 OWN_REPOSITORY_TOOLING = (
     "ci.yml",
     "release-bun-binary.yml",
+    "publish-continuum.yml",
 )
 
 #: The shadow harness is the one workflow allowed to name a Continuum revision,
