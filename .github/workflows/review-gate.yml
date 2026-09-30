@@ -45,7 +45,7 @@ on:
 
   # A submitted review is the provider's answer arriving. This is a wake-up, not
   # an input: the engine re-derives the verdict from the live pull request.
-  pull_request_review_target:
+  pull_request_review:
     types: [submitted, edited, dismissed]
 
   # CI completing is how a pushed repair comes back to be looked at.
@@ -154,7 +154,7 @@ jobs:
           }
 
           case "$EVENT_NAME" in
-            pull_request_target | pull_request_review_target)
+            pull_request_target | pull_request_review)
               pr="$PR_EVENT_NUMBER"
               ;;
             workflow_run)
@@ -228,55 +228,36 @@ jobs:
           PY
 
   # ---------------------------------------------------------------------------
-  # Privileged execution. Runs only for a trusted same-repository agent PR, and
-  # spends authority only for the single action the engine decided.
+  # Second read-only trust boundary. Job-level permissions are the smallest
+  # privilege boundary GitHub supports; a shell step inside a write-capable job
+  # cannot down-scope github.token. Re-verification therefore has its own job.
   # ---------------------------------------------------------------------------
-  gate:
-    name: Evaluate the review gate and repair
+  reverify:
+    name: Re-verify the live review target
     needs: authorize
-    # Only the control plane can authorize this job. There is deliberately no
-    # fallback that re-derives trust from the event payload: an event-supplied
-    # pull-request ref is exactly the value that must never reach a
-    # write-capable step unvalidated.
     if: >-
       always() &&
       (needs.authorize.result == 'success') &&
       (needs.authorize.outputs.proceed == 'true')
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
 
     permissions:
-      actions: write
-      checks: write
       contents: read
-      issues: write
-      pull-requests: write
+      pull-requests: read
+
+    outputs:
+      allowed: ${{ steps.dispatch.outputs.allowed }}
 
     steps:
       - name: Checkout trusted policy
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          # Base branch only, with no credentials persisted. The engine is the
-          # trusted code; the pull request's own diff is never checked out here.
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
 
-      # The control plane decided with a read-only token a workflow boundary
-      # ago. Authority is re-checked against the live pull request here, in the
-      # job that is about to spend it, so a pull request that was merged,
-      # retargeted, or replaced in between fails closed instead of receiving
-      # writes it no longer deserves.
-      #
-      # This step's own token is read-only, and the step-level `permissions`
-      # block is what makes that true: `github.token` in a job whose job-level
-      # scopes are write-capable would otherwise still be write-capable here. The
-      # write secret is deliberately not passed to this step at all - a
-      # verification must not need the authority it is deciding about.
       - name: Re-verify the dispatch against the live pull request
         id: dispatch
-        permissions:
-          contents: read
-          pull-requests: read
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
@@ -290,9 +271,38 @@ jobs:
             --head-ref "$HEAD_REF"
           echo "allowed=true" >> "$GITHUB_OUTPUT"
 
+  # ---------------------------------------------------------------------------
+  # Privileged execution. It receives only values already validated by two
+  # read-only jobs and never checks out pull-request code.
+  # ---------------------------------------------------------------------------
+  gate:
+    name: Evaluate the review gate and repair
+    needs: [authorize, reverify]
+    if: >-
+      always() &&
+      (needs.authorize.result == 'success') &&
+      (needs.authorize.outputs.proceed == 'true') &&
+      (needs.reverify.result == 'success') &&
+      (needs.reverify.outputs.allowed == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      actions: write
+      checks: write
+      contents: read
+      issues: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout trusted policy
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
       - name: Evaluate the gate and perform its next action
         id: reconcile
-        if: steps.dispatch.outputs.allowed == 'true'
         env:
           # Write authority, and only in this step: publishing the normalized
           # gate status, recording the durable repair ledger, asking the
