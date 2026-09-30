@@ -67,10 +67,15 @@ on:
         description: also write a replayable case for this run
         type: boolean
         default: true
-      engine_ref:
-        description: dispatch only; the full commit SHA of Continuum to judge with
+      engine_repository:
+        description: >-
+          Repository that hosts the Continuum release this run judges with. The
+          caller already names it in its `uses:` line, and GitHub forbids an
+          expression there, so the same literal is declared here as well. What
+          Continuum does *not* accept is a second choice of ref: the release is
+          the commit of this workflow file, read from the run itself.
         type: string
-        default: ""
+        required: true
       artifact_run_id:
         description: replay/cutover; the run holding the recorded window's artifact
         type: string
@@ -169,9 +174,14 @@ on:
         description: also write a replayable case
         type: boolean
         default: true
-      engine_ref:
-        description: the full commit SHA of Continuum to judge with
+      engine_repository:
+        description: >-
+          owner/name of the Continuum release to judge with. An operator rejudging
+          a recorded window names the release they mean, and the run uses this
+          workflow file's own commit as the pin -- there is no separate ref to
+          choose, because that is the only escape hatch this plane ever had.
         type: string
+        required: true
       artifact_run_id:
         description: the run holding the recorded window's artifact
         type: string
@@ -268,7 +278,7 @@ jobs:
       DELIVERY_ID: ${{ inputs.delivery_id }}
       BUDGET_MS: ${{ inputs.budget_ms }}
       SAVE_CASE: ${{ inputs.save_case }}
-      ENGINE_REF_INPUT: ${{ inputs.engine_ref }}
+      ENGINE_REPOSITORY: ${{ inputs.engine_repository }}
       RUN_ATTEMPT: ${{ github.run_attempt }}
       RUN_ID: ${{ github.run_id }}
       SERVER_URL: ${{ github.server_url }}
@@ -280,24 +290,26 @@ jobs:
           JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: |
           set -euo pipefail
-          # A called run uses job.workflow_sha, which is the exact commit SHA
-          # of the reusable workflow definition selected by the caller's uses:
-          # reference. A manual dispatch must name the engine commit explicitly.
-          if [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]; then
-            ref="${JOB_WORKFLOW_SHA:-}"
-          else
-            ref="${ENGINE_REF_INPUT:-}"
-          fi
+          # job.workflow_sha is the exact commit SHA of this workflow definition,
+          # whether it was selected by a caller's uses: reference or dispatched
+          # by an operator. Reading the pin from the run itself is what makes the
+          # evidence name the code that produced it; an input naming a different
+          # commit would make it name something else instead.
+          ref="${JOB_WORKFLOW_SHA:-}"
           if ! printf '%s' "$ref" | grep -Eq '^[0-9a-f]{40}$'; then
             echo "::error::the engine ref must be a full commit sha, got '${ref}'"
             exit 1
           fi
+          if [ -z "${ENGINE_REPOSITORY:-}" ]; then
+            echo "::error::engine_repository is unset; name the Continuum to judge with"
+            exit 1
+          fi
           echo "sha=$ref" >>"$GITHUB_OUTPUT"
-          echo "engine $ref"
+          echo "engine $ENGINE_REPOSITORY at $ref"
       - name: Check out the pinned engine
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          repository: kodmial/continuum
+          repository: ${{ inputs.engine_repository }}
           ref: ${{ steps.engine.outputs.sha }}
           path: engine
           persist-credentials: false
@@ -518,7 +530,7 @@ jobs:
       BASELINE_LEDGER_PATH: ${{ inputs.baseline_ledger_path }}
       WINDOW_START: ${{ inputs.window_start }}
       WINDOW_END: ${{ inputs.window_end }}
-      ENGINE_REF_INPUT: ${{ inputs.engine_ref }}
+      ENGINE_REPOSITORY: ${{ inputs.engine_repository }}
     steps:
       - name: Resolve the pinned engine
         id: engine
@@ -526,21 +538,21 @@ jobs:
           JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: |
           set -euo pipefail
-          if [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]; then
-            ref="${JOB_WORKFLOW_SHA:-}"
-          else
-            ref="${ENGINE_REF_INPUT:-}"
-          fi
+          ref="${JOB_WORKFLOW_SHA:-}"
           if ! printf '%s' "$ref" | grep -Eq '^[0-9a-f]{40}$'; then
             echo "::error::the engine ref must be a full commit sha, got '${ref}'"
             exit 1
           fi
+          if [ -z "${ENGINE_REPOSITORY:-}" ]; then
+            echo "::error::engine_repository is unset; name the Continuum to judge with"
+            exit 1
+          fi
           echo "sha=$ref" >>"$GITHUB_OUTPUT"
-          echo "engine $ref"
+          echo "engine $ENGINE_REPOSITORY at $ref"
       - name: Check out the pinned engine
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          repository: kodmial/continuum
+          repository: ${{ inputs.engine_repository }}
           ref: ${{ steps.engine.outputs.sha }}
           path: engine
           persist-credentials: false

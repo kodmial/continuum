@@ -1,0 +1,38 @@
+name: Child dispatcher
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_run:
+    workflows:
+      - Child task
+      - Child review
+    types:
+      - completed
+  push:
+    branches:
+      - main
+    paths:
+      - .continuum.yml
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: continuum-child-dispatcher
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    uses: kodmial/continuum/.github/workflows/consumer-child-dispatcher.yml@main
+    with:
+      # The caller already names Continuum in the `uses:` line above, and
+      # GitHub does not allow an expression there. It cannot pass its own
+      # `uses:` literal as an input, so it repeats the same literal and
+      # Continuum proves the two agree by checking out `job.workflow_sha` --
+      # the commit GitHub resolved that line to -- and refusing any other.
+      engine_repository: kodmial/continuum
+    secrets:
+      CHILD_RUNTIME_TOKEN: ${{ secrets.CONTINUUM_CHILD_TOKEN }}

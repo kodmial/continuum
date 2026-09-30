@@ -111,9 +111,15 @@ The installer runs in every workflow that starts a model, and nowhere else:
 schedule and dispatch, and never start a model. That is what keeps this list
 finite.
 
-`.github/actions/engine-path/action.yml` requires both the script and the
-canonical document, so a partial engine checkout fails at the action rather than
-part way through an agent run with the policy missing.
+Every reusable workflow loads its own engine before it starts a model: it takes
+the caller's `engine_repository`, checks out the commit GitHub selected for the
+called workflow (`job.workflow_sha`), verifies that the checkout is exactly that
+commit, and refuses to continue unless `.github/scripts/opencode_instructions.py`
+and `.github/agents/AGENTS.md` are both present in it. Continuum therefore has
+no shared composite action to load the engine: a composite action's `uses:` must
+name a repository literally, which would run one repository's scripts for every
+consumer. The incomplete-checkout guard means a partial engine fails at load
+rather than part way through an agent run with the policy missing.
 
 ## The guarantees, and their tests
 

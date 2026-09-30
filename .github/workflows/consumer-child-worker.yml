@@ -9,14 +9,15 @@ on:
       task_number:
         type: string
         required: true
-      model:
+      engine_repository:
+        description: >-
+          Repository that hosts the Continuum release this run is part of. The
+          caller already names it in its `uses:` line, and GitHub forbids an
+          expression there, so the same literal is declared here as well. What
+          Continuum does *not* accept is a second choice of ref: the release is
+          the commit of this workflow file, read from the run itself.
         type: string
-        required: false
-        default: opencode/big-pickle
-      max_agent_passes:
-        type: number
-        required: false
-        default: 4
+        required: true
     secrets:
       CHILD_RUNTIME_TOKEN:
         required: true
@@ -39,8 +40,15 @@ jobs:
       CHILD_REPOSITORIES: ${{ secrets.CHILD_RUNTIME_REPOSITORIES }}
       CHILD_ID: ${{ inputs.child_id }}
       TASK_NUMBER: ${{ inputs.task_number }}
-      OPENCODE_MODEL: ${{ inputs.model }}
-      MAX_AGENT_PASSES: ${{ inputs.max_agent_passes }}
+      # Consumer policy, resolved from the calling repository's variables rather
+      # than from a default baked into Continuum: which model runs the child
+      # task, how many passes it gets, which branch work is based on, and which
+      # workflow file its entry point is.
+      OPENCODE_MODEL: ${{ vars.CONTINUUM_AGENT_MODEL }}
+      MAX_AGENT_PASSES: ${{ vars.CONTINUUM_MAX_AGENT_PASSES }}
+      DEFAULT_BRANCH: ${{ vars.CONTINUUM_DEFAULT_BRANCH }}
+      LEGACY_TASK_BRANCH_PREFIX: ${{ vars.CONTINUUM_LEGACY_TASK_BRANCH_PREFIX }}
+      LEGACY_TASK_MARKER: ${{ vars.CONTINUUM_LEGACY_TASK_MARKER }}
       OPENCODE_CONFIG_CONTENT: '{"permission":{"bash":{"*":"allow","git *":"allow","git push *":"deny"}}}'
     steps:
       - name: Checkout parent control plane
@@ -49,30 +57,78 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      # ADR-0002: a delegated child run is part of the same release as the rest
-      # of the control plane, and it is reached through a nested reusable
-      # workflow, so `job.workflow_sha` is already the commit the consumer
-      # pinned. Resolving the engine from it removes the last way a child run
-      # could execute a different Continuum revision than the one it was
-      # dispatched from: there is no longer a ref to pass in at all.
-      - name: Check out the Continuum engine
+      - name: Resolve the selected Continuum release
+        id: engine
+        shell: bash
+        env:
+          JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          ENGINE_REPOSITORY: ${{ inputs.engine_repository }}
+        run: |
+          set -euo pipefail
+          # job.workflow_sha is the commit of this reusable workflow definition
+          # as selected by the caller's `uses:` reference, so the engine this
+          # run executes is exactly the release the consumer pinned. Nothing in
+          # the call can point it anywhere else, which is the whole point: a
+          # ref input here would be a way to run Continuum other than the
+          # release the consumer chose.
+          if [[ -z "${ENGINE_REPOSITORY:-}" ]]; then
+            echo "::error::engine_repository is unset; name the Continuum to run"
+            exit 1
+          fi
+          sha="${JOB_WORKFLOW_SHA:-}"
+          if ! printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::the selected Continuum release must be a full commit sha, got '${sha}'"
+            exit 1
+          fi
+          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+          echo "engine $sha"
+
+      - name: Checkout the selected Continuum release
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          repository: kodmial/continuum
-          ref: ${{ job.workflow_sha }}
+          repository: ${{ inputs.engine_repository }}
+          ref: ${{ steps.engine.outputs.sha }}
           path: .continuum-engine
           fetch-depth: 1
           persist-credentials: false
-      - name: Load Continuum engine
-        uses: ./.continuum-engine/.github/actions/engine-path
-        with:
-          release-sha: ${{ job.workflow_sha }}
+
+      - name: Refuse any other commit
+        shell: bash
+        env:
+          ENGINE_SHA: ${{ steps.engine.outputs.sha }}
+        run: |
+          set -euo pipefail
+          head="$(git -C .continuum-engine rev-parse HEAD)"
+          if [[ "$head" != "$ENGINE_SHA" ]]; then
+            echo "::error::engine checked out at $head, expected $ENGINE_SHA"
+            exit 1
+          fi
+          echo "engine $head is the selected release"
+
+      - name: Export Continuum engine root
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "CONTINUUM_ENGINE_ROOT=$GITHUB_WORKSPACE/.continuum-engine" >> "$GITHUB_ENV"
 
       - name: Execute child task
         shell: bash
         run: |
           set -euo pipefail
           [[ "$TASK_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::Invalid task number."; exit 2; }
+          # The three values below are the consumer's, not Continuum's. An unset
+          # variable is a configuration error, not a default: guessing a model
+          # or a branch here would silently run the wrong work.
+          for required_setting in CONTINUUM_AGENT_MODEL CONTINUUM_MAX_AGENT_PASSES CONTINUUM_DEFAULT_BRANCH; do
+            if [[ -z "${!required_setting:-}" ]]; then
+              echo "::error::repository variable ${required_setting} is required for delegated child work"
+              exit 2
+            fi
+          done
+          [[ "$MAX_AGENT_PASSES" =~ ^[1-9][0-9]*$ ]] || {
+            echo "::error::CONTINUUM_MAX_AGENT_PASSES must be a positive integer"
+            exit 2
+          }
           export PYTHONPATH="$CONTINUUM_ENGINE_ROOT/src"
           resolver="$CONTINUUM_ENGINE_ROOT/.github/scripts/delegation_repository.sh"
           child_repo="$(
@@ -98,7 +154,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           branch="continuum-child/task-${TASK_NUMBER}-${GITHUB_RUN_ID}"
-          git switch -c "$branch" origin/main >/dev/null 2>&1
+          git switch -c "$branch" "origin/$DEFAULT_BRANCH" >/dev/null 2>&1
           base_sha="$(git rev-parse HEAD)"
 
           for attempt in 1 2 3; do
@@ -140,7 +196,7 @@ jobs:
           Rules:
           - Work only in the child repository in the current directory.
           - Treat the full child issue body below as the authoritative specification.
-          - Inspect current main before changing anything.
+          - Inspect the current $DEFAULT_BRANCH before changing anything.
           - Continue through diagnose -> implement -> test -> repair until acceptance is genuinely satisfied.
           - Run relevant tests and any live/integration verification required by the issue.
           - Never print, persist, or expose credentials or secret values.
@@ -214,7 +270,7 @@ jobs:
           EOF
           )"
           pr_url="$(
-            gh pr create --repo "$child_repo" --base main --head "$branch"               --title "$issue_title" --body "$pr_body" 2>/dev/null
+            gh pr create --repo "$child_repo" --base "$DEFAULT_BRANCH" --head "$branch"               --title "$issue_title" --body "$pr_body" 2>/dev/null
           )"
           gh issue comment "$TASK_NUMBER" --repo "$child_repo"             --body "<!-- continuum-child-pr --> Child task #$TASK_NUMBER produced an accepted implementation PR: $pr_url"             >/dev/null 2>&1 || true
           echo "Child task [$CHILD_ID] #$TASK_NUMBER produced an implementation PR."

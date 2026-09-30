@@ -1,0 +1,10 @@
+# Proof fixture for the Continuum v0.1 contract: a consumer that asks for both
+# a normalized review gate and release orchestration. Resolved by the unchanged
+# contract core, exactly as this file is read in that repository's checkout.
+#
+# Named for the posture it proves, not for the repository that first needed it:
+# a fixture that carries a consumer's name is a fixture that has to be renamed
+# when that consumer is deleted, and the boundary guard would then have a
+# residual to explain.
+review: true
+release: true

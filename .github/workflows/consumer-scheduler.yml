@@ -4,9 +4,12 @@ on:
   workflow_call:
     inputs:
       opencode_workflow:
+        description: >-
+          Entry workflow file the scheduler dispatches the agent into. Left
+          unset, it resolves from CONTINUUM_AGENT_ENTRY_WORKFLOW, because the
+          file a repository's agent runs in is that repository's own choice.
         type: string
         required: false
-        default: continuum-opencode.yml
       wip_limit:
         type: number
         required: false
@@ -34,10 +37,16 @@ jobs:
       - name: Reconcile and dispatch
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
         env:
-          OPENCODE_WORKFLOW: ${{ inputs.opencode_workflow }}
+          OPENCODE_WORKFLOW: ${{ inputs.opencode_workflow || vars.CONTINUUM_AGENT_ENTRY_WORKFLOW }}
           WIP_LIMIT: ${{ inputs.wip_limit }}
           LEASE_MINUTES: ${{ inputs.lease_minutes }}
           MAX_ATTEMPTS: ${{ inputs.max_attempts }}
+          # Which labels rank work, in order, and which body marker makes an
+          # issue delegation-owned. Both are the consumer's own labelling
+          # convention; Continuum reads them and never invents them.
+          PRIORITY_LABELS: ${{ vars.CONTINUUM_DISPATCH_PRIORITY_LABELS }}
+          TASK_OPT_IN_MARKER: ${{ vars.CONTINUUM_TASK_OPT_IN_MARKER }}
+          LEGACY_TASK_MARKER: ${{ vars.CONTINUUM_LEGACY_TASK_MARKER }}
         with:
           github-token: ${{ github.token }}
           script: |
@@ -50,9 +59,21 @@ jobs:
             const wipLimit = Number(process.env.WIP_LIMIT || 2);
             const leaseMs = Number(process.env.LEASE_MINUTES || 45) * 60 * 1000;
             const maxAttempts = Number(process.env.MAX_ATTEMPTS || 3);
-            const priority = new Map([
-              ['priority:p0', 0], ['priority:p1', 1], ['priority:p2', 2],
-            ]);
+            const requiredSetting = name => {
+              const value = (process.env[name] || '').trim();
+              if (!value) {
+                throw new Error(
+                  `repository variable ${name} is required: Continuum does not choose it`
+                );
+              }
+              return value;
+            };
+            const agentWorkflow = requiredSetting('OPENCODE_WORKFLOW');
+            const priorityLabels = requiredSetting('PRIORITY_LABELS')
+              .split(',').map(l => l.trim()).filter(l => l);
+            const priority = new Map(priorityLabels.map((label, rank) => [label, rank]));
+            const optInMarker = requiredSetting('TASK_OPT_IN_MARKER');
+            const legacyMarker = (process.env.LEGACY_TASK_MARKER || '').trim();
 
             async function ensureLabel(name, color, description) {
               try {
@@ -133,8 +154,8 @@ jobs:
             const labelsOf = i => new Set((i.labels || []).map(l => typeof l === 'string' ? l : l.name));
             const delegatedToParent = i => {
               const body = i.body || '';
-              return body.includes('<!-- continuum-child-owned -->') ||
-                body.includes('<!-- runtime-worker-owned -->');
+              return body.includes(optInMarker) ||
+                (legacyMarker !== '' && body.includes(legacyMarker));
             };
 
             const prs = await github.paginate(github.rest.pulls.list, {
@@ -227,7 +248,7 @@ jobs:
               try {
                 await github.rest.actions.createWorkflowDispatch({
                   owner, repo,
-                  workflow_id: process.env.OPENCODE_WORKFLOW,
+                  workflow_id: agentWorkflow,
                   ref: 'main',
                   inputs: {mode:'issue', issue_number:String(issue.number)}
                 });
@@ -236,7 +257,7 @@ jobs:
                   body:[marker, 'Automatically dispatched by Continuum.'].join('\n')
                 });
                 dispatched++;
-                core.notice(`Dispatched #${issue.number} to ${process.env.OPENCODE_WORKFLOW}.`);
+                core.notice(`Dispatched #${issue.number} to ${agentWorkflow}.`);
               } catch (e) {
                 await removeLabel(issue.number, inProgress);
                 throw e;

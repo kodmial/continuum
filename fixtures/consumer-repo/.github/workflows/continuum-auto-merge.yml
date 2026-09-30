@@ -1,0 +1,60 @@
+name: Continuum merge
+
+# Thin fixture entry point: declare when the merge reconciler should run in a
+# consumer repository, and delegate every merge decision to it.
+#
+# Note what is *not* passed here: `review` and `release`. Those are declarations
+# in `.github/continuum.yml`, read by the merge controller from the base branch
+# on every run. A second place to declare the same switch is a second thing that
+# can disagree with the first, and the merge controller has exactly one thing to
+# say about eligibility.
+#
+# `additional_blocking_workflows` is the consumer's own list of exact-head gates
+# beyond its main CI. A name that has no run for a head is treated as not
+# applicable; once a run exists, it is blocking and must pass, and the repair
+# controller knows the same list, so a failing one is repairable without
+# anything about it being named in Continuum.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review, labeled, unlabeled]
+  pull_request_review:
+    types: [submitted]
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+  status: {}
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  actions: write
+  contents: write
+  issues: write
+  pull-requests: write
+  statuses: read
+
+concurrency:
+  group: continuum-consumer-auto-merge
+  cancel-in-progress: false
+
+jobs:
+  merge:
+    uses: kodmial/continuum/.github/workflows/consumer-auto-merge.yml@39ca6dc798f2201390c8fdef0395157f588657ec
+    permissions:
+      actions: write
+      contents: write
+      issues: write
+      pull-requests: write
+      statuses: read
+    with:
+      # The `uses:` line above already names the release this repository runs;
+      # GitHub does not allow an expression there, so the same literal is passed
+      # as an input and Continuum proves the two agree by checking out the commit
+      # GitHub resolved that line to.
+      engine_repository: kodmial/continuum
+      config_path: .github/continuum.yml
+      additional_blocking_workflows: ""
+      scheduler_workflow: continuum-scheduler.yml
+      release_workflow: continuum-release.yml

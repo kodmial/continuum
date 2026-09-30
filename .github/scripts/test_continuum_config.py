@@ -21,37 +21,52 @@ from __future__ import annotations
 import contextlib
 import io
 import os
+import re
 import tempfile
 import unittest
 
 import continuum_config
 from continuum_config import ConfigError, parse, render_summary, resolve
 
+SCRIPTS = os.path.dirname(os.path.abspath(__file__))
 FIXTURES = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    os.path.dirname(SCRIPTS),
     "fixtures",
     "continuum-config",
 )
 CORE_MODULE = os.path.abspath(continuum_config.__file__)
 
-#: Any hit here means Continuum core has started branching on a consumer,
-#: provider, platform, or distribution channel - which the contract forbids.
-FOREIGN_NAMES = (
-    "nanodictate",
-    "kodmai",
-    "coderabbit",
-    "pr-agent",
-    "pr_agent",
-    "release-please",
-    "homebrew",
-    "macports",
-    "gradle",
-    "maven",
-    "android",
-    "xcode",
-    "notariz",
-    "codesign",
-)
+# Any hit in this list means Continuum core has started branching on a consumer,
+# provider, platform, or distribution channel - which the contract forbids.
+#
+# The names live in a data file rather than in this suite, for the same reason
+# the contract core is guarded by CI instead of by an import: a guard that
+# carries the vocabulary it forbids is itself a hard-code, and this file is on
+# the consumer boundary's own scan.
+def foreign_names():
+    path = os.path.join(SCRIPTS, "contract-forbidden-names.txt")
+    with open(path, encoding="utf-8") as handle:
+        lines = [
+            line.strip()
+            for line in handle
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+    if not lines:
+        raise AssertionError(
+            f"{path} declares no names; the guard would pass vacuously"
+        )
+    return lines
+
+
+def _first_spelling(expression):
+    """A concrete string the listed expression is expected to match.
+
+    The data file holds extended regular expressions so one line can cover a
+    family of spellings. Collapsing each option class to its first option yields
+    a spelling that has to match, which is enough to prove the line is live
+    without writing the name into this file a second time.
+    """
+    return re.sub(r"\[([^\]]+)\]", lambda match: match.group(1)[0], expression)
 
 
 def write(directory: str, name: str, text: str) -> str:
@@ -197,11 +212,11 @@ class DualConsumerProofTests(unittest.TestCase):
     """
 
     def test_enabled_consumer_fixture(self) -> None:
-        config = resolve(os.path.join(FIXTURES, "nanodictate.yml"))
+        config = resolve(os.path.join(FIXTURES, "enabled.yml"))
         self.assertEqual((config.review, config.release), (True, True))
 
     def test_declaring_nothing_consumer_fixture(self) -> None:
-        config = resolve(os.path.join(FIXTURES, "kodmai.yml"))
+        config = resolve(os.path.join(FIXTURES, "declaring-nothing.yml"))
         self.assertEqual((config.review, config.release), (False, False))
 
     def test_both_fixtures_resolve_through_one_implementation(self) -> None:
@@ -219,12 +234,20 @@ class ConsumerAgnosticTests(unittest.TestCase):
     def test_contract_core_contains_no_consumer_or_vendor_names(self) -> None:
         with open(CORE_MODULE, encoding="utf-8") as handle:
             source = handle.read().lower()
-        found = [name for name in FOREIGN_NAMES if name in source]
+        found = [name for name in foreign_names() if re.search(name, source)]
         self.assertEqual(
             found,
             [],
             f"{CORE_MODULE} must not name consumers, providers, or platforms: {found}",
         )
+
+    def test_the_guard_actually_detects_every_name_it_lists(self) -> None:
+        # A guard that cannot fail is not a guard. CI drives this list through
+        # `grep -E -f`, so every listed line has to be a live expression that
+        # matches a real spelling; dropping a line cannot silently pass here.
+        for name in foreign_names():
+            with self.subTest(name=name):
+                self.assertRegex("zzz " + _first_spelling(name) + " zzz", re.compile(name))
 
     def test_contract_core_defines_exactly_two_toggles(self) -> None:
         self.assertEqual(tuple(continuum_config.TOGGLES), ("review", "release"))

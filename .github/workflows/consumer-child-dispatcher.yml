@@ -3,24 +3,34 @@ name: Continuum reusable child dispatcher
 on:
   workflow_call:
     inputs:
-      # All three default to the consumer's single generated ingress. GitHub
-      # cannot dispatch a reusable workflow, so a child run has to be entered
-      # through something in the consumer's own repository; naming the same file
-      # three times is what lets a consumer hold a single Continuum reference
-      # and still reach all three child surfaces. The `child:` mode the
-      # dispatcher sends is what distinguishes them.
       worker_workflow:
+        description: >-
+          Entry workflow file that runs one delegated child task. Left unset,
+          it resolves from CONTINUUM_CHILD_WORKER_WORKFLOW, because the file a
+          parent's tasks run in is the parent's own choice.
         type: string
         required: false
-        default: continuum.yml
       review_workflow:
+        description: >-
+          Entry workflow file that reviews one delegated child task. Left
+          unset, it resolves from CONTINUUM_CHILD_REVIEW_WORKFLOW.
         type: string
         required: false
-        default: continuum.yml
       manual_pr_review_workflow:
+        description: >-
+          Entry workflow file that reviews owner-created child pull requests.
+          Left unset, it resolves from CONTINUUM_CHILD_PR_REVIEW_WORKFLOW.
         type: string
         required: false
-        default: continuum.yml
+      engine_repository:
+        description: >-
+          Repository that hosts the Continuum release this run is part of. The
+          caller already names it in its `uses:` line, and GitHub forbids an
+          expression there, so the same literal is declared here as well. What
+          Continuum does *not* accept is a second choice of ref: the release is
+          the commit of this workflow file, read from the run itself.
+        type: string
+        required: true
     secrets:
       CHILD_RUNTIME_TOKEN:
         required: true
@@ -39,9 +49,20 @@ jobs:
       GH_TOKEN: ${{ secrets.CHILD_RUNTIME_TOKEN }}
       GITHUB_TOKEN: ${{ secrets.CHILD_RUNTIME_TOKEN }}
       CHILD_REPOSITORIES: ${{ secrets.CHILD_RUNTIME_REPOSITORIES }}
-      WORKER_WORKFLOW: ${{ inputs.worker_workflow }}
-      REVIEW_WORKFLOW: ${{ inputs.review_workflow }}
-      MANUAL_PR_REVIEW_WORKFLOW: ${{ inputs.manual_pr_review_workflow }}
+      # An explicit input wins; otherwise the parent's own variable names the
+      # file. Whichever way it resolves, an empty value is a configuration error
+      # the cycle refuses, not a file name Continuum supplies.
+      WORKER_WORKFLOW: ${{ inputs.worker_workflow || vars.CONTINUUM_CHILD_WORKER_WORKFLOW }}
+      REVIEW_WORKFLOW: ${{ inputs.review_workflow || vars.CONTINUUM_CHILD_REVIEW_WORKFLOW }}
+      MANUAL_PR_REVIEW_WORKFLOW: ${{ inputs.manual_pr_review_workflow || vars.CONTINUUM_CHILD_PR_REVIEW_WORKFLOW }}
+      # Consumer policy: which issue labels carry which dispatch priority, the
+      # marker that makes a child issue opt in, and the opt-in marker and branch
+      # prefix an earlier Continuum release wrote. All of it is the parent's
+      # own labelling convention, so none of it is Continuum's to guess.
+      PRIORITY_LABELS: ${{ vars.CONTINUUM_DISPATCH_PRIORITY_LABELS }}
+      TASK_OPT_IN_MARKER: ${{ vars.CONTINUUM_TASK_OPT_IN_MARKER }}
+      LEGACY_TASK_MARKER: ${{ vars.CONTINUUM_LEGACY_TASK_MARKER }}
+      LEGACY_TASK_BRANCH_PREFIX: ${{ vars.CONTINUUM_LEGACY_TASK_BRANCH_PREFIX }}
     steps:
       - name: Checkout parent control plane
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -49,29 +70,90 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      # ADR-0002: a delegated child run is part of the same release as the rest
-      # of the control plane, and it is reached through a nested reusable
-      # workflow, so `job.workflow_sha` is already the commit the consumer
-      # pinned. Resolving the engine from it removes the last way a child run
-      # could execute a different Continuum revision than the one it was
-      # dispatched from: there is no longer a ref to pass in at all.
-      - name: Check out the Continuum engine
+      - name: Resolve the selected Continuum release
+        id: engine
+        shell: bash
+        env:
+          JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          ENGINE_REPOSITORY: ${{ inputs.engine_repository }}
+        run: |
+          set -euo pipefail
+          # job.workflow_sha is the commit of this reusable workflow definition
+          # as selected by the caller's `uses:` reference, so the engine this
+          # run executes is exactly the release the consumer pinned. Nothing in
+          # the call can point it anywhere else, which is the whole point: a
+          # ref input here would be a way to run Continuum other than the
+          # release the consumer chose.
+          if [[ -z "${ENGINE_REPOSITORY:-}" ]]; then
+            echo "::error::engine_repository is unset; name the Continuum to run"
+            exit 1
+          fi
+          sha="${JOB_WORKFLOW_SHA:-}"
+          if ! printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::the selected Continuum release must be a full commit sha, got '${sha}'"
+            exit 1
+          fi
+          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+          echo "engine $sha"
+
+      - name: Checkout the selected Continuum release
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          repository: kodmial/continuum
-          ref: ${{ job.workflow_sha }}
+          repository: ${{ inputs.engine_repository }}
+          ref: ${{ steps.engine.outputs.sha }}
           path: .continuum-engine
           fetch-depth: 1
           persist-credentials: false
-      - name: Load Continuum engine
-        uses: ./.continuum-engine/.github/actions/engine-path
-        with:
-          release-sha: ${{ job.workflow_sha }}
+
+      - name: Refuse any other commit
+        shell: bash
+        env:
+          ENGINE_SHA: ${{ steps.engine.outputs.sha }}
+        run: |
+          set -euo pipefail
+          head="$(git -C .continuum-engine rev-parse HEAD)"
+          if [[ "$head" != "$ENGINE_SHA" ]]; then
+            echo "::error::engine checked out at $head, expected $ENGINE_SHA"
+            exit 1
+          fi
+          echo "engine $head is the selected release"
+
+      - name: Export Continuum engine root
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "CONTINUUM_ENGINE_ROOT=$GITHUB_WORKSPACE/.continuum-engine" >> "$GITHUB_ENV"
 
       - name: Reconcile configured children
         shell: bash
         run: |
           set -euo pipefail
+          # Every one of these is the parent's own naming convention. Guessing
+          # any of them would dispatch work the parent never opted in to, so an
+          # unset variable stops the cycle instead of picking something plausible.
+          for required_setting in WORKER_WORKFLOW REVIEW_WORKFLOW MANUAL_PR_REVIEW_WORKFLOW; do
+            if [[ -z "${!required_setting:-}" ]]; then
+              echo "::error::$required_setting is unset; pass the workflow as an input or set its CONTINUUM_* repository variable"
+              exit 2
+            fi
+          done
+          for required_setting in PRIORITY_LABELS TASK_OPT_IN_MARKER; do
+            if [[ -z "${!required_setting:-}" ]]; then
+              echo "::error::repository variable ${required_setting} is required to dispatch delegated child work"
+              exit 2
+            fi
+          done
+
+          # Delegated task branches carry one prefix Continuum owns; an earlier
+          # Continuum release used a second one, and a repository that has not
+          # finished migrating declares it. An unset legacy prefix simply does
+          # not participate, which is the correct end state.
+          TASK_BRANCH_PREFIX="continuum-child/"
+          TASK_BRANCH_PATTERN="$TASK_BRANCH_PREFIX"
+          if [[ -n "$LEGACY_TASK_BRANCH_PREFIX" ]]; then
+            TASK_BRANCH_PATTERN="$TASK_BRANCH_PREFIX|$LEGACY_TASK_BRANCH_PREFIX"
+          fi
+
           export PYTHONPATH="$CONTINUUM_ENGINE_ROOT/src"
           resolver="$CONTINUUM_ENGINE_ROOT/.github/scripts/delegation_repository.sh"
           plan="$(PARENT_CONFIG=.continuum.yml CHILD_REPOSITORIES="$CHILD_REPOSITORIES" bash "$resolver" plan)"
@@ -112,7 +194,7 @@ jobs:
             while IFS=$'\t' read -r stale_pr stale_head; do
               [[ -n "$stale_pr" && -n "$stale_head" ]] || continue
               stale_task="$(
-                sed -nE 's#^(continuum-child|runtime-worker)/task-([0-9]+)-.*#\2#p' <<<"$stale_head"
+                sed -nE "s#^(${TASK_BRANCH_PATTERN})/task-([0-9]+)-.*#\2#p" <<<"$stale_head"
               )"
               [[ -n "$stale_task" ]] || continue
               stale_issue_json="$(
@@ -150,23 +232,27 @@ jobs:
             done < <(
               gh pr list --repo "$child_repo" --state closed --limit 100 \
                 --json number,headRefName,mergedAt \
+                --arg task_prefix "$TASK_BRANCH_PREFIX" \
+                --arg legacy_prefix "$LEGACY_TASK_BRANCH_PREFIX" \
                 --jq '.[] | select(.mergedAt == null) | select(
-                    (.headRefName | startswith("continuum-child/task-")) or
-                    (.headRefName | startswith("runtime-worker/task-"))
+                    (.headRefName | startswith($task_prefix)) or
+                    (($legacy_prefix | length) > 0 and (.headRefName | startswith($legacy_prefix)))
                   ) | [.number,.headRefName] | @tsv' 2>/dev/null || true
             )
 
             open_prs="$(
               gh pr list --repo "$child_repo" --state open --limit 100 \
                 --json number,headRefName \
+                --arg task_prefix "$TASK_BRANCH_PREFIX" \
+                --arg legacy_prefix "$LEGACY_TASK_BRANCH_PREFIX" \
                 --jq 'sort_by(.number) | reverse | .[] | select(
-                    (.headRefName | startswith("continuum-child/task-")) or
-                    (.headRefName | startswith("runtime-worker/task-"))
+                    (.headRefName | startswith($task_prefix)) or
+                    (($legacy_prefix | length) > 0 and (.headRefName | startswith($legacy_prefix)))
                   ) | [.number,.headRefName] | @tsv' 2>/dev/null || true
             )"
             open_pr_tasks="$(
               cut -f2 <<<"$open_prs" \
-                | sed -nE 's#^(continuum-child|runtime-worker)/task-([0-9]+)-.*#\2#p'
+                | sed -nE "s#^(${TASK_BRANCH_PATTERN})/task-([0-9]+)-.*#\2#p"
             )"
 
             if [[ -n "$open_prs" ]]; then
@@ -174,7 +260,7 @@ jobs:
               while IFS=$'\t' read -r pr_number head_ref; do
                 [[ -n "$pr_number" ]] || continue
                 task_number="$(
-                  sed -nE 's#^(continuum-child|runtime-worker)/task-([0-9]+)-.*#\2#p' <<<"$head_ref"
+                  sed -nE "s#^(${TASK_BRANCH_PATTERN})/task-([0-9]+)-.*#\2#p" <<<"$head_ref"
                 )"
                 [[ -n "$task_number" ]] || continue
 
@@ -205,7 +291,6 @@ jobs:
                   continue
                 fi
                 gh workflow run "$REVIEW_WORKFLOW" --repo "$GITHUB_REPOSITORY" \
-                  -f mode=child:review \
                   -f child_id="$child_id" \
                   -f task_number="$task_number" \
                   -f pr_number="$pr_number" >/dev/null
@@ -218,13 +303,15 @@ jobs:
             # keep the stronger issue-based review path above.
             manual_prs="$(
               gh api --paginate "repos/$child_repo/pulls?state=open&per_page=100" \
+                --arg task_prefix "$TASK_BRANCH_PREFIX" \
+                --arg legacy_prefix "$LEGACY_TASK_BRANCH_PREFIX" \
                 --jq '.[] |
                   select(.draft == false) |
                   select(.head.repo.full_name == .base.repo.full_name) |
                   select(.user.login == .base.repo.owner.login) |
                   select(
-                    ((.head.ref | startswith("continuum-child/task-")) or
-                     (.head.ref | startswith("runtime-worker/task-"))) | not
+                    ((.head.ref | startswith($task_prefix)) or
+                     (($legacy_prefix | length) > 0 and (.head.ref | startswith($legacy_prefix)))) | not
                   ) |
                   select(([.labels[]?.name] | index("no-auto-merge")) | not) |
                   .number' 2>/dev/null || true
@@ -235,7 +322,6 @@ jobs:
                 [[ -n "$manual_pr" ]] || continue
                 manual_pr_active "$child_id" "$manual_pr" && continue
                 gh workflow run "$MANUAL_PR_REVIEW_WORKFLOW" --repo "$GITHUB_REPOSITORY" \
-                  -f mode=child:pr-review \
                   -f child_id="$child_id" \
                   -f pr_number="$manual_pr" >/dev/null
                 dispatched=$((dispatched + 1))
@@ -257,23 +343,25 @@ jobs:
                 >/dev/null 2>&1 || true
               echo "Cleared stale automation:paused on child task #$paused_task."
             done < <(
-              jq -r '
+              jq -r --arg opt_in "$TASK_OPT_IN_MARKER" \
+                    --arg legacy_marker "$LEGACY_TASK_MARKER" '
                 .[]
                 | select(.pull_request == null)
                 | select(any(.labels[]?.name; . == "automation:paused"))
                 | select(
-                    ((.body // "") | contains("<!-- continuum-child-owned -->")) or
-                    ((.body // "") | contains("<!-- runtime-worker-owned -->"))
+                    ((.body // "") | contains($opt_in)) or
+                    ((($legacy_marker | length) > 0) and ((.body // "") | contains($legacy_marker)))
                   )
                 | .number
               ' <<<"$issues_json"
             )
             issues_json="$(
-              jq '
+              jq --arg opt_in "$TASK_OPT_IN_MARKER" \
+                 --arg legacy_marker "$LEGACY_TASK_MARKER" '
                 map(
                   if (
-                    ((.body // "") | contains("<!-- continuum-child-owned -->")) or
-                    ((.body // "") | contains("<!-- runtime-worker-owned -->"))
+                    ((.body // "") | contains($opt_in)) or
+                    ((($legacy_marker | length) > 0) and ((.body // "") | contains($legacy_marker)))
                   )
                   then .labels = [(.labels[]? | select(.name != "automation:paused"))]
                   else .
@@ -282,7 +370,7 @@ jobs:
               ' <<<"$issues_json"
             )"
 
-            for priority in priority:p0 priority:p1 priority:p2; do
+            for priority in $PRIORITY_LABELS; do
               while IFS= read -r encoded; do
                 [[ -n "$encoded" ]] || continue
                 decoded="$(base64 -d <<<"$encoded")"
@@ -311,17 +399,19 @@ jobs:
                 done
                 [[ "$ready" == true ]] || continue
 
-                gh workflow run "$WORKER_WORKFLOW" --repo "$GITHUB_REPOSITORY"                   -f mode=child:worker                   -f child_id="$child_id"                   -f task_number="$task_number" >/dev/null
+                gh workflow run "$WORKER_WORKFLOW" --repo "$GITHUB_REPOSITORY"                   -f child_id="$child_id"                   -f task_number="$task_number" >/dev/null
                 dispatched=$((dispatched + 1))
               done < <(
-                jq -r --arg p "$priority" '
+                jq -r --arg p "$priority" \
+                   --arg opt_in "$TASK_OPT_IN_MARKER" \
+                   --arg legacy_marker "$LEGACY_TASK_MARKER" '
                   .[]
                   | select(.pull_request == null)
                   | select(any(.labels[]?.name; . == $p))
                   | select(all(.labels[]?.name; . != "automation:paused"))
                   | select(
-                      ((.body // "") | contains("<!-- continuum-child-owned -->")) or
-                      ((.body // "") | contains("<!-- runtime-worker-owned -->"))
+                      ((.body // "") | contains($opt_in)) or
+                      ((($legacy_marker | length) > 0) and ((.body // "") | contains($legacy_marker)))
                     )
                   | [.number, (.body // "")]
                   | @base64

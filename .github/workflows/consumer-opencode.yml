@@ -25,6 +25,16 @@ name: Continuum reusable OpenCode
 on:
   workflow_call:
     inputs:
+      engine_repository:
+        description: >-
+          Repository that hosts the Continuum release this run is part of. The
+          caller already names it in its `uses:` line, and GitHub forbids an
+          expression there, so the same literal is declared here as well. The
+          commit still comes from the run (`job.workflow_sha`), never from an
+          input, so a caller cannot run Continuum other than the release it
+          pinned.
+        type: string
+        required: true
       base_branch:
         type: string
         required: false
@@ -65,9 +75,12 @@ on:
         required: false
         default: ""
       model:
+        description: >-
+          Model identifier this run may use. Required, and required for a reason:
+          a model baked into Continuum would make every consumer's work run on
+          one vendor's model without having asked for it.
         type: string
-        required: false
-        default: opencode/big-pickle
+        required: true
       task_timeout_minutes:
         description: "Maximum runtime for one OpenCode task"
         type: number
@@ -218,26 +231,54 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      # ADR-0002: the engine *is* the Continuum implementation, so it has to
-      # come from the release commit the consumer already pinned and from no
-      # other. `job.workflow_sha` is that commit -- GitHub resolves a called
-      # reusable workflow from the reference its caller's `uses:` selected -- so
-      # the engine is derived from the one pin instead of being a second,
-      # independently maintained one. The action is then used as a local action
-      # out of the checkout it just verified, which is what keeps
-      # `.github/actions/engine-path` from needing a ref of its own.
-      - name: Check out the Continuum engine
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Check out the pinned Continuum release
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          repository: kodmial/continuum
+          repository: ${{ inputs.engine_repository }}
           ref: ${{ job.workflow_sha }}
           path: .continuum-engine
           persist-credentials: false
-      - name: Load Continuum engine
-        uses: ./.continuum-engine/.github/actions/engine-path
-        with:
-          release-sha: ${{ job.workflow_sha }}
 
+      - name: Load Continuum engine
+        shell: bash
+        env:
+          ENGINE_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          # `uses:` cannot take an expression, so the caller names this release
+          # twice: once in the pin that selected this file, and once in
+          # engine_repository. job.workflow_sha is the commit of this file as
+          # the caller pinned it, so checking *that* out is what makes the
+          # engine the release the consumer chose. Resolving it from a repository
+          # named inside this file instead would quietly hand one repository's
+          # scripts to a consumer who pinned another's.
+          if ! printf '%s' "${ENGINE_SHA:-}" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::the pinned Continuum release must be a full commit sha, got '${ENGINE_SHA:-}'"
+            exit 1
+          fi
+          if [[ -z "${ENGINE_REPOSITORY:-}" ]]; then
+            echo "::error::engine_repository is unset; name the Continuum to run"
+            exit 1
+          fi
+          root="$GITHUB_WORKSPACE/.continuum-engine"
+          head="$(git -C .continuum-engine rev-parse HEAD)"
+          if [[ "$head" != "$ENGINE_SHA" ]]; then
+            echo "::error::engine checked out at $head, expected $ENGINE_SHA"
+            exit 1
+          fi
+          for required in .github/scripts/conflict_repair.py .github/scripts/agent_workspace.py .github/scripts/opencode_runtime.py .github/scripts/opencode_instructions.py .github/agents/AGENTS.md src/continuum/cli.py; do
+            [[ -f "$root/$required" ]] || {
+              echo "::error::the pinned Continuum release is missing $required"
+              exit 1
+            }
+          done
+          echo "CONTINUUM_ENGINE_ROOT=$root" >> "$GITHUB_ENV"
+      - name: Resolve the repair budget
+        id: bounds
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/conflict_repair.py" plan --mode resolve-conflict
       # Before any OpenCode invocation in this job: issue implementation,
       # conflict repair, and CI repair all run under the same policy, so the
       # install is unconditional and sits ahead of all three rather than being

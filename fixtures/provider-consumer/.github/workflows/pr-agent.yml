@@ -1,0 +1,63 @@
+# PR-Agent review entry for a consumer repository.
+#
+# The review queue dispatches this workflow with the pull request number and the
+# commit it observed, and this file does three things with that: it declares the
+# wake-up, it hands Continuum this repository's own variable and secret names,
+# and it calls the shared provider surface.
+#
+# There is no provider image, no model routing, no checkout, no diff, and no
+# gate here. Those belong to the Continuum release this line pins, which is why
+# this repository's review cannot drift from its own automation: the endpoint,
+# the model, the credential, the provider version, the findings, the verdict,
+# and the merge-blocking status are all resolved inside that one commit.
+#
+# The permission block grants the shared surface exactly what it needs to
+# publish a review. Permissions can only be narrowed down the call chain, never
+# widened, so dropping one here fails the run rather than silently weakening it.
+name: PR-Agent review
+
+on:
+  workflow_dispatch:
+    inputs:
+      # `pr_number` is a string on purpose. The review queue dispatches over the
+      # REST API as strings, and asking the API to coerce one into a declared
+      # number is a behaviour nobody has documented; the shared surface checks
+      # the value instead of assuming it.
+      pr_number:
+        description: "Pull request to review"
+        required: true
+        type: string
+      head_sha:
+        description: "Commit the queue observed"
+        required: false
+        default: ""
+        type: string
+      mode:
+        description: "Why the queue asked for this review"
+        required: false
+        default: initial
+        type: string
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+  statuses: write
+
+jobs:
+  review:
+    uses: kodmial/continuum/.github/workflows/pr-agent.yml@39ca6dc798f2201390c8fdef0395157f588657ec
+    with:
+      # The `uses:` line above already names the release this repository runs;
+      # GitHub does not allow an expression there, so the same literal is passed
+      # as an input and Continuum proves the two agree by checking out the commit
+      # GitHub resolved that line to.
+      engine_repository: kodmial/continuum
+      pr_number: ${{ inputs.pr_number }}
+      head_sha: ${{ inputs.head_sha }}
+      api_base: ${{ vars.PR_AGENT_API_BASE }}
+      model: ${{ vars.PR_AGENT_MODEL }}
+      max_tokens: ${{ vars.PR_AGENT_MAX_TOKENS }}
+    secrets:
+      continuum_token: ${{ secrets.GITHUB_TOKEN }}
+      pr_agent_api_key: ${{ secrets.PR_AGENT_API_KEY }}

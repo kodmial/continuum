@@ -1,0 +1,31 @@
+# Reviewed residual surface: names that stay in generic Continuum code, why,
+# and under which verdict.
+#
+# One entry per line:
+#
+#     verdict<TAB>expression<TAB>glob<TAB>reason
+#
+# A verdict is a *reason category*, not a synonym for "allowed":
+#
+#   release      GitHub requires this exact spelling to be literal. The only
+#                instance is the Continuum release location and commit in a
+#                `uses:`. It cannot be an expression, so the caller's pinned
+#                ref is the only way to say it.
+#   compat       Continuum's own migration surface: a token an *earlier*
+#                Continuum release wrote into a consumer's issue bodies or
+#                branch names. Reading it is how an in-flight migration
+#                finishes; nothing routes on it.
+#   provenance   A postmortem reference to the incident that produced the
+#                code. It carries no operational value: no resolution reads
+#                it, no dispatch matches on it, no configuration points at
+#                it. It exists so the next reader knows why the code is
+#                shaped the way it is.
+#
+# `python3 .github/scripts/consumer_boundary.py` fails when a recorded residual
+# stops matching anything, so deleting a name from Continuum deletes its entry
+# here too. A ledger that only grows is not a review.
+#
+# Sorted by path, then by expression.
+provenance	kodmai	.github/scripts/agent_workspace.py	The module docstring cites the incident that produced the workspace publisher, including the pull-request body the failing step wrote. No code path reads the name; deleting it would delete the only record of why the recovery step refuses to trust the branch the model walked.
+provenance	runtime[-_]lab	.github/scripts/agent_workspace.py	Same docstring, the other side of the same incident: the runner-only result that a crash would destroy. Carried so the section reads as one story rather than two half-explained ones.
+provenance	runtime[-_]lab	.github/scripts/conflict_repair.py	The incident that made conflict repair a bounded operation on a finished change rather than a re-run of the source task, named at the four places the reasoning is load-bearing. The budget constant, the attempt cap, and the lock semantics all exist because of it.

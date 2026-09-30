@@ -799,15 +799,47 @@ class WorkflowWiringTests(unittest.TestCase):
                         "the launch modes its condition names".format(name),
                     )
 
-    def test_the_engine_action_requires_the_new_files(self):
-        # A partial engine checkout must fail at the action, not half way
-        # through an agent run with the policy missing. The required set lives in
-        # the verifier the action calls, so that is where it is asserted.
-        verifier = (ROOT / ".github" / "actions" / "engine-path" / "verify.py").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn(".github/scripts/opencode_instructions.py", verifier)
-        self.assertIn(".github/agents/AGENTS.md", verifier)
+    def test_every_engine_root_comes_from_the_release_the_caller_pinned(self):
+        # There is no composite action to load the engine any more. An action
+        # reference has to name a repository literally, and a literal is exactly
+        # the thing that would hand every consumer one repository's scripts
+        # instead of the release it pinned -- while looking, in review, like a
+        # perfectly ordinary pinned dependency. So each workflow checks out its
+        # own release, and every one that exports an engine root says so here.
+        for name, text in sorted(self.texts.items()):
+            if "CONTINUUM_ENGINE_ROOT" not in text:
+                continue
+            with self.subTest(workflow=name):
+                self.assertNotIn(
+                    "engine-path@", text, "{} still loads the engine from an action".format(name)
+                )
+                self.assertIn(
+                    "repository: ${{ inputs.engine_repository }}",
+                    text,
+                    "{} exports an engine root it did not check out itself".format(name),
+                )
+                self.assertIn("job.workflow_sha", text, name)
+
+    def test_an_incomplete_engine_checkout_fails_where_it_is_loaded(self):
+        # A partial checkout has to fail where the root is exported, not half way
+        # through an agent run with the policy missing.
+        for name, text in sorted(self.texts.items()):
+            if "CONTINUUM_ENGINE_ROOT" not in text:
+                continue
+            with self.subTest(workflow=name):
+                self.assertTrue(
+                    "the pinned Continuum release is missing" in text
+                    or "Refuse any other commit" in text
+                    or "Refuse anything but the pinned commit" in text,
+                    "{} exports an engine root without refusing an incomplete one".format(
+                        name
+                    ),
+                )
+                if INSTALL_TOKEN in text:
+                    # The script and the canonical document travel together, so
+                    # the completeness check has to name both.
+                    self.assertIn(".github/scripts/opencode_instructions.py", text)
+                    self.assertIn(".github/agents/AGENTS.md", text)
 
     def test_control_planes_do_not_start_an_agent(self):
         # The repair, scheduler, and merge controllers dispatch; they never run

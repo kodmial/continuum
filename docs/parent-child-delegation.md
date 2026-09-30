@@ -51,54 +51,54 @@ when all of these conditions hold:
 Zero matches or multiple matches fail closed. Repository visibility is never a
 routing signal.
 
-The old `.continuum.yml` relationship declaration and optional
-`CONTINUUM_CHILD_REPOSITORIES` secret remain readable only as a compatibility
-path while existing consumers migrate. New integrations should use repository
-variables.
+The old `.continuum.yml` relationship declaration remains readable only as a
+compatibility path while existing consumers migrate. New integrations should use
+repository variables.
 
-## Parent workflow
+## Which Continuum release runs
 
-A parent repository writes one file:
-`fixtures/delegation-parent/.github/workflows/continuum.yml`. It names the
-release entrypoint at a single exact Continuum reference and dispatches into it
-by `mode`:
+Every child workflow is a reusable workflow the parent pins by one literal
+`uses:` reference. The parent also passes `engine_repository` — the same
+`owner/repository` name already in that `uses:` line, because GitHub does not
+allow an expression there — and the workflow checks out the commit GitHub
+selected for the called file (`job.workflow_sha`), not a branch, tag, or input.
+The workflow verifies the checkout is exactly that commit before any privileged
+step. The two spellings of the repository are proved to agree by construction:
+if they disagreed, the checkout would contain a different tree than the one that
+defines the run. There is no input by which a caller can select a different
+Continuum release.
 
-- `mode: child:worker` reaches `consumer-child-worker.yml`
-- `mode: child:review` reaches `consumer-child-review.yml`
-- `mode: child:pr-review` reaches `consumer-child-pr-review.yml`
-- an empty `mode` reconciles the parent's own control plane, which includes
-  `consumer-child-dispatcher.yml`
+## Child repository bindings are a secret
 
-Those are reached through the entrypoint's same-repository relative references,
-so one line in the parent's ingress selects the dispatcher and all three child
-implementations as one snapshot. They used to be three separate parent entry
-workflows, each carrying its own Continuum reference; that is the shape ADR-0002
-rules out, because three references that agree today are three places that
-decide which Continuum a parent runs and can be moved independently.
+The map from an opaque child id to the child's `owner/repository` is the private
+part of the relationship. It is supplied to the child workflows through the
+`CHILD_RUNTIME_REPOSITORIES` secret (declared by every child workflow and exposed
+to the resolver as the `CHILD_REPOSITORIES` environment variable), never through
+a repository variable, a workflow input, or a tracked file. A missing, empty, or
+malformed map fails closed, the map must name exactly the ids the parent
+declared, two ids may not resolve to one repository, and the resolved repository
+is verified against the child's own `CONTINUUM_PARENT` before any work runs.
 
-The parent's ingress declares the union of inputs every controller dispatches
-into it: the four agent modes the scheduler and the repair controller send, the
-two repair budgets, and the three child modes. GitHub rejects a dispatch whose
-input the target workflow does not declare, so an incomplete union is a dispatch
-that fails in the parent's repository rather than a mistake that fails in review.
+## Parent workflows
 
-Reconciliation runs on the parent's schedule and whenever its own configuration
-changes. It does not run on `workflow_run`. A called workflow's jobs execute
-inside the caller's run, so the only workflow name such a filter could match is
-the ingress's own name — and a run that completes because of `workflow_run`
-completes in a way that triggers `workflow_run` again. The old per-child files
-were separate workflows and could be named; after the cutover they are jobs, so
-that trigger could only have been either dead or a loop.
+Use the three thin entry workflows in
+`fixtures/delegation-parent/.github/workflows/`. They call:
 
-The wrapper passes no parent/child relationship values. Continuum reads
-`CONTINUUM_ROLE` and `CONTINUUM_CHILDREN` directly from the parent repository
-through the GitHub API after the runner starts. This avoids exposing the child
-list in reusable-workflow inputs or job environment metadata. The child
-repository name is resolved only inside the runner and is not committed to the
-parent repository.
+- `consumer-child-dispatcher.yml`
+- `consumer-child-worker.yml`
+- `consumer-child-review.yml`
+
+The wrapper passes no parent/child relationship values, only the
+`engine_repository` name that its own `uses:` line already carries. Continuum
+reads `CONTINUUM_ROLE` and `CONTINUUM_CHILDREN` directly from the parent
+repository through the GitHub API after the runner starts. This avoids exposing
+the child list in reusable-workflow inputs or job environment metadata. The child
+repository name is resolved only inside the runner, from the
+`CHILD_RUNTIME_REPOSITORIES` secret, and is not committed to the parent
+repository.
 
 A token with access to the child repositories is still required through the
-ingress's child-runtime secret.
+wrapper's child-runtime secret.
 
 ## Deterministic child validation
 
@@ -123,6 +123,13 @@ A child task is opt-in per issue. Add:
 The legacy `<!-- runtime-worker-owned -->` marker remains accepted during
 migration. The local scheduler skips both markers so local private Actions do
 not race the parent execution path.
+
+The marker text and the branch prefix an earlier release used are the consumer's
+to change: `CONTINUUM_TASK_OPT_IN_MARKER`, `CONTINUUM_LEGACY_TASK_MARKER`, and
+`CONTINUUM_LEGACY_TASK_BRANCH_PREFIX` are repository variables, and the
+dispatcher refuses to run without the opt-in marker set. `continuum-child/`
+remains the branch prefix Continuum writes, so only a migration needs the legacy
+prefix.
 
 ## Visibility is not routing
 

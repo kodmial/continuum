@@ -1,0 +1,66 @@
+name: Review
+
+# Thin fixture entry point: declare the review loop's wake-up events in a
+# consumer repository and delegate every decision to the shared Continuum
+# controller.
+#
+# A reusable workflow cannot subscribe to this repository's own pull request,
+# CI, or schedule events, so the consumer owns the event set and the shared
+# controller re-derives the whole decision from live state on every wake-up.
+#
+# There is no reviewer named here and no switch passed in. `review` is a
+# declaration in `.github/continuum.yml`; the controller resolves everything
+# else. A consumer that deletes that file, or writes `review: false`, gets a
+# controller that returns before it touches GitHub.
+
+on:
+  # A new or moved HEAD is the only thing that invalidates an exact-head review.
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+
+  # CI completing is how a pushed repair comes back to be looked at.
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+  # Recovery. A loop that stalls between two events would otherwise leave a pull
+  # request waiting for a wake-up that already happened.
+  schedule:
+    - cron: "*/10 * * * *"
+
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Pull request number"
+        required: false
+        type: string
+
+permissions:
+  actions: write
+  checks: write
+  contents: read
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: continuum-consumer-review-gate
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    uses: kodmial/continuum/.github/workflows/consumer-review-gate.yml@39ca6dc798f2201390c8fdef0395157f588657ec
+    permissions:
+      actions: write
+      checks: write
+      contents: read
+      issues: write
+      pull-requests: write
+    with:
+      # The `uses:` line above already names the release this repository runs;
+      # GitHub does not allow an expression there, so the same literal is passed
+      # as an input and Continuum proves the two agree by checking out the commit
+      # GitHub resolved that line to.
+      engine_repository: kodmial/continuum
+      pr_number: ${{ github.event.pull_request.number || inputs.pr_number }}
+      agent_workflow: continuum-opencode.yml
+      config_path: .github/continuum.yml

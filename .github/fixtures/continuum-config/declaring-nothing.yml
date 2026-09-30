@@ -1,0 +1,9 @@
+# Proof fixture for the Continuum v0.1 contract: a consumer that adopts
+# Continuum without declaring anything. The repository has no
+# `.github/continuum.yml` at all, which must resolve to review:false and
+# release:false. This file exists only so the test can assert that an
+# equivalent "everything commented out" document behaves identically.
+#
+# Named for the posture it proves, not for the repository that first needed it.
+# review: true
+# release: true

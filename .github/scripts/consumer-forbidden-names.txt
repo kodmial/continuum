@@ -1,0 +1,39 @@
+# Consumer-specific names that must never appear in generic Continuum code.
+#
+# The rule this file enforces: a value that is true of one consumer and false of
+# another does not live in Continuum. It resolves from `.github/continuum.yml`,
+# from repository `vars`, from repository secrets, or from the consumer's own
+# scripts and manifests. Continuum carries the mechanism, never the fact.
+#
+# The single deliberate exception is the exact Continuum release reference in a
+# reusable-workflow `uses:` (and in a SHA-pinned `uses:` of a Continuum action),
+# because GitHub requires that spelling to be literal. Every other literal is a
+# hard-code waiting to be edited in a release.
+#
+# This list is data, not code. The scanner greps the generic surface for exactly
+# these expressions and the contract-core guard greps for the same file, so a
+# new consumer name is banned by adding one line here and nowhere else.
+#
+# One extended regular expression per line; blank lines and `#` lines are
+# ignored; a match on any scanned line fails the build.
+
+# --- Consumer identity ------------------------------------------------------
+# Owner login, product name, sibling repositories, and the branch/marker
+# vocabulary inherited from an earlier consumer control plane.
+kodmial
+nanodictate
+kodmai
+runtime[-_]lab
+runtime[-_]worker
+
+# --- Provider facts ---------------------------------------------------------
+# A model identifier is a repository operational value, not a Continuum default.
+# The shape is banned rather than the current identifier, because a new model
+# name is the most likely way this value creeps back in, and a ban on today's
+# spelling would only notice after somebody had already picked tomorrow's.
+(?<![.\w])opencode/(?!issue)[a-z0-9][a-z0-9._-]*
+
+# --- Release escape refs ----------------------------------------------------
+# An input that chooses which Continuum the reusable workflow then checks out is
+# a way to run something other than the release the caller pinned in `uses:`.
+engine_ref

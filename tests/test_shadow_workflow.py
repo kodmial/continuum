@@ -401,15 +401,30 @@ class ShadowWorkflowTests(unittest.TestCase):
     def test_the_engine_is_pinned_to_a_commit_and_verified(self) -> None:
         # Continuum itself is checked out by path, because a reusable workflow
         # called across repositories would otherwise check out the *caller*.
-        self.assertIn("repository: kodmial/continuum", self.raw)
+        # Which Continuum that is comes from the caller; there is no repository
+        # named inside this workflow for a consumer to inherit by accident.
+        self.assertIn("repository: ${{ inputs.engine_repository }}", self.raw)
+        self.assertNotIn("kodmial/continuum", self.raw)
         self.assertIn("ref: ${{ steps.engine.outputs.sha }}", self.raw)
         # The pin comes from the reusable job definition selected by the
-        # caller's `uses:` line, not from an untrusted input.
+        # caller's `uses:` line, not from an untrusted input. No trigger, and no
+        # input, offers a second commit to judge with.
         self.assertIn('JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}', self.raw)
         self.assertIn("grep -Eq '^[0-9a-f]{40}$'", self.raw)
+        self.assertNotIn("engine_ref", self.raw)
         # And the working tree must be the commit, not merely a request for it.
         self.assertIn("git -C engine rev-parse HEAD", self.raw)
         self.assertIn('if [ "$head" != "$ENGINE_SHA" ]', self.raw)
+
+    def test_both_triggers_must_name_the_continuum_they_judge_with(self) -> None:
+        triggers = self.document["on"]
+        for trigger in ("workflow_call", "workflow_dispatch"):
+            with self.subTest(trigger=trigger):
+                declared = triggers[trigger]["inputs"]["engine_repository"]
+                self.assertTrue(
+                    declared["required"],
+                    "{} may run without naming the Continuum it judges with".format(trigger),
+                )
 
     def test_the_barrier_is_proved_before_anything_is_decided(self) -> None:
         shadow = self.document["jobs"]["shadow"]

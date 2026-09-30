@@ -1,5 +1,0 @@
-# Proof fixture for the Continuum v0.1 contract: a consumer that asks for both
-# a normalized review gate and release orchestration. Resolved by the unchanged
-# contract core, exactly as this file is read in that repository's checkout.
-review: true
-release: true

@@ -9,14 +9,15 @@ on:
       pr_number:
         type: string
         required: true
-      model:
+      engine_repository:
+        description: >-
+          Repository that hosts the Continuum release this run is part of. The
+          caller already names it in its `uses:` line, and GitHub forbids an
+          expression there, so the same literal is declared here as well. What
+          Continuum does *not* accept is a second choice of ref: the release is
+          the commit of this workflow file, read from the run itself.
         type: string
-        required: false
-        default: opencode/muse-spark-1.3-contributor-free
-      max_review_passes:
-        type: number
-        required: false
-        default: 3
+        required: true
     secrets:
       CHILD_RUNTIME_TOKEN:
         required: true
@@ -39,8 +40,13 @@ jobs:
       CHILD_REPOSITORIES: ${{ secrets.CHILD_RUNTIME_REPOSITORIES }}
       CHILD_ID: ${{ inputs.child_id }}
       PR_NUMBER: ${{ inputs.pr_number }}
-      OPENCODE_MODEL: ${{ inputs.model }}
-      MAX_REVIEW_PASSES: ${{ inputs.max_review_passes }}
+      # Consumer policy, resolved from the calling repository's variables rather
+      # than from a default baked into Continuum: which model reviews the child's
+      # work, how many repair passes it gets, and the branch prefix an earlier
+      # Continuum release used for delegated task branches.
+      OPENCODE_MODEL: ${{ vars.CONTINUUM_AGENT_MODEL }}
+      MAX_REVIEW_PASSES: ${{ vars.CONTINUUM_MAX_REVIEW_PASSES }}
+      LEGACY_TASK_BRANCH_PREFIX: ${{ vars.CONTINUUM_LEGACY_TASK_BRANCH_PREFIX }}
     steps:
       - name: Checkout parent control plane
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -48,31 +54,74 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      # ADR-0002: a delegated child run is part of the same release as the rest
-      # of the control plane, and it is reached through a nested reusable
-      # workflow, so `job.workflow_sha` is already the commit the consumer
-      # pinned. Resolving the engine from it removes the last way a child run
-      # could execute a different Continuum revision than the one it was
-      # dispatched from: there is no longer a ref to pass in at all.
-      - name: Check out the Continuum engine
+      - name: Resolve the selected Continuum release
+        id: engine
+        shell: bash
+        env:
+          JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          ENGINE_REPOSITORY: ${{ inputs.engine_repository }}
+        run: |
+          set -euo pipefail
+          # job.workflow_sha is the commit of this reusable workflow definition
+          # as selected by the caller's `uses:` reference, so the engine this
+          # run executes is exactly the release the consumer pinned. Nothing in
+          # the call can point it anywhere else, which is the whole point: a
+          # ref input here would be a way to run Continuum other than the
+          # release the consumer chose.
+          if [[ -z "${ENGINE_REPOSITORY:-}" ]]; then
+            echo "::error::engine_repository is unset; name the Continuum to run"
+            exit 1
+          fi
+          sha="${JOB_WORKFLOW_SHA:-}"
+          if ! printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::the selected Continuum release must be a full commit sha, got '${sha}'"
+            exit 1
+          fi
+          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+          echo "engine $sha"
+
+      - name: Checkout the selected Continuum release
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          repository: kodmial/continuum
-          ref: ${{ job.workflow_sha }}
+          repository: ${{ inputs.engine_repository }}
+          ref: ${{ steps.engine.outputs.sha }}
           path: .continuum-engine
           fetch-depth: 1
           persist-credentials: false
-      - name: Load Continuum engine
-        uses: ./.continuum-engine/.github/actions/engine-path
-        with:
-          release-sha: ${{ job.workflow_sha }}
+
+      - name: Refuse any other commit
+        shell: bash
+        env:
+          ENGINE_SHA: ${{ steps.engine.outputs.sha }}
+        run: |
+          set -euo pipefail
+          head="$(git -C .continuum-engine rev-parse HEAD)"
+          if [[ "$head" != "$ENGINE_SHA" ]]; then
+            echo "::error::engine checked out at $head, expected $ENGINE_SHA"
+            exit 1
+          fi
+          echo "engine $head is the selected release"
 
       - name: Review and repair owner-created child pull request
         shell: bash
         run: |
           set -euo pipefail
           [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::Invalid pull request number."; exit 2; }
+          # The values below are the consumer's, not Continuum's. An unset
+          # variable is a configuration error, not a default: guessing a model
+          # here would silently review the child's work with the wrong one.
+          for required_setting in CONTINUUM_AGENT_MODEL CONTINUUM_MAX_REVIEW_PASSES; do
+            if [[ -z "${!required_setting:-}" ]]; then
+              echo "::error::repository variable ${required_setting} is required for delegated child review"
+              exit 2
+            fi
+          done
+          [[ "$MAX_REVIEW_PASSES" =~ ^[1-9][0-9]*$ ]] || {
+            echo "::error::CONTINUUM_MAX_REVIEW_PASSES must be a positive integer"
+            exit 2
+          }
 
+          export CONTINUUM_ENGINE_ROOT="$GITHUB_WORKSPACE/.continuum-engine"
           export PYTHONPATH="$CONTINUUM_ENGINE_ROOT/src"
           resolver="$CONTINUUM_ENGINE_ROOT/.github/scripts/delegation_repository.sh"
           child_repo="$(
@@ -105,7 +154,9 @@ jobs:
 
           # Delegated task branches already have their own stronger task review
           # contract. This workflow is only for ordinary owner-created PRs.
-          if [[ "$head_ref" == continuum-child/task-* || "$head_ref" == runtime-worker/task-* ]]; then
+          if [[ "$head_ref" == continuum-child/task-* ||
+                ( -n "$LEGACY_TASK_BRANCH_PREFIX" &&
+                  "$head_ref" == "$LEGACY_TASK_BRANCH_PREFIX"task-* ) ]]; then
             echo "PR #$PR_NUMBER is automation-owned delegated task work; task review owns it."
             exit 0
           fi
