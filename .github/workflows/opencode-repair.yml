@@ -604,7 +604,9 @@ jobs:
                 "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/$stale" \
                 >/dev/null 2>&1 || true
             done
-            echo "Reset per-head workflow-repair locks on PR #$PR_NUMBER."
+            gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+              --body "<!-- continuum-infra-retry-reset -->" >/dev/null 2>&1 || true
+            echo "Reset per-head workflow-repair locks and infrastructure retry budget on PR #$PR_NUMBER."
           fi
 
           case "$ACTION" in
