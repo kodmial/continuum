@@ -75,6 +75,7 @@ PRODUCTION_CONSUMER_WORKFLOWS = (
     "consumer-review-gate.yml",
     "consumer-scheduler.yml",
     "release.yml",
+    "publish-continuum.yml",
 )
 
 #: Continuum dogfooding the same control plane in this repository, held to the
