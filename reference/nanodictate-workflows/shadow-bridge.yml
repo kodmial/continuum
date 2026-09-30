@@ -91,6 +91,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions: {}
+    outputs:
+      event: ${{ steps.context.outputs.event }}
     steps:
       - name: Project the payload
         id: context
