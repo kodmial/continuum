@@ -157,7 +157,7 @@ the moment the gate runs — see `docs/shadow-validation.md`.
 
 ## NanoDictate workflow ledger (#60)
 
-Audited head: `d9e6dcc2e0c9c43bc87cd1963b75c097dec7ea1c`  
+Audited head: `08a5d920c5dbf1f4203160e92e3e530c5bbb3b8f`  
 Audited at: `2026-09-30T00:00:00Z`  
 Discovery issue for unclassified differences: `#60`
 
@@ -170,7 +170,7 @@ Discovery issue for unclassified differences: `#60`
 | `.github/workflows/coderabbit-retry.yml` | `a03f3431347b60000733b9c3ea94c0ea1d2f1984` | `absorbed` | #11 | The global quota controller is cancel-in-progress:false, so a repeated wake-up cannot starve a head that is waiting out a cooldown; single flight comes from the shared concurrency group instead. Absorbed by .github/workflows/review-queue.yml, with regressions in tests/test_queue_workflows.py for both halves. |
 | `.github/workflows/coderabbit-unresolved.yml` | `67a2df34d7e902441ce7c0d633accf52a2ed9471` | `absorbed` | #11 | Verdict parsing strips collapsed <details> blocks, fenced code and block-quoted history before reading a token, so a quoted older verdict cannot override the visible one. Absorbed by continuum.review.coderabbit._visible_conclusion, with regressions in tests/test_coderabbit.py including the truncated-details case. |
 | `.github/workflows/continuum-migration-preflight.yml` | `7b00e14db22d1e42981d6605436be34adfe15a2b` | `consumer-local` | #60 | Added after the 2026-09-30 audit point. Reports what a migration would have to carry before cutover, from the consumer's own tree. It reads and reports, so it has no generic semantics to port and no write Continuum has to preserve; the generic migration report is .github/workflows/continuum-shadow.yml. |
-| `.github/workflows/continuum-shadow-bridge.yml` | `34cc3ebbb8cb21a3e892158ec3bbe21b0a024bc9` | `absorbed` | #27 | Added after the 2026-09-30 audit point. The thin lifecycle bridge Continuum documents for installation; the matching implementation and its test are reference/nanodictate-workflows/shadow-bridge.yml and tests/test_shadow_workflow.py. |
+| `.github/workflows/continuum-shadow-bridge.yml` | `302ab4dda9f7efd10899f193a8f4ea79085052d9` | `absorbed` | #27 | Thin read-only lifecycle bridge pinned to the merged live parity gate. Its reusable implementation is .github/workflows/continuum-shadow.yml and its immutable-pin contract is covered by tests/test_shadow_workflow.py. |
 | `.github/workflows/issue-scheduler.yml` | `bc3f8c175210ab26c1f6033572e678356ec4d788` | `absorbed` | #27 | Byte-identical to the preserved snapshot. Priority ordering and the dependency-blocked refusal are absorbed by continuum.shadow.planner. |
 | `.github/workflows/opencode-repair.yml` | `56d08b852ed6f4c1c1b0456eee6d313a34e79a45` | `absorbed` | #27 | A stale persistent repair lock is released on age rather than left to suppress every later repair of the same head, an unreadable age is treated as held rather than released, and the age budget is resolved once in conflict-bounds instead of being spelled out per step. Absorbed by the age-checked lock in .github/workflows/consumer-repair.yml; asserted in tests/test_repair_workflow.py. |
 | `.github/workflows/opencode.yml` | `e5656c07b5758d4974540912f52a60525be889f8` | `absorbed` | #27 | The generic OpenCode lifecycle is absorbed by .github/workflows/consumer-opencode.yml. NanoDictate's required macOS 15 / Swift 6.1 execution capability is expressed through configurable runner/toolchain inputs, with the reusable boundary covered by .github/tests/test_workflow_hardening.py. |
