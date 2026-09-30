@@ -113,9 +113,9 @@
     {
       "path": ".github/workflows/release.yml",
       "blob_sha": "f699aaa4ea70d431962daae48ca4a8c6842088e7",
-      "classification": "absorbed",
+      "classification": "must-port",
       "owner": "#22",
-      "rationale": "Publication reuses the exact artifact bytes a packaging gate validated for the same immutable source head. Absorbed by continuum.release.provenance, which refuses a rebuilt artifact, a green run for another head, a publish that names no head, and a gate that did not pass; regressions in tests/test_release_verification.py and tests/test_release_cli.py."
+      "rationale": "Phase B requirement: publication must reuse the exact artifact bytes validated by Packaging smoke for the same immutable source head. NanoDictate keeps its existing release workflow as the sole writer during Phase A; #22 must prove and migrate this invariant before the release writer is replaced."
     },
     {
       "path": ".github/workflows/remove-review-label.yml",
