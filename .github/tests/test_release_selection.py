@@ -74,7 +74,6 @@ PRODUCTION_CONSUMER_WORKFLOWS = (
     "consumer-repair.yml",
     "consumer-review-gate.yml",
     "consumer-scheduler.yml",
-    "release.yml",
 )
 
 #: Continuum dogfooding the same control plane in this repository, held to the
@@ -96,6 +95,8 @@ OWN_CONTROL_PLANE = (
 OWN_REPOSITORY_TOOLING = (
     "ci.yml",
     "release-bun-binary.yml",
+    "release.yml",
+    "continuum-release.yml",
 )
 
 #: The shadow harness is the one workflow allowed to name a Continuum revision,
@@ -167,9 +168,6 @@ VERSION_INPUT = re.compile(r"(?:^|_)(?:ref|sha|commit|version|pin)(?:$|_)")
 #: - `opencode_release_*` describe the agent binary's *distribution* release --
 #:   the OpenCode executable a consumer installs, verified by digest. That is the
 #:   tool the agent runs on, not the control plane that runs the agent.
-#: - `version` and `source_sha` on `release.yml` identify the *consumer
-#:   product release* being built. They are bound to the consumer's tag/commit,
-#:   not a selector for the Continuum implementation executing the workflow.
 #: - `engine_ref` is the shadow harness's, and is handled on its own terms: see
 #:   `ShadowEngineSelectionTests`.
 NON_CONTINUUM_VERSION_INPUTS = frozenset(
@@ -183,8 +181,6 @@ NON_CONTINUUM_VERSION_INPUTS = frozenset(
         "opencode_release_sha256",
         "opencode_release_version",
         "opencode_release_source_sha",
-        "version",
-        "source_sha",
     }
 )
 
