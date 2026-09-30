@@ -253,6 +253,26 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+      - name: Materialize trusted control-plane helpers
+        env:
+          BASE_BRANCH: ${{ needs.authorize.outputs.base_branch }}
+        run: |
+          set -euo pipefail
+          [[ "$BASE_BRANCH" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || { echo "::error::Invalid base branch."; exit 1; }
+          git fetch origin "$BASE_BRANCH" --depth=1 --quiet
+          helper_dir="$RUNNER_TEMP/continuum-control-plane"
+          mkdir -p "$helper_dir"
+          for helper in failure_retry.py opencode_runtime.py opencode_instructions.py; do
+            git show "origin/$BASE_BRANCH:.github/scripts/$helper" > "$helper_dir/$helper"
+          done
+          git show "origin/$BASE_BRANCH:.github/agents/AGENTS.md" > "$helper_dir/AGENTS.md"
+          {
+            echo "CONTINUUM_FAILURE_RETRY_HELPER=$helper_dir/failure_retry.py"
+            echo "CONTINUUM_OPENCODE_RUNTIME_HELPER=$helper_dir/opencode_runtime.py"
+            echo "CONTINUUM_OPENCODE_INSTRUCTIONS_HELPER=$helper_dir/opencode_instructions.py"
+            echo "CONTINUUM_AGENT_INSTRUCTIONS=$helper_dir/AGENTS.md"
+          } >> "$GITHUB_ENV"
+
       # Unconditional, and ahead of every invocation in this job on purpose.
       # OpenCode loads one global instructions file in addition to whatever it
       # finds in the repository, and on a fresh runner the global one does not
@@ -268,8 +288,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 .github/scripts/opencode_instructions.py install \
-            --source .github/agents/AGENTS.md
+          python3 "$CONTINUUM_OPENCODE_INSTRUCTIONS_HELPER" install \
+            --source "$CONTINUUM_AGENT_INSTRUCTIONS"
 
       # workflow_dispatch repair modes must NOT use "opencode github run":
       # that integration owns a branch/PR lifecycle and can open a new PR even
@@ -280,26 +300,52 @@ jobs:
         if: github.event_name == 'workflow_dispatch'
         run: |
           set -euo pipefail
+          echo "failure_class=none" >> "$GITHUB_OUTPUT"
+          echo "failure_code=none" >> "$GITHUB_OUTPUT"
+          installer_log="$RUNNER_TEMP/opencode-installer.log"
+          : > "$installer_log"
+          installed=false
           for attempt in 1 2 3; do
             echo "OpenCode install attempt $attempt/3"
-            if curl -fsSL https://opencode.ai/install | bash; then
+            if (
+              set -o pipefail
+              curl -fsSL https://opencode.ai/install 2> >(tee -a "$installer_log" >&2) |
+                bash 2> >(tee -a "$installer_log" >&2)
+            ); then
+              installed=true
               break
             fi
-            if [[ "$attempt" == "3" ]]; then
-              echo "::error::OpenCode installer failed after 3 attempts."
-              exit 1
+            if [[ "$attempt" != "3" ]]; then
+              sleep $((attempt * 5))
             fi
-            sleep $((attempt * 5))
           done
-          test -x "$HOME/.opencode/bin/opencode"
+
+          if [[ "$installed" != "true" ]]; then
+            python3 "$CONTINUUM_FAILURE_RETRY_HELPER" classify \
+              --failed-step "Install OpenCode CLI for automated repair" \
+              < "$installer_log" > "$RUNNER_TEMP/opencode-installer-class.env"
+            # shellcheck disable=SC1090
+            source "$RUNNER_TEMP/opencode-installer-class.env"
+            echo "failure_class=$failure_class" >> "$GITHUB_OUTPUT"
+            echo "failure_code=$failure_code" >> "$GITHUB_OUTPUT"
+            echo "::error::OpenCode installer failed after 3 short transport attempts ($failure_class/$failure_code)."
+            exit 1
+          fi
+
+          if [[ ! -x "$HOME/.opencode/bin/opencode" ]]; then
+            echo "failure_class=control_plane" >> "$GITHUB_OUTPUT"
+            echo "failure_code=installer_missing_binary" >> "$GITHUB_OUTPUT"
+            echo "::error::OpenCode installer completed without producing the expected binary."
+            exit 1
+          fi
+
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
-          # runtime-lab #136. The installer is a pipe, so the install itself
-          # cannot be attested against a pinned digest -- but the identity of
-          # whatever is on PATH can be recorded, and every step that later runs
-          # the agent re-checks it. A binary swapped between here and the
-          # invocation is then a failed step rather than a trusted run.
-          PATH="$HOME/.opencode/bin:$PATH" \
-            python3 .github/scripts/opencode_runtime.py install
+          if ! PATH="$HOME/.opencode/bin:$PATH" \
+            python3 "$CONTINUUM_OPENCODE_RUNTIME_HELPER" install; then
+            echo "failure_class=control_plane" >> "$GITHUB_OUTPUT"
+            echo "failure_code=runtime_attestation_failed" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
 
       - name: Record issue execution ownership
         if: github.event_name == 'issue_comment'
@@ -715,9 +761,9 @@ jobs:
           - Keep all comments and commit messages in English.
           EOF
           )
-          python3 .github/scripts/opencode_runtime.py verify --expected-sha256 "$OPENCODE_RUNTIME_SHA256"
-          python3 .github/scripts/opencode_instructions.py verify \
-            --source .github/agents/AGENTS.md
+          python3 "$CONTINUUM_OPENCODE_RUNTIME_HELPER" verify --expected-sha256 "$OPENCODE_RUNTIME_SHA256"
+          python3 "$CONTINUUM_OPENCODE_INSTRUCTIONS_HELPER" verify \
+            --source "$CONTINUUM_AGENT_INSTRUCTIONS"
           timeout --signal=TERM "$REPAIR_AGENT_TIMEOUT_SECONDS" \
             opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
 
@@ -781,9 +827,9 @@ jobs:
           # Point of use: re-read the digest recorded at install time, so
           # the process about to start is the one that was verified rather
           # than whatever PATH happens to resolve at this moment.
-          python3 .github/scripts/opencode_runtime.py verify --expected-sha256 "$OPENCODE_RUNTIME_SHA256"
-          python3 .github/scripts/opencode_instructions.py verify \
-            --source .github/agents/AGENTS.md
+          python3 "$CONTINUUM_OPENCODE_RUNTIME_HELPER" verify --expected-sha256 "$OPENCODE_RUNTIME_SHA256"
+          python3 "$CONTINUUM_OPENCODE_INSTRUCTIONS_HELPER" verify \
+            --source "$CONTINUUM_AGENT_INSTRUCTIONS"
           opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
           AFTER_SHA=$(git rev-parse HEAD)
 
