@@ -55,7 +55,7 @@ permissions:
 
 concurrency:
   group: continuum-review-queue
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   reconcile:
