@@ -93,6 +93,12 @@ development on main
 The release is the unit of distribution for the entire Continuum automation implementation.
 Individual reusable workflows are not independently versioned for a consumer.
 
+Publication is implemented by `.github/workflows/release.yml`, dispatched by hand with the version
+to publish. It validates the release commit, resolves the whole graph reachable from the release
+entrypoint at that commit, and refuses unless immutable releases are already enabled and the tag
+does not already exist. The offline decision logic is `src/continuum/publication.py`; the consumer
+half is `src/continuum/pin.py`.
+
 ## Consumer upgrade lifecycle
 
 Publishing a new Continuum release performs no write in any consumer repository.

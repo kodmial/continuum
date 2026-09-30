@@ -107,6 +107,7 @@ NOT_AGENT_PLANE = (
     "consumer.yml",
     "continuum-shadow.yml",
     "release-bun-binary.yml",
+    "release.yml",
     "review-queue.yml",
 )
 

@@ -28,10 +28,16 @@ The repository currently dogfoods a deliberately small active control plane:
 The complete NanoDictate workflow set is preserved verbatim under
 `reference/nanodictate-workflows/`.
 
-CodeRabbit and release automation are intentionally **not active workflows** yet.
-Their implementations are preserved in the reference snapshot and will be
-reintroduced as optional adapters after the configuration/module boundaries are
-implemented.
+CodeRabbit and the consumer-facing release adapters are intentionally **not
+active workflows** yet. Their implementations are preserved in the reference
+snapshot and will be reintroduced as optional adapters after the
+configuration/module boundaries are implemented.
+
+Continuum does, however, publish releases *of itself* — see
+[Publishing a Continuum release](#publishing-a-continuum-release). That is a
+different thing: the consumer's own artifacts are built by the consumer's own
+release hook, while this repository's release is the control plane a consumer
+pins with one reference.
 
 ## Consumer contract (v0.1)
 
@@ -189,6 +195,66 @@ committed.
 `fixtures/consumer-repo/` is a working instance of both files, and
 `tests/test_fixture_consumer.py` runs the engine against that repository's own
 configuration to prove both opt-in and opt-out behave as documented.
+
+## Publishing a Continuum release
+
+A release of Continuum is a commit, not an archive. The tag names that commit,
+and everything a consumer executes comes out of it through the relative
+references in `consumer.yml`, so a published release is complete by
+construction — or it is refused.
+
+`.github/workflows/release.yml` is dispatched by hand with the version to
+publish:
+
+```text
+gh workflow run release.yml --repo kodmial/continuum \
+  -f version=v0.1.0 -f commit=<full sha on main>
+```
+
+`commit` is optional and defaults to the commit the run was dispatched on. The
+workflow refuses a version that is not an exact SemVer tag, and a commit that is
+not already on `main`.
+
+What a dispatch does, in order:
+
+1. **Resolves the identity.** The exact tag, the full commit, and the previous
+   release. The commit is checked out by SHA and shown to be merged.
+2. **Proves the commit.** `.github/scripts/release_validation.sh` runs the same
+   obligations CI runs — workflow syntax and actionlint, both unit suites,
+   configuration validation, the two-toggle contract, the consumer-agnostic
+   contract core, and the fixture workflows — against the release commit rather
+   than the head of a branch.
+3. **Derives the release.** `continuum release publish` resolves the whole graph
+   reachable from `consumer.yml` at that commit, hashes every file in it, and
+   computes the release notes — configuration-schema changes and compatibility
+   included — from what actually changed. The result is one graph digest and a
+   `release-manifest.json`.
+4. **Decides, then publishes.** The publish job observes the repository — GitHub
+   immutable releases, the published releases, the existing tags — and refuses
+   unless immutability is already enabled, the tag does not already exist, and
+   the version is not older than a published one. It then recomputes the
+   candidate, refuses unless the digest matches what validation produced, and
+   creates the tag at exactly that commit before creating the release. Afterwards
+   it reads the release back and proves the tag still names the released commit,
+   that the release is immutable, and that the manifest shipped is the manifest
+   that was validated.
+
+Two things it will never do: move an existing tag, and change a consumer.
+Publishing `v0.1.1` is not a statement about `v0.1.0`; a consumer moves by
+changing its own one-line reference.
+
+Before the first release, enable GitHub's immutable releases for this
+repository — Settings → Releases → Enable release immutability, or
+`PUT /repos/kodmial/continuum/immutable-releases` with an admin token. The
+workflow reads that setting and refuses rather than turning it on itself,
+because enabling it is an administrative decision about the repository rather
+than a property of any one release.
+
+The rules are in
+[ADR-0002](docs/architecture/adr/0002-consumer-controlled-immutable-releases.md);
+the offline decision logic is `src/continuum/publication.py`, asserted by
+`tests/test_publication.py` and audited as wiring by
+`.github/tests/test_release_publication.py`.
 
 
 ## Parent/child delegated execution
@@ -398,9 +464,11 @@ chosen by the destination's mode; secrets are checked for presence but never
 read. Project data and templates are consumer-owned; the publisher only knows
 the generic shape.
 
-No release workflow is active in this repository, and `.github/workflows/ci.yml`
-enforces an allowlist of workflow names. The module and the CLI are the
-deliverable; the macOS job is a follow-up.
+No *consumer-artifact* release workflow is active in this repository, and
+`.github/workflows/ci.yml` enforces an allowlist of workflow names. The module
+and the CLI are the deliverable; the macOS job is a follow-up. Publishing a
+release of Continuum itself is a separate, already-active workflow — see
+[Publishing a Continuum release](#publishing-a-continuum-release).
 
 ### The release core
 

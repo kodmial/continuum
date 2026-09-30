@@ -95,6 +95,7 @@ OWN_CONTROL_PLANE = (
 OWN_REPOSITORY_TOOLING = (
     "ci.yml",
     "release-bun-binary.yml",
+    "release.yml",
 )
 
 #: The shadow harness is the one workflow allowed to name a Continuum revision,
