@@ -565,6 +565,20 @@ class AgentExecutionTests(WorkflowAuditBase):
         self.assertNotIn("OPENCODE_API_KEY is not configured", text)
         self.assertIn("OPENCODE_MODEL", text)
 
+    def test_consumer_agent_platform_is_configurable_without_shell_injection(self):
+        document = self.workflows["consumer-opencode.yml"]
+        inputs = document["on"]["workflow_call"]["inputs"]
+        job = self.job("consumer-opencode.yml", "opencode")
+        self.assertEqual(inputs["runner"]["default"], "ubuntu-latest")
+        self.assertEqual(inputs["swift_version"]["default"], "")
+        self.assertEqual(job.get("runs-on"), "${{ inputs.runner }}")
+        raw = self.raw["consumer-opencode.yml"]
+        self.assertIn("swift-actions/setup-swift@7ca6abe6b3b0e8b5421b88be48feee39cbf52c6a", raw)
+        self.assertIn("swift-version: ${{ inputs.swift_version }}", raw)
+        self.assertIn("if: inputs.swift_version != ''", raw)
+        self.assertNotIn("eval ", raw)
+        self.assertNotIn("bash -c \"${{ inputs.", raw)
+
     def test_comment_gate_requires_a_trusted_author_and_a_real_issue(self):
         condition = str(self.job("opencode.yml", "authorize").get("if"))
         self.assertIn("github.event.comment.user.login", condition)
