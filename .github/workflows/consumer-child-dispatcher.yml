@@ -3,22 +3,24 @@ name: Continuum reusable child dispatcher
 on:
   workflow_call:
     inputs:
+      # All three default to the consumer's single generated ingress. GitHub
+      # cannot dispatch a reusable workflow, so a child run has to be entered
+      # through something in the consumer's own repository; naming the same file
+      # three times is what lets a consumer hold a single Continuum reference
+      # and still reach all three child surfaces. The `child:` mode the
+      # dispatcher sends is what distinguishes them.
       worker_workflow:
         type: string
         required: false
-        default: continuum-child-worker.yml
+        default: continuum.yml
       review_workflow:
         type: string
         required: false
-        default: continuum-child-review.yml
+        default: continuum.yml
       manual_pr_review_workflow:
         type: string
         required: false
-        default: continuum-child-pr-review.yml
-      engine_ref:
-        type: string
-        required: false
-        default: main
+        default: continuum.yml
     secrets:
       CHILD_RUNTIME_TOKEN:
         required: true
@@ -47,20 +49,24 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Checkout Continuum engine
+      # ADR-0002: a delegated child run is part of the same release as the rest
+      # of the control plane, and it is reached through a nested reusable
+      # workflow, so `job.workflow_sha` is already the commit the consumer
+      # pinned. Resolving the engine from it removes the last way a child run
+      # could execute a different Continuum revision than the one it was
+      # dispatched from: there is no longer a ref to pass in at all.
+      - name: Check out the Continuum engine
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: kodmial/continuum
-          ref: ${{ inputs.engine_ref }}
+          ref: ${{ job.workflow_sha }}
           path: .continuum-engine
           fetch-depth: 1
           persist-credentials: false
-
-      - name: Export Continuum engine root
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "CONTINUUM_ENGINE_ROOT=$GITHUB_WORKSPACE/.continuum-engine" >> "$GITHUB_ENV"
+      - name: Load Continuum engine
+        uses: ./.continuum-engine/.github/actions/engine-path
+        with:
+          release-sha: ${{ job.workflow_sha }}
 
       - name: Reconcile configured children
         shell: bash
@@ -199,6 +205,7 @@ jobs:
                   continue
                 fi
                 gh workflow run "$REVIEW_WORKFLOW" --repo "$GITHUB_REPOSITORY" \
+                  -f mode=child:review \
                   -f child_id="$child_id" \
                   -f task_number="$task_number" \
                   -f pr_number="$pr_number" >/dev/null
@@ -228,6 +235,7 @@ jobs:
                 [[ -n "$manual_pr" ]] || continue
                 manual_pr_active "$child_id" "$manual_pr" && continue
                 gh workflow run "$MANUAL_PR_REVIEW_WORKFLOW" --repo "$GITHUB_REPOSITORY" \
+                  -f mode=child:pr-review \
                   -f child_id="$child_id" \
                   -f pr_number="$manual_pr" >/dev/null
                 dispatched=$((dispatched + 1))
@@ -303,7 +311,7 @@ jobs:
                 done
                 [[ "$ready" == true ]] || continue
 
-                gh workflow run "$WORKER_WORKFLOW" --repo "$GITHUB_REPOSITORY"                   -f child_id="$child_id"                   -f task_number="$task_number" >/dev/null
+                gh workflow run "$WORKER_WORKFLOW" --repo "$GITHUB_REPOSITORY"                   -f mode=child:worker                   -f child_id="$child_id"                   -f task_number="$task_number" >/dev/null
                 dispatched=$((dispatched + 1))
               done < <(
                 jq -r --arg p "$priority" '

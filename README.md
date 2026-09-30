@@ -161,19 +161,32 @@ The wiring is:
 
 | You write | To |
 | --- | --- |
-| `.github/workflows/<name>.yml` | declare the events Continuum should wake up on |
-| `.github/workflows/continuum-auto-merge.yml` | reconcile merge eligibility, and hand off to your release hook when `release: true` |
-| `.github/workflows/review.yml` | close the review loop when `review: true` |
-| `.github/workflows/continuum-opencode.yml` | your agent runner and toolchain, as inputs |
+| `.github/workflows/continuum.yml` | declare the events Continuum should wake up on, and pin the one exact Continuum release you run |
 | `.github/workflows/continuum-release.yml` | your own release, given the merge commit |
 
-Every one of those files calls a shared controller at a pinned Continuum commit.
-You own the event set, your agent's runner, your language toolchain, which of your
-own checks block a merge, and your release; Continuum owns every decision. You do
-not pass `review` or `release` to a controller — a second place to declare them
-is a second thing that can disagree with the file you just committed.
+`continuum.yml` is the only file that names Continuum, and it names it once:
 
-`fixtures/consumer-repo/` is a working instance of all five files, and
+```yaml
+jobs:
+  continuum:
+    uses: kodmial/continuum/.github/workflows/consumer.yml@v0.1.0
+    secrets: inherit
+```
+
+That one line selects the scheduler, the agent, CI, packaging, review, repair,
+merge, and release controllers as a single coherent snapshot — the entrypoint
+reaches each of them through same-repository relative references, so nothing
+inside the selected release can resolve a revision of its own. An upgrade and a
+rollback are both that one line, and publishing a newer Continuum release
+changes nothing here.
+
+You own the event set, your agent's runner, your language toolchain, which of
+your own checks block a merge, and your release; Continuum owns every decision.
+You do not pass `review` or `release` to a controller — a second place to
+declare them is a second thing that can disagree with the file you just
+committed.
+
+`fixtures/consumer-repo/` is a working instance of both files, and
 `tests/test_fixture_consumer.py` runs the engine against that repository's own
 configuration to prove both opt-in and opt-out behave as documented.
 
@@ -240,8 +253,9 @@ selected candidate, cooldown or retry waits, released slots, and the single
 scheduled action. `queue reconcile --no-apply` prints the same plan without
 acting on it.
 
-A consumer repository declares the event set in a thin entry workflow and calls
-the shared reconciler — see `fixtures/consumer-repo/.github/workflows/review-queue.yml`.
+A consumer repository declares the event set in its single generated ingress and
+reaches the shared reconciler through the release entrypoint it pins — see
+`fixtures/consumer-repo/.github/workflows/continuum.yml`.
 `tests/test_queue_workflows.py` fails if the two event sets ever drift apart.
 
 ## Release

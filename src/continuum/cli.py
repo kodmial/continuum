@@ -16,6 +16,7 @@ import sys
 from typing import Any, Dict, Optional, Sequence
 
 from . import config as config_module
+from . import pin as pin_module
 from .release import adapters as release_adapters
 from .release import run as release_run
 from .review import commands as command_module
@@ -714,6 +715,127 @@ def cmd_release_sign(args: argparse.Namespace) -> int:
     return EXIT_ERROR
 
 
+DEFAULT_INGRESS = ".github/workflows/continuum.yml"
+
+
+def _read_ingress(path: str) -> str:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+    except OSError as exc:
+        raise SystemExit(f"CONTINUUM_ERROR: cannot read the generated ingress: {exc}")
+
+
+def cmd_release_pin_show(args: argparse.Namespace) -> int:
+    """Report the exact Continuum release a consumer currently executes."""
+
+    resolved = pin_module.require_single_release_pin(
+        _read_ingress(args.ingress), args.ingress
+    )
+    _print_json(
+        {
+            "ingress": args.ingress,
+            "reference": resolved.value,
+            "path": resolved.path,
+            "ref": resolved.ref,
+            "kind": resolved.kind,
+            "ok": True,
+        }
+    )
+    return EXIT_OK
+
+
+def cmd_release_pin_verify(args: argparse.Namespace) -> int:
+    """Fail unless the consumer holds exactly one exact Continuum release.
+
+    This is the check an upgrade runs *after* the pin changes and a rollback
+    runs after the pin is restored: it proves the file still says one thing,
+    that the thing is exact, and that the thing names the release entrypoint
+    rather than a single controller.
+    """
+
+    try:
+        resolved = pin_module.require_single_release_pin(
+            _read_ingress(args.ingress), args.ingress
+        )
+    except pin_module.PinError as exc:
+        print(f"::error::{exc}")
+        _print_json({"ingress": args.ingress, "ok": False, "error": str(exc)})
+        return EXIT_ERROR
+    _print_json(
+        {
+            "ingress": args.ingress,
+            "reference": resolved.value,
+            "kind": resolved.kind,
+            "ok": True,
+        }
+    )
+    print(
+        f"::notice::{args.ingress} executes Continuum {resolved.ref} "
+        "as a single coherent release."
+    )
+    return EXIT_OK
+
+
+def _pin_change(args: argparse.Namespace, move) -> int:
+    """Apply one explicit pin change, and only when it was asked for by name.
+
+    There is no background path here and no discovery mode: a pin moves when an
+    operator names the target release, and nothing else can move it. Without
+    `--write` the result is printed rather than written, so the change can be
+    reviewed as a diff before it lands.
+    """
+
+    text = _read_ingress(args.ingress)
+    try:
+        updated = move(text, args.ref, args.ingress)
+    except pin_module.PinError as exc:
+        print(f"::error::{exc}")
+        _print_json({"ingress": args.ingress, "ok": False, "error": str(exc)})
+        return EXIT_ERROR
+
+    before = pin_module.require_single_release_pin(text, args.ingress)
+    after = pin_module.require_single_release_pin(updated, args.ingress)
+    if not args.write:
+        sys.stdout.write(updated)
+        sys.stdout.flush()
+        _print_json(
+            {
+                "ingress": args.ingress,
+                "from": before.ref,
+                "to": after.ref,
+                "written": False,
+                "ok": True,
+            }
+        )
+        return EXIT_OK
+
+    with open(args.ingress, "w", encoding="utf-8") as handle:
+        handle.write(updated)
+    _print_json(
+        {
+            "ingress": args.ingress,
+            "from": before.ref,
+            "to": after.ref,
+            "written": True,
+            "ok": True,
+        }
+    )
+    print(
+        f"::notice::{args.ingress} now selects Continuum {after.ref} "
+        f"(was {before.ref}). Run the consumer's own validation before merging."
+    )
+    return EXIT_OK
+
+
+def cmd_release_pin_upgrade(args: argparse.Namespace) -> int:
+    return _pin_change(args, pin_module.upgrade)
+
+
+def cmd_release_pin_rollback(args: argparse.Namespace) -> int:
+    return _pin_change(args, pin_module.rollback)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="continuum", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -952,6 +1074,58 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print the plan without executing any signing tool.",
     )
     sign.set_defaults(func=cmd_release_sign)
+
+    release_pin = release_sub.add_parser(
+        "pin",
+        help="Read, verify, or change the consumer's one Continuum release reference.",
+        description=(
+            "ADR-0002 makes the Continuum release, not the module, the unit of "
+            "version selection. A consumer holds exactly one literal reference "
+            "in its generated ingress, and it is either an exact SemVer release "
+            "tag or a full commit SHA. These commands read it, assert it, and "
+            "change it on explicit request only: nothing here runs because a "
+            "newer Continuum release exists, and there is no automatic repin."
+        ),
+    )
+    release_pin_sub = release_pin.add_subparsers(dest="release_pin_command", required=True)
+
+    def add_ingress(target: argparse.ArgumentParser) -> None:
+        target.add_argument(
+            "--ingress",
+            default=DEFAULT_INGRESS,
+            help="Path to the consumer's generated ingress workflow.",
+        )
+
+    pin_show = release_pin_sub.add_parser(
+        "show", help="Report the Continuum release this consumer executes."
+    )
+    add_ingress(pin_show)
+    pin_show.set_defaults(func=cmd_release_pin_show)
+
+    pin_verify = release_pin_sub.add_parser(
+        "verify",
+        help="Fail unless exactly one exact Continuum release is selected.",
+    )
+    add_ingress(pin_verify)
+    pin_verify.set_defaults(func=cmd_release_pin_verify)
+
+    for name, help_text, handler in (
+        ("upgrade", "Move the single reference to the release you name.", cmd_release_pin_upgrade),
+        ("rollback", "Restore the single reference to the release you name.", cmd_release_pin_rollback),
+    ):
+        mover = release_pin_sub.add_parser(name, help=help_text)
+        add_ingress(mover)
+        mover.add_argument(
+            "--ref",
+            required=True,
+            help="Exact release tag (v0.1.1) or full commit SHA to select.",
+        )
+        mover.add_argument(
+            "--write",
+            action="store_true",
+            help="Write the ingress in place. Without it the result is printed.",
+        )
+        mover.set_defaults(func=handler)
 
     return parser
 

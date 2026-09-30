@@ -1,24 +1,55 @@
 name: Continuum engine path
-description: Expose the checked-out Continuum action repository root to reusable consumer workflows
+description: >-
+  Verify and export the checked-out Continuum engine root, and prove that the
+  checkout is the release commit the caller resolved
+
+# ADR-0002 makes the Continuum release, not the module, the unit of version
+# selection, so the engine a consumer's control plane executes has to be the same
+# commit as the workflow file that was loaded. This action is therefore always
+# used as a *local* action -- `./.continuum-engine/.github/actions/engine-path`
+# -- after a checkout of that exact commit, never as a separately referenced
+# remote action. A remote reference would be a second, independent pin, and a
+# consumer selected at vX.Y.Z could then run engine code from a different
+# revision. `.github/tests/test_release_selection.py` fails the build if one
+# reappears.
+#
+# `release-sha` is the commit the caller resolved from `job.workflow_sha` (or,
+# for a run Continuum dispatched into a consumer repository, the commit the
+# dispatcher passed down). It is verified here against the checkout rather than
+# trusted, so a checkout that resolved to something else fails the step instead
+# of quietly running different engine code.
+#
+# The verification itself is `verify.py` beside this file. It is a Python program
+# rather than shell so that it can be unit tested: `job.workflow_sha` describes
+# the workflow *file*, not the repository the engine was fetched from, so the
+# checkout's own commit *and* its own origin both have to be checked, and both
+# have to be right on the ordinary HTTPS form of a remote URL as well as the SSH
+# one.
+
+inputs:
+  release-sha:
+    description: "Full commit SHA of the selected Continuum release"
+    required: true
+  repository:
+    description: "Continuum repository the engine checkout must come from"
+    required: false
+    default: kodmial/continuum
 
 runs:
   using: composite
   steps:
-    - name: Export Continuum engine root
+    - name: Verify and export the Continuum engine root
       shell: bash
+      env:
+        CONTINUUM_RELEASE_SHA: ${{ inputs.release-sha }}
+        CONTINUUM_REPOSITORY: ${{ inputs.repository }}
       run: |
         set -euo pipefail
+        # Three directories up from this action is the engine checkout itself:
+        # `.continuum-engine/.github/actions/engine-path`.
         root="$(cd "$GITHUB_ACTION_PATH/../../.." && pwd)"
-        test -f "$root/.github/scripts/conflict_repair.py"
-        test -f "$root/.github/scripts/agent_workspace.py"
-        test -f "$root/.github/scripts/opencode_runtime.py"
-        # The global instructions document and its installer travel together.
-        # A consumer workflow installs one from the other, so a partial engine
-        # checkout has to fail here rather than half way through an agent run.
-        test -f "$root/.github/scripts/opencode_instructions.py"
-        test -f "$root/.github/agents/AGENTS.md"
-        # The review and release entrypoints run the engine package itself, not
-        # only the shell helpers above, so an engine checkout missing `src`
-        # would fail part way through a privileged step instead of here.
-        test -f "$root/src/continuum/cli.py"
-        echo "CONTINUUM_ENGINE_ROOT=$root" >> "$GITHUB_ENV"
+        python3 "$GITHUB_ACTION_PATH/verify.py" \
+          --root "$root" \
+          --release-sha "$CONTINUUM_RELEASE_SHA" \
+          --repository "$CONTINUUM_REPOSITORY" \
+          --exclude-from "$GITHUB_WORKSPACE" >> "$GITHUB_ENV"

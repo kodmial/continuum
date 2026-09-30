@@ -1,0 +1,411 @@
+# Continuum release entrypoint.
+#
+# This is the file a consumer's generated ingress names, once:
+#
+#     jobs:
+#       continuum:
+#         uses: kodmial/continuum/.github/workflows/consumer.yml@v0.1.0
+#         secrets: inherit
+#
+# Everything below that line is Continuum-owned. Because a reusable workflow
+# cannot subscribe to another repository's events, the consumer necessarily
+# keeps a thin local ingress, and that ingress declares events and one exact
+# release reference. This file is what that reference selects.
+#
+# Why one file and not one reference per controller
+# -------------------------------------------------
+# A consumer that pinned its scheduler, its agent, its review gate, and its
+# merge reconciler separately could hold a mixed-version graph: an old review
+# gate deciding what a new agent is allowed to do. ADR-0002 makes the release,
+# not the module, the unit of selection, so this file is the whole selection
+# surface. An upgrade is one edit here and one edit in the consumer.
+#
+# Why the nested references are relative
+# ---------------------------------------
+# Every call below is a same-repository relative reference, so GitHub resolves
+# it from the same commit as the `consumer.yml` the consumer pinned. The
+# consumer's `@v0.1.0` therefore selects one internally consistent snapshot of
+# the entire control plane rather than a mix of the pinned file with whatever
+# `main` holds today. There is deliberately no second revision anywhere in this
+# repository's production workflows: `.github/tests/test_release_selection.py`
+# fails the build if one reappears.
+#
+# What the consumer may still say
+# -------------------------------
+# Only "how should this repository behave": where its contract file is, which
+# branch is its base, how much work is in flight, what its agent's execution
+# environment is, and which of its own workflows Continuum may dispatch. Not
+# "which Continuum": that is the literal ref in the consumer's own ingress, and
+# it is not expressible as an input because `jobs.<job_id>.uses` accepts no
+# expressions.
+#
+# Secrets are passed explicitly and stay consumer-owned. `secrets: inherit`
+# from the ingress is the one call a consumer makes, and it passes nothing to
+# Continuum that the consumer did not already hold.
+name: Continuum
+
+on:
+  workflow_call:
+    inputs:
+      config_path:
+        type: string
+        required: false
+        default: .github/continuum.yml
+        description: "Path to the validated Continuum contract file in the base branch"
+      queue_config_path:
+        type: string
+        required: false
+        default: .continuum.yml
+        description: >-
+          Path to the consumer's versioned Continuum configuration document,
+          which the review queue resolves its labels, ordering, and shared
+          provider slot from
+      base_branch:
+        type: string
+        required: false
+        default: main
+        description: "Branch pull requests are opened against and merged into"
+      reconciler_workflow:
+        type: string
+        required: false
+        default: continuum.yml
+        description: >-
+          Consumer-owned workflow woken when a reconciler has to hand work back
+          to the control plane. A bare dispatch with no mode is a reconcile.
+      opencode_workflow:
+        type: string
+        required: false
+        default: continuum.yml
+        description: "Consumer-owned dispatchable workflow that runs the agent"
+      release_workflow:
+        type: string
+        required: false
+        default: continuum-release.yml
+        description: "Consumer-owned workflow that performs this repository's own release"
+      worker_workflow:
+        type: string
+        required: false
+        default: continuum.yml
+        description: "Consumer-owned dispatchable workflow that implements a delegated child task"
+      review_workflow:
+        type: string
+        required: false
+        default: continuum.yml
+        description: "Consumer-owned dispatchable workflow that reviews a delegated child change"
+      manual_pr_review_workflow:
+        type: string
+        required: false
+        default: continuum.yml
+        description: "Consumer-owned dispatchable workflow that reviews an owner-created child pull request"
+      additional_blocking_workflows:
+        type: string
+        required: false
+        default: ""
+        description: "Comma-separated exact-head blocking gates beyond the main CI run"
+      wip_limit:
+        type: number
+        required: false
+        default: 2
+      lease_minutes:
+        type: number
+        required: false
+        default: 45
+      max_attempts:
+        type: number
+        required: false
+        default: 3
+      max_attempts_per_head:
+        type: number
+        required: false
+        default: 3
+      max_attempts_per_finding:
+        type: number
+        required: false
+        default: 3
+      max_rereviews:
+        type: number
+        required: false
+        default: 1
+      agent_timeout_minutes:
+        type: number
+        required: false
+        default: 25
+      repair_agent_timeout_seconds:
+        type: number
+        required: false
+        default: 1200
+        description: "Hard cap on the single model call inside one conflict or gate repair"
+      queue_wait_minutes:
+        type: number
+        required: false
+        default: 45
+        description: "How long one review-queue run may stay alive waiting out a provider cooldown"
+      runner:
+        type: string
+        required: false
+        default: ubuntu-latest
+        description: "Runner label for the consumer's own execution environment"
+      swift_version:
+        type: string
+        required: false
+        default: ""
+        description: "Optional product toolchain version; empty installs none"
+      model:
+        type: string
+        required: false
+        default: opencode/big-pickle
+      mode:
+        type: string
+        required: false
+        default: ""
+        description: "Agent dispatch mode; empty means this run is a control-plane wake-up, not an agent run"
+      issue_number:
+        type: string
+        required: false
+        default: ""
+      pr_number:
+        type: string
+        required: false
+        default: ""
+      head_ref:
+        type: string
+        required: false
+        default: ""
+      run_id:
+        type: string
+        required: false
+        default: ""
+      rungs_ruled_out:
+        type: string
+        required: false
+        default: ""
+      child_id:
+        type: string
+        required: false
+        default: ""
+        description: "Delegated child repository id; only read for a `child:` mode"
+      task_number:
+        type: string
+        required: false
+        default: ""
+        description: "Delegated child issue number; only read for a `child:` mode"
+    secrets:
+      continuum_token:
+        description: "Optional consumer-owned write token used when review state must fan out"
+        required: false
+      OPENCODE_API_KEY:
+        required: false
+      TAP_PAT:
+        required: false
+      CHILD_RUNTIME_TOKEN:
+        required: false
+      CHILD_RUNTIME_REPOSITORIES:
+        required: false
+
+# The union of what the nested control plane needs. A called workflow can only
+# narrow these, never widen them, so the ingress grants this ceiling and each
+# job below asks for exactly the scope its own controller documents.
+permissions:
+  actions: write
+  checks: write
+  contents: write
+  issues: write
+  pull-requests: write
+  statuses: read
+
+# No `concurrency:` here on purpose. One ingress covers several reconcilers
+# that must not serialize behind each other -- a review gate waiting on an agent
+# must not block the merge reconciler that would release it -- and each nested
+# workflow already owns the constant, repository-scoped group that makes its own
+# controller single-flight. Declaring one group here would silently fuse five
+# independent reconcilers into one queue.
+jobs:
+  # A `workflow_dispatch` that carries a `mode` is a control-plane dispatch, and
+  # each mode belongs to exactly one surface. GitHub cannot dispatch a reusable
+  # workflow, so every one of them is entered through the consumer's own ingress;
+  # routing them here rather than through further consumer-side files is what
+  # keeps the release reference to one line.
+  #
+  # The four agent modes are listed rather than tested as "not a child mode",
+  # because the set has to match `consumer-opencode.yml` exactly. A test that
+  # only excluded `child:*` would pass on a typo and dispatch an agent run whose
+  # mode the agent does not implement.
+  agent:
+    name: Continuum agent
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      (inputs.mode == 'issue' || inputs.mode == 'resolve-conflict' ||
+       inputs.mode == 'ci-fix' || inputs.mode == 'review-fix')
+    uses: ./.github/workflows/consumer-opencode.yml
+    permissions:
+      actions: read
+      contents: write
+      issues: write
+      pull-requests: write
+    secrets:
+      continuum_token: ${{ secrets.continuum_token }}
+      OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+    with:
+      base_branch: ${{ inputs.base_branch }}
+      mode: ${{ inputs.mode }}
+      issue_number: ${{ inputs.issue_number }}
+      pr_number: ${{ inputs.pr_number }}
+      head_ref: ${{ inputs.head_ref }}
+      run_id: ${{ inputs.run_id }}
+      rungs_ruled_out: ${{ inputs.rungs_ruled_out }}
+      runner: ${{ inputs.runner }}
+      swift_version: ${{ inputs.swift_version }}
+      model: ${{ inputs.model }}
+
+  scheduler:
+    name: Continuum scheduler
+    if: github.event_name != 'workflow_dispatch' || inputs.mode == ''
+    uses: ./.github/workflows/consumer-scheduler.yml
+    permissions:
+      actions: write
+      contents: read
+      issues: write
+      pull-requests: read
+    with:
+      opencode_workflow: ${{ inputs.opencode_workflow }}
+      wip_limit: ${{ inputs.wip_limit }}
+      lease_minutes: ${{ inputs.lease_minutes }}
+      max_attempts: ${{ inputs.max_attempts }}
+
+  review:
+    name: Continuum review gate
+    if: github.event_name != 'workflow_dispatch' || inputs.mode == ''
+    uses: ./.github/workflows/consumer-review-gate.yml
+    permissions:
+      actions: write
+      checks: write
+      contents: read
+      issues: write
+      pull-requests: write
+    secrets:
+      continuum_token: ${{ secrets.continuum_token }}
+    with:
+      pr_number: ${{ inputs.pr_number }}
+      agent_workflow: ${{ inputs.opencode_workflow }}
+      config_path: ${{ inputs.config_path }}
+      base_branch: ${{ inputs.base_branch }}
+      max_attempts_per_head: ${{ inputs.max_attempts_per_head }}
+      max_attempts_per_finding: ${{ inputs.max_attempts_per_finding }}
+      max_rereviews: ${{ inputs.max_rereviews }}
+      agent_timeout_minutes: ${{ inputs.agent_timeout_minutes }}
+
+  review_queue:
+    name: Continuum review queue
+    if: github.event_name != 'workflow_dispatch' || inputs.mode == ''
+    uses: ./.github/workflows/review-queue.yml
+    permissions:
+      actions: write
+      contents: read
+      pull-requests: write
+      statuses: read
+    secrets:
+      continuum_token: ${{ secrets.continuum_token }}
+      TAP_PAT: ${{ secrets.TAP_PAT }}
+    with:
+      config_path: ${{ inputs.queue_config_path }}
+      wait_minutes: ${{ inputs.queue_wait_minutes }}
+
+  repair:
+    name: Continuum repair
+    if: github.event_name != 'workflow_dispatch' || inputs.mode == ''
+    uses: ./.github/workflows/consumer-repair.yml
+    permissions:
+      actions: write
+      contents: read
+      issues: write
+      pull-requests: write
+    with:
+      opencode_workflow: ${{ inputs.opencode_workflow }}
+      additional_blocking_workflows: ${{ inputs.additional_blocking_workflows }}
+      scheduler_workflow: ${{ inputs.reconciler_workflow }}
+      max_attempts: ${{ inputs.max_attempts }}
+      repair_timeout_minutes: ${{ inputs.agent_timeout_minutes }}
+      repair_agent_timeout_seconds: ${{ inputs.repair_agent_timeout_seconds }}
+
+  merge:
+    name: Continuum merge
+    if: github.event_name != 'workflow_dispatch' || inputs.mode == ''
+    uses: ./.github/workflows/consumer-auto-merge.yml
+    permissions:
+      actions: write
+      contents: write
+      issues: write
+      pull-requests: write
+      statuses: read
+    secrets:
+      continuum_token: ${{ secrets.continuum_token }}
+    with:
+      config_path: ${{ inputs.config_path }}
+      base_branch: ${{ inputs.base_branch }}
+      additional_blocking_workflows: ${{ inputs.additional_blocking_workflows }}
+      scheduler_workflow: ${{ inputs.reconciler_workflow }}
+      release_workflow: ${{ inputs.release_workflow }}
+
+  children:
+    name: Continuum child dispatcher
+    if: github.event_name != 'workflow_dispatch' || inputs.mode == ''
+    uses: ./.github/workflows/consumer-child-dispatcher.yml
+    permissions:
+      actions: write
+      contents: read
+    secrets:
+      CHILD_RUNTIME_TOKEN: ${{ secrets.CHILD_RUNTIME_TOKEN }}
+      CHILD_RUNTIME_REPOSITORIES: ${{ secrets.CHILD_RUNTIME_REPOSITORIES }}
+    with:
+      worker_workflow: ${{ inputs.worker_workflow }}
+      review_workflow: ${{ inputs.review_workflow }}
+      manual_pr_review_workflow: ${{ inputs.manual_pr_review_workflow }}
+
+  # Delegated child work is reached the same way the agent is: the child
+  # dispatcher dispatches into the consumer's own ingress, because a reusable
+  # workflow cannot be dispatched, and a `child:` mode says which of the three
+  # child surfaces the run is. The three surfaces are separate jobs rather than
+  # one job that branches, so a repository that never delegates sees three
+  # skipped jobs instead of a dispatcher that has to decide whether it is
+  # wanted.
+  child_worker:
+    name: Continuum delegated child task
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'child:worker'
+    uses: ./.github/workflows/consumer-child-worker.yml
+    permissions:
+      contents: read
+    secrets:
+      CHILD_RUNTIME_TOKEN: ${{ secrets.CHILD_RUNTIME_TOKEN }}
+      CHILD_RUNTIME_REPOSITORIES: ${{ secrets.CHILD_RUNTIME_REPOSITORIES }}
+    with:
+      child_id: ${{ inputs.child_id }}
+      task_number: ${{ inputs.task_number }}
+      model: ${{ inputs.model }}
+
+  child_review:
+    name: Continuum delegated child review
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'child:review'
+    uses: ./.github/workflows/consumer-child-review.yml
+    permissions:
+      contents: read
+    secrets:
+      CHILD_RUNTIME_TOKEN: ${{ secrets.CHILD_RUNTIME_TOKEN }}
+      CHILD_RUNTIME_REPOSITORIES: ${{ secrets.CHILD_RUNTIME_REPOSITORIES }}
+    with:
+      child_id: ${{ inputs.child_id }}
+      task_number: ${{ inputs.task_number }}
+      pr_number: ${{ inputs.pr_number }}
+      model: ${{ inputs.model }}
+
+  child_pr_review:
+    name: Continuum delegated owner pull-request review
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'child:pr-review'
+    uses: ./.github/workflows/consumer-child-pr-review.yml
+    permissions:
+      contents: read
+    secrets:
+      CHILD_RUNTIME_TOKEN: ${{ secrets.CHILD_RUNTIME_TOKEN }}
+      CHILD_RUNTIME_REPOSITORIES: ${{ secrets.CHILD_RUNTIME_REPOSITORIES }}
+    with:
+      child_id: ${{ inputs.child_id }}
+      pr_number: ${{ inputs.pr_number }}

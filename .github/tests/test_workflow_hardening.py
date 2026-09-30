@@ -78,6 +78,14 @@ AGENT_PLANE = (
 #: `pull_request_review`: a submitted review is what releases the provider slot
 #: the queue is waiting on, so dropping the trigger would stall the queue.
 #:
+#: `consumer.yml` is here for a different reason than the rest: it is the release
+#: entrypoint itself, the single reusable workflow a consumer's ingress names at
+#: one exact release reference. It holds no `steps` of its own -- it only routes
+#: to the implementations below through same-repository relative references -- so
+#: there is no consumer code for the trust policy to have an opinion about.
+#: `ReleaseSelectionTests` in `test_release_selection.py` is what holds it to
+#: ADR-0002 instead.
+#:
 #: The list is spelled out rather than derived, and `AuditScopeTests` asserts it
 #: is exactly the complement of `AGENT_PLANE`, so a workflow cannot enter this
 #: directory - or leave the agent plane - without a reviewer deciding so.
@@ -96,6 +104,7 @@ NOT_AGENT_PLANE = (
     "consumer-repair.yml",
     "consumer-review-gate.yml",
     "consumer-scheduler.yml",
+    "consumer.yml",
     "continuum-shadow.yml",
     "release-bun-binary.yml",
     "review-queue.yml",
@@ -1117,11 +1126,28 @@ class ConsumerReviewSurfaceTests(WorkflowAuditBase):
         self.assertFalse(concurrency.get("cancel-in-progress"))
 
     def test_the_review_gate_never_checks_out_pull_request_code(self):
+        # The gate is the most privileged surface in the repository, so the
+        # invariant it has to keep is about *what* it checks out rather than
+        # whether it checks anything out. Every checkout has to resolve to
+        # Continuum's own release commit; a checkout of the pull request's own
+        # code would let the change under review decide the gate that judges it.
         job = self.job("consumer-review-gate.yml", "gate")
-        self.assertEqual(
-            [s for s in steps_of(job) if uses(s, "actions/checkout")], []
-        )
-        # Everything it needs is read through the API from the base branch.
+        checkouts = [s for s in steps_of(job) if uses(s, "actions/checkout")]
+        self.assertTrue(checkouts, "the gate loads the engine it evaluates the gate with")
+        for step in checkouts:
+            values = step.get("with") or {}
+            self.assertEqual(
+                values.get("repository"),
+                "kodmial/continuum",
+                "the gate checks out a repository other than Continuum",
+            )
+            self.assertEqual(
+                values.get("ref"),
+                "${{ job.workflow_sha }}",
+                "the gate must evaluate the release commit its caller pinned",
+            )
+        # Everything it needs from the pull request itself is read through the
+        # API from the base branch, not materialized as code on disk.
         self.assertEqual(job_permissions(self.workflows["consumer-review-gate.yml"], job)["contents"], "read")
 
 
@@ -1254,17 +1280,34 @@ class SelfProtectionTests(WorkflowAuditBase):
         )
 
     def test_every_action_is_pinned_to_a_commit_sha(self):
+        # A relative reference carries no revision of its own: GitHub resolves
+        # `./.github/...` against the commit the calling workflow itself was
+        # loaded from, so there is nothing to pin and nothing extra to trust.
+        # That is the mechanism ADR-0002 depends on -- it is how one consumer
+        # pin reaches the whole control plane -- so the exemption is deliberate
+        # and narrow rather than a relaxed pattern. Anything reached over the
+        # network still has to be a full commit.
         pattern = re.compile(r"^\s*uses:\s*([^\s@]+)(@(\S+))?", re.M)
         for name, source in self.raw.items():
             for match in pattern.finditer(source):
+                action = match.group(1)
+                if action.startswith("./"):
+                    self.assertNotIn(
+                        "..",
+                        action,
+                        "{}: {} reaches outside the caller's repository".format(
+                            name, action
+                        ),
+                    )
+                    continue
                 reference = match.group(3)
                 self.assertIsNotNone(
-                    reference, "{}: {} is not pinned".format(name, match.group(1))
+                    reference, "{}: {} is not pinned".format(name, action)
                 )
                 self.assertRegex(
                     reference,
                     r"^[0-9a-f]{40}$",
-                    "{}: {} is not pinned to a full commit sha".format(name, match.group(1)),
+                    "{}: {} is not pinned to a full commit sha".format(name, action),
                 )
 
     def test_shell_steps_are_strict_mode(self):

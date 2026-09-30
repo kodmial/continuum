@@ -4,10 +4,11 @@
 # tests (test_fixture_consumer.py) to prove the adapter contracts:
 #   - a validated .continuum.yml that selects review.provider: pr-agent and
 #     configures the review queue's labels, ordering, and shared slot;
-#   - a thin workflow that calls kodmial/continuum/.github/workflows/pr-agent.yml
-#     and wires this repository's variables/secrets to the reusable inputs;
-#   - a thin queue entry workflow that declares the queue's event surface and
-#     calls kodmial/continuum/.github/workflows/review-queue.yml.
+#   - a single generated ingress, .github/workflows/continuum.yml, that carries
+#     the one exact Continuum release reference and declares this repository's
+#     event surface. ADR-0002 is why there is one such file and not one per
+#     controller: see .github/workflows/consumer.yml in the Continuum repository
+#     and docs/architecture/0002-consumer-owned-version-selection.md.
 # All values below are *names* of repository variables and secrets, never the
 # endpoint, model, or credential itself.
 
@@ -60,5 +61,11 @@ review:
     # PR-Agent is dispatched as a workflow, so the queue's provider action is a
     # workflow dispatch. The label pair is the eligibility contract this repository
     # already uses.
-    dispatch_workflow: pr-agent.yml
+    #
+    # The dispatched file is this repository's own ingress, not a per-provider
+    # adapter: a dispatch carrying a `mode` runs the agent, and a bare dispatch
+    # reconciles the control plane. Naming a workflow that does not exist in the
+    # consumer would fail at the first eligible candidate, long after the
+    # configuration was reviewed.
+    dispatch_workflow: continuum.yml
     max_candidates: 20

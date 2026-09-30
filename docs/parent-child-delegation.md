@@ -56,14 +56,39 @@ The old `.continuum.yml` relationship declaration and optional
 path while existing consumers migrate. New integrations should use repository
 variables.
 
-## Parent workflows
+## Parent workflow
 
-Use the three thin entry workflows in
-`fixtures/delegation-parent/.github/workflows/`. They call:
+A parent repository writes one file:
+`fixtures/delegation-parent/.github/workflows/continuum.yml`. It names the
+release entrypoint at a single exact Continuum reference and dispatches into it
+by `mode`:
 
-- `consumer-child-dispatcher.yml`
-- `consumer-child-worker.yml`
-- `consumer-child-review.yml`
+- `mode: child:worker` reaches `consumer-child-worker.yml`
+- `mode: child:review` reaches `consumer-child-review.yml`
+- `mode: child:pr-review` reaches `consumer-child-pr-review.yml`
+- an empty `mode` reconciles the parent's own control plane, which includes
+  `consumer-child-dispatcher.yml`
+
+Those are reached through the entrypoint's same-repository relative references,
+so one line in the parent's ingress selects the dispatcher and all three child
+implementations as one snapshot. They used to be three separate parent entry
+workflows, each carrying its own Continuum reference; that is the shape ADR-0002
+rules out, because three references that agree today are three places that
+decide which Continuum a parent runs and can be moved independently.
+
+The parent's ingress declares the union of inputs every controller dispatches
+into it: the four agent modes the scheduler and the repair controller send, the
+two repair budgets, and the three child modes. GitHub rejects a dispatch whose
+input the target workflow does not declare, so an incomplete union is a dispatch
+that fails in the parent's repository rather than a mistake that fails in review.
+
+Reconciliation runs on the parent's schedule and whenever its own configuration
+changes. It does not run on `workflow_run`. A called workflow's jobs execute
+inside the caller's run, so the only workflow name such a filter could match is
+the ingress's own name — and a run that completes because of `workflow_run`
+completes in a way that triggers `workflow_run` again. The old per-child files
+were separate workflows and could be named; after the cutover they are jobs, so
+that trigger could only have been either dead or a loop.
 
 The wrapper passes no parent/child relationship values. Continuum reads
 `CONTINUUM_ROLE` and `CONTINUUM_CHILDREN` directly from the parent repository
@@ -73,7 +98,7 @@ repository name is resolved only inside the runner and is not committed to the
 parent repository.
 
 A token with access to the child repositories is still required through the
-wrapper's child-runtime secret.
+ingress's child-runtime secret.
 
 ## Deterministic child validation
 

@@ -1,0 +1,164 @@
+name: Continuum
+
+# The generated ingress. This is the whole of what adopting Continuum writes
+# into a consumer repository's workflow directory, and the one line below is
+# the only place a Continuum version appears anywhere in a consumer.
+#
+# Everything else here is a fact GitHub requires to be local and static:
+#
+#   - the event subscriptions, because a reusable workflow in another
+#     repository cannot subscribe to this repository's events;
+#   - the exact-head gate name the merge controller has to watch, because
+#     `workflow_run.workflows` is matched statically;
+#   - the minimum permissions the called workflow chain may narrow but never
+#     widen;
+#   - the exact Continuum release reference.
+#
+# There is deliberately no controller logic, no retry policy, no merge rule, no
+# review-provider parsing, and no release state machine here. Those live in the
+# selected release, and moving them here is exactly the drift ADR-0001 exists to
+# prevent.
+#
+# Why this is the *only* file
+# ---------------------------
+# ADR-0002 makes the release, not the module, the unit of version selection, so
+# a consumer holds exactly one Continuum reference. That is not a style
+# preference: with one reference per controller, a repository could end up
+# holding a new scheduler driving an old merge reconciler, and nothing in the
+# file would show it. One reference means `v0.1.0` selects the scheduler, the
+# agent, CI, packaging, review, repair, merge, and release controllers as one
+# coherent snapshot, and an upgrade is one edit in this file.
+#
+# Why `v0.1.0` and not `@main`
+# ----------------------------
+# `uses:` accepts no expressions, so the version has to be a literal here. It
+# is a literal exact release tag, because `@main`, `@v0`, and `@v0.1` can all
+# move to newer code and would change this repository's behaviour without
+# anyone changing this repository. `tests/test_fixture_consumer.py` and
+# `.github/tests/test_release_selection.py` both fail if the reference stops
+# being one exact release, if a second one appears, or if any module grows an
+# independent pin.
+#
+# The one line an operator edits to move this repository forward:
+#
+#   uses: kodmial/continuum/.github/workflows/consumer.yml@v0.1.0
+#                 ^^^^ only this
+#
+# Rollback is the same edit in reverse. Nothing else about this file changes,
+# and publishing a newer Continuum release changes nothing here at all.
+
+on:
+  # A new or moved HEAD is what invalidates an exact-head review and what makes
+  # a change eligible to merge.
+  pull_request_target:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+      - converted_to_draft
+      - closed
+      - labeled
+      - unlabeled
+      - edited
+      - auto_merge_enabled
+      - auto_merge_disabled
+  # A submitted review consumes the provider's shared slot; a dismissal gives it
+  # back. Both have to move the review queue on.
+  pull_request_review:
+    types: [submitted, dismissed]
+  # Commands and state changes that can change who the next review candidate is.
+  issue_comment:
+    types: [created, edited]
+  issues:
+    types: [labeled, unlabeled, reopened, closed, edited]
+  # CI, checks, and statuses all move merge eligibility.
+  status: {}
+  check_run:
+    types: [completed, rerequested, created]
+  check_suite:
+    types: [completed]
+  # `CI` is this repository's own exact-head gate. The name has to be matched
+  # statically, which is why a product fact appears in the ingress at all.
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+  # Recovery, and the work-in-progress window.
+  schedule:
+    - cron: "7,37 * * * *"
+  # The agent is launched by dispatch because GitHub cannot dispatch a reusable
+  # workflow; a manual dispatch with no `mode` reconciles the control plane.
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "issue, resolve-conflict, ci-fix, or review-fix; empty reconciles"
+        required: false
+        type: string
+      issue_number:
+        required: false
+        type: string
+      pr_number:
+        required: false
+        type: string
+      head_ref:
+        required: false
+        type: string
+      run_id:
+        required: false
+        type: string
+      rungs_ruled_out:
+        required: false
+        type: string
+      # The repair controller sends the budgets it resolved from conflict-bounds
+      # on every conflict dispatch. `gh workflow run` rejects an undeclared
+      # input, so an ingress that omits them fails at dispatch time.
+      repair_timeout_minutes:
+        required: false
+        type: string
+      repair_agent_timeout_seconds:
+        required: false
+        type: string
+
+# The union of what the selected release's control plane needs. A called
+# workflow can only narrow these, never widen them.
+permissions:
+  actions: write
+  checks: write
+  contents: write
+  issues: write
+  pull-requests: write
+  statuses: read
+
+# No `concurrency:` block here on purpose. One ingress covers several
+# independent reconcilers, and each controller owns the constant,
+# repository-scoped group that makes it single-flight. A single group declared
+# here would fuse them into one queue, so a review repair waiting for an agent
+# would also stall the merge reconciler that would release it.
+
+jobs:
+  continuum:
+    uses: kodmial/continuum/.github/workflows/consumer.yml@v0.1.0
+    secrets: inherit
+    with:
+      # Where this repository's reviewed desired state lives. `.github/continuum.yml`
+      # is the v0.1 two-toggle contract the review gate, repair controller, and
+      # merge controller resolve their posture from; `.continuum.yml` is the
+      # versioned configuration document the review queue resolves its labels,
+      # ordering, and shared provider slot from.
+      config_path: .github/continuum.yml
+      queue_config_path: .continuum.yml
+      # Both are this file. A dispatch carrying a `mode` is the agent; a bare
+      # dispatch is a reconcile. That is a GitHub platform constraint -- a
+      # reusable workflow cannot be dispatched -- and it is why this file
+      # exists at all rather than the consumer having none.
+      reconciler_workflow: continuum.yml
+      opencode_workflow: continuum.yml
+      # This repository's own release stays its own file: what is built, signed,
+      # and published is a product fact, and Continuum decides only when to
+      # hand the merge commit over.
+      release_workflow: continuum-release.yml
+      # Scheduling policy is the repository's, declared once as inputs rather
+      # than duplicated in a file the controller would have to find.
+      wip_limit: 2
+      lease_minutes: 45
+      max_attempts: 3

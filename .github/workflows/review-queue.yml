@@ -10,10 +10,13 @@
 # Nothing here checks out or executes pull request code: the job only reads
 # repository state through the API and posts a fixed provider command.
 #
-# A consumer repository copies a thin entry workflow (see
-# `fixtures/consumer-repo/.github/workflows/review-queue.yml`) that declares the
-# event set and calls this workflow. The entry workflow must grant `actions:
-# write`, because dispatching a provider gate run needs it.
+# A consumer repository reaches this from its single generated ingress (see
+# `fixtures/consumer-repo/.github/workflows/continuum.yml`), which names the
+# release entrypoint at one exact reference and this workflow through it. There is
+# no per-module consumer adapter any more: ADR-0002 makes the release the unit of
+# version selection, and a consumer that named the queue separately would be
+# holding a second reference. The ingress must grant `actions: write`, because
+# dispatching a provider gate run needs it.
 
 name: Review queue reconciler
 

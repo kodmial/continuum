@@ -54,16 +54,6 @@ def with_inputs(text: str) -> dict:
     return keys
 
 
-def dispatch_inputs(text: str) -> set:
-    """The input names a consumer's own workflow_call surface declares."""
-    match = re.search(
-        r"^\s*workflow_call:\n\s*inputs:\n((?:\s{4,}\S.*(?:\n|$))+)", text, re.MULTILINE
-    )
-    if not match:
-        return set()
-    return set(re.findall(r"^\s*(\w+):\s*$", match.group(1), re.MULTILINE))
-
-
 class MvpBoundaryTests(unittest.TestCase):
     def test_pr_agent_workflows_are_not_active_in_mvp(self):
         self.assertFalse((ACTIVE / "pr-agent.yml").exists())
@@ -180,95 +170,101 @@ class ConsumerWiringTests(unittest.TestCase):
                 self.assertIn(secret, ("OPENCODE_API_KEY", "GITHUB_TOKEN"), name)
 
     def test_every_consumer_workflow_calls_a_pinned_continuum_surface(self):
-        seen = 0
+        # One reference, naming the release entrypoint, at something immutable.
+        # This is the whole selection surface ADR-0002 asks for, and the property
+        # worth defending is the *count*: a second reference is a second place that
+        # decides which Continuum this repository runs, and two references that
+        # happen to agree today can be moved independently tomorrow.
+        seen = []
         for name, text in self.workflow_texts().items():
             for line in text.splitlines():
                 if "uses:" not in line or "kodmial/continuum/" not in line:
                     continue
-                seen += 1
+                if line.lstrip().startswith("#"):
+                    # A comment documenting the line an operator edits is not a
+                    # reference; GitHub reads code, and so does this.
+                    continue
+                seen.append((name, line))
                 self.assertIn(".github/", line, name)
                 # A branch ref is a moving target, and this token is write
                 # authority. `@main` would mean the consumer's security model is
                 # only as good as whatever `main` holds when the workflow next
                 # fires, which is exactly the property a reviewer cannot check
-                # by reading the file.
+                # by reading the file. A bare `v1` is the same hazard wearing a
+                # version number.
                 ref = line.rsplit("@", 1)[1].strip()
                 self.assertRegex(
                     ref,
-                    r"^[0-9a-f]{40}$",
-                    f"{name} pins {ref!r}, not an immutable commit",
+                    r"^(?:v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+                    r"|[0-9a-f]{40})$",
+                    f"{name} pins {ref!r}, not an exact release or a full commit",
                 )
         # Guard against the loop vacuously passing on an empty fixture.
-        self.assertGreater(seen, 0)
+        self.assertEqual(len(seen), 1, seen)
+        self.assertIn(".github/workflows/consumer.yml@", seen[0][1])
 
     def test_the_consumer_declares_when_to_call_and_never_what_the_outcome_is(self):
         # `with:` is where a consumer states the policy it owns: which of its own
-        # workflows runs, which of its own gates block, where its contract file
-        # lives. The merge posture is not in that set, because a second place to
+        # workflows runs, which of its own gates block, where its contract files
+        # live. The merge posture is not in that set, because a second place to
         # declare `review` or `release` is a second thing that can disagree with
         # the file a reviewer reads.
-        for name in ("continuum-auto-merge.yml", "review.yml", "continuum-scheduler.yml"):
-            keys = with_inputs(self.workflow_texts()[name])
-            self.assertNotIn("review", keys, name)
-            self.assertNotIn("release", keys, name)
-            self.assertTrue(keys, f"{name} passes no inputs at all")
+        keys = with_inputs(self.workflow_texts()["continuum.yml"])
+        self.assertNotIn("review", keys)
+        self.assertNotIn("release", keys)
+        self.assertTrue(keys, "the ingress passes no inputs at all")
 
     def test_the_consumer_names_its_own_workflows_where_the_controllers_need_them(self):
-        merge = with_inputs(self.workflow_texts()["continuum-auto-merge.yml"])
-        self.assertEqual(merge["config_path"], ".github/continuum.yml")
-        # A release or scheduler hook that lives in another repository cannot be
-        # dispatched by this one, so these names have to be the consumer's own
-        # files, not `owner/repo/.github/workflows/thing.yml`.
-        for hook in ("release_workflow", "scheduler_workflow"):
-            self.assertEqual(merge[hook], f"continuum-{hook.split('_')[0]}.yml")
-
-        scheduler = with_inputs(self.workflow_texts()["continuum-scheduler.yml"])
-        self.assertEqual(scheduler["opencode_workflow"], "continuum-opencode.yml")
+        keys = with_inputs(self.workflow_texts()["continuum.yml"])
+        # Both halves of the control plane are entered by dispatching this same
+        # file, because GitHub cannot dispatch a reusable workflow. A dispatch
+        # carrying a `mode` runs the agent; a bare dispatch reconciles.
+        self.assertEqual(keys["opencode_workflow"], "continuum.yml")
+        self.assertEqual(keys["reconciler_workflow"], "continuum.yml")
+        # A release hook that lives in another repository cannot be dispatched by
+        # this one, so this name has to be the consumer's own file, not
+        # `owner/repo/.github/workflows/thing.yml`.
+        self.assertEqual(keys["release_workflow"], "continuum-release.yml")
+        # And the contract files are the consumer's, versioned with the code.
+        self.assertEqual(keys["config_path"], ".github/continuum.yml")
+        self.assertEqual(keys["queue_config_path"], ".continuum.yml")
         # Scheduling policy is the consumer's, declared once as inputs rather
         # than duplicated in a config file the controller would have to find.
-        self.assertIn("wip_limit", scheduler)
-        self.assertIn("lease_minutes", scheduler)
+        for policy in ("wip_limit", "lease_minutes", "max_attempts"):
+            self.assertIn(policy, keys)
 
     def test_the_fixture_reaches_the_review_loop_through_the_generic_surface(self):
-        review = self.workflow_texts()["review.yml"]
-        self.assertIn("consumer-review-gate.yml@", review)
-        # The wake-up may name a candidate pull request, but nothing it carries
-        # is authority: the gate re-derives trust, the HEAD, and the contract
-        # from live state. In particular no event-derived ref or commit is
-        # passed, because those are the two things an untrusted author controls.
-        self.assertNotIn("github.event.pull_request.head", review)
-        self.assertNotIn("head_ref", review)
-        self.assertNotIn("head_sha", review)
+        ingress = self.workflow_texts()["continuum.yml"]
+        # Nothing the wake-up carries into the control plane is authority: the gate
+        # re-derives trust, the HEAD, and the contract from live state. In
+        # particular no event-derived ref or commit reaches it, because those are
+        # the two things an untrusted author controls. With one ingress this is a
+        # whole-file check, which is stronger than it was when each controller had
+        # its own file.
+        self.assertNotIn("github.event.pull_request.head", ingress)
+        self.assertNotIn("head_sha", ingress)
+        # `head_ref` is declared, because a dispatch carrying a `mode` runs the
+        # agent and the agent has to be told which branch to work on. It is not
+        # *passed*: the reconciling jobs get it from a live dispatch, not from
+        # the event payload.
+        self.assertNotIn("head_ref", with_inputs(ingress))
+        self.assertIn("head_ref:", ingress)
 
     def test_the_fixture_owns_its_agent_runner_and_toolchain(self):
-        agent = self.workflow_texts()["continuum-opencode.yml"]
-        # Where the agent runs is an input with a default, so the same shared
-        # workflow serves a consumer that needs a particular runner and one that
-        # is content with the default.
-        self.assertIn("runner:", agent)
-        self.assertIn("default: ubuntu-latest", agent)
-        # And the toolchain is an input too, defaulted to none.
-        self.assertIn("swift_version:", agent)
-        self.assertIn("review-fix", agent)
-        # The agent workflow is dispatched by the controllers, so it must accept
-        # exactly the inputs they send -- and nothing the consumer invented.
-        declared = set(with_inputs(agent)) | dispatch_inputs(agent)
-        self.assertEqual(
-            sorted(declared),
-            sorted(
-                [
-                    "mode",
-                    "issue_number",
-                    "pr_number",
-                    "head_ref",
-                    "run_id",
-                    "rungs_ruled_out",
-                    "runner",
-                    "swift_version",
-                    "model",
-                ]
-            ),
-        )
+        # Where the agent runs and which toolchain it gets are consumer policy, so
+        # they are inputs. With one ingress they are inputs of the release
+        # entrypoint, and the fixture leaves them at their defaults -- a consumer
+        # that needs a different runner writes one line in the same file it
+        # already edits to move the version.
+        entrypoint = (ACTIVE / "consumer.yml").read_text(encoding="utf-8")
+        for name in ("runner:", "swift_version:", "model:"):
+            self.assertIn(name, entrypoint)
+        self.assertIn("default: ubuntu-latest", entrypoint)
+        # The agent modes are dispatched through the same ingress, so the entry
+        # has to declare them as its own `workflow_dispatch` inputs for the
+        # controllers' dispatches to be accepted.
+        for mode in ("issue_number", "pr_number", "head_ref", "run_id", "rungs_ruled_out"):
+            self.assertIn(mode + ":", self.workflow_texts()["continuum.yml"])
 
     def test_the_fixture_release_hook_is_a_thin_entrypoint(self):
         release = self.workflow_texts()["continuum-release.yml"]

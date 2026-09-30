@@ -1,2 +1,12 @@
 __pycache__/
 *.py[cod]
+
+# The engine checkout a consumer workflow makes beside its own, kept out of
+# history by `.github/actions/engine-path/verify.py` at run time. Ignored here
+# too so a local reproduction of a consumer run cannot commit the engine into
+# this repository.
+/.continuum-engine/
+
+# Scratch git checkouts built by `.github/tests/test_engine_path.py`. Removed by
+# the suite; ignored so an interrupted run cannot leave them staged.
+/.github/tests/_engine_fixtures/

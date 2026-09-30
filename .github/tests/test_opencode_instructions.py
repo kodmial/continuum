@@ -801,12 +801,13 @@ class WorkflowWiringTests(unittest.TestCase):
 
     def test_the_engine_action_requires_the_new_files(self):
         # A partial engine checkout must fail at the action, not half way
-        # through an agent run with the policy missing.
-        action = (ROOT / ".github" / "actions" / "engine-path" / "action.yml").read_text(
+        # through an agent run with the policy missing. The required set lives in
+        # the verifier the action calls, so that is where it is asserted.
+        verifier = (ROOT / ".github" / "actions" / "engine-path" / "verify.py").read_text(
             encoding="utf-8"
         )
-        self.assertIn(".github/scripts/opencode_instructions.py", action)
-        self.assertIn(".github/agents/AGENTS.md", action)
+        self.assertIn(".github/scripts/opencode_instructions.py", verifier)
+        self.assertIn(".github/agents/AGENTS.md", verifier)
 
     def test_control_planes_do_not_start_an_agent(self):
         # The repair, scheduler, and merge controllers dispatch; they never run

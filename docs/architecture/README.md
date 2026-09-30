@@ -348,10 +348,20 @@ A repository is fully Continuum-managed only when all of the following are true:
 
 ## 13. Current implementation status
 
-NanoDictate is a transitional consumer. Scheduler, agent, repair, review, and merge already call
-Continuum reusable workflows, but the target architecture is not yet complete: release, parts of
-CI/packaging orchestration, PR-Agent, migration-only workflows, a single generated ingress, and the
-consumer-selected immutable release model still need to converge on this architecture.
+NanoDictate is a transitional consumer. The consumer-selected immutable release model and the
+single generated ingress are implemented: `.github/workflows/consumer.yml` is the release
+entrypoint a consumer names, it routes the whole control plane through same-repository relative
+references, and every engine checkout resolves from `job.workflow_sha` — the commit the consumer's
+one pin already selected. The two generated fixtures
+(`fixtures/consumer-repo/.github/workflows/continuum.yml` and
+`fixtures/delegation-parent/.github/workflows/continuum.yml`) each hold exactly one literal
+Continuum reference, and `.github/tests/test_release_selection.py` fails the build if that stops
+being true.
+
+Still to converge on this architecture: release and parts of CI/packaging orchestration, PR-Agent,
+and the remaining migration-only workflows. `fixtures/consumer-repo/.github/workflows/continuum-release.yml`
+is retained as a product fact rather than migrated: what a consumer builds, signs, and publishes
+is its own, and Continuum decides only when to hand the merge commit over.
 
 The previously planned automatic-repin model is no longer part of the target architecture.
 
