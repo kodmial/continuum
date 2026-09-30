@@ -765,8 +765,24 @@ jobs:
           python3 "$CONTINUUM_OPENCODE_RUNTIME_HELPER" verify --expected-sha256 "$OPENCODE_RUNTIME_SHA256"
           python3 "$CONTINUUM_OPENCODE_INSTRUCTIONS_HELPER" verify \
             --source "$CONTINUUM_AGENT_INSTRUCTIONS"
+          agent_log="$RUNNER_TEMP/conflict-repair-opencode.log"
+          set +e
           timeout --signal=TERM "$REPAIR_AGENT_TIMEOUT_SECONDS" \
-            opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
+            opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" \
+            2>&1 | tee "$agent_log"
+          agent_rc=${PIPESTATUS[0]}
+          set -e
+          if (( agent_rc != 0 )); then
+            python3 "$CONTINUUM_FAILURE_RETRY_HELPER" classify \
+              --failed-step "Resolve the conflicting hunks" \
+              < "$agent_log" > "$RUNNER_TEMP/conflict-agent-class.env"
+            source "$RUNNER_TEMP/conflict-agent-class.env"
+            {
+              echo "REPAIR_FAILURE_CLASS=$failure_class"
+              echo "REPAIR_FAILURE_CODE=$failure_code"
+            } >> "$GITHUB_ENV"
+            exit "$agent_rc"
+          fi
 
           if [[ -n "$(git status --porcelain)" ]]; then
             git add -A
