@@ -243,6 +243,38 @@ the contract is written against:
   `PortFailure` keeps its code; anything else becomes a retryable failure with
   the name of the call that failed.
 
+### Wiring a declared target
+
+`continuum release run --target <id>` is the whole integration for a target
+declared in `.continuum.yml`. The command reads the configuration, builds the
+`AppleAdapter`, hands the chain to `ReleaseCore`, and prints the outcome:
+
+```
+continuum release run --target macos --tag v1.4.0 --sha "$GITHUB_SHA"
+```
+
+Three things about that command are worth stating, because each is a way the
+integration could have been less honest:
+
+- **It names no platform.** There is no Apple branch in it. The target's own
+  configuration supplies the bundle, the binaries, the architectures, the
+  artifact formats, and the signing identity; the adapter rehydrates them from
+  `TargetSpec.options`, which `ReleaseRequest.from_config()` fills in by
+  describing each configured target.
+- **A dry run walks the same chain.** `release run --dry-run` executes no tool
+  and writes no file — not even a checksum file — and declares the same
+  artifacts, by name, that the real run records. A plan that described a
+  different release than the one that ran would not be a plan.
+- **Publication is not wired here.** With no publisher configured, a completed
+  release ends as a verified no-op. That is the contract's answer for "nothing
+  to publish to", not a success that skipped a step.
+
+The checkout is checked before anything is built. The adapter is given a
+revision reader, and a real run refuses both a checkout on a different commit
+(`source-mismatch`) and a directory with no readable commit at all
+(`source-unreadable`) — a tarball or a vendored copy cannot promise which commit
+it is, and releasing it would build bytes nobody approved.
+
 ## The release plane
 
 The core is the contract; the release plane is the three jobs that run it.
@@ -323,10 +355,10 @@ identity without anything in the repository backing it.
 `.continuum.yml` still declares `adapter: apple` and still requires a target to
 name a binary or an `app_bundle`, because that schema is the MVP consumer
 contract and widening it is a consumer-facing change rather than a detail of
-this one. Apple has a complete signing *plan* and no release *adapter*, so
-`release target` refuses a target naming it by name, with the reason rather than
-a stack trace. A repository that wants to declare a non-Apple target in
-configuration needs that enum widened; the core needs nothing.
+this one. Apple now has both its signing plan and a release adapter, so a declared
+Apple target can enter the generic release chain without a platform branch in the
+core. A repository that wants to declare a non-Apple target in configuration
+still needs that enum widened; the core needs nothing.
 
 ## Permissions
 
@@ -375,6 +407,13 @@ destination configured is green, and neither has published anything.
   sharing only files, which is how the workflow runs them.
 - `.github/tests/test_workflow_hardening.py` — the release workflow's own
   boundaries: who holds a token, who runs a checkout, and what a secret reaches.
+
+- `tests/test_release_apple.py` — the Apple plans: which arguments, in which
+  order, with which identity.
+- `tests/test_release_apple_walk.py` — the same adapter walked end to end, with
+  `tests/apple_toolchain_support.py` standing in for `swift`, `codesign`,
+  `security`, and `lipo`. The plans, the runner, the manifest building, and the
+  packaging are the real ones; only the process boundary is replaced.
 
 `tests/release_core_support.py` holds the shared fixture: an adapter that writes
 a text file and counts every side effect, an in-memory release repository, and
