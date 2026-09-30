@@ -961,7 +961,7 @@ jobs:
 
             if [[ "$infra_retry_exhausted" == "true" || "${infra_retry_attempts:-0}" -ge 8 ]]; then
               infra_retry_exhausted=true
-              infra_retry_marker="<!-- continuum-infra-retry-exhausted -->"
+              infra_retry_marker=""
               infra_retry_note="Infrastructure retry budget 8/8 is exhausted; semantic repair attempts remain unchanged."
             else
               next_infra_attempt=$(( ${infra_retry_attempts:-0} + 1 ))
