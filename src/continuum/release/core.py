@@ -662,6 +662,19 @@ class ReleaseCore:
             if outcome.outcome in (FAILED, BLOCKED):
                 return self._finish(run, status=FAILED, failure=outcome)
             if outcome.outcome == NOOP and stage(name).terminal:
+                if any(item.outcome == contract.PUBLISHED for item in run.publications):
+                    # Something already holds this release, so the walk stops
+                    # here and the honest answer is "released", not "nothing
+                    # happened". Reporting NO_OP for a release whose assets are
+                    # public is the one summary a caller cannot act on: it says
+                    # the same thing about a successful release and about a
+                    # duplicate one, and a workflow branching on it either
+                    # re-publishes or reports a failure for a release that is
+                    # fine. This is reachable whenever a terminal optional
+                    # stage — the downstream sync — has nothing configured to
+                    # do, which is the common case for a single-destination
+                    # release.
+                    return self._finish(run, status=RELEASED)
                 return self._finish(run, status=NO_OP, no_op_reason=outcome.summary)
             previous = name
         if run.dry_run:

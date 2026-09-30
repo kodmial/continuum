@@ -17,7 +17,9 @@ from typing import Any, Dict, Optional, Sequence
 
 from . import config as config_module
 from . import pin as pin_module
+from .release.contract import ContractError
 from .release import adapters as release_adapters
+from .release import commands as release_commands
 from .release import run as release_run
 from .review import commands as command_module
 from .review import gate as gate_module
@@ -1127,7 +1129,217 @@ def build_parser() -> argparse.ArgumentParser:
         )
         mover.set_defaults(func=handler)
 
+    _add_release_plane(release, release_sub, add_common)
     return parser
+
+
+def _add_release_plane(
+    release: argparse.ArgumentParser,
+    release_sub: Any,
+    add_common: Any,
+) -> None:
+    """The three release-plane jobs, as the reusable workflow calls them.
+
+    Three commands, three privilege levels, and the separation is the point:
+    `resolve` reads configuration, `target` runs a build from whatever ref the
+    workflow dispatched, and only `transaction` holds a token. Each takes the
+    same `--config`, so all three read one validated policy rather than three
+    readings of it.
+    """
+
+    resolve = release_sub.add_parser(
+        "resolve",
+        help="Turn the policy and a pinned commit into the matrix every job runs on.",
+        description=(
+            "Read .continuum.yml, check every target against the static entrypoint "
+            "table, and write the matrix. Nothing is built and no credential is "
+            "needed; every other job reads what this writes."
+        ),
+    )
+    add_common(resolve)
+    resolve.add_argument("--version", required=True, help="Version to release.")
+    resolve.add_argument(
+        "--source-sha",
+        required=True,
+        help="Full 40-character commit the release is pinned to.",
+    )
+    resolve.add_argument("--channel", default="stable", help="Release channel.")
+    resolve.add_argument(
+        "--fragment-root",
+        default=release_commands.FRAGMENT_ROOT,
+        help="Directory for the matrix and the build jobs' fragments.",
+    )
+    resolve.add_argument("--out", default=None, help="Also write the matrix document here.")
+    resolve.add_argument(
+        "--signing-material",
+        choices=("auto", "present", "absent"),
+        default="auto",
+        help="What this job expects of the signing secrets. See 'release plan'.",
+    )
+    resolve.add_argument(
+        "--include-declared",
+        action="store_true",
+        help=(
+            "Release the buildable targets and report the declared ones as not shipped, "
+            "rather than refusing to resolve at all."
+        ),
+    )
+    resolve.add_argument("--dry-run", action="store_true", help="Resolve without building.")
+    resolve.set_defaults(func=cmd_release_resolve)
+
+    target = release_sub.add_parser(
+        "target",
+        help="Build one target and write the fragment the transaction merges.",
+        description=(
+            "Build, sign, and verify exactly one target, then write what was done. "
+            "This job has no destination and no token: the strongest thing it can do "
+            "is fail."
+        ),
+    )
+    add_common(target)
+    target.add_argument("--target", required=True, help="Id of the configured release target.")
+    target.add_argument("--repository", required=True, help="owner/name of the repository.")
+    target.add_argument("--event", default="tag-push", help="Release event name.")
+    target.add_argument(
+        "--matrix", default="", help="Path to the matrix (default: <fragment-root>/matrix.json)."
+    )
+    target.add_argument(
+        "--fragment-root",
+        default=release_commands.FRAGMENT_ROOT,
+        help="Directory the matrix is in and the fragment is written to.",
+    )
+    target.add_argument("--workdir", default="", help="Directory holding the built artifacts.")
+    target.add_argument(
+        "--signing-material",
+        choices=("auto", "present", "absent"),
+        default="auto",
+        help="What this job expects of the signing secrets. See 'release plan'.",
+    )
+    target.set_defaults(func=cmd_release_target)
+
+    finish = release_sub.add_parser(
+        "transaction",
+        help="Merge every target's fragment, publish once, and report the release.",
+        description=(
+            "The only job with a write credential. Refuses a partial set, a fragment "
+            "from another commit, and two targets that produced one asset name — "
+            "before a draft exists."
+        ),
+    )
+    add_common(finish)
+    finish.add_argument("--repository", default="", help="owner/name (default: GITHUB_REPOSITORY).")
+    finish.add_argument("--event", default="tag-push", help="Release event name.")
+    finish.add_argument(
+        "--matrix", default="", help="Path to the matrix (default: <fragment-root>/matrix.json)."
+    )
+    finish.add_argument(
+        "--fragment-root",
+        default=release_commands.FRAGMENT_ROOT,
+        help="Directory the build jobs wrote their fragments to.",
+    )
+    finish.add_argument(
+        "--journal",
+        default="",
+        help="A previous attempt's journal, to resume rather than repeat.",
+    )
+    finish.add_argument("--workdir", default="", help="Directory holding the built artifacts.")
+    finish.add_argument(
+        "--prerelease", action="store_true", help="Publish as a GitHub prerelease."
+    )
+    finish.add_argument(
+        "--immutable",
+        action="store_true",
+        help="Require the published release to be immutable, and refuse if it is not.",
+    )
+    finish.add_argument(
+        "--allow-unknown-digests",
+        action="store_true",
+        help=(
+            "Accept a digest algorithm this release cannot verify. Off by default: a "
+            "digest nobody can check is a claim, not evidence."
+        ),
+    )
+    finish.add_argument(
+        "--attest",
+        action="store_true",
+        help="Attach artifact attestations to everything published.",
+    )
+    finish.add_argument(
+        "--workflow",
+        default="",
+        help="Reusable workflow identity that built this release, as owner/name/.github/workflows/release.yml@ref.",
+    )
+    finish.add_argument(
+        "--workflow-ref",
+        default="",
+        help="The ref the workflow identity names.",
+    )
+    finish.add_argument(
+        "--source-sha",
+        default="",
+        help="Commit to attest, when it differs from the matrix's (it should not).",
+    )
+    finish.add_argument(
+        "--tag",
+        default="",
+        help="Tag that was pushed; empty for a dispatched release, which has none.",
+    )
+    finish.set_defaults(func=cmd_release_transaction)
+
+
+def _release_failure(exc: BaseException) -> int:
+    """Print one classified line, and write the same classification as outputs.
+
+    A release job that fails with a bare traceback is a job somebody has to read
+    the log of to find out whether to re-run it, which is the one thing the
+    failure taxonomy exists to prevent.
+    """
+
+    message, retryable, code, advice = release_commands.describe_failure(exc)
+    print(f"::error::{message}")
+    if advice:
+        print(f"::error::Advice: {advice}")
+    _write_output({"code": code, "retryable": str(retryable).lower(), "ok": "false"})
+    return EXIT_ERROR
+
+
+def cmd_release_resolve(args: argparse.Namespace) -> int:
+    """Resolve the release matrix and publish it as job outputs."""
+
+    try:
+        config = _load_config(args.config, required=False)
+        status, outputs = release_commands.cmd_resolve(args, config=config)
+    except (ContractError, release_adapters.ReleaseError) as exc:
+        return _release_failure(exc)
+    _print_json(json.loads(outputs["matrix"]))
+    _write_output(outputs)
+    print(f"::notice::{len(outputs['targets'].split(',')) if outputs['targets'] else 0} target(s) resolved.")
+    return status
+
+
+def cmd_release_target(args: argparse.Namespace) -> int:
+    """Build one target and write its fragment."""
+
+    try:
+        config = _load_config(args.config, required=False)
+        status, outputs = release_commands.cmd_target(args, config=config)
+    except (ContractError, release_adapters.ReleaseError) as exc:
+        return _release_failure(exc)
+    _write_output(outputs)
+    print(f"::notice::{outputs['target']}: built {outputs['artifacts'] or 'nothing'}.")
+    return status
+
+
+def cmd_release_transaction(args: argparse.Namespace) -> int:
+    """Merge the fragments, publish, and write the release's outputs."""
+
+    try:
+        config = _load_config(args.config, required=False)
+        status, outputs = release_commands.cmd_transaction(args, config=config)
+    except (ContractError, release_adapters.ReleaseError) as exc:
+        return _release_failure(exc)
+    _write_output(outputs)
+    return status
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
