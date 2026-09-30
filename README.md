@@ -67,6 +67,14 @@ Consumer repositories may use anonymous OpenCode models; an API key is optional
 rather than a prerequisite. The upstream installer is retried with bounded
 backoff and the resulting executable is verified before work starts.
 
+Every run also loads a global OpenCode instructions file that Continuum owns
+(`.github/agents/AGENTS.md`) and installs before the model starts. It holds only
+policy that is true in every managed repository: how the task is scoped, how
+results are reported honestly, who owns the Git lifecycle, and that the
+project's own `AGENTS.md` is the source of truth for its build, test, and
+release mechanics. A consumer repository's project instructions are never
+modified, replaced, or shadowed. See `docs/agent-instructions.md`.
+
 `CI` is the required merge gate. Consumers can also name optional blocking
 workflows through `additional_blocking_workflows` on the reusable merge and
 repair controllers. These are conditional by presence: if a path-filtered build
