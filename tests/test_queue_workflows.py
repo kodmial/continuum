@@ -138,14 +138,19 @@ class WakeUpTriggerTests(unittest.TestCase):
         self.assertIn("pull_request_target", self.consumer)
 
     def test_the_reconciler_is_single_flight(self):
+        # The common concurrency group prevents two controllers from spending
+        # the same provider slot.
         for name, text in (("shared", self.shared), ("consumer", self.consumer)):
             self.assertIn("group: continuum-review-queue", text, name)
 
     def test_a_waiting_reconciler_cannot_be_starved(self):
+        # A run waiting out provider cooldown must not be superseded by every
+        # subsequent wake-up. The reconciler recomputes GitHub state when it runs,
+        # so serialization is safe and cancellation is unnecessary.
         for name, text in (("shared", self.shared), ("consumer", self.consumer)):
             self.assertIn("cancel-in-progress: false", text, name)
             self.assertNotIn("cancel-in-progress: true", text, name)
-        timeout = re.search(r"^\\s*timeout-minutes: (\\d+)\\s*$", self.shared, re.MULTILINE)
+        timeout = re.search(r"^\s*timeout-minutes: (\d+)\s*$", self.shared, re.MULTILINE)
         self.assertIsNotNone(timeout)
         self.assertGreaterEqual(int(timeout.group(1)), 5)
 
