@@ -93,7 +93,7 @@
       "path": ".github/workflows/pr-agent.yml",
       "blob_sha": "53485dcafb1e06318c56b4dd1f2e64c22cedd5c0",
       "classification": "consumer-local",
-      "owner": "#28",
+      "owner": "#27",
       "rationale": "Existing manual PR-Agent capability remains in NanoDictate during Phase A. It is outside the Continuum MVP orchestration path, but working functionality must not be deleted merely because it is outside MVP."
     },
     {
