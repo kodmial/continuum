@@ -27,6 +27,11 @@ BUNDLE = "NanoDictate.app"
 VERSION = "1.4.0"
 VERSION_ENV = "CONTINUUM_RELEASE_VERSION"
 
+# The commit a release is approved for. The adapter checks the checkout against
+# this before it builds, so every walkable-adapter test needs it.
+SHA = "a" * 40
+OTHER_SHA = "b" * 40
+
 # Not a certificate. A PKCS#12 is a binary container, and the adapter only
 # needs to know that the transport is base64 and that the bytes are not empty.
 FAKE_P12 = base64.b64encode(b"\x30\x82\x00\x00 not a real certificate").decode("ascii")
