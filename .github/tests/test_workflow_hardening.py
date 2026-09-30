@@ -94,6 +94,7 @@ NOT_AGENT_PLANE = (
     "consumer-child-worker.yml",
     "consumer-opencode.yml",
     "consumer-repair.yml",
+    "consumer-review-gate.yml",
     "consumer-scheduler.yml",
     "continuum-shadow.yml",
     "release-bun-binary.yml",
@@ -882,11 +883,75 @@ class RepairControllerTests(WorkflowAuditBase):
     def test_consumer_merge_reconciliation_is_single_flight(self):
         job = self.job("consumer-auto-merge.yml", "merge")
         concurrency = job.get("concurrency") or {}
+        # One group, constant for the repository, derived from no payload field:
+        # that is what makes "at most one reconciliation owns side effects" a
+        # property of the runner rather than a convention.
         self.assertEqual(
             concurrency.get("group"),
             "continuum-auto-merge-${{ github.repository }}",
         )
+        # Cancelling a reconciler between its merge write and its release
+        # hand-off would drop a release on the floor, so a newer wake-up queues
+        # instead of replacing. A queued run is stale the moment it starts, which
+        # is safe only because every write revalidates; that is asserted below.
         self.assertFalse(concurrency.get("cancel-in-progress"))
+
+    def test_consumer_merge_resolves_the_toggles_from_the_versioned_contract(self):
+        # A second way to declare `review`/`release` is a second thing that can
+        # disagree with the file a reviewer reads, so the entrypoint may not
+        # carry them. They are resolved once per run, from the base branch.
+        document = self.workflows["consumer-auto-merge.yml"]
+        inputs = (document.get(True) or document.get("on") or {}).get("workflow_call", {})
+        declared = set((inputs.get("inputs") or {}).keys())
+        self.assertNotIn("review", declared)
+        self.assertNotIn("release", declared)
+        self.assertIn("config_path", declared)
+
+        contract = self.job("consumer-auto-merge.yml", "contract")
+        # Read-only, so a job that reports a merge posture cannot have changed
+        # one.
+        self.assertEqual(write_scopes(job_permissions(document, contract)), [])
+        self.assertEqual(job_permissions(document, contract)["contents"], "read")
+
+        text = self.raw["consumer-auto-merge.yml"]
+        self.assertIn("continuum_config.py", text)
+        self.assertIn("continuum-contract.yml", text)
+        # The engine's resolver publishes to the step summary itself; the
+        # contract requires the resolved posture to be visible without a log.
+        resolver = REPO_ROOT / ".github" / "scripts" / "continuum_config.py"
+        self.assertIn("GITHUB_STEP_SUMMARY", resolver.read_text(encoding="utf-8"))
+
+    def test_consumer_merge_revalidates_every_gate_immediately_before_the_write(self):
+        # Single-flight bounds how many reconcilers run; revalidation is what
+        # makes a queued or superseded one harmless.
+        text = self.raw["consumer-auto-merge.yml"]
+        write = text.index("github.rest.pulls.merge(")
+        window = text[:write]
+        for gate in (
+            "await baseFresh(pr.head.sha)",
+            "await currentHeadCiGreen(pr.head.sha)",
+            "await optionalBlockingWorkflowsGreen(pr.head.sha)",
+            "await reviewGreen(pr.head.sha)",
+        ):
+            self.assertIn(gate, window, gate)
+        # GitHub performs the final compare-and-swap: a head that moved after the
+        # re-check refuses the merge rather than merging something else.
+        self.assertIn("sha:pr.head.sha", text.replace(" ", ""))
+
+    def test_consumer_release_handoff_is_durable_and_never_duplicated_by_a_rerun(self):
+        text = self.raw["consumer-auto-merge.yml"]
+        # Recorded before dispatch, confirmed after: "recorded but unconfirmed" is
+        # the recoverable state, and a later run re-drives it instead of the
+        # merge silently losing its release.
+        self.assertIn("continuum-release-pending:", text)
+        self.assertIn("continuum-release-dispatched:", text)
+        self.assertIn("recoverReleaseHandoffs", text)
+        # Bounded, so a permanently failing hand-off cannot be retried forever.
+        self.assertIn("RELEASE_PENDING_ATTEMPTS", text)
+        self.assertIn("RELEASE_RECOVERY_WINDOW_HOURS", text)
+        # The consumer's entrypoint receives the merge commit, which is what
+        # makes a re-driven dispatch deduplicable on its side.
+        self.assertIn("source_sha", text)
 
     def test_repair_controller_has_no_human_stop_for_agent_repairs(self):
         text = self.raw["opencode-repair.yml"]
@@ -906,6 +971,158 @@ class RepairControllerTests(WorkflowAuditBase):
     def test_merge_titles_are_sanitized(self):
         text = self.raw["auto-merge.yml"]
         self.assertIn("commit-title", text)
+
+
+class ConsumerReviewSurfaceTests(WorkflowAuditBase):
+    """The consumer review loop: one generic repair mode, one resolved switch.
+
+    The self plane already runs this loop, and a workflow that only worked here
+    would make `review: true` unreachable for anyone adopting Continuum. What is
+    asserted is therefore not "the loop exists" but the three properties that
+    made it safe when it was written, re-asserted on the reusable surface: the
+    mode is generic, the instruction is the engine's and bound to one commit, and
+    the switch comes from the consumer's own versioned file.
+    """
+
+    def agent_modes(self):
+        condition = str(self.job("consumer-opencode.yml", "opencode").get("if"))
+        match = re.search(r"\[\s*\"[^\]]+\]", condition)
+        self.assertIsNotNone(match, "the agent job's mode allowlist is gone")
+        return json.loads(match.group(0))
+
+    def test_the_reusable_agent_surface_admits_the_generic_review_repair(self):
+        # A closed list of four modes, and `review-fix` is one of them. The
+        # absence of anything provider-specific is the point: the mode reaches
+        # the trust-policy allowlist, and an allowlist entry named after a
+        # reviewer would be a provider in the control plane.
+        modes = self.agent_modes()
+        self.assertEqual(
+            sorted(modes),
+            ["ci-fix", "issue", "resolve-conflict", "review-fix"],
+        )
+        for provider in ("coderabbit", "pr_agent", "pr-agent", "nano"):
+            self.assertNotIn(provider, json.dumps(modes).lower())
+
+    def test_the_repair_instruction_is_the_engine_s_and_bound_to_one_commit(self):
+        job = self.job("consumer-opencode.yml", "opencode")
+        step = next(
+            s
+            for s in steps_of(job)
+            if s.get("name") == "Repair the open review findings"
+        )
+        run = run_text(step)
+        # Reads the instruction the controller stored for this exact commit, and
+        # fails closed when there is none.
+        self.assertIn("continuum.cli review prompt", run)
+        self.assertIn('--head "$BEFORE_SHA"', run)
+        self.assertIn('if [[ -z "$PROMPT" ]]', run)
+        # The engine is read from the pinned Continuum checkout, never from the
+        # pull request's own tree: a change under review cannot decide its own
+        # repair scope.
+        self.assertIn('PYTHONPATH="$CONTINUUM_ENGINE_ROOT/src"', run)
+        # It must not talk to the reviewer or rebuild findings from the event.
+        self.assertNotIn("review reconcile", run)
+        self.assertNotIn("coderabbit", run.lower())
+        self.assertNotIn("github.event", json.dumps(step.get("env") or {}))
+
+    def test_the_review_repair_is_bounded_and_does_not_retry_itself(self):
+        job = self.job("consumer-opencode.yml", "opencode")
+        step = next(
+            s
+            for s in steps_of(job)
+            if s.get("name") == "Repair the open review findings"
+        )
+        run = run_text(step)
+        self.assertIn(
+            'timeout --signal=TERM "$REVIEW_AGENT_TIMEOUT_SECONDS"', run
+        )
+        # An unchanged HEAD is an answer the controller already planned for, so
+        # this step must not push, re-run, or spend a second attempt.
+        self.assertIn('if [[ "$AFTER_SHA" == "$BEFORE_SHA" ]]', run)
+        self.assertLess(
+            run.index('if [[ "$AFTER_SHA" == "$BEFORE_SHA" ]]'),
+            run.index('git push origin "HEAD:${HEAD_REF}"'),
+        )
+
+    def test_the_execution_environment_belongs_to_the_consumer(self):
+        job = self.job("consumer-opencode.yml", "opencode")
+        self.assertEqual(job.get("runs-on"), "${{ inputs.runner }}")
+        inputs = self.workflows["consumer-opencode.yml"]["on"]["workflow_call"]["inputs"]
+        self.assertEqual(inputs["runner"]["default"], "ubuntu-latest")
+        self.assertEqual(inputs["swift_version"]["default"], "")
+        # The toolchain is installed only when the consumer asked for one, so a
+        # consumer that needs no language toolchain pays nothing for the option.
+        setup = next(
+            s for s in steps_of(job) if uses(s, "swift-actions/setup-swift")
+        )
+        self.assertEqual(setup.get("if"), "inputs.swift_version != ''")
+        # No platform, product, or vendor vocabulary anywhere in the shared
+        # surface: the same file has to serve a repository that needs a
+        # particular toolchain and one that needs none.
+        text = self.raw["consumer-opencode.yml"].lower()
+        for name in ("macos", "xcode", "swift 6", "avfoundation", "nano", "kodmai"):
+            self.assertNotIn(name, text, name)
+
+    def test_the_consumer_review_gate_names_no_reviewer(self):
+        text = self.raw["consumer-review-gate.yml"].lower()
+        self.assertNotIn("coderabbit", text)
+        self.assertNotIn("pr-agent", text)
+        self.assertNotIn("pr_agent", text)
+
+    def test_the_review_gate_splits_decision_from_authority(self):
+        document = self.workflows["consumer-review-gate.yml"]
+        for job_name in ("authorize", "reverify"):
+            job = document["jobs"][job_name]
+            self.assertEqual(
+                write_scopes(job_permissions(document, job)), [], job_name
+            )
+        gate = document["jobs"]["gate"]
+        self.assertIn("authorize", gate.get("needs") or [])
+        self.assertIn("reverify", gate.get("needs") or [])
+        self.assertTrue(write_scopes(job_permissions(document, gate)))
+        # The dispatch the gate spends authority on is re-verified against the
+        # live pull request by the read-only policy first.
+        reverify = json.dumps(document["jobs"]["reverify"])
+        self.assertIn("--mode review-fix", reverify)
+        self.assertIn("verify-dispatch", reverify)
+
+    def test_the_review_gate_reads_the_switch_from_the_base_branch(self):
+        # A pull request does not get to declare that review is off, and the
+        # entrypoint does not get to pass it in either.
+        document = self.workflows["consumer-review-gate.yml"]
+        inputs = document["on"]["workflow_call"]["inputs"]
+        self.assertNotIn("review", inputs)
+        self.assertIn("config_path", inputs)
+        gate = json.dumps(document["jobs"]["gate"])
+        self.assertIn("continuum_config.py", gate)
+        self.assertIn("ref=$BASE_BRANCH", gate)
+        # The status context the gate publishes and the one the merge controller
+        # waits for are both engine-owned, so the workflow must not name either:
+        # if it named one, the two surfaces could drift and `review: true` would
+        # wait forever for a context nobody publishes.
+        self.assertNotIn("continuum/review", self.raw["consumer-review-gate.yml"])
+        merge_inputs = self.workflows["consumer-auto-merge.yml"]["on"]["workflow_call"]["inputs"]
+        self.assertEqual(
+            merge_inputs["review_status_context"]["default"], "continuum/review"
+        )
+
+    def test_the_review_gate_serializes_provider_quota(self):
+        concurrency = self.workflows["consumer-review-gate.yml"].get("concurrency") or {}
+        self.assertEqual(
+            concurrency.get("group"),
+            "continuum-consumer-review-gate-${{ github.repository }}",
+        )
+        # Cancelling mid-run can abandon a provider request that was already
+        # issued, which spends quota for no answer.
+        self.assertFalse(concurrency.get("cancel-in-progress"))
+
+    def test_the_review_gate_never_checks_out_pull_request_code(self):
+        job = self.job("consumer-review-gate.yml", "gate")
+        self.assertEqual(
+            [s for s in steps_of(job) if uses(s, "actions/checkout")], []
+        )
+        # Everything it needs is read through the API from the base branch.
+        self.assertEqual(job_permissions(self.workflows["consumer-review-gate.yml"], job)["contents"], "read")
 
 
 class SelfProtectionTests(WorkflowAuditBase):

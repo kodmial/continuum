@@ -162,8 +162,9 @@ class WakeUpTriggerTests(unittest.TestCase):
             self.assertNotIn("github.event.pull_request.head.ref", line)
 
     def test_the_consumer_entry_delegates_and_stays_thin(self):
-        self.assertIn(
-            "uses: kodmial/continuum/.github/workflows/review-queue.yml@main", self.consumer
+        self.assertRegex(
+            self.consumer,
+            r"uses: kodmial/continuum/\.github/workflows/review-queue\.yml@[0-9a-f]{40}\b",
         )
         self.assertNotIn("python3 -m continuum", self.consumer)
         # Dispatching a provider gate run needs the token to write actions.

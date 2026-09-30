@@ -190,10 +190,81 @@ vendor name in any branch of control flow. One unchanged copy of Continuum
 resolves every consumer's configuration, including consumers that do not exist
 yet. This is enforced by a test that scans the contract core for such names.
 
-## 9. Acceptance proof
+## 9. Adopting the contract
+
+The configuration above is what a consumer declares; this section is how it
+becomes reachable. A reusable workflow cannot subscribe to a consuming
+repository's own pull request, CI, or schedule events, so the consumer necessarily
+writes the entry workflows itself. That split is the reason the two toggles are
+the *whole* of what a consumer configures: everything else a consumer needs to
+state is either a property of its own repository or an input of a shared
+controller, never a second copy of a decision.
+
+### 9.1 Reusable surfaces
+
+| Surface | Called by the consumer to |
+| --- | --- |
+| `.github/workflows/consumer-opencode.yml` | run the agent in one of four modes: `issue`, `resolve-conflict`, `ci-fix`, `review-fix` |
+| `.github/workflows/consumer-scheduler.yml` | dispatch dependency-aware work on the consumer's own schedule |
+| `.github/workflows/consumer-review-gate.yml` | close the review loop: observe, repair, re-check |
+| `.github/workflows/consumer-repair.yml` | repair a merge conflict or a failing gate on the existing branch |
+| `.github/workflows/consumer-auto-merge.yml` | reconcile merge eligibility on every wake-up |
+
+Every call pins an immutable Continuum commit. A branch ref would make a
+consumer's security model a function of whatever `main` holds when the workflow
+next fires, which is precisely the property a reviewer cannot check by reading
+the file.
+
+### 9.2 What a consumer's entry workflows may state
+
+The consumer owns the event set, and with it everything that is a fact about its
+own repository:
+
+- which of its own workflows runs (its agent workflow, its release entrypoint),
+- which of its own checks block a merge, as exact-head workflow names,
+- where its contract file lives,
+- the runner and language toolchain its agent needs,
+- its scheduling policy — WIP limit, lease duration, attempt budget — as inputs
+  of the shared scheduler rather than as configuration Continuum would have to
+  look up.
+
+### 9.3 What a consumer's entry workflows may not state
+
+- **`review` or `release`.** These are read from `.github/continuum.yml` on the
+  base branch, on every run. A second place to declare them is a second thing
+  that can disagree with the file a reviewer reads. The shared controllers
+  therefore expose no such inputs, and `.github/workflows/ci.yml` actionlint-checks
+  that they do not appear.
+- **A reviewer, a reviewer credential, a release target, or a platform.**
+  `review: true` activates the single review implementation Continuum ships.
+  Which reviewer that is is Continuum's business, and adding a selector to the
+  consumer's file would make the "two booleans, nothing else" guarantee false.
+- **Anything derived from an event payload that the pull-request author
+  controls**, other than a candidate pull-request number. A ref or a commit
+  taken from an untrusted payload is an instruction, and every controller
+  re-derives the live state it acts on instead of trusting the value it was
+  handed.
+
+### 9.4 Reference consumer
+
+`fixtures/consumer-repo/` is a complete, working instance of this section: the
+contract file, and five entry workflows covering the merge, review, repair,
+schedule, and release surfaces. It is asserted to be a valid one by
+`tests/test_fixture_consumer.py`, which drives the engine with that
+repository's own contract file and its own workflow names — so if adopting the
+contract ever required a reviewer name, a platform, or a caller-supplied
+boolean, the reference consumer would stop satisfying the contract rather than
+quietly diverging from it.
+
+## 10. Acceptance proof
 
 The proof that one unchanged implementation satisfies both consumer postures is
-the fixture pair under `.github/fixtures/continuum-config/`, exercised by
+twofold: the configuration resolves identically for both, and both postures are
+reachable through the wiring above.
+
+### 10.1 Both configurations
+
+The fixture pair under `.github/fixtures/continuum-config/`, exercised by
 `.github/scripts/test_continuum_config.py`:
 
 | Fixture | Configuration | Expected resolution |
@@ -206,7 +277,18 @@ ways: the fixture file declares nothing, and a repository with no
 `.github/continuum.yml` at all resolves identically. Nothing in
 `.github/scripts/continuum_config.py` branches on either repository.
 
-## 10. Versioning this contract
+### 10.2 Both behaviours, end to end
+
+`tests/test_fixture_consumer.py` runs the engine's review reconciler against the
+fixture consumer's own contract file, dispatching into the fixture consumer's
+own agent workflow name, and asserts the two outcomes that matter:
+
+| Posture | Observed |
+| --- | --- |
+| `review: false` | no provider read, no status written, no comment posted, no dispatch — the opt-out costs nothing |
+| `review: true` | exactly one bounded dispatch, in the generic `review-fix` mode, naming no reviewer |
+
+## 11. Versioning this contract
 
 v0.1 exposes two keys. Adding a third key changes the guarantee that "this is
 the complete configuration" and therefore requires a minor-version decision

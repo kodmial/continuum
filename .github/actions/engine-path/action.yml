@@ -17,4 +17,8 @@ runs:
         # checkout has to fail here rather than half way through an agent run.
         test -f "$root/.github/scripts/opencode_instructions.py"
         test -f "$root/.github/agents/AGENTS.md"
+        # The review and release entrypoints run the engine package itself, not
+        # only the shell helpers above, so an engine checkout missing `src`
+        # would fail part way through a privileged step instead of here.
+        test -f "$root/src/continuum/cli.py"
         echo "CONTINUUM_ENGINE_ROOT=$root" >> "$GITHUB_ENV"

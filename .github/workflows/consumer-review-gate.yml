@@ -1,0 +1,336 @@
+# Continuum reusable review gate: the thin orchestrator that closes the review
+# loop in a consumer repository.
+#
+#     reviewer finding -> normalized findings on an exact HEAD
+#                      -> bounded agent repair on the existing branch
+#                      -> push -> CI
+#                      -> re-check of the original findings
+#                      -> merge on a green current-HEAD gate
+#
+# Every decision in that loop belongs to the engine. This workflow's whole job
+# is: resolve the target, ask the engine, and surface what it decided.
+#
+# A reusable workflow cannot subscribe to a consumer's own pull request, CI, or
+# schedule events, so the consumer declares its event surface in a thin entry
+# workflow and calls this. What arrives here is therefore a *wake-up*, never
+# state: the target is re-read from the live pull request, and the toggle is
+# re-read from the consumer's versioned contract file.
+#
+# Four rules keep it safe on a public repository:
+#
+#   1. `review: false` is silent. The engine returns before it touches GitHub, so
+#      a deliberate opt-out generates no provider traffic, no agent run, and no
+#      review status. There is no provider selector in this file: `review: true`
+#      activates the single review implementation Continuum ships, and the
+#      consumer's own file never names one.
+#   2. Trust is positional. `authorize` and `reverify` are read-only and decide;
+#      `gate` spends authority and consumes only their validated outputs, which
+#      the trust policy re-checks against the live pull request immediately
+#      before it acts. No ref, pull-request number, or run id from an event
+#      payload is ever interpolated into a privileged step.
+#   3. The engine is trusted code and the pull request is not. This workflow
+#      never checks out the pull request's tree, so a change cannot change what
+#      the engine decides about it.
+#   4. The provider's quota is a repository-wide resource. Runs are serialized
+#      and never cancelled: cancelling mid-run can abandon a provider request
+#      that has already been issued, which spends quota for no answer.
+name: Continuum reusable review gate
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        type: string
+        required: false
+        default: ""
+        description: "Pull request to reconcile; empty reconciles the lowest-numbered open agent pull request"
+      agent_workflow:
+        type: string
+        required: false
+        default: continuum-opencode.yml
+        description: "Consumer-owned agent workflow that runs the repair"
+      config_path:
+        type: string
+        required: false
+        default: .github/continuum.yml
+        description: "Path to the validated Continuum v0.1 contract file"
+      base_branch:
+        type: string
+        required: false
+        default: main
+      max_attempts_per_head:
+        type: number
+        required: false
+        default: 3
+      max_attempts_per_finding:
+        type: number
+        required: false
+        default: 3
+      max_rereviews:
+        type: number
+        required: false
+        default: 1
+      agent_timeout_minutes:
+        type: number
+        required: false
+        default: 25
+
+permissions: {}
+
+concurrency:
+  # Constant per repository and derived from no payload field, so every wake-up
+  # enters the same group and at most one reconciliation is ever in flight.
+  group: continuum-consumer-review-gate-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Control plane: read-only, and holding a credential that cannot write.
+  # ---------------------------------------------------------------------------
+  authorize:
+    name: Resolve the review target
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    outputs:
+      proceed: ${{ steps.target.outputs.proceed }}
+      pr_number: ${{ steps.target.outputs.pr_number }}
+      head_ref: ${{ steps.target.outputs.head_ref }}
+      head_sha: ${{ steps.target.outputs.head_sha }}
+      reason: ${{ steps.target.outputs.reason }}
+    steps:
+      - name: Load Continuum engine
+        uses: kodmial/continuum/.github/actions/engine-path@39ca6dc798f2201390c8fdef0395157f588657ec
+
+      # The wake-up event varies; the target does not. Every entry point resolves
+      # to one candidate pull request here, and the privileged job below is
+      # handed only what this step validated.
+      - name: Find the trusted pull request to reconcile
+        id: target
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          AUTOMATION_TRUSTED_ACTORS: ${{ vars.AUTOMATION_TRUSTED_ACTORS }}
+          BASE_BRANCH: ${{ inputs.base_branch }}
+          DISPATCH_PR: ${{ inputs.pr_number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          emit_skip() {
+            {
+              echo "proceed=false"
+              echo "pr_number="
+              echo "head_ref="
+              echo "head_sha="
+              echo "reason=$1"
+            } >> "$GITHUB_OUTPUT"
+            echo "::notice::$1"
+          }
+
+          if [[ -n "$DISPATCH_PR" ]]; then
+            pr="$DISPATCH_PR"
+          else
+            pr="$(gh pr list --repo "$GITHUB_REPOSITORY" --state open \
+              --json number,headRefName --jq 'map(select(.headRefName | startswith("opencode/"))) | sort_by(.number) | .[0].number // empty')"
+          fi
+          [[ "$pr" =~ ^[1-9][0-9]*$ ]] || { emit_skip "No open pull request found for this wake-up."; exit 0; }
+
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$pr" > "$RUNNER_TEMP/candidate-pr.json"
+          python3 - "$RUNNER_TEMP/candidate-pr.json" "$CONTINUUM_ENGINE_ROOT" "$BASE_BRANCH" "$GITHUB_REPOSITORY" <<'PY' > "$GITHUB_OUTPUT"
+          import json, pathlib, sys
+
+          engine, base_ref, repository = sys.argv[2], sys.argv[3], sys.argv[4]
+          sys.path.insert(0, str(pathlib.Path(engine) / ".github" / "scripts"))
+          import trust_policy
+
+          pull_request = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          trusted, code, reason = trust_policy.is_trusted_pull_request(
+              pull_request, repository, base_ref
+          )
+          if not trusted:
+              # This workflow observes every pull request on the repository but
+              # owns only trusted agent branches. A maintainer pull request, a
+              # fork, or a human pull request is an expected no-op.
+              print("proceed=false")
+              print("pr_number=")
+              print("head_ref=")
+              print("head_sha=")
+              print("reason=untrusted_pull_request")
+              print(
+                  "Review gate ignored a pull request it does not own: "
+                  + trust_policy.one_line(reason),
+                  file=sys.stderr,
+              )
+              raise SystemExit(0)
+          print("proceed=true")
+          print("pr_number=" + str(pull_request["number"]))
+          print("head_ref=" + pull_request["head"]["ref"])
+          print("head_sha=" + pull_request["head"]["sha"])
+          print("reason=trusted_pull_request")
+          PY
+
+  # ---------------------------------------------------------------------------
+  # Second read-only trust boundary. Job-level permissions are the smallest
+  # privilege boundary GitHub supports; a shell step inside a write-capable job
+  # cannot down-scope github.token. Re-verification therefore gets its own job.
+  # ---------------------------------------------------------------------------
+  reverify:
+    name: Re-verify the live review target
+    needs: authorize
+    if: >-
+      always() &&
+      (needs.authorize.result == 'success') &&
+      (needs.authorize.outputs.proceed == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      allowed: ${{ steps.dispatch.outputs.allowed }}
+    steps:
+      - name: Load Continuum engine
+        uses: kodmial/continuum/.github/actions/engine-path@39ca6dc798f2201390c8fdef0395157f588657ec
+
+      - name: Re-verify the dispatch against the live pull request
+        id: dispatch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ needs.authorize.outputs.pr_number }}
+          HEAD_REF: ${{ needs.authorize.outputs.head_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/trust_policy.py" verify-dispatch \
+            --mode review-fix \
+            --pr-number "$PR_NUMBER" \
+            --head-ref "$HEAD_REF"
+          echo "allowed=true" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # Privileged execution. Receives only values two read-only jobs validated, and
+  # never checks out pull-request code.
+  # ---------------------------------------------------------------------------
+  gate:
+    name: Evaluate the review gate and repair
+    needs: [authorize, reverify]
+    if: >-
+      always() &&
+      (needs.authorize.result == 'success') &&
+      (needs.authorize.outputs.proceed == 'true') &&
+      (needs.reverify.result == 'success') &&
+      (needs.reverify.outputs.allowed == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      checks: write
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Load Continuum engine
+        uses: kodmial/continuum/.github/actions/engine-path@39ca6dc798f2201390c8fdef0395157f588657ec
+
+      # The contract is repository-controlled and versioned with the code, so it
+      # is read from the base branch: a pull request does not get to declare that
+      # review is off. Resolving it here rather than accepting a caller boolean
+      # is what keeps the entrypoint from disagreeing with the file a reviewer
+      # reads.
+      - name: Resolve the Continuum contract
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CONFIG_PATH: ${{ inputs.config_path }}
+          BASE_BRANCH: ${{ inputs.base_branch }}
+        run: |
+          set -euo pipefail
+          if ! gh api "repos/$GITHUB_REPOSITORY/contents/$CONFIG_PATH?ref=$BASE_BRANCH" \
+            --jq '.content' 2>/dev/null | base64 --decode > "$RUNNER_TEMP/continuum-contract.yml"; then
+            printf '' > "$RUNNER_TEMP/continuum-contract.yml"
+          fi
+          python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/continuum_config.py" \
+            --config "$RUNNER_TEMP/continuum-contract.yml" >/dev/null
+
+      - name: Evaluate the gate and perform its next action
+        id: reconcile
+        env:
+          # Write authority, and only in this step: publishing the normalized
+          # gate status, recording the durable repair ledger, and dispatching one
+          # bounded agent repair.
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ needs.authorize.outputs.pr_number }}
+          HEAD_SHA: ${{ needs.authorize.outputs.head_sha }}
+          # The consumer's contract file, not the engine's own: `review` is the
+          # consumer's declared switch and the engine resolves the reviewer from
+          # it. Nothing here names a reviewer.
+          CONTINUUM_CONFIG: ${{ runner.temp }}/continuum-contract.yml
+          # Repairs run on the existing agent branch, so the dispatch names the
+          # consumer's own agent workflow and the generic repair mode.
+          CONTINUUM_REVIEW_AGENT_WORKFLOW: ${{ inputs.agent_workflow }}
+          CONTINUUM_BASE_BRANCH: ${{ inputs.base_branch }}
+          MAX_ATTEMPTS_PER_HEAD: ${{ inputs.max_attempts_per_head }}
+          MAX_ATTEMPTS_PER_FINDING: ${{ inputs.max_attempts_per_finding }}
+          MAX_REREVIEWS: ${{ inputs.max_rereviews }}
+          AGENT_TIMEOUT_MINUTES: ${{ inputs.agent_timeout_minutes }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH="$CONTINUUM_ENGINE_ROOT/src" python3 -m continuum.cli review reconcile \
+            --config "$CONTINUUM_CONFIG" \
+            --pr "$PR_NUMBER" \
+            --head "$HEAD_SHA" \
+            --dispatch-workflow "$CONTINUUM_REVIEW_AGENT_WORKFLOW" \
+            --dispatch-ref "$CONTINUUM_BASE_BRANCH" \
+            --max-attempts-per-head "$MAX_ATTEMPTS_PER_HEAD" \
+            --max-attempts-per-finding "$MAX_ATTEMPTS_PER_FINDING" \
+            --max-rereviews "$MAX_REREVIEWS" \
+            --agent-timeout-minutes "$AGENT_TIMEOUT_MINUTES" \
+            --out "$RUNNER_TEMP/reconcile.json" \
+            --prompt-out "$RUNNER_TEMP/agent-prompt.md"
+
+      - name: Record the decision in the job summary
+        if: always()
+        env:
+          PR_NUMBER: ${{ needs.authorize.outputs.pr_number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## Continuum review gate"
+            echo ""
+            if [[ ! -s "$RUNNER_TEMP/reconcile.json" ]]; then
+              echo "PR #${PR_NUMBER} produced no review decision."
+            else
+              python3 - "$RUNNER_TEMP/reconcile.json" <<'PY'
+          import json, sys
+
+          plan = json.load(open(sys.argv[1], encoding="utf-8"))
+          repair = plan.get("repair") or {}
+          gate = plan.get("gate") or {}
+          print("| Field | Value |")
+          print("| --- | --- |")
+          print("| Review enabled | {} |".format("yes" if plan.get("enabled") else "no"))
+          print("| HEAD | `{}` |".format(str(plan.get("head") or "")[:12]))
+          print("| Verdict | {} |".format(gate.get("verdict") or ""))
+          print("| Gate state | {} |".format(gate.get("state") or ""))
+          print("| Open findings | {} |".format(plan.get("open_findings", 0)))
+          print("| Agent repair dispatched | {} |".format("yes" if plan.get("dispatched") else "no"))
+          print("| Action | `{}` |".format(repair.get("action") or ""))
+          if repair.get("reason"):
+              print("")
+              print(repair["reason"])
+          if repair.get("paused"):
+              print("")
+              print("Review repair is paused and fails closed. It resumes when a new HEAD")
+              print("arrives or the remaining findings are resolved.")
+          PY
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
