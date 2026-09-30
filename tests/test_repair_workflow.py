@@ -93,12 +93,13 @@ class TheRepairLockIsAgeChecked(unittest.TestCase):
             "An unreadable age reads as a held lock", body
         )
 
-    def test_a_released_lock_is_labelled_so_the_failure_is_visible(self):
-        # The wedge is silent because the job is green. A label saying the repair
-        # made no progress is what turns a green no-op into something a maintainer
-        # can see.
+    def test_a_released_lock_does_not_create_a_permanent_failure_state(self):
+        # A stale lock is an expired lease. A durable failure label would wedge
+        # future recovery of the same head after an infrastructure failure.
         _, _, body = self.dispatch[0]
-        self.assertIn("opencode-repair-failed", body)
+        self.assertNotIn("opencode-repair-failed", body)
+        self.assertIn("--remove-label \"$LABEL\"", body)
+        self.assertIn("--add-label \"$LABEL\"", body)
 
     def test_the_budget_is_resolved_once_not_spelled_out_per_step(self):
         document = _load(REPAIR)
@@ -163,8 +164,11 @@ class TheDispatchCanBeRetried(unittest.TestCase):
         for path in (REPAIR, OPENCODE):
             text = path.read_text(encoding="utf-8").lower()
             with self.subTest(workflow=path.name):
-                for word in ("nanodictate", "swift", "xcode", "swiftlint", "cocoa"):
+                for word in ("nanodictate", "xcode", "swiftlint", "cocoa"):
                     self.assertNotIn(word, text)
+        # A generic optional Swift capability is allowed: the consumer selects
+        # the version and runner, while core contains no Nano-specific policy.
+        self.assertIn("swift_version", OPENCODE.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
