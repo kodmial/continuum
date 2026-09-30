@@ -1,9 +1,14 @@
 # ADR-0001: Centralized reusable control plane with thin consumer ingress
 
-- **Status:** Accepted
+- **Status:** Accepted; version-selection and automatic-upgrade portions superseded by [ADR-0002](0002-consumer-controlled-immutable-releases.md)
 - **Date:** 2026-09-30
 - **Decision owners:** Continuum maintainers
 - **Scope:** Consumer integration, configuration ownership, upgrades, and GitHub Actions execution
+
+> **Lifecycle note:** ADR-0001 remains authoritative for the centralized reusable control plane,
+> thin consumer ingress, and configuration boundaries. ADR-0002 supersedes only this ADR's
+> version-selection and automatic-repin decisions. The historical text below is preserved as the
+> original accepted decision.
 
 ## Context
 
@@ -164,7 +169,7 @@ References:
 ## Compliance
 
 New Continuum implementation work and consumer migrations must be reviewed against
-`docs/architecture/README.md` and this ADR.
+`docs/architecture/README.md`, this ADR, and ADR-0002.
 
 Temporary departures must be named as migration debt with a removal condition. They are not new
 architecture.
