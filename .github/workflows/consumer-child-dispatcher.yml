@@ -11,6 +11,10 @@ on:
         type: string
         required: false
         default: continuum-child-review.yml
+      manual_pr_review_workflow:
+        type: string
+        required: false
+        default: continuum-child-pr-review.yml
       engine_ref:
         type: string
         required: false
@@ -35,6 +39,7 @@ jobs:
       CHILD_REPOSITORIES: ${{ secrets.CHILD_RUNTIME_REPOSITORIES }}
       WORKER_WORKFLOW: ${{ inputs.worker_workflow }}
       REVIEW_WORKFLOW: ${{ inputs.review_workflow }}
+      MANUAL_PR_REVIEW_WORKFLOW: ${{ inputs.manual_pr_review_workflow }}
     steps:
       - name: Checkout parent control plane
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -72,6 +77,11 @@ jobs:
           task_active() {
             local child_id="$1" kind="$2" task="$3"
             grep -Fxq "Child $kind [$child_id] #$task" <<<"$active_titles"
+          }
+
+          manual_pr_active() {
+            local child_id="$1" pr="$2"
+            grep -Fxq "Child PR review [$child_id] #$pr" <<<"$active_titles"
           }
 
           invalid=0
