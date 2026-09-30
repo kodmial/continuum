@@ -90,10 +90,9 @@ jobs:
             fi
 
             # Delegated tasks must not become permanently stranded because a
-            # previous controller closed their PR or left automation:paused
-            # behind. Reopen automation-owned unmerged PRs while the task is
-            # still open; dependencies remain the source of intentional
-            # blocking.
+            # previous controller closed their PR. Reopen automation-owned
+            # unmerged PRs while the task is still open; explicit dependency
+            # markers remain the source of intentional blocking.
             while IFS=            open_pr_tasks="$(
               cut -f2 <<<"$open_prs"                 | sed -nE 's#^(continuum-child|runtime-worker)/task-([0-9]+)-.*#\2#p'
             )"
@@ -118,10 +117,9 @@ jobs:
               gh api --paginate "repos/$child_repo/issues?state=open&per_page=100" 2>/dev/null
             )"
 
-            # automation:paused is not a terminal state for delegated child
-            # work. It may be left by an interrupted migration/recovery cycle,
-            # so clear it automatically and let explicit dependency markers
-            # decide whether the task is actually ready.
+            # A delegated technical failure must never turn automation:paused
+            # into a terminal state. Clear stale pause labels on automation-
+            # owned child tasks and let dependency markers decide readiness.
             while IFS= read -r paused_task; do
               [[ -n "$paused_task" ]] || continue
               gh api --method DELETE \
@@ -217,7 +215,9 @@ jobs:
                 gh api "repos/$child_repo/issues/$stale_task" --jq '.state' 2>/dev/null || echo closed
               )"
               [[ "$stale_issue_state" == "open" ]] || continue
-              gh pr reopen "$stale_pr" --repo "$child_repo" >/dev/null 2>&1 || true
+              if gh pr reopen "$stale_pr" --repo "$child_repo" >/dev/null 2>&1; then
+                echo "Reopened stale delegated PR #$stale_pr for child task #$stale_task."
+              fi
             done < <(
               gh pr list --repo "$child_repo" --state closed --limit 100 \
                 --json number,headRefName,mergedAt \
