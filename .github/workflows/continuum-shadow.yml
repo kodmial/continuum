@@ -110,6 +110,16 @@ on:
       approval_path:
         description: cutover; the human approval document inside the window
         type: string
+      authorization_path:
+        description: cutover; the trusted controller's authorization document inside the window
+        type: string
+      change_set_path:
+        description: cutover; the atomic cutover's change-set document inside the window
+        type: string
+      phase:
+        description: cutover; phase-a replaces the control-plane writers only, phase-b every writer
+        type: string
+        default: "phase-b"
         default: ""
       authorization_path:
         description: cutover; the trusted controller's authorization document inside the window
@@ -146,21 +156,12 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: run, replay, or cutover
+        description: replay or cutover; live run events enter through workflow_call
         type: choice
         default: cutover
-        options: [run, replay, cutover]
+        options: [replay, cutover]
       repository:
         description: owner/name of the repository whose events are being shadowed
-        type: string
-      event_json:
-        description: the event context to judge, as JSON
-        type: string
-      observed_json:
-        description: what NanoDictate actually did, as JSON
-        type: string
-      state_json:
-        description: a captured state document
         type: string
       capture_live:
         description: read the state from GitHub
