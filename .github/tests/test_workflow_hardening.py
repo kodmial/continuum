@@ -537,7 +537,6 @@ class ReviewGateTests(WorkflowAuditBase):
         self.assertIn("emit_skip", body)
         for event in (
             "pull_request_target",
-            "pull_request_review",
             "workflow_run",
             "status",
             "schedule",
@@ -552,6 +551,16 @@ class ReviewGateTests(WorkflowAuditBase):
         body = job_text(self.gate_workflow(), self.gate_workflow()["jobs"]["gate"])
         self.assertIn(".github/continuum.yml", body)
         self.assertIn("--config \"$CONTINUUM_CONFIG\"", body)
+
+    def test_review_events_are_not_a_privileged_wake_up(self):
+        document = self.gate_workflow()
+        triggers = trigger_names(document)
+        self.assertNotIn("pull_request_review", triggers)
+        raw = self.raw["review-gate.yml"]
+        # Submitted reviews remain durable evidence consumed by the engine; the
+        # privileged workflow is merely not entered from their untrusted event.
+        self.assertIn("submitted reviews", raw.lower())
+        self.assertIn("review", raw.lower())
 
     def test_the_workflow_names_no_provider(self):
         # There is no user-facing provider selector. The provider is reached
