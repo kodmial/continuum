@@ -17,6 +17,7 @@ from typing import Any, Dict, Optional, Sequence
 
 from . import config as config_module
 from .release import adapters as release_adapters
+from .release import provenance as release_provenance
 from .release import run as release_run
 from .review import commands as command_module
 from .review import gate as gate_module
@@ -714,6 +715,86 @@ def cmd_release_sign(args: argparse.Namespace) -> int:
     return EXIT_ERROR
 
 
+
+def cmd_release_verify(args: argparse.Namespace) -> int:
+    """Prove that the bytes about to be published are the bytes a gate tested.
+
+    A release is the one operation where publishing a re-build of a tested
+    artifact is worse than failing: the download, the checksum, and the gate all
+    agree with each other and none of them describes the file. So the exit code is
+    the verification's verdict, and a refusal names which of the three failures it
+    is -- a gate that never ran, a gate that did not pass, or bytes that are not the
+    tested ones.
+    """
+
+    artifacts: Dict[str, str] = {}
+    for entry in args.artifact or []:
+        name, separator, path = entry.partition("=")
+        if not separator or not name.strip() or not path.strip():
+            print(f"::error::--artifact takes NAME=PATH; got {entry!r}")
+            return EXIT_ERROR
+        artifacts[name.strip()] = path.strip()
+
+    if args.source_sha is None:
+        # Absent means "whatever this run is for", which is the immutable head the
+        # environment already knows.
+        source_sha = os.environ.get("GITHUB_SHA", "")
+    else:
+        source_sha = args.source_sha
+
+    if args.no_commit_head and args.source_sha:
+        # The flag turns the head comparison off, so naming a head at the same time
+        # means the caller believes it is being checked when it is not.
+        #
+        # Only an *explicit* head is a contradiction. The environment always
+        # carries GITHUB_SHA in a workflow run, so treating the inferred value as a
+        # named head would make the flag unusable exactly where it is needed -- a
+        # job that published a tree with no commit and cannot un-set the variable.
+        print(
+            "::error::--no-commit-head and --source-sha are contradictory: the first "
+            "disables the head comparison the second asks for"
+        )
+        return EXIT_ERROR
+
+    if args.no_commit_head:
+        # Not compared against, so not passed on. Leaving the inferred head in
+        # would mean the verification carried a head it deliberately ignored.
+        source_sha = ""
+
+    try:
+        candidate = (
+            release_provenance.load_candidate(args.candidate)
+            if args.candidate
+            else None
+        )
+    except (OSError, json.JSONDecodeError, release_provenance.ProvenanceError) as error:
+        print(f"::error::unreadable tested candidate: {error}")
+        return EXIT_ERROR
+
+    try:
+        verification = release_provenance.verify_candidate(
+            candidate,
+            source_sha=source_sha,
+            artifacts=artifacts,
+            require_source=not args.no_commit_head,
+        )
+    except release_provenance.ProvenanceError as error:
+        print(f"::error::{error}", file=sys.stderr)
+        return EXIT_ERROR
+
+    payload = verification.describe()
+    if getattr(args, "out", None):
+        with open(args.out, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+    if verification.ok:
+        print(f"::notice::{release_provenance.summarize(verification)}")
+        _print_json(payload)
+        return EXIT_OK
+    print(f"::error::{release_provenance.summarize(verification)}")
+    _print_json(payload)
+    return EXIT_ERROR
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="continuum", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -952,6 +1033,51 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print the plan without executing any signing tool.",
     )
     sign.set_defaults(func=cmd_release_sign)
+
+    verify_release = release_sub.add_parser(
+        "verify",
+        help="Prove the publishable bytes are the bytes a gate tested.",
+        description=(
+            "Compare the artifacts a publish would upload against a recorded "
+            "tested candidate: the immutable source head the gate ran against, its "
+            "conclusion, and the digest of every artifact it exercised. Exits "
+            "non-zero unless all three agree, because a release whose bytes were "
+            "never exercised is published under a gate that did not cover it."
+        ),
+    )
+    verify_release.add_argument(
+        "--candidate",
+        required=False,
+        default="",
+        help="The tested-candidate record. Omit to demonstrate the refusal a publish "
+        "with no evidence receives.",
+    )
+    verify_release.add_argument(
+        "--source-sha",
+        default=None,
+        help="The immutable head this publish is for. Defaults to GITHUB_SHA, which "
+        "is what every workflow run already knows.",
+    )
+    verify_release.add_argument(
+        "--artifact",
+        action="append",
+        default=[],
+        metavar="NAME=PATH",
+        help="A publishable artifact and the path it will be uploaded from. "
+        "Repeatable.",
+    )
+    verify_release.add_argument(
+        "--no-commit-head",
+        action="store_true",
+        help="This publish has no immutable commit at all -- a vendored tree, a "
+        "generated archive. Drops the head comparison *and* the requirement that "
+        "the candidate name a source for the validated bytes, because such a "
+        "consumer has neither to check. Cannot be combined with --source-sha.",
+    )
+    verify_release.add_argument(
+        "--out", default=None, help="Write the verification document here."
+    )
+    verify_release.set_defaults(func=cmd_release_verify)
 
     return parser
 
