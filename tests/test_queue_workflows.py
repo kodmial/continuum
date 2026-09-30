@@ -140,7 +140,14 @@ class WakeUpTriggerTests(unittest.TestCase):
     def test_the_reconciler_is_single_flight(self):
         for name, text in (("shared", self.shared), ("consumer", self.consumer)):
             self.assertIn("group: continuum-review-queue", text, name)
-            self.assertIn("cancel-in-progress: true", text, name)
+
+    def test_a_waiting_reconciler_cannot_be_starved(self):
+        for name, text in (("shared", self.shared), ("consumer", self.consumer)):
+            self.assertIn("cancel-in-progress: false", text, name)
+            self.assertNotIn("cancel-in-progress: true", text, name)
+        timeout = re.search(r"^\\s*timeout-minutes: (\\d+)\\s*$", self.shared, re.MULTILINE)
+        self.assertIsNotNone(timeout)
+        self.assertGreaterEqual(int(timeout.group(1)), 5)
 
     def test_the_job_runs_the_reconciler_and_its_config_gate(self):
         self.assertIn("continuum.cli config-check", self.shared)
