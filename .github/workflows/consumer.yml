@@ -1,0 +1,573 @@
+# Continuum release entrypoint: the one file a consumer repository names.
+#
+#     uses: kodmial/continuum/.github/workflows/consumer.yml@v0.1.0
+#
+# That single literal reference selects the whole Continuum implementation. Every
+# call below is a same-repository relative reference, which GitHub resolves from the
+# same commit as this file, so one pin selects one internally consistent snapshot of
+# the scheduler, agent, repair, review, queue, provider, merge, packaging, delegation
+# and release surfaces together. There is deliberately no second Continuum reference
+# anywhere in the graph: a per-module pin would let a consumer run a mixture of
+# releases, and a branch or floating tag would let it change without anyone changing
+# it. See docs/architecture/adr/0002-consumer-controlled-immutable-releases.md.
+#
+# `surface` selects which controller this call runs. It is a closed set rather than a
+# dynamic call because `jobs.<job_id>.uses` does not accept expressions, and a
+# consumer's ingress is the only thing that names this file.
+name: Continuum
+
+on:
+  workflow_call:
+    inputs:
+      surface:
+        description: Which Continuum surface this call selects
+        type: string
+        required: true
+      additional_blocking_workflows:
+        description: "Comma-separated optional workflow names; absent runs are not applicable, present runs must succeed"
+        type: string
+        required: false
+        default: ""
+      agent_timeout_minutes:
+        description: "Budget for one dispatched review repair"
+        type: number
+        required: false
+        default: 25
+      agent_workflow:
+        description: "Consumer-owned agent workflow that runs the repair"
+        type: string
+        required: false
+        default: "continuum-opencode.yml"
+      api_base:
+        description: "OpenAI-compatible provider endpoint, as a repository variable value"
+        type: string
+        required: false
+        default: ""
+      asset_name:
+        description: "GitHub Release asset filename"
+        type: string
+        required: false
+        default: ""
+      base_branch:
+        description: "Branch the consumer's changes are based on and read from"
+        type: string
+        required: false
+        default: "main"
+      binary_path:
+        description: "Repository-relative path to the produced binary"
+        type: string
+        required: false
+        default: ""
+      build_argv_json:
+        description: "Exact JSON argv array for the build command; executed without a shell"
+        type: string
+        required: false
+        default: "[]"
+      build_env_json:
+        description: "JSON object of non-secret build environment values"
+        type: string
+        required: false
+        default: "{}"
+      build_script:
+        description: "Bun package script; unused when build_argv_json is provided"
+        type: string
+        required: false
+        default: ""
+      bun_version:
+        description: "Bun version used to build the binary"
+        type: string
+        required: false
+        default: "1.3.14"
+      child_id:
+        description: "Configured child relationship identifier"
+        type: string
+        required: false
+        default: ""
+      ci_workflow:
+        description: "Consumer-owned CI workflow that gates a pull request"
+        type: string
+        required: false
+        default: "CI"
+      config:
+        description: "Path to the consumer's Continuum configuration file"
+        type: string
+        required: false
+        default: ".continuum.yml"
+      config_path:
+        description: "Path to the consumer's versioned Continuum contract file"
+        type: string
+        required: false
+        default: ""
+      expected_sha256:
+        description: "Optional exact SHA-256 expected from the produced binary"
+        type: string
+        required: false
+        default: ""
+      expected_size_bytes:
+        description: "Optional exact byte size expected from the produced binary"
+        type: string
+        required: false
+        default: ""
+      expected_version:
+        description: "Optional exact --version output expected from the produced binary"
+        type: string
+        required: false
+        default: ""
+      head_ref:
+        description: "Branch the surface acts on, already validated by its caller"
+        type: string
+        required: false
+        default: ""
+      head_sha:
+        description: "Commit the caller observed; the engine re-checks it against live state"
+        type: string
+        required: false
+        default: ""
+      issue_number:
+        description: "Issue the agent run implements"
+        type: string
+        required: false
+        default: ""
+      lease_minutes:
+        description: "How long a dispatched task owns its issue before the lease expires"
+        type: number
+        required: false
+        default: 45
+      manual_pr_review_workflow:
+        description: "Consumer-owned workflow reviewing owner-created child pull requests"
+        type: string
+        required: false
+        default: "continuum-child-pr-review.yml"
+      max_agent_passes:
+        description: "Bounded passes one delegated child task may take"
+        type: number
+        required: false
+        default: 4
+      max_attempts:
+        description: "Semantic attempt budget before a task is paused"
+        type: number
+        required: false
+        default: 3
+      max_attempts_per_finding:
+        description: "Repair attempts one finding may take"
+        type: number
+        required: false
+        default: 3
+      max_attempts_per_head:
+        description: "Repair attempts one exact head may take"
+        type: number
+        required: false
+        default: 3
+      max_rereviews:
+        description: "Times one head may be re-reviewed after a repair"
+        type: number
+        required: false
+        default: 1
+      max_review_passes:
+        description: "Bounded passes one delegated review may take"
+        type: number
+        required: false
+        default: 3
+      max_tokens:
+        description: "Completion limit; empty uses the provider default"
+        type: string
+        required: false
+        default: ""
+      mode:
+        description: "What the agent run is for: issue, resolve-conflict, ci-fix, or review-fix"
+        type: string
+        required: false
+        default: ""
+      model:
+        description: "Agent or provider model routing identifier"
+        type: string
+        required: false
+        default: ""
+      opencode_distribution:
+        description: "OpenCode binary source: upstream or github-release"
+        type: string
+        required: false
+        default: "upstream"
+      opencode_release_asset:
+        description: "Release asset filename for the OpenCode executable"
+        type: string
+        required: false
+        default: "opencode-coding-linux-x64"
+      opencode_release_repo:
+        description: "Repository publishing the optimized OpenCode release; empty means the caller"
+        type: string
+        required: false
+        default: ""
+      opencode_release_sha256:
+        description: "Expected SHA-256 for the exact release asset"
+        type: string
+        required: false
+        default: ""
+      opencode_release_source_sha:
+        description: "Expected source SHA from the release metadata sidecar"
+        type: string
+        required: false
+        default: ""
+      opencode_release_tag:
+        description: "Exact immutable release tag; when set, SHA-256 is required"
+        type: string
+        required: false
+        default: ""
+      opencode_release_tag_prefix:
+        description: "Release tag prefix used to select the newest optimized binary"
+        type: string
+        required: false
+        default: "coding-v"
+      opencode_release_version:
+        description: "Expected `opencode --version` for the exact release"
+        type: string
+        required: false
+        default: ""
+      opencode_workflow:
+        description: "Consumer-owned agent workflow the controller dispatches into"
+        type: string
+        required: false
+        default: "continuum-opencode.yml"
+      package_dir:
+        description: "Directory containing the product manifest"
+        type: string
+        required: false
+        default: ""
+      pr_number:
+        description: "Pull request the surface acts on, as its number"
+        type: string
+        required: false
+        default: ""
+      prerelease:
+        description: "Publish the GitHub Release as a prerelease"
+        type: boolean
+        required: false
+        default: false
+      release_workflow:
+        description: "Consumer-owned release entrypoint that receives the merge hand-off"
+        type: string
+        required: false
+        default: "continuum-release.yml"
+      repair_agent_timeout_seconds:
+        description: "Hard cap on the single model call inside a conflict repair"
+        type: number
+        required: false
+        default: 1200
+      repair_timeout_minutes:
+        description: "Conflict-repair budget, independent of the task budget"
+        type: number
+        required: false
+        default: 25
+      review_agent_timeout_seconds:
+        description: "Hard cap on the single model call inside a review repair"
+        type: number
+        required: false
+        default: 1500
+      review_status_context:
+        description: "Commit status context the merge controller reads for review"
+        type: string
+        required: false
+        default: "continuum/review"
+      review_workflow:
+        description: "Consumer-owned workflow reviewing a delegated child task"
+        type: string
+        required: false
+        default: "continuum-child-review.yml"
+      run_id:
+        description: "Run the caller observed, for durable ownership markers"
+        type: string
+        required: false
+        default: ""
+      rungs_ruled_out:
+        description: "Comma-separated mechanical conflict-repair rungs the controller already tried"
+        type: string
+        required: false
+        default: ""
+      runner:
+        description: "GitHub-hosted runner label for the consumer execution environment"
+        type: string
+        required: false
+        default: "ubuntu-latest"
+      scheduler_workflow:
+        description: "Consumer-owned scheduler entrypoint woken after a merge"
+        type: string
+        required: false
+        default: "continuum-scheduler.yml"
+      source_sha:
+        description: "Exact consumer commit to release"
+        type: string
+        required: false
+        default: ""
+      swift_version:
+        description: "Optional Swift toolchain version required by the consumer; empty disables Swift setup"
+        type: string
+        required: false
+        default: ""
+      tag_prefix:
+        description: "Prefix for immutable release tags"
+        type: string
+        required: false
+        default: "bun-v"
+      task_number:
+        description: "Child issue the delegated task implements"
+        type: string
+        required: false
+        default: ""
+      task_timeout_minutes:
+        description: "Maximum runtime for one agent task"
+        type: number
+        required: false
+        default: 180
+      wait_minutes:
+        description: "How long one queue run may stay alive to re-reconcile"
+        type: number
+        required: false
+        default: 45
+      wip_limit:
+        description: "Maximum dispatched tasks in flight at once"
+        type: number
+        required: false
+        default: 2
+      worker_workflow:
+        description: "Consumer-owned workflow running one delegated child task"
+        type: string
+        required: false
+        default: "continuum-child-worker.yml"
+    secrets:
+      CHILD_RUNTIME_REPOSITORIES:
+        description: "Optional repository-variable map of configured child relationships"
+        # A consumer that does not run this surface simply has no such
+        # secret, so nothing here is required of every consumer.
+        required: false
+      CHILD_RUNTIME_TOKEN:
+        description: "Token that may act in the configured child repositories"
+        # A consumer that does not run this surface simply has no such
+        # secret, so nothing here is required of every consumer.
+        required: false
+      OPENCODE_API_KEY:
+        description: "Agent model credential, owned by the consumer"
+        # A consumer that does not run this surface simply has no such
+        # secret, so nothing here is required of every consumer.
+        required: false
+      RELEASE_TOKEN:
+        description: "Optional token used to publish when the caller's token is read-only"
+        # A consumer that does not run this surface simply has no such
+        # secret, so nothing here is required of every consumer.
+        required: false
+      TAP_PAT:
+        description: "Optional consumer-owned token the queue may present"
+        # A consumer that does not run this surface simply has no such
+        # secret, so nothing here is required of every consumer.
+        required: false
+      continuum_token:
+        description: "Optional consumer-owned write token used when downstream events must fan out"
+        # A consumer that does not run this surface simply has no such
+        # secret, so nothing here is required of every consumer.
+        required: false
+      pr_agent_api_key:
+        description: "Review provider credential, owned by the consumer"
+        # A consumer that does not run this surface simply has no such
+        # secret, so nothing here is required of every consumer.
+        required: false
+    outputs:
+      repair_budget_minutes:
+        description: The budget a conflict repair of an existing change is given
+        value: ${{ jobs.repair.outputs.repair_budget_minutes }}
+
+# No `permissions:` block, and that is the point rather than an omission.
+# Permissions can only be narrowed along a reusable-workflow call chain, so a
+# permission declared here would be an upper bound on every surface below it --
+# `read-all` on a merge surface that needs `contents: write` would silently stop
+# merges. Each routed surface therefore keeps declaring its own least-privilege
+# scopes, and the consumer's ingress grants each call what that surface needs.
+#
+# Every `uses:` below is a same-repository relative reference, so GitHub resolves
+# each target from the same commit as this file. The consumer's one literal
+# release reference therefore selects this file, every file it reaches, and the
+# engine each of them checks out at `job.workflow_sha`.
+
+jobs:
+  # scheduler -- dependency-aware dispatch: what may start, and what may not
+  scheduler:
+    if: inputs.surface == 'scheduler'
+    uses: ./.github/workflows/consumer-scheduler.yml
+    with:
+      opencode_workflow: ${{ inputs.opencode_workflow }}
+      wip_limit: ${{ inputs.wip_limit }}
+      lease_minutes: ${{ inputs.lease_minutes }}
+      max_attempts: ${{ inputs.max_attempts }}
+
+  # agent -- the one agent surface, in its four closed modes
+  agent:
+    if: inputs.surface == 'agent'
+    uses: ./.github/workflows/consumer-opencode.yml
+    with:
+      base_branch: ${{ inputs.base_branch }}
+      mode: ${{ inputs.mode }}
+      issue_number: ${{ inputs.issue_number }}
+      pr_number: ${{ inputs.pr_number }}
+      head_ref: ${{ inputs.head_ref }}
+      run_id: ${{ inputs.run_id }}
+      rungs_ruled_out: ${{ inputs.rungs_ruled_out }}
+      runner: ${{ inputs.runner }}
+      swift_version: ${{ inputs.swift_version }}
+      model: ${{ inputs.model != '' && inputs.model || 'opencode/big-pickle' }}
+      task_timeout_minutes: ${{ inputs.task_timeout_minutes }}
+      repair_timeout_minutes: ${{ inputs.repair_timeout_minutes }}
+      repair_agent_timeout_seconds: ${{ inputs.repair_agent_timeout_seconds }}
+      review_agent_timeout_seconds: ${{ inputs.review_agent_timeout_seconds }}
+      opencode_distribution: ${{ inputs.opencode_distribution }}
+      opencode_release_repo: ${{ inputs.opencode_release_repo }}
+      opencode_release_tag_prefix: ${{ inputs.opencode_release_tag_prefix }}
+      opencode_release_asset: ${{ inputs.opencode_release_asset }}
+      opencode_release_tag: ${{ inputs.opencode_release_tag }}
+      opencode_release_sha256: ${{ inputs.opencode_release_sha256 }}
+      opencode_release_version: ${{ inputs.opencode_release_version }}
+      opencode_release_source_sha: ${{ inputs.opencode_release_source_sha }}
+    secrets:
+      OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+      continuum_token: ${{ secrets.continuum_token }}
+
+  # repair -- conflict, base-sync and failed-gate recovery
+  repair:
+    if: inputs.surface == 'repair'
+    uses: ./.github/workflows/consumer-repair.yml
+    with:
+      opencode_workflow: ${{ inputs.opencode_workflow }}
+      ci_workflow: ${{ inputs.ci_workflow }}
+      additional_blocking_workflows: ${{ inputs.additional_blocking_workflows }}
+      scheduler_workflow: ${{ inputs.scheduler_workflow }}
+      max_attempts: ${{ inputs.max_attempts }}
+      repair_timeout_minutes: ${{ inputs.repair_timeout_minutes }}
+      repair_agent_timeout_seconds: ${{ inputs.repair_agent_timeout_seconds }}
+
+  # review -- the review loop: normalized findings, bounded repair, re-check
+  review:
+    if: inputs.surface == 'review'
+    uses: ./.github/workflows/consumer-review-gate.yml
+    with:
+      pr_number: ${{ inputs.pr_number }}
+      agent_workflow: ${{ inputs.agent_workflow }}
+      config_path: ${{ inputs.config_path != '' && inputs.config_path || '.github/continuum.yml' }}
+      base_branch: ${{ inputs.base_branch }}
+      max_attempts_per_head: ${{ inputs.max_attempts_per_head }}
+      max_attempts_per_finding: ${{ inputs.max_attempts_per_finding }}
+      max_rereviews: ${{ inputs.max_rereviews }}
+      agent_timeout_minutes: ${{ inputs.agent_timeout_minutes }}
+    secrets:
+      continuum_token: ${{ secrets.continuum_token }}
+
+  # queue -- provider slot scheduling, so a candidate never starves
+  queue:
+    if: inputs.surface == 'queue'
+    uses: ./.github/workflows/review-queue.yml
+    with:
+      config_path: ${{ inputs.config_path != '' && inputs.config_path || '.continuum.yml' }}
+      wait_minutes: ${{ inputs.wait_minutes }}
+    secrets:
+      TAP_PAT: ${{ secrets.TAP_PAT }}
+      continuum_token: ${{ secrets.continuum_token }}
+
+  # provider -- the PR-Agent review adapter and its merge-blocking status
+  provider:
+    if: inputs.surface == 'provider'
+    uses: ./.github/workflows/pr-agent.yml
+    with:
+      pr_number: ${{ inputs.pr_number }}
+      head_sha: ${{ inputs.head_sha }}
+      api_base: ${{ inputs.api_base }}
+      model: ${{ inputs.model }}
+      max_tokens: ${{ inputs.max_tokens }}
+      config: ${{ inputs.config }}
+      base_branch: ${{ inputs.base_branch }}
+    secrets:
+      continuum_token: ${{ secrets.continuum_token }}
+      pr_agent_api_key: ${{ secrets.pr_agent_api_key }}
+
+  # merge -- the single merge reconciler and the durable release hand-off
+  merge:
+    if: inputs.surface == 'merge'
+    uses: ./.github/workflows/consumer-auto-merge.yml
+    with:
+      config_path: ${{ inputs.config_path != '' && inputs.config_path || '.github/continuum.yml' }}
+      base_branch: ${{ inputs.base_branch }}
+      ci_workflow: ${{ inputs.ci_workflow }}
+      additional_blocking_workflows: ${{ inputs.additional_blocking_workflows }}
+      review_status_context: ${{ inputs.review_status_context }}
+      scheduler_workflow: ${{ inputs.scheduler_workflow }}
+      release_workflow: ${{ inputs.release_workflow }}
+    secrets:
+      continuum_token: ${{ secrets.continuum_token }}
+
+  # packaging -- immutable binary publication from one exact source commit
+  packaging:
+    if: inputs.surface == 'packaging'
+    uses: ./.github/workflows/release-bun-binary.yml
+    with:
+      source_sha: ${{ inputs.source_sha }}
+      package_dir: ${{ inputs.package_dir }}
+      build_script: ${{ inputs.build_script }}
+      build_argv_json: ${{ inputs.build_argv_json }}
+      build_env_json: ${{ inputs.build_env_json }}
+      binary_path: ${{ inputs.binary_path }}
+      asset_name: ${{ inputs.asset_name }}
+      tag_prefix: ${{ inputs.tag_prefix }}
+      bun_version: ${{ inputs.bun_version }}
+      prerelease: ${{ inputs.prerelease }}
+      expected_version: ${{ inputs.expected_version }}
+      expected_sha256: ${{ inputs.expected_sha256 }}
+      expected_size_bytes: ${{ inputs.expected_size_bytes }}
+    secrets:
+      RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+
+  # child-dispatcher -- reconciling delegated child repositories
+  child-dispatcher:
+    if: inputs.surface == 'child-dispatcher'
+    uses: ./.github/workflows/consumer-child-dispatcher.yml
+    with:
+      worker_workflow: ${{ inputs.worker_workflow }}
+      review_workflow: ${{ inputs.review_workflow }}
+      manual_pr_review_workflow: ${{ inputs.manual_pr_review_workflow }}
+    secrets:
+      CHILD_RUNTIME_REPOSITORIES: ${{ secrets.CHILD_RUNTIME_REPOSITORIES }}
+      CHILD_RUNTIME_TOKEN: ${{ secrets.CHILD_RUNTIME_TOKEN }}
+
+  # child-worker -- one delegated child task, to verified acceptance
+  child-worker:
+    if: inputs.surface == 'child-worker'
+    uses: ./.github/workflows/consumer-child-worker.yml
+    with:
+      child_id: ${{ inputs.child_id }}
+      task_number: ${{ inputs.task_number }}
+      model: ${{ inputs.model != '' && inputs.model || 'opencode/big-pickle' }}
+      max_agent_passes: ${{ inputs.max_agent_passes }}
+    secrets:
+      CHILD_RUNTIME_REPOSITORIES: ${{ secrets.CHILD_RUNTIME_REPOSITORIES }}
+      CHILD_RUNTIME_TOKEN: ${{ secrets.CHILD_RUNTIME_TOKEN }}
+
+  # child-review -- delegated review and repair inside a child repository
+  child-review:
+    if: inputs.surface == 'child-review'
+    uses: ./.github/workflows/consumer-child-review.yml
+    with:
+      child_id: ${{ inputs.child_id }}
+      task_number: ${{ inputs.task_number }}
+      pr_number: ${{ inputs.pr_number }}
+      model: ${{ inputs.model != '' && inputs.model || 'opencode/big-pickle' }}
+      max_review_passes: ${{ inputs.max_review_passes }}
+    secrets:
+      CHILD_RUNTIME_REPOSITORIES: ${{ secrets.CHILD_RUNTIME_REPOSITORIES }}
+      CHILD_RUNTIME_TOKEN: ${{ secrets.CHILD_RUNTIME_TOKEN }}
+
+  # child-pr-review -- independent review of an owner-created child pull request
+  child-pr-review:
+    if: inputs.surface == 'child-pr-review'
+    uses: ./.github/workflows/consumer-child-pr-review.yml
+    with:
+      child_id: ${{ inputs.child_id }}
+      pr_number: ${{ inputs.pr_number }}
+      model: ${{ inputs.model != '' && inputs.model || 'opencode/muse-spark-1.3-contributor-free' }}
+      max_review_passes: ${{ inputs.max_review_passes }}
+    secrets:
+      CHILD_RUNTIME_REPOSITORIES: ${{ secrets.CHILD_RUNTIME_REPOSITORIES }}
+      CHILD_RUNTIME_TOKEN: ${{ secrets.CHILD_RUNTIME_TOKEN }}

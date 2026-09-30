@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import pathlib
 import re
+import sys
 import unittest
 
 import yaml
@@ -33,6 +34,10 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 ACTIVE = ROOT / ".github" / "workflows"
 CONSUMER = ROOT / "fixtures" / "consumer-repo"
 CONSUMER_WORKFLOWS = CONSUMER / ".github" / "workflows"
+
+sys.path.insert(0, str(ROOT / ".github" / "scripts"))
+
+import continuum_engine as engine_module  # noqa: E402
 
 
 def _load(path: pathlib.Path) -> dict:
@@ -168,11 +173,13 @@ class ProviderConsumerTests(unittest.TestCase):
     FIXTURE = ROOT / "fixtures" / "provider-consumer"
     ENTRY = FIXTURE / ".github" / "workflows" / "pr-agent.yml"
     REUSABLE = ACTIVE / "pr-agent.yml"
+    ROUTER = ACTIVE / "consumer.yml"
 
     def setUp(self):
         self.config = load_config(str(self.FIXTURE / ".continuum.yml"))
         self.entry = _load(self.ENTRY)
         self.reusable = _load(self.REUSABLE)
+        self.router = _load(self.ROUTER)
 
     def test_the_repository_configures_the_provider_and_names_its_credentials(self):
         self.assertEqual(self.config.review.provider, "pr-agent")
@@ -209,9 +216,9 @@ class ProviderConsumerTests(unittest.TestCase):
         uses = job["uses"]
         self.assertRegex(
             uses,
-            r"^kodmial/continuum/\.github/workflows/pr-agent\.yml@[0-9a-f]{40}$",
-            "the consumer must select one exact Continuum release, and the "
-            "review provider is the surface it selects",
+            r"^kodmial/continuum/\.github/workflows/consumer\.yml@v\d+\.\d+\.\d+$",
+            "the consumer must select one exact Continuum release, and the pin "
+            "names the release entrypoint rather than one surface inside it",
         )
 
     def test_the_entry_passes_exactly_what_the_shared_surface_declares(self):
@@ -220,14 +227,20 @@ class ProviderConsumerTests(unittest.TestCase):
         # the surface already decided it, so an omitted input must carry a
         # default rather than being left to chance.
         job = self.entry["jobs"]["review"]
+        # The provider surface's own contract, read from the workflow the
+        # release routes to. `surface` selects it, so it is what the entry has
+        # to declare as well as the provider's own inputs.
+        routed = self.router["jobs"]["provider"]
         call = self.reusable["on"]["workflow_call"]
         self.assertEqual(sorted(job["secrets"]), sorted(call["secrets"]))
-        self.assertLessEqual(set(job["with"]), set(call["inputs"]))
-        for name, declared in call["inputs"].items():
-            if name in job["with"]:
-                continue
+        # The entry states what the provider surface needs, and the release
+        # entrypoint routes each of those inputs under a name the surface
+        # declares. `surface` is the exception: the release entrypoint consumes
+        # it to choose the provider, so it is not one of the provider's inputs.
+        self.assertLessEqual(set(job["with"]) - {"surface"}, set(routed["with"]))
+        for name in routed["with"]:
             with self.subTest(input=name):
-                self.assertIn("default", declared, "{} is neither passed nor defaulted".format(name))
+                self.assertIn(name, call["inputs"])
         for name in ("pr_number", "head_sha"):
             with self.subTest(input=name):
                 self.assertIn(name, job["with"])
@@ -308,6 +321,14 @@ class ConsumerWiringTests(unittest.TestCase):
     what they pass is checked as carefully as what they omit.
     """
 
+    #: The one Continuum release the fixture selects. Read from the files rather
+    #: than written here, so this assertion cannot become a second copy of the
+    #: pin that drifts.
+    RELEASE_PIN = re.search(
+        r"consumer\.yml@(\S+)",
+        (CONSUMER_WORKFLOWS / "continuum.yml").read_text(encoding="utf-8"),
+    ).group(1)
+
     def workflow_texts(self):
         return {
             path.name: path.read_text(encoding="utf-8")
@@ -338,27 +359,75 @@ class ConsumerWiringTests(unittest.TestCase):
             for secret in set(re.findall(r"secrets\.([A-Z0-9_]+)", text)):
                 self.assertIn(secret, ("OPENCODE_API_KEY", "GITHUB_TOKEN"), name)
 
-    def test_every_consumer_workflow_calls_a_pinned_continuum_surface(self):
+    def test_every_consumer_workflow_calls_the_one_pinned_release(self):
+        # The consumer's whole Continuum dependency is one exact release, named
+        # through the release entrypoint. A pin to any other Continuum workflow
+        # would be a per-module pin that could drift away from the rest of the
+        # graph, and a branch ref would mean the consumer's security model is
+        # only as good as whatever `main` holds when the workflow next fires.
         seen = 0
         for name, text in self.workflow_texts().items():
             for line in text.splitlines():
                 if "uses:" not in line or "kodmial/continuum/" not in line:
                     continue
                 seen += 1
-                self.assertIn(".github/", line, name)
-                # A branch ref is a moving target, and this token is write
-                # authority. `@main` would mean the consumer's security model is
-                # only as good as whatever `main` holds when the workflow next
-                # fires, which is exactly the property a reviewer cannot check
-                # by reading the file.
-                ref = line.rsplit("@", 1)[1].strip()
                 self.assertRegex(
-                    ref,
-                    r"^[0-9a-f]{40}$",
-                    f"{name} pins {ref!r}, not an immutable commit",
+                    line.strip(),
+                    r"^uses: kodmial/continuum/\.github/workflows/consumer\.yml@"
+                    r"(?:v\d+\.\d+\.\d+|[0-9a-f]{40})$",
+                    name,
                 )
         # Guard against the loop vacuously passing on an empty fixture.
         self.assertGreater(seen, 0)
+
+    def test_the_fixture_has_one_continuum_release_and_no_engine_ref(self):
+        # Read the way an upgrade tool reads it: every Continuum reference in
+        # every file of the fixture, and one value across all of them. An
+        # `engine_ref` would be the caller choosing the code revision at run
+        # time, which is exactly the independent pin ADR-0002 removes.
+# `continuum-release.yml` is the consumer's own release internals and
+        # references nothing, which is the point of it. Every file that does
+        # reference Continuum is held to the single-pin rule.
+        referenced = {
+            name: text
+            for name, text in self.workflow_texts().items()
+            if engine_module.consumer_pins(text)
+        }
+        self.assertNotIn("continuum-release.yml", referenced)
+        for name, text in referenced.items():
+            engine_module.assert_single_pin(text, name)
+        self.assertNotIn("engine_ref", "".join(self.workflow_texts().values()))
+        self.assertEqual(
+            {
+                pin
+                for text in referenced.values()
+                for _, pin in engine_module.consumer_pins(text)
+            },
+            {self.RELEASE_PIN},
+        )
+        self.assertEqual(
+            {
+                workflow
+                for text in referenced.values()
+                for workflow, _ in engine_module.consumer_pins(text)
+            },
+            {engine_module.RELEASE_ENTRYPOINT},
+        )
+
+    def job_inputs(self, text: str, job: str) -> dict:
+        """The `with:` keys one job of the ingress passes, as a plain dict.
+
+        Read per job rather than from the first `with:` in the file, because the
+        ingress declares one call per surface and each one states different
+        policy. The slice is the job's own lines, so `with_inputs` sees the same
+        indentation it would see in the file.
+        """
+        start = re.search(r"^  {0}:\n".format(re.escape(job)), text, re.MULTILINE)
+        if start is None:
+            return {}
+        rest = text[start.end() :]
+        end = re.search(r"^  [A-Za-z0-9_-]+:\n", rest, re.MULTILINE)
+        return with_inputs(rest[: end.start()] if end else rest)
 
     def test_the_consumer_declares_when_to_call_and_never_what_the_outcome_is(self):
         # `with:` is where a consumer states the policy it owns: which of its own
@@ -366,14 +435,16 @@ class ConsumerWiringTests(unittest.TestCase):
         # lives. The merge posture is not in that set, because a second place to
         # declare `review` or `release` is a second thing that can disagree with
         # the file a reviewer reads.
-        for name in ("continuum-auto-merge.yml", "review.yml", "continuum-scheduler.yml"):
-            keys = with_inputs(self.workflow_texts()[name])
-            self.assertNotIn("review", keys, name)
-            self.assertNotIn("release", keys, name)
-            self.assertTrue(keys, f"{name} passes no inputs at all")
+        ingress = self.workflow_texts()["continuum.yml"]
+        for job in ("scheduler", "review", "queue", "merge"):
+            keys = self.job_inputs(ingress, job)
+            self.assertNotIn("review", keys, job)
+            self.assertNotIn("release", keys, job)
+            self.assertTrue(keys, f"{job} passes no inputs at all")
 
     def test_the_consumer_names_its_own_workflows_where_the_controllers_need_them(self):
-        merge = with_inputs(self.workflow_texts()["continuum-auto-merge.yml"])
+        ingress = self.workflow_texts()["continuum.yml"]
+        merge = self.job_inputs(ingress, "merge")
         self.assertEqual(merge["config_path"], ".github/continuum.yml")
         # A release or scheduler hook that lives in another repository cannot be
         # dispatched by this one, so these names have to be the consumer's own
@@ -381,26 +452,39 @@ class ConsumerWiringTests(unittest.TestCase):
         for hook in ("release_workflow", "scheduler_workflow"):
             self.assertEqual(merge[hook], f"continuum-{hook.split('_')[0]}.yml")
 
-        scheduler = with_inputs(self.workflow_texts()["continuum-scheduler.yml"])
-        self.assertEqual(scheduler["opencode_workflow"], "continuum-opencode.yml")
+        scheduler = self.job_inputs(ingress, "scheduler")
+        self.assertEqual(scheduler["opencode_workflow"], "continuum-agent.yml")
         # Scheduling policy is the consumer's, declared once as inputs rather
         # than duplicated in a config file the controller would have to find.
         self.assertIn("wip_limit", scheduler)
         self.assertIn("lease_minutes", scheduler)
 
+        # And the agent workflow those names point at is really there, or the
+        # controllers would dispatch a file this repository does not have.
+        self.assertIn("continuum-agent.yml", self.workflow_texts())
+
+    def test_both_scheduler_wake_up_paths_state_the_same_policy(self):
+        # Two wake-up paths into the same surface, so two declarations of its
+        # policy. A difference is invisible in either file on its own.
+        ingress = self.job_inputs(self.workflow_texts()["continuum.yml"], "scheduler")
+        hook = with_inputs(self.workflow_texts()["continuum-scheduler.yml"])
+        for name in ("opencode_workflow", "wip_limit", "lease_minutes", "max_attempts"):
+            with self.subTest(input=name):
+                self.assertEqual(ingress[name], hook[name])
+
     def test_the_fixture_reaches_the_review_loop_through_the_generic_surface(self):
-        review = self.workflow_texts()["review.yml"]
-        self.assertIn("consumer-review-gate.yml@", review)
+        ingress = self.workflow_texts()["continuum.yml"]
+        self.assertEqual(self.job_inputs(ingress, "review")["surface"], "review")
         # The wake-up may name a candidate pull request, but nothing it carries
         # is authority: the gate re-derives trust, the HEAD, and the contract
         # from live state. In particular no event-derived ref or commit is
         # passed, because those are the two things an untrusted author controls.
-        self.assertNotIn("github.event.pull_request.head", review)
-        self.assertNotIn("head_ref", review)
-        self.assertNotIn("head_sha", review)
+        self.assertNotIn("github.event.pull_request.head", ingress)
+        self.assertNotIn("head_ref", ingress)
+        self.assertNotIn("head_sha", ingress)
 
     def test_the_fixture_owns_its_agent_runner_and_toolchain(self):
-        agent = self.workflow_texts()["continuum-opencode.yml"]
+        agent = self.workflow_texts()["continuum-agent.yml"]
         # Where the agent runs is an input with a default, so the same shared
         # workflow serves a consumer that needs a particular runner and one that
         # is content with the default.
@@ -425,6 +509,7 @@ class ConsumerWiringTests(unittest.TestCase):
                     "runner",
                     "swift_version",
                     "model",
+                    "surface",
                 ]
             ),
         )
@@ -437,6 +522,108 @@ class ConsumerWiringTests(unittest.TestCase):
         self.assertIn("source_sha", release)
         self.assertIn("SOURCE_SHA", release)
         self.assertNotIn("uses: kodmial/continuum/", release)
+
+
+class DelegationWiringTests(unittest.TestCase):
+    """A parent repository that delegates work into child repositories.
+
+    Delegation splits one release across two repositories, which is where the
+    one-pin rule is easiest to get subtly wrong: the dispatcher runs in the
+    parent and the child surfaces run in children, so the shared pin is the only
+    thing that says which release those two halves belong to together.
+    """
+
+    PARENT = ROOT / "fixtures" / "delegation-parent"
+    PARENT_WORKFLOWS = PARENT / ".github" / "workflows"
+
+    #: The three files, and the surface each one selects. They are one release
+    #: reached three ways, so they are held to one value together.
+    SURFACES = {
+        "continuum.yml": "child-dispatcher",
+        "continuum-child-task.yml": "child-worker",
+        "continuum-child-review.yml": "child-review",
+    }
+
+    def workflow_texts(self):
+        return {
+            path.name: path.read_text(encoding="utf-8")
+            for path in sorted(self.PARENT_WORKFLOWS.glob("*.yml"))
+        }
+
+    def test_there_are_exactly_three_ingresses_and_no_more(self):
+        self.assertEqual(set(self.workflow_texts()), set(self.SURFACES))
+
+    def test_every_ingress_calls_the_one_release(self):
+        pins = {}
+        for name in self.SURFACES:
+            text = self.workflow_texts()[name]
+            engine_module.assert_single_pin(text, name)
+            pins[name] = {pin for _, pin in engine_module.consumer_pins(text)}
+        self.assertEqual(
+            {frozenset(values) for values in pins.values()},
+            {frozenset({"v0.1.0"})},
+            "a parent and its children are one dependency, so one value covers both",
+        )
+
+    def test_each_ingress_selects_its_own_surface(self):
+        for name, surface in self.SURFACES.items():
+            with self.subTest(workflow=name):
+                document = _load(self.PARENT_WORKFLOWS / name)
+                jobs = [
+                    job for job in document["jobs"].values() if "uses" in job
+                ]
+                self.assertTrue(jobs, "{} calls nothing".format(name))
+                for job in jobs:
+                    with self.subTest(call=job["uses"]):
+                        self.assertIn(
+                            "/.github/workflows/consumer.yml", job["uses"]
+                        )
+                        # The surface is the capability being asked for. A
+                        # consumer names one, not a file in Continuum's own
+                        # directory, so it cannot reach a surface the release
+                        # entrypoint does not offer.
+                        self.assertEqual((job.get("with") or {}).get("surface"), surface)
+
+    def test_no_ingress_can_be_reached_at_a_moving_ref(self):
+        for name, text in self.workflow_texts().items():
+            with self.subTest(workflow=name):
+                for _, ref in engine_module.consumer_pins(text):
+                    self.assertTrue(
+                        engine_module.is_pinnable(ref),
+                        "{} follows a ref that can change without an edit".format(name),
+                    )
+
+    def test_the_parent_declares_the_relationship_through_repository_variables(self):
+        # The child list is deliberately not a workflow input. An input appears
+        # in the run's own metadata, and the dispatcher reads the relationship
+        # from the parent's own repository once the runner is up.
+        for name, text in self.workflow_texts().items():
+            with self.subTest(workflow=name):
+                self.assertNotIn("CHILD_REPOSITORIES", text)
+                self.assertNotIn("CONTINUUM_CHILD_REPOSITORIES", text)
+
+    def test_the_child_surfaces_are_dispatch_targets_and_not_event_surfaces(self):
+        # A relative reusable-workflow call cannot cross a repository boundary,
+        # so the two child surfaces are reached with `workflow_dispatch`. They
+        # must not also claim `workflow_call`: the dispatcher never calls them,
+        # and an input the caller cannot supply is an input nothing reads.
+        for name in ("continuum-child-task.yml", "continuum-child-review.yml"):
+            with self.subTest(workflow=name):
+                triggers = _load(self.PARENT_WORKFLOWS / name)["on"]
+                self.assertEqual(list(triggers), ["workflow_dispatch"])
+
+    def test_the_parent_ingress_is_the_only_event_surface(self):
+        # The parent is woken by the relationship map changing and by its own
+        # schedule, and the dispatcher is the only surface those wake-ups select.
+        # A child surface claiming an event trigger would make a child's own
+        # events reach into Continuum without the parent having declared it.
+        triggers = _load(self.PARENT_WORKFLOWS / "continuum.yml")["on"]
+        self.assertEqual(sorted(triggers), ["push", "schedule", "workflow_dispatch"])
+        self.assertEqual(
+            triggers["push"]["paths"],
+            [".continuum.yml"],
+            "a push that cannot change a relationship should not wake the parent",
+        )
 
 
 class ConsumerPostureTests(unittest.TestCase):

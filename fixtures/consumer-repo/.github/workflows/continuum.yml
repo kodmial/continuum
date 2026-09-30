@@ -1,0 +1,151 @@
+name: Continuum
+
+# This file is the whole of the dependency. Every `uses:` below names
+# `consumer.yml` at one exact release, and nothing else in this repository
+# references Continuum: the events, the scheduling policy, the gate list, and
+# the release hand-off are all declared here.
+#
+# The repetition of the one pin is deliberate and bounded. A reusable workflow
+# cannot subscribe to this repository's own events, so this file declares them,
+# and a surface that needs write authority needs a call granted that authority
+# -- permissions can only narrow along a call chain, never widen, so folding
+# several surfaces into one call would mean granting all of them the union. One
+# job per surface keeps each grant least-privilege. What must not vary between
+# those jobs is the release: an upgrade is this one value, changed deliberately,
+# and publishing a new Continuum release changes nothing here.
+#
+# Every surface below re-derives its whole decision from live state on every
+# wake-up, so being woken by an event that turns out to be irrelevant costs a
+# run, not correctness. That is what lets the event set below be the union of
+# what the surfaces need rather than a per-surface filter: `continuum-agent.yml`
+# is the exception, because it is a dispatch target rather than an event
+# surface, which is why it is a separate file with its own grant.
+
+on:
+  # The queue's eligibility transitions, which is the widest set any one surface
+  # needs: a pull request event, a review, a comment, a label, a status, a check
+  # run, or a check suite can each change which candidate is next.
+  pull_request_target:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+      - converted_to_draft
+      - closed
+      - labeled
+      - unlabeled
+      - edited
+      - auto_merge_enabled
+      - auto_merge_disabled
+  pull_request_review:
+    types: [submitted, dismissed]
+  issue_comment:
+    types: [created, edited]
+  issues:
+    types: [labeled, unlabeled, reopened, closed, edited]
+  status: {}
+  check_run:
+    types: [completed, rerequested, created]
+  check_suite:
+    types: [completed]
+
+  # A completed CI run is how a pushed repair comes back to be looked at, and how
+  # the repair controller learns a gate failed.
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+  # The scheduler's dependency-aware dispatch, and recovery for a loop that
+  # stalled between two events. A wake-up that changes nothing finishes quietly.
+  schedule:
+    - cron: "*/15 * * * *"
+    - cron: "7,37 * * * *"
+
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Pull request number"
+        required: false
+        type: string
+
+# The default grant is read-only. Each call below widens it to exactly what its
+# surface needs, so a job added to this file later cannot silently inherit
+# authority from the file's top level.
+permissions:
+  contents: read
+
+# One ingress, so one concurrency group. It carries the queue's name because the
+# single-flight rule it exists to enforce is the queue's: two reconcilers must
+# never spend the same shared provider slot. A run waiting out a provider
+# cooldown must finish rather than be superseded by the next wake-up, or a busy
+# repository starves the queued head.
+concurrency:
+  group: continuum-review-queue
+  cancel-in-progress: false
+
+jobs:
+  scheduler:
+    uses: kodmial/continuum/.github/workflows/consumer.yml@v0.1.0
+    permissions:
+      actions: write
+      contents: read
+      issues: write
+      pull-requests: read
+    with:
+      surface: scheduler
+      # Scheduling policy is the consumer's, declared once here rather than
+      # duplicated in a config file the controller would have to find.
+      opencode_workflow: continuum-agent.yml
+      wip_limit: 2
+      lease_minutes: 45
+      max_attempts: 3
+
+  review:
+    uses: kodmial/continuum/.github/workflows/consumer.yml@v0.1.0
+    permissions:
+      actions: write
+      checks: write
+      contents: read
+      issues: write
+      pull-requests: write
+    with:
+      surface: review
+      # The wake-up may name a candidate pull request, but nothing it carries is
+      # authority: the gate re-derives trust, the HEAD, and the contract from
+      # live state.
+      pr_number: ${{ inputs.pr_number }}
+      agent_workflow: continuum-agent.yml
+      config_path: .github/continuum.yml
+
+  queue:
+    uses: kodmial/continuum/.github/workflows/consumer.yml@v0.1.0
+    permissions:
+      actions: write
+      contents: read
+      issues: write
+      pull-requests: write
+      statuses: read
+    with:
+      surface: queue
+      config_path: .continuum.yml
+      wait_minutes: 45
+    secrets:
+      continuum_token: ${{ secrets.GITHUB_TOKEN }}
+
+  merge:
+    uses: kodmial/continuum/.github/workflows/consumer.yml@v0.1.0
+    permissions:
+      actions: write
+      contents: write
+      issues: write
+      pull-requests: write
+      statuses: read
+    with:
+      surface: merge
+      config_path: .github/continuum.yml
+      additional_blocking_workflows: ""
+      # A release or scheduler hook in another repository cannot be dispatched
+      # from this one, so these name this repository's own files.
+      scheduler_workflow: continuum-scheduler.yml
+      release_workflow: continuum-release.yml

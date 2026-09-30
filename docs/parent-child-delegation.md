@@ -58,12 +58,19 @@ variables.
 
 ## Parent workflows
 
-Use the three thin entry workflows in
-`fixtures/delegation-parent/.github/workflows/`. They call:
+Use the thin entry workflows in
+`fixtures/delegation-parent/.github/workflows/`. `continuum.yml` calls
+`consumer.yml` once at a single exact release with `surface: child-dispatcher`,
+and `continuum-child-task.yml` and `continuum-child-review.yml` call the same
+release with `surface: child-worker` and `surface: child-review`.
 
-- `consumer-child-dispatcher.yml`
-- `consumer-child-worker.yml`
-- `consumer-child-review.yml`
+One pin covers the whole graph. The dispatcher and the two child surfaces are
+three files, but they are three surfaces of one release: none of them names a
+version of its own, and a fork inherits the same pin from the commit it calls.
+The child targets live in the child repository because a relative
+reusable-workflow call cannot cross a repository boundary, which is why they
+are `workflow_dispatch` surfaces reached by the dispatch API rather than by
+`workflow_call`.
 
 The wrapper passes no parent/child relationship values. Continuum reads
 `CONTINUUM_ROLE` and `CONTINUUM_CHILDREN` directly from the parent repository

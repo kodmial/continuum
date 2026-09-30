@@ -9,7 +9,11 @@
 # gate here. Those belong to the Continuum release this line pins, which is why
 # this repository's review cannot drift from its own automation: the endpoint,
 # the model, the credential, the provider version, the findings, the verdict,
-# and the merge-blocking status are all resolved inside that one commit.
+# and the merge-blocking status are all resolved inside that one release.
+#
+# The pin names the release entrypoint rather than the provider surface directly,
+# so this repository has one Continuum dependency rather than a pin per workflow
+# that would have to be upgraded in step.
 #
 # The permission block grants the shared surface exactly what it needs to
 # publish a review. Permissions can only be narrowed down the call chain, never
@@ -46,8 +50,9 @@ permissions:
 
 jobs:
   review:
-    uses: kodmial/continuum/.github/workflows/pr-agent.yml@39ca6dc798f2201390c8fdef0395157f588657ec
+    uses: kodmial/continuum/.github/workflows/consumer.yml@v0.1.0
     with:
+      surface: provider
       pr_number: ${{ inputs.pr_number }}
       head_sha: ${{ inputs.head_sha }}
       api_base: ${{ vars.PR_AGENT_API_BASE }}

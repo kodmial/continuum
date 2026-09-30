@@ -1,0 +1,48 @@
+name: Continuum delegation
+
+# The parent's half of a child relationship: declare when the dispatcher should
+# reconcile configured children, and delegate every decision to it.
+#
+# This file is the whole of the dependency for the dispatcher. The two child
+# surfaces are dispatch targets rather than event surfaces, so they live in
+# `continuum-child-task.yml` and `continuum-child-review.yml` with
+# `workflow_dispatch` triggers of their own -- a relative reusable-workflow call
+# cannot cross a repository boundary. They carry the same single Continuum pin,
+# which is the point: the surface that dispatches and the surfaces that are
+# dispatched are one release.
+#
+# No parent/child relationship values are passed here. Continuum reads
+# `CONTINUUM_ROLE` and `CONTINUUM_CHILDREN` from the parent repository through the
+# GitHub API after the runner starts, so the child list never appears in reusable
+# -workflow inputs or job environment metadata, and the child repository name is
+# resolved only inside the runner.
+
+on:
+  workflow_dispatch:
+  # A change to the relationship map itself is the only change worth reconciling
+  # on push: nothing else in this repository affects what a child relationship is.
+  push:
+    branches:
+      - main
+    paths:
+      - .continuum.yml
+  schedule:
+    - cron: '*/10 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: continuum-child-dispatcher
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    uses: kodmial/continuum/.github/workflows/consumer.yml@v0.1.0
+    permissions:
+      actions: write
+      contents: read
+    with:
+      surface: child-dispatcher
+    secrets:
+      CHILD_RUNTIME_TOKEN: ${{ secrets.CONTINUUM_CHILD_TOKEN }}

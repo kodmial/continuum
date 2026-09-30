@@ -799,14 +799,24 @@ class WorkflowWiringTests(unittest.TestCase):
                         "the launch modes its condition names".format(name),
                     )
 
-    def test_the_engine_action_requires_the_new_files(self):
-        # A partial engine checkout must fail at the action, not half way
-        # through an agent run with the policy missing.
-        action = (ROOT / ".github" / "actions" / "engine-path" / "action.yml").read_text(
+    def test_the_engine_assertion_requires_the_new_files(self):
+        # A partial engine checkout must fail at the assertion, not half way
+        # through an agent run with the policy missing. The script has to be in
+        # the required set as well: it is the thing deciding completeness, so a
+        # checkout that lost it could not report itself incomplete.
+        source = (ROOT / ".github" / "scripts" / "continuum_engine.py").read_text(
             encoding="utf-8"
         )
-        self.assertIn(".github/scripts/opencode_instructions.py", action)
-        self.assertIn(".github/agents/AGENTS.md", action)
+        required = re.search(r"REQUIRED_PATHS = \((.*?)\n\)", source, re.S).group(1)
+        self.assertIn('".github/scripts/opencode_instructions.py"', required)
+        self.assertIn('".github/agents/AGENTS.md"', required)
+        self.assertIn('".github/scripts/continuum_engine.py"', required)
+        # And every one of those files is actually a file in this repository,
+        # so the assertion cannot pass on a path that does not exist.
+        for name in re.findall(r'"([^"]+)"', required):
+            self.assertTrue(
+                (ROOT / name).is_file(), "{} is required but absent".format(name)
+            )
 
     def test_control_planes_do_not_start_an_agent(self):
         # The repair, scheduler, and merge controllers dispatch; they never run

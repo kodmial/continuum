@@ -1,6 +1,12 @@
 name: Child review
 run-name: "Child review [${{ inputs.child_id }}] #${{ inputs.task_number }}"
 
+# A dispatch target, not an event surface: the parent dispatcher runs the
+# delegated review of a child's pull request, so it lives in the child
+# repository and is reached by `workflow_dispatch` rather than a relative call,
+# which cannot cross a repository boundary. It carries the same single Continuum
+# pin as the dispatcher that reaches it.
+
 on:
   workflow_dispatch:
     inputs:
@@ -19,8 +25,9 @@ permissions:
 
 jobs:
   review:
-    uses: kodmial/continuum/.github/workflows/consumer-child-review.yml@main
+    uses: kodmial/continuum/.github/workflows/consumer.yml@v0.1.0
     with:
+      surface: child-review
       child_id: ${{ inputs.child_id }}
       task_number: ${{ inputs.task_number }}
       pr_number: ${{ inputs.pr_number }}

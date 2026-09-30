@@ -202,24 +202,38 @@ controller, never a second copy of a decision.
 
 ### 9.1 Reusable surfaces
 
-| Surface | Called by the consumer to |
-| --- | --- |
-| `.github/workflows/consumer-opencode.yml` | run the agent in one of four modes: `issue`, `resolve-conflict`, `ci-fix`, `review-fix` |
-| `.github/workflows/consumer-scheduler.yml` | dispatch dependency-aware work on the consumer's own schedule |
-| `.github/workflows/consumer-review-gate.yml` | close the review loop: observe, repair, re-check |
-| `.github/workflows/consumer-repair.yml` | repair a merge conflict or a failing gate on the existing branch |
-| `.github/workflows/consumer-auto-merge.yml` | reconcile merge eligibility on every wake-up |
-| `.github/workflows/pr-agent.yml` | run the review provider itself: provider request, normalized findings, verdict, blocking commit status |
+| Surface | Reached with `surface:` | Called by the consumer to |
+| --- | --- | --- |
+| `consumer.yml` | — | the release entrypoint: the one file a consumer names |
+| `consumer-opencode.yml` | `agent` | run the agent in one of four modes: `issue`, `resolve-conflict`, `ci-fix`, `review-fix` |
+| `consumer-scheduler.yml` | `scheduler` | dispatch dependency-aware work on the consumer's own schedule |
+| `consumer-review-gate.yml` | `review` | close the review loop: observe, repair, re-check |
+| `consumer-repair.yml` | `repair` | repair a merge conflict or a failing gate on the existing branch |
+| `consumer-auto-merge.yml` | `merge` | reconcile merge eligibility on every wake-up |
+| `review-queue.yml` | `queue` | run the shared review queue's own wake-ups |
+| `pr-agent.yml` | `provider` | run the review provider itself: provider request, normalized findings, verdict, blocking commit status |
+| `release-bun-binary.yml` | `packaging` | build and publish the consumer's binary release |
+| `consumer-child-dispatcher.yml` | `child-dispatcher` | open and follow up delegated child work |
+| `consumer-child-worker.yml` | `child-worker` | run one delegated task in a child repository |
+| `consumer-child-review.yml` | `child-review` | run the delegated review of a child pull request |
+| `consumer-child-pr-review.yml` | `child-pr-review` | run the delegated manual review of a child pull request |
+
+A consumer writes one reference, `consumer.yml` at one exact release, and its
+own event file chooses which surfaces run by naming a `surface`. `consumer.yml`
+reaches each surface with a relative reference in Continuum's own repository, so
+GitHub resolves it from the commit of the `consumer.yml` the consumer pinned: one
+pin covers the whole graph, and each surface keeps its own permission grant
+because it is a separate job in the caller's workflow.
 
 Every call pins an immutable Continuum commit. A branch ref would make a
 consumer's security model a function of whatever `main` holds when the workflow
 next fires, which is precisely the property a reviewer cannot check by reading
-the file. `pr-agent.yml` goes one step further and needs no second pin at all:
-it resolves its engine from `job.workflow_sha`, the commit of the workflow file
+the file. Each surface goes one step further and needs no second pin at all: it
+resolves its engine from `job.workflow_sha`, the commit of the workflow file
 itself, so the one reference the consumer writes selects an atomic snapshot of
-the whole provider and cannot drift from it.
+the whole graph and cannot drift from it.
 
-`pr-agent.yml` is the one surface a consumer reaches *directly* rather than
+`provider` is the one surface a consumer reaches *directly* rather than
 through a toggle, because selecting a review provider is configuration rather
 than a boolean: `.continuum.yml` names the provider and the repository variables
 and secrets it is reached through, and the consumer's entry workflow maps those

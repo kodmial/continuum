@@ -1,0 +1,31 @@
+name: Child task
+run-name: "Child task [${{ inputs.child_id }}] #${{ inputs.task_number }}"
+
+# A dispatch target, not an event surface: the parent dispatcher runs one
+# delegated task in a child repository, so it lives in the child repository and
+# is reached by `workflow_dispatch` rather than a relative call, which cannot
+# cross a repository boundary. It carries the same single Continuum pin as the
+# dispatcher that reaches it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      child_id:
+        type: string
+        required: true
+      task_number:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  worker:
+    uses: kodmial/continuum/.github/workflows/consumer.yml@v0.1.0
+    with:
+      surface: child-worker
+      child_id: ${{ inputs.child_id }}
+      task_number: ${{ inputs.task_number }}
+    secrets:
+      CHILD_RUNTIME_TOKEN: ${{ secrets.CONTINUUM_CHILD_TOKEN }}

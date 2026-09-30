@@ -106,8 +106,67 @@ jobs:
       head_sha: ${{ steps.target.outputs.head_sha }}
       reason: ${{ steps.target.outputs.reason }}
     steps:
-      - name: Load Continuum engine
-        uses: kodmial/continuum/.github/actions/engine-path@81adcea69ce9c260f1aad4177867f8449a75d9b3
+      - name: Resolve the pinned Continuum engine
+        id: engine
+        shell: bash
+        env:
+          JOB_WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          # A consumer selects Continuum with one literal reference in the
+          # caller's `jobs.<job_id>.uses`, and `job.workflow_sha` is the commit of
+          # *this* file -- so this is the release the consumer pinned, not a
+          # revision chosen here. A branch, a default, or an input any caller
+          # could set would each let the graph and the code it runs come from
+          # different Continuum revisions, which is the whole property that one
+          # release reference exists to guarantee.
+          #
+          # `job.workflow_repository` is the repository this file came from, so
+          # the engine is checked out from there rather than from a name written
+          # into this file. It is empty in a run that was not entered through a
+          # reusable-workflow call, and an empty `workflow_sha` means nothing
+          # pinned this commit, so both fail here rather than silently running
+          # whatever branch the workflow file came from.
+          if ! printf '%s' "${JOB_WORKFLOW_REPOSITORY:-}" | grep -Eq '^[^/]+/[^/]+$'; then
+            echo "::error::expected the repository holding the pinned Continuum workflow, got '${JOB_WORKFLOW_REPOSITORY:-}'"
+            exit 1
+          fi
+          if ! printf '%s' "${JOB_WORKFLOW_SHA:-}" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::expected a full commit sha for the Continuum engine, got '${JOB_WORKFLOW_SHA:-}'"
+            exit 1
+          fi
+          printf 'repository=%s\n' "$JOB_WORKFLOW_REPOSITORY" >> "$GITHUB_OUTPUT"
+          printf 'sha=%s\n' "$JOB_WORKFLOW_SHA" >> "$GITHUB_OUTPUT"
+
+      # A checkout cleans its target path, and the engine is an untracked
+      # directory inside the caller's working tree -- so where this job also
+      # checks the caller out, that has to happen *before* here. A caller
+      # checkout running afterwards would delete the engine the next steps are
+      # about to run. This step is placed last among the checkouts so its clean
+      # stays confined to `engine/`.
+      - name: Check out the pinned Continuum engine
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ steps.engine.outputs.repository }}
+          ref: ${{ steps.engine.outputs.sha }}
+          path: engine
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Refuse anything but the pinned Continuum engine
+        shell: bash
+        env:
+          ENGINE_ROOT: ${{ github.workspace }}/engine
+          ENGINE_SHA: ${{ steps.engine.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # The engine has to be the pinned commit *and* carry every file the
+          # surfaces below it import or execute, so a partial engine stops here
+          # instead of part way through a privileged run.
+          python3 "$ENGINE_ROOT/.github/scripts/continuum_engine.py" assert \
+            --root "$ENGINE_ROOT" --expect-sha "$ENGINE_SHA"
+          printf 'CONTINUUM_ENGINE_ROOT=%s\n' "$ENGINE_ROOT" >> "$GITHUB_ENV"
 
       # The wake-up event varies; the target does not. Every entry point resolves
       # to one candidate pull request here, and the privileged job below is
@@ -197,9 +256,66 @@ jobs:
     outputs:
       allowed: ${{ steps.dispatch.outputs.allowed }}
     steps:
-      - name: Load Continuum engine
-        uses: kodmial/continuum/.github/actions/engine-path@81adcea69ce9c260f1aad4177867f8449a75d9b3
+      - name: Resolve the pinned Continuum engine
+        id: engine
+        shell: bash
+        env:
+          JOB_WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          # A consumer selects Continuum with one literal reference in the
+          # caller's `jobs.<job_id>.uses`, and `job.workflow_sha` is the commit of
+          # *this* file -- so this is the release the consumer pinned, not a
+          # revision chosen here. A branch, a default, or an input any caller
+          # could set would each let the graph and the code it runs come from
+          # different Continuum revisions, which is the whole property that one
+          # release reference exists to guarantee.
+          #
+          # `job.workflow_repository` is the repository this file came from, so
+          # the engine is checked out from there rather than from a name written
+          # into this file. It is empty in a run that was not entered through a
+          # reusable-workflow call, and an empty `workflow_sha` means nothing
+          # pinned this commit, so both fail here rather than silently running
+          # whatever branch the workflow file came from.
+          if ! printf '%s' "${JOB_WORKFLOW_REPOSITORY:-}" | grep -Eq '^[^/]+/[^/]+$'; then
+            echo "::error::expected the repository holding the pinned Continuum workflow, got '${JOB_WORKFLOW_REPOSITORY:-}'"
+            exit 1
+          fi
+          if ! printf '%s' "${JOB_WORKFLOW_SHA:-}" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::expected a full commit sha for the Continuum engine, got '${JOB_WORKFLOW_SHA:-}'"
+            exit 1
+          fi
+          printf 'repository=%s\n' "$JOB_WORKFLOW_REPOSITORY" >> "$GITHUB_OUTPUT"
+          printf 'sha=%s\n' "$JOB_WORKFLOW_SHA" >> "$GITHUB_OUTPUT"
 
+      # The caller's own code is checked out before this, deliberately. A
+      # checkout cleans its target path, and the engine is an untracked
+      # directory inside the caller's working tree -- so a caller checkout
+      # running after the engine checkout would delete the engine it is about
+      # to need. Leaving this last confines its clean to `engine/`.
+      - name: Check out the pinned Continuum engine
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ steps.engine.outputs.repository }}
+          ref: ${{ steps.engine.outputs.sha }}
+          path: engine
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Refuse anything but the pinned Continuum engine
+        shell: bash
+        env:
+          ENGINE_ROOT: ${{ github.workspace }}/engine
+          ENGINE_SHA: ${{ steps.engine.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # The engine has to be the pinned commit *and* carry every file the
+          # surfaces below it import or execute, so a partial engine stops here
+          # instead of part way through a privileged run.
+          python3 "$ENGINE_ROOT/.github/scripts/continuum_engine.py" assert \
+            --root "$ENGINE_ROOT" --expect-sha "$ENGINE_SHA"
+          printf 'CONTINUUM_ENGINE_ROOT=%s\n' "$ENGINE_ROOT" >> "$GITHUB_ENV"
       - name: Re-verify the dispatch against the live pull request
         id: dispatch
         env:
@@ -238,9 +354,66 @@ jobs:
       issues: write
       pull-requests: write
     steps:
-      - name: Load Continuum engine
-        uses: kodmial/continuum/.github/actions/engine-path@81adcea69ce9c260f1aad4177867f8449a75d9b3
+      - name: Resolve the pinned Continuum engine
+        id: engine
+        shell: bash
+        env:
+          JOB_WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          # A consumer selects Continuum with one literal reference in the
+          # caller's `jobs.<job_id>.uses`, and `job.workflow_sha` is the commit of
+          # *this* file -- so this is the release the consumer pinned, not a
+          # revision chosen here. A branch, a default, or an input any caller
+          # could set would each let the graph and the code it runs come from
+          # different Continuum revisions, which is the whole property that one
+          # release reference exists to guarantee.
+          #
+          # `job.workflow_repository` is the repository this file came from, so
+          # the engine is checked out from there rather than from a name written
+          # into this file. It is empty in a run that was not entered through a
+          # reusable-workflow call, and an empty `workflow_sha` means nothing
+          # pinned this commit, so both fail here rather than silently running
+          # whatever branch the workflow file came from.
+          if ! printf '%s' "${JOB_WORKFLOW_REPOSITORY:-}" | grep -Eq '^[^/]+/[^/]+$'; then
+            echo "::error::expected the repository holding the pinned Continuum workflow, got '${JOB_WORKFLOW_REPOSITORY:-}'"
+            exit 1
+          fi
+          if ! printf '%s' "${JOB_WORKFLOW_SHA:-}" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::expected a full commit sha for the Continuum engine, got '${JOB_WORKFLOW_SHA:-}'"
+            exit 1
+          fi
+          printf 'repository=%s\n' "$JOB_WORKFLOW_REPOSITORY" >> "$GITHUB_OUTPUT"
+          printf 'sha=%s\n' "$JOB_WORKFLOW_SHA" >> "$GITHUB_OUTPUT"
 
+      # The caller's own code is checked out before this, deliberately. A
+      # checkout cleans its target path, and the engine is an untracked
+      # directory inside the caller's working tree -- so a caller checkout
+      # running after the engine checkout would delete the engine it is about
+      # to need. Leaving this last confines its clean to `engine/`.
+      - name: Check out the pinned Continuum engine
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ steps.engine.outputs.repository }}
+          ref: ${{ steps.engine.outputs.sha }}
+          path: engine
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Refuse anything but the pinned Continuum engine
+        shell: bash
+        env:
+          ENGINE_ROOT: ${{ github.workspace }}/engine
+          ENGINE_SHA: ${{ steps.engine.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # The engine has to be the pinned commit *and* carry every file the
+          # surfaces below it import or execute, so a partial engine stops here
+          # instead of part way through a privileged run.
+          python3 "$ENGINE_ROOT/.github/scripts/continuum_engine.py" assert \
+            --root "$ENGINE_ROOT" --expect-sha "$ENGINE_SHA"
+          printf 'CONTINUUM_ENGINE_ROOT=%s\n' "$ENGINE_ROOT" >> "$GITHUB_ENV"
       # The contract is repository-controlled and versioned with the code, so it
       # is read from the base branch: a pull request does not get to declare that
       # review is off. Resolving it here rather than accepting a caller boolean

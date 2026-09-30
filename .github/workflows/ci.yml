@@ -45,17 +45,19 @@ jobs:
           curl -fsSL --retry 3 --retry-all-errors "$url" -o "$RUNNER_TEMP/$archive"
           printf '%s  %s\n' "$ACTIONLINT_SHA256" "$RUNNER_TEMP/$archive" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" actionlint
-          "$RUNNER_TEMP/actionlint" -color -ignore 'shellcheck reported issue' -ignore 'property "workflow_sha" is not defined'
-          "$RUNNER_TEMP/actionlint" -color -ignore 'shellcheck reported issue' -ignore 'property "workflow_sha" is not defined' \
+          "$RUNNER_TEMP/actionlint" -color -ignore 'shellcheck reported issue' -ignore 'property "workflow_sha" is not defined' -ignore 'property "workflow_repository" is not defined'
+          "$RUNNER_TEMP/actionlint" -color -ignore 'shellcheck reported issue' -ignore 'property "workflow_sha" is not defined' -ignore 'property "workflow_repository" is not defined' \
             fixtures/consumer-repo/.github/workflows/*.yml
           "$RUNNER_TEMP/actionlint" -color \
             fixtures/provider-consumer/.github/workflows/*.yml
+          "$RUNNER_TEMP/actionlint" -color -ignore 'shellcheck reported issue' -ignore 'property "workflow_sha" is not defined' -ignore 'property "workflow_repository" is not defined' \
+            fixtures/delegation-parent/.github/workflows/*.yml
 
       - name: Enforce MVP active workflow boundary
         shell: bash
         run: |
           set -euo pipefail
-          allowed='^(auto-merge|ci|issue-scheduler|review-gate|review-queue|opencode|opencode-repair|continuum-shadow|consumer-scheduler|consumer-opencode|consumer-repair|consumer-auto-merge|consumer-review-gate|consumer-child-dispatcher|consumer-child-worker|consumer-child-review|consumer-child-pr-review|pr-agent|pr-agent-comment|release-bun-binary)\.ya?ml$'
+          allowed='^(auto-merge|ci|consumer|consumer-scheduler|consumer-opencode|consumer-repair|consumer-auto-merge|consumer-review-gate|consumer-child-dispatcher|consumer-child-worker|consumer-child-review|consumer-child-pr-review|issue-scheduler|review-gate|review-queue|opencode|opencode-repair|continuum-shadow|pr-agent|pr-agent-comment|release-bun-binary)\.ya?ml$'
           bad=0
           while IFS= read -r file; do
             base="$(basename "$file")"

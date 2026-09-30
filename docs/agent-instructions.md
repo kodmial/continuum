@@ -111,9 +111,12 @@ The installer runs in every workflow that starts a model, and nowhere else:
 schedule and dispatch, and never start a model. That is what keeps this list
 finite.
 
-`.github/actions/engine-path/action.yml` requires both the script and the
-canonical document, so a partial engine checkout fails at the action rather than
-part way through an agent run with the policy missing.
+`.github/scripts/continuum_engine.py assert` requires both the script and the
+canonical document, so a partial engine checkout fails at the assertion rather
+than part way through an agent run with the policy missing. It is a script rather
+than a composite action on purpose: GitHub downloads a remote action into its own
+directory, so a composite action could only ever see the copy GitHub made of it
+and not the checkout the next steps import.
 
 ## The guarantees, and their tests
 

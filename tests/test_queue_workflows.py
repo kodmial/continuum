@@ -18,9 +18,7 @@ from continuum.review import queue
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SHARED = ROOT / ".github" / "workflows" / "review-queue.yml"
-CONSUMER = (
-    ROOT / "fixtures" / "consumer-repo" / ".github" / "workflows" / "review-queue.yml"
-)
+CONSUMER = ROOT / "fixtures" / "consumer-repo" / ".github" / "workflows" / "continuum.yml"
 CI = ROOT / ".github" / "workflows" / "ci.yml"
 
 # The reconciler is triggered by `pull_request_target` (trusted metadata, no
@@ -174,10 +172,14 @@ class WakeUpTriggerTests(unittest.TestCase):
             self.assertNotIn("github.event.pull_request.head.ref", line)
 
     def test_the_consumer_entry_delegates_and_stays_thin(self):
+        # One call to the release entrypoint, not a pin to the queue's own
+        # workflow: a consumer has one Continuum dependency, and the pin names
+        # the release rather than one surface inside it.
         self.assertRegex(
             self.consumer,
-            r"uses: kodmial/continuum/\.github/workflows/review-queue\.yml@[0-9a-f]{40}\b",
+            r"uses: kodmial/continuum/\.github/workflows/consumer\.yml@v\d+\.\d+\.\d+\b",
         )
+        self.assertNotIn("review-queue.yml", self.consumer)
         self.assertNotIn("python3 -m continuum", self.consumer)
         # Dispatching a provider gate run needs the token to write actions.
         self.assertIn("actions: write", self.consumer)

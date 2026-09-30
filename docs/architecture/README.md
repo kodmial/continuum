@@ -91,11 +91,19 @@ Continuum release v0.3.0
     +----> release controller
 ```
 
-The top-level `consumer.yml` in Continuum is the release entrypoint. It may route to nested
-reusable workflows inside Continuum. Those internal calls use same-repository relative reusable
-workflow references so GitHub resolves them from the same commit as the running `consumer.yml`.
-Therefore the consumer's single `@vX.Y.Z` pin selects an internally consistent snapshot of the
-entire workflow graph.
+The top-level `consumer.yml` in Continuum is the release entrypoint. It routes to nested
+reusable workflows inside Continuum, one job per surface, selected by the `surface` input.
+Those internal calls use same-repository relative reusable workflow references so GitHub resolves
+them from the same commit as the running `consumer.yml`. Therefore the consumer's single `@vX.Y.Z`
+pin selects an internally consistent snapshot of the entire workflow graph.
+
+Keeping one job per surface is what lets each one carry its own `permissions` block: a nested
+reusable workflow can only narrow the caller's grant, never widen it, so the surface has to be a
+job rather than a branch inside a shared one.
+
+Each surface then resolves its engine from `job.workflow_sha`, which inside a reusable workflow is
+the commit of the file that called it — that is, the consumer's pin, arrived at indirectly. No
+workflow names an engine revision, and no caller can supply one.
 
 Although the implementation is loaded from Continuum, the run belongs to the consumer repository.
 The called reusable workflow receives the caller's GitHub context and operates on the caller

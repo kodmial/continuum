@@ -1,37 +1,40 @@
 name: Continuum scheduler
 
-# Thin fixture entry point: declare the scheduler's wake-up surface in a
-# consumer repository and delegate the dependency-aware dispatch to it.
+# The consumer's own post-merge wake-up: the merge controller hands off to a
+# workflow in *this* repository rather than dispatching one Continuum owns, so
+# this file exists and the merge surface names it.
 #
 # The WIP limit, lease duration and retry budget are repository scheduling
-# policy, not v0.1 configuration: they are declared here, on inputs of the
-# shared controller, because that is where a consumer states them once and
-# Continuum reads them rather than owning a second copy.
+# policy, and they are declared on the shared controller's inputs rather than in
+# a config file Continuum would have to find and parse. They are stated here and
+# in `continuum.yml`, which is the periodic and event-driven wake-up; a test
+# asserts the two agree, because a scheduling policy that differs by wake-up
+# path is a policy nobody can reason about.
 #
 # Continuum never creates the consumer's CI. Each dispatched run lands in the
 # consumer's own repository, and its tests are the consumer's own workflows.
 
 on:
-  schedule:
-    - cron: "*/15 * * * *"
   workflow_dispatch: {}
 
 permissions:
-  actions: write
   contents: read
-  issues: write
-  pull-requests: read
+
+concurrency:
+  group: continuum-review-queue
+  cancel-in-progress: false
 
 jobs:
   schedule:
-    uses: kodmial/continuum/.github/workflows/consumer-scheduler.yml@39ca6dc798f2201390c8fdef0395157f588657ec
+    uses: kodmial/continuum/.github/workflows/consumer.yml@v0.1.0
     permissions:
       actions: write
       contents: read
       issues: write
       pull-requests: read
     with:
-      opencode_workflow: continuum-opencode.yml
+      surface: scheduler
+      opencode_workflow: continuum-agent.yml
       wip_limit: 2
       lease_minutes: 45
       max_attempts: 3

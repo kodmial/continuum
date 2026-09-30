@@ -69,6 +69,15 @@ workflows inside Continuum using same-repository relative references. Those nest
 therefore resolved from the same commit as the selected `consumer.yml`, so the external
 `@v0.3.0` pin selects one internally consistent release snapshot.
 
+"Exactly one pin" means exactly one *version*, not one textual occurrence. A consumer ingress that
+calls several surfaces repeats the identical literal reference, once per job, because each job
+carries its own `permissions` block and a reusable workflow can only narrow the caller's grant.
+Collapsing those calls into a single job to save a duplicated string would force every surface to
+share one grant, which is the larger regression. The rule this ADR enforces is therefore: every
+external Continuum reference in a consumer's repository targets `consumer.yml`, and all of them
+name the same exact release. `continuum_engine.py assert` is the check, and it fails on a second
+version, on a directly pinned surface, and on any floating reference.
+
 Exact patch-level release tags are the standard human-facing pin. Floating references such as
 `@main`, `@v1`, or `@v1.2` are not the standard production version-selection mechanism because
 they can change consumer behavior without an explicit consumer version edit.
@@ -108,11 +117,34 @@ consumer @v0.3.0
     -> consumer now runs v0.3.1
 ```
 
+Because a consumer may spread one dependency over several ingress files — a provider entrypoint and
+a dispatch target are separate files in the same repository — the upgrade is one command over the
+repository rather than one command per file:
+
+```bash
+# Read the release the repository currently selects, across every referencing file.
+.github/scripts/continuum_engine.py pin --repo .
+
+# Upgrade. Only the release references change; the diff is reviewable as the pin itself.
+.github/scripts/continuum_engine.py rewrite --repo . --pin v0.3.1
+
+# Rollback is the same command with the previous release.
+.github/scripts/continuum_engine.py rewrite --repo . --pin v0.3.0
+```
+
+`pin --repo` resolves the value across every referencing file at once and fails if they disagree.
+That check is what makes the upgrade safe to script: a repository left half-upgraded by an
+interrupted change is reported with both releases named, and `rewrite --repo` refuses to touch it
+rather than guessing which half the operator meant. An ambiguous invocation — neither `--repo` nor
+`--ingress`, or both — is refused rather than resolved by preferring a flag.
+
 Tooling may discover or report newer versions, compare compatibility, or prepare an upgrade only
 when explicitly invoked. There is no background automatic repin and no automatic merge caused by
 the existence of a newer Continuum release.
 
-Rollback is the inverse operation: restore the previous exact release pin and validate.
+Rollback is the inverse operation: restore the previous exact release pin and validate. It is the
+same command with the previous release, and it is byte-identical — a rewrite touches the release
+references and nothing else.
 
 ## Configuration boundary
 

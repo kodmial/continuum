@@ -1,23 +1,30 @@
 name: Continuum agent
 
-# Thin fixture entry point: the consumer-owned agent workflow.
+# The consumer's own agent workflow. Continuum dispatches into this file -- the
+# scheduler for a new task, the repair controller for a conflict or a failed
+# gate, and the review controller for the repair leg of the review loop -- so it
+# exists as a separate file from `continuum.yml`: it is a dispatch target rather
+# than an event surface, and dispatch needs a `workflow_call` trigger of its own.
 #
-# This is the workflow Continuum dispatches into -- the scheduler for a new task,
-# the repair controller for a conflict or a failed gate, and the review
-# controller for the repair leg of the review loop. It exists here so a consumer
-# owns the choice of where its agent runs.
+# It carries the same single Continuum pin as every other file in this
+# repository. That is the point of the pin: the surface this dispatches into and
+# the surfaces that dispatch it are one release, and an upgrade changes both in
+# the same deliberate edit.
 #
-# `runner` and `swift_version` are the whole of that choice. They are inputs of
-# this file, not of Continuum: a repository that compiles and tests a particular
-# platform sets them once, in its own copy, and no platform, language, or vendor
-# name appears anywhere in the shared controller. Leaving them unset gives the
-# shared default, which is a Linux runner with no language toolchain.
+# `runner` and `swift_version` are the whole of what a consumer states about
+# where its agent runs. They are inputs of this file, not of Continuum: a
+# repository that compiles and tests a particular platform sets them once, here,
+# and no platform, language, or vendor name appears anywhere in the shared
+# controller. Leaving them unset gives the shared default, which is a Linux
+# runner with no language toolchain.
 #
 # `review-fix` is one of the four dispatch modes below, alongside `issue`,
 # `resolve-conflict`, and `ci-fix`. It is generic: which reviewer produced the
 # findings never reaches this file.
 
 on:
+  # The controllers dispatch into this workflow, so it has to be dispatchable
+  # with exactly the inputs they send and nothing else.
   workflow_call:
     inputs:
       mode:
@@ -56,8 +63,6 @@ on:
         required: false
         default: opencode/big-pickle
 
-  # The controllers dispatch into this workflow, so it has to be dispatchable
-  # with exactly the inputs they send and nothing else.
   workflow_dispatch:
     inputs:
       mode:
@@ -93,15 +98,14 @@ permissions:
 
 jobs:
   agent:
-    uses: kodmial/continuum/.github/workflows/consumer-opencode.yml@39ca6dc798f2201390c8fdef0395157f588657ec
+    uses: kodmial/continuum/.github/workflows/consumer.yml@v0.1.0
     permissions:
       actions: read
       contents: write
       issues: write
       pull-requests: write
-    secrets:
-      OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
     with:
+      surface: agent
       mode: ${{ inputs.mode }}
       issue_number: ${{ inputs.issue_number }}
       pr_number: ${{ inputs.pr_number }}
@@ -111,3 +115,5 @@ jobs:
       runner: ${{ inputs.runner }}
       swift_version: ${{ inputs.swift_version }}
       model: ${{ inputs.model }}
+    secrets:
+      OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}

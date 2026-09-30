@@ -4,17 +4,17 @@
 # tests (test_fixture_consumer.py) to prove the adapter contracts:
 #   - a validated .continuum.yml that selects review.provider: pr-agent and
 #     configures the review queue's labels, ordering, and shared slot;
-#   - the entry workflows of the two-boolean contract: review.yml declares the
-#     review loop's wake-ups and delegates every decision to the reusable
-#     controller, which resolves `review` from .github/continuum.yml;
-#   - a thin queue entry workflow (review-queue.yml) that declares the queue's
-#     event surface and calls kodmial/continuum/.github/workflows/review-queue.yml.
+#   - one release entrypoint (continuum.yml) that declares the event surface
+#     and calls kodmial/continuum/.github/workflows/consumer.yml at a single
+#     exact release, which routes every surface in the graph;
+#   - the thin ingress files for the surfaces that are dispatched rather than
+#     triggered, each calling that same release.
 # All values below are *names* of repository variables and secrets, never the
 # endpoint, model, or credential itself.
 #
-# The workflow that calls the provider itself is not here: review.yml names no
+# The workflow that calls the provider itself is not here: the ingress names no
 # reviewer and no switch. A repository that adopts review.provider wires the
-# names below onto kodmial/continuum/.github/workflows/pr-agent.yml, and
+# names below onto Continuum's provider surface through `surface: provider`, and
 # fixtures/provider-consumer/ is that repository.
 
 version: 1

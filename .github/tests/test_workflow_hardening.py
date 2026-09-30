@@ -85,6 +85,12 @@ AGENT_PLANE = (
 #: reason and for no other: it never executes pull request code, and the
 #: provider tripwire below grants it its exception by name.
 #:
+#: `consumer.yml` is the release entrypoint, so it selects the other
+#: implementations rather than implementing anything itself. It is here for the
+#: same reason the shared implementations are: it is entered through
+#: `workflow_call` by the consumer's own entry workflow, holds no token of its
+#: own, and never executes code.
+#:
 #: The list is spelled out rather than derived, and `AuditScopeTests` asserts it
 #: is exactly the complement of `AGENT_PLANE`, so a workflow cannot enter this
 #: directory - or leave the agent plane - without a reviewer deciding so.
@@ -94,6 +100,7 @@ AGENT_PLANE = (
 #: references, strict shell mode, no residue of the disabled CodeRabbit path,
 #: and a tokenless privileged checkout.
 NOT_AGENT_PLANE = (
+    "consumer.yml",
     "consumer-auto-merge.yml",
     "consumer-child-dispatcher.yml",
     "consumer-child-pr-review.yml",
@@ -341,16 +348,50 @@ class UntrustedEventTests(WorkflowAuditBase):
 
 
 class PermissionsTests(WorkflowAuditBase):
+    #: The reusable workflows that hold write authority without naming it here.
+    #:
+    #: Permissions can only be narrowed along a reusable-workflow call chain, so
+    #: a `permissions:` block on a router is an upper bound on every surface it
+    #: calls -- `read-all` on a merge surface that needs `contents: write` would
+    #: silently stop merges rather than announce the conflict. `consumer.yml`
+    #: routes all twelve surfaces, so declaring a scope at all would have to
+    #: name the union of them, which is exactly the over-grant this repository
+    #: does not make. Each routed surface declares its own least-privilege
+    #: scopes instead, and the consumer's ingress grants each call what that
+    #: surface needs.
+    PERMISSION_EXEMPT_ROUTERS = ("consumer.yml",)
+
     def test_every_workflow_declares_permissions_explicitly(self):
         # The implicit default is read/write for a new workflow; relying on it
         # is how a workflow silently becomes privileged later.
         for name, document in self.workflows.items():
+            if name in self.PERMISSION_EXEMPT_ROUTERS:
+                self.assertNotIn(
+                    "permissions",
+                    document,
+                    "{} is a router, so a scope here would narrow every surface it "
+                    "calls; the routed surfaces declare their own".format(name),
+                )
+                continue
             self.assertIn("permissions", document, name)
             self.assertNotEqual(
                 permission_map(document.get("permissions")).get("*"),
                 "write-all",
                 name,
             )
+
+    def test_the_permission_exempt_router_grants_nothing_itself(self):
+        # The exemption is for the declaration, not for a way around it: the
+        # router runs no step, so there is no place a permission could apply.
+        for name in self.PERMISSION_EXEMPT_ROUTERS:
+            document = self.workflows[name]
+            self.assertEqual(trigger_names(document), ["workflow_call"])
+            for job_name, job in (document.get("jobs") or {}).items():
+                self.assertEqual(
+                    steps_of(job),
+                    [],
+                    "{}/{} must delegate rather than run a step".format(name, job_name),
+                )
 
     def test_ci_fix_step_never_runs_for_conflict_repair_dispatch(self):
         document = self.agent_plane()["opencode.yml"]
@@ -895,7 +936,7 @@ class RepairControllerTests(WorkflowAuditBase):
         self.assertIn("Infrastructure retry", repair)
         self.assertIn("semantic attempt budget remains untouched", repair)
         self.assertLess(
-            repair.index("Load Continuum engine", repair.index("issue-run-recovery:")),
+            repair.index("Resolve the pinned Continuum engine", repair.index("issue-run-recovery:")),
             repair.index("failure_retry.py", repair.index("issue-run-recovery:")),
         )
 
@@ -1173,10 +1214,17 @@ class ConsumerReviewSurfaceTests(WorkflowAuditBase):
 
     def test_the_review_gate_never_checks_out_pull_request_code(self):
         job = self.job("consumer-review-gate.yml", "gate")
+        # The only checkout it may make is the pinned engine, and that lands in
+        # `engine/` -- never the caller's tree, and never a pull request's. The
+        # candidate itself is read through the API from the base branch.
         self.assertEqual(
-            [s for s in steps_of(job) if uses(s, "actions/checkout")], []
+            [
+                s
+                for s in steps_of(job)
+                if uses(s, "actions/checkout") and (s.get("with") or {}).get("path") != "engine"
+            ],
+            [],
         )
-        # Everything it needs is read through the API from the base branch.
         self.assertEqual(job_permissions(self.workflows["consumer-review-gate.yml"], job)["contents"], "read")
 
 
@@ -1553,6 +1601,133 @@ class ReviewProviderSurfaceTests(WorkflowAuditBase):
                     if not uses(step, "actions/checkout"):
                         continue
                     self.assertNotIn("ref", (step.get("with") or {}))
+
+
+class EnginePinTests(WorkflowAuditBase):
+    """One pin has to select the whole graph, and it can only do that if every
+    surface that loads the engine loads *that* engine.
+
+    A consumer names `consumer.yml` at one exact release. `consumer.yml` reaches
+    the surfaces below it through same-repository relative references, which
+    GitHub resolves from the commit of the file that names them -- so
+    `job.workflow_sha` inside a surface is the consumer's pin, arrived at
+    indirectly. Anything else -- a `default: main`, an `engine_ref` input, a
+    literal repository name the caller cannot change -- is a second way to choose
+    the revision, and that is the property the pin exists to remove.
+    """
+
+    #: The surfaces a consumer reaches, and the job in each that runs privileged
+    #: work. Every one of them has to agree on where the engine comes from.
+    CONSUMER_SURFACES = (
+        ("consumer-opencode.yml", "opencode"),
+        ("consumer-review-gate.yml", "gate"),
+        ("consumer-auto-merge.yml", "contract"),
+        ("consumer-repair.yml", "conflict-bounds"),
+        ("consumer-child-dispatcher.yml", "dispatch"),
+        ("consumer-child-worker.yml", "execute"),
+        ("consumer-child-review.yml", "review"),
+        ("consumer-child-pr-review.yml", "review"),
+    )
+
+    def engine_jobs(self, name):
+        """The jobs in a workflow that load the engine, which is every job that
+        sets `CONTINUUM_ENGINE_ROOT`."""
+        found = []
+        for job_name, job in (self.workflows[name].get("jobs") or {}).items():
+            for step in steps_of(job):
+                if "CONTINUUM_ENGINE_ROOT" in run_text(step):
+                    found.append(job_name)
+                    break
+        return found
+
+    def test_every_engine_loading_job_resolves_it_from_the_pinned_commit(self):
+        for name, sample in self.CONSUMER_SURFACES:
+            jobs = self.engine_jobs(name)
+            self.assertTrue(jobs, "{} never loads the engine".format(name))
+            for job_name in jobs:
+                with self.subTest(workflow=name, job=job_name):
+                    job = self.job(name, job_name)
+                    resolve = self.step_matching(job, "JOB_WORKFLOW_SHA")
+                    self.assertIsNotNone(
+                        resolve,
+                        "{}/{} loads the engine without resolving a commit".format(
+                            name, job_name
+                        ),
+                    )
+                    environment = json.dumps(resolve.get("env") or {})
+                    self.assertIn("${{ job.workflow_sha }}", environment)
+                    self.assertIn("${{ job.workflow_repository }}", environment)
+                    # A ref that is not a full commit sha would be a second
+                    # version selector, resolved at run time.
+                    self.assertIn("^[0-9a-f]{40}$", run_text(resolve))
+
+    def test_the_engine_repository_is_never_written_into_a_workflow(self):
+        # The checkout takes the repository the workflow file came from, so the
+        # engine is whatever release the pin selected even in a fork, and no
+        # workflow can point at a different one by editing a string. A literal
+        # repository name here would also break the pin in a fork, which calls
+        # `consumer.yml` from its own commit.
+        #
+        # The two workflows that do write it are deliberately outside this set:
+        # `pr-agent.yml` is an independently pinnable provider surface, and
+        # `continuum-shadow.yml` is hand-dispatched with no caller pin to
+        # inherit. Both name a release, so neither is a hidden selector.
+        for name, _job in self.CONSUMER_SURFACES:
+            with self.subTest(workflow=name):
+                self.assertNotIn("repository: kodmial/continuum", self.raw[name])
+
+    def test_no_caller_can_choose_the_engine_revision(self):
+        for name, _sample in self.CONSUMER_SURFACES:
+            with self.subTest(workflow=name):
+                self.assertNotIn("engine_ref", self.raw[name])
+
+    def test_the_engine_is_asserted_complete_before_anything_uses_it(self):
+        # A partial engine has to stop here, not half way through a privileged
+        # run with half the policy missing.
+        for name, job_name in self.CONSUMER_SURFACES:
+            with self.subTest(workflow=name, job=job_name):
+                job = self.job(name, job_name)
+                steps = steps_of(job)
+                checkout = next(
+                    index
+                    for index, step in enumerate(steps)
+                    if uses(step, "actions/checkout")
+                    and (step.get("with") or {}).get("path") == "engine"
+                )
+                verification = next(
+                    index
+                    for index, step in enumerate(steps)
+                    if "continuum_engine.py" in run_text(step)
+                )
+                self.assertLess(
+                    checkout, verification, "the engine is verified before it is checked out"
+                )
+                self.assertIn("--expect-sha", run_text(steps[verification]))
+                # And nothing after the checkout may clean the workspace, or the
+                # engine the next steps import would already be gone.
+                for step in steps[checkout + 1 :]:
+                    if uses(step, "actions/checkout"):
+                        self.assertEqual(
+                            (step.get("with") or {}).get("path"),
+                            "engine",
+                            "{}/{} cleans the workspace after the engine "
+                            "checkout".format(name, job_name),
+                        )
+
+    def test_the_release_entrypoint_routes_with_same_repository_references(self):
+        router = self.workflows["consumer.yml"]
+        self.assertEqual(trigger_names(router), ["workflow_call"])
+        for job_name, job in (router.get("jobs") or {}).items():
+            with self.subTest(job=job_name):
+                self.assertTrue(job["uses"].startswith("./.github/workflows/"))
+                # A ref here would pin the call to something other than the
+                # commit of `consumer.yml`, which is what the consumer's pin is.
+                self.assertNotIn("@", job["uses"])
+                # And the call is selected by `surface`, so a consumer names a
+                # capability rather than a file in Continuum's own directory.
+                self.assertEqual(
+                    job.get("if"), "inputs.surface == '{}'".format(job_name)
+                )
 
 
 class DelegatedChildLivenessTests(WorkflowAuditBase):
