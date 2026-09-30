@@ -843,6 +843,15 @@ class RepairControllerTests(WorkflowAuditBase):
         self.assertIn("merge-plan", text)
         self.assertNotIn("head.repo?.full_name !== ", text)
 
+    def test_consumer_merge_reconciliation_is_single_flight(self):
+        job = self.job("consumer-auto-merge.yml", "merge")
+        concurrency = job.get("concurrency") or {}
+        self.assertEqual(
+            concurrency.get("group"),
+            "continuum-auto-merge-${{ github.repository }}",
+        )
+        self.assertFalse(concurrency.get("cancel-in-progress"))
+
     def test_repair_controller_has_no_human_stop_for_agent_repairs(self):
         text = self.raw["opencode-repair.yml"]
         self.assertNotIn("flag-human", text)
@@ -850,6 +859,13 @@ class RepairControllerTests(WorkflowAuditBase):
         self.assertNotIn("privilege_boundary_change", text)
         self.assertIn("--mode resolve-conflict", text)
         self.assertIn("--mode ci-fix", text)
+
+    def test_consumer_repair_uses_attempt_budget_not_persistent_failure_label(self):
+        text = self.raw["consumer-repair.yml"]
+        self.assertNotIn("opencode-repair-failed", text)
+        self.assertIn("MAX_ATTEMPTS", text)
+        self.assertIn("REPAIR_BUDGET_MINUTES", text)
+        self.assertIn("--remove-label \"$LABEL\"", text)
 
     def test_merge_titles_are_sanitized(self):
         text = self.raw["auto-merge.yml"]

@@ -32,6 +32,16 @@ on:
         type: string
         required: false
         default: ""
+      runner:
+        description: "GitHub-hosted runner label for the consumer execution environment"
+        type: string
+        required: false
+        default: ubuntu-latest
+      swift_version:
+        description: "Optional Swift toolchain version required by the consumer; empty disables Swift setup"
+        type: string
+        required: false
+        default: ""
       model:
         type: string
         required: false
@@ -104,7 +114,7 @@ permissions:
 jobs:
   opencode:
     if: contains(fromJSON('["issue","resolve-conflict","ci-fix"]'), inputs.mode)
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     # Conflict repair repairs a change that already exists, so it is bounded by
     # its own small constant rather than inheriting the source task's runtime.
     # That separation is what keeps a long task from deciding how long
@@ -124,6 +134,19 @@ jobs:
       BASE_BRANCH: ${{ inputs.base_branch }}
 
     steps:
+      - name: Install requested Swift toolchain
+        if: inputs.swift_version != ''
+        uses: swift-actions/setup-swift@7ca6abe6b3b0e8b5421b88be48feee39cbf52c6a
+        with:
+          swift-version: ${{ inputs.swift_version }}
+
+      - name: Verify requested Swift toolchain
+        if: inputs.swift_version != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          swift --version
+
       - name: Record issue execution ownership
         if: inputs.mode == 'issue'
         shell: bash
