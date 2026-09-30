@@ -93,12 +93,10 @@ class TheRepairLockIsAgeChecked(unittest.TestCase):
             "An unreadable age reads as a held lock", body
         )
 
-    def test_a_released_lock_is_labelled_so_the_failure_is_visible(self):
-        # The wedge is silent because the job is green. A label saying the repair
-        # made no progress is what turns a green no-op into something a maintainer
-        # can see.
+    def test_a_released_lock_does_not_create_persistent_failure_state(self):
         _, _, body = self.dispatch[0]
-        self.assertIn("opencode-repair-failed", body)
+        self.assertNotIn("opencode-repair-failed", body)
+        self.assertIn("--remove-label", body)
 
     def test_the_budget_is_resolved_once_not_spelled_out_per_step(self):
         document = _load(REPAIR)
@@ -157,14 +155,17 @@ class TheDispatchCanBeRetried(unittest.TestCase):
         self.assertIn("opencode_runtime.py", self.raw)
         self.assertRegex(self.raw, r"install.{0,80}", re.S)
 
-    def test_no_workflow_claims_a_product_toolchain(self):
-        # The mechanism is adoptable by a repository that has none of these, and a
-        # generic workflow that names one is a workflow that cannot be shared.
-        for path in (REPAIR, OPENCODE):
-            text = path.read_text(encoding="utf-8").lower()
-            with self.subTest(workflow=path.name):
-                for word in ("nanodictate", "swift", "xcode", "swiftlint", "cocoa"):
-                    self.assertNotIn(word, text)
+    def test_platform_capability_is_generic_not_consumer_specific(self):
+        repair = REPAIR.read_text(encoding="utf-8").lower()
+        opencode = OPENCODE.read_text(encoding="utf-8").lower()
+        for text in (repair, opencode):
+            self.assertNotIn("nanodictate", text)
+            self.assertNotIn("swiftlint", text)
+            self.assertNotIn("cocoa", text)
+        self.assertIn("runner:", opencode)
+        self.assertIn("swift_version:", opencode)
+        self.assertIn("inputs.runner", opencode)
+        self.assertIn("inputs.swift_version", opencode)
 
 
 if __name__ == "__main__":
