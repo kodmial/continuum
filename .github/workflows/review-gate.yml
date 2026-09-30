@@ -118,6 +118,7 @@ jobs:
           # Read-only on purpose. Resolving the target must not be able to
           # change what it resolves.
           GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           AUTOMATION_TRUSTED_ACTORS: ${{ vars.AUTOMATION_TRUSTED_ACTORS }}
           CONTINUUM_BASE_BRANCH: ${{ github.event.repository.default_branch }}
