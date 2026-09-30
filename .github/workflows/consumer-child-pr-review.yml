@@ -67,7 +67,7 @@ jobs:
           set -euo pipefail
           [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::Invalid pull request number."; exit 2; }
 
-          CONTINUUM_ENGINE_ROOT="$GITHUB_WORKSPACE/.continuum-engine"
+          export CONTINUUM_ENGINE_ROOT="$GITHUB_WORKSPACE/.continuum-engine"
           export PYTHONPATH="$CONTINUUM_ENGINE_ROOT/src"
           resolver="$CONTINUUM_ENGINE_ROOT/.github/scripts/delegation_repository.sh"
           child_repo="$(
