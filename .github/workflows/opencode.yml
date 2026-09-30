@@ -941,14 +941,42 @@ jobs:
             freeze_original=true
           fi
 
-          # The episode marker is the durable record. The watchdog reads it to
-          # tell a live repair from an abandoned one, and the attempt counter
-          # it carries is what bounds retries.
+          # The episode marker is the durable record. Infrastructure-only
+          # failures explicitly cancel the semantic charge for this attempt.
+          failure_class="${REPAIR_FAILURE_CLASS:-${RUNTIME_FAILURE_CLASS:-none}}"
+          failure_code="${REPAIR_FAILURE_CODE:-${RUNTIME_FAILURE_CODE:-none}}"
+          infra_retry_marker=""
+          infra_retry_note=""
+          infra_retry_exhausted=false
+
           if [[ "$resolved" == "1" ]]; then
             episode_state=resolved
+          elif [[ "$failure_class" == "transient_infra" ]]; then
+            episode_state=infra_failed
+            gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100" \
+              --jq '.[].body // ""' \
+              | python3 "$CONTINUUM_FAILURE_RETRY_HELPER" state \
+              > "$RUNNER_TEMP/conflict-infra-state.env"
+            source "$RUNNER_TEMP/conflict-infra-state.env"
+
+            if [[ "$infra_retry_exhausted" == "true" || "${infra_retry_attempts:-0}" -ge 8 ]]; then
+              infra_retry_exhausted=true
+              infra_retry_marker="<!-- continuum-infra-retry-exhausted -->"
+              infra_retry_note="Infrastructure retry budget 8/8 is exhausted; semantic repair attempts remain unchanged."
+            else
+              next_infra_attempt=$(( ${infra_retry_attempts:-0} + 1 ))
+              python3 "$CONTINUUM_FAILURE_RETRY_HELPER" schedule \
+                --attempt "$next_infra_attempt" \
+                --seed "pr-$PR_NUMBER-run-$GITHUB_RUN_ID-$failure_code" \
+                > "$RUNNER_TEMP/conflict-infra-retry.env"
+              source "$RUNNER_TEMP/conflict-infra-retry.env"
+              infra_retry_marker="<!-- continuum-infra-retry: attempt=$next_infra_attempt next_retry_at=$next_retry_at code=$failure_code run=$GITHUB_RUN_ID -->"
+              infra_retry_note="Infrastructure retry $next_infra_attempt/8 is eligible at $next_retry_at; it does not consume the semantic 3-attempt budget."
+            fi
           else
             episode_state=failed
           fi
+
           marker="$(python3 "$CONTINUUM_CONFLICT_REPAIR_HELPER" render-marker \
             --episode "$REPAIR_EPISODE" \
             --pr-number "$PR_NUMBER" \
@@ -957,10 +985,14 @@ jobs:
             --state "$episode_state")"
 
           {
-            printf '%s\n' "Conflict repair of this pull request ran the \`$REPAIR_ACTION\` rung and finished with outcome \`$outcome\`."
+            printf '%s\n' "Conflict repair of this pull request ran the $REPAIR_ACTION rung and finished with outcome $outcome."
             printf '%s\n' "Existing commits preserved: $preserved. The source issue was not re-executed."
             if [[ -n "$marker" ]]; then
               printf '%s\n' "$marker"
+            fi
+            if [[ -n "$infra_retry_marker" ]]; then
+              printf '%s\n' "$infra_retry_marker"
+              printf '%s\n' "$infra_retry_note"
             fi
           } | gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file - \
             || echo "::warning::Could not record the conflict-repair outcome on PR #$PR_NUMBER."
