@@ -94,8 +94,34 @@ def _forced_findings(snapshot: ProviderSnapshot) -> List[Dict[str, Any]]:
 
 
 def _merge_current(current: List[Dict[str, Any]], forced: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Current-HEAD findings, with the verdict's prose restatements folded in.
+
+    A provider reports the same item twice whenever it both raises an inline
+    thread and lists it in the review body: once with a file and line, once as
+    prose. Both are merged here by id, but the two ids differ because only the
+    located one carries a location, so the prose copy would survive as a second
+    finding for one issue.
+
+    A forced finding has no location at all, so it can never be the *only*
+    record of an issue that a located finding already describes. Dropping it when
+    the title matches keeps one issue one identity — which is what the repair
+    batch is keyed on, so a duplicate would hand the agent the same problem twice.
+    Two located findings that share a title are left alone: their files differ,
+    so they really are two things to fix.
+    """
+
     known = {finding["id"] for finding in current}
-    merged = list(current) + [finding for finding in forced if finding["id"] not in known]
+    located_titles = {
+        str(finding.get("title") or "").strip()
+        for finding in current
+        if str(finding.get("file") or "")
+    }
+    merged = list(current) + [
+        finding
+        for finding in forced
+        if finding["id"] not in known
+        and str(finding.get("title") or "").strip() not in located_titles
+    ]
     merged.sort(key=lambda finding: finding["id"])
     return merged
 
@@ -224,7 +250,7 @@ def run_gate(
 
     files = client.list_pull_files(int(pr_number))
     issue_comments = client.list_issue_comments(int(pr_number))
-    _existing, state = load_tracker(issue_comments, trusted_logins=_trusted_logins(config))
+    _existing, state = load_tracker(issue_comments, trusted_logins=trusted_logins(config))
 
     snapshot = registry.collect_snapshot(
         provider_name, client, pr_number, head, settings, apply=apply
@@ -253,13 +279,37 @@ def run_gate(
     return result
 
 
-def _trusted_logins(config: ContinuumConfig) -> Sequence[str]:
-    """Identities allowed to author a tracker comment."""
+def automation_logins() -> Sequence[str]:
+    """Identities Continuum itself writes state as.
+
+    This is the narrower set: the accounts the engine's own credentials publish
+    under. It is separated from `trusted_logins` because the two are not
+    interchangeable. A review verdict resolved by the review provider is
+    legitimate review state and the provider bot may author it. An agent
+    instruction is not: it becomes the literal text a privileged model executes
+    with a write-capable credential, so only the engine's own identity may
+    write one. A provider's findings are untrusted data by construction, which is
+    the same reason they are fenced when they are quoted into a prompt.
+    """
+
+    return ("github-actions[bot]", "github-actions")
+
+
+def trusted_logins(config: ContinuumConfig) -> Sequence[str]:
+    """Identities allowed to author Continuum's own review state.
+
+    The tracker comment, the verdict comment, and the repair ledger are all
+    state the gate trusts on the next run, so the set of identities allowed to
+    author them is resolved once here and reused by every writer and reader.
+    """
 
     settings = config.review.provider_settings()
-    logins = ["github-actions[bot]", "github-actions"]
+    logins = list(automation_logins())
+    bot_login = getattr(settings, "bot_login", "")
     if isinstance(settings, PrAgentSettings):
         logins.append(settings.bot_login)
+    elif isinstance(bot_login, str) and bot_login:
+        logins.append(bot_login)
     return tuple(dict.fromkeys(logins))
 
 

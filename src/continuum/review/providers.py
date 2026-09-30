@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 
 from .. import config as config_module
 from . import coderabbit, pr_agent
+from . import repair
 from .snapshot import ProviderSnapshot
 
 PR_AGENT = config_module.PROVIDER_PR_AGENT
@@ -198,4 +199,28 @@ def provider_covers_head(
     return any(
         (review.get("commit_id") or "").lower() == (head or "").lower()
         for review in reviews or []
+    )
+
+
+def repair_port(name: str) -> repair.RepairPort:
+    """The provider-shaped half of the generic review-repair contract.
+
+    Every adapter returns a port; an adapter with nothing to build returns a port
+    with empty builders, which makes the contract answer "wait" instead of
+    pretending it asked the provider for something. That is the honest degradation
+    for a provider whose repair surface has not been ported yet.
+    """
+
+    if name == CODERABBIT:
+        return repair.RepairPort(
+            provider=CODERABBIT,
+            verification_body=coderabbit.verification_body,
+            full_review_body=coderabbit.full_review_body,
+            historical_verification_markers=coderabbit.HISTORICAL_VERIFICATION_MARKERS,
+            historical_rereview_markers=coderabbit.HISTORICAL_REREVIEW_MARKERS,
+        )
+    if name == PR_AGENT:
+        return repair.RepairPort(provider=PR_AGENT)
+    raise UnsupportedProvider(
+        f"Unsupported review provider {name!r}; supported: {', '.join(supported_providers())}"
     )

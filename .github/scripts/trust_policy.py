@@ -88,7 +88,13 @@ AGENT_BRANCH_RE = re.compile(
 
 #: Repair dispatch modes. Each one implies a checkout of a specific same-repository
 #: branch, so each one requires a verified pull request before anything runs.
-ALLOWED_DISPATCH_MODES = ("resolve-conflict", "ci-fix")
+#:
+#: ``review-fix`` repairs the open review findings of an already-verified pull
+#: request. It is named generically on purpose: the merge core and this policy
+#: must not branch on which provider produced a finding, so a provider-specific
+#: name such as ``coderabbit-fix`` is not in the allowlist and cannot be added
+#: without a policy change.
+ALLOWED_DISPATCH_MODES = ("resolve-conflict", "ci-fix", "review-fix")
 
 #: Modes that need a run id to inspect.
 MODES_REQUIRING_RUN_ID = ("ci-fix",)

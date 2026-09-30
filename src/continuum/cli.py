@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 from typing import Any, Dict, Optional, Sequence
 
@@ -22,6 +23,8 @@ from .review import gate as gate_module
 from .review import github as github_module
 from .review import llm as llm_module
 from .review import providers as providers_module
+from .review import reconcile as reconcile_module
+from .review import repair as repair_module
 from .review import queue as queue_module
 from .review import queue_controller as queue_controller_module
 from .review import verify as verify_module
@@ -241,6 +244,178 @@ def _emit_result(result: Dict[str, Any], args: argparse.Namespace) -> None:
             f"::warning::Review gate is closed: {result.get('verdict')} "
             f"({result.get('state')}) — {result.get('reason')}"
         )
+
+
+def cmd_reconcile_review(args: argparse.Namespace) -> int:
+    """Close the review loop: evaluate the gate and perform its next action.
+
+    This is the entrypoint a review-aware workflow calls on every wake-up. With
+    review disabled it resolves the configuration and returns without touching
+    the pull request, which is what makes `review: false` cost zero traffic.
+    """
+
+    try:
+        config = _load_config(args.config, required=not args.allow_missing)
+    except config_module.ConfigError as exc:
+        print(f"::error::{exc}")
+        return EXIT_ERROR
+
+    if not config.review.enabled:
+        plan = reconcile_module.disabled_plan(config, args.pr, args.head or "")
+        _emit_review_plan(plan, args)
+        return EXIT_OK
+
+    client = _client()
+    limits = repair_module.RepairPolicy(
+        max_attempts_per_head=args.max_attempts_per_head,
+        max_attempts_per_finding=args.max_attempts_per_finding,
+        max_rereviews_per_head=args.max_rereviews,
+        max_batch_size=args.max_batch_size,
+        agent_timeout_minutes=args.agent_timeout_minutes,
+    )
+    dispatch = _agent_dispatch(client) if args.dispatch_workflow else None
+    try:
+        plan = reconcile_module.reconcile(
+            client,
+            config,
+            args.pr,
+            head_sha=args.head,
+            apply=not args.no_apply,
+            policy=limits,
+            dispatch=dispatch,
+            dispatch_workflow=args.dispatch_workflow or "",
+            dispatch_ref=args.dispatch_ref or "",
+        )
+    except (
+        reconcile_module.ReconcileError,
+        gate_module.GateError,
+        providers_module.UnsupportedProvider,
+    ) as exc:
+        # Fail closed: the gate was not published, so the merge controller sees
+        # no green review gate for this HEAD and refuses to merge.
+        print(f"::error::Review reconciliation failed: {exc}")
+        return EXIT_ERROR
+    except github_module.GitHubError as exc:
+        print(f"::error::Review reconciliation could not complete: {exc}")
+        return EXIT_ERROR
+
+    _emit_review_plan(plan, args)
+    return EXIT_OK
+
+
+def _agent_dispatch(client: Any) -> Any:
+    """Dispatch the agent workflow for a bounded review repair.
+
+    The workflow file, its ref, the pull-request number, and the head ref are all
+    decided inside the review controller, which reads the head ref from the live
+    pull request. Nothing here accepts a caller-supplied ref.
+    """
+
+    def dispatch(workflow: str, ref: str, inputs: Dict[str, str]) -> None:
+        client.dispatch_workflow(workflow, ref, inputs)
+
+    return dispatch
+
+
+def _emit_review_plan(plan: Dict[str, Any], args: argparse.Namespace) -> None:
+    repair = plan.get("repair") or {}
+    for line in _review_plan_notices(plan):
+        print(line)
+    _print_json(plan)
+    _write_output(
+        {
+            "review_enabled": str(bool(plan.get("enabled"))).lower(),
+            "action": str(repair.get("action") or ""),
+            "verdict": str(plan.get("verdict") or ""),
+            "gate_passed": "true" if plan.get("gate_passed") else "false",
+            "paused": "true" if repair.get("paused") else "false",
+            "dispatched": "true" if plan.get("dispatched") else "false",
+            "requests_sent": str(plan.get("requests_sent", 0)),
+            "head": str(plan.get("head") or ""),
+        }
+    )
+    if getattr(args, "out", None):
+        with open(args.out, "w", encoding="utf-8") as handle:
+            json.dump(plan, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+    if getattr(args, "prompt_out", None) and plan.get("agent_prompt"):
+        with open(args.prompt_out, "w", encoding="utf-8") as handle:
+            handle.write(str(plan["agent_prompt"]))
+            handle.write("\n")
+
+
+def _review_plan_notices(plan: Dict[str, Any]) -> list:
+    """Operator-facing lines. Every value here comes from the engine's decision."""
+
+    if not plan.get("enabled"):
+        return ["::notice::Review is disabled by configuration; no review traffic was generated."]
+    repair = plan.get("repair") or {}
+    action = str(repair.get("action") or "")
+    head = str(plan.get("head") or "")
+    notices = [
+        "::notice::Review action {action} on HEAD {head} (verdict {verdict}, "
+        "{open} open finding(s)).".format(
+            action=action,
+            head=head[:12],
+            verdict=plan.get("verdict") or "",
+            open=plan.get("open_findings", 0),
+        )
+    ]
+    if action == repair_module.ACTION_PAUSE:
+        notices.append(f"::error::Review repair paused: {repair.get('reason')}")
+    elif action == repair_module.ACTION_REPAIR:
+        notices.append("::notice::Dispatching a bounded review repair for this pull request.")
+    return notices
+
+
+def cmd_review_prompt(args: argparse.Namespace) -> int:
+    """Print the repair instruction the controller stored for one exact HEAD.
+
+    The privileged agent step runs this instead of rebuilding the instruction,
+    so the agent executes what the review controller decided rather than a second
+    reading of state that may have moved.
+    """
+
+    try:
+        config = _load_config(args.config, required=not args.allow_missing)
+    except config_module.ConfigError as exc:
+        print(f"::error::{exc}")
+        return EXIT_ERROR
+
+    head = args.head or _current_head()
+    try:
+        prompt = reconcile_module.agent_prompt(_client(), args.pr, head)
+    except (
+        reconcile_module.ReconcileError,
+        providers_module.UnsupportedProvider,
+    ) as exc:
+        print(f"::error::{exc}")
+        return EXIT_ERROR
+    except github_module.GitHubError as exc:
+        print(f"::error::Could not read the review repair instruction: {exc}")
+        return EXIT_ERROR
+
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as handle:
+            handle.write(prompt)
+            handle.write("\n")
+    sys.stdout.write(prompt + "\n")
+    return EXIT_OK
+
+
+def _current_head() -> str:
+    """The checked-out commit, for callers that do not pass --head."""
+
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return completed.stdout.strip()
 
 
 def cmd_verify(args: argparse.Namespace) -> int:
@@ -578,6 +753,102 @@ def build_parser() -> argparse.ArgumentParser:
         help="Evaluate without writing tracker, review, or status.",
     )
     gate.set_defaults(func=cmd_gate)
+
+    review = sub.add_parser(
+        "review",
+        help="Run the review controller.",
+        description=(
+            "Evaluate the normalized review gate for one pull request and perform the "
+            "single next action the repair contract allows: hand the open findings to a "
+            "bounded agent repair, ask the provider to re-check them on the exact HEAD, "
+            "request one full re-review of an unchanged HEAD, wait, or fail closed. "
+            "With review disabled this resolves the configuration and writes nothing."
+        ),
+    )
+    review_sub = review.add_subparsers(dest="review_command", required=True)
+
+    reconcile_review = review_sub.add_parser(
+        "reconcile", help="Evaluate the gate and perform its next action."
+    )
+    add_common(reconcile_review)
+    reconcile_review.add_argument("--pr", type=int, required=True)
+    reconcile_review.add_argument(
+        "--head", default=None, help="Override the current HEAD sha."
+    )
+    reconcile_review.add_argument(
+        "--no-apply",
+        action="store_true",
+        help="Decide without writing tracker, verdict, status, requests, or ledger.",
+    )
+    reconcile_review.add_argument(
+        "--max-attempts-per-head",
+        type=int,
+        default=3,
+        help="Repair dispatches allowed for one exact HEAD.",
+    )
+    reconcile_review.add_argument(
+        "--max-attempts-per-finding",
+        type=int,
+        default=2,
+        help="Repair dispatches allowed for one finding across the whole PR.",
+    )
+    reconcile_review.add_argument(
+        "--max-rereviews",
+        type=int,
+        default=1,
+        help="Full re-reviews allowed for a HEAD whose repair produced no change.",
+    )
+    reconcile_review.add_argument(
+        "--max-batch-size",
+        type=int,
+        default=repair_module.DEFAULT_MAX_BATCH_SIZE,
+        help="Open findings handed to one repair attempt.",
+    )
+    reconcile_review.add_argument(
+        "--agent-timeout-minutes",
+        type=int,
+        default=20,
+        help="Wall-clock budget for one dispatched agent repair.",
+    )
+    reconcile_review.add_argument(
+        "--dispatch-workflow",
+        default=os.environ.get("CONTINUUM_REVIEW_AGENT_WORKFLOW", ""),
+        help="Workflow dispatched for a review repair (default: no dispatch).",
+    )
+    reconcile_review.add_argument(
+        "--dispatch-ref",
+        default=os.environ.get("CONTINUUM_BASE_BRANCH", ""),
+        help="Branch the repair workflow is dispatched from.",
+    )
+    reconcile_review.add_argument(
+        "--out", default=None, help="Write the reconcile plan document here."
+    )
+    reconcile_review.add_argument(
+        "--prompt-out",
+        default=None,
+        help="Write the repair agent instruction here when one is dispatched.",
+    )
+    reconcile_review.set_defaults(func=cmd_reconcile_review)
+
+    review_prompt = review_sub.add_parser(
+        "prompt",
+        help="Print the stored repair instruction for one exact HEAD.",
+        description=(
+            "Print the bounded review-repair instruction the review controller stored "
+            "for the given commit. Exits non-zero when no trusted instruction exists "
+            "for that HEAD, so a repair agent never runs an instruction assembled "
+            "against a different diff."
+        ),
+    )
+    add_common(review_prompt)
+    review_prompt.add_argument("--pr", type=int, required=True)
+    review_prompt.add_argument(
+        "--head", default=None, help="The commit the instruction must name (default: HEAD)."
+    )
+    review_prompt.add_argument(
+        "--out", default=None, help="Write the instruction here as well as to stdout."
+    )
+    review_prompt.set_defaults(func=cmd_review_prompt)
 
     verify = sub.add_parser("verify", help="Re-check one tracked finding.")
     add_common(verify)

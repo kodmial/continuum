@@ -27,6 +27,43 @@ class MvpBoundaryTests(unittest.TestCase):
             self.assertNotIn(".github/workflows", str(path))
 
 
+class ConsumerToggleTests(unittest.TestCase):
+    """The two-boolean contract, in both postures, from real fixture files."""
+
+    CONTRACT = CONSUMER / ".github" / "continuum.yml"
+    REPO_CONTRACT = ROOT / ".github" / "continuum.yml"
+
+    def test_the_enabled_fixture_activates_the_single_review_implementation(self):
+        enabled = load_config(str(self.CONTRACT))
+        # The consumer does not choose; it only turns the loop on. The provider
+        # is what `true` resolves to inside the engine, and no configuration
+        # line in the consumer's own file names or selects one. Comments are
+        # excluded deliberately: prose may explain the choice, but it may not
+        # make one.
+        self.assertEqual(enabled.review.provider, "coderabbit")
+        declared = [
+            line
+            for line in self.CONTRACT.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        self.assertEqual(
+            sorted(declared), ["release: false", "review: true"], declared
+        )
+
+    def test_the_disabled_fixture_resolves_to_no_traffic_at_all(self):
+        # Continuum's own contract is the disabled posture: it is not a consumer
+        # product, so adopting the contract declares nothing.
+        disabled = load_config(str(self.REPO_CONTRACT))
+        self.assertEqual(disabled.review.provider, "none")
+        self.assertEqual(disabled.release.targets, ())
+
+    def test_both_fixtures_declare_release_without_declaring_a_target(self):
+        for path in (self.CONTRACT, self.REPO_CONTRACT):
+            with self.subTest(path=path.name):
+                config = load_config(str(path))
+                self.assertEqual(config.release.targets, ())
+
+
 class ConsumerConfigTests(unittest.TestCase):
     """The fixture is documentation that executes, so it must stay valid."""
 

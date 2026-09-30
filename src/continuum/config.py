@@ -24,6 +24,11 @@ PROVIDER_PR_AGENT = "pr-agent"
 PROVIDER_CODERABBIT = "coderabbit"
 SUPPORTED_PROVIDERS = (PROVIDER_NONE, PROVIDER_PR_AGENT, PROVIDER_CODERABBIT)
 
+# The single review implementation Continuum v0.1 ships. `review: true` resolves
+# to it, so the MVP boolean carries no provider selector: choosing a reviewer is
+# an adapter change inside the engine, never a user-facing configuration key.
+MVP_REVIEW_PROVIDER = PROVIDER_CODERABBIT
+
 DEFAULT_PR_AGENT_BOT_LOGIN = "github-actions[bot]"
 DEFAULT_CODERABBIT_BOT_LOGIN = "coderabbitai[bot]"
 DEFAULT_CODERABBIT_STATUS_CONTEXT = "CodeRabbit"
@@ -488,6 +493,30 @@ def _require_mapping(value: Any, where: str) -> Dict[str, Any]:
     if not isinstance(value, dict):
         raise ConfigError(f"{where} must be a mapping, got {type(value).__name__}")
     return value
+
+
+_TOP_LEVEL_KEY_RE = "^{key}\\s*:(?P<value>.*)$"
+_INLINE_COMMENT_RE = re.compile(r"\s+#")
+
+
+def _top_level_value(text: str, key: str) -> str:
+    """The literal value written for one top-level key, comments excluded.
+
+    Read from the source rather than from the parsed document because the point
+    is to see what was *written*: `yes`, `on`, and `"true"` all parse to a
+    boolean, and the contract accepts exactly two spellings.
+    """
+
+    pattern = re.compile(_TOP_LEVEL_KEY_RE.format(key=re.escape(key)))
+    for raw in (text or "").splitlines():
+        line = raw.rstrip("\r")
+        if not line.strip() or line[:1].isspace():
+            continue
+        match = pattern.match(line.strip())
+        if match is None:
+            continue
+        return _INLINE_COMMENT_RE.split(match.group("value"), maxsplit=1)[0].strip()
+    return ""
 
 
 def _reject_unknown(mapping: Dict[str, Any], allowed: Any, where: str) -> None:
@@ -1026,8 +1055,25 @@ def _parse_target(value: Any, where: str) -> ReleaseTarget:
     )
 
 
-def _parse_release(value: Any) -> ReleaseSettings:
-    mapping = _require_mapping(value, "release")
+def _parse_release(value: Any, source: str = "release") -> ReleaseSettings:
+    if value is None:
+        return ReleaseSettings()
+    if not isinstance(value, dict):
+        # Same single-boolean surface as `review`, for the same reason: the
+        # MVP contract is two toggles and no selectors, so both are read the
+        # way they were written rather than as whatever YAML made of them.
+        token = _top_level_value(source, "release")
+        if token in ("true", "false"):
+            # Neither spelling declares a target, and a declared target is what
+            # release orchestration consumes. `true` therefore means "the
+            # contract is adopted, no targets are declared", which is exactly
+            # the disabled posture.
+            return ReleaseSettings()
+        raise ConfigError(
+            f"release must be the bare boolean true or false (unquoted), or a "
+            f"mapping of release options; got {token or value!r}"
+        )
+    mapping = value
     _reject_unknown(mapping, _ALLOWED_RELEASE_KEYS, "release")
     targets_value = mapping.get("targets")
     if targets_value is None:
@@ -1136,7 +1182,25 @@ def parse_config(text: str, source: str = "<string>") -> ContinuumConfig:
     if not isinstance(version, int) or isinstance(version, bool) or version != SCHEMA_VERSION:
         raise ConfigError(f"{source}: version must be the integer {SCHEMA_VERSION}, got {version!r}")
 
-    review = _require_mapping(mapping.get("review"), "review")
+    raw_review = mapping.get("review")
+    if raw_review is None:
+        review: Dict[str, Any] = {}
+    elif isinstance(raw_review, dict):
+        review = raw_review
+    else:
+        # The MVP contract's surface: one boolean, no provider selector. Only the
+        # bare tokens are accepted, so a YAML 1.1 truthy spelling cannot turn a
+        # gate on by accident.
+        token = _top_level_value(text, "review")
+        if token == "true":
+            review = {"provider": MVP_REVIEW_PROVIDER}
+        elif token == "false":
+            review = {}
+        else:
+            raise ConfigError(
+                f"{source}: review must be the bare boolean true or false (unquoted), "
+                f"or a mapping of review options; got {token or raw_review!r}"
+            )
     _reject_unknown(review, _ALLOWED_REVIEW_KEYS, "review")
 
     provider = review.get("provider", PROVIDER_NONE)
@@ -1177,7 +1241,7 @@ def parse_config(text: str, source: str = "<string>") -> ContinuumConfig:
             coderabbit=_parse_coderabbit(review.get("coderabbit")),
             queue=_parse_queue(review.get("queue")),
         ),
-        release=_parse_release(mapping.get("release")),
+        release=_parse_release(mapping.get("release"), text),
         delegation=_parse_delegation(mapping.get("delegation")),
         source=source,
     )

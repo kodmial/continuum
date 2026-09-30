@@ -1,0 +1,17 @@
+# Consumer contract fixture: the two-toggle form a repository actually writes.
+#
+# This file is the normative shape from docs/continuum-mvp-contract.md. It is
+# deliberately NOT the engine configuration: there is no version, no provider,
+# and no selector. Two booleans, and nothing a consumer can misread as a choice.
+#
+#   review: true   closes the review loop. The engine resolves the single
+#                  review implementation Continuum ships; the repository never
+#                  names it.
+#   review: false  the repository opts out. The gate returns before it reads or
+#                  writes anything on GitHub, so the opt-out costs no provider
+#                  traffic, no agent run, and no review status.
+#
+# Both are on the same file as `release`, so a repository that adopts one and
+# not the other still loads.
+review: true
+release: false

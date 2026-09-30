@@ -342,6 +342,56 @@ class DispatchTests(unittest.TestCase):
         self.assertFalse(decision.allowed)
         self.assertEqual(decision.code, "invalid_run_id")
 
+    def test_review_fix_is_allowed_without_a_run_id(self):
+        # A review repair is driven by provider findings, not by a failed CI run,
+        # so requiring a run id would make the review loop undispatchable. It is
+        # the same privileged mode as the other repairs otherwise: same ref
+        # validation, same trusted-dispatcher rule.
+        for run_id in ("", "0"):
+            decision = trust_policy.validate_dispatch_shape(
+                {
+                    "mode": "review-fix",
+                    "pr_number": "3",
+                    "head_ref": "opencode/issue12-20260928135106",
+                    "run_id": run_id,
+                },
+                repository=REPOSITORY,
+            )
+            self.assertTrue(decision.allowed, decision.reason)
+            self.assertEqual(decision.mode, "review-fix")
+
+    def test_review_fix_is_dispatchable_end_to_end(self):
+        # The shape check alone decides nothing about the ref; the checkout ref
+        # is only ever set from the pull request the read-only job verified, so
+        # the acceptance is asserted through the full evaluation.
+        payload = load_fixture("workflow_dispatch_trusted_repair")
+        payload["inputs"]["mode"] = "review-fix"
+        pr = load_fixture("pull_request_agent_branch")["pull_request"]
+        decision = trust_policy.evaluate_event(
+            "workflow_dispatch",
+            payload,
+            repository=REPOSITORY,
+            actor=(payload.get("sender") or {}).get("login", ""),
+            pull_request=pr,
+        )
+        self.assertTrue(decision.allowed, decision.reason)
+        self.assertEqual(decision.mode, "review-fix")
+        self.assertEqual(decision.checkout_ref, "opencode/issue12-20260928135106")
+
+    def test_review_fix_still_refuses_an_untrusted_ref(self):
+        decision = trust_policy.validate_dispatch_shape(
+            {
+                "mode": "review-fix",
+                "pr_number": "3",
+                "head_ref": "attacker/pwn",
+                "run_id": "",
+            },
+            repository=REPOSITORY,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.code, "untrusted_dispatch_ref")
+        self.assertEqual(decision.checkout_ref, "")
+
     def test_numeric_inputs_reject_argument_smuggling(self):
         for pr_number in ("3 --metadata-file=/tmp/x", "3;id", "+3", " 3 4", "0x3", "1_0", "-3", ""):
             decision = trust_policy.validate_dispatch_shape(
