@@ -43,6 +43,9 @@ permissions:
 jobs:
   merge:
     runs-on: ubuntu-latest
+    concurrency:
+      group: continuum-auto-merge-${{ github.repository }}
+      cancel-in-progress: false
     timeout-minutes: 10
     steps:
       - name: Reconcile eligible PRs
