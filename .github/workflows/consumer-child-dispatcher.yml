@@ -141,7 +141,7 @@ jobs:
             )
 
             open_prs="$(
-              gh pr list --repo "$child_repo" --state open --limit 100                 --json number,headRefName                 --jq '.[] | select(
+              gh pr list --repo "$child_repo" --state open --limit 100                 --json number,headRefName                 --jq 'sort_by(.number) | reverse | .[] | select(
                     (.headRefName | startswith("continuum-child/task-")) or
                     (.headRefName | startswith("runtime-worker/task-"))
                   ) | [.number,.headRefName] | @tsv' 2>/dev/null || true
@@ -151,12 +151,227 @@ jobs:
             )"
 
             if [[ -n "$open_prs" ]]; then
-              while IFS=$'\t' read -r pr_number head_ref; do
+              selected_review_tasks=""
+              while IFS=
+
+            issues_json="$(
+              gh api --paginate "repos/$child_repo/issues?state=open&per_page=100" 2>/dev/null
+            )"
+
+            # A delegated technical failure must never turn automation:paused
+            # into a terminal state. Clear stale pause labels on automation-
+            # owned child tasks and let dependency markers decide readiness.
+            while IFS= read -r paused_task; do
+              [[ -n "$paused_task" ]] || continue
+              gh api --method DELETE \
+                "repos/$child_repo/issues/$paused_task/labels/automation%3Apaused" \
+                >/dev/null 2>&1 || true
+              echo "Cleared stale automation:paused on child task #$paused_task."
+            done < <(
+              jq -r '
+                .[]
+                | select(.pull_request == null)
+                | select(any(.labels[]?.name; . == "automation:paused"))
+                | select(
+                    ((.body // "") | contains("<!-- continuum-child-owned -->")) or
+                    ((.body // "") | contains("<!-- runtime-worker-owned -->"))
+                  )
+                | .number
+              ' <<<"$issues_json"
+            )
+            issues_json="$(
+              jq '
+                map(
+                  if (
+                    ((.body // "") | contains("<!-- continuum-child-owned -->")) or
+                    ((.body // "") | contains("<!-- runtime-worker-owned -->"))
+                  )
+                  then .labels = [(.labels[]? | select(.name != "automation:paused"))]
+                  else .
+                  end
+                )
+              ' <<<"$issues_json"
+            )"
+
+            for priority in priority:p0 priority:p1 priority:p2; do
+              while IFS= read -r encoded; do
+                [[ -n "$encoded" ]] || continue
+                decoded="$(base64 -d <<<"$encoded")"
+                task_number="$(jq -r '.[0]' <<<"$decoded")"
+                body="$(jq -r '.[1]' <<<"$decoded")"
+
+                task_active "$child_id" task "$task_number" && continue
+                task_active "$child_id" review "$task_number" && continue
+                grep -qx "$task_number" <<<"$open_pr_tasks" && continue
+
+                ready=true
+                deps="$(
+                  sed -nE 's/.*<!-- *automation-blocked-by: *([^>]*) *-->.*/\1/p'                     <<<"$body" | head -1 | tr ',' ' '
+                )"
+                for dep in $deps; do
+                  dep="${dep//#/}"
+                  dep="${dep//[[:space:]]/}"
+                  [[ "$dep" =~ ^[0-9]+$ ]] || continue
+                  state="$(
+                    gh api "repos/$child_repo/issues/$dep" --jq '.state' 2>/dev/null || echo open
+                  )"
+                  if [[ "$state" != "closed" ]]; then
+                    ready=false
+                    break
+                  fi
+                done
+                [[ "$ready" == true ]] || continue
+
+                gh workflow run "$WORKER_WORKFLOW" --repo "$GITHUB_REPOSITORY"                   -f child_id="$child_id"                   -f task_number="$task_number" >/dev/null
+                dispatched=$((dispatched + 1))
+              done < <(
+                jq -r --arg p "$priority" '
+                  .[]
+                  | select(.pull_request == null)
+                  | select(any(.labels[]?.name; . == $p))
+                  | select(all(.labels[]?.name; . != "automation:paused"))
+                  | select(
+                      ((.body // "") | contains("<!-- continuum-child-owned -->")) or
+                      ((.body // "") | contains("<!-- runtime-worker-owned -->"))
+                    )
+                  | [.number, (.body // "")]
+                  | @base64
+                ' <<<"$issues_json"
+              )
+            done
+          done < <(jq -c '.[]' <<<"$plan")
+
+          echo "Reconciled configured child relationships; dispatched $dispatched run(s)."
+          if [[ "$invalid" -gt 0 ]]; then
+            echo "::error::$invalid configured child relationship(s) failed bidirectional verification."
+            exit 2
+          fi
+\t' read -r pr_number head_ref; do
                 [[ -n "$pr_number" ]] || continue
                 task_number="$(
                   sed -nE 's#^(continuum-child|runtime-worker)/task-([0-9]+)-.*#\2#p' <<<"$head_ref"
                 )"
                 [[ -n "$task_number" ]] || continue
+
+                # A completed child task must never resurrect through a stale
+                # retry PR. Close leftovers immediately.
+                task_state="$(
+                  gh api "repos/$child_repo/issues/$task_number" --jq '.state' 2>/dev/null || echo closed
+                )"
+                if [[ "$task_state" != "open" ]]; then
+                  gh pr comment "$pr_number" --repo "$child_repo" \
+                    --body "Closed automatically: delegated task #$task_number is already completed." \
+                    >/dev/null 2>&1 || true
+                  gh pr close "$pr_number" --repo "$child_repo" >/dev/null 2>&1 || true
+                  echo "Closed stale delegated PR #$pr_number for completed task #$task_number."
+                  continue
+                fi
+
+                # At most one PR per task may enter delegated review in one
+                # dispatcher cycle. PRs are sorted newest-first above, so the
+                # newest retry is canonical; older retries remain untouched
+                # until the canonical PR completes, then the closed-task guard
+                # removes them on the next reconciliation.
+                if grep -Fxq "$task_number" <<<"$selected_review_tasks"; then
+                  echo "Skipping duplicate delegated PR #$pr_number for task #$task_number in this cycle."
+                  continue
+                fi
+                selected_review_tasks+="$task_number"
+
+            issues_json="$(
+              gh api --paginate "repos/$child_repo/issues?state=open&per_page=100" 2>/dev/null
+            )"
+
+            # A delegated technical failure must never turn automation:paused
+            # into a terminal state. Clear stale pause labels on automation-
+            # owned child tasks and let dependency markers decide readiness.
+            while IFS= read -r paused_task; do
+              [[ -n "$paused_task" ]] || continue
+              gh api --method DELETE \
+                "repos/$child_repo/issues/$paused_task/labels/automation%3Apaused" \
+                >/dev/null 2>&1 || true
+              echo "Cleared stale automation:paused on child task #$paused_task."
+            done < <(
+              jq -r '
+                .[]
+                | select(.pull_request == null)
+                | select(any(.labels[]?.name; . == "automation:paused"))
+                | select(
+                    ((.body // "") | contains("<!-- continuum-child-owned -->")) or
+                    ((.body // "") | contains("<!-- runtime-worker-owned -->"))
+                  )
+                | .number
+              ' <<<"$issues_json"
+            )
+            issues_json="$(
+              jq '
+                map(
+                  if (
+                    ((.body // "") | contains("<!-- continuum-child-owned -->")) or
+                    ((.body // "") | contains("<!-- runtime-worker-owned -->"))
+                  )
+                  then .labels = [(.labels[]? | select(.name != "automation:paused"))]
+                  else .
+                  end
+                )
+              ' <<<"$issues_json"
+            )"
+
+            for priority in priority:p0 priority:p1 priority:p2; do
+              while IFS= read -r encoded; do
+                [[ -n "$encoded" ]] || continue
+                decoded="$(base64 -d <<<"$encoded")"
+                task_number="$(jq -r '.[0]' <<<"$decoded")"
+                body="$(jq -r '.[1]' <<<"$decoded")"
+
+                task_active "$child_id" task "$task_number" && continue
+                task_active "$child_id" review "$task_number" && continue
+                grep -qx "$task_number" <<<"$open_pr_tasks" && continue
+
+                ready=true
+                deps="$(
+                  sed -nE 's/.*<!-- *automation-blocked-by: *([^>]*) *-->.*/\1/p'                     <<<"$body" | head -1 | tr ',' ' '
+                )"
+                for dep in $deps; do
+                  dep="${dep//#/}"
+                  dep="${dep//[[:space:]]/}"
+                  [[ "$dep" =~ ^[0-9]+$ ]] || continue
+                  state="$(
+                    gh api "repos/$child_repo/issues/$dep" --jq '.state' 2>/dev/null || echo open
+                  )"
+                  if [[ "$state" != "closed" ]]; then
+                    ready=false
+                    break
+                  fi
+                done
+                [[ "$ready" == true ]] || continue
+
+                gh workflow run "$WORKER_WORKFLOW" --repo "$GITHUB_REPOSITORY"                   -f child_id="$child_id"                   -f task_number="$task_number" >/dev/null
+                dispatched=$((dispatched + 1))
+              done < <(
+                jq -r --arg p "$priority" '
+                  .[]
+                  | select(.pull_request == null)
+                  | select(any(.labels[]?.name; . == $p))
+                  | select(all(.labels[]?.name; . != "automation:paused"))
+                  | select(
+                      ((.body // "") | contains("<!-- continuum-child-owned -->")) or
+                      ((.body // "") | contains("<!-- runtime-worker-owned -->"))
+                    )
+                  | [.number, (.body // "")]
+                  | @base64
+                ' <<<"$issues_json"
+              )
+            done
+          done < <(jq -c '.[]' <<<"$plan")
+
+          echo "Reconciled configured child relationships; dispatched $dispatched run(s)."
+          if [[ "$invalid" -gt 0 ]]; then
+            echo "::error::$invalid configured child relationship(s) failed bidirectional verification."
+            exit 2
+          fi
+\n'
+
                 if task_active "$child_id" task "$task_number" ||
                    task_active "$child_id" review "$task_number"; then
                   continue
