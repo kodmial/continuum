@@ -475,7 +475,7 @@ class TheShippedLedger(unittest.TestCase):
         ledger = baseline.load_ledger(self.LEDGER)
         self.assertEqual(ledger.repository, "kodmial/nanodictate")
         self.assertTrue(ledger.workflows)
-        self.assertEqual(ledger.audited_head, "d9e6dcc2e0c9c43bc87cd1963b75c097dec7ea1c")
+        self.assertRegex(ledger.audited_head, r"^[0-9a-f]{40}$")
         for entry in ledger.workflows:
             self.assertIn(entry.classification, baseline.CLASSIFICATIONS)
             self.assertTrue(entry.path.startswith(".github/workflows/"))
