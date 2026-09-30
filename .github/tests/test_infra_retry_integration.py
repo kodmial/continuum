@@ -1,22 +1,13 @@
 #!/usr/bin/env python3
 import datetime as dt
-import importlib.util
 import pathlib
+import sys
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-
-
-def load(name, relative):
-    path = ROOT / relative
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-failure_retry = load("failure_retry_integration", ".github/scripts/failure_retry.py")
-conflict_repair = load("conflict_repair_integration", ".github/scripts/conflict_repair.py")
+sys.path.insert(0, str(ROOT / ".github" / "scripts"))
+import failure_retry
+import conflict_repair
 
 HEAD = "a" * 40
 
@@ -47,6 +38,21 @@ class InfrastructureRetryStateTests(unittest.TestCase):
         self.assertEqual(state["infra_retry_attempts"], 2)
         self.assertEqual(state["next_retry_at"], "2026-09-30T12:10:00Z")
         self.assertFalse(state["retry_due"])
+
+    def test_new_head_reset_starts_a_fresh_infrastructure_budget(self):
+        text = "\n".join(
+            [
+                "<!-- continuum-infra-retry: attempt=8 next_retry_at=2026-09-30T11:00:00Z code=http_503 run=8 -->",
+                "<!-- continuum-infra-retry-reset -->",
+            ]
+        )
+        state = failure_retry.retry_state(
+            text, dt.datetime(2026, 9, 30, 12, 0, tzinfo=dt.timezone.utc)
+        )
+        self.assertEqual(state["infra_retry_attempts"], 0)
+        self.assertEqual(state["next_retry_at"], "")
+        self.assertTrue(state["retry_due"])
+        self.assertFalse(state["infra_retry_exhausted"])
 
 
 class ConflictBudgetSeparationTests(unittest.TestCase):
