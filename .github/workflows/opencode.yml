@@ -135,7 +135,7 @@ jobs:
           set -euo pipefail
 
           if [[ "$MODE" != "resolve-conflict" ]]; then
-            python3 "$CONTINUUM_CONFLICT_REPAIR_HELPER" plan --mode "$MODE"
+            python3 .github/scripts/conflict_repair.py plan --mode "$MODE"
             echo "base_branch=$CONTINUUM_BASE_BRANCH" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -149,10 +149,10 @@ jobs:
           # restart, a cancelled run, and a fresh process.
           attempts="$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100" \
             --jq '.[] | select(.user.login == "'"$GITHUB_REPOSITORY_OWNER"'" or .user.login == "github-actions[bot]") | .body // ""' \
-            | python3 "$CONTINUUM_CONFLICT_REPAIR_HELPER" episode --pr-number "$PR_NUMBER" \
+            | python3 .github/scripts/conflict_repair.py episode --pr-number "$PR_NUMBER" \
             | sed -n 's/^episode_attempts=//p')"
 
-          python3 "$CONTINUUM_CONFLICT_REPAIR_HELPER" plan \
+          python3 .github/scripts/conflict_repair.py plan \
             --mode "$MODE" \
             --behind "$behind" \
             --ruled-out "$RULED_OUT" \
