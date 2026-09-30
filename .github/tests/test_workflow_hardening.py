@@ -854,5 +854,30 @@ class SelfProtectionTests(WorkflowAuditBase):
                     )
 
 
+class DelegatedChildLivenessTests(WorkflowAuditBase):
+    """Delegated child work must recover from controller metadata failures."""
+
+    def test_dispatcher_reopens_closed_unmerged_child_pull_requests(self):
+        text = self.raw["consumer-child-dispatcher.yml"]
+        self.assertIn('gh pr list --repo "$child_repo" --state closed', text)
+        self.assertIn('gh pr reopen "$stale_pr" --repo "$child_repo"', text)
+
+    def test_dispatcher_clears_stale_child_pause_labels(self):
+        text = self.raw["consumer-child-dispatcher.yml"]
+        self.assertIn('labels/automation%3Apaused', text)
+        self.assertIn('Cleared stale automation:paused on child task', text)
+
+    def test_child_review_reopens_pr_and_defers_merge_for_retry(self):
+        text = self.raw["consumer-child-review.yml"]
+        self.assertIn('gh pr reopen "$PR_NUMBER" --repo "$child_repo"', text)
+        self.assertIn('continuum-child-review-merge-retry', text)
+        self.assertNotIn('exit 32', text)
+
+    def test_child_review_surfaces_base_drift_before_acceptance(self):
+        text = self.raw["consumer-child-review.yml"]
+        self.assertIn('git merge --no-edit "origin/$base_ref"', text)
+        self.assertIn('git diff --name-only --diff-filter=U', text)
+
+
 if __name__ == "__main__":
     unittest.main()
