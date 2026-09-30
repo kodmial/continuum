@@ -55,6 +55,36 @@ class PaginationTests(unittest.TestCase):
         self.assertEqual([item["id"] for item in items], [1, 2])
         self.assertEqual(len(seen), 2)
 
+    def test_paginate_stops_at_a_limit_instead_of_walking_every_page(self):
+        # The cost of a listing is its pages, not its rows. A caller that will show
+        # twenty results should not pay for the other nineteen pages of a repository
+        # with five hundred open pull requests, every week, forever.
+        seen = []
+
+        def opener(request, timeout):
+            seen.append(request.full_url)
+            return [{"number": n} for n in range(100)], '<https://api.github.com/p2>; rel="next"'
+
+        client = GitHubClient("token", "o/r", opener=opener)
+        pulls = client.list_pulls(limit=20)
+        self.assertEqual(len(pulls), 20)
+        self.assertEqual(len(seen), 1)
+
+    def test_list_pulls_without_a_limit_still_walks_every_page(self):
+        # A caller that wants the whole list gets the whole list. The bound is opt-in
+        # so that no existing caller silently stops seeing rows.
+        seen = []
+
+        def opener(request, timeout):
+            seen.append(request.full_url)
+            if len(seen) == 1:
+                return [{"number": 1}], '<https://api.github.com/p2>; rel="next"'
+            return [{"number": 2}], ""
+
+        client = GitHubClient("token", "o/r", opener=opener)
+        self.assertEqual([p["number"] for p in client.list_pulls()], [1, 2])
+        self.assertEqual(len(seen), 2)
+
     def test_paginate_preserves_status_on_failure(self):
         def opener(request, timeout):
             raise urllib.error.HTTPError(request.full_url, 502, "Bad gateway", {}, None)

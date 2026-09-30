@@ -1,0 +1,57 @@
+{
+  "schema": "continuum.provenance-ledger/v1",
+  "version": 1,
+  "generated_from": "continuum.provenance.cli render, reviewed by hand; the per-path dispositions are the classifications recorded in docs/parity-ledger.json at its audit point",
+  "sources": [
+    {
+      "id": "nanodictate",
+      "repository": "kodmial/nanodictate",
+      "visibility": "public",
+      "disposition": "absorbed",
+      "severity": "p0",
+      "baseline_sha": "08a5d920c5dbf1f4203160e92e3e530c5bbb3b8f",
+      "current_sha": "08a5d920c5dbf1f4203160e92e3e530c5bbb3b8f",
+      "audit_version": "1",
+      "audited_at": "2026-09-30T00:00:00Z",
+      "workflow_ledger": "docs/parity-ledger.json",
+      "rationale": "The repository Continuum absorbed its orchestration from. Every workflow in it was classified against docs/parity-ledger.json at the audited head, so a change here is a change to a claim somebody already made. Severity is p0 because these workflows are the trust boundary Continuum replaced: this is the source whose unnoticed movement would matter most.",
+      "tracked_prefixes": [
+        ".github/workflows/"
+      ],
+      "path_dispositions": {
+        ".github/workflows/add-review-label.yml": "absorbed",
+        ".github/workflows/auto-merge.yml": "absorbed",
+        ".github/workflows/bootstrap-runtime-secret.yml": "not-applicable",
+        ".github/workflows/ci.yml": "consumer-local",
+        ".github/workflows/coderabbit-retry.yml": "absorbed",
+        ".github/workflows/coderabbit-unresolved.yml": "absorbed",
+        ".github/workflows/continuum-migration-preflight.yml": "consumer-local",
+        ".github/workflows/continuum-shadow-bridge.yml": "absorbed",
+        ".github/workflows/issue-scheduler.yml": "absorbed",
+        ".github/workflows/opencode-repair.yml": "absorbed",
+        ".github/workflows/opencode.yml": "absorbed",
+        ".github/workflows/packaging-smoke.yml": "consumer-local",
+        ".github/workflows/pr-agent.yml": "consumer-local",
+        ".github/workflows/release-automation-merge.yml": "consumer-local",
+        ".github/workflows/release-pr.yml": "consumer-local",
+        ".github/workflows/release.yml": "consumer-local",
+        ".github/workflows/remove-review-label.yml": "absorbed"
+      },
+      "incidents": [
+        "#60"
+      ],
+      "continuum": {
+        "implementation": [
+          "src/continuum/shadow/planner.py",
+          "src/continuum/shadow/cutover.py",
+          "src/continuum/review/github.py"
+        ],
+        "tests": [
+          "tests/test_shadow_cutover.py",
+          "tests/test_provenance_drift.py",
+          "tests/test_provenance_ledger.py"
+        ]
+      }
+    }
+  ]
+}

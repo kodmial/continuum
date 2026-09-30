@@ -1,0 +1,188 @@
+# Continuum provenance drift check.
+#
+# The parity claims in `docs/parity-ledger.json` were made against a commit of a
+# repository that keeps moving. This workflow asks, on a schedule or on demand,
+# whether those sources have moved since, and publishes one deduplicated issue
+# describing whatever has not been classified yet.
+#
+# It is a reporting plane and deliberately narrow:
+#
+#   * the `audit` job reads and nothing else -- no issues scope, no contents
+#     write, and it uploads its report whether it passed or failed;
+#   * the `publish` job holds `issues: write` and nothing else, and exists only
+#     to turn a report into at most one issue or one comment;
+#   * the private-source credential is *not* this workflow's. A private source
+#     is read only through its own least-privilege variable -- by default
+#     `PRIVATE_SOURCE_READ_TOKEN`, or whatever the ledger names for that source --
+#     and its absence is reported as `unavailable` rather than worked around with a
+#     broader credential. No credential for a private source is referenced in this
+#     file at all, which is what lets a reader confirm that by reading this file.
+#   * the deduplication fingerprint is computed by the engine and printed as an
+#     output, not by shell string handling here, so "is this the same drift we
+#     already have an issue for" is one implementation rather than two.
+#
+# Nothing here copies code from a source. A drift finding asks a reviewer to
+# classify paths; the classification is recorded by a human in the ledger, and the
+# next run re-reads it.
+
+name: Continuum provenance drift
+
+on:
+  # A deliberate read of one repository's head and workflow inventory, for the
+  # moment somebody is deciding whether to register it as a tracked source.
+  workflow_dispatch:
+    inputs:
+      observe_repository:
+        description: owner/name of a repository to observe instead of auditing the ledger
+        type: string
+        default: ""
+
+  # Weekly, deliberately off the hour: every other Continuum schedule runs on a
+  # five-minute cadence that stacks every repository's jobs onto the same minute.
+  schedule:
+    - cron: "23 7 * * 1"
+
+# Nothing at the workflow level. The audit job is read-only, and the publish job
+# is the only thing that needs a scope, so it declares its own.
+permissions: {}
+
+concurrency:
+  group: continuum-provenance-drift
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    name: Audit the tracked sources
+    permissions:
+      contents: read
+      issues: read
+    outputs:
+      fingerprint: ${{ steps.check.outputs.fingerprint }}
+      drift: ${{ steps.check.outputs.drift }}
+    steps:
+      - name: Check out Continuum at the pinned engine
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+
+      - name: Set up Python
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2a # v5.3.0
+        with:
+          python-version: "3.11"
+
+      - name: Observe a single repository when asked
+        id: observe
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.observe_repository != '' }}
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          # Carried in the environment rather than spliced into the script: an
+          # expression inside a `run:` block is text the shell parses, so a
+          # repository name is a shell word unless it arrives as a variable.
+          OBSERVE_REPOSITORY: ${{ inputs.observe_repository }}
+        run: |
+          set -euo pipefail
+          PYTHONPATH=src python3 -m continuum.provenance.cli observe \
+            --repo "$OBSERVE_REPOSITORY" \
+            --token-env GITHUB_TOKEN \
+            --out provenance-out/observed.json
+
+      - name: Check every source in the ledger
+        id: check
+        # A dispatch that named a repository was asked to observe that repository.
+        # Running the ledger audit as well would publish an unrelated verdict in the
+        # same run, and the observation's own report is what that run is for.
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.observe_repository != '') }}
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          set +e
+          PYTHONPATH=src python3 -m continuum.provenance.cli check \
+            --ledger docs/provenance-ledger.json \
+            --capture-live \
+            --public-token-env GITHUB_TOKEN \
+            --out provenance-out/drift.json \
+            --issue-title provenance-out/title.txt \
+            --issue-body provenance-out/body.md
+          status=$?
+          set -e
+          # 0 is a clean audit. 1 is drift, or an audit that could not read every
+          # source: both are results this workflow exists to publish, not failures
+          # of the checker. Anything else means the checker could not run, and the
+          # report is not trustworthy enough to publish.
+          if [ "$status" -gt 1 ]; then
+            echo "The provenance checker could not run (exit $status); nothing will be published."
+            exit "$status"
+          fi
+          {
+            echo "fingerprint=$(python3 -c 'import json,sys; print(json.load(open("provenance-out/drift.json"))["fingerprint"])')"
+            echo "drift=$(python3 -c 'import json,sys; print(json.load(open("provenance-out/drift.json"))["verdict"])')"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish the report
+        # The report is the evidence, and it is written whether the audit was clean,
+        # drifted, could not complete, or was replaced by a single-repository
+        # observation.
+        if: ${{ always() && (steps.check.outcome != 'skipped' || steps.observe.outcome == 'success') }}
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08f75defe8d4f9f9072e2af # v4.4.3
+        with:
+          name: provenance-drift
+          path: provenance-out/
+          if-no-files-found: warn
+
+  publish:
+    name: Open or update the parity issue
+    # Needs the audit. A report nobody collected cannot be published against.
+    needs: audit
+    # Only for a finding. A clean audit, and an audit that only re-observed the same
+    # evidence, must not touch the issue tracker at all -- a weekly schedule that
+    # comments every week is a schedule nobody reads.
+    if: ${{ github.event_name == 'schedule' && (needs.audit.outputs.drift == 'drifted' || needs.audit.outputs.drift == 'incomplete') }}
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Check out Continuum at the pinned engine
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+
+      - name: Set up Python
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2a # v5.3.0
+        with:
+          python-version: "3.11"
+
+      - name: Download the audit's report
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: provenance-drift
+          path: provenance-out
+
+      - name: Decide what to publish
+        id: plan
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Read the open parity issue through the API and let the engine decide
+          # whether it describes this evidence. An empty result is the normal case
+          # on a repository that has never drifted, and it means "open one".
+          PYTHONPATH=src python3 -m continuum.provenance.publish \
+            --report provenance-out/drift.json \
+            --repo "$GITHUB_REPOSITORY" \
+            --out provenance-out/plan.json
+          # The guard on the next step reads this output. Without it the output is
+          # empty, every comparison against 'none' is true, and the one step that can
+          # write to the issue tracker runs on every scheduled audit including the
+          # ones that decided there was nothing to say.
+          echo "action=$(python3 -c 'import json; print(json.load(open("provenance-out/plan.json"))["action"])')" >> "$GITHUB_OUTPUT"
+
+      - name: Create the issue, or comment on the open one
+        if: ${{ steps.plan.outputs.action != 'none' }}
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          PYTHONPATH=src python3 -m continuum.provenance.publish --apply \
+            --plan provenance-out/plan.json \
+            --repo "$GITHUB_REPOSITORY"

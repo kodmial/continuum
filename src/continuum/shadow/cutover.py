@@ -657,6 +657,11 @@ class CutoverDecision:
     #: supplied. A window recorded while the consumer's workflows matched the
     #: ledger says nothing about the consumer's workflows now.
     baseline: Optional["baseline.BaselineReport"] = None
+    #: The source-drift reading this decision was made against. The rolling baseline
+    #: above asks whether the *consumer's* workflows moved; this asks whether the
+    #: repositories Continuum's parity claims were taken from moved. Both can be
+    #: clean at once while the claim has quietly expired.
+    provenance: Optional[Any] = None
     approval: Optional[Approval] = None
     authorization: Optional[Authorization] = None
     change_set: Optional[ChangeSet] = None
@@ -691,6 +696,9 @@ class CutoverDecision:
             "unresolved": [dict(entry) for entry in self.unresolved],
             "coverage": self.coverage.describe() if self.coverage is not None else None,
             "baseline": self.baseline.describe() if self.baseline is not None else None,
+            "provenance": (
+                self.provenance.describe() if self.provenance is not None else None
+            ),
             "canary": dict(self.canary),
             "rollback": dict(self.rollback),
             "approval": self.approval.describe() if self.approval is not None else None,
@@ -724,6 +732,7 @@ def decide(
     liveness_report: Optional[liveness.LivenessReport] = None,
     *,
     baseline: Optional["baseline.BaselineReport"] = None,
+    provenance: Optional[Any] = None,
     origins: Optional[Mapping[str, str]] = None,
     resolutions: Sequence[Resolution] = (),
     approval: Optional[Approval] = None,
@@ -746,9 +755,11 @@ def decide(
 
     ``phase`` selects the requirement (see :func:`required_scenarios`) and the
     writers the cutover may replace (see :func:`phase_writers`). ``ledger`` is the
-    reviewed audit the change set's declared writer roles are checked against, and
-    ``controller_sha`` is the Continuum commit the authorization is expected to name;
-    empty means "the engine this gate is running as", which is the only value a
+    reviewed audit the change set's declared writer roles are checked against,
+    ``baseline`` is the rolling reading of the consumer's own workflows, and
+    ``provenance`` is the drift reading of the sources those parity claims came
+    from. ``controller_sha`` is the Continuum commit the authorization is expected to
+    name; empty means "the engine this gate is running as", which is the only value a
     caller should ever rely on.
     """
 
@@ -878,6 +889,13 @@ def decide(
                 )
             )
 
+    # 5. Source drift: whether the repositories Continuum's parity claims were taken
+    #    from have moved since the commit each claim was audited against. A clean
+    #    rolling baseline above says the consumer's own workflows are unchanged; it
+    #    says nothing about whether the source those claims came from moved on, and a
+    #    claim about content that has since been replaced is not still a claim.
+    blockers.extend(provenance_blockers(provenance))
+
     digest = evidence_digest(
         report,
         results,
@@ -886,9 +904,10 @@ def decide(
         window_started_at,
         window_ended_at,
         baseline_digest=(baseline.evidence_digest if baseline is not None else ""),
+        provenance_digest=(provenance.digest if provenance is not None else ""),
     )
 
-    # 5. The canary and the rollback path, then whichever decision record the window
+    # 6. The canary and the rollback path, then whichever decision record the window
     #    carries. Both are required before either kind of decision is honoured: a
     #    cutover with no recorded way back is refused however it was authorised.
     deciding = approval is not None or authorization is not None
@@ -946,14 +965,14 @@ def decide(
         else:
             approved = True
 
-    # 6. What the atomic cutover itself does. The phase says which writers it
+    # 7. What the atomic cutover itself does. The phase says which writers it
     #    replaces, and the ledger says which writer each path implements, so a
     #    control-plane cutover cannot remove the consumer's release workflows even
     #    by declaring them to be something else.
     if change_set is not None:
         blockers.extend(phase_scope_blockers(phase, change_set, ledger))
 
-    # 7. The controller's authorization, and the only path that merges with nobody
+    # 8. The controller's authorization, and the only path that merges with nobody
     #    watching. Checked against everything it names, and only over a window with
     #    no blockers left.
     authorized = False
@@ -995,6 +1014,12 @@ def decide(
         blockers=tuple(blockers),
         coverage=report,
         evidence_digest=digest,
+        # Carried on the decision itself, not only in the digest: an artifact that
+        # records the digest a reading contributed but not the reading would leave a
+        # reviewer unable to see what was checked, which is the whole reason the
+        # evidence exists.
+        baseline=baseline,
+        provenance=provenance,
         approval=approval,
         authorization=authorization,
         change_set=change_set,
@@ -1006,6 +1031,104 @@ def decide(
         canary=dict(canary or {}),
         rollback=dict(rollback or {}),
     )
+
+
+def provenance_blockers(provenance: Optional[Any]) -> List[Blocker]:
+    """What the source-drift reading refuses about this window.
+
+    Four blockers, in the order a reader needs them:
+
+    ``no_provenance_evidence``
+        No reading was supplied at all. Without it the gate cannot tell a window
+        whose sources still bear on Continuum from one whose sources have moved on
+        since the claim was made, and it cannot report that as ready.
+    ``provenance_unclassified_drift``
+        A tracked source advanced on paths that no surviving classification covers.
+        This is the substantive one: the property Continuum claims parity with may
+        have changed, and nothing has been recorded about what it changed into.
+    ``provenance_source_unavailable`` / ``provenance_source_unreadable``
+        A source could not be read -- a private source with no credential
+        configured, or a failed API read. Never folded into "clean": a source that
+        was not read has not been shown to be unchanged.
+
+    One blocker per source rather than one summary, because the fix differs -- a
+    credential to configure is not the same work as a classification to record.
+    """
+
+    if provenance is None:
+        return [
+            Blocker(
+                code="no_provenance_evidence",
+                message=(
+                    "no source-drift reading was supplied; the repositories Continuum's "
+                    "parity claims were audited against may have moved since that audit, "
+                    "and a window recorded without it cannot say they have not"
+                ),
+            )
+        ]
+
+    blockers: List[Blocker] = []
+    for reading in provenance.readings:
+        if reading.drifted:
+            paths = ", ".join(finding.path for finding in reading.findings) or "unknown paths"
+            blockers.append(
+                Blocker(
+                    code="provenance_unclassified_drift",
+                    scenario=reading.id,
+                    message=(
+                        "source {} advanced from {} to {} on {} path(s) with no surviving "
+                        "classification: {}; classify them in the provenance ledger, or "
+                        "this source cannot be used to support a cutover".format(
+                            reading.id,
+                            (reading.baseline_sha or "?")[:12],
+                            (reading.head_sha or "?")[:12],
+                            len(reading.findings),
+                            paths,
+                        )
+                    ),
+                )
+            )
+        elif reading.status == "unavailable":
+            blockers.append(
+                Blocker(
+                    code="provenance_source_unavailable",
+                    scenario=reading.id,
+                    message=(
+                        "source {} is private and its read credential is not configured, "
+                        "so it was not read; its parity claims are unverified rather "
+                        "than confirmed ({})".format(
+                            reading.id,
+                            ", ".join(reading.limits) or "no credential",
+                        )
+                    ),
+                )
+            )
+        elif reading.status == "unreadable":
+            blockers.append(
+                Blocker(
+                    code="provenance_source_unreadable",
+                    scenario=reading.id,
+                    message=(
+                        "source {} could not be read ({}); an unread source is not an "
+                        "unchanged one".format(
+                            reading.id, ", ".join(reading.limits) or "unknown reason"
+                        )
+                    ),
+                )
+            )
+        elif reading.limits:
+            # A partial reading on a source with no drift: report it under the code
+            # for what happened rather than quietly folding it into "read".
+            blockers.append(
+                Blocker(
+                    code="provenance_source_unreadable",
+                    scenario=reading.id,
+                    message="source {} was read only partially: {}".format(
+                        reading.id, ", ".join(reading.limits)
+                    ),
+                )
+            )
+    return blockers
 
 
 def phase_scope_blockers(
@@ -1261,13 +1384,15 @@ def evidence_digest(
     window_started_at: str,
     window_ended_at: str,
     baseline_digest: str = "",
+    provenance_digest: str = "",
 ) -> str:
     """A digest of the evidence an approval is granted against.
 
     Covers the verdicts, the coverage, the liveness verdicts, the resolutions,
-    the rolling baseline, and the window's dates -- so an approval cannot be carried
-    over to a window that has gained an event, lost a resolution, moved its dates,
-    or been judged against a consumer whose workflows have since changed. Ordering
+    the rolling baseline, the source-drift reading, and the window's dates -- so an
+    approval cannot be carried over to a window that has gained an event, lost a
+    resolution, moved its dates, been judged against a consumer whose workflows have
+    since changed, or been judged against sources that have since moved. Ordering
     is canonicalised first, so two runs that saw the same events in a different
     delivery order produce the same digest.
     """
@@ -1284,6 +1409,10 @@ def evidence_digest(
         # against a clean reading, and a digest that could not tell those apart
         # would let the second be carried forward under the first's approval.
         "baseline": baseline_digest,
+        # And the same for source drift: an empty provenance digest has to be
+        # distinguishable from a clean one, or a window judged against sources that
+        # were read would be indistinguishable from one judged against none.
+        "provenance": provenance_digest,
         "verdicts": sorted(
             (
                 result.correlation_id,
@@ -1332,6 +1461,7 @@ def from_documents(
     liveness_document: Optional[Mapping[str, Any]] = None,
     *,
     baseline_document: Optional[Mapping[str, Any]] = None,
+    provenance_document: Optional[Mapping[str, Any]] = None,
     ledger_document: Optional[Mapping[str, Any]] = None,
     origins: Optional[Mapping[str, str]] = None,
     resolution_documents: Iterable[Mapping[str, Any]] = (),
@@ -1393,6 +1523,11 @@ def from_documents(
             if baseline_document is not None
             else None
         ),
+        provenance=(
+            _read_provenance_document(provenance_document)
+            if provenance_document is not None
+            else None
+        ),
         ledger=(
             baseline.read_ledger(ledger_document)
             if ledger_document is not None
@@ -1427,6 +1562,20 @@ def from_documents(
         window_ended_at=window_ended_at or str((liveness_document or {}).get("window_ended_at", "")),
         generated_from=generated_from,
     )
+
+
+def _read_provenance_document(document: Mapping[str, Any]) -> Any:
+    """Read a source-drift report, imported here so the cutover module's own
+    imports stay on its own vocabulary.
+
+    The gate refuses a report whose stated verdict disagrees with its readings, which
+    is the one thing this boundary has to guarantee: a document cannot claim to be
+    clean while carrying a drifted source inside it.
+    """
+
+    from ..provenance.drift import read_report
+
+    return read_report(document)
 
 
 def read_authorization(document: Mapping[str, Any]) -> Authorization:

@@ -450,6 +450,7 @@ READ_ONLY_METHODS = frozenset(
         "default_branch",
         "ref_sha",
         "workflow_inventory",
+        "compare_commits",
         "review_threads",
         "unresolved_thread_comment_ids",
     }

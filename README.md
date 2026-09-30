@@ -81,6 +81,16 @@ project's own `AGENTS.md` is the source of truth for its build, test, and
 release mechanics. A consumer repository's project instructions are never
 modified, replaced, or shadowed. See `docs/agent-instructions.md`.
 
+Continuum also holds parity claims against repositories it does not own. Those
+repositories keep moving, so the claims are versioned rather than assumed:
+[`docs/provenance-ledger.md`](docs/provenance-ledger.md) records what was
+classified against which commit of which source, a weekly audit asks whether any
+of them have drifted, and one deduplicated issue describes whatever has not been
+classified yet. A source is never copied and a private one is never read with the
+ambient token. The reading is required evidence for a migration cutover, so a
+promotion cannot assert that the preserved workflows still match the code they
+were preserved from.
+
 `CI` is the required merge gate. Consumers can also name optional blocking
 workflows through `additional_blocking_workflows` on the reusable merge and
 repair controllers. These are conditional by presence: if a path-filtered build

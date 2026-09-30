@@ -365,4 +365,14 @@ is its own, and Continuum decides only when to hand the merge commit over.
 
 The previously planned automatic-repin model is no longer part of the target architecture.
 
+Continuum holds parity claims against repositories it does not own, and those repositories keep
+moving. `src/continuum/provenance/` is the plane that keeps the claims honest: a versioned ledger
+records what was classified against which commit of which source
+(`docs/provenance-ledger.json`), a weekly read-only audit asks whether those sources have moved
+(`.github/workflows/parity-drift.yml`), and one deduplicated issue describes whatever has not been
+classified yet. Nothing is copied from a source — a finding asks a human to classify a path, and the
+classification is reviewed data in the ledger, not an automated import. The reading is not advisory:
+`--provenance` is required by the cutover gate, so a promotion cannot assert that the preserved
+workflows still match the code they were preserved from.
+
 Issues describe implementation work. This document defines the destination.

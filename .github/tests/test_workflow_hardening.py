@@ -86,6 +86,15 @@ AGENT_PLANE = (
 #: `ReleaseSelectionTests` in `test_release_selection.py` is what holds it to
 #: ADR-0002 instead.
 #:
+#: `parity-drift.yml` is a reporting plane: it reads other repositories' workflow
+#: heads on a schedule, and its one write scope is `issues: write` in a single job
+#: that opens or updates one parity issue. It executes no pull request code and
+#: dispatches no agent, so the trust-policy contract -- which is about what happens
+#: when pull request code reaches a privileged job -- has nothing to say about it.
+#: What *is* asserted about it is below, in `ProvenanceDriftWorkflowTests`: no
+#: private-source credential reference, no code copy, and a write scope confined to
+#: the publish job.
+#:
 #: The list is spelled out rather than derived, and `AuditScopeTests` asserts it
 #: is exactly the complement of `AGENT_PLANE`, so a workflow cannot enter this
 #: directory - or leave the agent plane - without a reviewer deciding so.
@@ -106,6 +115,7 @@ NOT_AGENT_PLANE = (
     "consumer-scheduler.yml",
     "consumer.yml",
     "continuum-shadow.yml",
+    "parity-drift.yml",
     "release-bun-binary.yml",
     "review-queue.yml",
 )
@@ -1352,6 +1362,78 @@ class DelegatedChildLivenessTests(WorkflowAuditBase):
         text = self.raw["consumer-child-review.yml"]
         self.assertIn('git merge --no-edit "origin/$base_ref"', text)
         self.assertIn('git diff --name-only --diff-filter=U', text)
+
+
+class ProvenanceDriftWorkflowTests(WorkflowAuditBase):
+    """The drift checker's boundary: read everything, write one issue, copy nothing.
+
+    The claims asserted here are the ones a reviewer cannot check by reading the
+    engine, because they are about the workflow: that the plane cannot reach a
+    private source with a broad credential, that its write scope is one scope in
+    one job, and that it never turns a source's movement into a copy.
+    """
+
+    NAME = "parity-drift.yml"
+
+    def test_it_runs_on_a_schedule_and_on_demand(self):
+        # The issue asks for a manual trigger as well as a schedule: registering a
+        # source is a human decision, and nobody should have to wait a week for it.
+        triggers = trigger_names(self.workflows[self.NAME]) + list(
+            (self.workflows[self.NAME].get(True) or {})
+        )
+        self.assertIn("schedule", triggers)
+        self.assertIn("workflow_dispatch", triggers)
+
+    def test_the_write_scope_is_one_scope_in_one_job(self):
+        document = self.workflows[self.NAME]
+        writers = {}
+        for job_name, job in (document.get("jobs") or {}).items():
+            scopes = write_scopes(job_permissions(document, job))
+            if scopes:
+                writers[job_name] = scopes
+        self.assertEqual(writers, {"publish": ["issues"]})
+
+    def test_the_reading_job_cannot_write(self):
+        # Splitting the jobs is the point: the job that reads other repositories'
+        # workflow files has no way to change anything, so a bug in the classifier
+        # has nothing to escalate into.
+        audit = self.job(self.NAME, "audit")
+        self.assertEqual(write_scopes(job_permissions(self.workflows[self.NAME], audit)), [])
+
+    def test_it_never_names_a_private_source_credential(self):
+        # The whole point of the private-source rule is that no credential is
+        # reachable from this file: a private source is read only through its own
+        # least-privilege variable, and the engine refuses to read it without one.
+        # If a secret reference for a private token ever appears here, a reader can
+        # no longer confirm that by reading, so this fails loudly instead.
+        self.assertNotIn("secrets.", self.raw[self.NAME])
+        self.assertIn("PRIVATE_SOURCE_READ_TOKEN", self.raw[self.NAME])
+
+    def test_it_never_copies_from_a_source(self):
+        # No fetch of another repository's code, and no `cp` of anything it read.
+        text = self.raw[self.NAME]
+        for forbidden in ("git clone", "actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n          with", "ref: refs/heads/"):
+            self.assertNotIn(forbidden, text, forbidden)
+        self.assertIn("Nothing here copies code from a source", text)
+
+    def test_the_publish_job_runs_only_after_an_audit_that_found_something(self):
+        publish = self.job(self.NAME, "publish")
+        self.assertEqual(publish["needs"], "audit")
+        condition = str(publish.get("if") or "")
+        # Not merely "the audit ran": an audit that found nothing must not touch the
+        # issue tracker, or the weekly schedule becomes weekly noise.
+        self.assertIn("drifted", condition)
+        self.assertIn("incomplete", condition)
+
+    def test_a_clean_audit_still_uploads_its_evidence(self):
+        # A report that is only uploaded on drift is a report nobody can compare a
+        # drift against afterwards.
+        upload = next(
+            step
+            for step in steps_of(self.job(self.NAME, "audit"))
+            if uses(step, "actions/upload-artifact")
+        )
+        self.assertIn("always()", str(upload.get("if") or ""))
 
 
 if __name__ == "__main__":

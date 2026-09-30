@@ -94,6 +94,7 @@ OWN_CONTROL_PLANE = (
 #: workflow cannot appear without a reviewer deciding which side it is on.
 OWN_REPOSITORY_TOOLING = (
     "ci.yml",
+    "parity-drift.yml",
     "release-bun-binary.yml",
 )
 

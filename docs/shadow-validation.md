@@ -233,6 +233,7 @@ PYTHONPATH=src python3 -m continuum.shadow.cli cutover \
   --rollback window/rollback.json \
   --change-set window/change-set.json \
   --ledger docs/parity-ledger.json \
+  --provenance provenance-out/drift.json \
   --authorization window/authorization.json \
   --phase phase-a \
   --window-start 2026-03-01T00:00:00Z \
@@ -253,16 +254,55 @@ are read together or not at all.
 
 The gate blocks on, among others: `uncovered_scenario`,
 `replayed_only_coverage`, `unresolved_divergence`, `no_baseline_evidence`,
-`no_liveness_evidence`,
+`no_provenance_evidence`, `no_liveness_evidence`,
 `liveness_stalled` / `liveness_orphaned` / `liveness_crashed`,
-`incomplete_approval`, `stale_approval`, `no_rollback`, and
-`approval_over_blocked_window`.
+`incomplete_approval`, `stale_approval`, `no_rollback`,
+`approval_over_blocked_window`, and the provenance blockers below.
 
 That last one deserves its own note, because it is the failure this whole plane
 exists to prevent. A complete, digest-matching approval is still refused when
 the window has blockers. A signature on the evidence does not make the evidence
 sufficient, and an operator who is told otherwise will learn it at the worst
 possible moment.
+
+### The provenance reading
+
+Parity says whether a window covered what it was supposed to cover. It does not
+say whether the claims being preserved still describe the code they were made
+against: a source repository can move on a Tuesday, in a different window, and
+the parity run that would have noticed is not this one.
+
+So `--provenance` is not optional and has no default. A cutover with no
+provenance reading is refused with `no_provenance_evidence`, which means a
+decision that records "all sources were read and none has drifted" cannot be
+written at all. The reading is folded into `evidence_digest`, so the drift
+checker has to agree with the reading that was approved: a source that moved
+between the audit and the cutover makes the approval `stale` rather than being
+quietly re-read at promotion time.
+
+```
+PYTHONPATH=src python3 -m continuum.provenance.cli check \
+  --ledger docs/provenance-ledger.json \
+  --capture-live \
+  --public-token-env GITHUB_TOKEN \
+  --out provenance-out/drift.json
+```
+
+Exit code `0` is clean, `1` is drift or an audit that could not read every
+source, and `2` or more means the checker could not run — a distinction the
+workflow preserves, because a crashed checker is not a clean report.
+
+| Blocker | Means |
+| --- | --- |
+| `no_provenance_evidence` | The run named no reading, so nothing says whether the sources still match the claims |
+| `provenance_unclassified_drift` | A tracked path changed and no one has classified it |
+| `provenance_source_unavailable` | A source could not be read — usually a private source with no credential configured |
+| `provenance_source_unreadable` | A source was read and the result could not be interpreted |
+
+`provenance_source_unavailable` and `provenance_source_unreadable` are as
+blocking as drift. A checker that could not read a repository has not found
+drift there; it has failed to look, and treating silence as absence is the exact
+failure this reading exists to make impossible.
 
 ### The authorization
 
@@ -273,7 +313,7 @@ decision depended on and the gate re-derives all of them:
 
 | Field | Bound to |
 | --- | --- |
-| `evidence_digest` | the window's verdicts, coverage, liveness, resolutions, phase and baseline reading |
+| `evidence_digest` | the window's verdicts, coverage, liveness, resolutions, phase, baseline reading and provenance reading |
 | `baseline_digest` | the rolling baseline reading, so a moved workflow expires the record |
 | `consumer_head` | the NanoDictate commit that reading was taken from |
 | `controller_sha` | the Continuum commit that issued it, compared with `engine.engine_sha()` |

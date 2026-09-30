@@ -111,7 +111,15 @@ class GitHubClient:
             return result[0]
         return result
 
-    def paginate(self, path: str) -> List[Any]:
+    def paginate(self, path: str, *, limit: int = 0) -> List[Any]:
+        """Follow a paginated list, optionally stopping once `limit` items are held.
+
+        Stopping early matters as much as stopping at all: the loop's cost is
+        proportional to the number of pages, so a caller that will only look at the
+        first twenty results of a thousand-row listing is paying for the other
+        nineteen pages unless it says what it needs here.
+        """
+
         items: List[Any] = []
         url = self.api_base + path
         while url:
@@ -124,6 +132,8 @@ class GitHubClient:
                 ) from None
             if isinstance(page, list):
                 items.extend(page)
+            if limit and limit > 0 and len(items) >= limit:
+                return items[:limit]
             url = _next_link(link)
         return items
 
@@ -137,9 +147,27 @@ class GitHubClient:
     def get_pull(self, number: int) -> Dict[str, Any]:
         return self.request("GET", f"/repos/{self.owner}/{self.name}/pulls/{number}")
 
-    def list_pulls(self, *, state: str = "open", base: str = "") -> List[Dict[str, Any]]:
-        query = urllib.parse.urlencode({"state": state, "per_page": 100, **({"base": base} if base else {})})
-        return self.paginate(f"/repos/{self.owner}/{self.name}/pulls?{query}")
+    def list_pulls(
+        self, *, state: str = "open", base: str = "", limit: int = 0
+    ) -> List[Dict[str, Any]]:
+        """List pull requests, optionally stopping at `limit`.
+
+        `limit` is about cost, not correctness. Callers that show a bounded amount
+        of evidence -- a weekly audit attaching PR numbers to a drift finding -- do
+        not want to walk every page of a repository with hundreds of open pull
+        requests to print twenty of them. A positive `limit` stops once it has that
+        many, and a larger page size is not requested because GitHub caps `per_page`
+        at 100 anyway.
+        """
+
+        params: Dict[str, Any] = {"state": state}
+        if base:
+            params["base"] = base
+        if limit and limit > 0:
+            params["per_page"] = min(limit, 100)
+        query = urllib.parse.urlencode(params)
+        path = f"/repos/{self.owner}/{self.name}/pulls?{query}"
+        return self.paginate(path, limit=limit if limit and limit > 0 else 0)
 
     def get_issue(self, number: int) -> Dict[str, Any]:
         return self.request("GET", f"/repos/{self.owner}/{self.name}/issues/{number}")
@@ -239,6 +267,46 @@ class GitHubClient:
                 )
             inventory[f".github/workflows/{name}"] = sha
         return inventory
+
+    def compare_commits(self, base: str, head: str) -> Dict[str, Any]:
+        """The commits and files between two commits in this repository.
+
+        A read-only comparison: `base...head` in the same repository, so it needs
+        no cross-repository permission and returns nothing the caller did not
+        already have read access to. The comparison can be *behind* or *diverged*,
+        not just ahead -- a rewritten history moves the other way -- so the
+        relation is returned rather than assumed.
+
+        The file list is capped by the API at 300 entries. `files_truncated` says so
+        explicitly rather than leaving a caller to treat a short list as a complete
+        one, because a truncated change set is the shape of answer that turns a
+        drift audit into a green one for the wrong reason.
+        """
+
+        span = f"{urllib.parse.quote(str(base), safe='')}...{urllib.parse.quote(str(head), safe='')}"
+        payload = self.request("GET", f"/repos/{self.owner}/{self.name}/compare/{span}")
+        if not isinstance(payload, dict):
+            raise GitHubError(f"Comparison {base}...{head} did not return an object")
+        files: List[Dict[str, str]] = []
+        for entry in payload.get("files") or []:
+            if not isinstance(entry, dict):
+                continue
+            files.append(
+                {
+                    "path": str(entry.get("filename") or ""),
+                    "status": str(entry.get("status") or ""),
+                }
+            )
+        return {
+            "status": str(payload.get("status") or ""),
+            "ahead_by": int(payload.get("ahead_by") or 0),
+            "behind_by": int(payload.get("behind_by") or 0),
+            "total_commits": int(payload.get("total_commits") or 0),
+            "files": files,
+            # The API documents a 300-file ceiling and does not report that it
+            # applied one, so a full page is treated as a page that might be short.
+            "files_truncated": len(files) >= 300,
+        }
 
     def file_at_ref(self, path: str, ref: str) -> Optional[str]:
         quoted = urllib.parse.quote(path)

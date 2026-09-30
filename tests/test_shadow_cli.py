@@ -52,6 +52,20 @@ _LEDGER = {
 }
 
 
+def _provenance_cli(*args: str) -> subprocess.CompletedProcess:
+    """Run the provenance CLI in its own process, for the same reason as ``_cli``."""
+
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = str(REPO_ROOT / "src")
+    return subprocess.run(
+        [sys.executable, "-m", "continuum.provenance.cli", *args],
+        cwd=str(REPO_ROOT),
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+
 def _cli(*args: str) -> subprocess.CompletedProcess:
     """Run the CLI in a process, because the barrier is per-process.
 
@@ -623,6 +637,73 @@ class ZeroTouchCutover(unittest.TestCase):
             },
         )
 
+    def _provenance(self):
+        """A source-drift report for the same consumer, produced by its own CLI.
+
+        Written through ``continuum.provenance.cli check`` rather than assembled here,
+        so the artifact the gate is handed is the one the plane actually emits -- a
+        report hand-written to satisfy the gate would prove nothing about whether the
+        two agree.
+        """
+
+        ledger = _write(
+            self.dir / "provenance-ledger.json",
+            {
+                "schema": "continuum.provenance-ledger/v1",
+                "version": 1,
+                "sources": [
+                    {
+                        "id": "nanodictate",
+                        "repository": "kodmial/nanodictate",
+                        "visibility": "public",
+                        "disposition": "absorbed",
+                        "severity": "p0",
+                        "baseline_sha": "a" * 40,
+                        "audited_at": "2026-03-01T00:00:00Z",
+                        "tracked_prefixes": [".github/workflows/"],
+                        "path_dispositions": {
+                            ".github/workflows/release.yml": "must-port"
+                        },
+                        "continuum": {
+                            "implementation": ["src/continuum/shadow/planner.py"],
+                            "tests": ["tests/test_shadow_cutover.py"],
+                        },
+                    }
+                ],
+            },
+        )
+        # A reading with nothing changed, captured rather than read live, so the test
+        # depends on no network and no credential.
+        readings = _write(
+            self.dir / "provenance-readings.json",
+            {
+                "readings": [
+                    {
+                        "id": "nanodictate",
+                        "repository": "kodmial/nanodictate",
+                        "visibility": "public",
+                        "severity": "p0",
+                        "status": "unchanged",
+                        "baseline_sha": "a" * 40,
+                        "head_sha": "a" * 40,
+                        "pull_requests": [],
+                        "limits": [],
+                        "credential": "public-read",
+                        "ledger_digest": "",
+                        "audited_at": "2026-03-20T00:00:00Z",
+                    }
+                ]
+            },
+        )
+        checked = _provenance_cli(
+            "check",
+            "--ledger", str(ledger),
+            "--readings", str(readings),
+            "--out", str(self.dir / "provenance-out" / "drift.json"),
+        )
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        return self.dir / "provenance-out" / "drift.json"
+
     def _window(self):
         """Every control-plane scenario, live, plus the artifacts the gate reads."""
 
@@ -707,6 +788,7 @@ class ZeroTouchCutover(unittest.TestCase):
         return {
             "ledger": ledger_path,
             "report": self.dir / "baseline-out" / "baseline" / "report.json",
+            "provenance": self._provenance(),
             "parity": parity_paths,
             "liveness": live,
             "origins": origins_path,
@@ -742,6 +824,7 @@ class ZeroTouchCutover(unittest.TestCase):
             "--liveness", str(window["liveness"]),
             "--origins", str(window["origins"]),
             "--baseline", str(window["report"]),
+            "--provenance", str(window["provenance"]),
             "--canary", str(window["canary"]),
             "--rollback", str(window["rollback"]),
             "--ledger", str(window["ledger"]),

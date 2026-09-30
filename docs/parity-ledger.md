@@ -8,6 +8,11 @@ this repository does not have to re-derive them from a diff.
 
 Parent: runtime-lab #59. Dispatched implementation: runtime-lab #61.
 
+This file records *what was decided*. Whether those decisions still describe the
+code they were made against is a separate question with its own ledger:
+[`provenance-ledger.md`](provenance-ledger.md), checked weekly by
+`.github/workflows/parity-drift.yml`.
+
 ## The five classifications
 
 | Classification | Meaning |

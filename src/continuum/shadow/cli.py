@@ -162,6 +162,12 @@ def _parser() -> argparse.ArgumentParser:
         "gate refuses a window without one",
     )
     gate.add_argument(
+        "--provenance",
+        help="a source-drift report from `continuum.provenance.cli check`; the cutover "
+        "gate refuses a window without one, and refuses one whose tracked sources have "
+        "advanced on unclassified paths",
+    )
+    gate.add_argument(
         "--ledger",
         help="the reviewed parity ledger; required with --change-set, because a "
         "change is checked against the writer role the ledger recorded",
@@ -463,6 +469,7 @@ def _cutover(args: argparse.Namespace) -> int:
         [_read_json(path) for path in args.parity],
         _read_json(args.liveness) if args.liveness else None,
         baseline_document=_read_json(args.baseline) if args.baseline else None,
+        provenance_document=_read_json(args.provenance) if args.provenance else None,
         ledger_document=_read_json(args.ledger) if args.ledger else None,
         origins=_optional_json(args.origins),
         resolution_documents=[_read_json(path) for path in args.resolutions],

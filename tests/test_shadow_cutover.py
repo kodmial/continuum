@@ -13,6 +13,8 @@ import dataclasses
 import json
 import unittest
 
+from continuum.provenance import drift as provenance_drift
+from continuum.provenance import ledger as provenance_ledger
 from continuum.shadow import baseline, cutover, engine, liveness, parity, planner
 from continuum.shadow.observation import outcome_from_payload
 from tests import shadow_support as fixtures
@@ -136,6 +138,59 @@ def _baseline(*, workflows=LEDGER_WORKFLOWS, live_workflows=None, live=None):
     return baseline.audit(ledger, live_head)
 
 
+#: The one source the gate tests are judged against. Public, p0, and tracked at a
+#: single workflow whose disposition is content-scoped -- so a test that wants drift
+#: only has to move that one file.
+PROVENANCE_BASELINE = "a" * 40
+
+
+def _provenance_ledger():
+    return provenance_ledger.read_provenance(
+        {
+            "schema": provenance_ledger.PROVENANCE_SCHEMA,
+            "version": provenance_ledger.LEDGER_VERSION,
+            "sources": [
+                {
+                    "id": "nanodictate",
+                    "repository": "kodmial/nanodictate",
+                    "visibility": "public",
+                    "disposition": "absorbed",
+                    "severity": "p0",
+                    "baseline_sha": PROVENANCE_BASELINE,
+                    "audited_at": "2026-03-01T00:00:00Z",
+                    "tracked_prefixes": [".github/workflows/"],
+                    "path_dispositions": {".github/workflows/dictate.yml": "must-port"},
+                    "continuum": {
+                        "implementation": ["src/continuum/shadow/planner.py"],
+                        "tests": ["tests/test_shadow_cutover.py"],
+                    },
+                }
+            ],
+        }
+    )
+
+
+def _provenance(*, head_sha=None, changes=(), **kwargs):
+    """A source-drift reading; by default one where the source has not moved.
+
+    The gate refuses a window without one, for the same reason it refuses one
+    without a rolling baseline: a window that never checked whether the sources its
+    parity claims came from had moved is not evidence of anything. ``ProvenanceGate``
+    covers the requirement itself, and every test about *other* blockers supplies a
+    clean reading so it is not asserting on an already-refused window.
+    """
+
+    ledger = _provenance_ledger()
+    source = ledger.sources[0]
+    reading = provenance_drift.classify(
+        source,
+        head_sha=head_sha if head_sha is not None else PROVENANCE_BASELINE,
+        changes=[{"path": path, "status": status} for path, status in changes],
+        **kwargs
+    )
+    return provenance_drift.check(ledger, readings=[reading])
+
+
 class ScenarioRequirements(unittest.TestCase):
     def test_the_required_classes_are_the_ones_the_issue_lists(self) -> None:
         self.assertEqual(
@@ -221,6 +276,7 @@ class Gate(unittest.TestCase):
             results,
             _liveness([result.correlation_id for result in results]),
             baseline=_baseline(),
+            provenance=_provenance(),
             origins=origins,
             window_started_at=WINDOW[0],
             window_ended_at=WINDOW[1],
@@ -242,6 +298,7 @@ class Gate(unittest.TestCase):
             results,
             _liveness(["corr-merge-decision"]),
             baseline=_baseline(),
+            provenance=_provenance(),
             origins=origins,
             window_started_at=WINDOW[0],
             window_ended_at=WINDOW[1],
@@ -270,6 +327,7 @@ class Gate(unittest.TestCase):
             results,
             _liveness([result.correlation_id for result in results]),
             baseline=_baseline(),
+            provenance=_provenance(),
             origins=origins,
             window_started_at=WINDOW[0],
             window_ended_at=WINDOW[1],
@@ -295,6 +353,7 @@ class Gate(unittest.TestCase):
             results,
             _liveness([result.correlation_id for result in results]),
             baseline=_baseline(),
+            provenance=_provenance(),
             origins=origins,
             resolutions=[resolution],
             window_started_at=WINDOW[0],
@@ -313,6 +372,7 @@ class Gate(unittest.TestCase):
             results,
             _liveness([result.correlation_id for result in results]),
             baseline=_baseline(),
+            provenance=_provenance(),
             origins=origins,
             resolutions=[cutover.Resolution(correlation_id="corr-diverged", resolution="  ")],
             window_started_at=WINDOW[0],
@@ -338,6 +398,7 @@ class Gate(unittest.TestCase):
             results,
             report,
             baseline=_baseline(),
+            provenance=_provenance(),
             origins=origins,
             window_started_at=WINDOW[0],
             window_ended_at=WINDOW[1],
@@ -347,7 +408,7 @@ class Gate(unittest.TestCase):
     def test_no_liveness_report_is_a_blocker_not_an_assumption(self) -> None:
         results, origins = _results()
         decision = cutover.decide(
-            results, None, baseline=_baseline(), origins=origins,
+            results, None, baseline=_baseline(), provenance=_provenance(), origins=origins,
             window_started_at=WINDOW[0], window_ended_at=WINDOW[1],
         )
         self.assertIn("no_liveness_evidence", decision.codes)
@@ -358,6 +419,7 @@ class Gate(unittest.TestCase):
             results,
             liveness.LivenessReport(),
             baseline=_baseline(),
+            provenance=_provenance(),
             origins=origins,
             window_started_at=WINDOW[0],
             window_ended_at=WINDOW[1],
@@ -372,6 +434,7 @@ class Approval(unittest.TestCase):
             results,
             _liveness([result.correlation_id for result in results]),
             baseline=_baseline(),
+            provenance=_provenance(),
             origins=origins,
             window_started_at=WINDOW[0],
             window_ended_at=WINDOW[1],
@@ -395,6 +458,7 @@ class Approval(unittest.TestCase):
             results,
             _liveness([result.correlation_id for result in results]),
             baseline=_baseline(),
+            provenance=_provenance(),
             origins=origins,
             window_started_at=WINDOW[0],
             window_ended_at=WINDOW[1],
@@ -403,6 +467,7 @@ class Approval(unittest.TestCase):
             results,
             _liveness([result.correlation_id for result in results]),
             baseline=_baseline(),
+            provenance=_provenance(),
             origins=origins,
             approval=self._approval(base),
             canary={"run": "runs/canary-1"},
@@ -417,13 +482,14 @@ class Approval(unittest.TestCase):
         results, origins = _results()
         live = _liveness([result.correlation_id for result in results])
         base = cutover.decide(
-            results, live, baseline=_baseline(), origins=origins,
+            results, live, baseline=_baseline(), provenance=_provenance(), origins=origins,
             window_started_at=WINDOW[0], window_ended_at=WINDOW[1],
         )
         decision = cutover.decide(
             results,
             live,
             baseline=_baseline(),
+            provenance=_provenance(),
             origins=origins,
             approval=self._approval(base),
             canary={"run": "runs/canary-1", "result": "clean"},
@@ -440,7 +506,7 @@ class Approval(unittest.TestCase):
         results, origins = _results()
         live = _liveness([result.correlation_id for result in results])
         base = cutover.decide(
-            results, live, baseline=_baseline(), origins=origins,
+            results, live, baseline=_baseline(), provenance=_provenance(), origins=origins,
             window_started_at=WINDOW[0], window_ended_at=WINDOW[1],
         )
         # The window gains an event after the approval was granted.
@@ -450,6 +516,7 @@ class Approval(unittest.TestCase):
             extended,
             _liveness([result.correlation_id for result in extended]),
             baseline=_baseline(),
+            provenance=_provenance(),
             origins=origins,
             approval=self._approval(base),
             canary={"run": "runs/canary-1"},
@@ -489,13 +556,14 @@ class Approval(unittest.TestCase):
         )
         # The approval is signed against this very window, stall and all.
         base = cutover.decide(
-            results, stalled, baseline=_baseline(), origins=origins,
+            results, stalled, baseline=_baseline(), provenance=_provenance(), origins=origins,
             window_started_at=WINDOW[0], window_ended_at=WINDOW[1],
         )
         decision = cutover.decide(
             results,
             stalled,
             baseline=_baseline(),
+            provenance=_provenance(),
             origins=origins,
             approval=self._approval(base),
             canary={"run": "runs/canary-1"},
@@ -515,6 +583,7 @@ class Approval(unittest.TestCase):
             results,
             live,
             baseline=_baseline(),
+            provenance=_provenance(),
             origins=origins,
             approval=cutover.Approval(approved_by="maintainer"),
             canary={"run": "runs/canary-1"},
@@ -612,13 +681,14 @@ class BaselineGate(unittest.TestCase):
         results, origins = _results()
         live = _liveness([result.correlation_id for result in results])
         clean = cutover.decide(
-            results, live, baseline=_baseline(), origins=origins,
+            results, live, baseline=_baseline(), provenance=_provenance(), origins=origins,
             window_started_at=WINDOW[0], window_ended_at=WINDOW[1],
         )
         moved = cutover.decide(
             results,
             live,
             baseline=_baseline(live_workflows=((".github/workflows/ci.yml", "9" * 40),)),
+            provenance=_provenance(),
             origins=origins,
             window_started_at=WINDOW[0],
             window_ended_at=WINDOW[1],
@@ -634,7 +704,7 @@ class BaselineGate(unittest.TestCase):
         # The approval matches the clean window exactly...
         self.assertTrue(
             cutover.decide(
-                results, live, baseline=_baseline(), origins=origins,
+                results, live, baseline=_baseline(), provenance=_provenance(), origins=origins,
                 approval=approval, canary={"run": "runs/canary-1"},
                 rollback={"reference": "workflows/issue-scheduler.yml@revert-1"},
                 window_started_at=WINDOW[0], window_ended_at=WINDOW[1],
@@ -647,6 +717,7 @@ class BaselineGate(unittest.TestCase):
                 results,
                 live,
                 baseline=_baseline(live_workflows=((".github/workflows/ci.yml", "9" * 40),)),
+            provenance=_provenance(),
                 origins=origins,
                 approval=approval,
                 canary={"run": "runs/canary-1"},
@@ -688,6 +759,7 @@ class FromArtifacts(unittest.TestCase):
             [result.describe() for result in results],
             live.describe(),
             baseline_document=_baseline().describe(),
+            provenance_document=_provenance().describe(),
             origins=origins,
             window_started_at=WINDOW[0],
             window_ended_at=WINDOW[1],
@@ -713,7 +785,7 @@ class FromArtifacts(unittest.TestCase):
         results, origins = _results()
         live = _liveness([result.correlation_id for result in results])
         decision = cutover.decide(
-            results, live, baseline=_baseline(), origins=origins,
+            results, live, baseline=_baseline(), provenance=_provenance(), origins=origins,
             window_started_at=WINDOW[0], window_ended_at=WINDOW[1],
         )
         document = decision.describe()
@@ -731,7 +803,7 @@ class FromArtifacts(unittest.TestCase):
     def test_a_changed_verdict_summary_moves_the_digest(self) -> None:
         results, origins = _results()
         first = cutover.decide(
-            results, _liveness([r.correlation_id for r in results]), baseline=_baseline(), origins=origins,
+            results, _liveness([r.correlation_id for r in results]), baseline=_baseline(), provenance=_provenance(), origins=origins,
             window_started_at=WINDOW[0], window_ended_at=WINDOW[1],
         )
         # Same event, same classification, different substance: the summary names
@@ -744,7 +816,7 @@ class FromArtifacts(unittest.TestCase):
             for index, result in enumerate(results)
         ]
         second = cutover.decide(
-            retitled, _liveness([r.correlation_id for r in results]), baseline=_baseline(), origins=origins,
+            retitled, _liveness([r.correlation_id for r in results]), baseline=_baseline(), provenance=_provenance(), origins=origins,
             window_started_at=WINDOW[0], window_ended_at=WINDOW[1],
         )
         self.assertNotEqual(first.evidence_digest, second.evidence_digest)
@@ -752,13 +824,14 @@ class FromArtifacts(unittest.TestCase):
     def test_the_evidence_digest_ignores_delivery_order(self) -> None:
         results, origins = _results()
         forward = cutover.decide(
-            results, _liveness([r.correlation_id for r in results]), baseline=_baseline(), origins=origins,
+            results, _liveness([r.correlation_id for r in results]), baseline=_baseline(), provenance=_provenance(), origins=origins,
             window_started_at=WINDOW[0], window_ended_at=WINDOW[1],
         )
         backward = cutover.decide(
             list(reversed(results)),
             _liveness([r.correlation_id for r in results]),
             baseline=_baseline(),
+            provenance=_provenance(),
             origins=origins,
             window_started_at=WINDOW[0],
             window_ended_at=WINDOW[1],
@@ -814,6 +887,7 @@ class Phases(unittest.TestCase):
             results,
             live,
             baseline=_baseline(),
+            provenance=_provenance(),
             origins=origins,
             phase=cutover.PHASE_A,
             window_started_at=WINDOW[0],
@@ -831,6 +905,7 @@ class Phases(unittest.TestCase):
             results,
             live,
             baseline=_baseline(),
+            provenance=_provenance(),
             origins=origins,
             phase=cutover.PHASE_B,
             window_started_at=WINDOW[0],
@@ -862,6 +937,7 @@ class Phases(unittest.TestCase):
                 results,
                 live,
                 baseline=_baseline(),
+                provenance=_provenance(),
                 origins=origins,
                 phase=phase,
                 window_started_at=WINDOW[0],
@@ -915,6 +991,7 @@ class PhaseScope(unittest.TestCase):
             results,
             _liveness([result.correlation_id for result in results]),
             baseline=_baseline(),
+            provenance=_provenance(),
             origins=origins,
             change_set=change_set,
             ledger=self.ledger if ledger is _DEFAULT else ledger,
@@ -1006,6 +1083,7 @@ class PhaseScope(unittest.TestCase):
             results,
             _liveness([result.correlation_id for result in results]),
             baseline=_baseline(),
+            provenance=_provenance(),
             origins=origins,
             change_set=self._change_set(
                 (".github/workflows/release.yml", "remove", "release")
@@ -1099,6 +1177,7 @@ class Authorization(unittest.TestCase):
             [result.correlation_id for result in self.results]
         )
         self.baseline = _baseline()
+        self.provenance = _provenance()
         self.change_set = cutover.ChangeSet(
             cutover_head="c" * 40,
             phase=self.phase,
@@ -1119,6 +1198,7 @@ class Authorization(unittest.TestCase):
 
         defaults = {
             "baseline": self.baseline,
+            "provenance": self.provenance,
             "origins": self.origins,
             "change_set": self.change_set,
             "ledger": self.ledger,
@@ -1424,6 +1504,7 @@ class Authorization(unittest.TestCase):
             [result.describe() for result in results],
             live.describe(),
             baseline_document=reading.describe(),
+            provenance_document=self.provenance.describe(),
             ledger_document=ledger.describe(),
             change_set_document=change_set.describe(),
             authorization_document=self._authorization().describe(),
