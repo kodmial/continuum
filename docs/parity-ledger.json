@@ -1,7 +1,7 @@
 {
   "schema": "continuum.parity-ledger/v1",
   "repository": "kodmial/nanodictate",
-  "audited_head": "d9e6dcc2e0c9c43bc87cd1963b75c097dec7ea1c",
+  "audited_head": "08a5d920c5dbf1f4203160e92e3e530c5bbb3b8f",
   "audited_at": "2026-09-30T00:00:00Z",
   "discovery_issue": "#60",
   "workflows": [
@@ -56,10 +56,10 @@
     },
     {
       "path": ".github/workflows/continuum-shadow-bridge.yml",
-      "blob_sha": "34cc3ebbb8cb21a3e892158ec3bbe21b0a024bc9",
+      "blob_sha": "302ab4dda9f7efd10899f193a8f4ea79085052d9",
       "classification": "absorbed",
       "owner": "#27",
-      "rationale": "Added after the 2026-09-30 audit point. The thin lifecycle bridge Continuum documents for installation; the matching implementation and its test are reference/nanodictate-workflows/shadow-bridge.yml and tests/test_shadow_workflow.py."
+      "rationale": "Thin read-only lifecycle bridge pinned to the merged live parity gate. Its reusable implementation is .github/workflows/continuum-shadow.yml and its immutable-pin contract is covered by tests/test_shadow_workflow.py."
     },
     {
       "path": ".github/workflows/issue-scheduler.yml",
