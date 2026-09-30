@@ -135,4 +135,65 @@ class ContinuumTest < Minitest::Test
       refute Dir.exist?(File.join(dir, 'invalid'))
     end
   end
+  def test_parent_templates_match_reusable_contracts
+    Dir[File.join(ROOT, '.github/caller-stubs/parent/*.yml')].each do |file|
+      caller = yaml(file)
+      caller.fetch('jobs').each_value do |job|
+        next unless job['uses']
+        name = job.fetch('uses').split('/').last.split('@').first
+        callee = yaml(File.join(ROOT, '.github/workflows', name))
+        assert_equal ['workflow_call'], events(callee).keys
+        contract = events(callee).fetch('workflow_call')
+        job.fetch('with').each_key { |key| assert contract.fetch('inputs').key?(key), key }
+        contract.fetch('inputs').each do |key, spec|
+          assert job.fetch('with').key?(key), key if spec['required']
+        end
+        assert job.fetch('secrets').key?('CHILD_RUNTIME_TOKEN')
+        assert_equal 'main', job.fetch('with').fetch('engine_ref')
+        callee.fetch('jobs').each_value do |inner|
+          checkout = inner.fetch('steps').find { |step| step['name'] == 'Checkout Continuum engine' }
+          assert_equal '${{ inputs.engine_ref }}', checkout.fetch('with').fetch('ref')
+          assert inner.fetch('steps').any? { |step| step['run'].to_s.include?('CONTINUUM_ENGINE_ROOT=') }
+        end
+      end
+    end
+  end
+
+  def test_parent_install_keeps_project_workflows_and_pins_engine
+    fixture do |dir|
+      destination = File.join(dir, 'consumer')
+      workflows = File.join(destination, '.github/workflows')
+      FileUtils.mkdir_p(workflows)
+      preserved = %w[ci.yml release.yml issue-scheduler.yml opencode.yml]
+      preserved.each { |name| File.write(File.join(workflows, name), "project-owned #{name}\n") }
+      bin = File.join(dir, 'bin')
+      FileUtils.mkdir_p(bin)
+      File.write(File.join(bin, 'curl'), <<~SH)
+        #!/usr/bin/env bash
+        set -eu
+        url="${@: -1}"
+        [[ "$url" == */.github/caller-stubs/parent/* ]]
+        cat "$TEMPLATES/${url##*/}"
+      SH
+      FileUtils.chmod(0755, File.join(bin, 'curl'))
+      env = {'PATH'=>"#{bin}:#{ENV['PATH']}", 'TEMPLATES'=>File.join(ROOT, '.github/caller-stubs/parent')}
+      ref = 'b' * 40
+      output, status = Open3.capture2e(env, 'bash', File.join(ROOT, 'install.sh'), destination, ref, 'parent')
+      assert status.success?, output
+      preserved.each { |name| assert_equal "project-owned #{name}\n", File.read(File.join(workflows, name)) }
+      installed = Dir[File.join(workflows, 'child-*.yml')]
+      assert_equal 4, installed.size
+      installed.each do |file|
+        yaml(file).fetch('jobs').each_value do |job|
+          next unless job['uses']
+          assert job['uses'].end_with?("@#{ref}")
+          assert_equal ref, job.fetch('with').fetch('engine_ref')
+        end
+      end
+      output, status = Open3.capture2e('bash', File.join(ROOT, 'install.sh'), File.join(dir, 'invalid'), 'main', 'unknown')
+      refute status.success?, output
+      refute Dir.exist?(File.join(dir, 'invalid'))
+    end
+  end
+
 end

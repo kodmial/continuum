@@ -1,0 +1,42 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "include-component-in-tag": false,
+  "include-v-in-tag": true,
+  "skip-github-release": true,
+  "packages": {
+    ".": {
+      "release-type": "go",
+      "versioning": "always-bump-patch",
+      "skip-changelog": true,
+      "skip-github-release": true,
+      "include-component-in-tag": false,
+      "include-v-in-tag": true,
+      "pull-request-header": ":robot: NanoDictate Release PR — merges here publish the next version. Do not edit the version by hand; merge this PR to release.",
+      "extra-files": [
+        {
+          "type": "generic",
+          "path": "Sources/NanoDictateCore/Version.swift"
+        }
+      ],
+      "exclude-paths": [
+        "Sources/NanoDictateCore/Version.swift",
+        "CHANGELOG.md",
+        "README.md",
+        "SECURITY.md",
+        "CODE_OF_CONDUCT.md",
+        "CONTRIBUTING.md",
+        "LICENSE",
+        ".gitignore",
+        ".swift-format",
+        ".swiftlint.yml",
+        ".coderabbit.yaml",
+        "docs",
+        ".github",
+        ".githooks",
+        "packaging",
+        "nanodictate.rb",
+        "config.example.toml"
+      ]
+    }
+  }
+}

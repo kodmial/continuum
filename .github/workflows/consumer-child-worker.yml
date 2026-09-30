@@ -1,0 +1,230 @@
+name: Continuum reusable child worker
+
+on:
+  workflow_call:
+    inputs:
+      child_id:
+        type: string
+        required: true
+      task_number:
+        type: string
+        required: true
+      model:
+        type: string
+        required: false
+        default: opencode/big-pickle
+      max_agent_passes:
+        type: number
+        required: false
+        default: 4
+      python_version:
+        description: Python version available to the child validation gate
+        type: string
+        required: false
+        default: '3.12'
+      engine_ref:
+        type: string
+        required: false
+        default: main
+    secrets:
+      CHILD_RUNTIME_TOKEN:
+        required: true
+      CHILD_RUNTIME_REPOSITORIES:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  execute:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    concurrency:
+      group: continuum-child-task-${{ inputs.child_id }}-${{ inputs.task_number }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ secrets.CHILD_RUNTIME_TOKEN }}
+      GITHUB_TOKEN: ${{ secrets.CHILD_RUNTIME_TOKEN }}
+      CHILD_REPOSITORIES: ${{ secrets.CHILD_RUNTIME_REPOSITORIES }}
+      CHILD_ID: ${{ inputs.child_id }}
+      TASK_NUMBER: ${{ inputs.task_number }}
+      OPENCODE_MODEL: ${{ inputs.model }}
+      MAX_AGENT_PASSES: ${{ inputs.max_agent_passes }}
+      OPENCODE_CONFIG_CONTENT: '{"permission":{"bash":{"*":"allow","git *":"allow","git push *":"deny"}}}'
+    steps:
+      - name: Checkout parent control plane
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout Continuum engine
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: kodmial/continuum
+          ref: ${{ inputs.engine_ref }}
+          path: .continuum-engine
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up child Python
+        uses: actions/setup-python@82c7e631bb3cdc910f68e0081d67478d79c6982d
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Export Continuum engine root
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "CONTINUUM_ENGINE_ROOT=$GITHUB_WORKSPACE/.continuum-engine" >> "$GITHUB_ENV"
+
+      - name: Execute child task
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$TASK_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::Invalid task number."; exit 2; }
+          export PYTHONPATH="$CONTINUUM_ENGINE_ROOT/src"
+          resolver="$CONTINUUM_ENGINE_ROOT/.github/scripts/delegation_repository.sh"
+          child_repo="$(
+            PARENT_CONFIG=.continuum.yml CHILD_REPOSITORIES="$CHILD_REPOSITORIES"               bash "$resolver" resolve "$CHILD_ID"
+          )"
+
+          PARENT_CONFIG=.continuum.yml CHILD_REPOSITORIES="$CHILD_REPOSITORIES" \
+            bash "$resolver" verify "$CHILD_ID" "$child_repo" >/dev/null
+
+          issue_state="$(gh api "repos/$child_repo/issues/$TASK_NUMBER" --jq '.state' 2>/dev/null || true)"
+          [[ "$issue_state" == "open" ]] || exit 0
+
+          workdir="$RUNNER_TEMP/continuum-child-target"
+          transcript="$RUNNER_TEMP/continuum-child-agent.log"
+          result_file="automation/runtime-results/task-${TASK_NUMBER}.md"
+
+          gh auth setup-git >/dev/null 2>&1
+          rm -rf "$workdir"
+          gh repo clone "$child_repo" "$workdir" -- --quiet >/dev/null 2>&1
+          cd "$workdir"
+          git fetch --all --tags --prune --quiet >/dev/null 2>&1
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          branch="continuum-child/task-${TASK_NUMBER}-${GITHUB_RUN_ID}"
+          git switch -c "$branch" origin/main >/dev/null 2>&1
+          base_sha="$(git rev-parse HEAD)"
+
+          for attempt in 1 2 3; do
+            if curl -fsSL https://opencode.ai/install | bash >/dev/null 2>&1; then
+              break
+            fi
+            if [[ "$attempt" -eq 3 ]]; then
+              gh issue comment "$TASK_NUMBER" --repo "$child_repo"                 --body "<!-- continuum-child-infra --> Child task #$TASK_NUMBER could not install the agent runtime."                 >/dev/null 2>&1 || true
+              exit 3
+            fi
+            sleep $((attempt * 5))
+          done
+          export PATH="$HOME/.opencode/bin:$PATH"
+          test -x "$HOME/.opencode/bin/opencode"
+
+          # Continuum's global OpenCode instructions, before the first pass.
+          # The delegated worktree is a different repository from the parent,
+          # and it is cloned here, so its own AGENTS.md is whatever that
+          # repository ships -- which this must not replace. The installer only
+          # writes to a resolved global configuration directory and refuses any
+          # target inside the worktree.
+          #
+          # The script path is spelled out rather than held in a variable, so
+          # the audit in .github/tests/test_opencode_instructions.py can see the
+          # install and the verify statically instead of inferring them from a
+          # shell variable assignment.
+          python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/opencode_instructions.py" install \
+            --source "$CONTINUUM_ENGINE_ROOT/.github/agents/AGENTS.md"
+
+          issue_json="$(gh issue view "$TASK_NUMBER" --repo "$child_repo" --json title,body 2>/dev/null)"
+          issue_title="$(jq -r '.title' <<<"$issue_json")"
+          issue_body="$(jq -r '.body // ""' <<<"$issue_json")"
+
+          mkdir -p "$(dirname "$result_file")"
+          prompt="$RUNNER_TEMP/continuum-child-task.txt"
+          cat >"$prompt" <<EOF
+          Execute delegated child repository task #$TASK_NUMBER to completion.
+          
+          Rules:
+          - Work only in the child repository in the current directory.
+          - Treat the full child issue body below as the authoritative specification.
+          - Inspect current main before changing anything.
+          - Continue through diagnose -> implement -> test -> repair until acceptance is genuinely satisfied.
+          - Run relevant tests and any live/integration verification required by the issue.
+          - Never print, persist, or expose credentials or secret values.
+          - Do not upload child source, diffs, issue text, logs, or agent transcripts to the parent repository.
+          - You may use local git operations, including commits. Do not push; the outer worker publishes the branch.
+          - Before finishing, create or update exactly: $result_file
+          - Record scope, files/areas changed, verification executed, observed results, remaining risks.
+          - End with a standalone line exactly: Acceptance: PASS
+          - Write Acceptance: PASS only when mandatory acceptance conditions are satisfied.
+          
+          --- CHILD ISSUE TITLE ---
+          $issue_title
+          
+          --- CHILD ISSUE BODY ---
+          $issue_body
+          EOF
+
+          accepted=false
+          for pass in $(seq 1 "$MAX_AGENT_PASSES"); do
+            pass_prompt="$RUNNER_TEMP/continuum-child-pass-$pass.txt"
+            cp "$prompt" "$pass_prompt"
+            if [[ "$pass" -gt 1 ]]; then
+              cat >>"$pass_prompt" <<EOF
+          
+          Continuation pass $pass:
+          - Continue from the existing working tree and prior transcript at $transcript.
+          - Resolve the concrete remaining blocker, rerun verification, and update $result_file.
+          EOF
+            fi
+            # The point-of-use gate sits outside the failure-tolerant block on
+            # purpose. A missing or altered global instructions file is a
+            # Continuum defect, not an agent failure to retry, so it stops the
+            # pass instead of burning the remaining ones under no policy.
+            python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/opencode_instructions.py" verify \
+              --source "$CONTINUUM_ENGINE_ROOT/.github/agents/AGENTS.md"
+            set +e
+            opencode run --auto --model "$OPENCODE_MODEL" "$(cat "$pass_prompt")" >"$transcript" 2>&1
+            rc=$?
+            set -e
+            if [[ -f "$result_file" ]] && grep -qx 'Acceptance: PASS' "$result_file"; then
+              accepted=true
+              break
+            fi
+            echo "Child task #$TASK_NUMBER pass $pass incomplete (agent rc=$rc); continuing."
+          done
+
+          if [[ "$accepted" != true ]]; then
+            gh issue comment "$TASK_NUMBER" --repo "$child_repo"               --body "<!-- continuum-child-needs-retry --> Child task #$TASK_NUMBER exhausted this runner cycle without verified acceptance."               >/dev/null 2>&1 || true
+            exit 30
+          fi
+
+          if git diff --no-ext-diff -- . | grep -Eiq '(github_pat_[A-Za-z0-9_]+|ghp_[A-Za-z0-9]+|rnd_[A-Za-z0-9]+)'; then
+            gh issue comment "$TASK_NUMBER" --repo "$child_repo"               --body "<!-- continuum-child-security --> Child task #$TASK_NUMBER produced token-like material; publication was blocked."               >/dev/null 2>&1 || true
+            exit 31
+          fi
+
+          if [[ -n "$(git status --porcelain)" ]]; then
+            git add -A
+            git commit -m "task #$TASK_NUMBER: delegated implementation" >/dev/null 2>&1
+          fi
+          [[ "$(git rev-list --count "$base_sha"..HEAD)" -gt 0 ]] || exit 32
+
+          git push -u origin "HEAD:$branch" >/dev/null 2>&1
+          pr_body="$(cat <<EOF
+          Delegated implementation for #$TASK_NUMBER executed by the configured Continuum parent.
+          
+          Child source, issue text, test logs, and agent transcript were not uploaded to the parent repository.
+          
+          <!-- continuum-child-accepted -->
+          Closes #$TASK_NUMBER
+          EOF
+          )"
+          pr_url="$(
+            gh pr create --repo "$child_repo" --base main --head "$branch"               --title "$issue_title" --body "$pr_body" 2>/dev/null
+          )"
+          gh issue comment "$TASK_NUMBER" --repo "$child_repo"             --body "<!-- continuum-child-pr --> Child task #$TASK_NUMBER produced an accepted implementation PR: $pr_url"             >/dev/null 2>&1 || true
+          echo "Child task [$CHILD_ID] #$TASK_NUMBER produced an implementation PR."

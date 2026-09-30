@@ -1,0 +1,382 @@
+name: Continuum reusable child review
+
+on:
+  workflow_call:
+    inputs:
+      child_id:
+        type: string
+        required: true
+      task_number:
+        type: string
+        required: true
+      pr_number:
+        type: string
+        required: true
+      model:
+        type: string
+        required: false
+        default: opencode/big-pickle
+      max_review_passes:
+        type: number
+        required: false
+        default: 3
+      python_version:
+        description: Python version available to the child validation gate
+        type: string
+        required: false
+        default: '3.12'
+      engine_ref:
+        type: string
+        required: false
+        default: main
+    secrets:
+      CHILD_RUNTIME_TOKEN:
+        required: true
+      CHILD_RUNTIME_REPOSITORIES:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    concurrency:
+      group: continuum-child-review-${{ inputs.child_id }}-${{ inputs.task_number }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ secrets.CHILD_RUNTIME_TOKEN }}
+      GITHUB_TOKEN: ${{ secrets.CHILD_RUNTIME_TOKEN }}
+      CHILD_REPOSITORIES: ${{ secrets.CHILD_RUNTIME_REPOSITORIES }}
+      CHILD_ID: ${{ inputs.child_id }}
+      TASK_NUMBER: ${{ inputs.task_number }}
+      PR_NUMBER: ${{ inputs.pr_number }}
+      OPENCODE_MODEL: ${{ inputs.model }}
+      MAX_REVIEW_PASSES: ${{ inputs.max_review_passes }}
+      OPENCODE_CONFIG_CONTENT: '{"permission":{"bash":{"*":"allow","git *":"allow","git push *":"deny"}}}'
+    steps:
+      - name: Checkout parent control plane
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout Continuum engine
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: kodmial/continuum
+          ref: ${{ inputs.engine_ref }}
+          path: .continuum-engine
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up child Python
+        uses: actions/setup-python@82c7e631bb3cdc910f68e0081d67478d79c6982d
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Export Continuum engine root
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "CONTINUUM_ENGINE_ROOT=$GITHUB_WORKSPACE/.continuum-engine" >> "$GITHUB_ENV"
+
+      - name: Review and repair child task
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$TASK_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::Invalid task number."; exit 2; }
+          [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::Invalid pull request number."; exit 2; }
+
+          export PYTHONPATH="$CONTINUUM_ENGINE_ROOT/src"
+          resolver="$CONTINUUM_ENGINE_ROOT/.github/scripts/delegation_repository.sh"
+          child_repo="$(
+            PARENT_CONFIG=.continuum.yml CHILD_REPOSITORIES="$CHILD_REPOSITORIES"               bash "$resolver" resolve "$CHILD_ID"
+          )"
+
+          PARENT_CONFIG=.continuum.yml CHILD_REPOSITORIES="$CHILD_REPOSITORIES" \
+            bash "$resolver" verify "$CHILD_ID" "$child_repo" >/dev/null
+          validation_script="$(
+            PARENT_CONFIG=.continuum.yml CHILD_REPOSITORIES="$CHILD_REPOSITORIES" \
+              bash "$resolver" validation "$child_repo"
+          )"
+
+          pr_state_json="$(
+            gh pr view "$PR_NUMBER" --repo "$child_repo" --json state,mergedAt 2>/dev/null || true
+          )"
+          [[ -n "$pr_state_json" ]] || exit 0
+          if [[ "$(jq -r '.mergedAt // ""' <<<"$pr_state_json")" != "" ]]; then
+            exit 0
+          fi
+          pr_state="$(jq -r '.state // ""' <<<"$pr_state_json")"
+          if [[ "$pr_state" != "OPEN" ]]; then
+            if gh pr reopen "$PR_NUMBER" --repo "$child_repo" >/dev/null 2>&1; then
+              gh issue comment "$TASK_NUMBER" --repo "$child_repo" \
+                --body "<!-- continuum-child-review-reopened --> Reopened the automation-owned PR so delegated review can continue." \
+                >/dev/null 2>&1 || true
+            else
+              gh issue comment "$TASK_NUMBER" --repo "$child_repo" \
+                --body "<!-- continuum-child-review-retry --> The automation-owned PR is closed and could not be reopened in this cycle; the dispatcher will retry or recreate work." \
+                >/dev/null 2>&1 || true
+              exit 0
+            fi
+          fi
+
+          workdir="$RUNNER_TEMP/continuum-child-review"
+          transcript="$RUNNER_TEMP/continuum-child-review.log"
+          review_file="automation/runtime-results/task-${TASK_NUMBER}-review.md"
+
+          review_started="<!-- continuum-child-review-started --> Independent delegated review/repair for child task #$TASK_NUMBER started on PR #$PR_NUMBER."
+          gh issue comment "$TASK_NUMBER" --repo "$child_repo" --body "$review_started" >/dev/null 2>&1 || true
+
+          pr_json="$(gh pr view "$PR_NUMBER" --repo "$child_repo" --json headRefName,baseRefName 2>/dev/null)"
+          head_ref="$(jq -r '.headRefName' <<<"$pr_json")"
+          base_ref="$(jq -r '.baseRefName' <<<"$pr_json")"
+          if [[ "$head_ref" != continuum-child/task-"$TASK_NUMBER"-* &&
+                "$head_ref" != runtime-worker/task-"$TASK_NUMBER"-* ]]; then
+            echo "::error::PR does not belong to the delegated child worker."
+            exit 3
+          fi
+
+          gh auth setup-git >/dev/null 2>&1
+          rm -rf "$workdir"
+          gh repo clone "$child_repo" "$workdir" -- --quiet >/dev/null 2>&1
+          cd "$workdir"
+          git fetch origin "$base_ref" "$head_ref" --quiet >/dev/null 2>&1
+          git checkout -B "$head_ref" "origin/$head_ref" >/dev/null 2>&1
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Surface base drift before review. A clean merge is kept; conflicts
+          # remain in the working tree for the review agent to repair instead
+          # of becoming a terminal merge failure after acceptance.
+          set +e
+          git merge --no-edit "origin/$base_ref" >/dev/null 2>&1
+          base_sync_rc=$?
+          set -e
+          if [[ "$base_sync_rc" -ne 0 ]]; then
+            echo "Child review [$CHILD_ID] #$TASK_NUMBER detected base conflicts; review will repair them."
+          fi
+
+          validation_log="$RUNNER_TEMP/continuum-child-validation.log"
+          trusted_validation=""
+          run_validation() {
+            [[ -n "$trusted_validation" ]] || return 0
+            env -i               PATH="$PATH"               HOME="$HOME"               TMPDIR="${TMPDIR:-/tmp}"               LANG="${LANG:-C.UTF-8}"               CI=true               bash "$trusted_validation" >"$validation_log" 2>&1
+          }
+
+          initial_validation="not configured"
+          if [[ -n "$validation_script" ]]; then
+            if ! git cat-file -e "origin/$base_ref:$validation_script" 2>/dev/null; then
+              gh issue comment "$TASK_NUMBER" --repo "$child_repo"                 --body "<!-- continuum-child-validation-missing --> The configured delegated validation gate is missing from the base branch."                 >/dev/null 2>&1 || true
+              exit 5
+            fi
+            trusted_validation="$RUNNER_TEMP/continuum-child-validation.sh"
+            git show "origin/$base_ref:$validation_script" >"$trusted_validation"
+            chmod 700 "$trusted_validation"
+            set +e
+            run_validation
+            validation_rc=$?
+            set -e
+            if [[ "$validation_rc" -eq 0 ]]; then
+              initial_validation="passed"
+            else
+              initial_validation="failed; diagnostics are available only in the local runner file $validation_log"
+            fi
+          fi
+
+          for attempt in 1 2 3; do
+            if curl -fsSL https://opencode.ai/install | bash >/dev/null 2>&1; then
+              break
+            fi
+            if [[ "$attempt" -eq 3 ]]; then
+              gh issue comment "$TASK_NUMBER" --repo "$child_repo"                 --body "<!-- continuum-child-review-infra --> Review for child task #$TASK_NUMBER could not install the agent runtime."                 >/dev/null 2>&1 || true
+              exit 4
+            fi
+            sleep $((attempt * 5))
+          done
+          export PATH="$HOME/.opencode/bin:$PATH"
+          test -x "$HOME/.opencode/bin/opencode"
+
+          # Continuum's global OpenCode instructions, before the first pass. A
+          # review pass re-runs the agent against the child's own code, so it
+          # runs under the same policy as the implementation pass; the child's
+          # AGENTS.md is left exactly as that repository ships it.
+          #
+          # The script path is spelled out rather than held in a variable, so
+          # the audit in .github/tests/test_opencode_instructions.py can see the
+          # install and the verify statically instead of inferring them from a
+          # shell variable assignment.
+          python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/opencode_instructions.py" install \
+            --source "$CONTINUUM_ENGINE_ROOT/.github/agents/AGENTS.md"
+
+          issue_json="$(gh issue view "$TASK_NUMBER" --repo "$child_repo" --json title,body 2>/dev/null)"
+          issue_title="$(jq -r '.title' <<<"$issue_json")"
+          issue_body="$(jq -r '.body // ""' <<<"$issue_json")"
+
+          mkdir -p "$(dirname "$review_file")"
+          prompt="$RUNNER_TEMP/continuum-child-review.txt"
+          cat >"$prompt" <<EOF
+          Independently review and, if necessary, repair delegated child task #$TASK_NUMBER.
+          
+          Rules:
+          - Treat the full child issue body below as authoritative.
+          - Do not trust the implementation summary or prior green-looking tests.
+          - Compare the PR branch against origin/$base_ref and inspect every relevant behavioral change.
+          - Re-run relevant tests and required live/integration acceptance checks.
+          - Fix defects directly on this PR branch and rerun verification.
+          - Never expose credentials or secret values.
+          - Do not upload child source, diffs, issue text, logs, or transcripts to the parent repository.
+          - You may make local commits. Do not push; the outer review job pushes the branch.
+          - Before finishing, create or update exactly: $review_file
+          - Record findings, repairs, verification executed, observed results, remaining risks.
+          - End with a standalone line exactly: Review: PASS
+          - Write Review: PASS only when the implementation satisfies the issue.
+          - A deterministic validation gate from the child base branch is part of acceptance.
+          - Its initial state is: $initial_validation
+          - If it failed, inspect the local runner diagnostics at: $validation_log
+          - Do not weaken, replace, or edit the validation gate to make it pass; it is loaded from origin/$base_ref.
+          
+          --- CHILD ISSUE TITLE ---
+          $issue_title
+          
+          --- CHILD ISSUE BODY ---
+          $issue_body
+          EOF
+
+          accepted=false
+          for pass in $(seq 1 "$MAX_REVIEW_PASSES"); do
+            pass_prompt="$RUNNER_TEMP/continuum-child-review-pass-$pass.txt"
+            cp "$prompt" "$pass_prompt"
+            if [[ "$pass" -gt 1 ]]; then
+              cat >>"$pass_prompt" <<EOF
+          
+          Continuation review pass $pass:
+          - Continue from the existing working tree and prior transcript at $transcript.
+          - Repair remaining blockers, rerun verification, and update $review_file.
+          EOF
+            fi
+            # The point-of-use gate sits outside the failure-tolerant block on
+            # purpose. A missing or altered global instructions file is a
+            # Continuum defect, not an agent failure to retry, so it stops the
+            # pass instead of burning the remaining ones under no policy.
+            python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/opencode_instructions.py" verify \
+              --source "$CONTINUUM_ENGINE_ROOT/.github/agents/AGENTS.md"
+            set +e
+            opencode run --auto --model "$OPENCODE_MODEL" "$(cat "$pass_prompt")" >"$transcript" 2>&1
+            rc=$?
+            set -e
+            if [[ -f "$review_file" ]] && grep -qx 'Review: PASS' "$review_file"; then
+              set +e
+              run_validation
+              validation_rc=$?
+              set -e
+              if [[ "$validation_rc" -eq 0 ]]; then
+                if git diff --name-only --diff-filter=U | grep -q .; then
+                  echo "Child review [$CHILD_ID] #$TASK_NUMBER still has unresolved base conflicts; continuing repair."
+                else
+                  accepted=true
+                  break
+                fi
+              fi
+              echo "Child review [$CHILD_ID] #$TASK_NUMBER validation gate failed after pass $pass; continuing repair."
+            else
+              echo "Child review [$CHILD_ID] #$TASK_NUMBER pass $pass incomplete (agent rc=$rc); continuing."
+            fi
+          done
+
+          if [[ "$accepted" != true ]]; then
+            gh issue comment "$TASK_NUMBER" --repo "$child_repo"               --body "<!-- continuum-child-review-needs-retry --> Review for child task #$TASK_NUMBER did not reach verified acceptance, including its delegated validation gate."               >/dev/null 2>&1 || true
+            exit 30
+          fi
+
+          if git diff --no-ext-diff -- . | grep -Eiq '(github_pat_[A-Za-z0-9_]+|ghp_[A-Za-z0-9]+|rnd_[A-Za-z0-9]+)'; then
+            gh issue comment "$TASK_NUMBER" --repo "$child_repo"               --body "<!-- continuum-child-review-security --> Review detected token-like material; merge was blocked."               >/dev/null 2>&1 || true
+            exit 31
+          fi
+
+          if [[ -n "$(git status --porcelain)" ]]; then
+            git add -A
+            git commit -m "task #$TASK_NUMBER: delegated independent review" >/dev/null 2>&1
+          fi
+          if [[ "$(git rev-list --count "origin/$head_ref"..HEAD)" -gt 0 ]]; then
+            git push origin "HEAD:$head_ref" >/dev/null 2>&1
+          fi
+
+          merge_ok=false
+          for merge_attempt in 1 2 3; do
+            live_pr="$(
+              gh pr view "$PR_NUMBER" --repo "$child_repo" --json state,mergedAt,headRefOid 2>/dev/null || true
+            )"
+            if [[ -n "$live_pr" && "$(jq -r '.mergedAt // ""' <<<"$live_pr")" != "" ]]; then
+              merge_ok=true
+              break
+            fi
+
+            live_state="$(jq -r '.state // ""' <<<"$live_pr" 2>/dev/null || true)"
+            if [[ "$live_state" != "OPEN" ]]; then
+              gh pr reopen "$PR_NUMBER" --repo "$child_repo" >/dev/null 2>&1 || true
+            fi
+
+            set +e
+            gh pr merge "$PR_NUMBER" --repo "$child_repo" --squash --delete-branch >/dev/null 2>&1
+            merge_rc=$?
+            if [[ "$merge_rc" -ne 0 ]]; then
+              gh pr merge "$PR_NUMBER" --repo "$child_repo" --squash --delete-branch --admin >/dev/null 2>&1
+              merge_rc=$?
+            fi
+            set -e
+            if [[ "$merge_rc" -eq 0 ]]; then
+              merge_ok=true
+              break
+            fi
+
+            live_head="$(jq -r '.headRefOid // ""' <<<"$live_pr" 2>/dev/null || true)"
+            if [[ -n "$live_head" ]]; then
+              gh api --method PUT \
+                "repos/$child_repo/pulls/$PR_NUMBER/update-branch" \
+                -f "expected_head_sha=$live_head" >/dev/null 2>&1 || true
+            fi
+            sleep $((merge_attempt * 2))
+          done
+
+          if [[ "$merge_ok" != true ]]; then
+            gh issue comment "$TASK_NUMBER" --repo "$child_repo" \
+              --body "<!-- continuum-child-review-merge-retry --> Child task #$TASK_NUMBER passed review, but the PR could not be merged in this cycle. The PR remains/reopens for automatic delegated retry; this is not a terminal task pause." \
+              >/dev/null 2>&1 || true
+            echo "Child task [$CHILD_ID] #$TASK_NUMBER merge deferred for automatic retry."
+            exit 0
+          fi
+
+          # A successful delegated merge is authoritative completion. Close the
+          # child issue explicitly instead of relying on GitHub's "Closes #N"
+          # parsing: multiple runtime retries can otherwise leave the issue open
+          # and cause the dispatcher to review/merge a second stale PR.
+          gh api --method PATCH "repos/$child_repo/issues/$TASK_NUMBER" \
+            -f state=closed -f state_reason=completed >/dev/null
+          for label in automation:in-progress automation:paused; do
+            gh api --method DELETE \
+              "repos/$child_repo/issues/$TASK_NUMBER/labels/${label//:/%3A}" \
+              >/dev/null 2>&1 || true
+          done
+
+          # Close any other automation-owned PRs for the same completed task.
+          # They are stale retries, not independent work, and must never be
+          # picked up by a later dispatcher cycle.
+          gh pr list --repo "$child_repo" --state open --limit 100 \
+            --json number,headRefName \
+            --jq '.[] | select(
+              (.headRefName | startswith("continuum-child/task-'"$TASK_NUMBER"'-")) or
+              (.headRefName | startswith("runtime-worker/task-'"$TASK_NUMBER"'-"))
+            ) | .number' |
+          while IFS= read -r stale_pr; do
+            [[ -n "$stale_pr" && "$stale_pr" != "$PR_NUMBER" ]] || continue
+            gh pr comment "$stale_pr" --repo "$child_repo" \
+              --body "Closed automatically: task #$TASK_NUMBER completed via PR #$PR_NUMBER." \
+              >/dev/null 2>&1 || true
+            gh pr close "$stale_pr" --repo "$child_repo" >/dev/null 2>&1 || true
+          done
+
+          gh issue comment "$TASK_NUMBER" --repo "$child_repo"             --body "<!-- continuum-child-review-merged --> Child task #$TASK_NUMBER passed delegated review and its PR was merged."             >/dev/null 2>&1 || true
+          echo "Child task [$CHILD_ID] #$TASK_NUMBER reviewed, merged, and closed."

@@ -1,0 +1,45 @@
+[config]
+model = "groq/openai/gpt-oss-120b"
+fallback_models = ["groq/openai/gpt-oss-20b"]
+reasoning_effort = "medium"
+response_language = "en-US"
+ai_timeout = 180
+retry_same_model_on_timeout = false
+propagate_tool_errors = true
+repo_context_files = ["AGENTS.md"]
+
+[pr_reviewer]
+require_score_review = false
+require_tests_review = true
+require_security_review = true
+require_risk_assessment = true
+require_priority_files = true
+require_merge_recommendation = false
+publish_error_details = true
+persistent_comment = true
+inline_key_issues = true
+num_max_findings = 6
+enable_review_coverage_footer = true
+extra_instructions = """\
+Focus on actionable correctness issues introduced by the PR: logic bugs, regressions,
+race conditions, unsafe GitHub Actions behavior, security issues, error handling,
+resource leaks, performance regressions, macOS compatibility, packaging/release
+correctness, and test gaps. Verify findings against the actual diff and repository
+context. Do not report cosmetic style preferences or speculative issues without a
+concrete failure scenario.
+"""
+enable_large_pr_chunking = true
+max_number_of_calls = 3
+
+[pr_code_suggestions]
+focus_only_on_problems = true
+persistent_comment = true
+suggestions_score_threshold = 7
+num_code_suggestions_per_chunk = 4
+max_number_of_calls = 3
+commitable_code_suggestions = false
+extra_instructions = """\
+Only suggest changes that fix a concrete bug, security issue, reliability problem,
+performance regression, or meaningful maintainability risk. Avoid formatting-only
+or subjective style suggestions.
+"""
