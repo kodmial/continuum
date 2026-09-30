@@ -1,0 +1,143 @@
+{
+  "schema": "continuum.parity-ledger/v1",
+  "repository": "kodmial/nanodictate",
+  "audited_head": "d9e6dcc2e0c9c43bc87cd1963b75c097dec7ea1c",
+  "audited_at": "2026-09-30T00:00:00Z",
+  "discovery_issue": "#60",
+  "workflows": [
+    {
+      "path": ".github/workflows/add-review-label.yml",
+      "blob_sha": "6d0967539a12e72adf7675dc0f608601ee1b6dd2",
+      "classification": "absorbed",
+      "owner": "#11",
+      "rationale": "Per-head review lock is taken when a request is scheduled and released on a decisive review; absorbed by continuum.review.queue."
+    },
+    {
+      "path": ".github/workflows/auto-merge.yml",
+      "blob_sha": "f641a89943c58cac62d783fa04c1c6dc98c7d1df",
+      "classification": "absorbed",
+      "owner": "#11",
+      "rationale": "Exact-head decisive review supersedes earlier nitpick-only COMMENTED reviews, and the commit status is treated as operational state only. Both are absorbed by continuum.review.coderabbit.head_verdict and status_reason, with regressions in tests/test_coderabbit.py."
+    },
+    {
+      "path": ".github/workflows/bootstrap-runtime-secret.yml",
+      "blob_sha": "e6295c930867472d88b30e98c208b24427258129",
+      "classification": "not-applicable",
+      "owner": "#60",
+      "rationale": "A migration-era bootstrap diagnostic for the shadow bridge token. Continuum installs the bridge from .github/workflows/continuum-shadow.yml instead, so there is no runtime parity writer to port and nothing is left behind that Continuum removes."
+    },
+    {
+      "path": ".github/workflows/ci.yml",
+      "blob_sha": "86b9a651e101f13b6fb31e8268225c93e05e6c66",
+      "classification": "consumer-local",
+      "owner": "#27",
+      "rationale": "The coverage threshold and test matrix belong to the product's own suite. Continuum treats required CI as an exact-head blocking gate -- the same head check continuum.release.provenance performs against the candidate run -- through its configured required checks, without naming any product's checks."
+    },
+    {
+      "path": ".github/workflows/coderabbit-retry.yml",
+      "blob_sha": "a03f3431347b60000733b9c3ea94c0ea1d2f1984",
+      "classification": "absorbed",
+      "owner": "#11",
+      "rationale": "The global quota controller is cancel-in-progress:false, so a repeated wake-up cannot starve a head that is waiting out a cooldown; single flight comes from the shared concurrency group instead. Absorbed by .github/workflows/review-queue.yml, with regressions in tests/test_queue_workflows.py for both halves."
+    },
+    {
+      "path": ".github/workflows/coderabbit-unresolved.yml",
+      "blob_sha": "67a2df34d7e902441ce7c0d633accf52a2ed9471",
+      "classification": "absorbed",
+      "owner": "#11",
+      "rationale": "Verdict parsing strips collapsed <details> blocks, fenced code and block-quoted history before reading a token, so a quoted older verdict cannot override the visible one. Absorbed by continuum.review.coderabbit._visible_conclusion, with regressions in tests/test_coderabbit.py including the truncated-details case."
+    },
+    {
+      "path": ".github/workflows/continuum-migration-preflight.yml",
+      "blob_sha": "7b00e14db22d1e42981d6605436be34adfe15a2b",
+      "classification": "consumer-local",
+      "owner": "#60",
+      "rationale": "Added after the 2026-09-30 audit point. Reports what a migration would have to carry before cutover, from the consumer's own tree. It reads and reports, so it has no generic semantics to port and no write Continuum has to preserve; the generic migration report is .github/workflows/continuum-shadow.yml."
+    },
+    {
+      "path": ".github/workflows/continuum-shadow-bridge.yml",
+      "blob_sha": "34cc3ebbb8cb21a3e892158ec3bbe21b0a024bc9",
+      "classification": "absorbed",
+      "owner": "#27",
+      "rationale": "Added after the 2026-09-30 audit point. The thin lifecycle bridge Continuum documents for installation; the matching implementation and its test are reference/nanodictate-workflows/shadow-bridge.yml and tests/test_shadow_workflow.py."
+    },
+    {
+      "path": ".github/workflows/issue-scheduler.yml",
+      "blob_sha": "bc3f8c175210ab26c1f6033572e678356ec4d788",
+      "classification": "absorbed",
+      "owner": "#27",
+      "rationale": "Byte-identical to the preserved snapshot. Priority ordering and the dependency-blocked refusal are absorbed by continuum.shadow.planner."
+    },
+    {
+      "path": ".github/workflows/opencode-repair.yml",
+      "blob_sha": "56d08b852ed6f4c1c1b0456eee6d313a34e79a45",
+      "classification": "absorbed",
+      "owner": "#27",
+      "rationale": "A stale persistent repair lock is released on age rather than left to suppress every later repair of the same head, an unreadable age is treated as held rather than released, and the age budget is resolved once in conflict-bounds instead of being spelled out per step. Absorbed by the age-checked lock in .github/workflows/consumer-repair.yml; asserted in tests/test_repair_workflow.py."
+    },
+    {
+      "path": ".github/workflows/opencode.yml",
+      "blob_sha": "e5656c07b5758d4974540912f52a60525be889f8",
+      "classification": "absorbed",
+      "owner": "#27",
+      "rationale": "The generic OpenCode lifecycle is absorbed by .github/workflows/consumer-opencode.yml. NanoDictate's required macOS 15 / Swift 6.1 execution capability is expressed through configurable runner/toolchain inputs, with the reusable boundary covered by .github/tests/test_workflow_hardening.py."
+    },
+    {
+      "path": ".github/workflows/packaging-smoke.yml",
+      "blob_sha": "c6b99cc0e6c2ed11cf2e1b9886eac86c47272429",
+      "classification": "consumer-local",
+      "owner": "#21",
+      "rationale": "Candidate, post-publish and canary smoke are the consumer's own production validation. Continuum consumes the candidate run as an exact-head blocking gate and as the release candidate's artifact source, which is continuum.release.provenance; neither half names a product, and the smoke cases themselves stay consumer-local."
+    },
+    {
+      "path": ".github/workflows/pr-agent.yml",
+      "blob_sha": "53485dcafb1e06318c56b4dd1f2e64c22cedd5c0",
+      "classification": "consumer-local",
+      "owner": "#27",
+      "rationale": "Existing manual PR-Agent capability remains in NanoDictate during Phase A. It is outside the generic orchestration cutover described by docs/continuum-mvp-contract.md, so working functionality is retained locally rather than deleted."
+    },
+    {
+      "path": ".github/workflows/release-automation-merge.yml",
+      "blob_sha": "75ae83ffd55b11c2e9b49bc91e1920bf24e83484",
+      "classification": "consumer-local",
+      "owner": "#22",
+      "rationale": "Phase A keeps NanoDictate's current release automation as the sole release writer. The release hook remains outside the first control-plane replacement defined in docs/continuum-mvp-contract.md; #21/#22 own the later Phase B parity/canary migration."
+    },
+    {
+      "path": ".github/workflows/release-pr.yml",
+      "blob_sha": "c0870464a47c698a22acc206aa77eee068cb8b44",
+      "classification": "consumer-local",
+      "owner": "#22",
+      "rationale": "Phase A keeps NanoDictate's current release automation as the sole release writer. The release hook remains outside the first control-plane replacement defined in docs/continuum-mvp-contract.md; #21/#22 own the later Phase B parity/canary migration."
+    },
+    {
+      "path": ".github/workflows/release.yml",
+      "blob_sha": "f699aaa4ea70d431962daae48ca4a8c6842088e7",
+      "classification": "consumer-local",
+      "owner": "#22",
+      "rationale": "Phase A keeps NanoDictate's current release automation as the sole release writer. The release hook remains outside the first control-plane replacement defined in docs/continuum-mvp-contract.md; #21/#22 own the later Phase B parity/canary migration."
+    },
+    {
+      "path": ".github/workflows/remove-review-label.yml",
+      "blob_sha": "26f05b0c80934195f2d9c52663c3a059fd902210",
+      "classification": "absorbed",
+      "owner": "#11",
+      "rationale": "Per-head review and repair locks are reset together when a new head arrives; absorbed by the head-scoped lock reset in continuum.review.queue."
+    }
+  ],
+  "open_pull_requests": [
+    {
+      "number": 67,
+      "paths": [
+        ".github/pull_request_template.md",
+        ".github/workflows/ci.yml",
+        ".github/workflows/packaging-smoke.yml",
+        ".github/workflows/release.yml",
+        ".github/workflows/rust.yml"
+      ],
+      "classification": "consumer-local",
+      "owner": "#60",
+      "rationale": "A shared Rust engine build and portability gates. Product behavior with no generic semantic, and none of the five paths reintroduces a scheduler, review, repair, merge or release writer Continuum removes, so it cannot restore pre-cutover orchestration. It stays classified so the gate keeps proving that."
+    }
+  ]
+}

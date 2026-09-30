@@ -36,7 +36,7 @@ import hashlib
 import json
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from . import liveness, parity
+from . import baseline, liveness, parity
 
 CUTOVER_SCHEMA = "continuum.shadow-cutover/v1"
 
@@ -391,6 +391,10 @@ class CutoverDecision:
     blockers: Tuple[Blocker, ...] = ()
     coverage: Optional[Coverage] = None
     evidence_digest: str = ""
+    #: The rolling parity reading this decision was made against, when one was
+    #: supplied. A window recorded while the consumer's workflows matched the
+    #: ledger says nothing about the consumer's workflows now.
+    baseline: Optional["baseline.BaselineReport"] = None
     approval: Optional[Approval] = None
     window_started_at: str = ""
     window_ended_at: str = ""
@@ -416,6 +420,7 @@ class CutoverDecision:
             "blockers": [blocker.describe() for blocker in self.blockers],
             "unresolved": [dict(entry) for entry in self.unresolved],
             "coverage": self.coverage.describe() if self.coverage is not None else None,
+            "baseline": self.baseline.describe() if self.baseline is not None else None,
             "canary": dict(self.canary),
             "rollback": dict(self.rollback),
             "approval": self.approval.describe() if self.approval is not None else None,
@@ -438,6 +443,7 @@ def decide(
     results: Sequence[parity.ParityResult],
     liveness_report: Optional[liveness.LivenessReport] = None,
     *,
+    baseline: Optional["baseline.BaselineReport"] = None,
     origins: Optional[Mapping[str, str]] = None,
     resolutions: Sequence[Resolution] = (),
     approval: Optional[Approval] = None,
@@ -553,11 +559,43 @@ def decide(
                 )
             )
 
+    # 4. The rolling baseline: what the consumer's workflows look like now, against
+    #    the ledger the parity claim was made from. Checked before the digest so a
+    #    drifted consumer is refused on its own terms, and included in the digest so
+    #    an approval cannot outlive the repository state it was granted against.
+    if baseline is None:
+        blockers.append(
+            Blocker(
+                code="no_baseline_evidence",
+                message=(
+                    "no rolling baseline reading was supplied; a window says nothing "
+                    "about the consumer's current workflow blobs or open .github/** "
+                    "pull requests, and a historical snapshot alone can never "
+                    "authorize cutover"
+                ),
+            )
+        )
+    else:
+        for blocker in baseline.blockers:
+            blockers.append(
+                Blocker(
+                    code="baseline_{}".format(blocker.code),
+                    message=blocker.message,
+                    scenario=blocker.subject,
+                )
+            )
+
     digest = evidence_digest(
-        report, results, liveness_report, resolutions, window_started_at, window_ended_at
+        report,
+        results,
+        liveness_report,
+        resolutions,
+        window_started_at,
+        window_ended_at,
+        baseline_digest=(baseline.evidence_digest if baseline is not None else ""),
     )
 
-    # 4. The canary and the rollback path, then the human decision.
+    # 5. The canary and the rollback path, then the human decision.
     approved = False
     if approval is not None:
         if not approval.complete:
@@ -637,18 +675,25 @@ def evidence_digest(
     resolutions: Sequence[Resolution],
     window_started_at: str,
     window_ended_at: str,
+    baseline_digest: str = "",
 ) -> str:
     """A digest of the evidence an approval is granted against.
 
     Covers the verdicts, the coverage, the liveness verdicts, the resolutions,
-    and the window's dates -- so an approval cannot be carried over to a window
-    that has gained an event, lost a resolution, or moved its dates. Ordering is
-    canonicalised first, so two runs that saw the same events in a different
+    the rolling baseline, and the window's dates -- so an approval cannot be carried
+    over to a window that has gained an event, lost a resolution, moved its dates,
+    or been judged against a consumer whose workflows have since changed. Ordering
+    is canonicalised first, so two runs that saw the same events in a different
     delivery order produce the same digest.
     """
 
     payload = {
         "window": [window_started_at, window_ended_at],
+        # An empty baseline digest still travels. It is the difference between a
+        # window that was refused for having no baseline and one that was judged
+        # against a clean reading, and a digest that could not tell those apart
+        # would let the second be carried forward under the first's approval.
+        "baseline": baseline_digest,
         "verdicts": sorted(
             (
                 result.correlation_id,
@@ -696,6 +741,7 @@ def from_documents(
     parity_documents: Iterable[Mapping[str, Any]],
     liveness_document: Optional[Mapping[str, Any]] = None,
     *,
+    baseline_document: Optional[Mapping[str, Any]] = None,
     origins: Optional[Mapping[str, str]] = None,
     resolution_documents: Iterable[Mapping[str, Any]] = (),
     approval_document: Optional[Mapping[str, Any]] = None,
@@ -747,6 +793,11 @@ def from_documents(
     return decide(
         results,
         report,
+        baseline=(
+            baseline.read_report(baseline_document)
+            if baseline_document is not None
+            else None
+        ),
         origins=origins,
         resolutions=[
             Resolution(

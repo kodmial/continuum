@@ -431,6 +431,54 @@ class ReplyClassificationTests(unittest.TestCase):
             coderabbit.thread_reply_verdict(thread), coderabbit.REPLY_RESOLVED
         )
 
+    def test_quoted_history_is_not_a_verdict(self):
+        # A resolved-then-reopened thread is the one failure the gate cannot
+        # recover from: it reads as settled, the thread is not, and nothing
+        # downstream re-checks. The older verdict survives in the reply as a
+        # quote, so the quote is what has to be ignored.
+        body = (
+            "> CodeRabbit resolved this thread.\n"
+            "\n"
+            "This was reopened: the guard is still missing.\n"
+        )
+        self.assertEqual(coderabbit.classify_reply(body), "")
+        self.assertEqual(
+            coderabbit.classify_reply(
+                "> CodeRabbit resolved this thread.\n\nUNRESOLVED: reopened.\n"
+            ),
+            coderabbit.REPLY_UNRESOLVED,
+        )
+
+    def test_a_collapsed_details_block_is_not_a_verdict(self):
+        # Where a provider puts the prior thread body and its own transcript.
+        body = (
+            "<details>\n<summary>Review details</summary>\n\n"
+            "**UNRESOLVED**: the earlier attempt was rejected.\n\n"
+            "</details>\n\nFixed the guard; this thread is resolved.\n"
+        )
+        self.assertEqual(coderabbit.classify_reply(body), coderabbit.REPLY_RESOLVED)
+
+    def test_a_truncated_details_block_does_not_swallow_the_verdict(self):
+        # A provider that truncates its own reply leaves the block unterminated.
+        # Treated as running to the end of the body it would take the visible
+        # conclusion with it, and an unresolved thread would read as silent --
+        # which fails closed, so it is the resolved thread that would be lost.
+        body = "<details>\n<summary>Review details</summary>\n\nEarlier: UNRESOLVED.\n"
+        self.assertEqual(coderabbit.classify_reply(body), "")
+
+    def test_a_fenced_code_block_is_not_a_verdict(self):
+        body = (
+            "```\n"
+            "RESOLVED\n"
+            "```\n\n"
+            "Not actually: the test still fails.\n"
+        )
+        self.assertEqual(coderabbit.classify_reply(body), "")
+        self.assertEqual(
+            coderabbit.classify_reply("```\nUNRESOLVED\n```\n\nStill unresolved.\n"),
+            coderabbit.REPLY_UNRESOLVED,
+        )
+
     def test_a_human_reply_never_overrides_the_provider(self):
         thread = support.coderabbit_thread("PRRT_a", replies=[RESOLVED_REPLY])
         thread["comments"].append(

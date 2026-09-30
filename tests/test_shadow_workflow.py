@@ -174,6 +174,94 @@ class ShellSyntaxTests(unittest.TestCase):
                     )
 
 
+class TheCutoverGateReadsTheLiveConsumer(unittest.TestCase):
+    """The window gate must judge the consumer as it is now.
+
+    Without a live reading the gate compares the window against a historical
+    snapshot, so a workflow added after the snapshot, or a blob moved, cuts over
+    on evidence that no longer describes the consumer -- and the snapshot says
+    nothing about either. The whole point of the parity claim is that it was made
+    against a specific reading, and that reading has a shelf life.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.document = load(WORKFLOW)
+        cls.steps = steps_of(cls.document["jobs"]["evidence"])
+
+    def _cutover_steps(self) -> list:
+        found = []
+        for step in self.steps:
+            script = run_text(step)
+            if "continuum.shadow.cli baseline" in script or (
+                script and "--baseline" in script
+            ):
+                found.append(step)
+        return found
+
+    def test_the_consumer_is_read_before_the_window_is_judged(self) -> None:
+        names = [str(step.get("name")) for step in self._cutover_steps()]
+        self.assertTrue(
+            any("Read the consumer" in name for name in names), names
+        )
+        reading = next(
+            index
+            for index, step in enumerate(self.steps)
+            if "continuum.shadow.cli baseline" in run_text(step)
+        )
+        judging = next(
+            index
+            for index, step in enumerate(self.steps)
+            if "--baseline" in run_text(step)
+        )
+        # Reading afterwards would be a reading of the wrong instant: the window
+        # ended before it was taken, so a workflow merged into the consumer after
+        # the window would be judged as though it were in the window.
+        self.assertLess(reading, judging)
+
+    def test_the_reading_is_taken_from_the_api_not_from_the_window(self) -> None:
+        step = next(
+            step for step in self.steps if "continuum.shadow.cli baseline" in run_text(step)
+        )
+        script = run_text(step)
+        self.assertIn("--capture-live", script)
+        self.assertIn("--repo", script)
+        self.assertIn("GITHUB_TOKEN", str(self.document["jobs"]["evidence"]["env"]))
+
+    def test_the_judge_cannot_run_without_a_reading(self) -> None:
+        # The `if:` on the step is not the guard. A missing report has to fail here,
+        # because a judge handed nothing must not be able to report "clean".
+        step = next(step for step in self.steps if "--baseline" in run_text(step))
+        script = run_text(step)
+        self.assertIn("replay-out/baseline/report.json", script)
+        self.assertIn("exit 2", script)
+
+    def test_a_missing_ledger_is_a_usage_error_not_a_clean_gate(self) -> None:
+        step = next(
+            step for step in self.steps if "continuum.shadow.cli baseline" in run_text(step)
+        )
+        self.assertIn("exit 2", run_text(step))
+
+    def test_a_drifted_consumer_fails_before_the_judge_runs(self) -> None:
+        # `baseline` exits non-zero when the reading is not clean, so the drifted
+        # case stops here. The judge never gets to see it, and so never gets to
+        # treat an empty difference set as agreement.
+        step = next(
+            step for step in self.steps if "continuum.shadow.cli baseline" in run_text(step)
+        )
+        self.assertIn(
+            "set -euo pipefail", run_text(step)
+        )
+
+    def test_the_gate_needs_only_read_scopes(self) -> None:
+        # The capture reads the consumer's repository. A write scope here would be
+        # a scope the validation plane does not need, and would break the rule the
+        # barrier test asserts everywhere else.
+        job = self.document["jobs"]["evidence"]
+        self.assertEqual(write_scopes(permission_map(job["permissions"])), [])
+        self.assertIn("pull-requests", permission_map(job["permissions"]))
+
+
 class ShadowWorkflowTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -929,6 +1017,7 @@ class DocumentationTests(unittest.TestCase):
             "replayed_only_coverage",
             "unresolved_divergence",
             "no_liveness_evidence",
+            "no_baseline_evidence",
             "incomplete_approval",
             "stale_approval",
             "no_rollback",
@@ -938,8 +1027,44 @@ class DocumentationTests(unittest.TestCase):
         self.assertTrue(issubclass(Blocker, object))
 
     def test_it_names_the_files_a_run_writes(self) -> None:
-        for name in ("journals/", "parity/", "liveness/", "barrier/", "cases/"):
+        for name in (
+            "journals/",
+            "parity/",
+            "liveness/",
+            "barrier/",
+            "cases/",
+            "baseline/",
+        ):
             self.assertIn(name, self.raw, name)
+
+    def test_it_names_the_baseline_blockers_the_gate_can_raise(self) -> None:
+        # Every blocker the baseline audit produces, so a reader who hits one can
+        # look it up rather than guessing from the message.
+        from continuum.shadow.baseline import Blocker
+
+        codes = {
+            code
+            for code in (
+                "no_baseline_evidence",
+                "baseline_live_head_incomplete",
+                "baseline_repository_mismatch",
+                "baseline_unclassified_workflow",
+                "baseline_workflow_blob_changed",
+                "baseline_workflow_removed",
+                "baseline_unclassified_open_pull_request",
+                "baseline_open_pull_request_drift",
+            )
+        }
+        self.assertTrue(codes)
+        self.assertTrue(issubclass(Blocker, object))
+        for code in sorted(codes):
+            self.assertIn(code, self.raw, code)
+
+    def test_it_says_the_approval_is_bound_to_the_reading(self) -> None:
+        # Otherwise the digest rule reads as applying only to the window's
+        # verdicts, and a reader assumes the baseline reading does not expire an
+        # approval.
+        self.assertIn("evidence_digest", self.raw)
 
     def test_its_commands_are_the_commands_this_engine_has(self) -> None:
         import subprocess
@@ -970,12 +1095,30 @@ class DocumentationTests(unittest.TestCase):
                 "--approval",
                 "--canary",
                 "--rollback",
+                "--baseline",
                 "--window-start",
                 "--window-end",
                 "--out",
             ),
+            "baseline": (
+                "--ledger",
+                "--capture-live",
+                "--live-head",
+                "--repo",
+                "--token-env",
+                "--render",
+                "--out",
+            ),
         }
-        for command in ("run", "parity", "liveness", "replay", "cutover", "summary"):
+        for command in (
+            "run",
+            "parity",
+            "liveness",
+            "replay",
+            "cutover",
+            "baseline",
+            "summary",
+        ):
             self.assertIn(
                 "continuum.shadow.cli {}".format(command),
                 self.raw,

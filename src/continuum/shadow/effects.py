@@ -447,6 +447,9 @@ READ_ONLY_METHODS = frozenset(
         "list_reviews",
         "combined_status_for_ref",
         "file_at_ref",
+        "default_branch",
+        "ref_sha",
+        "workflow_inventory",
         "review_threads",
         "unresolved_thread_comment_ids",
     }
