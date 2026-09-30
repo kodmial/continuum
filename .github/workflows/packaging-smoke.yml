@@ -298,7 +298,9 @@ jobs:
           if [[ ! -f scripts/packaging-smoke/common.sh ]]; then
             if [[ -d .continuum ]]; then ln -sfn .continuum/scripts scripts 2>/dev/null || true; fi
             if [[ ! -f scripts/packaging-smoke/common.sh ]]; then
-              git clone --depth 1 https://github.com/kodmial/continuum.git .continuum 2>/dev/null || true
+              REF="${REF:-main}"
+              [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "invalid ref: $REF" >&2; exit 1; }
+              git clone --branch "$REF" --depth 1 https://github.com/kodmial/continuum.git .continuum 2>/dev/null || true
               ln -sfn .continuum/scripts scripts 2>/dev/null || true
             fi
           fi
@@ -352,7 +354,9 @@ jobs:
           if [[ ! -f scripts/packaging-smoke/common.sh ]]; then
             if [[ -d .continuum ]]; then ln -sfn .continuum/scripts scripts 2>/dev/null || true; fi
             if [[ ! -f scripts/packaging-smoke/common.sh ]]; then
-              git clone --depth 1 https://github.com/kodmial/continuum.git .continuum 2>/dev/null || true
+              REF="${REF:-main}"
+              [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "invalid ref: $REF" >&2; exit 1; }
+              git clone --branch "$REF" --depth 1 https://github.com/kodmial/continuum.git .continuum 2>/dev/null || true
               ln -sfn .continuum/scripts scripts 2>/dev/null || true
             fi
           fi
@@ -402,7 +406,9 @@ jobs:
           if [[ ! -f scripts/packaging-smoke/common.sh ]]; then
             if [[ -d .continuum ]]; then ln -sfn .continuum/scripts scripts 2>/dev/null || true; fi
             if [[ ! -f scripts/packaging-smoke/common.sh ]]; then
-              git clone --depth 1 https://github.com/kodmial/continuum.git .continuum 2>/dev/null || true
+              REF="${REF:-main}"
+              [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "invalid ref: $REF" >&2; exit 1; }
+              git clone --branch "$REF" --depth 1 https://github.com/kodmial/continuum.git .continuum 2>/dev/null || true
               ln -sfn .continuum/scripts scripts 2>/dev/null || true
             fi
           fi
@@ -457,7 +463,9 @@ jobs:
           if [[ ! -f scripts/packaging-smoke/common.sh ]]; then
             if [[ -d .continuum ]]; then ln -sfn .continuum/scripts scripts 2>/dev/null || true; fi
             if [[ ! -f scripts/packaging-smoke/common.sh ]]; then
-              git clone --depth 1 https://github.com/kodmial/continuum.git .continuum 2>/dev/null || true
+              REF="${REF:-main}"
+              [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "invalid ref: $REF" >&2; exit 1; }
+              git clone --branch "$REF" --depth 1 https://github.com/kodmial/continuum.git .continuum 2>/dev/null || true
               ln -sfn .continuum/scripts scripts 2>/dev/null || true
             fi
           fi

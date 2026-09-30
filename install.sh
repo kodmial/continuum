@@ -7,6 +7,7 @@ set -euo pipefail
 # ref defaults to main.
 DEST="${1:-.}"
 REF="${2:-main}"
+[[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "invalid ref: $REF" >&2; exit 1; }
 if [[ ! -d "$DEST/.github/workflows" ]]; then
   mkdir -p "$DEST/.github/workflows"
 fi
@@ -31,7 +32,12 @@ STUBS=(
 )
 LOCAL_STUBS_DIR="$(dirname "$0")/.github/caller-stubs"
 if [[ -d "$LOCAL_STUBS_DIR" ]]; then
-  cp "$LOCAL_STUBS_DIR"/*.yml "$DEST/.github/workflows/"
+  shopt -s nullglob
+  files=("$LOCAL_STUBS_DIR"/*.yml)
+  shopt -u nullglob
+  if (( ${#files[@]} )); then
+    cp "${files[@]}" "$DEST/.github/workflows/"
+  fi
 else
   for f in "${STUBS[@]}"; do
     curl -fsSL "$BASE/$f" -o "$DEST/.github/workflows/$f"

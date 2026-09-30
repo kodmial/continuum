@@ -135,7 +135,7 @@ jobs:
           set -euo pipefail
 
           if [[ ! -f scripts/release-policy.sh && -d .continuum ]]; then ln -sfn .continuum/scripts scripts 2>/dev/null || true; fi
-          if [[ ! -f scripts/release-policy.sh ]]; then git clone --depth 1 https://github.com/kodmial/continuum.git .continuum 2>/dev/null || true; ln -sfn .continuum/scripts scripts 2>/dev/null || true; fi
+          if [[ ! -f scripts/release-policy.sh ]]; then REF="${REF:-main}"; [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "invalid ref: $REF" >&2; exit 1; }; git clone --branch "$REF" --depth 1 https://github.com/kodmial/continuum.git .continuum 2>/dev/null || true; ln -sfn .continuum/scripts scripts 2>/dev/null || true; fi
           # shellcheck source=scripts/release-policy.sh
           source scripts/release-policy.sh
 
@@ -324,7 +324,7 @@ jobs:
           set -euo pipefail
 
           if [[ ! -f scripts/release-policy.sh && -d .continuum ]]; then ln -sfn .continuum/scripts scripts 2>/dev/null || true; fi
-          if [[ ! -f scripts/release-policy.sh ]]; then git clone --depth 1 https://github.com/kodmial/continuum.git .continuum 2>/dev/null || true; ln -sfn .continuum/scripts scripts 2>/dev/null || true; fi
+          if [[ ! -f scripts/release-policy.sh ]]; then REF="${REF:-main}"; [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "invalid ref: $REF" >&2; exit 1; }; git clone --branch "$REF" --depth 1 https://github.com/kodmial/continuum.git .continuum 2>/dev/null || true; ln -sfn .continuum/scripts scripts 2>/dev/null || true; fi
           # shellcheck source=scripts/release-policy.sh
           source scripts/release-policy.sh
 
@@ -442,7 +442,7 @@ jobs:
         run: |
           set -euo pipefail
           if [[ ! -f scripts/release-policy.sh && -d .continuum ]]; then ln -sfn .continuum/scripts scripts 2>/dev/null || true; fi
-          if [[ ! -f scripts/release-policy.sh ]]; then git clone --depth 1 https://github.com/kodmial/continuum.git .continuum 2>/dev/null || true; ln -sfn .continuum/scripts scripts 2>/dev/null || true; fi
+          if [[ ! -f scripts/release-policy.sh ]]; then REF="${REF:-main}"; [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "invalid ref: $REF" >&2; exit 1; }; git clone --branch "$REF" --depth 1 https://github.com/kodmial/continuum.git .continuum 2>/dev/null || true; ln -sfn .continuum/scripts scripts 2>/dev/null || true; fi
           # shellcheck source=scripts/release-policy.sh
           source scripts/release-policy.sh
           {
