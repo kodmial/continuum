@@ -16,13 +16,16 @@ a log line.
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
+import subprocess
 from typing import Any, Dict, Optional, Tuple
 
 from .. import config as config_module
 from . import adapters as release_adapters
 from . import android as android_module
+from . import apple as apple_module
 from . import entrypoints
 from . import github_api
 from . import jvm as jvm_module
@@ -31,19 +34,46 @@ from . import provenance as provenance_module
 from .contract import EVENT_DISPATCH, EVENT_TAG_PUSH, ContractError, ReleaseEvent
 from .core import ReleaseComponents, ReleaseRequest
 from .entrypoints import ReleaseMatrix
-from .transaction import classify, write_fragment
+from .transaction import build_target, classify, resolve_release, write_fragment
 from .version import ExplicitVersion, TagVersion, VersionPolicy
 
 #: The adapters that have a release adapter — a `build`/`sign`/`verify` object
 #: the chain can walk — rather than only a plan. Named explicitly rather than
 #: discovered, because "has a plan" and "can produce a manifest" are different
-#: properties and only this table knows which is which: Apple has a complete
-#: signing plan and no adapter, so a target naming it is refused by name here
-#: instead of being attempted through a path that cannot produce a manifest.
+#: properties and only this table knows which is which: an adapter with a plan
+#: and no adapter here is refused by name rather than being attempted through a
+#: path that cannot produce a manifest.
 CORE_ADAPTERS = {
     android_module.ADAPTER_NAME: android_module.AndroidAdapter,
+    apple_module.ADAPTER_NAME: apple_module.AppleAdapter,
     jvm_module.ADAPTER_NAME: jvm_module.JvmAdapter,
 }
+
+#: Long enough for any checkout's `rev-parse` and short enough that a job cannot
+#: be held by one. `rev-parse HEAD` reads `.git`, not the history, so this is
+#: generous.
+GIT_TIMEOUT_SECONDS = 30
+
+
+def walkable_adapter_class(target: config_module.ReleaseTarget, *, problem: str) -> Any:
+    """The adapter class a target's name resolves to, or a refusal.
+
+    One guard for both jobs, and a function rather than an inline check so the
+    refusal is reachable from a test: the configuration schema only accepts
+    adapter names that *do* have an adapter, so an inline check would have no
+    test that could ever reach it. `problem` is the two jobs' differing half —
+    what each one was about to do with the adapter — kept out of the guard so
+    the message a reader sees still names their own job.
+    """
+
+    adapter_class = CORE_ADAPTERS.get(target.adapter)
+    if adapter_class is None:
+        raise ReleasePlaneError(
+            f"target {target.id!r} names adapter {target.adapter!r}, which {problem}",
+            code="adapter-not-walkable",
+        )
+    return adapter_class
+
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -248,15 +278,15 @@ def build_components(
             f"no release target {target_id!r} in {config.source}; configured: {available}",
             code="target-absent",
         )
-    adapter_class = CORE_ADAPTERS.get(target.adapter)
-    if adapter_class is None:
-        raise ReleasePlaneError(
-            f"target {target_id!r} names adapter {target.adapter!r}, which has a plan but no "
-            "release adapter the chain can walk. A target cannot be published from a plan: a "
-            "plan produces no manifest, so the transaction would have nothing to merge. "
-            "Build it with 'continuum release sign', or add an adapter for it",
-            code="adapter-not-walkable",
-        )
+    adapter_class = walkable_adapter_class(
+        target,
+        problem=(
+            "has a plan but no release adapter the chain can walk. A target cannot be "
+            "published from a plan: a plan produces no manifest, so the transaction would "
+            "have nothing to merge. Build it with 'continuum release sign', or add an "
+            "adapter for it"
+        ),
+    )
     environment = release_adapters.bind_material(target, os.environ)
     return ReleaseComponents(
         eligibility=plane.eligibility_for(policy),
@@ -265,10 +295,63 @@ def build_components(
         # says v1.4.0 stops the release rather than picking one.
         version=ExplicitVersion(),
         notes=plane.notes_for(),
-        adapters={target.adapter: adapter_class(environment=environment)},
+        adapters={
+            target.adapter: adapter_class(
+                environment=environment, **checkout_reader_for(adapter_class)
+            )
+        },
         publishers=(),
         syncs=(),
     )
+
+
+def checkout_reader_for(adapter_class: Any) -> Dict[str, Any]:
+    """The keyword arguments that give an adapter a way to read its checkout.
+
+    An adapter that can refuse to build unreviewed bytes needs to be able to ask
+    which commit it is pointed at, and the only honest way for this module to
+    answer is to run `git` in the checkout: a release's approval names a SHA,
+    and the adapter compares what it finds against it.
+
+    Passed only to adapters that declare the parameter. An adapter written
+    before this existed is not broken by a release becoming stricter — it simply
+    has no such check, which is what it was written to be — and a table here that
+    had to name every adapter's keywords would be a second place to update every
+    time one grew a parameter.
+    """
+
+    try:
+        accepts = inspect.signature(adapter_class).parameters
+    except (TypeError, ValueError):  # pragma: no cover - a non-callable adapter
+        return {}
+    if "git_revision" not in accepts:
+        return {}
+    return {"git_revision": checkout_revision}
+
+
+def checkout_revision(root: str) -> str:
+    """The commit `root` is checked out at, or "" when that cannot be read.
+
+    No shell, a fixed argument vector, and a timeout: this runs in a build job
+    against a directory an untrusted ref controls, so the reading must not be
+    able to become anything but a question. Returning "" rather than raising is
+    deliberate — the adapter that asked decides what an unreadable checkout
+    means, and it refuses the release.
+    """
+
+    try:
+        completed = subprocess.run(
+            ["git", "-C", root or ".", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=GIT_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if completed.returncode != 0:
+        return ""
+    return completed.stdout.strip()
 
 
 def check_signing_material(matrix: ReleaseMatrix, mode: str, environment: Any) -> Tuple[str, ...]:
@@ -409,14 +492,13 @@ def transaction_components(
     publisher = github_publisher(destination, args, notes)
     adapters: Dict[str, Any] = {}
     for target in config.release.targets:
-        adapter_class = CORE_ADAPTERS.get(target.adapter)
-        if adapter_class is None:
-            raise ReleasePlaneError(
-                f"target {target.id!r} names adapter {target.adapter!r}, which has no release "
-                "adapter, so the transaction has no way to read the manifest a build job "
-                "produced for it",
-                code="adapter-not-walkable",
-            )
+        adapter_class = walkable_adapter_class(
+            target,
+            problem=(
+                "has no release adapter, so the transaction has no way to read the "
+                "manifest a build job produced for it"
+            ),
+        )
         # The transaction needs the adapter registered so the chain can resolve
         # the targets it is resuming; it never rebuilds, because the merged
         # journal records every build and sign as done.
@@ -659,6 +741,8 @@ def describe_failure(exc: BaseException) -> Tuple[str, bool, str, str]:
 
 __all__ = [
     "CORE_ADAPTERS",
+    "checkout_reader_for",
+    "checkout_revision",
     "JOURNAL_NAME",
     "MATRIX_NAME",
     "RESULT_NAME",
@@ -673,4 +757,5 @@ __all__ = [
     "read_matrix",
     "transaction_components",
     "version_checks_for",
+    "walkable_adapter_class",
 ]

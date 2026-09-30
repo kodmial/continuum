@@ -45,7 +45,9 @@ from .adoption import (
     require_retirable,
     retention,
 )
+from . import archive
 from .android import AndroidAdapter, AndroidError
+from .apple import AppleAdapter, AppleError
 from .contract import (
     PORT_ATTRIBUTES,
     PORT_SURFACES,
@@ -119,6 +121,8 @@ from .maven_publish import (
     write_bundle,
 )
 from .plan import (
+    COPY_ARGV_PAIR,
+    STEP_COPY,
     PlanStep,
     ReleaseError,
     ReleasePlan,
@@ -179,8 +183,11 @@ from .version import (
 __all__ = [
     "AndroidAdapter",
     "AndroidError",
+    "AppleAdapter",
+    "AppleError",
     "Artifact",
     "ArtifactManifest",
+    "archive",
     "BLOCKED",
     "BUILD_AUTO",
     "BUILD_GRADLE",
@@ -189,6 +196,7 @@ __all__ = [
     "BuildRequest",
     "CENTRAL_PUBLISHER",
     "COMPLETED",
+    "COPY_ARGV_PAIR",
     "CentralSettings",
     "ContractError",
     "ENTRYPOINTS",
@@ -251,6 +259,7 @@ __all__ = [
     "ReleaseRequest",
     "SKIPPED",
     "SOURCE_CONFLICT_CODE",
+    "STEP_COPY",
     "SigningUnavailable",
     "StageOutcome",
     "StatementBundle",

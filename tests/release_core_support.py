@@ -189,6 +189,11 @@ class FixtureAdapter:
     signed: List[BuildRequest] = field(default_factory=list)
     verified: List[BuildRequest] = field(default_factory=list)
     writes: List[str] = field(default_factory=list)
+    #: A name an archive is written under at *signing* time, modelling an adapter
+    #: that only names its archives when it packages them. Two targets can then
+    #: build distinct products and still publish one asset name — a collision
+    #: that exists only after signing, which is the stage that has to catch it.
+    packaged_name: str = ""
     fail_build: bool = False
     #: A failure the adapter claims a classification for, so a test can prove
     #: that a claimed retryability survives the trip through the core.
@@ -320,9 +325,53 @@ class FixtureAdapter:
                 # declared about them is carried across rather than dropped.
                 provenance=artifact.provenance,
             )
+        self._package(request, builder, directory)
         if not request.dry_run:
             self._record_checksums(builder, directory, self._checksums_name(request))
         return builder.build()
+
+    def _package(self, request: BuildRequest, builder: ManifestBuilder, directory: str) -> None:
+        """Add the archive a real adapter produces when it signs.
+
+        Named here rather than at build so a test can make two targets agree on
+        an asset name only once packaging has happened, which is where a real
+        release does it: the products are the adapter's own, and the name a
+        destination sees is the archive's.
+        """
+
+        if not self.packaged_name:
+            return
+        path = os.path.join(directory, self.packaged_name)
+        if request.dry_run:
+            builder.declare(
+                self.packaged_name,
+                path,
+                contract.TYPE_ARCHIVE,
+                classifier=contract.TYPE_ARCHIVE,
+                media_type="application/gzip",
+            )
+            return
+        with open(path, "wb") as handle:
+            # Signed like every other artifact, so a test that makes the archive
+            # names collide reaches the collision rather than a signature
+            # mismatch on a fixture that forgot to sign. The bytes name the
+            # target because two real archives of two targets are never the same
+            # file, and the contract reads identical bytes under one name as the
+            # same artifact recorded twice.
+            handle.write(
+                self._signature(request)
+                + f"packaged for {request.target.id}\n".encode("utf-8")
+            )
+        self.writes.append(path)
+        builder.record(
+            self.packaged_name,
+            path,
+            contract.TYPE_ARCHIVE,
+            classifier=contract.TYPE_ARCHIVE,
+            media_type="application/gzip",
+            signing=contract.SIGNING_SIGNED,
+            signing_identity=self.identity,
+        )
 
     def verify(
         self, request: BuildRequest, manifest: ArtifactManifest

@@ -452,5 +452,197 @@ class SigningContractTests(unittest.TestCase):
             parse(self._body("        mode: notarized\n"))
 
 
+class RoundTripTests(unittest.TestCase):
+    """A target survives the trip the release hands its options to an adapter.
+
+    The core passes each target to its adapter as the mapping `describe()`
+    produced, and the adapter parses it back with this module. So for every
+    optional field, "left out" and "written as the default" have to parse to the
+    same target — otherwise a target that legitimately configures nothing is
+    rejected the moment a real release hands it over, with an error about a
+    field the repository never mentioned.
+    """
+
+    def _blank(self, **fields) -> dict:
+        """The described target with optional fields written as their defaults.
+
+        `describe()` emits every key so a reader can see the whole target, which
+        is exactly why an unset optional has to arrive as `""` or `[]` rather
+        than being missing.
+        """
+
+        described = dict(support.target().describe())
+        described.update(fields)
+        return described
+
+    def test_a_fully_declared_target_round_trips(self):
+        target = support.target()
+        self.assertEqual(config_module.parse_release_target(target.describe()), target)
+
+    def test_a_target_that_optionals_every_thing_round_trips(self):
+        minimal = support.target(
+            app_bundle=None,
+            universal=False,
+            hardened_runtime=False,
+            publishers=(),
+            binaries=(
+                config_module.ReleaseBinary(
+                    name="tool", identifier="com.example.tool"
+                ),
+            ),
+        )
+        self.assertEqual(
+            config_module.parse_release_target(minimal.describe()), minimal
+        )
+
+    def test_optional_fields_written_empty_read_as_their_defaults(self):
+        """A blank means "not declared", so it reads as what a target declares
+        nothing to be — which is the same target with that field left out, not a
+        target whose field was cleared."""
+
+        reference = support.target(
+            app_bundle=None,
+            publishers=(),
+            binaries=tuple(
+                config_module.ReleaseBinary(
+                    name=binary.name, identifier=binary.identifier
+                )
+                for binary in support.binaries()
+            ),
+        )
+        described = dict(reference.describe())
+        described.update(
+            universal=None,
+            hardened_runtime=None,
+            publishers=None,
+            app_bundle=None,
+            signing={**reference.signing.describe(), "timestamp": None, "team_id_var": None},
+            binaries=[
+                {"name": binary.name, "identifier": binary.identifier,
+                 "entitlements": None, "link_flags": []}
+                for binary in reference.binaries
+            ],
+        )
+        self.assertEqual(config_module.parse_release_target(described), reference)
+
+    def test_an_empty_list_of_architectures_is_the_default_not_a_refusal(self):
+        """`architectures: []` means "not declared", which means the defaults.
+
+        Reading it as a refusal would reject a target that declares nothing
+        about its architectures, which is a legitimate thing to do.
+        """
+
+        again = config_module.parse_release_target(self._blank(architectures=[]))
+        self.assertEqual(again.architectures, support.target().architectures)
+
+    def test_an_empty_list_of_link_flags_is_no_flags(self):
+        """Flags live on the binary, and an empty list is "this binary adds none".
+
+        The linker flags a product declares are how a target ships against a
+        system framework; an empty list has to mean the default rather than
+        failing a release that simply declares no extra flags.
+        """
+
+        binary = support.binaries()[0]
+        described = self._blank(
+            binaries=[
+                {
+                    "name": binary.name,
+                    "identifier": binary.identifier,
+                    "entitlements": None,
+                    "link_flags": [],
+                }
+            ]
+        )
+        again = config_module.parse_release_target(described)
+        self.assertEqual(again.binaries[0].link_flags, ())
+        self.assertEqual(again.binaries[0].entitlements, "")
+
+    def test_a_wrong_type_is_still_refused(self):
+        """Emptiness is not a loophole.
+
+        A value of the wrong shape is a mistake whether it is empty or not, and
+        accepting it would turn "this repository wrote `architectures: {}`" into
+        a release quietly built with default architectures.
+        """
+
+        for field, value in (
+            ("architectures", {"arm64": True}),
+            ("universal", "yes please"),
+            ("publishers", "homebrew"),
+            ("artifacts", 3),
+            ("binaries", "tool"),
+        ):
+            with self.subTest(field=field):
+                with self.assertRaises(config_module.ConfigError):
+                    config_module.parse_release_target(self._blank(**{field: value}))
+
+    def test_an_empty_value_inside_a_list_is_still_refused(self):
+        """`[arm64, ""]` is a list with a hole, not a list with one entry.
+
+        Dropping the empty entry would ship an architecture the repository did
+        not name in the position it did not name it.
+        """
+
+        with self.assertRaises(config_module.ConfigError) as caught:
+            config_module.parse_release_target(self._blank(architectures=["arm64", ""]))
+        self.assertIn("architectures", str(caught.exception))
+
+    def test_a_duplicate_is_still_refused_after_the_empty_check(self):
+        with self.assertRaises(config_module.ConfigError):
+            config_module.parse_release_target(self._blank(architectures=["arm64", "arm64"]))
+
+    def test_the_public_reader_refuses_what_the_document_refuses(self):
+        """One validator, so the two cannot drift.
+
+        A caller holding a target already — the CLI reading a fragment, a test
+        asserting on a declared target — gets the document's answers, not a
+        second, looser opinion about the same configuration.
+        """
+
+        for field, value in (("adapter", "windows"), ("platform", "tvos")):
+            with self.subTest(field=field):
+                with self.assertRaises(config_module.ConfigError) as direct:
+                    config_module.parse_release_target(self._blank(**{field: value}))
+                self.assertIn(field, str(direct.exception))
+                document = textwrap.indent(
+                    _yaml_of(self._blank(**{field: value})), "    "
+                )
+                with self.assertRaises(config_module.ConfigError):
+                    parse("version: 1\nrelease:\n  targets:\n" + document)
+
+    def test_the_public_reader_names_where_the_target_came_from(self):
+        """A refusal says which target, and where it was read from.
+
+        A caller that hands over one of several targets needs to know which one
+        was rejected without keeping a counter.
+        """
+
+        with self.assertRaises(config_module.ConfigError) as caught:
+            config_module.parse_release_target(self._blank(adapter="windows"), "fragment")
+        self.assertIn("fragment", str(caught.exception))
+
+
+def _yaml_of(described: dict) -> str:
+    """A target mapping as YAML, for the document-level comparison."""
+
+    lines = ["    - id: " + described["id"]]
+    for key, value in described.items():
+        if key == "id":
+            continue
+        lines.append(f"      {key}: {_yaml_value(value)}")
+    return "\n".join(lines) + "\n"
+
+
+def _yaml_value(value) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_yaml_value(item) for item in value) + "]"
+    if isinstance(value, dict):
+        return "{" + ", ".join(f"{k}: {_yaml_value(v)}" for k, v in value.items()) + "}"
+    return repr(value)
+
+
 if __name__ == "__main__":
     unittest.main()

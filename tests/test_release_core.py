@@ -548,6 +548,137 @@ class ResumabilityTests(ReleaseTestCase):
         self.assertEqual(second.outcome_for("build").outcome, "failed")
 
 
+class PackagingCollisionTests(ReleaseTestCase):
+    """A collision that only exists once the targets have packaged.
+
+    Products are the adapter's own business and are usually distinct. The *asset*
+    names are not: they are what a destination addresses an upload by, and an
+    adapter that names its archive at packaging time can hand two targets the
+    same one. The build stage cannot see that collision, because at build time
+    the names are different — so the sign stage has to, before anything is
+    published.
+    """
+
+    def _release(self):
+        self.adapters = {
+            name: support.FixtureAdapter(
+                workdir=self.directory, packaged_name="app.tar.gz"
+            )
+            for name in ("fixture", "other")
+        }
+        core = ReleaseCore(support.components(adapters=self.adapters))
+        return core.execute(
+            self.request(
+                targets=(
+                    contract.TargetSpec(id="fixture", adapter="fixture"),
+                    contract.TargetSpec(id="other", adapter="other"),
+                )
+            )
+        )
+
+    def test_the_build_stage_is_clean_because_the_products_differ(self):
+        """Why the sign stage has to be where this is caught.
+
+        Each target builds its own product, and the build manifests are
+        unambiguous — so nothing here can be read as a configuration error and
+        pointed at.
+        """
+
+        outcome = self._release()
+        self.assertEqual(outcome.outcome_for("build").outcome, "completed")
+        products = {
+            name: {
+                os.path.basename(path)
+                for path in adapter.writes
+                if not path.endswith("app.tar.gz")
+            }
+            for name, adapter in self.adapters.items()
+        }
+        self.assertEqual(products["fixture"] & products["other"], set())
+        for name, adapter in self.adapters.items():
+            self.assertEqual(
+                [request.target.id for request in adapter.built],
+                [name],
+                f"{name} was built for another target",
+            )
+
+    def test_the_release_is_refused_for_the_packaged_name(self):
+        outcome = self._release()
+        self.assertTrue(outcome.failed)
+        self.assertIn("app.tar.gz", outcome.failure.summary)
+
+    def test_the_refusal_names_the_stage_that_found_it(self):
+        """Signing, not building.
+
+        The stage is what a reader needs to know: "the products collided" sends
+        them to the build configuration, and the answer was in the packaging.
+        """
+
+        outcome = self._release()
+        self.assertEqual(outcome.failure.stage, "sign")
+        self.assertEqual(outcome.failure.code, "asset-name-collision")
+
+    def test_nothing_is_published(self):
+        """The whole point of finding it before the upload.
+
+        A collision discovered while attaching assets has already written one
+        target's bytes over the other's.
+        """
+
+        self._release()
+        self.assertEqual(self.repository.calls, [])
+        self.assertEqual(self.repository.attached("1.4.0"), ())
+
+    def test_a_collision_at_build_is_still_caught_there(self):
+        """The earlier check stays, for the adapters that collide immediately."""
+
+        core = ReleaseCore(
+            support.components(
+                adapters={
+                    "fixture": support.FixtureAdapter(
+                        workdir=self.directory, artifact_name="app.tar.gz"
+                    ),
+                    "other": support.FixtureAdapter(
+                        workdir=self.directory, artifact_name="app.tar.gz"
+                    ),
+                }
+            )
+        )
+        outcome = core.execute(self.request(targets=support.targets("fixture", "other")))
+        self.assertEqual(outcome.failure.stage, "build")
+        self.assertEqual(outcome.failure.code, "asset-name-collision")
+
+    def test_the_refusal_names_the_name_and_the_remedy(self):
+        """A reader has to be able to act on this without a second run.
+
+        The message names the colliding name, says why it matters — a
+        destination addresses assets by name — and says what to change.
+        """
+
+        summary = self._release().failure.summary
+        self.assertIn("app.tar.gz", summary)
+        self.assertIn("A destination addresses assets by name", summary)
+        self.assertIn("target, platform, or classifier", summary)
+
+    def test_the_refusal_distinguishes_the_two_assets_it_found(self):
+        """Two different artifacts, not one artifact seen twice.
+
+        The contract reports identities rather than targets, so the message has
+        to make it clear these are two files rather than one recorded twice.
+        """
+
+        outcome = self._release()
+        digests = {
+            contract.digest_file(path, "sha256")[1]
+            for adapter in self.adapters.values()
+            for path in adapter.writes
+            if path.endswith("app.tar.gz")
+        }
+        self.assertEqual(len(digests), 2, "the fixture packaged one file twice")
+        for digest in digests:
+            self.assertIn(digest, outcome.failure.summary)
+
+
 class MultiTargetTests(ReleaseTestCase):
     def _two_target_release(self):
         request = self.request(targets=support.targets("fixture", "other"))

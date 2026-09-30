@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional
 
 from continuum import cli
 from continuum import config as config_module
+from continuum.release import apple as apple_module
 from continuum.release import commands, entrypoints
 from continuum.release.transaction import TargetFragment
 
@@ -246,12 +247,13 @@ class ResolveCommandTests(ReleasePlaneTestCase):
 
 
 class TargetCommandTests(ReleasePlaneTestCase):
-    def test_refuses_a_target_with_no_release_adapter(self):
-        """Apple has a complete signing plan and no release adapter.
+    def test_walks_an_apple_target_instead_of_refusing_the_adapter(self):
+        """The chain reaches the toolchain, which is the only thing left to refuse.
 
-        The refusal names both halves, because the natural next question is
-        "so use the plan then" and the answer is that a plan produces no
-        manifest for the transaction to merge.
+        This runner has no `swift`, so the honest answer is
+        `toolchain-unavailable` naming the target — not `adapter-not-walkable`,
+        which would say the adapter does not exist. A refusal that reports the
+        wrong half sends a reader to look for a missing module that is present.
         """
 
         self.resolve()
@@ -266,8 +268,9 @@ class TargetCommandTests(ReleasePlaneTestCase):
             SECRETS,
         )
         self.assertEqual(code, 1)
-        self.assertIn("adapter-not-walkable", out)
-        self.assertIn("no manifest", out)
+        self.assertNotIn("adapter-not-walkable", out)
+        self.assertIn("toolchain-unavailable", out)
+        self.assertIn("macos-app", out)
 
     def test_refuses_a_target_the_policy_does_not_declare(self):
         self.resolve()
@@ -730,20 +733,107 @@ class WiringTests(ReleasePlaneTestCase):
     def test_the_build_table_is_explicit_about_what_it_has(self):
         """A discovered registry would drift as adapters are added.
 
-        The property worth pinning is that Apple is *absent*: it is the adapter
-        the config supports, so a table that quietly included it would dispatch a
-        build job that cannot produce a manifest.
+        The property worth pinning is both halves: the adapter the configuration
+        schema accepts is present, so a repository that writes an Apple target
+        gets a build rather than a refusal; and an adapter with no entry here —
+        the fixture one — is absent, so the table stays a decision rather than
+        whatever happened to be imported.
         """
 
         self.assertIn("apple", entrypoints.supported())
+        self.assertIn("apple", commands.CORE_ADAPTERS)
+        self.assertIs(commands.CORE_ADAPTERS["apple"], apple_module.AppleAdapter)
         self.assertNotIn(ADAPTER, commands.CORE_ADAPTERS)
-        self.assertNotIn("apple", commands.CORE_ADAPTERS)
+
+    def test_a_apple_target_is_handed_its_own_configuration(self):
+        """The adapter is constructed from the target, not from a hand-built spec.
+
+        The core passes a target's options through as `TargetSpec.options`, so a
+        build job that never re-derived them would silently release a default
+        target: no bundle, no architectures but the default, no secret names.
+        """
+
+        from continuum.release import core as release_core
+
+        config = _apple_config()
+        request = release_core.ReleaseRequest.from_config(
+            config,
+            commands.load_event(repository=REPOSITORY, source_sha=SHA, version=VERSION),
+            requested_version=VERSION,
+        )
+        (spec,) = request.targets
+        options = dict(spec.options)
+        self.assertEqual(options["id"], "macos-app")
+        self.assertEqual(options["adapter"], "apple")
+        self.assertEqual(options["architectures"], ["arm64"])
+        self.assertEqual(options["signing"]["identity"], "Example Co")
+        self.assertEqual(
+            options["signing"]["p12_secret"], "CONTINUUM_APPLE_P12"
+        )
+
+    def test_a_build_job_hands_the_adapter_a_way_to_read_its_checkout(self):
+        """The approved SHA is only enforced if something can read the checkout.
+
+        An adapter that refuses to build unreviewed bytes needs to ask which
+        commit it is pointed at; without a reader it is a check that cannot run,
+        and a job that appears to enforce it does not.
+        """
+
+        components = commands.build_components(_apple_config(), "macos-app")
+        (adapter,) = components.adapters.values()
+        self.assertIs(adapter.git_revision, commands.checkout_revision)
+
+    def test_the_reader_agrees_with_git_about_this_repository(self):
+        import subprocess
+
+        expected = subprocess.run(
+            ["git", "-C", os.path.dirname(os.path.dirname(__file__)), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        self.assertEqual(
+            commands.checkout_revision(os.path.dirname(os.path.dirname(__file__))),
+            expected,
+        )
+
+    def test_the_reader_reports_an_unreadable_checkout_rather_than_guessing(self):
+        """A directory with no repository in it has no commit to report.
+
+        An adapter is told "" and refuses the release; a reader that invented a
+        SHA, or raised here, would move the refusal somewhere it cannot be
+        reasoned about.
+        """
+
+        self.assertEqual(commands.checkout_revision(self.workdir), "")
+        os.makedirs(os.path.join(self.workdir, "not-a-checkout"))
+        self.assertEqual(commands.checkout_revision(os.path.join(self.workdir, "x")), "")
+
+    def test_an_adapter_that_declares_no_reader_is_not_given_one(self):
+        """The keyword is passed only to adapters that ask for it.
+
+        An adapter written before this existed is not broken by a release
+        becoming stricter; it simply has no such check, which is what it was
+        written to be.
+        """
+
+        self.assertEqual(commands.checkout_reader_for(core_support.FixtureAdapter), {})
+        self.assertEqual(
+            commands.checkout_reader_for(dict), {}, "a non-callable entry gets nothing"
+        )
+        self.assertEqual(
+            list(commands.checkout_reader_for(apple_module.AppleAdapter)),
+            ["git_revision"],
+        )
 
     def test_names_an_adapter_with_no_release_adapter(self):
-        config = _apple_config()
+        from continuum import config as config_module
+
+        target = config_module.ReleaseTarget(id="example", adapter="fixture")
         with self.assertRaises(commands.ReleasePlaneError) as caught:
-            commands.build_components(config, "macos-app")
+            commands.walkable_adapter_class(target, problem="has no release adapter")
         self.assertEqual(caught.exception.code, "adapter-not-walkable")
+        self.assertIn("no release adapter", str(caught.exception))
 
     def test_a_build_job_holds_no_destination(self):
         """The privilege boundary, asserted on the wiring rather than the run.

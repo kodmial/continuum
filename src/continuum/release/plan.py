@@ -34,9 +34,10 @@ PLAN_KIND = PLAN_SCHEMA
 
 TEARDOWN = "teardown"
 
-# A step is one of these three things and nothing else. `run` executes an
+# A step is one of these four things and nothing else. `run` executes an
 # argument vector; `assert` runs the same vector but additionally requires a
-# substring in its output; `materialize` writes a secret to a scratch file.
+# substring in its output; `materialize` writes a secret to a scratch file;
+# `copy` moves already-signed bytes from one path to another.
 #
 # The distinction matters because "the command exited 0" and "the output says
 # the thing we care about" are different claims, and a step that makes the
@@ -44,10 +45,17 @@ TEARDOWN = "teardown"
 # secret material on disk is something the runner does deliberately, can record,
 # and can clean up — rather than something an adapter smuggles in through a
 # shell redirection, which is exactly the kind of step whose leftovers nobody
-# remembers to delete.
+# remembers to delete. `copy` exists for the same reason: assembling a bundle
+# out of signed binaries has to be a step the plan states, in order, between
+# signing and sealing — not a `cp` an adapter performs behind the plan's back
+# where its ordering cannot be reviewed.
 STEP_RUN = "run"
 STEP_ASSERT = "assert"
 STEP_MATERIALIZE = "materialize"
+STEP_COPY = "copy"
+
+#: `copy` steps carry alternating source and destination paths in `argv`.
+COPY_ARGV_PAIR = 2
 
 # How a materialized secret is encoded on the way in. `base64` is the transport
 # a repository secret uses for binary material, because a secret value has to
@@ -169,7 +177,7 @@ class PlanStep:
     def __post_init__(self) -> None:
         if not self.name:
             raise ReleaseError("a plan step needs a name")
-        if self.kind not in (STEP_RUN, STEP_ASSERT, STEP_MATERIALIZE):
+        if self.kind not in (STEP_RUN, STEP_ASSERT, STEP_MATERIALIZE, STEP_COPY):
             raise ReleaseError(f"unknown plan step kind {self.kind!r}")
         if self.kind == STEP_MATERIALIZE:
             if not self.source_env or not self.path:
@@ -187,12 +195,29 @@ class PlanStep:
             return
         if not self.argv:
             raise ReleaseError(f"step {self.name!r}: a {self.kind} step needs a command")
+        if self.kind == STEP_COPY:
+            # An odd number of paths means the last one has nowhere to go, and a
+            # silent copy of the wrong prefix is the kind of thing that ships an
+            # unsigned binary inside a sealed bundle.
+            if len(self.argv) % COPY_ARGV_PAIR or self.expect is not None:
+                raise ReleaseError(
+                    f"step {self.name!r}: a copy step takes alternating source and "
+                    "destination paths and asserts nothing"
+                )
         if self.kind == STEP_RUN and self.expect is not None:
             raise ReleaseError(f"step {self.name!r}: only an assert step may pin output")
         if self.source_env or self.path:
             raise ReleaseError(
                 f"step {self.name!r}: source_env and path belong to a materialize step"
             )
+
+    def copies(self) -> Tuple[Tuple[str, str], ...]:
+        """The (source, destination) pairs a copy step performs."""
+
+        return tuple(
+            (self.argv[index], self.argv[index + 1])
+            for index in range(0, len(self.argv), COPY_ARGV_PAIR)
+        )
 
     def slots(self) -> Tuple[Tuple[str, str], ...]:
         """The substitution slots this step carries, as (kind, name) pairs.
@@ -372,6 +397,7 @@ def render(plan: ReleasePlan) -> Dict[str, Any]:
 
 
 __all__ = [
+    "COPY_ARGV_PAIR",
     "ENCODING_BASE64",
     "ENCODING_RAW",
     "ENV_ENV_PREFIX",
@@ -380,6 +406,7 @@ __all__ = [
     "SECRET_ENV_PREFIX",
     "SLOT_PATTERN",
     "STEP_ASSERT",
+    "STEP_COPY",
     "STEP_MATERIALIZE",
     "STEP_RUN",
     "SUPPORTED_ENCODINGS",
