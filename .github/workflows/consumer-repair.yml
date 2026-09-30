@@ -60,7 +60,7 @@ jobs:
       GITHUB_TOKEN: ${{ github.token }}
     steps:
       - name: Load Continuum engine
-        uses: kodmial/continuum/.github/actions/engine-path@39ca6dc798f2201390c8fdef0395157f588657ec
+        uses: kodmial/continuum/.github/actions/engine-path@81adcea69ce9c260f1aad4177867f8449a75d9b3
       - name: Resolve the repair budget
         id: bounds
         shell: bash
@@ -83,7 +83,7 @@ jobs:
       MAX_ATTEMPTS: ${{ inputs.max_attempts }}
     steps:
       - name: Load Continuum engine
-        uses: kodmial/continuum/.github/actions/engine-path@39ca6dc798f2201390c8fdef0395157f588657ec
+        uses: kodmial/continuum/.github/actions/engine-path@81adcea69ce9c260f1aad4177867f8449a75d9b3
 
       - name: Recover failed issue-mode OpenCode run
         shell: bash

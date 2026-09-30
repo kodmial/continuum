@@ -134,6 +134,9 @@ on:
     secrets:
       OPENCODE_API_KEY:
         required: false
+      continuum_token:
+        description: "Optional consumer-owned write token used when downstream GitHub events must fan out"
+        required: false
 
 permissions:
   actions: read
@@ -158,8 +161,8 @@ jobs:
     # replaces the first, so `BASE_BRANCH` was being dropped and every `$BASE_BRANCH`
     # reference in this job expanded to nothing.
     env:
-      GH_TOKEN: ${{ github.token }}
-      GITHUB_TOKEN: ${{ github.token }}
+      GH_TOKEN: ${{ secrets.continuum_token || github.token }}
+      GITHUB_TOKEN: ${{ secrets.continuum_token || github.token }}
       OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
       OPENCODE_MODEL: ${{ inputs.model }}
       BASE_BRANCH: ${{ inputs.base_branch }}
@@ -196,7 +199,7 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ inputs.base_branch }}
-          token: ${{ github.token }}
+          token: ${{ secrets.continuum_token || github.token }}
           persist-credentials: true
 
       - name: Checkout PR branch
@@ -205,7 +208,7 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ inputs.head_ref }}
-          token: ${{ github.token }}
+          token: ${{ secrets.continuum_token || github.token }}
           persist-credentials: true
 
       - name: Configure git
@@ -216,7 +219,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
       - name: Load Continuum engine
-        uses: kodmial/continuum/.github/actions/engine-path@39ca6dc798f2201390c8fdef0395157f588657ec
+        uses: kodmial/continuum/.github/actions/engine-path@81adcea69ce9c260f1aad4177867f8449a75d9b3
 
       # Before any OpenCode invocation in this job: issue implementation,
       # conflict repair, and CI repair all run under the same policy, so the
