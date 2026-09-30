@@ -79,14 +79,38 @@ conflict/mergeability gates succeed. This is the current behaviour of
 Continuum requires a **normalized review gate** to be satisfied before it
 will merge.
 
-The provider is deliberately **not** a user-facing setting in v0.1. A thin
-consumer-owned review adapter is responsible for translating whatever reviewer
-the consumer already uses into that one normalized signal. Continuum's core
-must not parse vendor-specific reviews, comments, labels, or check names.
+The provider is deliberately **not** a user-facing setting in v0.1. `true`
+activates the single review implementation Continuum ships, and the repository
+never names, selects, or configures it. Continuum is not asking a consumer to
+assemble a reviewer before it can merge.
 
-The consequence is the contract's central portability guarantee: swapping or
-adding a review provider is an adapter change inside the consumer, and never a
-change to this file or to the two toggles.
+What ships in v0.1 is the review adapter, the finding normalizer, and the
+bounded repair loop:
+
+```
+provider finding -> normalized findings on an exact HEAD
+                  -> bounded agent repair on the existing branch
+                  -> push -> CI
+                  -> provider re-check of the original findings
+                  -> merge on a green current-HEAD gate
+```
+
+Three properties of that loop are contract, not implementation detail:
+
+- **The gate is exact-head.** A review of one commit decides that commit. A new
+  push invalidates it, and a green gate is never carried across HEADs.
+- **Repair is bounded and fails closed.** Attempts are counted per HEAD and per
+  finding, an unchanged repair is asked about rather than retried indefinitely,
+  a full re-review happens at most once, and the budget then pauses the loop
+  rather than merging.
+- **Repair never re-executes the source task.** It receives the normalized
+  findings for one commit and nothing else.
+
+The consequence of the portability guarantee is unchanged: the **merge core is
+provider-neutral**. It consumes one normalized signal and never parses
+vendor-specific reviews, comments, labels, or check names. The provider sits
+behind an adapter inside Continuum, so adding or swapping one is a change to
+that adapter and never a change to this file or to the two toggles.
 
 ## 5. Meaning of `release`
 

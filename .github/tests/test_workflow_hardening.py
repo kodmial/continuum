@@ -63,6 +63,7 @@ AGENT_PLANE = (
     "issue-scheduler.yml",
     "opencode-repair.yml",
     "opencode.yml",
+    "review-gate.yml",
 )
 
 #: The workflows that are deliberately outside that plane.
@@ -368,6 +369,7 @@ class PermissionsTests(WorkflowAuditBase):
                 "opencode-repair.yml/sync-current-pr",
                 "opencode-repair.yml/sync-stale-prs",
                 "opencode.yml/opencode",
+                "review-gate.yml/gate",
             ],
         )
         for job_key, scopes in writers.items():
@@ -470,6 +472,138 @@ class PullRequestTargetTests(WorkflowAuditBase):
         self.assertGreater(identity_checks, 0, "no workflow verifies its dispatch credential")
 
 
+class ReviewGateTests(WorkflowAuditBase):
+    """The loop orchestrator: thin, positional trust, and provider-neutral."""
+
+    def gate_workflow(self):
+        return self.workflows["review-gate.yml"]
+
+    def test_the_control_plane_is_read_only_and_the_gate_is_not(self):
+        document = self.gate_workflow()
+        self.assertEqual(
+            write_scopes(job_permissions(document, document["jobs"]["authorize"])), []
+        )
+        self.assertEqual(
+            write_scopes(job_permissions(document, document["jobs"]["reverify"])), []
+        )
+        self.assertIn("authorize", document["jobs"]["gate"].get("needs") or [])
+        self.assertIn("reverify", document["jobs"]["gate"].get("needs") or [])
+
+    def test_the_gate_runs_only_on_the_control_planes_decision(self):
+        # There is deliberately no second path that re-derives trust from the
+        # event payload. An event-supplied pull-request ref is exactly the value
+        # that must never reach a write-capable step unvalidated, so the gate's
+        # only condition is the read-only job's own verdict.
+        condition = str(self.gate_workflow()["jobs"]["gate"].get("if"))
+        self.assertIn("needs.authorize.outputs.proceed == 'true'", condition)
+        self.assertIn("needs.reverify.outputs.allowed == 'true'", condition)
+        self.assertNotIn("github.event.pull_request", condition)
+
+    def test_authority_is_re_verified_with_a_read_only_token(self):
+        job = self.gate_workflow()["jobs"]["reverify"]
+        steps = steps_of(job)
+        verify = [s for s in steps if POLICY_PATH in run_text(s)]
+        self.assertEqual(len(verify), 1, "expected one trust-policy re-verification")
+        step = verify[0]
+        body = run_text(step) + json.dumps(step.get("env") or {})
+        self.assertIn("--mode review-fix", run_text(step))
+        # GitHub permissions are a job boundary, not a step boundary. The
+        # verification job therefore owns no write scope and receives no secret.
+        self.assertNotIn("secrets.", body)
+        self.assertEqual(
+            write_scopes(job_permissions(self.gate_workflow(), job)),
+            [],
+            "the re-verification job is not read-only",
+        )
+
+    def test_the_engine_comes_from_the_base_branch_not_the_pull_request(self):
+        # A pull request must not be able to choose the code that reviews it.
+        for job in self.gate_workflow()["jobs"].values():
+            for step in steps_of(job):
+                if uses(step, "actions/checkout"):
+                    self.assertEqual(
+                        (step.get("with") or {}).get("ref"),
+                        "${{ github.event.repository.default_branch }}",
+                    )
+
+    def test_every_wake_up_resolves_to_a_target_and_nothing_else(self):
+        # The event varies, the target does not, and a wake-up that resolves no
+        # trusted pull request has to be a silent no-op rather than a fallback
+        # that guesses one.
+        body = job_text(
+            self.gate_workflow(), self.gate_workflow()["jobs"]["authorize"]
+        )
+        self.assertIn("is_trusted_pull_request", body)
+        self.assertIn("emit_skip", body)
+        for event in (
+            "pull_request_target",
+            "workflow_run",
+            "status",
+            "schedule",
+            "workflow_dispatch",
+        ):
+            self.assertIn(event, body, "{} is not a resolved wake-up".format(event))
+
+    def test_the_consumer_contract_is_the_configuration_of_record(self):
+        # `review` is the repository's declared switch. The gate reads the
+        # consumer contract rather than this repository's own engine file, so
+        # the toggle a maintainer edits is the toggle that decides.
+        body = job_text(self.gate_workflow(), self.gate_workflow()["jobs"]["gate"])
+        self.assertIn(".github/continuum.yml", body)
+        self.assertIn("--config \"$CONTINUUM_CONFIG\"", body)
+
+    def test_review_events_are_not_a_privileged_wake_up(self):
+        document = self.gate_workflow()
+        triggers = trigger_names(document)
+        self.assertNotIn("pull_request_review", triggers)
+        raw = self.raw["review-gate.yml"]
+        # Submitted reviews remain durable evidence consumed by the engine; the
+        # privileged workflow is merely not entered from their untrusted event.
+        self.assertIn("submitted reviews", raw.lower())
+        self.assertIn("review", raw.lower())
+
+    def test_the_workflow_names_no_provider(self):
+        # There is no user-facing provider selector. The provider is reached
+        # through the engine, which resolves it from `review: true`.
+        self.assertNotIn("coderabbit", self.raw["review-gate.yml"].lower())
+        self.assertNotIn("pr-agent", self.raw["review-gate.yml"].lower())
+
+    def test_provider_runs_are_serialized_and_never_cancelled(self):
+        concurrency = self.gate_workflow().get("concurrency") or {}
+        self.assertEqual(concurrency.get("cancel-in-progress"), False)
+        self.assertTrue(str(concurrency.get("group")))
+
+    def test_the_agent_step_reads_the_instruction_the_controller_stored(self):
+        # The repair must not rebuild its own instruction from the event: the
+        # normalized, deduplicated findings are what the controller wrote for
+        # this exact commit, and that is the only thing the model may be given.
+        agent = self.job("opencode.yml", "opencode")
+        step = next(
+            s for s in steps_of(agent) if s.get("name") == "Repair the open review findings"
+        )
+        self.assertIn("review prompt", run_text(step))
+        self.assertIn("--head \"$BEFORE_SHA\"", run_text(step))
+        # The step must not go to the provider itself, and must not read
+        # findings out of the event payload: both are how a repair would end up
+        # answering something other than what the controller decided.
+        self.assertNotIn("review reconcile", run_text(step))
+        self.assertNotIn("coderabbit", run_text(step).lower())
+        self.assertNotIn("github.event", json.dumps(step.get("env") or {}))
+
+    def test_the_agent_mode_is_generic_and_the_engine_is_trusted_code(self):
+        document = self.workflows["opencode.yml"]
+        agent = document["jobs"]["opencode"]
+        condition = json.dumps(steps_of(agent))
+        self.assertIn("inputs.mode == 'review-fix'", condition)
+        for step in steps_of(agent):
+            if step.get("name") == "Checkout the trusted review engine":
+                self.assertEqual(
+                    (step.get("with") or {}).get("ref"),
+                    "${{ github.event.repository.default_branch }}",
+                )
+                self.assertEqual((step.get("with") or {}).get("path"), "engine")
+
+
 class AgentExecutionTests(WorkflowAuditBase):
     def test_privileged_agent_job_is_gated_by_the_authorize_job(self):
         agent = self.job("opencode.yml", "opencode")
@@ -483,9 +617,28 @@ class AgentExecutionTests(WorkflowAuditBase):
     def test_privileged_job_checks_out_only_the_verified_ref(self):
         agent = self.job("opencode.yml", "opencode")
         checkouts = [step for step in steps_of(agent) if uses(step, "actions/checkout")]
-        self.assertEqual(len(checkouts), 1)
-        ref = (checkouts[0].get("with") or {}).get("ref")
-        self.assertEqual(ref, "${{ needs.authorize.outputs.checkout_ref }}")
+        self.assertGreaterEqual(len(checkouts), 1)
+        # The pull request's tree is the only checkout whose ref may come from a
+        # validated job output. Every other checkout must be a fixed, untrusted
+        # input - the base branch - because it supplies trusted code (the engine)
+        # or trusted policy to a job that is about to spend write authority. A
+        # pull request must not be able to choose the code that reviews it, and
+        # it must not be able to shadow the workspace root.
+        for step in checkouts:
+            with_block = step.get("with") or {}
+            ref = with_block.get("ref")
+            if ref == "${{ needs.authorize.outputs.checkout_ref }}":
+                continue
+            self.assertEqual(
+                ref,
+                "${{ github.event.repository.default_branch }}",
+                "opencode.yml checks out {} from {}".format(with_block.get("path"), ref),
+            )
+            self.assertNotEqual(
+                with_block.get("path"),
+                None,
+                "a trusted checkout must not land on the workspace root",
+            )
 
     def test_privileged_job_never_interpolates_raw_dispatch_inputs(self):
         agent = self.job("opencode.yml", "opencode")
@@ -571,19 +724,30 @@ class AgentExecutionTests(WorkflowAuditBase):
         self.assertIn("github.repository_owner", condition)
         self.assertIn("github.event.issue.pull_request == null", condition)
 
-    def test_inactive_review_integration_is_fully_removed(self):
-        # The disabled CodeRabbit path handed a write-capable token an
-        # attacker-supplied PR ref. No automation workflow may keep any residue
-        # of it. ci.yml is exempt: its snapshot guard only asserts the disabled
-        # reference tree is still present on disk and executes none of it.
+    def test_no_privileged_job_names_the_review_provider(self):
+        # This repository used to carry a disabled CodeRabbit path, and the
+        # audit for it banned the provider name outright because that path handed
+        # a write-capable token an attacker-supplied pull-request ref. The
+        # provider is the MVP review implementation now, so the name is
+        # expected -- but nowhere that matters. It is resolved inside the engine
+        # from `review: true`, and no workflow selects, names, or dispatches it.
+        #
+        # The tripwire matters more than the current state: the day a job does
+        # name a provider, that job must either be read-only or go through the
+        # trust policy before spending anything.
         for name, document in self.workflows.items():
-            if name == "ci.yml":
-                continue
             for job_name, job in (document.get("jobs") or {}).items():
-                self.assertNotIn(
-                    "coderabbit",
-                    json.dumps(job).lower(),
-                    "{}/{} still references CodeRabbit".format(name, job_name),
+                body = json.dumps(job).lower()
+                if "coderabbit" not in body and "pr_agent" not in body:
+                    continue
+                label = "{}/{}".format(name, job_name)
+                if not write_scopes(job_permissions(document, job)):
+                    continue
+                self.fail(
+                    "{} holds {} and names a review provider. The provider is "
+                    "resolved by the engine from the review toggle; a "
+                    "workflow that names it has re-opened the ref-trust "
+                    "hazard.".format(label, write_scopes(job_permissions(document, job)))
                 )
 
     def test_ci_only_asserts_the_disabled_snapshot(self):

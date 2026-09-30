@@ -51,6 +51,23 @@ REPLY_UNRESOLVED = "UNRESOLVED"
 
 OUTPUT_MARKERS = ("coderabbit", "walkthrough", "review details", "nitpick")
 
+# The commands and marker families the preserved NanoDictate snapshot used for
+# the same three intents. They are read, never written: a pull request that was
+# already being repaired before the migration must not be asked to verify or to
+# re-review the same finding and HEAD a second time.
+HISTORICAL_VERIFICATION_MARKERS = (
+    "opencode-coderabbit-verification",
+    "auto-merge-coderabbit-verification",
+)
+HISTORICAL_REREVIEW_MARKERS = (
+    "opencode-coderabbit-full-rereview",
+)
+
+# The mention CodeRabbit answers to when asked to look at a specific finding
+# again. It re-checks one original thread against the current HEAD rather than
+# spending a full included review.
+VERIFICATION_COMMAND = "@coderabbitai review"
+
 # CodeRabbit's shared included-review quota is a repository-wide resource, so
 # the queue must serialize against it. A rate-limit notice is the provider
 # telling us when the next slot exists; the countdown is parsed here, once.
@@ -152,6 +169,54 @@ def queue_request(
 
     del settings, pr_number, head_sha
     return QueueRequest(kind=REQUEST_COMMENT, provider=PROVIDER_NAME, body=FULL_REVIEW_COMMAND)
+
+
+def verification_body(finding_id: str, head: str) -> str:
+    """Ask CodeRabbit to re-check one original finding on one exact HEAD.
+
+    The marker is Continuum's, so the same body means the same thing whatever the
+    provider is called. What the wording is, how the bot is addressed, and which
+    surface answers stay here: the generic repair contract only asks for a body.
+    """
+
+    from .repair import verification_marker
+
+    marker = verification_marker(finding_id, head)
+    return "\n".join(
+        [
+            BOT_PREFIX,
+            VERIFICATION_COMMAND,
+            "",
+            f"Re-check finding {finding_id} against the current pull request HEAD "
+            f"({head[:12]}).",
+            "",
+            "Compare the original finding in its own thread with the current code "
+            "itself, not with the latest incremental diff.",
+            "",
+            f"Answer with exactly one of **RESOLVED** or **UNRESOLVED** and one "
+            f"sentence of justification. Finding id: {finding_id}.",
+            "",
+            marker,
+        ]
+    )
+
+
+def full_review_body(head: str) -> str:
+    """One full re-review request for a HEAD that a repair attempt did not move."""
+
+    from .repair import rereview_marker
+
+    return "\n".join(
+        [
+            BOT_PREFIX,
+            FULL_REVIEW_COMMAND,
+            "",
+            f"The pull request HEAD is still {head[:12]} and review findings on it are "
+            "still open.",
+            "",
+            rereview_marker(head),
+        ]
+    )
 
 # Sections whose bullets can be actionable. The walkthrough and the file table
 # describe the diff; they never produce findings on their own.

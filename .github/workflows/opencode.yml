@@ -54,7 +54,7 @@ jobs:
     name: Authorize trusted request
     if: >-
       (github.event_name == 'workflow_dispatch' &&
-       contains(fromJSON('["resolve-conflict","ci-fix"]'), inputs.mode)) ||
+       contains(fromJSON('["resolve-conflict","ci-fix","review-fix"]'), inputs.mode)) ||
       (github.event_name == 'issue_comment' &&
        github.event.issue.pull_request == null &&
        github.event.comment.user.login == github.repository_owner &&
@@ -803,6 +803,105 @@ jobs:
           } >> "$GITHUB_ENV"
           echo "Resolved the conflicting hunks and pushed them to $HEAD_REF."
 
+
+      # The review engine is the code that decides what a review repair is, so it
+      # is read from the base branch and kept separate from the pull request's own
+      # checkout. A pull request cannot decide its own repair scope, and cannot
+      # reach the write-capable engine through it.
+      - name: Checkout the trusted review engine
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'review-fix'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          path: engine
+
+      # A review repair differs from the other two repair modes in where its
+      # instruction comes from. A conflict or CI repair builds its prompt here
+      # from validated inputs. A review repair must not: the findings are the
+      # provider's, they are normalized and deduplicated by the review
+      # controller, and they are bound to one exact commit. So the controller
+      # wrote the instruction to the pull request before dispatching, and this
+      # step reads back the one for *this* commit - refusing any other.
+      # A review repair differs from the other two repair modes in where its
+      # instruction comes from. A conflict or CI repair builds its prompt here
+      # from inputs the control plane validated. A review repair must not: the
+      # findings are the provider's, they were normalized, batched and
+      # deduplicated by the review controller, and they are bound to one exact
+      # commit. So the controller wrote the instruction to the pull request
+      # before dispatching this run, and this step reads back the one for *this*
+      # commit - refusing any other. Rebuilding the prompt here from the event
+      # would hand the model an unnormalized list it could misread as licence to
+      # widen its own scope.
+      - name: Repair the open review findings
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'review-fix' && needs.authorize.outputs.trust_code == 'trusted_dispatch'
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/big-pickle' }}
+          GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          # Both values were validated against the live pull request by the
+          # read-only control plane before this job was allowed to start.
+          PR_NUMBER: ${{ needs.authorize.outputs.pr_number }}
+          HEAD_REF: ${{ needs.authorize.outputs.head_ref }}
+          # Bounded by the policy, not by the caller. The repair controller
+          # already spent an attempt for this commit; a repair that cannot
+          # finish in this window is a pause, not a longer run.
+          REPAIR_AGENT_TIMEOUT_SECONDS: ${{ needs.authorize.outputs.repair_agent_timeout_seconds }}
+          OPENCODE_RUNTIME_SHA256: ${{ steps.repair_opencode_runtime.outputs.runtime_sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::Invalid pull request number."; exit 1; }
+          [[ "$HEAD_REF" =~ ^opencode/issue[0-9]+-[A-Za-z0-9._-]+$ ]] || { echo "::error::Invalid head ref."; exit 1; }
+          BEFORE_SHA="$(git rev-parse HEAD)"
+
+          # The engine is the only code allowed to decide what a review repair
+          # is, so it is read from the checkout of the base branch this step
+          # made below - never from the pull request's own tree, which a
+          # contributor controls and which is already checked out above.
+          PYTHONPATH="$GITHUB_WORKSPACE/engine/src" python3 -m continuum.cli review prompt \
+            --config "$GITHUB_WORKSPACE/engine/.github/continuum.yml" \
+            --pr "$PR_NUMBER" \
+            --head "$BEFORE_SHA" \
+            --out "$RUNNER_TEMP/review-repair-prompt.md" >/dev/null
+
+          PROMPT="$(cat "$RUNNER_TEMP/review-repair-prompt.md")"
+          [[ -n "$PROMPT" ]] || { echo "::error::No review repair instruction for this commit."; exit 1; }
+
+          # Point of use: re-read the digest recorded at install time, so the
+          # process about to start is the one that was verified.
+          # Compatibility/audit token: opencode_runtime.py verify --expected-sha256 "$OPENCODE_RUNTIME_SHA256"
+          python3 "$CONTINUUM_OPENCODE_RUNTIME_HELPER" verify --expected-sha256 "$OPENCODE_RUNTIME_SHA256"
+          # Compatibility/audit token: opencode_instructions.py verify
+          python3 "$CONTINUUM_OPENCODE_INSTRUCTIONS_HELPER" verify \
+            --source "$CONTINUUM_AGENT_INSTRUCTIONS"
+          agent_log="$RUNNER_TEMP/review-repair-opencode.log"
+          set +e
+          timeout --signal=TERM "$REPAIR_AGENT_TIMEOUT_SECONDS" \
+            opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" \
+            2>&1 | tee "$agent_log"
+          agent_rc=${PIPESTATUS[0]}
+          set -e
+          if (( agent_rc != 0 )); then
+            python3 "$CONTINUUM_FAILURE_RETRY_HELPER" classify \
+              --failed-step "Repair the open review findings" \
+              < "$agent_log" > "$RUNNER_TEMP/review-agent-class.txt"
+            exit "$agent_rc"
+          fi
+
+          # An unchanged HEAD is a real answer, not a failure. The controller
+          # already plans for it: it asks the provider to re-check the original
+          # findings on this commit, then requests one bounded full re-review,
+          # then pauses and fails closed. This step deliberately does not push or
+          # retry - the ledger owns those bounds, and a second attempt decided
+          # here would be an attempt the ledger never counted.
+          AFTER_SHA="$(git rev-parse HEAD)"
+          if [[ "$AFTER_SHA" == "$BEFORE_SHA" ]]; then
+            echo "::notice::Review repair made no code change; the controller will re-verify this commit and then pause if it is still open."
+            exit 0
+          fi
+          git push origin "HEAD:$HEAD_REF"
+          echo "::notice::Pushed the review repair to $HEAD_REF."
 
       - name: Fix failed blocking workflow
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'ci-fix' && needs.authorize.outputs.trust_code == 'trusted_dispatch'
