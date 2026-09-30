@@ -18,6 +18,7 @@ import json
 import os
 import tempfile
 import unittest
+import unittest.mock
 from typing import List, Optional
 
 from continuum import cli
@@ -324,6 +325,249 @@ def apple_p12_name() -> str:
     return apple.P12_ENV
 
 
+class ReleaseRunCommandTests(ReleaseCliTests):
+    """`continuum release run`, from argv to a walked chain.
+
+    The command has to be thin: it reads a target, hands the chain to the
+    release core, and reports what happened. What these tests protect is the
+    join — that the configuration a repository wrote reaches the adapter, that a
+    dry run executes nothing, and that the exit code says whether the release
+    happened.
+    """
+
+    def run_argv(self, *extra: str) -> List[str]:
+        return ["release", "run", "--config", self.config_path, "--target", "macos", *extra]
+
+    def _checkout(self) -> None:
+        for relative, body in (
+            ("Resources/com.nanodictate.agent.entitlements", "sandbox\n"),
+            ("Resources/com.nanodictate.ctl.entitlements", "jit\n"),
+            ("packaging/Info.NanoDictateApp.plist", "<plist/>\n"),
+            ("config.example.toml", "listen = 0.0.0.0:9000\n"),
+        ):
+            path = os.path.join(self.workdir, relative)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(body)
+
+    def _toolchain(self):
+        from .apple_toolchain_support import FakeToolchain
+        from .release_support import binaries
+
+        return FakeToolchain(binaries=[item.name for item in binaries()])
+
+    def test_a_dry_run_walks_the_chain_without_building_or_writing(self):
+        self.write_config(support.nanodictate_document())
+        toolchain = self._toolchain()
+        with _patched_toolchain(toolchain):
+            result = self.run_cli(
+                self.run_argv(
+                    "--dry-run",
+                    "--workdir",
+                    self.workdir,
+                    "--sha",
+                    "a" * 40,
+                    "--tag",
+                    "v1.4.0",
+                    "--repository",
+                    "example/widgets",
+                ),
+                env=support.environment(),
+            )
+        self.assertEqual(result.code, 0, result.stderr)
+        payload = result.json()
+        self.assertEqual(payload["dry_run"], True)
+        # `no-op` rather than `planned`: the whole chain was walked and there is
+        # no destination configured to receive anything. The distinction that
+        # matters is the one the walk itself records.
+        self.assertEqual(payload["status"], "no-op")
+        stages = [entry["stage"] for entry in payload["stages"]]
+        self.assertIn("build", stages)
+        self.assertIn("sign", stages)
+        self.assertIn("verify", stages)
+        self.assertEqual(toolchain.calls, [], "a dry run started a tool")
+        self.assertFalse(os.path.isdir(os.path.join(self.workdir, "dist")))
+        self.assertFalse(
+            os.path.isfile(os.path.join(self.workdir, "macos-SHA256SUMS.txt")),
+            "a dry run wrote a checksum file into the checkout",
+        )
+
+    def test_a_dry_run_describes_the_release_the_real_run_would_produce(self):
+        self.write_config(support.nanodictate_document())
+        self._checkout()
+        with _patched_toolchain(self._toolchain()):
+            planned = self.run_cli(
+                self.run_argv(
+                    "--dry-run", "--workdir", self.workdir, "--sha", "a" * 40,
+                    "--tag", "v1.4.0", "--repository", "example/widgets",
+                ),
+                env=support.environment(),
+            ).json()
+        with _patched_toolchain(self._toolchain(), revision="a" * 40):
+            released = self.run_cli(
+                self.run_argv(
+                    "--workdir", self.workdir, "--sha", "a" * 40,
+                    "--tag", "v1.4.0", "--repository", "example/widgets",
+                ),
+                env=support.environment(),
+            ).json()
+        self.assertEqual(released["status"], "no-op")
+        self.assertEqual(
+            sorted(item["name"] for item in planned["manifests"][0]["artifacts"]),
+            sorted(item["name"] for item in released["manifests"][0]["artifacts"]),
+        )
+        self.assertTrue(
+            all(os.path.isfile(os.path.join(self.workdir, "dist", item["name"]))
+                for item in released["manifests"][0]["artifacts"]),
+            "the real run's manifest names files that are not in the release",
+        )
+
+    def test_a_run_reports_the_version_the_tag_named(self):
+        self.write_config(support.nanodictate_document())
+        self._checkout()
+        with _patched_toolchain(self._toolchain(), revision="a" * 40):
+            result = self.run_cli(
+                self.run_argv(
+                    "--workdir", self.workdir, "--sha", "a" * 40,
+                    "--tag", "v1.4.0", "--repository", "example/widgets",
+                ),
+                env=support.environment(),
+            )
+        self.assertEqual(result.code, 0, result.stderr)
+        payload = result.json()
+        self.assertEqual(payload["version"], "1.4.0")
+        self.assertEqual(payload["tag"], "v1.4.0")
+        self.assertEqual(payload["source_sha"], "a" * 40)
+        self.assertEqual(payload["status"], "no-op", "no destination is configured yet")
+
+    def test_the_outcome_is_written_to_the_github_output_file(self):
+        self.write_config(support.nanodictate_document())
+        output = os.path.join(self.workdir, "github-output")
+        with open(output, "w", encoding="utf-8") as handle:
+            handle.write("")
+        with _patched_toolchain(self._toolchain()):
+            result = self.run_cli(
+                self.run_argv(
+                    "--dry-run", "--workdir", self.workdir, "--sha", "a" * 40,
+                    "--tag", "v1.4.0", "--repository", "example/widgets",
+                ),
+                env={**support.environment(), "GITHUB_OUTPUT": output},
+            )
+        self.assertEqual(result.code, 0, result.stderr)
+        with open(output, encoding="utf-8") as handle:
+            body = handle.read()
+        self.assertIn("status=no-op", body)
+        self.assertIn("version=1.4.0", body)
+        self.assertIn("dry_run=true", body)
+
+    def test_a_checkout_that_is_not_the_approved_commit_fails_the_run(self):
+        self.write_config(support.nanodictate_document())
+        self._checkout()
+        with _patched_toolchain(self._toolchain(), revision="b" * 40):
+            result = self.run_cli(
+                self.run_argv(
+                    "--workdir", self.workdir, "--sha", "a" * 40,
+                    "--tag", "v1.4.0", "--repository", "example/widgets",
+                ),
+                env=support.environment(),
+            )
+        self.assertEqual(result.code, 1)
+        payload = result.json()
+        self.assertEqual(payload["status"], "failed")
+        self.assertEqual(payload["failure"]["code"], "source-mismatch")
+        self.assertFalse(os.path.isdir(os.path.join(self.workdir, "dist")))
+
+    def test_a_directory_that_is_not_a_checkout_cannot_be_released(self):
+        # The command reads the commit with `git rev-parse HEAD`. In this test the
+        # workdir is a plain directory, so there is no HEAD to read — and a
+        # release that quietly proceeded would be building bytes nobody approved.
+        self.write_config(support.nanodictate_document())
+        self._checkout()
+        with _patched_toolchain(self._toolchain(), revision=""):
+            result = self.run_cli(
+                self.run_argv(
+                    "--workdir", self.workdir, "--sha", "a" * 40,
+                    "--tag", "v1.4.0", "--repository", "example/widgets",
+                ),
+                env=support.environment(),
+            )
+        self.assertEqual(result.code, 1)
+        self.assertEqual(result.json()["failure"]["code"], "source-unreadable")
+        self.assertFalse(os.path.isdir(os.path.join(self.workdir, "dist")))
+
+    def test_a_dry_run_of_a_directory_that_is_not_a_checkout_still_walks(self):
+        # Nothing is built, so there is nothing unreviewed to ship, and a plan is
+        # exactly what a repository runs to review configuration before it has a
+        # checkout worth releasing from.
+        self.write_config(support.nanodictate_document())
+        with _patched_toolchain(self._toolchain(), revision=""):
+            result = self.run_cli(
+                self.run_argv(
+                    "--dry-run", "--workdir", self.workdir, "--sha", "a" * 40,
+                    "--tag", "v1.4.0", "--repository", "example/widgets",
+                ),
+                env=support.environment(),
+            )
+        self.assertEqual(result.code, 0, result.stderr)
+        self.assertEqual(result.json()["dry_run"], True)
+
+    def test_a_missing_secret_refuses_the_run_rather_than_signing_ad_hoc(self):
+        self.write_config(support.nanodictate_document())
+        result = self.run_cli(
+            self.run_argv("--signing-material", "present", "--dry-run"),
+            env=support.environment(p12=None),
+        )
+        self.assertEqual(result.code, 1)
+        self.assertIn("CONTINUUM_ERROR", result.stderr)
+        self.assertIn("Refusing to sign ad-hoc", result.stderr)
+
+    def test_an_unknown_target_is_named_in_the_failure(self):
+        self.write_config(support.nanodictate_document())
+        result = self.run_cli(["release", "run", "--config", self.config_path, "--target", "nope"])
+        self.assertEqual(result.code, 1)
+        self.assertIn("no release target 'nope'", result.stderr)
+        self.assertIn("available: macos", result.stderr)
+
+    def test_an_unknown_version_strategy_is_refused_by_name(self):
+        self.write_config(support.nanodictate_document())
+        result = self.run_cli(self.run_argv("--version-strategy", "yolo"))
+        self.assertEqual(result.code, 1)
+        self.assertIn("unknown version strategy 'yolo'", result.stderr)
+
+    def test_a_target_whose_adapter_is_not_wired_fails_with_its_own_code(self):
+        self.write_config(support.nanodictate_document())
+        with _patched_toolchain(self._toolchain(), available=False):
+            result = self.run_cli(
+                self.run_argv(
+                    "--dry-run", "--workdir", self.workdir, "--sha", "a" * 40,
+                    "--tag", "v1.4.0", "--repository", "example/widgets",
+                ),
+                env=support.environment(),
+            )
+        self.assertEqual(result.code, 1)
+        self.assertEqual(result.json()["failure"]["code"], "toolchain-unavailable")
+
+    def test_run_accepts_the_same_signing_material_expectation_as_the_others(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(
+            ["release", "run", "--target", "t", "--signing-material", "present"]
+        )
+        self.assertEqual(args.signing_material, "present")
+        self.assertEqual(args.target, "t")
+
+    def test_the_tag_is_read_from_the_environment_on_a_tag_event_only(self):
+        # The parser is built inside the context because its defaults are read
+        # when the parser is built, which in production is inside the job that
+        # GitHub set the variables for.
+        with _github_environment(GITHUB_REF_TYPE="tag", GITHUB_REF_NAME="v9.9.9"):
+            args = cli.build_parser().parse_args(["release", "run", "--target", "t"])
+        self.assertEqual(args.tag, "v9.9.9")
+        self.assertEqual(args.branch, "v9.9.9")
+        with _github_environment(GITHUB_REF_TYPE="branch", GITHUB_REF_NAME="main"):
+            args = cli.build_parser().parse_args(["release", "run", "--target", "t"])
+        self.assertEqual(args.tag, "", "a branch name is not a release tag")
+
+
 class ReleaseCommandSurfaceTests(unittest.TestCase):
     def test_release_requires_a_subcommand(self):
         with self.assertRaises(SystemExit):
@@ -351,6 +595,48 @@ class ReleaseCommandSurfaceTests(unittest.TestCase):
         parser = cli.build_parser()
         args = parser.parse_args(["release", "sign", "--target", "t"])
         self.assertEqual(args.signing_material, "auto")
+
+
+def _patched_toolchain(toolchain, *, available: bool = True, revision=None):
+    """Replace the process boundary the Apple adapter runs against.
+
+    `continuum release run` builds its own adapter, so a test cannot hand one in.
+    The seam that is patched is the constructor argument itself, which keeps the
+    command's own wiring — environment, workdir, revision reader — under test
+    while replacing only the tools.
+
+    `revision` replaces the command's `git rev-parse` reader, so a test can put
+    the checkout on a commit of its choosing without standing up a repository.
+    """
+
+    from continuum.release import apple as apple_module
+
+    original = apple_module.AppleAdapter
+
+    def factory(**kwargs):
+        kwargs["command_runner"] = toolchain
+        kwargs["is_available"] = available
+        if revision is not None:
+            kwargs["git_revision"] = lambda workdir: revision
+        return original(**kwargs)
+
+    return unittest.mock.patch.object(apple_module, "AppleAdapter", factory)
+
+
+@contextlib.contextmanager
+def _github_environment(**values: str):
+    """Set GitHub's event variables for the duration of a parse."""
+
+    saved = {key: os.environ.get(key) for key in values}
+    os.environ.update(values)
+    try:
+        yield
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 if __name__ == "__main__":
