@@ -135,7 +135,7 @@ jobs:
           set -euo pipefail
 
           if [[ "$MODE" != "resolve-conflict" ]]; then
-            python3 .github/scripts/conflict_repair.py plan --mode "$MODE"
+            python3 "$CONTINUUM_CONFLICT_REPAIR_HELPER" plan --mode "$MODE"
             echo "base_branch=$CONTINUUM_BASE_BRANCH" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -149,10 +149,10 @@ jobs:
           # restart, a cancelled run, and a fresh process.
           attempts="$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100" \
             --jq '.[] | select(.user.login == "'"$GITHUB_REPOSITORY_OWNER"'" or .user.login == "github-actions[bot]") | .body // ""' \
-            | python3 .github/scripts/conflict_repair.py episode --pr-number "$PR_NUMBER" \
+            | python3 "$CONTINUUM_CONFLICT_REPAIR_HELPER" episode --pr-number "$PR_NUMBER" \
             | sed -n 's/^episode_attempts=//p')"
 
-          python3 .github/scripts/conflict_repair.py plan \
+          python3 "$CONTINUUM_CONFLICT_REPAIR_HELPER" plan \
             --mode "$MODE" \
             --behind "$behind" \
             --ruled-out "$RULED_OUT" \
@@ -262,11 +262,12 @@ jobs:
           git fetch origin "$BASE_BRANCH" --depth=1 --quiet
           helper_dir="$RUNNER_TEMP/continuum-control-plane"
           mkdir -p "$helper_dir"
-          for helper in failure_retry.py opencode_runtime.py opencode_instructions.py; do
+          for helper in conflict_repair.py failure_retry.py opencode_runtime.py opencode_instructions.py; do
             git show "origin/$BASE_BRANCH:.github/scripts/$helper" > "$helper_dir/$helper"
           done
           git show "origin/$BASE_BRANCH:.github/agents/AGENTS.md" > "$helper_dir/AGENTS.md"
           {
+            echo "CONTINUUM_CONFLICT_REPAIR_HELPER=$helper_dir/conflict_repair.py"
             echo "CONTINUUM_FAILURE_RETRY_HELPER=$helper_dir/failure_retry.py"
             echo "CONTINUUM_OPENCODE_RUNTIME_HELPER=$helper_dir/opencode_runtime.py"
             echo "CONTINUUM_OPENCODE_INSTRUCTIONS_HELPER=$helper_dir/opencode_instructions.py"
@@ -905,14 +906,14 @@ jobs:
             # same branch, so the head has moved and the sha differs -- which,
             # read as "a replacement exists", would opt out a pull request that
             # is now perfectly mergeable.
-            python3 .github/scripts/conflict_repair.py publication-gate \
+            python3 "$CONTINUUM_CONFLICT_REPAIR_HELPER" publication-gate \
               --original-head "$original_head" \
               --replacement-head "$repaired_head" \
               --repair-succeeded true \
               --repaired-in-place true \
               --attempts "$REPAIR_ATTEMPT" >> "$publication"
           else
-            python3 .github/scripts/conflict_repair.py publication-gate \
+            python3 "$CONTINUUM_CONFLICT_REPAIR_HELPER" publication-gate \
               --original-head "$original_head" \
               --attempts "$REPAIR_ATTEMPT" >> "$publication"
           fi
@@ -930,7 +931,7 @@ jobs:
           else
             episode_state=failed
           fi
-          marker="$(python3 .github/scripts/conflict_repair.py render-marker \
+          marker="$(python3 "$CONTINUUM_CONFLICT_REPAIR_HELPER" render-marker \
             --episode "$REPAIR_EPISODE" \
             --pr-number "$PR_NUMBER" \
             --head-sha "${repaired_head:-$original_head}" \
@@ -950,7 +951,7 @@ jobs:
           # is what made the pull request invisible to every later
           # reconciliation, so the attempt budget -- not the lock -- is what
           # bounds retries.
-          python3 .github/scripts/conflict_repair.py lock \
+          python3 "$CONTINUUM_CONFLICT_REPAIR_HELPER" lock \
             --lock-present true \
             --attempts "$REPAIR_ATTEMPT" \
             --max-attempts "$MAX_ATTEMPTS" >> "$RUNNER_TEMP/lock.env"
