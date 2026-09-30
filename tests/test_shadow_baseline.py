@@ -368,12 +368,9 @@ class TheLedgerClaimsWhatItCanBeCheckedAgainst(unittest.TestCase):
                 return True
         return False
 
-    def test_every_completed_entry_names_something_that_resolves(self):
+    def test_every_absorbed_entry_names_something_that_resolves(self):
         for entry in self.ledger.workflows:
-            if entry.classification == "must-port":
-                # A must-port is intentionally not implemented in this revision.
-                # Requiring it to name an existing implementation/test would force
-                # the ledger to lie about completion.
+            if entry.classification != "absorbed":
                 continue
             references = self._references(entry.rationale)
             with self.subTest(workflow=entry.path):
