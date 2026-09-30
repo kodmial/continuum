@@ -659,6 +659,26 @@ class RepairControllerTests(WorkflowAuditBase):
         self.assertIn("continuum-dispatch", consumer)
         self.assertIn('gh workflow run "$SCHEDULER_WORKFLOW"', consumer)
 
+    def test_consumer_infrastructure_failures_have_a_separate_retry_budget(self):
+        scheduler = self.raw["consumer-scheduler.yml"]
+        repair = self.raw["consumer-repair.yml"]
+
+        self.assertIn("continuum-infra-retry:", scheduler)
+        self.assertIn("semanticAttempts:Math.max(0, dispatches.length - infraRetries.length)", scheduler)
+        self.assertIn("retry.latestInfraRetry.nextRetryAt", scheduler)
+        self.assertNotIn("dispatches.length >= maxAttempts", scheduler)
+
+        self.assertIn("failure_retry.py", repair)
+        self.assertIn("transient_infra", repair)
+        self.assertIn("continuum-infra-retry:", repair)
+        self.assertIn("semantic_attempts=$(( attempts - infra_attempts ))", repair)
+        self.assertIn("Infrastructure retry", repair)
+        self.assertIn("semantic attempt budget remains untouched", repair)
+        self.assertLess(
+            repair.index("Load Continuum engine", repair.index("issue-run-recovery:")),
+            repair.index("failure_retry.py", repair.index("issue-run-recovery:")),
+        )
+
     def test_consumer_blocking_workflows_are_generic_and_repairable(self):
         merge = self.raw["consumer-auto-merge.yml"]
         repair = self.raw["consumer-repair.yml"]

@@ -82,6 +82,9 @@ jobs:
       SCHEDULER_WORKFLOW: ${{ inputs.scheduler_workflow }}
       MAX_ATTEMPTS: ${{ inputs.max_attempts }}
     steps:
+      - name: Load Continuum engine
+        uses: kodmial/continuum/.github/actions/engine-path@39ca6dc798f2201390c8fdef0395157f588657ec
+
       - name: Recover failed issue-mode OpenCode run
         shell: bash
         run: |
@@ -90,7 +93,7 @@ jobs:
           [[ "$MAX_ATTEMPTS" =~ ^[1-9][0-9]*$ ]] || { echo "::error::Invalid max_attempts."; exit 1; }
 
           run_marker="<!-- continuum-opencode-run:$RUN_ID -->"
-          dispatch_marker="<!-- continuum-dispatch -->"
+          infra_marker="<!-- continuum-infra-retry:"
           issue_number=""
 
           while read -r candidate; do
@@ -128,11 +131,61 @@ jobs:
               --jq '.[] | select((.body // "") | contains("<!-- continuum-dispatch -->")) | .created_at' \
               | awk -v epoch="$epoch" 'epoch == "" || $0 >= epoch {count++} END {print count + 0}'
           )"
+          infra_attempts="$(
+            gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$issue_number/comments?per_page=100" \
+              --jq '.[] | select((.body // "") | contains("<!-- continuum-infra-retry:")) | .created_at' \
+              | awk -v epoch="$epoch" 'epoch == "" || $0 >= epoch {count++} END {print count + 0}'
+          )"
 
+          failed_step="$(
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/jobs?filter=latest&per_page=100" \
+              --jq '[.jobs[].steps[]? | select(.conclusion == "failure") | .name][0] // ""' \
+              2>/dev/null || true
+          )"
+          gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --log-failed \
+            > "$RUNNER_TEMP/opencode-failed.log" 2>&1 || true
+          python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/failure_retry.py" classify \
+            --failed-step "$failed_step" \
+            < "$RUNNER_TEMP/opencode-failed.log" \
+            > "$RUNNER_TEMP/failure-class.env"
+          # shellcheck disable=SC1090
+          source "$RUNNER_TEMP/failure-class.env"
+
+          if [[ "$failure_class" == "transient_infra" ]]; then
+            if (( infra_attempts >= 8 )); then
+              gh issue comment "$issue_number" --repo "$GITHUB_REPOSITORY" \
+                --body "Continuum OpenCode run $RUN_ID hit transient infrastructure again ($failure_code). The independent infrastructure retry budget of 8 is exhausted; the semantic attempt budget remains untouched."
+              gh issue edit "$issue_number" --repo "$GITHUB_REPOSITORY" \
+                --add-label "automation:paused" \
+                --remove-label "automation:in-progress" >/dev/null
+              echo "Issue #$issue_number paused after 8 infrastructure retries; semantic attempts were not consumed."
+              exit 0
+            fi
+
+            next_infra_attempt=$(( infra_attempts + 1 ))
+            python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/failure_retry.py" schedule \
+              --attempt "$next_infra_attempt" \
+              --seed "consumer-issue-$issue_number-run-$RUN_ID-$failure_code" \
+              > "$RUNNER_TEMP/infra-retry.env"
+            # shellcheck disable=SC1090
+            source "$RUNNER_TEMP/infra-retry.env"
+
+            marker="<!-- continuum-infra-retry: attempt=$next_infra_attempt next_retry_at=$next_retry_at code=$failure_code run=$RUN_ID -->"
+            gh issue comment "$issue_number" --repo "$GITHUB_REPOSITORY" \
+              --body "$(printf '%s\nContinuum OpenCode run %s failed in infrastructure (%s). Infrastructure retry %s/8 is eligible at %s; it does not consume the semantic attempt budget.' "$marker" "$RUN_ID" "$failure_code" "$next_infra_attempt" "$next_retry_at")"
+            gh issue edit "$issue_number" --repo "$GITHUB_REPOSITORY" \
+              --remove-label "automation:in-progress" >/dev/null
+            gh workflow run "$SCHEDULER_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref main
+            echo "Released issue #$issue_number for infrastructure retry $next_infra_attempt/8 after $next_retry_at."
+            exit 0
+          fi
+
+          semantic_attempts=$(( attempts - infra_attempts ))
+          (( semantic_attempts < 0 )) && semantic_attempts=0
           gh issue comment "$issue_number" --repo "$GITHUB_REPOSITORY" \
-            --body "Continuum OpenCode run $RUN_ID ended with '$CONCLUSION' before a usable PR completed. Dispatch attempts recorded: $attempts."
+            --body "Continuum OpenCode run $RUN_ID ended with '$CONCLUSION' (class=$failure_class, code=$failure_code). Semantic attempts recorded: $semantic_attempts/$MAX_ATTEMPTS; infrastructure retries recorded: $infra_attempts/8."
 
-          if (( attempts >= MAX_ATTEMPTS )); then
+          if (( semantic_attempts >= MAX_ATTEMPTS )); then
             gh issue edit "$issue_number" --repo "$GITHUB_REPOSITORY" \
               --add-label "automation:paused" \
               --remove-label "automation:in-progress" >/dev/null
