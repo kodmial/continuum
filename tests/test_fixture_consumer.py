@@ -1,4 +1,4 @@
-"""MVP boundary checks for post-MVP PR-Agent material, and for the consumer
+"""MVP boundary checks for the PR-Agent provider material, and for the consumer
 contract as a consumer would actually adopt it.
 
 The engine-level behaviour of the two toggles is pinned in
@@ -17,19 +17,33 @@ project on the way, fails here.
 
 from __future__ import annotations
 
+import json
 import pathlib
 import re
 import unittest
 
+import yaml
+
 from continuum.config import load_config
+from continuum.review import pr_agent as pr_agent_module
 from continuum.review import reconcile as reconcile_module
 from tests import support
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 ACTIVE = ROOT / ".github" / "workflows"
-REFERENCE = ROOT / "reference" / "post-mvp-pr-agent-workflows"
 CONSUMER = ROOT / "fixtures" / "consumer-repo"
 CONSUMER_WORKFLOWS = CONSUMER / ".github" / "workflows"
+
+
+def _load(path: pathlib.Path) -> dict:
+    """Read a workflow the way GitHub reads it."""
+    with path.open(encoding="utf-8") as handle:
+        document = yaml.safe_load(handle)
+    if True in document:
+        # PyYAML reads `on:` as the boolean True, which is YAML 1.1 being
+        # pedantic about a word that is not a boolean.
+        document["on"] = document.pop(True)
+    return document
 
 
 def with_inputs(text: str) -> dict:
@@ -65,16 +79,22 @@ def dispatch_inputs(text: str) -> set:
 
 
 class MvpBoundaryTests(unittest.TestCase):
-    def test_pr_agent_workflows_are_not_active_in_mvp(self):
-        self.assertFalse((ACTIVE / "pr-agent.yml").exists())
-        self.assertFalse((ACTIVE / "pr-agent-comment.yml").exists())
+    def test_the_pr_agent_provider_surface_is_active(self):
+        for name in ("pr-agent.yml", "pr-agent-comment.yml"):
+            with self.subTest(workflow=name):
+                self.assertTrue((ACTIVE / name).is_file(), name)
 
-    def test_post_mvp_pr_agent_reference_is_preserved(self):
-        self.assertTrue((REFERENCE / "pr-agent.yml").is_file())
-        self.assertTrue((REFERENCE / "pr-agent-comment.yml").is_file())
+    def test_the_queue_dispatches_a_workflow_continuum_actually_ships(self):
+        # The fixture's queue dispatches `pr-agent.yml` in the consumer's own
+        # repository. That name is now a workflow Continuum publishes, so the
+        # dispatch target is a reusable capability rather than a name with no
+        # implementation behind it.
+        config = load_config(str(CONSUMER / ".continuum.yml"))
+        self.assertEqual(config.review.queue.dispatch_workflow, "pr-agent.yml")
+        self.assertTrue((ACTIVE / config.review.queue.dispatch_workflow).is_file())
 
-    def test_reference_is_non_executable_by_github_actions(self):
-        for path in REFERENCE.glob("*.yml"):
+    def test_reference_material_is_non_executable_by_github_actions(self):
+        for path in (ROOT / "reference").rglob("*.yml"):
             self.assertNotIn(".github/workflows", str(path))
 
 
@@ -132,6 +152,145 @@ class ConsumerConfigTests(unittest.TestCase):
     def test_the_fixture_still_resolves_provider_credentials_by_name(self):
         self.assertEqual(
             self.config.review.pr_agent.api_key_secret, "PR_AGENT_API_KEY"
+        )
+
+
+class ProviderConsumerTests(unittest.TestCase):
+    """What adopting the provider costs a consumer: configuration and a pin.
+
+    `fixtures/provider-consumer` is the repository that stopped implementing
+    review. It is the acceptance criterion as a file, so the assertions here are
+    about the *absence* of implementation: no provider image, no engine, no
+    model routing, no diff, no gate. What remains has to be exactly the wiring
+    GitHub forces a consumer to own -- the wake-up and the credential mapping.
+    """
+
+    FIXTURE = ROOT / "fixtures" / "provider-consumer"
+    ENTRY = FIXTURE / ".github" / "workflows" / "pr-agent.yml"
+    REUSABLE = ACTIVE / "pr-agent.yml"
+
+    def setUp(self):
+        self.config = load_config(str(self.FIXTURE / ".continuum.yml"))
+        self.entry = _load(self.ENTRY)
+        self.reusable = _load(self.REUSABLE)
+
+    def test_the_repository_configures_the_provider_and_names_its_credentials(self):
+        self.assertEqual(self.config.review.provider, "pr-agent")
+        self.assertTrue(self.config.review.enabled)
+        pr_agent = self.config.review.pr_agent
+        self.assertEqual(pr_agent.api_base_var, "PR_AGENT_API_BASE")
+        self.assertEqual(pr_agent.model_var, "PR_AGENT_MODEL")
+        self.assertEqual(pr_agent.api_key_secret, "PR_AGENT_API_KEY")
+
+    def test_the_entry_contains_no_implementation(self):
+        # Anything here would be a second copy of something Continuum already
+        # owns, and the copy would be the one that silently rots.
+        for banned in (
+            "docker://",
+            "pragent/pr-agent",
+            "actions/checkout",
+            "continuum.cli",
+            "PYTHONPATH",
+            "openai/",
+            "CONFIG.MODEL",
+            "OPENAI.",
+            "gh api",
+            "git ",
+        ):
+            with self.subTest(needle=banned):
+                self.assertNotIn(banned, self.ENTRY.read_text(encoding="utf-8"))
+        job = self.entry["jobs"]["review"]
+        # A job that only calls the shared surface has no steps to get wrong.
+        self.assertNotIn("steps", job)
+        self.assertNotIn("runs-on", job)
+
+    def test_the_entry_calls_exactly_one_pinned_continuum_surface(self):
+        job = self.entry["jobs"]["review"]
+        uses = job["uses"]
+        self.assertRegex(
+            uses,
+            r"^kodmial/continuum/\.github/workflows/pr-agent\.yml@[0-9a-f]{40}$",
+            "the consumer must select one exact Continuum release, and the "
+            "review provider is the surface it selects",
+        )
+
+    def test_the_entry_passes_exactly_what_the_shared_surface_declares(self):
+        # Passing an input the surface does not declare is an interface that
+        # has drifted from the implementation. Omitting one is only safe when
+        # the surface already decided it, so an omitted input must carry a
+        # default rather than being left to chance.
+        job = self.entry["jobs"]["review"]
+        call = self.reusable["on"]["workflow_call"]
+        self.assertEqual(sorted(job["secrets"]), sorted(call["secrets"]))
+        self.assertLessEqual(set(job["with"]), set(call["inputs"]))
+        for name, declared in call["inputs"].items():
+            if name in job["with"]:
+                continue
+            with self.subTest(input=name):
+                self.assertIn("default", declared, "{} is neither passed nor defaulted".format(name))
+        for name in ("pr_number", "head_sha"):
+            with self.subTest(input=name):
+                self.assertIn(name, job["with"])
+
+    def test_the_entry_declares_exactly_what_the_queue_dispatches(self):
+        # The queue is what calls this file, so its wake-up contract has to be
+        # read from the same place the dispatcher builds it.
+        request = pr_agent_module.queue_request(
+            self.config.review.pr_agent,
+            pr_number=7,
+            head_sha="a" * 40,
+            kind="retry",
+        )
+        self.assertEqual(request.workflow, "pr-agent.yml")
+        self.assertEqual(request.workflow, self.config.review.queue.dispatch_workflow)
+        dispatch = self.entry["on"]["workflow_dispatch"]["inputs"]
+        self.assertEqual(sorted(request.inputs), sorted(dispatch))
+        self.assertTrue(dispatch["pr_number"]["required"])
+
+    def test_the_dispatch_declares_the_types_the_queue_actually_sends(self):
+        # The queue dispatches over the REST API, where every input is a string,
+        # and the reusable surface takes the same value onward. Declaring a
+        # `number` here would depend on the API coercing it, which is exactly
+        # the kind of undocumented behaviour that fails on the day it matters and
+        # passes in a test.
+        request = pr_agent_module.queue_request(
+            self.config.review.pr_agent,
+            pr_number=7,
+            head_sha="a" * 40,
+            kind="initial",
+        )
+        for name, value in request.inputs.items():
+            with self.subTest(input=name):
+                self.assertIsInstance(value, str)
+        dispatch = self.entry["on"]["workflow_dispatch"]["inputs"]
+        for name, value in request.inputs.items():
+            with self.subTest(input=name):
+                self.assertEqual(dispatch[name]["type"], "string")
+        call = self.reusable["on"]["workflow_call"]["inputs"]
+        for name in request.inputs:
+            # `mode` stays in this repository, so only the inputs that actually
+            # cross the call boundary have a second declared type to match.
+            if name not in call:
+                continue
+            with self.subTest(input=name):
+                self.assertEqual(call[name]["type"], "string")
+
+    def test_the_entry_never_hands_a_secret_anything_but_a_name(self):
+        # The endpoint, the model, and the credential all arrive as repository
+        # variable and secret names, so a reviewer can read what the consumer
+        # asks for without the file holding anything sensitive.
+        job = self.entry["jobs"]["review"]
+        wired = json.dumps(job["with"])
+        for name in (
+            self.config.review.pr_agent.api_base_var,
+            self.config.review.pr_agent.model_var,
+        ):
+            with self.subTest(variable=name):
+                self.assertIn(f"vars.{name}", wired)
+        self.assertNotRegex(wired, r"https?://")
+        self.assertEqual(
+            job["secrets"]["pr_agent_api_key"],
+            "${{ secrets.%s }}" % self.config.review.pr_agent.api_key_secret,
         )
 
 

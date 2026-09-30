@@ -72,20 +72,27 @@ AGENT_PLANE = (
 #: consumer repository: they are entered through `workflow_call` by the
 #: consumer's own entry workflow, they never execute pull request code, and
 #: their write scopes are intrinsic to the job itself (reconciling a queue,
-#: publishing a release). Demanding that they call `.github/scripts/trust_policy.py`
-#: would assert a contract a consumer repository has not opted into, and
-#: `review-queue.yml` in particular *must* hold write authority on
-#: `pull_request_review`: a submitted review is what releases the provider slot
-#: the queue is waiting on, so dropping the trigger would stall the queue.
+#: publishing a release, publishing a review). Demanding that they call
+#: `.github/scripts/trust_policy.py` would assert a contract a consumer
+#: repository has not opted into, and `review-queue.yml` in particular *must*
+#: hold write authority on `pull_request_review`: a submitted review is what
+#: releases the provider slot the queue is waiting on, so dropping the trigger
+#: would stall the queue.
+#:
+#: `pr-agent.yml` is the review *provider* adapter, so it is privileged by
+#: construction -- writing the review, its tracker, and its commit status is the
+#: job, and there is no lower-privileged form of it. It is in this list for that
+#: reason and for no other: it never executes pull request code, and the
+#: provider tripwire below grants it its exception by name.
 #:
 #: The list is spelled out rather than derived, and `AuditScopeTests` asserts it
 #: is exactly the complement of `AGENT_PLANE`, so a workflow cannot enter this
 #: directory - or leave the agent plane - without a reviewer deciding so.
 #:
 #: The invariants that are unconditionally true of *any* workflow in this
-#: repository stay repository-wide: declared permissions, commit-pinned actions,
-#: strict shell mode, no residue of the disabled CodeRabbit path, and a
-#: tokenless privileged checkout.
+#: repository stay repository-wide: declared permissions, immutable action
+#: references, strict shell mode, no residue of the disabled CodeRabbit path,
+#: and a tokenless privileged checkout.
 NOT_AGENT_PLANE = (
     "consumer-auto-merge.yml",
     "consumer-child-dispatcher.yml",
@@ -97,8 +104,27 @@ NOT_AGENT_PLANE = (
     "consumer-review-gate.yml",
     "consumer-scheduler.yml",
     "continuum-shadow.yml",
+    "pr-agent-comment.yml",
+    "pr-agent.yml",
     "release-bun-binary.yml",
     "review-queue.yml",
+)
+
+#: The workflows allowed to hold write scopes while naming the review provider.
+#:
+#: Everything else that holds write authority must leave provider selection to
+#: the engine. This pair is the provider surface itself: the reusable adapter
+#: publishes the review, and the manual command entry hands that same adapter
+#: its owner's credentials.
+PROVIDER_SURFACE = ("pr-agent-comment.yml", "pr-agent.yml")
+
+#: An attacker-controllable ref must never reach a privileged provider job: the
+#: provider's own earlier incarnation used one to decide which tree it read.
+UNTRUSTED_REF_EXPRESSIONS = (
+    "github.head_ref",
+    "github.ref_name",
+    "github.event.pull_request.head",
+    "github.event.issue.pull_request.head",
 )
 
 #: Events whose payload and code are contributed by whoever opened the pull
@@ -733,23 +759,52 @@ class AgentExecutionTests(WorkflowAuditBase):
         # expected -- but nowhere that matters. It is resolved inside the engine
         # from `review: true`, and no workflow selects, names, or dispatches it.
         #
+        # `PROVIDER_SURFACE` is the one admissible exception and it is enumerated
+        # rather than inferred: the provider adapter holds write authority
+        # because publishing the review *is* the job, and its manual command
+        # entry exists to hand that adapter the owner's credentials. The
+        # exception buys nothing about refs -- the tripwire's original hazard is
+        # asserted against these jobs too, so a privileged job that names the
+        # provider still may not let an attacker choose what it reads.
+        #
         # The tripwire matters more than the current state: the day a job does
-        # name a provider, that job must either be read-only or go through the
-        # trust policy before spending anything.
+        # name a provider, that job must either be read-only, be one of these,
+        # or go through the trust policy before spending anything.
+        found = {}
         for name, document in self.workflows.items():
             for job_name, job in (document.get("jobs") or {}).items():
                 body = json.dumps(job).lower()
                 if "coderabbit" not in body and "pr_agent" not in body:
                     continue
                 label = "{}/{}".format(name, job_name)
-                if not write_scopes(job_permissions(document, job)):
+                scopes = write_scopes(job_permissions(document, job))
+                if not scopes:
                     continue
-                self.fail(
+                found[label] = scopes
+                self.assertIn(
+                    name,
+                    PROVIDER_SURFACE,
                     "{} holds {} and names a review provider. The provider is "
                     "resolved by the engine from the review toggle; a "
                     "workflow that names it has re-opened the ref-trust "
-                    "hazard.".format(label, write_scopes(job_permissions(document, job)))
+                    "hazard.".format(label, scopes),
                 )
+                for expression in UNTRUSTED_REF_EXPRESSIONS:
+                    self.assertNotIn(
+                        expression,
+                        body,
+                        "{} is the provider surface, but it must still not "
+                        "spend a ref an attacker supplied".format(label),
+                    )
+        # The exception is enumerated, so it cannot quietly widen: a provider
+        # job that stopped holding write authority has to be removed here too.
+        self.assertTrue(found, "the provider surface no longer holds write authority")
+        self.assertEqual(
+            sorted({label.split("/")[0] for label in found}),
+            sorted(PROVIDER_SURFACE),
+            "the provider surface exception and the privileged provider jobs "
+            "disagree",
+        )
 
     def test_ci_only_asserts_the_disabled_snapshot(self):
         # The reference tree stays as documentation of the inactive path. The
@@ -1253,18 +1308,36 @@ class SelfProtectionTests(WorkflowAuditBase):
             "the active workflow set and the CI allowlist disagree",
         )
 
-    def test_every_action_is_pinned_to_a_commit_sha(self):
+    def test_every_action_is_pinned_to_an_immutable_reference(self):
+        # Three reference shapes are legitimate and all three are immutable:
+        # a commit sha for a third-party or Continuum action, a content digest
+        # for a container, and a same-repository reference, which GitHub resolves
+        # from the commit of the workflow that names it. A mutable tag or branch
+        # in any position is the failure this guards.
         pattern = re.compile(r"^\s*uses:\s*([^\s@]+)(@(\S+))?", re.M)
         for name, source in self.raw.items():
             for match in pattern.finditer(source):
-                reference = match.group(3)
-                self.assertIsNotNone(
-                    reference, "{}: {} is not pinned".format(name, match.group(1))
-                )
+                reference = match.group(1)
+                pinned = match.group(3)
+                label = "{}: {}".format(name, reference)
+                if reference.startswith("./") or reference.startswith("$/"):
+                    # A same-repository reference takes the caller's commit, so
+                    # adding a ref here would pin it to something else entirely.
+                    self.assertIsNone(pinned, "{} must not carry a ref".format(label))
+                    continue
+                self.assertIsNotNone(pinned, "{} is not pinned".format(label))
+                if reference.startswith("docker://"):
+                    # A tag would let a moved image answer for the review.
+                    self.assertRegex(
+                        pinned,
+                        r"^sha256:[0-9a-f]{64}$",
+                        "{} is not pinned to an image digest".format(label),
+                    )
+                    continue
                 self.assertRegex(
-                    reference,
+                    pinned,
                     r"^[0-9a-f]{40}$",
-                    "{}: {} is not pinned to a full commit sha".format(name, match.group(1)),
+                    "{} is not pinned to a full commit sha".format(label),
                 )
 
     def test_shell_steps_are_strict_mode(self):
@@ -1284,6 +1357,202 @@ class SelfProtectionTests(WorkflowAuditBase):
                             name, job_name, step.get("name", "<unnamed>")
                         ),
                     )
+
+
+class ReviewProviderSurfaceTests(WorkflowAuditBase):
+    """The PR-Agent provider surface is the repository's privileged exception.
+
+    It has to be: writing the review, its tracker, and its commit status is the
+    job, and no lesser-privileged form of it exists. So these tests assert the
+    properties that make that authority safe rather than asserting it away --
+    the surface is entered only by a caller, runs only the Continuum commit it
+    was pinned to, asks the consumer's own file before spending anything, and
+    never lets a wake-up choose what it reads.
+    """
+
+    PROVIDER = "pr-agent.yml"
+    MANUAL = "pr-agent-comment.yml"
+
+    def provider(self):
+        return self.workflows[self.PROVIDER]
+
+    def test_the_provider_surface_is_only_ever_called(self):
+        # A consumer's entry workflow declares the event; a reusable workflow
+        # cannot subscribe to one. So this file must have no trigger of its own,
+        # which also means no pull request and no comment can start it.
+        self.assertEqual(trigger_names(self.provider()), ["workflow_call"])
+        self.assertNotIn("if", self.provider().get("jobs", {}).get("review", {}))
+
+    def test_the_engine_is_the_commit_that_defines_the_provider(self):
+        # The caller pins this workflow with one literal reference. Resolving
+        # the engine from `job.workflow_sha` is what makes that single pin
+        # select an atomic snapshot: the workflow graph and the engine that runs
+        # it cannot come from different Continuum commits. A default or a
+        # branch here would silently decouple them.
+        job = self.job(self.PROVIDER, "review")
+        resolve = self.step_matching(job, "JOB_WORKFLOW_SHA")
+        self.assertIn("${{ job.workflow_sha }}", json.dumps(resolve.get("env") or {}))
+        self.assertIn("^[0-9a-f]{40}$", run_text(resolve))
+        checkout = next(s for s in steps_of(job) if uses(s, "actions/checkout") and (s.get("with") or {}).get("path") == "engine")
+        self.assertEqual((checkout["with"])["repository"], "kodmial/continuum")
+        self.assertEqual(checkout["with"]["ref"], "${{ steps.engine.outputs.sha }}")
+        self.assertFalse(checkout["with"].get("persist-credentials", True))
+        # And the checkout is verified rather than assumed, so a registry
+        # serving a different tree fails before any privileged step runs.
+        verify = self.step_matching(job, "git -C engine rev-parse HEAD")
+        self.assertIn('if [ "$head" != "$ENGINE_SHA" ]', run_text(verify))
+
+    def test_the_consumer_configuration_decides_before_any_provider_traffic(self):
+        job = self.job(self.PROVIDER, "review")
+        steps = steps_of(job)
+        contract = next(s for s in steps if "config-check" in run_text(s))
+        provider_steps = [
+            s
+            for s in steps
+            if uses(s, "docker://")
+            or "continuum.cli gate" in run_text(s)
+            or "route_model" in run_text(s)
+        ]
+        self.assertTrue(provider_steps, "the provider surface stopped running a provider")
+        for step in provider_steps:
+            with self.subTest(step=step.get("name")):
+                self.assertEqual(
+                    step.get("if"),
+                    "steps.contract.outputs.enabled == 'true'",
+                    "a provider step must ask the consumer's own file first",
+                )
+        self.assertLess(steps.index(contract), steps.index(provider_steps[0]))
+        # A contract that enables a different provider fails instead of quietly
+        # reviewing through the wrong adapter.
+        refuse = self.step_matching(job, "this workflow implements 'pr-agent'")
+        self.assertIn(
+            "steps.contract.outputs.provider != 'pr-agent'",
+            str(refuse.get("if")),
+        )
+        self.assertIn("exit 1", run_text(refuse))
+
+    def test_the_configuration_is_read_from_a_branch_and_not_from_the_wake_up(self):
+        # The toggle is versioned with the code, so it comes from a branch the
+        # caller named. Nothing in this job may read a ref out of an event.
+        job = self.job(self.PROVIDER, "review")
+        caller = next(
+            s
+            for s in steps_of(job)
+            if uses(s, "actions/checkout") and (s.get("with") or {}).get("path") != "engine"
+        )
+        self.assertEqual(caller["with"]["ref"], "${{ inputs.base_branch }}")
+        self.assertFalse(caller["with"].get("persist-credentials", True))
+        self.assertNotIn("ref: refs/", self.raw[self.PROVIDER])
+
+    def test_the_engine_outlives_the_caller_checkout_that_cleans_the_workspace(self):
+        # A checkout cleans its target path, and the engine is an untracked
+        # directory inside the caller's working tree. So a caller checkout that
+        # runs after the engine checkout deletes the engine the next steps are
+        # about to import, and the failure is an import error at best and a
+        # silent fallback at worst. The caller is therefore checked out first.
+        job = self.job(self.PROVIDER, "review")
+        steps = steps_of(job)
+        engine = next(
+            s
+            for s in steps
+            if uses(s, "actions/checkout") and (s.get("with") or {}).get("path") == "engine"
+        )
+        caller = next(
+            s
+            for s in steps
+            if uses(s, "actions/checkout") and (s.get("with") or {}).get("path") != "engine"
+        )
+        self.assertLess(
+            steps.index(caller),
+            steps.index(engine),
+            "the caller's checkout must run before the engine checkout",
+        )
+        # And nothing after the engine may clean the workspace again.
+        for step in steps[steps.index(engine) + 1 :]:
+            with self.subTest(step=step.get("name")):
+                self.assertFalse(uses(step, "actions/checkout"))
+
+    def test_the_provider_image_is_immutable(self):
+        job = self.job(self.PROVIDER, "review")
+        image = next(s for s in steps_of(job) if uses(s, "docker://"))
+        reference = image["uses"]
+        self.assertIn("@sha256:", reference)
+        self.assertNotRegex(reference, r"@sha256:[0-9a-f]{0,63}$")
+
+    def test_the_provider_keeps_the_authority_the_gate_actually_needs(self):
+        # The gate publishes a commit status, which is a different API from the
+        # check-run API the other controllers hold, and a workflow that grants
+        # `checks: write` cannot publish one. So `statuses: write` is required
+        # here and `checks: write` is not: the review is a status, and nothing
+        # in this surface creates a check run.
+        permissions = workflow_permissions(self.provider())
+        self.assertEqual(permissions["statuses"], "write")
+        self.assertNotIn("checks", permissions)
+        self.assertEqual(sorted(write_scopes(permissions)), ["issues", "pull-requests", "statuses"])
+
+    def test_provider_runs_are_serialized_and_never_cancelled(self):
+        # Cancelling mid-run can abandon a provider request that was already
+        # issued, which spends the shared slot for no answer.
+        concurrency = self.provider().get("concurrency") or {}
+        self.assertIn("inputs.pr_number", str(concurrency.get("group")))
+        self.assertFalse(concurrency.get("cancel-in-progress", True))
+
+    def test_the_manual_entry_is_the_owner_and_nothing_else(self):
+        document = self.workflows[self.MANUAL]
+        self.assertEqual(document["on"]["issue_comment"], {"types": ["created"]})
+        parse = self.job(self.MANUAL, "parse")
+        condition = str(parse.get("if"))
+        self.assertIn("github.actor == github.repository_owner", condition)
+        self.assertIn("github.event.issue.pull_request", condition)
+        route = self.step_matching(parse, "continuum.cli command")
+        # The body reaches the engine as data. An expression spliced into a
+        # script would let a comment author choose what the runner executes.
+        self.assertIn("CONTINUUM_COMMENT_BODY", json.dumps(route.get("env") or {}))
+        self.assertNotIn("github.event.comment", run_text(route))
+        self.assertNotIn("github.event.comment", json.dumps(parse.get("with") or {}))
+
+    def test_the_manual_entry_hands_the_shared_surface_the_owners_credential(self):
+        # The commands themselves are Continuum's own surface, called from the
+        # same commit rather than reimplemented, so a manual run and a queued
+        # run cannot disagree about what a finding means.
+        review = self.job(self.MANUAL, "review")
+        self.assertEqual(review["uses"], "./.github/workflows/pr-agent.yml")
+        self.assertEqual(
+            review["secrets"]["pr_agent_api_key"], "${{ secrets.PR_AGENT_API_KEY }}"
+        )
+        self.assertEqual(
+            sorted(review["with"]),
+            ["api_base", "max_tokens", "model", "pr_number"],
+        )
+        # The called surface cannot ask for more authority than this call grants
+        # it, so a caller that forgets `statuses: write` would run the whole
+        # review and then fail to publish the status the merge gate reads --
+        # a green manual command and a permanently blocked head.
+        granted = job_permissions(self.workflows[self.MANUAL], review)
+        self.assertEqual(
+            sorted(write_scopes(granted)), ["issues", "pull-requests", "statuses"]
+        )
+        rank = {"none": 0, "read": 1, "write": 2}
+        for scope, level in workflow_permissions(self.provider()).items():
+            with self.subTest(scope=scope):
+                self.assertGreaterEqual(
+                    rank.get(granted.get(scope, "none"), 0),
+                    rank.get(level, 0),
+                    "the call grants less than the surface asks for",
+                )
+        # A re-check posts a comment about a finding, so it needs issue write
+        # and nothing more: it creates no review, no status, and no check.
+        verify = self.job(self.MANUAL, "verify")
+        self.assertEqual(write_scopes(job_permissions(self.workflows[self.MANUAL], verify)), ["issues"])
+        self.assertIn("continuum.cli verify", run_text(steps_of(verify)[-1]))
+
+    def test_the_manual_entry_never_checks_out_a_pull_request(self):
+        for job_name in ("parse", "verify"):
+            with self.subTest(job=job_name):
+                for step in steps_of(self.job(self.MANUAL, job_name)):
+                    if not uses(step, "actions/checkout"):
+                        continue
+                    self.assertNotIn("ref", (step.get("with") or {}))
 
 
 class DelegatedChildLivenessTests(WorkflowAuditBase):
