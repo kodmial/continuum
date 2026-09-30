@@ -1020,10 +1020,22 @@ jobs:
             exit 0
           fi
 
+          if [[ "$episode_state" == "infra_failed" ]]; then
+            if [[ "$infra_retry_exhausted" == "true" ]]; then
+              gh label create opencode-infra-retry-exhausted --repo "$GITHUB_REPOSITORY" --color BFDADC \
+                --description "Infrastructure retry budget exhausted without consuming semantic repair attempts" --force >/dev/null 2>&1 || true
+              gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels" \
+                -f 'labels[]=opencode-infra-retry-exhausted' >/dev/null 2>&1 || true
+              echo "::warning::Conflict repair of PR #$PR_NUMBER stopped after 8 infrastructure retries; semantic repair budget is unchanged."
+            else
+              echo "Conflict repair of PR #$PR_NUMBER deferred for infrastructure retry; semantic repair budget is unchanged."
+            fi
+            exit 0
+          fi
+
           if [[ "$resolved" != "1" ]]; then
-            # The pull request stays live and reconcilable. Recording the
-            # failure is what makes an exhausted budget visible instead of
-            # silently skipped.
+            # Only a non-infrastructure repair failure consumes the bounded
+            # semantic repair budget.
             gh label create opencode-repair-failed --repo "$GITHUB_REPOSITORY" --color D93F0B \
               --description "Continuum conflict repair exhausted its attempt budget" --force >/dev/null 2>&1 || true
             gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels" \
