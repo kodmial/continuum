@@ -160,6 +160,18 @@ jobs:
           export PATH="$HOME/.opencode/bin:$PATH"
           test -x "$HOME/.opencode/bin/opencode"
 
+          # Continuum's global OpenCode instructions, before the first pass. A
+          # review pass re-runs the agent against the child's own code, so it
+          # runs under the same policy as the implementation pass; the child's
+          # AGENTS.md is left exactly as that repository ships it.
+          #
+          # The script path is spelled out rather than held in a variable, so
+          # the audit in .github/tests/test_opencode_instructions.py can see the
+          # install and the verify statically instead of inferring them from a
+          # shell variable assignment.
+          python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/opencode_instructions.py" install \
+            --source "$CONTINUUM_ENGINE_ROOT/.github/agents/AGENTS.md"
+
           issue_json="$(gh issue view "$TASK_NUMBER" --repo "$child_repo" --json title,body 2>/dev/null)"
           issue_title="$(jq -r '.title' <<<"$issue_json")"
           issue_body="$(jq -r '.body // ""' <<<"$issue_json")"
@@ -206,6 +218,12 @@ jobs:
           - Repair remaining blockers, rerun verification, and update $review_file.
           EOF
             fi
+            # The point-of-use gate sits outside the failure-tolerant block on
+            # purpose. A missing or altered global instructions file is a
+            # Continuum defect, not an agent failure to retry, so it stops the
+            # pass instead of burning the remaining ones under no policy.
+            python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/opencode_instructions.py" verify \
+              --source "$CONTINUUM_ENGINE_ROOT/.github/agents/AGENTS.md"
             set +e
             opencode run --auto --model "$OPENCODE_MODEL" "$(cat "$pass_prompt")" >"$transcript" 2>&1
             rc=$?

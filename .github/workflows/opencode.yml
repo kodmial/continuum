@@ -253,6 +253,24 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+      # Unconditional, and ahead of every invocation in this job on purpose.
+      # OpenCode loads one global instructions file in addition to whatever it
+      # finds in the repository, and on a fresh runner the global one does not
+      # exist -- so an agent that was not given Continuum's policy ran without
+      # it and nothing failed. One step, before the action-based issue run and
+      # before both repair invocations, is what makes "every OpenCode execution
+      # path" a property of the job rather than a habit per call site.
+      #
+      # The repository's own AGENTS.md is not touched and is not replaced: the
+      # installer only ever writes to a resolved global configuration
+      # directory, and refuses any target inside the worktree.
+      - name: Install Continuum global agent instructions
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/opencode_instructions.py install \
+            --source .github/agents/AGENTS.md
+
       # workflow_dispatch repair modes must NOT use "opencode github run":
       # that integration owns a branch/PR lifecycle and can open a new PR even
       # when the prompt says not to. Plain "opencode run" works in this already
@@ -698,6 +716,8 @@ jobs:
           EOF
           )
           python3 .github/scripts/opencode_runtime.py verify --expected-sha256 "$OPENCODE_RUNTIME_SHA256"
+          python3 .github/scripts/opencode_instructions.py verify \
+            --source .github/agents/AGENTS.md
           timeout --signal=TERM "$REPAIR_AGENT_TIMEOUT_SECONDS" \
             opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
 
@@ -762,6 +782,8 @@ jobs:
           # the process about to start is the one that was verified rather
           # than whatever PATH happens to resolve at this moment.
           python3 .github/scripts/opencode_runtime.py verify --expected-sha256 "$OPENCODE_RUNTIME_SHA256"
+          python3 .github/scripts/opencode_instructions.py verify \
+            --source .github/agents/AGENTS.md
           opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
           AFTER_SHA=$(git rev-parse HEAD)
 

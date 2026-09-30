@@ -12,4 +12,9 @@ runs:
         test -f "$root/.github/scripts/conflict_repair.py"
         test -f "$root/.github/scripts/agent_workspace.py"
         test -f "$root/.github/scripts/opencode_runtime.py"
+        # The global instructions document and its installer travel together.
+        # A consumer workflow installs one from the other, so a partial engine
+        # checkout has to fail here rather than half way through an agent run.
+        test -f "$root/.github/scripts/opencode_instructions.py"
+        test -f "$root/.github/agents/AGENTS.md"
         echo "CONTINUUM_ENGINE_ROOT=$root" >> "$GITHUB_ENV"

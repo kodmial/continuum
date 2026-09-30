@@ -164,6 +164,21 @@ jobs:
       - name: Load Continuum engine
         uses: kodmial/continuum/.github/actions/engine-path@39ca6dc798f2201390c8fdef0395157f588657ec
 
+      # Before any OpenCode invocation in this job: issue implementation,
+      # conflict repair, and CI repair all run under the same policy, so the
+      # install is unconditional and sits ahead of all three rather than being
+      # repeated at each call site. Each `opencode run` still re-verifies
+      # immediately before it starts, so a removed or replaced global file is a
+      # failed step instead of an agent that quietly ran without it.
+      #
+      # Nothing here touches the repository's own AGENTS.md.
+      - name: Install Continuum global agent instructions
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/opencode_instructions.py" install \
+            --source "$CONTINUUM_ENGINE_ROOT/.github/agents/AGENTS.md"
+
       - name: Validate OpenCode distribution
         shell: bash
         env:
@@ -366,6 +381,8 @@ jobs:
           # the process about to start is the one that was verified rather than
           # whatever PATH happens to resolve at this moment.
           python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/opencode_runtime.py" verify --expected-sha256 "$OPENCODE_RUNTIME_SHA256"
+          python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/opencode_instructions.py" verify \
+            --source "$CONTINUUM_ENGINE_ROOT/.github/agents/AGENTS.md"
           opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
 
           # The model edited the working tree; the workflow publishes it. The
@@ -587,6 +604,8 @@ jobs:
           EOF
           )"
           python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/opencode_runtime.py" verify --expected-sha256 "$OPENCODE_RUNTIME_SHA256"
+          python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/opencode_instructions.py" verify \
+            --source "$CONTINUUM_ENGINE_ROOT/.github/agents/AGENTS.md"
           timeout --signal=TERM "$REPAIR_AGENT_TIMEOUT_SECONDS" \
             opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
           if [[ -n "$(git status --porcelain)" ]]; then
@@ -647,6 +666,8 @@ jobs:
           # the process about to start is the one that was verified rather than
           # whatever PATH happens to resolve at this moment.
           python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/opencode_runtime.py" verify --expected-sha256 "$OPENCODE_RUNTIME_SHA256"
+          python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/opencode_instructions.py" verify \
+            --source "$CONTINUUM_ENGINE_ROOT/.github/agents/AGENTS.md"
           opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
           if [[ -n "$(git status --porcelain)" ]]; then
             git add -A
