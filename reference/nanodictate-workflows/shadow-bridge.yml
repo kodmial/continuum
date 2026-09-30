@@ -82,7 +82,7 @@ permissions:
   actions: read
 
 concurrency:
-  group: continuum-shadow-bridge-${{ github.repository }}-${{ github.event_name }}-${{ github.event_id || github.run_id }}
+  group: continuum-shadow-bridge-${{ github.repository }}-${{ github.event_name }}-${{ github.run_id }}
   cancel-in-progress: false
 
 jobs:
@@ -99,7 +99,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           EVENT_ACTION: ${{ github.event.action || inputs.action || 'tick' }}
-          EVENT_ID: ${{ github.event_id || github.run_id }}
+          EVENT_ID: ${{ github.run_id }}
           DEFAULT_EVENT_TYPE: ${{ inputs.event_type }}
           DEFAULT_NUMBER: ${{ inputs.number }}
           # Every fact below is read from the webhook payload GitHub already
