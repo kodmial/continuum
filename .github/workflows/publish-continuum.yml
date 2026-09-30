@@ -1,0 +1,411 @@
+name: Publish Continuum release
+
+# Publishing an immutable SemVer release of Continuum itself.
+#
+# A consumer holds exactly one literal reference --
+# kodmial/continuum/.github/workflows/consumer.yml@v0.1.0 -- and everything else
+# it executes follows from that one commit through same-repository relative
+# references. Publication is therefore a statement about a commit rather than an
+# upload, which is why this workflow:
+#
+#   * is dispatched by hand, with the release named, never inferred;
+#   * validates the release commit first and publishes only the digest it
+#     validated, so what ships cannot differ from what was proved;
+#   * refuses unless GitHub immutable releases are already enabled, because a tag
+#     that can be moved is not a dependency identity (ADR-0002);
+#   * never moves an existing tag, never publishes behind a newer release, and
+#     never writes to a consumer repository.
+#
+# Publishing a release updates no consumer. Adoption is the consumer's own
+# decision, taken with its release pin command, which this workflow deliberately
+# does not run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Exact SemVer release tag to publish, for example v0.1.0."
+        required: true
+        type: string
+      commit:
+        description:
+          "Full commit SHA to release; it must already be on main. Defaults to the
+          commit the workflow was dispatched on."
+        required: false
+        default: ""
+        type: string
+
+# The validate job reads the repository; only the publish job can write, and only
+# to release objects.
+permissions:
+  contents: read
+
+concurrency:
+  # One release at a time, and never cancelled: a half-published release is worse
+  # than a queued one, and cancelling mid-publish is how a tag ends up naming a
+  # commit nobody validated.
+  group: continuum-release
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate the release commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.identity.outputs.tag }}
+      commit: ${{ steps.identity.outputs.commit }}
+      previous: ${{ steps.identity.outputs.previous }}
+      tree: ${{ steps.identity.outputs.tree }}
+      digest: ${{ steps.candidate.outputs.digest }}
+      notes: ${{ steps.candidate.outputs.notes }}
+      compatibility: ${{ steps.candidate.outputs.compatibility }}
+      workflows: ${{ steps.candidate.outputs.workflows }}
+      files: ${{ steps.candidate.outputs.files }}
+    steps:
+      - name: Check out the release commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          # Dispatch inputs are named here and read from the environment in the
+          # steps below; they are never interpolated into a shell script. Full
+          # history and tags are needed to resolve the previous release.
+          ref: ${{ inputs.commit || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve the release identity
+        id: identity
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+          REQUESTED_COMMIT: ${{ inputs.commit }}
+        run: |
+          set -euo pipefail
+
+          head_commit="$(git rev-parse HEAD)"
+          if [ -n "$REQUESTED_COMMIT" ] && [ "$REQUESTED_COMMIT" != "$head_commit" ]; then
+            echo "::error::the requested commit is not the checked-out commit: $REQUESTED_COMMIT"
+            exit 1
+          fi
+
+          if ! git rev-parse --verify --quiet origin/main >/dev/null; then
+            echo "::error::origin/main was not fetched, so the release commit cannot be shown to be merged"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$head_commit" origin/main; then
+            echo "::error::the release commit is not on main; release only what has been merged"
+            exit 1
+          fi
+
+          # The predecessor is chosen with git's own version sort and then
+          # cross-checked by `continuum release publish` against --tags-file, so
+          # the two places that select it cannot disagree unnoticed.
+          git tag --list > "$RUNNER_TEMP/tags.txt"
+          git tag --list 'v[0-9]*' --sort=-v:refname > "$RUNNER_TEMP/sorted-tags.txt"
+          previous_tag="$(head -n 1 "$RUNNER_TEMP/sorted-tags.txt")"
+
+          {
+            echo "tag=$REQUESTED_VERSION"
+            echo "commit=$head_commit"
+            echo "previous=$previous_tag"
+            echo "tree=$(git rev-parse 'HEAD^{tree}')"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "requested release $REQUESTED_VERSION at $head_commit"
+          echo "previous release: ${previous_tag:-none}"
+
+      - name: Prove the release commit
+        run: |
+          set -euo pipefail
+          .github/scripts/release_validation.sh .
+
+      - name: Build the release
+        id: candidate
+        env:
+          RELEASE_TAG: ${{ steps.identity.outputs.tag }}
+          RELEASE_COMMIT: ${{ steps.identity.outputs.commit }}
+          PREVIOUS_TAG: ${{ steps.identity.outputs.previous }}
+          RELEASE_TREE: ${{ steps.identity.outputs.tree }}
+        run: |
+          set -euo pipefail
+
+          previous_args=()
+          if [ -n "$PREVIOUS_TAG" ]; then
+            git worktree add --detach "$RUNNER_TEMP/previous" "$PREVIOUS_TAG"
+            git diff --name-only "$PREVIOUS_TAG" "$RELEASE_COMMIT" > "$RUNNER_TEMP/changed.txt"
+            previous_args=(--previous-root "$RUNNER_TEMP/previous")
+          else
+            : > "$RUNNER_TEMP/changed.txt"
+          fi
+
+          PYTHONPATH=src python3 -m continuum.cli release publish \
+            --tag "$RELEASE_TAG" \
+            --commit "$RELEASE_COMMIT" \
+            --tree "$RELEASE_TREE" \
+            --previous-tag "$PREVIOUS_TAG" \
+            --tags-file "$RUNNER_TEMP/tags.txt" \
+            "${previous_args[@]}" \
+            --changed-from-file "$RUNNER_TEMP/changed.txt" \
+            --out-dir "$RUNNER_TEMP/release-documents"
+
+          manifest="$RUNNER_TEMP/release-documents/release-manifest.json"
+          notes="$RUNNER_TEMP/release-documents/release-notes.md"
+          read_field() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$manifest" "$1"; }
+          {
+            echo "digest=$(read_field digest)"
+            echo "notes=$(sha256sum "$notes" | cut -d' ' -f1)"
+            echo "compatibility=$(read_field compatibility)"
+            echo "workflows=$(read_field workflows)"
+            echo "files=$(read_field files)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Keep the validated release documents
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: continuum-release-${{ steps.identity.outputs.tag }}
+          path: ${{ runner.temp }}/release-documents
+          if-no-files-found: error
+          retention-days: 90
+
+  publish:
+    name: Publish the validated release
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      # The only write a release needs: creating the tag and the release object.
+      # Nothing here edits a file in the repository, and no consumer is contacted.
+      contents: write
+    steps:
+      - name: Check out the release commit again
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Observe the repository state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          setting="$RUNNER_TEMP/immutable-releases.json"
+          if ! gh api "repos/$GITHUB_REPOSITORY/immutable-releases" > "$setting" 2> "$RUNNER_TEMP/setting-error"; then
+            # 404 is how the endpoint reports immutability being off. Anything
+            # else is an inability to see the setting, which must never be read
+            # as permission to publish a movable tag.
+            if ! grep -qi '404' "$RUNNER_TEMP/setting-error"; then
+              echo "::error::the immutable releases setting could not be read: $(tr '\n' ' ' < "$RUNNER_TEMP/setting-error")"
+              exit 1
+            fi
+            printf '{"enabled": false}\n' > "$setting"
+          fi
+
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$RUNNER_TEMP/releases.json"
+          git tag --list > "$RUNNER_TEMP/tags.txt"
+
+          python3 - "$RUNNER_TEMP" <<'PYTHON'
+          import json
+          import pathlib
+          import subprocess
+          import sys
+
+          scratch = pathlib.Path(sys.argv[1])
+
+
+          def pages(text):
+              """gh --paginate writes one JSON array per page, back to back."""
+              decoder = json.JSONDecoder()
+              found = []
+              index = 0
+              while index < len(text):
+                  while index < len(text) and text[index] in " \n\r\t":
+                      index += 1
+                  if index >= len(text):
+                      break
+                  value, index = decoder.raw_decode(text, index)
+                  found.append(value)
+              return found
+
+
+          published = []
+          for page in pages((scratch / "releases.json").read_text()):
+              for release in page:
+                  if release.get("draft"):
+                      continue
+                  tag = release.get("tag_name") or ""
+                  # A published release names the commit its tag peels to. If the
+                  # tag cannot be resolved locally the record keeps an empty
+                  # commit, which the decision treats as a refusal to publish
+                  # rather than as agreement.
+                  peeled = subprocess.run(
+                      ["git", "rev-list", "-n", "1", tag],
+                      capture_output=True,
+                      text=True,
+                      check=False,
+                  )
+                  published.append(
+                      {
+                          "tag": tag,
+                          "commit": peeled.stdout.strip(),
+                          "published_at": release.get("published_at") or "",
+                          "immutable": bool(release.get("immutable", False)),
+                      }
+                  )
+
+          state = {
+              "immutable_releases": json.loads((scratch / "immutable-releases.json").read_text()),
+              "published_releases": published,
+              "tags": [
+                  line
+                  for line in (scratch / "tags.txt").read_text().splitlines()
+                  if line.strip()
+              ],
+          }
+          (scratch / "state.json").write_text(json.dumps(state, indent=2) + "\n")
+          PYTHON
+
+      - name: Decide, on the validated bytes
+        id: decide
+        env:
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
+          PREVIOUS_TAG: ${{ needs.validate.outputs.previous }}
+          RELEASE_TREE: ${{ needs.validate.outputs.tree }}
+          VALIDATED_DIGEST: ${{ needs.validate.outputs.digest }}
+          VALIDATED_NOTES: ${{ needs.validate.outputs.notes }}
+        run: |
+          set -euo pipefail
+
+          previous_args=()
+          if [ -n "$PREVIOUS_TAG" ]; then
+            git worktree add --detach "$RUNNER_TEMP/previous" "$PREVIOUS_TAG"
+            git diff --name-only "$PREVIOUS_TAG" "$RELEASE_COMMIT" > "$RUNNER_TEMP/changed.txt"
+            previous_args=(--previous-root "$RUNNER_TEMP/previous")
+          else
+            : > "$RUNNER_TEMP/changed.txt"
+          fi
+
+          PYTHONPATH=src python3 -m continuum.cli release publish \
+            --tag "$RELEASE_TAG" \
+            --commit "$RELEASE_COMMIT" \
+            --tree "$RELEASE_TREE" \
+            --previous-tag "$PREVIOUS_TAG" \
+            --tags-file "$RUNNER_TEMP/tags.txt" \
+            "${previous_args[@]}" \
+            --changed-from-file "$RUNNER_TEMP/changed.txt" \
+            --state "$RUNNER_TEMP/state.json" \
+            --expect-digest "$VALIDATED_DIGEST" \
+            --out-dir "$RUNNER_TEMP/publish"
+
+          # The notes to publish have to be the notes that were validated, byte
+          # for byte: this is what makes "the validated release" a statement
+          # about the published one.
+          printf '%s  %s\n' "$VALIDATED_NOTES" "$RUNNER_TEMP/publish/release-notes.md" \
+            | sha256sum -c -
+
+          decision="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["decision"])' "$RUNNER_TEMP/publish/release-manifest.json")"
+          echo "decision=$decision" >> "$GITHUB_OUTPUT"
+
+      - name: Publish the release
+        if: steps.decide.outputs.decision == 'publish'
+        env:
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # The tag is created first, at exactly the validated commit, and
+          # explicitly: creating a ref fails if the tag exists rather than
+          # retargeting it, and an existing tag is already refused by the
+          # decision above. A tag left behind by a failure here is inert -- it
+          # names a commit nobody can select as a release, because a release
+          # object is what a consumer's release tag resolves to.
+          if ! gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+            -f ref="refs/tags/$RELEASE_TAG" \
+            -f sha="$RELEASE_COMMIT" > "$RUNNER_TEMP/created-ref" 2> "$RUNNER_TEMP/created-ref-error"; then
+            echo "::error::the tag $RELEASE_TAG could not be created: $(tr '\n' ' ' < "$RUNNER_TEMP/created-ref-error")"
+            echo "::error::nothing was published. If the tag already exists it points somewhere else; delete that unused tag deliberately rather than letting a release move it."
+            exit 1
+          fi
+
+          if ! gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Continuum $RELEASE_TAG" \
+            --notes-file "$RUNNER_TEMP/publish/release-notes.md" \
+            "$RUNNER_TEMP/publish/release-manifest.json" \
+            > "$RUNNER_TEMP/release-url" 2> "$RUNNER_TEMP/release-error"; then
+            echo "::error::the release could not be created: $(tr '\n' ' ' < "$RUNNER_TEMP/release-error")"
+            echo "::error::the tag $RELEASE_TAG exists but no release names it, so nothing is selectable yet. Read the error before deleting anything."
+            exit 1
+          fi
+
+          echo "published $(tr -d '\n' < "$RUNNER_TEMP/release-url")"
+
+      - name: Prove the published release is what was validated
+        if: steps.decide.outputs.decision == 'publish'
+        env:
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
+          VALIDATED_DIGEST: ${{ needs.validate.outputs.digest }}
+          RELEASE_COMPATIBILITY: ${{ needs.validate.outputs.compatibility }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          git fetch --tags origin
+
+          published_commit="$(git rev-list -n 1 "$RELEASE_TAG")"
+          if [ "$published_commit" != "$RELEASE_COMMIT" ]; then
+            echo "::error::$RELEASE_TAG names $published_commit, not the released commit $RELEASE_COMMIT"
+            exit 1
+          fi
+
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" > "$RUNNER_TEMP/published.json"
+          if ! python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("immutable") else 1)' "$RUNNER_TEMP/published.json"; then
+            echo "::error::the published release is not immutable, so $RELEASE_TAG can still be moved and is not a dependency identity; treat it as unsafe and publish a new tag"
+            exit 1
+          fi
+
+          # The manifest that ships with the release has to be the validated one.
+          mkdir -p "$RUNNER_TEMP/downloaded"
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern release-manifest.json \
+            --dir "$RUNNER_TEMP/downloaded"
+          cmp "$RUNNER_TEMP/publish/release-manifest.json" "$RUNNER_TEMP/downloaded/release-manifest.json"
+
+          digest="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["digest"])' "$RUNNER_TEMP/downloaded/release-manifest.json")"
+          if [ "$digest" != "$VALIDATED_DIGEST" ]; then
+            echo "::error::the published manifest digests to $digest, but $VALIDATED_DIGEST was validated"
+            exit 1
+          fi
+
+          {
+            echo "### Continuum $RELEASE_TAG"
+            echo ""
+            echo "- commit: \`$RELEASE_COMMIT\`"
+            echo "- workflow graph digest: \`$VALIDATED_DIGEST\`"
+            echo "- compatibility: $RELEASE_COMPATIBILITY"
+            echo "- immutable: yes, so $RELEASE_TAG cannot be moved"
+            echo ""
+            echo "Adopt it by pinning your single release reference. This release changed"
+            echo "no consumer: moving to it is your repository's decision."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report a release that was already published
+        if: steps.decide.outputs.decision == 'already-published'
+        env:
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Continuum $RELEASE_TAG was already published"
+            echo ""
+            echo "It already names \`$RELEASE_COMMIT\`. Nothing was published, the tag was"
+            echo "not moved, and no consumer was updated."
+          } >> "$GITHUB_STEP_SUMMARY"
