@@ -164,6 +164,35 @@ jobs:
               selected_review_tasks=""
               while IFS=
 
+            # Owner-created same-repository PRs are first-class child
+            # work even when they have no source issue. Automation-owned task
+            # branches keep the stronger issue-based review path above.
+            manual_prs="$(
+              gh api --paginate "repos/$child_repo/pulls?state=open&per_page=100" \
+                --jq '.[] |
+                  select(.draft == false) |
+                  select(.head.repo.full_name == .base.repo.full_name) |
+                  select(.user.login == .base.repo.owner.login) |
+                  select(
+                    ((.head.ref | startswith("continuum-child/task-")) or
+                     (.head.ref | startswith("runtime-worker/task-"))) | not
+                  ) |
+                  select(([.labels[]?.name] | index("no-auto-merge")) | not) |
+                  .number' 2>/dev/null || true
+            )"
+
+            if [[ -n "$manual_prs" ]]; then
+              while IFS= read -r manual_pr; do
+                [[ -n "$manual_pr" ]] || continue
+                manual_pr_active "$child_id" "$manual_pr" && continue
+                gh workflow run "$MANUAL_PR_REVIEW_WORKFLOW" --repo "$GITHUB_REPOSITORY" \
+                  -f child_id="$child_id" \
+                  -f pr_number="$manual_pr" >/dev/null
+                dispatched=$((dispatched + 1))
+                echo "Dispatched owner-created child PR #$manual_pr for independent review."
+              done <<<"$manual_prs"
+            fi
+
             issues_json="$(
               gh api --paginate "repos/$child_repo/issues?state=open&per_page=100" 2>/dev/null
             )"
