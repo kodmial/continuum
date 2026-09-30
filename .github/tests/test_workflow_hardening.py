@@ -539,6 +539,19 @@ class AgentExecutionTests(WorkflowAuditBase):
                 text.index(execution_token),
             )
 
+    def test_authorize_plan_uses_trusted_checked_out_helper(self):
+        """Issue-mode authorization must not depend on privileged-job env."""
+        document = self.agent_plane()["opencode.yml"]
+        authorize = document["jobs"]["authorize"]
+        step = next(
+            step
+            for step in (authorize.get("steps") or [])
+            if step.get("name") == "Plan the repair ladder"
+        )
+        text = json.dumps(step, sort_keys=True)
+        self.assertIn("python3 .github/scripts/conflict_repair.py", text)
+        self.assertNotIn("CONTINUUM_CONFLICT_REPAIR_HELPER", text)
+
     def test_upstream_installer_is_bounded_and_verified(self):
         for name in ("opencode.yml", "consumer-opencode.yml"):
             text = self.raw[name]
