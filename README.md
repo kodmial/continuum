@@ -130,6 +130,47 @@ adapter:
 To enable in another repository, validate a `.continuum.yml`, then call the
 reusable workflow — see `fixtures/consumer-repo/` for the reference consumer.
 
+## Adopting Continuum
+
+A consuming repository declares two booleans and nothing else, in
+`.github/continuum.yml`:
+
+```yaml
+review: false
+release: false
+```
+
+A missing file is the same as both being `false`, so adopting Continuum costs
+nothing until a repository opts in. `review: true` activates the review loop
+above without the repository naming a reviewer or holding a reviewer credential;
+`release: false` forbids the merge controller from dispatching anything.
+
+```yaml
+review: true
+release: true
+```
+
+The full rules are in [`docs/continuum-mvp-contract.md`](docs/continuum-mvp-contract.md).
+The wiring is:
+
+| You write | To |
+| --- | --- |
+| `.github/workflows/<name>.yml` | declare the events Continuum should wake up on |
+| `.github/workflows/continuum-auto-merge.yml` | reconcile merge eligibility, and hand off to your release hook when `release: true` |
+| `.github/workflows/review.yml` | close the review loop when `review: true` |
+| `.github/workflows/continuum-opencode.yml` | your agent runner and toolchain, as inputs |
+| `.github/workflows/continuum-release.yml` | your own release, given the merge commit |
+
+Every one of those files calls a shared controller at a pinned Continuum commit.
+You own the event set, your agent's runner, your language toolchain, which of your
+own checks block a merge, and your release; Continuum owns every decision. You do
+not pass `review` or `release` to a controller — a second place to declare them
+is a second thing that can disagree with the file you just committed.
+
+`fixtures/consumer-repo/` is a working instance of all five files, and
+`tests/test_fixture_consumer.py` runs the engine against that repository's own
+configuration to prove both opt-in and opt-out behave as documented.
+
 
 ## Parent/child delegated execution
 

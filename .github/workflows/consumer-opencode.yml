@@ -1,5 +1,27 @@
 name: Continuum reusable OpenCode
 
+# The single agent surface a consumer repository drives. `mode` selects what the
+# run is *for*, and there are exactly four, closed and generic:
+#
+#   issue              implement one issue on a new branch and open its PR
+#   resolve-conflict   repair an existing change so it merges (recovery ladder)
+#   ci-fix             repair a failed exact-head gate on the existing branch
+#   review-fix         repair the normalized review findings on this exact HEAD
+#
+# The fourth is the review loop's repair leg. It is generic on purpose: the mode
+# that reaches the trust-policy allowlist and this workflow must never branch on
+# which reviewer produced the findings, so there is no provider-specific mode and
+# no provider name anywhere below. `review-fix` also differs in where its
+# instruction comes from -- the review controller normalizes, deduplicates and
+# binds findings to one commit, writes that instruction to the pull request
+# before dispatching, and this step reads back exactly that one. Rebuilding it
+# here would hand the model an unnormalized list it could read as licence to
+# widen its own scope.
+#
+# The execution environment is the consumer's, not Continuum's: `runner` and
+# `swift_version` decide where the agent runs and which toolchain it gets, and
+# no platform, language, or vendor name appears in this file.
+
 on:
   workflow_call:
     inputs:
@@ -61,6 +83,14 @@ on:
         type: number
         required: false
         default: 1200
+      review_agent_timeout_seconds:
+        description: >-
+          Hard cap on the single model call inside a review repair. Bounded
+          independently of both task and conflict-repair budgets, because a
+          review repair repairs a finished change against normalized findings.
+        type: number
+        required: false
+        default: 1500
       opencode_distribution:
         description: "OpenCode binary source: upstream or github-release"
         type: string
@@ -113,12 +143,13 @@ permissions:
 
 jobs:
   opencode:
-    if: contains(fromJSON('["issue","resolve-conflict","ci-fix"]'), inputs.mode)
+    if: contains(fromJSON('["issue","resolve-conflict","ci-fix","review-fix"]'), inputs.mode)
     runs-on: ${{ inputs.runner }}
     # Conflict repair repairs a change that already exists, so it is bounded by
     # its own small constant rather than inheriting the source task's runtime.
     # That separation is what keeps a long task from deciding how long
-    # repairing its own merge conflict may take.
+    # repairing its own merge conflict may take. A review repair repairs the same
+    # finished change and is bounded the same way.
     timeout-minutes: ${{ inputs.mode == 'issue' && inputs.task_timeout_minutes || inputs.repair_timeout_minutes }}
     concurrency:
       group: continuum-opencode-${{ inputs.mode }}-${{ inputs.issue_number || inputs.pr_number || github.run_id }}
@@ -708,3 +739,69 @@ jobs:
           else
             echo "No source change was produced; leaving retry policy to the controller."
           fi
+
+      # The review loop's repair leg. Everything about where this instruction
+      # comes from is in the header: the review controller wrote it to the pull
+      # request for one exact commit before dispatching this run, and this step
+      # reads back that one instruction or fails. It does not talk to the
+      # reviewer, and it does not read findings out of the event.
+      - name: Repair the open review findings
+        if: inputs.mode == 'review-fix'
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_REF: ${{ inputs.head_ref }}
+          REVIEW_AGENT_TIMEOUT_SECONDS: ${{ inputs.review_agent_timeout_seconds }}
+          OPENCODE_RUNTIME_SHA256: ${{ steps.upstream_opencode.outputs.runtime_sha256 || steps.optimized_opencode.outputs.runtime_sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "::error::Invalid pull request number."
+            exit 1
+          fi
+          BEFORE_SHA="$(git rev-parse HEAD)"
+
+          # The engine is the only code allowed to decide what a review repair
+          # is. It is read from the pinned Continuum checkout this job loaded,
+          # never from the pull request's own tree -- a contributor cannot
+          # decide its own repair scope by editing the branch under review.
+          PYTHONPATH="$CONTINUUM_ENGINE_ROOT/src" python3 -m continuum.cli review prompt \
+            --config "$CONTINUUM_ENGINE_ROOT/.github/continuum.yml" \
+            --pr "$PR_NUMBER" \
+            --head "$BEFORE_SHA" \
+            --out "$RUNNER_TEMP/review-repair-prompt.md" >/dev/null
+
+          PROMPT="$(cat "$RUNNER_TEMP/review-repair-prompt.md")"
+          if [[ -z "$PROMPT" ]]; then
+            echo "::error::No review repair instruction for this commit."
+            exit 1
+          fi
+
+          # Point of use, same as every other invocation in this job.
+          python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/opencode_runtime.py" verify --expected-sha256 "$OPENCODE_RUNTIME_SHA256"
+          python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/opencode_instructions.py" verify \
+            --source "$CONTINUUM_ENGINE_ROOT/.github/agents/AGENTS.md"
+          # Bounded by the review repair policy, not by the caller and not by the
+          # source task. The controller already spent an attempt for this commit,
+          # so a repair that cannot finish in this window is a pause, not a
+          # longer run.
+          timeout --signal=TERM "$REVIEW_AGENT_TIMEOUT_SECONDS" \
+            opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
+
+          # An unchanged HEAD is a real answer, not a failure. The controller
+          # plans for it: it asks the reviewer to re-check the original findings
+          # on this commit, then requests one bounded full re-review, then pauses
+          # and fails closed. This step deliberately does not push, re-run, or
+          # decide that -- a second attempt chosen here would be an attempt the
+          # controller's durable ledger never counted.
+          AFTER_SHA="$(git rev-parse HEAD)"
+          if [[ "$AFTER_SHA" == "$BEFORE_SHA" ]]; then
+            echo "::notice::Review repair made no code change; the controller re-verifies this commit and then pauses if the findings are still open."
+            exit 0
+          fi
+          if [[ -n "$(git status --porcelain)" ]]; then
+            git add -A
+            git commit -m "fix: repair review findings for PR #${PR_NUMBER}"
+          fi
+          HUSKY=0 git push origin "HEAD:${HEAD_REF}"
+          echo "::notice::Pushed the review repair to ${HEAD_REF}."

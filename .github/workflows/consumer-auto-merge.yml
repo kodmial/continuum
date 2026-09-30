@@ -1,16 +1,51 @@
-name: Continuum reusable auto-merge
-
+# Continuum reusable auto-merge: the single merge reconciler a consumer runs.
+#
+# This workflow owns exactly one decision -- may this pull request merge right
+# now, and may this merge happen -- and it recomputes that from live repository
+# state on every wake-up. Events are wake-ups, never inputs: a stale event can
+# cost this workflow one no-op, never one wrong merge.
+#
+# Single owner, single flight
+# ---------------------------
+# Merge writes are the only writes in Continuum that cannot be replayed, so the
+# controller is deliberately structured so that at most one reconciliation owns
+# side effects at any moment, and so that ownership is not merely hoped for:
+#
+#   1. One repository-scoped concurrency group, constant for the repository and
+#      derived from no event payload. Every trigger -- CI completion, a push,
+#      a manual dispatch, the recovery schedule -- enters the same group, so
+#      GitHub itself guarantees at most one run is executing.
+#   2. `cancel-in-progress: false`. Cancelling a reconciler between its merge
+#      write and its release handoff would drop a release on the floor, so a
+#      newer wake-up queues behind the running one instead of replacing it. A
+#      queued run is stale the moment it starts, and that is safe: step 3 makes
+#      every write re-derive its own preconditions.
+#   3. Every write revalidates the exact-head gates immediately before it acts.
+#      The candidate loop's filters are a cheap pre-pass; the block immediately
+#      before `pulls.merge` re-reads base freshness, exact-head CI, the
+#      applicable blocking workflows and the review gate, and the merge itself
+#      carries `sha: <head>` so GitHub performs the final compare-and-swap. A
+#      reconciler that was queued behind another one therefore cannot merge
+#      something that stopped being mergeable while it waited.
+#
+# The toggle posture comes from the versioned contract file, never from this
+# workflow's caller. `review` and `release` are resolved once per run by the
+# engine's own configuration resolver from the consumer's `.github/continuum.yml`
+# and published to the job summary, so the entrypoint cannot disagree with the
+# file a reviewer reads and there is no second place to declare the same switch.
 on:
   workflow_call:
     inputs:
-      review:
-        type: boolean
+      config_path:
+        type: string
         required: false
-        default: false
-      release:
-        type: boolean
+        default: .github/continuum.yml
+        description: "Path to the validated Continuum v0.1 contract file in the base branch"
+      base_branch:
+        type: string
         required: false
-        default: false
+        default: main
+        description: "Branch pull requests are merged into"
       ci_workflow:
         type: string
         required: false
@@ -41,7 +76,46 @@ permissions:
   statuses: read
 
 jobs:
+  # Read-only. Resolves the two-toggle contract once per run so the privileged
+  # job below consumes a value that was validated against the same
+  # configuration a human reads, and so an invalid contract fails the entrypoint
+  # loudly instead of quietly resolving to "both off".
+  contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      review: ${{ steps.resolve.outputs.review }}
+      release: ${{ steps.resolve.outputs.release }}
+    env:
+      # Read-only by construction: this job resolves a switch, and a job that
+      # could write would not be able to say the merge posture it reports is the
+      # one it read.
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Load Continuum engine
+        uses: kodmial/continuum/.github/actions/engine-path@39ca6dc798f2201390c8fdef0395157f588657ec
+      - name: Resolve the Continuum contract
+        id: resolve
+        env:
+          CONFIG_PATH: ${{ inputs.config_path }}
+          DEFAULT_BRANCH: ${{ inputs.base_branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The contract is repository-controlled and versioned with the code, so
+          # it is read from the base branch. A pull request does not get to
+          # declare that review is off.
+          if ! gh api "repos/$GITHUB_REPOSITORY/contents/$CONFIG_PATH?ref=$DEFAULT_BRANCH" \
+            --jq '.content' 2>/dev/null | base64 --decode > "$RUNNER_TEMP/continuum-contract.yml"; then
+            printf '' > "$RUNNER_TEMP/continuum-contract.yml"
+          fi
+          python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/continuum_config.py" \
+            --config "$RUNNER_TEMP/continuum-contract.yml" >/dev/null
+
   merge:
+    needs: contract
     runs-on: ubuntu-latest
     concurrency:
       group: continuum-auto-merge-${{ github.repository }}
@@ -51,8 +125,9 @@ jobs:
       - name: Reconcile eligible PRs
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
         env:
-          REVIEW_ENABLED: ${{ inputs.review }}
-          RELEASE_ENABLED: ${{ inputs.release }}
+          REVIEW_ENABLED: ${{ needs.contract.outputs.review }}
+          RELEASE_ENABLED: ${{ needs.contract.outputs.release }}
+          BASE_BRANCH: ${{ inputs.base_branch }}
           CI_WORKFLOW: ${{ inputs.ci_workflow }}
           ADDITIONAL_BLOCKING_WORKFLOWS: ${{ inputs.additional_blocking_workflows }}
           REVIEW_CONTEXT: ${{ inputs.review_status_context }}
@@ -64,10 +139,22 @@ jobs:
             const {owner, repo} = context.repo;
             const reviewEnabled = process.env.REVIEW_ENABLED === 'true';
             const releaseEnabled = process.env.RELEASE_ENABLED === 'true';
+            const baseBranch = process.env.BASE_BRANCH;
+
+            // Release handoff state is durable, not in-memory. A hand-off that
+            // was recorded but not confirmed is re-driven on a later run, so a
+            // dispatch that failed after the merge was durable is retried
+            // instead of lost. `RELEASE_PENDING_ATTEMPTS` bounds that retry and
+            // `RELEASE_RECOVERY_WINDOW_HOURS` bounds how far back recovery looks,
+            // so a run cannot walk a repository's whole merge history.
+            const RELEASE_PENDING_ATTEMPTS = 3;
+            const RELEASE_RECOVERY_WINDOW_HOURS = 72;
+            const releasePending = sha => `<!-- continuum-release-pending:${sha} -->`;
+            const releaseDispatched = sha => `<!-- continuum-release-dispatched:${sha} -->`;
 
             async function baseFresh(sha) {
               const {data} = await github.rest.repos.compareCommitsWithBasehead({
-                owner, repo, basehead: `main...${sha}`,
+                owner, repo, basehead: `${baseBranch}...${sha}`,
               });
               return data.status === 'ahead' || data.status === 'identical';
             }
@@ -128,8 +215,80 @@ jobs:
               return Boolean(status && status.state === 'success');
             }
 
+            async function commentBodies(number) {
+              const comments = await github.paginate(
+                github.rest.issues.listComments,
+                {owner, repo, issue_number: number, per_page: 100}
+              );
+              return comments.map(c => c.body || '');
+            }
+
+            // The consumer's release entrypoint receives the merge SHA, so a
+            // re-driven hand-off is safe to be duplicated on its side; what
+            // must not happen here is a hand-off that silently disappears. The
+            // pending marker is written first and the confirmation only after a
+            // dispatch returned, which is what makes "recorded but unconfirmed"
+            // the recoverable state.
+            async function dispatchRelease(number, sha) {
+              try {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: number,
+                  body: `${releasePending(sha)}\nContinuum is handing ${sha} to ${process.env.RELEASE_WORKFLOW}.`
+                });
+                await github.rest.actions.createWorkflowDispatch({
+                  owner, repo,
+                  workflow_id: process.env.RELEASE_WORKFLOW,
+                  ref: baseBranch,
+                  inputs: {source_sha: sha}
+                });
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: number,
+                  body: `${releaseDispatched(sha)}\nContinuum dispatched the consumer release entrypoint for ${sha}.`
+                });
+                core.notice(`Handed ${sha} to ${process.env.RELEASE_WORKFLOW}.`);
+                return true;
+              } catch (e) {
+                // The pending marker stays, so a later run re-drives this
+                // hand-off instead of the merge silently losing its release.
+                core.warning(`Release hand-off for ${sha} did not complete: ${e.message}`);
+                return false;
+              }
+            }
+
+            // Pure latest-state reconciliation of interrupted hand-offs: any
+            // recently merged pull request that carries a pending marker and no
+            // confirmation is re-driven, within the attempt budget. Nothing here
+            // is remembered by this process, so a crashed or cancelled run costs
+            // nothing, and a queued run behind another one simply finds the work
+            // already confirmed.
+            async function recoverReleaseHandoffs() {
+              const cutoff = Date.now() - RELEASE_RECOVERY_WINDOW_HOURS * 3600 * 1000;
+              const {data: merged} = await github.rest.pulls.list({
+                owner, repo, state:'closed', base: baseBranch,
+                sort:'updated', direction:'desc', per_page: 20
+              });
+              for (const pull of merged) {
+                const sha = pull.merged_commit?.sha || '';
+                if (!sha) continue;
+                if (!pull.merged_at || new Date(pull.merged_at).getTime() < cutoff) continue;
+                const bodies = await commentBodies(pull.number);
+                const pending = bodies.filter(b => b.includes(releasePending(sha))).length;
+                if (!pending) continue;
+                if (bodies.some(b => b.includes(releaseDispatched(sha)))) continue;
+                if (pending > RELEASE_PENDING_ATTEMPTS) {
+                  core.warning(
+                    `Release hand-off for PR #${pull.number} (${sha}) exhausted ${RELEASE_PENDING_ATTEMPTS} attempts; not retrying.`
+                  );
+                  continue;
+                }
+                await dispatchRelease(pull.number, sha);
+              }
+            }
+
+            if (releaseEnabled) await recoverReleaseHandoffs();
+
             const prs = await github.paginate(github.rest.pulls.list, {
-              owner, repo, state:'open', base:'main', per_page:100
+              owner, repo, state:'open', base: baseBranch, per_page:100
             });
 
             for (const listed of prs) {
@@ -139,7 +298,7 @@ jobs:
               if (labels.has('no-auto-merge')) continue;
 
               if (!(await baseFresh(listed.head.sha))) {
-                core.info(`PR #${listed.number}: stale against current main; branch sync/repair must run first.`);
+                core.info(`PR #${listed.number}: stale against current ${baseBranch}; branch sync/repair must run first.`);
                 continue;
               }
               if (!(await currentHeadCiGreen(listed.head.sha))) {
@@ -170,7 +329,7 @@ jobs:
               // Re-check immediately before the write. If another PR merged
               // earlier in this same run, every sibling branch is stale now.
               if (!(await baseFresh(pr.head.sha))) {
-                core.info(`PR #${pr.number}: main advanced before merge; branch sync/repair must run first.`);
+                core.info(`PR #${pr.number}: ${baseBranch} advanced before merge; branch sync/repair must run first.`);
                 continue;
               }
               if (!(await currentHeadCiGreen(pr.head.sha)) ||
@@ -230,18 +389,13 @@ jobs:
                 await github.rest.actions.createWorkflowDispatch({
                   owner, repo,
                   workflow_id:process.env.SCHEDULER_WORKFLOW,
-                  ref:'main'
+                  ref: baseBranch
                 });
               } catch (e) {
                 core.warning(`Could not wake scheduler: ${e.message}`);
               }
 
               if (releaseEnabled) {
-                await github.rest.actions.createWorkflowDispatch({
-                  owner, repo,
-                  workflow_id:process.env.RELEASE_WORKFLOW,
-                  ref:'main',
-                  inputs:{source_sha:result.data.sha}
-                });
+                await dispatchRelease(pr.number, result.data.sha);
               }
             }

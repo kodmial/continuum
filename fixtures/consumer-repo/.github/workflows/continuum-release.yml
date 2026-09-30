@@ -1,0 +1,46 @@
+name: Continuum release
+
+# The consumer's own release entrypoint, and the whole of what `release: true`
+# means in Continuum v0.1.
+#
+# Continuum decides *when* this runs and what it hands over -- one merge commit,
+# read from the base branch, never invented here -- and nothing else. What is
+# built, how it is signed, where it is published, and which artifacts exist are
+# this repository's business and stay in this repository. Continuum does not
+# rewrite them, and there is no Continuum setting that would.
+#
+# The hand-off is at-least-once by construction: the merge controller records the
+# hand-off before dispatching and confirms it afterwards, so a dispatch that
+# failed is re-driven on a later run. That makes `source_sha` the deduplication
+# key, and consuming it idempotently is this workflow's obligation.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: "Merge commit Continuum handed over"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: continuum-consumer-release-${{ inputs.source_sha }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SOURCE_SHA: ${{ inputs.source_sha }}
+    steps:
+      - name: Publish what this repository publishes
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A consumer's release internals live here. This fixture only records
+          # that the hand-off arrived, because the point of the entrypoint is
+          # that Continuum does not care what is inside it.
+          echo "::notice::Release hand-off for ${SOURCE_SHA} reached the consumer entrypoint."

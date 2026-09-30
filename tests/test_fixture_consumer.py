@@ -1,16 +1,67 @@
-"""MVP boundary checks for post-MVP PR-Agent material."""
+"""MVP boundary checks for post-MVP PR-Agent material, and for the consumer
+contract as a consumer would actually adopt it.
+
+The engine-level behaviour of the two toggles is pinned in
+``tests/test_review_repair.py``. What that cannot prove is that a *consumer* can
+reach either posture, because a consumer's two halves live in different files:
+the switches in ``.github/continuum.yml``, and the wiring in the thin workflows
+it commits. The engine tests would still pass if every reusable workflow still
+asked for a caller-supplied boolean, in which case ``review: true`` and
+``release: true`` would be unreachable for anyone but Continuum itself.
+
+So these read the fixture the way a consumer reads it — its contract file, its
+workflow names, its dispatch surface — and drive the engine with those exact
+values. A change that moves the switch out of the file, or names a reviewer or a
+project on the way, fails here.
+"""
 
 from __future__ import annotations
 
 import pathlib
+import re
 import unittest
 
 from continuum.config import load_config
+from continuum.review import reconcile as reconcile_module
+from tests import support
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 ACTIVE = ROOT / ".github" / "workflows"
 REFERENCE = ROOT / "reference" / "post-mvp-pr-agent-workflows"
 CONSUMER = ROOT / "fixtures" / "consumer-repo"
+CONSUMER_WORKFLOWS = CONSUMER / ".github" / "workflows"
+
+
+def with_inputs(text: str) -> dict:
+    """The `with:` keys a reusable-workflow call passes, as a plain dict.
+
+    A hand-rolled scan rather than a full YAML load, because these are read as
+    text on purpose: the property under test is what a reviewer sees in the file,
+    not what a parser recovers from it.
+    """
+
+    match = re.search(r"^\s+with:\n((?:\s{6,}\S.*(?:\n|$))+)", text, re.MULTILINE)
+    if not match:
+        return {}
+    body = match.group(1)
+    base = len(body) - len(body.lstrip(" "))
+    keys = {}
+    for line in body.splitlines():
+        if not line.strip() or len(line) - len(line.lstrip(" ")) != base:
+            continue
+        key, _, value = line.strip().partition(":")
+        keys[key] = value.strip()
+    return keys
+
+
+def dispatch_inputs(text: str) -> set:
+    """The input names a consumer's own workflow_call surface declares."""
+    match = re.search(
+        r"^\s*workflow_call:\n\s*inputs:\n((?:\s{4,}\S.*(?:\n|$))+)", text, re.MULTILINE
+    )
+    if not match:
+        return set()
+    return set(re.findall(r"^\s*(\w+):\s*$", match.group(1), re.MULTILINE))
 
 
 class MvpBoundaryTests(unittest.TestCase):
@@ -82,6 +133,239 @@ class ConsumerConfigTests(unittest.TestCase):
         self.assertEqual(
             self.config.review.pr_agent.api_key_secret, "PR_AGENT_API_KEY"
         )
+
+
+class ConsumerWiringTests(unittest.TestCase):
+    """The fixture's committed wiring, read the way a consumer reads it.
+
+    A reusable workflow cannot subscribe to a consumer's own events, so the
+    consumer necessarily writes entry workflows. Those files are the only place
+    a reviewer will look to decide whether adopting Continuum means learning a
+    reviewer, a provider credential, or a platform, so they are asserted to
+    contain none of it: the consumer declares when to call and which of its own
+    workflows to call, and the shared controller holds everything else.
+
+    They are also the only place a consumer's trust boundary is written down, so
+    what they pass is checked as carefully as what they omit.
+    """
+
+    def workflow_texts(self):
+        return {
+            path.name: path.read_text(encoding="utf-8")
+            for path in sorted(CONSUMER_WORKFLOWS.glob("*.yml"))
+        }
+
+    def test_no_consumer_workflow_names_a_reviewer_a_platform_or_a_project(self):
+        for name, text in self.workflow_texts().items():
+            lowered = text.lower()
+            for banned in (
+                "coderabbit",
+                "pr-agent",
+                "pr_agent",
+                "review-bot",
+                "macos",
+                "xcode",
+                "avfoundation",
+            ):
+                self.assertNotIn(banned, lowered, f"{name} names {banned}")
+            # `swift_version` is allowed: a consumer may need a language
+            # toolchain, and naming the language it needs is not naming the
+            # platform Continuum assumes. The platform is what must not appear.
+            #
+            # The credential story is the same shape. The only secrets a consumer
+            # supplies are the model key its own runner needs and the default
+            # token; a reviewer credential would mean the boolean in the
+            # contract file is not the whole of the switch.
+            for secret in set(re.findall(r"secrets\.([A-Z0-9_]+)", text)):
+                self.assertIn(secret, ("OPENCODE_API_KEY", "GITHUB_TOKEN"), name)
+
+    def test_every_consumer_workflow_calls_a_pinned_continuum_surface(self):
+        seen = 0
+        for name, text in self.workflow_texts().items():
+            for line in text.splitlines():
+                if "uses:" not in line or "kodmial/continuum/" not in line:
+                    continue
+                seen += 1
+                self.assertIn(".github/", line, name)
+                # A branch ref is a moving target, and this token is write
+                # authority. `@main` would mean the consumer's security model is
+                # only as good as whatever `main` holds when the workflow next
+                # fires, which is exactly the property a reviewer cannot check
+                # by reading the file.
+                ref = line.rsplit("@", 1)[1].strip()
+                self.assertRegex(
+                    ref,
+                    r"^[0-9a-f]{40}$",
+                    f"{name} pins {ref!r}, not an immutable commit",
+                )
+        # Guard against the loop vacuously passing on an empty fixture.
+        self.assertGreater(seen, 0)
+
+    def test_the_consumer_declares_when_to_call_and_never_what_the_outcome_is(self):
+        # `with:` is where a consumer states the policy it owns: which of its own
+        # workflows runs, which of its own gates block, where its contract file
+        # lives. The merge posture is not in that set, because a second place to
+        # declare `review` or `release` is a second thing that can disagree with
+        # the file a reviewer reads.
+        for name in ("continuum-auto-merge.yml", "review.yml", "continuum-scheduler.yml"):
+            keys = with_inputs(self.workflow_texts()[name])
+            self.assertNotIn("review", keys, name)
+            self.assertNotIn("release", keys, name)
+            self.assertTrue(keys, f"{name} passes no inputs at all")
+
+    def test_the_consumer_names_its_own_workflows_where_the_controllers_need_them(self):
+        merge = with_inputs(self.workflow_texts()["continuum-auto-merge.yml"])
+        self.assertEqual(merge["config_path"], ".github/continuum.yml")
+        # A release or scheduler hook that lives in another repository cannot be
+        # dispatched by this one, so these names have to be the consumer's own
+        # files, not `owner/repo/.github/workflows/thing.yml`.
+        for hook in ("release_workflow", "scheduler_workflow"):
+            self.assertEqual(merge[hook], f"continuum-{hook.split('_')[0]}.yml")
+
+        scheduler = with_inputs(self.workflow_texts()["continuum-scheduler.yml"])
+        self.assertEqual(scheduler["opencode_workflow"], "continuum-opencode.yml")
+        # Scheduling policy is the consumer's, declared once as inputs rather
+        # than duplicated in a config file the controller would have to find.
+        self.assertIn("wip_limit", scheduler)
+        self.assertIn("lease_minutes", scheduler)
+
+    def test_the_fixture_reaches_the_review_loop_through_the_generic_surface(self):
+        review = self.workflow_texts()["review.yml"]
+        self.assertIn("consumer-review-gate.yml@", review)
+        # The wake-up may name a candidate pull request, but nothing it carries
+        # is authority: the gate re-derives trust, the HEAD, and the contract
+        # from live state. In particular no event-derived ref or commit is
+        # passed, because those are the two things an untrusted author controls.
+        self.assertNotIn("github.event.pull_request.head", review)
+        self.assertNotIn("head_ref", review)
+        self.assertNotIn("head_sha", review)
+
+    def test_the_fixture_owns_its_agent_runner_and_toolchain(self):
+        agent = self.workflow_texts()["continuum-opencode.yml"]
+        # Where the agent runs is an input with a default, so the same shared
+        # workflow serves a consumer that needs a particular runner and one that
+        # is content with the default.
+        self.assertIn("runner:", agent)
+        self.assertIn("default: ubuntu-latest", agent)
+        # And the toolchain is an input too, defaulted to none.
+        self.assertIn("swift_version:", agent)
+        self.assertIn("review-fix", agent)
+        # The agent workflow is dispatched by the controllers, so it must accept
+        # exactly the inputs they send -- and nothing the consumer invented.
+        declared = set(with_inputs(agent)) | dispatch_inputs(agent)
+        self.assertEqual(
+            sorted(declared),
+            sorted(
+                [
+                    "mode",
+                    "issue_number",
+                    "pr_number",
+                    "head_ref",
+                    "run_id",
+                    "rungs_ruled_out",
+                    "runner",
+                    "swift_version",
+                    "model",
+                ]
+            ),
+        )
+
+    def test_the_fixture_release_hook_is_a_thin_entrypoint(self):
+        release = self.workflow_texts()["continuum-release.yml"]
+        # It receives the merge commit, so a re-driven dispatch after an
+        # interrupted hand-off is deduplicable on the consumer's side rather
+        # than publishing twice.
+        self.assertIn("source_sha", release)
+        self.assertIn("SOURCE_SHA", release)
+        self.assertNotIn("uses: kodmial/continuum/", release)
+
+
+class ConsumerPostureTests(unittest.TestCase):
+    """The engine, driven with the fixture's own contract and workflow names.
+
+    This is the acceptance proof for both postures: the switch lives in a file a
+    consumer can commit, and the dispatch names a workflow the consumer owns.
+    Nothing else has to be configured, so nothing else is checked.
+    """
+
+    OPEN = "This misses the null guard around the parsed payload."
+    BODY = "Actionable review comments:\n\n- " + OPEN + "\n"
+    HEAD_REF = "opencode/issue11-x"
+
+    def reviewed_pull_request(self):
+        """A pull request whose current HEAD carries one actionable finding."""
+        head = support.HEAD_A
+        return support.FakeGitHub(
+            head=head,
+            reviews=[
+                support.coderabbit_review(
+                    "CHANGES_REQUESTED", head_sha=head, body=self.BODY
+                )
+            ],
+            threads=[
+                support.coderabbit_thread(
+                    "PRRT_a", body=self.OPEN, comment_id=500
+                )
+            ],
+            review_comments=[
+                support.review_comment(
+                    self.OPEN,
+                    path="app.py",
+                    line=42,
+                    login=support.CODERABBIT_LOGIN,
+                    commit_id=head,
+                    comment_id=501,
+                )
+            ],
+        )
+
+    def reconcile(self, contract: str):
+        fake = self.reviewed_pull_request()
+        fake.pr = {"number": 7, "head": {"sha": support.HEAD_A, "ref": self.HEAD_REF}}
+        seen: list = []
+
+        def dispatch(workflow, ref, inputs):
+            seen.append({"workflow": workflow, "ref": ref, "inputs": inputs})
+
+        plan = reconcile_module.reconcile(
+            fake,
+            load_config(contract),
+            7,
+            apply=True,
+            dispatch=dispatch,
+            # The consumer's own agent workflow, which is what the fixture
+            # commits and what a real consumer would replace with its own.
+            dispatch_workflow="continuum-opencode.yml",
+            dispatch_ref="main",
+        )
+        return plan, fake, seen
+
+    def test_the_disabled_posture_costs_the_consumer_nothing(self):
+        plan, fake, seen = self.reconcile(str(ROOT / ".github" / "continuum.yml"))
+
+        self.assertFalse(plan["enabled"])
+        self.assertEqual(seen, [])
+        # Silent is the whole requirement: a deliberate opt-out must not produce
+        # provider traffic, a review status, or a comment on the consumer's pull
+        # requests. Anything here is a consumer who said "no" and got "yes".
+        self.assertEqual(fake.calls, [])
+        self.assertEqual(fake.statuses_created, [])
+        self.assertEqual(fake.comments_created, [])
+
+    def test_the_enabled_posture_needs_nothing_but_the_boolean(self):
+        contract = CONSUMER / ".github" / "continuum.yml"
+        plan, _fake, seen = self.reconcile(str(contract))
+
+        self.assertTrue(plan["enabled"])
+        self.assertEqual(plan["repair"]["action"], "repair")
+        # One bounded dispatch, to the consumer's own workflow, in the generic
+        # mode. If this ever needs a provider name or a platform, the consumer
+        # had to learn something the contract does not contain.
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0]["workflow"], "continuum-opencode.yml")
+        self.assertEqual(seen[0]["inputs"]["mode"], "review-fix")
+        self.assertEqual(seen[0]["inputs"]["pr_number"], "7")
+        self.assertEqual(seen[0]["inputs"]["head_ref"], self.HEAD_REF)
 
 
 if __name__ == "__main__":

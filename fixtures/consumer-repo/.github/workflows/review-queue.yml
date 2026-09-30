@@ -59,7 +59,7 @@ concurrency:
 
 jobs:
   reconcile:
-    uses: kodmial/continuum/.github/workflows/review-queue.yml@main
+    uses: kodmial/continuum/.github/workflows/review-queue.yml@39ca6dc798f2201390c8fdef0395157f588657ec
     permissions:
       actions: write
       contents: read
