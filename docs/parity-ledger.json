@@ -80,7 +80,7 @@
       "blob_sha": "e5656c07b5758d4974540912f52a60525be889f8",
       "classification": "absorbed",
       "owner": "#27",
-      "rationale": "The generic OpenCode lifecycle is absorbed by .github/workflows/consumer-opencode.yml. NanoDictate's required macOS 15 / Swift 6.1 execution capability is expressed through configurable runner/toolchain inputs, with the reusable boundary covered by tests/test_workflow_hardening.py."
+      "rationale": "The generic OpenCode lifecycle is absorbed by .github/workflows/consumer-opencode.yml. NanoDictate's required macOS 15 / Swift 6.1 execution capability is expressed through configurable runner/toolchain inputs, with the reusable boundary covered by .github/tests/test_workflow_hardening.py."
     },
     {
       "path": ".github/workflows/packaging-smoke.yml",
