@@ -261,7 +261,7 @@ jobs:
     # would mean the evidence in the window was produced by code nobody reviewed.
     # Pinned to the validated merged shadow implementation. Consumer rollout
     # may advance this only through an explicitly validated immutable SHA.
-    uses: kodmial/continuum/.github/workflows/continuum-shadow.yml@d599d9ebb66c86e31af35fc322011168f94ef661
+    uses: kodmial/continuum/.github/workflows/continuum-shadow.yml@12926511ef8cf8901199bfc99cfe06bfc995b488
     with:
       mode: run
       repository: ${{ github.repository }}
