@@ -159,7 +159,7 @@ RECOVERY_RUNGS = MECHANICAL_RUNGS + AGENT_RUNGS
 FAILED_ACTION = "failed"
 
 #: States an episode marker may report.
-EPISODE_STATES = ("open", "resolved", "failed", "superseded")
+EPISODE_STATES = ("open", "resolved", "failed", "infra_failed", "superseded")
 
 #: Every field a marker must carry to count as a record. A marker missing any of
 #: them is not one this controller wrote, so it is not a record at all.
@@ -753,12 +753,23 @@ def episode_attempts(texts, pr_number=None) -> int:
     and no write access at all. Anything past the cap is treated as noise.
     """
     wanted = non_negative_int(pr_number)
-    attempts = 0
+    latest_by_attempt = {}
     for fields in parse_episode_history(texts):
         if wanted and non_negative_int(fields.get("pr")) != wanted:
             continue
         recorded = non_negative_int(fields.get("attempt"))
-        if recorded > MAX_RECORDED_ATTEMPTS:
+        if recorded <= 0 or recorded > MAX_RECORDED_ATTEMPTS:
+            continue
+        # An attempt is opened before dispatch so a dead runner still leaves a
+        # durable trace. If that dispatch later proves to be infrastructure-only,
+        # the later infra_failed marker cancels the semantic charge for the same
+        # attempt number. A later open/resolved/failed marker for that number
+        # makes it semantic again.
+        latest_by_attempt[recorded] = fields
+
+    attempts = 0
+    for recorded, fields in latest_by_attempt.items():
+        if fields.get("state") == "infra_failed":
             continue
         attempts = max(attempts, recorded)
     return attempts
