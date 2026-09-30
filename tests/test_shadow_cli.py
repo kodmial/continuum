@@ -30,6 +30,27 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 ARTIFACTS = "shadow-cli-out"
 HEAD_E = "e" * 40
 
+_WORKFLOWS = (
+    (".github/workflows/ci.yml", "1" * 40),
+    (".github/workflows/auto-merge.yml", "2" * 40),
+)
+_LEDGER = {
+    "schema": "continuum.parity-ledger/v1",
+    "repository": "kodmial/nanodictate",
+    "audited_head": "a" * 40,
+    "workflows": [
+        {
+            "path": path,
+            "blob_sha": sha,
+            "classification": "consumer-local",
+            "owner": "#27",
+            "rationale": "product CI",
+        }
+        for path, sha in _WORKFLOWS
+    ],
+    "open_pull_requests": [],
+}
+
 
 def _cli(*args: str) -> subprocess.CompletedProcess:
     """Run the CLI in a process, because the barrier is per-process.
@@ -539,6 +560,250 @@ class CutoverCommand(unittest.TestCase):
             "--out", str(self.dir / "out"),
         )
         self.assertEqual(result.returncode, cli.USAGE_ERROR)
+
+
+class BaselineCommand(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dir = Path(ARTIFACTS) / "baseline"
+        self.ledger = _write(self.dir / "ledger.json", _LEDGER)
+
+    def tearDown(self) -> None:
+        _remove(REPO_ROOT / ARTIFACTS / "baseline")
+
+    def _live(self, **overrides):
+        head = {
+            "schema": "continuum.shadow-baseline/v1",
+            "repository": "kodmial/nanodictate",
+            "default_branch": "main",
+            "head_sha": HEAD_E,
+            "workflows": [{"path": path, "blob_sha": sha} for path, sha in _WORKFLOWS],
+            "open_pull_requests": [],
+        }
+        head.update(overrides)
+        return _write(self.dir / "live.json", head)
+
+    def test_a_matching_reading_writes_both_artifacts_and_exits_zero(self) -> None:
+        result = _cli(
+            "baseline",
+            "--ledger", str(self.ledger),
+            "--live-head", str(self._live()),
+            "--out", str(self.dir / "out"),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(
+            (self.dir / "out" / "baseline" / "report.json").read_text()
+        )
+        self.assertTrue(report["ready"])
+        self.assertEqual(report["verdict"], "clean")
+        self.assertEqual(
+            report["live_head"], HEAD_E, "the reading has to record what it read"
+        )
+        # The reading is kept beside the report so a later approval can be checked
+        # against the state the state it was granted in.
+        self.assertEqual(
+            json.loads((self.dir / "out" / "baseline" / "live-head.json").read_text())["head_sha"],
+            HEAD_E,
+        )
+
+    def test_a_workflow_that_moved_fails_the_job_and_names_the_issue(self) -> None:
+        moved = _write(
+            self.dir / "moved.json",
+            json.loads(self._live().read_text())
+            | {
+                "workflows": [
+                    {"path": path, "blob_sha": ("9" * 40 if path.endswith("ci.yml") else sha)}
+                    for path, sha in _WORKFLOWS
+                ]
+            },
+        )
+        result = _cli(
+            "baseline",
+            "--ledger", str(self.ledger),
+            "--live-head", str(moved),
+            "--out", str(self.dir / "out"),
+        )
+        self.assertEqual(result.returncode, cli.VALIDATION_FAILED)
+        report = json.loads(
+            (self.dir / "out" / "baseline" / "report.json").read_text()
+        )
+        self.assertEqual(report["verdict"], "drifted")
+        self.assertIn(
+            "workflow_blob_changed",
+            {blocker["code"] for blocker in report["blockers"]},
+        )
+        self.assertIn("#27", report["routing"], "drift has to be routed to its owner")
+
+    def test_a_reading_nobody_took_is_refused_rather_than_assumed_clean(self) -> None:
+        # Without a capture and without a file there is nothing to compare, and an
+        # audit of nothing is the one result that must never be called clean.
+        result = _cli(
+            "baseline", "--ledger", str(self.ledger), "--out", str(self.dir / "out")
+        )
+        # A usage error, not a validation result: nothing was audited, and the
+        # command must not exit zero having written no report.
+        self.assertEqual(result.returncode, cli.USAGE_ERROR)
+        self.assertIn("no_live_head", result.stderr)
+        self.assertFalse((self.dir / "out" / "baseline" / "report.json").exists())
+
+    def test_capturing_a_repository_needs_to_be_asked_for_by_name(self) -> None:
+        result = _cli(
+            "baseline", "--ledger", str(self.ledger), "--capture-live",
+            "--out", str(self.dir / "out"),
+        )
+        self.assertEqual(result.returncode, cli.USAGE_ERROR)
+        self.assertIn("missing_repository", result.stderr)
+
+    def test_the_ledger_can_be_rendered_without_reading_anything(self) -> None:
+        # The table is what a maintainer reads when deciding a classification, so it
+        # has to be regenerable from the file that the gate consumes.
+        result = _cli(
+            "baseline",
+            "--ledger", str(self.ledger),
+            "--live-head", str(self._live()),
+            "--render",
+            "--out", str(self.dir / "out"),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(".github/workflows/ci.yml", result.stdout)
+        self.assertIn("consumer-local", result.stdout)
+
+    def test_the_cutover_command_refuses_a_window_with_no_reading(self) -> None:
+        # The rule, seen from the entry point CI uses: even a window with a canary,
+        # a rollback path and an approval is refused when the consumer's workflows
+        # were never read.
+        from continuum.shadow import cutover, liveness, parity, planner
+        from continuum.shadow.observation import outcome_from_payload
+
+        journal = planner.plan(
+            fixtures.event_for("merge-decision"),
+            fixtures.state(),
+            fixtures.config(),
+            now_ms=1,
+        )
+        compared = parity.compare(
+            journal,
+            outcome_from_payload(
+                {
+                    "correlation_id": journal.event.correlation_id,
+                    "fidelity": "exact",
+                    "terminal_state": journal.status,
+                    "actions": [action.describe() for action in journal.actions],
+                }
+            ),
+        )
+        parity_path = _write(self.dir / "parity.json", compared.describe())
+        live_path = _write(
+            self.dir / "liveness.json",
+            liveness.LivenessReport(
+                runs=(
+                    liveness.RunLiveness(
+                        correlation_id=journal.event.correlation_id,
+                        verdict=liveness.LIVE,
+                        status="ok",
+                        duration_ms=5,
+                    ),
+                )
+            ).describe(),
+        )
+        result = _cli(
+            "cutover",
+            "--parity", str(parity_path),
+            "--liveness", str(live_path),
+            "--window-start", "2026-03-01T00:00:00Z",
+            "--window-end", "2026-03-15T00:00:00Z",
+            "--out", str(self.dir / "cutover"),
+        )
+        decision = json.loads(
+            (self.dir / "cutover" / "cutover" / "decision.json").read_text()
+        )
+        codes = {blocker["code"] for blocker in decision["blockers"]}
+        self.assertIn("no_baseline_evidence", codes)
+        # Named alongside the real reasons, not instead of them.
+        self.assertIn("uncovered_scenario", codes)
+        self.assertEqual(cutover.describe(decision)["ready"], False)
+
+    def test_a_report_that_disagrees_with_itself_fails_the_command(self) -> None:
+        # The contradictory shape a truncated write leaves behind: `ready` true
+        # beside a real blocker. Reconciling it would print a decision over a
+        # document the gate never read, so the command fails and writes nothing a
+        # reviewer could mistake for a verdict.
+        from continuum.shadow import liveness, parity, planner
+        from continuum.shadow.observation import outcome_from_payload
+
+        journal = planner.plan(
+            fixtures.event_for("merge-decision"),
+            fixtures.state(),
+            fixtures.config(),
+            now_ms=1,
+        )
+        live_path = _write(
+            self.dir / "liveness-2.json",
+            liveness.LivenessReport(
+                runs=(
+                    liveness.RunLiveness(
+                        correlation_id=journal.event.correlation_id,
+                        verdict=liveness.LIVE,
+                        status="ok",
+                        duration_ms=5,
+                    ),
+                )
+            ).describe(),
+        )
+        parity_path = _write(
+            self.dir / "parity-2.json",
+            parity.compare(
+                journal,
+                outcome_from_payload(
+                    {
+                        "correlation_id": journal.event.correlation_id,
+                        "fidelity": "exact",
+                        "terminal_state": journal.status,
+                        "actions": [action.describe() for action in journal.actions],
+                    }
+                ),
+            ).describe(),
+        )
+        contradictory = {
+            "schema": "continuum.shadow-baseline/v1",
+            "ready": True,
+            "repository": "kodmial/nanodictate",
+            "ledger_digest": "pl-1",
+            "live_digest": "lh-1",
+            "evidence_digest": "be-1",
+            "audited_head": HEAD_E,
+            "live_head": "b" * 40,
+            "complete": True,
+            "verdict": "clean",
+            "differences": [],
+            "blockers": [
+                {
+                    "code": "workflow_blob_changed",
+                    "message": "ci.yml moved",
+                    "subject": ".github/workflows/ci.yml",
+                    "owner": "#27",
+                }
+            ],
+            "routing": {"#27": [".github/workflows/ci.yml"]},
+            "limits": [],
+        }
+        baseline_path = _write(self.dir / "baseline-contradictory.json", contradictory)
+        result = _cli(
+            "cutover",
+            "--parity", str(parity_path),
+            "--liveness", str(live_path),
+            "--baseline", str(baseline_path),
+            "--window-start", "2026-03-01T00:00:00Z",
+            "--window-end", "2026-03-15T00:00:00Z",
+            "--out", str(self.dir / "cutover-contradictory"),
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("inconsistent_report", result.stderr)
+        # Nothing a reviewer could mistake for a verdict: an empty --out tree is
+        # not a decision, and a decision over this document would be one.
+        self.assertEqual(
+            [path.name for path in (self.dir / "cutover-contradictory").rglob("*") if path.is_file()],
+            [],
+        )
 
 
 class BarrierCheck(unittest.TestCase):

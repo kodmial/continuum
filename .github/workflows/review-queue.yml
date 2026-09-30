@@ -96,11 +96,23 @@ on:
 
 permissions: {}
 
-# One controller at a time decides who gets the next shared provider slot. A new
-# wake-up supersedes a run that is only waiting out a cooldown.
+# One controller at a time decides who gets the next shared provider slot.
+#
+# `cancel-in-progress: false`, and the reason is starvation rather than
+# bookkeeping. A run that is only waiting out a provider cooldown holds the group;
+# with cancellation on, every subsequent wake-up replaced it, so on a busy
+# repository the head that needed the cooldown could be superseded indefinitely and
+# the shared slot never went to it. With cancellation off, GitHub guarantees the
+# waiting run starts before any queued successor -- and a queued successor that is
+# itself replaced still leaves one run that runs to completion.
+#
+# Serialising is safe because the reconciler is a recomputation, not an
+# accumulation: it reads the queue from GitHub state and schedules at most one
+# provider request, so two runs in sequence make the same decision twice rather
+# than spend the slot twice.
 concurrency:
   group: continuum-review-queue
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   reconcile:
