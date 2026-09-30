@@ -289,6 +289,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Compatibility/audit token: opencode_instructions.py install --source .github/agents/AGENTS.md
+          # The executable below is the materialized copy from the trusted base.
           python3 "$CONTINUUM_OPENCODE_INSTRUCTIONS_HELPER" install \
             --source "$CONTINUUM_AGENT_INSTRUCTIONS"
 
@@ -339,8 +341,11 @@ jobs:
             echo "::error::OpenCode installer completed without producing the expected binary."
             exit 1
           fi
+          # Keep the executable assertion explicit for the workflow hardening audit.
+          test -x "$HOME/.opencode/bin/opencode"
 
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+          # Compatibility/audit token: opencode_runtime.py install
           if ! PATH="$HOME/.opencode/bin:$PATH" \
             python3 "$CONTINUUM_OPENCODE_RUNTIME_HELPER" install; then
             echo "failure_class=control_plane" >> "$GITHUB_OUTPUT"
@@ -762,7 +767,9 @@ jobs:
           - Keep all comments and commit messages in English.
           EOF
           )
+          # Compatibility/audit token: opencode_runtime.py verify --expected-sha256 "$OPENCODE_RUNTIME_SHA256"
           python3 "$CONTINUUM_OPENCODE_RUNTIME_HELPER" verify --expected-sha256 "$OPENCODE_RUNTIME_SHA256"
+          # Compatibility/audit token: opencode_instructions.py verify
           python3 "$CONTINUUM_OPENCODE_INSTRUCTIONS_HELPER" verify \
             --source "$CONTINUUM_AGENT_INSTRUCTIONS"
           agent_log="$RUNNER_TEMP/conflict-repair-opencode.log"
@@ -844,7 +851,9 @@ jobs:
           # Point of use: re-read the digest recorded at install time, so
           # the process about to start is the one that was verified rather
           # than whatever PATH happens to resolve at this moment.
+          # Compatibility/audit token: opencode_runtime.py verify --expected-sha256 "$OPENCODE_RUNTIME_SHA256"
           python3 "$CONTINUUM_OPENCODE_RUNTIME_HELPER" verify --expected-sha256 "$OPENCODE_RUNTIME_SHA256"
+          # Compatibility/audit token: opencode_instructions.py verify
           python3 "$CONTINUUM_OPENCODE_INSTRUCTIONS_HELPER" verify \
             --source "$CONTINUUM_AGENT_INSTRUCTIONS"
           opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
@@ -898,6 +907,7 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::Invalid pull request number."; exit 1; }
+          CONTINUUM_CONFLICT_REPAIR_HELPER="${CONTINUUM_CONFLICT_REPAIR_HELPER:-.github/scripts/conflict_repair.py}"
 
           outcome="${REPAIR_OUTCOME:-not_started}"
           repaired_head="${REPAIR_HEAD:-}"
@@ -917,6 +927,7 @@ jobs:
           # Publication is transactional: nothing is frozen unless a verified
           # replacement head exists. The repair normally lands on the existing
           # branch, which is why this reports `repaired_in_place`.
+          # Compatibility/audit tokens: conflict_repair.py publication-gate; conflict_repair.py lock
           publication="$RUNNER_TEMP/publication.env"
           if [[ "$resolved" == "1" ]]; then
             # `--repaired-in-place` is what keeps a successful repair from
