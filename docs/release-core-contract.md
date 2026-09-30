@@ -214,8 +214,22 @@ artifact 'app.tar.gz' is claimed by 'fixture/1.4.0' and 'other/1.4.0'
 The check is a free function, `assert_distinct_artifact_names()`, because the
 collision is a property of the release's asset set rather than of any
 destination: a release with two colliding targets is ambiguous whether or not a
-destination is configured, so it is refused at the build rather than at the
-first upload that happens to notice.
+destination is configured, so it is refused rather than at the first upload that
+happens to notice.
+
+It is asked twice, after the build and again after signing, because signing is
+where products become the assets a destination receives. An adapter that
+packages per architecture, or names an archive after its product, publishes
+names that did not exist at the build stage — two targets can collide only
+there. Finding that collision at verification is too late: both targets have
+already written over each other's files, and the release has already lost its
+archives.
+
+The adapter's own naming does the rest. The Apple adapter names its checksum
+listing after the target (`macos-SHA256SUMS.txt`), because a release's assets
+share one flat namespace and two targets shipping `SHA256SUMS.txt` would be one
+file written twice — and a consumer verifying the second target's archives would
+read the first target's digests.
 
 ## The GitHub destination
 
@@ -241,15 +255,46 @@ the contract is written against:
   `PortFailure` keeps its code; anything else becomes a retryable failure with
   the name of the call that failed.
 
+### Wiring a declared target
+
+`continuum release run --target <id>` is the whole integration for a target
+declared in `.continuum.yml`. The command reads the configuration, builds the
+`AppleAdapter`, hands the chain to `ReleaseCore`, and prints the outcome:
+
+```
+continuum release run --target macos --tag v1.4.0 --sha "$GITHUB_SHA"
+```
+
+Three things about that command are worth stating, because each is a way the
+integration could have been less honest:
+
+- **It names no platform.** There is no Apple branch in it. The target's own
+  configuration supplies the bundle, the binaries, the architectures, the
+  artifact formats, and the signing identity; the adapter rehydrates them from
+  `TargetSpec.options`, which `ReleaseRequest.from_config()` fills in by
+  describing each configured target.
+- **A dry run walks the same chain.** `release run --dry-run` executes no tool
+  and writes no file — not even a checksum file — and declares the same
+  artifacts, by name, that the real run records. A plan that described a
+  different release than the one that ran would not be a plan.
+- **Publication is not wired here.** With no publisher configured, a completed
+  release ends as a verified no-op. That is the contract's answer for "nothing
+  to publish to", not a success that skipped a step.
+
+The checkout is checked before anything is built. The adapter is given a
+revision reader, and a real run refuses both a checkout on a different commit
+(`source-mismatch`) and a directory with no readable commit at all
+(`source-unreadable`) — a tarball or a vendored copy cannot promise which commit
+it is, and releasing it would build bytes nobody approved.
+
 ### What is not expressible yet
 
 `.continuum.yml` still declares `adapter: apple` and still requires a target to
 name a binary or an `app_bundle`, because that schema is the MVP consumer
 contract and widening it is a consumer-facing change rather than a detail of
-this one. So the generic path is reached today by a consumer that builds its own
-`ReleaseRequest` (or, for the Apple targets that exist, by the plan adapters
-above). A repository that wants to declare a non-Apple target in configuration
-needs that enum widened; the core needs nothing.
+this one. The generic path is reached today through that one adapter; a
+repository that wants to declare a non-Apple target in configuration needs that
+enum widened, and the core needs nothing.
 
 ## Permissions
 
@@ -285,6 +330,14 @@ destination configured is green, and neither has published anything.
   that is deliberately not a platform.
 - `tests/test_release_github.py` — the destination, against a repository that is
   a dict with the shape of the API.
+- `tests/test_release_apple.py` — the Apple plans: which arguments, in which
+  order, with which identity.
+- `tests/test_release_apple_walk.py` — the same adapter walked end to end, with
+  `tests/apple_toolchain_support.py` standing in for `swift`, `codesign`,
+  `security`, and `lipo`. The plans, the runner, the manifest building, and the
+  packaging are the real ones; only the process boundary is replaced, so the
+  recorded command order and the bytes inside the shipped archive are the
+  release's own.
 
 `tests/release_core_support.py` holds the shared fixture: an adapter that writes
 a text file and counts every side effect, an in-memory release repository, and

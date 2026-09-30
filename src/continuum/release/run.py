@@ -1,9 +1,10 @@
 """Running a release plan.
 
-The runner knows three things and no more: a step is an argument vector, an
-assert step's output must contain a named substring, and teardown runs whatever
-happened. It does not know what the vectors contain, so an adapter can change
-its toolchain without the runner — and everything above it — changing at all.
+The runner knows four things and no more: a step is an argument vector, an
+assert step's output must contain a named substring, a copy step moves bytes
+between paths without a tool, and teardown runs whatever happened. It does not
+know what the vectors contain, so an adapter can change its toolchain without
+the runner — and everything above it — changing at all.
 
 The invariants this module enforces are the ones a release cannot recover from
 getting wrong:
@@ -32,12 +33,13 @@ import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .plan import (
     ENCODING_BASE64,
     SLOT_PATTERN,
     STEP_ASSERT,
+    STEP_COPY,
     STEP_MATERIALIZE,
     PlanStep,
     ReleasePlan,
@@ -53,6 +55,17 @@ MAX_CAPTURED_OUTPUT = 65536
 # handing over its own wholesale, so a release step never inherits the job's
 # GitHub credentials.
 _STRIPPED_ENV_PREFIXES = ("GITHUB_", "RUNNER_", "ACTIONS_", "CI_")
+
+
+@dataclass(frozen=True)
+class CommandResult:
+    """What one command step produced."""
+
+    code: int
+    output: str
+
+
+CommandRunner = Callable[[Sequence[str], str, Mapping[str, str]], CommandResult]
 
 
 def base_environment() -> Dict[str, str]:
@@ -97,9 +110,10 @@ class Runner:
     def __init__(
         self,
         *,
-        environment: Optional[Mapping[str, str]] = None,
+        environment: Optional[Dict[str, str]] = None,
         workdir: str = "",
         dry_run: bool = False,
+        command_runner: Optional["CommandRunner"] = None,
     ) -> None:
         self.environment: Dict[str, str] = dict(
             base_environment() if environment is None else environment
@@ -107,6 +121,13 @@ class Runner:
         self.workdir = workdir
         self.dry_run = dry_run
         self.completed: List[str] = []
+        #: How a command step is carried out. The default starts a process; a test
+        #: supplies a callable and runs a whole macOS plan on a machine that has
+        #: no macOS toolchain on it. The plan, and therefore the ordering and the
+        #: assertions in it, are identical either way — which is the point: a test
+        #: that exercises a different runner than production would be testing its
+        #: own runner.
+        self.command_runner: Optional["CommandRunner"] = command_runner
 
     # -- substitution ------------------------------------------------------
     def resolve(self, step: PlanStep) -> Tuple[List[str], List[str]]:
@@ -194,10 +215,59 @@ class Runner:
             return 1, f"could not write {step.path}: {exc}"
         return 0, ""
 
+    def _copy(self, step: PlanStep) -> Tuple[int, str]:
+        """Move bytes from one path to another, with no tool and no shell.
+
+        A copy is not a command because there is nothing to execute: the reason
+        this is a step at all is that the *ordering* is the claim. A bundle is
+        assembled out of binaries that have already been signed, and a reviewer
+        has to be able to see that those copies happen after the signatures and
+        before the seal. Making it a command would mean inventing a `cp` for the
+        plan to invoke; making it invisible would mean the ordering is a property
+        of the adapter rather than of the plan.
+        """
+
+        if self.dry_run:
+            return 0, ""
+        for source, destination in step.copies():
+            source = self._resolve(source)
+            destination = self._resolve(destination)
+            parent = os.path.dirname(destination)
+            try:
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                # `copy2` keeps the mode and the timestamps, which is what a
+                # signature covers: `codesign` records the signed content, and a
+                # bundle assembled from a copy whose timestamps were rewritten
+                # after the fact is a bundle whose seal describes other bytes.
+                shutil.copy2(source, destination)
+            except OSError as exc:
+                return 1, f"could not copy {source} to {destination}: {exc}"
+        return 0, ""
+
+    def _resolve(self, path: str) -> str:
+        """Where a path in a plan actually is, relative to this runner's workdir.
+
+        A plan names paths as the repository names them, and a repository runs
+        from its own root. Subprocess steps get that for free through `cwd`;
+        a filesystem step has to be told, or it would resolve against whatever
+        directory the process happened to start in.
+        """
+
+        if os.path.isabs(path) or not self.workdir:
+            return path
+        return os.path.join(self.workdir, path)
+
     def _execute(self, step: PlanStep, argv: Sequence[str]) -> Tuple[int, str]:
         if self.dry_run:
             return 0, ""
         try:
+            if self.command_runner is not None:
+                result = self.command_runner(list(argv), self.workdir, self.environment)
+                return result.code, result.output
+            # `check=False` because the exit status is this method's to
+            # interpret: a step that fails is a `StepFailure` carrying the output
+            # and a code, not an exception thrown from three frames down.
             completed = subprocess.run(
                 list(argv),
                 capture_output=True,
@@ -207,6 +277,7 @@ class Runner:
                 env=self.environment,
                 check=False,
             )
+            return completed.returncode, (completed.stdout or "") + (completed.stderr or "")
         except FileNotFoundError:
             raise StepFailure(
                 step.name,
@@ -223,7 +294,7 @@ class Runner:
                 "tool-failed",
                 f"step {step.name!r} could not start {argv[0]!r}: {exc}",
             ) from None
-        return completed.returncode, (completed.stdout or "") + (completed.stderr or "")
+        return code, output
 
     def run_step(self, step: PlanStep) -> str:
         """Run one step, raising `StepFailure` if it does not hold up."""
@@ -231,6 +302,9 @@ class Runner:
         if step.kind == STEP_MATERIALIZE:
             values = [self.environment.get(step.source_env, "")]
             code, output = self._materialize(step)
+        elif step.kind == STEP_COPY:
+            values = []
+            code, output = self._copy(step)
         else:
             argv, values = self.resolve(step)
             code, output = self._execute(step, argv)
@@ -338,5 +412,11 @@ def run_plan(
     environment: Optional[Mapping[str, str]] = None,
     workdir: str = "",
     dry_run: bool = False,
+    command_runner: Optional[CommandRunner] = None,
 ) -> ExecutionResult:
-    return Runner(environment=environment, workdir=workdir, dry_run=dry_run).run(plan)
+    return Runner(
+        environment=environment,
+        workdir=workdir,
+        dry_run=dry_run,
+        command_runner=command_runner,
+    ).run(plan)

@@ -287,6 +287,15 @@ vectors, each one stating what it is for — and `continuum release sign` runs
 it. The plan is the review surface: it is a value, so it can be printed,
 diffed, and asserted on without a Mac anywhere in sight.
 
+`continuum release run` is the whole integration for a declared target: it
+builds, signs, packages, verifies, and publishes one target by walking the
+generic release chain in `docs/release-core-contract.md`. It names no platform
+— the target's own configuration supplies the bundle, binaries, architectures,
+artifact formats, and signing identity — and `--dry-run` walks the same chain
+without executing a tool or writing a file, declaring the artifacts by name that
+the real run would record. The checkout is checked against the approved commit
+before anything is built.
+
 Only `apple` on `macos` with `swiftpm` is executable today. `ios`,
 `xcode-archive`, and `app-store` are valid configuration that no adapter builds
 yet, and asking for one fails with a refusal rather than a validation error, so

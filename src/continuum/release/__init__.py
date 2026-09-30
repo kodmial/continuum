@@ -28,7 +28,9 @@ already have one.
 
 from __future__ import annotations
 
+from . import archive
 from .android import AndroidAdapter, AndroidError
+from .apple import AppleAdapter, AppleError
 from .contract import (
     PORT_ATTRIBUTES,
     PORT_SURFACES,
@@ -127,7 +129,10 @@ from .version import (
 __all__ = [
     "AndroidAdapter",
     "AndroidError",
+    "AppleAdapter",
+    "AppleError",
     "Artifact",
+    "archive",
     "ArtifactManifest",
     "BLOCKED",
     "BUILD_AUTO",
