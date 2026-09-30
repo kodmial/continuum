@@ -667,6 +667,51 @@ class PublisherResultTests(ReleaseTestCase):
         self.assertEqual(len(self.adapter.verified), 1)
 
 
+class StatusReportingTests(ReleaseTestCase):
+    """A published release says so, whichever stage happened to finish last.
+
+    The chain's last stage is a downstream sync, and for a single-destination
+    repository there is nothing to sync. Reporting that as a no-op would say the
+    same thing about a release whose assets are public and about one that was
+    already published, which is the one distinction a caller cannot recover
+    from the summary.
+    """
+
+    def test_a_release_published_without_a_downstream_sync_is_released(self):
+        core = ReleaseCore(self.components(syncs=()))
+        outcome = core.execute(self.request())
+        self.assertEqual(outcome.status, RELEASED)
+        self.assertTrue(outcome.released)
+        self.assertFalse(outcome.no_op)
+
+    def test_still_records_why_the_sync_had_nothing_to_do(self):
+        """The status is "released"; the stage journal still says why it stopped.
+
+        A released outcome carries no `no_op_reason` — the release happened, so
+        there is no no-op to explain. The reason the walk ended early is still a
+        fact about the run, and it stays in the stage record where a reader of
+        the outcome looks for it.
+        """
+
+        core = ReleaseCore(self.components(syncs=()))
+        outcome = core.execute(self.request())
+        self.assertEqual(outcome.status, RELEASED)
+        self.assertTrue(outcome.published)
+        self.assertEqual(outcome.no_op_reason, "")
+        self.assertIn("downstream sync", outcome.outcome_for("sync").summary)
+
+    def test_a_release_with_no_destination_is_still_a_no_op(self):
+        core = ReleaseCore(support.components(adapter=self.adapter))
+        outcome = core.execute(self.request())
+        self.assertTrue(outcome.no_op)
+        self.assertFalse(outcome.published)
+
+    def test_a_plan_that_published_nothing_is_not_released(self):
+        outcome = self.core.plan(self.request())
+        self.assertEqual(outcome.status, PLANNED)
+        self.assertFalse(outcome.published)
+
+
 class VersionAgreementTests(ReleaseTestCase):
     def test_two_sources_that_agree_are_recorded_as_the_evidence_for_the_version(self):
         path = support.project_file(self.directory, VERSION)

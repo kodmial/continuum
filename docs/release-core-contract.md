@@ -13,6 +13,8 @@ It lives in `src/continuum/release/`:
 | `version.py` | how one release agrees on one version number |
 | `core.py` | the walk: the stage order, the failure policy, the resume policy |
 | `github.py` | the GitHub Release destination, as the reference implementation |
+| `github_api.py` | that destination over the real GitHub Releases API, behind the same port |
+| `provenance.py` | in-toto statements, and the checks that make one worth reading |
 
 The core holds no adapter, opens no client, and reads no file except through a
 component. That is what makes a plan possible for a release nobody has run, and
@@ -241,15 +243,90 @@ the contract is written against:
   `PortFailure` keeps its code; anything else becomes a retryable failure with
   the name of the call that failed.
 
+## The release plane
+
+The core is the contract; the release plane is the three jobs that run it.
+
+| job | token | what it does |
+| --- | --- | --- |
+| `release resolve` | none | reads the policy, writes the matrix every other job reads |
+| `release target` | none | builds, signs, and verifies one target; writes one fragment |
+| `release transaction` | the only one | merges every fragment, publishes once, reports |
+
+`.github/workflows/release.yml` is that split as a `workflow_call`-only reusable
+workflow. It has no trigger of its own on purpose: a workflow that both offers a
+release and triggers one cannot say which code was under review when the token
+was in scope.
+
+The privilege boundary is enforced by the wiring rather than by convention.
+`commands.build_components()` takes no publisher argument at all, so the job that
+runs a caller's build has nothing to construct a destination with even if the
+build asks for one; `commands.transaction_components()` is the only function that
+reads `GITHUB_TOKEN`, and it refuses without one. Both facts are asserted in
+`tests/test_release_plane_cli.py`.
+
+### The matrix is the only thing the jobs agree on
+
+`resolve` writes `runs/matrix.json` and every other job reads that file rather
+than re-deriving it. A build job that decided for itself what it was building
+would be a second source of truth, and a disagreement between it and the
+transaction would be discovered only at the merge.
+
+The matrix is also what decides where a build runs: each row carries the runner
+label from the static entrypoint table, and the workflow uses
+`runs-on: ${{ matrix.runner }}`. A caller cannot name a runner, so a release
+cannot be built somewhere the table never described.
+
+### Secrets are scoped by adapter
+
+`entrypoints.ENTRYPOINTS` names the secrets each adapter reads. The workflow
+declares exactly those names and passes each one to the build job only when the
+row's adapter is the one that reads it:
+
+```yaml
+CONTINUUM_APPLE_P12: ${{ matrix.adapter == 'apple' && secrets.CONTINUUM_APPLE_P12 || '' }}
+```
+
+The gate is visible in the workflow rather than assembled in a loop, and
+`.github/tests/test_workflow_hardening.py` asserts that the workflow's `secrets:`
+block and the entrypoint table name the same set — a key read by one and not
+passed by the other is a release that cannot be signed.
+
+### Declared targets are named, not hidden
+
+A target the policy lists but no adapter can build is refused at resolve time by
+default. `--include-declared` asks for the other reading: release the buildable
+targets and report the declared ones as not shipped. Then the gap appears in
+three places, because it has three readers:
+
+- the release body, which is where a consumer looks;
+- the job summary, which is where an operator looks;
+- the `declared` output, which is where a downstream workflow looks.
+
+A release smaller than its policy is defensible. A release that is smaller
+without saying so is not.
+
+### Two kinds of release event
+
+`tag-push` takes its identity from the tag that was pushed, and the version
+input is cross-checked against it — two independent sources that must agree.
+
+`workflow-dispatch` has no tag, because nobody pushed one. The version input is
+then the only source of the version, which is why the publishing job sits behind
+a required `environment` input: that approval is what stands in for the second
+source. `load_event()` refuses to synthesise `v<version>` for a dispatch, because
+a fabricated tag would reach the journal, the release body, and the publisher's
+identity without anything in the repository backing it.
+
 ### What is not expressible yet
 
 `.continuum.yml` still declares `adapter: apple` and still requires a target to
 name a binary or an `app_bundle`, because that schema is the MVP consumer
 contract and widening it is a consumer-facing change rather than a detail of
-this one. So the generic path is reached today by a consumer that builds its own
-`ReleaseRequest` (or, for the Apple targets that exist, by the plan adapters
-above). A repository that wants to declare a non-Apple target in configuration
-needs that enum widened; the core needs nothing.
+this one. Apple has a complete signing *plan* and no release *adapter*, so
+`release target` refuses a target naming it by name, with the reason rather than
+a stack trace. A repository that wants to declare a non-Apple target in
+configuration needs that enum widened; the core needs nothing.
 
 ## Permissions
 
@@ -285,6 +362,19 @@ destination configured is green, and neither has published anything.
   that is deliberately not a platform.
 - `tests/test_release_github.py` — the destination, against a repository that is
   a dict with the shape of the API.
+- `tests/test_release_github_api.py` — the same destination over the real API's
+  wire shape: classification, re-reads, and the immutable-release refusals.
+- `tests/test_release_provenance.py` — statements, and every way one can be made
+  to say something other than what it was built from.
+- `tests/test_release_entrypoints.py` — the static table, the matrix it produces,
+  and the anti-tamper checks a matrix has to survive between two jobs.
+- `tests/test_release_transaction.py` — fragments, the merge, target convergence,
+  and the failure taxonomy.
+- `tests/test_release_plane.py` — eligibility and the generated release notes.
+- `tests/test_release_plane_cli.py` — the three commands, as separate processes
+  sharing only files, which is how the workflow runs them.
+- `.github/tests/test_workflow_hardening.py` — the release workflow's own
+  boundaries: who holds a token, who runs a checkout, and what a secret reaches.
 
 `tests/release_core_support.py` holds the shared fixture: an adapter that writes
 a text file and counts every side effect, an in-memory release repository, and
