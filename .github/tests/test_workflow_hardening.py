@@ -106,6 +106,7 @@ AGENT_PLANE = (
 NOT_AGENT_PLANE = (
     "consumer-auto-merge.yml",
     "release.yml",
+    "publish-continuum.yml",
     "consumer-child-dispatcher.yml",
     "consumer-child-pr-review.yml",
     "consumer-child-review.yml",

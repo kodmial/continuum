@@ -17,6 +17,7 @@ from typing import Any, Dict, Optional, Sequence
 
 from . import config as config_module
 from . import pin as pin_module
+from . import publication as publication_module
 from .release.contract import ContractError
 from .release import adapters as release_adapters
 from .release import commands as release_commands
@@ -986,6 +987,165 @@ def cmd_release_pin_rollback(args: argparse.Namespace) -> int:
     return _pin_change(args, pin_module.rollback)
 
 
+def _read_publication_state(path: str) -> publication_module.ReleaseState:
+    """Read the observed repository state a publication decision needs.
+
+    The facts are observed by the caller -- it is the side that holds a token --
+    and read here, so the decision itself stays offline and testable. A file that
+    is missing or unreadable is an error rather than an absent state: "I could not
+    see whether immutability is enabled" must never read as "it is not".
+    """
+    try:
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"CONTINUUM_ERROR: cannot read the release state: {exc}")
+    if not isinstance(payload, dict):
+        raise SystemExit("CONTINUUM_ERROR: the release state must be a JSON object")
+    return publication_module.ReleaseState.from_payload(payload)
+
+
+def _read_lines(path: str, what: str) -> list:
+    """The non-blank lines of ``path``, in the order git wrote them."""
+    lines = []
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                value = line.strip()
+                if value and not value.startswith("#"):
+                    lines.append(value)
+    except OSError as exc:
+        raise SystemExit(f"CONTINUUM_ERROR: cannot read the {what} list: {exc}")
+    return lines
+
+
+def _read_changed_paths(args: argparse.Namespace) -> list:
+    """The changed paths a release compares against its predecessor."""
+    changed = list(args.changed or [])
+    if args.changed_from_file:
+        changed.extend(_read_lines(args.changed_from_file, "changed-path"))
+    return changed
+
+
+def _read_tags(args: argparse.Namespace) -> list:
+    """The tags the repository already has, so the predecessor can be cross-checked."""
+    tags = list(args.tags or [])
+    if args.tags_file:
+        tags.extend(_read_lines(args.tags_file, "tag"))
+    return tags
+
+
+def cmd_release_publish(args: argparse.Namespace) -> int:
+    """Validate one Continuum release, and decide whether it may be published.
+
+    Two modes, because two facts are not available at the same moment. Without
+    ``--state`` this is the validation a release candidate needs: it resolves the
+    whole graph from the release commit, hashes it, and writes the notes and the
+    manifest. With ``--state`` it also decides -- immutability, an existing tag,
+    and the ordering against published releases -- and ``--expect-digest`` is how
+    the deciding side proves it is publishing the bytes that were validated.
+
+    Nothing here contacts a consumer, and nothing here runs because a newer
+    release exists.
+    """
+    try:
+        candidate = publication_module.build_candidate(
+            tag=args.tag,
+            commit=args.commit,
+            root=args.root,
+            previous_root=args.previous_root or None,
+            previous_tag=args.previous_tag or "",
+            tags=_read_tags(args),
+            changed_paths=_read_changed_paths(args),
+            tree=args.tree or "",
+        )
+    except publication_module.PublicationRefusal as exc:
+        print(f"::error::{exc}")
+        if exc.remediation:
+            print(f"::error::{exc.remediation}")
+        _print_json({"ok": False, "reason": exc.reason, "error": str(exc)})
+        return EXIT_ERROR
+
+    if args.expect_digest and args.expect_digest != candidate.digest:
+        refusal = publication_module.PublicationRefusal(
+            "graph-digest-mismatch",
+            "the release graph now digests to {0}, but the validated candidate "
+            "digests to {1}. Publishing would ship a graph that was not "
+            "validated.".format(candidate.digest, args.expect_digest),
+            "Re-run the release from the same commit, and check out that commit "
+            "rather than a moving ref.",
+        )
+        print(f"::error::{refusal}")
+        _print_json({"ok": False, "reason": refusal.reason, "error": str(refusal)})
+        return EXIT_ERROR
+
+    decision = "candidate"
+    if args.state:
+        try:
+            decision = publication_module.decide(
+                candidate, _read_publication_state(args.state)
+            )
+        except publication_module.PublicationRefusal as exc:
+            print(f"::error::{exc}")
+            if exc.remediation:
+                print(f"::error::{exc.remediation}")
+            _print_json(
+                {
+                    "release": candidate.tag,
+                    "commit": candidate.commit,
+                    "ok": False,
+                    "reason": exc.reason,
+                    "error": str(exc),
+                }
+            )
+            return EXIT_ERROR
+
+    if args.out_dir:
+        try:
+            os.makedirs(args.out_dir, exist_ok=True)
+            notes_path = os.path.join(args.out_dir, publication_module.NOTES_NAME)
+            manifest_path = os.path.join(args.out_dir, publication_module.MANIFEST_NAME)
+            with open(notes_path, "w", encoding="utf-8") as handle:
+                handle.write(candidate.notes)
+            with open(manifest_path, "w", encoding="utf-8") as handle:
+                handle.write(publication_module.manifest_document(candidate, decision))
+        except OSError as exc:
+            raise SystemExit(f"CONTINUUM_ERROR: cannot write the release documents: {exc}")
+
+    _print_json(
+        {
+            "release": candidate.tag,
+            "commit": candidate.commit,
+            "entrypoint": candidate.graph.entrypoint,
+            "workflows": len(candidate.graph.workflows),
+            "files": len(candidate.graph.files),
+            "digest": candidate.digest,
+            "previous": candidate.previous,
+            "compatibility": candidate.compatibility.level,
+            "config_schema_changes": list(candidate.config_changes),
+            "decision": decision,
+            "ok": True,
+        }
+    )
+    if decision == "already-published":
+        print(
+            f"::notice::{candidate.tag} is already published at {candidate.commit}; "
+            "the immutable release is complete and nothing was written."
+        )
+    elif decision == "publish":
+        print(
+            f"::notice::{candidate.tag} is validated and may be published: "
+            f"{len(candidate.graph.workflows)} workflows, graph digest "
+            f"{candidate.digest}."
+        )
+    else:
+        print(
+            f"::notice::{candidate.tag} is a validated candidate; publication was "
+            "not decided because no repository state was supplied."
+        )
+    return EXIT_OK
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="continuum", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1343,6 +1503,97 @@ def build_parser() -> argparse.ArgumentParser:
             help="Write the ingress in place. Without it the result is printed.",
         )
         mover.set_defaults(func=handler)
+
+    release_publish = release_sub.add_parser(
+        "publish",
+        help="Validate a Continuum release, and decide whether it may be published.",
+        description=(
+            "A Continuum release is a commit that a consumer selects with one "
+            "reference. This command resolves the whole graph reachable from the "
+            "release entrypoint at that commit, hashes it, and derives the release "
+            "notes -- configuration schema and compatibility included -- from what "
+            "actually changed. With --state it also decides whether the release may "
+            "be published: GitHub immutable releases have to be enabled first, an "
+            "existing release tag is never moved, and a release is never published "
+            "behind a newer one. It writes nothing in any consumer repository."
+        ),
+    )
+    release_publish.add_argument(
+        "--tag",
+        required=True,
+        help="Exact SemVer release tag to publish, for example v0.1.0.",
+    )
+    release_publish.add_argument(
+        "--commit",
+        required=True,
+        help="Full 40-character commit SHA the release identifies.",
+    )
+    release_publish.add_argument(
+        "--root",
+        default=".",
+        help="Checkout holding the release commit.",
+    )
+    release_publish.add_argument(
+        "--previous-root",
+        default="",
+        help="Checkout of the previous release, for the compatibility comparison.",
+    )
+    release_publish.add_argument(
+        "--previous-tag",
+        default="",
+        help=(
+            "Tag of the release this one replaces, or nothing for a first release. "
+            "Cross-checked against --tags, so a stale comparison is refused."
+        ),
+    )
+    release_publish.add_argument(
+        "--tags",
+        action="append",
+        default=[],
+        metavar="TAG",
+        help="A tag the repository already has. Repeatable; prereleases are ignored.",
+    )
+    release_publish.add_argument(
+        "--tags-file",
+        default="",
+        help="File of tags the repository already has, one per line, as `git tag` writes it.",
+    )
+    release_publish.add_argument(
+        "--changed",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="A path changed since the previous release. Repeatable.",
+    )
+    release_publish.add_argument(
+        "--changed-from-file",
+        default="",
+        help="File of changed paths, one per line, as `git diff --name-only` writes it.",
+    )
+    release_publish.add_argument(
+        "--tree",
+        default="",
+        help="Git tree object of the release commit, recorded in the manifest.",
+    )
+    release_publish.add_argument(
+        "--state",
+        default="",
+        help=(
+            "JSON document of observed repository state -- immutable_releases, "
+            "published_releases, tags. Without it the release is only validated."
+        ),
+    )
+    release_publish.add_argument(
+        "--expect-digest",
+        default="",
+        help="Refuse unless the release graph digests to this value.",
+    )
+    release_publish.add_argument(
+        "--out-dir",
+        default="",
+        help="Write release-notes.md and release-manifest.json here.",
+    )
+    release_publish.set_defaults(func=cmd_release_publish)
 
     _add_release_plane(release, release_sub, add_common)
     return parser
