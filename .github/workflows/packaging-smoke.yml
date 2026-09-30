@@ -1,0 +1,626 @@
+name: Packaging smoke
+
+# Reusable macOS packaging lifecycle smoke for the real production channels
+# (Homebrew Cask via kodmial/nanodictate, MacPorts via
+# kodmial/macports-nanodictate, release binaries via GitHub Releases).
+# Never the official homebrew/cask or MacPorts ports trees.
+#
+# Three modes share one lifecycle implementation
+# (scripts/packaging-smoke/*-lifecycle.sh):
+#   1. candidate gate (blocking): exact CI-built bytes via temporary
+#      Cask/Portfile metadata; a red gate must block publication.
+#   2. immediate post-publish verification: real public install paths after
+#      the Release workflow and the tap/tree sync complete.
+#   3. daily canary (03:17 UTC) plus manual workflow_dispatch: latest stable
+#      release through the same real public channels.
+#
+# Lifecycle per channel: install -> verify files/CLI -> start (Homebrew
+# explicit start; MacPorts post-activate auto-start with NO prior manual
+# start) -> verify live launchd job + real process -> stop -> uninstall ->
+# verify package-owned cleanup. No microphone/TCC, STT, GUI, keyboard input,
+# exact localized text or fixed-sleep readiness.
+#
+# Homebrew and MacPorts legs run on separate fresh VMs. The candidate gate
+# pins an explicit GA baseline (macos-15 / macos-15-intel); the scheduled and
+# manual production canary additionally exercises macos-latest so upcoming
+# runner-image changes are detected before they become the baseline.
+
+on:
+  pull_request:
+    paths:
+      - 'Sources/**'
+      - 'Package.swift'
+      - 'packaging/**'
+      - 'scripts/**'
+      - 'Resources/**'
+      - 'config.example.toml'
+      - '.github/workflows/packaging-smoke.yml'
+      - '.github/workflows/release.yml'
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+    paths:
+      - 'Sources/**'
+      - 'Package.swift'
+      - 'packaging/**'
+      - 'scripts/**'
+      - 'Resources/**'
+      - 'config.example.toml'
+      - '.github/workflows/packaging-smoke.yml'
+      - '.github/workflows/release.yml'
+  workflow_run:
+    workflows:
+      - Release
+    types:
+      - completed
+  schedule:
+    # Non-round daily canary time (03:17 UTC), not the top of the hour.
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Which smoke mode to run'
+        required: false
+        type: choice
+        default: both
+        options:
+          - both
+          - candidate
+          - production
+      version:
+        description: 'Production version to verify (e.g. 0.1.7). Empty = latest stable release.'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  # Decide which modes run for this event. Documentation-only changes never
+  # reach this workflow (path filters above); the candidate gate is required
+  # for deliverable-affecting PRs and main pushes.
+  resolve:
+    name: Resolve smoke modes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run_candidate: ${{ steps.modes.outputs.run_candidate }}
+      run_production: ${{ steps.modes.outputs.run_production }}
+    steps:
+      - name: Compute modes
+        id: modes
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const event = context.eventName;
+            let runCandidate = 'false';
+            let runProduction = 'false';
+            if (event === 'pull_request' || event === 'push') {
+              runCandidate = 'true';
+            } else if (event === 'schedule') {
+              runProduction = 'true';
+            } else if (event === 'workflow_run') {
+              const run = context.payload.workflow_run;
+              if (run && run.conclusion === 'success' && run.event !== 'workflow_dispatch') {
+                runProduction = 'true';
+                core.notice('Release workflow succeeded; running post-publish production verification.');
+              } else {
+                core.notice('Release run conclusion ' + (run && run.conclusion) + '; skipping production smoke.');
+              }
+              // A dry-run manual Release must not page the production channel.
+              if (run && run.event === 'workflow_dispatch') {
+                core.notice('Release was a manual dispatch; skipping production smoke.');
+              }
+            } else if (event === 'workflow_dispatch') {
+              const mode = (context.payload.inputs && context.payload.inputs.mode) || 'both';
+              if (mode === 'candidate' || mode === 'both') runCandidate = 'true';
+              if (mode === 'production' || mode === 'both') runProduction = 'true';
+            }
+            core.setOutput('run_candidate', runCandidate);
+            core.setOutput('run_production', runProduction);
+            core.notice('modes: candidate=' + runCandidate + ' production=' + runProduction + ' event=' + event);
+
+  # Build/sign the final macOS artifacts ONCE per architecture and pass those
+  # exact bytes to the candidate smoke jobs. Smoke jobs never rebuild.
+  candidate-build:
+    name: Candidate build (${{ matrix.arch }})
+    needs: resolve
+    if: needs.resolve.outputs.run_candidate == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+            arch: x86_64
+            swift: '6.1'
+          - os: macos-15
+            arch: arm64
+            swift: '6.1'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Install Swift
+        uses: swift-actions/setup-swift@7ca6abe6b3b0e8b5421b88be48feee39cbf52c6a
+        with:
+          swift-version: ${{ matrix.swift }}
+
+      - name: Build release binaries
+        run: |
+          swift build -c release --product NanoDictateAgent \
+            -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist \
+            -Xlinker packaging/Info.NanoDictateAgent.plist
+          swift build -c release --product nanodictate \
+            -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist \
+            -Xlinker packaging/Info.nanodictate.plist
+
+      - name: Code-sign binaries and assemble the .app bundle
+        env:
+          # Never expose the production signing credential to pull-request
+          # candidate jobs. PRs still exercise the full package lifecycle with
+          # an ad-hoc signature; trusted push/manual candidate gates use the
+          # production identity, and those exact tested bytes are what the
+          # Release workflow publishes.
+          P12_B64: ${{ github.event_name != 'pull_request' && secrets.NANODICTATE_SIGNING_P12 || '' }}
+          P12_PASS: ${{ github.event_name != 'pull_request' && secrets.NANODICTATE_SIGNING_PASSWORD || '' }}
+        run: |
+          set -euo pipefail
+          VERSION="$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' Sources/NanoDictateCore/Version.swift)"
+          if [ -n "${P12_B64:-}" ] && [ -n "${P12_PASS:-}" ]; then
+            KC="/tmp/nanodictate-signing.keychain"
+            KC_PASS="nanodictate"
+            security create-keychain -p "$KC_PASS" "$KC"
+            security set-keychain-settings -lut 21600 "$KC"
+            security list-keychains -d user -s "$KC"
+            security default-keychain -s "$KC"
+            security unlock-keychain -p "$KC_PASS" "$KC"
+            echo "$P12_B64" | base64 --decode > /tmp/nanodictate-ci.p12
+            security import /tmp/nanodictate-ci.p12 -k "$KC" -P "$P12_PASS" -T /usr/bin/codesign
+            security set-key-partition-list -S apple-tool:,apple: -s -k "$KC_PASS" "$KC"
+            SIGN_ARGS=(--force --sign "NanoDictate CI Signing" --keychain "$KC")
+            rm -f /tmp/nanodictate-ci.p12
+          else
+            echo "::warning::No CI signing secrets; ad-hoc signature for the candidate smoke only."
+            SIGN_ARGS=(--force -s -)
+            KC=""
+          fi
+          codesign "${SIGN_ARGS[@]}" --identifier com.nanodictate.agent --options runtime \
+            --entitlements Resources/com.nanodictate.agent.entitlements \
+            .build/release/NanoDictateAgent
+          codesign "${SIGN_ARGS[@]}" --identifier com.nanodictate.ctl --options runtime \
+            --entitlements Resources/com.nanodictate.ctl.entitlements \
+            .build/release/nanodictate
+          APP=".build/release/NanoDictate.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp .build/release/NanoDictateAgent .build/release/nanodictate "$APP/Contents/MacOS/"
+          cp packaging/Info.NanoDictateApp.plist "$APP/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$APP/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist"
+          cp config.example.toml "$APP/Contents/Resources/"
+          cp Resources/com.nanodictate.agent.entitlements \
+             Resources/com.nanodictate.ctl.entitlements \
+             Resources/nanodictate-agent.plist.template \
+             "$APP/Contents/Resources/"
+          if [ -n "$KC" ]; then
+            codesign "${SIGN_ARGS[@]}" --identifier com.nanodictate.agent --options runtime \
+              --entitlements "$APP/Contents/Resources/com.nanodictate.agent.entitlements" "$APP"
+            security delete-keychain "$KC"
+          else
+            codesign "${SIGN_ARGS[@]}" --identifier com.nanodictate.agent --options runtime \
+              --entitlements "$APP/Contents/Resources/com.nanodictate.agent.entitlements" "$APP"
+          fi
+          codesign --verify --strict .build/release/NanoDictateAgent
+          codesign --verify --strict .build/release/nanodictate
+          codesign --verify --strict --deep .build/release/NanoDictate.app
+
+      - name: Package candidate tarball and app-bundle zip
+        run: |
+          set -euo pipefail
+          VERSION="$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' Sources/NanoDictateCore/Version.swift)"
+          DIST="candidate-dist"
+          mkdir -p "$DIST"
+          cp .build/release/NanoDictateAgent .build/release/nanodictate config.example.toml "$DIST"/
+          cp -R Resources "$DIST"/
+          cp -R .build/release/NanoDictate.app "$DIST"/
+
+          # These archives are release-candidate artifacts, not throwaway test
+          # bundles. Make them deterministic so a retry of the same immutable
+          # commit produces the same bytes and therefore the same checksums.
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          TAR_MTIME="$(TZ=UTC date -u -r "$SOURCE_DATE_EPOCH" +%y%m%d%H%M.%S)"
+          find "$DIST" ! -type l -exec env TZ=UTC touch -m -t "$TAR_MTIME" {} +
+
+          ARCHIVE="$DIST/nanodictate-$VERSION-macos-${{ matrix.arch }}.tar.gz"
+          (cd "$DIST" && find . -type f ! -path '*/NanoDictate.app/*' ! -name 'nanodictate-*.tar.gz' ! -name 'nanodictate-*.zip' | sed 's|^\./||' | sort > /tmp/nanodictate-members.txt)
+          COPYFILE_DISABLE=1 tar -c \
+            --uid 0 --gid 0 --numeric-owner \
+            --no-xattrs --no-acls --no-fflags --no-mac-metadata \
+            -C "$DIST" -T /tmp/nanodictate-members.txt \
+            | gzip -n > "$ARCHIVE"
+
+          ZIP_ARCHIVE="$DIST/nanodictate-$VERSION-macos-${{ matrix.arch }}.zip"
+          ZIP_PATH="$(pwd)/$ZIP_ARCHIVE"
+          (cd "$DIST" && find . -type f ! -name 'nanodictate-*.tar.gz' ! -name 'nanodictate-*.zip' | sed 's|^\./||' | sort > /tmp/nanodictate-zip-members.txt)
+          (cd "$DIST" && TZ=UTC SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" COPYFILE_DISABLE=1 zip -Xr -y -q "$ZIP_PATH" -@ < /tmp/nanodictate-zip-members.txt)
+          shasum -a 256 "$ARCHIVE" "$ZIP_ARCHIVE"
+          ls -l "$DIST"/
+
+      - name: Upload candidate artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: candidate-dist-${{ matrix.arch }}
+          path: candidate-dist/nanodictate-*.tar.gz
+          if-no-files-found: error
+      - name: Upload candidate zips
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: candidate-zip-${{ matrix.arch }}
+          path: candidate-dist/nanodictate-*.zip
+          if-no-files-found: error
+
+  # Candidate Homebrew leg: temporary Cask from the production Cask logic with
+  # only version/source/SHA adapted to the exact candidate bytes.
+  candidate-homebrew:
+    name: Candidate Homebrew (${{ matrix.os }})
+    needs: [resolve, candidate-build]
+    if: needs.resolve.outputs.run_candidate == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Download exact candidate bytes (both architectures)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: candidate-*
+          path: candidate-dist
+          merge-multiple: true
+
+      - name: Derive candidate Cask and run the Homebrew lifecycle
+        run: |
+          set -euo pipefail
+          chmod +x scripts/packaging-smoke/*.sh
+          VERSION="$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' Sources/NanoDictateCore/Version.swift)"
+          echo "Candidate version: $VERSION"
+          ls -l candidate-dist/
+          bash scripts/packaging-smoke/make-candidate.sh \
+            --version "$VERSION" --dist-dir candidate-dist --out-dir candidate-out
+          bash scripts/packaging-smoke/homebrew-lifecycle.sh \
+            --mode candidate --expected-version "$VERSION" \
+            --cask-file "$PWD/candidate-out/candidate-cask.rb" \
+            --result-dir smoke-homebrew
+
+      - name: Upload smoke results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: smoke-homebrew-${{ matrix.os }}-${{ github.run_attempt }}
+          path: smoke-homebrew/
+          if-no-files-found: warn
+
+  # Candidate MacPorts leg: temporary local ports tree with the production
+  # Portfile logic adapted only to the exact candidate bytes.
+  candidate-macports:
+    name: Candidate MacPorts (${{ matrix.os }})
+    needs: [resolve, candidate-build]
+    if: needs.resolve.outputs.run_candidate == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Download exact candidate bytes (both architectures)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: candidate-*
+          path: candidate-dist
+          merge-multiple: true
+
+      - name: Derive candidate Portfile and run the MacPorts lifecycle
+        run: |
+          set -euo pipefail
+          chmod +x scripts/packaging-smoke/*.sh
+          VERSION="$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' Sources/NanoDictateCore/Version.swift)"
+          echo "Candidate version: $VERSION"
+          ls -l candidate-dist/
+          bash scripts/packaging-smoke/make-candidate.sh \
+            --version "$VERSION" --dist-dir candidate-dist --out-dir candidate-out
+          bash scripts/packaging-smoke/macports-lifecycle.sh \
+            --mode candidate --expected-version "$VERSION" \
+            --ports-dir "$PWD/candidate-out/candidate-ports" \
+            --dist-dir "$PWD/candidate-dist" \
+            --result-dir smoke-macports
+
+      - name: Upload smoke results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: smoke-macports-${{ matrix.os }}-${{ github.run_attempt }}
+          path: smoke-macports/
+          if-no-files-found: warn
+
+  # Production Homebrew leg: the real public user path, never a local Cask.
+  production-homebrew:
+    name: Production Homebrew (${{ matrix.os }})
+    needs: resolve
+    if: needs.resolve.outputs.run_production == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel, macos-latest]
+    steps:
+      - name: Checkout (smoke scripts only)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Run the production Homebrew lifecycle
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          chmod +x scripts/packaging-smoke/*.sh
+          if [ -n "${INPUT_VERSION:-}" ]; then
+            VERSION="${INPUT_VERSION#v}"
+          else
+            VERSION="$(gh release view --json tagName --jq '.tagName' | sed 's/^v//')"
+          fi
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not resolve the latest stable release version."
+            exit 1
+          fi
+          echo "Production Homebrew verification for v$VERSION"
+          bash scripts/packaging-smoke/homebrew-lifecycle.sh \
+            --mode production --expected-version "$VERSION" \
+            --result-dir smoke-homebrew
+
+      - name: Upload smoke results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: smoke-prod-homebrew-${{ matrix.os }}-${{ github.run_attempt }}
+          path: smoke-homebrew/
+          if-no-files-found: warn
+
+  # Production MacPorts leg: the documented installer path covering the real
+  # kodmial/macports-nanodictate tree, pinned revision, sources.conf
+  # integration, portindex, `port install` and post-activate behavior.
+  production-macports:
+    name: Production MacPorts (${{ matrix.os }})
+    needs: resolve
+    if: needs.resolve.outputs.run_production == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel, macos-latest]
+    steps:
+      - name: Checkout (smoke scripts only)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Run the production MacPorts lifecycle
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          chmod +x scripts/packaging-smoke/*.sh
+          if [ -n "${INPUT_VERSION:-}" ]; then
+            VERSION="${INPUT_VERSION#v}"
+          else
+            VERSION="$(gh release view --json tagName --jq '.tagName' | sed 's/^v//')"
+          fi
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not resolve the latest stable release version."
+            exit 1
+          fi
+          echo "Production MacPorts verification for v$VERSION"
+          bash scripts/packaging-smoke/macports-lifecycle.sh \
+            --mode production --expected-version "$VERSION" \
+            --result-dir smoke-macports
+
+      - name: Upload smoke results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: smoke-prod-macports-${{ matrix.os }}-${{ github.run_attempt }}
+          path: smoke-macports/
+          if-no-files-found: warn
+
+  # A Mode 2 / Mode 3 failure must not stay visible only as a red run: create
+  # or update one P0 incident issue (existing priority:p0 label, deterministic
+  # marker, no issue storms), or close it with a recovery comment once the
+  # real public-channel smoke is fully green again.
+  production-incident:
+    name: Production incident report
+    needs: [resolve, production-homebrew, production-macports]
+    if: always() && needs.resolve.outputs.run_production == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Download production smoke results
+        if: always()
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: smoke-prod-*
+          path: smoke-all
+
+      - name: Create, update or close the P0 incident issue
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const marker = '<!-- nanodictate-production-packaging-smoke-incident -->';
+            const title = 'Production packaging smoke failure';
+            const runUrl = context.serverUrl + '/' + owner + '/' + repo + '/actions/runs/' + context.runId;
+
+            const hb = '${{ needs.production-homebrew.result }}';
+            const mp = '${{ needs.production-macports.result }}';
+            const green = (r) => r === 'success';
+            const allGreen = green(hb) && green(mp);
+
+            function readDirTree(dir, out) {
+              if (!fs.existsSync(dir)) return;
+              for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+                const full = path.join(dir, entry.name);
+                if (entry.isDirectory()) readDirTree(full, out);
+                else if (entry.isFile()) out.push(full);
+              }
+            }
+            const files = [];
+            readDirTree('smoke-all', files);
+            const readFirst = (suffix, limit) => {
+              const hits = files.filter((f) => f.endsWith(suffix));
+              if (hits.length === 0) return 'n/a';
+              hits.sort();
+              const parts = hits.map((f) => {
+                let body = '';
+                try { body = fs.readFileSync(f, 'utf8'); } catch (e) { body = '<unreadable>'; }
+                if (body.length > limit) body = body.slice(0, limit) + '\n...[truncated]...';
+                return '--- ' + f + ' ---\n' + body;
+              });
+              return parts.join('\n\n').slice(0, 8000);
+            };
+            const readJson = (suffix) => {
+              const hits = files.filter((f) => f.endsWith(suffix)).sort();
+              return hits.map((f) => {
+                try { return f + ': ' + fs.readFileSync(f, 'utf8').trim(); }
+                catch (e) { return f + ': <unreadable>'; }
+              }).join('\n') || 'n/a';
+            };
+
+            const metadata = readJson('smoke-metadata.json');
+            const summaries = readFirst('failure-summary.md', 3000);
+            const versions = readJson('nanodictate-version.txt');
+            const launchctl = readFirst('launchctl-print.txt', 2000);
+            const diagnostics = readFirst('diagnostics.log', 6000);
+
+            async function findOpenIncident() {
+              const issues = await github.paginate(github.rest.issues.listForRepo, {
+                owner, repo, state: 'open', per_page: 100,
+              });
+              for (const issue of issues) {
+                if (issue.pull_request) continue;
+                if (issue.title !== title) continue;
+                let body = issue.body || '';
+                if (body.includes(marker)) return issue;
+                // Fall back to a comment scan for issues created before the
+                // marker reached the body.
+                const comments = await github.paginate(github.rest.issues.listComments, {
+                  owner, repo, issue_number: issue.number, per_page: 100,
+                });
+                if (comments.some((c) => (c.body || '').includes(marker))) return issue;
+              }
+              return null;
+            }
+
+            const mode = context.eventName === 'schedule'
+              ? 'scheduled canary'
+              : (context.eventName === 'workflow_run' ? 'immediate post-publish' : 'manual production');
+            const facts = [
+              marker,
+              '',
+              'Failing mode: ' + mode + ' (event: ' + context.eventName + ').',
+              'Homebrew legs: ' + hb + '; MacPorts legs: ' + mp + '.',
+              'Failed workflow run: ' + runUrl + ' (attempt ' + (process.env.GITHUB_RUN_ATTEMPT || '1') + ').',
+              '',
+              'Per-leg metadata (mode/channel/expected_version/result/failed_phase/arch/macos):',
+              '```',
+              metadata,
+              '```',
+              '',
+              'Failure summaries:',
+              summaries,
+              '',
+              '`nanodictate --version` results when available:',
+              '```',
+              versions,
+              '```',
+              '',
+              '`launchctl print` excerpts when available:',
+              '```',
+              launchctl,
+              '```',
+              '',
+              'Bounded diagnostics (package info, receipts, codesign, xattr, log tail, tap/tree revisions):',
+              '```',
+              diagnostics,
+              '```',
+              '',
+              'Root cause: NOT established from this evidence alone — the failed invariant above is the fact to investigate. State an identified root cause only when the collected evidence supports it.',
+              'Retry: attempt ' + (process.env.GITHUB_RUN_ATTEMPT || '1') + '; whether the failure reproduced on retry is visible in the linked run history.',
+              '',
+              'Required assignee/scheduler steps:',
+              '1. Investigate the failure and determine the root cause.',
+              '2. Fix NanoDictate packaging/distribution/lifecycle code or automation as appropriate.',
+              '3. Add or adjust regression coverage when needed.',
+              '4. Rerun the affected production-channel smoke test.',
+              '5. Consider the incident resolved only after the real public-channel smoke is green.',
+            ].join('\n');
+
+            const existing = await findOpenIncident();
+            if (!allGreen) {
+              if (existing) {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: existing.number,
+                  body: 'Production smoke still failing (' + mode + ').\n\n' + facts,
+                });
+                core.notice('Updated existing incident #' + existing.number + '.');
+              } else {
+                const created = await github.rest.issues.create({
+                  owner, repo, title,
+                  body: '# Production packaging smoke failure\n\n' + facts,
+                  labels: ['priority:p0'],
+                });
+                core.notice('Created incident #' + created.data.number + '.');
+              }
+              core.setFailed('Production packaging smoke failed (homebrew=' + hb + ' macports=' + mp + '). See the P0 incident issue.');
+              return;
+            }
+
+            if (existing) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: existing.number,
+                body: 'Recovery: the production-channel smoke is fully green again (' + mode + ').\n\nSuccessful run: ' + runUrl,
+              });
+              await github.rest.issues.update({
+                owner, repo, issue_number: existing.number, state: 'closed', state_reason: 'completed',
+              });
+              core.notice('Closed recovered incident #' + existing.number + '.');
+            } else {
+              core.notice('Production smoke green; no open incident to close.');
+            }
