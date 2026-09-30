@@ -67,6 +67,10 @@ on:
         type: string
         required: false
         default: continuum-release.yml
+    secrets:
+      continuum_token:
+        description: "Optional consumer-owned write token used when merge fan-out must trigger downstream workflows"
+        required: false
 
 permissions:
   actions: write
@@ -134,7 +138,7 @@ jobs:
           SCHEDULER_WORKFLOW: ${{ inputs.scheduler_workflow }}
           RELEASE_WORKFLOW: ${{ inputs.release_workflow }}
         with:
-          github-token: ${{ github.token }}
+          github-token: ${{ secrets.continuum_token || github.token }}
           script: |
             const {owner, repo} = context.repo;
             const reviewEnabled = process.env.REVIEW_ENABLED === 'true';
