@@ -177,6 +177,28 @@ is a second thing that can disagree with the file you just committed.
 `tests/test_fixture_consumer.py` runs the engine against that repository's own
 configuration to prove both opt-in and opt-out behave as documented.
 
+### Migrating an existing repository
+
+A repository that already runs its own workflows is not adopted by copying
+anything. It is *cut over*: one commit that installs pinned callers and retires
+the independent implementations behind them, installed and retired together so
+there is no moment when two implementations of one writer are live.
+
+The controller is `.github/workflows/continuum-migrate.yml`, and it is the only
+supported way to do this. It renders the whole change as a reviewable artifact
+before writing anything, takes the cutover gate's verdict bound to that exact
+head and that exact set of file changes, waits for the checks on the head it
+published rather than on a default branch that was green yesterday, merges, and
+writes the revision to return to into the same commit. A single
+`workflow_dispatch` undoes it.
+
+Its phases are explicit: Phase A replaces the scheduler, agent, repair, review
+and merge writers and leaves release alone, and `phase-b` is refused outright
+rather than half-built.
+
+See [docs/migration-controller.md](docs/migration-controller.md) for the stages,
+the refusals, and the trust boundary.
+
 
 ## Parent/child delegated execution
 
@@ -502,7 +524,10 @@ define scheduling priority.
 The first phase creates feature flags and security boundaries. The next phase
 performs an evidence-based industry benchmark. Reusable workflows, authentication
 hardening, reliability, CodeRabbit, release adapters, fault injection,
-observability, versioning, and migration tooling follow from that baseline.
+observability, versioning, and migration tooling follow from that baseline. The
+migration controller in [docs/migration-controller.md](docs/migration-controller.md)
+implements the Phase A cutover; Phase B waits on the release-owner decision
+(#21, #22).
 
 ## Reference snapshot
 

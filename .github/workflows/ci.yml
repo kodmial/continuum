@@ -53,7 +53,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          allowed='^(auto-merge|ci|issue-scheduler|review-gate|review-queue|opencode|opencode-repair|continuum-shadow|consumer-scheduler|consumer-opencode|consumer-repair|consumer-auto-merge|consumer-review-gate|consumer-child-dispatcher|consumer-child-worker|consumer-child-review|consumer-child-pr-review|release-bun-binary)\.ya?ml$'
+          allowed='^(auto-merge|ci|issue-scheduler|review-gate|review-queue|opencode|opencode-repair|continuum-shadow|continuum-migrate|consumer-scheduler|consumer-opencode|consumer-repair|consumer-auto-merge|consumer-review-gate|consumer-child-dispatcher|consumer-child-worker|consumer-child-review|consumer-child-pr-review|release-bun-binary)\.ya?ml$'
           bad=0
           while IFS= read -r file; do
             base="$(basename "$file")"

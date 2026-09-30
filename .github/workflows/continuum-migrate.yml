@@ -1,0 +1,433 @@
+name: Continuum migrate
+
+# The trusted migration controller for #28: it reads a repository, decides
+# whether that repository may be cut over to the Continuum control plane,
+# renders the atomic change, and -- for `apply` and `rollback` -- publishes and
+# merges it.
+#
+# Three rules, and each of them is a job boundary rather than a convention.
+#
+#   * **Reading and writing are different jobs with different tokens.** `plan`
+#     holds `contents: read` and can only describe a change. `act` holds the
+#     write scopes and the PAT, and cannot start until `plan` has proved the
+#     change is legal. A mis-dispatched `inventory` costs an API call; a
+#     mis-dispatched `apply` costs a repository, so the read that decides is not
+#     the same process as the write that acts.
+#
+#   * **Nobody presses the button on a stranger's behalf.** `authorize` resolves
+#     the `workflow_dispatch` sender through the trust policy and holds no
+#     credentials at all. A manual trigger is not reviewed the way a pull request
+#     is, so the credential's own identity is checked again inside the job that
+#     has it: a trusted person is not a licence for an untrusted token.
+#
+#   * **The verdict is bound to the change.** `apply` does not take "yes,
+#     migrate" on trust. The cutover gate's document has to name this head, this
+#     phase, and exactly these file changes, or the run stops. An authorization
+#     that survives a re-plan is an authorization for a cutover nobody judged.
+#
+# The engine is Continuum itself, always at the default branch: this workflow
+# migrates the repository it runs in, so the code that decides and the code that
+# acts are the same commit the repository has already agreed to run.
+#
+# `plan` runs for every mode including `rollback`. A rollback is a change set
+# too, and reading the repository first is what lets the controller notice that
+# the thing it is about to undo has been overtaken before it undoes anything.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: inventory, preflight, plan, apply, or rollback
+        type: choice
+        default: plan
+        options: [inventory, preflight, plan, apply, rollback]
+      phase:
+        description: the cutover phase; phase-b is refused until a generated release caller exists
+        type: choice
+        default: phase-a
+        options: [phase-a, phase-b]
+      candidate:
+        description: >-
+          the Continuum commit SHA the installed callers will pin. Leave empty
+          for this repository's default branch head. Never a branch name: a
+          branch means the consumer runs whatever it points at when each
+          workflow starts.
+        type: string
+        default: ""
+      ledger:
+        description: >-
+          the reviewed parity ledger as a JSON document, naming a writer role for
+          every workflow in the repository. Required for everything but
+          `inventory`.
+        type: string
+        default: ""
+      gate:
+        description: >-
+          apply only. The cutover gate's decision document as JSON, judged with
+          `--change-set` against the change set the `plan` run published.
+        type: string
+        default: ""
+      record:
+        description: rollback only. The cutover record the cutover itself wrote, as JSON.
+        type: string
+        default: ""
+      required_ci:
+        description: >-
+          comma-separated blocking check names, as the consumer's own config
+          declares them
+        type: string
+        default: ""
+      additional_gates:
+        description: comma-separated advisory gate names
+        type: string
+        default: ""
+      release_workflow:
+        description: the product release workflow path, if the consumer has one
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  # A cutover is a single-writer operation on the default branch. Two runs
+  # planning against two heads and both publishing is the race the expected-tip
+  # check refuses -- better to refuse it at the queue, where the reason can be
+  # said out loud.
+  group: continuum-migrate-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  # ------------------------------------------------------------------------ #
+  # Who asked for this, and are they allowed to ask.
+  # ------------------------------------------------------------------------ #
+  authorize:
+    name: Authorize the dispatch
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    permissions: {}
+
+    steps:
+      - name: Checkout trusted policy
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Refuse a dispatch from an untrusted sender
+        env:
+          AUTOMATION_TRUSTED_ACTORS: ${{ vars.AUTOMATION_TRUSTED_ACTORS }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/trust_policy.py check-dispatcher
+
+  # ------------------------------------------------------------------------ #
+  # Read the repository, decide whether it may be cut over, render the change.
+  # ------------------------------------------------------------------------ #
+  plan:
+    name: Read, decide, render
+    needs: authorize
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    permissions:
+      contents: read
+      issues: read
+      actions: read
+      checks: read
+      statuses: read
+
+    outputs:
+      candidate: ${{ steps.resolve.outputs.candidate }}
+
+    steps:
+      - name: Checkout the engine
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # The default branch, not the dispatch ref: a manual trigger runs
+          # whatever this file says on main, so the code that decides the cutover
+          # is the code the repository has already agreed to run.
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve the candidate
+        id: resolve
+        env:
+          CANDIDATE_INPUT: ${{ github.event.inputs.candidate }}
+        run: |
+          set -euo pipefail
+          # A pin is a promise about what the consumer will run tomorrow, so it
+          # is resolved against this repository's own history: the commit has to
+          # exist here and the default branch has to contain it. Anything else is
+          # a fork, a dangling ref, or a typo, and a consumer that pinned one of
+          # those would be running code this repository has never seen.
+          head="$(git rev-parse HEAD)"
+          candidate="${CANDIDATE_INPUT:-$head}"
+          if ! printf '%s' "$candidate" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::the candidate must be a full 40-character commit SHA, got '$candidate'"
+            exit 1
+          fi
+          if ! git cat-file -e "${candidate}^{commit}" 2>/dev/null; then
+            echo "::error::$candidate is not a commit in this repository"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$candidate" "$head"; then
+            echo "::error::$candidate is not on the default branch; a consumer would be pinning a commit this repository cannot vouch for"
+            exit 1
+          fi
+          echo "candidate=$candidate" >>"$GITHUB_OUTPUT"
+          echo "pinning $candidate (default branch head is $head)"
+
+      - name: Materialise the ledger
+        env:
+          LEDGER_INPUT: ${{ github.event.inputs.ledger }}
+          MODE: ${{ github.event.inputs.mode }}
+        run: |
+          set -euo pipefail
+          mkdir -p migration-in
+          if [ -n "$LEDGER_INPUT" ]; then
+            printf '%s' "$LEDGER_INPUT" >migration-in/ledger.json
+            python3 -c "import json,sys; json.load(open(sys.argv[1]))" migration-in/ledger.json
+          fi
+          if [ "$MODE" != inventory ] && [ ! -s migration-in/ledger.json ]; then
+            # An absent ledger is not a default. It is the absence of the
+            # document writer roles come from, and a plan built without it would
+            # be guessing which of two files it is about to retire.
+            echo "::error::the ledger input is required for $MODE"
+            exit 1
+          fi
+
+      - name: Read the repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODE: ${{ github.event.inputs.mode }}
+        run: |
+          set -euo pipefail
+          PYTHONPATH=src python3 -m continuum.migrate.cli inventory \
+            --repo "$GITHUB_REPOSITORY" \
+            --ledger migration-in/ledger.json \
+            --out migration-out
+          echo "read $(python3 -c 'import json;print(len(json.load(open("migration-out/inventory.json"))["workflows"]))') workflow(s)"
+
+      - name: Decide whether the repository may be cut over
+        id: preflight
+        if: github.event.inputs.mode != 'inventory'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE: ${{ steps.resolve.outputs.candidate }}
+          PHASE_INPUT: ${{ github.event.inputs.phase }}
+        run: |
+          set -euo pipefail
+          # No `--inventory`: the preflight has to judge the repository as it is
+          # now, not the document the step above happened to write.
+          set +e
+          PYTHONPATH=src python3 -m continuum.migrate.cli preflight \
+            --repo "$GITHUB_REPOSITORY" \
+            --ledger migration-in/ledger.json \
+            --candidate "$CANDIDATE" \
+            --phase "$PHASE_INPUT" \
+            --out migration-out
+          code=$?
+          set -e
+          # NOT_READY is an answer, not a crash. The document says why, so the run
+          # reports every reason and stops -- rather than failing on a bare exit
+          # code an operator has to go and look up.
+          python3 - <<'PY'
+          import json, pathlib, sys
+          document = json.loads(pathlib.Path("migration-out/preflight.json").read_text())
+          if document.get("status") == "ready":
+              print("preflight: ready")
+              sys.exit(0)
+          for reason in document.get("reasons") or []:
+              print("::error::preflight [{}] {}".format(reason.get("code"), reason.get("message")))
+          sys.exit(1)
+          PY
+
+      - name: Render the atomic change
+        if: >-
+          github.event.inputs.mode == 'plan' || github.event.inputs.mode == 'apply'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE: ${{ steps.resolve.outputs.candidate }}
+          PHASE_INPUT: ${{ github.event.inputs.phase }}
+          REQUIRED_CI_INPUT: ${{ github.event.inputs.required_ci }}
+          ADDITIONAL_GATES_INPUT: ${{ github.event.inputs.additional_gates }}
+          RELEASE_WORKFLOW_INPUT: ${{ github.event.inputs.release_workflow }}
+        run: |
+          set -euo pipefail
+          PYTHONPATH=src python3 -m continuum.migrate.cli plan \
+            --repo "$GITHUB_REPOSITORY" \
+            --ledger migration-in/ledger.json \
+            --candidate "$CANDIDATE" \
+            --phase "$PHASE_INPUT" \
+            --required-ci "$REQUIRED_CI_INPUT" \
+            --additional-gates "$ADDITIONAL_GATES_INPUT" \
+            --release-workflow "$RELEASE_WORKFLOW_INPUT" \
+            --out migration-out
+
+      - name: Show what the cutover would do
+        if: >-
+          github.event.inputs.mode == 'plan' || github.event.inputs.mode == 'apply'
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, pathlib
+          plan = json.loads(pathlib.Path("migration-out/plan.json").read_text())
+          for edit in plan.get("edits", []):
+              print("{:9} {} [{}]".format(edit["action"], edit["path"], edit.get("writer", "")))
+          for path, writer in plan.get("retained", []):
+              print("keep      {} [{}]".format(path, writer))
+          PY
+
+      - name: Upload the reading, the verdict, and the change set
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: migration-plan-${{ github.run_id }}
+          path: |
+            migration-out/
+            migration-in/
+          if-no-files-found: warn
+          retention-days: 30
+
+  # ------------------------------------------------------------------------ #
+  # Act, with the credential, on the change the plan job already proved legal.
+  # ------------------------------------------------------------------------ #
+  act:
+    name: Apply or roll back
+    needs: [authorize, plan]
+    if: >-
+      github.event.inputs.mode == 'apply' || github.event.inputs.mode == 'rollback'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+
+    steps:
+      - name: Refuse anything but apply or rollback
+        env:
+          MODE: ${{ github.event.inputs.mode }}
+        run: |
+          set -euo pipefail
+          case "$MODE" in
+            apply | rollback) echo "$MODE" ;;
+            *) echo "::error::this is the write path; mode '$MODE' has no business here"; exit 1 ;;
+          esac
+
+      - name: Checkout the engine
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Refuse an untrusted credential
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+        run: |
+          set -euo pipefail
+          # Checked separately from the dispatcher on purpose. A trusted
+          # maintainer pressing the button does not make a PAT belonging to
+          # somebody else safe to spend.
+          python3 .github/scripts/trust_policy.py check-token
+
+      - name: Materialise the ledger
+        env:
+          MODE: ${{ github.event.inputs.mode }}
+          LEDGER_INPUT: ${{ github.event.inputs.ledger }}
+          GATE_INPUT: ${{ github.event.inputs.gate }}
+          RECORD_INPUT: ${{ github.event.inputs.record }}
+        run: |
+          set -euo pipefail
+          mkdir -p migration-in
+          for pair in "ledger:$LEDGER_INPUT" "gate:$GATE_INPUT" "record:$RECORD_INPUT"; do
+            name="${pair%%:*}"
+            value="${pair#*:}"
+            [ -n "$value" ] || continue
+            printf '%s' "$value" >"migration-in/${name}.json"
+            # Malformed input is a refusal, not an empty configuration: an
+            # unparseable gate document that became an empty one would turn a
+            # broken input into a silent "no".
+            python3 -c "import json,sys; json.load(open(sys.argv[1]))" "migration-in/${name}.json"
+          done
+          [ -s migration-in/ledger.json ] || {
+            echo "::error::the ledger input is required: writer roles come from it, never from a workflow's name"
+            exit 1
+          }
+          case "$MODE" in
+            apply) [ -s migration-in/gate.json ] || {
+              echo "::error::apply needs the cutover gate's verdict for this change set"
+              exit 1
+            } ;;
+            rollback) [ -s migration-in/record.json ] || {
+              echo "::error::rollback needs the cutover record the cutover itself wrote"
+              exit 1
+            } ;;
+          esac
+
+      - name: Resume from an interrupted attempt
+        if: github.event.inputs.mode == 'apply'
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          CANDIDATE: ${{ needs.plan.outputs.candidate }}
+          PHASE_INPUT: ${{ github.event.inputs.phase }}
+          REQUIRED_CI_INPUT: ${{ github.event.inputs.required_ci }}
+          ADDITIONAL_GATES_INPUT: ${{ github.event.inputs.additional_gates }}
+          RELEASE_WORKFLOW_INPUT: ${{ github.event.inputs.release_workflow }}
+        run: |
+          set -euo pipefail
+          PYTHONPATH=src python3 -m continuum.migrate.cli apply \
+            --repo "$GITHUB_REPOSITORY" \
+            --ledger migration-in/ledger.json \
+            --candidate "$CANDIDATE" \
+            --phase "$PHASE_INPUT" \
+            --gate migration-in/gate.json \
+            --required-ci "$REQUIRED_CI_INPUT" \
+            --additional-gates "$ADDITIONAL_GATES_INPUT" \
+            --release-workflow "$RELEASE_WORKFLOW_INPUT" \
+            --out migration-out
+          # No `--state` on purpose. The state document is an optimisation that
+          # saves this run re-pushing a branch it already owns; the branch
+          # ownership check is the correctness, and it works without it -- a
+          # branch holding a commit whose *tree* is this plan's tree is this
+          # plan, adopted, whatever happened to the previous run's bookkeeping.
+          # A controller that could only resume from a state file would strand
+          # its own branch the first time a runner was cancelled between the push
+          # and the upload.
+
+      - name: Roll the cutover back
+        if: github.event.inputs.mode == 'rollback'
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+        run: |
+          set -euo pipefail
+          PYTHONPATH=src python3 -m continuum.migrate.cli rollback \
+            --repo "$GITHUB_REPOSITORY" \
+            --ledger migration-in/ledger.json \
+            --record migration-in/record.json \
+            --out migration-out
+
+      - name: Report what happened
+        if: always()
+        run: |
+          set -euo pipefail
+          for name in state rollback preflight; do
+            source="migration-out/${name}.json"
+            [ -f "$source" ] || continue
+            echo "--- ${name} ---"
+            cat "$source"
+          done
+
+      - name: Upload the outcome
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: migration-outcome-${{ github.run_id }}
+          path: migration-out/
+          if-no-files-found: warn
+          retention-days: 90

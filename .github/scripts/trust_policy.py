@@ -334,6 +334,36 @@ def is_trusted_actor(login, repository_owner, configured_actors="") -> bool:
     return candidate in allowed
 
 
+def verify_dispatcher(login, repository, configured_actors="") -> Decision:
+    """Fail closed unless a ``workflow_dispatch`` came from a trusted actor.
+
+    Separate from :func:`is_trusted_issue` and from the dispatch *shape* check
+    because it answers a different question. Those two ask whether the work
+    requested is about a pull request somebody reviewed. This asks whether the
+    person who pressed the button is somebody whose judgement the repository
+    already accepts -- which is the entire basis of a privileged manual
+    trigger, and the reason a long-lived write-capable credential cannot simply
+    be wired into a ``workflow_dispatch`` and trusted.
+    """
+    if not repository or repository.count("/") != 1:
+        return deny("unknown_repository", "Repository context is unknown.")
+    owner, _ = repository.split("/", 1)
+    candidate = normalize_login(login)
+    if not candidate:
+        return deny("unknown_dispatcher", "The dispatch payload names no sender.")
+    if not is_trusted_actor(candidate, owner, configured_actors):
+        return deny(
+            "untrusted_dispatcher",
+            "Dispatch was requested by untrusted actor {!r}; only the repository "
+            "owner or an configured automation account may start privileged "
+            "work.".format(candidate),
+        )
+    return allow(
+        "trusted_dispatcher",
+        "Dispatch was requested by trusted actor @{}.".format(candidate),
+    )
+
+
 def is_trusted_issue(issue, repository_owner, configured_actors="") -> tuple:
     """Return ``(trusted, code, reason)`` for an issue payload."""
     if not isinstance(issue, dict):
@@ -1200,15 +1230,10 @@ def cmd_authorize_event(args) -> int:
         # Dispatch trust is a two-phase decision. First validate the caller and
         # input shape without trusting any PR fields from the event; only then
         # fetch the live pull request and make the final decision below.
-        repository_owner = repository.split("/", 1)[0]
         sender = (payload.get("sender") or {}).get("login") or context["actor"]
-        if not is_trusted_actor(
-            sender, repository_owner, context["configured_actors"]
-        ):
-            decision = deny(
-                "untrusted_dispatcher",
-                "Dispatch was requested by untrusted actor {!r}.".format(sender),
-            )
+        dispatch = verify_dispatcher(sender, repository, context["configured_actors"])
+        if not dispatch.allowed:
+            decision = dispatch
         else:
             inputs = payload.get("inputs")
             if not isinstance(inputs, dict):
@@ -1323,6 +1348,34 @@ def cmd_verify_dispatch(args) -> int:
 
     write_outputs(decision.as_outputs())
     report(decision)
+    return 0 if decision.allowed else 1
+
+
+def cmd_check_dispatcher(args) -> int:
+    """Fail closed unless whoever dispatched this run may start privileged work.
+
+    Deliberately cheap and offline: it reads the event payload and no API, so it
+    can run in a job holding no credentials at all. The privileged job that holds
+    the credential still verifies the credential separately -- a trusted person
+    pressing the button does not make an untrusted token acceptable.
+    """
+    context = env_context()
+    repository = args.repository or context["repository"]
+    event_name = context["event_name"]
+    if event_name and event_name != "workflow_dispatch":
+        decision = deny(
+            "not_a_dispatch",
+            "Dispatch authority applies to workflow_dispatch only, not to {}.".format(event_name),
+        )
+        report(decision)
+        write_outputs(decision.as_outputs())
+        return 1
+
+    payload = context["payload"]
+    sender = (payload.get("sender") or {}).get("login") or context["actor"]
+    decision = verify_dispatcher(sender, repository, context["configured_actors"])
+    report(decision)
+    write_outputs(decision.as_outputs())
     return 0 if decision.allowed else 1
 
 
@@ -1536,6 +1589,13 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--base-ref", dest="base_ref", default="")
     plan.add_argument("--repository", default="")
     plan.set_defaults(func=cmd_merge_plan)
+
+    dispatcher = sub.add_parser(
+        "check-dispatcher",
+        help="Fail closed unless the workflow_dispatch sender is a trusted actor",
+    )
+    dispatcher.add_argument("--repository", default="")
+    dispatcher.set_defaults(func=cmd_check_dispatcher)
 
     credential = sub.add_parser(
         "check-token",

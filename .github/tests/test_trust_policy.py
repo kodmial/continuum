@@ -719,6 +719,70 @@ class DispatchCredentialTests(unittest.TestCase):
             self.assertNotIn(verb, source, verb)
 
 
+class DispatcherTrustTests(unittest.TestCase):
+    """A privileged manual trigger is only as safe as who pressed the button.
+
+    The migration controller rewrites a repository's workflows and merges the
+    result, from a ``workflow_dispatch``, with a long-lived write credential
+    wired in. Nobody reviews a manual trigger the way they review a pull
+    request, so the only thing standing between that credential and anybody with
+    dispatch rights is this decision.
+    """
+
+    def run_check(self, sender, event="workflow_dispatch", **environ):
+        env = {"GITHUB_REPOSITORY": REPOSITORY, "GITHUB_EVENT_NAME": event}
+        env.update(environ)
+        payload = {"sender": {"login": sender}} if sender is not None else {}
+        with unittest.mock.patch.dict(os.environ, env, clear=True), \
+                unittest.mock.patch.object(trust_policy, "read_event_payload", lambda _: payload):
+            return trust_policy.main(["check-dispatcher"])
+
+    def test_owner_dispatch_is_accepted(self):
+        self.assertEqual(self.run_check(OWNER), 0)
+
+    def test_configured_automation_dispatch_is_accepted(self):
+        self.assertEqual(
+            self.run_check("migrate-bot", AUTOMATION_TRUSTED_ACTORS="migrate-bot"), 0
+        )
+
+    def test_an_unrelated_dispatcher_fails_closed(self):
+        self.assertEqual(self.run_check("drive-by"), 1)
+
+    def test_a_bot_dispatcher_fails_closed(self):
+        for login in ("github-actions[bot]", "dependabot[bot]"):
+            self.assertEqual(self.run_check(login), 1, login)
+
+    def test_a_dispatch_with_no_named_sender_fails_closed(self):
+        self.assertEqual(self.run_check(None), 1)
+
+    def test_a_dispatcher_in_another_repository_fails_closed(self):
+        """The owner of a *different* repository gets nothing here."""
+        self.assertEqual(self.run_check("drive-by"), 1)
+
+    def test_it_does_not_apply_to_a_trigger_that_was_not_a_dispatch(self):
+        """A scheduled or automatic run has no sender to have asked for this."""
+        self.assertEqual(self.run_check(OWNER, event="schedule"), 1)
+        self.assertEqual(self.run_check(OWNER, event="push"), 1)
+
+    def test_an_unknown_repository_fails_closed(self):
+        self.assertEqual(self.run_check(OWNER, GITHUB_REPOSITORY=""), 1)
+
+    def test_it_never_reaches_the_api(self):
+        """It gates a dispatch, it does not verify one: no token, no network."""
+
+        def boom(*args, **kwargs):
+            raise AssertionError("check-dispatcher must not call the API")
+
+        with unittest.mock.patch.object(trust_policy, "api_request", boom):
+            self.assertEqual(self.run_check(OWNER), 0)
+
+    def test_the_agent_dispatch_path_uses_the_same_decision(self):
+        """One answer to "may this person start privileged work", not two."""
+        source = inspect.getsource(trust_policy.cmd_authorize_event)
+        self.assertIn("verify_dispatcher(", source)
+        self.assertNotIn("is_trusted_actor(", source)
+
+
 class GithubOutputEncodingTests(unittest.TestCase):
     def test_multiline_output_uses_github_delimiter_syntax(self):
         value = "70\tallow\tfirst\n69\tallow\tsecond"
