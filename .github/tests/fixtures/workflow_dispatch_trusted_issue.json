@@ -1,0 +1,16 @@
+{
+  "_comment": "Regression fixture: the trusted task dispatch. A control-plane workflow with a write-capable credential dispatches `mode: issue` for issue #44, which the policy then verifies against the live issue. Only this shape may reach a checkout step.",
+  "ref": "main",
+  "workflow": "opencode.yml",
+  "inputs": {
+    "mode": "issue",
+    "issue_number": "44",
+    "pr_number": "",
+    "head_ref": "",
+    "run_id": "",
+    "rungs_ruled_out": ""
+  },
+  "sender": { "login": "kodmial", "type": "User" },
+  "repository": { "full_name": "kodmial/continuum" },
+  "organization": { "login": "kodmial" }
+}

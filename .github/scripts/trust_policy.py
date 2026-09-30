@@ -20,8 +20,12 @@ Trust model
   listed in the ``AUTOMATION_TRUSTED_ACTORS`` repository variable (comma
   separated). Nothing else is trusted: not bots, not collaborators discovered at
   runtime, not "the author of the thing that triggered me".
-* **Issues** are trusted when they are not pull requests and their author is a
-  trusted actor. Issue titles and bodies are data, never instructions.
+* **Issues** are trusted when they are not pull requests, their author is a
+  trusted actor, and they still carry the canonical dispatch label from
+  ``continuum_labels``. Issue titles and bodies are data, never instructions.
+  The request to work comes from the label, never from a comment body: a comment
+  is untrusted text that anybody with comment permission can write, and reading
+  an instruction out of it is what made ``/oc`` a privileged input.
 * **Branches / pull requests** are trusted only when they live in this
   repository (``head.repo.full_name == repository``) and the ref matches
   ``opencode/issue<N>-<slug>``, the only shape the agent itself creates. Fork
@@ -29,6 +33,8 @@ Trust model
   metacharacters are never trusted.
 * **Dispatch modes** are an explicit allowlist. A mode outside the allowlist is
   denied, so a newly added input can never silently become a privileged path.
+  ``issue`` executes a task and names an issue; every other mode repairs a
+  change that already exists and names a pull request.
 * **Trust is positional.** A read-only control-plane job makes the decision and
   the code-execution job consumes only that job's validated outputs. A
   privileged job never interpolates a ref, PR number, or run id that came
@@ -54,8 +60,7 @@ CLI
 Environment:
     GITHUB_EVENT_NAME, GITHUB_EVENT_PATH, GITHUB_REPOSITORY, GITHUB_ACTOR,
     GITHUB_OUTPUT, GITHUB_API_URL, GITHUB_TOKEN (read-only),
-    AUTOMATION_TRUSTED_ACTORS, CONTINUUM_BASE_BRANCH (default ``main``),
-    CONTINUUM_AGENT_COMMANDS (default ``/oc,/opencode``).
+    AUTOMATION_TRUSTED_ACTORS, CONTINUUM_BASE_BRANCH (default ``main``).
 
 Standard library only, so it runs on stock ``ubuntu-latest`` runners without
 dependency installation.
@@ -74,12 +79,13 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+import continuum_labels
+
 # --------------------------------------------------------------------------- #
 # Policy constants
 # --------------------------------------------------------------------------- #
 
 DEFAULT_BASE_BRANCH = "main"
-DEFAULT_AGENT_COMMANDS = ("/oc", "/opencode")
 
 #: The only ref shape the agent itself creates. Everything else is untrusted.
 AGENT_BRANCH_RE = re.compile(
@@ -94,7 +100,16 @@ AGENT_BRANCH_RE = re.compile(
 #: must not branch on which provider produced a finding, so a provider-specific
 #: name such as ``coderabbit-fix`` is not in the allowlist and cannot be added
 #: without a policy change.
-ALLOWED_DISPATCH_MODES = ("resolve-conflict", "ci-fix", "review-fix")
+#:
+#: ``issue`` is the task-execution mode that replaced the ``/oc`` comment. It is
+#: listed with the repair modes because it shares their privilege: a named issue
+#: causes a checkout and a model to run. What differs is the target it verifies
+#: -- a trusted, still-dispatched issue rather than a trusted agent pull request
+#: -- so the two are validated by separate code below.
+ALLOWED_DISPATCH_MODES = ("issue", "resolve-conflict", "ci-fix", "review-fix")
+
+#: Modes that execute a task and therefore name an issue instead of a PR.
+TASK_DISPATCH_MODES = ("issue",)
 
 #: Modes that need a run id to inspect.
 MODES_REQUIRING_RUN_ID = ("ci-fix",)
@@ -270,12 +285,15 @@ def positive_int(value) -> int:
 
     Only plain digits are accepted: ``+1``, `` 1``, ``1_0`` and ``1e3`` are
     rejected so an attacker-controlled value cannot smuggle a second argument.
+    Padding is a rejection rather than a courtesy because the same value has to
+    compare equal whether it came from a form field, a CLI flag, or a dispatch
+    payload, and "  1 " should not be one of the spellings that does.
     """
     if isinstance(value, int) and not isinstance(value, bool):
         return value if value > 0 else 0
-    if not isinstance(value, str) or not re.fullmatch(r"[1-9][0-9]{0,9}", value.strip()):
+    if not isinstance(value, str) or not re.fullmatch(r"[1-9][0-9]{0,9}", value):
         return 0
-    return int(value.strip())
+    return int(value)
 
 
 def is_agent_branch(ref) -> bool:
@@ -323,8 +341,9 @@ def trust_sensitive_changes(paths) -> list:
 def is_trusted_actor(login, repository_owner, configured_actors="") -> bool:
     """Only the repository owner and explicitly configured logins are trusted.
 
-    Bots are intentionally not trusted: a bot's comment body is frequently a
-    verbatim echo of untrusted user content.
+    Bots are intentionally not trusted: a bot's authored text is frequently a
+    verbatim echo of untrusted user content, and a trusted bot would turn every
+    echoed instruction into a privileged request.
     """
     owner = normalize_login(repository_owner)
     candidate = normalize_login(login)
@@ -342,9 +361,9 @@ def is_trusted_issue(issue, repository_owner, configured_actors="") -> tuple:
     if issue.get("pull_request"):
         return (
             False,
-            "comment_on_pull_request",
-            "Pull-request conversations are an untrusted content surface; "
-            "privileged runs are only dispatched for issues.",
+            "pull_request_not_issue",
+            "A pull request is not an issue to execute; privileged task runs are "
+            "only dispatched for issues.",
         )
 
     author = (issue.get("user") or {}).get("login")
@@ -543,45 +562,76 @@ def sanitize_commit_title(title, max_length: int = MAX_COMMIT_TITLE) -> str:
     return cleaned
 
 
-def parse_command_list(value) -> tuple:
-    """Normalize the accepted agent commands into a tuple of lowercase tokens."""
-    if isinstance(value, str):
-        candidates = re.split(r"[,\s]+", value.strip())
-    elif isinstance(value, (list, tuple)):
-        candidates = list(value)
-    else:
-        return DEFAULT_AGENT_COMMANDS
-    commands = tuple(
-        token.lower()
-        for token in (
-            c.strip().lower() if isinstance(c, str) else "" for c in candidates
-        )
-        if re.fullmatch(r"/[a-z0-9][a-z0-9._-]{0,31}", token)
-    )
-    return commands or DEFAULT_AGENT_COMMANDS
+def label_names(value) -> frozenset:
+    """Normalise an API label collection into a set of canonical names.
 
-
-def has_agent_command(body, commands=DEFAULT_AGENT_COMMANDS) -> bool:
-    """Detect an agent command on the *first* non-empty line.
-
-    Requiring the command to lead the message means quoted or forwarded text
-    ("the attacker wrote: /oc") cannot smuggle a privileged run request, and
-    editing a later paragraph cannot re-trigger an existing comment.
+    Accepts the two shapes GitHub uses: a list of ``{"name": ...}`` objects, or
+    a list of bare strings. Anything else contributes nothing, so a malformed
+    payload cannot manufacture a label the caller then trusts.
     """
-    if not isinstance(body, str):
-        return False
-    accepted = parse_command_list(commands)
-    for raw_line in neutralize_untrusted_text(body).split("\n"):
-        line = raw_line.strip()
-        while line.startswith(">"):
-            line = line[1:].strip()
-        if not line:
-            continue
-        match = re.match(r"^(/[A-Za-z0-9][A-Za-z0-9._-]*)\b(.*)$", line)
-        if not match:
-            return False
-        return match.group(1).lower() in accepted
-    return False
+    if not isinstance(value, (list, tuple)):
+        return frozenset()
+    names = []
+    for entry in value:
+        if isinstance(entry, dict):
+            entry = entry.get("name")
+        if isinstance(entry, str) and entry.strip():
+            names.append(entry.strip())
+    return frozenset(names)
+
+
+def is_dispatch_requested(issue) -> tuple:
+    """Decide whether an issue still carries the canonical dispatch label.
+
+    A label is the whole activation signal, so this is a strict membership test
+    against the canonical name from the registry. An attacker-chosen label that
+    merely looks similar is refused: ``Continuum:Dispatch`` is the same label by
+    GitHub's own case-insensitive rules and is accepted, but
+    ``continuum:dispatch:`` and ``continuum:dispatcher`` are not. Unrelated
+    repository labels (``bug``, ``help wanted``) are simply ignored rather than
+    treated as a failure, because an issue accumulates labels as it is triaged.
+
+    There is deliberately no way to add a second activation label from a
+    repository variable: one canonical name is what makes "is this issue still
+    dispatched?" a question with one answer.
+    """
+    if not isinstance(issue, dict):
+        return False, "not_dispatch_labeled", "Issue payload is missing."
+
+    names = label_names(issue.get("labels"))
+    if not names:
+        return (
+            False,
+            "not_dispatch_labeled",
+            "Issue carries no {} label.".format(continuum_labels.DISPATCH_LABEL),
+        )
+
+    for name in sorted(names):
+        if continuum_labels.is_dispatch_label(name):
+            return (
+                True,
+                "dispatch_labeled",
+                "Issue carries the canonical {} label.".format(
+                    continuum_labels.DISPATCH_LABEL
+                ),
+            )
+
+    return (
+        False,
+        "not_dispatch_labeled",
+        "Issue does not carry the canonical {} label.".format(
+            continuum_labels.DISPATCH_LABEL
+        ),
+    )
+
+
+    return (
+        False,
+        "not_dispatch_labeled",
+        "Issue does not carry the canonical {} label.".format(
+            continuum_labels.DISPATCH_LABEL
+        ),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -589,64 +639,54 @@ def has_agent_command(body, commands=DEFAULT_AGENT_COMMANDS) -> bool:
 # --------------------------------------------------------------------------- #
 
 
-def evaluate_issue_comment(
-    payload,
-    *,
-    repository_owner,
-    configured_actors="",
-    commands=DEFAULT_AGENT_COMMANDS,
+def evaluate_issue_dispatch(
+    issue, *, repository_owner, configured_actors=""
 ) -> Decision:
-    """Decide whether an ``issue_comment`` event may run privileged automation."""
-    if not isinstance(payload, dict):
-        return deny("malformed_event", "Event payload is not a JSON object.")
+    """Decide whether an issue may be executed as a task.
 
-    action = payload.get("action")
-    if action != "created":
-        # An edit re-delivers the same body; only a fresh command may start work.
+    Three things have to hold, in this order, and each one alone is enough to
+    refuse:
+
+    1. the issue exists in this repository and is still open,
+    2. a trusted actor opened it (issue text is data, never instructions),
+    3. it still carries the canonical dispatch label, so a withdrawn request is
+       never executed.
+
+    The label check is last deliberately. Author trust is cheap and does not
+    change between runs, while the label is the part a human moves; checking it
+    against live API state means "removed the label" takes effect on the next
+    decision rather than on the next checkout.
+    """
+    if not isinstance(issue, dict):
+        return deny("missing_issue", "No issue payload was supplied.")
+
+    state = issue.get("state")
+    if state != "open":
         return deny(
-            "comment_not_created",
-            "Only newly created comments may request privileged work (action={!r}).".format(
-                action
-            ),
+            "issue_not_open",
+            "Issue #{} is {} rather than open.".format(issue.get("number", "?"), state),
         )
 
-    issue = payload.get("issue")
     issue_ok, issue_code, issue_reason = is_trusted_issue(
         issue, repository_owner, configured_actors
     )
     if not issue_ok:
         return deny(issue_code, issue_reason)
 
-    comment = payload.get("comment")
-    if not isinstance(comment, dict):
-        return deny("missing_comment", "Event payload has no comment object.")
-
-    comment_author = (comment.get("user") or {}).get("login")
-    if not is_trusted_actor(comment_author, repository_owner, configured_actors):
-        return deny(
-            "untrusted_comment_author",
-            "Comment on issue #{} was written by untrusted actor {!r}.".format(
-                (issue or {}).get("number", "?"), comment_author
-            ),
-        )
-
-    if not has_agent_command(comment.get("body"), commands):
-        return deny(
-            "no_agent_command",
-            "Comment on issue #{} does not start with an agent command {}.".format(
-                (issue or {}).get("number", "?"), list(parse_command_list(commands))
-            ),
-        )
-
-    issue_number = positive_int((issue or {}).get("number")) or 0
+    issue_number = positive_int(issue.get("number"))
     if not issue_number:
-        return deny("invalid_issue_number", "Issue number could not be verified.")
+        return deny(
+            "invalid_issue_number",
+            "Issue payload has no usable number.",
+        )
+
+    labeled, label_code, label_reason = is_dispatch_requested(issue)
+    if not labeled:
+        return deny(label_code, "{} Issue #{}.".format(label_reason, issue_number))
 
     return allow(
-        "trusted_comment",
-        "{}: trusted actor {!r} requested work on their own issue #{}.".format(
-            issue_code, comment_author, issue_number
-        ),
+        "trusted_issue_dispatch",
+        "{}: {} Issue #{}.".format(issue_code, label_reason, issue_number),
         issue_number=issue_number,
     )
 
@@ -657,9 +697,15 @@ def validate_dispatch_shape(
     """Validate the shape of ``workflow_dispatch`` inputs before any lookup.
 
     This is the cheap, offline half of the dispatch decision: it proves the
-    request names an allowlisted mode and a syntactically safe agent branch
-    before the caller spends an API call on it, and it is the step that makes an
-    arbitrary ``head_ref`` impossible to smuggle into a checkout.
+    request names an allowlisted mode and the target that mode is allowed to
+    name, before the caller spends an API call on it. It is the step that makes
+    an arbitrary ``head_ref`` impossible to smuggle into a checkout, and the one
+    that makes an arbitrary ``issue_number`` impossible to point at somebody
+    else's issue.
+
+    The mode decides which fields are required, so a task dispatch cannot be
+    laundered through the PR fields and a repair dispatch cannot be laundered
+    through the issue field.
     """
     if not repository or repository.count("/") != 1:
         return deny("unknown_repository", "Repository context is unknown.")
@@ -675,6 +721,9 @@ def validate_dispatch_shape(
                 mode, list(ALLOWED_DISPATCH_MODES)
             ),
         )
+
+    if mode in TASK_DISPATCH_MODES:
+        return _validate_issue_dispatch_shape(inputs, mode=mode)
 
     pr_number = positive_int(inputs.get("pr_number"))
     if not pr_number:
@@ -714,6 +763,32 @@ def validate_dispatch_shape(
         run_id=positive_int(inputs.get("run_id")),
         head_ref=head_ref,
         ruled_out_rungs=ruled_out,
+    )
+
+
+def _validate_issue_dispatch_shape(inputs, *, mode: str) -> Decision:
+    """Validate the inputs of a task dispatch, which names an issue.
+
+    ``pr_number`` and ``head_ref`` are ignored rather than rejected: the workflow
+    passes empty strings for them on every dispatch. ``issue_number`` is the
+    only field that selects work, so it is the only one parsed, and it must be a
+    bare positive integer.
+    """
+    issue_number = positive_int(inputs.get("issue_number"))
+    if not issue_number:
+        return deny(
+            "invalid_issue_input",
+            "Dispatch issue_number {!r} is not a positive integer.".format(
+                inputs.get("issue_number")
+            ),
+            mode=mode,
+        )
+
+    return allow(
+        "dispatch_shape_valid",
+        "Dispatch {} names issue #{}.".format(mode, issue_number),
+        mode=mode,
+        issue_number=issue_number,
     )
 
 
@@ -772,12 +847,15 @@ def evaluate_dispatch_inputs(
     *,
     repository,
     pull_request=None,
+    issue=None,
+    configured_actors="",
     base_ref: str = DEFAULT_BASE_BRANCH,
 ) -> Decision:
-    """Validate a ``workflow_dispatch`` request against a verified pull request.
+    """Validate a ``workflow_dispatch`` request against its verified target.
 
-    ``pull_request`` must be the pull request as the API reports it. When it is
-    missing the decision is denied: an unverified dispatch target must never
+    ``pull_request`` must be the pull request as the API reports it, and
+    ``issue`` the issue as the API reports it; each is required only by the modes
+    that name it. A missing one denies: an unverified dispatch target must never
     reach a checkout step.
     """
     shape = validate_dispatch_shape(inputs, repository=repository, base_ref=base_ref)
@@ -785,6 +863,15 @@ def evaluate_dispatch_inputs(
         return shape
 
     mode = shape.mode
+    if mode in TASK_DISPATCH_MODES:
+        return _evaluate_issue_dispatch(
+            inputs,
+            issue=issue,
+            shape=shape,
+            repository=repository,
+            configured_actors=configured_actors,
+        )
+
     head_ref = shape.head_ref
     pr_number = shape.pr_number
 
@@ -823,6 +910,54 @@ def evaluate_dispatch_inputs(
     )
 
 
+def _evaluate_issue_dispatch(
+    inputs, *, issue, shape: Decision, repository: str, configured_actors: str = ""
+) -> Decision:
+    """Final decision for a task dispatch, against live issue state.
+
+    Two distinct mistakes are caught here. A dispatch that names an issue other
+    than the one it was issued for cannot silently retarget somebody else's
+    issue, and an issue whose dispatch label was removed after the dispatch was
+    sent does not start: the label is re-read from the live issue rather than
+    assumed from when the request was made.
+    """
+    owner = repository.split("/", 1)[0]
+    issue_number = shape.issue_number
+
+    if not isinstance(issue, dict):
+        return deny(
+            "missing_issue",
+            "Dispatch mode {} requires a verified issue.".format(shape.mode),
+            mode=shape.mode,
+        )
+
+    if positive_int(issue.get("number")) != issue_number:
+        return deny(
+            "issue_number_mismatch",
+            "Dispatch targets issue #{} but the verified issue is #{}.".format(
+                issue_number, issue.get("number")
+            ),
+            mode=shape.mode,
+        )
+
+    decision = evaluate_issue_dispatch(
+        issue, repository_owner=owner, configured_actors=configured_actors
+    )
+    if not decision.allowed:
+        return deny(
+            decision.code,
+            "{} Dispatch mode={}.".format(decision.reason, shape.mode),
+            mode=shape.mode,
+        )
+
+    return allow(
+        "trusted_issue_dispatch",
+        "Dispatch {} targets verified trusted issue #{}.".format(shape.mode, issue_number),
+        mode=shape.mode,
+        issue_number=issue_number,
+    )
+
+
 def evaluate_event(
     event_name,
     payload,
@@ -830,29 +965,32 @@ def evaluate_event(
     repository,
     configured_actors="",
     base_ref: str = DEFAULT_BASE_BRANCH,
-    commands=DEFAULT_AGENT_COMMANDS,
     actor: str = "",
     pull_request=None,
+    issue=None,
 ) -> Decision:
     """Route an event to the evaluation that applies to it.
 
     Unknown events are denied. This is the entry point used by the
     control-plane job, so an event type nobody reasoned about fails closed.
-    ``pull_request`` carries the API-verified pull request for dispatch events;
-    without it a dispatch is denied rather than trusted on its inputs alone.
+
+    Only ``workflow_dispatch`` has a privileged path. There is no
+    ``issue_comment`` path: a comment is untrusted text, and an untrusted text
+    field must not be able to select work, select a checkout, or reach a model.
+    The request to work is a label, and the scheduler that reads it is itself
+    dispatched through ``workflow_dispatch``.
+
+    ``pull_request`` and ``issue`` carry the API-verified targets for dispatch
+    events; a mode that needs one denies without it rather than trusting the
+    dispatch inputs alone.
     """
     if not isinstance(repository, str) or repository.count("/") != 1:
         return deny("unknown_repository", "Repository context is unknown.")
 
-    repository_owner = repository.split("/", 1)[0]
+    if not isinstance(payload, dict):
+        return deny("malformed_payload", "Event payload is not an object.")
 
-    if event_name == "issue_comment":
-        return evaluate_issue_comment(
-            payload,
-            repository_owner=repository_owner,
-            configured_actors=configured_actors,
-            commands=commands,
-        )
+    repository_owner = repository.split("/", 1)[0]
 
     if event_name == "workflow_dispatch":
         sender = (payload.get("sender") or {}).get("login") or actor
@@ -868,17 +1006,20 @@ def evaluate_event(
             inputs,
             repository=repository,
             pull_request=pull_request,
+            issue=issue,
+            configured_actors=configured_actors,
             base_ref=base_ref,
         )
 
     return deny("unhandled_event", "Event {!r} has no trusted automation path.".format(event_name))
 
 
-def _issue_comment_ref(decision: Decision, base_branch: str) -> Decision:
-    """Attach the checkout ref for a comment-triggered run.
+def _task_ref(decision: Decision, base_branch: str) -> Decision:
+    """Attach the checkout ref for a task-execution run.
 
-    The privileged job starts from the base branch that produced the trusted
-    event; the agent creates its own issue branch from there.
+    The privileged job starts from the base branch rather than from anything in
+    the dispatch payload: the agent creates its own issue branch from there, so
+    the base is the only ref it needs, and it must not come from the request.
     """
     if not is_safe_ref(base_branch) or ".." in base_branch:
         return deny(
@@ -991,6 +1132,20 @@ def fetch_pull_request(repository: str, number: int, token: str) -> dict:
     )
 
 
+def fetch_issue(repository: str, number: int, token: str) -> dict:
+    """Read a live issue, labels included.
+
+    The label set is the activation signal, so it has to come from the same read
+    as the author and state rather than from the dispatch payload. Reading it
+    here is what makes "the label was removed" authoritative instead of advisory.
+    """
+    owner, name = repository.split("/", 1)
+    return api_request(
+        "/repos/{}/{}/issues/{}".format(urllib.parse.quote(owner), urllib.parse.quote(name), number),
+        token,
+    )
+
+
 def fetch_pull_request_files(repository: str, number: int, token: str) -> list:
     owner, name = repository.split("/", 1)
     path = "/repos/{}/{}/pulls/{}/files?per_page=100".format(
@@ -1023,10 +1178,10 @@ def resolve_token_login(token: str) -> str:
 
     This is the only place the policy inspects a write-capable credential, and
     it performs a single authenticated ``GET /user``. It exists because a
-    scheduler holding a write token must prove *which* identity that token
-    speaks for: a ``github.token`` acting as ``github-actions[bot]`` cannot
-    satisfy the comment gate in the agent workflow, so dispatching with it
-    would burn a reservation and produce no work.
+    scheduler holding a write token must prove *which* identity that token speaks
+    for: a ``github.token`` acting as ``github-actions[bot]`` is not a trusted
+    actor, and a dispatch made with it would be refused by the agent workflow's
+    dispatch gate -- burning a reservation and producing no work.
     """
     data = api_request("/user", token)
     return normalize_login(data.get("login"))
@@ -1137,7 +1292,6 @@ def env_context() -> dict:
         "payload": read_event_payload(os.environ.get("GITHUB_EVENT_PATH", "")),
         "configured_actors": os.environ.get("AUTOMATION_TRUSTED_ACTORS", ""),
         "base_ref": os.environ.get("CONTINUUM_BASE_BRANCH", DEFAULT_BASE_BRANCH),
-        "commands": os.environ.get("CONTINUUM_AGENT_COMMANDS", ",".join(DEFAULT_AGENT_COMMANDS)),
         "actor": os.environ.get("GITHUB_ACTOR", ""),
         "token": os.environ.get("GITHUB_TOKEN", ""),
         "default_branch": os.environ.get("GITHUB_DEFAULT_BRANCH", ""),
@@ -1149,34 +1303,39 @@ def report(decision: Decision) -> None:
     print("::{}::trust policy [{}] {}".format(level, decision.code, one_line(decision.reason)))
 
 
-def write_trusted_context(context, decision: Decision) -> str:
+def write_trusted_context(context, decision: Decision, issue=None) -> str:
     """Persist the untrusted-but-verified issue text for the agent prompt.
 
-    The privileged job reads this file instead of re-deriving prompt content
-    from the event payload, so the exact text the policy approved is the exact
-    text the agent sees.
+    The text is returned *and* written to a file, because the two consumers
+    cannot be served by the same mechanism. The read-only job that made the
+    decision cannot hand a file to the privileged job -- they are different
+    runners -- so the decision output carries the text itself. The file remains
+    the artifact of what was approved, on the runner that approved it.
+
+    ``issue`` is the API-verified issue for a task dispatch. It is a separate
+    argument because a ``workflow_dispatch`` payload carries no issue object:
+    the payload names an issue *number*, and the text has to come from the live
+    issue the policy just verified, not from anything the requester supplied.
     """
     directory = os.environ.get("RUNNER_TEMP") or tempfile.mkdtemp(prefix="continuum-trust-")
     os.makedirs(directory, exist_ok=True)
     path = os.path.join(directory, "trusted-context-{}.md".format(decision.issue_number or 0))
-    issue = context.get("payload", {}).get("issue") or {}
+    source = issue if isinstance(issue, dict) else {}
+    title = fence_untrusted(
+        "issue #{} title".format(decision.issue_number or 0),
+        source.get("title", ""),
+        max_chars=512,
+    )
+    body = fence_untrusted(
+        "issue #{} body".format(decision.issue_number or 0),
+        source.get("body", ""),
+    )
     with open(path, "w", encoding="utf-8") as handle:
-        handle.write(
-            fence_untrusted(
-                "issue #{} title".format(decision.issue_number or 0),
-                issue.get("title", ""),
-                max_chars=512,
-            )
-        )
+        handle.write(title)
         handle.write("\n\n")
-        handle.write(
-            fence_untrusted(
-                "issue #{} body".format(decision.issue_number or 0),
-                issue.get("body", ""),
-            )
-        )
+        handle.write(body)
         handle.write("\n")
-    return path
+    return "\n\n".join([title, body])
 
 
 # --------------------------------------------------------------------------- #
@@ -1196,56 +1355,50 @@ def cmd_authorize_event(args) -> int:
         write_outputs(decision.as_outputs())
         return 1
 
-    if event_name == "workflow_dispatch":
-        # Dispatch trust is a two-phase decision. First validate the caller and
-        # input shape without trusting any PR fields from the event; only then
-        # fetch the live pull request and make the final decision below.
-        repository_owner = repository.split("/", 1)[0]
-        sender = (payload.get("sender") or {}).get("login") or context["actor"]
-        if not is_trusted_actor(
-            sender, repository_owner, context["configured_actors"]
-        ):
-            decision = deny(
-                "untrusted_dispatcher",
-                "Dispatch was requested by untrusted actor {!r}.".format(sender),
-            )
-        else:
-            inputs = payload.get("inputs")
-            if not isinstance(inputs, dict):
-                decision = deny("missing_inputs", "Dispatch payload has no inputs.")
-            else:
-                decision = validate_dispatch_shape(
-                    inputs,
-                    repository=repository,
-                    base_ref=context["base_ref"],
-                )
-    else:
-        decision = evaluate_event(
-            event_name,
-            payload,
-            repository=repository,
-            configured_actors=context["configured_actors"],
-            base_ref=context["base_ref"],
-            commands=context["commands"],
-            actor=context["actor"],
+    # Dispatch trust is a two-phase decision. First validate the caller and
+    # input shape without trusting any target field from the event; only then
+    # fetch the live target and make the final decision below.
+    repository_owner = repository.split("/", 1)[0]
+    sender = (payload.get("sender") or {}).get("login") or context["actor"]
+    if not is_trusted_actor(sender, repository_owner, context["configured_actors"]):
+        decision = deny(
+            "untrusted_dispatcher",
+            "Dispatch was requested by untrusted actor {!r}.".format(sender),
         )
+    else:
+        inputs = payload.get("inputs")
+        if not isinstance(inputs, dict):
+            decision = deny("missing_inputs", "Dispatch payload has no inputs.")
+        else:
+            decision = validate_dispatch_shape(
+                inputs,
+                repository=repository,
+                base_ref=context["base_ref"],
+            )
 
+    # Re-verify against the live API before any write-capable step is allowed to
+    # run. Verification uses a read-only token, so confirming an attacker's
+    # request never itself requires write authority.
+    verified_issue = None
+    verified_pull_request = None
     if decision.allowed and decision.mode:
-        # Re-verify against the live API before any write-capable step is
-        # allowed to run. Verification uses a read-only token, so confirming an
-        # attacker's request never itself requires write authority.
         if not context["token"]:
             decision = deny(
                 "verification_unavailable",
                 "Dispatch verification requires a read-only GITHUB_TOKEN; refusing "
-                "to authorize a checkout of an unverified pull request.",
+                "to authorize a checkout of an unverified target.",
                 mode=decision.mode,
             )
         else:
             try:
-                pull_request = fetch_pull_request(
-                    repository, decision.pr_number, context["token"]
-                )
+                if decision.mode in TASK_DISPATCH_MODES:
+                    verified_issue = fetch_issue(
+                        repository, decision.issue_number, context["token"]
+                    )
+                else:
+                    verified_pull_request = fetch_pull_request(
+                        repository, decision.pr_number, context["token"]
+                    )
             except TrustPolicyError as exc:
                 decision = deny("verification_failed", str(exc), mode=decision.mode)
             else:
@@ -1255,19 +1408,22 @@ def cmd_authorize_event(args) -> int:
                     repository=repository,
                     configured_actors=context["configured_actors"],
                     base_ref=context["base_ref"],
-                    commands=context["commands"],
                     actor=context["actor"],
-                    pull_request=pull_request,
+                    pull_request=verified_pull_request,
+                    issue=verified_issue,
                 )
 
-    if decision.allowed and not decision.mode:
-        decision = _issue_comment_ref(
+    if decision.allowed and decision.mode in TASK_DISPATCH_MODES:
+        decision = _task_ref(
             decision, context["default_branch"] or context["base_ref"]
         )
 
     outputs = decision.as_outputs()
-    if decision.allowed:
-        outputs["trusted_context_file"] = write_trusted_context(context, decision)
+    if decision.allowed and decision.mode in TASK_DISPATCH_MODES:
+        # Only a task dispatch has issue text to carry. A repair dispatch works
+        # from an existing pull request, and publishing an empty fenced block
+        # would look like a verified-but-empty issue.
+        outputs["trusted_context"] = write_trusted_context(context, decision, verified_issue)
 
     write_outputs(outputs)
     report(decision)
@@ -1275,10 +1431,30 @@ def cmd_authorize_event(args) -> int:
 
 
 def cmd_verify_dispatch(args) -> int:
+    """Pre-flight a repair dispatch before the controller sends it.
+
+    This verifies the ``(mode, PR, head ref)`` triple of a repair dispatch. It
+    cannot verify a task dispatch: an issue has no head ref, and the only
+    authority for "may this issue run" is the label on the live issue, which is
+    read by ``authorize-event`` once the dispatch arrives. A task mode here is
+    refused rather than half-verified.
+    """
     context = env_context()
     repository = args.repository or context["repository"]
     if not repository or repository.count("/") != 1:
         report(deny("unknown_repository", "Repository context is unknown."))
+        return 1
+
+    if args.mode in TASK_DISPATCH_MODES:
+        report(
+            deny(
+                "task_mode_not_verifiable",
+                "verify-dispatch cannot verify a task dispatch; {} dispatches are "
+                "authorized by authorize-event against the live issue.".format(
+                    ", ".join(TASK_DISPATCH_MODES)
+                ),
+            )
+        )
         return 1
 
     owner = repository.split("/", 1)[0]
@@ -1370,7 +1546,7 @@ def cmd_check_token(args) -> int:
             deny(
                 "untrusted_credential",
                 "Dispatch credential acts as untrusted account {!r}; a "
-                "comment from that account would be refused by the agent "
+                "dispatch made with it would be refused by the agent "
                 "workflow.".format(login),
             )
         )
@@ -1386,11 +1562,20 @@ def cmd_check_token(args) -> int:
 
 
 def cmd_trusted_issues(args) -> int:
-    """Print the issue numbers a scheduler is allowed to consider.
+    """Print the issue numbers a scheduler is allowed to dispatch.
 
-    The caller is expected to treat the result as an allowlist: it must not
-    dispatch work for any issue the policy did not name, even if its own
-    filtering disagrees.
+    The result is an allowlist of *dispatchable* issues, which means all three
+    conditions hold: the issue is not a pull request, a trusted actor opened it,
+    and it currently carries the canonical dispatch label. A caller must treat
+    the result as authoritative -- it must not dispatch work for any issue the
+    policy did not name, even if its own filtering disagrees, and it must not
+    dispatch an issue the policy refused.
+
+    The label filter lives here as well as in the scheduler on purpose. Here it
+    is part of the read-only decision, made against live API state by the
+    component that owns the trust model; in the scheduler it is cheap redundancy
+    that keeps the eligible set readable. They read the same canonical name, so
+    they cannot disagree about which label is meant.
     """
     context = env_context()
     repository = args.repository or context["repository"]
@@ -1416,15 +1601,26 @@ def cmd_trusted_issues(args) -> int:
 
     trusted = []
     for issue in issues:
+        if not isinstance(issue, dict):
+            continue
         if issue.get("pull_request"):
+            continue
+        if issue.get("state") != "open":
+            # The query already asks for open issues, so a closed one here means
+            # the answer did not come from the query that was made. Re-checking
+            # costs nothing and keeps a closed issue off the candidate list.
             continue
         ok, _code, _reason = is_trusted_issue(
             issue, owner, context["configured_actors"]
         )
-        if ok:
-            number = positive_int(issue.get("number"))
-            if number:
-                trusted.append(number)
+        if not ok:
+            continue
+        labeled, _label_code, _label_reason = is_dispatch_requested(issue)
+        if not labeled:
+            continue
+        number = positive_int(issue.get("number"))
+        if number:
+            trusted.append(number)
 
     payload = ",".join(str(number) for number in trusted)
     print(payload)
@@ -1437,8 +1633,9 @@ def cmd_trusted_issues(args) -> int:
     report(
         allow(
             "trusted_issues_listed",
-            "{} of {} open issues are trusted for dispatch.".format(
-                len(trusted), len(issues)
+            "{} of {} open issues are trusted and carry the {} dispatch "
+            "label.".format(
+                len(trusted), len(issues), continuum_labels.DISPATCH_LABEL
             ),
         )
     )

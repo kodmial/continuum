@@ -2,17 +2,29 @@
 # Release and external-review modules are disabled during bootstrap.
 #
 # This is a dispatch control plane on a public repository: it labels issues and
-# posts the /oc comment that starts the agent. Everything it acts on is
-# attacker-supplyable, so the schedule is gated before any write:
+# dispatches the agent workflow. Everything it acts on is attacker-supplyable,
+# so the schedule is gated before any write:
 #
 #   1. The trust policy computes an allowlist of issues with a read-only token.
-#      The script below treats it as authoritative and intersects its own
-#      filter with it, so a disagreement resolves in favour of the policy.
-#   2. The dispatch credential must prove it acts as a trusted account. A
-#      github.token acts as github-actions[bot], whose comments the agent
-#      workflow's author gate refuses, so dispatching with it would consume an
-#      issue reservation and produce no work.
+#      An issue is on it only when a trusted actor opened it, it is not a pull
+#      request, and it currently carries the canonical dispatch label from
+#      .github/scripts/continuum_labels.py. The script below treats that as
+#      authoritative and intersects its own filter with it, so a disagreement
+#      resolves in favour of the policy.
+#   2. The dispatch credential must prove it acts as a trusted account. The
+#      agent workflow authorizes a dispatch on the identity that requested it,
+#      so dispatching as github-actions[bot] would consume an issue reservation
+#      and produce no work.
 #   3. Only then does the write-capable token appear, in the reconcile step.
+#
+# Activation is a label, not a comment. The scheduler used to post a slash
+# command on the issue, which made an untrusted text field the request that
+# starts a write-capable agent.
+# The request is now issue metadata that appears in the issue's own history, and
+# removing it withdraws the request: the agent workflow re-reads the label before
+# it is allowed to start, and this workflow stops treating the issue as
+# eligible. The dispatch marker comment below is audit and retry metadata only;
+# it never starts anything.
 #
 # Failure at any gate stops the run. It never falls back to dispatching.
 name: Issue scheduler
@@ -22,6 +34,9 @@ on:
   schedule:
     - cron: "*/5 * * * *"
   issues:
+    # `labeled` is the prompt path: a human handed an issue to Continuum.
+    # `unlabeled` is how that hand-off is withdrawn. The rest reconcile state
+    # the cron would otherwise discover up to five minutes late.
     types: [opened, reopened, closed, labeled, unlabeled]
   pull_request_target:
     types: [closed]
@@ -52,6 +67,11 @@ jobs:
       trusted_issues: ${{ steps.allowlist.outputs.trusted_issues }}
       trusted_issue_count: ${{ steps.allowlist.outputs.trusted_issue_count }}
       credential_login: ${{ steps.credential.outputs.credential_login }}
+      dispatch_label: ${{ steps.labels.outputs.dispatch_label }}
+      in_progress_label: ${{ steps.labels.outputs.in_progress_label }}
+      paused_label: ${{ steps.labels.outputs.paused_label }}
+      priority_labels: ${{ steps.labels.outputs.priority_labels }}
+      label_specs: ${{ steps.labels.outputs.label_specs }}
 
     steps:
       - name: Checkout trusted policy
@@ -61,6 +81,34 @@ jobs:
           # code, never from anything an issue author contributed.
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
+
+      - name: Read the canonical label registry
+        id: labels
+        env:
+          # Read-only. The registry is data, but it decides which label makes an
+          # issue eligible for a write-capable run, so it is rendered here -- by
+          # the trusted base-branch copy -- rather than typed into the script
+          # below. A label literal in this workflow is a definition that can
+          # drift from the one the trust policy authorizes.
+          BASE_BRANCH: ${{ vars.AUTOMATION_BASE_BRANCH || 'main' }}
+        run: |
+          set -euo pipefail
+          [[ "$BASE_BRANCH" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || {
+            echo "::error::Invalid base branch."
+            exit 1
+          }
+          registry=.github/scripts/continuum_labels.py
+          test -f "$registry"
+
+          {
+            echo "dispatch_label=$(python3 "$registry" name dispatch)"
+            echo "in_progress_label=$(python3 "$registry" name in-progress)"
+            echo "paused_label=$(python3 "$registry" name paused)"
+            echo "priority_labels=$(python3 "$registry" list --format names | python3 -c 'import json,sys; print(",".join(json.load(sys.stdin)))')"
+            echo "label_specs=$(python3 "$registry" provision-plan)"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Canonical dispatch label: $(python3 "$registry" name dispatch)"
 
       - name: List the issues the trust policy allows
         id: allowlist
@@ -100,6 +148,16 @@ jobs:
       WIP_LIMIT: ${{ vars.AUTOMATION_WIP_LIMIT || '3' }}
       LEASE_MINUTES: ${{ vars.AUTOMATION_LEASE_MINUTES || '45' }}
       MAX_DISPATCH_ATTEMPTS: ${{ vars.AUTOMATION_MAX_DISPATCH_ATTEMPTS || '3' }}
+      BASE_BRANCH: ${{ vars.AUTOMATION_BASE_BRANCH || 'main' }}
+      # Every label name below comes from .github/scripts/continuum_labels.py via
+      # the read-only job, which read the trusted base-branch copy. The
+      # reconcile step is handed data, not a definition: it must be impossible
+      # for it to check a different label than the trust policy authorized.
+      DISPATCH_LABEL: ${{ needs.authorize.outputs.dispatch_label }}
+      IN_PROGRESS_LABEL: ${{ needs.authorize.outputs.in_progress_label }}
+      PAUSED_LABEL: ${{ needs.authorize.outputs.paused_label }}
+      PRIORITY_LABELS: ${{ needs.authorize.outputs.priority_labels }}
+      LABEL_SPECS: ${{ needs.authorize.outputs.label_specs }}
 
     steps:
       - name: Reconcile state and dispatch ready issues
@@ -111,9 +169,10 @@ jobs:
           TRUSTED_ISSUES: ${{ needs.authorize.outputs.trusted_issues }}
           CREDENTIAL_LOGIN: ${{ needs.authorize.outputs.credential_login }}
         with:
-          # TAP_PAT is required because the existing OpenCode workflow accepts
-          # /oc only from the repository owner. It also makes issue-state
-          # mutations and comments created here visible as normal owner actions.
+          # TAP_PAT is required because the agent workflow authorizes a dispatch
+          # on the identity that requested it, and github.token acts as
+          # github-actions[bot]. It also makes issue-state mutations and comments
+          # created here visible as normal owner actions.
           github-token: ${{ secrets.TAP_PAT }}
           script: |
             const owner = context.repo.owner;
@@ -147,51 +206,54 @@ jobs:
               return value;
             }
 
-            const wipLimit = positiveInt('WIP_LIMIT', 2);
+            const wipLimit = positiveInt('WIP_LIMIT', 3);
             const leaseMinutes = positiveInt('LEASE_MINUTES', 45);
             const maxDispatchAttempts = positiveInt('MAX_DISPATCH_ATTEMPTS', 3);
             const leaseMs = leaseMinutes * 60 * 1000;
 
-            const priorityOrder = [
-              'priority:p0',
-              'priority:p1',
-              'priority:p2',
-            ];
+            // The canonical label names, from the registry. Nothing below may
+            // hard-code one: if these are missing the run must fail rather than
+            // fall back to a guessed name, because a guessed name would
+            // silently activate a different set of issues than the trust policy
+            // authorized.
+            const dispatchLabel = (process.env.DISPATCH_LABEL || '').trim();
+            const inProgressLabel = (process.env.IN_PROGRESS_LABEL || '').trim();
+            const pausedLabel = (process.env.PAUSED_LABEL || '').trim();
+            const priorityOrder = (process.env.PRIORITY_LABELS || '')
+              .split(',')
+              .map(name => name.trim())
+              .filter(name => name !== '');
+            for (const [name, value] of Object.entries({
+              DISPATCH_LABEL: dispatchLabel,
+              IN_PROGRESS_LABEL: inProgressLabel,
+              PAUSED_LABEL: pausedLabel,
+            })) {
+              if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,79}$/.test(value)) {
+                throw new Error('Invalid ' + name + ': ' + JSON.stringify(value));
+              }
+            }
+            if (priorityOrder.length === 0) {
+              throw new Error('PRIORITY_LABELS is empty; refusing to reconcile.');
+            }
             const priorityRank = new Map(
               priorityOrder.map((name, index) => [name, index])
             );
-            const inProgressLabel = 'automation:in-progress';
-            const pausedLabel = 'automation:paused';
+
+            // Audit and retry metadata. This comment is what the repair
+            // controller counts semantic attempts against and what the lease
+            // below measures; it is not an activation signal.
             const dispatchMarker = '<!-- issue-scheduler-dispatch -->';
             const infraRetryPrefix = '<!-- continuum-infra-retry:';
 
-            const labelSpecs = [
-              {
-                name: 'priority:p0',
-                color: 'B60205',
-                description: 'P0 — critical work that should be handled immediately.',
-              },
-              {
-                name: 'priority:p1',
-                color: 'D93F0B',
-                description: 'P1 — high-priority planned work.',
-              },
-              {
-                name: 'priority:p2',
-                color: 'FBCA04',
-                description: 'P2 — normal planned work.',
-              },
-              {
-                name: inProgressLabel,
-                color: '5319E7',
-                description: 'Actively reserved or implemented by the automatic issue scheduler.',
-              },
-              {
-                name: pausedLabel,
-                color: 'BFDADC',
-                description: 'Automation is paused after a failed/stopped implementation; remove to retry.',
-              },
-            ];
+            let labelSpecs;
+            try {
+              labelSpecs = JSON.parse(process.env.LABEL_SPECS || '[]');
+            } catch (err) {
+              throw new Error('LABEL_SPECS is not valid JSON: ' + err.message);
+            }
+            if (!Array.isArray(labelSpecs) || labelSpecs.length === 0) {
+              throw new Error('LABEL_SPECS is empty; refusing to provision nothing.');
+            }
 
             for (const spec of labelSpecs) {
               try {
@@ -214,21 +276,42 @@ jobs:
               );
             }
 
-            async function addLabel(issueNumber, name) {
+            // Label equality is case-insensitive: the API folds case, so a
+            // scheduler that compared raw names could disagree with the trust
+            // policy over a difference the API does not consider real.
+            function hasLabel(issueNumber, name) {
               const labels = labelsByIssue.get(issueNumber);
-              if (labels?.has(name)) return;
+              if (!labels) return false;
+              const wanted = name.toLowerCase();
+              for (const label of labels) {
+                if (typeof label === 'string' && label.toLowerCase() === wanted) {
+                  return true;
+                }
+              }
+              return false;
+            }
+
+            function labelNames(issue) {
+              return (issue.labels || []).map(label =>
+                typeof label === 'string' ? label : label.name
+              ).filter(name => typeof name === 'string');
+            }
+
+            async function addLabel(issueNumber, name) {
+              if (hasLabel(issueNumber, name)) return;
               await github.rest.issues.addLabels({
                 owner,
                 repo,
                 issue_number: issueNumber,
                 labels: [name],
               });
+              const labels = labelsByIssue.get(issueNumber);
               if (labels) labels.add(name);
             }
 
             async function removeLabel(issueNumber, name) {
               const labels = labelsByIssue.get(issueNumber);
-              if (labels && !labels.has(name)) return;
+              if (labels && !hasLabel(issueNumber, name)) return;
               try {
                 await github.rest.issues.removeLabel({
                   owner,
@@ -239,7 +322,14 @@ jobs:
               } catch (err) {
                 if (err.status !== 404) throw err;
               }
-              if (labels) labels.delete(name);
+              if (!labels) return;
+              // Drop every tracked spelling of the name. Removing only the
+              // exact string would leave `Continuum:Dispatch` in the set and
+              // let a removed label read as present for the rest of the run.
+              const wanted = name.toLowerCase();
+              for (const label of [...labels]) {
+                if (label.toLowerCase() === wanted) labels.delete(label);
+              }
             }
 
             async function pauseIssue(issueNumber, reason) {
@@ -295,6 +385,12 @@ jobs:
               return latest;
             }
 
+            // Issues completed earlier in this run. The eligible list was read
+            // before those reconciliations, so without this an issue closed as
+            // merged would still look eligible below: it would take a fresh
+            // reservation and be dispatched again in the same run.
+            const completedIssues = new Set();
+
             // A closed OpenCode PR is authoritative:
             // - merged means the implementation is done -> close the issue;
             // - closed without merge means the attempt was rejected/stopped ->
@@ -314,6 +410,7 @@ jobs:
                     rememberIssue(response.data);
 
                     if (pr.merged) {
+                      completedIssues.add(issueNumber);
                       await removeLabel(issueNumber, inProgressLabel);
                       await removeLabel(issueNumber, pausedLabel);
                       if (response.data.state !== 'closed') {
@@ -350,15 +447,20 @@ jobs:
             });
             // Intersect with the policy allowlist. The policy is authoritative:
             // an issue it did not name is ineligible no matter what this
-            // workflow's own author check concluded.
+            // workflow's own author check concluded. It requires the canonical
+            // dispatch label too, so the two sides read the same signal.
             issues = issues.filter(issue =>
               !issue.pull_request &&
               issue.user?.login === owner &&
-              trustedIssueNumbers.has(String(issue.number))
+              trustedIssueNumbers.has(String(issue.number)) &&
+              labelNames(issue).some(
+                name => name.toLowerCase() === dispatchLabel.toLowerCase()
+              )
             );
             core.notice(
               'Public-repository bootstrap trust policy: ' + issues.length +
-              ' issue(s) are both owner-authored and policy-trusted.'
+              ' issue(s) are owner-authored, policy-trusted, and labelled ' +
+              dispatchLabel + '.'
             );
             for (const issue of issues) rememberIssue(issue);
 
@@ -433,10 +535,31 @@ jobs:
               }
             }
 
-            // Reconcile reservations for the gap between posting /oc and the PR
-            // appearing. The dispatch comment is audit/timing metadata only; it
-            // never blocks an issue forever.
-            for (const issue of issues) {
+            // Reconcile reservations for the gap between the dispatch and the
+            // PR appearing. The dispatch marker comment is audit/timing
+            // metadata only; it never blocks an issue forever.
+            //
+            // Reserved issues are reconciled whether or not they are still
+            // eligible. An issue whose dispatch label was removed mid-run
+            // leaves the eligible set above, and if this loop only saw eligible
+            // issues its reservation would never be released -- a withdrawn
+            // request would hold a WIP slot for ever.
+            const reservedIssues = await github.paginate(
+              github.rest.issues.listForRepo,
+              {
+                owner,
+                repo,
+                state: 'open',
+                labels: inProgressLabel,
+                per_page: 100,
+              }
+            );
+            for (const issue of reservedIssues) rememberIssue(issue);
+            core.notice(
+              reservedIssues.length + ' issue(s) hold a reservation.'
+            );
+
+            for (const issue of reservedIssues) {
               const issueNumber = issue.number;
               if (openPrIssues.has(issueNumber)) continue;
 
@@ -465,6 +588,37 @@ jobs:
                 );
               const latestDispatch = dispatches.at(-1);
               const latestPr = latestPrByIssue.get(issueNumber);
+              const latestDispatchAt = latestDispatch
+                ? new Date(latestDispatch.created_at).getTime()
+                : null;
+
+              if (!trustedIssueNumbers.has(String(issueNumber))) {
+                // Withdrawn. Removal is a withdrawal, not a cancellation: a
+                // dispatch already in flight has already passed the trust
+                // policy, so nothing can recall it, and it will publish what it
+                // produced. Holding the reservation until the lease expires is
+                // what keeps a withdrawn issue from freeing a WIP slot while
+                // its run is still using one.
+                //
+                // What the withdrawal does guarantee is that no *new* work
+                // starts: the issue is off the allowlist, so it is not a
+                // candidate below, and a lease-expired release stops any retry.
+                if (latestDispatchAt !== null && Date.now() - latestDispatchAt < leaseMs) {
+                  activeIssueNumbers.add(issueNumber);
+                  core.notice(
+                    'Issue #' + issueNumber + ' was withdrawn; its run holds ' +
+                    'the reservation until the lease expires.'
+                  );
+                } else {
+                  await removeLabel(issueNumber, inProgressLabel);
+                  core.notice(
+                    'Released the reservation on issue #' + issueNumber +
+                    ': it is no longer labelled ' + dispatchLabel +
+                    ', and no run is holding it.'
+                  );
+                }
+                continue;
+              }
 
               // If a PR from the current/latest dispatch already completed but
               // its event was missed, reconcile it here.
@@ -473,6 +627,7 @@ jobs:
                 const prAt = new Date(latestPr.created_at).getTime();
                 if (prAt >= dispatchAt && latestPr.state === 'closed') {
                   if (latestPr.merged_at) {
+                    completedIssues.add(issueNumber);
                     await removeLabel(issueNumber, inProgressLabel);
                     await removeLabel(issueNumber, pausedLabel);
                     await github.rest.issues.update({
@@ -507,10 +662,7 @@ jobs:
                 continue;
               }
 
-              const ageMs =
-                Date.now() - new Date(latestDispatch.created_at).getTime();
-
-              if (ageMs < leaseMs) {
+              if (Date.now() - latestDispatchAt < leaseMs) {
                 activeIssueNumbers.add(issueNumber);
                 continue;
               }
@@ -550,9 +702,30 @@ jobs:
             const candidates = [];
             for (const issue of issues) {
               if (activeIssueNumbers.has(issue.number)) continue;
+              if (completedIssues.has(issue.number)) {
+                core.info(
+                  'Skipping #' + issue.number + ': completed earlier in this run.'
+                );
+                continue;
+              }
+
+              // The hand-off is the label, re-checked here against the live
+              // issue rather than assumed from the filter above. Between the
+              // read and here a human may have withdrawn it; the trust policy
+              // checks again in the agent workflow, so this is the second of
+              // three gates rather than the only one.
+              if (!labelNames(issue).some(
+                name => name.toLowerCase() === dispatchLabel.toLowerCase()
+              )) {
+                core.info(
+                  'Skipping #' + issue.number + ': ' + dispatchLabel +
+                  ' is no longer on it.'
+                );
+                continue;
+              }
 
               const labels = labelsByIssue.get(issue.number);
-              if (labels.has(pausedLabel)) {
+              if (hasLabel(issue.number, pausedLabel)) {
                 core.info('Skipping #' + issue.number + ': automation is paused.');
                 continue;
               }
@@ -630,11 +803,20 @@ jobs:
             }
 
             // The credential was already resolved to a trusted account by the
-            // check-token gate, so reaching here means the /oc comment will be
-            // authored by an account the agent workflow accepts.
+            // check-token gate, so reaching here means the dispatch is
+            // requested by an identity the agent workflow's trust policy
+            // accepts. A github.token would fail that gate.
             core.notice(
               'Dispatching as @' + process.env.CREDENTIAL_LOGIN + '.'
             );
+
+            // The dispatch runs a workflow file from this ref, so it is the one
+            // value here that must not be taken from a payload. It comes from a
+            // repository variable and is pattern-checked before use.
+            const dispatchRef = (process.env.BASE_BRANCH || '').trim();
+            if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(dispatchRef)) {
+              throw new Error('Invalid BASE_BRANCH: ' + JSON.stringify(dispatchRef));
+            }
 
             core.notice(
               'Selected: ' +
@@ -647,28 +829,49 @@ jobs:
             );
 
             for (const { issue, priority } of selected) {
-              // A label acts as a short lease/reservation while OpenCode starts.
-              // It is rolled back immediately if posting /oc fails, expires
-              // automatically if no PR appears, and is reconciled from PR state.
+              // The in-progress label is a short lease/reservation for the
+              // window between this dispatch and the pull request appearing.
+              // It is rolled back immediately if the dispatch fails, expires
+              // automatically if no PR appears, and is reconciled from PR
+              // state on every later run.
               await addLabel(issue.number, inProgressLabel);
 
               try {
-                await github.rest.issues.createComment({
+                await github.rest.actions.createWorkflowDispatch({
                   owner,
                   repo,
-                  issue_number: issue.number,
-                  body: [
-                    '/oc',
-                    '',
-                    dispatchMarker,
-                    'Automatically dispatched by the issue scheduler (' +
-                      (priority || 'no explicit priority') + ').',
-                  ].join('\n'),
+                  workflow_id: 'opencode.yml',
+                  ref: dispatchRef,
+                  inputs: {
+                    mode: 'issue',
+                    issue_number: String(issue.number),
+                    // Repair inputs are sent empty rather than omitted: the
+                    // agent workflow's dispatch shape requires a
+                    // repair-shaped target for every other mode, and an absent
+                    // input is indistinguishable from one that was forgotten.
+                    pr_number: '',
+                    head_ref: '',
+                    run_id: '',
+                    rungs_ruled_out: '',
+                  },
                 });
               } catch (err) {
                 await removeLabel(issue.number, inProgressLabel);
                 throw err;
               }
+
+              // Audit and retry metadata only. Written after the dispatch
+              // succeeded so a marker never claims work that was not started.
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: issue.number,
+                body: [
+                  dispatchMarker,
+                  'Automatically dispatched by the issue scheduler (' +
+                    (priority || 'no explicit priority') + ').',
+                ].join('\n'),
+              });
 
               core.notice(
                 'Dispatched issue #' + issue.number + ' (' +

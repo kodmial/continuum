@@ -12,8 +12,15 @@ import opencode_runtime  # noqa: E402
 SCRIPT = SCRIPTS / "opencode_runtime.py"
 NAMES = ("opencode.yml", "consumer-opencode.yml")
 INSTALL_RE = re.compile(r'opencode_runtime\.py["\']?\s+install')
+# Two forms of the same guard. The privileged job calls the helper that the
+# read-only job materialized from the base branch, so the path is a variable
+# there; the read-only job calls the checked-out script directly. Both have to
+# re-verify the digest before the process starts.
+# Continuation backslashes and newlines are allowed between the tokens because a
+# long guard is written across lines to keep the step readable.
 VERIFY_RE = re.compile(
-    r'opencode_runtime\.py["\']?\s+verify\s+--expected-sha256\s+"\$OPENCODE_RUNTIME_SHA256"'
+    r'(opencode_runtime\.py["\']?|\$CONTINUUM_OPENCODE_RUNTIME_HELPER"?)'
+    r'\s*\\?\s*verify\s*\\?\s*--expected-sha256\s*\\?\s*"\$OPENCODE_RUNTIME_SHA256"'
 )
 
 def digest(path):

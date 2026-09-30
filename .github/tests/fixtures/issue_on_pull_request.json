@@ -1,0 +1,15 @@
+{
+  "_comment": "Regression fixture: a pull request that carries the dispatch label. Denied: pull_request_not_issue. Applying the activation label to a pull request must not turn an untrusted code surface into an executable task.",
+  "number": 43,
+  "title": "Fix the parser",
+  "body": "The implementation PR for this issue is open.",
+  "user": { "login": "kodmial", "type": "User" },
+  "author_association": "OWNER",
+  "state": "open",
+  "labels": [{ "name": "continuum:dispatch", "color": "1D76DB" }],
+  "pull_request": {
+    "url": "https://api.github.com/repos/kodmial/continuum/pulls/43",
+    "html_url": "https://github.com/kodmial/continuum/pull/43",
+    "diff_url": "https://github.com/kodmial/continuum/pull/43.diff"
+  }
+}

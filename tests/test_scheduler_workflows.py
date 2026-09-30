@@ -36,6 +36,11 @@ TRUST_FIXTURES = ROOT / ".github" / "tests" / "fixtures"
 sys.path.insert(0, str(TRUST_POLICY.parent))
 
 import trust_policy  # noqa: E402
+import continuum_labels  # noqa: E402
+
+#: The label the scheduler filters on, read from the same registry the workflow
+#: renders it from, so this harness cannot drift from what the run checks.
+DISPATCH_LABEL = continuum_labels.DISPATCH_LABEL
 
 OWNER = "kodmial"
 REPOSITORY = "kodmial/continuum"
@@ -86,14 +91,39 @@ def allowlist_expression(script: str) -> str:
     return balanced_expression(script, start)
 
 
+def eligibility_call(script: str) -> str:
+    """The whole `issues.filter(...)` argument list, not just its first clause.
+
+    Balanced-parenthesis scanning stops at the first close, which for a
+    multi-clause predicate is somewhere in the middle of it. Reading only that
+    prefix is worse than not testing the predicate at all: the filter would
+    pass while the clause that actually decides eligibility -- the dispatch
+    label -- was never evaluated.
+    """
+    start = script.index(ELIGIBILITY_FILTER) + len("issues = ")
+    return balanced_expression(script, start)
+
+
 def eligibility_predicate(script: str) -> str:
     """The arrow function the scheduler filters its backlog with."""
     start = script.index(ELIGIBILITY_FILTER) + len(ELIGIBILITY_FILTER)
     return balanced_expression(script, start)
 
 
+def helper_function(script: str, name: str) -> str:
+    """A `function name(...) {...}` declaration, lifted from the workflow."""
+    start = script.index("function {}(".format(name))
+    end = script.index("}", start)
+    return script[start : end + 1]
+
+
 def issue(number: int, login: str = OWNER, **extra) -> dict:
-    payload = {"number": number, "state": "open", "user": {"login": login}}
+    payload = {
+        "number": number,
+        "state": "open",
+        "user": {"login": login},
+        "labels": [{"name": DISPATCH_LABEL}],
+    }
     payload.update(extra)
     return payload
 
@@ -116,9 +146,9 @@ def eligible(issues, trusted_issues: str = "") -> list:
             "const owner = {};".format(json.dumps(OWNER)),
             "const trustedIssueNumbers = {};".format(allowlist_expression(script)),
             "const issues = {};".format(json.dumps(issues)),
-            "const eligible = issues.filter({});".format(
-                eligibility_predicate(script)
-            ),
+            "const dispatchLabel = {};".format(json.dumps(DISPATCH_LABEL)),
+            helper_function(script, "labelNames"),
+            "const eligible = {};".format(eligibility_call(script)),
             "console.log(JSON.stringify(eligible.map(issue => issue.number)));",
         ]
     )
@@ -163,7 +193,7 @@ def policy_allowlist(issues) -> str:
 
 def fixture(name: str) -> dict:
     with open(TRUST_FIXTURES / (name + ".json"), encoding="utf-8") as handle:
-        return json.load(handle)["issue"]
+        return json.load(handle)
 
 
 class EligibilityFilterTests(unittest.TestCase):
@@ -203,13 +233,32 @@ class EligibilityFilterTests(unittest.TestCase):
         # End to end across the boundary that broke: the policy's own output
         # string, consumed by the scheduler's own allowlist and predicate.
         issues = [
-            fixture("issue_comment_owner_on_owner_issue"),
-            fixture("issue_comment_attacker_authored_issue"),
-            fixture("issue_comment_on_pull_request"),
+            fixture("issue_owner_labeled"),
+            fixture("issue_stranger_authored_labeled"),
+            fixture("issue_on_pull_request"),
         ]
         payload = policy_allowlist(issues)
         self.assertEqual(payload, "44")
         self.assertEqual(eligible(issues, payload), [44])
+
+    def test_an_unlabeled_issue_is_not_a_dispatch_candidate(self):
+        # The hand-off is the label, so the filter has to read it. Removing the
+        # label has to make the issue ineligible in the scheduler as well as in
+        # the policy, or the two sides disagree about what is dispatched.
+        unlabeled = issue(37, labels=[{"name": "bug"}])
+        self.assertEqual(eligible([unlabeled], "37"), [])
+
+    def test_the_label_is_matched_the_way_the_api_matches_it(self):
+        # GitHub folds label case, so the scheduler folding it too is what keeps
+        # a renamed label from looking like a withdrawn one.
+        self.assertEqual(
+            eligible([issue(37, labels=[{"name": "Continuum:Dispatch"}])], "37"),
+            [37],
+        )
+
+    def test_a_label_near_miss_is_not_a_hand_off(self):
+        for name in ("continuum:dispatcher", "continuum:dispatch " + "x", "dispatch"):
+            self.assertEqual(eligible([issue(37, labels=[{"name": name}])], "37"), [], name)
 
     def test_the_empty_allowlist_dispatches_nothing(self):
         # Not an error, and still not a dispatch: an empty allowlist is a
@@ -236,11 +285,22 @@ class ExtractionTests(unittest.TestCase):
         self.assertIn("process.env.TRUSTED_ISSUES", expression)
 
     def test_the_predicate_compares_one_kind_at_a_time(self):
-        predicate = eligibility_predicate(self.script)
+        # Read the whole filter argument, not its first clause: the allowlist
+        # comparison is the second clause, and a prefix-only read would stop
+        # exactly before it.
+        predicate = eligibility_call(self.script)
         # The regression this suite exists for: a bare `issue.number` is a
         # number tested against a Set of strings, which is always false.
         self.assertNotRegex(predicate, r"has\(\s*issue\.number\s*\)")
         self.assertRegex(predicate, r"has\(\s*String\(issue\.number\)\s*\)")
+
+    def test_the_predicate_requires_the_dispatch_label(self):
+        # The scheduler's own eligibility rule, not only the policy's: an issue
+        # the policy listed must still carry the label to be dispatched here.
+        predicate = eligibility_call(self.script)
+        self.assertIn("dispatchLabel", predicate)
+        self.assertIn("toLowerCase()", predicate)
+        self.assertNotIn(DISPATCH_LABEL, self.script)
 
     def test_a_parenthesis_inside_a_string_cannot_unbalance_the_scan(self):
         # `')'` inside a literal must not close the expression early, and a
@@ -248,6 +308,14 @@ class ExtractionTests(unittest.TestCase):
         self.assertEqual(balanced_expression("f(g(1), ')')", 1), "(g(1), ')')")
         with self.assertRaises(AssertionError):
             balanced_expression("f(g(1)", 1)
+
+    def test_the_filter_argument_is_not_truncated_at_its_first_clause(self):
+        # The failure this guards against is silent: the harness would evaluate
+        # a strict subset of the predicate and still report a pass.
+        predicate = eligibility_call(self.script)
+        self.assertEqual(self.script.count("issues.filter("), 1)
+        for clause in ("!issue.pull_request", "issue.user?.login === owner", "dispatchLabel"):
+            self.assertIn(clause, predicate)
 
     def test_the_workflow_declares_exactly_one_script_body(self):
         text = SCHEDULER.read_text(encoding="utf-8")

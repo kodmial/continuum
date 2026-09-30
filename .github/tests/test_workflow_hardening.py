@@ -303,15 +303,29 @@ class UntrustedEventTests(WorkflowAuditBase):
         for event in UNTRUSTED_EVENTS + ("pull_request_target", "issues", "push", "schedule"):
             self.assertNotIn(event, trigger_names(document), event)
 
-    def test_agent_workflow_accepts_only_comment_and_dispatch(self):
+    def test_agent_workflow_is_reached_only_by_a_verified_dispatch(self):
+        # One trigger, and it is the control plane's. A workflow_dispatch event
+        # still has to survive the trust policy, so this is the narrowest
+        # trigger set the agent can have while remaining schedulable.
         self.assertEqual(
             sorted(trigger_names(self.workflows["opencode.yml"])),
-            ["issue_comment", "workflow_dispatch"],
+            ["workflow_dispatch"],
         )
 
-    def test_comment_trigger_is_create_only(self):
-        triggers = self.workflows["opencode.yml"]["on"]["issue_comment"]
-        self.assertEqual(triggers, {"types": ["created"]})
+    def test_no_agent_plane_workflow_activates_from_an_issue_comment(self):
+        # The activation path is the dispatch label. An issue_comment trigger on
+        # any workflow that reaches the agent would reintroduce an untrusted text
+        # field as a request to a write-capable run. The review plane is
+        # deliberately not covered here: it reads review comments by design, and
+        # it cannot dispatch the agent.
+        for name, document in self.agent_plane().items():
+            self.assertNotIn("issue_comment", trigger_names(document), name)
+
+    def test_the_agent_workflow_requires_a_satisfied_dispatch_shape(self):
+        document = self.workflows["opencode.yml"]
+        self.assertIn("workflow_dispatch", document["on"])
+        self.assertIn("mode", document["on"]["workflow_dispatch"]["inputs"])
+        self.assertIn("issue_number", document["on"]["workflow_dispatch"]["inputs"])
 
 
 class PermissionsTests(WorkflowAuditBase):
@@ -334,7 +348,10 @@ class PermissionsTests(WorkflowAuditBase):
             if step.get("name") == "Fix failed blocking workflow"
         )
         condition = str(step.get("if") or "")
-        self.assertIn("github.event_name == 'workflow_dispatch'", condition)
+        # The event clause is gone with the trigger set: this workflow only runs
+        # on workflow_dispatch now, so naming the event here would be redundant
+        # rather than protective.
+        self.assertNotIn("github.event_name", condition)
         self.assertIn("inputs.mode == 'ci-fix'", condition)
         self.assertIn("needs.authorize.outputs.trust_code == 'trusted_dispatch'", condition)
 
@@ -683,11 +700,8 @@ class AgentExecutionTests(WorkflowAuditBase):
             text = self.raw[name]
             self.assertIn("continuum-opencode-run:$GITHUB_RUN_ID", text)
             self.assertIn("Record issue execution ownership", text)
-            execution_token = (
-                "uses: anomalyco/opencode"
-                if name == "opencode.yml"
-                else "opencode run --auto"
-            )
+            execution_token = "opencode run --auto"
+            self.assertIn(execution_token, text, name)
             self.assertLess(
                 text.index("Record issue execution ownership"),
                 text.index(execution_token),
@@ -719,11 +733,44 @@ class AgentExecutionTests(WorkflowAuditBase):
         self.assertNotIn("OPENCODE_API_KEY is not configured", text)
         self.assertIn("OPENCODE_MODEL", text)
 
-    def test_comment_gate_requires_a_trusted_author_and_a_real_issue(self):
-        condition = str(self.job("opencode.yml", "authorize").get("if"))
-        self.assertIn("github.event.comment.user.login", condition)
-        self.assertIn("github.repository_owner", condition)
-        self.assertIn("github.event.issue.pull_request == null", condition)
+    def test_issue_execution_is_gated_on_a_verified_live_issue(self):
+        """The privileged job may only follow a read-only allow decision."""
+        document = self.agent_plane()["opencode.yml"]
+        authorize = document["jobs"]["authorize"]
+
+        # The authorize job runs on the read-only token only, and its decision is
+        # the sole thing the privileged job can be conditioned on.
+        self.assertNotIn("write-all", json.dumps(authorize))
+        step = next(
+            step
+            for step in authorize["steps"]
+            if "trust_policy.py" in str(step.get("run") or "")
+        )
+        self.assertIn("authorize-event", str(step["run"]))
+        self.assertNotIn("TAP_PAT", json.dumps(step))
+
+        # The privileged job requires that decision, and in issue mode it
+        # requires the verified issue number it will work on.
+        # The privileged job's condition is the read-only decision and nothing
+        # else. The repository-owner check is not a job-level clause any more:
+        # the policy resolves it against the API in the job that is allowed to
+        # ask, which is a finer gate than a string comparison in YAML.
+        condition = str(document["jobs"]["opencode"].get("if"))
+        self.assertIn("needs.authorize.result == 'success'", condition)
+        self.assertIn("needs.authorize.outputs.authorized == 'true'", condition)
+        self.assertNotIn("github.event", condition)
+
+    def test_the_authorize_job_checks_out_trusted_policy_and_not_a_payload(self):
+        document = self.agent_plane()["opencode.yml"]
+        checkout = next(
+            step
+            for step in document["jobs"]["authorize"]["steps"]
+            if str(step.get("uses") or "").startswith("actions/checkout")
+        )
+        self.assertEqual(
+            "${{ github.event.repository.default_branch }}", checkout["with"]["ref"]
+        )
+        self.assertEqual(False, checkout["with"]["persist-credentials"])
 
     def test_no_privileged_job_names_the_review_provider(self):
         # This repository used to carry a disabled CodeRabbit path, and the
@@ -813,15 +860,15 @@ class RepairControllerTests(WorkflowAuditBase):
         self.assertIn('"OpenCode agent"', text)
         self.assertIn("recover-failed-issue-run", text)
         self.assertIn("continuum-opencode-run:$RUN_ID", text)
-        self.assertIn("automation:in-progress", text)
-        self.assertIn("automation:paused", text)
+        self.assertIn('python3 "$registry" name in-progress', text)
+        self.assertIn('python3 "$registry" name paused', text)
         self.assertIn("gh workflow run issue-scheduler.yml", text)
         self.assertIn("MAX_ATTEMPTS", text)
 
         consumer = self.raw["consumer-repair.yml"]
         self.assertIn("issue-run-recovery", consumer)
         self.assertIn("continuum-opencode-run:$RUN_ID", consumer)
-        self.assertIn("continuum-dispatch", consumer)
+        self.assertIn("continuum-dispatch", consumer)  # consumer label plane
         self.assertIn('gh workflow run "$SCHEDULER_WORKFLOW"', consumer)
 
     def test_consumer_infrastructure_failures_have_a_separate_retry_budget(self):
@@ -857,6 +904,12 @@ class RepairControllerTests(WorkflowAuditBase):
         self.assertNotIn("Packaging smoke", self.raw["opencode-repair.yml"])
 
     def test_retry_budget_resets_after_explicit_unpause(self):
+        """An explicit unpause starts a new budget epoch for one issue.
+
+        Every plane counts attempts only from the most recent removal of the
+        paused label, so a human who pauses and then unpauses an issue gets a
+        full budget rather than the remainder of the old one.
+        """
         for name in (
             "issue-scheduler.yml",
             "opencode-repair.yml",
@@ -865,8 +918,18 @@ class RepairControllerTests(WorkflowAuditBase):
         ):
             text = self.raw[name]
             self.assertIn("/events", text, name)
-            self.assertIn("automation:paused", text, name)
             self.assertIn("unlabeled", text, name)
+            self.assertIn("paused", text, name)
+
+    def test_the_self_plane_reads_paused_and_reserved_labels_from_the_registry(self):
+        # The self plane has one registry; a typed-in label name here would be a
+        # second definition that could drift from the scheduler's.
+        for name in ("issue-scheduler.yml", "opencode-repair.yml"):
+            text = self.raw[name]
+            self.assertIn("continuum_labels.py", text, name)
+            self.assertIn("name paused", text, name)
+            self.assertIn("name in-progress", text, name)
+            self.assertNotIn('"automation:', text, name)
 
     def test_failed_agent_run_does_not_retry_when_open_pr_exists(self):
         for name in ("opencode-repair.yml", "consumer-repair.yml"):

@@ -1,0 +1,13 @@
+{
+  "_comment": "Regression fixture: the trusted path. The owner opened issue #44, applied the canonical dispatch label, and the scheduler dispatched it. Allowed, and checkout_ref is the base branch rather than anything in the payload.",
+  "number": 44,
+  "title": "Document the trust policy",
+  "body": "Add a short trust-boundary section to the README.",
+  "user": { "login": "kodmial", "type": "User" },
+  "author_association": "OWNER",
+  "state": "open",
+  "labels": [
+    { "name": "continuum:dispatch", "color": "1D76DB" },
+    { "name": "priority:p1", "color": "D93F0B" }
+  ]
+}

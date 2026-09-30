@@ -870,13 +870,20 @@ class WorkflowWiringTests(unittest.TestCase):
 
     def test_the_agent_workflow_never_dispatches_itself_in_issue_mode(self):
         # The original incident was a conflict triggering the issue lifecycle.
-        # A repair mode must be structurally unable to reach the issue path.
+        # A repair mode must be structurally unable to reach the issue path, and
+        # the issue path must be structurally unable to reach a repair rung.
         text = workflow_text(AGENT_WORKFLOW)
-        self.assertIn("github.event_name != 'workflow_dispatch'", text)
-        for step_gated in ("Run OpenCode",):
-            self.assertIn(step_gated, text)
-        # The issue-mode agent step is not reachable from a dispatch, and the
-        # repair steps are not reachable from a comment.
+        self.assertIn("Implement the issue", text)
+        # Isolation is now structural. The issue step names one mode and the
+        # repair steps name a repair_action the ladder computes; neither reads
+        # the other's field, and no step is conditioned on an event payload.
+        # The one event clause left is the authorize job's own guard, which is
+        # what stops a future trigger addition from authorizing by accident.
+        self.assertEqual(
+            1, text.count("github.event_name"), "unexpected event-conditioned step"
+        )
+        self.assertIn("github.event_name == 'workflow_dispatch'", text)
+        self.assertIn("if: inputs.mode == 'issue'", text)
         self.assertIn("needs.authorize.outputs.repair_action == 'replay-commits'", text)
         self.assertIn("needs.authorize.outputs.repair_action == 'resolve-hunks'", text)
 
@@ -973,8 +980,7 @@ class WorkflowWiringTests(unittest.TestCase):
     def test_the_outcome_step_runs_even_when_the_repair_fails(self):
         text = workflow_text(AGENT_WORKFLOW)
         self.assertIn(
-            "if: always() && github.event_name == 'workflow_dispatch' "
-            "&& contains(fromJSON('[\"replay-commits\",\"resolve-hunks\"]'), "
+            "if: always() && contains(fromJSON('[\"replay-commits\",\"resolve-hunks\"]'), "
             "needs.authorize.outputs.repair_action)",
             text,
         )

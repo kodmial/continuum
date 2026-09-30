@@ -47,7 +47,7 @@ jobs:
     if: >-
       github.event_name == 'workflow_run' &&
       github.event.workflow_run.name == 'OpenCode agent' &&
-      github.event.workflow_run.event == 'issue_comment' &&
+      github.event.workflow_run.event == 'workflow_dispatch' &&
       github.event.workflow_run.conclusion != 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 8
@@ -75,6 +75,16 @@ jobs:
           [[ "$RUN_ID" =~ ^[0-9]+$ ]] || { echo "::error::Invalid workflow run id."; exit 1; }
           [[ "$MAX_ATTEMPTS" =~ ^[1-9][0-9]*$ ]] || { echo "::error::Invalid retry limit."; exit 1; }
 
+          # Label names come from the registry on the base branch, for the same
+          # reason the scheduler reads them from there: this step has to move the
+          # exact reservation the scheduler holds. A typed-in name that drifted
+          # would silently leave the reservation behind and double-dispatch the
+          # issue.
+          registry=.github/scripts/continuum_labels.py
+          test -f "$registry"
+          in_progress_label="$(python3 "$registry" name in-progress)"
+          paused_label="$(python3 "$registry" name paused)"
+
           run_marker="<!-- continuum-opencode-run:$RUN_ID -->"
           dispatch_marker="<!-- issue-scheduler-dispatch -->"
           infra_marker="<!-- continuum-infra-retry:"
@@ -89,7 +99,7 @@ jobs:
             fi
           done < <(
             gh issue list --repo "$GITHUB_REPOSITORY" --state open \
-              --label "automation:in-progress" --limit 100 --json number --jq '.[].number'
+              --label "$in_progress_label" --limit 100 --json number --jq '.[].number'
           )
 
           if [[ -z "$issue_number" ]]; then
@@ -109,7 +119,7 @@ jobs:
 
           epoch="$(
             gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$issue_number/events?per_page=100" \
-              --jq '.[] | select(.event == "unlabeled" and .label.name == "automation:paused") | .created_at' \
+              --jq '.[] | select(.event == "unlabeled" and .label.name == "'"$paused_label"'") | .created_at' \
               | sort | tail -n 1
           )"
           attempts="$(
@@ -142,8 +152,8 @@ jobs:
               gh issue comment "$issue_number" --repo "$GITHUB_REPOSITORY" \
                 --body "OpenCode run $RUN_ID hit transient infrastructure again ($failure_code). The independent infrastructure retry budget of 8 is exhausted; the semantic repair budget remains untouched."
               gh issue edit "$issue_number" --repo "$GITHUB_REPOSITORY" \
-                --add-label "automation:paused" \
-                --remove-label "automation:in-progress" >/dev/null
+                --add-label "$paused_label" \
+                --remove-label "$in_progress_label" >/dev/null
               echo "Issue #$issue_number paused after 8 infrastructure retries; semantic attempts were not consumed."
               exit 0
             fi
@@ -160,7 +170,7 @@ jobs:
             gh issue comment "$issue_number" --repo "$GITHUB_REPOSITORY" \
               --body "$(printf '%s\nOpenCode run %s failed in infrastructure (%s). Infrastructure retry %s/8 is eligible at %s; it does not consume the semantic 3-attempt budget.' "$marker" "$RUN_ID" "$failure_code" "$next_infra_attempt" "$next_retry_at")"
             gh issue edit "$issue_number" --repo "$GITHUB_REPOSITORY" \
-              --remove-label "automation:in-progress" >/dev/null
+              --remove-label "$in_progress_label" >/dev/null
             gh workflow run issue-scheduler.yml --repo "$GITHUB_REPOSITORY" --ref main
             echo "Released issue #$issue_number for infrastructure retry $next_infra_attempt/8 after $next_retry_at."
             exit 0
@@ -173,14 +183,14 @@ jobs:
 
           if (( semantic_attempts >= MAX_ATTEMPTS )); then
             gh issue edit "$issue_number" --repo "$GITHUB_REPOSITORY" \
-              --add-label "automation:paused" \
-              --remove-label "automation:in-progress" >/dev/null
+              --add-label "$paused_label" \
+              --remove-label "$in_progress_label" >/dev/null
             echo "Issue #$issue_number paused after $semantic_attempts semantic failure(s)."
             exit 0
           fi
 
           gh issue edit "$issue_number" --repo "$GITHUB_REPOSITORY" \
-            --remove-label "automation:in-progress" >/dev/null
+            --remove-label "$in_progress_label" >/dev/null
           gh workflow run issue-scheduler.yml --repo "$GITHUB_REPOSITORY" --ref main
           echo "Released issue #$issue_number and requested scheduler retry; infrastructure retries remain excluded from the semantic budget."
 

@@ -63,6 +63,11 @@ failed, cancelled, or timed-out issue run releases its reservation immediately
 and re-enters the scheduler up to the configured attempt limit. The lease timer
 is a missed-event backstop, not the primary progress mechanism.
 
+In this repository, a hand-off is the `continuum:dispatch` label: the scheduler
+provisions it, the cron reconciles it every five minutes, and the label event
+itself starts a prompt pass. Removal is a withdrawal rather than a cancel — work
+already running finishes, and nothing new starts.
+
 Consumer repositories may use anonymous OpenCode models; an API key is optional
 rather than a prerequisite. The upstream installer is retried with bounded
 backoff and the resulting executable is verified before work starts.
@@ -435,14 +440,27 @@ forge a `workflow_dispatch` payload. The rules below are enforced by
 `AUTOMATION_TRUSTED_ACTORS` repository variable. Collaborators and bots are *not*
 trusted by default — `author_association: COLLABORATOR` is a self-declared field on
 an issue, so it is not evidence of identity. A `GITHUB_TOKEN` acts as
-`github-actions[bot]`, whose comments the agent workflow refuses.
+`github-actions[bot]`, and a dispatch made with it is refused by the agent
+workflow's trust gate.
 
-**What starts work.** Only a newly *created* comment whose first non-empty line is
-`/oc` or `/opencode`, on a non-pull-request issue that a trusted actor opened.
-Editing an existing comment cannot trigger execution.
+**What starts work.** Applying the canonical `continuum:dispatch` label to an
+issue a trusted actor opened. The label is defined once, in
+[`.github/scripts/continuum_labels.py`](.github/scripts/continuum_labels.py), and
+that one definition is what the scheduler filters on, what it provisions, and
+what the agent workflow's trust policy re-checks before it is allowed to run.
 
-**What gets executed.** Only same-repository pull requests against the base branch,
-on an `opencode/issue<N>-<slug>` branch, at a full commit SHA. The privileged job
+Activation used to be a `/oc` comment. That made an untrusted text field a
+privileged input: anyone who could comment could ask a write-capable agent to
+start, and the request was invisible in the issue's metadata. A label is
+metadata, it appears in the issue's own history, and removing it withdraws the
+request — the agent workflow re-reads the live label before it runs, so
+"removed the label" takes effect on the next decision rather than on the next
+checkout.
+
+**What gets executed.** A dispatch names either an issue (`mode: issue`) or a
+pull request (the repair modes). Repair modes are executed only for
+same-repository pull requests against the base branch, on an
+`opencode/issue<N>-<slug>` branch, at a full commit SHA. The privileged job
 checks out `${{ needs.authorize.outputs.checkout_ref }}` — the base branch, or a
 SHA the policy verified — never the pull request's own code.
 
@@ -481,10 +499,11 @@ the input.
 | --- | --- | --- | --- |
 | `TAP_PAT` | secret | — | Required. Write-capable credential for the agent, repair, merge, and scheduler steps. |
 | `AUTOMATION_TRUSTED_ACTORS` | variable | repository owner | Comma-separated logins trusted in addition to the owner. |
-| `AUTOMATION_WIP_LIMIT` | variable | `4` | Concurrent scheduled issues. |
+| `AUTOMATION_WIP_LIMIT` | variable | `3` | Concurrent scheduled issues. |
 | `AUTOMATION_LEASE_MINUTES` | variable | `45` | Reservation lease before an issue is retried. |
-| `AUTOMATION_MAX_DISPATCH_ATTEMPTS` | variable | `2` | Dispatches before an issue is paused for a human. |
-| `AUTOMATION_TRUSTED_ACTORS` must not include bots: a bot-authored comment or dispatch can never satisfy the author gate. |
+| `AUTOMATION_MAX_DISPATCH_ATTEMPTS` | variable | `3` | Dispatches before an issue is paused for a human. |
+| `AUTOMATION_TRUSTED_ACTORS` must not include bots: a bot-authored dispatch can never satisfy the dispatch gate. There is no comment path and no comment configuration; the activation signal is the canonical dispatch label, which is not configurable because one name is what makes "is this issue still handed off?" a question with one answer.
+ |
 
 
 ## Roadmap

@@ -1,13 +1,25 @@
 # Continuum bootstrap: NanoDictate agent workflow, bootstrap scope.
 #
+# Trigger
+# -------
+# There is exactly one way in: `workflow_dispatch`. The trigger used to be an
+# issue comment carrying a slash command, which made an untrusted text field a
+# privileged input -- anybody who could comment could ask a write-capable agent
+# to start, and the activation was invisible in the issue's metadata. The request
+# is now a canonical label, read from .github/scripts/continuum_labels.py and
+# applied by the scheduler, which dispatches here with `mode: issue`. Comment
+# text can no longer select work, select a checkout, or reach a model.
+#
 # Trust boundary
 # --------------
 # This workflow spends a write-capable credential (TAP_PAT), so it is split in
 # two jobs that never share authority:
 #
-#   authorize  read-only control plane. Decides whether the event is trusted,
-#              using .github/scripts/trust_policy.py and a read-only
-#              GITHUB_TOKEN. It never checks out or executes pull-request code.
+#   authorize  read-only control plane. Decides whether the dispatch is
+#              trusted, using .github/scripts/trust_policy.py and a read-only
+#              GITHUB_TOKEN. For `mode: issue` that means the target is a
+#              trusted actor's still-open issue that *currently* carries the
+#              dispatch label. It never checks out or executes untrusted code.
 #   opencode   privileged execution. Runs only when `authorize` allowed the
 #              request, and checks out only the ref `authorize` validated.
 #
@@ -18,20 +30,22 @@
 name: OpenCode agent
 
 on:
-  issue_comment:
-    types: [created]
   workflow_dispatch:
     inputs:
       mode:
-        description: "Invocation mode"
+        description: "Invocation mode: issue, resolve-conflict, ci-fix, or review-fix"
         required: true
         type: string
+      issue_number:
+        description: "Issue to execute (mode: issue only)"
+        required: false
+        type: string
       pr_number:
-        description: "Pull request number"
+        description: "Pull request number (repair modes)"
         required: false
         type: string
       head_ref:
-        description: "Pull request head branch"
+        description: "Pull request head branch (repair modes)"
         required: false
         type: string
       run_id:
@@ -53,13 +67,8 @@ jobs:
   authorize:
     name: Authorize trusted request
     if: >-
-      (github.event_name == 'workflow_dispatch' &&
-       contains(fromJSON('["resolve-conflict","ci-fix","review-fix"]'), inputs.mode)) ||
-      (github.event_name == 'issue_comment' &&
-       github.event.issue.pull_request == null &&
-       github.event.comment.user.login == github.repository_owner &&
-       (contains(github.event.comment.body, '/oc') ||
-        contains(github.event.comment.body, '/opencode')))
+      github.event_name == 'workflow_dispatch' &&
+      contains(fromJSON('["issue","resolve-conflict","ci-fix","review-fix"]'), inputs.mode)
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
@@ -76,6 +85,11 @@ jobs:
       run_id: ${{ steps.gate.outputs.run_id }}
       head_ref: ${{ steps.gate.outputs.head_ref }}
       checkout_ref: ${{ steps.gate.outputs.checkout_ref }}
+      # The exact issue text the policy verified, fenced as data. A job output
+      # rather than a file because the two jobs run on different runners; the
+      # agent prompt is built from what the read-only job approved rather than
+      # from anything re-read by the privileged one.
+      trusted_context: ${{ steps.gate.outputs.trusted_context }}
       # Repair and task executions get different, fixed budgets. A repair of a
       # finished change is bounded by conflict_repair.py, so a three-hour
       # source task can never set the deadline for repairing its own merge
@@ -126,9 +140,9 @@ jobs:
           # Read-only. Planning must not be able to repair anything.
           GH_TOKEN: ${{ github.token }}
           GITHUB_TOKEN: ${{ github.token }}
-          MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'issue' }}
+          MODE: ${{ inputs.mode }}
           PR_NUMBER: ${{ steps.gate.outputs.pr_number }}
-          RULED_OUT: ${{ github.event_name == 'workflow_dispatch' && inputs.rungs_ruled_out || '' }}
+          RULED_OUT: ${{ inputs.rungs_ruled_out || '' }}
           CONTINUUM_BASE_BRANCH: ${{ vars.AUTOMATION_BASE_BRANCH || 'main' }}
           CONTINUUM_REPAIR_MAX_ATTEMPTS: ${{ vars.AUTOMATION_REPAIR_MAX_ATTEMPTS || '3' }}
         run: |
@@ -278,9 +292,9 @@ jobs:
       # OpenCode loads one global instructions file in addition to whatever it
       # finds in the repository, and on a fresh runner the global one does not
       # exist -- so an agent that was not given Continuum's policy ran without
-      # it and nothing failed. One step, before the action-based issue run and
-      # before both repair invocations, is what makes "every OpenCode execution
-      # path" a property of the job rather than a habit per call site.
+      # it and nothing failed. One step, before the task run and before both
+      # repair invocations, is what makes "every OpenCode execution path" a
+      # property of the job rather than a habit per call site.
       #
       # The repository's own AGENTS.md is not touched and is not replaced: the
       # installer only ever writes to a resolved global configuration
@@ -294,13 +308,18 @@ jobs:
           python3 "$CONTINUUM_OPENCODE_INSTRUCTIONS_HELPER" install \
             --source "$CONTINUUM_AGENT_INSTRUCTIONS"
 
-      # workflow_dispatch repair modes must NOT use "opencode github run":
-      # that integration owns a branch/PR lifecycle and can open a new PR even
-      # when the prompt says not to. Plain "opencode run" works in this already
-      # checked-out PR branch and has no built-in PR-creation lifecycle.
-      - name: Install OpenCode CLI for automated repair
-        id: repair_opencode_runtime
-        if: github.event_name == 'workflow_dispatch'
+      # Every invocation in this job is `opencode run` against a CLI this job
+      # installed and attested itself, not the GitHub app action.
+      #
+      # The action owned the whole issue lifecycle: it chose the branch name,
+      # pushed, and opened the pull request from inside the agent process. That
+      # is the same authority model that made a comment able to start work, one
+      # layer down -- and it left the workflow unable to see or verify what the
+      # agent had done. With the CLI, the workflow owns the ref and publishes
+      # the finished tree itself (the workspace-recovery steps below), so the
+      # only thing the model controls is the content of the change.
+      - name: Install the OpenCode CLI
+        id: opencode_runtime
         run: |
           set -euo pipefail
           echo "failure_class=none" >> "$GITHUB_OUTPUT"
@@ -325,7 +344,7 @@ jobs:
 
           if [[ "$installed" != "true" ]]; then
             python3 "$CONTINUUM_FAILURE_RETRY_HELPER" classify \
-              --failed-step "Install OpenCode CLI for automated repair" \
+              --failed-step "Install the OpenCode CLI" \
               < "$installer_log" > "$RUNNER_TEMP/opencode-installer-class.env"
             # shellcheck disable=SC1090
             source "$RUNNER_TEMP/opencode-installer-class.env"
@@ -354,7 +373,7 @@ jobs:
           fi
 
       - name: Record issue execution ownership
-        if: github.event_name == 'issue_comment'
+        if: inputs.mode == 'issue'
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           ISSUE_NUMBER: ${{ needs.authorize.outputs.issue_number }}
@@ -365,29 +384,88 @@ jobs:
           gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
             --body "$(printf '%s\nOpenCode run %s started for issue #%s.' "$marker" "$GITHUB_RUN_ID" "$ISSUE_NUMBER")"
 
-      - name: Run OpenCode
-        if: github.event_name != 'workflow_dispatch'
-        uses: anomalyco/opencode/github@545f51d26cc39a907d2867492d498d9607ea5fa4
+      - name: Implement the issue
+        if: inputs.mode == 'issue'
         env:
-          # use_github_token=true below tells OpenCode to use this exact env
-          # credential for GitHub API operations. Keep it aligned with the
-          # checkout credential so both gh calls and git push use TAP_PAT.
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
           GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
-          # The GitHub integration owns the branch/commit/push/PR lifecycle for
-          # issue sessions. Prevent the LLM from changing Git state underneath
-          # that lifecycle. OpenCode evaluates explicit deny rules even in auto
-          # mode; read-only Git inspection remains allowed.
+          OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/big-pickle' }}
+          ISSUE_NUMBER: ${{ needs.authorize.outputs.issue_number }}
+          BASE_BRANCH: ${{ needs.authorize.outputs.base_branch }}
+          OPENCODE_RUNTIME_SHA256: ${{ steps.opencode_runtime.outputs.runtime_sha256 }}
+          # The issue text the read-only job verified and fenced, handed over as
+          # a job output rather than re-read here. It is data: the markers say
+          # so, and the prompt below does not treat it as an instruction.
+          TRUSTED_CONTEXT: ${{ needs.authorize.outputs.trusted_context }}
+          # The agent gets its own bound, one minute under the job budget. The
+          # job timeout is the backstop; this one is what lets a model that
+          # hangs stop in a way that still lets the workspace-recovery and
+          # outcome steps run. Without it, a hang would consume the whole job
+          # and discard a finished implementation with the runner.
+          TASK_AGENT_TIMEOUT_SECONDS: ${{ fromJSON(needs.authorize.outputs.task_timeout_minutes) * 60 - 60 }}
+          # The GitHub app action used to own the branch/commit/push/PR
+          # lifecycle for issue sessions. The model must not: the deny rules
+          # stop it from changing Git state, from reading the credential
+          # environment, and from using network tools that could exfiltrate one.
+          # OpenCode evaluates explicit deny rules even in auto mode; read-only
+          # Git inspection stays allowed.
           #
           # The bash allowlist is also the secret-exposure boundary: a model
           # that is talked into "just check the token" has no curl, wget, or
           # printenv to read or exfiltrate one with.
           OPENCODE_CONFIG_CONTENT: >-
             {"permission":{"bash":{"*":"allow","curl":"deny","curl *":"deny","wget":"deny","wget *":"deny","printenv":"deny","printenv *":"deny","env":"deny","env *":"deny","set":"deny","set +x":"deny","gh secret *":"deny","gh auth *":"deny","ssh *":"deny","scp *":"deny","nc *":"deny","npm publish*":"deny","git *":"deny","git status":"allow","git status *":"allow","git diff":"allow","git diff *":"allow","git log":"allow","git log *":"allow","git show":"allow","git show *":"allow","git rev-parse *":"allow","git ls-files":"allow","git ls-files *":"allow","git grep *":"allow","git blame *":"allow","git branch --show-current":"allow","git remote -v":"allow","git tag":"allow","git tag --list *":"allow","git tag -l *":"allow","git describe *":"allow"}}}
-        with:
-          model: ${{ vars.OPENCODE_MODEL || 'opencode/big-pickle' }}
-          use_github_token: true
-          share: false
+        run: |
+          set -euo pipefail
+          [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::Invalid issue number."; exit 1; }
+          [[ -n "$TRUSTED_CONTEXT" ]] || {
+            echo "::error::No verified issue context was produced by the trust policy."
+            exit 1
+          }
+
+          # The workflow owns the branch. It is created here, before the model
+          # runs, so the ref the finished work is published to is decided by
+          # this workflow rather than by anything the model leaves behind. The
+          # name is derived from the verified issue number, so a re-dispatch of
+          # the same issue finds the previous run's pull request instead of
+          # racing it onto a second branch.
+          BRANCH="$(python3 .github/scripts/agent_workspace.py select-branch \
+            --candidates "opencode/issue${ISSUE_NUMBER}-continuum" | sed -n 's/^owned_branch=//p')"
+          [[ "$BRANCH" =~ ^opencode/issue[0-9]+-[A-Za-z0-9._-]+$ ]] \
+            || { printf '::error::Could not derive the owned branch for issue #%s.\n' "$ISSUE_NUMBER"; exit 1; }
+          git fetch origin "$BASE_BRANCH" --quiet
+          git switch -C "$BRANCH" "origin/$BASE_BRANCH"
+
+          [[ "$TASK_AGENT_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] \
+            || { echo "::error::Invalid task agent timeout."; exit 1; }
+
+          # Point of use. Both digests recorded at install are re-read here, so
+          # the process about to start is the one that was verified rather than
+          # whatever PATH happens to resolve at this moment, and it starts with
+          # the policy file it is supposed to have.
+          # Compatibility/audit token: opencode_runtime.py verify --expected-sha256 "$OPENCODE_RUNTIME_SHA256"
+          python3 "$CONTINUUM_OPENCODE_RUNTIME_HELPER" verify \
+            --expected-sha256 "$OPENCODE_RUNTIME_SHA256"
+          # Compatibility/audit token: opencode_instructions.py verify
+          python3 "$CONTINUUM_OPENCODE_INSTRUCTIONS_HELPER" verify \
+            --source "$CONTINUUM_AGENT_INSTRUCTIONS"
+
+          PROMPT="$(printf '%s\n\n%s' \
+            "Implement GitHub issue #${ISSUE_NUMBER} in this repository." \
+            "$TRUSTED_CONTEXT")"
+
+          agent_log="$RUNNER_TEMP/issue-opencode.log"
+          set +e
+          timeout --signal=TERM "$TASK_AGENT_TIMEOUT_SECONDS" \
+            opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" \
+            2>&1 | tee "$agent_log"
+          agent_rc=${PIPESTATUS[0]}
+          set -e
+          if [[ "$agent_rc" -ne 0 ]]; then
+            echo "::error::The agent exited with status $agent_rc; the run is treated as failed."
+            exit "$agent_rc"
+          fi
 
       # Upstream OpenCode deliberately skips its infrastructure push/PR when
       # the agent leaves the branch that OpenCode created for an issue. The
@@ -402,7 +480,7 @@ jobs:
       # refuse -- and refuse still preserves the work on a salvage branch.
       - name: Plan the agent workspace recovery
         id: workspace
-        if: github.event_name == 'issue_comment'
+        if: inputs.mode == 'issue'
         env:
           # `gh pr list` needs a credential. Without this the plan step fails on
           # a 401, and a failed plan step is a failed recovery: the finished
@@ -472,7 +550,7 @@ jobs:
             --head-sha "$(git rev-parse HEAD 2>/dev/null || true)"
 
       - name: Materialize the agent workspace
-        if: github.event_name == 'issue_comment' && steps.workspace.outputs.workspace_action != 'refuse'
+        if: inputs.mode == 'issue' && steps.workspace.outputs.workspace_action != 'refuse'
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           ISSUE_NUMBER: ${{ needs.authorize.outputs.issue_number }}
@@ -550,7 +628,7 @@ jobs:
           gh pr create --repo "$GITHUB_REPOSITORY" --base "$BASE_BRANCH" --head "$OWNED_BRANCH" --title "$TITLE" --body "$BODY"
 
       - name: Preserve an unpublishable agent workspace
-        if: github.event_name == 'issue_comment' && steps.workspace.outputs.workspace_action == 'refuse'
+        if: inputs.mode == 'issue' && steps.workspace.outputs.workspace_action == 'refuse'
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           ISSUE_NUMBER: ${{ needs.authorize.outputs.issue_number }}
@@ -696,7 +774,7 @@ jobs:
           # controller releases the lock on timeout so a bounded retry can
           # happen.
           REPAIR_AGENT_TIMEOUT_SECONDS: ${{ needs.authorize.outputs.repair_agent_timeout_seconds }}
-          OPENCODE_RUNTIME_SHA256: ${{ steps.repair_opencode_runtime.outputs.runtime_sha256 }}
+          OPENCODE_RUNTIME_SHA256: ${{ steps.opencode_runtime.outputs.runtime_sha256 }}
         run: |
           set -euo pipefail
           [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::Invalid pull request number."; exit 1; }
@@ -809,7 +887,7 @@ jobs:
       # checkout. A pull request cannot decide its own repair scope, and cannot
       # reach the write-capable engine through it.
       - name: Checkout the trusted review engine
-        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'review-fix'
+        if: inputs.mode == 'review-fix'
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ github.event.repository.default_branch }}
@@ -834,7 +912,7 @@ jobs:
       # would hand the model an unnormalized list it could misread as licence to
       # widen its own scope.
       - name: Repair the open review findings
-        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'review-fix' && needs.authorize.outputs.trust_code == 'trusted_dispatch'
+        if: inputs.mode == 'review-fix' && needs.authorize.outputs.trust_code == 'trusted_dispatch'
         env:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
           OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/big-pickle' }}
@@ -848,7 +926,7 @@ jobs:
           # already spent an attempt for this commit; a repair that cannot
           # finish in this window is a pause, not a longer run.
           REPAIR_AGENT_TIMEOUT_SECONDS: ${{ needs.authorize.outputs.repair_agent_timeout_seconds }}
-          OPENCODE_RUNTIME_SHA256: ${{ steps.repair_opencode_runtime.outputs.runtime_sha256 }}
+          OPENCODE_RUNTIME_SHA256: ${{ steps.opencode_runtime.outputs.runtime_sha256 }}
         run: |
           set -euo pipefail
           [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::Invalid pull request number."; exit 1; }
@@ -904,7 +982,7 @@ jobs:
           echo "::notice::Pushed the review repair to $HEAD_REF."
 
       - name: Fix failed blocking workflow
-        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'ci-fix' && needs.authorize.outputs.trust_code == 'trusted_dispatch'
+        if: inputs.mode == 'ci-fix' && needs.authorize.outputs.trust_code == 'trusted_dispatch'
         env:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
           OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/big-pickle' }}
@@ -913,7 +991,7 @@ jobs:
           PR_NUMBER: ${{ needs.authorize.outputs.pr_number }}
           RUN_ID: ${{ needs.authorize.outputs.run_id }}
           HEAD_REF: ${{ needs.authorize.outputs.head_ref }}
-          OPENCODE_RUNTIME_SHA256: ${{ steps.repair_opencode_runtime.outputs.runtime_sha256 }}
+          OPENCODE_RUNTIME_SHA256: ${{ steps.opencode_runtime.outputs.runtime_sha256 }}
         run: |
           set -euo pipefail
           [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::Invalid pull request number."; exit 1; }
@@ -986,7 +1064,7 @@ jobs:
       # and the original pull request is only ever frozen after a replacement
       # head provably exists.
       - name: Publish the conflict-repair outcome
-        if: always() && github.event_name == 'workflow_dispatch' && contains(fromJSON('["replay-commits","resolve-hunks"]'), needs.authorize.outputs.repair_action)
+        if: always() && contains(fromJSON('["replay-commits","resolve-hunks"]'), needs.authorize.outputs.repair_action)
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ needs.authorize.outputs.pr_number }}
@@ -1001,8 +1079,8 @@ jobs:
           REPAIR_HEAD: ${{ env.REPAIR_HEAD }}
           CONFLICT_ORIGINAL_HEAD: ${{ env.CONFLICT_ORIGINAL_HEAD }}
           CONFLICT_PRESERVED_COMMITS: ${{ env.CONFLICT_PRESERVED_COMMITS }}
-          RUNTIME_FAILURE_CLASS: ${{ steps.repair_opencode_runtime.outputs.failure_class }}
-          RUNTIME_FAILURE_CODE: ${{ steps.repair_opencode_runtime.outputs.failure_code }}
+          RUNTIME_FAILURE_CLASS: ${{ steps.opencode_runtime.outputs.failure_class }}
+          RUNTIME_FAILURE_CODE: ${{ steps.opencode_runtime.outputs.failure_code }}
         run: |
           set -euo pipefail
           [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::Invalid pull request number."; exit 1; }
