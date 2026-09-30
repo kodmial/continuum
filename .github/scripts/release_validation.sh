@@ -31,7 +31,7 @@ set -euo pipefail
 root="${1:-.}"
 cd "$root"
 
-allowed='^(auto-merge|ci|issue-scheduler|review-gate|review-queue|opencode|opencode-repair|continuum-shadow|consumer|consumer-scheduler|consumer-opencode|consumer-repair|consumer-auto-merge|consumer-review-gate|consumer-child-dispatcher|consumer-child-worker|consumer-child-review|consumer-child-pr-review|release-bun-binary|release|publish-continuum)\.ya?ml
+allowed='^(auto-merge|ci|issue-scheduler|review-gate|review-queue|opencode|opencode-repair|continuum-shadow|consumer|consumer-scheduler|consumer-opencode|consumer-repair|consumer-auto-merge|consumer-review-gate|consumer-child-dispatcher|consumer-child-worker|consumer-child-review|consumer-child-pr-review|release-bun-binary|release|publish-continuum)\\.ya?ml$'
 actionlint_version="1.7.12"
 actionlint_sha256="8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
 
