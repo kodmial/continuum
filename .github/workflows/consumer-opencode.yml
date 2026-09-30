@@ -134,6 +134,9 @@ on:
     secrets:
       OPENCODE_API_KEY:
         required: false
+      continuum_token:
+        description: "Optional consumer-owned write token used when downstream GitHub events must fan out"
+        required: false
 
 permissions:
   actions: read
@@ -158,8 +161,8 @@ jobs:
     # replaces the first, so `BASE_BRANCH` was being dropped and every `$BASE_BRANCH`
     # reference in this job expanded to nothing.
     env:
-      GH_TOKEN: ${{ github.token }}
-      GITHUB_TOKEN: ${{ github.token }}
+      GH_TOKEN: ${{ secrets.continuum_token || github.token }}
+      GITHUB_TOKEN: ${{ secrets.continuum_token || github.token }}
       OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
       OPENCODE_MODEL: ${{ inputs.model }}
       BASE_BRANCH: ${{ inputs.base_branch }}
@@ -196,7 +199,7 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ inputs.base_branch }}
-          token: ${{ github.token }}
+          token: ${{ secrets.continuum_token || github.token }}
           persist-credentials: true
 
       - name: Checkout PR branch
@@ -205,7 +208,7 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ inputs.head_ref }}
-          token: ${{ github.token }}
+          token: ${{ secrets.continuum_token || github.token }}
           persist-credentials: true
 
       - name: Configure git
