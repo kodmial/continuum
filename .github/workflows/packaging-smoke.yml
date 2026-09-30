@@ -296,10 +296,10 @@ jobs:
         run: |
           set -euo pipefail
           if [[ ! -f scripts/packaging-smoke/common.sh ]]; then
-            if [[ -d .continuum ]]; then ln -sf .continuum/scripts scripts 2>/dev/null || true; fi
+            if [[ -d .continuum ]]; then ln -sfn .continuum/scripts scripts 2>/dev/null || true; fi
             if [[ ! -f scripts/packaging-smoke/common.sh ]]; then
               git clone --depth 1 https://github.com/kodmial/continuum.git .continuum 2>/dev/null || true
-              ln -sf .continuum/scripts scripts 2>/dev/null || true
+              ln -sfn .continuum/scripts scripts 2>/dev/null || true
             fi
           fi
           chmod +x scripts/packaging-smoke/*.sh
@@ -350,10 +350,10 @@ jobs:
         run: |
           set -euo pipefail
           if [[ ! -f scripts/packaging-smoke/common.sh ]]; then
-            if [[ -d .continuum ]]; then ln -sf .continuum/scripts scripts 2>/dev/null || true; fi
+            if [[ -d .continuum ]]; then ln -sfn .continuum/scripts scripts 2>/dev/null || true; fi
             if [[ ! -f scripts/packaging-smoke/common.sh ]]; then
               git clone --depth 1 https://github.com/kodmial/continuum.git .continuum 2>/dev/null || true
-              ln -sf .continuum/scripts scripts 2>/dev/null || true
+              ln -sfn .continuum/scripts scripts 2>/dev/null || true
             fi
           fi
           chmod +x scripts/packaging-smoke/*.sh
@@ -400,10 +400,10 @@ jobs:
         run: |
           set -euo pipefail
           if [[ ! -f scripts/packaging-smoke/common.sh ]]; then
-            if [[ -d .continuum ]]; then ln -sf .continuum/scripts scripts 2>/dev/null || true; fi
+            if [[ -d .continuum ]]; then ln -sfn .continuum/scripts scripts 2>/dev/null || true; fi
             if [[ ! -f scripts/packaging-smoke/common.sh ]]; then
               git clone --depth 1 https://github.com/kodmial/continuum.git .continuum 2>/dev/null || true
-              ln -sf .continuum/scripts scripts 2>/dev/null || true
+              ln -sfn .continuum/scripts scripts 2>/dev/null || true
             fi
           fi
           chmod +x scripts/packaging-smoke/*.sh
@@ -455,10 +455,10 @@ jobs:
         run: |
           set -euo pipefail
           if [[ ! -f scripts/packaging-smoke/common.sh ]]; then
-            if [[ -d .continuum ]]; then ln -sf .continuum/scripts scripts 2>/dev/null || true; fi
+            if [[ -d .continuum ]]; then ln -sfn .continuum/scripts scripts 2>/dev/null || true; fi
             if [[ ! -f scripts/packaging-smoke/common.sh ]]; then
               git clone --depth 1 https://github.com/kodmial/continuum.git .continuum 2>/dev/null || true
-              ln -sf .continuum/scripts scripts 2>/dev/null || true
+              ln -sfn .continuum/scripts scripts 2>/dev/null || true
             fi
           fi
           chmod +x scripts/packaging-smoke/*.sh

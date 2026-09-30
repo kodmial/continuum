@@ -989,7 +989,7 @@ jobs:
           persist-credentials: false
       - name: Link Continuum scripts if needed
         if: hashFiles('scripts/release-prep.rb') == ''
-        run: ln -sf .continuum/scripts scripts
+        run: ln -sfn .continuum/scripts scripts
       - name: Prepare release manifests
         run: ruby scripts/release-prep.rb "v$VERSION"
 

@@ -139,7 +139,7 @@ jobs:
 
       - name: Link Continuum scripts if needed
         if: hashFiles('scripts/release-policy.sh') == ''
-        run: ln -sf .continuum/scripts scripts
+        run: ln -sfn .continuum/scripts scripts
 
       - name: Test the release policy
         run: bash scripts/test-release-policy.sh
@@ -174,7 +174,7 @@ jobs:
 
       - name: Link Continuum scripts if needed
         if: hashFiles('scripts/release-policy.sh') == ''
-        run: ln -sf .continuum/scripts scripts
+        run: ln -sfn .continuum/scripts scripts
 
       - name: Reject hand-written version bumps
         env:
