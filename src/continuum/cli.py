@@ -643,6 +643,154 @@ def _report_plan(plan: Any) -> None:
         )
 
 
+def _version_strategy(args: argparse.Namespace) -> Any:
+    """The version strategy this run was asked for, built from its arguments.
+
+    `release-pr` is not offered: a pull request that names the version is a
+    strategy a repository opts into by registering it, and offering it here would
+    put a driver in the command line that no consumer has configured.
+    """
+
+    from .release import version as version_module
+
+    if args.version_strategy == version_module.STRATEGY_EXPLICIT:
+        return version_module.ExplicitVersion(requested=(args.version or "").strip())
+    if args.version_strategy == version_module.STRATEGY_PROJECT_FILE:
+        # The default location, not a requirement: a repository that keeps its
+        # version somewhere else names the strategy's own options in its own
+        # wiring rather than through this argument.
+        return version_module.ProjectFileVersion(
+            path=os.path.join(args.workdir or ".", "VERSION")
+        )
+    if args.version_strategy == version_module.STRATEGY_TAG:
+        return version_module.TagVersion(tag=(args.tag or "").strip())
+    raise SystemExit(
+        f"CONTINUUM_ERROR: unknown version strategy {args.version_strategy!r}; "
+        "available: " + ", ".join(version_module.strategies())
+    )
+
+
+def _release_event(args: argparse.Namespace, target: Any) -> Any:
+    """The event a `release run` treats itself as answering.
+
+    Built from the tag when one is given, and otherwise from the commit being
+    released, because the release core refuses to release a version nothing
+    declares. A tag is the stronger of the two: it is what a human pushed when
+    they decided this was the release.
+    """
+
+    from .release.contract import ReleaseEvent
+
+    tag = args.tag or ""
+    return ReleaseEvent(
+        repository=args.repository,
+        name="tag-push" if tag else "release-dispatch",
+        sha=args.sha or "",
+        ref=f"refs/tags/{tag}" if tag else f"refs/heads/{args.branch}",
+        tag=tag,
+        default_branch=args.branch,
+        delivery=f"continuum-release-{args.delivery}",
+    )
+
+
+def _current_head(workdir: str) -> str:
+    """The commit this checkout is at, or `""` when it cannot be read.
+
+    Returned as a function so the adapter can ask the question and this module
+    stays the only place that starts a `git` process. A checkout that is not a
+    git repository — a tarball, a vendor drop — yields `""`, which the adapter
+    reads as "there is nothing to check against" rather than as a mismatch.
+    """
+
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            shell=False,
+            cwd=workdir or None,
+            check=False,
+        )
+    except OSError:
+        return ""
+    if completed.returncode != 0:
+        return ""
+    return (completed.stdout or "").strip()
+
+
+def cmd_release_run(args: argparse.Namespace) -> int:
+    """Walk the release chain for one target, and print what it decided.
+
+    This is the whole integration for a declared target: the configuration
+    supplies the target, `ReleaseRequest.from_config` carries its options to the
+    adapter, and the core walks eligibility, version, build, sign, verify, and
+    publication in the order it always walks them. There is no Apple path here
+    and no consumer path here — the command knows only which components were
+    handed to it.
+
+    A dry run is the same walk with `dry_run` set, so a plan cannot describe a
+    release the run would not perform.
+    """
+
+    from .release import apple as apple_module
+    from .release import wiring as wiring_module
+    from .release.contract import ContractError
+    from .release.core import ReleaseCore
+    from .release.version import get_strategy
+
+    config = _load_config(args.config, required=not args.allow_missing)
+    target = _select_target(config, args.target)
+    environment = release_run.base_environment()
+    _require_material(target, args.signing_material, environment)
+
+    adapter = apple_module.AppleAdapter(
+        environment=environment,
+        workdir=args.workdir,
+        git_revision=_current_head,
+    )
+    try:
+        strategy = _version_strategy(args)
+        plane = wiring_module.components(
+            config,
+            version=strategy,
+            adapters={target.adapter: adapter},
+            publishers=(),
+        )
+    except ContractError as exc:
+        print(f"::error::{exc}")
+        raise SystemExit(f"CONTINUUM_ERROR: {exc}") from None
+
+    event = _release_event(args, target)
+    try:
+        request = wiring_module.request_from_config(
+            config,
+            event,
+            workdir=args.workdir,
+            dry_run=args.dry_run,
+            requested_version=(args.version or "").strip(),
+        )
+    except ContractError as exc:
+        print(f"::error::{exc}")
+        raise SystemExit(f"CONTINUUM_ERROR: {exc}") from None
+
+    outcome = ReleaseCore(plane).execute(request)
+    payload = outcome.describe()
+    _print_json(payload)
+    _write_output(
+        {
+            "status": outcome.status,
+            "version": outcome.version,
+            "tag": outcome.tag,
+            "source_sha": outcome.source_sha,
+            "dry_run": str(outcome.dry_run).lower(),
+        }
+    )
+    if not outcome.ok:
+        print(f"::error::release {outcome.status}: {outcome.no_op_reason or 'see the journal'}")
+    return EXIT_OK if outcome.ok else EXIT_ERROR
+
+
+
 def cmd_release_plan(args: argparse.Namespace) -> int:
     """Show what a release target will do, without doing it."""
 
@@ -1076,6 +1224,73 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print the plan without executing any signing tool.",
     )
     sign.set_defaults(func=cmd_release_sign)
+
+    run = release_sub.add_parser(
+        "run",
+        help="Walk the whole release chain for a target.",
+        description=(
+            "Build, sign, package, verify, and publish one configured target by "
+            "walking the generic release chain: the target's own configuration "
+            "supplies its options, the core supplies the stages, and this command "
+            "supplies nothing platform-specific. A dry run walks the same chain "
+            "without executing a tool or writing a file, so a plan cannot describe "
+            "a release the run would not perform."
+        ),
+    )
+    add_common(run)
+    run.add_argument("--target", required=True, help="Id of the configured release target.")
+    run.add_argument(
+        "--signing-material",
+        choices=("auto", "present", "absent"),
+        default="auto",
+        help="What this job expects of the signing secrets. See 'release plan'.",
+    )
+    run.add_argument(
+        "--workdir",
+        default="",
+        help="Directory holding the checkout to release (default: the current directory).",
+    )
+    run.add_argument(
+        "--sha",
+        default=os.environ.get("GITHUB_SHA", ""),
+        help="The commit this release is approved for (default: GITHUB_SHA).",
+    )
+    run.add_argument(
+        "--tag",
+        default=os.environ.get("GITHUB_REF_NAME", "") if os.environ.get("GITHUB_REF_TYPE") == "tag" else "",
+        help="The release tag being published (default: GITHUB_REF_NAME on a tag event).",
+    )
+    run.add_argument(
+        "--repository",
+        default=os.environ.get("GITHUB_REPOSITORY", ""),
+        help="Owner/name of the repository being released.",
+    )
+    run.add_argument(
+        "--branch",
+        default=os.environ.get("GITHUB_REF_NAME", "main"),
+        help="The branch this event came from, used when no tag was given.",
+    )
+    run.add_argument(
+        "--delivery",
+        default=os.environ.get("GITHUB_RUN_ID", "0"),
+        help="Identifier for this run, so a second run over the same tag is distinguishable.",
+    )
+    run.add_argument(
+        "--version-strategy",
+        default="tag",
+        help=(
+            "Where the version comes from: 'tag' takes the version from the tag "
+            "being released, 'explicit' requires --version, 'project-file' reads "
+            "it from the checkout."
+        ),
+    )
+    run.add_argument("--version", default="", help="Version to release, for 'explicit'.")
+    run.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Walk the chain without executing a tool or writing a file.",
+    )
+    run.set_defaults(func=cmd_release_run)
 
     release_pin = release_sub.add_parser(
         "pin",
