@@ -78,9 +78,9 @@
     {
       "path": ".github/workflows/opencode.yml",
       "blob_sha": "e5656c07b5758d4974540912f52a60525be889f8",
-      "classification": "consumer-local",
+      "classification": "absorbed",
       "owner": "#27",
-      "rationale": "The generic lifecycle -- dispatch, install retry with backoff, and recovery from a failed dispatch that clears the lock so a later run can retry -- is absorbed by the dispatch/repair ladder in .github/workflows/consumer-repair.yml. The macOS and Swift toolchain and the runner image that provides them are consumer capability configured per repository; Continuum's workflows run on ubuntu-latest and name neither."
+      "rationale": "The generic OpenCode lifecycle is absorbed by .github/workflows/consumer-opencode.yml. NanoDictate's required macOS 15 / Swift 6.1 execution capability is expressed through configurable runner/toolchain inputs rather than a second project-specific controller."
     },
     {
       "path": ".github/workflows/packaging-smoke.yml",
@@ -92,30 +92,30 @@
     {
       "path": ".github/workflows/pr-agent.yml",
       "blob_sha": "53485dcafb1e06318c56b4dd1f2e64c22cedd5c0",
-      "classification": "superseded",
+      "classification": "consumer-local",
       "owner": "#27",
-      "rationale": "A manually dispatched advisory reviewer, outside MVP orchestration. Retained in the consumer through cutover rather than deleted, and Continuum's own PR-Agent capability in continuum.review.pr_agent supersedes it."
+      "rationale": "Existing manual PR-Agent capability remains in NanoDictate during Phase A. It is outside the Continuum MVP orchestration path, but working functionality must not be deleted merely because it is outside MVP."
     },
     {
       "path": ".github/workflows/release-automation-merge.yml",
       "blob_sha": "75ae83ffd55b11c2e9b49bc91e1920bf24e83484",
-      "classification": "absorbed",
-      "owner": "#21",
-      "rationale": "Rejects active unfilled template tokens while ignoring the generated files' explanatory comments, including a token named inside one. Absorbed by continuum.release.publishers.validation.unfilled_template_tokens, with regressions in tests/test_release_publishers.py. The main-push wake-up is consumer-local: it decides which events wake this consumer's release automation and names no product behaviour Continuum should port."
+      "classification": "consumer-local",
+      "owner": "#22",
+      "rationale": "Phase A keeps NanoDictate's current release automation as the sole release writer. Its semantics are preserved locally until #21/#22 complete Phase B parity/canary migration; only the Phase B atomic cutover may replace/remove this workflow."
     },
     {
       "path": ".github/workflows/release-pr.yml",
       "blob_sha": "c0870464a47c698a22acc206aa77eee068cb8b44",
-      "classification": "absorbed",
-      "owner": "#21",
-      "rationale": "A completed release wakes release-PR reconciliation so a deferred update cannot strand. The derivation is absorbed by continuum.release.state.owed_reconciliation (with wake_key scoping one wake per source head) and is asserted in tests/test_release_state.py; deciding which events dispatch that wake is the consumer's release-automation workflow, so Continuum supplies the rule and not a trigger."
+      "classification": "consumer-local",
+      "owner": "#22",
+      "rationale": "Phase A keeps NanoDictate's current release automation as the sole release writer. Its semantics are preserved locally until #21/#22 complete Phase B parity/canary migration; only the Phase B atomic cutover may replace/remove this workflow."
     },
     {
       "path": ".github/workflows/release.yml",
       "blob_sha": "f699aaa4ea70d431962daae48ca4a8c6842088e7",
-      "classification": "must-port",
+      "classification": "consumer-local",
       "owner": "#22",
-      "rationale": "Phase B requirement: publication must reuse the exact artifact bytes validated by Packaging smoke for the same immutable source head. NanoDictate keeps its existing release workflow as the sole writer during Phase A; #22 must prove and migrate this invariant before the release writer is replaced."
+      "rationale": "Phase A keeps NanoDictate's current release automation as the sole release writer. Its semantics are preserved locally until #21/#22 complete Phase B parity/canary migration; only the Phase B atomic cutover may replace/remove this workflow."
     },
     {
       "path": ".github/workflows/remove-review-label.yml",
