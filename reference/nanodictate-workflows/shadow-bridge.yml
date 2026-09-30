@@ -71,9 +71,15 @@ on:
         type: string
         default: ""
 
-# No token of its own. Everything the bridge reads arrives in the event payload,
-# and the only thing it does with it is hand it to the shadow plane.
-permissions: {}
+# The bridge's projection job explicitly drops all authority below. The reusable
+# call inherits only these read scopes; reusable workflows cannot elevate them.
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+  checks: read
+  statuses: read
+  actions: read
 
 concurrency:
   group: continuum-shadow-bridge-${{ github.repository }}-${{ github.event_name }}-${{ github.event_id || github.run_id }}
@@ -245,16 +251,9 @@ jobs:
   shadow:
     name: Ask Continuum what it would have done
     needs: context
-    # The called workflow receives the caller repository's GITHUB_TOKEN.
-    # Grant exactly the read surfaces live capture needs; reusable workflows
-    # cannot elevate beyond these caller permissions.
-    permissions:
-      contents: read
-      pull-requests: read
-      issues: read
-      checks: read
-      statuses: read
-      actions: read
+    # A reusable-workflow call job cannot declare its own permissions. It
+    # inherits the workflow-level read-only scopes above; the called workflow
+    # cannot elevate them.
     # Pinned to a commit, like every other Continuum entry point: a branch here
     # would mean the evidence in the window was produced by code nobody reviewed.
     # Pinned to the validated merged shadow implementation. Consumer rollout
