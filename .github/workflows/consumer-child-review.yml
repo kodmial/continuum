@@ -92,8 +92,26 @@ jobs:
               bash "$resolver" validation "$child_repo"
           )"
 
-          pr_state="$(gh pr view "$PR_NUMBER" --repo "$child_repo" --json state --jq '.state' 2>/dev/null || true)"
-          [[ "$pr_state" == "OPEN" ]] || exit 0
+          pr_state_json="$(
+            gh pr view "$PR_NUMBER" --repo "$child_repo" --json state,mergedAt 2>/dev/null || true
+          )"
+          [[ -n "$pr_state_json" ]] || exit 0
+          if [[ "$(jq -r '.mergedAt // ""' <<<"$pr_state_json")" != "" ]]; then
+            exit 0
+          fi
+          pr_state="$(jq -r '.state // ""' <<<"$pr_state_json")"
+          if [[ "$pr_state" != "OPEN" ]]; then
+            if gh pr reopen "$PR_NUMBER" --repo "$child_repo" >/dev/null 2>&1; then
+              gh issue comment "$TASK_NUMBER" --repo "$child_repo" \
+                --body "<!-- continuum-child-review-reopened --> Reopened the automation-owned PR so delegated review can continue." \
+                >/dev/null 2>&1 || true
+            else
+              gh issue comment "$TASK_NUMBER" --repo "$child_repo" \
+                --body "<!-- continuum-child-review-retry --> The automation-owned PR is closed and could not be reopened in this cycle; the dispatcher will retry or recreate work." \
+                >/dev/null 2>&1 || true
+              exit 0
+            fi
+          fi
 
           workdir="$RUNNER_TEMP/continuum-child-review"
           transcript="$RUNNER_TEMP/continuum-child-review.log"
@@ -119,6 +137,17 @@ jobs:
           git checkout -B "$head_ref" "origin/$head_ref" >/dev/null 2>&1
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Surface base-branch drift before review. A clean merge is kept;
+          # conflicts remain in the working tree for the review agent to
+          # repair, rather than turning into a terminal merge failure later.
+          set +e
+          git merge --no-edit "origin/$base_ref" >/dev/null 2>&1
+          base_sync_rc=$?
+          set -e
+          if [[ "$base_sync_rc" -ne 0 ]]; then
+            echo "Child review [$CHILD_ID] #$TASK_NUMBER detected base conflicts; review will repair them."
+          fi
 
           validation_log="$RUNNER_TEMP/continuum-child-validation.log"
           trusted_validation=""
@@ -234,8 +263,12 @@ jobs:
               validation_rc=$?
               set -e
               if [[ "$validation_rc" -eq 0 ]]; then
-                accepted=true
-                break
+                if git diff --name-only --diff-filter=U | grep -q .; then
+                  echo "Child review [$CHILD_ID] #$TASK_NUMBER still has unresolved base conflicts; continuing repair."
+                else
+                  accepted=true
+                  break
+                fi
               fi
               echo "Child review [$CHILD_ID] #$TASK_NUMBER validation gate failed after pass $pass; continuing repair."
             else
@@ -261,17 +294,52 @@ jobs:
             git push origin "HEAD:$head_ref" >/dev/null 2>&1
           fi
 
-          set +e
-          gh pr merge "$PR_NUMBER" --repo "$child_repo" --squash --delete-branch >/dev/null 2>&1
-          merge_rc=$?
-          if [[ "$merge_rc" -ne 0 ]]; then
-            gh pr merge "$PR_NUMBER" --repo "$child_repo" --squash --delete-branch --admin >/dev/null 2>&1
+          merge_ok=false
+          for merge_attempt in 1 2 3; do
+            live_pr="$(
+              gh pr view "$PR_NUMBER" --repo "$child_repo" --json state,mergedAt,headRefOid 2>/dev/null || true
+            )"
+            if [[ -n "$live_pr" && "$(jq -r '.mergedAt // ""' <<<"$live_pr")" != "" ]]; then
+              merge_ok=true
+              break
+            fi
+
+            live_state="$(jq -r '.state // ""' <<<"$live_pr" 2>/dev/null || true)"
+            if [[ "$live_state" != "OPEN" ]]; then
+              gh pr reopen "$PR_NUMBER" --repo "$child_repo" >/dev/null 2>&1 || true
+            fi
+
+            set +e
+            gh pr merge "$PR_NUMBER" --repo "$child_repo" --squash --delete-branch >/dev/null 2>&1
             merge_rc=$?
-          fi
-          set -e
-          if [[ "$merge_rc" -ne 0 ]]; then
-            gh issue comment "$TASK_NUMBER" --repo "$child_repo"               --body "<!-- continuum-child-review-merge-blocked --> Child task #$TASK_NUMBER passed review, but GitHub blocked the merge."               >/dev/null 2>&1 || true
-            exit 32
+            if [[ "$merge_rc" -ne 0 ]]; then
+              gh pr merge "$PR_NUMBER" --repo "$child_repo" --squash --delete-branch --admin >/dev/null 2>&1
+              merge_rc=$?
+            fi
+            set -e
+            if [[ "$merge_rc" -eq 0 ]]; then
+              merge_ok=true
+              break
+            fi
+
+            # Base may have advanced during a long review. Ask GitHub to sync
+            # the branch; if that cannot be done cleanly, leave the PR open and
+            # let the next delegated review cycle resolve the conflict.
+            live_head="$(jq -r '.headRefOid // ""' <<<"$live_pr" 2>/dev/null || true)"
+            if [[ -n "$live_head" ]]; then
+              gh api --method PUT \
+                "repos/$child_repo/pulls/$PR_NUMBER/update-branch" \
+                -f "expected_head_sha=$live_head" >/dev/null 2>&1 || true
+            fi
+            sleep $((merge_attempt * 2))
+          done
+
+          if [[ "$merge_ok" != true ]]; then
+            gh issue comment "$TASK_NUMBER" --repo "$child_repo" \
+              --body "<!-- continuum-child-review-merge-retry --> Child task #$TASK_NUMBER passed review, but the PR could not be merged in this cycle. The PR remains/reopens for automatic delegated retry; this is not a terminal task pause." \
+              >/dev/null 2>&1 || true
+            echo "Child task [$CHILD_ID] #$TASK_NUMBER merge deferred for automatic retry."
+            exit 0
           fi
 
           gh issue comment "$TASK_NUMBER" --repo "$child_repo"             --body "<!-- continuum-child-review-merged --> Child task #$TASK_NUMBER passed delegated review and its PR was merged."             >/dev/null 2>&1 || true
