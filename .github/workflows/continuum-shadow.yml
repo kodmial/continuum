@@ -248,7 +248,6 @@ jobs:
       DELIVERY_ID: ${{ inputs.delivery_id }}
       BUDGET_MS: ${{ inputs.budget_ms }}
       SAVE_CASE: ${{ inputs.save_case }}
-      JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
       ENGINE_REF_INPUT: ${{ inputs.engine_ref }}
       RUN_ATTEMPT: ${{ github.run_attempt }}
       RUN_ID: ${{ github.run_id }}
@@ -257,6 +256,8 @@ jobs:
     steps:
       - name: Resolve the pinned engine
         id: engine
+        env:
+          JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: |
           set -euo pipefail
           # A called run uses job.workflow_sha, which is the exact commit SHA
@@ -492,11 +493,12 @@ jobs:
       ROLLBACK_PATH: ${{ inputs.rollback_path }}
       WINDOW_START: ${{ inputs.window_start }}
       WINDOW_END: ${{ inputs.window_end }}
-      JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
       ENGINE_REF_INPUT: ${{ inputs.engine_ref }}
     steps:
       - name: Resolve the pinned engine
         id: engine
+        env:
+          JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: |
           set -euo pipefail
           if [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]; then
