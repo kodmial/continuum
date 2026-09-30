@@ -61,6 +61,7 @@ WRITE_SCOPES = ("actions", "checks", "contents", "deployments", "issues", "packa
 AGENT_PLANE = (
     "auto-merge.yml",
     "ci.yml",
+    "continuum-migrate.yml",
     "issue-scheduler.yml",
     "opencode-repair.yml",
     "opencode.yml",
@@ -378,11 +379,14 @@ class PermissionsTests(WorkflowAuditBase):
         # The write-capable surface is deliberately tiny and fully audited.
         # auto-merge/issue-scheduler/agent are the three automation roles; the
         # repair jobs are label-and-dispatch/watchdog control planes that never
-        # check out or execute pull-request code.
+        # check out or execute pull-request code; `act` is the migration
+        # controller's write half, separated from its read half so that a
+        # mis-dispatched read-only mode can never reach a credential.
         self.assertEqual(
             sorted(writers),
             [
                 "auto-merge.yml/reconcile",
+                "continuum-migrate.yml/act",
                 "issue-scheduler.yml/schedule",
                 "opencode-repair.yml/ci-repair",
                 "opencode-repair.yml/recover-failed-issue-run",
@@ -1593,6 +1597,236 @@ class ReleaseWorkflowTests(WorkflowAuditBase):
         self.assertIn("release-matrix-${{ inputs.source_sha }}", text)
         self.assertIn("release-fragment-*-${{ inputs.source_sha }}", text)
         self.assertNotIn("release-fragment-*-${{ github.sha }}", text)
+
+
+class MigrationControllerTests(WorkflowAuditBase):
+    """The #28 controller is the most privileged workflow in this repository.
+
+    It rewrites every writer in a repository and merges the result, from a manual
+    trigger, with a write-capable credential. Each of the assertions below is one
+    way that could stop being true without the cutover itself noticing: a
+    credential that outlived its authorizer, a decision made from a stale
+    reading, a read-only mode that grew a write scope, or a gate verdict spent on
+    a change it never saw.
+    """
+
+    @property
+    def text(self):
+        return self.raw["continuum-migrate.yml"]
+
+    def test_it_is_a_manual_trigger_only(self):
+        """Nothing automatic may start a cutover."""
+
+        self.assertEqual(trigger_names(self.workflows["continuum-migrate.yml"]), ["workflow_dispatch"])
+
+    def test_the_dispatcher_and_the_credential_are_checked_separately(self):
+        """A trusted person is not a licence for an untrusted token."""
+
+        self.assertIn("trust_policy.py check-dispatcher", self.text)
+        self.assertIn("trust_policy.py check-token", self.text)
+
+        document = self.workflows["continuum-migrate.yml"]
+        # check-token has to run in the job that holds the credential, and the
+        # job that checks the caller has to hold none at all.
+        self.assertIn("check-dispatcher", job_text(document, self.job("continuum-migrate.yml", "authorize")))
+        self.assertIn("check-token", job_text(document, self.job("continuum-migrate.yml", "act")))
+        self.assertEqual(permission_map(self.job("continuum-migrate.yml", "authorize")["permissions"]), {})
+        self.assertNotIn("TAP_PAT", job_text(document, self.job("continuum-migrate.yml", "authorize")))
+
+    def test_the_credential_is_never_reachable_from_the_reading_job(self):
+        document = self.workflows["continuum-migrate.yml"]
+        plan_text = job_text(document, self.job("continuum-migrate.yml", "plan"))
+
+        self.assertNotIn("TAP_PAT", plan_text)
+        self.assertEqual(write_scopes(job_permissions(document, self.job("continuum-migrate.yml", "plan"))), [])
+
+    def test_the_write_half_runs_only_in_the_write_half(self):
+        document = self.workflows["continuum-migrate.yml"]
+        act = self.job("continuum-migrate.yml", "act")
+
+        self.assertIn("github.event.inputs.mode == 'apply'", str(act.get("if", "")))
+        self.assertIn("github.event.inputs.mode == 'rollback'", str(act.get("if", "")))
+        # Every mutating step is behind one of the two mode conditions. A step
+        # with no condition would run for `plan` too, with the PAT in its
+        # environment, and a plan that could write would be a plan nobody could
+        # read.
+        # The job's own `if` is the boundary: everything in it runs only for
+        # these two modes. A step-level condition may narrow that further, but it
+        # must not widen it -- a credential in a step conditioned on something
+        # other than the mode would be reachable from a read-only dispatch.
+        condition = str(act.get("if") or "")
+        self.assertIn("github.event.inputs.mode", condition)
+        for step in steps_of(act):
+            if "TAP_PAT" not in json.dumps(step):
+                continue
+            step_condition = str(step.get("if") or "")
+            if not step_condition:
+                continue
+            self.assertIn(
+                "github.event.inputs.mode",
+                step_condition,
+                "a credential-bearing step is conditioned on something other than "
+                "the mode: {}".format(step.get("name")),
+            )
+
+    def test_the_reading_has_to_be_ready_before_anything_is_written(self):
+        document = self.workflows["continuum-migrate.yml"]
+
+        self.assertEqual(
+            self.workflows["continuum-migrate.yml"]["jobs"]["act"]["needs"],
+            ["authorize", "plan"],
+        )
+        self.assertIn("preflight", self.text)
+        self.assertIn("preflight.json", self.text)
+
+    def test_the_candidate_is_pinned_and_proven_to_be_this_repository_s_commit(self):
+        text = self.text
+
+        self.assertIn("merge-base --is-ancestor", text)
+        self.assertIn("cat-file -e", text)
+        # A branch name where a SHA belongs is the bug this rule exists to stop,
+        # and a `default:` of "main" is that bug wearing a disguise.
+        self.assertNotIn("default: main", text)
+        self.assertNotIn("default: 'main'", text)
+
+    def test_the_write_half_does_not_check_out_anything_a_caller_supplied(self):
+        """Every checkout is at a ref GitHub, not the dispatch, chose."""
+
+        for step in steps_of(self.job("continuum-migrate.yml", "act")) + steps_of(
+            self.job("continuum-migrate.yml", "plan")
+        ):
+            if not uses(step, "actions/checkout"):
+                continue
+            ref = (step.get("with") or {}).get("ref", "")
+            self.assertIn("github.event.repository.default_branch", str(ref), step.get("name"))
+
+    def test_apply_cannot_run_without_the_cutover_gate_verdict(self):
+        act = self.job("continuum-migrate.yml", "act")
+
+        gate_steps = [step for step in steps_of(act) if "--gate" in run_text(step)]
+        self.assertEqual(len(gate_steps), 1, "the apply step must pass a gate")
+        self.assertIn("migration-in/gate.json", run_text(gate_steps[0]))
+        # And the workflow must not be able to apply without having produced one.
+        self.assertIn("apply needs the cutover gate's verdict", self.text)
+
+    def test_a_rollback_needs_the_record_the_cutover_wrote(self):
+        self.assertIn("rollback needs the cutover record", self.text)
+        self.assertIn("--record", self.text)
+
+    def test_the_ledger_is_required_by_everything_but_an_inventory(self):
+        text = self.text
+        self.assertIn("writer roles come from it, never from a workflow's name", text)
+        self.assertIn("the ledger input is required for", text)
+
+    def test_it_uploads_evidence_even_when_the_run_fails(self):
+        document = self.workflows["continuum-migrate.yml"]
+        uploads = [
+            step
+            for job in (document.get("jobs") or {}).values()
+            for step in steps_of(job)
+            if uses(step, "actions/upload-artifact")
+        ]
+
+        self.assertTrue(uploads, "a controller that discards its evidence cannot be reviewed")
+        for step in uploads:
+            self.assertEqual(step.get("if"), "always()", step.get("name"))
+
+    def test_two_runs_cannot_cut_over_the_same_default_branch_at_once(self):
+        document = self.workflows["continuum-migrate.yml"]
+
+        self.assertFalse(document["concurrency"]["cancel-in-progress"])
+
+    def test_the_ledger_never_reaches_a_shell_unquoted(self):
+        """Inputs are JSON documents, so they are parsed, not interpolated."""
+
+        for job_name, job in (self.workflows["continuum-migrate.yml"].get("jobs") or {}).items():
+            for step in steps_of(job):
+                if "$GITHUB_INPUT" in run_text(step):
+                    continue
+                self.assertNotIn("$(cat ", run_text(step), "{}: {}".format(job_name, step.get("name")))
+
+    def test_the_target_repository_is_an_input_and_defaults_to_here(self):
+        """A consumer is named by the dispatcher, and Continuum by default.
+
+        The default matters: an operator who forgets the input has to be
+        migrating the repository they are looking at, not a target chosen by
+        whatever the input last held.
+        """
+
+        document = self.workflows["continuum-migrate.yml"]
+        inputs = (document.get("on") or {})["workflow_dispatch"]["inputs"]
+        self.assertIn("target_repository", inputs)
+        self.assertEqual(inputs["target_repository"]["type"], "string")
+        self.assertEqual(inputs["target_repository"]["default"], "")
+        self.assertIn(
+            '${TARGET_INPUT:-$GITHUB_REPOSITORY}', run_text(self.resolve_step())
+        )
+
+    def test_the_target_is_validated_before_it_is_used(self):
+        """A named repository is a value, never an expression or an injection.
+
+        The value reaches a shell as an argument to a Python CLI rather than
+        being interpolated into the script, and it is shape-checked first, so a
+        value cannot smuggle in a second target, a path, or a shell fragment.
+        """
+
+        run = run_text(self.resolve_step())
+        self.assertIn("^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$", run)
+        self.assertIn('the target must be owner/name', run)
+        # A value that is not the current repository is announced, so a run log
+        # says plainly which repository was rewritten.
+        self.assertIn("::warning::this cutover rewrites", run)
+
+    def test_every_controller_call_uses_the_resolved_target(self):
+        """One target, resolved once, and never re-derived by a later job.
+
+        The write half reads the target from the plan job's output rather than
+        from the dispatch. A write job that resolved its own target could act on
+        a different repository than the one the read half judged.
+        """
+
+        document = self.workflows["continuum-migrate.yml"]
+        # The read half resolves the target in its own job; the write half may
+        # only consume the value the read half published.
+        bindings = {
+            "plan": "${{ steps.resolve.outputs.target }}",
+            "act": "${{ needs.plan.outputs.target }}",
+        }
+        calls = 0
+        for job_name, expected in bindings.items():
+            for step in steps_of(document["jobs"][job_name]):
+                if "continuum.migrate.cli" not in run_text(step):
+                    continue
+                calls += 1
+                with self.subTest(job=job_name, step=step.get("name")):
+                    self.assertIn('--repo "$TARGET"', run_text(step), step.get("name"))
+                    self.assertNotIn(
+                        '--repo "$GITHUB_REPOSITORY"', run_text(step), step.get("name")
+                    )
+                    # Read from the step's own env, so a step cannot appear
+                    # satisfied because a sibling step happens to bind it.
+                    self.assertEqual(
+                        (step.get("env") or {}).get("TARGET"),
+                        expected,
+                        step.get("name"),
+                    )
+        self.assertEqual(calls, 5, "every subcommand must go through the resolved target")
+
+    def test_the_write_half_declares_the_target_the_read_half_published(self):
+        """The value has to actually cross the job boundary, not just be named."""
+
+        document = self.workflows["continuum-migrate.yml"]
+        self.assertEqual(
+            document["jobs"]["plan"]["outputs"]["target"],
+            "${{ steps.resolve.outputs.target }}",
+        )
+        self.assertIn("plan", document["jobs"]["act"]["needs"])
+
+    def resolve_step(self):
+        for step in steps_of(self.job("continuum-migrate.yml", "plan")):
+            if "TARGET_INPUT" in run_text(step):
+                return step
+        self.fail("no step resolves the target repository")
 
 
 if __name__ == "__main__":

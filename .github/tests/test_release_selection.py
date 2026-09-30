@@ -96,6 +96,7 @@ OWN_CONTROL_PLANE = (
 #: side it is on.
 OWN_REPOSITORY_TOOLING = (
     "ci.yml",
+    "continuum-migrate.yml",
     "release-bun-binary.yml",
     "publish-continuum.yml",
 )

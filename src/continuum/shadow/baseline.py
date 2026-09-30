@@ -56,6 +56,16 @@ CLASSIFICATIONS: Tuple[str, ...] = (
     "not-applicable",
 )
 
+#: The two classifications that decide whether Continuum may replace a consumer's
+#: writer. ``absorbed`` is a claim that Continuum already implements the
+#: behaviour, which is what makes retiring the consumer's copy legitimate.
+#: ``consumer-local`` is a claim that the file is the product's own, which is
+#: what makes retiring it somebody else's decision. Named because #28's cutover
+#: turns on the difference and a reader should not have to hold both spellings in
+#: their head.
+CLASSIFICATION_ABSORBED = "absorbed"
+CLASSIFICATION_CONSUMER_LOCAL = "consumer-local"
+
 #: The issues a generic difference may be routed to. The ledger's declared owners
 #: are checked against this, so a ledger cannot invent a destination that nobody
 #: will ever read.
