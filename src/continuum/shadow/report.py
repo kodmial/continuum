@@ -363,8 +363,9 @@ def window_summary(directory: Path, artifact: str = "") -> str:
         lines.append("Cutover: {}.".format(_cutover_headline(decision)))
         lines.append("")
         lines.append(
-            "Evidence digest `{}`, window {} to {}.".format(
+            "Evidence digest `{}`, phase `{}`, window {} to {}.".format(
                 str(decision.get("evidence_digest", ""))[:16] or "none",
+                decision.get("phase", "?") or "?",
                 decision.get("window_started_at", "?") or "?",
                 decision.get("window_ended_at", "?") or "?",
             )
@@ -390,6 +391,17 @@ def window_summary(directory: Path, artifact: str = "") -> str:
                 "Approved by `{who}` against digest `{digest}`.".format(
                     who=approval.get("approved_by"),
                     digest=str(approval.get("evidence_digest", ""))[:16] or "none",
+                )
+            )
+            lines.append("")
+        authorization = decision.get("authorization")
+        if isinstance(authorization, Mapping) and authorization.get("authorized_by"):
+            lines.append(
+                "Authorized by `{who}` at controller `{sha}` for cutover head "
+                "`{head}`.".format(
+                    who=authorization.get("authorized_by"),
+                    sha=str(authorization.get("controller_sha", ""))[:12] or "unknown",
+                    head=str(authorization.get("cutover_head", ""))[:12] or "unknown",
                 )
             )
             lines.append("")
@@ -444,18 +456,23 @@ def window_summary(directory: Path, artifact: str = "") -> str:
 
 
 def _cutover_headline(decision: Mapping[str, Any]) -> str:
-    """One sentence, in the gate's own three states.
+    """One sentence, in the gate's own states.
 
-    ``ready`` and ``approved`` are separate, and conflating them is the mistake
-    this plane exists to prevent: evidence that is sufficient is not a decision
-    that was taken, and a summary that said "approved" for a window with no
-    approval recorded would be the summary inventing the cutover.
+    ``ready``, ``approved`` and ``authorized`` are separate, and conflating them is
+    the mistake this plane exists to prevent: evidence that is sufficient is not a
+    decision that was taken, a person's approval is not the controller's
+    authorization, and a summary that said either one for a window with neither
+    recorded would be the summary inventing the cutover.
     """
 
+    if decision.get("authorized"):
+        return "**authorized** by the controller for phase {}".format(
+            decision.get("phase", "?")
+        )
     if decision.get("approved"):
         return "**approved** against the evidence digest"
     if decision.get("ready"):
-        return "**evidence sufficient, awaiting a recorded approval**"
+        return "**evidence sufficient, awaiting a recorded decision**"
     codes = [
         str(item.get("code"))
         for item in decision.get("blockers") or ()

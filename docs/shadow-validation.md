@@ -137,6 +137,23 @@ evidence for all of these:
 A scenario seen only through replays is `replayed-only`: covered, but not by the
 live path, and the cutover gate says so with a `replayed_only_coverage` blocker.
 
+### Which of them a phase asks for
+
+`release-planning` is the one the phases disagree about, so the requirement is a
+property of the phase and not of the gate:
+
+| Phase | Required live evidence | Writer roles it replaces |
+| --- | --- | --- |
+| `phase-a` | the seven control-plane classes; `release-planning` is observed and reported but not required | `scheduler`, `opencode`, `repair`, `review`, `merge` |
+| `phase-b` | all eight | the above, plus `release` |
+
+Omitting `--phase` means `phase-b`: a window that was good enough for the phase
+before this one existed is still good enough for the phase after it, and a reader
+who forgets the flag gets the stricter gate rather than a different one. The
+phase is part of the window's evidence digest, so an authorization issued for
+`phase-a` cannot be presented for a `phase-b` cutover — that is
+`authorization_phase_mismatch`.
+
 ## Running one event locally
 
 The same run the workflow performs, without the workflow, against a recorded
@@ -184,7 +201,8 @@ PYTHONPATH=src python3 -m continuum.shadow.cli liveness \
 ## Judging a window
 
 Collect the window's parity results, its liveness report, any recorded
-resolutions, and the human approval, then:
+resolutions, and one of the two records — the human approval or the trusted
+controller's authorization — then:
 
 ```
 PYTHONPATH=src python3 -m continuum.shadow.cli cutover \
@@ -201,7 +219,37 @@ PYTHONPATH=src python3 -m continuum.shadow.cli cutover \
 ```
 
 Exit code `0` means approved, `1` means the gate is not satisfied, and `3` means
-the gate could not run — three states a CI job must not conflate.
+the gate could not run — three states a CI job must not conflate. The zero-touch
+form replaces `--approval` and adds the phase, the change set and the ledger it is
+judged against:
+
+```
+PYTHONPATH=src python3 -m continuum.shadow.cli cutover \
+  --parity window/parity/*.json \
+  --liveness window/liveness/report.json \
+  --origins window/origins.json \
+  --baseline window/baseline/report.json \
+  --canary window/canary.json \
+  --rollback window/rollback.json \
+  --change-set window/change-set.json \
+  --ledger docs/parity-ledger.json \
+  --authorization window/authorization.json \
+  --phase phase-a \
+  --window-start 2026-03-01T00:00:00Z \
+  --window-end 2026-03-08T00:00:00Z \
+  --out window
+```
+
+Exit code `0` now covers two decisions — `authorized`, when the controller's
+record matched everything the gate re-derived, and `approved`, when a person's
+approval did. The decision document says which one it is, and no flag makes one
+stand in for the other: an authorization is not an approval, and a window with
+neither is refused with `no_cutover_change_set` or `incomplete_authorization`
+rather than quietly treated as ready.
+
+`--change-set` requires `--ledger`, because a change set is a claim about specific
+paths and the ledger is the reviewed record of what each path implements. The two
+are read together or not at all.
 
 The gate blocks on, among others: `uncovered_scenario`,
 `replayed_only_coverage`, `unresolved_divergence`, `no_baseline_evidence`,
@@ -215,6 +263,70 @@ exists to prevent. A complete, digest-matching approval is still refused when
 the window has blockers. A signature on the evidence does not make the evidence
 sufficient, and an operator who is told otherwise will learn it at the worst
 possible moment.
+
+### The authorization
+
+Zero-touch means nothing clicks and nobody comments between the window being
+ready and the expected head merging. That is only safe if the record authorizing
+it cannot outlive the evidence, so an authorization names **every** input the
+decision depended on and the gate re-derives all of them:
+
+| Field | Bound to |
+| --- | --- |
+| `evidence_digest` | the window's verdicts, coverage, liveness, resolutions, phase and baseline reading |
+| `baseline_digest` | the rolling baseline reading, so a moved workflow expires the record |
+| `consumer_head` | the NanoDictate commit that reading was taken from |
+| `controller_sha` | the Continuum commit that issued it, compared with `engine.engine_sha()` |
+| `canary_reference` | the canary evidence supplied with this run |
+| `rollback_reference` | the way back, matched against this run's evidence |
+| `cutover_head` | the exact head of the atomic cutover pull request |
+
+Each of those is a blocker of its own — `stale_authorization` naming the evidence
+digest that moved, `stale_baseline_binding`, `stale_consumer_head`,
+`stale_controller`, `stale_cutover_head`, `stale_canary_binding`,
+`stale_rollback_binding` — so a moved binding is a refusal, never a warning. The
+controller is trusted, not believed: `stale_controller` fires when the record
+names an engine other than the one running, `undeterminable_controller_sha` when
+this gate cannot name its own commit at all, and there is no flag to tell the gate
+to believe a different one.
+
+`controller_sha` is the only field the controller has to get right about itself.
+It is not a secret and not a signature, and it is deliberately not one: the
+authorization's authority comes from the controller the repository trusts to
+issue it, and the binding's job is to make sure a record cannot be replayed
+against an engine that has since changed what it checks.
+
+An authorization over a window that has blockers is refused with
+`authorization_over_blocked_window`, exactly as an approval over one is refused
+with `approval_over_blocked_window`. Trust in the controller is not a waiver, and
+a trusted controller that could sign off a broken window would be the same
+failure with a better story.
+
+### What a phase may change
+
+`phase-a` replaces the control-plane writers and leaves the consumer's release
+machinery exactly where it is. That is enforced against the ledger's own `writer`
+roles rather than against filenames, so the boundary cannot be crossed by naming:
+
+| Blocker | Means |
+| --- | --- |
+| `no_cutover_change_set` | The run is a Phase A or zero-touch cutover and named no change set, so nothing says what it intends to replace |
+| `change_set_phase_mismatch` | The change set was written for the other phase |
+| `unclassified_cutover_path` | The change set touches a path the ledger does not audit, so its role is unknown |
+| `undeclared_writer_role` | A change names no role, and the gate will not infer one from a filename |
+| `writer_role_disagrees_with_ledger` | The change calls a path something the reviewed ledger does not |
+| `release_writer_in_phase_a` | The change would have replaced a release writer in the phase that leaves releases alone |
+| `out_of_phase_removal` | The change removes a path implementing a role this phase does not replace |
+| `no_ledger_evidence` | A change set was supplied without the ledger to judge it against |
+| `incomplete_authorization` | An authorization was supplied but does not carry every binding |
+| `authorization_phase_unknown` | The record names a phase that does not exist |
+| `authorization_phase_mismatch` | The record was issued for the other phase |
+| `authorization_over_blocked_window` | A complete, matching record over a window that still has blockers |
+
+The writer roles themselves are reviewed data in `docs/parity-ledger.json`, one
+per audited workflow, and the ledger's digest covers them — so reclassifying a
+release workflow as a merge workflow is a change to the audit, visible in the
+digest, and not a quiet edit to a file the gate happens to read.
 
 ### The approval is bound to one window
 
@@ -327,5 +439,8 @@ change in the engine rather than to a change in the world.
 - It is not a staging environment. State is read live; nothing is written, and
   the plane performs nothing in the repository it observes.
 - It is not a licence to cut over on a green tick. A cutover needs the coverage,
-  the liveness, the digest-bound approval, and the rollback, and a human still
-  decides.
+  the liveness, a digest-bound record — a person's approval or the controller's
+  authorization — the canary, and the way back. Which record a window needs is the
+  consumer's choice: an authorization is issued by the controller the repository
+  already trusts, so nobody has to read the window for the merge to happen, but it
+  is the repository's decision that no person does, and not the gate's.

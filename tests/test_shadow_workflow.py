@@ -253,6 +253,68 @@ class TheCutoverGateReadsTheLiveConsumer(unittest.TestCase):
             "set -euo pipefail", run_text(step)
         )
 
+    def judge(self) -> str:
+        """The run block that judges the window."""
+
+        step = next(
+            step
+            for step in self.steps
+            if "continuum.shadow.cli" in run_text(step) and "--window-end" in run_text(step)
+        )
+        return run_text(step)
+
+    def test_a_zero_touch_cutover_is_reachable_from_the_judge(self) -> None:
+        # The authorization, the change set and the phase are the whole zero-touch
+        # path, so the judge has to be able to be given all three. Without them the
+        # gate would still work for a human approval and issue #84 would be
+        # implemented only in the library.
+        text = self.judge()
+        for flag in ("--authorization", "--change-set", "--phase", "--ledger"):
+            self.assertIn(flag, text, flag)
+        # The change set is judged against the ledger the reading was taken with,
+        # not a separately supplied one.
+        self.assertIn("--ledger", text.split("--change-set")[1])
+        # And each one reaches the step as an environment variable, from both
+        # triggers: a workflow_call input the dispatch cannot set is a decision
+        # path that only exists for the bridge.
+        raw = WORKFLOW.read_text(encoding="utf-8")
+        for name in ("AUTHORIZATION_PATH", "CHANGE_SET_PATH", "PHASE"):
+            self.assertIn("${{{{ inputs.{} }}}}".format(name.lower()), raw, name)
+
+    def test_the_judge_names_evidence_files_instead_of_inlining_them(self) -> None:
+        # An authorization binds the canary and the rollback the gate verified, so
+        # the gate has to read them from disk. A `$(cat ...)` inlined into the
+        # argument would be handed to the reader as a *filename* that does not
+        # exist, and the window refused for a document it actually has.
+        text = self.judge()
+        for flag in ("--canary", "--rollback", "--origins", "--approval"):
+            line = text.split(flag)[1].splitlines()[0]
+            self.assertIn("$WINDOW_ROOT/", line, "{} does not read a path".format(flag))
+        self.assertNotIn('--canary "$(cat', text)
+
+    def test_the_judge_reads_every_parity_document_in_the_window(self) -> None:
+        # `--parity` takes a list after one flag. Repeating it per document reads
+        # as "the last one wins", and a window judged against a single verdict
+        # reports every other scenario as unobserved -- which looks like a missing
+        # scenario and hides the evidence that was actually there.
+        text = self.judge()
+        self.assertEqual(text.count('args+=(--parity "${parity[@]}")'), 1)
+        self.assertEqual(text.count('args+=(--resolutions "${resolutions[@]}")'), 1)
+        # The per-document form is the one that drops a window's evidence, so it
+        # must not come back wearing a different flag.
+        for flag in ("--parity", "--resolutions"):
+            self.assertNotIn('{} "$WINDOW_ROOT/$path"'.format(flag), text)
+
+    def test_the_judge_returns_the_gates_own_exit_code(self) -> None:
+        # Nothing branches on the verdict: the judge runs the gate and lets its
+        # exit code stand, so an authorized window and an approved one both pass
+        # and a blocked one fails. A workflow that decided for itself would be the
+        # very thing this plane exists to avoid.
+        self.assertIn(
+            'PYTHONPATH=engine/src python3 -m continuum.shadow.cli "${args[@]}"',
+            self.judge(),
+        )
+
     def test_the_gate_needs_only_read_scopes(self) -> None:
         # The capture reads the consumer's repository. A write scope here would be
         # a scope the validation plane does not need, and would break the rule the
@@ -1022,9 +1084,34 @@ class DocumentationTests(unittest.TestCase):
             "stale_approval",
             "no_rollback",
             "approval_over_blocked_window",
+            # The zero-touch path's own blockers. A reader who hits one of these
+            # has to be able to look it up without reading the gate's source, and
+            # "the controller's record did not match" is not a diagnosis.
+            "incomplete_authorization",
+            "authorization_phase_unknown",
+            "authorization_phase_mismatch",
+            "authorization_over_blocked_window",
+            "stale_controller",
+            "undeterminable_controller_sha",
+            "no_cutover_change_set",
+            "change_set_phase_mismatch",
+            "no_ledger_evidence",
+            "unclassified_cutover_path",
+            "undeclared_writer_role",
+            "writer_role_disagrees_with_ledger",
+            "release_writer_in_phase_a",
+            "out_of_phase_removal",
         ):
             self.assertIn(code, self.raw, code)
         self.assertTrue(issubclass(Blocker, object))
+
+    def test_it_names_the_phases_the_gate_can_judge(self) -> None:
+        from continuum.shadow.cutover import PHASES
+
+        # A phase is a reader-facing term, so the phases have to be written down
+        # next to the scenarios they change the requirement for.
+        for phase in PHASES:
+            self.assertIn("`{}`".format(phase), self.raw, phase)
 
     def test_it_names_the_files_a_run_writes(self) -> None:
         for name in (
@@ -1093,6 +1180,10 @@ class DocumentationTests(unittest.TestCase):
                 "--resolutions",
                 "--origins",
                 "--approval",
+                "--authorization",
+                "--change-set",
+                "--ledger",
+                "--phase",
                 "--canary",
                 "--rollback",
                 "--baseline",

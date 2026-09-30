@@ -61,6 +61,41 @@ CLASSIFICATIONS: Tuple[str, ...] = (
 #: will ever read.
 ROUTABLE_ISSUES: Tuple[str, ...] = ("#60", "#11", "#27", "#21", "#22")
 
+#: The orchestration writer a workflow implements, if any. Recorded per entry
+#: rather than inferred from a filename, because the cutover gate has to be able to
+#: say which writer a change replaces -- and a gate that read the role off a path
+#: would be trusting the very thing it is judging. A workflow that implements no
+#: writer this gate knows about is ``other``.
+WRITER_SCHEDULER = "scheduler"
+WRITER_OPENCODE = "opencode"
+WRITER_REPAIR = "repair"
+WRITER_REVIEW = "review"
+WRITER_MERGE = "merge"
+WRITER_RELEASE = "release"
+WRITER_OTHER = "other"
+WRITER_ROLES: Tuple[str, ...] = (
+    WRITER_SCHEDULER,
+    WRITER_OPENCODE,
+    WRITER_REPAIR,
+    WRITER_REVIEW,
+    WRITER_MERGE,
+    WRITER_RELEASE,
+    WRITER_OTHER,
+)
+
+#: The writers the control-plane phase of a cutover replaces, and the ones it must
+#: leave alone. Kept beside the ledger's vocabulary because the two have to agree:
+#: a phase may only claim a writer the ledger can name, and the release writer is
+#: the one the consumer keeps until the release phase replaces it.
+CONTROL_PLANE_WRITERS: Tuple[str, ...] = (
+    WRITER_SCHEDULER,
+    WRITER_OPENCODE,
+    WRITER_REPAIR,
+    WRITER_REVIEW,
+    WRITER_MERGE,
+)
+RELEASE_WRITER = WRITER_RELEASE
+
 #: The prefix that makes a changed path part of this gate rather than of ordinary
 #: product work. A pull request that touches it can reintroduce or remove an
 #: orchestration writer, which is what cutover has to reason about.
@@ -325,6 +360,10 @@ class LedgerEntry:
     classification: str
     owner: str = ""
     rationale: str = ""
+    #: The writer this workflow implements, from :data:`WRITER_ROLES`. Optional on
+    #: read so an older ledger still loads; the cutover gate refuses a change to a
+    #: path with no role rather than guessing one.
+    writer: str = ""
 
     def describe(self) -> Dict[str, Any]:
         return {
@@ -333,6 +372,7 @@ class LedgerEntry:
             "classification": self.classification,
             "owner": self.owner,
             "rationale": self.rationale,
+            "writer": self.writer,
         }
 
 
@@ -393,7 +433,7 @@ class ParityLedger:
             "repository": self.repository,
             "discovery_issue": self.discovery_issue,
             "workflows": sorted(
-                (entry.path, entry.blob_sha, entry.classification, entry.owner)
+                (entry.path, entry.blob_sha, entry.classification, entry.owner, entry.writer)
                 for entry in self.workflows
             ),
             "open_pull_requests": sorted(
@@ -462,6 +502,17 @@ def read_ledger(document: Mapping[str, Any]) -> ParityLedger:
                     repository, path, owner, ", ".join(ROUTABLE_ISSUES)
                 ),
             )
+        # A role this gate does not know would silently become "no role", and a
+        # path with no role is a path the cutover gate cannot reason about. Refuse
+        # the ledger instead, the same as an unknown classification.
+        writer = str(entry.get("writer", ""))
+        if writer and writer not in WRITER_ROLES:
+            raise BaselineError(
+                "unknown_writer_role",
+                "{} gives {} the writer role {!r}, which is not one of {}".format(
+                    repository, path, writer, ", ".join(WRITER_ROLES)
+                ),
+            )
         workflows.append(
             LedgerEntry(
                 path=path,
@@ -469,6 +520,7 @@ def read_ledger(document: Mapping[str, Any]) -> ParityLedger:
                 classification=classification,
                 owner=owner,
                 rationale=str(entry.get("rationale", "")),
+                writer=writer,
             )
         )
 
@@ -998,15 +1050,18 @@ def render_markdown(ledger: ParityLedger) -> str:
         "Audited at: `{}`  ".format(ledger.audited_at or "unknown"),
         "Discovery issue for unclassified differences: `{}`".format(ledger.discovery_issue),
         "",
-        "| Workflow | Blob | Classification | Owner | Rationale |",
-        "| --- | --- | --- | --- | --- |",
+        "| Workflow | Blob | Classification | Writer | Owner | Rationale |",
+        "| --- | --- | --- | --- | --- | --- |",
     ]
     for entry in ledger.workflows:
         lines.append(
-            "| `{}` | `{}` | `{}` | {} | {} |".format(
+            "| `{}` | `{}` | `{}` | `{}` | {} | {} |".format(
                 entry.path,
                 entry.blob_sha,
                 entry.classification,
+                # An undeclared role renders as absent rather than as a guess: the
+                # document must not claim a writer the ledger did not.
+                entry.writer or "-",
                 entry.owner or "-",
                 entry.rationale.replace("|", "\\|") if entry.rationale else "-",
             )
@@ -1043,6 +1098,7 @@ __all__ = [
     "Blocker",
     "CHANGED",
     "CLASSIFICATIONS",
+    "CONTROL_PLANE_WRITERS",
     "Difference",
     "INCOMPLETE",
     "LEDGER_SCHEMA",
@@ -1051,8 +1107,17 @@ __all__ = [
     "LiveHead",
     "OpenPullRequest",
     "ParityLedger",
+    "RELEASE_WRITER",
     "REMOVED",
     "ROUTABLE_ISSUES",
+    "WRITER_MERGE",
+    "WRITER_OTHER",
+    "WRITER_OPENCODE",
+    "WRITER_RELEASE",
+    "WRITER_REPAIR",
+    "WRITER_REVIEW",
+    "WRITER_ROLES",
+    "WRITER_SCHEDULER",
     "audit",
     "capture_live_head",
     "load_ledger",
