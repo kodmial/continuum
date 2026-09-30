@@ -118,7 +118,7 @@ jobs:
       - name: Prove the release commit
         run: |
           set -euo pipefail
-          .github/scripts/release_validation.sh .
+          bash .github/scripts/release_validation.sh .
 
       - name: Build the release
         id: candidate
