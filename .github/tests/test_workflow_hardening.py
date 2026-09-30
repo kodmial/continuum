@@ -713,6 +713,27 @@ class AgentExecutionTests(WorkflowAuditBase):
             self.assertIn('test -x "$HOME/.opencode/bin/opencode"', text)
             self.assertIn("sleep $((attempt * 5))", text)
 
+    def test_consumer_reusable_workflows_execute_their_own_exact_engine_sha(self):
+        paths = (
+            "consumer-opencode.yml",
+            "consumer-repair.yml",
+            "consumer-review-gate.yml",
+            "consumer-auto-merge.yml",
+            "review-queue.yml",
+        )
+        for name in paths:
+            text = self.raw[name]
+            with self.subTest(workflow=name):
+                self.assertNotIn("engine-path@39ca6dc798f2201390c8fdef0395157f588657ec", text)
+                self.assertNotIn("engine-path@", text)
+                self.assertIn("JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}", text)
+                self.assertIn('git -C "$root" rev-parse HEAD', text)
+                self.assertIn('[[ "$head" == "$JOB_WORKFLOW_SHA" ]]', text)
+                self.assertIn("CONTINUUM_ENGINE_ROOT=$root", text)
+        queue = self.raw["review-queue.yml"]
+        self.assertIn('PYTHONPATH="$CONTINUUM_ENGINE_ROOT/src" python3 -m continuum.cli', queue)
+        self.assertNotIn("PYTHONPATH=src python3 -m continuum.cli", queue)
+
     def test_consumer_allows_anonymous_models_without_api_key(self):
         text = self.raw["consumer-opencode.yml"]
         self.assertNotIn("Require model credential", text)
