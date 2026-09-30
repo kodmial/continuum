@@ -322,9 +322,6 @@ jobs:
               break
             fi
 
-            # Base may have advanced during a long review. Ask GitHub to sync
-            # the branch. If that cannot be done cleanly, leave the PR open;
-            # the dispatcher will launch another review cycle to repair it.
             live_head="$(jq -r '.headRefOid // ""' <<<"$live_pr" 2>/dev/null || true)"
             if [[ -n "$live_head" ]]; then
               gh api --method PUT \
