@@ -80,7 +80,7 @@
       "blob_sha": "e5656c07b5758d4974540912f52a60525be889f8",
       "classification": "absorbed",
       "owner": "#27",
-      "rationale": "The generic OpenCode lifecycle is absorbed by .github/workflows/consumer-opencode.yml. NanoDictate's required macOS 15 / Swift 6.1 execution capability is expressed through configurable runner/toolchain inputs rather than a second project-specific controller."
+      "rationale": "The generic OpenCode lifecycle is absorbed by .github/workflows/consumer-opencode.yml. NanoDictate's required macOS 15 / Swift 6.1 execution capability is expressed through configurable runner/toolchain inputs, with the reusable boundary covered by tests/test_workflow_hardening.py."
     },
     {
       "path": ".github/workflows/packaging-smoke.yml",
@@ -94,28 +94,28 @@
       "blob_sha": "53485dcafb1e06318c56b4dd1f2e64c22cedd5c0",
       "classification": "consumer-local",
       "owner": "#27",
-      "rationale": "Existing manual PR-Agent capability remains in NanoDictate during Phase A. It is outside the Continuum MVP orchestration path, but working functionality must not be deleted merely because it is outside MVP."
+      "rationale": "Existing manual PR-Agent capability remains in NanoDictate during Phase A. It is outside the generic orchestration cutover described by docs/continuum-mvp-contract.md, so working functionality is retained locally rather than deleted."
     },
     {
       "path": ".github/workflows/release-automation-merge.yml",
       "blob_sha": "75ae83ffd55b11c2e9b49bc91e1920bf24e83484",
       "classification": "consumer-local",
       "owner": "#22",
-      "rationale": "Phase A keeps NanoDictate's current release automation as the sole release writer. Its semantics are preserved locally until #21/#22 complete Phase B parity/canary migration; only the Phase B atomic cutover may replace/remove this workflow."
+      "rationale": "Phase A keeps NanoDictate's current release automation as the sole release writer. The release hook remains outside the first control-plane replacement defined in docs/continuum-mvp-contract.md; #21/#22 own the later Phase B parity/canary migration."
     },
     {
       "path": ".github/workflows/release-pr.yml",
       "blob_sha": "c0870464a47c698a22acc206aa77eee068cb8b44",
       "classification": "consumer-local",
       "owner": "#22",
-      "rationale": "Phase A keeps NanoDictate's current release automation as the sole release writer. Its semantics are preserved locally until #21/#22 complete Phase B parity/canary migration; only the Phase B atomic cutover may replace/remove this workflow."
+      "rationale": "Phase A keeps NanoDictate's current release automation as the sole release writer. The release hook remains outside the first control-plane replacement defined in docs/continuum-mvp-contract.md; #21/#22 own the later Phase B parity/canary migration."
     },
     {
       "path": ".github/workflows/release.yml",
       "blob_sha": "f699aaa4ea70d431962daae48ca4a8c6842088e7",
       "classification": "consumer-local",
       "owner": "#22",
-      "rationale": "Phase A keeps NanoDictate's current release automation as the sole release writer. Its semantics are preserved locally until #21/#22 complete Phase B parity/canary migration; only the Phase B atomic cutover may replace/remove this workflow."
+      "rationale": "Phase A keeps NanoDictate's current release automation as the sole release writer. The release hook remains outside the first control-plane replacement defined in docs/continuum-mvp-contract.md; #21/#22 own the later Phase B parity/canary migration."
     },
     {
       "path": ".github/workflows/remove-review-label.yml",
