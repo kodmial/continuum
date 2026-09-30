@@ -106,8 +106,25 @@ jobs:
       head_sha: ${{ steps.target.outputs.head_sha }}
       reason: ${{ steps.target.outputs.reason }}
     steps:
+      # ADR-0002: the engine *is* the Continuum implementation, so it has to
+      # come from the release commit the consumer already pinned and from no
+      # other. `job.workflow_sha` is that commit -- GitHub resolves a called
+      # reusable workflow from the reference its caller's `uses:` selected -- so
+      # the engine is derived from the one pin instead of being a second,
+      # independently maintained one. The action is then used as a local action
+      # out of the checkout it just verified, which is what keeps
+      # `.github/actions/engine-path` from needing a ref of its own.
+      - name: Check out the Continuum engine
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: kodmial/continuum
+          ref: ${{ job.workflow_sha }}
+          path: .continuum-engine
+          persist-credentials: false
       - name: Load Continuum engine
-        uses: kodmial/continuum/.github/actions/engine-path@81adcea69ce9c260f1aad4177867f8449a75d9b3
+        uses: ./.continuum-engine/.github/actions/engine-path
+        with:
+          release-sha: ${{ job.workflow_sha }}
 
       # The wake-up event varies; the target does not. Every entry point resolves
       # to one candidate pull request here, and the privileged job below is
@@ -197,8 +214,25 @@ jobs:
     outputs:
       allowed: ${{ steps.dispatch.outputs.allowed }}
     steps:
+      # ADR-0002: the engine *is* the Continuum implementation, so it has to
+      # come from the release commit the consumer already pinned and from no
+      # other. `job.workflow_sha` is that commit -- GitHub resolves a called
+      # reusable workflow from the reference its caller's `uses:` selected -- so
+      # the engine is derived from the one pin instead of being a second,
+      # independently maintained one. The action is then used as a local action
+      # out of the checkout it just verified, which is what keeps
+      # `.github/actions/engine-path` from needing a ref of its own.
+      - name: Check out the Continuum engine
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: kodmial/continuum
+          ref: ${{ job.workflow_sha }}
+          path: .continuum-engine
+          persist-credentials: false
       - name: Load Continuum engine
-        uses: kodmial/continuum/.github/actions/engine-path@81adcea69ce9c260f1aad4177867f8449a75d9b3
+        uses: ./.continuum-engine/.github/actions/engine-path
+        with:
+          release-sha: ${{ job.workflow_sha }}
 
       - name: Re-verify the dispatch against the live pull request
         id: dispatch
@@ -238,8 +272,25 @@ jobs:
       issues: write
       pull-requests: write
     steps:
+      # ADR-0002: the engine *is* the Continuum implementation, so it has to
+      # come from the release commit the consumer already pinned and from no
+      # other. `job.workflow_sha` is that commit -- GitHub resolves a called
+      # reusable workflow from the reference its caller's `uses:` selected -- so
+      # the engine is derived from the one pin instead of being a second,
+      # independently maintained one. The action is then used as a local action
+      # out of the checkout it just verified, which is what keeps
+      # `.github/actions/engine-path` from needing a ref of its own.
+      - name: Check out the Continuum engine
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: kodmial/continuum
+          ref: ${{ job.workflow_sha }}
+          path: .continuum-engine
+          persist-credentials: false
       - name: Load Continuum engine
-        uses: kodmial/continuum/.github/actions/engine-path@81adcea69ce9c260f1aad4177867f8449a75d9b3
+        uses: ./.continuum-engine/.github/actions/engine-path
+        with:
+          release-sha: ${{ job.workflow_sha }}
 
       # The contract is repository-controlled and versioned with the code, so it
       # is read from the base branch: a pull request does not get to declare that

@@ -59,7 +59,7 @@ CLASSIFICATIONS: Tuple[str, ...] = (
 #: The issues a generic difference may be routed to. The ledger's declared owners
 #: are checked against this, so a ledger cannot invent a destination that nobody
 #: will ever read.
-ROUTABLE_ISSUES: Tuple[str, ...] = ("#60", "#11", "#25", "#27", "#21", "#22")
+ROUTABLE_ISSUES: Tuple[str, ...] = ("#60", "#11", "#27", "#21", "#22")
 
 #: The orchestration writer a workflow implements, if any. Recorded per entry
 #: rather than inferred from a filename, because the cutover gate has to be able to

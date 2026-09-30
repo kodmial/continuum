@@ -1,14 +1,11 @@
-# Continuum PR-Agent manual review commands.
-#
-#     /review           -> full review of the current pull request head
-#     /verify <id>      -> re-check one tracked finding, e.g. /verify CRV-1A2B3C4D
-#
-# The repository owner is the only actor whose comment is read, and the engine
-# parses the command: the body reaches a strict grammar, never a shell and never
-# a workflow expression. Everything the commands decide is decided by the same
-# engine the provider surface uses, so a manual run and a queued run cannot
-# disagree about what a finding means.
 name: Continuum PR-Agent manual review commands
+
+# Repository-owner comment entry to the Continuum review gate. Trusted-actor
+# contract only: the actor must be the repository owner, and every command body
+# is parsed by the Continuum module (never by a shell or a GitHub expression).
+#
+#   /review         - full review of the current PR HEAD
+#   /verify <id>    - re-check one finding, e.g. /verify CRV-1A2B3C4D
 
 on:
   issue_comment:
@@ -17,7 +14,7 @@ on:
 permissions:
   contents: read
   issues: write
-  pull-requests: read
+  pull-requests: write
 
 jobs:
   parse:
@@ -27,21 +24,15 @@ jobs:
     outputs:
       command: ${{ steps.route.outputs.command }}
       finding: ${{ steps.route.outputs.finding }}
-      # An issue comment on a pull request is an event about that pull request,
-      # so the number is the event's own rather than something the command
-      # grammar parsed out of a body an author could shape.
-      pr_number: ${{ github.event.issue.number }}
+      pr_number: ${{ steps.route.outputs.pr_number }}
     steps:
-      - name: Check out the engine
+      - name: Checkout Continuum module
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           sparse-checkout: src/continuum
           sparse-checkout-cone-mode: false
-          persist-credentials: false
 
-      - name: Route the command through the trusted-actor contract
-        id: route
-        shell: bash
+      - id: route
         env:
           CONTINUUM_COMMENT_BODY: ${{ github.event.comment.body }}
           CONTINUUM_ACTOR: ${{ github.actor }}
@@ -55,16 +46,6 @@ jobs:
     needs: parse
     if: needs.parse.outputs.command == 'review'
     uses: ./.github/workflows/pr-agent.yml
-    # Permissions narrow down the call chain and never widen, so this job has to
-    # grant the provider surface everything it needs on its own: a manual
-    # `/review` publishes the same commit status a queued review publishes, and
-    # a caller that cannot grant `statuses: write` would produce a green run
-    # that left the merge gate with no status at all.
-    permissions:
-      contents: read
-      issues: write
-      pull-requests: write
-      statuses: write
     with:
       pr_number: ${{ needs.parse.outputs.pr_number }}
       api_base: ${{ vars.PR_AGENT_API_BASE }}
@@ -79,10 +60,6 @@ jobs:
     if: needs.parse.outputs.command == 'verify'
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    permissions:
-      contents: read
-      issues: write
-      pull-requests: read
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GITHUB_REPOSITORY: ${{ github.repository }}
@@ -93,17 +70,13 @@ jobs:
       CONTINUUM_REVIEW_MODEL: ${{ vars.PR_AGENT_MODEL }}
       CONTINUUM_REVIEW_MAX_TOKENS: ${{ vars.PR_AGENT_MAX_TOKENS }}
     steps:
-      - name: Check out the engine and the repository configuration
+      - name: Checkout Continuum module
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          # Verify reads the provider's settings -- which reviewer, which
-          # credential names, which verdict rules -- from the repository's own
-          # configuration, so the full tree is what this step needs. A sparse
-          # checkout of the engine alone would verify against defaults.
-          persist-credentials: false
+          sparse-checkout: src/continuum
+          sparse-checkout-cone-mode: false
 
-      - name: Re-check one finding against the current head
-        shell: bash
+      - name: Re-check one finding against current HEAD
         run: |
           set -euo pipefail
           PYTHONPATH=src python3 -m continuum.cli verify \

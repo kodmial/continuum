@@ -104,10 +104,10 @@
     {
       "path": ".github/workflows/pr-agent.yml",
       "blob_sha": "53485dcafb1e06318c56b4dd1f2e64c22cedd5c0",
-      "classification": "absorbed",
-      "writer": "review",
-      "owner": "#25",
-      "rationale": "The existing manual PR-Agent capability is provided by Continuum's own review provider surface, not reimplemented in the consumer. .github/workflows/pr-agent.yml in this repository is a dispatch entry that maps the queue's pr_number/head_sha wake-up and the repository's PR_AGENT_API_BASE, PR_AGENT_MODEL, PR_AGENT_MAX_TOKENS variables and PR_AGENT_API_KEY secret onto the pinned reusable provider; the provider image digest, the model routing table, the finding/tracker/coverage/verdict normalization, the exact-head binding, and the blocking commit status all come from that one Continuum commit. Absorbed by .github/workflows/pr-agent.yml, with the thin entry pinned as a fixture in fixtures/provider-consumer and regressions in tests/test_fixture_consumer.py and .github/tests/test_workflow_hardening.py."
+      "classification": "consumer-local",
+      "writer": "other",
+      "owner": "#27",
+      "rationale": "Existing manual PR-Agent capability remains in NanoDictate during Phase A. It is outside the generic orchestration cutover described by docs/continuum-mvp-contract.md, so working functionality is retained locally rather than deleted."
     },
     {
       "path": ".github/workflows/release-automation-merge.yml",

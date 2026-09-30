@@ -1,0 +1,96 @@
+name: Continuum
+
+# A delegating parent repository's generated ingress.
+#
+# Same shape as every other Continuum consumer: one event adapter, one exact
+# release reference, no controller logic. What is specific to a parent is the
+# event set -- it reconciles its children on a schedule and whenever its own
+# configuration changes -- and the one child-runtime secret its delegated work
+# needs.
+#
+# The child surfaces are not three files here. GitHub cannot dispatch a reusable
+# workflow, so `consumer-child-dispatcher.yml` dispatches a `mode=child:...`
+# into this same ingress, and the selected release routes it to the right child
+# implementation. That is what keeps a parent on one Continuum reference while
+# still reaching the worker, the review, and the owner pull-request review.
+#
+# It is also why there is no `workflow_run` trigger here. A called workflow's
+# jobs run *inside this run*, so the only workflow name a `workflow_run` filter
+# could match is this ingress's own name -- and a workflow that completes
+# because of `workflow_run` completes in a way that triggers `workflow_run`
+# again, forever. Reconciling on the schedule is how one ingress covers the
+# same ground the old per-child workflow files used to.
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  push:
+    branches:
+      - main
+    paths:
+      - .continuum.yml
+  # The union of every input the selected release dispatches into this file:
+  # the agent modes the scheduler and the repair controller send, and the three
+  # child modes the dispatcher sends. `gh workflow run` rejects an undeclared
+  # input, so an incomplete union is a dispatch that fails at runtime rather
+  # than at review.
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "issue, resolve-conflict, ci-fix, review-fix, child:worker, child:review, child:pr-review; empty reconciles"
+        required: false
+        type: string
+      issue_number:
+        required: false
+        type: string
+      pr_number:
+        required: false
+        type: string
+      head_ref:
+        required: false
+        type: string
+      run_id:
+        required: false
+        type: string
+      rungs_ruled_out:
+        required: false
+        type: string
+      # Sent by the repair controller alongside every conflict dispatch.
+      repair_timeout_minutes:
+        required: false
+        type: string
+      repair_agent_timeout_seconds:
+        required: false
+        type: string
+      child_id:
+        required: false
+        type: string
+      task_number:
+        required: false
+        type: string
+
+# The union the selected release's control plane may narrow but never widen.
+permissions:
+  actions: write
+  checks: write
+  contents: write
+  issues: write
+  pull-requests: write
+  statuses: read
+
+jobs:
+  continuum:
+    # The one line an operator edits to move this repository to another
+    # Continuum release. Nothing here refers to `main`, to a moving tag, or to
+    # a second Continuum revision.
+    uses: kodmial/continuum/.github/workflows/consumer.yml@v0.1.0
+    secrets: inherit
+    with:
+      # The dispatcher reads `CONTINUUM_ROLE` and `CONTINUUM_CHILDREN` from this
+      # repository's own variables after the runner starts, so no parent/child
+      # relationship value is passed in here or exposed in job metadata.
+      reconciler_workflow: continuum.yml
+      opencode_workflow: continuum.yml
+      worker_workflow: continuum.yml
+      review_workflow: continuum.yml
+      manual_pr_review_workflow: continuum.yml

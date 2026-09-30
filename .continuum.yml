@@ -8,19 +8,8 @@
 version: 1
 
 review:
-  # This repository runs its own automation, so it is not a consumer product and
-  # declares no review traffic. The provider surfaces in
-  # `.github/workflows/pr-agent.yml` and `.github/workflows/pr-agent-comment.yml`
-  # are live and consumer-facing (#25); they stay silent here because this file
-  # selects no provider, which is the zero-traffic opt-out the merge controller
-  # also reads. A consumer selects `provider: pr-agent` instead, and names the
-  # repository variables and secrets the provider is reached through:
-  #
-  #   pr_agent:
-  #     api_base_var: PR_AGENT_API_BASE
-  #     api_key_secret: PR_AGENT_API_KEY
-  #     model_var: PR_AGENT_MODEL
-  #     max_tokens_var: PR_AGENT_MAX_TOKENS
+  # MVP bootstrap: review is disabled until the CodeRabbit adapter (#11) lands.
+  # PR-Agent is post-MVP and must not be selected by v0.1.
   provider: none
 
 # Release targets are declared here but not yet run: no release workflow is

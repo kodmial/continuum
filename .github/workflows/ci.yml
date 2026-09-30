@@ -48,14 +48,12 @@ jobs:
           "$RUNNER_TEMP/actionlint" -color -ignore 'shellcheck reported issue' -ignore 'property "workflow_sha" is not defined'
           "$RUNNER_TEMP/actionlint" -color -ignore 'shellcheck reported issue' -ignore 'property "workflow_sha" is not defined' \
             fixtures/consumer-repo/.github/workflows/*.yml
-          "$RUNNER_TEMP/actionlint" -color \
-            fixtures/provider-consumer/.github/workflows/*.yml
 
       - name: Enforce MVP active workflow boundary
         shell: bash
         run: |
           set -euo pipefail
-          allowed='^(auto-merge|ci|issue-scheduler|review-gate|review-queue|opencode|opencode-repair|continuum-shadow|consumer-scheduler|consumer-opencode|consumer-repair|consumer-auto-merge|consumer-review-gate|consumer-child-dispatcher|consumer-child-worker|consumer-child-review|consumer-child-pr-review|pr-agent|pr-agent-comment|release-bun-binary)\.ya?ml$'
+          allowed='^(auto-merge|ci|issue-scheduler|review-gate|review-queue|opencode|opencode-repair|continuum-shadow|consumer|consumer-scheduler|consumer-opencode|consumer-repair|consumer-auto-merge|consumer-review-gate|consumer-child-dispatcher|consumer-child-worker|consumer-child-review|consumer-child-pr-review|release-bun-binary)\.ya?ml$'
           bad=0
           while IFS= read -r file; do
             base="$(basename "$file")"

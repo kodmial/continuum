@@ -209,23 +209,11 @@ controller, never a second copy of a decision.
 | `.github/workflows/consumer-review-gate.yml` | close the review loop: observe, repair, re-check |
 | `.github/workflows/consumer-repair.yml` | repair a merge conflict or a failing gate on the existing branch |
 | `.github/workflows/consumer-auto-merge.yml` | reconcile merge eligibility on every wake-up |
-| `.github/workflows/pr-agent.yml` | run the review provider itself: provider request, normalized findings, verdict, blocking commit status |
 
 Every call pins an immutable Continuum commit. A branch ref would make a
 consumer's security model a function of whatever `main` holds when the workflow
 next fires, which is precisely the property a reviewer cannot check by reading
-the file. `pr-agent.yml` goes one step further and needs no second pin at all:
-it resolves its engine from `job.workflow_sha`, the commit of the workflow file
-itself, so the one reference the consumer writes selects an atomic snapshot of
-the whole provider and cannot drift from it.
-
-`pr-agent.yml` is the one surface a consumer reaches *directly* rather than
-through a toggle, because selecting a review provider is configuration rather
-than a boolean: `.continuum.yml` names the provider and the repository variables
-and secrets it is reached through, and the consumer's entry workflow maps those
-names onto the reusable inputs. `fixtures/provider-consumer/` is that
-repository, and it is the whole cost of adoption — a configuration file and a
-dispatch entry, with no provider image, model routing, checkout, or gate in it.
+the file.
 
 ### 9.2 What a consumer's entry workflows may state
 
@@ -247,18 +235,10 @@ own repository:
   that can disagree with the file a reviewer reads. The shared controllers
   therefore expose no such inputs, and `.github/workflows/ci.yml` actionlint-checks
   that they do not appear.
-- **A reviewer, a reviewer credential, a release target, or a platform** — in the
-  entry workflows of a consumer that adopted the two-boolean contract. `review:
-  true` activates the single review implementation Continuum ships. Which reviewer
-  that is is Continuum's business, and adding a selector to the consumer's file
-  would make the "two booleans, nothing else" guarantee false. The exception is
-  the provider surface, which is not selected by a boolean at all: a consumer
-  that adopts `review.provider` in `.continuum.yml` *does* name the provider,
-  because that is what selecting one means. Its entry workflow may therefore
-  name the provider credential, and may do nothing else — no provider image, no
-  model routing, no checkout, no diff, and no gate. `fixtures/provider-consumer/`
-  is that entry, and `tests/test_fixture_consumer.py` fails if any of the
-  forbidden machinery appears in it.
+- **A reviewer, a reviewer credential, a release target, or a platform.**
+  `review: true` activates the single review implementation Continuum ships.
+  Which reviewer that is is Continuum's business, and adding a selector to the
+  consumer's file would make the "two booleans, nothing else" guarantee false.
 - **Anything derived from an event payload that the pull-request author
   controls**, other than a candidate pull-request number. A ref or a commit
   taken from an untrusted payload is an instruction, and every controller
@@ -275,12 +255,6 @@ repository's own contract file and its own workflow names — so if adopting the
 contract ever required a reviewer name, a platform, or a caller-supplied
 boolean, the reference consumer would stop satisfying the contract rather than
 quietly diverging from it.
-
-`fixtures/provider-consumer/` is the instance for §9.1's provider surface, and
-is held to the same standard from the other side: the caller passes exactly the
-inputs and secrets the reusable surface declares, omits only the ones it
-already defaults, declares exactly the wake-up the review queue dispatches, and
-contains no review implementation of any kind.
 
 ## 10. Acceptance proof
 
