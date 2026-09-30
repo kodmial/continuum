@@ -893,6 +893,8 @@ jobs:
           REPAIR_HEAD: ${{ env.REPAIR_HEAD }}
           CONFLICT_ORIGINAL_HEAD: ${{ env.CONFLICT_ORIGINAL_HEAD }}
           CONFLICT_PRESERVED_COMMITS: ${{ env.CONFLICT_PRESERVED_COMMITS }}
+          RUNTIME_FAILURE_CLASS: ${{ steps.repair_opencode_runtime.outputs.failure_class }}
+          RUNTIME_FAILURE_CODE: ${{ steps.repair_opencode_runtime.outputs.failure_code }}
         run: |
           set -euo pipefail
           [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::Invalid pull request number."; exit 1; }
