@@ -111,6 +111,18 @@ on:
         description: cutover; the human approval document inside the window
         type: string
         default: ""
+      authorization_path:
+        description: cutover; the trusted controller's authorization document inside the window
+        type: string
+        default: ""
+      change_set_path:
+        description: cutover; the atomic cutover's change-set document inside the window
+        type: string
+        default: ""
+      phase:
+        description: cutover; phase-a replaces the control-plane writers only, phase-b every writer
+        type: string
+        default: "phase-b"
       canary_path:
         description: cutover; the canary evidence document inside the window
         type: string
@@ -134,21 +146,12 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: run, replay, or cutover
+        description: replay or cutover; live run events enter through workflow_call
         type: choice
         default: cutover
-        options: [run, replay, cutover]
+        options: [replay, cutover]
       repository:
         description: owner/name of the repository whose events are being shadowed
-        type: string
-      event_json:
-        description: the event context to judge, as JSON
-        type: string
-      observed_json:
-        description: what NanoDictate actually did, as JSON
-        type: string
-      state_json:
-        description: a captured state document
         type: string
       capture_live:
         description: read the state from GitHub
@@ -202,6 +205,16 @@ on:
       approval_path:
         description: cutover; the human approval document inside the window
         type: string
+      authorization_path:
+        description: cutover; the trusted controller's authorization document inside the window
+        type: string
+      change_set_path:
+        description: cutover; the atomic cutover's change-set document inside the window
+        type: string
+      phase:
+        description: cutover; phase-a replaces the control-plane writers only, phase-b every writer
+        type: string
+        default: "phase-b"
       canary_path:
         description: cutover; the canary evidence document inside the window
         type: string
@@ -497,6 +510,9 @@ jobs:
       RESOLUTIONS_PATH: ${{ inputs.resolutions_path }}
       ORIGINS: ${{ inputs.origins }}
       APPROVAL_PATH: ${{ inputs.approval_path }}
+      AUTHORIZATION_PATH: ${{ inputs.authorization_path }}
+      CHANGE_SET_PATH: ${{ inputs.change_set_path }}
+      PHASE: ${{ inputs.phase }}
       CANARY_PATH: ${{ inputs.canary_path }}
       ROLLBACK_PATH: ${{ inputs.rollback_path }}
       BASELINE_LEDGER_PATH: ${{ inputs.baseline_ledger_path }}
@@ -636,25 +652,54 @@ jobs:
             --liveness "$WINDOW_ROOT/$LIVENESS_PATH"
             --window-start "$WINDOW_START"
             --window-end "$WINDOW_END")
+          # `--parity` and `--resolutions` take a list after one flag, so they are
+          # passed once, with every document the window produced. Repeating the
+          # flag would read as "the last one wins", and a window judged against a
+          # single verdict would report the other scenarios as unobserved.
+          parity=()
           while IFS= read -r path; do
             [ -n "$path" ] || continue
-            args+=(--parity "$WINDOW_ROOT/$path")
+            parity+=("$WINDOW_ROOT/$path")
           done <<<"${PARITY_PATHS:-}"
+          resolutions=()
           while IFS= read -r path; do
             [ -n "$path" ] || continue
-            args+=(--resolutions "$WINDOW_ROOT/$path")
+            resolutions+=("$WINDOW_ROOT/$path")
           done <<<"${RESOLUTIONS_PATH:-}"
+          if [ "${#parity[@]}" -gt 0 ]; then
+            args+=(--parity "${parity[@]}")
+          fi
+          if [ "${#resolutions[@]}" -gt 0 ]; then
+            args+=(--resolutions "${resolutions[@]}")
+          fi
           if [ -n "${ORIGINS:-}" ]; then
             args+=(--origins "$WINDOW_ROOT/$ORIGINS")
           fi
           if [ -n "${APPROVAL_PATH:-}" ]; then
             args+=(--approval "$WINDOW_ROOT/$APPROVAL_PATH")
           fi
+          if [ -n "${AUTHORIZATION_PATH:-}" ]; then
+            args+=(--authorization "$WINDOW_ROOT/$AUTHORIZATION_PATH")
+          fi
+          if [ -n "${PHASE:-}" ]; then
+            args+=(--phase "$PHASE")
+          fi
+          if [ -n "${CHANGE_SET_PATH:-}" ]; then
+            # The change set is judged against the same ledger the reading was
+            # taken with, recorded by the step above. Re-resolving the ledger
+            # here would let the two halves of one cutover disagree about which
+            # reviewer approved which writer.
+            ledger="$(cat replay-out/baseline-ledger-path.txt)"
+            args+=(--change-set "$WINDOW_ROOT/$CHANGE_SET_PATH" --ledger "$ledger")
+          fi
+          # The evidence documents are named, not inlined: the gate re-reads them
+          # from disk and hashes what it read, so an authorization can bind the
+          # canary and rollback it actually verified.
           if [ -n "${CANARY_PATH:-}" ]; then
-            args+=(--canary "$(cat "$WINDOW_ROOT/$CANARY_PATH")")
+            args+=(--canary "$WINDOW_ROOT/$CANARY_PATH")
           fi
           if [ -n "${ROLLBACK_PATH:-}" ]; then
-            args+=(--rollback "$(cat "$WINDOW_ROOT/$ROLLBACK_PATH")")
+            args+=(--rollback "$WINDOW_ROOT/$ROLLBACK_PATH")
           fi
           PYTHONPATH=engine/src python3 -m continuum.shadow.cli "${args[@]}"
       - name: Summarise the decision

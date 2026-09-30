@@ -142,13 +142,39 @@ def _parser() -> argparse.ArgumentParser:
     gate.add_argument("--liveness", help="a liveness report document")
     gate.add_argument("--origins", help="correlation id -> origin mapping, as JSON")
     gate.add_argument("--resolutions", nargs="*", default=[])
-    gate.add_argument("--approval", help="an approval document")
-    gate.add_argument("--canary", help="canary evidence, as JSON")
-    gate.add_argument("--rollback", help="rollback evidence, as JSON")
+    gate.add_argument("--approval", help="a human approval document")
+    gate.add_argument(
+        "--authorization",
+        help="a trusted controller's authorization document; the zero-touch path, "
+        "where no person has to look at the window",
+    )
+    gate.add_argument(
+        "--change-set",
+        help="a change-set document: what the atomic cutover changes at one head, "
+        "with the writer each path implements; the ledger's roles decide which of it "
+        "this phase may do",
+    )
+    gate.add_argument("--canary", help="a canary evidence document")
+    gate.add_argument("--rollback", help="a rollback evidence document")
     gate.add_argument(
         "--baseline",
         help="a rolling baseline report from the `baseline` subcommand; the cutover "
         "gate refuses a window without one",
+    )
+    gate.add_argument(
+        "--ledger",
+        help="the reviewed parity ledger; required with --change-set, because a "
+        "change is checked against the writer role the ledger recorded",
+    )
+    gate.add_argument(
+        "--phase",
+        choices=list(cutover.PHASES),
+        default=cutover.DEFAULT_PHASE,
+        help="{}: the control-plane cutover, which leaves the consumer's release "
+        "workflows in place and does not require release evidence; {}: every writer, "
+        "release evidence required. Default {}".format(
+            cutover.PHASE_A, cutover.PHASE_B, cutover.DEFAULT_PHASE
+        ),
     )
     gate.add_argument("--window-start", required=True)
     gate.add_argument("--window-end", required=True)
@@ -427,21 +453,36 @@ def _replay(args: argparse.Namespace) -> int:
 
 def _cutover(args: argparse.Namespace) -> int:
     output = _output_dir(args.out)
+    if args.change_set and not args.ledger:
+        _fail(
+            "missing_ledger: --change-set needs --ledger; a change is checked "
+            "against the writer role the ledger recorded for that path"
+        )
+        return USAGE_ERROR
     decision = cutover.from_documents(
         [_read_json(path) for path in args.parity],
         _read_json(args.liveness) if args.liveness else None,
         baseline_document=_read_json(args.baseline) if args.baseline else None,
+        ledger_document=_read_json(args.ledger) if args.ledger else None,
         origins=_optional_json(args.origins),
         resolution_documents=[_read_json(path) for path in args.resolutions],
         approval_document=_read_json(args.approval) if args.approval else None,
+        authorization_document=(
+            _read_json(args.authorization) if args.authorization else None
+        ),
+        change_set_document=_read_json(args.change_set) if args.change_set else None,
         canary=_optional_json(args.canary),
         rollback=_optional_json(args.rollback),
+        phase=args.phase,
         window_started_at=args.window_start,
         window_ended_at=args.window_end,
     )
     _write(output / "cutover" / "decision.json", decision.describe())
     _summary(cutover.summarize(decision))
-    return 0 if decision.approved else VALIDATION_FAILED
+    # Either record is a decision to act on: a human approval, or the controller's
+    # authorization for the exact window this run re-derived. Neither substitutes
+    # for the other, and a window with neither is refused.
+    return 0 if decision.authorized or decision.approved else VALIDATION_FAILED
 
 
 # --------------------------------------------------------------------------- #

@@ -562,6 +562,349 @@ class CutoverCommand(unittest.TestCase):
         self.assertEqual(result.returncode, cli.USAGE_ERROR)
 
 
+class ZeroTouchCutover(unittest.TestCase):
+    """The zero-touch path, driven the way CI drives it.
+
+    NanoDictate's first cutover merges with nobody watching: the trusted controller
+    issues an authorization bound to the window, the reading, the consumer HEAD, the
+    engine, the canary, the rollback target and the cutover head, and the gate
+    re-derives all of them. What has to be proven here is that the exit code says
+    *authorized* rather than *approved*, and that nothing in it names a person.
+    """
+
+    PHASE = "phase-a"
+    CUTOVER_HEAD = "c" * 40
+    CANARY = {"reference": "runs/canary-1", "result": "clean"}
+    ROLLBACK = {"reference": ".github/workflows/issue-scheduler.yml@revert-1"}
+    #: Roles the ledger records for the paths this cutover touches. Kept in the
+    #: test rather than borrowed from the shipped ledger so the assertion is about
+    #: the gate, not about one consumer's inventory.
+    WORKFLOWS = (
+        (".github/workflows/issue-scheduler.yml", "1" * 40, "scheduler"),
+        (".github/workflows/release.yml", "2" * 40, "release"),
+    )
+
+    def setUp(self) -> None:
+        self.dir = Path(ARTIFACTS) / "zero-touch"
+
+    def tearDown(self) -> None:
+        _remove(REPO_ROOT / ARTIFACTS / "zero-touch")
+
+    def _ledger(self):
+        return {
+            "schema": "continuum.parity-ledger/v1",
+            "repository": "kodmial/nanodictate",
+            "audited_head": "a" * 40,
+            "workflows": [
+                {
+                    "path": path,
+                    "blob_sha": sha,
+                    "classification": "consumer-local",
+                    "owner": "#27",
+                    "writer": writer,
+                }
+                for path, sha, writer in self.WORKFLOWS
+            ],
+            "open_pull_requests": [],
+        }
+
+    def _reading(self):
+        return _write(
+            self.dir / "live-head.json",
+            {
+                "schema": "continuum.shadow-baseline/v1",
+                "repository": "kodmial/nanodictate",
+                "default_branch": "main",
+                "head_sha": HEAD_E,
+                "workflows": [
+                    {"path": path, "blob_sha": sha} for path, sha, _ in self.WORKFLOWS
+                ],
+                "open_pull_requests": [],
+            },
+        )
+
+    def _window(self):
+        """Every control-plane scenario, live, plus the artifacts the gate reads."""
+
+        from continuum.shadow import liveness, parity, planner
+        from continuum.shadow.observation import outcome_from_payload
+
+        ledger_path = _write(self.dir / "ledger.json", self._ledger())
+        reading = _cli(
+            "baseline",
+            "--ledger", str(ledger_path),
+            "--live-head", str(self._reading()),
+            "--out", str(self.dir / "baseline-out"),
+        )
+        self.assertEqual(reading.returncode, 0, reading.stderr)
+        report = json.loads(
+            (self.dir / "baseline-out" / "baseline" / "report.json").read_text()
+        )
+
+        results = []
+        origins = {}
+        runs = []
+        for scenario in (
+            "issue-lifecycle",
+            "ci-repair",
+            "coderabbit-finding",
+            "merge-decision",
+            "dependency-blocked",
+            "duplicate-replay",
+            "timeout-recovery",
+        ):
+            journal = planner.plan(
+                fixtures.event_for(scenario), fixtures.state(), fixtures.config(), now_ms=1
+            )
+            result = parity.compare(
+                journal,
+                outcome_from_payload(
+                    {
+                        "correlation_id": journal.event.correlation_id,
+                        "fidelity": "exact",
+                        "terminal_state": journal.status,
+                        "decision": journal.decision,
+                        "actions": [effect.describe() for effect in journal.actions],
+                    }
+                ),
+            )
+            results.append(result)
+            origins[result.correlation_id] = "bridge"
+            runs.append(
+                liveness.RunLiveness(
+                    correlation_id=result.correlation_id,
+                    verdict=liveness.LIVE,
+                    status="ok",
+                    duration_ms=5,
+                )
+            )
+        parity_paths = [
+            _write(self.dir / "parity-{}".format(index), result.describe())
+            for index, result in enumerate(results)
+        ]
+        live = _write(
+            self.dir / "liveness.json", liveness.LivenessReport(runs=tuple(runs)).describe()
+        )
+        origins_path = _write(self.dir / "origins.json", origins)
+        canary_path = _write(self.dir / "canary.json", self.CANARY)
+        rollback_path = _write(self.dir / "rollback.json", self.ROLLBACK)
+        change_set = _write(
+            self.dir / "change-set.json",
+            {
+                "schema": "continuum.shadow-change-set/v1",
+                "kind": "change-set",
+                "cutover_head": self.CUTOVER_HEAD,
+                "phase": self.PHASE,
+                "changes": [
+                    {
+                        "path": ".github/workflows/issue-scheduler.yml",
+                        "action": "remove",
+                        "writer": "scheduler",
+                    }
+                ],
+            },
+        )
+        return {
+            "ledger": ledger_path,
+            "report": self.dir / "baseline-out" / "baseline" / "report.json",
+            "parity": parity_paths,
+            "liveness": live,
+            "origins": origins_path,
+            "canary": canary_path,
+            "rollback": rollback_path,
+            "change_set": change_set,
+            "reading": report,
+        }
+
+    def _authorization(self, window, **overrides):
+        from continuum.shadow import cutover, engine
+
+        fields = {
+            "schema": cutover.AUTHORIZATION_SCHEMA,
+            "kind": "authorization",
+            "phase": self.PHASE,
+            "authorized_by": "continuum-cutover-controller",
+            "authorized_at": "2026-03-20T00:00:00Z",
+            "baseline_digest": window["reading"]["evidence_digest"],
+            "consumer_head": window["reading"]["live_head"],
+            "controller_sha": engine.engine_sha(),
+            "canary_reference": self.CANARY["reference"],
+            "rollback_reference": self.ROLLBACK["reference"],
+            "cutover_head": self.CUTOVER_HEAD,
+        }
+        fields.update(overrides)
+        return fields
+
+    def _judge(self, window, authorization, *extra, out="out"):
+        args = ["cutover", "--out", str(self.dir / out)]
+        args += ["--parity"] + [str(path) for path in window["parity"]]
+        args += [
+            "--liveness", str(window["liveness"]),
+            "--origins", str(window["origins"]),
+            "--baseline", str(window["report"]),
+            "--canary", str(window["canary"]),
+            "--rollback", str(window["rollback"]),
+            "--ledger", str(window["ledger"]),
+            "--change-set", str(window["change_set"]),
+            "--phase", self.PHASE,
+            "--window-start", "2026-03-01T00:00:00Z",
+            "--window-end", "2026-03-15T00:00:00Z",
+        ]
+        if authorization is not None:
+            args += ["--authorization", str(authorization)]
+        return _cli(*(args + list(extra)))
+
+    def _evidence_digest(self, window):
+        """The digest the controller would have authorized: one judge, no record."""
+
+        result = self._judge(window, None, out="digest")
+        self.assertNotEqual(result.returncode, 0)
+        return json.loads(
+            (self.dir / "digest" / "cutover" / "decision.json").read_text()
+        )["evidence_digest"]
+
+    def test_a_bound_authorization_exits_zero_with_no_human_record(self) -> None:
+        window = self._window()
+        path = _write(
+            self.dir / "authorization.json",
+            self._authorization(window, evidence_digest=self._evidence_digest(window)),
+        )
+        result = self._judge(window, path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        decision = json.loads(
+            (self.dir / "out" / "cutover" / "decision.json").read_text()
+        )
+        self.assertTrue(decision["authorized"])
+        self.assertTrue(decision["ready"])
+        # Authorized, not approved: the gate did not decide for itself, and no
+        # person is named anywhere in the record.
+        self.assertFalse(decision["approved"])
+        self.assertIsNone(decision["approval"])
+        self.assertIn("authorized for {}".format(self.PHASE), result.stdout)
+
+    def test_phase_a_merges_without_release_evidence(self) -> None:
+        window = self._window()
+        path = _write(
+            self.dir / "authorization.json",
+            self._authorization(window, evidence_digest=self._evidence_digest(window)),
+        )
+        self.assertEqual(self._judge(window, path).returncode, 0)
+        decision = json.loads(
+            (self.dir / "out" / "cutover" / "decision.json").read_text()
+        )
+        self.assertEqual(decision["phase"], self.PHASE)
+        # release-planning was never observed, and that did not stop the cutover.
+        coverage = {entry["scenario"]: entry for entry in decision["coverage"]["scenarios"]}
+        self.assertEqual(coverage["release-planning"]["events"], 0)
+        self.assertFalse(coverage["release-planning"]["required"])
+
+    def test_the_same_window_is_refused_in_phase_b(self) -> None:
+        window = self._window()
+        path = _write(
+            self.dir / "authorization.json",
+            self._authorization(window, evidence_digest=self._evidence_digest(window)),
+        )
+        result = self._judge(window, path, "--phase", "phase-b", out="phase-b")
+        self.assertEqual(result.returncode, cli.VALIDATION_FAILED)
+        decision = json.loads(
+            (self.dir / "phase-b" / "cutover" / "decision.json").read_text()
+        )
+        self.assertFalse(decision["authorized"])
+        codes = {blocker["code"] for blocker in decision["blockers"]}
+        self.assertIn("uncovered_scenario", codes)
+
+    def test_a_moved_binding_fails_the_command(self) -> None:
+        window = self._window()
+        digest = self._evidence_digest(window)
+        for field, value in (
+            ("consumer_head", "f" * 40),
+            ("controller_sha", "f" * 40),
+            ("cutover_head", "d" * 40),
+            ("canary_reference", "runs/canary-2"),
+            ("rollback_reference", "workflows/issue-scheduler.yml@revert-9"),
+            ("baseline_digest", "bl-0000000000000000"),
+            ("evidence_digest", "ev-0000000000000000"),
+        ):
+            with self.subTest(binding=field):
+                path = _write(
+                    self.dir / "authorization-{}.json".format(field),
+                    self._authorization(
+                        window, **{"evidence_digest": digest, field: value}
+                    ),
+                )
+                out = "moved-{}".format(field)
+                result = self._judge(window, path, out=out)
+                self.assertEqual(result.returncode, cli.VALIDATION_FAILED, field)
+                decision = json.loads(
+                    (self.dir / out / "cutover" / "decision.json").read_text()
+                )
+                self.assertFalse(decision["authorized"])
+                self.assertTrue(
+                    any(code.startswith("stale_") for code in (
+                        blocker["code"] for blocker in decision["blockers"]
+                    )),
+                    [blocker["code"] for blocker in decision["blockers"]],
+                )
+
+    def test_a_change_set_that_reaches_the_release_writer_is_refused(self) -> None:
+        window = self._window()
+        window["change_set"] = _write(
+            self.dir / "change-set-release.json",
+            {
+                "schema": "continuum.shadow-change-set/v1",
+                "kind": "change-set",
+                "cutover_head": self.CUTOVER_HEAD,
+                "phase": self.PHASE,
+                "changes": [
+                    {
+                        "path": ".github/workflows/release.yml",
+                        "action": "remove",
+                        "writer": "release",
+                    }
+                ],
+            },
+        )
+        path = _write(
+            self.dir / "authorization.json",
+            self._authorization(window, evidence_digest=self._evidence_digest(window)),
+        )
+        result = self._judge(window, path, out="release-scope")
+        self.assertEqual(result.returncode, cli.VALIDATION_FAILED, result.stderr)
+        decision = json.loads(
+            (self.dir / "release-scope" / "cutover" / "decision.json").read_text()
+        )
+        codes = {blocker["code"] for blocker in decision["blockers"]}
+        self.assertIn("release_writer_in_phase_a", codes)
+        self.assertIn("authorization_over_blocked_window", codes)
+        self.assertFalse(decision["authorized"])
+
+    def test_a_change_set_without_a_ledger_is_a_usage_error(self) -> None:
+        window = self._window()
+        result = _cli(
+            "cutover",
+            "--change-set", str(window["change_set"]),
+            "--window-start", "2026-03-01T00:00:00Z",
+            "--window-end", "2026-03-15T00:00:00Z",
+            "--out", str(self.dir / "no-ledger"),
+        )
+        self.assertEqual(result.returncode, cli.USAGE_ERROR)
+        self.assertIn("missing_ledger", result.stderr)
+
+    def test_an_authorization_for_another_engine_is_refused(self) -> None:
+        # The controller binding names the engine this gate is running as, and no
+        # flag exists to tell the gate to believe a different one.
+        window = self._window()
+        path = _write(
+            self.dir / "authorization.json",
+            self._authorization(
+                window,
+                evidence_digest=self._evidence_digest(window),
+                controller_sha="0" * 40,
+            ),
+        )
+        self.assertEqual(self._judge(window, path, out="other-engine").returncode, cli.VALIDATION_FAILED)
+
+
 class BaselineCommand(unittest.TestCase):
     def setUp(self) -> None:
         self.dir = Path(ARTIFACTS) / "baseline"
@@ -980,8 +1323,9 @@ class SummaryCommand(unittest.TestCase):
             cutover.CutoverDecision(ready=True, approved=False).describe(),
         )
         waiting = _cli("summary", "--out", str(self.out), "--window")
-        self.assertIn("awaiting a recorded approval", waiting.stdout)
+        self.assertIn("awaiting a recorded decision", waiting.stdout)
         self.assertNotIn("**approved**", waiting.stdout)
+        self.assertNotIn("**authorized**", waiting.stdout)
 
     def test_the_summary_never_invents_a_decision_from_a_broken_artifact(self) -> None:
         self._run()

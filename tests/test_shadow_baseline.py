@@ -307,6 +307,69 @@ class TheLedgerItself(unittest.TestCase):
             baseline.read_ledger(_ledger_document(repository="  "))
         self.assertEqual(caught.exception.code, "ledger_repository_missing")
 
+    def test_a_writer_role_nobody_defines_is_refused(self):
+        # The cutover gate checks a change against the role the ledger recorded, so
+        # a typo in one would silently become "no role" -- which reads as a path it
+        # cannot reason about, rather than as a mistake in the audit.
+        with self.assertRaises(baseline.BaselineError) as caught:
+            baseline.read_ledger(
+                _ledger_document(
+                    workflows=[
+                        {
+                            "path": ".github/workflows/release.yml",
+                            "blob_sha": "1" * 40,
+                            "classification": "consumer-local",
+                            "writer": "relase",
+                        }
+                    ]
+                )
+            )
+        self.assertEqual(caught.exception.code, "unknown_writer_role")
+
+    def test_a_ledger_without_roles_still_reads(self):
+        # Optional on read, so an older ledger loads; the cutover gate is where a
+        # missing role is refused, because that is where the role is needed.
+        ledger = baseline.read_ledger(_ledger_document())
+        self.assertEqual([entry.writer for entry in ledger.workflows], ["", ""])
+
+    def test_a_changed_role_is_a_changed_audit(self):
+        document = _ledger_document(
+            workflows=[
+                {
+                    "path": ".github/workflows/auto-merge.yml",
+                    "blob_sha": "2" * 40,
+                    "classification": "absorbed",
+                    "writer": baseline.WRITER_MERGE,
+                }
+            ]
+        )
+        self.assertNotEqual(
+            baseline.read_ledger(document).digest,
+            baseline.read_ledger(
+                {**document, "workflows": [{**document["workflows"][0], "writer": "other"}]}
+            ).digest,
+        )
+
+    def test_the_rendering_makes_a_role_visible(self):
+        markdown = baseline.render_markdown(
+            baseline.read_ledger(
+                _ledger_document(
+                    workflows=[
+                        {
+                            "path": ".github/workflows/release.yml",
+                            "blob_sha": "1" * 40,
+                            "classification": "consumer-local",
+                            "writer": baseline.RELEASE_WRITER,
+                        }
+                    ]
+                )
+            )
+        )
+        self.assertIn("| Workflow | Blob | Classification | Writer |", markdown)
+        self.assertIn("| `release` |", markdown)
+        # And an undeclared role renders as absent, not as a guess.
+        self.assertNotIn("| `other` |", markdown)
+
     def test_every_entry_carries_a_rationale_or_says_it_needs_none(self):
         # Rationale is not enforced -- some classifications are self-explanatory --
         # but a ledger row with neither is a claim with no support, so the
@@ -485,6 +548,30 @@ class TheShippedLedger(unittest.TestCase):
             self.assertTrue(entry.paths)
             for path in entry.paths:
                 self.assertTrue(path.startswith(".github/"))
+
+    def test_it_names_the_writer_every_workflow_implements(self):
+        # The Phase A cutover gate refuses a change to a path with no role, so the
+        # shipped ledger has to carry one for every workflow it audits -- including
+        # the consumer's release workflows, which is what keeps Phase A away from
+        # them rather than a naming convention.
+        ledger = baseline.load_ledger(self.LEDGER)
+        for entry in ledger.workflows:
+            with self.subTest(workflow=entry.path):
+                self.assertIn(entry.writer, baseline.WRITER_ROLES)
+        roles = {entry.writer: entry.path for entry in ledger.workflows}
+        for role in baseline.CONTROL_PLANE_WRITERS + (baseline.RELEASE_WRITER,):
+            self.assertIn(role, roles)
+        # The release workflows are the ones Phase A must not touch, and the ledger
+        # is where that fact is recorded rather than inferred from a filename.
+        self.assertEqual(roles[baseline.RELEASE_WRITER], ".github/workflows/release.yml")
+        for path in (
+            ".github/workflows/release-pr.yml",
+            ".github/workflows/release-automation-merge.yml",
+            ".github/workflows/packaging-smoke.yml",
+        ):
+            with self.subTest(workflow=path):
+                entry = ledger.workflow_map[path]
+                self.assertEqual(entry.writer, baseline.RELEASE_WRITER)
 
     def test_it_covers_both_workflows_the_live_audit_found_beyond_the_issue_table(self):
         # These two were added after the 2026-09-30 audit point, so a ledger built

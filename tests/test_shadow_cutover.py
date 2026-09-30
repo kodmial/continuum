@@ -10,15 +10,25 @@ against evidence that has since moved.
 from __future__ import annotations
 
 import dataclasses
+import json
 import unittest
 
-from continuum.shadow import baseline, cutover, liveness, parity, planner
+from continuum.shadow import baseline, cutover, engine, liveness, parity, planner
 from continuum.shadow.observation import outcome_from_payload
 from tests import shadow_support as fixtures
 
 WINDOW = ("2026-03-01T00:00:00Z", "2026-03-15T00:00:00Z")
 
 ALL_REQUIRED = tuple(name for name, _ in cutover.REQUIRED_SCENARIOS)
+
+#: The control-plane scenarios, which is what Phase A asks for.
+CONTROL_PLANE_REQUIRED = tuple(
+    name for name in ALL_REQUIRED if name != cutover.RELEASE_SCENARIO
+)
+
+#: "Not supplied", which is not the same as ``None`` -- the gate treats an absent
+#: ledger differently from a caller that passed nothing at all.
+_DEFAULT = object()
 
 
 def _agreed(scenario: str, journal):
@@ -754,6 +764,678 @@ class FromArtifacts(unittest.TestCase):
             window_ended_at=WINDOW[1],
         )
         self.assertEqual(forward.evidence_digest, backward.evidence_digest)
+
+
+class Phases(unittest.TestCase):
+    """Phase A is the control-plane cutover; Phase B replaces the release writer too.
+
+    The two assertions that matter are the ones the issue names: Phase A must not
+    wait for release evidence it is not going to use, and Phase B must not cut over
+    on a window that never showed one.
+    """
+
+    def _window(self, scenarios):
+        results, origins = _results(scenarios)
+        return results, origins, _liveness(
+            [result.correlation_id for result in results]
+        )
+
+    def test_phase_a_does_not_require_the_release_scenario(self) -> None:
+        required = dict(cutover.required_scenarios(cutover.PHASE_A))
+        self.assertEqual(set(required), set(CONTROL_PLANE_REQUIRED))
+        self.assertNotIn(cutover.RELEASE_SCENARIO, required)
+        # Every class it does require still carries its reason.
+        for name, reason in required.items():
+            self.assertTrue(reason.strip(), name)
+
+    def test_phase_b_requires_the_release_scenario(self) -> None:
+        self.assertEqual(
+            cutover.required_scenarios(cutover.PHASE_B), cutover.REQUIRED_SCENARIOS
+        )
+
+    def test_the_strict_phase_is_the_default(self) -> None:
+        # An unnamed phase gets the full list, so nothing is loosened by omission.
+        self.assertEqual(cutover.DEFAULT_PHASE, cutover.PHASE_B)
+        self.assertEqual(cutover.required_scenarios(), cutover.REQUIRED_SCENARIOS)
+        self.assertEqual(len(cutover.required_scenarios()), 8)
+
+    def test_a_phase_nobody_declared_is_refused(self) -> None:
+        for call in (
+            lambda: cutover.required_scenarios("phase-c"),
+            lambda: cutover.phase_writers("phase-c"),
+        ):
+            with self.assertRaises(cutover.CutoverError) as caught:
+                call()
+            self.assertEqual(caught.exception.code, "unknown_cutover_phase")
+
+    def test_phase_a_is_ready_without_release_evidence(self) -> None:
+        results, origins, live = self._window(CONTROL_PLANE_REQUIRED)
+        decision = cutover.decide(
+            results,
+            live,
+            baseline=_baseline(),
+            origins=origins,
+            phase=cutover.PHASE_A,
+            window_started_at=WINDOW[0],
+            window_ended_at=WINDOW[1],
+        )
+        self.assertEqual(decision.blockers, ())
+        self.assertTrue(decision.ready)
+        self.assertEqual(decision.phase, cutover.PHASE_A)
+        # Sufficient is not authorized: nothing has said this window may be acted on.
+        self.assertFalse(decision.authorized)
+
+    def test_the_same_window_is_refused_in_phase_b(self) -> None:
+        results, origins, live = self._window(CONTROL_PLANE_REQUIRED)
+        decision = cutover.decide(
+            results,
+            live,
+            baseline=_baseline(),
+            origins=origins,
+            phase=cutover.PHASE_B,
+            window_started_at=WINDOW[0],
+            window_ended_at=WINDOW[1],
+        )
+        blockers = [b for b in decision.blockers if b.code == "uncovered_scenario"]
+        self.assertEqual([b.scenario for b in blockers], [cutover.RELEASE_SCENARIO])
+        self.assertFalse(decision.ready)
+
+    def test_release_planning_is_still_reported_in_phase_a(self) -> None:
+        # Observed, not demanded: a reader still sees that it happened.
+        results, origins, live = self._window(ALL_REQUIRED)
+        report = cutover.coverage(
+            results, origins=origins, phase=cutover.PHASE_A, window_started_at=WINDOW[0]
+        )
+        entry = report.for_scenario(cutover.RELEASE_SCENARIO)
+        self.assertEqual(entry.state, "live")
+        self.assertFalse(entry.required)
+        self.assertIn(cutover.RELEASE_SCENARIO, report.optional_seen)
+        self.assertEqual(report.describe()["phase"], cutover.PHASE_A)
+
+    def test_the_phase_travels_in_the_digest(self) -> None:
+        # Otherwise an authorization issued for the control-plane phase could be
+        # spent on the release phase, where the same events are not enough.
+        results, origins, live = self._window(ALL_REQUIRED)
+        digests = {}
+        for phase in cutover.PHASES:
+            decision = cutover.decide(
+                results,
+                live,
+                baseline=_baseline(),
+                origins=origins,
+                phase=phase,
+                window_started_at=WINDOW[0],
+                window_ended_at=WINDOW[1],
+            )
+            digests[phase] = decision.evidence_digest
+        self.assertEqual(len(set(digests.values())), 2, digests)
+
+    def test_a_phase_only_replaces_the_writers_it_names(self) -> None:
+        self.assertEqual(
+            cutover.phase_writers(cutover.PHASE_A), baseline.CONTROL_PLANE_WRITERS
+        )
+        self.assertNotIn(baseline.RELEASE_WRITER, cutover.phase_writers(cutover.PHASE_A))
+        self.assertIn(
+            baseline.RELEASE_WRITER, cutover.phase_writers(cutover.PHASE_B)
+        )
+        # Neither phase retires a workflow that implements no writer it knows.
+        for phase in cutover.PHASES:
+            self.assertNotIn(baseline.WRITER_OTHER, cutover.phase_writers(phase))
+
+
+class PhaseScope(unittest.TestCase):
+    """What the atomic cutover may change, in the phase being judged.
+
+    Checked against the ledger's writer roles rather than the change set's own
+    claims: a control-plane cutover that renamed `release.yml` in its change set
+    would otherwise pass by calling it a merge workflow.
+    """
+
+    LEDGER = "docs/parity-ledger.json"
+
+    def setUp(self) -> None:
+        self.ledger = baseline.load_ledger(self.LEDGER)
+        self.cutover_head = "c" * 40
+
+    def _change_set(self, *changes, **kwargs):
+        return cutover.ChangeSet(
+            cutover_head=kwargs.pop("cutover_head", self.cutover_head),
+            phase=kwargs.pop("phase", ""),
+            changes=tuple(
+                cutover.FileChange(path=path, action=action, writer=writer)
+                for path, action, writer in changes
+            ),
+        )
+
+    def _decide(self, change_set, *, phase=cutover.PHASE_A, ledger=_DEFAULT, **kwargs):
+        results, origins = _results(
+            CONTROL_PLANE_REQUIRED if phase == cutover.PHASE_A else ALL_REQUIRED
+        )
+        return cutover.decide(
+            results,
+            _liveness([result.correlation_id for result in results]),
+            baseline=_baseline(),
+            origins=origins,
+            change_set=change_set,
+            ledger=self.ledger if ledger is _DEFAULT else ledger,
+            phase=phase,
+            window_started_at=WINDOW[0],
+            window_ended_at=WINDOW[1],
+            **kwargs
+        )
+
+    def test_the_shipped_ledger_names_a_writer_for_every_workflow(self) -> None:
+        # The gate refuses a path with no role, so a ledger that leaves any blank
+        # is a ledger that cannot judge its own consumer's cutover.
+        for entry in self.ledger.workflows:
+            self.assertIn(entry.writer, baseline.WRITER_ROLES, entry.path)
+        roles = {entry.writer for entry in self.ledger.workflows}
+        for expected in (baseline.CONTROL_PLANE_WRITERS + (baseline.RELEASE_WRITER,)):
+            self.assertIn(expected, roles)
+
+    def test_phase_a_may_replace_the_control_plane_writers(self) -> None:
+        decision = self._decide(
+            self._change_set(
+                (".github/workflows/issue-scheduler.yml", "remove", "scheduler"),
+                (".github/workflows/opencode.yml", "remove", "opencode"),
+                (".github/workflows/auto-merge.yml", "disable", "merge"),
+            )
+        )
+        self.assertEqual(decision.blockers, ())
+        self.assertTrue(decision.ready)
+
+    def test_phase_a_may_not_remove_a_release_workflow(self) -> None:
+        decision = self._decide(
+            self._change_set((".github/workflows/release.yml", "remove", "release"))
+        )
+        self.assertIn("release_writer_in_phase_a", decision.codes)
+        self.assertFalse(decision.ready)
+
+    def test_phase_a_may_not_mutate_a_release_workflow_either(self) -> None:
+        # The rule is about who owns the writer, not about deleting it: a Phase A
+        # cutover that edited release.yml would already have taken the decision
+        # that belongs to the release phase.
+        for action in ("modify", "add", "disable", "retain"):
+            with self.subTest(action=action):
+                decision = self._decide(
+                    self._change_set(
+                        (".github/workflows/release-pr.yml", action, "release")
+                    )
+                )
+                self.assertIn("release_writer_in_phase_a", decision.codes)
+
+    def test_a_change_set_cannot_redeclare_a_release_workflow(self) -> None:
+        decision = self._decide(
+            self._change_set((".github/workflows/release.yml", "remove", "merge"))
+        )
+        self.assertIn("writer_role_disagrees_with_ledger", decision.codes)
+        self.assertNotIn("release_writer_in_phase_a", decision.codes)
+
+    def test_a_path_the_ledger_never_classified_is_refused(self) -> None:
+        decision = self._decide(
+            self._change_set((".github/workflows/brand-new.yml", "remove", "scheduler"))
+        )
+        self.assertIn("unclassified_cutover_path", decision.codes)
+
+    def test_a_change_that_names_no_writer_is_refused(self) -> None:
+        decision = self._decide(
+            self._change_set((".github/workflows/issue-scheduler.yml", "remove", ""))
+        )
+        self.assertIn("undeclared_writer_role", decision.codes)
+
+    def test_phase_a_may_not_retire_a_writer_it_does_not_replace(self) -> None:
+        decision = self._decide(
+            self._change_set((".github/workflows/ci.yml", "remove", "other"))
+        )
+        self.assertIn("out_of_phase_removal", decision.codes)
+
+    def test_phase_b_may_replace_the_release_writer(self) -> None:
+        decision = self._decide(
+            self._change_set((".github/workflows/release.yml", "remove", "release")),
+            phase=cutover.PHASE_B,
+        )
+        self.assertNotIn("release_writer_in_phase_a", decision.codes)
+        self.assertEqual(decision.blockers, ())
+        self.assertTrue(decision.ready)
+
+    def test_phase_b_still_needs_the_release_evidence_it_is_replacing(self) -> None:
+        # The scope check passing is not the gate: the release phase replaced the
+        # release writer, so it has to have watched it work.
+        results, origins = _results(CONTROL_PLANE_REQUIRED)
+        decision = cutover.decide(
+            results,
+            _liveness([result.correlation_id for result in results]),
+            baseline=_baseline(),
+            origins=origins,
+            change_set=self._change_set(
+                (".github/workflows/release.yml", "remove", "release")
+            ),
+            ledger=self.ledger,
+            phase=cutover.PHASE_B,
+            window_started_at=WINDOW[0],
+            window_ended_at=WINDOW[1],
+        )
+        self.assertIn("uncovered_scenario", decision.codes)
+        self.assertFalse(decision.ready)
+
+    def test_the_scope_is_judged_without_a_ledger_by_nobody(self) -> None:
+        decision = self._decide(
+            self._change_set(
+                (".github/workflows/issue-scheduler.yml", "remove", "scheduler")
+            ),
+            ledger=None,
+        )
+        self.assertIn("no_ledger_evidence", decision.codes)
+
+    def test_a_change_set_written_for_another_phase_is_refused(self) -> None:
+        decision = self._decide(
+            self._change_set(
+                (".github/workflows/issue-scheduler.yml", "remove", "scheduler"),
+                phase=cutover.PHASE_B,
+            )
+        )
+        self.assertIn("change_set_phase_mismatch", decision.codes)
+
+    def test_a_change_set_must_name_a_commit(self) -> None:
+        for head in ("", "main", "c" * 7):
+            with self.subTest(head=head):
+                with self.assertRaises(cutover.CutoverError) as caught:
+                    cutover.read_change_set(
+                        {
+                            "schema": cutover.CHANGE_SET_SCHEMA,
+                            "cutover_head": head,
+                            "changes": [],
+                        }
+                    )
+                self.assertEqual(caught.exception.code, "change_set_head_not_a_commit")
+
+    def test_a_change_set_this_gate_cannot_read_is_refused(self) -> None:
+        for document in (
+            {"schema": "continuum.shadow-change-set/v99", "cutover_head": "c" * 40},
+            {"cutover_head": "c" * 40},
+            {
+                "schema": cutover.CHANGE_SET_SCHEMA,
+                "cutover_head": "c" * 40,
+                "changes": [{"path": ".github/workflows/ci.yml", "action": "delete"}],
+            },
+            {
+                "schema": cutover.CHANGE_SET_SCHEMA,
+                "cutover_head": "c" * 40,
+                "changes": [
+                    {"path": ".github/workflows/ci.yml", "action": "remove", "writer": "ci"}
+                ],
+            },
+            {
+                "schema": cutover.CHANGE_SET_SCHEMA,
+                "cutover_head": "c" * 40,
+                "changes": [
+                    {"path": ".github/workflows/ci.yml", "action": "remove", "writer": "other"},
+                    {"path": ".github/workflows/ci.yml", "action": "modify", "writer": "other"},
+                ],
+            },
+        ):
+            with self.assertRaises(cutover.CutoverError):
+                cutover.read_change_set(document)
+
+    def test_a_change_set_round_trips(self) -> None:
+        change_set = self._change_set(
+            (".github/workflows/issue-scheduler.yml", "remove", "scheduler"),
+            phase=cutover.PHASE_A,
+        )
+        self.assertEqual(cutover.read_change_set(change_set.describe()), change_set)
+
+
+class Authorization(unittest.TestCase):
+    """The trusted controller's authorization, bound to everything it named.
+
+    Each test moves exactly one binding and asserts the code that names it: the
+    whole point of the record is that a reader can tell *what* moved.
+    """
+
+    def setUp(self) -> None:
+        self.phase = cutover.PHASE_A
+        self.results, self.origins = _results(CONTROL_PLANE_REQUIRED)
+        self.live = _liveness(
+            [result.correlation_id for result in self.results]
+        )
+        self.baseline = _baseline()
+        self.change_set = cutover.ChangeSet(
+            cutover_head="c" * 40,
+            phase=self.phase,
+            changes=(
+                cutover.FileChange(
+                    path=".github/workflows/issue-scheduler.yml",
+                    action="remove",
+                    writer="scheduler",
+                ),
+            ),
+        )
+        self.canary = {"reference": "runs/canary-1", "result": "clean"}
+        self.rollback = {"reference": "workflows/opencode.yml@revert-9f2"}
+        self.ledger = baseline.load_ledger("docs/parity-ledger.json")
+
+    def _decide(self, authorization=None, **kwargs):
+        """Judge the window, optionally with a record attached."""
+
+        defaults = {
+            "baseline": self.baseline,
+            "origins": self.origins,
+            "change_set": self.change_set,
+            "ledger": self.ledger,
+            "canary": self.canary,
+            "rollback": self.rollback,
+            "phase": self.phase,
+            "window_started_at": WINDOW[0],
+            "window_ended_at": WINDOW[1],
+        }
+        defaults.update(kwargs)
+        return cutover.decide(
+            self.results, self.live, authorization=authorization, **defaults
+        )
+
+    def _digest(self, **kwargs) -> str:
+        return self._decide(**kwargs).evidence_digest
+
+    def _authorization(self, **overrides) -> cutover.Authorization:
+        """A record bound to this window exactly as it stands right now."""
+
+        fields = {
+            "phase": self.phase,
+            "authorized_by": "continuum-cutover-controller",
+            "authorized_at": "2026-03-20T00:00:00Z",
+            "evidence_digest": self._digest(),
+            "baseline_digest": self.baseline.evidence_digest,
+            "consumer_head": self.baseline.live_head,
+            "controller_sha": engine.engine_sha(),
+            "canary_reference": self.canary["reference"],
+            "rollback_reference": self.rollback["reference"],
+            "cutover_head": self.change_set.cutover_head,
+        }
+        fields.update(overrides)
+        return cutover.Authorization(**fields)
+
+    def _expect_stale(self, code, authorization, **kwargs):
+        decision = self._decide(authorization, **kwargs)
+        self.assertIn(code, decision.codes)
+        self.assertFalse(decision.authorized)
+        self.assertFalse(decision.ready)
+        return decision
+
+    def test_a_complete_authorization_authorizes_the_window(self) -> None:
+        decision = self._decide(self._authorization())
+        self.assertEqual(decision.blockers, ())
+        self.assertTrue(decision.ready)
+        self.assertTrue(decision.authorized)
+        self.assertIn("authorized for {}".format(self.phase), decision.summary_line())
+        self.assertEqual(
+            decision.describe()["phase_writers"], list(baseline.CONTROL_PLANE_WRITERS)
+        )
+
+    def test_a_zero_touch_cutover_carries_no_human_record(self) -> None:
+        # What makes this zero-touch: nothing in the decision names a person, so
+        # there is no comment to leave and no click to wait for between READY and
+        # the expected-head merge.
+        decision = self._decide(self._authorization())
+        self.assertTrue(decision.authorized)
+        self.assertFalse(decision.approved)
+        self.assertIsNone(decision.approval)
+        document = decision.describe()
+        self.assertIsNone(document["approval"])
+        self.assertNotIn("approved_by", json.dumps(document["authorization"]))
+
+    def test_the_controller_binding_names_the_engine_running_the_gate(self) -> None:
+        # The gate attests to its own commit, because it cannot attest to anything
+        # else: an authorization for one engine is not a statement about another.
+        self.assertEqual(
+            self._decide(self._authorization()).authorized, True
+        )
+        self._expect_stale("stale_controller", self._authorization(controller_sha="f" * 40))
+        # And no caller can name a different controller for the gate to accept.
+        self.assertFalse(
+            self._decide(
+                self._authorization(), controller_sha="not-a-commit"
+            ).authorized
+        )
+
+    def test_an_authorization_expires_when_the_evidence_moves(self) -> None:
+        authorization = self._authorization()
+        # The window gains a run after the controller issued the record.
+        moved = list(self.results) + [_result("merge-decision", correlation="corr-later")]
+        decision = cutover.decide(
+            moved,
+            self.live,
+            authorization=authorization,
+            baseline=self.baseline,
+            origins={**self.origins, "corr-later": "bridge"},
+            change_set=self.change_set,
+            canary=self.canary,
+            rollback=self.rollback,
+            phase=self.phase,
+            window_started_at=WINDOW[0],
+            window_ended_at=WINDOW[1],
+        )
+        self.assertIn("stale_authorization", decision.codes)
+        self.assertFalse(decision.authorized)
+
+    def test_an_authorization_expires_when_the_consumer_head_moves(self) -> None:
+        moved = _baseline(live=baseline.LiveHead(
+            repository="kodmial/nanodictate",
+            default_branch="main",
+            head_sha="9" * 40,
+            workflows=tuple(
+                baseline.WorkflowFile(path=path, blob_sha=sha)
+                for path, sha in LEDGER_WORKFLOWS
+            ),
+        ))
+        self.assertTrue(moved.ready)
+        self.assertNotEqual(moved.live_head, self.baseline.live_head)
+        self._expect_stale(
+            "stale_consumer_head",
+            self._authorization(),
+            baseline=moved,
+        )
+
+    def test_an_authorization_expires_when_the_baseline_reading_moves(self) -> None:
+        drifted = _baseline(live_workflows=((".github/workflows/ci.yml", "9" * 40),))
+        self._expect_stale(
+            "stale_baseline_binding", self._authorization(), baseline=drifted
+        )
+
+    def test_an_authorization_expires_when_the_cutover_head_moves(self) -> None:
+        self._expect_stale(
+            "stale_cutover_head",
+            self._authorization(),
+            change_set=dataclasses.replace(
+                self.change_set, cutover_head="d" * 40
+            ),
+        )
+
+    def test_an_authorization_expires_when_the_canary_moves(self) -> None:
+        self._expect_stale(
+            "stale_canary_binding",
+            self._authorization(),
+            canary={"reference": "runs/canary-2", "result": "clean"},
+        )
+
+    def test_an_authorization_expires_when_the_rollback_target_moves(self) -> None:
+        self._expect_stale(
+            "stale_rollback_binding",
+            self._authorization(),
+            rollback={"reference": "workflows/opencode.yml@revert-0000"},
+        )
+
+    def test_a_binding_that_is_not_a_commit_is_a_missing_binding(self) -> None:
+        authorization = self._authorization(controller_sha="main")
+        self.assertIn("controller_sha", authorization.missing)
+        decision = self._decide(authorization)
+        self.assertIn("incomplete_authorization", decision.codes)
+        self.assertIn("controller_sha", " ".join(decision.summary_line().split()))
+        self.assertFalse(decision.authorized)
+
+    def test_an_incomplete_authorization_names_every_gap(self) -> None:
+        decision = self._decide(cutover.Authorization(phase=self.phase))
+        self.assertEqual(decision.codes, ("incomplete_authorization",))
+        message = decision.blockers[0].message
+        for gap in cutover.Authorization().missing:
+            self.assertIn(gap, message)
+
+    def test_an_authorization_for_another_phase_is_refused(self) -> None:
+        self._expect_stale(
+            "authorization_phase_mismatch",
+            self._authorization(phase=cutover.PHASE_B),
+        )
+
+    def test_an_authorization_for_a_phase_nobody_declared_is_refused(self) -> None:
+        decision = self._decide(self._authorization(phase="phase-c"))
+        self.assertEqual(decision.codes, ("authorization_phase_unknown",))
+        self.assertFalse(decision.authorized)
+
+    def test_an_authorization_over_a_blocked_window_is_not_an_authorization(self) -> None:
+        # A trusted controller, a complete record, every binding matching, and a
+        # window whose cutover would remove the consumer's release writer: still not
+        # authorized. The scope blocker does not move the evidence digest, so the
+        # record still matches everything it names -- and a signature is not a
+        # waiver, here or in the human path.
+        authorization = self._authorization()
+        self.assertTrue(authorization.complete)
+        decision = self._decide(
+            authorization,
+            change_set=cutover.ChangeSet(
+                cutover_head=self.change_set.cutover_head,
+                phase=self.phase,
+                changes=(
+                    cutover.FileChange(
+                        path=".github/workflows/release.yml",
+                        action="remove",
+                        writer="release",
+                    ),
+                ),
+            ),
+        )
+        self.assertIn("release_writer_in_phase_a", decision.codes)
+        self.assertIn("authorization_over_blocked_window", decision.codes)
+        self.assertFalse(decision.authorized)
+        self.assertFalse(decision.ready)
+        self.assertNotIn("stale_authorization", decision.codes)
+
+    def test_a_record_cannot_waive_a_window_whose_evidence_moved(self) -> None:
+        # The same rule from the other side: here the window itself moved, so the
+        # record is stale, and neither the stale record nor the stall is waived.
+        stalled = liveness.LivenessReport(
+            runs=tuple(
+                liveness.RunLiveness(
+                    correlation_id=result.correlation_id,
+                    verdict=(
+                        liveness.STALLED
+                        if result.correlation_id == "corr-issue-lifecycle"
+                        else liveness.LIVE
+                    ),
+                    status=(
+                        "timeout" if result.correlation_id == "corr-issue-lifecycle" else "ok"
+                    ),
+                    reason=(
+                        "exceeded the 300000ms budget"
+                        if result.correlation_id == "corr-issue-lifecycle"
+                        else ""
+                    ),
+                    duration_ms=(
+                        900000 if result.correlation_id == "corr-issue-lifecycle" else 5
+                    ),
+                )
+                for result in self.results
+            )
+        )
+        decision = cutover.decide(
+            self.results,
+            stalled,
+            authorization=self._authorization(),
+            baseline=self.baseline,
+            origins=self.origins,
+            change_set=self.change_set,
+            ledger=self.ledger,
+            canary=self.canary,
+            rollback=self.rollback,
+            phase=self.phase,
+            window_started_at=WINDOW[0],
+            window_ended_at=WINDOW[1],
+        )
+        self.assertIn("stale_authorization", decision.codes)
+        self.assertIn("liveness_stalled", decision.codes)
+        self.assertFalse(decision.authorized)
+
+    def test_an_authorization_with_no_change_set_is_refused(self) -> None:
+        # The record names a pull request head, so something has to describe it.
+        decision = self._decide(self._authorization(), change_set=None)
+        self.assertIn("no_cutover_change_set", decision.codes)
+        self.assertFalse(decision.authorized)
+
+    def test_a_window_with_no_record_is_ready_but_not_authorized(self) -> None:
+        decision = self._decide()
+        self.assertTrue(decision.ready)
+        self.assertFalse(decision.approved)
+        self.assertFalse(decision.authorized)
+        self.assertIn("awaiting a recorded approval", decision.summary_line())
+
+    def test_an_authorization_needs_a_canary_and_a_rollback(self) -> None:
+        for missing, code in (("canary", "no_canary"), ("rollback", "no_rollback")):
+            with self.subTest(missing=missing):
+                decision = self._decide(self._authorization(), **{missing: None})
+                self.assertIn(code, decision.codes)
+                self.assertFalse(decision.authorized)
+
+    def test_an_authorization_document_round_trips(self) -> None:
+        authorization = self._authorization()
+        self.assertEqual(
+            cutover.read_authorization(authorization.describe()), authorization
+        )
+        for document in (
+            {"schema": "continuum.shadow-authorization/v99"},
+            {"evidence_digest": authorization.evidence_digest},
+        ):
+            with self.assertRaises(cutover.CutoverError):
+                cutover.read_authorization(document)
+        # A document that parses but binds nothing is not a parse failure: it is an
+        # incomplete record, and the gate says so by name.
+        incomplete = cutover.read_authorization(
+            {"schema": cutover.AUTHORIZATION_SCHEMA, "kind": "authorization"}
+        )
+        self.assertFalse(incomplete.complete)
+        self.assertIn("controller_sha", incomplete.missing)
+
+    def test_the_decision_carries_the_phase_the_phase_and_the_records(self) -> None:
+        authorization = self._authorization()
+        decision = self._decide(authorization)
+        document = decision.describe()
+        self.assertTrue(document["authorized"])
+        self.assertEqual(document["phase"], self.phase)
+        self.assertEqual(document["phase_writers"], list(baseline.CONTROL_PLANE_WRITERS))
+        self.assertEqual(document["change_set"], self.change_set.describe())
+        self.assertEqual(document["authorization"], authorization.describe())
+        # And it survives the trip through a document, which is how CI reads it.
+        self.assertEqual(cutover.describe(document), document)
+
+    def test_a_whole_window_is_authorized_from_its_documents(self) -> None:
+        results, origins = _results(CONTROL_PLANE_REQUIRED)
+        live = _liveness([result.correlation_id for result in results])
+        reading = self.baseline
+        change_set = self.change_set
+        ledger = baseline.load_ledger("docs/parity-ledger.json")
+        decision = cutover.from_documents(
+            [result.describe() for result in results],
+            live.describe(),
+            baseline_document=reading.describe(),
+            ledger_document=ledger.describe(),
+            change_set_document=change_set.describe(),
+            authorization_document=self._authorization().describe(),
+            canary=self.canary,
+            rollback=self.rollback,
+            origins=origins,
+            phase=self.phase,
+            window_started_at=WINDOW[0],
+            window_ended_at=WINDOW[1],
+        )
+        self.assertTrue(decision.authorized, [b.code for b in decision.blockers])
+        self.assertEqual(decision.change_set, change_set)
 
 
 if __name__ == "__main__":
