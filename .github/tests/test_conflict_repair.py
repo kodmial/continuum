@@ -1638,7 +1638,7 @@ class GateRepairLockTests(unittest.TestCase):
         joined = "\n".join(calls)
         self.assertTrue(self._dispatched(calls), "a stale lock must not suppress repair")
         self.assertIn("--remove-label {}".format(label), joined)
-        self.assertIn("labels[]=opencode-repair-failed", joined)
+        self.assertNotIn("opencode-repair-failed", joined)
 
     def test_a_stale_lock_is_released_even_without_a_trailing_newline(self):
         # `read` returns non-zero for a final line with no terminator, so a

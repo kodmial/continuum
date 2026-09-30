@@ -352,12 +352,10 @@ jobs:
               exit 0
             fi
           fi
-          if [[ "$LOCK_STALE" == "true" ]]; then
-            gh label create "opencode-repair-failed" --repo "$GITHUB_REPOSITORY" --color D93F0B \
-              --description "Continuum repair made no progress within its budget" --force >/dev/null 2>&1 || true
-            gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$pr/labels" \
-              -f 'labels[]=opencode-repair-failed' >/dev/null 2>&1 || true
-          fi
+          # A stale repair lock is an expired lease, not a permanent failure
+          # state. The bounded attempt budget controls retries; a durable
+          # "repair failed" label would suppress future recovery of the same
+          # head after an infrastructure failure.
           gh issue edit "$pr" --repo "$GITHUB_REPOSITORY" --add-label "$LABEL"
 
           gh api --method POST             "repos/$GITHUB_REPOSITORY/actions/workflows/$OPENCODE_WORKFLOW/dispatches"             -f ref=main             -f "inputs[mode]=ci-fix"             -f "inputs[pr_number]=$pr"             -f "inputs[head_ref]=$head_ref"             -f "inputs[run_id]=$RUN_ID"

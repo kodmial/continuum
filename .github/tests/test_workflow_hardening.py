@@ -712,6 +712,13 @@ class RepairControllerTests(WorkflowAuditBase):
         self.assertIn("--mode resolve-conflict", text)
         self.assertIn("--mode ci-fix", text)
 
+    def test_consumer_repair_uses_attempt_budget_not_persistent_failure_label(self):
+        text = self.raw["consumer-repair.yml"]
+        self.assertNotIn("opencode-repair-failed", text)
+        self.assertIn("MAX_ATTEMPTS", text)
+        self.assertIn("REPAIR_BUDGET_MINUTES", text)
+        self.assertIn("--remove-label \"$LABEL\"", text)
+
     def test_merge_titles_are_sanitized(self):
         text = self.raw["auto-merge.yml"]
         self.assertIn("commit-title", text)
