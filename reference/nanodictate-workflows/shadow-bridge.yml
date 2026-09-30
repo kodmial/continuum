@@ -247,16 +247,10 @@ jobs:
     needs: context
     # Pinned to a commit, like every other Continuum entry point: a branch here
     # would mean the evidence in the window was produced by code nobody reviewed.
-    #
-    # PLACEHOLDER PIN: this reference copy is written before
-    # continuum-shadow.yml is merged, so it cannot yet name a commit that
-    # contains the workflow it calls. Installing it as-is fails at run time with
-    # an unresolvable workflow, which is the safe way to fail. Before installing,
-    # replace the SHA below with a commit of Continuum that contains
-    # continuum-shadow.yml and delete this paragraph; CI refuses a reference copy
-    # whose pin is current but still marked as a placeholder, and one whose pin is
-    # stale but unmarked. See docs/shadow-validation.md.
-    uses: kodmial/continuum/.github/workflows/continuum-shadow.yml@cf1602f9e06117a1894eb9b0abe222cebc669edd
+    # This reference is deliberately pinned to the first validated commit that
+    # contains the corrected reusable shadow workflow. Consumer rollout may
+    # advance this pin only through the validated Continuum repin path.
+    uses: kodmial/continuum/.github/workflows/continuum-shadow.yml@9446b1a7ce31aebe8676e721c831b5c1c3698a1f
     with:
       mode: run
       repository: ${{ github.repository }}
