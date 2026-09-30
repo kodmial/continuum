@@ -212,10 +212,11 @@ class ShadowWorkflowTests(unittest.TestCase):
         # engine, so a replay and a live run cannot disagree about how to start.
         called = set(triggers["workflow_call"]["inputs"])
         dispatched = set(triggers["workflow_dispatch"]["inputs"])
+        bridge_only = {"run_url", "delivery_id", "token"}
         self.assertTrue(
-            called <= dispatched,
-            "a dispatch cannot reach an input the bridge can: {}".format(
-                sorted(called - dispatched)
+            (called - bridge_only) <= dispatched,
+            "a dispatch cannot reach a non-bridge-only input: {}".format(
+                sorted((called - bridge_only) - dispatched)
             ),
         )
 
@@ -244,8 +245,9 @@ class ShadowWorkflowTests(unittest.TestCase):
         # called across repositories would otherwise check out the *caller*.
         self.assertIn("repository: kodmial/continuum", self.raw)
         self.assertIn("ref: ${{ steps.engine.outputs.sha }}", self.raw)
-        # The pin comes from the caller's `uses:` line, not from an input.
-        self.assertIn('${JOB_WORKFLOW_REF#*@}', self.raw)
+        # The pin comes from the reusable job definition selected by the
+        # caller's `uses:` line, not from an untrusted input.
+        self.assertIn('JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}', self.raw)
         self.assertIn("grep -Eq '^[0-9a-f]{40}$'", self.raw)
         # And the working tree must be the commit, not merely a request for it.
         self.assertIn("git -C engine rev-parse HEAD", self.raw)
@@ -401,8 +403,13 @@ class BridgeTests(unittest.TestCase):
         self.assertIn("event_id: $event_id", self.raw)
         self.assertIn("event_at", self.raw)
         self.assertIn("observed_at", self.raw)
-        # The forwarded token is read-only or the read-only claim is false.
-        self.assertIn("secrets.SHADOW_READ_TOKEN", self.raw)
+        # The bridge does not need a dedicated PAT/secret. The reusable job
+        # receives the caller's scoped GITHUB_TOKEN and the bridge grants only
+        # the read permissions required for live capture.
+        self.assertNotIn("secrets.SHADOW_READ_TOKEN", self.raw)
+        self.assertIn("contents: read", self.raw)
+        self.assertIn("pull-requests: read", self.raw)
+        self.assertIn("actions: read", self.raw)
 
     def test_a_bridge_document_is_something_the_engine_accepts(self) -> None:
         from continuum.shadow.config import load as load_config
