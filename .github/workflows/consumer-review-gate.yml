@@ -102,8 +102,34 @@ jobs:
       head_sha: ${{ steps.target.outputs.head_sha }}
       reason: ${{ steps.target.outputs.reason }}
     steps:
-      - name: Load Continuum engine
-        uses: kodmial/continuum/.github/actions/engine-path@39ca6dc798f2201390c8fdef0395157f588657ec
+      - name: Materialize the exact Continuum engine
+        env:
+          JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$JOB_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::Reusable workflow SHA is not immutable."; exit 1; }
+          root="$RUNNER_TEMP/continuum-engine"
+          ok=false
+          for attempt in 1 2 3; do
+            rm -rf "$root"
+            git init -q "$root"
+            git -C "$root" remote add origin https://github.com/kodmial/continuum.git
+            if git -C "$root" fetch --quiet --depth=1 origin "$JOB_WORKFLOW_SHA" &&
+               git -C "$root" checkout --quiet --detach FETCH_HEAD; then
+              ok=true
+              break
+            fi
+            sleep $((attempt * 5))
+          done
+          [[ "$ok" == "true" ]] || { echo "::error::Unable to materialize Continuum engine $JOB_WORKFLOW_SHA."; exit 1; }
+          head="$(git -C "$root" rev-parse HEAD)"
+          [[ "$head" == "$JOB_WORKFLOW_SHA" ]] || { echo "::error::Continuum engine SHA mismatch: $head != $JOB_WORKFLOW_SHA"; exit 1; }
+          test -f "$root/src/continuum/cli.py"
+          test -f "$root/.github/scripts/trust_policy.py"
+          test -f "$root/.github/scripts/conflict_repair.py"
+          test -f "$root/.github/scripts/failure_retry.py"
+          echo "CONTINUUM_ENGINE_ROOT=$root" >> "$GITHUB_ENV"
 
       # The wake-up event varies; the target does not. Every entry point resolves
       # to one candidate pull request here, and the privileged job below is
@@ -193,8 +219,34 @@ jobs:
     outputs:
       allowed: ${{ steps.dispatch.outputs.allowed }}
     steps:
-      - name: Load Continuum engine
-        uses: kodmial/continuum/.github/actions/engine-path@39ca6dc798f2201390c8fdef0395157f588657ec
+      - name: Materialize the exact Continuum engine
+        env:
+          JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$JOB_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::Reusable workflow SHA is not immutable."; exit 1; }
+          root="$RUNNER_TEMP/continuum-engine"
+          ok=false
+          for attempt in 1 2 3; do
+            rm -rf "$root"
+            git init -q "$root"
+            git -C "$root" remote add origin https://github.com/kodmial/continuum.git
+            if git -C "$root" fetch --quiet --depth=1 origin "$JOB_WORKFLOW_SHA" &&
+               git -C "$root" checkout --quiet --detach FETCH_HEAD; then
+              ok=true
+              break
+            fi
+            sleep $((attempt * 5))
+          done
+          [[ "$ok" == "true" ]] || { echo "::error::Unable to materialize Continuum engine $JOB_WORKFLOW_SHA."; exit 1; }
+          head="$(git -C "$root" rev-parse HEAD)"
+          [[ "$head" == "$JOB_WORKFLOW_SHA" ]] || { echo "::error::Continuum engine SHA mismatch: $head != $JOB_WORKFLOW_SHA"; exit 1; }
+          test -f "$root/src/continuum/cli.py"
+          test -f "$root/.github/scripts/trust_policy.py"
+          test -f "$root/.github/scripts/conflict_repair.py"
+          test -f "$root/.github/scripts/failure_retry.py"
+          echo "CONTINUUM_ENGINE_ROOT=$root" >> "$GITHUB_ENV"
 
       - name: Re-verify the dispatch against the live pull request
         id: dispatch
@@ -234,8 +286,34 @@ jobs:
       issues: write
       pull-requests: write
     steps:
-      - name: Load Continuum engine
-        uses: kodmial/continuum/.github/actions/engine-path@39ca6dc798f2201390c8fdef0395157f588657ec
+      - name: Materialize the exact Continuum engine
+        env:
+          JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$JOB_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::Reusable workflow SHA is not immutable."; exit 1; }
+          root="$RUNNER_TEMP/continuum-engine"
+          ok=false
+          for attempt in 1 2 3; do
+            rm -rf "$root"
+            git init -q "$root"
+            git -C "$root" remote add origin https://github.com/kodmial/continuum.git
+            if git -C "$root" fetch --quiet --depth=1 origin "$JOB_WORKFLOW_SHA" &&
+               git -C "$root" checkout --quiet --detach FETCH_HEAD; then
+              ok=true
+              break
+            fi
+            sleep $((attempt * 5))
+          done
+          [[ "$ok" == "true" ]] || { echo "::error::Unable to materialize Continuum engine $JOB_WORKFLOW_SHA."; exit 1; }
+          head="$(git -C "$root" rev-parse HEAD)"
+          [[ "$head" == "$JOB_WORKFLOW_SHA" ]] || { echo "::error::Continuum engine SHA mismatch: $head != $JOB_WORKFLOW_SHA"; exit 1; }
+          test -f "$root/src/continuum/cli.py"
+          test -f "$root/.github/scripts/trust_policy.py"
+          test -f "$root/.github/scripts/conflict_repair.py"
+          test -f "$root/.github/scripts/failure_retry.py"
+          echo "CONTINUUM_ENGINE_ROOT=$root" >> "$GITHUB_ENV"
 
       # The contract is repository-controlled and versioned with the code, so it
       # is read from the base branch: a pull request does not get to declare that
