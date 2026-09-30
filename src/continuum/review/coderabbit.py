@@ -413,10 +413,10 @@ def status_reason(status: Optional[Dict[str, Any]], context: str) -> Optional[st
 
 #: Fenced code blocks can quote an earlier verdict; quoted history is not
 #: the provider's current conclusion.
-_CODE_FENCE_RE = re.compile(r"```[\\s\\S]*?(?:```|\\Z)")
-_DETAILS_RE = re.compile(r"<details\\b[\\s\\S]*?</details\\s*>", re.I)
-_DETAILS_UNTERMINATED_RE = re.compile(r"<details\\b[\\s\\S]*\\Z", re.I)
-_QUOTE_LINE_RE = re.compile(r"(?m)^[ \\t]*>+[^\\n]*(?:\\n|\\Z)")
+_CODE_FENCE_RE = re.compile(r"```[\s\S]*?(?:```|\Z)")
+_DETAILS_RE = re.compile(r"<details\b[\s\S]*?</details\s*>", re.I)
+_DETAILS_UNTERMINATED_RE = re.compile(r"<details\b[\s\S]*\Z", re.I)
+_QUOTE_LINE_RE = re.compile(r"(?m)^[ \t]*>+[^\n]*(?:\n|\Z)")
 
 
 def _visible_conclusion(body: str) -> str:
