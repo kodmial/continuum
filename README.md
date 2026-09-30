@@ -99,8 +99,17 @@ contains no product-specific workflow names.
 The first reusable review adapter (`review.provider: pr-agent`) is, as of the
 P0 issue #25, now **the blocking review signal** for the merge controller. The
 imported NanoDictate reviewer is extracted into a provider-agnostic Continuum
-adapter:
+adapter, and the provider itself is a reusable workflow Continuum owns:
 
+- `.github/workflows/pr-agent.yml` is the provider surface. It is entered only
+  through `workflow_call`, so no pull request and no comment can start it, and
+  it runs the engine from `job.workflow_sha` — the commit of that very file —
+  re-verified after checkout. A consumer therefore selects the provider with a
+  single literal pin, and that one reference brings the whole review
+  implementation with it.
+- The consumer's own `.continuum.yml` decides before any provider traffic: a
+  disabled review is silent, and a contract that enables a different provider
+  fails instead of reviewing through the wrong adapter.
 - One normalized result document (`continuum.review-gate/v1`) and one commit
   status contract: `verdict=<V> state=<S> provider=<P> head=<sha>` in the
   context named by `review.status_context` (default `continuum/review`).
@@ -134,7 +143,13 @@ adapter:
     over-report a finding but may never silently drop one.
 
 To enable in another repository, validate a `.continuum.yml`, then call the
-reusable workflow — see `fixtures/consumer-repo/` for the reference consumer.
+reusable workflow — see `fixtures/consumer-repo/` for the two-boolean reference
+consumer and `fixtures/provider-consumer/` for the repository that adopted this
+provider. The second fixture is the whole of what adoption costs: a
+configuration naming variables and secrets, and a dispatch entry that maps the
+queue's wake-up onto the pinned reusable surface. It contains no provider image,
+no model routing, no checkout, and no gate, and `tests/test_fixture_consumer.py`
+fails if one ever appears there.
 
 ## Adopting Continuum
 

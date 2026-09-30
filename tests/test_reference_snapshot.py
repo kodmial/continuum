@@ -1,9 +1,11 @@
 """Deterministic reference-snapshot checks.
 
 The NanoDictate PR-Agent implementation is preserved verbatim under
-`reference/nanodictate-workflows/pr-agent/` and must never become an active
-workflow. These tests keep the snapshot immutable, credential-free, and unwired
-while PR-Agent remains post-MVP and non-executable from GitHub Actions.
+`reference/nanodictate-workflows/pr-agent/`. The capability it provided is now
+Continuum's, so the provider surface is active under `.github/workflows` and the
+snapshot keeps only its provenance. These tests keep the snapshot immutable,
+credential-free, and unwired, and keep the promoted surface the single
+implementation rather than one of several.
 """
 
 from __future__ import annotations
@@ -69,14 +71,57 @@ class ReferenceNotWiredTests(unittest.TestCase):
                 self.assertIn("reference/nanodictate-workflows", line)
                 self.assertIn("test -f", line)
 
-    def test_pr_agent_is_not_an_active_mvp_workflow(self):
-        self.assertFalse((WORKFLOWS / "pr-agent.yml").exists())
-        self.assertFalse((WORKFLOWS / "pr-agent-comment.yml").exists())
+    def test_the_snapshot_is_never_executed_by_an_active_workflow(self):
+        # Absorbing the capability means the implementation lives in
+        # `.github/workflows` now. The snapshot stays for provenance only, so
+        # nothing under `reference/` may be a checkout, a dispatch, or a run.
+        for workflow in sorted(WORKFLOWS.glob("*.yml")):
+            text = workflow.read_text(encoding="utf-8")
+            for line in text.splitlines():
+                if "reference/" not in line:
+                    continue
+                self.assertRegex(
+                    line.strip(),
+                    r"^test -f reference/",
+                    "{} reaches into the reference tree: {}".format(
+                        workflow.name, line.strip()
+                    ),
+                )
 
-    def test_post_mvp_rewrite_is_archived_outside_actions(self):
-        archived = ROOT / "reference" / "post-mvp-pr-agent-workflows"
-        self.assertTrue((archived / "pr-agent.yml").is_file())
-        self.assertTrue((archived / "pr-agent-comment.yml").is_file())
+
+class ProviderSurfaceTests(unittest.TestCase):
+    """Exactly one implementation of the provider, and it is the active one."""
+
+    ACTIVE_PROVIDER = ("pr-agent.yml", "pr-agent-comment.yml")
+
+    def test_the_provider_surface_is_active(self):
+        for name in self.ACTIVE_PROVIDER:
+            with self.subTest(workflow=name):
+                self.assertTrue((WORKFLOWS / name).is_file(), name)
+
+    def test_no_second_pr_agent_implementation_is_kept(self):
+        # A promoted draft left beside the promoted file is two places to
+        # update and a second thing for a reader to mistake for the
+        # implementation, so the archive goes when the surface goes live. The
+        # provider fixture is exempt because it is wiring and is asserted to
+        # contain no implementation of its own.
+        self.assertFalse((ROOT / "reference" / "post-mvp-pr-agent-workflows").exists())
+        stray = sorted(
+            path
+            for path in ROOT.rglob("pr-agent*.yml")
+            if ".git" not in path.parts
+            and "nanodictate-workflows" not in path.parts
+            and "fixtures" not in path.parts
+            and path.parent != WORKFLOWS
+        )
+        self.assertEqual(stray, [], stray)
+
+    def test_the_nano_snapshot_is_not_the_active_surface(self):
+        # The absorbed file and the live one are different files: the active
+        # surface is Continuum's own, so nothing here was ever wired as-is.
+        snapshot = (REFERENCE / "pr-agent.yml").read_text(encoding="utf-8")
+        active = (WORKFLOWS / "pr-agent.yml").read_text(encoding="utf-8")
+        self.assertNotEqual(snapshot, active)
 
 
 class AdapterParityTests(unittest.TestCase):

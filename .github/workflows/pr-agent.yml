@@ -1,0 +1,279 @@
+# Continuum reusable review provider: the PR-Agent adapter.
+#
+#     provider report -> normalized findings on an exact HEAD
+#                   -> tracker + coverage + verdict
+#                   -> one commit status the merge controller reads
+#
+# This file is the *only* implementation of the PR-Agent provider. A consumer
+# selects it with configuration and credentials; it never keeps a copy of the
+# provider's own logic, and Continuum never keeps a copy of a consumer's.
+#
+# Rules:
+#
+#   1. One exact Continuum release runs the provider. A reusable workflow
+#      cannot be pinned through a context in `uses:`, so the caller pins this
+#      file with one literal reference, e.g.
+#      `kodmial/continuum/.github/workflows/pr-agent.yml@v0.3.0`. The engine is
+#      then checked out at `job.workflow_sha` -- the commit of *this* file -- and
+#      that checkout is verified before anything privileged runs. The workflow
+#      graph and the engine code are therefore one atomic snapshot, and a new
+#      Continuum release cannot change an existing consumer's behavior.
+#   2. The consumer's own file decides whether review runs. `config-check`
+#      resolves the provider from the versioned contract before any provider
+#      traffic is generated: disabled is silent, and an enabled contract naming
+#      a different provider fails instead of reviewing through the wrong adapter.
+#   3. Nothing from the wake-up decides what runs. `pr_number` is a number the
+#      caller resolved; the reviewed commit is re-read from the live pull
+#      request by the engine, and the provider itself fetches the diff with the
+#      API token. No attacker-supplied ref is ever checked out.
+#   4. The provider's quota is repository-wide. Runs are serialized per pull
+#      request and never cancelled, so a cancelled run cannot abandon a request
+#      that was already issued.
+#
+# Manual `/review` and `/verify <finding-id>` are owner-only and are parsed by
+# the engine in pr-agent-comment.yml, never by a shell or an expression.
+name: Continuum PR-Agent review gate
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        type: string
+        required: true
+        description: "Pull request to review, as its number"
+      head_sha:
+        type: string
+        required: false
+        default: ""
+        description: "Commit the caller observed; the engine re-checks it against the live pull request"
+      api_base:
+        type: string
+        required: true
+        description: "OpenAI-compatible provider endpoint (repository variable)"
+      model:
+        type: string
+        required: true
+        description: "Provider model (repository variable)"
+      max_tokens:
+        type: string
+        required: false
+        default: ""
+        description: "Completion limit (repository variable); empty uses the provider default"
+      config:
+        type: string
+        required: false
+        default: .continuum.yml
+        description: "Path to the consumer's Continuum configuration"
+      base_branch:
+        type: string
+        required: false
+        default: main
+        description: "Branch the configuration is read from"
+    secrets:
+      continuum_token:
+        required: true
+      pr_agent_api_key:
+        required: true
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+  statuses: write
+
+concurrency:
+  group: continuum-pr-agent-${{ inputs.pr_number }}
+  cancel-in-progress: false
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GITHUB_TOKEN: ${{ secrets.continuum_token }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
+      CONTINUUM_CONFIG: ${{ inputs.config }}
+      PR_NUMBER: ${{ inputs.pr_number }}
+      PR_AGENT_HEAD_SHA: ${{ inputs.head_sha }}
+      PR_AGENT_API_KEY: ${{ secrets.pr_agent_api_key }}
+      PR_AGENT_API_BASE: ${{ inputs.api_base }}
+      PR_AGENT_MODEL: ${{ inputs.model }}
+      PR_AGENT_MAX_TOKENS: ${{ inputs.max_tokens }}
+    steps:
+      - name: Validate the request
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `pr_number` is a string because that is what the review queue and the
+          # dispatch API carry, and coercing a number across that boundary is
+          # behaviour nobody documented. It is checked here instead, so a value
+          # that does not name a pull request fails before anything privileged
+          # runs rather than somewhere inside the engine.
+          if ! printf '%s' "${PR_NUMBER:-}" | grep -Eq '^[1-9][0-9]*$'; then
+            echo "::error::pr_number must be a pull request number, got '${PR_NUMBER:-}'"
+            exit 1
+          fi
+          if [ -n "${PR_AGENT_HEAD_SHA:-}" ] && ! printf '%s' "$PR_AGENT_HEAD_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::head_sha must be a full commit sha, got '${PR_AGENT_HEAD_SHA}'"
+            exit 1
+          fi
+
+      - name: Resolve the pinned engine
+        id: engine
+        shell: bash
+        env:
+          JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          # This workflow is only ever entered through workflow_call, so the
+          # caller has already named the exact Continuum commit. Anything that
+          # is not a full commit sha fails here rather than later.
+          if ! printf '%s' "${JOB_WORKFLOW_SHA:-}" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::expected a full commit sha for the Continuum engine, got '${JOB_WORKFLOW_SHA:-}'"
+            exit 1
+          fi
+          printf 'sha=%s\n' "$JOB_WORKFLOW_SHA" >> "$GITHUB_OUTPUT"
+
+      # The caller's own code is checked out first, deliberately. A checkout
+      # cleans its target path, and the engine is an untracked directory inside
+      # the caller's working tree -- so a caller checkout running after the
+      # engine checkout would delete the engine it is about to need. Checking the
+      # caller out first leaves the engine checkout, whose clean is confined to
+      # `engine/`, as the last thing that touches the workspace.
+      #
+      # The configuration is repository-controlled and versioned with the code,
+      # so it is read from the base branch: a pull request does not get to
+      # declare that its own review is off.
+      - name: Check out the caller repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.base_branch }}
+          persist-credentials: false
+
+      - name: Check out the pinned engine
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: kodmial/continuum
+          ref: ${{ steps.engine.outputs.sha }}
+          path: engine
+          persist-credentials: false
+
+      - name: Refuse anything but the pinned commit
+        shell: bash
+        env:
+          ENGINE_SHA: ${{ steps.engine.outputs.sha }}
+        run: |
+          set -euo pipefail
+          head="$(git -C engine rev-parse HEAD)"
+          if [ "$head" != "$ENGINE_SHA" ]; then
+            echo "::error::engine checked out at $head, expected $ENGINE_SHA"
+            exit 1
+          fi
+          printf 'CONTINUUM_ENGINE_ROOT=%s\n' "$GITHUB_WORKSPACE/engine" >> "$GITHUB_ENV"
+
+      - name: Resolve the provider contract
+        id: contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH="$CONTINUUM_ENGINE_ROOT/src" python3 -m continuum.cli config-check \
+            --config "$CONTINUUM_CONFIG"
+
+      - name: Report a disabled review
+        if: steps.contract.outputs.enabled != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::notice::review is disabled in $CONTINUUM_CONFIG; no provider request was made."
+
+      - name: Refuse a contract this provider cannot serve
+        if: steps.contract.outputs.enabled == 'true' && steps.contract.outputs.provider != 'pr-agent'
+        shell: bash
+        env:
+          CONFIGURED_PROVIDER: ${{ steps.contract.outputs.provider }}
+        run: |
+          set -euo pipefail
+          echo "::error::$CONTINUUM_CONFIG enables review.provider '$CONFIGURED_PROVIDER'; this workflow implements 'pr-agent'"
+          exit 1
+
+      - name: Resolve the provider model routing
+        id: model
+        if: steps.contract.outputs.enabled == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$PR_AGENT_MODEL" ]; then
+            echo "::error::the provider model is empty; it is required to review"
+            exit 1
+          fi
+          # The routing table is the engine's, so a consumer cannot end up with
+          # a model string this repository would never produce.
+          routed="$(PYTHONPATH="$CONTINUUM_ENGINE_ROOT/src" python3 -c \
+            'import os, sys; from continuum.review.llm import route_model; sys.stdout.write(route_model(os.environ["PR_AGENT_MODEL"]))')"
+          printf 'model=%s\n' "$routed" >> "$GITHUB_OUTPUT"
+
+      - name: Synthesize the pull request event for the provider
+        if: steps.contract.outputs.enabled == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The provider reads the pull request through the API, so it needs an
+          # event document to exist rather than a payload this workflow could
+          # forge. The number comes from the caller and the contract resolves it
+          # against the live pull request; the rest is the provider's own
+          # argument shape.
+          owner="${GITHUB_REPOSITORY%/*}"
+          name="${GITHUB_REPOSITORY#*/}"
+          event_file="$RUNNER_TEMP/pr_event.json"
+          printf '{"action":"opened","number":%s,"repository":{"owner":{"login":"%s"},"name":"%s"},"pull_request":{}}\n' \
+            "$PR_NUMBER" "$owner" "$name" > "$event_file"
+          printf 'GITHUB_EVENT_NAME=pull_request\n' >> "$GITHUB_ENV"
+          printf 'GITHUB_EVENT_PATH=%s\n' "$event_file" >> "$GITHUB_ENV"
+
+      - name: Run PR-Agent against the current head
+        if: steps.contract.outputs.enabled == 'true'
+        uses: docker://pragent/pr-agent:github_action@sha256:65e5b196e38cecd7df8a71fe29942052e081a0c6645132c2ac874df60b1760c7 # 0.46.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.continuum_token }}
+          # The provider is driven through the generic OpenAI-compatible
+          # interface, so moving to a different provider is a change to the
+          # caller's api_base/model inputs and the credential it passes --
+          # not to this file. Both spellings are set because the provider and
+          # its router accept either.
+          OPENAI.KEY: ${{ secrets.pr_agent_api_key }}
+          OPENAI.API_BASE: ${{ inputs.api_base }}
+          OPENAI__KEY: ${{ secrets.pr_agent_api_key }}
+          OPENAI__API_BASE: ${{ inputs.api_base }}
+          OPENAI_API_KEY: ${{ secrets.pr_agent_api_key }}
+          OPENAI_API_BASE: ${{ inputs.api_base }}
+          CONFIG.MODEL: ${{ steps.model.outputs.model }}
+          CONFIG.FALLBACK_MODELS: "[]"
+          # An unset limit must not become zero, which would be "no output
+          # allowed" rather than "unlimited".
+          CONFIG.MAX_OUTPUT_TOKENS: ${{ inputs.max_tokens != '' && inputs.max_tokens || '16000' }}
+
+      - name: Enforce the review contract
+        id: gate
+        if: steps.contract.outputs.enabled == 'true'
+        shell: bash
+        env:
+          INPUTS_HEAD_SHA: ${{ inputs.head_sha }}
+        run: |
+          set -euo pipefail
+          # The gate is the decision: it records the findings, tracks their
+          # state, publishes the verdict, and writes the commit status the
+          # merge controller reads. Nothing above it decides anything.
+          if [ -n "$INPUTS_HEAD_SHA" ]; then
+            PYTHONPATH="$CONTINUUM_ENGINE_ROOT/src" python3 -m continuum.cli gate \
+              --pr "$PR_NUMBER" --head "$INPUTS_HEAD_SHA" --out gate-result.json
+          else
+            PYTHONPATH="$CONTINUUM_ENGINE_ROOT/src" python3 -m continuum.cli gate \
+              --pr "$PR_NUMBER" --out gate-result.json
+          fi
+
+    outputs:
+      verdict: ${{ steps.gate.outputs.verdict }}
+      state: ${{ steps.gate.outputs.state }}
+      gate_passed: ${{ steps.gate.outputs.gate_passed }}
+      open_findings: ${{ steps.gate.outputs.open_findings }}
+      head: ${{ steps.gate.outputs.head }}
