@@ -94,8 +94,34 @@ jobs:
       # one it read.
       GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Load Continuum engine
-        uses: kodmial/continuum/.github/actions/engine-path@39ca6dc798f2201390c8fdef0395157f588657ec
+      - name: Materialize the exact Continuum engine
+        env:
+          JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$JOB_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::Reusable workflow SHA is not immutable."; exit 1; }
+          root="$RUNNER_TEMP/continuum-engine"
+          ok=false
+          for attempt in 1 2 3; do
+            rm -rf "$root"
+            git init -q "$root"
+            git -C "$root" remote add origin https://github.com/kodmial/continuum.git
+            if git -C "$root" fetch --quiet --depth=1 origin "$JOB_WORKFLOW_SHA" &&
+               git -C "$root" checkout --quiet --detach FETCH_HEAD; then
+              ok=true
+              break
+            fi
+            sleep $((attempt * 5))
+          done
+          [[ "$ok" == "true" ]] || { echo "::error::Unable to materialize Continuum engine $JOB_WORKFLOW_SHA."; exit 1; }
+          head="$(git -C "$root" rev-parse HEAD)"
+          [[ "$head" == "$JOB_WORKFLOW_SHA" ]] || { echo "::error::Continuum engine SHA mismatch: $head != $JOB_WORKFLOW_SHA"; exit 1; }
+          test -f "$root/src/continuum/cli.py"
+          test -f "$root/.github/scripts/trust_policy.py"
+          test -f "$root/.github/scripts/conflict_repair.py"
+          test -f "$root/.github/scripts/failure_retry.py"
+          echo "CONTINUUM_ENGINE_ROOT=$root" >> "$GITHUB_ENV"
       - name: Resolve the Continuum contract
         id: resolve
         env:
