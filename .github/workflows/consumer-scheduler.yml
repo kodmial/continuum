@@ -46,6 +46,7 @@ jobs:
             const inProgress = 'automation:in-progress';
             const paused = 'automation:paused';
             const marker = '<!-- continuum-dispatch -->';
+            const infraRetryPrefix = '<!-- continuum-infra-retry:';
             const wipLimit = Number(process.env.WIP_LIMIT || 2);
             const leaseMs = Number(process.env.LEASE_MINUTES || 45) * 60 * 1000;
             const maxAttempts = Number(process.env.MAX_ATTEMPTS || 3);
@@ -79,17 +80,47 @@ jobs:
                 .filter(Number.isFinite);
               return resets.length ? Math.max(...resets) : 0;
             }
-            async function dispatchHistory(number) {
+            async function retryState(number) {
               const [comments, epochStartedAt] = await Promise.all([
                 github.paginate(github.rest.issues.listComments, {
                   owner, repo, issue_number:number, per_page:100
                 }),
                 retryEpochStartedAt(number),
               ]);
-              return comments
-                .filter(c => (c.body || '').includes(marker))
+              const current = comments
                 .filter(c => new Date(c.created_at).getTime() >= epochStartedAt)
                 .sort((a,b) => new Date(a.created_at) - new Date(b.created_at));
+              const dispatches = current.filter(c => (c.body || '').includes(marker));
+              const infraRetries = [];
+              let latestInfraRetry = null;
+              for (const comment of current) {
+                const body = comment.body || '';
+                if (!body.includes(infraRetryPrefix)) continue;
+                const match = body.match(
+                  /<!-- continuum-infra-retry:\s*attempt=(\d+)\s+next_retry_at=([^\s]+)\s+code=([A-Za-z0-9_.-]+)\s+run=(\d+)\s*-->/
+                );
+                if (!match) continue;
+                const nextRetryAt = new Date(match[2]).getTime();
+                if (!Number.isFinite(nextRetryAt)) continue;
+                const candidate = {
+                  attempt:Number(match[1]),
+                  nextRetryAt,
+                  nextRetryAtText:match[2],
+                  code:match[3],
+                  runId:Number(match[4]),
+                  createdAt:new Date(comment.created_at).getTime(),
+                };
+                infraRetries.push(candidate);
+                if (!latestInfraRetry || candidate.createdAt > latestInfraRetry.createdAt) {
+                  latestInfraRetry = candidate;
+                }
+              }
+              return {
+                dispatches,
+                infraRetries,
+                semanticAttempts:Math.max(0, dispatches.length - infraRetries.length),
+                latestInfraRetry,
+              };
             }
 
             await ensureLabel(inProgress, 'FBCA04', 'Continuum currently owns this issue');
@@ -121,8 +152,8 @@ jobs:
               const labels = labelsOf(issue);
               if (!labels.has(inProgress) || activeByPr.has(issue.number)) continue;
 
-              const dispatches = await dispatchHistory(issue.number);
-              const last = dispatches.at(-1);
+              const retry = await retryState(issue.number);
+              const last = retry.dispatches.at(-1);
               if (!last) {
                 await removeLabel(issue.number, inProgress);
                 continue;
@@ -132,7 +163,7 @@ jobs:
                 active.add(issue.number);
               } else {
                 await removeLabel(issue.number, inProgress);
-                if (dispatches.length >= maxAttempts) await addLabel(issue.number, paused);
+                if (retry.semanticAttempts >= maxAttempts) await addLabel(issue.number, paused);
               }
             }
 
@@ -160,10 +191,20 @@ jobs:
               // clear the ownership label immediately; without this guard each
               // scheduler reconciliation would dispatch the same broken task
               // forever.
-              const dispatches = await dispatchHistory(issue.number);
-              if (dispatches.length >= maxAttempts) {
+              const retry = await retryState(issue.number);
+              if (retry.latestInfraRetry && Date.now() < retry.latestInfraRetry.nextRetryAt) {
+                core.info(
+                  `Issue #${issue.number}: infrastructure retry ${retry.latestInfraRetry.attempt}/8 ` +
+                  `is deferred until ${retry.latestInfraRetry.nextRetryAtText} (${retry.latestInfraRetry.code}).`
+                );
+                continue;
+              }
+              if (retry.semanticAttempts >= maxAttempts) {
                 await addLabel(issue.number, paused);
-                core.warning(`Issue #${issue.number}: automatic attempt budget ${maxAttempts} exhausted; pausing further dispatches.`);
+                core.warning(
+                  `Issue #${issue.number}: semantic attempt budget ${maxAttempts} exhausted; ` +
+                  `${retry.infraRetries.length} infrastructure retry/retries were excluded.`
+                );
                 continue;
               }
 
