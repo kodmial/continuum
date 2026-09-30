@@ -33,7 +33,7 @@ on:
   # all: the failure it exists for is precisely the state where nothing else
   # runs.
   schedule:
-    - cron: "7,37 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 permissions: {}
@@ -254,6 +254,22 @@ jobs:
               continue
             fi
 
+            if gh api "repos/$GITHUB_REPOSITORY/issues/$pr_number/labels" \
+              --jq '.[].name' | grep -Fxq "opencode-infra-retry-exhausted"; then
+              echo "::warning::PR #$pr_number exhausted its independent infrastructure retry budget; semantic repair attempts remain untouched."
+              continue
+            fi
+
+            gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$pr_number/comments?per_page=100" \
+              --jq '.[].body // ""' \
+              | python3 .github/scripts/failure_retry.py state \
+              > "$RUNNER_TEMP/infra-state-$pr_number.env"
+            source "$RUNNER_TEMP/infra-state-$pr_number.env"
+            if [[ "${retry_due:-true}" != "true" ]]; then
+              echo "PR #$pr_number infrastructure retry is deferred until ${next_retry_at:-unknown}."
+              continue
+            fi
+
             lock_label="opencode-conflict-repair"
             gh label create "$lock_label" --repo "$GITHUB_REPOSITORY" --color B60205 \
               --description "One automatic conflict-repair attempt at a time; released when the attempt concludes." \
@@ -432,10 +448,37 @@ jobs:
 
           behind=$(gh api "repos/$GITHUB_REPOSITORY/compare/$CONTINUUM_BASE_BRANCH...$HEAD_SHA" --jq '.behind_by')
 
+          labels="$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels" --jq '.[].name')"
           locked=false
-          if gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels" \
-            --jq '.[].name' | grep -Fxq "$lock_label"; then
+          if grep -Fxq "$lock_label" <<<"$labels"; then
             locked=true
+          fi
+
+          infra_exhausted=false
+          if grep -Fxq "opencode-infra-retry-exhausted" <<<"$labels"; then
+            infra_exhausted=true
+          fi
+          if [[ "$PR_ACTION" == "synchronize" || "$PR_ACTION" == "reopened" ]]; then
+            infra_exhausted=false
+          fi
+
+          gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100" \
+            --jq '.[].body // ""' \
+            | python3 .github/scripts/failure_retry.py state \
+            > "$RUNNER_TEMP/current-infra-state.env"
+          source "$RUNNER_TEMP/current-infra-state.env"
+          if [[ "$infra_exhausted" == "true" ]]; then
+            echo "action=none" >> "$GITHUB_OUTPUT"
+            echo "reason=infra_retry_exhausted" >> "$GITHUB_OUTPUT"
+            echo "attempts=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ "${retry_due:-true}" != "true" ]]; then
+            echo "action=none" >> "$GITHUB_OUTPUT"
+            echo "reason=infra_retry_backoff" >> "$GITHUB_OUTPUT"
+            echo "attempts=0" >> "$GITHUB_OUTPUT"
+            echo "Infrastructure retry is deferred until ${next_retry_at:-unknown}."
+            exit 0
           fi
 
           # The attempt count is the durable record of how many repair attempts
@@ -556,7 +599,7 @@ jobs:
           echo "Decision: $ACTION ($REASON)."
 
           if [[ "${RESET_HEAD_LOCKS:-false}" == "true" ]]; then
-            for stale in opencode-ci-repair opencode-conflict-repair; do
+            for stale in opencode-ci-repair opencode-conflict-repair opencode-infra-retry-exhausted; do
               gh api --method DELETE \
                 "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/$stale" \
                 >/dev/null 2>&1 || true
