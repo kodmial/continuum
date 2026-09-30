@@ -12,7 +12,7 @@ import re
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set
 
 DEFAULT_API_BASE = "https://api.github.com"
 USER_AGENT = "continuum-review-gate"
@@ -127,6 +127,32 @@ class GitHubClient:
             url = _next_link(link)
         return items
 
+    def _paginate_wrapped(self, path: str, key: str) -> List[Dict[str, Any]]:
+        """Every page of an endpoint that wraps its records in an object.
+
+        The Actions endpoints answer ``{"total_count": n, "workflow_runs": [...]}``
+        rather than a bare list, so :meth:`paginate` would read the first page and
+        throw it away. Stopping at page one is not a small loss on these endpoints:
+        they are read to answer "what happened", and a caller that silently saw
+        only the newest hundred runs would report an absent action as one that
+        never happened.
+        """
+
+        items: List[Dict[str, Any]] = []
+        url = self.api_base + path
+        while url:
+            request = urllib.request.Request(url, headers=self._headers(), method="GET")
+            try:
+                page, link = self._opener(request, self.timeout)
+            except urllib.error.HTTPError as exc:
+                raise GitHubError(
+                    f"GitHub API GET {url} failed with status {exc.code}", status=exc.code
+                ) from None
+            if isinstance(page, Mapping):
+                items.extend(page.get(key) or [])
+            url = _next_link(link)
+        return [dict(item) for item in items if isinstance(item, Mapping)]
+
     def graphql(self, query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
         payload = self.request("POST", "/graphql", {"query": query, "variables": variables})
         if not isinstance(payload, dict):
@@ -146,11 +172,10 @@ class GitHubClient:
 
     def list_check_runs(self, ref: str) -> List[Dict[str, Any]]:
         quoted = urllib.parse.quote(str(ref), safe="")
-        payload = self.request(
-            "GET",
+        return self._paginate_wrapped(
             f"/repos/{self.owner}/{self.name}/commits/{quoted}/check-runs?per_page=100",
+            "check_runs",
         )
-        return list(payload.get("check_runs") or [])
 
     def list_pull_files(self, number: int) -> List[Dict[str, Any]]:
         return self.paginate(f"/repos/{self.owner}/{self.name}/pulls/{number}/files?per_page=100")
@@ -163,6 +188,74 @@ class GitHubClient:
 
     def list_reviews(self, number: int) -> List[Dict[str, Any]]:
         return self.paginate(f"/repos/{self.owner}/{self.name}/pulls/{number}/reviews?per_page=100")
+
+    def list_issue_events(self, number: int = 0, *, since: str = "") -> List[Dict[str, Any]]:
+        """The timeline of label, lock, review-request, close and merge events.
+
+        Two shapes on purpose. With ``number`` it is one issue's timeline, which
+        is what correlates a window; without it, the repository-wide feed bounded
+        by ``since``, which is what lets an observer read *every* event in a
+        window and therefore support a claim that one did not happen.
+
+        Repository issue events, not the timeline API: the timeline needs a
+        preview header and returns a differently-shaped document per event type,
+        and a comparison that has to understand both shapes is a comparison that
+        will eventually quietly drop the type it did not understand.
+        """
+
+        if number:
+            path = f"/repos/{self.owner}/{self.name}/issues/{int(number)}/events?per_page=100"
+        else:
+            query = urllib.parse.urlencode({"per_page": 100, **({"since": since} if since else {})})
+            path = f"/repos/{self.owner}/{self.name}/issues/events?{query}"
+        return self.paginate(path)
+
+    def list_workflow_runs(
+        self,
+        *,
+        workflow: str = "",
+        event: str = "",
+        branch: str = "",
+        head_sha: str = "",
+        created: str = "",
+        status: str = "",
+    ) -> List[Dict[str, Any]]:
+        """Workflow runs, optionally narrowed to one workflow, event, or commit.
+
+        Read-only, and the evidence a dispatch or a repair is reconstructed from:
+        a run that exists is a dispatch somebody made, whatever the workflow that
+        made it claims about itself. ``workflow`` takes a workflow *file* name, so
+        ``coderabbit-retry.yml`` needs no id lookup first.
+        """
+
+        query = urllib.parse.urlencode(
+            {
+                "per_page": 100,
+                **({"event": event} if event else {}),
+                **({"branch": branch} if branch else {}),
+                **({"head_sha": head_sha} if head_sha else {}),
+                **({"created": created} if created else {}),
+                **({"status": status} if status else {}),
+            }
+        )
+        if workflow:
+            quoted = urllib.parse.quote(str(workflow), safe="")
+            path = f"/repos/{self.owner}/{self.name}/actions/workflows/{quoted}/runs?{query}"
+        else:
+            path = f"/repos/{self.owner}/{self.name}/actions/runs?{query}"
+        return self._paginate_wrapped(path, "workflow_runs")
+
+    def get_workflow_run(self, run_id: int) -> Dict[str, Any]:
+        return self.request("GET", f"/repos/{self.owner}/{self.name}/actions/runs/{int(run_id)}")
+
+    def list_releases(self) -> List[Dict[str, Any]]:
+        """Published releases, newest first.
+
+        The release surface is small enough to read whole, which is what makes
+        "no release exists for this tag" a supported answer rather than a guess.
+        """
+
+        return self.paginate(f"/repos/{self.owner}/{self.name}/releases?per_page=100")
 
     def combined_status_for_ref(self, ref: str) -> Dict[str, Any]:
         quoted = urllib.parse.quote(str(ref), safe="")

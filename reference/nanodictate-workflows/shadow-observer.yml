@@ -1,0 +1,310 @@
+name: Continuum shadow observer
+
+# The independent reader. Where the bridge asks Continuum what it *would* do and
+# records the answer, this file asks Continuum what NanoDictate *actually* did and
+# records that. The two answers are then compared, and the comparison is the only
+# thing in the plane that means anything.
+#
+# It is a separate file from the bridge on purpose. The bridge is triggered by the
+# production events themselves; this one is triggered by those events *and* by a
+# schedule, because a production outcome is not an instant. An issue opened at
+# nine is dispatched, labelled, and given a pull request over the following hour,
+# and a release is published long after the branch that produced it was green. An
+# observer that only looked when the event arrived would open a window it could
+# never close, and would report every long-running decision as unobserved. The
+# schedule is not a retry; it is how a window is given the chance to finish.
+#
+# Like the bridge, this file holds no authority beyond reading: every judgement is
+# Continuum's, every write is forbidden, and the read scopes below are the whole of
+# what the reusable call inherits.
+#
+# This copy lives under `reference/` so GitHub Actions cannot execute it from the
+# Continuum repository. Install it in the production repository as
+# `.github/workflows/continuum-shadow-observer.yml`.
+
+on:
+  issues:
+    types: [opened, closed, labeled]
+  pull_request:
+    types: [opened, synchronize]
+  pull_request_review:
+    types: [submitted]
+  pull_request_review_comment:
+    types: [created]
+  check_suite:
+    types: [completed]
+  workflow_run:
+    workflows: ["CI", "Packaging smoke", "Release", "OpenCode agent"]
+    types: [completed]
+  release:
+    types: [published]
+  schedule:
+    - cron: '41 */2 * * *'
+  workflow_dispatch:
+    inputs:
+      event_type:
+        description: the shadow event type to observe by hand
+        type: string
+        default: schedule.tick
+      action:
+        description: the action to observe
+        type: string
+        default: tick
+      number:
+        description: the issue or pull request number
+        type: string
+        default: ""
+      reconcile:
+        description: pair the journals in this run's window with the observer's record
+        type: boolean
+        default: false
+      journals_run_id:
+        description: reconcile; the run holding the journals to pair
+        type: string
+        default: ""
+      journals_artifact:
+        description: reconcile; the artifact within that run
+        type: string
+        default: ""
+      journal_paths:
+        description: reconcile; newline-separated journal documents inside that artifact
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+  checks: read
+  statuses: read
+  actions: read
+
+concurrency:
+  # One observer pass at a time per repository. Two concurrent passes would each
+  # download the same previous ledger and each upload a ledger that has seen only
+  # their own reads, so whichever finished last would silently drop the other's
+  # evidence. Serialising is the whole of the concurrency control this needs.
+  group: continuum-shadow-observer-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  locate:
+    name: Find the ledger this pass continues
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # `actions: read` and nothing else: finding the previous pass is a read of this
+    # repository's own run history, and a job that could write it could rewrite
+    # which ledger this pass continues from.
+    permissions:
+      actions: read
+    outputs:
+      previous_run_id: ${{ steps.previous.outputs.run_id }}
+      previous_artifact: ${{ steps.previous.outputs.artifact }}
+    steps:
+      - name: Look for the previous observer pass
+        id: previous
+        run: |
+          set -euo pipefail
+          # A correlation window outlives the run that opened it, so this pass has
+          # to start from the ledger the last one wrote. The observer's own history
+          # is the only record of which run that was -- there is no other place to
+          # keep it, because an artifact is immutable and cannot be appended to.
+          #
+          # `GITHUB_WORKFLOW_REF` rather than the workflow name, because the API
+          # identifies a workflow by file, and a name is not unique.
+          workflow="${GITHUB_WORKFLOW_REF#*/}"
+          workflow="${workflow%@*}"
+          # This run is in the list too; asking for successes excludes it, because
+          # a run that has not finished has not written a ledger to continue from.
+          run_id="$(
+            gh api \
+              "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow/runs?status=success&per_page=1&exclude_pull_requests=true" \
+              --jq '.workflow_runs[0].id // ""'
+          )"
+          if [ -z "$run_id" ]; then
+            echo "no previous observer pass succeeded, so this one opens a fresh ledger"
+            echo "run_id=" >>"$GITHUB_OUTPUT"
+            echo "artifact=" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          artifact="$(
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts" \
+              --jq '[.artifacts[] | select(.expired == false) | .name][0] // ""'
+          )"
+          if [ -z "$artifact" ]; then
+            # A previous pass that succeeded but kept no artifact is a gap in the
+            # chain, not a reason to forget it: starting fresh here would open a
+            # second window over the same subject, and the first window's evidence
+            # would never be compared against anything.
+            echo "::error::run $run_id succeeded but kept no artifact; the ledger chain has a hole"
+            exit 1
+          fi
+          echo "continuing run $run_id's artifact $artifact"
+          echo "run_id=$run_id" >>"$GITHUB_OUTPUT"
+          echo "artifact=$artifact" >>"$GITHUB_OUTPUT"
+
+  context:
+    name: Shape the event
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      event: ${{ steps.context.outputs.event }}
+    steps:
+      - name: Project the payload
+        id: context
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action || inputs.action || 'tick' }}
+          EVENT_ID: ${{ github.run_id }}
+          DEFAULT_EVENT_TYPE: ${{ inputs.event_type }}
+          DEFAULT_NUMBER: ${{ inputs.number }}
+          # Every fact below is read from the webhook payload GitHub already
+          # delivered, not from a second API call: a second source is a second
+          # thing to keep correct, and this file exists to be small enough to
+          # audit.
+          NUMBER: ${{ github.event.issue.number || github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || inputs.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.check_suite.head_sha || github.event.workflow_run.head_sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          ACTOR: ${{ github.event.sender.login }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          ISSUE_STATE: ${{ github.event.issue.state }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::${GITHUB_TOKEN}"
+          # The mapping from GitHub's event name to Continuum's is stated once
+          # here and once in the bridge, and tests assert the two agree. It is
+          # stated twice because restating it is cheap and drifting is not: two
+          # files mapping the same event to different types would compare two
+          # different questions and report the difference as a divergence, which
+          # is the one failure this whole plane cannot detect in itself.
+          case "$EVENT_NAME" in
+            issues)
+              case "$EVENT_ACTION" in
+                opened) event_type="issue.opened" ;;
+                closed) event_type="issue.closed" ;;
+                labeled) event_type="issue.labelled" ;;
+                *) echo "::notice::no shadow event for issues.$EVENT_ACTION"; exit 0 ;;
+              esac
+              ;;
+            pull_request)
+              case "$EVENT_ACTION" in
+                opened) event_type="pull_request.opened" ;;
+                synchronize) event_type="pull_request.synchronize" ;;
+                *) echo "::notice::no shadow event for pull_request.$EVENT_ACTION"; exit 0 ;;
+              esac
+              ;;
+            pull_request_review) event_type="pull_request.review" ;;
+            pull_request_review_comment) event_type="pull_request.review_comment" ;;
+            check_suite) event_type="check_suite.completed" ;;
+            workflow_run) event_type="workflow_run.completed" ;;
+            release) event_type="release.event" ;;
+            schedule) event_type="schedule.tick" ;;
+            workflow_dispatch)
+              event_type="$DEFAULT_EVENT_TYPE"
+              EVENT_ACTION="${EVENT_ACTION:-tick}"
+              ;;
+            *)
+              echo "::notice::no shadow event for $EVENT_NAME"
+              exit 0
+              ;;
+          esac
+          observed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          document="$(
+            jq -c \
+              --arg event_type "$event_type" \
+              --arg observed_at "$observed_at" \
+              --arg action "$EVENT_ACTION" \
+              --arg event_id "${GITHUB_REPOSITORY}/$EVENT_NAME/$EVENT_ID" \
+              --arg delivery "$GITHUB_RUN_ID" \
+              --arg repository "$GITHUB_REPOSITORY" \
+              --arg number "${NUMBER:-${DEFAULT_NUMBER:-}}" \
+              --arg head_sha "${HEAD_SHA:-}" \
+              --arg base_sha "${BASE_SHA:-}" \
+              --arg base_ref "${BASE_REF:-}" \
+              --arg head_ref "${HEAD_REF:-}" \
+              --arg actor "${ACTOR:-}" \
+              --arg release_tag "${RELEASE_TAG:-}" \
+              --arg issue_state "${ISSUE_STATE:-}" \
+              '{
+                 event_type: $event_type,
+                 action: $action,
+                 event_id: $event_id,
+                 delivery_id: $delivery,
+                 repository: $repository,
+                 number: (if $number == "" then null else ($number | tonumber) end),
+                 head_sha: (if $head_sha == "" then null else $head_sha end),
+                 base_sha: (if $base_sha == "" then null else $base_sha end),
+                 base_ref: (if $base_ref == "" then "main" else $base_ref end),
+                 head_ref: (if $head_ref == "" then null else $head_ref end),
+                 # Labels live under the issue or the pull request, never at the
+                 # root of the payload, and they are what the queue dispatches
+                 # on. Reading them from the root would forward an empty list for
+                 # every real event, which looks exactly like a repository with
+                 # nothing labelled and nothing queued.
+                 labels: [((.issue.labels // .pull_request.labels // [])[])
+                          | (.name // empty)],
+                 actor: (if $actor == "" then null else $actor end),
+                 release: (if $release_tag == "" then null
+                           else {tag: $release_tag, source_sha: (if $head_sha == "" then null else $head_sha end)}
+                           end),
+                 context: {
+                   event_at: (.issue.updated_at // .pull_request.updated_at
+                              // .review.submitted_at // .check_suite.updated_at
+                              // .workflow_run.updated_at // .release.published_at
+                              // null),
+                   observed_at: $observed_at,
+                   issue_state: (if $issue_state == "" then null else $issue_state end)
+                 }
+               }' "$GITHUB_EVENT_PATH"
+          )"
+          echo "event=$document" >>"$GITHUB_OUTPUT"
+          echo "observing $document"
+      - name: Refuse a document that is not an event
+        if: steps.context.outputs.event == ''
+        run: |
+          set -euo pipefail
+          echo "::error::no event was forwarded; nothing to observe"
+          exit 1
+
+  observer:
+    name: Read production
+    needs: [locate, context]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # A reusable-workflow call job cannot declare its own permissions. It
+    # inherits the workflow-level read-only scopes above.
+    uses: kodmial/continuum/.github/workflows/continuum-shadow.yml@12926511ef8cf8901199bfc99cfe06bfc995b488
+    with:
+      mode: observe
+      repository: ${{ github.repository }}
+      event_json: ${{ needs.context.outputs.event }}
+      ledger_run_id: ${{ needs.locate.outputs.previous_run_id }}
+      ledger_artifact: ${{ needs.locate.outputs.previous_artifact }}
+      trusted_actors: ${{ vars.AUTOMATION_TRUSTED_ACTORS || '' }}
+
+  reconciler:
+    name: Pair the decisions with what was observed
+    # Reconciliation is a separate call because it needs two artifacts that this
+    # repository's observer runs do not produce together: the ledger comes from
+    # an observer pass and the journals from a bridge pass, and neither run waits
+    # for the other. Folding it into the observer pass would make it wait for a
+    # decision that may not exist yet, and would report every long-running
+    # decision as unevaluated.
+    if: github.event_name == 'workflow_dispatch' && inputs.reconcile
+    needs: [locate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    uses: kodmial/continuum/.github/workflows/continuum-shadow.yml@12926511ef8cf8901199bfc99cfe06bfc995b488
+    with:
+      mode: reconcile
+      repository: ${{ github.repository }}
+      ledger_run_id: ${{ needs.locate.outputs.previous_run_id }}
+      ledger_artifact: ${{ needs.locate.outputs.previous_artifact }}
+      journals_run_id: ${{ inputs.journals_run_id }}
+      journals_artifact: ${{ inputs.journals_artifact }}
+      journal_paths: ${{ inputs.journal_paths || '' }}
+      trusted_actors: ${{ vars.AUTOMATION_TRUSTED_ACTORS || '' }}

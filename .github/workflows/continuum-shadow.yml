@@ -26,7 +26,7 @@ on:
   workflow_call:
     inputs:
       mode:
-        description: run, replay, or cutover
+        description: run, observe, reconcile, replay, or cutover
         type: string
         default: run
       repository:
@@ -38,6 +38,30 @@ on:
       observed_json:
         description: what NanoDictate actually did, as JSON; without it parity is unevaluated
         type: string
+      ledger_run_id:
+        description: observe/reconcile; the run holding the previous observer ledger
+        type: string
+        default: ""
+      ledger_artifact:
+        description: observe/reconcile; the artifact within that run
+        type: string
+        default: ""
+      horizon_ms:
+        description: how long a correlation window stays open before its reads are the whole story
+        type: number
+        default: 21600000
+      journal_paths:
+        description: reconcile; newline-separated journal documents inside the artifact
+        type: string
+        default: ""
+      journals_run_id:
+        description: reconcile; the run holding the journals
+        type: string
+        default: ""
+      journals_artifact:
+        description: reconcile; the artifact within that run
+        type: string
+        default: ""
       state_json:
         description: a captured state document; omit to read live state from GitHub
         type: string
@@ -134,10 +158,10 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: run, replay, or cutover
+        description: run, observe, reconcile, replay, or cutover
         type: choice
         default: cutover
-        options: [run, replay, cutover]
+        options: [run, observe, reconcile, replay, cutover]
       repository:
         description: owner/name of the repository whose events are being shadowed
         type: string
@@ -146,6 +170,26 @@ on:
         type: string
       observed_json:
         description: what NanoDictate actually did, as JSON
+        type: string
+      ledger_run_id:
+        description: the run holding the previous observer ledger
+        type: string
+      ledger_artifact:
+        description: the artifact within that run
+        type: string
+      horizon_ms:
+        description: how long a correlation window stays open
+        type: string
+        default: "21600000"
+      journal_paths:
+        description: reconcile; newline-separated journal documents
+        type: string
+        default: ""
+      journals_run_id:
+        description: the run holding the journals
+        type: string
+      journals_artifact:
+        description: the artifact within that run
         type: string
       state_json:
         description: a captured state document
@@ -469,6 +513,230 @@ jobs:
           name: shadow-run-${{ inputs.delivery_id || github.run_id }}-${{ github.run_attempt }}
           path: shadow-out
           retention-days: 30
+          if-no-files-found: warn
+
+  observer:
+    name: Read production and record what it did
+    if: inputs.mode == 'observe' || inputs.mode == 'reconcile'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Reads only, and the reason is the same as everywhere else in this file: the
+    # observer's entire claim to be trustworthy is that it could not have written
+    # anything, and a write scope here would make that claim unfalsifiable.
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      checks: read
+      statuses: read
+      actions: read
+    env:
+      GITHUB_TOKEN: ${{ inputs.token || github.token }}
+      SHADOWED_REPOSITORY: ${{ inputs.repository || github.repository }}
+      EVENT_JSON: ${{ inputs.event_json }}
+      LEDGER_RUN_ID: ${{ inputs.ledger_run_id }}
+      LEDGER_ARTIFACT: ${{ inputs.ledger_artifact }}
+      JOURNAL_PATHS: ${{ inputs.journal_paths }}
+      JOURNALS_RUN_ID: ${{ inputs.journals_run_id }}
+      JOURNALS_ARTIFACT: ${{ inputs.journals_artifact }}
+      HORIZON_MS: ${{ inputs.horizon_ms }}
+      ENGINE_REF_INPUT: ${{ inputs.engine_ref }}
+    steps:
+      - name: Resolve the pinned engine
+        id: engine
+        env:
+          JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]; then
+            ref="${JOB_WORKFLOW_SHA:-}"
+          else
+            ref="${ENGINE_REF_INPUT:-}"
+          fi
+          if ! printf '%s' "$ref" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::the engine ref must be a full commit sha, got '${ref}'"
+            exit 1
+          fi
+          echo "sha=$ref" >>"$GITHUB_OUTPUT"
+          echo "engine $ref"
+      - name: Check out the pinned engine
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: kodmial/continuum
+          ref: ${{ steps.engine.outputs.sha }}
+          path: engine
+          persist-credentials: false
+      - name: Refuse anything but the pinned commit
+        run: |
+          set -euo pipefail
+          head="$(git -C engine rev-parse HEAD)"
+          if [ "$head" != "$ENGINE_SHA" ]; then
+            echo "::error::engine checked out at $head, expected $ENGINE_SHA"
+            exit 1
+          fi
+          echo "engine $head is the pinned commit"
+        env:
+          ENGINE_SHA: ${{ steps.engine.outputs.sha }}
+      - name: Materialise the event context
+        if: inputs.mode == 'observe'
+        run: |
+          set -euo pipefail
+          echo "::add-mask::${GITHUB_TOKEN}"
+          mkdir -p observer-out
+          if [ -z "${EVENT_JSON:-}" ]; then
+            echo "::error::no event context was forwarded; a window has to be opened by something"
+            exit 2
+          fi
+          printf '%s' "$EVENT_JSON" >observer-out/event.json
+      - name: Carry the ledger forward
+        # A correlation window outlives any single run: it stays open until
+        # production reaches a terminal state or the horizon passes, which is hours
+        # after the run that opened it ended. The ledger is the observer's memory,
+        # so it is downloaded from the previous pass's artifact and uploaded again
+        # by this one, and the caller threads the run id forward. Each pass keeps
+        # its own artifact rather than appending to a shared one, because an
+        # artifact is immutable and a window's history has to stay readable as the
+        # history it was.
+        #
+        # A missing ledger is a first pass and opens a window. A named ledger that
+        # cannot be read is a failure: starting fresh would silently open a second
+        # window over the same subject and orphan the evidence of the first.
+        run: |
+          set -euo pipefail
+          mkdir -p observer-out/observer
+          if [ -z "${LEDGER_RUN_ID:-}" ] || [ -z "${LEDGER_ARTIFACT:-}" ]; then
+            echo "no previous ledger named, so this pass opens a fresh one"
+            exit 0
+          fi
+          if ! printf '%s' "$LEDGER_RUN_ID" | grep -Eq '^[0-9]+$'; then
+            echo "::error::ledger_run_id must be a run id, got '${LEDGER_RUN_ID}'"
+            exit 2
+          fi
+          if ! gh run download "$LEDGER_RUN_ID" --name "$LEDGER_ARTIFACT" --dir previous; then
+            echo "::error::the previous ledger artifact could not be read; a fresh ledger would lose this window's evidence"
+            exit 2
+          fi
+          ledger="$(find previous -name ledger.json -type f | head -n 1)"
+          if [ -z "$ledger" ]; then
+            echo "::error::the artifact has no observer/ledger.json; refusing to start a second window over the same subject"
+            exit 2
+          fi
+          cp "$ledger" observer-out/observer/ledger.json
+          echo "carried the ledger forward from run $LEDGER_RUN_ID"
+      - name: Prove the barrier holds before reading anything
+        run: |
+          set -euo pipefail
+          # The observer does not install the barrier -- it is read-only by
+          # construction rather than by supervision -- but the registry proof is
+          # cheap and it is the artefact that says the classification this
+          # component relies on is still true of the engine.
+          PYTHONPATH=engine/src python3 -m continuum.shadow.cli barrier-check --out observer-out
+      - name: Read production
+        if: inputs.mode == 'observe'
+        run: |
+          set -euo pipefail
+          args=(observe
+            --event observer-out/event.json
+            --repo "$SHADOWED_REPOSITORY"
+            --out observer-out
+            --horizon-ms "$HORIZON_MS")
+          if [ -f observer-out/observer/ledger.json ]; then
+            args+=(--ledger observer-out/observer/ledger.json)
+          fi
+          # Prior outcomes are carried forward rather than re-derived: a closed
+          # window's evidence may have aged out of the API, and an observer that
+          # re-read production to recover it would either get a different answer
+          # or none at all.
+          if [ -d previous ]; then
+            while IFS= read -r outcome; do
+              [ -n "$outcome" ] || continue
+              args+=(--outcomes "$outcome")
+            done < <(find previous -path '*/outcomes/*.json' -type f | sort)
+          fi
+          PYTHONPATH=engine/src python3 -m continuum.shadow.cli "${args[@]}"
+      - name: Pair the journals with the observer's record
+        if: inputs.mode == 'reconcile'
+        run: |
+          set -euo pipefail
+          if [ ! -f observer-out/observer/ledger.json ]; then
+            echo "::error::name the observer ledger with ledger_run_id and ledger_artifact"
+            exit 2
+          fi
+          if [ -z "${JOURNALS_RUN_ID:-}" ] || [ -z "${JOURNALS_ARTIFACT:-}" ]; then
+            echo "::error::name the run holding the journals with journals_run_id and journals_artifact"
+            exit 2
+          fi
+          if [ -z "${JOURNAL_PATHS:-}" ]; then
+            echo "::error::name the journals to pair with journal_paths"
+            exit 2
+          fi
+          if ! printf '%s' "$JOURNALS_RUN_ID" | grep -Eq '^[0-9]+$'; then
+            echo "::error::journals_run_id must be a run id, got '${JOURNALS_RUN_ID}'"
+            exit 2
+          fi
+          if ! gh run download "$JOURNALS_RUN_ID" --name "$JOURNALS_ARTIFACT" --dir previous-journals; then
+            echo "::error::the journals artifact could not be read; an unpaired journal would go unnoticed"
+            exit 2
+          fi
+          journals=()
+          while IFS= read -r path; do
+            [ -n "$path" ] || continue
+            case "$path" in
+              /*|*..*) echo "::error::journal_paths must be relative and inside the artifact"; exit 2 ;;
+            esac
+            if [ ! -f "previous-journals/$path" ]; then
+              echo "::error::no journal at previous-journals/$path"
+              exit 2
+            fi
+            journals+=("previous-journals/$path")
+          done <<<"${JOURNAL_PATHS:-}"
+          if [ "${#journals[@]}" -eq 0 ]; then
+            echo "::error::no journals were named"
+            exit 2
+          fi
+          # The ledger artifact holds the outcomes, the journal artifact the
+          # decisions, and the two are written by different runs on different
+          # schedules. Neither is a subset of the other, which is the whole reason
+          # this plane reconciles instead of judging.
+          outcomes=()
+          while IFS= read -r outcome; do
+            [ -n "$outcome" ] || continue
+            outcomes+=(--outcomes "$outcome")
+          done < <(find previous -path '*/outcomes/*.json' -type f | sort)
+          set +e
+          PYTHONPATH=engine/src python3 -m continuum.shadow.cli reconcile \
+            --ledger observer-out/observer/ledger.json \
+            --journals "${journals[@]}" \
+            "${outcomes[@]}" \
+            --out observer-out
+          code=$?
+          set -e
+          # The exit code is passed through whatever it is, because the command
+          # already distinguishes the cases: 1 means the comparisons that could be
+          # made disagreed, which is the finding and fails this pass; 0 means they
+          # agreed, and any window still open was counted as outstanding rather
+          # than as a mismatch -- a decision that has not been observed yet has not
+          # been contradicted; anything else is the plane failing. A pass that
+          # swallowed a failure would upload an artifact that reads like evidence.
+          exit "$code"
+      - name: Summarise the observation
+        if: always()
+        env:
+          ARTIFACT: shadow-observe-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          PYTHONPATH=engine/src python3 -m continuum.shadow.cli summary \
+            --out observer-out \
+            --observer \
+            --artifact "$ARTIFACT" \
+            >>"$GITHUB_STEP_SUMMARY"
+      - name: Upload the observation
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: shadow-observe-${{ github.run_id }}-${{ github.run_attempt }}
+          path: observer-out
+          retention-days: 90
           if-no-files-found: warn
 
   evidence:

@@ -1,10 +1,14 @@
 """The shadow command line: the one place CI, the bridge, and a person all use.
 
-Five subcommands, one per artifact:
+The decision subcommands, one per artifact:
 
 * ``run``      -- turn one real lifecycle event into a journal (and optionally a
   replay case). The command the bridge workflow calls.
+* ``observe``  -- read production for one event's correlation window and write the
+  observer's own ledger and outcome, independently of any journal.
 * ``parity``   -- compare a journal with a captured NanoDictate outcome.
+* ``reconcile`` -- pair journals with the observer's ledger and write the parity
+  results that pairing implies.
 * ``liveness`` -- account for every accepted event in a window.
 * ``replay``   -- re-run a captured case, optionally against a second engine.
 * ``cutover``  -- judge a window against the scenario requirements.
@@ -21,6 +25,13 @@ Two rules run through all of them:
   produced a journal saying ``denied`` has *succeeded* -- the refusal is the
   result, not an error -- so a non-zero exit means the shadow plane itself could
   not do its job, and never that Continuum said no to something.
+
+``observe`` and ``reconcile`` are the two commands that make the plane a
+comparison rather than a report. They are separate from ``run`` because the
+observer must not need the shadow run and the shadow run must not need the
+observer: a production outcome arrives over hours, across workflow runs the
+journal's run never saw, and a plane that could only observe during its own run
+would report every long-running decision as absent.
 """
 
 from __future__ import annotations
@@ -32,7 +43,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from . import barrier, baseline, cutover, engine, liveness, parity, replay, report
+from . import barrier, baseline, cutover, engine, liveness, observer, parity, replay, report
 from .effects import READ_ONLY_METHODS
 from .config import ConfigError, ShadowConfig
 from .config import load as load_config
@@ -73,6 +84,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         replay.ReplayError,
         cutover.CutoverError,
         baseline.BaselineError,
+        observer.ObserverError,
     ) as error:
         _fail("{}: {}".format(type(error).__name__, error))
         return PLANE_FAILURE
@@ -117,6 +129,43 @@ def _parser() -> argparse.ArgumentParser:
     compare.add_argument("--out", default="shadow-out")
     compare.add_argument("--report", action="store_true", help="emit an aggregate report")
     compare.set_defaults(handler=_parity)
+
+    watch = subparsers.add_parser(
+        "observe", help="read production for one event's correlation window, read-only"
+    )
+    watch.add_argument("--event", required=True, help="the event payload that opened the window")
+    watch.add_argument("--repo", required=True, help="owner/name of the consumer repository")
+    watch.add_argument(
+        "--ledger", help="the ledger a previous observer pass wrote; omit to start one"
+    )
+    watch.add_argument(
+        "--outcomes",
+        nargs="*",
+        default=[],
+        help="outcome documents a previous observer pass wrote",
+    )
+    watch.add_argument("--token-env", default="GITHUB_TOKEN", help="read-only token variable")
+    watch.add_argument("--out", default="shadow-out")
+    watch.add_argument("--now-ms", type=int, help="fix the clock; for reproducible runs only")
+    watch.add_argument(
+        "--horizon-ms",
+        type=int,
+        default=observer.DEFAULT_HORIZON_MS,
+        help="how long a correlation window stays open before its reads are the whole story",
+    )
+    watch.set_defaults(handler=_observe)
+
+    pair = subparsers.add_parser(
+        "reconcile", help="pair journals with the observer's independent record of them"
+    )
+    pair.add_argument("--journals", nargs="*", default=[], help="journals from the window")
+    pair.add_argument("--ledger", required=True, help="the observer's ledger")
+    pair.add_argument("--outcomes", nargs="*", default=[], help="outcome documents")
+    pair.add_argument("--out", default="shadow-out")
+    pair.add_argument(
+        "--origins", help="correlation id -> origin mapping, as JSON, for the cutover gate"
+    )
+    pair.set_defaults(handler=_reconcile)
 
     live = subparsers.add_parser("liveness", help="account for a window's runs")
     live.add_argument("--acceptances", nargs="*", default=[], help="acceptance records")
@@ -192,6 +241,11 @@ def _parser() -> argparse.ArgumentParser:
         "--window",
         action="store_true",
         help="summarise a judged window rather than a single run",
+    )
+    summary.add_argument(
+        "--observer",
+        action="store_true",
+        help="summarise what the observer read rather than what a run decided",
     )
     summary.set_defaults(handler=_render_summary)
 
@@ -362,6 +416,167 @@ def _parity(args: argparse.Namespace) -> int:
     _write(output / "parity" / _name(result.correlation_id), result.describe())
     _summary(parity.summarize(result))
     return VALIDATION_FAILED if result.divergent else 0
+
+
+# --------------------------------------------------------------------------- #
+# observe
+# --------------------------------------------------------------------------- #
+
+
+def _observe(args: argparse.Namespace) -> int:
+    """Read production for one event's window and write the observer's artifacts.
+
+    Not behind the write barrier, for the same reason ``baseline`` is not: the
+    barrier blocks process spawning and file writes that the shadow *decision*
+    path needs, and installing it here would claim a guarantee about the write
+    barrier rather than about this command. What this command's read-only nature
+    rests on is the call allowlist inside :mod:`continuum.shadow.observer` --
+    every read is a named method on it, and the generic transports that take a
+    verb are excluded.
+
+    The ledger is written unconditionally, even when the window stays open. An
+    observer that only wrote artifacts when it had a verdict would leave a long
+    correlation with no record of its own progress, which is the state in which a
+    reviewer cannot tell "still waiting" from "never ran".
+    """
+
+    from continuum.review.github import GitHubClient
+
+    output = _output_dir(args.out)
+    event = _event_from(_read_json(args.event))
+    ledger = observer.ledger_from_payload(_read_json(args.ledger)) if args.ledger else observer.Ledger()
+    now_ms = args.now_ms if args.now_ms is not None else int(time.time() * 1000)
+
+    client = GitHubClient(repository=args.repo, token=_token(args.token_env))
+    observation = observer.observe(
+        client,
+        repository=args.repo,
+        event=event,
+        ledger=ledger,
+        now_ms=now_ms,
+        horizon_ms=args.horizon_ms,
+    )
+
+    _write(output / "observer" / "ledger.json", observation.ledger.describe())
+    _write(
+        output / "observer" / "evidence" / _name(observation.window.window_id, "evidence.json"),
+        {
+            "schema": "continuum.shadow-observer-evidence/v1",
+            "window_id": observation.window.window_id,
+            "repository": observation.window.repository,
+            "subject": observation.window.subject,
+            "scenario": observation.window.scenario,
+            "opened_at": observation.window.opened_at,
+            "closed_at": observation.window.closed_at,
+            "terminal": observation.window.terminal,
+            "missing": list(observation.window.missing),
+            "limits": list(observation.window.limits),
+            "evidence": [item.describe() for item in observation.reading.evidence],
+            "read_failures": [
+                {"read": name, "reason": reason}
+                for name, reason in observation.reading.failures
+            ],
+            "truncated_reads": list(observation.reading.truncated),
+        },
+    )
+    if observation.outcome is not None:
+        _write(
+            output / "outcomes" / _name(observation.window.window_id),
+            observation.outcome.describe(),
+        )
+    # Outcomes from earlier passes are carried forward rather than re-derived:
+    # the observer cannot reconstruct a closed window's outcome from a later read
+    # of production, because the evidence that closed it may have aged out of the
+    # API's window. Copying them is what lets one artifact hold a whole
+    # correlation window's worth of outcomes.
+    for path in args.outcomes:
+        document = _read_json(path)
+        _write(
+            output / "outcomes" / _name(str(document.get("correlation_id", "outcome"))),
+            document,
+        )
+    _summary(observer.summarize(observation))
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# reconcile
+# --------------------------------------------------------------------------- #
+
+
+def _reconcile(args: argparse.Namespace) -> int:
+    """Pair each journal with the observer's record, and compare.
+
+    The pairing is what the observer deliberately does not do. Its artifacts are
+    written by whatever workflow run happened to be looking at production at the
+    time, and a journal is written by the run that made the decision; the two are
+    frequently not the same run and neither waits for the other. Pairing them here
+    means an outcome that arrived first is still compared, and a journal whose
+    window has not closed yet is reported as not-yet-evaluable instead of as a
+    divergence.
+    """
+
+    from .journal import journal_from_payload
+
+    output = _output_dir(args.out)
+    ledger = observer.ledger_from_payload(_read_json(args.ledger))
+    outcomes = {}
+    for path in args.outcomes:
+        document = _read_json(path)
+        outcomes[str(document.get("correlation_id", ""))] = document
+
+    pairings: List[Dict[str, Any]] = []
+    results = []
+    pending = 0
+    for path in args.journals:
+        journal = journal_from_payload(_read_json(path))
+        correlation = journal.event.correlation_id
+        document = outcomes.get(correlation)
+        observed = outcome_from_payload(document) if document is not None else None
+        pairing = observer.reconcile(ledger, correlation, observed)
+        pairings.append(pairing.describe())
+        if observed is None:
+            # Not compared at all. ``parity.compare`` would answer
+            # ``unevaluable``, which the cutover gate rightly treats as a blocker,
+            # but here it would mean something narrower: the observer has not
+            # finished reading this window yet. Calling that a divergence would
+            # report every long-running decision as a mismatch and drown the real
+            # ones, so it is counted as outstanding work instead.
+            pending += 1
+            _summary("reconcile {}: not yet observable".format(correlation))
+            continue
+        result = parity.compare(journal, observed)
+        _write(output / "parity" / _name(correlation), result.describe())
+        results.append(result)
+        _summary(
+            "reconcile {}: {} ({})".format(correlation, result.classification, pairing.verdict)
+        )
+
+    _write(
+        output / "observer" / "reconciliation.json",
+        {
+            "schema": "continuum.shadow-observer-reconciliation/v1",
+            "repository": ledger.repository,
+            "journals": len(args.journals),
+            "outcomes": len(outcomes),
+            "paired": len([item for item in pairings if item["outcome_emitted"]]),
+            "not_yet_observable": pending,
+            "windows_still_open": len(ledger.open_windows),
+            "pairings": pairings,
+        },
+    )
+    _summary(
+        "reconcile: {} journal(s), {} paired, {} not yet observable, {} window(s) "
+        "still open".format(
+            len(args.journals),
+            len([item for item in pairings if item["outcome_emitted"]]),
+            pending,
+            len(ledger.open_windows),
+        )
+    )
+    if args.origins:
+        _write(output / "observer" / "origins.json", _read_json(args.origins))
+    return VALIDATION_FAILED if any(result.divergent for result in results) else 0
 
 
 # --------------------------------------------------------------------------- #
@@ -555,6 +770,10 @@ def _describe(args: argparse.Namespace) -> int:
             for name, reason in cutover.REQUIRED_SCENARIOS
         ],
         "read_only_methods": sorted(READ_ONLY_METHODS),
+        "observer_read_methods": sorted(observer.OBSERVER_READ_METHODS),
+        "observer_unobservable_keys": list(observer.UNOBSERVABLE_DETAIL_KEYS),
+        "observer_unreconstructible_kinds": list(observer.UNRECONSTRUCTIBLE_KINDS),
+        "observer_horizon_ms": observer.DEFAULT_HORIZON_MS,
         "verdicts": list(parity.CLASSIFICATIONS),
         "liveness_verdicts": [
             liveness.LIVE,
@@ -588,6 +807,8 @@ def _render_summary(args: argparse.Namespace) -> int:
     directory = Path(args.out)
     if getattr(args, "window", False):
         _summary(report.window_summary(directory, artifact=str(args.artifact or "")))
+    elif getattr(args, "observer", False):
+        _summary(report.observation_summary(directory, artifact=str(args.artifact or "")))
     else:
         _summary(report.run_summary(directory, artifact=str(args.artifact or "")))
     return 0

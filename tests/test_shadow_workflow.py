@@ -29,6 +29,7 @@ import unittest
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "continuum-shadow.yml"
 BRIDGE = REPO_ROOT / "reference" / "nanodictate-workflows" / "shadow-bridge.yml"
+OBSERVER_REFERENCE = REPO_ROOT / "reference" / "nanodictate-workflows" / "shadow-observer.yml"
 DOCS = REPO_ROOT / "docs" / "shadow-validation.md"
 
 #: Workflow YAML is parsed with Ruby's Psych, which is already part of this
@@ -142,7 +143,7 @@ class ShellSyntaxTests(unittest.TestCase):
     """
 
     def test_every_run_block_is_valid_bash(self) -> None:
-        for path in (WORKFLOW, BRIDGE):
+        for path in (WORKFLOW, BRIDGE, OBSERVER_REFERENCE):
             document = load(path)
             for job_name, job in document["jobs"].items():
                 for step in steps_of(job):
@@ -158,7 +159,7 @@ class ShellSyntaxTests(unittest.TestCase):
                     )
 
     def test_every_run_block_is_strict(self) -> None:
-        for path in (WORKFLOW, BRIDGE):
+        for path in (WORKFLOW, BRIDGE, OBSERVER_REFERENCE):
             document = load(path)
             for job_name, job in document["jobs"].items():
                 for step in steps_of(job):
@@ -268,11 +269,11 @@ class ShadowWorkflowTests(unittest.TestCase):
         cls.document = load(WORKFLOW)
         cls.raw = WORKFLOW.read_text(encoding="utf-8")
 
-    def test_both_jobs_render_their_evidence_into_the_job_summary(self) -> None:
+    def test_every_job_renders_its_evidence_into_the_job_summary(self) -> None:
         # The summary is what a reviewer reads without downloading the artifact,
         # and it is rendered from the same documents the gate reads, so it cannot
         # become a second opinion.
-        for job_name in ("shadow", "evidence"):
+        for job_name in self.document["jobs"]:
             steps = steps_of(self.document["jobs"][job_name])
             summaries = [
                 step
@@ -283,13 +284,26 @@ class ShadowWorkflowTests(unittest.TestCase):
             script = run_text(summaries[0])
             self.assertIn("continuum.shadow.cli summary", script, job_name)
             self.assertIn("always()", str(summaries[0].get("if")), job_name)
-        # And the window's summary asks for the window renderer, not the run one.
-        window = [
-            step
-            for step in steps_of(self.document["jobs"]["evidence"])
-            if "GITHUB_STEP_SUMMARY" in run_text(step)
-        ][0]
-        self.assertIn("--window", run_text(window))
+        # And each renderer is the one that matches the job: the run one for a
+        # decision, the window one for a judged window, the observer one for what
+        # the observer read. Rendering a decision directory through the observer
+        # renderer would produce a summary full of "not recorded", which reads as
+        # a finding rather than as a mismatch between the two.
+        renderers = {
+            "shadow": "",
+            "observer": "--observer",
+            "evidence": "--window",
+        }
+        for job_name, flag in renderers.items():
+            summary = [
+                step
+                for step in steps_of(self.document["jobs"][job_name])
+                if "GITHUB_STEP_SUMMARY" in run_text(step)
+            ][0]
+            script = run_text(summary)
+            self.assertIn("continuum.shadow.cli summary", script, job_name)
+            if flag:
+                self.assertIn(flag, script, "{} renders through the wrong renderer".format(job_name))
 
 
     def test_it_is_reusable_and_dispatchable(self) -> None:
@@ -327,6 +341,72 @@ class ShadowWorkflowTests(unittest.TestCase):
                 text = json.dumps(step)
                 for call in WRITE_CALLS:
                     self.assertNotIn(call, text, "{}/{}: {}".format(job_name, step.get("name"), call))
+
+    def test_the_observer_job_reads_production_and_records_it(self) -> None:
+        # The observer is the component whose entire value is that it looks at
+        # production independently, so it is asserted here at the workflow level:
+        # a job that exists, runs only for the observe and reconcile modes, and
+        # goes through the observer commands rather than the decision path.
+        job = self.document["jobs"]["observer"]
+        self.assertEqual(
+            write_scopes(permission_map(job.get("permissions"))), [], "the observer holds a write scope"
+        )
+        guard = str(job["if"])
+        for mode in ("observe", "reconcile"):
+            self.assertIn(mode, guard, "the observer job does not run for mode={}".format(mode))
+        script = " ".join(run_text(step) for step in steps_of(job))
+        for verb in ("observe", "reconcile", "barrier-check"):
+            self.assertIn(
+                "continuum.shadow.cli {}".format(verb) if verb != "observe" else "args=(observe",
+                script,
+                "the observer job never runs {}".format(verb),
+            )
+        # And it must not decide anything: a job that both observed and judged
+        # could not be used as evidence about the judge.
+        self.assertNotIn("args=(run ", script, "the observer job also decided an event")
+
+    def test_the_observer_needs_no_event_to_reconcile(self) -> None:
+        # Reconciliation pairs two artifacts written by different runs, so
+        # requiring an event context in that mode would make the pass
+        # impossible: the observer's pass is not the run that made the decision.
+        job = self.document["jobs"]["observer"]
+        guards = {
+            str(step.get("name")): str(step.get("if"))
+            for step in steps_of(job)
+            if step.get("name")
+        }
+        self.assertIn("inputs.mode == 'observe'", guards.get("Materialise the event context", ""))
+        self.assertIn("inputs.mode == 'observe'", guards.get("Read production", ""))
+        self.assertIn("inputs.mode == 'reconcile'", guards.get("Pair the journals with the observer's record", ""))
+
+    def test_the_observer_carries_its_ledger_across_runs(self) -> None:
+        # A correlation window stays open for hours, so it outlives the run that
+        # opened it. Without carrying the ledger forward, every pass would open a
+        # new window over the same subject and the observer would never reach a
+        # verdict on anything that takes more than one run.
+        job = self.document["jobs"]["observer"]
+        script = "\n".join(run_text(step) for step in steps_of(job))
+        self.assertIn("gh run download", script, "the observer never reads a previous ledger")
+        self.assertIn("ledger.json", script, "the observer never carries its ledger forward")
+        # Carrying it forward is not optional: a named artifact that cannot be
+        # read has to fail, or a fresh ledger silently orphans the evidence of the
+        # window that was already in flight.
+        carry = "\n".join(
+            run_text(step) for step in steps_of(job) if step.get("name") == "Carry the ledger forward"
+        )
+        self.assertIn("exit 2", carry, "an unreadable previous ledger is not an error")
+
+    def test_the_reconcile_pass_passes_the_exit_code_through(self) -> None:
+        # The command already separates a divergence from a failure, so the step
+        # has to hand both back unchanged: swallowing either would upload an
+        # artifact that reads like evidence when it is not one.
+        job = self.document["jobs"]["observer"]
+        step = [
+            item
+            for item in steps_of(job)
+            if item.get("name") == "Pair the journals with the observer's record"
+        ][0]
+        self.assertIn('exit "$code"', run_text(step))
 
     def test_the_engine_is_pinned_to_a_commit_and_verified(self) -> None:
         # Continuum itself is checked out by path, because a reusable workflow
@@ -588,6 +668,12 @@ def _resolve_term(term: str, payload: dict, event_name: str, inputs: dict):
             if node is None:
                 return ""
         return node
+    if term == "github.token":
+        # A read-only token is not a payload fact, so the harness supplies a
+        # stand-in. The projection must not depend on its value, and if it ever
+        # did the documents below would still normalise -- which is exactly why
+        # the value has to be a constant here rather than something meaningful.
+        return "test-token"
     raise AssertionError("the bridge uses an expression form this test cannot evaluate: " + term)
 
 
@@ -926,6 +1012,147 @@ def commit_contains(revision: str, path: str) -> bool:
         text=True,
     )
     return fetched.returncode == 0 and contains()
+
+
+class ObserverProjectionTests(BridgeProjectionTests):
+    """The observer's projection, executed and fed to the engine.
+
+    Inherited rather than restated: the observer watches the same events as the
+    bridge and must produce documents the engine accepts for the same reason --
+    an observer that forwards a name the normaliser refuses would report an
+    unreadable window rather than a clean one, and the difference is invisible
+    until someone reads the artifact.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        document = load(OBSERVER_REFERENCE)
+        cls.step = steps_of(document["jobs"]["context"])[0]
+        cls.script = cls.step["run"]
+        cls.env_expressions = cls.step.get("env") or {}
+        cls.triggers = document["on"]
+
+
+class ObserverReferenceTests(unittest.TestCase):
+    """The observer's production-side file, and the properties it must keep.
+
+    The observer is the half of the comparison that is supposed to be independent,
+    and independence is the property most easily lost by accident. So the file is
+    held to the same boundary as the bridge -- reads only, no decision, pinned to
+    a commit -- and to two things the bridge does not need:
+
+    * it must be scheduled, because a production outcome arrives hours after the
+      event that started it, and an observer that only looked at the event would
+      open windows it could never close;
+    * it must find its own previous pass, because the ledger is the only record
+      of which run a window was opened in, and an artifact cannot be appended to.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.document = load(OBSERVER_REFERENCE)
+        cls.raw = OBSERVER_REFERENCE.read_text(encoding="utf-8")
+
+    def test_it_holds_no_authority_beyond_reading(self) -> None:
+        top = permission_map(self.document.get("permissions"))
+        self.assertEqual(write_scopes(top), [], "the observer's top-level scopes")
+        self.assertTrue(set(top) <= READ_SCOPES, sorted(set(top) - READ_SCOPES))
+        for name, job in self.document["jobs"].items():
+            declared = permission_map(job.get("permissions", self.document["permissions"]))
+            self.assertEqual(write_scopes(declared), [], name)
+        self.assertIn("continuum-shadow.yml@", self.raw)
+        for call in WRITE_CALLS:
+            self.assertNotIn(call, self.raw, call)
+
+    def test_it_is_pinned_to_a_commit(self) -> None:
+        for name in ("observer", "reconciler"):
+            pin = self.document["jobs"][name]["uses"].split("@")[-1]
+            self.assertRegex(pin, r"^[0-9a-f]{40}$", name)
+            self.assertNotIn("main", pin, name)
+            self.assertNotIn("master", pin, name)
+
+    def test_it_reads_production_through_the_reusable_workflow(self) -> None:
+        job = self.document["jobs"]["observer"]
+        self.assertEqual(job["with"]["mode"], "observe")
+        self.assertEqual(job["with"]["repository"], "${{ github.repository }}")
+        # A cross-repository call inherits only the caller's scopes, so the read
+        # scopes at the top of this file are the ceiling for the observer.
+        self.assertNotIn("token", job["with"], "the observer passes its own token")
+        self.assertIn("schedule", self.document["on"], "the observer is never scheduled")
+
+    def test_it_names_the_same_events_the_bridge_names(self) -> None:
+        # Two files mapping the same webhook to different Continuum event types
+        # would compare two different questions and report the difference as a
+        # divergence -- the one failure this plane cannot detect in itself. The
+        # trigger lists are asserted equal, and the projection is asserted to be
+        # the engine's own projection.
+        bridge = load(BRIDGE)
+        self.assertEqual(
+            sorted(self.document["on"]),
+            sorted(bridge["on"]),
+            "the observer and the bridge do not watch the same events",
+        )
+
+    def test_it_finds_the_pass_whose_ledger_it_continues(self) -> None:
+        job = self.document["jobs"]["locate"]
+        script = "\n".join(run_text(step) for step in steps_of(job))
+        self.assertIn("gh api", script, "the observer never looks at its own run history")
+        self.assertIn("workflow_runs", script, "the observer does not ask for runs")
+        # Asking for successes is what keeps a pass from continuing from itself.
+        self.assertIn("status=success", script, "the observer might continue from a run in flight")
+        # And a hole in the chain is an error rather than a fresh start, because a
+        # fresh start silently opens a second window over the same subject.
+        self.assertIn("exit 1", script, "a hole in the ledger chain is not an error")
+        outputs = job.get("outputs") or {}
+        self.assertEqual(
+            set(outputs),
+            {"previous_run_id", "previous_artifact"},
+            "the locate job exports {} rather than the two ids the call needs".format(
+                sorted(outputs)
+            ),
+        )
+
+    def test_it_passes_the_previous_ledger_to_both_calls(self) -> None:
+        for name in ("observer", "reconciler"):
+            with_ = self.document["jobs"][name]["with"]
+            self.assertEqual(
+                with_["ledger_run_id"],
+                "${{ needs.locate.outputs.previous_run_id }}",
+                name,
+            )
+            self.assertEqual(
+                with_["ledger_artifact"],
+                "${{ needs.locate.outputs.previous_artifact }}",
+                name,
+            )
+
+    def test_reconciliation_is_a_separate_call_from_observation(self) -> None:
+        # It needs two artifacts that no single run produces together: the ledger
+        # from an observer pass and the journals from a bridge pass. Folding it
+        # into the observer pass would make it wait for a decision that may not
+        # exist yet.
+        job = self.document["jobs"]["reconciler"]
+        self.assertEqual(job["with"]["mode"], "reconcile")
+        self.assertEqual(job["needs"], ["locate"])
+        self.assertNotIn("context", job["needs"], "reconciliation is waiting for an event")
+
+    def test_only_one_pass_runs_at_a_time(self) -> None:
+        # Two concurrent passes would each download the same ledger and each upload
+        # one that has seen only their own reads, so whichever finished last would
+        # silently drop the other's evidence.
+        group = str(self.document["concurrency"]["group"])
+        self.assertNotIn("run_id", group, "the concurrency group is per run, not per repository")
+        self.assertEqual(
+            self.document["concurrency"]["cancel-in-progress"], False, "a pass is cancelled by the next"
+        )
+
+    def test_every_run_block_is_strict(self) -> None:
+        for name, job in self.document["jobs"].items():
+            for step in steps_of(job):
+                script = run_text(step)
+                if not script:
+                    continue
+                self.assertIn("set -euo pipefail", script, "{}/{}".format(name, step.get("name")))
 
 
 class BridgePinTests(unittest.TestCase):

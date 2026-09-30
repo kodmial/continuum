@@ -236,6 +236,42 @@ class Effect:
         )
         return (self.kind, self.target, semantic)
 
+    def signature_excluding(
+        self, keys: "frozenset[str] | set[str] | tuple[str, ...]"
+    ) -> Tuple[str, str, Tuple[Tuple[str, str], ...]]:
+        """:attr:`signature` with the named detail keys left out.
+
+        Exists for the one comparison a full signature cannot serve: an outcome
+        observed from read-only evidence cannot see everything a journal planned.
+        A ``workflow.dispatch`` names the ``inputs`` it was given, and the REST
+        read APIs do not return them; a ``pull.merge`` names the ``method`` it
+        used, and a squash is not distinguishable from a merge commit by looking
+        at the merged pull request afterwards.
+
+        Those keys are dropped from *both* sides rather than the observed effect
+        being built without them, because dropping them from one side only would
+        report every dispatch as a detail difference -- which is the same as
+        reporting every dispatch as a divergence, just more slowly. What is lost
+        is stated by the observer in its ``limits``, so a reader knows the
+        comparison was coarser and which fields it could not see.
+
+        The set is supplied per comparison rather than being a module constant
+        because it is a property of a particular capture: an outcome reconstructed
+        from a fixture can know the inputs, and one reconstructed from live
+        evidence cannot.
+        """
+
+        if not keys:
+            return self.signature
+        semantic = tuple(
+            sorted(
+                (str(key), _scalar(value))
+                for key, value in self.detail.items()
+                if key not in _PROSE_DETAIL_KEYS and key not in keys
+            )
+        )
+        return (self.kind, self.target, semantic)
+
     def describe(self) -> Dict[str, Any]:
         """The artifact form, which is *not* the comparison form.
 
@@ -452,6 +488,10 @@ READ_ONLY_METHODS = frozenset(
         "workflow_inventory",
         "review_threads",
         "unresolved_thread_comment_ids",
+        "list_issue_events",
+        "list_workflow_runs",
+        "get_workflow_run",
+        "list_releases",
     }
 )
 

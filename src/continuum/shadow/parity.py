@@ -103,6 +103,26 @@ DIVERGENT: Tuple[str, ...] = (
 #: decision.
 _NO_PRODUCTION_COUNTERPART = ("denied",)
 
+#: Scenarios whose planned effects are a *plan*, not a prediction.
+#:
+#: The release dry run walks the whole publication chain -- build, sign, verify,
+#: draft, publish, open the release pull request -- through record-only ports, and
+#: production is not expected to perform any of it: a dry run's entire purpose is
+#: that nothing is written. Comparing those effects against a read-only release
+#: record would report six missing actions against a system that behaved
+#: correctly by publishing nothing, and a gate that is always blocked by a
+#: scenario that cannot ever agree is a gate nobody trusts.
+#:
+#: The check is still made, and it is the check that matters: did production
+#: publish anything it should not have? A release observed where a dry run
+#: planned one is ``extra-action``. Only the *absence* of the planned effects is
+#: expected.
+#:
+#: Named by scenario string rather than imported from :mod:`continuum.shadow.
+#: planner`, which would make the comparison plane depend on the decision plane.
+#: ``tests/test_shadow_observer.py`` asserts this matches the planner's constant.
+PLAN_ONLY_SCENARIOS: Tuple[str, ...] = ("release-planning",)
+
 
 @dataclasses.dataclass(frozen=True)
 class Difference:
@@ -295,7 +315,8 @@ def compare(
         )
 
     observed = outcome.effects
-    left_matched, right_matched = reconcile_targets(expected, observed)
+    opaque = outcome.opaque_keys if outcome is not None else frozenset()
+    left_matched, right_matched = reconcile_targets(expected, observed, opaque=opaque)
     matched = len(left_matched)
 
     missing = [
@@ -309,7 +330,20 @@ def compare(
         if index not in set(right_matched)
     ]
 
-    # 3. Terminal state first: a run that merged and a run that recorded a
+    # 3. A scenario whose effects are a plan rather than a prediction.
+    #
+    #    Checked before the terminal state, because for these scenarios the
+    #    journal's status describes the *plan* -- "the release was planned and
+    #    suppressed" -- while the outcome describes production's ending. Comparing
+    #    them would report "Continuum ended 'ok', production ended 'no-action'" for
+    #    every dry run whose tag was never published, which is the single most
+    #    common and least interesting thing that can happen to a dry run.
+    if scenario in PLAN_ONLY_SCENARIOS:
+        return _plan_only_result(
+            result, missing, extra, matched, len(expected), len(observed), journal, outcome
+        )
+
+    # 4. Terminal state next: a run that merged and a run that recorded a
     #    failure have not diverged in detail.
     terminal = _terminal_difference(journal, outcome)
     if terminal is not None:
@@ -320,14 +354,14 @@ def compare(
             matched=matched,
         )
 
-    # 4. The action set, as a *multiset*. Compared this way rather than by the
+    # 5. The action set, as a *multiset*. Compared this way rather than by the
     #    alignment above, because a pure reordering leaves the alignment with
     #    unmatched entries on both sides: reporting those as a missing action and
     #    an extra one would be wrong, and it would make ``ordering-guard``
     #    unreachable in the only case it exists for.
-    same_members = _multiset(expected) == _multiset(observed)
+    same_members = _multiset(expected, opaque) == _multiset(observed, opaque)
 
-    # 5. Same members. Did the order matter?
+    # 6. Same members. Did the order matter?
     if same_members:
         ordering = _ordering_difference(expected, observed)
         if ordering is not None:
@@ -362,7 +396,7 @@ def compare(
         )
 
     # 6. Same members, same order. Anything left is presentation.
-    undecidable, note = _presentation_difference(expected, observed)
+    undecidable, note = _presentation_difference(expected, observed, opaque)
     if undecidable:
         return result(
             EXPLAINABLE,
@@ -389,7 +423,10 @@ def compare(
     )
 
 
-def _multiset(effects: Sequence[Effect]) -> Tuple[Tuple[str, str, Tuple[Tuple[str, str], ...]], ...]:
+def _multiset(
+    effects: Sequence[Effect],
+    opaque: "frozenset[str] | set[str] | tuple[str, ...]" = (),
+) -> Tuple[Tuple[str, str, Tuple[Tuple[str, str], ...]], ...]:
     """Signatures in sorted order, so order is not part of the comparison.
 
     A multiset rather than a set, because two identical effects are two effects:
@@ -397,7 +434,47 @@ def _multiset(effects: Sequence[Effect]) -> Tuple[Tuple[str, str, Tuple[Tuple[st
     identical to one that wrote it once.
     """
 
-    return tuple(sorted(effect.signature for effect in effects))
+    return tuple(sorted(effect.signature_excluding(opaque) for effect in effects))
+
+
+def _plan_only_result(
+    result: Any,
+    missing: Sequence[Effect],
+    extra: Sequence[Effect],
+    matched: int,
+    expected_count: int,
+    observed_count: int,
+    journal: ShadowJournal,
+    outcome: ObservedOutcome,
+) -> ParityResult:
+    """The verdict for a scenario whose effects are a plan, not a prediction.
+
+    Production was never asked to perform them, so their absence is the
+    agreement. Production performing one of them *is* a divergence -- something
+    happened on the release surface that a dry run says should not have -- and
+    that is checked here rather than assumed away, because "the dry run planned a
+    release" and "a release was published" being the same event is exactly the
+    bug this plane exists to catch.
+
+    Returned through the caller's ``result`` factory so the correlation id, the
+    config version, and the links come from the same place as every other verdict.
+    """
+
+    if extra:
+        return result(
+            EXTRA_ACTION,
+            "production performed {} effect(s) on a surface the dry run only planned".format(
+                len(extra)
+            ),
+            _action_differences(missing, extra, ordering=None),
+            matched=matched,
+        )
+    return result(
+        EXACT,
+        "Continuum planned {} suppressed publication(s) and production published "
+        "nothing, which is what a dry run is for".format(expected_count),
+        matched=matched,
+    )
 
 
 def _terminal_difference(
@@ -543,7 +620,9 @@ _PRESENTATION_KEYS = frozenset(
 
 
 def _presentation_difference(
-    expected: Sequence[Effect], observed: Sequence[Effect]
+    expected: Sequence[Effect],
+    observed: Sequence[Effect],
+    opaque: "frozenset[str] | set[str] | tuple[str, ...]" = (),
 ) -> Tuple[bool, str]:
     """Whether anything outside presentation differs, and a note if so.
 
@@ -556,12 +635,17 @@ def _presentation_difference(
     A *matched* effect is a pair, so a genuinely undecidable difference -- one
     that is neither a presentation key nor identical -- is reported as
     explainable with the fields named. It is never silently absorbed.
+
+    ``opaque`` keys are skipped rather than reported: they are already absent from
+    both signatures, so counting them again here would make every dispatch land on
+    ``explainable`` for a field the capture was never able to read, and the best
+    possible verdict would be unreachable for every scenario that dispatches.
     """
 
     notes: List[str] = []
     decisional: List[str] = []
     for left, right in zip(expected, observed):
-        for key in sorted(set(left.detail) | set(right.detail)):
+        for key in sorted((set(left.detail) | set(right.detail)) - set(opaque)):
             if left.detail.get(key) == right.detail.get(key):
                 continue
             note = "{} on {}: expected {!r}, observed {!r}".format(

@@ -85,6 +85,11 @@ class ObservedOutcome:
     fidelity: str = OBSERVED_UNKNOWN
     #: What the capture could not see, stated rather than left blank.
     limits: Tuple[str, ...] = ()
+    #: Detail keys this capture could not read from the observed side. The
+    #: comparison drops them from *both* sides rather than reporting every
+    #: effect that has one as a difference; see
+    #: :meth:`continuum.shadow.effects.Effect.signature_excluding`.
+    unobservable: Tuple[str, ...] = ()
     #: Links back to the real run, so a report can be acted on.
     links: Mapping[str, str] = dataclasses.field(default_factory=dict)
 
@@ -92,17 +97,32 @@ class ObservedOutcome:
     def is_usable(self) -> bool:
         return self.fidelity in (OBSERVED_EXACT, OBSERVED_PARTIAL)
 
+    @property
+    def opaque_keys(self) -> frozenset:
+        """The detail keys this capture could not see, as a set."""
+
+        return frozenset(self.unobservable)
+
     def describe(self) -> Dict[str, Any]:
         return {
             "schema": OUTCOME_SCHEMA,
             "correlation_id": self.correlation_id,
             "window_started_at": self.window_started_at,
             "window_ended_at": self.window_ended_at,
-            "effects": [effect.describe() for effect in self.effects],
+            # ``actions``, not ``effects``: this is the wire format
+            # :func:`outcome_from_payload` reads, and it is what ``capture`` writes
+            # and ``replay`` compares. The two names drifted once, and the drift was
+            # invisible -- a document written under one name and read under the
+            # other produced an outcome with no actions and, worse, read back as
+            # ``unknown`` fidelity because the reader infers fidelity from the
+            # presence of the key. A capture of production's behaviour that silently
+            # came back empty is the one failure this whole plane cannot have.
+            "actions": [effect.describe() for effect in self.effects],
             "terminal_status": self.terminal_status,
             "terminal_detail": self.terminal_detail,
             "fidelity": self.fidelity,
             "limits": list(self.limits),
+            "unobservable": list(self.unobservable),
             "links": {key: self.links[key] for key in sorted(self.links, key=str)},
         }
 
@@ -157,6 +177,13 @@ def outcome_from_payload(
         )
 
     limits.extend(_text(item) for item in _sequence(payload.get("limits")) if _text(item))
+    unobservable = tuple(
+        sorted(
+            _text(item)
+            for item in _sequence(payload.get("unobservable"))
+            if _text(item)
+        )
+    )
     fidelity = _text(payload.get("fidelity")) or (
         OBSERVED_EXACT if "actions" in payload else OBSERVED_UNKNOWN
     )
@@ -180,6 +207,7 @@ def outcome_from_payload(
         terminal_detail=_text(payload.get("terminal_detail")),
         fidelity=fidelity,
         limits=tuple(limits),
+        unobservable=unobservable,
         links=links,
     )
 
@@ -203,6 +231,7 @@ def observed_from_effects(
     fidelity: str = OBSERVED_EXACT,
     links: Optional[Mapping[str, str]] = None,
     limits: Sequence[str] = (),
+    unobservable: Sequence[str] = (),
 ) -> ObservedOutcome:
     """Build an observed outcome from a list of effects or effect documents.
 
@@ -242,6 +271,7 @@ def observed_from_effects(
         terminal_detail=terminal_detail,
         fidelity=fidelity,
         limits=tuple(_text(item) for item in limits if _text(item)),
+        unobservable=tuple(sorted(_text(item) for item in unobservable if _text(item))),
         links=dict(links or {}),
     )
 
@@ -293,7 +323,10 @@ def assert_in_vocabulary(effect: Effect) -> Effect:
 
 
 def reconcile_targets(
-    expected: Sequence[Effect], observed: Sequence[Effect]
+    expected: Sequence[Effect],
+    observed: Sequence[Effect],
+    *,
+    opaque: "frozenset[str] | set[str] | tuple[str, ...]" = (),
 ) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
     """A longest-common-subsequence alignment of two effect sequences.
 
@@ -301,10 +334,14 @@ def reconcile_targets(
     differences to be their own classification. Two sequences with the same
     members in a different order are not the same as two sequences with
     different members, and only an alignment tells those apart.
+
+    ``opaque`` names detail keys the capture could not read; see
+    :meth:`continuum.shadow.effects.Effect.signature_excluding` for why they are
+    dropped from both sides rather than from the observed one.
     """
 
-    left = [effect.signature for effect in expected]
-    right = [effect.signature for effect in observed]
+    left = [effect.signature_excluding(opaque) for effect in expected]
+    right = [effect.signature_excluding(opaque) for effect in observed]
     rows, columns = len(left), len(right)
     table = [[0] * (columns + 1) for _ in range(rows + 1)]
     for row in range(rows - 1, -1, -1):

@@ -188,3 +188,16 @@ Discovery issue for unclassified differences: `#60`
 | `#67` | `.github/pull_request_template.md`, `.github/workflows/ci.yml`, `.github/workflows/packaging-smoke.yml`, `.github/workflows/release.yml`, `.github/workflows/rust.yml` | `consumer-local` | #60 | A shared Rust engine build and portability gates. Product behavior with no generic semantic, and none of the five paths reintroduces a scheduler, review, repair, merge or release writer Continuum removes, so it cannot restore pre-cutover orchestration. It stays classified so the gate keeps proving that. |
 
 <!-- END GENERATED: docs/parity-ledger.json -->
+
+### Why there is no row for the shadow observer
+
+`reference/nanodictate-workflows/shadow-observer.yml` exists, but this table has
+no row for it, and will not until it is installed in NanoDictate. A row is a claim
+about what the consumer's tree contains at `audited_head`, and the gate
+`continuum.shadow.cli baseline` compares the live tree against exactly those
+claims: a row for a file the consumer does not have would make the baseline
+report a difference that does not exist and fail the cutover gate on it.
+
+The same reasoning put the bridge's row there rather than its absence: the bridge
+is installed, so the claim is true. The observer is not installed yet, so the
+claim is not available. The audit head moves, and the row appears with it.

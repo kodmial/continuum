@@ -52,6 +52,23 @@ def _documents(directory: Path, subdirectory: str) -> List[Mapping[str, Any]]:
     return found
 
 
+def _first_document(path: Path) -> Optional[Mapping[str, Any]]:
+    """Read one JSON document, or ``None`` if it is absent or unreadable.
+
+    Same contract as :func:`_documents` for a file that does not parse: this
+    renders evidence, so a document it cannot read becomes "not recorded" rather
+    than an exception that costs the reviewer the rest of the summary.
+    """
+
+    if not path.is_file():
+        return None
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return document if isinstance(document, dict) else None
+
+
 def _first_line(text: Any) -> str:
     value = str(text or "").strip()
     return value if value else "_not recorded_"
@@ -320,6 +337,197 @@ def run_summary(directory: Path, artifact: str = "") -> str:
     lines.append("### Liveness")
     lines.append("")
     lines.extend(_liveness_lines(directory))
+    lines.append("")
+    barrier = _barrier_lines(directory)
+    if barrier:
+        lines.append("### Write barrier")
+        lines.append("")
+        lines.extend(barrier)
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _window_rows(ledger: Mapping[str, Any]) -> List[List[str]]:
+    """One row per correlation window, open and closed alike.
+
+    A window that is still open is not a smaller result than a closed one; it is
+    the state the observer is in most of the time, because production reaches a
+    terminal state hours after the run that started watching it ended. Rendering
+    it as its own row is what stops "the observer has not finished" from being
+    read as "the observer found nothing".
+    """
+
+    rows: List[List[str]] = []
+    windows = ledger.get("windows")
+    if not isinstance(windows, list):
+        return rows
+    for window in windows:
+        if not isinstance(window, Mapping):
+            continue
+        closed = window.get("closed_at")
+        missing = window.get("missing") or []
+        limits = window.get("limits") or []
+        rows.append(
+            [
+                str(window.get("scenario") or "unspecified"),
+                str(window.get("subject") or "?"),
+                "closed" if closed else "open",
+                ", ".join(str(item) for item in missing) or "-",
+                ", ".join(str(item) for item in limits) or "-",
+            ]
+        )
+    return rows
+
+
+def _observation_rows(observation: Mapping[str, Any]) -> List[List[str]]:
+    """One row per outcome the observer is willing to stand behind."""
+
+    rows: List[List[str]] = []
+    outcomes = observation.get("outcomes")
+    if not isinstance(outcomes, list):
+        return rows
+    for outcome in outcomes:
+        if not isinstance(outcome, Mapping):
+            continue
+        links = outcome.get("links")
+        links = links if isinstance(links, Mapping) else {}
+        actions = outcome.get("actions")
+        actions = actions if isinstance(actions, list) else []
+        rows.append(
+            [
+                str(outcome.get("correlation_id") or "?"),
+                str(links.get("scenario") or "unspecified"),
+                str(outcome.get("fidelity") or "unevaluable"),
+                ", ".join(
+                    "{} {}".format(item.get("kind") or "?", item.get("target") or "").strip()
+                    for item in actions
+                    if isinstance(item, Mapping)
+                )
+                or "_nothing observed_",
+            ]
+        )
+    return rows
+
+
+def _reconciliation_rows(reconciliation: Mapping[str, Any]) -> List[List[str]]:
+    rows: List[List[str]] = []
+    pairings = reconciliation.get("pairings")
+    if not isinstance(pairings, list):
+        return rows
+    for pairing in pairings:
+        if not isinstance(pairing, Mapping):
+            continue
+        rows.append(
+            [
+                str(pairing.get("correlation_id") or "?"),
+                str(pairing.get("verdict") or "?"),
+                str(pairing.get("classification") or "-"),
+            ]
+        )
+    return rows
+
+
+def observation_summary(directory: Path, artifact: str = "") -> str:
+    """Render what the observer read: its ledger, its outcomes, its pairings.
+
+    This is the counterpart to :func:`run_summary`. A run summary answers "what
+    did Continuum decide and did production agree"; this one answers "what did
+    the observer independently see, and has every decision been compared against
+    it yet". The two are rendered from different documents on purpose, because
+    they are claims with different authors: a journal is written by the process
+    being judged, and an outcome is written by the process doing the looking.
+    """
+
+    directory = Path(directory)
+    root = directory / "observer"
+    ledger = _first_document(root / "ledger.json")
+    # Outcomes sit beside the ledger's directory rather than inside it, because
+    # that is where `observe` writes them and where the workflow's carry-forward
+    # glob looks for them. Reading from a second place would render an empty table
+    # for a pass that plainly recorded one.
+    outcomes = _documents(directory, "outcomes")
+    reconciliation = _first_document(root / "reconciliation.json")
+    readable = [item for item in outcomes if "_unreadable" not in item]
+
+    lines: List[str] = ["## Continuum shadow observer", ""]
+    if artifact:
+        lines.append(
+            "Observation: artifact `{artifact}` ({path}/).".format(
+                artifact=artifact, path=directory.as_posix()
+            )
+        )
+        lines.append("")
+
+    if ledger is None:
+        lines.append(
+            "_This pass wrote no ledger, so nothing was observed. Everything below "
+            "is what the pass recorded about itself._"
+        )
+    else:
+        windows = ledger.get("windows")
+        windows = windows if isinstance(windows, list) else []
+        open_windows = [
+            item
+            for item in windows
+            if isinstance(item, Mapping) and not item.get("closed_at")
+        ]
+        lines.append(
+            "Repository `{}` — {} window(s), {} still open, {} outcome(s) carried forward.".format(
+                ledger.get("repository") or "?",
+                len(windows),
+                len(open_windows),
+                len(readable),
+            )
+        )
+        lines.append("")
+        lines.extend(
+            _table(
+                ("scenario", "subject", "state", "not yet observed", "not observable"),
+                _window_rows(ledger),
+            )
+        )
+        lines.append("")
+
+    lines.append("### What production did")
+    lines.append("")
+    if not readable:
+        lines.append(
+            "_No outcome was emitted. That is not the same as production having "
+            "done nothing: a window that is still open, or a read that failed, "
+            "both produce no outcome, and both are listed above._"
+        )
+    else:
+        lines.extend(
+            _table(
+                ("correlation", "scenario", "fidelity", "actions"),
+                _observation_rows({"outcomes": readable}),
+            )
+        )
+    lines.append("")
+
+    lines.append("### Pairing with Continuum's decisions")
+    lines.append("")
+    if reconciliation is None:
+        lines.append(
+            "_No reconciliation pass has been recorded, so no decision has been "
+            "compared against what the observer read yet._"
+        )
+    else:
+        lines.append(
+            "{} journal(s), {} paired, {} not yet observable, {} window(s) still open.".format(
+                reconciliation.get("journals", 0),
+                reconciliation.get("paired", 0),
+                reconciliation.get("not_yet_observable", 0),
+                reconciliation.get("windows_still_open", 0),
+            )
+        )
+        lines.append("")
+        lines.extend(
+            _table(
+                ("correlation", "verdict", "classification"),
+                _reconciliation_rows(reconciliation),
+            )
+        )
     lines.append("")
     barrier = _barrier_lines(directory)
     if barrier:

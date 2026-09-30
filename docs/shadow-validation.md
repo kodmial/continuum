@@ -13,19 +13,60 @@ one.
 
 ## The shape of it
 
-Three files, in three repositories:
+Four files, in three repositories:
 
 | File | Where it lives | What it does |
 | --- | --- | --- |
 | `shadow-bridge.yml` | NanoDictate, `.github/workflows/` | Names the lifecycle event and hands a small immutable document to Continuum |
-| `continuum-shadow.yml` | Continuum, `.github/workflows/` | Checks out a pinned engine, captures live state, decides, records, uploads |
-| `src/continuum/shadow/` | Continuum | The engine: capture, planner, barrier, parity, liveness, cutover |
+| `shadow-observer.yml` | NanoDictate, `.github/workflows/` | Reads production independently and records what it did, on the events and on a schedule |
+| `continuum-shadow.yml` | Continuum, `.github/workflows/` | Checks out a pinned engine, decides, observes, reconciles, records, uploads |
+| `src/continuum/shadow/` | Continuum | The engine: capture, planner, barrier, observer, parity, liveness, cutover |
 
-The bridge is the only thing a production repository has to add, and it is
-deliberately thin: one shaping step and one call. It has no token, no
-permissions, no retry, no queue and no decision. A bridge that grew logic would
-be a second orchestration surface, and the value of the whole exercise is that
-the two surfaces being compared are the same decision.
+The bridge and the observer are the only things a production repository has to
+add, and both are deliberately thin: a shaping step and a call, with no decision
+and no write of any kind. A file that grew logic would be a second orchestration
+surface, and the value of the whole exercise is that the two surfaces being
+compared are the same decision.
+
+## Why the observer is a separate file
+
+The bridge asks *what would Continuum have done*. The observer asks *what did
+NanoDictate actually do*. Both answers have to exist before the comparison means
+anything, and they arrive on different clocks: the bridge runs when the event
+happens, while a production outcome — an issue dispatched and labelled and given
+a pull request over the following hour, a release published long after the branch
+that produced it was green — finishes hours later.
+
+That is why the observer is triggered by a schedule as well as by the same events
+the bridge watches. The schedule is not a retry: it is how a correlation window
+gets the chance to close. An observer that only looked at the event would open a
+window it could never finish reading and would report every long-running decision
+as unobserved.
+
+The two files watch the same triggers and name the same events. Two mappings that
+drifted would compare two different questions and report the difference as a
+divergence, which is the one failure this plane cannot detect in itself, so
+`tests/test_shadow_workflow.py` asserts the trigger lists are equal and executes
+both projections against the engine's own normaliser.
+
+## Installing the observer
+
+1. Copy `reference/nanodictate-workflows/shadow-observer.yml` into
+   `.github/workflows/continuum-shadow-observer.yml`.
+2. Set both reusable-workflow pins to a full commit SHA of Continuum that
+   contains `continuum-shadow.yml`, exactly as for the bridge. **The reference
+   copies ship with placeholder pins; replacing them is a required step.**
+3. No token is needed. The observer reads the production repository with the
+   caller's own `GITHUB_TOKEN`, whose read scopes are declared at the top of the
+   file, so its entire reach is the six `read` scopes already listed for the
+   bridge.
+
+The observer finds the pass whose ledger it continues by reading its own run
+history with `actions: read` — nothing else — and takes the most recent
+*successful* pass, so a run in flight is never continued from. A previous pass
+that succeeded but kept no artifact is a hard error rather than a fresh start: a
+fresh start silently opens a second correlation window over the same subject and
+orphans the evidence of the first.
 
 ## Installing the bridge
 
@@ -81,10 +122,48 @@ Every run writes `shadow-out/`, uploaded as an artifact. The files:
 | `barrier/check.json` | Every write path the barrier refused |
 | `cases/<correlation>.case.json` | A replayable case: the same event and state, re-runnable |
 
+An observer pass writes `observer-out/` instead, and carries the previous pass's
+ledger and outcomes forward:
+
+| File | What it holds |
+| --- | --- |
+| `observer/ledger.json` | Every open and closed correlation window, so a window that outlives one run can be continued by the next |
+| `observer/evidence/<window>.json` | Every read the pass made for that window, with the reads that failed and the ones that were truncated |
+| `outcomes/<correlation>.json` | What production was observed to do, its fidelity, and what could not be observed about it |
+| `observer/parity/<correlation>.json` | The comparison, written by the pass that paired them |
+| `observer/reconciliation.json` | Every journal, how it paired, and what is still outstanding |
+
 Read it in the job summary first — `continuum.shadow.cli summary` renders the
 same documents as markdown — and open the artifact only for the line you need
 to check. The summary reports absence as absence: a run with no parity document
 says the parity was *not evaluated*, which is a different state from *matched*.
+Pass `--observer` for an observer pass and `--window` for a judged window; each
+renders the documents its own pass wrote, so the summary cannot disagree with the
+evidence.
+
+### What the observer will and will not say
+
+The observer's whole value is that it is looking at something other than the thing
+being judged, and that constrains it in ways worth stating plainly:
+
+| Situation | What it records |
+| --- | --- |
+| A surface could not be read | The failure, and **no** outcome at all |
+| A read was truncated | The outcome at `partial` fidelity, and the truncation |
+| A record could not be tied to this subject | The record as evidence, and not as an effect |
+| The window has not reached a terminal state | A ledger entry and no outcome |
+| A detail has no read-only source | Excluded from the comparison on **both** sides, and named in `unobservable` |
+
+The last row is the one most easily mistaken for agreement. Workflow dispatch
+inputs, the merge method, and a release's publication destination are dropped
+from the comparison because no read-only API returns them — not because either
+side was right. Every such exclusion is written into the outcome's `unobservable`
+list and its `limits`, so a reader can tell "these matched" from "these could not
+be compared".
+
+`release-planning` is `plan-only`: a release decision in dry-run mode is not a
+production prediction, so a suppressed plan is not a `missing-action` and an
+observed release is an `extra-action`.
 
 ### Parity classifications
 
@@ -180,6 +259,47 @@ PYTHONPATH=src python3 -m continuum.shadow.cli liveness \
   --out replay-out \
   --budget-ms 300000
 ```
+
+## Reading production yourself
+
+The observer runs the same way locally. It reads only through a named allowlist
+of read calls — the generic transports that take a verb are refused — so it needs
+a read-only token and cannot write whatever scope it is handed:
+
+```
+# Open or continue a window and record what production did
+SHADOW_READ_TOKEN=... PYTHONPATH=src python3 -m continuum.shadow.cli observe \
+  --event event.json \
+  --repo kodmial/nanodictate \
+  --token-env SHADOW_READ_TOKEN \
+  --out observer-out
+
+# Continue the window the last pass left open, and carry its outcomes forward
+PYTHONPATH=src python3 -m continuum.shadow.cli observe \
+  --event event.json \
+  --repo kodmial/nanodictate \
+  --token-env SHADOW_READ_TOKEN \
+  --ledger observer-out/observer/ledger.json \
+  --outcomes 'observer-out/outcomes/*.json' \
+  --out observer-out
+```
+
+Reconciliation is a separate pass because it needs two artifacts that different
+runs write: the ledger from an observer pass and the journals from a decision
+pass, and neither waits for the other.
+
+```
+PYTHONPATH=src python3 -m continuum.shadow.cli reconcile \
+  --ledger observer-out/observer/ledger.json \
+  --journals 'replay-out/journals/*.json' \
+  --outcomes 'observer-out/outcomes/*.json' \
+  --out observer-out
+```
+
+It exits `1` only when a comparison that could be made disagreed. A journal whose
+window has not closed yet is counted as outstanding and exits `0` — calling that a
+divergence would report every long-running decision as a mismatch and bury the
+real ones.
 
 ## Judging a window
 
