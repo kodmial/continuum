@@ -62,7 +62,19 @@ from .core import (
     ReleaseOutcome,
     ReleaseRequest,
 )
+from .entrypoints import (
+    ENTRYPOINT_SCHEMA,
+    ENTRYPOINTS,
+    EntrypointError,
+    MatrixTarget,
+    ReleaseMatrix,
+    assert_secrets_available,
+    fragment_path,
+    parse_matrix_file,
+    supported,
+)
 from .github import GitHubReleasePublisher
+from .github_api import GitHubReleaseRepository, UrllibGitHubTransport
 from .jvm import (
     BUILD_AUTO,
     BUILD_GRADLE,
@@ -96,7 +108,17 @@ from .plan import (
     SigningUnavailable,
     TargetNotExecutable,
 )
+from .plane import RELEASE_REFS, ReleaseEligibility, TagNotes, eligibility_for, notes_for
 from .play import GooglePlayPublisher, PlayError, PlaySettings
+from .provenance import (
+    BuildIdentity,
+    ProvenanceAttestor,
+    ProvenanceError,
+    StatementBundle,
+    read_bundle,
+    statement,
+    verify_statement,
+)
 from .state import (
     BLOCKED,
     COMPLETED,
@@ -110,6 +132,19 @@ from .state import (
     stage_names,
     unit_key,
 )
+from .transaction import (
+    FAILURE_TAXONOMY,
+    ReleaseResult,
+    TargetFailure,
+    TargetFragment,
+    TransactionError,
+    build_target,
+    classify,
+)
+# `transaction()` is deliberately not re-exported: a function of the same name as
+# the module shadows it for every `from continuum.release import transaction`, and
+# a call site that stops working because something was added to this file is not
+# a call site anybody signed up for.
 from .version import (
     ExplicitVersion,
     ProjectFileVersion,
@@ -133,11 +168,17 @@ __all__ = [
     "BUILD_AUTO",
     "BUILD_GRADLE",
     "BUILD_MAVEN",
+    "BuildIdentity",
     "BuildRequest",
     "CENTRAL_PUBLISHER",
     "COMPLETED",
     "CentralSettings",
     "ContractError",
+    "ENTRYPOINTS",
+    "ENTRYPOINT_SCHEMA",
+    "EntrypointError",
+    "FAILURE_TAXONOMY",
+    "GitHubReleaseRepository",
     "DISABLED_CODE",
     "DUPLICATE_EVENT_CODE",
     "EMPTY_JOURNAL",
@@ -175,7 +216,15 @@ __all__ = [
     "ReleaseComponents",
     "ReleaseCore",
     "ReleaseError",
+    "MatrixTarget",
+    "read_bundle",
+    "ProvenanceAttestor",
+    "ProvenanceError",
+    "RELEASE_REFS",
+    "ReleaseEligibility",
     "ReleaseEvent",
+    "ReleaseMatrix",
+    "ReleaseResult",
     "ReleaseNotes",
     "ReleaseOutcome",
     "ReleasePlan",
@@ -187,6 +236,11 @@ __all__ = [
     "SOURCE_CONFLICT_CODE",
     "SigningUnavailable",
     "StageOutcome",
+    "StatementBundle",
+    "TagNotes",
+    "TargetFailure",
+    "TargetFragment",
+    "TransactionError",
     "TagVersion",
     "TargetNotExecutable",
     "TargetSpec",

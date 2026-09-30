@@ -190,6 +190,9 @@ class FixtureAdapter:
     verified: List[BuildRequest] = field(default_factory=list)
     writes: List[str] = field(default_factory=list)
     fail_build: bool = False
+    #: A failure the adapter claims a classification for, so a test can prove
+    #: that a claimed retryability survives the trip through the core.
+    failure: Optional[BaseException] = None
     fail_verify: bool = False
     report_unverified: bool = False
     wrong_source: bool = False
@@ -247,6 +250,8 @@ class FixtureAdapter:
 
     def build(self, request: BuildRequest) -> ArtifactManifest:
         self.built.append(request)
+        if self.failure is not None:
+            raise self.failure
         if self.fail_build:
             raise ContractError("the fixture toolchain is broken")
         directory = self._directory(request)

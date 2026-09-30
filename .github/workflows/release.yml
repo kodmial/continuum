@@ -1,0 +1,383 @@
+name: Continuum release
+
+# The three jobs of the generic release contract, at the privilege levels the
+# contract requires. A consumer repository calls this from its own entry
+# workflow; it never runs on an event here, because a workflow that both offers
+# a release and triggers one cannot say which code was under test when the token
+# was in scope.
+#
+# The split is the security property, not a convenience:
+#
+#   resolve       no token. Reads policy, writes the matrix every job shares.
+#   target        no token. Builds from the pinned ref, writes one fragment.
+#   transaction   the only token. Merges every fragment, publishes once.
+#
+# A build runs code from a repository's own tree at a caller-supplied commit, so
+# the job that runs it is the job an attacker would like to reach. It is given no
+# credential and no destination: `continuum release target` cannot construct a
+# publisher even if the build asks for one. Everything that can write lives in
+# the transaction, which only runs after every fragment exists and has been
+# checked against the matrix.
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Version to release, as it appears in the tag
+        required: true
+        type: string
+      source_sha:
+        description: Exact commit to release, as a full 40-character SHA
+        required: true
+        type: string
+      event:
+        description: 'Release event: tag-push (from the pushed tag) or workflow-dispatch'
+        required: false
+        default: tag-push
+        type: string
+      tag:
+        description: Tag that was pushed; empty for a dispatched release, which has none
+        required: false
+        default: ""
+        type: string
+      channel:
+        description: Release channel
+        required: false
+        default: stable
+        type: string
+      config_path:
+        description: Path to the release policy
+        required: false
+        default: .continuum.yml
+        type: string
+      fragment_root:
+        description: Directory the build jobs write fragments to and the transaction reads
+        required: false
+        default: runs
+        type: string
+      environment:
+        description: Environment whose protection rules gate the publishing job
+        required: false
+        default: release
+        type: string
+      signing_material:
+        description: 'What each job expects of the signing secrets: auto, present, or absent'
+        required: false
+        default: auto
+        type: string
+      include_declared:
+        description: Release the buildable targets and report the declared ones as not shipped
+        required: false
+        default: false
+        type: boolean
+      prerelease:
+        description: Publish the GitHub Release as a prerelease
+        required: false
+        default: false
+        type: boolean
+      immutable:
+        description: Require the published release to be immutable, and refuse if it is not
+        required: false
+        default: false
+        type: boolean
+      attest:
+        description: Attach artifact attestations to everything published
+        required: false
+        default: false
+        type: boolean
+    secrets:
+      # Every secret is declared by name. Inheriting the caller's secrets
+      # wholesale would hand each job whatever the caller happened to have,
+      # which is how a signing key ends up in the environment of a job that
+      # builds untrusted code. The names below are the same set the static
+      # entrypoint table says the adapters read.
+      RELEASE_TOKEN:
+        description: Token that writes the GitHub Release; held by the transaction job only
+        required: true
+      CONTINUUM_APPLE_P12:
+        description: Apple signing certificate, as base64 PKCS#12
+        required: false
+      CONTINUUM_APPLE_P12_PASSWORD:
+        description: Passphrase for CONTINUUM_APPLE_P12
+        required: false
+      CONTINUUM_ANDROID_KEYSTORE:
+        description: Android upload keystore, as base64
+        required: false
+      CONTINUUM_ANDROID_KEYSTORE_PASSWORD:
+        description: Passphrase for CONTINUUM_ANDROID_KEYSTORE
+        required: false
+      CONTINUUM_GPG_PRIVATE_KEY:
+        description: ASCII-armoured GPG private key for JVM signing
+        required: false
+      CONTINUUM_GPG_PASSPHRASE:
+        description: Passphrase for CONTINUUM_GPG_PRIVATE_KEY
+        required: false
+
+# Contents is read for the whole workflow. Only the transaction job raises it,
+# and only for its own job, so a new job added here cannot inherit write
+# authority by being written next to the one that has it.
+permissions:
+  contents: read
+
+# One release per version, and never cancelled. Cancelling a transaction midway
+# leaves a draft that the next attempt has to recognise; the concurrency group
+# exists to stop two transactions publishing the same version at once, not to
+# stop the second one from starting.
+concurrency:
+  group: continuum-release-${{ github.repository }}-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve the release matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.resolve.outputs.matrix }}
+      rows: ${{ steps.resolve.outputs.rows }}
+      targets: ${{ steps.resolve.outputs.targets }}
+      declared_targets: ${{ steps.resolve.outputs.declared_targets }}
+      version: ${{ steps.resolve.outputs.version }}
+      source_sha: ${{ steps.resolve.outputs.source_sha }}
+      channel: ${{ steps.resolve.outputs.channel }}
+      ok: ${{ steps.resolve.outputs.ok }}
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+
+      - name: Resolve the matrix
+        id: resolve
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          CHANNEL: ${{ inputs.channel }}
+          CONFIG_PATH: ${{ inputs.config_path }}
+          FRAGMENT_ROOT: ${{ inputs.fragment_root }}
+          SIGNING_MATERIAL: ${{ inputs.signing_material }}
+          INCLUDE_DECLARED: ${{ inputs.include_declared }}
+        run: |
+          set -euo pipefail
+          # Built as an array and executed without a shell. These are
+          # caller-supplied strings, and the runner substitutes them before the
+          # shell ever parses this file, so a version containing a semicolon
+          # spliced into a command line would be a second command rather than a
+          # version.
+          args=(
+            release resolve
+            --config "$CONFIG_PATH"
+            --fragment-root "$FRAGMENT_ROOT"
+            --version "$VERSION"
+            --source-sha "$SOURCE_SHA"
+            --channel "$CHANNEL"
+            --signing-material "$SIGNING_MATERIAL"
+          )
+          # A boolean input is either the flag or nothing. `--include-declared
+          # false` is not a way to turn it off: argparse would read the flag as
+          # set and `false` as a stray positional, and the release would resolve
+          # in the mode the caller asked it not to.
+          if [[ "$INCLUDE_DECLARED" == "true" ]]; then args+=(--include-declared); fi
+          PYTHONPATH=src python3 -m continuum.cli "${args[@]}"
+
+      - name: Preserve the matrix for the build jobs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-matrix-${{ inputs.source_sha }}
+          path: ${{ inputs.fragment_root }}
+          if-no-files-found: error
+          retention-days: 7
+
+  target:
+    name: Build ${{ matrix.target }}
+    needs: resolve
+    if: needs.resolve.outputs.ok == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    # fail-fast is off so one broken platform does not cancel the others: the
+    # transaction refuses a partial set anyway, so cancelling the survivors
+    # would only turn a reportable gap into less evidence about it.
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.resolve.outputs.rows) }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+
+      - name: Restore the matrix
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v5.0.0
+        with:
+          name: release-matrix-${{ inputs.source_sha }}
+          path: ${{ inputs.fragment_root }}
+
+      - name: Build, sign, and verify this target
+        id: target
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          REPOSITORY: ${{ github.repository }}
+          EVENT: ${{ inputs.event }}
+          CONFIG_PATH: ${{ inputs.config_path }}
+          FRAGMENT_ROOT: ${{ inputs.fragment_root }}
+          SIGNING_MATERIAL: ${{ inputs.signing_material }}
+          # One variable per secret in the entrypoint table, each gated on the
+          # adapter that reads it. A secret reaches this job only when the row
+          # it belongs to is the row being built: the Apple certificate is not
+          # in the environment of the Android build, and the gating is visible
+          # in the workflow rather than inside a loop the reader has to trust.
+          CONTINUUM_APPLE_P12: ${{ matrix.adapter == 'apple' && secrets.CONTINUUM_APPLE_P12 || '' }}
+          CONTINUUM_APPLE_P12_PASSWORD: ${{ matrix.adapter == 'apple' && secrets.CONTINUUM_APPLE_P12_PASSWORD || '' }}
+          CONTINUUM_ANDROID_KEYSTORE: ${{ matrix.adapter == 'android' && secrets.CONTINUUM_ANDROID_KEYSTORE || '' }}
+          CONTINUUM_ANDROID_KEYSTORE_PASSWORD: ${{ matrix.adapter == 'android' && secrets.CONTINUUM_ANDROID_KEYSTORE_PASSWORD || '' }}
+          CONTINUUM_GPG_PRIVATE_KEY: ${{ matrix.adapter == 'jvm' && secrets.CONTINUUM_GPG_PRIVATE_KEY || '' }}
+          CONTINUUM_GPG_PASSPHRASE: ${{ matrix.adapter == 'jvm' && secrets.CONTINUUM_GPG_PASSPHRASE || '' }}
+        run: |
+          set -euo pipefail
+          # No token is in this step's environment, and none is in this job's.
+          # `release target` has no publisher to construct, so the strongest
+          # thing this build can do is fail.
+          PYTHONPATH=src python3 -m continuum.cli release target \
+            --config "$CONFIG_PATH" \
+            --fragment-root "$FRAGMENT_ROOT" \
+            --target "$TARGET" \
+            --repository "$REPOSITORY" \
+            --event "$EVENT" \
+            --signing-material "$SIGNING_MATERIAL"
+
+      - name: Publish the fragment for the transaction
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-fragment-${{ matrix.target }}-${{ inputs.source_sha }}
+          path: ${{ inputs.fragment_root }}
+          if-no-files-found: error
+          retention-days: 7
+
+  transaction:
+    name: Publish the release
+    needs: [resolve, target]
+    # Runs even when a build job failed. A skipped transaction and a transaction
+    # that refused an incomplete set look identical from the outside, and only
+    # one of them says which target is missing and what to do about it. The
+    # refusal is the report.
+    if: ${{ !cancelled() && needs.resolve.outputs.ok == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # The only job that can write, and only after the environment's protection
+    # rules have approved it. The environment is a required input rather than a
+    # literal so a repository can point it at its own reviewers, and a
+    # repository that wants no approval gate says so explicitly.
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: write
+    outputs:
+      status: ${{ steps.transaction.outputs.status }}
+      ok: ${{ steps.transaction.outputs.ok }}
+      retryable: ${{ steps.transaction.outputs.retryable }}
+      code: ${{ steps.transaction.outputs.code }}
+      tag: ${{ steps.transaction.outputs.tag }}
+      release: ${{ steps.transaction.outputs.release }}
+      targets: ${{ steps.transaction.outputs.targets }}
+      declared: ${{ steps.transaction.outputs.declared }}
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+
+      - name: Restore the matrix
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v5.0.0
+        with:
+          name: release-matrix-${{ inputs.source_sha }}
+          path: ${{ inputs.fragment_root }}
+
+      # Every fragment this run's build jobs wrote, merged into one directory.
+      # A missing one is a refusal rather than a smaller release, and the
+      # transaction names the target that is missing.
+      - name: Restore every target's fragment
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v5.0.0
+        with:
+          pattern: release-fragment-*-${{ inputs.source_sha }}
+          path: ${{ inputs.fragment_root }}
+          merge-multiple: true
+
+      - name: Merge, verify, and publish once
+        id: transaction
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          EVENT: ${{ inputs.event }}
+          TAG: ${{ inputs.tag }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          CONFIG_PATH: ${{ inputs.config_path }}
+          FRAGMENT_ROOT: ${{ inputs.fragment_root }}
+          PRERELEASE: ${{ inputs.prerelease }}
+          IMMUTABLE: ${{ inputs.immutable }}
+          ATTEST: ${{ inputs.attest }}
+          # The caller's workflow identity, not this one. An attestation has to
+          # name the workflow that was entered, because that is the entry a
+          # consumer reviews; `BuildIdentity` requires the two halves to agree,
+          # so the ref is taken from the same string rather than passed twice.
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_REVISION: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          # Built as an array and executed without a shell so a version or a tag
+          # containing a space cannot become two arguments.
+          args=(
+            release transaction
+            --config "$CONFIG_PATH"
+            --fragment-root "$FRAGMENT_ROOT"
+            --repository "$REPOSITORY"
+            --event "$EVENT"
+            --tag "$TAG"
+            --workflow "$WORKFLOW_REF"
+            --workflow-ref "${WORKFLOW_REVISION##*@}"
+            --source-sha "$SOURCE_SHA"
+          )
+          if [[ "$PRERELEASE" == "true" ]]; then args+=(--prerelease); fi
+          if [[ "$IMMUTABLE" == "true" ]]; then args+=(--immutable); fi
+          if [[ "$ATTEST" == "true" ]]; then args+=(--attest); fi
+          # A previous attempt's journal, if this run was given one, so a
+          # publish that partly succeeded is resumed rather than repeated.
+          if [[ -f "$FRAGMENT_ROOT/journal.json" ]]; then
+            args+=(--journal "$FRAGMENT_ROOT/journal.json")
+          fi
+          PYTHONPATH=src python3 -m continuum.cli "${args[@]}"
+
+      - name: Report the release
+        if: always()
+        shell: bash
+        env:
+          STATUS: ${{ steps.transaction.outputs.status }}
+          CODE: ${{ steps.transaction.outputs.code }}
+          RETRYABLE: ${{ steps.transaction.outputs.retryable }}
+          TAG: ${{ steps.transaction.outputs.tag }}
+          RELEASE_URL: ${{ steps.transaction.outputs.release }}
+          TARGETS: ${{ steps.transaction.outputs.targets }}
+          DECLARED: ${{ steps.transaction.outputs.declared }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Continuum release: ${STATUS:-not reached}"
+            if [[ -n "$TAG" ]]; then echo "- tag: \`$TAG\`"; fi
+            if [[ -n "$RELEASE_URL" ]]; then echo "- release: $RELEASE_URL"; fi
+            if [[ -n "$TARGETS" ]]; then echo "- targets: $TARGETS"; fi
+            if [[ -n "$DECLARED" ]]; then
+              echo "- **not shipped**: $DECLARED — declared in the policy, with no release adapter"
+            fi
+            if [[ -n "$CODE" ]]; then
+              echo "- failure: \`$CODE\` ($([ "$RETRYABLE" = "true" ] && echo retryable || echo needs a human))"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
