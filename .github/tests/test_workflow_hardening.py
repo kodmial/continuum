@@ -861,7 +861,7 @@ class RepairControllerTests(WorkflowAuditBase):
         self.assertIn("Infrastructure retry", repair)
         self.assertIn("semantic attempt budget remains untouched", repair)
         self.assertLess(
-            repair.index("Load Continuum engine", repair.index("issue-run-recovery:")),
+            repair.index("Materialize the exact Continuum engine", repair.index("issue-run-recovery:")),
             repair.index("failure_retry.py", repair.index("issue-run-recovery:")),
         )
 
