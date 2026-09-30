@@ -150,18 +150,8 @@ on:
         description: read the state from GitHub
         type: boolean
         default: false
-      run_url:
-        description: provenance; the run this evidence belongs to
-        type: string
-      delivery_id:
-        description: provenance; the webhook delivery id
-        type: string
       trusted_actors:
         description: AUTOMATION_TRUSTED_ACTORS for the shadowed repository
-        type: string
-        default: ""
-      token:
-        description: a read-only token for the shadowed repository
         type: string
         default: ""
       budget_ms:
@@ -193,14 +183,14 @@ on:
       parity_paths:
         description: cutover; newline-separated parity result documents
         type: string
-      default: ""
+        default: ""
       liveness_path:
         description: cutover; the window's liveness report
         type: string
       resolutions_path:
         description: cutover; newline-separated divergence resolution documents
         type: string
-      default: ""
+        default: ""
       origins:
         description: cutover; correlation id to origin mapping, as JSON
         type: string
@@ -258,7 +248,7 @@ jobs:
       DELIVERY_ID: ${{ inputs.delivery_id }}
       BUDGET_MS: ${{ inputs.budget_ms }}
       SAVE_CASE: ${{ inputs.save_case }}
-      JOB_WORKFLOW_REF: ${{ github.job_workflow_ref }}
+      JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
       ENGINE_REF_INPUT: ${{ inputs.engine_ref }}
       RUN_ATTEMPT: ${{ github.run_attempt }}
       RUN_ID: ${{ github.run_id }}
@@ -269,12 +259,11 @@ jobs:
         id: engine
         run: |
           set -euo pipefail
-          # The pin lives in the caller's `uses:` line, so a called run derives
-          # the ref from this workflow's own reference rather than trusting an
-          # input. A dispatch has no `uses:` line and must name the commit
-          # explicitly, because evidence has to name the code that made it.
-          if [ -n "${JOB_WORKFLOW_REF:-}" ] && [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]; then
-            ref="${JOB_WORKFLOW_REF#*@}"
+          # A called run uses job.workflow_sha, which is the exact commit SHA
+          # of the reusable workflow definition selected by the caller's uses:
+          # reference. A manual dispatch must name the engine commit explicitly.
+          if [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]; then
+            ref="${JOB_WORKFLOW_SHA:-}"
           else
             ref="${ENGINE_REF_INPUT:-}"
           fi
@@ -503,15 +492,15 @@ jobs:
       ROLLBACK_PATH: ${{ inputs.rollback_path }}
       WINDOW_START: ${{ inputs.window_start }}
       WINDOW_END: ${{ inputs.window_end }}
-      JOB_WORKFLOW_REF: ${{ github.job_workflow_ref }}
+      JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
       ENGINE_REF_INPUT: ${{ inputs.engine_ref }}
     steps:
       - name: Resolve the pinned engine
         id: engine
         run: |
           set -euo pipefail
-          if [ -n "${JOB_WORKFLOW_REF:-}" ] && [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]; then
-            ref="${JOB_WORKFLOW_REF#*@}"
+          if [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]; then
+            ref="${JOB_WORKFLOW_SHA:-}"
           else
             ref="${ENGINE_REF_INPUT:-}"
           fi
