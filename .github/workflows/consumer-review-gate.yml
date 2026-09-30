@@ -103,7 +103,7 @@ jobs:
       reason: ${{ steps.target.outputs.reason }}
     steps:
       - name: Load Continuum engine
-        uses: kodmial/continuum/.github/actions/engine-path@39ca6dc798f2201390c8fdef0395157f588657ec
+        uses: kodmial/continuum/.github/actions/engine-path@81adcea69ce9c260f1aad4177867f8449a75d9b3
 
       # The wake-up event varies; the target does not. Every entry point resolves
       # to one candidate pull request here, and the privileged job below is
@@ -194,7 +194,7 @@ jobs:
       allowed: ${{ steps.dispatch.outputs.allowed }}
     steps:
       - name: Load Continuum engine
-        uses: kodmial/continuum/.github/actions/engine-path@39ca6dc798f2201390c8fdef0395157f588657ec
+        uses: kodmial/continuum/.github/actions/engine-path@81adcea69ce9c260f1aad4177867f8449a75d9b3
 
       - name: Re-verify the dispatch against the live pull request
         id: dispatch
@@ -235,7 +235,7 @@ jobs:
       pull-requests: write
     steps:
       - name: Load Continuum engine
-        uses: kodmial/continuum/.github/actions/engine-path@39ca6dc798f2201390c8fdef0395157f588657ec
+        uses: kodmial/continuum/.github/actions/engine-path@81adcea69ce9c260f1aad4177867f8449a75d9b3
 
       # The contract is repository-controlled and versioned with the code, so it
       # is read from the base branch: a pull request does not get to declare that
