@@ -1,12 +1,17 @@
-name: pr-agent
+name: PR Agent (manual, Groq)
 
 on:
   issue_comment:
     types: [created]
 
-permissions: read-all
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
 
 jobs:
   call:
     uses: kodmial/continuum/.github/workflows/pr-agent.yml@main
     secrets: inherit
+    with:
+      continuum_ref: main

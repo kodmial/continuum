@@ -1,4 +1,4 @@
-name: ci
+name: CI
 
 on:
   push:
@@ -11,9 +11,13 @@ on:
       - 'LICENSE'
   pull_request:
 
-permissions: read-all
+permissions:
+  contents: read
+  pull-requests: read
 
 jobs:
   call:
     uses: kodmial/continuum/.github/workflows/ci.yml@main
     secrets: inherit
+    with:
+      continuum_ref: main

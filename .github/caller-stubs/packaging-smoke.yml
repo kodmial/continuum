@@ -1,4 +1,4 @@
-name: packaging-smoke
+name: Packaging smoke
 
 on:
   pull_request:
@@ -50,9 +50,15 @@ on:
         type: string
         default: ''
 
-permissions: read-all
+permissions:
+  contents: read
+  issues: write
 
 jobs:
   call:
     uses: kodmial/continuum/.github/workflows/packaging-smoke.yml@main
     secrets: inherit
+    with:
+      continuum_ref: main
+      mode: "${{ inputs.mode || 'both' }}"
+      version: "${{ inputs.version || '' }}"

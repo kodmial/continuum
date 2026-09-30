@@ -1,0 +1,138 @@
+# frozen_string_literal: true
+
+require 'minitest/autorun'
+require 'yaml'
+require 'tmpdir'
+require 'fileutils'
+require 'open3'
+
+class ContinuumTest < Minitest::Test
+  ROOT = File.expand_path('..', __dir__)
+  STUBS = Dir[File.join(ROOT, '.github/caller-stubs/*.yml')].sort
+
+  def yaml(path)
+    YAML.load_file(path)
+  end
+
+  def events(workflow)
+    workflow['on'] || workflow[true]
+  end
+
+  def each_pair
+    STUBS.each do |path|
+      yield yaml(path), yaml(File.join(ROOT, '.github/workflows', File.basename(path)))
+    end
+  end
+
+  def fixture
+    parent = File.join(ROOT, '.opencode-tmp')
+    FileUtils.mkdir_p(parent)
+    Dir.mktmpdir('continuum-tests-', parent) { |dir| yield dir }
+  ensure
+    Dir.rmdir(parent) if parent && Dir.exist?(parent) && Dir.empty?(parent)
+  end
+
+  def test_callable_contracts_and_dispatch_inputs
+    each_pair do |caller, callee|
+      assert_equal ['workflow_call'], events(callee).keys
+      call = events(callee).fetch('workflow_call')
+      assert(call['secrets'].nil? || call['secrets'].is_a?(Hash))
+      assert_equal callee['name'], caller['name']
+      job = caller.fetch('jobs').fetch('call')
+      events(caller).fetch('workflow_dispatch', nil).to_h.fetch('inputs', {}).each do |key, value|
+        expected = value['type'] == 'choice' ? 'string' : value['type']
+        assert_equal expected, call.fetch('inputs').fetch(key).fetch('type')
+        assert_includes job.fetch('with').fetch(key), "inputs.#{key}"
+      end
+      job.fetch('with').each_key { |key| assert call.fetch('inputs').key?(key) }
+      assert_equal 'main', job.fetch('with').fetch('continuum_ref')
+      assert_equal 'inherit', job['secrets']
+    end
+  end
+
+  def test_callers_grant_required_permissions
+    rank = {'none'=>0, 'read'=>1, 'write'=>2}
+    each_pair do |caller, callee|
+      permissions = caller.fetch('permissions')
+      ([callee['permissions']] + callee['jobs'].values.map { |job| job['permissions'] }).compact.each do |required|
+        required.each do |key, value|
+          assert_operator rank.fetch(permissions.fetch(key, 'none')), :>=, rank.fetch(value), "#{caller['name']}: #{key}"
+        end
+      end
+    end
+  end
+
+  def test_workflow_run_dependencies_exist
+    names = STUBS.map { |path| yaml(path).fetch('name') }
+    each_pair do |caller, _|
+      events(caller).fetch('workflow_run', {}).fetch('workflows', []).each do |name|
+        assert_includes names, name
+      end
+    end
+  end
+
+  def test_manifest_environment_belongs_to_executable_step
+    release = yaml(File.join(ROOT, '.github/workflows/release.yml'))
+    steps = release.fetch('jobs').fetch('manifests').fetch('steps')
+    steps.each { |step| assert(step.key?('run') || step.key?('uses'), step['name']) }
+    generate = steps.find { |step| step['run'].to_s.include?('ruby scripts/release-prep.rb "v$VERSION"') }
+    %w[VERSION MAINTAINERS REVISION].each { |key| assert generate.fetch('env').key?(key) }
+  end
+
+  def test_fallback_preserves_existing_scripts_and_copies_missing_files
+    fixture do |dir|
+      FileUtils.mkdir_p(File.join(dir, 'scripts'))
+      File.write(File.join(dir, 'scripts/local.sh'), 'consumer')
+      File.write(File.join(dir, 'scripts/release-policy.sh'), 'consumer policy')
+      FileUtils.mkdir_p(File.join(dir, '.continuum'))
+      FileUtils.cp_r(File.join(ROOT, 'scripts'), File.join(dir, '.continuum/scripts'))
+      each_pair do |_, callee|
+        callee['jobs'].each_value do |job|
+          job.fetch('steps', []).each do |step|
+            next unless step['name'] == 'Copy missing Continuum scripts'
+            output, status = Open3.capture2e('bash', '-e', '-c', step.fetch('run'), chdir: dir)
+            assert status.success?, output
+          end
+        end
+      end
+      assert_equal 'consumer', File.read(File.join(dir, 'scripts/local.sh'))
+      assert_equal 'consumer policy', File.read(File.join(dir, 'scripts/release-policy.sh'))
+      %w[release-prep.rb test-release-policy.sh packaging-smoke/common.sh packaging-smoke/make-candidate.sh].each do |file|
+        assert File.file?(File.join(dir, 'scripts', file)), file
+      end
+    end
+  end
+
+  def test_installer_local_and_explicit_ref
+    fixture do |dir|
+      output, status = Open3.capture2e('bash', File.join(ROOT, 'install.sh'), File.join(dir, 'local'))
+      assert status.success?, output
+      assert_equal 16, Dir[File.join(dir, 'local/.github/workflows/*.yml')].size
+      bin = File.join(dir, 'bin')
+      FileUtils.mkdir_p(bin)
+      # Record downloads and serve templates locally, without network requests.
+      File.write(File.join(bin, 'curl'), <<~SH)
+        #!/usr/bin/env bash
+        set -eu
+        printf '%s\\n' "$*" >> "$DOWNLOAD_LOG"
+        url="${@: -1}"
+        cat "$TEMPLATES/${url##*/}"
+      SH
+      FileUtils.chmod(0755, File.join(bin, 'curl'))
+      env = {'PATH'=>"#{bin}:#{ENV['PATH']}", 'DOWNLOAD_LOG'=>File.join(dir, 'downloads'), 'TEMPLATES'=>File.join(ROOT, '.github/caller-stubs')}
+      ['release/v2', 'a' * 40, '123'].each do |ref|
+        output, status = Open3.capture2e(env, 'bash', File.join(ROOT, 'install.sh'), File.join(dir, 'pinned'), ref)
+        assert status.success?, output
+        Dir[File.join(dir, 'pinned/.github/workflows/*.yml')].each do |file|
+          job = yaml(file).fetch('jobs').fetch('call')
+          assert job['uses'].end_with?("@#{ref}")
+          assert_equal ref, job.fetch('with').fetch('continuum_ref')
+        end
+        assert_includes File.read(env['DOWNLOAD_LOG']), "/#{ref}/.github/caller-stubs/"
+      end
+      output, status = Open3.capture2e('bash', File.join(ROOT, 'install.sh'), File.join(dir, 'invalid'), 'bad&ref')
+      refute status.success?, output
+      refute Dir.exist?(File.join(dir, 'invalid'))
+    end
+  end
+end

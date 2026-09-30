@@ -27,55 +27,23 @@ name: Packaging smoke
 
 on:
   workflow_call:
-    secrets: inherit
-  pull_request:
-    paths:
-      - 'Sources/**'
-      - 'Package.swift'
-      - 'packaging/**'
-      - 'scripts/**'
-      - 'Resources/**'
-      - 'config.example.toml'
-      - '.github/workflows/packaging-smoke.yml'
-      - '.github/workflows/release.yml'
-  push:
-    branches:
-      - main
-    tags:
-      - 'v*'
-    paths:
-      - 'Sources/**'
-      - 'Package.swift'
-      - 'packaging/**'
-      - 'scripts/**'
-      - 'Resources/**'
-      - 'config.example.toml'
-      - '.github/workflows/packaging-smoke.yml'
-      - '.github/workflows/release.yml'
-  workflow_run:
-    workflows:
-      - Release
-    types:
-      - completed
-  schedule:
-    # Non-round daily canary time (03:17 UTC), not the top of the hour.
-    - cron: '17 3 * * *'
-  workflow_dispatch:
     inputs:
       mode:
-        description: 'Which smoke mode to run'
+        description: Which smoke mode to run
         required: false
-        type: choice
+        type: string
         default: both
-        options:
-          - both
-          - candidate
-          - production
       version:
-        description: 'Production version to verify (e.g. 0.1.7). Empty = latest stable release.'
+        description: Production version to verify (e.g. 0.1.7). Empty = latest stable
+          release.
         required: false
         type: string
         default: ''
+      continuum_ref:
+        description: Continuum revision supplying fallback scripts
+        type: string
+        default: main
+        required: false
 
 permissions:
   contents: read
@@ -292,18 +260,24 @@ jobs:
           path: candidate-dist
           merge-multiple: true
 
+      - name: Ensure Continuum scripts available
+        if: hashFiles('scripts/packaging-smoke/common.sh') == ''
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: kodmial/continuum
+          ref: ${{ inputs.continuum_ref || 'main' }}
+          path: .continuum
+          persist-credentials: false
+
+      - name: Copy missing Continuum scripts
+        if: hashFiles('scripts/packaging-smoke/common.sh') == ''
+        run: |
+          mkdir -p scripts
+          rsync -a --ignore-existing .continuum/scripts/ scripts/
+
       - name: Derive candidate Cask and run the Homebrew lifecycle
         run: |
           set -euo pipefail
-          if [[ ! -f scripts/packaging-smoke/common.sh ]]; then
-            if [[ -d .continuum ]]; then ln -sfn .continuum/scripts scripts 2>/dev/null || true; fi
-            if [[ ! -f scripts/packaging-smoke/common.sh ]]; then
-              REF="${REF:-main}"
-              [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "invalid ref: $REF" >&2; exit 1; }
-              git clone --branch "$REF" --depth 1 https://github.com/kodmial/continuum.git .continuum 2>/dev/null || true
-              ln -sfn .continuum/scripts scripts 2>/dev/null || true
-            fi
-          fi
           chmod +x scripts/packaging-smoke/*.sh
           VERSION="$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' Sources/NanoDictateCore/Version.swift)"
           echo "Candidate version: $VERSION"
@@ -348,18 +322,24 @@ jobs:
           path: candidate-dist
           merge-multiple: true
 
+      - name: Ensure Continuum scripts available
+        if: hashFiles('scripts/packaging-smoke/common.sh') == ''
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: kodmial/continuum
+          ref: ${{ inputs.continuum_ref || 'main' }}
+          path: .continuum
+          persist-credentials: false
+
+      - name: Copy missing Continuum scripts
+        if: hashFiles('scripts/packaging-smoke/common.sh') == ''
+        run: |
+          mkdir -p scripts
+          rsync -a --ignore-existing .continuum/scripts/ scripts/
+
       - name: Derive candidate Portfile and run the MacPorts lifecycle
         run: |
           set -euo pipefail
-          if [[ ! -f scripts/packaging-smoke/common.sh ]]; then
-            if [[ -d .continuum ]]; then ln -sfn .continuum/scripts scripts 2>/dev/null || true; fi
-            if [[ ! -f scripts/packaging-smoke/common.sh ]]; then
-              REF="${REF:-main}"
-              [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "invalid ref: $REF" >&2; exit 1; }
-              git clone --branch "$REF" --depth 1 https://github.com/kodmial/continuum.git .continuum 2>/dev/null || true
-              ln -sfn .continuum/scripts scripts 2>/dev/null || true
-            fi
-          fi
           chmod +x scripts/packaging-smoke/*.sh
           VERSION="$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' Sources/NanoDictateCore/Version.swift)"
           echo "Candidate version: $VERSION"
@@ -397,21 +377,27 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Ensure Continuum scripts available
+        if: hashFiles('scripts/packaging-smoke/common.sh') == ''
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: kodmial/continuum
+          ref: ${{ inputs.continuum_ref || 'main' }}
+          path: .continuum
+          persist-credentials: false
+
+      - name: Copy missing Continuum scripts
+        if: hashFiles('scripts/packaging-smoke/common.sh') == ''
+        run: |
+          mkdir -p scripts
+          rsync -a --ignore-existing .continuum/scripts/ scripts/
+
       - name: Run the production Homebrew lifecycle
         env:
           INPUT_VERSION: ${{ inputs.version }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if [[ ! -f scripts/packaging-smoke/common.sh ]]; then
-            if [[ -d .continuum ]]; then ln -sfn .continuum/scripts scripts 2>/dev/null || true; fi
-            if [[ ! -f scripts/packaging-smoke/common.sh ]]; then
-              REF="${REF:-main}"
-              [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "invalid ref: $REF" >&2; exit 1; }
-              git clone --branch "$REF" --depth 1 https://github.com/kodmial/continuum.git .continuum 2>/dev/null || true
-              ln -sfn .continuum/scripts scripts 2>/dev/null || true
-            fi
-          fi
           chmod +x scripts/packaging-smoke/*.sh
           if [ -n "${INPUT_VERSION:-}" ]; then
             VERSION="${INPUT_VERSION#v}"
@@ -454,21 +440,27 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Ensure Continuum scripts available
+        if: hashFiles('scripts/packaging-smoke/common.sh') == ''
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: kodmial/continuum
+          ref: ${{ inputs.continuum_ref || 'main' }}
+          path: .continuum
+          persist-credentials: false
+
+      - name: Copy missing Continuum scripts
+        if: hashFiles('scripts/packaging-smoke/common.sh') == ''
+        run: |
+          mkdir -p scripts
+          rsync -a --ignore-existing .continuum/scripts/ scripts/
+
       - name: Run the production MacPorts lifecycle
         env:
           INPUT_VERSION: ${{ inputs.version }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if [[ ! -f scripts/packaging-smoke/common.sh ]]; then
-            if [[ -d .continuum ]]; then ln -sfn .continuum/scripts scripts 2>/dev/null || true; fi
-            if [[ ! -f scripts/packaging-smoke/common.sh ]]; then
-              REF="${REF:-main}"
-              [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "invalid ref: $REF" >&2; exit 1; }
-              git clone --branch "$REF" --depth 1 https://github.com/kodmial/continuum.git .continuum 2>/dev/null || true
-              ln -sfn .continuum/scripts scripts 2>/dev/null || true
-            fi
-          fi
           chmod +x scripts/packaging-smoke/*.sh
           if [ -n "${INPUT_VERSION:-}" ]; then
             VERSION="${INPUT_VERSION#v}"

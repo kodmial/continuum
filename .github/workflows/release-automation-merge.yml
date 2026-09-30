@@ -2,13 +2,12 @@ name: Merge trusted release automation PRs
 
 on:
   workflow_call:
-    secrets: inherit
-  workflow_run:
-    workflows: ["CI"]
-    types: [completed]
-  push:
-    branches: [main]
-  workflow_dispatch:
+    inputs:
+      continuum_ref:
+        description: Continuum revision supplying fallback scripts
+        type: string
+        default: main
+        required: false
 
 # This workflow is deliberately privileged but never checks out or executes PR
 # code. It only reads PR metadata/file contents through the GitHub API, validates

@@ -2,10 +2,12 @@ name: mark-ready-for-coderabbit
 
 on:
   workflow_call:
-    secrets: inherit
-  workflow_run:
-    workflows: ["CI"]
-    types: [completed]
+    inputs:
+      continuum_ref:
+        description: Continuum revision supplying fallback scripts
+        type: string
+        default: main
+        required: false
 
 permissions:
   actions: write

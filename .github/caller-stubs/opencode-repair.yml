@@ -1,4 +1,4 @@
-name: opencode-repair
+name: OpenCode repair controller
 
 on:
   # This trusted metadata workflow never checks out or executes PR code.
@@ -8,9 +8,11 @@ on:
     workflows: ["CI", "Packaging smoke"]
     types: [completed]
 
-permissions: read-all
+permissions: {}
 
 jobs:
   call:
     uses: kodmial/continuum/.github/workflows/opencode-repair.yml@main
     secrets: inherit
+    with:
+      continuum_ref: main

@@ -1,4 +1,4 @@
-name: auto-merge
+name: Auto-merge reviewed pull requests
 
 on:
   # Successful PR CI explicitly dispatches this reconciler from
@@ -16,9 +16,16 @@ on:
     - cron: '17,47 * * * *'
   workflow_dispatch:
 
-permissions: read-all
+permissions:
+  actions: write
+  contents: write
+  issues: write
+  pull-requests: write
+  statuses: read
 
 jobs:
   call:
     uses: kodmial/continuum/.github/workflows/auto-merge.yml@main
     secrets: inherit
+    with:
+      continuum_ref: main

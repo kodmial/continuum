@@ -1,12 +1,17 @@
-name: opencode-unresolved
+name: Retry OpenCode on CodeRabbit unresolved
 
 on:
   pull_request_review_comment:
     types: [created]
 
-permissions: read-all
+permissions:
+  actions: write
+  contents: read
+  pull-requests: read
 
 jobs:
   call:
     uses: kodmial/continuum/.github/workflows/opencode-unresolved.yml@main
     secrets: inherit
+    with:
+      continuum_ref: main

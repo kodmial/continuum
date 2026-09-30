@@ -2,19 +2,13 @@ name: Retry CodeRabbit after rate limit
 
 on:
   workflow_call:
-    secrets: inherit
+    inputs:
+      continuum_ref:
+        description: Continuum revision supplying fallback scripts
+        type: string
+        default: main
+        required: false
   # Any new/edited CodeRabbit rate-limit response wakes the global controller.
-  issue_comment:
-    types: [created, edited]
-
-  # A completed CodeRabbit review consumes the shared included-review quota.
-  # Wake the controller so it can move the next queued PR behind the global
-  # cooldown instead of immediately burning another retry.
-  pull_request_review:
-    types: [submitted]
-
-  # Manual/safety-net reconciliation.
-  workflow_dispatch:
 
 permissions: {}
 

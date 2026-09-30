@@ -2,9 +2,12 @@ name: Retry OpenCode on CodeRabbit unresolved
 
 on:
   workflow_call:
-    secrets: inherit
-  pull_request_review_comment:
-    types: [created]
+    inputs:
+      continuum_ref:
+        description: Continuum revision supplying fallback scripts
+        type: string
+        default: main
+        required: false
 
 permissions: {}
 

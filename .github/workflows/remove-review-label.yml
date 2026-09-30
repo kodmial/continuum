@@ -6,9 +6,12 @@ name: remove-review-ready-on-sync
 
 on:
   workflow_call:
-    secrets: inherit
-  pull_request:
-    types: [synchronize]
+    inputs:
+      continuum_ref:
+        description: Continuum revision supplying fallback scripts
+        type: string
+        default: main
+        required: false
 
 permissions:
   issues: write

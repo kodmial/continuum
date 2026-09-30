@@ -1,4 +1,4 @@
-name: release-automation-merge
+name: Merge trusted release automation PRs
 
 on:
   workflow_run:
@@ -8,9 +8,15 @@ on:
     branches: [main]
   workflow_dispatch:
 
-permissions: read-all
+permissions:
+  actions: read
+  contents: write
+  issues: write
+  pull-requests: write
 
 jobs:
   call:
     uses: kodmial/continuum/.github/workflows/release-automation-merge.yml@main
     secrets: inherit
+    with:
+      continuum_ref: main

@@ -30,17 +30,19 @@ STUBS=(
   release.yml
   remove-review-label.yml
 )
-LOCAL_STUBS_DIR="$(dirname "$0")/.github/caller-stubs"
-if [[ -d "$LOCAL_STUBS_DIR" ]]; then
-  shopt -s nullglob
-  files=("$LOCAL_STUBS_DIR"/*.yml)
-  shopt -u nullglob
-  if (( ${#files[@]} )); then
-    cp "${files[@]}" "$DEST/.github/workflows/"
+# Only use local templates when installing the default working-tree version.
+# An explicit ref must fetch that revision, even when run from a local clone.
+LOCAL_STUBS_DIR="$(dirname "${BASH_SOURCE[0]:-$0}")/.github/caller-stubs"
+for f in "${STUBS[@]}"; do
+  if [[ $# -lt 2 && -f "$LOCAL_STUBS_DIR/$f" ]]; then
+    template="$(cat "$LOCAL_STUBS_DIR/$f")"
+  else
+    template="$(curl -fsSL "$BASE/$f")"
   fi
-else
-  for f in "${STUBS[@]}"; do
-    curl -fsSL "$BASE/$f" -o "$DEST/.github/workflows/$f"
-  done
-fi
+  # Use the same revision for the workflow and its fallback scripts.
+  printf '%s\n' "$template" | sed \
+    -e "s|kodmial/continuum/\\(.github/workflows/[^@ ]*\\)@main|kodmial/continuum/\\1@$REF|g" \
+    -e "s|continuum_ref: main|continuum_ref: '$REF'|" \
+    > "$DEST/.github/workflows/$f"
+done
 echo "Continuum callers installed to $DEST/.github/workflows/ (ref: $REF)"

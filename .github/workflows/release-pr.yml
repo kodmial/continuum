@@ -68,18 +68,12 @@ name: Release PR
 
 on:
   workflow_call:
-    secrets: inherit
-  pull_request:
-    types: [closed]
-  # Recovery/reconciliation wake-up: a normal code PR can merge while the
-  # previous Release workflow is still publishing. In that window
-  # Version.swift is already ahead of the latest published release, so the
-  # pull_request event correctly defers. Re-run reconciliation when Release
-  # finishes successfully so that deferred code cannot be stranded forever.
-  workflow_run:
-    workflows: ["Release"]
-    types: [completed]
-  workflow_dispatch:
+    inputs:
+      continuum_ref:
+        description: Continuum revision supplying fallback scripts
+        type: string
+        default: main
+        required: false
 
 permissions: {}
 
@@ -119,6 +113,21 @@ jobs:
       # Everything that DECIDES whether the Release PR is updated happens here,
       # so the only steps that can touch the Release PR branch are the ones
       # gated on decision == 'releasable'.
+      - name: Ensure Continuum scripts available
+        if: hashFiles('scripts/release-policy.sh') == ''
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: kodmial/continuum
+          ref: ${{ inputs.continuum_ref || 'main' }}
+          path: .continuum
+          persist-credentials: false
+
+      - name: Copy missing Continuum scripts
+        if: hashFiles('scripts/release-policy.sh') == ''
+        run: |
+          mkdir -p scripts
+          rsync -a --ignore-existing .continuum/scripts/ scripts/
+
       - name: Decide release policy
         id: policy
         env:
@@ -134,8 +143,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ ! -f scripts/release-policy.sh && -d .continuum ]]; then ln -sfn .continuum/scripts scripts 2>/dev/null || true; fi
-          if [[ ! -f scripts/release-policy.sh ]]; then REF="${REF:-main}"; [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "invalid ref: $REF" >&2; exit 1; }; git clone --branch "$REF" --depth 1 https://github.com/kodmial/continuum.git .continuum 2>/dev/null || true; ln -sfn .continuum/scripts scripts 2>/dev/null || true; fi
           # shellcheck source=scripts/release-policy.sh
           source scripts/release-policy.sh
 
@@ -314,6 +321,21 @@ jobs:
       # later build red. Cut the section on the Release PR branch in the same
       # flow (release-please owns Version.swift + the manifest; this step owns
       # CHANGELOG.md, which release-please is configured to skip).
+      - name: Ensure Continuum scripts available
+        if: hashFiles('scripts/release-policy.sh') == ''
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: kodmial/continuum
+          ref: ${{ inputs.continuum_ref || 'main' }}
+          path: .continuum
+          persist-credentials: false
+
+      - name: Copy missing Continuum scripts
+        if: hashFiles('scripts/release-policy.sh') == ''
+        run: |
+          mkdir -p scripts
+          rsync -a --ignore-existing .continuum/scripts/ scripts/
+
       - name: Cut CHANGELOG section on Release PR branch
         id: changelog
         if: steps.policy.outputs.decision == 'releasable'
@@ -323,8 +345,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ ! -f scripts/release-policy.sh && -d .continuum ]]; then ln -sfn .continuum/scripts scripts 2>/dev/null || true; fi
-          if [[ ! -f scripts/release-policy.sh ]]; then REF="${REF:-main}"; [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "invalid ref: $REF" >&2; exit 1; }; git clone --branch "$REF" --depth 1 https://github.com/kodmial/continuum.git .continuum 2>/dev/null || true; ln -sfn .continuum/scripts scripts 2>/dev/null || true; fi
           # shellcheck source=scripts/release-policy.sh
           source scripts/release-policy.sh
 
@@ -426,6 +446,21 @@ jobs:
 
       # One place that spells out what happened, so a no-op merge is not
       # mistaken for a broken pipeline.
+      - name: Ensure Continuum scripts available
+        if: hashFiles('scripts/release-policy.sh') == ''
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: kodmial/continuum
+          ref: ${{ inputs.continuum_ref || 'main' }}
+          path: .continuum
+          persist-credentials: false
+
+      - name: Copy missing Continuum scripts
+        if: hashFiles('scripts/release-policy.sh') == ''
+        run: |
+          mkdir -p scripts
+          rsync -a --ignore-existing .continuum/scripts/ scripts/
+
       - name: Release policy summary
         # hashFiles guard: if the checkout itself failed there is no script to
         # source, and a second red step would only hide the real failure.
@@ -441,8 +476,6 @@ jobs:
           PROPOSED: ${{ steps.changelog.outputs.proposed }}
         run: |
           set -euo pipefail
-          if [[ ! -f scripts/release-policy.sh && -d .continuum ]]; then ln -sfn .continuum/scripts scripts 2>/dev/null || true; fi
-          if [[ ! -f scripts/release-policy.sh ]]; then REF="${REF:-main}"; [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "invalid ref: $REF" >&2; exit 1; }; git clone --branch "$REF" --depth 1 https://github.com/kodmial/continuum.git .continuum 2>/dev/null || true; ln -sfn .continuum/scripts scripts 2>/dev/null || true; fi
           # shellcheck source=scripts/release-policy.sh
           source scripts/release-policy.sh
           {

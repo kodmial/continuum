@@ -1,4 +1,4 @@
-name: release-pr
+name: Release PR
 
 on:
   pull_request:
@@ -13,9 +13,14 @@ on:
     types: [completed]
   workflow_dispatch:
 
-permissions: read-all
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
 
 jobs:
   call:
     uses: kodmial/continuum/.github/workflows/release-pr.yml@main
     secrets: inherit
+    with:
+      continuum_ref: main

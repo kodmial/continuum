@@ -1,0 +1,24 @@
+name: Validate Continuum
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Test reusable workflow contracts and installation
+        run: ruby -E UTF-8 scripts/test-continuum.rb
+      - name: Validate workflow syntax
+        run: |
+          mkdir -p .opencode-tmp/bin
+          GOBIN="$PWD/.opencode-tmp/bin" go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          .opencode-tmp/bin/actionlint -shellcheck= -pyflakes= .github/workflows/*.yml .github/caller-stubs/*.yml

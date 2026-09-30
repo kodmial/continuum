@@ -1,4 +1,4 @@
-name: issue-scheduler
+name: Issue scheduler
 
 on:
   workflow_dispatch:
@@ -9,9 +9,12 @@ on:
   pull_request_target:
     types: [closed]
 
-permissions: read-all
+permissions:
+  contents: read
 
 jobs:
   call:
     uses: kodmial/continuum/.github/workflows/issue-scheduler.yml@main
     secrets: inherit
+    with:
+      continuum_ref: main

@@ -1,4 +1,4 @@
-name: opencode
+name: OpenCode agent
 
 on:
   issue_comment:
@@ -30,9 +30,20 @@ on:
         required: false
         type: string
 
-permissions: read-all
+permissions:
+  actions: write
+  contents: write
+  issues: write
+  pull-requests: write
 
 jobs:
   call:
     uses: kodmial/continuum/.github/workflows/opencode.yml@main
     secrets: inherit
+    with:
+      continuum_ref: main
+      mode: "${{ inputs.mode }}"
+      pr_number: "${{ inputs.pr_number }}"
+      head_ref: "${{ inputs.head_ref }}"
+      review_id: "${{ inputs.review_id }}"
+      run_id: "${{ inputs.run_id }}"

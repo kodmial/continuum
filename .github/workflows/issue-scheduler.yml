@@ -2,14 +2,12 @@ name: Issue scheduler
 
 on:
   workflow_call:
-    secrets: inherit
-  workflow_dispatch:
-  schedule:
-    - cron: "*/15 * * * *"
-  issues:
-    types: [opened, reopened, closed, labeled, unlabeled]
-  pull_request_target:
-    types: [closed]
+    inputs:
+      continuum_ref:
+        description: Continuum revision supplying fallback scripts
+        type: string
+        default: main
+        required: false
 
 permissions:
   contents: read
