@@ -368,8 +368,13 @@ class TheLedgerClaimsWhatItCanBeCheckedAgainst(unittest.TestCase):
                 return True
         return False
 
-    def test_every_entry_names_something_that_resolves(self):
+    def test_every_completed_entry_names_something_that_resolves(self):
         for entry in self.ledger.workflows:
+            if entry.classification == "must-port":
+                # A must-port is intentionally not implemented in this revision.
+                # Requiring it to name an existing implementation/test would force
+                # the ledger to lie about completion.
+                continue
             references = self._references(entry.rationale)
             with self.subTest(workflow=entry.path):
                 self.assertTrue(
@@ -405,12 +410,14 @@ class TheLedgerClaimsWhatItCanBeCheckedAgainst(unittest.TestCase):
                 self.assertNotIn("absorbed by", lowered)
                 self.assertNotIn("continuum.", lowered)
 
-    def test_a_must_port_entry_names_the_test_that_would_close_it(self):
+    def test_a_must_port_entry_names_its_deferred_owner(self):
         for entry in self.ledger.workflows:
             if entry.classification != "must-port":
                 continue
             with self.subTest(workflow=entry.path):
-                self.assertIn("tests/", entry.rationale)
+                self.assertRegex(entry.owner, r"^#[0-9]+$")
+                self.assertIn("Phase B", entry.rationale)
+                self.assertNotIn("tests/", entry.rationale)
 
     def test_a_nothing_to_port_classification_explains_itself(self):
         for entry in self.ledger.workflows:
