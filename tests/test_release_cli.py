@@ -324,6 +324,190 @@ def apple_p12_name() -> str:
     return apple.P12_ENV
 
 
+class ReleaseVerifyCommandTests(ReleaseCliTests):
+    """`release verify` as a workflow calls it.
+
+    The interesting part is not that it passes -- that is covered in
+    `test_release_verification`. It is that every way of getting the evidence
+    wrong ends in a non-zero exit and a named reason, because a workflow that
+    treats "no candidate" as success is worse than no workflow.
+    """
+
+    HEAD = "a" * 40
+    OTHER = "b" * 40
+
+    def setUp(self):
+        super().setUp()
+        self.artifact = os.path.join(self.workdir, "dist.tar.gz")
+        with open(self.artifact, "wb") as handle:
+            handle.write(b"the tested bytes")
+        self.candidate_path = os.path.join(self.workdir, "candidate.json")
+        self._candidate(self.HEAD)
+
+    def _candidate(self, source_sha: str, artifacts: Optional[dict] = None) -> None:
+        from continuum.release import provenance
+
+        record = provenance.build_candidate(
+            source_sha=source_sha,
+            artifacts=artifacts or {"dist.tar.gz": self.artifact},
+            gate=".github/workflows/validate.yml",
+            gate_run_id="runs/1",
+            artifact_source="run artifacts",
+        )
+        with open(self.candidate_path, "w", encoding="utf-8") as handle:
+            handle.write(record.to_json())
+
+    def verify_argv(self, *extra: str) -> List[str]:
+        return [
+            "release",
+            "verify",
+            "--candidate",
+            self.candidate_path,
+            "--artifact",
+            "dist.tar.gz=" + self.artifact,
+            *extra,
+        ]
+
+    def test_matching_evidence_exits_zero_and_says_what_it_proved(self):
+        run = self.run_cli(self.verify_argv("--source-sha", self.HEAD))
+        self.assertEqual(run.code, 0, run.stderr)
+        self.assertIn("dist.tar.gz", run.stdout)
+        self.assertIn(self.HEAD[:12], run.stdout)
+
+    def test_the_head_defaults_to_the_one_this_run_is_for(self):
+        # Every workflow already knows its own commit; making the caller restate it
+        # is how a caller eventually restates the wrong one.
+        run = self.run_cli(self.verify_argv(), env={"GITHUB_SHA": self.HEAD})
+        self.assertEqual(run.code, 0, run.stderr)
+        run = self.run_cli(self.verify_argv(), env={"GITHUB_SHA": self.OTHER})
+        self.assertNotEqual(run.code, 0)
+        self.assertIn("source-head-mismatch", run.stdout)
+
+    def test_no_candidate_fails_the_job(self):
+        run = self.run_cli(
+            ["release", "verify", "--source-sha", self.HEAD,
+             "--artifact", "dist.tar.gz=" + self.artifact]
+        )
+        self.assertNotEqual(run.code, 0)
+        self.assertIn("no-tested-candidate", run.stdout)
+
+    def test_a_gate_that_did_not_pass_fails_the_job(self):
+        from continuum.release import provenance
+
+        record = provenance.build_candidate(
+            source_sha=self.HEAD,
+            artifacts={"dist.tar.gz": self.artifact},
+            gate=".github/workflows/validate.yml",
+            gate_conclusion=provenance.GATE_CANCELLED,
+        )
+        with open(self.candidate_path, "w", encoding="utf-8") as handle:
+            handle.write(record.to_json())
+        run = self.run_cli(self.verify_argv("--source-sha", self.HEAD))
+        self.assertNotEqual(run.code, 0)
+        self.assertIn("gate-not-green", run.stdout)
+
+    def test_a_rebuilt_artifact_fails_the_job(self):
+        rebuilt = os.path.join(self.workdir, "rebuilt.tar.gz")
+        with open(rebuilt, "wb") as handle:
+            handle.write(b"a rebuild, near enough")
+        run = self.run_cli(
+            ["release", "verify", "--candidate", self.candidate_path,
+             "--source-sha", self.HEAD,
+             "--artifact", "dist.tar.gz=" + rebuilt]
+        )
+        self.assertNotEqual(run.code, 0)
+        self.assertIn("artifact-digest-mismatch", run.stdout)
+
+    def test_a_publish_that_names_no_head_fails_rather_than_skipping_the_check(self):
+        run = self.run_cli(self.verify_argv("--source-sha", ""))
+        self.assertNotEqual(run.code, 0)
+        self.assertIn("publish-head-unknown", run.stdout)
+
+    def test_a_malformed_artifact_argument_is_a_usage_error(self):
+        run = self.run_cli(
+            ["release", "verify", "--candidate", self.candidate_path,
+             "--artifact", "dist.tar.gz"]
+        )
+        self.assertNotEqual(run.code, 0)
+        self.assertIn("NAME=PATH", run.stdout)
+
+    def test_claiming_no_commit_and_naming_one_at_once_is_refused(self):
+        # Whichever the caller meant, they cannot both be true, and silently
+        # honouring the flag would disable the check the caller asked for.
+        run = self.run_cli(self.verify_argv("--source-sha", self.HEAD, "--no-commit-head"))
+        self.assertNotEqual(run.code, 0)
+        self.assertIn("contradictory", run.stdout)
+
+    def test_a_publish_with_no_commit_may_opt_out(self):
+        run = self.run_cli(
+            ["release", "verify", "--candidate", self.candidate_path,
+             "--artifact", "dist.tar.gz=" + self.artifact,
+             "--no-commit-head"],
+            env={"GITHUB_SHA": ""},
+        )
+        self.assertEqual(run.code, 0, run.stderr)
+
+    def test_the_opt_out_still_works_where_git_hub_sha_is_always_set(self):
+        # The case the flag exists for. In a workflow run GITHUB_SHA is always in
+        # the environment, so a job publishing a tree with no commit cannot
+        # un-set it. Rejecting the flag there makes the only legal caller of it
+        # the one place it is never needed.
+        run = self.run_cli(
+            ["release", "verify", "--candidate", self.candidate_path,
+             "--artifact", "dist.tar.gz=" + self.artifact,
+             "--no-commit-head"],
+            env={"GITHUB_SHA": self.HEAD},
+        )
+        self.assertEqual(run.code, 0, run.stderr)
+        self.assertNotIn("contradictory", run.stdout)
+
+    def test_the_opt_out_does_not_silently_keep_the_inferred_head(self):
+        # Leaving it in would put a head on the verification that was never
+        # compared, and the artifact of a check that did not happen looks like the
+        # artifact of one that did.
+        out = os.path.join(self.workdir, "verification-no-commit.json")
+        run = self.run_cli(
+            ["release", "verify", "--candidate", self.candidate_path,
+             "--artifact", "dist.tar.gz=" + self.artifact,
+             "--no-commit-head", "--out", out],
+            env={"GITHUB_SHA": self.HEAD},
+        )
+        self.assertEqual(run.code, 0, run.stderr)
+        with open(out, encoding="utf-8") as handle:
+            document = json.load(handle)
+        # Still green on the bytes -- the head check is what was opted out of, and
+        # the artifact digests are still proved.
+        self.assertTrue(document["ok"])
+        self.assertEqual(document["verified"], ["dist.tar.gz"])
+
+    def test_the_verification_is_written_where_a_workflow_can_upload_it(self):
+        out = os.path.join(self.workdir, "verification.json")
+        run = self.run_cli(self.verify_argv("--source-sha", self.HEAD, "--out", out))
+        self.assertEqual(run.code, 0, run.stderr)
+        with open(out, encoding="utf-8") as handle:
+            document = json.load(handle)
+        self.assertTrue(document["ok"])
+        self.assertEqual(document["verified"], ["dist.tar.gz"])
+
+    def test_a_refusal_is_written_too(self):
+        # A refusal that leaves no artifact behind is a failure a later step cannot
+        # explain.
+        out = os.path.join(self.workdir, "verification.json")
+        run = self.run_cli(self.verify_argv("--source-sha", self.OTHER, "--out", out))
+        self.assertNotEqual(run.code, 0)
+        with open(out, encoding="utf-8") as handle:
+            document = json.load(handle)
+        self.assertFalse(document["ok"])
+        self.assertEqual(document["code"], "source-head-mismatch")
+
+    def test_an_unreadable_record_is_a_usage_error_not_a_publish(self):
+        with open(self.candidate_path, "w", encoding="utf-8") as handle:
+            handle.write("{not json")
+        run = self.run_cli(self.verify_argv("--source-sha", self.HEAD))
+        self.assertNotEqual(run.code, 0)
+        self.assertIn("unreadable tested candidate", run.stdout)
+
+
 class ReleaseCommandSurfaceTests(unittest.TestCase):
     def test_release_requires_a_subcommand(self):
         with self.assertRaises(SystemExit):

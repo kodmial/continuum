@@ -70,6 +70,7 @@ from .settings import (
     require_block_text,
     require_bool,
     require_int,
+    require_manifest_word,
     require_mapping,
     require_mapping_of_text,
     require_relative_path,
@@ -253,12 +254,24 @@ def _optional_path(value: Any, where: str) -> str:
     return require_relative_path(value, where)
 
 
-def _text_tuple(value: Any, where: str) -> Tuple[str, ...]:
+def _text_tuple(
+    value: Any, where: str, *, into_manifest: bool = False
+) -> Tuple[str, ...]:
+    """A list of free-text values.
+
+    `into_manifest` marks the lists whose items are written into a generated
+    Portfile as bare Tcl words -- `categories` and `depends_lib`. Those are checked
+    against the manifest boundary rather than only for being text; `required_text`
+    and `forbidden_text` are never emitted, so a pattern there may contain anything
+    a regular expression needs.
+    """
+
     if value is None:
         return ()
     if not isinstance(value, list) or not value:
         raise PublisherError(CONFIGURATION_INVALID, f"{where} must be a non-empty list")
-    return tuple(require_text(item, f"{where}[{index}]") for index, item in enumerate(value))
+    check = require_manifest_word if into_manifest else require_text
+    return tuple(check(item, f"{where}[{index}]") for index, item in enumerate(value))
 
 
 def _parse_portfile(value: Any, where: str) -> PortfileSettings:
@@ -273,20 +286,27 @@ def _parse_portfile(value: Any, where: str) -> PortfileSettings:
         enabled=require_bool(mapping.get("enabled"), f"{where}.enabled", True),
         optional=require_bool(mapping.get("optional"), f"{where}.optional", False),
         name=name,
-        category=require_text(
+        category=require_manifest_word(
             mapping.get("category"), f"{where}.category", maximum=64, allow_empty=True
         ),
-        categories=_text_tuple(mapping.get("categories"), f"{where}.categories"),
-        license=require_text(
+        categories=_text_tuple(
+            mapping.get("categories"), f"{where}.categories", into_manifest=True
+        ),
+        license=require_manifest_word(
             mapping.get("license"), f"{where}.license", maximum=200, allow_empty=True
         ),
-        maintainers=require_text(
-            mapping.get("maintainers"), f"{where}.maintainers", allow_empty=True
+        maintainers=require_manifest_word(
+            mapping.get("maintainers"),
+            f"{where}.maintainers",
+            allow_empty=True,
+            # The documented MacPorts form is a brace group, so the braces are
+            # required syntax here rather than something to refuse.
+            allow_braces=True,
         ),
-        description=require_text(
+        description=require_manifest_word(
             mapping.get("description"), f"{where}.description", maximum=300, allow_empty=True
         ),
-        long_description=require_text(
+        long_description=require_manifest_word(
             mapping.get("long_description"),
             f"{where}.long_description",
             maximum=2000,
@@ -295,10 +315,12 @@ def _parse_portfile(value: Any, where: str) -> PortfileSettings:
         revision=require_int(
             mapping.get("revision"), f"{where}.revision", 0, minimum=0, maximum=1000
         ),
-        homepage=require_text(
+        homepage=require_manifest_word(
             mapping.get("homepage"), f"{where}.homepage", maximum=300, allow_empty=True
         ),
-        depends_lib=_text_tuple(mapping.get("depends_lib"), f"{where}.depends_lib"),
+        depends_lib=_text_tuple(
+            mapping.get("depends_lib"), f"{where}.depends_lib", into_manifest=True
+        ),
         template=require_block_text(mapping.get("template"), f"{where}.template")
         if mapping.get("template")
         else "",

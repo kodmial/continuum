@@ -229,6 +229,22 @@ def audit(
             )
         )
 
+    unfilled = unfilled_template_tokens(generated.content)
+    checks.append(
+        CheckOutcome(
+            name="template-tokens-filled",
+            status=CHECK_PASSED if not unfilled else CHECK_FAILED,
+            detail=(
+                "no unfilled template token remains outside the file's comments"
+                if not unfilled
+                else "unfilled template token(s) {} remain in executable lines, so the "
+                "file describes a value the generator never supplied".format(
+                    ", ".join(unfilled)
+                )
+            ),
+        )
+    )
+
     for text in generated.required_text:
         present = text in generated.content
         checks.append(
@@ -257,6 +273,88 @@ def audit(
             )
         )
     return ValidationReport(surface=generated.surface, path=generated.path, checks=tuple(checks))
+
+
+#: A template token: two underscores, a name, two underscores. This is the shape a
+#: generator leaves behind when it wrote the template rather than a rendered value,
+#: and it is deliberately loose about the name so a newly added token is caught by
+#: the same check rather than needing its own pattern.
+_TEMPLATE_TOKEN_RE = re.compile(r"__[A-Z][A-Z0-9_]*__")
+
+#: Comment introducers, per syntax. A generated package-manager file legitimately
+#: carries explanatory comments that *mention* the token names -- "the generator
+#: fills __SHA256__" is documentation, not an unfilled value -- so a scanner that
+#: does not know about comments reports those files as broken and gets ignored,
+#: which costs it the one signal it exists to give.
+_COMMENT_PREFIXES = ("#", "//", "--", ";")
+
+
+def _comment_start(line: str) -> int:
+    """Where the trailing comment on `line` begins, or ``len(line)`` if it has none.
+
+    The subtlety is that the introducers are also ordinary punctuation: ``//``
+    separates a path from a version and ``--`` begins a command-line flag. A
+    scanner that treated either as a comment introducer would delete live text, and
+    deleting live text here means missing an unfilled token -- the failure this
+    whole check exists to prevent.
+
+    So an introducer has to be whitespace-delimited on both sides and sit outside
+    any quoted string, which is what separates ``url "https://x/y"`` from
+    ``url "https://x/y"  # __SHA256__ unfilled``. Whole-line comments are handled
+    by the caller, which needs to keep the ``str.startswith`` form readable.
+    """
+
+    quote = ""
+    index = 0
+    length = len(line)
+    while index < length:
+        char = line[index]
+        if quote:
+            if char == quote:
+                quote = ""
+            index += 1
+            continue
+        if char in "\"'":
+            quote = char
+            index += 1
+            continue
+        for prefix in _COMMENT_PREFIXES:
+            if not line.startswith(prefix, index):
+                continue
+            before = line[index - 1] if index else ""
+            after = line[index + len(prefix) :][:1]
+            if before.isspace() and (after == "" or after.isspace()):
+                return index
+        index += 1
+    return length
+
+
+def unfilled_template_tokens(content: str) -> List[str]:
+    """Template tokens left unfilled in the *executable* lines of a generated file.
+
+    A generated file keeps its explanatory comments, and those comments mention the
+    tokens by name. Only text outside a comment can carry a value the generator
+    failed to supply: a `version "1.2.3" # was __VERSION__` line installs
+    correctly, while a bare `version "__VERSION__"` installs the previous release,
+    quietly.
+
+    Both a whole-line comment and a trailing one are skipped, because generated
+    manifests document themselves inline and a scanner that only knew about the
+    first kind would report every documented token as unfilled.
+
+    Order is stable and duplicates are collapsed, so a report of what is unfilled is
+    the same set whatever order the file is read in.
+    """
+
+    active: List[str] = []
+    for line in (content or "").splitlines():
+        if line.strip().startswith(_COMMENT_PREFIXES):
+            continue
+        active.extend(
+            match.group(0)
+            for match in _TEMPLATE_TOKEN_RE.finditer(line[: _comment_start(line)])
+        )
+    return sorted(set(active))
 
 
 def scratch_directory(surface: str) -> str:
@@ -349,5 +447,6 @@ __all__ = [
     "raise_for",
     "scratch_directory",
     "syntax_check",
+    "unfilled_template_tokens",
     "write_for_check",
 ]

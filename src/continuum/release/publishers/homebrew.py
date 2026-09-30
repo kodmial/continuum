@@ -73,9 +73,10 @@ from .settings import (
     reject_unknown,
     require_block_text,
     require_bool,
+    require_manifest_path,
+    require_manifest_string,
     require_mapping,
     require_mapping_of_text,
-    require_relative_path,
     require_text,
     require_token,
     require_url,
@@ -173,10 +174,12 @@ def _parse_service(value: Any, where: str) -> Optional[ServiceMetadata]:
         label=require_text(mapping.get("label"), f"{where}.label", maximum=200),
         run_at_load=require_bool(mapping.get("run_at_load"), f"{where}.run_at_load", True),
         keep_alive=require_bool(mapping.get("keep_alive"), f"{where}.keep_alive", True),
-        working_dir=require_text(
+        working_dir=require_manifest_string(
             mapping.get("working_dir"), f"{where}.working_dir", allow_empty=True
         ),
-        log_path=require_text(mapping.get("log_path"), f"{where}.log_path", allow_empty=True),
+        log_path=require_manifest_string(
+            mapping.get("log_path"), f"{where}.log_path", allow_empty=True
+        ),
     )
 
 
@@ -409,12 +412,16 @@ def _parse_formula(value: Any, where: str) -> FormulaSettings:
     return FormulaSettings(
         **common,
         install_paths=tuple(
-            require_relative_path(item, f"{where}.install_paths[{index}]")
+            require_manifest_path(item, f"{where}.install_paths[{index}]")
             for index, item in enumerate(install_paths)
         ),
-        desc=require_text(mapping.get("desc"), f"{where}.desc", maximum=300, allow_empty=True),
+        desc=require_manifest_string(
+            mapping.get("desc"), f"{where}.desc", maximum=300, allow_empty=True
+        ),
         homepage=_url_or_empty(mapping.get("homepage"), f"{where}.homepage"),
-        license=require_text(mapping.get("license"), f"{where}.license", maximum=200, allow_empty=True),
+        license=require_manifest_string(
+            mapping.get("license"), f"{where}.license", maximum=200, allow_empty=True
+        ),
         service=_parse_service(mapping.get("service"), f"{where}.service"),
     )
 
@@ -425,13 +432,17 @@ def _parse_cask(value: Any, where: str) -> CaskSettings:
     common = _parse_common(mapping, where)
     return CaskSettings(
         **common,
-        app_name=require_text(mapping.get("app_name"), f"{where}.app_name", maximum=200, allow_empty=True),
-        binary_path=require_text(
+        app_name=require_manifest_string(
+            mapping.get("app_name"), f"{where}.app_name", maximum=200, allow_empty=True
+        ),
+        binary_path=require_manifest_string(
             mapping.get("binary_path"), f"{where}.binary_path", allow_empty=True
         ),
-        desc=require_text(mapping.get("desc"), f"{where}.desc", maximum=300, allow_empty=True),
+        desc=require_manifest_string(
+            mapping.get("desc"), f"{where}.desc", maximum=300, allow_empty=True
+        ),
         homepage=_url_or_empty(mapping.get("homepage"), f"{where}.homepage"),
-        macos_requirement=require_text(
+        macos_requirement=require_manifest_string(
             mapping.get("macos_requirement"), f"{where}.macos_requirement", maximum=40, allow_empty=True
         ),
         signed=require_bool(mapping.get("signed"), f"{where}.signed", False),
@@ -595,7 +606,7 @@ def default_formula_template(
         f'  version "{release.version}"',
         f'  license "{settings.license}"',
         "",
-        f"  def install\n    bin.install {', '.join(settings.install_paths)}\n  end",
+        f"  def install\n    bin.install {', '.join(f'\"{path}\"' for path in settings.install_paths)}\n  end",
     ]
     service = _service_stanza(settings.service)
     if service:

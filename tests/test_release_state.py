@@ -29,12 +29,14 @@ from continuum.release.state import (
     channel_key,
     event_key,
     next_stage,
+    owed_reconciliation,
     release_key,
     scopes_are_isolated,
     stage,
     stage_key,
     stage_names,
     unit_key,
+    wake_key,
 )
 
 from . import release_core_support as support
@@ -365,6 +367,100 @@ class JournalTests(unittest.TestCase):
     def test_a_summary_is_one_line_per_transition(self):
         journal = Journal().record(StageOutcome.noop("sync", "k", "no sync configured"))
         self.assertEqual(journal.summaries(), ["sync: noop — no sync configured"])
+
+
+class ReconciliationWakeTests(unittest.TestCase):
+    """Deferred work becomes owed when the release it was waiting on completes.
+
+    The failure is a stranded release-PR update, and it strands silently. A code
+    change merges while a release is still publishing, the release-pr reconciliation
+    correctly defers, the release then completes green -- and nothing ever looks at
+    the deferral again, so the code waits indefinitely for a reconciliation that
+    already happened once and was told to wait.
+
+    So the deferral has to survive into the next run as something *owed*.
+    """
+
+    def _deferred_then_published(self):
+        return Journal().record(
+            StageOutcome.blocked("release-pr", "k-pr", "deferred: a release is publishing")
+        ).record(StageOutcome.completed("publish", "k-publish", "published 1.4.0"))
+
+    def test_a_completed_release_owes_the_stage_it_deferred(self):
+        self.assertEqual(owed_reconciliation(self._deferred_then_published()), "release-pr")
+
+    def test_a_deferral_is_not_owed_while_the_release_is_still_running(self):
+        # Otherwise the wake fires immediately, before the thing it is waiting for
+        # has happened, and re-defers -- a wake loop driven by its own retry.
+        journal = Journal().record(
+            StageOutcome.blocked("release-pr", "k", "deferred: a release is publishing")
+        )
+        self.assertIsNone(owed_reconciliation(journal))
+
+    def test_a_non_terminal_completion_does_not_owe_anything(self):
+        # `source` completing says the release is pinned, not finished. Waking on it
+        # would re-run reconciliation against a release that has not published.
+        journal = Journal().record(
+            StageOutcome.blocked("release-pr", "k", "deferred")
+        ).record(StageOutcome.completed("source", "k2", "bound 9e6dcc2"))
+        self.assertIsNone(owed_reconciliation(journal))
+
+    def test_a_fatal_failure_is_not_reopened_by_an_unrelated_completion(self):
+        # The thing that has to change is the release, not the failure. Re-opening it
+        # on somebody else's success is how a fatal failure becomes a loop.
+        journal = Journal().record(
+            StageOutcome.failed("release-pr", "k", "branch is protected", code="protected")
+        ).record(StageOutcome.completed("publish", "k2", "published"))
+        self.assertIsNone(owed_reconciliation(journal))
+
+    def test_a_dry_run_owes_nothing(self):
+        # A plan's blocked entry describes what *would* wait, so treating it as a
+        # real deferral would make planning a release schedule a wake-up.
+        journal = Journal().record(
+            StageOutcome.blocked(
+                "release-pr", "k", "deferred", **{"dry-run": "true"}
+            )
+        ).record(StageOutcome.completed("publish", "k2", "published"))
+        self.assertIsNone(owed_reconciliation(journal))
+
+    def test_the_earliest_deferred_stage_is_the_one_owed(self):
+        journal = Journal().record(
+            StageOutcome.blocked("sync", "k-sync", "deferred")
+        ).record(StageOutcome.blocked("release-pr", "k-pr", "deferred")).record(
+            StageOutcome.completed("publish", "k-publish", "published")
+        )
+        self.assertEqual(owed_reconciliation(journal), "release-pr")
+
+    def test_a_nothing_deferred_release_owes_nothing(self):
+        journal = Journal().record(StageOutcome.completed("publish", "k", "published"))
+        self.assertIsNone(owed_reconciliation(journal))
+
+    def test_the_terminal_stages_are_read_off_the_chain(self):
+        # A stage added to the chain has to be terminal by being declared terminal,
+        # not by being added to a second list here.
+        self.assertEqual(
+            tuple(item.name for item in STAGES if item.terminal), state.TERMINAL_STAGES
+        )
+        self.assertIn("publish", state.TERMINAL_STAGES)
+
+    def test_a_wake_is_idempotent_for_one_source_head(self):
+        # Three deliveries of one completed release -- a re-dispatch, a re-run, and
+        # a second workflow watching the same branch -- are one wake. Without this a
+        # busy repository reconciles its release PR once per delivery.
+        head = "d9e6dcc2e0c9c43bc87cd1963b75c097dec7ea1c"
+        first = wake_key("acme/widget", head)
+        self.assertEqual(wake_key("acme/widget", head), first)
+        self.assertEqual(wake_key("acme/widget", head.upper()), first)
+        self.assertNotEqual(wake_key("acme/widget", "9" * 40), first)
+        self.assertNotEqual(wake_key("acme/other", head), first)
+
+    def test_a_wake_must_name_the_head_that_completed(self):
+        # Keyed on nothing, every completion in the repository shares one key and
+        # only the first of them is ever reconciled.
+        for value in ("", "   "):
+            with self.assertRaises(ReleaseStateError) as caught:
+                wake_key("acme/widget", value)
+            self.assertEqual(caught.exception.code, "missing-source-sha")
 
 
 if __name__ == "__main__":

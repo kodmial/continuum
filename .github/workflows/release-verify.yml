@@ -1,0 +1,160 @@
+name: release verify
+
+# The publish step refuses to upload anything it cannot prove was exercised.
+#
+# A release workflow has two halves that fail apart: the gate that builds and
+# tests an artifact, and the publish that uploads one. They agree in the happy
+# case, and in every other case they do not -- a rebuilt archive, a retried job
+# that produced a fresh build under the same name, a green run for the previous
+# commit. The published artifact is then a file no gate ever saw, while the
+# checksum, the manifest and the log all describe it faithfully.
+#
+# So the gate records what it exercised, this workflow proves the bytes on disk
+# are those bytes, and the publish step runs only when it exits zero. The three
+# refusals are kept apart on purpose, because each needs a different repair:
+#   no-tested-candidate  the gate produced no record -- run it, or fix it
+#   gate-not-green       the gate ran and did not pass -- fix the artifact
+#   artifact-*           the bytes are not the tested ones -- publish the
+#                        artifact the gate produced instead of re-building it
+#
+# Inputs are opaque names, not product or language details. A consumer with no
+# validation gate omits this workflow entirely, which is a different statement
+# from running it and failing for want of a candidate.
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate:
+        description: "Path to the tested-candidate record the gate wrote."
+        required: true
+        type: string
+      source_sha:
+        description: "The immutable head this publish is for. Defaults to GITHUB_SHA."
+        required: false
+        type: string
+      artifact:
+        description: "A publishable artifact as NAME=PATH, or a JSON array of them."
+        required: true
+        type: string
+      out:
+        description: "Where to write the verification document."
+        required: false
+        default: release-out/provenance-verification.json
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Prove the bytes are the tested bytes
+    runs-on: ubuntu-latest
+    outputs:
+      ok: ${{ steps.verify.outputs.ok }}
+      code: ${{ steps.verify.outputs.code }}
+      verified: ${{ steps.verify.outputs.verified }}
+      candidate_digest: ${{ steps.verify.outputs.candidate_digest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The commit being published, not the tip of the default branch: the
+          # candidate names a tree, and taking the branch head would let a later
+          # run verify against a different one.
+          ref: ${{ inputs.source_sha || github.sha }}
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify the tested candidate against the artifacts on disk
+        id: verify
+        env:
+          PYTHONPATH: ${{ github.workspace }}/src
+          CANDIDATE: ${{ inputs.candidate }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          ARTIFACT: ${{ inputs.artifact }}
+          OUT: ${{ inputs.out }}
+          OUTPUTS: ${{ github.output }}
+          SUMMARY: ${{ github.step_summary }}
+        run: |
+          # Strict mode throughout. The verdict is still the exit code and is
+          # still recorded: the heredoc writes the outputs and the summary before
+          # it exits non-zero, so a refusal leaves the document and the outputs a
+          # later job needs. Strict mode buys the steps in between -- writing the
+          # output directory, reading it back -- the same fail-fast guarantee every
+          # other workflow in this repository has.
+          set -euo pipefail
+          mkdir -p "$(dirname "$OUT")"
+
+          python3 <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+
+          candidate = os.environ["CANDIDATE"]
+          source_sha = os.environ["SOURCE_SHA"]
+          artifact = os.environ["ARTIFACT"]
+          out = os.environ["OUT"]
+
+          # `artifact` is a string so it can be typed by hand in the dispatch
+          # dialog, and optionally a JSON array so a matrix can pass several at
+          # once. Both spell the same list; reading them here keeps the refusal
+          # codes the single source of truth rather than something a shell
+          # expression has to re-derive.
+          spec = artifact.strip()
+          try:
+              entries = json.loads(spec) if spec.startswith("[") else [spec]
+          except ValueError:
+              entries = [spec]
+
+          argv = ["-m", "continuum.cli", "release", "verify", "--candidate", candidate]
+          for entry in entries:
+              argv += ["--artifact", str(entry)]
+          if source_sha:
+              argv += ["--source-sha", source_sha]
+          argv += ["--out", out]
+
+          completed = subprocess.run(argv, capture_output=True, text=True)
+          sys.stdout.write(completed.stdout)
+          sys.stdout.write(completed.stderr)
+
+          try:
+              with open(out, encoding="utf-8") as handle:
+                  document = json.load(handle)
+          except (OSError, ValueError):
+              # A missing document is a refusal, not a blank success: the command
+              # was asked for a verdict and produced none.
+              document = {
+                  "ok": False,
+                  "code": "no-verification-document",
+                  "verified": [],
+                  "candidate_digest": "",
+              }
+
+          with open(os.environ["OUTPUTS"], "a", encoding="utf-8") as handle:
+              handle.write("ok={}\n".format("true" if document.get("ok") else "false"))
+              handle.write("code={}\n".format(document.get("code", "")))
+              handle.write("verified={}\n".format(" ".join(document.get("verified", []))))
+              handle.write("candidate_digest={}\n".format(document.get("candidate_digest", "")))
+
+          with open(os.environ["SUMMARY"], "a", encoding="utf-8") as handle:
+              handle.write("### Provenance verification\n\n")
+              if document.get("ok"):
+                  handle.write(
+                      "The bytes about to be published are the bytes a validation "
+                      "gate exercised: "
+                      + ", ".join(document.get("verified", []))
+                      + "\n"
+                  )
+              else:
+                  handle.write(
+                      "**Refused** (`{}`). The publish must not proceed; the log "
+                      "above names which of the three failures it was.\n".format(
+                          document.get("code", "no-verification-document")
+                      )
+                  )
+
+          raise SystemExit(completed.returncode)
+          PY

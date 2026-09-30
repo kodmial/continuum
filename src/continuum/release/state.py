@@ -715,10 +715,80 @@ class Journal:
 EMPTY_JOURNAL = Journal()
 
 
+# -- reconciliation wake-ups --------------------------------------------------
+
+
+#: The stages whose completion is terminal for a release, and therefore the point
+#: after which anything the release deferred is owed a re-run. Read off `STAGES`
+#: rather than restated, so a stage added to the chain cannot be silently left out
+#: of the rule about when deferred work becomes owed.
+TERMINAL_STAGES: Tuple[str, ...] = tuple(
+    item.name for item in STAGES if item.terminal
+)
+
+
+def wake_key(repository: str, source_sha: str) -> str:
+    """The idempotency key for one release-completion wake.
+
+    Keyed on the source head rather than on the release version, because the thing
+    a wake re-runs is *reconciliation of the head*, not publication of a version.
+    Two deliveries of one completed run, a re-run of a failed job, and a second
+    workflow watching the same branch are three deliveries and one wake; the same
+    head genuinely released twice is one head and still one wake.
+    """
+
+    if not (source_sha or "").strip():
+        raise ReleaseStateError(
+            "a reconciliation wake must name the source head that completed",
+            code="missing-source-sha",
+        )
+    return digest_key("wake", repository, source_sha.strip().lower())
+
+
+def owed_reconciliation(journal: Journal) -> Optional[str]:
+    """The stage a completed release should re-open, or ``None`` if nothing is owed.
+
+    A release-pr update is deferred, not skipped, when it lands while a release is
+    still publishing: the version in the tree is already ahead of what has been
+    published, so acting on it immediately would compute the same answer twice. The
+    deferral is recorded as a *blocked* outcome rather than a failure, because it is
+    not an error and re-running it on its own would fail the same way -- the thing
+    that has to change is the release finishing.
+
+    That is what makes this function necessary. Without it the deferral is invisible
+    to everything downstream: the release completes, the run is green, and the code
+    that was waiting on it is never picked up again. So a terminal stage that
+    completed after a stage was blocked re-opens the blocked stage, by name, for the
+    caller to dispatch.
+
+    Only ``blocked`` counts. A stage that failed fatally has to change something
+    first, and re-opening it on an unrelated completion would loop.
+    """
+
+    blocked = [
+        entry.stage
+        for entry in journal.entries
+        if entry.outcome == BLOCKED and not journal.was_just_a_plan(entry)
+    ]
+    if not blocked:
+        return None
+    if not any(
+        entry.outcome == COMPLETED and entry.stage in TERMINAL_STAGES
+        for entry in journal.entries
+    ):
+        return None
+    # Earliest blocked stage on the chain, so a resumption re-opens the first thing
+    # that is owed rather than the last.
+    return min(blocked, key=lambda name: stage_names().index(name))
+
+
 __all__ = [
     "BLOCKED",
     "COMPLETED",
     "EMPTY_JOURNAL",
+    "TERMINAL_STAGES",
+    "owed_reconciliation",
+    "wake_key",
     "FAILED",
     "FIRST_STAGE",
     "GREEN_OUTCOMES",
