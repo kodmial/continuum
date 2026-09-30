@@ -74,6 +74,10 @@ on:
         type: number
         required: false
         default: 25
+    secrets:
+      continuum_token:
+        description: "Optional consumer-owned write token used when review state must fan out to downstream workflows"
+        required: false
 
 permissions: {}
 
@@ -263,8 +267,8 @@ jobs:
           # Write authority, and only in this step: publishing the normalized
           # gate status, recording the durable repair ledger, and dispatching one
           # bounded agent repair.
-          GH_TOKEN: ${{ github.token }}
-          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.continuum_token || github.token }}
+          GITHUB_TOKEN: ${{ secrets.continuum_token || github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           PR_NUMBER: ${{ needs.authorize.outputs.pr_number }}
           HEAD_SHA: ${{ needs.authorize.outputs.head_sha }}
