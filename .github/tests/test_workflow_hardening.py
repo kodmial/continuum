@@ -82,6 +82,14 @@ AGENT_PLANE = (
 #: is exactly the complement of `AGENT_PLANE`, so a workflow cannot enter this
 #: directory - or leave the agent plane - without a reviewer deciding so.
 #:
+#: `parity-drift.yml` is here for a different reason: it is Continuum's own
+#: record of what it copied and what has moved since. It runs on a schedule or a
+#: dispatch, names no consumer, dispatches no agent, and its write scope is an
+#: issue body whose decision was computed by read-only code in a different job.
+#: Nothing an untrusted author can contribute reaches it, so the trust policy has
+#: no boundary to police here -- and the workflow asserts that separation itself by
+#: keeping the write in its own job.
+#:
 #: The invariants that are unconditionally true of *any* workflow in this
 #: repository stay repository-wide: declared permissions, commit-pinned actions,
 #: strict shell mode, no residue of the disabled CodeRabbit path, and a
@@ -97,6 +105,7 @@ NOT_AGENT_PLANE = (
     "consumer-review-gate.yml",
     "consumer-scheduler.yml",
     "continuum-shadow.yml",
+    "parity-drift.yml",
     "release-bun-binary.yml",
     "review-queue.yml",
 )

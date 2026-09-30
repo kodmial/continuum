@@ -1,0 +1,177 @@
+{
+  "schema": "continuum.parity-ledger/v1",
+  "version": 1,
+  "generated_at": "2026-09-30T13:40:00Z",
+  "note": "Committed half of the provenance ledger. Private sources are not here: Continuum is public, so a private repository is named by an uncommitted overlay (see reference/parity-ledger-overlay.example.json). docs/parity-ledger.md is the human account of the same classifications and tests/test_parity_ledger.py asserts the two agree.",
+  "sources": [
+    {
+      "id": "runtime-lab",
+      "repository": "kodmial/runtime-lab",
+      "visibility": "public",
+      "note": "The parent automation repository the parity sweep in kodmial/runtime-lab#59 audited. Public, so it is read with the ambient read-only token.",
+      "audit": {
+        "baseline_sha": "7fe4fc955a54109f3bcab377197c28bc39022bc0",
+        "current_sha": "7fe4fc955a54109f3bcab377197c28bc39022bc0",
+        "audited_at": "2026-09-30T13:40:00Z",
+        "audited_by": "docs/parity-ledger.md",
+        "ledger_version": 1
+      },
+      "paths": [
+        {
+          "pattern": "automation/cross_repo.py",
+          "disposition": "not-applicable",
+          "note": "kodmial/runtime-lab#99 write-back: Continuum's agent plane writes only to a branch on the repository it was dispatched against, so there is no second repository for it to write back into."
+        },
+        {
+          "pattern": "automation/result_materialize.py",
+          "disposition": "absorbed",
+          "note": "kodmial/runtime-lab#23 lossless publication: absorbed by .github/scripts/agent_workspace.py, which materializes the workspace tree with git commit-tree."
+        },
+        {
+          "pattern": "automation/install-opencode.sh",
+          "disposition": "absorbed",
+          "note": "kodmial/runtime-lab#136 point-of-use identity: absorbed by .github/scripts/opencode_runtime.py, which re-checks the resolved binary digest immediately before each invocation."
+        },
+        {
+          "pattern": "automation/workflow_credential_guard.py",
+          "disposition": "absorbed",
+          "note": "kodmial/runtime-lab#143 trust boundary: absorbed by .github/scripts/trust_policy.py and the authorize/gate job split."
+        },
+        {
+          "pattern": "automation/exact_artifact_delivery.py",
+          "disposition": "absorbed",
+          "note": "Exact-artifact delivery, whose portable form Continuum already ships."
+        },
+        {
+          "pattern": ".github/workflows/opencode-repair.yml",
+          "disposition": "absorbed",
+          "note": "kodmial/runtime-lab#145 repair lock with a release path: absorbed by the age check and conflict-bounds budget in .github/workflows/consumer-repair.yml."
+        },
+        {
+          "pattern": ".github/workflows/opencode.yml",
+          "disposition": "absorbed",
+          "note": "Publication and idempotence (kodmial/runtime-lab#23, #131) are properties Continuum holds in its own agent workflows."
+        },
+        {
+          "pattern": ".continuum.yml",
+          "disposition": "consumer-local",
+          "note": "The consumer's own two-toggle configuration. An advance here is that repository's business; this file exists to be edited by whoever owns the consumer."
+        },
+        {
+          "pattern": "automation/knowledge/experiments/",
+          "disposition": "consumer-local",
+          "note": "Per-issue experiment records. These advance on every issue and would otherwise make the checker unignorable."
+        },
+        {
+          "pattern": "automation/knowledge/",
+          "disposition": "consumer-local",
+          "note": "The parent repository's own knowledge store and sync automation, which Continuum does not mirror."
+        },
+        {
+          "pattern": "automation/benchmark-results/",
+          "disposition": "consumer-local",
+          "note": "Benchmark output for that repository's own qualification harness."
+        }
+      ],
+      "incidents": [
+        {
+          "id": "kodmial/runtime-lab#23",
+          "disposition": "must-port",
+          "paths": [
+            "automation/result_materialize.py"
+          ],
+          "implementation": [
+            ".github/scripts/agent_workspace.py"
+          ],
+          "tests": [
+            ".github/tests/test_agent_workspace.py"
+          ],
+          "note": "Lossless agent publication: the work reaches a pull request without being guessed at, re-derived, or dropped. Branch derived from the issue number, provenance proven by candidate refs, change materialized by git commit-tree."
+        },
+        {
+          "id": "kodmial/runtime-lab#99-write-back",
+          "disposition": "not-applicable",
+          "paths": [
+            "automation/cross_repo.py"
+          ],
+          "implementation": [],
+          "tests": [],
+          "note": "First half of kodmial/runtime-lab#99. Continuum's agent plane writes only to a branch on the repository it was dispatched against, so the mechanism the report asks for would have nothing to point at."
+        },
+        {
+          "id": "kodmial/runtime-lab#99-immutable-target",
+          "disposition": "absorbed",
+          "paths": [
+            ".github/workflows/opencode.yml"
+          ],
+          "implementation": [
+            ".github/workflows/opencode.yml",
+            ".github/workflows/consumer-opencode.yml"
+          ],
+          "tests": [
+            ".github/tests/test_workflow_hardening.py"
+          ],
+          "note": "Second half of kodmial/runtime-lab#99, split because two reports share that number. The property a push must not silently overwrite a moved target is enforced by --force-with-lease and by the immutable release-tag input. The mechanism differs; the property does not."
+        },
+        {
+          "id": "kodmial/runtime-lab#131",
+          "disposition": "absorbed",
+          "paths": [
+            ".github/workflows/opencode.yml"
+          ],
+          "implementation": [
+            ".github/scripts/agent_workspace.py"
+          ],
+          "tests": [
+            ".github/tests/test_agent_workspace.py"
+          ],
+          "note": "Publication idempotence: open pull requests are queried in --state open before anything is published, so a re-dispatched run finds the existing pull request. Absorbed rather than must-port because it is a consequence of the recovery path implemented for #23."
+        },
+        {
+          "id": "kodmial/runtime-lab#136",
+          "disposition": "must-port",
+          "paths": [
+            "automation/install-opencode.sh"
+          ],
+          "implementation": [
+            ".github/scripts/opencode_runtime.py"
+          ],
+          "tests": [
+            ".github/tests/test_opencode_runtime.py"
+          ],
+          "note": "Point-of-use OpenCode identity. $GITHUB_PATH appends while PATH resolution takes the first match, so an earlier entry providing a file called opencode would run instead of the verified binary with every digest check still green."
+        },
+        {
+          "id": "kodmial/runtime-lab#143",
+          "disposition": "absorbed",
+          "paths": [
+            "automation/workflow_credential_guard.py"
+          ],
+          "implementation": [
+            ".github/scripts/trust_policy.py"
+          ],
+          "tests": [
+            ".github/tests/test_trust_policy.py",
+            ".github/tests/test_workflow_hardening.py"
+          ],
+          "note": "Trust boundary around the privileged agent job: a separate authorize job resolves the dispatching credential, the agent keeps git * denied, and the model produces a commit and a pull request body rather than performing either."
+        },
+        {
+          "id": "kodmial/runtime-lab#145",
+          "disposition": "must-port",
+          "paths": [
+            ".github/workflows/opencode-repair.yml"
+          ],
+          "implementation": [
+            ".github/workflows/consumer-repair.yml",
+            ".github/scripts/conflict_repair.py"
+          ],
+          "tests": [
+            ".github/tests/test_conflict_repair.py"
+          ],
+          "note": "Repair lock with a release path. A dispatched repair that was cancelled, timed out, or wedged left the label behind and every later failure re-entered the step, saw the label, and exited. Closed by an age check on the lock, with an unreadable age treated as held."
+        }
+      ]
+    }
+  ]
+}

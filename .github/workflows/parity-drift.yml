@@ -1,0 +1,266 @@
+# Cross-repository parity: read every tracked source, classify the advance, and
+# keep one issue open per drifting source.
+#
+# This is Continuum's own maintenance automation, not a consumer contract: it
+# names no consumer, runs on no pull request event, and dispatches no agent. That
+# is why it is outside the agent plane in `.github/tests/test_workflow_hardening.py`
+# rather than beside `issue-scheduler.yml`. The invariants asserted of *every*
+# workflow in this directory still hold here, and are asserted: declared
+# permissions, commit-pinned actions, strict shell mode.
+#
+# The three jobs are separated by what they are allowed to do, and the separation
+# is the point:
+#
+#   audit  -- read-only. Fetches, scans, writes artifacts. Cannot write anything
+#             to the repository. A drift finding is a *result*, so this job does
+#             not fail when it finds one: the job that is supposed to say no is
+#             `gate`, and it says no by answering.
+#   record -- the only job that writes, and all it may write is issues. It applies
+#             a plan computed from the audit's report, so the decision about what
+#             to say was made by read-only code. It uses the ambient token: the
+#             issue it opens is attributed to github-actions[bot], which
+#             `issue-scheduler.yml` refuses to dispatch, so an audit finding can
+#             never start an agent run.
+#   gate   -- read-only. Judges a consumer pin promotion against the same report
+#             and, when asked, fails the run.
+#
+# No credential is ever passed as an argument. The private token is read from the
+# environment by variable name inside the checker, and the private overlay is not
+# in this repository, so a run without one simply does not track a private source
+# at all.
+name: Parity drift
+
+on:
+  workflow_dispatch:
+    inputs:
+      overlay:
+        description: Path to an uncommitted private-source overlay (empty for none).
+        required: false
+        default: ""
+        type: string
+      fail_on_drift:
+        description: Fail the audit run when unclassified P0 drift is found.
+        required: false
+        default: false
+        type: boolean
+      consumer:
+        description: Consumer whose pin is moving (empty to skip the gate).
+        required: false
+        default: ""
+        type: string
+      from_pin:
+        description: The pinned commit being left.
+        required: false
+        default: ""
+        type: string
+      to_pin:
+        description: The commit being pinned.
+        required: false
+        default: ""
+        type: string
+  schedule:
+    # Once a day, off the hour: nothing here needs a minute-level answer, and a
+    # scheduled job that lands on :00 competes with every other one for the runner.
+    - cron: "37 6 * * *"
+
+permissions:
+  contents: read
+  issues: read
+
+concurrency:
+  group: parity-drift
+  cancel-in-progress: false
+
+jobs:
+  # Read-only. Every decision about what drift exists is made here.
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    permissions:
+      contents: read
+      issues: read
+
+    steps:
+      - name: Checkout trusted code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+
+      - name: Check the committed ledger
+        shell: bash
+        env:
+          PYTHONPATH: src
+        run: |
+          set -euo pipefail
+          python3 -m continuum.parity.cli ledger-check \
+            --ledger reference/parity-ledger.json \
+            --out parity-out/ledger-check.json
+
+      - name: Read the tracked sources and classify the advance
+        id: scan
+        shell: bash
+        env:
+          PYTHONPATH: src
+          # Read-only ambient token. Public sources need no credential at all; this
+          # only raises the anonymous rate limit. The private token is a separate
+          # least-privilege secret, named here and read by name inside the
+          # checker, never passed as an argument.
+          GITHUB_TOKEN: ${{ github.token }}
+          CONTINUUM_PARITY_PRIVATE_TOKEN: ${{ secrets.PARITY_PRIVATE_SOURCE_TOKEN }}
+          OVERLAY: ${{ inputs.overlay }}
+          FAIL_ON_DRIFT: ${{ inputs.fail_on_drift }}
+        run: |
+          set -euo pipefail
+          # An empty overlay input means "none": the committed ledger carries only
+          # public sources, and a private source nobody tracks cannot be missed.
+          # Bash arrays keep the empty case out of the argument list entirely.
+          overlay=()
+          if [ -n "$OVERLAY" ]; then
+            overlay=(--overlay "$OVERLAY")
+          fi
+          fail=()
+          if [ "$FAIL_ON_DRIFT" = "true" ]; then
+            fail=(--fail-on-drift)
+          fi
+          # The scan writes its own job outputs; nothing here recomputes them,
+          # because a second writer of the same key wins silently.
+          python3 -m continuum.parity.cli scan \
+            --ledger reference/parity-ledger.json \
+            "${overlay[@]}" \
+            "${fail[@]}" \
+            --out parity-out/drift-report.json \
+            --markdown parity-out/drift-report.md \
+            --public-observations-out parity-out/observations.json
+
+      - name: Upload the audit artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: parity-drift
+          path: parity-out/
+          if-no-files-found: error
+
+  # The only write. It applies a plan, it does not form one.
+  record:
+    needs: audit
+    if: always() && needs.audit.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: read
+      issues: write
+
+    steps:
+      - name: Checkout trusted code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+
+      - name: Download the audit artifacts
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
+        with:
+          name: parity-drift
+          path: parity-out
+
+      - name: Plan the parity issues
+        shell: bash
+        env:
+          PYTHONPATH: src
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Both states, not just open: a parity issue that a human closed while
+          # its source was still drifting has to be reopened, and one whose source
+          # stopped drifting has to be closed. An issue the checker did not plan is
+          # never touched, so a human's own notes are not overwritten.
+          gh issue list --state all --limit 200 --json number,title,body,state \
+            > parity-out/existing-issues.json
+          python3 -m continuum.parity.cli issue \
+            --report parity-out/drift-report.json \
+            --existing parity-out/existing-issues.json \
+            --out parity-out/issue-plan.json \
+            > parity-out/issue-plan.txt
+          cat parity-out/issue-plan.txt
+
+      - name: Apply the parity issues
+        shell: bash
+        env:
+          PYTHONPATH: src
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # GITHUB_REPOSITORY is set by the runner, so the target is never an
+          # interpolated input. The plan was computed read-only in the previous
+          # step; this applies it and stops at the first failure. Re-running is
+          # safe: the actions that already landed plan as `none` next time.
+          python3 -m continuum.parity.cli apply \
+            --plan parity-out/issue-plan.json \
+            --out parity-out/applied-issues.json
+
+      - name: Upload the issue plan
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: parity-issues
+          path: parity-out/
+          if-no-files-found: error
+
+  # Read-only. Answers whether a pin may move, and fails the run when asked.
+  gate:
+    needs: audit
+    if: always() && needs.audit.result == 'success' && inputs.consumer != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    permissions:
+      contents: read
+      issues: read
+
+    steps:
+      - name: Checkout trusted code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+
+      - name: Download the audit artifacts
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
+        with:
+          name: parity-drift
+          path: parity-out
+
+      - name: Judge the promotion
+        shell: bash
+        env:
+          PYTHONPATH: src
+          CONSUMER: ${{ inputs.consumer }}
+          FROM_PIN: ${{ inputs.from_pin }}
+          TO_PIN: ${{ inputs.to_pin }}
+        run: |
+          set -euo pipefail
+          # The verdict document carries the exact claim string, so nothing
+          # downstream has to quote a paraphrase of "clean".
+          python3 -m continuum.parity.cli promote \
+            --report parity-out/drift-report.json \
+            --consumer "$CONSUMER" \
+            --from-pin "$FROM_PIN" \
+            --to-pin "$TO_PIN" \
+            --fail-on-refused \
+            --out parity-out/promotion-verdict.json

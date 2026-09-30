@@ -1,0 +1,39 @@
+{
+  "schema": "continuum.parity-ledger/v1",
+  "version": 1,
+  "generated_at": "2026-09-30T13:40:00Z",
+  "note": "Example overlay, not the real one. An overlay is the only file that may name a private source: Continuum is public, so the committed ledger carries public sources and an operator-supplied overlay adds the private ones. The repository below is a placeholder; the real overlay is not committed and is passed with --overlay or CONTINUUM_PARITY_LEDGER_OVERLAY. Sources here are read only with the least-privilege credential in CONTINUUM_PARITY_PRIVATE_TOKEN, and their repository, paths, and commit metadata are redacted from every published artifact.",
+  "sources": [
+    {
+      "id": "private-consumer",
+      "repository": "example/private-consumer",
+      "visibility": "private",
+      "note": "A private automation repository this installation tracks. Reached only through a configured least-privilege credential; without one it is reported unavailable and every public source is still audited.",
+      "audit": {
+        "baseline_sha": "0000000000000000000000000000000000000000",
+        "current_sha": "0000000000000000000000000000000000000000",
+        "audited_at": "2026-09-30T13:40:00Z",
+        "audited_by": "operator",
+        "ledger_version": 1
+      },
+      "paths": [
+        {
+          "pattern": ".github/workflows/opencode.yml",
+          "disposition": "absorbed",
+          "note": "Publication and idempotence properties Continuum holds."
+        },
+        {
+          "pattern": "automation/*.yml",
+          "disposition": "absorbed",
+          "note": "The private repository's automation configuration."
+        },
+        {
+          "pattern": ".continuum.yml",
+          "disposition": "consumer-local",
+          "note": "That consumer's own contract configuration."
+        }
+      ],
+      "incidents": []
+    }
+  ]
+}
