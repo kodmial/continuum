@@ -48,6 +48,7 @@ on:
   check_suite:
     types: [completed]
   workflow_run:
+    workflows: ["CI", "Packaging smoke", "Release", "OpenCode agent"]
     types: [completed]
   release:
     types: [published]
