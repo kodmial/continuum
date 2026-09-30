@@ -138,9 +138,9 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # Surface base-branch drift before review. A clean merge is kept;
-          # conflicts remain in the working tree for the review agent to
-          # repair, rather than turning into a terminal merge failure later.
+          # Surface base drift before review. A clean merge is kept; conflicts
+          # remain in the working tree for the review agent to repair instead
+          # of becoming a terminal merge failure after acceptance.
           set +e
           git merge --no-edit "origin/$base_ref" >/dev/null 2>&1
           base_sync_rc=$?
@@ -323,8 +323,8 @@ jobs:
             fi
 
             # Base may have advanced during a long review. Ask GitHub to sync
-            # the branch; if that cannot be done cleanly, leave the PR open and
-            # let the next delegated review cycle resolve the conflict.
+            # the branch. If that cannot be done cleanly, leave the PR open;
+            # the dispatcher will launch another review cycle to repair it.
             live_head="$(jq -r '.headRefOid // ""' <<<"$live_pr" 2>/dev/null || true)"
             if [[ -n "$live_head" ]]; then
               gh api --method PUT \
