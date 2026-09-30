@@ -411,23 +411,72 @@ def status_reason(status: Optional[Dict[str, Any]], context: str) -> Optional[st
     return f"the {context!r} status for this HEAD is {state or 'unknown'}: {description[:200]}"
 
 
-def classify_reply(body: str) -> str:
-    """One verdict token for a provider reply, or `""` when it states none.
+#: Fenced code blocks, collapsed on one line or spanning several. A bot quoting its
+#: own earlier verdict inside a fence is quoting history, not stating a new one.
+_CODE_FENCE_RE = re.compile(r"```[\s\S]*?(?:```|\Z)")
+#: A collapsed `<details>` block, which is where a provider puts the prior thread
+#: body and its own "Review details" transcript.
+_DETAILS_RE = re.compile(r"<details\b[\s\S]*?</details\s*>", re.I)
+#: The same block with the closing tag missing, which happens when a provider
+#: truncates its own reply. Left in place the block would swallow the visible
+#: verdict, so an unterminated block runs to the end of the body.
+_DETAILS_UNTERMINATED_RE = re.compile(r"<details\b[\s\S]*\Z", re.I)
+#: A block-quoted line. The whole line goes, not just the marker: stripping only
+#: the ``>`` would promote somebody else's statement to the provider's own, which is
+#: the exact substitution the quote exists to prevent.
+_QUOTE_LINE_RE = re.compile(r"(?m)^[ \t]*>+[^\n]*(?:\n|\Z)")
 
-    A reply that only *asks* whether something is resolved states no verdict, so
-    the lines that carry a question are dropped before the positive form is
-    accepted. Guessing in that direction would let a fixed-looking finding be
-    dropped, which is the one failure mode the gate cannot recover from.
+
+def _visible_conclusion(body: str) -> str:
+    """The part of a reply the provider meant as its conclusion.
+
+    Three removals, in this order, because each one hides history the next would
+    otherwise read as a statement:
+
+    * collapsed ``<details>`` blocks and fenced code, which carry the provider's
+      own earlier verdict and the diff it was reasoning about;
+    * block-quoted lines, which are somebody else's statement repeated back;
+    * lines that only *ask* whether something is resolved.
+
+    What remains is the conclusion. This is the same reduction the production
+    adapter applies, and it is the difference between "the newest reply says the
+    finding is still unresolved" and "the newest reply quotes a reply that once
+    said resolved".
     """
 
     text = body or ""
+    # Terminated blocks first: the unterminated pattern would otherwise swallow
+    # everything after the *first* opening tag, including a conclusion the provider
+    # wrote after closing it.
+    text = _DETAILS_RE.sub("", text)
+    text = _DETAILS_UNTERMINATED_RE.sub("", text)
+    text = _CODE_FENCE_RE.sub("", text)
+    text = _QUOTE_LINE_RE.sub("", text)
+    return text
+
+
+def classify_reply(body: str) -> str:
+    """One verdict token for a provider reply, or `""` when it states none.
+
+    Only the visible conclusion is read. A reply that quotes an older verdict, or
+    reproduces it inside a collapsed block or a code fence, states no *new*
+    verdict, and treating the quote as the verdict would let a resolved-then-
+    reopened thread read as resolved -- the one failure mode the gate cannot
+    recover from.
+
+    The ordering of the two checks is deliberate and is not symmetric. An explicit
+    refusal wins wherever it appears in the conclusion, because a provider that
+    says UNRESOLVED and also says "this was resolved earlier" is describing the
+    present and the past. Only then is the positive form accepted.
+    """
+
+    text = _visible_conclusion(body)
     if UNRESOLVED_REPLY_RE.search(text):
         return REPLY_UNRESOLVED
     statements = "\n".join(line for line in text.splitlines() if "?" not in line)
     if RESOLVED_REPLY_RE.search(statements):
         return REPLY_RESOLVED
     return ""
-
 
 def thread_reply_verdict(
     thread: Dict[str, Any], bot_login: str = DEFAULT_BOT_LOGIN
