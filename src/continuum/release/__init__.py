@@ -28,6 +28,23 @@ already have one.
 
 from __future__ import annotations
 
+from .adoption import (
+    ADOPTION_SCHEMA,
+    AdoptionError,
+    Canary,
+    Comparison,
+    Divergence,
+    Ledger,
+    Preserved,
+    ReleaseFacts,
+    Rollback,
+    canary,
+    compare,
+    ledger,
+    require_retained,
+    require_retirable,
+    retention,
+)
 from .android import AndroidAdapter, AndroidError
 from .contract import (
     PORT_ATTRIBUTES,
@@ -262,5 +279,20 @@ __all__ = [
     "stage_names",
     "strategies",
     "unit_key",
+    "ADOPTION_SCHEMA",
+    "AdoptionError",
+    "Canary",
+    "Comparison",
+    "Divergence",
+    "Ledger",
+    "Preserved",
+    "ReleaseFacts",
+    "Rollback",
+    "canary",
+    "compare",
+    "ledger",
+    "require_retained",
+    "require_retirable",
+    "retention",
     "write_bundle",
 ]
