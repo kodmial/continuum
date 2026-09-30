@@ -204,7 +204,8 @@ Exit code `0` means approved, `1` means the gate is not satisfied, and `3` means
 the gate could not run — three states a CI job must not conflate.
 
 The gate blocks on, among others: `uncovered_scenario`,
-`replayed_only_coverage`, `unresolved_divergence`, `no_liveness_evidence`,
+`replayed_only_coverage`, `unresolved_divergence`, `no_baseline_evidence`,
+`no_liveness_evidence`,
 `liveness_stalled` / `liveness_orphaned` / `liveness_crashed`,
 `incomplete_approval`, `stale_approval`, `no_rollback`, and
 `approval_over_blocked_window`.
@@ -226,6 +227,73 @@ an approval is to say *this specific evidence was good enough*.
 A complete approval also names who approved, when, the canary evidence and the
 rollback path. NanoDictate must remain able to resume ownership; a cutover with
 no recorded way back is refused with `no_rollback`.
+
+## The rolling baseline
+
+A window says Continuum agreed with production on the paths it saw. It says
+nothing about what the consumer's workflows look like *now* — and the
+parity claim was made against a particular reading of them, which goes stale the
+moment a file is added or a blob moves.
+
+So the window cannot be judged without a second artifact: a live reading of the
+consumer taken at the moment the gate runs.
+
+```
+PYTHONPATH=src python3 -m continuum.shadow.cli baseline \
+  --ledger docs/parity-ledger.json \
+  --capture-live --repo owner/name \
+  --out baseline-out
+```
+
+Exit code `0` means the repository still matches the ledger, `1` means it does
+not, and `2` means there was no reading to compare. Each difference is routed to
+the issue that owns it. The report goes to `baseline-out/baseline/report.json`
+and is handed to the gate:
+
+```
+PYTHONPATH=src python3 -m continuum.shadow.cli cutover \
+  --baseline baseline-out/baseline/report.json \
+  ... the rest of the window ...
+```
+
+`.github/workflows/continuum-shadow.yml` does both, in that order, and refuses to
+run the judge if the reading is missing.
+
+### What blocks
+
+| Blocker | Means |
+| --- | --- |
+| `no_baseline_evidence` | No reading was supplied. A window alone can never authorize cutover |
+| `baseline_live_head_incomplete` | A read failed, so a comparison would be a claim about files nobody read |
+| `baseline_repository_mismatch` | The ledger audits a different repository than the one that was read |
+| `baseline_unclassified_workflow` | A workflow is active that nobody classified |
+| `baseline_workflow_blob_changed` | The file moved since it was audited, so the evidence granted against the old blob is no longer evidence about this file |
+| `baseline_workflow_removed` | The ledger audits a file that is no longer active |
+| `baseline_unclassified_open_pull_request` | An open pull request touches `.github/**` and nobody classified it |
+| `baseline_open_pull_request_drift` | A classified pull request now touches different paths |
+
+### Three ways it refuses to guess
+
+- **An incomplete reading is not a clean one.** If any read failed, the difference
+  walk is skipped entirely and the verdict is `incomplete`. Comparing a partial
+  inventory with a complete ledger would name every file it did not happen to see as
+  deleted, and that is a claim about the gap rather than about the repository.
+- **A truncated reading is an incomplete one.** The capture's ceiling on open pull
+  requests marks the capture incomplete rather than dropping the remainder, because
+  a repository with an unclassified pull request that the gate did not read would
+  otherwise report itself clean.
+- **A report that disagrees with itself is refused.** `ready` and `verdict` are
+  derivable from the rest of the document, so an edit to one field only is a report
+  whose remaining fields cannot be assumed to mean what they say — which is also the
+  shape a truncated write leaves behind. The reader refuses rather than reconciles,
+  and the cutover command fails instead of printing a decision.
+
+### The approval is bound to it
+
+The baseline report's `evidence_digest` is folded into the window's digest, so an
+approval granted before a workflow moved does not survive the move. That is the
+same rule as the rest of the window: an approval is a statement about *this specific
+evidence*, and evidence that has changed is not the evidence that was approved.
 
 ## Replaying one case
 

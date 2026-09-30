@@ -32,7 +32,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from . import barrier, cutover, engine, liveness, parity, replay, report
+from . import barrier, baseline, cutover, engine, liveness, parity, replay, report
 from .effects import READ_ONLY_METHODS
 from .config import ConfigError, ShadowConfig
 from .config import load as load_config
@@ -66,7 +66,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return USAGE_ERROR
     try:
         return int(args.handler(args))
-    except (EventError, StateError, ConfigError, replay.ReplayError, cutover.CutoverError) as error:
+    except (
+        EventError,
+        StateError,
+        ConfigError,
+        replay.ReplayError,
+        cutover.CutoverError,
+        baseline.BaselineError,
+    ) as error:
         _fail("{}: {}".format(type(error).__name__, error))
         return PLANE_FAILURE
     except FileNotFoundError as error:
@@ -138,10 +145,33 @@ def _parser() -> argparse.ArgumentParser:
     gate.add_argument("--approval", help="an approval document")
     gate.add_argument("--canary", help="canary evidence, as JSON")
     gate.add_argument("--rollback", help="rollback evidence, as JSON")
+    gate.add_argument(
+        "--baseline",
+        help="a rolling baseline report from the `baseline` subcommand; the cutover "
+        "gate refuses a window without one",
+    )
     gate.add_argument("--window-start", required=True)
     gate.add_argument("--window-end", required=True)
     gate.add_argument("--out", default="shadow-out")
     gate.set_defaults(handler=_cutover)
+
+    head = subparsers.add_parser(
+        "baseline", help="read the consumer's live workflows and compare them with the ledger"
+    )
+    head.add_argument("--ledger", required=True, help="the approved parity ledger")
+    head.add_argument(
+        "--capture-live", action="store_true", help="read the live head from GitHub"
+    )
+    head.add_argument(
+        "--live-head", help="a recorded live-head reading; the alternative to --capture-live"
+    )
+    head.add_argument("--repo", help="owner/name, required with --capture-live")
+    head.add_argument("--token-env", default="GITHUB_TOKEN", help="read-only token variable")
+    head.add_argument(
+        "--render", action="store_true", help="also print the ledger as markdown"
+    )
+    head.add_argument("--out", default="shadow-out")
+    head.set_defaults(handler=_baseline)
 
     barrier_command = subparsers.add_parser(
         "barrier-check", help="prove the write barrier refuses every mutating adapter"
@@ -400,6 +430,7 @@ def _cutover(args: argparse.Namespace) -> int:
     decision = cutover.from_documents(
         [_read_json(path) for path in args.parity],
         _read_json(args.liveness) if args.liveness else None,
+        baseline_document=_read_json(args.baseline) if args.baseline else None,
         origins=_optional_json(args.origins),
         resolution_documents=[_read_json(path) for path in args.resolutions],
         approval_document=_read_json(args.approval) if args.approval else None,
@@ -411,6 +442,58 @@ def _cutover(args: argparse.Namespace) -> int:
     _write(output / "cutover" / "decision.json", decision.describe())
     _summary(cutover.summarize(decision))
     return 0 if decision.approved else VALIDATION_FAILED
+
+
+# --------------------------------------------------------------------------- #
+# baseline
+# --------------------------------------------------------------------------- #
+
+
+def _baseline(args: argparse.Namespace) -> int:
+    """Read the consumer's live workflows and compare them with the ledger.
+
+    Deliberately not behind the write barrier: every read it performs is on
+    ``READ_ONLY_METHODS``, and the capture runs through the same client the shadow
+    plane uses. Installing the barrier would claim a guarantee this command does not
+    need rather than one it has.
+    """
+
+    output = _output_dir(args.out)
+    ledger = baseline.load_ledger(args.ledger)
+
+    if args.live_head:
+        live = baseline.read_live_head(_read_json(args.live_head))
+    elif args.capture_live:
+        from continuum.review.github import GitHubClient
+
+        if not args.repo:
+            _fail("missing_repository: --capture-live needs --repo owner/name")
+            return USAGE_ERROR
+        client = GitHubClient(token=_token(args.token_env), repository=args.repo)
+        live = baseline.capture_live_head(client, repository=args.repo)
+    else:
+        _fail(
+            "no_live_head: pass --capture-live --repo owner/name to read the "
+            "consumer now, or --live-head <file> to audit a reading somebody else "
+            "took"
+        )
+        return USAGE_ERROR
+
+    document = live.describe()
+    _write(output / "baseline" / "live-head.json", document)
+
+    result = baseline.audit(ledger, live, generated_from=ledger.repository)
+    _write(output / "baseline" / "report.json", result.describe())
+    _summary(baseline.summarize(result))
+    for owner in sorted(result.routing):
+        _summary(
+            "baseline: routed {} difference(s) to {}: {}".format(
+                len(result.routing[owner]), owner, ", ".join(result.routing[owner])
+            )
+        )
+    if args.render:
+        print(baseline.render_markdown(ledger))
+    return 0 if result.ready else VALIDATION_FAILED
 
 
 # --------------------------------------------------------------------------- #

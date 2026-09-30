@@ -170,6 +170,76 @@ class GitHubClient:
             "GET", f"/repos/{self.owner}/{self.name}/commits/{quoted}/status"
         )
 
+    def default_branch(self) -> str:
+        """The repository's current default branch.
+
+        Read rather than configured, because the rolling parity baseline is about
+        what the repository is *now*: a default branch pinned in Continuum's
+        configuration would be a snapshot that goes stale silently.
+        """
+
+        payload = self.request("GET", f"/repos/{self.owner}/{self.name}")
+        branch = str(payload.get("default_branch") or "")
+        if not branch:
+            raise GitHubError(
+                f"Repository {self.repository} reported no default branch; the live "
+                "head cannot be named"
+            )
+        return branch
+
+    def ref_sha(self, ref: str) -> str:
+        """The commit SHA a branch or tag currently points at."""
+
+        quoted = urllib.parse.quote(str(ref), safe="")
+        payload = self.request("GET", f"/repos/{self.owner}/{self.name}/commits/{quoted}")
+        sha = str(payload.get("sha") or "")
+        if not sha:
+            raise GitHubError(
+                f"Ref {ref!r} in {self.repository} resolved to no commit; there is no "
+                "immutable head to compare against"
+            )
+        return sha
+
+    def workflow_inventory(self, ref: str) -> Dict[str, str]:
+        """Every active workflow at `ref`, as `path -> blob SHA`.
+
+        The blob SHA rather than the content, because the question this answers is
+        "is this the file the parity ledger audited?", and content would make the
+        same question depend on how the reader decodes a byte. A directory that
+        does not exist is an empty inventory rather than an error: a repository with
+        no workflows is a legitimate reading, and the caller still compares it.
+        """
+
+        query = urllib.parse.urlencode({"ref": ref})
+        try:
+            listing = self.request(
+                "GET", f"/repos/{self.owner}/{self.name}/contents/.github/workflows?{query}"
+            )
+        except GitHubError as error:
+            if error.status == 404:
+                return {}
+            raise
+        if not isinstance(listing, list):
+            raise GitHubError(
+                f"Listing .github/workflows in {self.repository} did not return a directory"
+            )
+        inventory: Dict[str, str] = {}
+        for entry in listing:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name") or "")
+            if entry.get("type") != "file" or not name.endswith((".yml", ".yaml")):
+                continue
+            sha = str(entry.get("sha") or "")
+            if not sha:
+                # A file with no blob SHA cannot be compared, and silently dropping
+                # it would under-report the inventory the caller is about to trust.
+                raise GitHubError(
+                    f"{self.repository}:.github/workflows/{name} listed with no blob SHA"
+                )
+            inventory[f".github/workflows/{name}"] = sha
+        return inventory
+
     def file_at_ref(self, path: str, ref: str) -> Optional[str]:
         quoted = urllib.parse.quote(path)
         query = urllib.parse.urlencode({"ref": ref})

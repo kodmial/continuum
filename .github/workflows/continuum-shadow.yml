@@ -119,6 +119,10 @@ on:
         description: cutover; the rollback evidence document inside the window
         type: string
         default: ""
+      baseline_ledger_path:
+        description: cutover; the parity ledger inside the window; empty uses the one shipped with the engine
+        type: string
+        default: ""
       window_start:
         description: cutover; the first instant of the observation window (ISO 8601)
         type: string
@@ -203,6 +207,9 @@ on:
         type: string
       rollback_path:
         description: cutover; the rollback evidence document inside the window
+        type: string
+      baseline_ledger_path:
+        description: cutover; the parity ledger inside the window; empty uses the one shipped with the engine
         type: string
       window_start:
         description: cutover; the first instant of the observation window (ISO 8601)
@@ -326,7 +333,7 @@ jobs:
           printf '%s' "$BUDGET_MS" >shadow-out/budget-ms.txt
           printf '%s' "$SERVER_URL/$HOST_REPOSITORY/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT" \
             >shadow-out/shadow-run-url.txt
-          printf '%s' "kodmial/continuum/.github/workflows/continuum-shadow.yml@$ENGINE_SHA" >shadow-out/engine-ref.txt
+          printf '%s' "$JOB_WORKFLOW_REF" >shadow-out/engine-ref.txt
           printf '%s' "$ENGINE_SHA" >shadow-out/engine-sha.txt
           printf '%s' "$(python3 -c 'import platform; print(platform.python_version())')" \
             >shadow-out/python-version.txt
@@ -479,6 +486,7 @@ jobs:
     env:
       GITHUB_TOKEN: ${{ inputs.token || github.token }}
       MODE: ${{ inputs.mode }}
+      SHADOWED_REPOSITORY: ${{ inputs.repository || github.repository }}
       ARTIFACT_RUN_ID: ${{ inputs.artifact_run_id }}
       ARTIFACT_NAME: ${{ inputs.artifact_name }}
       WINDOW_DIR: ${{ inputs.window_dir }}
@@ -491,6 +499,7 @@ jobs:
       APPROVAL_PATH: ${{ inputs.approval_path }}
       CANARY_PATH: ${{ inputs.canary_path }}
       ROLLBACK_PATH: ${{ inputs.rollback_path }}
+      BASELINE_LEDGER_PATH: ${{ inputs.baseline_ledger_path }}
       WINDOW_START: ${{ inputs.window_start }}
       WINDOW_END: ${{ inputs.window_end }}
       ENGINE_REF_INPUT: ${{ inputs.engine_ref }}
@@ -556,7 +565,7 @@ jobs:
           printf '%s' "$ARTIFACT_RUN_ID" >replay-out/window-run-id.txt
           printf '%s' "$ARTIFACT_NAME" >replay-out/window-artifact.txt
           printf '%s' "$ENGINE_SHA" >replay-out/engine-sha.txt
-          printf '%s' "kodmial/continuum/.github/workflows/continuum-shadow.yml@$ENGINE_SHA" >replay-out/engine-ref.txt
+          printf '%s' "$JOB_WORKFLOW_REF" >replay-out/engine-ref.txt
           printf '%s' "$(python3 -c 'import platform; print(platform.python_version())')" \
             >replay-out/python-version.txt
           printf '%s' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >replay-out/rejudged-at.txt
@@ -575,6 +584,37 @@ jobs:
             args+=(--compare "$WINDOW_ROOT/$COMPARE_PATH")
           fi
           PYTHONPATH=engine/src python3 -m continuum.shadow.cli "${args[@]}"
+      - name: Read the consumer's current workflows
+        if: inputs.mode == 'cutover'
+        # The ledger is the parity claim, and the live reading is whether the
+        # repository still matches it. Without this the gate judges a window
+        # against a historical snapshot, so a workflow added or a blob moved
+        # after the snapshot would cut over on evidence that no longer describes
+        # the consumer.
+        #
+        # The read is deliberately taken here, now, and its report handed to the
+        # judge: a reading taken during the window and judged afterwards is a
+        # snapshot of the wrong instant. A capture that could not finish is
+        # recorded as incomplete and fails this step rather than passing an
+        # empty reading to a judge that would see "nothing changed".
+        run: |
+          set -euo pipefail
+          ledger="${BASELINE_LEDGER_PATH:-engine/docs/parity-ledger.json}"
+          case "$ledger" in
+            /*) ledger="$WINDOW_ROOT/$ledger" ;;
+            engine/*) ;;
+            *) ledger="$WINDOW_ROOT/$ledger" ;;
+          esac
+          if [ ! -f "$ledger" ]; then
+            echo "::error::no parity ledger at $ledger; the cutover gate cannot compare anything"
+            exit 2
+          fi
+          PYTHONPATH=engine/src python3 -m continuum.shadow.cli baseline \
+            --ledger "$ledger" \
+            --capture-live \
+            --repo "${SHADOWED_REPOSITORY:-$GITHUB_REPOSITORY}" \
+            --out replay-out
+          printf '%s' "$ledger" >replay-out/baseline-ledger-path.txt
       - name: Judge the window against the cutover requirements
         if: inputs.mode == 'cutover'
         run: |
@@ -587,7 +627,12 @@ jobs:
             echo "::error::name the window's liveness report with liveness_path"
             exit 2
           fi
+          if [ ! -f replay-out/baseline/report.json ]; then
+            echo "::error::the consumer's workflows were not read; refusing to judge a window against a snapshot"
+            exit 2
+          fi
           args=(cutover --out replay-out
+            --baseline replay-out/baseline/report.json
             --liveness "$WINDOW_ROOT/$LIVENESS_PATH"
             --window-start "$WINDOW_START"
             --window-end "$WINDOW_END")
