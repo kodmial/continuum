@@ -20,7 +20,7 @@ name: Issue scheduler
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/5 * * * *"
   issues:
     types: [opened, reopened, closed, labeled, unlabeled]
   pull_request_target:
@@ -163,6 +163,7 @@ jobs:
             const inProgressLabel = 'automation:in-progress';
             const pausedLabel = 'automation:paused';
             const dispatchMarker = '<!-- issue-scheduler-dispatch -->';
+            const infraRetryPrefix = '<!-- continuum-infra-retry:';
 
             const labelSpecs = [
               {
@@ -261,6 +262,37 @@ jobs:
                 .map(event => new Date(event.created_at).getTime())
                 .filter(Number.isFinite);
               return resets.length ? Math.max(...resets) : 0;
+            }
+
+            async function latestInfrastructureRetry(issueNumber) {
+              const epochStartedAt = await retryEpochStartedAt(issueNumber);
+              const comments = await github.paginate(
+                github.rest.issues.listComments,
+                {owner, repo, issue_number: issueNumber, per_page: 100}
+              );
+              let latest = null;
+              for (const comment of comments) {
+                const createdAt = new Date(comment.created_at).getTime();
+                if (!Number.isFinite(createdAt) || createdAt < epochStartedAt) continue;
+                const body = comment.body || '';
+                if (!body.includes(infraRetryPrefix)) continue;
+                const match = body.match(
+                  /<!-- continuum-infra-retry:\s*attempt=(\d+)\s+next_retry_at=([^\s]+)\s+code=([A-Za-z0-9_.-]+)\s+run=(\d+)\s*-->/
+                );
+                if (!match) continue;
+                const nextRetryAt = new Date(match[2]).getTime();
+                if (!Number.isFinite(nextRetryAt)) continue;
+                const candidate = {
+                  attempt: Number(match[1]),
+                  nextRetryAt,
+                  nextRetryAtText: match[2],
+                  code: match[3],
+                  runId: Number(match[4]),
+                  createdAt,
+                };
+                if (!latest || candidate.createdAt > latest.createdAt) latest = candidate;
+              }
+              return latest;
             }
 
             // A closed OpenCode PR is authoritative:
@@ -522,6 +554,16 @@ jobs:
               const labels = labelsByIssue.get(issue.number);
               if (labels.has(pausedLabel)) {
                 core.info('Skipping #' + issue.number + ': automation is paused.');
+                continue;
+              }
+
+              const infraRetry = await latestInfrastructureRetry(issue.number);
+              if (infraRetry && Date.now() < infraRetry.nextRetryAt) {
+                core.info(
+                  'Skipping #' + issue.number + ': infrastructure retry ' +
+                  infraRetry.attempt + '/8 is not due until ' +
+                  infraRetry.nextRetryAtText + ' (' + infraRetry.code + ').'
+                );
                 continue;
               }
 
