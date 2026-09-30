@@ -98,6 +98,7 @@ NOT_AGENT_PLANE = (
     "consumer-scheduler.yml",
     "continuum-shadow.yml",
     "release-bun-binary.yml",
+    "release-verify.yml",
     "review-queue.yml",
 )
 
