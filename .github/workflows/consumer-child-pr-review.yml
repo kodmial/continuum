@@ -1,0 +1,292 @@
+name: Continuum reusable child pull-request review
+
+on:
+  workflow_call:
+    inputs:
+      child_id:
+        type: string
+        required: true
+      pr_number:
+        type: string
+        required: true
+      model:
+        type: string
+        required: false
+        default: opencode/muse-spark-1.3-contributor-free
+      max_review_passes:
+        type: number
+        required: false
+        default: 3
+      engine_ref:
+        type: string
+        required: false
+        default: main
+    secrets:
+      CHILD_RUNTIME_TOKEN:
+        required: true
+      CHILD_RUNTIME_REPOSITORIES:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    concurrency:
+      group: continuum-child-pr-review-${{ inputs.child_id }}-${{ inputs.pr_number }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ secrets.CHILD_RUNTIME_TOKEN }}
+      GITHUB_TOKEN: ${{ secrets.CHILD_RUNTIME_TOKEN }}
+      CHILD_REPOSITORIES: ${{ secrets.CHILD_RUNTIME_REPOSITORIES }}
+      CHILD_ID: ${{ inputs.child_id }}
+      PR_NUMBER: ${{ inputs.pr_number }}
+      OPENCODE_MODEL: ${{ inputs.model }}
+      MAX_REVIEW_PASSES: ${{ inputs.max_review_passes }}
+    steps:
+      - name: Checkout parent control plane
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout Continuum engine
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: kodmial/continuum
+          ref: ${{ inputs.engine_ref }}
+          path: .continuum-engine
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Review and repair owner-created child pull request
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::Invalid pull request number."; exit 2; }
+
+          CONTINUUM_ENGINE_ROOT="$GITHUB_WORKSPACE/.continuum-engine"
+          export PYTHONPATH="$CONTINUUM_ENGINE_ROOT/src"
+          resolver="$CONTINUUM_ENGINE_ROOT/.github/scripts/delegation_repository.sh"
+          child_repo="$(
+            PARENT_CONFIG=.continuum.yml CHILD_REPOSITORIES="$CHILD_REPOSITORIES"               bash "$resolver" resolve "$CHILD_ID"
+          )"
+          PARENT_CONFIG=.continuum.yml CHILD_REPOSITORIES="$CHILD_REPOSITORIES"             bash "$resolver" verify "$CHILD_ID" "$child_repo" >/dev/null
+          validation_script="$(
+            PARENT_CONFIG=.continuum.yml CHILD_REPOSITORIES="$CHILD_REPOSITORIES"               bash "$resolver" validation "$child_repo"
+          )"
+
+          pr_json="$(gh pr view "$PR_NUMBER" --repo "$child_repo"             --json state,isDraft,author,headRefName,headRepository,baseRefName,title,body,mergedAt 2>/dev/null)"
+          state="$(jq -r '.state' <<<"$pr_json")"
+          merged_at="$(jq -r '.mergedAt // ""' <<<"$pr_json")"
+          [[ -z "$merged_at" ]] || { echo "PR #$PR_NUMBER is already merged."; exit 0; }
+          [[ "$state" == "OPEN" ]] || { echo "PR #$PR_NUMBER is not open."; exit 0; }
+          [[ "$(jq -r '.isDraft' <<<"$pr_json")" == "false" ]] || { echo "PR #$PR_NUMBER is draft."; exit 0; }
+
+          child_owner="${child_repo%%/*}"
+          author="$(jq -r '.author.login // ""' <<<"$pr_json")"
+          head_owner="$(jq -r '.headRepository.owner.login // ""' <<<"$pr_json")"
+          [[ "$author" == "$child_owner" && "$head_owner" == "$child_owner" ]] || {
+            echo "PR #$PR_NUMBER is not an owner-created same-repository pull request; ignoring."
+            exit 0
+          }
+
+          head_ref="$(jq -r '.headRefName' <<<"$pr_json")"
+          base_ref="$(jq -r '.baseRefName' <<<"$pr_json")"
+          title="$(jq -r '.title' <<<"$pr_json")"
+          body="$(jq -r '.body // ""' <<<"$pr_json")"
+
+          # Delegated task branches already have their own stronger task review
+          # contract. This workflow is only for ordinary owner-created PRs.
+          if [[ "$head_ref" == continuum-child/task-* || "$head_ref" == runtime-worker/task-* ]]; then
+            echo "PR #$PR_NUMBER is automation-owned delegated task work; task review owns it."
+            exit 0
+          fi
+
+          gh pr comment "$PR_NUMBER" --repo "$child_repo"             --body "<!-- continuum-child-pr-review-started --> Independent external review/repair started for owner-created PR #$PR_NUMBER."             >/dev/null 2>&1 || true
+
+          workdir="$RUNNER_TEMP/continuum-child-pr-review"
+          transcript="$RUNNER_TEMP/continuum-child-pr-review.log"
+          review_file="$RUNNER_TEMP/continuum-child-pr-review-result.md"
+          validation_log="$RUNNER_TEMP/continuum-child-pr-validation.log"
+
+          gh auth setup-git >/dev/null 2>&1
+          rm -rf "$workdir"
+          gh repo clone "$child_repo" "$workdir" -- --quiet >/dev/null 2>&1
+          cd "$workdir"
+          git fetch origin "$base_ref" "$head_ref" --quiet >/dev/null 2>&1
+          git checkout -B "$head_ref" "origin/$head_ref" >/dev/null 2>&1
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          set +e
+          git merge --no-edit "origin/$base_ref" >/dev/null 2>&1
+          base_sync_rc=$?
+          set -e
+          if [[ "$base_sync_rc" -ne 0 ]]; then
+            echo "PR #$PR_NUMBER has conflicts with $base_ref; review agent will repair them."
+          fi
+
+          trusted_validation=""
+          run_validation() {
+            [[ -n "$trusted_validation" ]] || return 0
+            env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" LANG="${LANG:-C.UTF-8}" CI=true               bash "$trusted_validation" >"$validation_log" 2>&1
+          }
+
+          initial_validation="not configured"
+          if [[ -n "$validation_script" ]]; then
+            if ! git cat-file -e "origin/$base_ref:$validation_script" 2>/dev/null; then
+              gh pr comment "$PR_NUMBER" --repo "$child_repo"                 --body "<!-- continuum-child-pr-validation-missing --> Configured delegated validation gate is missing from the base branch."                 >/dev/null 2>&1 || true
+              exit 5
+            fi
+            trusted_validation="$RUNNER_TEMP/continuum-child-pr-validation.sh"
+            git show "origin/$base_ref:$validation_script" >"$trusted_validation"
+            chmod 700 "$trusted_validation"
+            set +e
+            run_validation
+            validation_rc=$?
+            set -e
+            if [[ "$validation_rc" -eq 0 ]]; then
+              initial_validation="passed"
+            else
+              initial_validation="failed; diagnostics are available only in the local runner at $validation_log"
+            fi
+          fi
+
+          for attempt in 1 2 3; do
+            if curl -fsSL https://opencode.ai/install | bash >/dev/null 2>&1; then
+              break
+            fi
+            if [[ "$attempt" -eq 3 ]]; then
+              gh pr comment "$PR_NUMBER" --repo "$child_repo"                 --body "<!-- continuum-child-pr-review-infra --> Review could not install the agent runtime; dispatcher may retry."                 >/dev/null 2>&1 || true
+              exit 4
+            fi
+            sleep $((attempt * 5))
+          done
+          export PATH="$HOME/.opencode/bin:$PATH"
+          test -x "$HOME/.opencode/bin/opencode"
+
+          python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/opencode_instructions.py" install             --source "$CONTINUUM_ENGINE_ROOT/.github/agents/AGENTS.md"
+
+          prompt="$RUNNER_TEMP/continuum-child-pr-review.txt"
+          cat >"$prompt" <<EOF
+          Independently review and, if necessary, repair owner-created pull request #$PR_NUMBER in $child_repo.
+
+          Rules:
+          - Treat the PR title/body and the actual diff against origin/$base_ref as the intended change.
+          - Do not assume prior tests or the author's summary are correct.
+          - Resolve all merge conflicts with current origin/$base_ref while preserving the intended behavior from both sides.
+          - Inspect every behaviorally relevant change, including tests and configuration.
+          - Run relevant tests and the repository's deterministic validation gate.
+          - Fix defects directly on this existing PR branch.
+          - Do not create another branch or another pull request.
+          - Never expose credentials or secret values.
+          - Do not upload child source, diffs, logs, or transcripts to the public parent repository.
+          - You may make local commits. Do not push; the outer workflow pushes the branch.
+          - Before finishing, create or replace exactly: $review_file
+          - Record findings, repairs, verification and remaining risks.
+          - End that file with a standalone line exactly: Review: PASS
+          - Write Review: PASS only when this PR is safe to merge and satisfies its stated intent.
+          - The deterministic validation gate is loaded from the trusted base branch and must not be edited or weakened.
+          - Initial validation state: $initial_validation
+          - If it failed, inspect local diagnostics at: $validation_log
+
+          --- PR TITLE ---
+          $title
+
+          --- PR BODY ---
+          $body
+          EOF
+
+          accepted=false
+          for pass in $(seq 1 "$MAX_REVIEW_PASSES"); do
+            pass_prompt="$RUNNER_TEMP/continuum-child-pr-review-pass-$pass.txt"
+            cp "$prompt" "$pass_prompt"
+            if [[ "$pass" -gt 1 ]]; then
+              cat >>"$pass_prompt" <<EOF
+
+          Continuation review pass $pass:
+          - Continue from the existing working tree.
+          - Repair remaining blockers, rerun verification, and update $review_file.
+          EOF
+            fi
+
+            python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/opencode_instructions.py" verify               --source "$CONTINUUM_ENGINE_ROOT/.github/agents/AGENTS.md"
+            rm -f "$review_file"
+            set +e
+            opencode run --auto --model "$OPENCODE_MODEL" "$(cat "$pass_prompt")" >"$transcript" 2>&1
+            rc=$?
+            set -e
+
+            if [[ -f "$review_file" ]] && grep -qx 'Review: PASS' "$review_file"; then
+              set +e
+              run_validation
+              validation_rc=$?
+              set -e
+              if [[ "$validation_rc" -eq 0 ]] && ! git diff --name-only --diff-filter=U | grep -q .; then
+                accepted=true
+                break
+              fi
+            fi
+            echo "Manual child PR #$PR_NUMBER review pass $pass incomplete (agent rc=$rc); continuing."
+          done
+
+          if [[ "$accepted" != true ]]; then
+            gh pr comment "$PR_NUMBER" --repo "$child_repo"               --body "<!-- continuum-child-pr-review-needs-retry --> Independent review did not reach verified acceptance; the PR remains open for automatic retry."               >/dev/null 2>&1 || true
+            exit 30
+          fi
+
+          if git diff --no-ext-diff "origin/$base_ref"...HEAD -- . |              grep -Eiq '(github_pat_[A-Za-z0-9_]+|ghp_[A-Za-z0-9]+|rnd_[A-Za-z0-9]+)'; then
+            gh pr comment "$PR_NUMBER" --repo "$child_repo"               --body "<!-- continuum-child-pr-review-security --> Token-like material detected; merge blocked."               >/dev/null 2>&1 || true
+            exit 31
+          fi
+
+          if [[ -n "$(git status --porcelain)" ]]; then
+            git add -A
+            git commit -m "fix: repair PR #$PR_NUMBER after independent review" >/dev/null 2>&1
+          fi
+          if [[ "$(git rev-list --count "origin/$head_ref"..HEAD)" -gt 0 ]]; then
+            git push origin "HEAD:$head_ref" >/dev/null 2>&1
+          fi
+
+          merge_ok=false
+          for merge_attempt in 1 2 3; do
+            live_pr="$(gh pr view "$PR_NUMBER" --repo "$child_repo"               --json state,mergedAt,headRefOid 2>/dev/null || true)"
+            if [[ -n "$live_pr" && "$(jq -r '.mergedAt // ""' <<<"$live_pr")" != "" ]]; then
+              merge_ok=true
+              break
+            fi
+            [[ "$(jq -r '.state // ""' <<<"$live_pr")" == "OPEN" ]] || {
+              echo "PR #$PR_NUMBER closed before merge; stopping."
+              exit 0
+            }
+
+            set +e
+            gh pr merge "$PR_NUMBER" --repo "$child_repo" --squash --delete-branch >/dev/null 2>&1
+            merge_rc=$?
+            if [[ "$merge_rc" -ne 0 ]]; then
+              gh pr merge "$PR_NUMBER" --repo "$child_repo" --squash --delete-branch --admin >/dev/null 2>&1
+              merge_rc=$?
+            fi
+            set -e
+            if [[ "$merge_rc" -eq 0 ]]; then
+              merge_ok=true
+              break
+            fi
+
+            live_head="$(jq -r '.headRefOid // ""' <<<"$live_pr")"
+            if [[ -n "$live_head" ]]; then
+              gh api --method PUT "repos/$child_repo/pulls/$PR_NUMBER/update-branch"                 -f "expected_head_sha=$live_head" >/dev/null 2>&1 || true
+            fi
+            sleep $((merge_attempt * 2))
+          done
+
+          if [[ "$merge_ok" != true ]]; then
+            gh pr comment "$PR_NUMBER" --repo "$child_repo"               --body "<!-- continuum-child-pr-review-merge-retry --> Review passed, but merge was deferred; dispatcher will retry."               >/dev/null 2>&1 || true
+            exit 0
+          fi
+
+          gh pr comment "$PR_NUMBER" --repo "$child_repo"             --body "<!-- continuum-child-pr-review-merged --> Independent review passed and this owner-created PR was merged."             >/dev/null 2>&1 || true
+          echo "Owner-created child PR [$CHILD_ID] #$PR_NUMBER reviewed and merged."
