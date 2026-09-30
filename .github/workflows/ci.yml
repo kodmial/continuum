@@ -53,7 +53,161 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          allowed='^(auto-merge|ci|issue-scheduler|review-gate|review-queue|opencode|opencode-repair|continuum-shadow|consumer|consumer-scheduler|consumer-opencode|consumer-repair|consumer-auto-merge|consumer-review-gate|consumer-child-dispatcher|consumer-child-worker|consumer-child-review|consumer-child-pr-review|release-bun-binary|release|publish-continuum)\\.ya?ml$'
+          allowed='^(auto-merge|ci|issue-scheduler|review-gate|review-queue|opencode|opencode-repair|continuum-shadow|consumer|consumer-scheduler|consumer-opencode|consumer-repair|consumer-auto-merge|consumer-review-gate|consumer-child-dispatcher|consumer-child-worker|consumer-child-review|consumer-child-pr-review|release-bun-binary|release|publish-continuum)\.ya?ml
+          bad=0
+          while IFS= read -r file; do
+            base="$(basename "$file")"
+            if ! grep -Eq "$allowed" <<<"$base"; then
+              echo "::error::Unexpected active workflow: $file"
+              bad=1
+            fi
+          done < <(find .github/workflows -maxdepth 1 -type f \( -name '*.yml' -o -name '*.yaml' \) | sort)
+          exit "$bad"
+
+      - name: Run the trust policy and workflow hardening suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The policy module and the fixtures that document the attack shapes
+          # are the trust boundary. Run them on every PR, not just on a schedule:
+          # a change that weakens the boundary must fail here.
+          test -f .github/scripts/trust_policy.py
+          python3 -m unittest discover -s .github/tests -p 'test_*.py' -v
+
+      - name: Run Continuum unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=src python3 -m unittest discover -s tests -t . -v
+
+      - name: Validate repository configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=src python3 -m continuum.cli config-check --config .continuum.yml
+
+      - name: Verify disabled NanoDictate snapshot is preserved
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f reference/nanodictate-workflows/release.yml
+          test -f reference/nanodictate-workflows/coderabbit-retry.yml
+          test -f reference/nanodictate-workflows/auto-merge.yml
+          test -f reference/nanodictate-workflows/issue-scheduler.yml
+
+      - name: Validate the two-toggle MVP contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/test_continuum_config.py
+          PYTHONPATH=.github/scripts python3 .github/scripts/test_delegation_runtime.py
+
+      - name: Resolve the repository configuration as a consumer would
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Continuum must satisfy its own contract from its own checkout.
+          python3 .github/scripts/continuum_config.py
+
+      - name: Verify contract core stays consumer-agnostic
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The two-toggle contract is the portability guarantee: one unchanged
+          # copy of Continuum must resolve every consumer. A consumer, provider,
+          # or platform name in the contract core would break that silently, so
+          # it fails the build here rather than at migration time.
+          #
+          # The banned names live in a data file rather than inline: the MVP
+          # boundary asserts that no active workflow names a consumer, so the
+          # pattern list is read instead of hard-coded here.
+          core='.github/scripts/continuum_config.py'
+          # `grep -f` has no comment syntax, so '#' lines are stripped before
+          # they are used as patterns; otherwise a comment would match every
+          # commented line in the core.
+          if grep -Eino -f <(grep -v '^[[:space:]]*#' .github/scripts/contract-forbidden-names.txt) "$core"; then
+            echo "::error::Consumer/provider/platform name found in the contract core: $core"
+            exit 1
+          fi
+          echo "validated $core"
+
+          bad=0
+          while IFS= read -r file; do
+            base="$(basename "$file")"
+            if ! grep -Eq "$allowed" <<<"$base"; then
+              echo "::error::Unexpected active workflow: $file"
+              bad=1
+            fi
+          done < <(find .github/workflows -maxdepth 1 -type f \( -name '*.yml' -o -name '*.yaml' \) | sort)
+          exit "$bad"
+
+      - name: Run the trust policy and workflow hardening suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The policy module and the fixtures that document the attack shapes
+          # are the trust boundary. Run them on every PR, not just on a schedule:
+          # a change that weakens the boundary must fail here.
+          test -f .github/scripts/trust_policy.py
+          python3 -m unittest discover -s .github/tests -p 'test_*.py' -v
+
+      - name: Run Continuum unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=src python3 -m unittest discover -s tests -t . -v
+
+      - name: Validate repository configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=src python3 -m continuum.cli config-check --config .continuum.yml
+
+      - name: Verify disabled NanoDictate snapshot is preserved
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f reference/nanodictate-workflows/release.yml
+          test -f reference/nanodictate-workflows/coderabbit-retry.yml
+          test -f reference/nanodictate-workflows/auto-merge.yml
+          test -f reference/nanodictate-workflows/issue-scheduler.yml
+
+      - name: Validate the two-toggle MVP contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/test_continuum_config.py
+          PYTHONPATH=.github/scripts python3 .github/scripts/test_delegation_runtime.py
+
+      - name: Resolve the repository configuration as a consumer would
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Continuum must satisfy its own contract from its own checkout.
+          python3 .github/scripts/continuum_config.py
+
+      - name: Verify contract core stays consumer-agnostic
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The two-toggle contract is the portability guarantee: one unchanged
+          # copy of Continuum must resolve every consumer. A consumer, provider,
+          # or platform name in the contract core would break that silently, so
+          # it fails the build here rather than at migration time.
+          #
+          # The banned names live in a data file rather than inline: the MVP
+          # boundary asserts that no active workflow names a consumer, so the
+          # pattern list is read instead of hard-coded here.
+          core='.github/scripts/continuum_config.py'
+          # `grep -f` has no comment syntax, so '#' lines are stripped before
+          # they are used as patterns; otherwise a comment would match every
+          # commented line in the core.
+          if grep -Eino -f <(grep -v '^[[:space:]]*#' .github/scripts/contract-forbidden-names.txt) "$core"; then
+            echo "::error::Consumer/provider/platform name found in the contract core: $core"
+            exit 1
+          fi
+          echo "validated $core"
+
           bad=0
           while IFS= read -r file; do
             base="$(basename "$file")"
