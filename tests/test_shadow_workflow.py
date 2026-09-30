@@ -812,20 +812,32 @@ class BridgeProjectionTests(unittest.TestCase):
 def commit_contains(revision: str, path: str) -> bool:
     """Whether ``revision``'s tree contains ``path``.
 
-    Answers "no" rather than raising when the commit is not in this clone, which
-    is the case for a shallow clone of a pin that has since been pushed. A pin
-    this test cannot see is treated as unverified, and the unverified case is the
-    one that requires the placeholder marker -- so a reader never mistakes an
-    unverified pin for a current one.
+    CI uses a shallow checkout, while an immutable consumer pin normally points
+    at an earlier commit. If the object is missing locally, fetch exactly that
+    full SHA read-only and retry. A network/offline failure still answers "no",
+    which keeps an unverifiable pin fail-closed.
     """
 
-    result = subprocess.run(
-        ["git", "cat-file", "-e", "{}:{}".format(revision, path)],
+    def contains() -> bool:
+        result = subprocess.run(
+            ["git", "cat-file", "-e", "{}:{}".format(revision, path)],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode == 0
+
+    if contains():
+        return True
+    if not re.fullmatch(r"[0-9a-f]{40}", revision):
+        return False
+    fetched = subprocess.run(
+        ["git", "fetch", "--no-tags", "--depth=1", "origin", revision],
         cwd=str(REPO_ROOT),
         capture_output=True,
         text=True,
     )
-    return result.returncode == 0
+    return fetched.returncode == 0 and contains()
 
 
 class BridgePinTests(unittest.TestCase):
