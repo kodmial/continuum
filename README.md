@@ -7,6 +7,12 @@ real repositories. The initial reference implementation is an exact snapshot of
 the NanoDictate workflows at commit
 `64e89a3bcbab671513a933855e7495a07fac56bb`.
 
+## Architecture
+
+The normative target architecture for Continuum consumers is documented in
+[docs/architecture/README.md](docs/architecture/README.md). Architecturally significant decisions
+are preserved as ADRs under [docs/architecture/adr/](docs/architecture/adr/).
+
 ## Bootstrap state
 
 The repository currently dogfoods a deliberately small active control plane:
