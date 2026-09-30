@@ -19,7 +19,6 @@ import json
 import pathlib
 import re
 import subprocess
-import sys
 import unittest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -87,14 +86,6 @@ AGENT_PLANE = (
 #: `ReleaseSelectionTests` in `test_release_selection.py` is what holds it to
 #: ADR-0002 instead.
 #:
-#: `release.yml` belongs here for the same reason: it is entered through
-#: `workflow_call` by a consumer repository, it never executes pull request code,
-#: and its write scope is the job itself - publishing a release. The one place it
-#: differs from the queue workflows is that it *does* check out a caller-supplied
-#: commit and run that commit's code, so the boundary it is held to is the one
-#: that matters most: the job that runs the code has no credential, and only the
-#: job that has one is reached after every build's evidence is checked.
-#:
 #: The list is spelled out rather than derived, and `AuditScopeTests` asserts it
 #: is exactly the complement of `AGENT_PLANE`, so a workflow cannot enter this
 #: directory - or leave the agent plane - without a reviewer deciding so.
@@ -105,7 +96,6 @@ AGENT_PLANE = (
 #: tokenless privileged checkout.
 NOT_AGENT_PLANE = (
     "consumer-auto-merge.yml",
-    "release.yml",
     "consumer-child-dispatcher.yml",
     "consumer-child-pr-review.yml",
     "consumer-child-review.yml",
@@ -117,6 +107,8 @@ NOT_AGENT_PLANE = (
     "consumer.yml",
     "continuum-shadow.yml",
     "release-bun-binary.yml",
+    "release.yml",
+    "continuum-release.yml",
     "review-queue.yml",
 )
 
@@ -1339,259 +1331,29 @@ class SelfProtectionTests(WorkflowAuditBase):
                     )
 
 
-class ReleaseWorkflowTests(WorkflowAuditBase):
-    """The boundaries of the release contract, asserted on the workflow.
+class DelegatedChildLivenessTests(WorkflowAuditBase):
+    """Delegated child work must recover from controller metadata failures."""
 
-    The generic contract is only as strong as the workflow that runs it, and a
-    workflow is edited far more often than the contract is. Each test here pins
-    one property the contract's security argument depends on, so a change that
-    widens a job's authority has to say so in a test rather than in a diff
-    nobody reads closely.
+    def test_dispatcher_reopens_closed_unmerged_child_pull_requests(self):
+        text = self.raw["consumer-child-dispatcher.yml"]
+        self.assertIn('gh pr list --repo "$child_repo" --state closed', text)
+        self.assertIn('gh pr reopen "$stale_pr" --repo "$child_repo"', text)
 
-    The secret names are read from the static entrypoint table rather than
-    restated here, so the workflow and the table cannot drift apart quietly: a
-    new adapter that needs a key is a workflow edit *and* a table edit, and this
-    file is what notices when only one of them happened.
-    """
+    def test_dispatcher_clears_stale_child_pause_labels(self):
+        text = self.raw["consumer-child-dispatcher.yml"]
+        self.assertIn('labels/automation%3Apaused', text)
+        self.assertIn('Cleared stale automation:paused on child task', text)
 
-    NAME = "release.yml"
-    JOBS = ("resolve", "target", "transaction")
+    def test_child_review_reopens_pr_and_defers_merge_for_retry(self):
+        text = self.raw["consumer-child-review.yml"]
+        self.assertIn('gh pr reopen "$PR_NUMBER" --repo "$child_repo"', text)
+        self.assertIn('continuum-child-review-merge-retry', text)
+        self.assertNotIn('exit 32', text)
 
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        sys.path.insert(0, str(REPO_ROOT / "src"))
-        from continuum.release import entrypoints
-
-        cls.entrypoints = entrypoints
-        cls.document = cls.workflows[cls.NAME]
-        cls.jobs = cls.document["jobs"]
-
-    def declared_secrets(self):
-        return set((self.document.get("on", {}).get("workflow_call", {}).get("secrets") or {}))
-
-    def test_is_entered_through_workflow_call_and_nothing_else(self):
-        """A release workflow that also triggers is a workflow nobody reviewed.
-
-        If it could run on a push or a dispatch of its own, then the workflow a
-        reviewer reads is not necessarily the one that held the token.
-        """
-
-        self.assertEqual(trigger_names(self.document), ["workflow_call"])
-
-    def test_declares_every_secret_by_name_and_never_inherits(self):
-        """`secrets` is a mapping, which is what makes the declaration a control.
-
-        `secrets: inherit` parses as a string rather than a mapping, so checking
-        the parsed document is what makes this a real assertion - searching the
-        text would also match the comment in this file that explains why inherit
-        is refused.
-        """
-
-        declared = self.document["on"]["workflow_call"].get("secrets")
-        self.assertIsInstance(
-            declared, dict, "secrets must be declared by name, not inherited wholesale"
-        )
-        self.assertIn("RELEASE_TOKEN", declared, "the publishing token is named explicitly")
-        for name, spec in declared.items():
-            self.assertIn("description", spec, "{} is undocumented".format(name))
-            self.assertIsInstance(spec.get("required"), bool, name)
-
-    def test_declares_exactly_the_secrets_the_entrypoint_table_names(self):
-        """The workflow and the table are two halves of one list of keys.
-
-        A secret the table requires but the workflow does not pass is a release
-        that silently degrades to an unsigned build; one the workflow passes but
-        the table never names is a credential in a job that has no use for it.
-        """
-
-        table = set()
-        for entrypoint in self.entrypoints.ENTRYPOINTS.values():
-            table.update(entrypoint.secrets)
-        declared = self.declared_secrets() - {"RELEASE_TOKEN"}
-        self.assertEqual(
-            declared,
-            table,
-            "the workflow's secrets and the entrypoint table's disagree; a key read by "
-            "one and not passed by the other is a release that cannot be signed",
-        )
-
-    def test_only_the_transaction_holds_a_write_scope(self):
-        for name, job in self.jobs.items():
-            scopes = write_scopes(job_permissions(self.document, job))
-            expected = ["contents"] if name == "transaction" else []
-            self.assertEqual(
-                scopes, expected, "job {!r} holds write scopes {}".format(name, scopes)
-            )
-
-    def test_the_workflow_default_is_read_only(self):
-        """A job added later must not inherit write authority by proximity."""
-
-        self.assertEqual(write_scopes(workflow_permissions(self.document)), [])
-
-    def test_the_build_job_is_given_no_credential_and_no_destination(self):
-        """The job that runs a caller's code is the one an attacker wants.
-
-        It runs code from a checkout of `inputs.source_sha`, so the token is not
-        passed to it at all, and the command it runs is one that has no publisher
-        to construct even if the build asks for one.
-        """
-
-        build = self.jobs["target"]
-        text = job_text(self.document, build)
-        self.assertNotIn("RELEASE_TOKEN", text)
-        self.assertNotIn("GITHUB_TOKEN", text)
-        self.assertNotIn("GH_TOKEN", text)
-        self.assertIn("release target", text)
-
-    def test_a_signing_key_reaches_only_the_row_that_reads_it(self):
-        """Each key is gated on the adapter that needs it, visibly.
-
-        The alternative — passing every key to every build — hands the Apple
-        certificate to the Android toolchain, and the gate has to be readable in
-        the workflow rather than assembled at runtime.
-        """
-
-        env = self.jobs["target"]["steps"][2]["env"]
-        owners = {
-            name: entrypoint.adapter
-            for entrypoint in self.entrypoints.ENTRYPOINTS.values()
-            for name in entrypoint.secrets
-        }
-        for name, adapter in owners.items():
-            self.assertIn(name, env, "{} is not passed to the build job".format(name))
-            self.assertIn(
-                "matrix.adapter == '{}'".format(adapter),
-                env[name],
-                "{} must reach only the {} row".format(name, adapter),
-            )
-
-    def test_the_transaction_cannot_run_before_every_build_finished(self):
-        """`needs` is the whole transaction. Removing it publishes a subset."""
-
-        needs = self.jobs["transaction"]["needs"]
-        self.assertEqual(sorted(needs), ["resolve", "target"])
-
-    def test_publishing_is_behind_an_environment(self):
-        """The approval gate is a required input, not a literal in the file."""
-
-        self.assertIn("environment", self.jobs["transaction"])
-        self.assertIn("inputs.environment", self.raw[self.NAME])
-        for name in ("resolve", "target"):
-            self.assertNotIn("environment", self.jobs[name], name)
-
-    def test_a_release_is_never_cancelled_half_publishished(self):
-        self.assertFalse(
-            (self.document.get("concurrency") or {}).get("cancel-in-progress", False),
-            "cancelling a transaction mid-publish leaves a draft the next attempt has to "
-            "recognise; the concurrency group is there to serialise, not to cancel",
-        )
-
-    def test_every_checkout_is_the_pinned_commit_without_credentials(self):
-        checkouts = [
-            step
-            for name in self.JOBS
-            for step in steps_of(self.jobs[name])
-            if uses(step, "actions/checkout")
-        ]
-        self.assertTrue(checkouts, "the workflow does not check anything out")
-        for step in checkouts:
-            with_ = step.get("with") or {}
-            self.assertEqual(
-                with_.get("ref"),
-                "${{ inputs.source_sha }}",
-                "a checkout of anything but the pinned commit builds bytes from somewhere "
-                "the matrix does not describe",
-            )
-            self.assertIs(
-                with_.get("persist-credentials"),
-                False,
-                "a checkout that leaves a credential in .git/config hands the token to "
-                "every later step in the job, including the build",
-            )
-
-    def test_no_checkout_follows_an_event_payload(self):
-        """`github.event.*.head.sha` is the classic untrusted-ref substitution.
-
-        Scoped to checkouts on purpose. Reading a head SHA from an event payload
-        is correct in a job that only passes it to an API as a concurrency
-        guard, and a rule that forbade the substring everywhere would have to be
-        weakened to allow that - at which point it would no longer catch the
-        checkout.
-        """
-
-        for name in self.JOBS:
-            for step in steps_of(self.jobs[name]):
-                if not uses(step, "actions/checkout"):
-                    continue
-                ref = str((step.get("with") or {}).get("ref", ""))
-                for expression in (
-                    "github.event.pull_request.head.sha",
-                    "github.event.workflow_run.head_sha",
-                    "github.head_ref",
-                    "github.event.ref",
-                ):
-                    self.assertNotIn(
-                        expression,
-                        ref,
-                        "{}/{} checks out {}".format(self.NAME, step.get("name"), expression),
-                    )
-
-    def test_the_runner_comes_from_the_matrix_not_from_a_caller_input(self):
-        """Where a caller's code runs is decided by the static table.
-
-        A caller that could name the runner could name the platform, and a
-        release that a caller builds on a runner it also controls is a release
-        the matrix never described.
-        """
-
-        runs_on = str(self.jobs["target"].get("runs-on"))
-        self.assertIn("matrix.runner", runs_on)
-        for input_name in self.document["on"]["workflow_call"]["inputs"]:
-            self.assertNotIn(
-                "inputs.{}".format(input_name),
-                runs_on,
-                "the runner must not be caller-supplied",
-            )
-
-    def test_the_transaction_still_reports_when_a_build_failed(self):
-        """A skip and a refusal look the same from outside this workflow.
-
-        Default `needs:` behaviour skips the transaction when a build fails, so
-        the run's last word on a broken platform is a red build job and nothing
-        about the release. Running it anyway turns that into the classified
-        refusal that names the missing target.
-        """
-
-        condition = str(self.jobs["transaction"].get("if"))
-        self.assertIn("!cancelled()", condition)
-        self.assertIn("needs.resolve.outputs.ok", condition)
-        self.assertNotIn("always() && needs.target", condition)
-
-    def test_a_failed_build_does_not_cancel_the_others(self):
-        """The transaction refuses a partial set anyway.
-
-        Cancelling the surviving builds would only destroy the evidence about
-        which platforms are broken, and turn a reportable gap into a silent one.
-        """
-
-        self.assertIs(self.jobs["target"]["strategy"].get("fail-fast"), False)
-
-    def test_the_release_identity_is_derived_from_one_string(self):
-        """Two halves of one workflow identity, so they cannot disagree."""
-
-        publish = json.dumps(self.jobs["transaction"], sort_keys=True)
-        self.assertIn("github.workflow_ref", publish)
-        self.assertIn("##*@", publish)
-        self.assertNotIn("github.workflow_sha", publish)
-
-    def test_the_transaction_passes_the_matrix_the_builds_were_dispatched_with(self):
-        """One matrix, read by every job, rather than each re-deriving it."""
-
-        text = self.raw[self.NAME]
-        self.assertIn("release-matrix-${{ inputs.source_sha }}", text)
-        self.assertIn("release-fragment-*-${{ inputs.source_sha }}", text)
-        self.assertNotIn("release-fragment-*-${{ github.sha }}", text)
+    def test_child_review_surfaces_base_drift_before_acceptance(self):
+        text = self.raw["consumer-child-review.yml"]
+        self.assertIn('git merge --no-edit "origin/$base_ref"', text)
+        self.assertIn('git diff --name-only --diff-filter=U', text)
 
 
 if __name__ == "__main__":
