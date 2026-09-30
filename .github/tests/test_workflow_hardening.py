@@ -483,7 +483,11 @@ class ReviewGateTests(WorkflowAuditBase):
         self.assertEqual(
             write_scopes(job_permissions(document, document["jobs"]["authorize"])), []
         )
+        self.assertEqual(
+            write_scopes(job_permissions(document, document["jobs"]["reverify"])), []
+        )
         self.assertIn("authorize", document["jobs"]["gate"].get("needs") or [])
+        self.assertIn("reverify", document["jobs"]["gate"].get("needs") or [])
 
     def test_the_gate_runs_only_on_the_control_planes_decision(self):
         # There is deliberately no second path that re-derives trust from the
@@ -492,21 +496,24 @@ class ReviewGateTests(WorkflowAuditBase):
         # only condition is the read-only job's own verdict.
         condition = str(self.gate_workflow()["jobs"]["gate"].get("if"))
         self.assertIn("needs.authorize.outputs.proceed == 'true'", condition)
+        self.assertIn("needs.reverify.outputs.allowed == 'true'", condition)
         self.assertNotIn("github.event.pull_request", condition)
 
     def test_authority_is_re_verified_with_a_read_only_token(self):
-        steps = steps_of(self.gate_workflow()["jobs"]["gate"])
+        job = self.gate_workflow()["jobs"]["reverify"]
+        steps = steps_of(job)
         verify = [s for s in steps if POLICY_PATH in run_text(s)]
         self.assertEqual(len(verify), 1, "expected one trust-policy re-verification")
         step = verify[0]
         body = run_text(step) + json.dumps(step.get("env") or {})
         self.assertIn("--mode review-fix", run_text(step))
-        # A verification must not need the authority it is deciding about.
+        # GitHub permissions are a job boundary, not a step boundary. The
+        # verification job therefore owns no write scope and receives no secret.
         self.assertNotIn("secrets.", body)
         self.assertEqual(
-            write_scopes(permission_map(step.get("permissions"))),
+            write_scopes(job_permissions(self.gate_workflow(), job)),
             [],
-            "the re-verification step is not read-only",
+            "the re-verification job is not read-only",
         )
 
     def test_the_engine_comes_from_the_base_branch_not_the_pull_request(self):
@@ -530,7 +537,7 @@ class ReviewGateTests(WorkflowAuditBase):
         self.assertIn("emit_skip", body)
         for event in (
             "pull_request_target",
-            "pull_request_review_target",
+            "pull_request_review",
             "workflow_run",
             "status",
             "schedule",
