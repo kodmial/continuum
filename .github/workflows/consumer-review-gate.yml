@@ -238,6 +238,7 @@ jobs:
         id: dispatch
         env:
           GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           PR_NUMBER: ${{ needs.authorize.outputs.pr_number }}
           HEAD_REF: ${{ needs.authorize.outputs.head_ref }}
