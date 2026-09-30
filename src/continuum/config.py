@@ -519,6 +519,36 @@ def _top_level_value(text: str, key: str) -> str:
     return ""
 
 
+def _carries_nothing(value: Any) -> bool:
+    """Whether an optional value is really the same as leaving it out.
+
+    Every optional field in this schema defaults to `""` or `()`, and
+    `describe()` writes those defaults rather than dropping the keys. So an
+    empty value has to mean what an absent key means, or a target cannot make
+    the trip a release hands it: the core passes each target to its adapter as
+    the mapping `describe()` produced, and the adapter parses those options back
+    with this module. Reading "nothing configured" as a mistake would fail every
+    target that legitimately configures nothing for an optional field.
+
+    A non-empty value of the wrong type is *not* absent: `0` and `[]`-shaped
+    mistakes still reach the validators below and are still rejected.
+    """
+
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, (list, tuple, dict)):
+        return not value
+    return False
+
+
+def _without_empty(value: Any) -> Any:
+    """``value``, or ``None`` when it carries nothing."""
+
+    return None if _carries_nothing(value) else value
+
+
 def _reject_unknown(mapping: Dict[str, Any], allowed: Any, where: str) -> None:
     unknown = sorted(set(mapping) - set(allowed))
     if unknown:
@@ -629,10 +659,10 @@ def _require_file_name(value: Any, where: str) -> str:
 def _require_choice_list(
     value: Any, where: str, choices: tuple, default: Any
 ) -> tuple:
-    if value is None:
+    if _carries_nothing(value):
         return tuple(default)
-    if not isinstance(value, list) or not value:
-        raise ConfigError(f"{where} must be a non-empty list of {', '.join(choices)}")
+    if not isinstance(value, list):
+        raise ConfigError(f"{where} must be a list of {', '.join(choices)}")
     seen: List[str] = []
     for index, item in enumerate(value):
         if item is None:
@@ -645,10 +675,10 @@ def _require_choice_list(
 
 
 def _require_freeform_list(value: Any, where: str, default: Any) -> tuple:
-    if value is None:
+    if _carries_nothing(value):
         return tuple(default)
-    if not isinstance(value, list) or not value:
-        raise ConfigError(f"{where} must be a non-empty list")
+    if not isinstance(value, list):
+        raise ConfigError(f"{where} must be a list")
     items: List[str] = []
     for index, item in enumerate(value):
         items.append(_require_relative_path(item, f"{where}[{index}]"))
@@ -663,10 +693,8 @@ def _require_link_flags(value: Any, where: str) -> tuple:
     dangerous.
     """
 
-    if value is None:
+    if _carries_nothing(value):
         return ()
-    if not isinstance(value, list) or not value:
-        raise ConfigError(f"{where} must be a non-empty list of linker flags")
     flags: List[str] = []
     for index, item in enumerate(value):
         if not isinstance(item, str) or not item or len(item) > 120:
@@ -870,7 +898,7 @@ def _parse_signing(value: Any, where: str) -> ReleaseSigningSettings:
         mapping.get("allow_adhoc_fallback"), f"{where}.allow_adhoc_fallback", defaults.allow_adhoc_fallback
     )
 
-    identity = mapping.get("identity")
+    identity = _without_empty(mapping.get("identity"))
     if identity is None:
         identity = ""
     elif not isinstance(identity, str) or not identity.strip() or len(identity) > 200:
@@ -882,12 +910,12 @@ def _parse_signing(value: Any, where: str) -> ReleaseSigningSettings:
     else:
         identity = identity.strip()
 
-    team_id_var = mapping.get("team_id_var")
+    team_id_var = _without_empty(mapping.get("team_id_var"))
     if team_id_var is not None:
         team_id_var = _require_name(team_id_var, f"{where}.team_id_var")
 
-    p12_secret = mapping.get("p12_secret")
-    password_secret = mapping.get("password_secret")
+    p12_secret = _without_empty(mapping.get("p12_secret"))
+    password_secret = _without_empty(mapping.get("password_secret"))
     if p12_secret is not None:
         p12_secret = _require_name(p12_secret, f"{where}.p12_secret")
     if password_secret is not None:
@@ -898,7 +926,7 @@ def _parse_signing(value: Any, where: str) -> ReleaseSigningSettings:
         # them here would imply a guarantee the mode cannot keep, so the
         # configuration must say out loud that it is degraded instead.
         for stale in ("identity", "p12_secret", "password_secret", "team_id_var"):
-            if mapping.get(stale) is not None:
+            if not _carries_nothing(mapping.get(stale)):
                 raise ConfigError(
                     f"{where}.{stale} is configured but {where}.mode is "
                     f"'{SIGNING_ADHOC}', which signs without an identity; remove the "
@@ -946,7 +974,7 @@ def _parse_signing(value: Any, where: str) -> ReleaseSigningSettings:
 def _parse_binary(value: Any, where: str) -> ReleaseBinary:
     mapping = _require_mapping(value, where)
     _reject_unknown(mapping, _ALLOWED_BINARY_KEYS, where)
-    entitlements = mapping.get("entitlements")
+    entitlements = _without_empty(mapping.get("entitlements"))
     if entitlements is not None:
         entitlements = _require_relative_path(entitlements, f"{where}.entitlements")
     return ReleaseBinary(
@@ -966,7 +994,7 @@ def _parse_app_bundle(value: Any, where: str) -> Optional[ReleaseAppBundle]:
     if not name.endswith(".app"):
         raise ConfigError(f"{where}.name must end with '.app'; got {name!r}")
     for key in ("info_plist", "entitlements"):
-        if mapping.get(key) is not None:
+        if not _carries_nothing(mapping.get(key)):
             mapping[key] = _require_relative_path(mapping[key], f"{where}.{key}")
     return ReleaseAppBundle(
         name=name,
@@ -1090,6 +1118,20 @@ def _parse_release(value: Any, source: str = "release") -> ReleaseSettings:
             raise ConfigError(f"release.targets[{index}].id duplicates {target.id!r}")
         seen.append(target.id)
     return ReleaseSettings(targets=targets)
+
+
+def parse_release_target(value: Any, where: str = "release target") -> ReleaseTarget:
+    """Parse one release target from a mapping.
+
+    Public because a target's configuration is no longer confined to the file it
+    was parsed from: the release core hands a target to its adapter as
+    `TargetSpec.options`, and the adapter needs the same validation applied to
+    those options that this module applied to the file. Re-parsing rather than
+    trusting the round trip means a hand-assembled target is held to the schema
+    instead of being privileged by the route it arrived on.
+    """
+
+    return _parse_target(value, where)
 
 
 
