@@ -333,13 +333,27 @@ class ReleaseRequest:
         """Build a request from a validated `.continuum.yml`.
 
         `release` with no targets is a repository that has not opted in, so
-        `enabled` comes straight from the configuration's own answer. That is the
-        only place the "release can be completely disabled" property is decided;
-        the core above it never has to be told to do nothing.
+        `enabled` comes straight from the configuration's own answer. That is
+        the only place the "release can be completely disabled" property is
+        decided; the core above it never has to be told to do nothing.
+
+        Each target's own configuration rides along in `TargetSpec.options`,
+        carried through untouched. That is what makes this method the whole
+        integration for a declared target: an adapter registered by name
+        rehydrates the settings it needs from those options, so the core needs
+        no field for a bundle identifier, a linker flag, or a secret name, and
+        a repository that configures a target does not have to hand-assemble a
+        `ReleaseRequest` to have that target built.
         """
 
         targets = tuple(
-            TargetSpec(id=target.id, adapter=target.adapter)
+            TargetSpec(
+                id=target.id,
+                adapter=target.adapter,
+                options=tuple(
+                    sorted(target.describe().items(), key=lambda pair: pair[0])
+                ),
+            )
             for target in config.release.targets
         )
         return cls(
@@ -1091,7 +1105,26 @@ class ReleaseCore:
         )
 
     def _sign(self, run: _Run) -> StageOutcome:
-        return self._per_target(run, "sign", self._sign_target)
+        outcome = self._per_target(run, "sign", self._sign_target)
+        if outcome.outcome != COMPLETED:
+            return outcome
+        # Signing is where products become the assets a destination receives: an
+        # adapter that packages per architecture, or names an archive after its
+        # product, publishes names that did not exist at the build stage. Two
+        # targets can therefore collide only here, and a collision found at
+        # verification — after both targets have already overwritten each
+        # other's files on disk — is a collision that has already cost the
+        # release its archives.
+        collision = self._collision(run)
+        if collision is not None:
+            return StageOutcome.failed(
+                "sign",
+                run.key_for("sign"),
+                collision,
+                code="asset-name-collision",
+                **run.note(),
+            )
+        return outcome
 
     def _sign_target(self, run: _Run, target: TargetSpec) -> StageOutcome:
         key = unit_key(run.release, "sign", target.id)
