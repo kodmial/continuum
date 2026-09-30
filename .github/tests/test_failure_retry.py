@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
-import importlib.util
 import pathlib
+import sys
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-PATH = ROOT / ".github" / "scripts" / "failure_retry.py"
-spec = importlib.util.spec_from_file_location("failure_retry", PATH)
-failure_retry = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(failure_retry)
+sys.path.insert(0, str(ROOT / ".github" / "scripts"))
+import failure_retry
 
 
 class FailureClassificationTests(unittest.TestCase):
