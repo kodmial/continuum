@@ -94,6 +94,7 @@ NOT_AGENT_PLANE = (
     "consumer-opencode.yml",
     "consumer-repair.yml",
     "consumer-scheduler.yml",
+    "continuum-shadow.yml",
     "release-bun-binary.yml",
     "review-queue.yml",
 )
