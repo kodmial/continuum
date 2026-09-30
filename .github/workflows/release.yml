@@ -1,0 +1,1633 @@
+name: Release
+
+# Release triggers:
+#   1. push of a v* tag  — the classic path; the released version = the pushed
+#      tag (v-prefix stripped).
+#   2. push to main      — the merge path: the automated Release PR (which is
+#      the only PR that bumps Sources/NanoDictateCore/Version.swift) merged
+#      into main automatically builds, publishes a GitHub Release (the workflow
+#      itself creates the tag v<version>) and opens the release-manifests PR
+#      with the regenerated Homebrew/MacPorts manifests. A push to main that
+#      did NOT bump the version is a no-op: the preflight guard sees the
+#      release already exists and skips creation + manifests (green, not red).
+#   3. workflow_dispatch — manual release: optional `version` input, else the
+#      value of Sources/NanoDictateCore/Version.swift. `dry_run` only prints
+#      the plan (build still runs, nothing is created).
+# A tag created by `gh release create` under GITHUB_TOKEN does NOT re-trigger
+# workflow runs, so the merge path must do everything in this one workflow —
+# there is no tag-trigger round trip.
+
+on:
+  push:
+    tags:
+      - 'v*'
+    branches:
+      - main
+    paths:
+      - 'Sources/**'
+      - 'Package.swift'
+      - 'packaging/**'
+      - 'scripts/**'
+      - 'Resources/**'
+      - 'config.example.toml'
+      - '.github/workflows/packaging-smoke.yml'
+      - '.github/workflows/release.yml'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: >-
+          Version to publish (e.g. 0.0.2 or v0.0.2). Leave empty to derive it
+          from Sources/NanoDictateCore/Version.swift.
+        required: false
+        type: string
+        default: ''
+      dry_run:
+        description: 'Only print what would be released — do not create a release or touch manifests.'
+        required: false
+        type: boolean
+        default: false
+
+# Creating the GitHub Release needs contents: write; the build job only reads
+# the repo. Permissions are set per job (least privilege).
+permissions: {}
+
+jobs:
+  # Single source of the release version for every downstream job. Runs with no
+  # `needs` (in parallel with the build); build, release and manifests all
+  # consume its outputs so the tarball names, the release and the manifests
+  # share ONE computed version across all three trigger paths.
+  preflight:
+    name: Compute version & guard
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      skip_release: ${{ steps.guard.outputs.skip_release }}
+      skip_manifests: ${{ steps.guard.outputs.skip_manifests }}
+    steps:
+      - name: Checkout
+        # Needed to read Sources/NanoDictateCore/Version.swift on the
+        # merge/manual paths (the tag path uses github.ref_name instead).
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Compute release version
+        id: ver
+        # Three version sources, resolved from the event type:
+        #   push v* tag            -> the pushed tag (v-prefix stripped)
+        #   push main (merge path) -> Sources/NanoDictateCore/Version.swift
+        #   workflow_dispatch      -> inputs.version if provided, else Version.swift
+        run: |
+          set -euo pipefail
+          case "${{ github.event_name }}" in
+            workflow_dispatch)
+              if [[ -n "${{ inputs.version }}" ]]; then
+                VERSION="${{ inputs.version }}"
+                VERSION="${VERSION#v}"
+                # The input version must equal Version.swift: the release tag
+                # and the Homebrew/MacPorts manifests would say v$VERSION while
+                # the binary prints the Version.swift value — refuse instead of
+                # publishing a release that disagrees with its own binaries.
+                FILE_VERSION=$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' Sources/NanoDictateCore/Version.swift)
+                if [[ "$VERSION" != "$FILE_VERSION" ]]; then
+                  echo "::error::Input version $VERSION does not match Sources/NanoDictateCore/Version.swift ($FILE_VERSION) — the release tag/formula would say v$VERSION while the binary prints $FILE_VERSION. Bump Version.swift in a PR first, or pass the matching version."
+                  exit 1
+                fi
+              else
+                VERSION=$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' Sources/NanoDictateCore/Version.swift)
+              fi
+              ;;
+            push)
+              if [[ "${{ github.ref_type }}" == "tag" ]]; then
+                VERSION="${{ github.ref_name }}"
+                VERSION="${VERSION#v}"
+                # The tag version must equal Version.swift: the bundle's
+                # CFBundleShortVersionString would say v$VERSION while the
+                # overlay header prints the Version.swift value — refuse
+                # instead of publishing a release that disagrees with itself.
+                FILE_VERSION=$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' Sources/NanoDictateCore/Version.swift)
+                if [[ "$VERSION" != "$FILE_VERSION" ]]; then
+                  echo "::error::Tag version $VERSION does not match Sources/NanoDictateCore/Version.swift ($FILE_VERSION) — the release tag would say v$VERSION while the binary prints $FILE_VERSION. Push a tag matching Version.swift instead."
+                  exit 1
+                fi
+              else
+                VERSION=$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' Sources/NanoDictateCore/Version.swift)
+              fi
+              ;;
+            *)
+              VERSION=$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' Sources/NanoDictateCore/Version.swift)
+              ;;
+          esac
+          if [[ -z "$VERSION" ]]; then
+            echo "::error::Could not extract a semver from Sources/NanoDictateCore/Version.swift (and no tag/input version was provided)."
+            exit 1
+          fi
+          # User version policy: only the 0.0.x and 0.1.x series may be
+          # released — any other major/minor, a prerelease, or a leading zero
+          # (0.0.05) fails.
+          if ! [[ "$VERSION" =~ ^0\.(0|1)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Forbidden version $VERSION: only 0.0.x and 0.1.x (no leading zeros) are allowed (user policy)"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Computed release version: $VERSION (event=${{ github.event_name }}, ref=${{ github.ref_type }}:${{ github.ref_name }})"
+
+      - name: Guard — version already released?
+        id: guard
+        env:
+          # Explicit auth for the gh api existence probe below (gh would
+          # otherwise fall back to GITHUB_TOKEN implicitly). GH_REPO makes
+          # `gh release download` (SHA256SUMS.txt probe below) independent of
+          # the checkout's git remote.
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        # Two independent flags are emitted:
+        #   skip_release   - true -> the release job prints a no-op and does
+        #                    NOT create/re-touch the release (merge/manual
+        #                    runs on an already-published version, dry runs).
+        #   skip_manifests - true -> the manifests job is skipped entirely.
+        #                    True ONLY when the committed manifests already
+        #                    match the current version, verified against real
+        #                    files: the Homebrew formula, the cask WHEN the
+        #                    release ships app-bundle zips (v0.0.13+; a
+        #                    zip-less release has no cask — absence is the
+        #                    norm, not a failure), the MacPorts Portfile
+        #                    (github.setup) AND the sha256 of the published
+        #                    release's SHA256SUMS.txt (union across formula
+        #                    tarball hashes + cask zip hashes). AND the
+        #                    installer pin: PIN_REV in
+        #                    scripts/install-macports.sh must equal the
+        #                    macports-nanodictate tree HEAD — a committed
+        #                    manifest set whose pin push failed must not be
+        #                    skipped forever (the re-run repairs the pin).
+        #                    A re-run whose committed formula is stale (wrong
+        #                    version, or sha256 absent from the release) leaves
+        #                    skip_manifests FALSE and REGENERATES — a stale
+        #                    formula must never be skipped forever. A tag-push
+        #                    re-run whose manifests already match is skipped
+        #                    (same reason as before: regenerating identical
+        #                    manifests is pointless and the detached-tag-HEAD
+        #                    push can hit the non-fast-forward guard).
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.ver.outputs.version }}"
+          SKIP=false
+          SKIP_MANIFESTS=false
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.dry_run }}" == "true" ]]; then
+            echo "================ DRY RUN ================"
+            echo "Manual run with dry_run=true — nothing will be created."
+            echo "Would release: v$VERSION"
+            echo "Would build tarballs: nanodictate-$VERSION-macos-x86_64.tar.gz and nanodictate-$VERSION-macos-arm64.tar.gz"
+            echo "Would build app-bundle zips: nanodictate-$VERSION-macos-{x86_64,arm64}.zip (NanoDictate.app bundle — the cask asset)"
+            echo "Would create GitHub Release v$VERSION (workflow creates the tag), open the release-manifests PR with the regenerated Homebrew formula + cask + MacPorts manifests and sync the kodmial/homebrew-nanodictate tap."
+            SKIP=true
+            SKIP_MANIFESTS=true
+          # Existence probe via the REST API: releases/tags/<tag> returns 200
+          # only for an actual release and 404 for a tag with no release.
+          # `gh release view` is deliberately NOT used here — it falls back to
+          # displaying the raw tag when no release exists for it, so a
+          # tag-without-release is indistinguishable from a published release
+          # and the guard mis-detects existing releases (the 5/5 miss).
+          # The probe below returns the release JSON; the asset-name list is
+          # extracted from its output via --jq and captured (no second request)
+          # for reuse further down, to decide whether the cask is a mandatory
+          # manifest (the cask's asset is the app-bundle zip — a zip-less
+          # release has no cask).
+          elif RELEASE_ASSETS="$(gh api "repos/${{ github.repository }}/releases/tags/v$VERSION" --jq '.assets[].name' 2>/dev/null)"; then
+            echo "Release v$VERSION already exists — verifying whether the committed manifests already match it."
+            # skip_manifests is set ONLY after proving the committed manifests
+            # describe THIS version (version + sha256); a stale formula must
+            # regenerate instead of being skipped forever.
+            MANIFESTS_OK=true
+            # Read the manifests AS COMMITTED TO origin/main, not from the
+            # checkout ref — a tag-push re-run checks out the tagged commit,
+            # which predates the manifest commit that lives on main.
+            git fetch --quiet origin main || true
+            # The cask is a mandatory manifest ONLY when this release carries
+            # app-bundle zips (the zip is the cask's asset): a release without
+            # zips (≤ v0.0.12) has no cask by design, so a missing cask there
+            # is the NORM, not a failure. Presence is detected from the
+            # RELEASE_ASSETS list already captured by the existence probe
+            # above — no duplicate request. The same flag drives the manifest
+            # loops here and the UNION back-check below (2 formula files
+            # without zips, + the cask = 4 files when zips are present).
+            CASK_MANDATORY=false
+            if grep -qE -- '-macos-.*\.zip' <<<"$RELEASE_ASSETS"; then
+              CASK_MANDATORY=true
+            fi
+            MANIFEST_FILES="nanodictate.rb packaging/homebrew/nanodictate.rb packaging/macports/Portfile"
+            if [[ "$CASK_MANDATORY" == "true" ]]; then
+              MANIFEST_FILES="$MANIFEST_FILES packaging/homebrew/Casks/nanodictate.rb"
+            fi
+            for f in $MANIFEST_FILES; do
+              if ! git cat-file -e "origin/main:$f" 2>/dev/null; then
+                echo "Committed manifest $f not found on origin/main — manifests do not match v$VERSION yet."
+                MANIFESTS_OK=false
+                continue
+              fi
+              content="$(git show "origin/main:$f")"
+              case "$f" in
+                *.rb)
+                  # Homebrew formula pins the version as `version "0.0.N"`.
+                  if ! grep -q "version \"$VERSION\"" <<<"$content"; then
+                    echo "Committed $f does not pin version $VERSION — formula is stale."
+                    MANIFESTS_OK=false
+                  fi
+                  ;;
+                packaging/macports/Portfile)
+                  # The Portfile pins the version in its `github.setup` line.
+                  if ! grep -q "github.setup kodmial nanodictate $VERSION" <<<"$content"; then
+                    echo "Committed $f does not pin version $VERSION — Portfile is stale."
+                    MANIFESTS_OK=false
+                  fi
+                  ;;
+              esac
+            done
+            # sha256: every 64-hex checksum baked into the committed manifests
+            # must appear in the published release's SHA256SUMS.txt — otherwise
+            # the formula describes tarballs that were never released. A file
+            # that pins the right version but carries NO checksum at all fails
+            # too: a zero-token manifest matches vacuously and would otherwise
+            # be skipped forever.
+            if gh release download "v$VERSION" -p SHA256SUMS.txt --dir /tmp/nanodictate-sums --clobber >/dev/null 2>&1; then
+              SUMS="$(cat /tmp/nanodictate-sums/SHA256SUMS.txt)"
+              SUM_TOKENS=$(grep -oE '[0-9a-f]{64}' <<<"$SUMS" | sort -u)
+              if [[ -z "$SUM_TOKENS" ]]; then
+                echo "Published SHA256SUMS.txt carries no sha256 checksums — cannot prove the committed sha256 matches; regenerate."
+                MANIFESTS_OK=false
+              fi
+              for f in $MANIFEST_FILES; do
+                FILE_TOKENS=$(git show "origin/main:$f" 2>/dev/null | grep -oE '[0-9a-f]{64}' || true)
+                if [[ -z "$FILE_TOKENS" ]]; then
+                  echo "Committed $f pins the version but carries NO sha256 checksums — manifests do not match v$VERSION; regenerate."
+                  MANIFESTS_OK=false
+                  continue
+                fi
+                while read -r sha; do
+                  if ! grep -q "$sha" <<<"$SUM_TOKENS"; then
+                    echo "Committed $f carries sha256 $sha absent from the published SHA256SUMS.txt — manifests do not match v$VERSION."
+                    MANIFESTS_OK=false
+                  fi
+                done <<<"$FILE_TOKENS"
+              done
+              # Back-check: every sha256 of the release's SHA256SUMS.txt must
+              # also be pinned by a committed manifest — the forward check only
+              # proves each manifest's own sha256 exists in the release, not
+              # that every released asset hash is baked into a manifest. This is
+              # a UNION check across the formula (pins the tarballs) and — when
+              # the release carries app-bundle zips — the cask (pins the zips);
+              # a per-file check would falsely fail, since the cask's zip hashes
+              # are absent from the formula by design. Union count: the 2
+              # formula files without zips, plus the cask (4 files) when
+              # CASK_MANDATORY.
+              UNION_FILES="nanodictate.rb packaging/homebrew/nanodictate.rb"
+              if [[ "$CASK_MANDATORY" == "true" ]]; then
+                UNION_FILES="$UNION_FILES packaging/homebrew/Casks/nanodictate.rb"
+              fi
+              UNION_PINNED=""
+              for rb in $UNION_FILES; do
+                git cat-file -e "origin/main:$rb" 2>/dev/null || continue
+                UNION_PINNED+="$(git show "origin/main:$rb" | grep -oE '[0-9a-f]{64}' || true)
+                "
+              done
+              for sha in $SUM_TOKENS; do
+                if ! grep -q "$sha" <<<"$UNION_PINNED"; then
+                  echo "Release sha256 $sha is not pinned by any committed manifest (formula; cask only when the release ships zips) — manifests do not match v$VERSION; regenerate."
+                  MANIFESTS_OK=false
+                fi
+              done
+            else
+              echo "Could not download SHA256SUMS.txt from release v$VERSION — cannot prove the committed sha256 matches; regenerate."
+              MANIFESTS_OK=false
+            fi
+            # Installer-pin check: the manifests job syncs the MacPorts tree
+            # to the just-published Portfile and pins
+            # scripts/install-macports.sh PIN_REV to the tree revision it
+            # pushed. If that pin push fails after the manifests commit
+            # succeeded, the committed manifests match while the installer
+            # still points at a stale revision — and a re-run's
+            # skip_manifests would otherwise skip the pin repair. So the skip
+            # decision now includes the synced tree revision: only when the
+            # committed pin already equals the tree's current HEAD is the
+            # skip kept. A failed HEAD resolution forces regeneration (same
+            # "cannot prove, so do not skip" direction as the sha256 check);
+            # regenerating identical manifests is harmless and deterministic.
+            if [[ "$MANIFESTS_OK" == "true" ]]; then
+              TREE_HEAD="$(git ls-remote https://github.com/kodmial/macports-nanodictate refs/heads/main 2>/dev/null | awk '{print $1}' || true)"
+              PIN_COMMITTED="$(git show "origin/main:scripts/install-macports.sh" 2>/dev/null | sed -n 's/^PIN_REV="\([0-9a-f]*\)"$/\1/p')"
+              if [ -n "$TREE_HEAD" ] && [ "$PIN_COMMITTED" != "$TREE_HEAD" ]; then
+                echo "Committed scripts/install-macports.sh pins PIN_REV ${PIN_COMMITTED:-<none>}, but the macports-nanodictate tree HEAD is $TREE_HEAD — the installer pin is stale; regenerate."
+                MANIFESTS_OK=false
+              elif [ -z "$TREE_HEAD" ]; then
+                echo "Could not resolve the macports-nanodictate tree HEAD — cannot verify the installer pin; regenerate."
+                MANIFESTS_OK=false
+              fi
+            fi
+            if [[ "$MANIFESTS_OK" == "true" ]]; then
+              echo "Committed manifests already match v$VERSION — manifest regeneration is skipped."
+              SKIP_MANIFESTS=true
+            else
+              echo "Committed manifests do NOT match v$VERSION — will regenerate them."
+            fi
+            if [[ "${{ github.ref_type }}" == "tag" ]]; then
+              echo "Release v$VERSION already exists (tag-push re-run) — the release job will make sure every asset is attached (missing ones only, never overwriting existing bytes)."
+            else
+              echo "Release v$VERSION already exists — this is not a NEW version."
+              echo "Bump Sources/NanoDictateCore/Version.swift in the PR and merge again to create a new release."
+              SKIP=true
+            fi
+          else
+            echo "Release v$VERSION does not exist yet — will create it."
+          fi
+          echo "skip_release=$SKIP" >> "$GITHUB_OUTPUT"
+          echo "skip_manifests=$SKIP_MANIFESTS" >> "$GITHUB_OUTPUT"
+
+  # Publication gate: a release may only publish artifacts that were already
+  # exercised by the Packaging smoke candidate jobs for this exact immutable
+  # commit. Packaging smoke is triggered by the same main/tag push; this job
+  # waits for that run, requires it to be green, verifies that all four release
+  # artifacts exist, and exposes the run id used by the release job below.
+  candidate-gate:
+    name: Require tested release candidate
+    needs: preflight
+    if: ${{ needs.preflight.outputs.skip_release != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      run_id: ${{ steps.gate.outputs.run_id }}
+    steps:
+      - name: Wait for exact-head Packaging smoke
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          RUN_ID=""
+          EVENT="push"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            EVENT="workflow_dispatch"
+          fi
+          # The candidate workflow is triggered by the same push (or by a
+          # manual dispatch for manual releases). It can be created a few
+          # seconds after Release, so allow a bounded discovery window
+          # before declaring the gate missing.
+          for _ in {1..40}; do
+            while read -r CANDIDATE_ID; do
+              [[ -n "$CANDIDATE_ID" ]] || continue
+              JOB_NAMES="$(gh api "repos/$REPO/actions/runs/$CANDIDATE_ID/jobs?per_page=100" \
+                --jq '.jobs[].name')"
+              if grep -qxF 'Candidate build (x86_64)' <<<"$JOB_NAMES" && \
+                 grep -qxF 'Candidate build (arm64)' <<<"$JOB_NAMES"; then
+                RUN_ID="$CANDIDATE_ID"
+                break
+              fi
+            done < <(
+              gh api "repos/$REPO/actions/workflows/packaging-smoke.yml/runs?event=$EVENT&head_sha=$SHA&per_page=100" \
+                --jq '.workflow_runs[].id'
+            )
+            if [[ -n "$RUN_ID" ]]; then
+              break
+            fi
+            sleep 15
+          done
+
+          if [[ -z "$RUN_ID" ]]; then
+            echo "::error::No Packaging smoke $EVENT run exists for release commit $SHA. Publication is blocked."
+            exit 1
+          fi
+
+          echo "Waiting for Packaging smoke run $RUN_ID on exact head $SHA."
+          gh run watch "$RUN_ID" --repo "$REPO" --exit-status
+
+          NAMES="$(gh api "repos/$REPO/actions/runs/$RUN_ID/artifacts" --jq '.artifacts[].name')"
+          REQUIRED=(
+            candidate-dist-x86_64
+            candidate-dist-arm64
+            candidate-zip-x86_64
+            candidate-zip-arm64
+          )
+          for name in "${REQUIRED[@]}"; do
+            if ! grep -qxF "$name" <<<"$NAMES"; then
+              echo "::error::Packaging smoke run $RUN_ID is green but required tested artifact '$name' is missing."
+              exit 1
+            fi
+          done
+
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "::notice::Release publication is bound to tested Packaging smoke run $RUN_ID for $SHA."
+
+  # Build the two macOS binaries (Intel + Apple Silicon), code-sign them with
+  # the NanoDictate CI Signing identity and pack the release tarball. The
+  # archive name contract is fixed:
+  #   nanodictate-<VERSION>-macos-<arch>.tar.gz   (VERSION without the "v" prefix)
+  build:
+    name: Build & Package (${{ matrix.arch }})
+    needs: preflight
+    # Normal publication reuses the exact artifacts from Packaging smoke and
+    # therefore does not rebuild them here. Keep this legacy build only for a
+    # manual dry-run, which intentionally exercises compilation without
+    # publishing anything.
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macos-13 is retired from Actions; macos-15-intel is the Intel
+          # runner that still produces a native x86_64 binary.
+          - os: macos-15-intel
+            arch: x86_64
+            swift: "6.1"
+          - os: macos-14
+            arch: arm64
+            swift: "6.1"
+
+    steps:
+      - name: Checkout
+        # actions/checkout@v4 = 11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install Swift
+        uses: swift-actions/setup-swift@7ca6abe6b3b0e8b5421b88be48feee39cbf52c6a
+        with:
+          # Same toolchain as the CI workflow (swift-tools-version:5.7 manifest,
+          # Swift 5 language mode), pinned by full commit SHA (tag v2). Set
+          # explicitly per matrix entry: macOS 15 runner images ship a newer
+          # Xcode/Swift by default.
+          swift-version: "${{ matrix.swift }}"
+
+      - name: Build release binaries
+        # Each binary embeds its own Info.plist as a Mach-O __info_plist
+        # section (via -sectcreate) so tccd sees a real bundle identifier
+        # (client_type 0) instead of a bare absolute path: the TCC grant then
+        # follows the CFBundleIdentifier and survives path changes (the
+        # Homebrew Cellar/<version> directory moves on every upgrade) and the
+        # binary is addressable via `tccutil reset`. CFBundleIdentifier here
+        # must match the codesign --identifier below — tccd reads both.
+        run: |
+          # Invariant: CFBundleIdentifier in each Info.*.plist must match the codesign
+          # --identifier for the same product (tccd reads both):
+          #   packaging/Info.NanoDictateAgent.plist -> com.nanodictate.agent
+          #   packaging/Info.nanodictate.plist       -> com.nanodictate.ctl
+          swift build -c release --product NanoDictateAgent \
+            -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist \
+            -Xlinker packaging/Info.NanoDictateAgent.plist
+          swift build -c release --product nanodictate \
+            -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist \
+            -Xlinker packaging/Info.nanodictate.plist
+
+      - name: Code-sign binaries, assemble & sign the .app bundle
+        # Signed with a purpose-made self-signed "NanoDictate CI Signing"
+        # identity (openssl RSA-2048 + X.509 codeSigning EKU, unrelated to the
+        # maintainer's Mac or Apple account; p12 stored in GitHub secrets).
+        # The designated requirement pins the leaf certificate
+        #   identifier "<bundle-id>" and certificate leaf = H"<sha1>"
+        # — NOT the cdhash — so a rebuild produces the identical DR and TCC
+        # does not mint a new Microphone/Accessibility row (or re-prompt the
+        # user) across releases. Combined with __info_plist above, both the
+        # cdhash drift and the per-version path drift are eliminated.
+        # Untrusted by Gatekeeper (no Apple anchor): a self-signed CI
+        # certificate (not Developer ID, no notarization) with a CMS signature
+        # and hardened runtime (--options runtime); the archives ship without
+        # a quarantine attribute, so launchd/CGEvent insertion path is
+        # unaffected.
+        #
+        # After the per-binary signing the step assembles the NanoDictate.app
+        # bundle (Contents/MacOS/ holds the SAME two signed binaries
+        # (NanoDictateAgent, nanodictate); config.example.toml lives in
+        # Contents/Resources/ — resource seal, no per-file signature required,
+        # and Config.bundledExampleURLs() finds it via Bundle.main.resourcePath
+        # right after executableDir/prefixDir; Contents/Info.plist comes from
+        # packaging/Info.NanoDictateApp.plist) and seals it with the SAME
+        # identity, identifier and entitlements as the agent binary — the
+        # bundle is the cask's asset (see Casks/nanodictate.rb.tpl), the
+        # tarball stays pure CLI. Bundle signing must happen here, before the
+        # temp keychain is deleted and before the version-carrying Info.plist
+        # is sealed (PlistBuddy injection runs first; the signature seals it).
+        env:
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+          P12_B64: ${{ secrets.NANODICTATE_SIGNING_P12 }}
+          P12_PASS: ${{ secrets.NANODICTATE_SIGNING_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -n "$P12_B64" ] && [ -n "$P12_PASS" ]; then
+            KC="/tmp/nanodictate-signing.keychain"
+            KC_PASS="nanodictate"
+            security create-keychain -p "$KC_PASS" "$KC"
+            security set-keychain-settings -lut 21600 "$KC"
+            security list-keychains -d user -s "$KC"
+            security default-keychain -s "$KC"
+            security unlock-keychain -p "$KC_PASS" "$KC"
+            echo "$P12_B64" | base64 --decode > /tmp/nanodictate-ci.p12
+            security import /tmp/nanodictate-ci.p12 -k "$KC" -P "$P12_PASS" \
+              -T /usr/bin/codesign
+            security set-key-partition-list -S apple-tool:,apple: \
+              -s -k "$KC_PASS" "$KC"
+            SIGN_CERT="NanoDictate CI Signing"
+            # No --timestamp: RSA PKCS#1v1.5 signatures are deterministic, so a re-run of
+            # the same rev produces byte-identical binaries and the sha256 committed to the
+            # release manifests stays valid. Adding --timestamp would silently break that.
+            codesign --force --sign "$SIGN_CERT" --keychain "$KC" \
+              --identifier com.nanodictate.agent --options runtime \
+              --entitlements Resources/com.nanodictate.agent.entitlements \
+              .build/release/NanoDictateAgent
+            codesign --force --sign "$SIGN_CERT" --keychain "$KC" \
+              --identifier com.nanodictate.ctl --options runtime \
+              --entitlements Resources/com.nanodictate.ctl.entitlements \
+              .build/release/nanodictate
+            # --- Assemble NanoDictate.app. The bundle reuses the SAME two
+            # binaries (Contents/MacOS/{NanoDictateAgent,nanodictate}) and the
+            # SAME com.nanodictate.agent identifier as the CLI tarball — the
+            # cask install and the formula install are two faces of one daemon
+            # behind one canonical LaunchAgent plist (see
+            # packaging/homebrew/Casks/nanodictate.rb.tpl). Resources/ ships
+            # inside the bundle for reference; the agent's plist is generated
+            # by the CLI at `nanodictate start` time.
+            APP=".build/release/NanoDictate.app"
+            mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+            cp .build/release/NanoDictateAgent .build/release/nanodictate "$APP/Contents/MacOS/"
+            cp packaging/Info.NanoDictateApp.plist "$APP/Contents/Info.plist"
+            # Real version into the bundle's Info.plist. MUST run before the
+            # bundle codesign — the signature seals Info.plist, so an injection
+            # afterwards would invalidate the seal.
+            RELEASE_VERSION="${RELEASE_VERSION#v}"
+            /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $RELEASE_VERSION" "$APP/Contents/Info.plist"
+            /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $RELEASE_VERSION" "$APP/Contents/Info.plist"
+            # config.example.toml lives in Contents/Resources/ (resource seal —
+            # no per-file signature needed, so the --deep verification below
+            # passes; macOS 15 --deep demands a signature for every sealed
+            # code-catalog item, and Contents/MacOS is code).
+            # Config.bundledExampleURLs() resolves Bundle.main.resourcePath
+            # right after executableDir/prefixDir and finds the canon here as
+            # the bundle's first existing candidate.
+            cp config.example.toml "$APP/Contents/Resources/"
+            cp Resources/com.nanodictate.agent.entitlements \
+               Resources/com.nanodictate.ctl.entitlements \
+               Resources/nanodictate-agent.plist.template \
+               "$APP/Contents/Resources/"
+            # Sign the bundle with the SAME identity, identifier and
+            # entitlements as the agent binary: no --deep (that would re-seal
+            # the nested CLI and change its cdhash), no --timestamp (keeps the
+            # bundle byte-identical on a re-run of the same rev). The bundle
+            # sign replaces the main executable's signature and enumerates the
+            # nested nanodictate CLI (already signed above) — tccd keys the
+            # TCC grants to the cdhash of Contents/MacOS/NanoDictateAgent, and
+            # identical sign inputs keep that cdhash stable.
+            codesign --force --sign "$SIGN_CERT" --keychain "$KC" \
+              --identifier com.nanodictate.agent --options runtime \
+              --entitlements "$APP/Contents/Resources/com.nanodictate.agent.entitlements" \
+              "$APP"
+            # Signing material lives only for this job; drop the p12 and the temp keychain.
+            rm -f /tmp/nanodictate-ci.p12
+            security delete-keychain "$KC"
+            # Authority pin (main branch only): an ad-hoc signature
+            # (codesign -s -) prints no Authority= line at all — only
+            # Signature=adhoc — so the pin can run only here, where $SIGN_CERT
+            # carries the CI identity; the ad-hoc fallback branch is not
+            # checked. The binaries (and the bundle's main executable) must
+            # carry the CI identity's leaf as signer — a wrong certificate
+            # would change the cdhash and reset TCC grants on the next
+            # release.
+            codesign -dv --verbose=4 .build/release/NanoDictateAgent 2>&1 \
+              | grep -q "Authority=NanoDictate CI Signing"
+            codesign -dv --verbose=4 .build/release/nanodictate 2>&1 \
+              | grep -q "Authority=NanoDictate CI Signing"
+            codesign -dv --verbose=4 "$APP" 2>&1 \
+              | grep -q "Authority=NanoDictate CI Signing"
+          else
+            # No CI signing secrets configured (manual run on a fork, or the
+            # secrets were not uploaded yet): fall back to ad-hoc so the
+            # release still builds — TCC stability is lost, and the loss is
+            # loud in the log. Upload NANODICTATE_SIGNING_P12 (base64 p12)
+            # + NANODICTATE_SIGNING_PASSWORD to kill the warning.
+            echo "WARNING: NANODICTATE_SIGNING_P12/PASSWORD not set — " \
+                 "falling back to ad-hoc signature (no stable TCC DR)"
+            codesign --force -s - --identifier com.nanodictate.agent \
+              --options runtime \
+              --entitlements Resources/com.nanodictate.agent.entitlements \
+              .build/release/NanoDictateAgent
+            codesign --force -s - --identifier com.nanodictate.ctl \
+              --options runtime \
+              --entitlements Resources/com.nanodictate.ctl.entitlements \
+              .build/release/nanodictate
+            # Same bundle assembly + version injection as the CI branch
+            # (ad-hoc seal; no TCC stability, same loud warning above).
+            APP=".build/release/NanoDictate.app"
+            mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+            cp .build/release/NanoDictateAgent .build/release/nanodictate "$APP/Contents/MacOS/"
+            cp packaging/Info.NanoDictateApp.plist "$APP/Contents/Info.plist"
+            RELEASE_VERSION="${RELEASE_VERSION#v}"
+            /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $RELEASE_VERSION" "$APP/Contents/Info.plist"
+            /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $RELEASE_VERSION" "$APP/Contents/Info.plist"
+            cp config.example.toml "$APP/Contents/Resources/"
+            cp Resources/com.nanodictate.agent.entitlements \
+               Resources/com.nanodictate.ctl.entitlements \
+               Resources/nanodictate-agent.plist.template \
+               "$APP/Contents/Resources/"
+            codesign --force -s - --identifier com.nanodictate.agent \
+              --options runtime \
+              --entitlements "$APP/Contents/Resources/com.nanodictate.agent.entitlements" \
+              "$APP"
+          fi
+          codesign --verify --strict .build/release/NanoDictateAgent
+          codesign --verify --strict .build/release/nanodictate
+          codesign --verify --strict --deep .build/release/NanoDictate.app
+
+      - name: Package tarball
+        env:
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          RELEASE_VERSION="${RELEASE_VERSION#v}"
+          DIST="dist"
+          mkdir -p "$DIST"
+          # Resources/ ships for reference only: the binaries already carry
+          # their entitlements — embedded at codesign time in the Code-sign
+          # step above; no install-time re-signing is performed by any
+          # formula/port, the tarballed binaries are self-sufficient. The
+          # LaunchAgent plist is generated inline by the CLI (`nanodictate
+          # start` writes the canonical
+          # ~/Library/LaunchAgents/com.nanodictate.agent.plist). The runtime
+          # needs none of these — formulae/ports ship binaries + config only.
+          cp .build/release/NanoDictateAgent .build/release/nanodictate config.example.toml "$DIST"/
+          cp -R Resources "$DIST"/
+          cp -R .build/release/NanoDictate.app "$DIST"/
+          ARCHIVE="$DIST/nanodictate-$RELEASE_VERSION-macos-${{ matrix.arch }}.tar.gz"
+          # Deterministic archive so a re-run of the same version produces a
+          # byte-identical tarball (and thus the same sha256 as the committed
+          # manifests):
+          #   - fixed mtime: the committer timestamp of the checked-out HEAD.
+          #     On the merge/manual path `gh release create` tags this exact
+          #     commit, so this equals the tag date; on the tag path the
+          #     checkout IS the tagged commit.
+          #   - fixed member order: macOS bsdtar has no GNU --sort=name, so we
+          #     build a sorted member list and feed it via -T (readdir order
+          #     cannot leak in).
+          #   - fixed owner/group (0/0), no xattrs/ACLs/file-flags/Mac
+          #     metadata (no AppleDouble '._' companion entries), and a gzip
+          #     header carrying neither name nor timestamp (gzip -n).
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          # macOS-only runner (the matrix has no linux entry): `date -r`
+          # prints the given epoch; GNU date would read -r as a FILE
+          # reference instead.
+          # BSD touch rejects the 14-digit CCYY form ("out of range or illegal
+          # time specification") — %y gives the accepted 12-digit YYMMDDhhmm.SS.
+          TAR_MTIME=$(TZ=UTC date -u -r "$SOURCE_DATE_EPOCH" +%y%m%d%H%M.%S)
+          # Touch dirs too (bsdtar records their mtimes in the archive), and
+          # "$DIST" itself (tar stores it as the './' entry); skip symlinks.
+          find "$DIST" ! -type l -exec env TZ=UTC touch -m -t "$TAR_MTIME" {} +
+          # Exclude the archive itself from the member list: "$ARCHIVE" lives
+          # inside "$DIST", and on a non-fresh dir (re-pack, artifact cache) a
+          # stale archive would be sucked into its own listing — breaking the
+          # deterministic sha256 (the reviewer's 🟡). Fresh CI runners never
+          # hit it, but the guard costs one -name. NanoDictate.app is excluded
+          # too — the CLI tarball's composition stays identical to previous
+          # releases (binaries + config + Resources), so its sha256 semantics
+          # never drift; the app bundle travels in the zip only.
+          (cd "$DIST" && find . -type f ! -path '*/NanoDictate.app/*' ! -name 'nanodictate-*.tar.gz' | sed 's|^\./||' | sort > /tmp/nanodictate-members.txt)
+          COPYFILE_DISABLE=1 tar -c \
+            --uid 0 --gid 0 --numeric-owner \
+            --no-xattrs --no-acls --no-fflags --no-mac-metadata \
+            -C "$DIST" -T /tmp/nanodictate-members.txt \
+            | gzip -n > "$ARCHIVE"
+          ls -l "$ARCHIVE"
+
+          # --- App-bundle zip (the cask asset). Same determinism recipe as
+          # the tarball, applied to Info-ZIP (macOS /usr/bin/zip 3.0):
+          #   - COPYFILE_DISABLE kills AppleDouble '._' companion entries;
+          #   - /usr/bin/zip 3.0 IGNORES SOURCE_DATE_EPOCH (verified by test):
+          #     the entry timestamps come from the files' mtimes, which were
+          #     already normalized to TAR_MTIME by the touch-loop above. Do NOT
+          #     drop that touch-loop "in favor of" SOURCE_DATE_EPOCH — the loop
+          #     IS the timestamp determinism for the system zip;
+          #   - the sorted member list fixes member order.
+          # Members = the whole dist minus both archive kinds: the .app bundle
+          # (Contents/MacOS/ holds the SAME two signed binaries; its
+          # config.example.toml sits in Contents/Resources/ — resource seal,
+          # no per-file signature, located by Config.bundledExampleURLs() via
+          # Bundle.main.resourcePath after executableDir/prefixDir), the bare
+          # binaries, config + Resources. The
+          # zip itself and the tarball are excluded, so a re-pack
+          # on a reused dir cannot swallow stale archives.
+          ZIP_ARCHIVE="$DIST/nanodictate-$RELEASE_VERSION-macos-${{ matrix.arch }}.zip"
+          ZIP_PATH="$(pwd)/$ZIP_ARCHIVE"
+          (cd "$DIST" && find . -type f ! -name 'nanodictate-*.tar.gz' ! -name 'nanodictate-*.zip' | sed 's|^\./||' | sort > /tmp/nanodictate-zip-members.txt)
+          (cd "$DIST" && TZ=UTC SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" COPYFILE_DISABLE=1 zip -Xr -y -q "$ZIP_PATH" -@ < /tmp/nanodictate-zip-members.txt)
+          ls -l "$ZIP_ARCHIVE"
+
+      - name: Upload tarball + app-bundle zip
+        # actions/upload-artifact@v4 = ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: nanodictate-release-${{ matrix.arch }}
+          path: |
+            dist/nanodictate-*.tar.gz
+            dist/nanodictate-*.zip
+          if-no-files-found: error
+
+  # Aggregation: collect both tarballs, print names/checksums, create the
+  # GitHub Release and attach the assets. When preflight said skip_release,
+  # this job still runs (green) and only prints a no-op message — a main push
+  # without a version bump must not fail the pipeline.
+  release:
+    name: Create GitHub Release
+    needs: [candidate-gate, preflight]
+    # No-op pushes skip the candidate gate. A real publication is reachable
+    # only after the exact-head Packaging smoke run completed successfully.
+    if: ${{ always() && needs.preflight.result == 'success' && (needs.candidate-gate.result == 'success' || needs.candidate-gate.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+      # release-please labels the Release PR (autorelease: pending/tagged);
+      # this job transitions the merged Release PR to tagged after publication.
+      issues: write
+      pull-requests: write
+    steps:
+      - name: No-op — version already released / dry run
+        if: ${{ needs.preflight.outputs.skip_release == 'true' }}
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.dry_run }}" == "true" ]]; then
+            echo "DRY RUN — release v$VERSION was NOT created (build ran; release creation and manifests skipped)."
+          else
+            echo "Release v$VERSION already exists — no new version; bump Sources/NanoDictateCore/Version.swift in the PR to create a new one."
+          fi
+
+      - name: Download exact tested candidate artifacts
+        if: ${{ needs.preflight.outputs.skip_release != 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          GATE_RUN_ID: ${{ needs.candidate-gate.outputs.run_id }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for name in \
+            candidate-dist-x86_64 candidate-dist-arm64 \
+            candidate-zip-x86_64 candidate-zip-arm64
+          do
+            gh run download "$GATE_RUN_ID" --repo "$REPO" --name "$name" --dir dist
+          done
+
+          EXPECTED=(
+            "nanodictate-$VERSION-macos-x86_64.tar.gz"
+            "nanodictate-$VERSION-macos-arm64.tar.gz"
+            "nanodictate-$VERSION-macos-x86_64.zip"
+            "nanodictate-$VERSION-macos-arm64.zip"
+          )
+          for file in "${EXPECTED[@]}"; do
+            if [[ ! -f "dist/$file" ]]; then
+              echo "::error::Tested candidate artifact dist/$file is missing from Packaging smoke run $GATE_RUN_ID."
+              exit 1
+            fi
+          done
+          echo "::notice::Publishing the exact bytes validated by Packaging smoke run $GATE_RUN_ID."
+
+      - name: Compute asset info
+        id: assets
+        if: ${{ needs.preflight.outputs.skip_release != 'true' }}
+        env:
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          echo "version=${RELEASE_VERSION}" >> "$GITHUB_OUTPUT"
+          ls -1 dist/nanodictate-*.tar.gz dist/nanodictate-*.zip
+
+      - name: Generate SHA256SUMS.txt
+        if: ${{ needs.preflight.outputs.skip_release != 'true' }}
+        working-directory: dist
+        run: sha256sum nanodictate-*.tar.gz nanodictate-*.zip | tee SHA256SUMS.txt
+
+      - name: Create release & upload assets
+        if: ${{ needs.preflight.outputs.skip_release != 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # gh resolves the repo either from a git remote (needs a checkout)
+          # or from GH_REPO — this job has no checkout, so set it explicitly.
+          GH_REPO: ${{ github.repository }}
+          RELEASE_VERSION: ${{ steps.assets.outputs.version }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref_name }}
+          TAG: v${{ steps.assets.outputs.version }}
+        # On the merge/manual paths TAG (v<version>) does not exist yet:
+        # `gh release create` creates the tag itself from the default branch.
+        # A re-run whose release already exists never overwrites an existing
+        # asset: uploaded bytes are the canonical sha256 baked into the
+        # committed manifests, and a silently-replaced asset (--clobber) is
+        # exactly what made the manifests go stale. Attach-the-missing (repair
+        # of partial uploads) works only on the tag-push path — the guard turns
+        # merge/manual re-runs into SKIP=true, so a partially published release
+        # reached that way is not repaired here (re-run the workflow on the
+        # existing tag instead). The job exits 0 only after the upload itself
+        # succeeded (set -e); any other failure exits non-zero.
+        run: |
+          set -euo pipefail
+          NOTES="Release v$RELEASE_VERSION.
+
+          See [CHANGELOG.md](https://github.com/$REPO/blob/$REF/CHANGELOG.md) for the full release notes.
+          Generated by the release workflow."
+          if gh release create "$TAG" \
+            dist/nanodictate-*.tar.gz \
+            dist/nanodictate-*.zip \
+            dist/SHA256SUMS.txt \
+            --title "v$RELEASE_VERSION" \
+            --notes "$NOTES"; then
+            : # release created
+          else
+            rc=$?
+            # A DRAFT release also makes `gh release create` fail with
+            # "already exists", while the guard's releases/tags/ probe above
+            # returns 404 for drafts — so the guard thought "not released".
+            # Attaching assets into a draft would silently publish bytes in an
+            # unpublished release; fail instead (the draft must be published or
+            # deleted first). gh release view exposes the draft flag and does
+            # NOT fall back to the raw tag for a release that exists.
+            if gh release view "$TAG" --json draft --jq '.draft' 2>/dev/null | grep -qx 'true'; then
+              echo "::error::release is draft, cannot attach — publish or delete first"
+              exit 1
+            fi
+            # Release already exists (re-run): attach only the assets that
+            # are missing; every already-published byte stays untouched.
+            if gh release view "$TAG" --json assets --jq '.assets[].name' > /tmp/existing-assets.txt 2>/dev/null; then
+              MISSING=()
+              for f in dist/nanodictate-*.tar.gz dist/nanodictate-*.zip dist/SHA256SUMS.txt; do
+                if grep -qxF "$(basename "$f")" /tmp/existing-assets.txt; then
+                  echo "Asset $(basename "$f") is already attached to $TAG — keeping the existing bytes (no --clobber)."
+                else
+                  MISSING+=("$f")
+                fi
+              done
+              if [[ ${#MISSING[@]} -gt 0 ]]; then
+                echo "Release $TAG already exists (re-run); attaching missing assets: ${MISSING[*]}"
+                gh release upload "$TAG" "${MISSING[@]}"
+              else
+                echo "Release $TAG already exists (re-run); every asset is already attached — nothing to upload."
+              fi
+              exit 0
+            fi
+            exit "$rc"
+          fi
+
+      # release-please runs PR-only here (skip-github-release: true), so a
+      # merged Release PR keeps `autorelease: pending` and a later
+      # release-please run stops with "untagged, merged release PRs
+      # outstanding". release.yml owns tagging/publication, so transition
+      # the merged Release PR that produced this version to
+      # `autorelease: tagged` once the release exists. Runs on fresh
+      # publishes and on re-runs where the release already exists
+      # (skip_release=true): a previous attempt may have published without
+      # flipping the label, and the retry must repair it. Skipped only for
+      # dry runs (no publication happened). No-op when nothing matches
+      # (tag-push path, manual versions, already repaired).
+      - name: Mark merged Release PR as tagged
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run == true) }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${RELEASE_VERSION:-}" ]]; then
+            echo "::error::preflight version is empty — cannot match the merged Release PR."
+            exit 1
+          fi
+          if ! gh release view "v$RELEASE_VERSION" --repo "$GH_REPO" >/dev/null; then
+            echo "Release v$RELEASE_VERSION does not exist yet — nothing to mark tagged."
+            exit 0
+          fi
+          # Lookup failures must fail the step (no `|| true`): an API error
+          # is not "nothing pending".
+          PENDING_JSON=$(gh pr list --repo "$GH_REPO" --label "autorelease: pending" --state merged --limit 1000 --json number,title,body,headRefName)
+          MATCHED=$(jq -r --arg v "$RELEASE_VERSION" '($v | gsub("\\."; "\\.")) as $re | .[] | select(.headRefName == "release-please--branches--main") | select(((.title // "") + "\n" + (.body // "")) | test("(^|[^0-9.])v?" + $re + "([^0-9.]|\\.[^0-9]|$)")) | .number' <<<"$PENDING_JSON")
+          if [[ -z "${MATCHED//[[:space:]]/}" ]]; then
+            echo "No merged Release PR labeled 'autorelease: pending' matches v$RELEASE_VERSION — nothing to mark tagged."
+            exit 0
+          fi
+          # release-please may not have created this label yet (v0.1.7
+          # published successfully but the workflow failed here because the
+          # label was missing). Upsert it before applying it so housekeeping can
+          # never block post-release manifest synchronization again.
+          gh label create "autorelease: tagged" --repo "$GH_REPO" \
+            --color "0E8A16" \
+            --description "Release PR has been published and tagged." \
+            --force
+
+          for PR in $MATCHED; do
+            echo "Marking merged Release PR #$PR (v$RELEASE_VERSION) as tagged."
+            gh pr edit "$PR" --repo "$GH_REPO" --remove-label "autorelease: pending" --add-label "autorelease: tagged"
+          done
+
+  # Post-release: regenerate the Homebrew formula + MacPorts Portfile from the
+  # .tpl sources (real sha256 of the published tarballs), open a
+  # `chore/release-manifests-v<version>` PR into main with them (plus the
+  # installer PIN_REV update below), and sync the formula into the
+  # kodmial/homebrew-nanodictate tap. Nothing is pushed to `main` directly:
+  # the manifests reach `main` only through a normal PR merge, so `main` can
+  # stay protected with "Require a pull request before merging" and no
+  # automation needs a direct-push bypass. Runs only after the release exists,
+  # so scripts/release-prep.rb can download both tarballs. Gated on
+  # preflight's skip_manifests flag (NOT skip_release): manifests stay off on
+  # a re-run whose committed manifests ALREADY match the version (the guard
+  # verified version + sha256) — regenerating identical manifests is pointless;
+  # a STALE formula leaves skip_manifests=false and regenerates. The tap and
+  # MacPorts-tree syncs push to those EXTERNAL repositories (not to this
+  # repo's `main`), so they are not direct pushes to the protected branch.
+  manifests:
+    name: Update release manifests
+    needs: [release, preflight]
+    if: ${{ needs.preflight.outputs.skip_manifests != 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        # Same pinned actions/checkout as the build job. On a tag push the
+        # default ref is the tagged commit (detached HEAD); on a branch push /
+        # manual run the checkout is HEAD of the selected ref. fetch-depth: 0
+        # pulls the full history so the manifests PR branch below can be
+        # (re)created from origin/main (a shallow checkout has no origin/main
+        # ref at all).
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+
+      - name: Generate manifests
+        # Downloads both release tarballs AND both app-bundle zips, computes
+        # sha256 and fills __VERSION__ / __SHA256_ARM64__ / __SHA256_X86_64__
+        # / __ZIP_SHA256_ARM64__ / __ZIP_SHA256_X86_64__ / __MAINTAINERS__ /
+        # __REVISION__ into the .tpl sources, writing
+        # packaging/homebrew/nanodictate.rb, packaging/homebrew/Casks/
+        # nanodictate.rb and packaging/macports/Portfile. The formula and the
+        # port pin the TARBALL hashes, the cask pins the ZIP hashes.
+        # MAINTAINERS (MacPorts maintainers handle) comes from the MAINTAINERS
+        # repo variable, default "@kodmial"; REVISION overrides the port
+        # revision directive (default "0" — first publish of a version).
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          MAINTAINERS: ${{ vars.MAINTAINERS != '' && vars.MAINTAINERS || '@kodmial' }}
+          REVISION: ${{ vars.REVISION != '' && vars.REVISION || '0' }}
+        run: ruby scripts/release-prep.rb "v$VERSION"
+
+      - name: Sync root formula copy
+        run: cp packaging/homebrew/nanodictate.rb nanodictate.rb
+
+      - name: Sanity-check generated manifests
+        run: |
+          set -euo pipefail
+          ruby -c scripts/release-prep.rb
+          # The generated formula must parse (Ruby syntax check).
+          ruby -c packaging/homebrew/nanodictate.rb
+          # Homebrew requires the class name to be the CamelCase of the file
+          # stem ("nanodictate.rb" -> Nanodictate) and the filled tarball
+          # url + sha256 stanzas: release-prep.rb replaces the __VERSION__ /
+          # __SHA256_*__ tokens, so a formula that lost them (or a template
+          # that was not regenerated) is caught here. Service registration is
+          # explicit — `brew services start nanodictate` — and the canonical
+          # label is checked by the service-block greps below.
+          grep -q '^class Nanodictate < Formula$' packaging/homebrew/nanodictate.rb
+          grep -q '^    url "https://github.com/kodmial/nanodictate/releases/download/' packaging/homebrew/nanodictate.rb
+          grep -q '^    sha256 "' packaging/homebrew/nanodictate.rb
+          # Service block with the canonical label: a lost label would let brew invent homebrew.mxcl.nanodictate — a second daemon.
+          grep -q '^  service do$' packaging/homebrew/nanodictate.rb
+          grep -q 'name macos: "com.nanodictate.agent"' packaging/homebrew/nanodictate.rb
+          # POSITIVE guard on the formula prose. The caveats used to state, as
+          # fact, that a Homebrew download never sets the quarantine attribute
+          # and that the attribute is limited to browser downloads. That is
+          # false — the cask has to clear the attribute itself — and it was
+          # removed from the .tpl, but nothing stops it from coming back and it
+          # would tell users the opposite of what the cask does. The text lives
+          # in the caveats heredoc, i.e. in plain prose rather than in a Ruby
+          # comment, so the whole file is read here.
+          #
+          # One Perl program instead of grep + dd + cut + awk + tr, which spelled
+          # out FOUR ways of asking the same question — show me the text around
+          # this match: a flattened copy, a paragraph copy, a `dd` byte window
+          # and a `grep -o` character window. The SEAM between them is where the
+          # old guard leaked: the word `cask`, part of the shared corrective
+          # vocabulary, sat in the window before an appended lie and silenced it,
+          # and the same word silenced the paragraph-scoped branch. Perl does the
+          # offset arithmetic natively ($-[0] / substr) over raw bytes, so the file
+          # is read once and the LC_ALL / multibyte question cannot arise at all.
+          # The program arrives on stdin (`perl - FILE`), so the failing path
+          # writes nothing to disk: it prints one line naming the reason on stderr
+          # and exits 1, and `set -e` stops the step there. Perl is preinstalled
+          # on the ubuntu runner next to the ruby this step already needs; should
+          # it ever go missing the shell reports 127 and the step FAILS rather
+          # than passing with the check silently skipped.
+          #
+          # Three branches, tried in order, each judged on its own evidence:
+          #   A) claim + consequence ("... so Gatekeeper stays quiet"): the
+          #      consequence is what turns a claim into user-facing advice.
+          #      Judged PER OCCURRENCE — the corrective test reads only the text
+          #      between the start of THAT occurrence's own PARAGRAPH and the
+          #      occurrence, so a correction beside one claim cannot veto a
+          #      different, uncorrected claim in another paragraph.
+          #   B) the attribute attributed to browser downloads alone, false
+          #      whoever the subject is. Narrowed to windows that also name the
+          #      attribute and skipped when such a window is corrective. Left on a
+          #      BYTE window ($B_PAD, and `open '<:raw'` above so it really is a
+          #      byte count): that phrasing carries its claim on its own.
+          #   C) the bare claim, silenced when the PARAGRAPH holding it refutes it
+          #      rather than asserts it. The unit is the paragraph and not a
+          #      character count because a claim and its correction are one
+          #      thought that a fixed cut splits for no reason — a correction 137
+          #      characters earlier in the same paragraph is still the same
+          #      correction, and cutting there turned correct prose into a
+          #      release failure. A uses that same unit, and for that same reason.
+          #
+          # THE PARAGRAPH IS THE UNIT FOR A AND C ALIKE, and the boundary it draws
+          # is the contract, stated here so no reader has to infer it: a refutation
+          # in the SAME paragraph as the claim silences it at ANY distance — 52
+          # bytes back or 250 — and a refutation in a DIFFERENT paragraph silences
+          # nothing. A lies introduced with its own corrective one paragraph up is
+          # therefore still caught, which is what the paragraph boundary buys.
+          #
+          # WHAT COUNTS AS A REFUTATION differs per branch, and that difference
+          # is the fix, not a detail:
+          #   A knows CUE words only (wrong, was once, no longer, do not, ...).
+          #      Words like cask / postflight / xattr are NOT refutations — they
+          #      name the mechanism and deny nothing. Counting them as denial is
+          #      what let a correct sentence in the same paragraph veto a lie
+          #      appended next to it, which is the scenario this guard exists for.
+          #      A consequence-carrying lie now trips A wherever it sits.
+          #   C also accepts a MECHANISM refutation, but only one that acts on the
+          #      attribute: cask / postflight / xattr / ... together with does /
+          #      clears / removes / instead. The claim text is blanked out of the
+          #      paragraph first, so the claim's own "does not" cannot veto
+          #      itself. A bare mention of a mechanism no longer silences C.
+          #
+          # Documented trade-offs — what this guard still misses, and what it
+          # still lets through. Neither "it never fires on correct text" nor "it
+          # catches every lie" is claimed; the branches above are the contract.
+          #   - A claim with NO consequence, in a paragraph that also ACTS on the
+          #      mechanism ("the cask does nothing" beside a bare claim), is still
+          #      silenced by C. Telling an assertion from a correction about the
+          #      same subject needs a claim-vs-correction parser, and the price of
+          #      guessing is failing releases on correct prose, so the conservative
+          #      branch is kept and the gap is written down here.
+          #   - A refutation phrased OUTSIDE the closed CUE vocabulary above still
+          #      reads as a claim. Five ordinary English corrections are carried in
+          #      $cue for exactly this reason -- "is false", "formerly",
+          #      "rather than", "instead of", "documented that" -- so the common
+          #      editorial rewrites of the caveat are not failed by the guard. A
+          #      rewrite phrased outside even those must use one of the CUE words
+          #      ("wrong", "no longer", "used to", "previously", "was once",
+          #      "not true", "that claim", ...) or name a mechanism that ACTS on
+          #      the attribute ($mech: cask/formula/tarball/... with clears/
+          #      removes/handles) to be recognised as a correction.
+          #   - A's veto window stops at the paragraph boundary and nowhere else.
+          #      It is NOT true that a correction further back in the paragraph is
+          #      left to branch C: when A matches it sets $why and C is then
+          #      skipped entirely (`if ($why eq '')`), so C never re-examines
+          #      anything A already judged. The window had been a fixed 80 bytes
+          #      and that was simply a bug — a correction 150 bytes earlier was
+          #      outside the window, A fired, C never ran, and correct prose failed
+          #      the release. The window is now paragraph-wide, which is the unit
+          #      C already used and the unit a correction actually lives in.
+          #   - The guard reads the file with `or exit 0`, so on an UNREADABLE or
+          #      MISSING file it fails OPEN and lets the release through. That is
+          #      safe only because the `ruby -c packaging/homebrew/nanodictate.rb`
+          #      line above already read the same path and would have stopped the
+          #      step first; do not move or drop that line without giving this one
+          #      a hard failure.
+          perl - packaging/homebrew/nanodictate.rb <<'ND_QUARANTINE_GUARD'
+          use strict;
+          use warnings;
+
+          # Positive guard on the formula prose. $ARGV[0] is the generated formula; the
+          # program arrives on stdin, so nothing is written to disk on the failing path.
+          # Read as raw bytes on purpose: every window below counts BYTES, so a multibyte
+          # character earlier in the file cannot shift a window and an exported LC_ALL
+          # cannot change the result.
+          my $file = shift @ARGV;
+          open(my $fh, '<:raw', $file) or exit 0;
+          my $src = do { local $/; <$fh> };
+          close $fh;
+          $src = '' unless defined $src;
+
+          # The retired claim, and the user-facing consequence that turns it into advice.
+          #
+          # DELIBERATE: $claim is NOT widened to the SEMANTIC claim, and must not be.
+          # It matches the retired WORDING only, and that is a considered trade, not an
+          # oversight — widening was measured, not guessed (see the trade-off note below).
+          # The template DELIBERATELY retains a hedged restatement of the same idea:
+          #   "This install path sets no quarantine attribute, so no Gatekeeper dialog
+          #    is expected ... and none has been observed."
+          # That sentence is CORRECT and must reach users. It asserts the same thing the
+          # retired claim asserted — no quarantine attribute on this path — so there is
+          # no semantic predicate that separates the two; they differ only in subject
+          # ("this install path" vs "Homebrew's download"). A $claim widened to the
+          # semantic claim (matching "sets no quarantine", "no quarantine attribute",
+          # or a bare negation near the word) FIRES ON THE GOOD ARTIFACT and would break
+          # every future release. A subject-anchored widening is subtler and still fails:
+          # it catches the retired claim reworded, but it equally catches the RETAINED
+          # hedge restated with a Homebrew subject ("Homebrew's download does not set any
+          # quarantine attribute, so no Gatekeeper dialog is expected"), which is correct
+          # prose an editor may legitimately write. Measured over a fixture set, every
+          # widening level that caught the reworded retired claim blocked 6/6 legitimate
+          # rewrites of the retained hedge.
+          #
+          # So the cost is accepted knowingly: a REWORDED retired claim that no longer
+          # contains this literal string is a KNOWN GAP, not a regression, and under-firing
+          # on an unanticipated rewording is a maintainer-reviewable MEDIUM. A false
+          # positive that blocks a correct release is a P0 and is the worse failure by
+          # every margin. If the retired caveat ever needs policing again, the cheap and
+          # safe way is a POSITIVE assertion that the correct sentence is present (the
+          # retained hedge or the postflight stanza), not a wider $claim: a positive check
+          # can only fail on prose that is genuinely missing, never on a rewording.
+          my $claim = qr/Homebrew'?s?\s+download\s+does\s+not\s+set\s+the\s+quarantine/i;
+          my $conseq = qr/\s(?:so|therefore|thus|hence)\s+[^.]{0,80}(?:Gatekeeper|stays\s+quiet|no\s+action|nothing\s+to\s+do|warn)/i;
+          # Refutation cues ONLY. Words like cask/postflight/xattr name the mechanism;
+          # they do not deny anything, and counting them as denial is what let a correct
+          # sentence in the same paragraph veto a lie appended next to it.
+          #
+          # The list is CLOSED: a phrase outside it does not refute, so an ordinary
+          # English correction phrased any other way reads as a claim. The five that
+          # matter most for real editorial rewrites are carried here — "is false",
+          # "formerly", "rather than", "instead of", "documented that" — because a
+          # caveat that refutes the retired advice with any of them is correct prose
+          # and must not fail a release. Dropping them (as a once-tried revision did)
+          # turned a working refutation into rc=1 on the very sentence it corrects.
+          # The cost is the ordinary cost of a cue list, already accepted for its
+          # members: a cue sitting in the same paragraph about a DIFFERENT subject
+          # silences this one ("the bundle formerly shipped a seal ... <claim>"). The
+          # existing members -- previously, used to, no longer, wrong -- behave
+          # identically, so this widens a known trade-off rather than opening a new
+          # hole; distinguishing assertion from correction needs the claim-vs-
+          # correction parser this guard deliberately does not attempt.
+          my $cue = qr/wrong|incorrect|misleading|myth|untrue|not\s+true|do\s+not|don'?t|no\s+longer|was\s+once|used\s+to|previously|documented\s+that|formerly|is\s+false|rather\s+than|instead\s+of|contrary\s+to|opposite\s+of|that\s+claim|this\s+claim|wrongly|incorrectly/i;
+          # Branch B: the attribute handed to browser downloads alone.
+          my $browser = qr/only\s+(?:the\s+)?[*_]*browser[*_]*\s+downloads?\s+(?:get|set|receive)/i;
+          # Branch C: a mechanism that is ACTED ON, not merely named.
+          my $mech = qr/\b(?:cask|postflight|xattr|formula|tarball)\b[^.]{0,60}\b(?:does|do|clears?|clearing|removes?|removing|strips?|handles?|handled|instead|rather)\b/i;
+
+          my $A_AHEAD = 400;  # bytes of context read AFTER a claim occurrence
+          my $B_PAD = 120;    # bytes of context on each side of a browser-only mention
+
+          # One flattened view for the two windowed branches. The old claim was wrapped
+          # across several template lines and its halves can sit a dozen lines apart,
+          # which a line window truncates or splits.
+          my $flat = $src;
+          $flat =~ s/\n/ /g;
+          my $why = '';
+
+          # Start offset of every paragraph, cut on a blank line exactly as branch C cuts
+          # it. The flatten above swaps each "\n" for a single space, so $flat is the
+          # SAME LENGTH as $src and an offset means the same place in both — which is why
+          # these offsets can be cut on $src and applied to $flat. A paragraph boundary
+          # cannot be found in $flat itself: there the blank line is two ordinary spaces,
+          # indistinguishable from Ruby indentation.
+          my @para_start = (0);
+          while ($src =~ /\n\s*\n/g) {
+            push @para_start, $+[0];
+          }
+
+          # A) per occurrence: claim + consequence, vetoed only by a cue word between the
+          #    START OF THIS OCCURRENCE'S OWN PARAGRAPH and the occurrence. A claim and
+          #    the correction that neutralises it are one thought, so the unit is the
+          #    paragraph and not a byte count: a fixed 80-byte cut split a correction
+          #    sitting 150 bytes earlier from the claim it corrects, and because A
+          #    matches first that turned correct prose into a release failure.
+          #    The window stops at the paragraph on purpose. A correction in a
+          #    NEIGHBOURING paragraph says nothing about this one, so a lie introduced
+          #    with its own corrective one paragraph up is still caught.
+          #    Every OTHER claim occurrence is blanked out of the window before the cue
+          #    test, for the same reason branch C blanks the claim text: a claim's own
+          #    "does not" must never veto it, and neither must a claim that was itself
+          #    corrected a sentence earlier. The window therefore also stops at the END
+          #    of the PREVIOUS claim occurrence: a cue sitting in the gap between two
+          #    claims belongs to the first one ("that is wrong: <claim>. ... <claim>, so
+          #    Gatekeeper stays quiet"), and letting it reach the second claim would
+          #    hand a writer a paragraph in which any lie goes unchallenged.
+          my $prev_end = 0;   # end offset of the previous claim occurrence, 0 if none
+          while ($flat =~ /$claim/g) {
+            # $-[0] and $& are read here, before any nested match can reset them.
+            my $off = $-[0];
+            my $gap_start = $prev_end;          # end of the previous occurrence
+            $prev_end = $off + length($&);     # advanced for EVERY occurrence, including
+                                               # one that fails the consequence test below:
+                                               # a bare claim earlier in the paragraph is
+                                               # still a claim an earlier cue was about.
+            next unless substr($flat, $off, $A_AHEAD) =~ /^$claim.{0,200}$conseq/;
+            my $start = 0;
+            for my $p (@para_start) {
+              last if $p > $off;
+              $start = $p;
+            }
+            $start = $gap_start if $gap_start > $start;
+            my $win = substr($flat, $start, $off - $start);
+            $win =~ s/$claim/(claim)/gi;
+            next if $win =~ /$cue/i;
+            $why = 'claim plus user-facing consequence';
+            last;
+          }
+
+          # B) the attribute attributed to browser downloads alone, which is false
+          #    whoever the subject is. Narrowed to windows that also name the attribute,
+          #    and skipped when such a window is corrective.
+          if ($why eq '') {
+            while ($flat =~ /.{0,$B_PAD}$browser.{0,$B_PAD}/g) {
+              my $win = $&;
+              next unless $win =~ /quarantine/i;
+              next if $win =~ /$cue/i;
+              $why = 'attribute limited to browser downloads';
+              last;
+            }
+          }
+
+          # C) the bare claim, judged on the PARAGRAPH that holds it (a blank source line
+          #    ends a paragraph; after flattening a blank line is two spaces and no
+          #    longer distinguishable from Ruby indentation). A claim and its correction
+          #    are one thought, so a cue anywhere in that paragraph — in front or after —
+          #    refutes it.
+          if ($why eq '') {
+            for my $para (split /\n\s*\n/, $src) {
+              next unless $para =~ /$claim/i;
+              my $rest = $para;
+              $rest =~ s/$claim/(claim)/gi;  # the claim must not veto itself
+              next if $rest =~ /$cue/i || $rest =~ /$mech/i;
+              $why = 'unattributed bare claim';
+              last;
+            }
+          }
+
+          if ($why ne '') {
+            print STDERR "ERROR: generated formula matches the retired quarantine caveat VERBATIM ($why); this guard matches that one retired WORDING, not the general idea — the correctly-worded hedge in packaging/homebrew/nanodictate.rb.tpl (\"This install path sets no quarantine attribute, so no Gatekeeper dialog is expected\") is intended to ship; see docs/packaging/homebrew.md\n";
+            exit 1;
+          }
+          exit 0;
+          ND_QUARANTINE_GUARD
+          # The generated cask must parse (Ruby syntax check) and carry the .app
+          # stanza. The release bundle is self-signed and NOT notarized, so the
+          # download carries com.apple.quarantine and Homebrew propagates it
+          # into /Applications on install (Cask::Quarantine.propagate). The
+          # cask therefore clears THAT ONE attribute in a postflight step, so
+          # a normal `brew install --cask` never needs "Open Anyway" nor a
+          # manual `xattr -dr`. Gatekeeper itself is left untouched.
+          ruby -c packaging/homebrew/Casks/nanodictate.rb
+          grep -q '^cask "nanodictate" do$' packaging/homebrew/Casks/nanodictate.rb
+          grep -q '^  app "NanoDictate.app"$' packaging/homebrew/Casks/nanodictate.rb
+          # macOS floor: the app requires Monterey. `depends_on :macos` alone
+          # only marks the cask macOS-only; the version symbol is what makes
+          # brew refuse the install on an older macOS.
+          grep -q '^  depends_on macos: :monterey$' packaging/homebrew/Casks/nanodictate.rb
+          if grep -q '^  depends_on :macos$' packaging/homebrew/Casks/nanodictate.rb; then
+            echo "ERROR: cask lost the macOS floor (depends_on :macos found)" >&2
+            exit 1
+          fi
+          # The cask must still reference the installed bundle path: the `app`
+          # stanza MOVES the bundle into appdir and the `binary` stanza resolves
+          # the executable from the installed location at #{appdir}/NanoDictate.app.
+          grep -q '#{appdir}/NanoDictate.app' packaging/homebrew/Casks/nanodictate.rb
+          # POSITIVE guard on the quarantine fix: a release must not silently
+          # drop the postflight and bring the Gatekeeper warning back. Every
+          # token of the structured `postflight_steps` block is asserted.
+          # EXACTLY one such block — a positive count, not a single match. A
+          # duplicated or half-merged block would run the step twice, and a
+          # stanza at a different indentation would slip past a line grep.
+          # Checked before the token greps below so that BOTH a missing block
+          # and a second one fail with a message naming the count.
+          POSTFLIGHT_COUNT="$(grep -c '^  postflight_steps do$' packaging/homebrew/Casks/nanodictate.rb || true)"
+          if [ "$POSTFLIGHT_COUNT" -ne 1 ]; then
+            echo "ERROR: expected exactly 1 postflight_steps block in the cask, found $POSTFLIGHT_COUNT" >&2
+            exit 1
+          fi
+          grep -q '^  postflight_steps do$' packaging/homebrew/Casks/nanodictate.rb
+          grep -q 'run "/usr/bin/xattr",' packaging/homebrew/Casks/nanodictate.rb
+          grep -q 'args: \["-dr", "com.apple.quarantine", "{{appdir}}/NanoDictate.app"\]$' packaging/homebrew/Casks/nanodictate.rb
+          # Removing quarantine must not become removing every extended
+          # attribute (-c) and must never reach for the Gatekeeper override.
+          # Scoped to executable code: full-line comments are stripped first, so
+          # that prose in the template which legitimately mentions these tokens
+          # cannot trip this guard. Nothing in today's cask requires it — it is
+          # there so that the next comment explaining the scope of the
+          # postflight cannot break the release. The filtered copy goes to a
+          # temp file rather than a pipe because this job runs under
+          # `set -o pipefail`.
+          # The flag lives on the `args:` line, NOT on the `run` line: the
+          # idiomatic cask form is two lines (`run "/usr/bin/xattr",` then
+          # `args: ["-dr", ...]`), so a `run`-anchored pattern alone MISSES a
+          # "-c"/"-cr" substituted into that second line. Hence the args-anchored
+          # alternative — a line that begins with `args:` and carries the flag
+          # is the regression regardless of which line the tool call is on.
+          CASK_CODE="$(mktemp)"
+          grep -vE '^[[:space:]]*#' packaging/homebrew/Casks/nanodictate.rb > "$CASK_CODE" || true
+          if grep -qE 'run[[:space:]].*xattr.*"-(c|cr)"|xattr.*"-(c|cr)"|^[[:space:]]*args:.*"-(c|cr)"|/usr/sbin/spctl|spctl[[:space:]]+--master-disable' "$CASK_CODE"; then
+            echo "ERROR: cask clears all xattrs or touches the Gatekeeper override" >&2
+            rm -f "$CASK_CODE"
+            exit 1
+          fi
+          rm -f "$CASK_CODE"
+          # Then load the cask FOR REAL through CaskLoader — the same path brew uses
+          # on tap/install. This catches any cask load error (a cask
+          # that parses yet fails to load) and any `depends_on :macos` loss (which
+          # would otherwise load as a Linux cask on this ubuntu runner). Homebrew on
+          # ubuntu-latest is NOT in PATH (preinstalled at /home/linuxbrew/.linuxbrew),
+          # so resolve it explicitly; when brew is unavailable entirely, warn and skip
+          # instead of killing the job (exit 127) — the greps above still guard the cask.
+          echo "=== Load-check cask with CaskLoader ==="
+          if command -v brew >/dev/null 2>&1; then
+            BREW_BIN="$(command -v brew)"
+          elif [ -x /home/linuxbrew/.linuxbrew/bin/brew ]; then
+            BREW_BIN="/home/linuxbrew/.linuxbrew/bin/brew"
+          else
+            echo "::warning::brew not available; cask load check skipped"
+            BREW_BIN=""
+          fi
+          if [ -n "$BREW_BIN" ]; then
+            "$BREW_BIN" ruby -e 'require "cask/cask_loader"; c = Cask::CaskLoader::FromContentLoader.new(File.read("packaging/homebrew/Casks/nanodictate.rb")).load(config: nil) || abort("cask failed to load"); abort("cask lost its macOS dependency") unless c.supports_macos? && !c.supports_linux?'
+          fi
+          echo "=== CaskLoader load-check done ==="
+          # No unfilled __PLACEHOLDER__ may remain in the generated files
+          # (formula + cask + port; the cask's zip tokens are distinct from the
+          # formula's tarball tokens by design, see release-prep.rb).
+          if grep -qE '__VERSION__|__SHA256_(ARM64|X86_64)__|__ZIP_SHA256_(ARM64|X86_64)__|__MAINTAINERS__|__REVISION__' \
+            packaging/homebrew/nanodictate.rb packaging/homebrew/Casks/nanodictate.rb packaging/macports/Portfile; then
+            echo "ERROR: unfilled placeholders remain in generated manifests" >&2
+            exit 1
+          fi
+          # Structural Portfile sanity (a macOS-only `port lint` is impossible
+          # on the ubuntu runner, so grep the generated file instead): a
+          # numeric revision, an empty build phase, no configure step, a real
+          # version (not a placeholder) in github.setup and a livecheck.
+          grep -q '^revision[[:space:]]\+[0-9]' packaging/macports/Portfile
+          grep -q '^build[[:space:]]\?{}' packaging/macports/Portfile
+          grep -q '^use_configure[[:space:]]\+no' packaging/macports/Portfile
+          grep -q '^github.setup[[:space:]]\+kodmial nanodictate [0-9]' packaging/macports/Portfile
+          grep -q '^livecheck.type[[:space:]]\+github' packaging/macports/Portfile
+
+      # Attach the generated MacPorts Portfile to the release as an asset.
+      # The Portfile only exists in this job (release-prep.rb writes it under
+      # packaging/macports/), so this is the natural place to upload it — the
+      # release itself already exists (this job needs `release`). Re-runs are
+      # idempotent WITHOUT --clobber: an asset already present is left
+      # untouched (its bytes are the canonical sha256 the tarballs were
+      # released with), and the deterministic tarballs mean a re-run cannot
+      # legitimately change them.
+      - name: Upload Portfile to release assets
+        if: ${{ needs.preflight.outputs.skip_release != 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # gh resolves the repo from the checkout's git remote (this job has
+          # a checkout, unlike the release job).
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          ASSET="/tmp/nanodictate-$VERSION-Portfile"
+          cp packaging/macports/Portfile "$ASSET"
+          ASSET_NAME="$(basename "$ASSET")"
+          if gh release view "v$VERSION" --json assets --jq '.assets[].name' | grep -qxF "$ASSET_NAME"; then
+            echo "nanodictate-$VERSION-Portfile is already attached to release v$VERSION — keeping the existing bytes (no --clobber)."
+          else
+            gh release upload "v$VERSION" "$ASSET"
+            echo "Uploaded packaging/macports/Portfile as nanodictate-$VERSION-Portfile to release v$VERSION"
+          fi
+
+      # Sync the generated Portfile + config into the kodmial/macports-nanodictate
+      # git repo — the tree users clone and register as a file:// port source
+      # (`sudo port selfupdate` then git-pulls it). The old tar-asset channel
+      # (nanodictate-macos-macports-tree.tar.gz) is gone: the git repo is the
+      # chosen install channel. Needs the TAP_PAT repo secret (same as the tap
+      # step — a Personal Access Token, classic "repo" scope,
+      # owned by kodmial). The secret is read through the env context, NOT the
+      # `if:` condition (the secrets context is unavailable in `if:` and fails
+      # workflow validation). Without TAP_PAT this step FAILS (exit 1) — the
+      # channel must not silently skip a version on a green run. This pushes to
+      # the EXTERNAL macports-nanodictate repo (its own `main`), never to this
+      # repo's protected `main`.
+      - name: Sync MacPorts port tree (kodmial/macports-nanodictate)
+        if: ${{ needs.preflight.outputs.skip_release != 'true' }}
+        env:
+          # NO GH_TOKEN here on purpose: with GH_TOKEN set, `gh auth login
+          # --with-token` below refuses to run ("the value of GH_TOKEN is
+          # being used for authentication") and the step cannot switch to
+          # the TAP_PAT credential.
+          VERSION: ${{ needs.preflight.outputs.version }}
+          TAP_PAT: ${{ secrets.TAP_PAT }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$TAP_PAT" ]]; then
+            echo "::error::TAP_PAT secret is not set — the kodmial/macports-nanodictate tree sync FAILED. To enable it, create a repo secret TAP_PAT holding a Personal Access Token (classic, 'repo' scope) owned by kodmial, then re-run the release workflow (the build/release jobs are idempotent)."
+            exit 1
+          fi
+          printf '%s' "$TAP_PAT" | gh auth login --with-token
+          gh auth setup-git
+          gh repo clone kodmial/macports-nanodictate /tmp/macports-nanodictate
+          cp packaging/macports/Portfile /tmp/macports-nanodictate/audio/nanodictate/Portfile
+          cp config.example.toml /tmp/macports-nanodictate/audio/nanodictate/config.example.toml
+          cd /tmp/macports-nanodictate
+          git config user.name "kodmial"
+          git config user.email "kodmial@gmail.com"
+          git add audio/nanodictate/Portfile audio/nanodictate/config.example.toml
+          if git diff --cached --quiet; then
+            echo "MacPorts tree unchanged since the last release — nothing to commit."
+          else
+            git commit -m "chore(release): sync nanodictate v$VERSION port tree"
+            git push origin main
+          fi
+
+      # Open (or update) the `chore/release-manifests-v<version>` PR with the
+      # generated manifests plus the installer pin — the in-repo half of the
+      # post-release sync. Nothing here touches `main` directly: the manifests
+      # and the PIN_REV edit land on a feature branch and reach `main` only
+      # through a normal PR merge, so no branch-protection bypass is needed.
+      #
+      # Pin background: PIN_REV in scripts/install-macports.sh is the
+      # installer's exact-revision checkout of the tree — if it stays on an
+      # older commit, fresh installs check out a stale Portfile (not the one
+      # generated by this very workflow). A re-run whose committed manifests
+      # already match but whose pin is stale still reaches this step
+      # (preflight's pin check keeps skip_manifests=false while the pinned
+      # revision differs from the tree HEAD), so the pin repair rides along
+      # here. Runs on both paths (tree changed or not): TREE_SHA is the tree
+      # HEAD either way, and the installer edit is skipped when the pin is
+      # already current.
+      #
+      # The branch push and the PR creation authenticate with TAP_PAT (the same
+      # PAT the tree-sync step above already requires): a PR created with the
+      # default GITHUB_TOKEN would NOT trigger CI, and the manifests PR must
+      # pass required checks before merge like any other PR.
+      - name: Open release-manifests PR (manifests + installer pin)
+        if: ${{ needs.preflight.outputs.skip_manifests != 'true' }}
+        env:
+          # NO GH_TOKEN here on purpose (same reason as the tree-sync step):
+          # TAP_PAT is used for every write below.
+          VERSION: ${{ needs.preflight.outputs.version }}
+          TAP_PAT: ${{ secrets.TAP_PAT }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$TAP_PAT" ]]; then
+            echo "::error::TAP_PAT secret is not set — cannot open the release-manifests PR. To enable it, create a repo secret TAP_PAT holding a Personal Access Token (classic, 'repo' scope) owned by kodmial, then re-run the release workflow (the build/release jobs are idempotent)."
+            exit 1
+          fi
+          BRANCH="chore/release-manifests-v$VERSION"
+          # The revision to pin: the HEAD the tree-sync step just pushed when it
+          # ran (the /tmp clone is left in place), else the tree's live main tip
+          # via ls-remote — the same probe preflight's pin check uses for a
+          # sync-free re-run.
+          if [ -d /tmp/macports-nanodictate/.git ]; then
+            TREE_SHA="$(git -C /tmp/macports-nanodictate rev-parse HEAD)"
+          else
+            TREE_SHA="$(git ls-remote https://github.com/kodmial/macports-nanodictate refs/heads/main | awk '{print $1}')"
+          fi
+          if ! [[ "$TREE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::could not resolve the macports-nanodictate tree HEAD (${TREE_SHA:-<empty>}) — cannot pin install-macports.sh"
+            exit 1
+          fi
+          # Stale-pin guard: the revision about to be pinned is only good if
+          # remote main still matches it. When the tree-sync step ran in this
+          # run, the /tmp clone reports the HEAD this run pushed — a concurrent
+          # release that advanced the tree after that push keeps the clone on the
+          # older HEAD, and pinning it would hand fresh installs a stale
+          # Portfile. Compare the live remote main against TREE_SHA before
+          # committing; any drift fails the step for a retry.
+          REMOTE_MAIN="$(git ls-remote https://github.com/kodmial/macports-nanodictate refs/heads/main | awk '{print $1}')"
+          if ! [[ "$REMOTE_MAIN" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::could not resolve the macports-nanodictate remote main revision (${REMOTE_MAIN:-<empty>}) — cannot verify the pin target; re-run the workflow"
+            exit 1
+          fi
+          if [[ "$REMOTE_MAIN" != "$TREE_SHA" ]]; then
+            echo "::error::macports-nanodictate remote main ($REMOTE_MAIN) no longer matches the revision this run synced ($TREE_SHA) — a concurrent release advanced the tree after the sync step. Do not pin a stale tree; re-run the workflow to pin the current tip."
+            exit 1
+          fi
+          # Stash the generated manifests aside: the branch below is (re)based
+          # on origin/main, which on a tag-push re-run is NEWER than this
+          # checkout — switching branches with the generated files dirty in the
+          # tree could refuse the checkout. The scratch dir lives inside the
+          # worktree (never /tmp) and is removed before the step ends, so it is
+          # never committed.
+          STASH="$GITHUB_WORKSPACE/.opencode-tmp/release-manifests-$VERSION"
+          rm -rf "$STASH"
+          mkdir -p "$STASH"
+          cp packaging/homebrew/nanodictate.rb "$STASH/nanodictate.rb"
+          cp packaging/homebrew/Casks/nanodictate.rb "$STASH/Casks-nanodictate.rb"
+          cp packaging/macports/Portfile "$STASH/Portfile"
+          cp nanodictate.rb "$STASH/root-nanodictate.rb"
+          # Drop the dirty generated copies so the branch switch below cannot
+          # refuse on a re-run (the target branch may already carry different
+          # manifest content, or origin/main may be newer than this checkout).
+          git -C "$GITHUB_WORKSPACE" checkout -- nanodictate.rb packaging/homebrew/nanodictate.rb packaging/homebrew/Casks/nanodictate.rb packaging/macports/Portfile
+          git -C "$GITHUB_WORKSPACE" fetch origin main
+          if git -C "$GITHUB_WORKSPACE" ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            git -C "$GITHUB_WORKSPACE" checkout "$BRANCH"
+            git -C "$GITHUB_WORKSPACE" merge --ff-only "origin/$BRANCH"
+          else
+            git -C "$GITHUB_WORKSPACE" checkout -b "$BRANCH" origin/main
+          fi
+          cp "$STASH/nanodictate.rb" packaging/homebrew/nanodictate.rb
+          cp "$STASH/Casks-nanodictate.rb" packaging/homebrew/Casks/nanodictate.rb
+          cp "$STASH/Portfile" packaging/macports/Portfile
+          cp "$STASH/root-nanodictate.rb" nanodictate.rb
+          rm -rf "$STASH"
+          rmdir "$GITHUB_WORKSPACE/.opencode-tmp" 2>/dev/null || true
+          sed -i "s/^PIN_REV=\"[^\"]*\"$/PIN_REV=\"$TREE_SHA\"/" scripts/install-macports.sh
+          if ! grep -qxF "PIN_REV=\"$TREE_SHA\"" scripts/install-macports.sh; then
+            echo "::error::PIN_REV in scripts/install-macports.sh was not updated to $TREE_SHA"
+            exit 1
+          fi
+          git config user.name "kodmial"
+          git config user.email "kodmial@gmail.com"
+          # The manifest outputs are tracked in git (root nanodictate.rb plus
+          # packaging/homebrew/nanodictate.rb, packaging/homebrew/Casks/
+          # nanodictate.rb and packaging/macports/Portfile) together with the
+          # installer pin. The /packaging/... .gitignore entries would only
+          # filter untracked files, which these are not; `git add -f`
+          # force-adds them anyway (and would bring them back even if ever
+          # absent).
+          git add -f nanodictate.rb packaging/homebrew/nanodictate.rb packaging/homebrew/Casks/nanodictate.rb packaging/macports/Portfile scripts/install-macports.sh
+          if git diff --cached --quiet; then
+            echo "Manifests and installer pin already match v$VERSION — nothing to commit."
+          else
+            git commit -m "chore(release): update v$VERSION manifests"
+            # PAT-authenticated push of the FEATURE branch (never `main`): a
+            # PAT push triggers the manifests PR's CI, a GITHUB_TOKEN push
+            # would suppress it. Pushing a feature branch is allowed under
+            # branch protection — only `main` requires a pull request. A
+            # non-fast-forward refusal means a concurrent run updated the
+            # branch first; re-run the workflow to retry on the new tip.
+            git remote set-url origin "https://x-access-token:${TAP_PAT}@github.com/${GITHUB_REPOSITORY}.git"
+            git push origin "HEAD:${BRANCH}"
+            echo "Pushed manifests + PIN_REV ($TREE_SHA) to ${BRANCH}."
+          fi
+          # Create the PR when there isn't one yet; an already-open PR for the
+          # branch only needs the push above. `gh pr view` probes without
+          # failing the step when no PR exists.
+          if GH_TOKEN="$TAP_PAT" gh pr view "$BRANCH" --json number --jq '.number' >/dev/null 2>&1; then
+            echo "PR for ${BRANCH} is already open — updated it with the push above."
+          else
+            GH_TOKEN="$TAP_PAT" gh pr create \
+              --base main --head "$BRANCH" \
+              --title "chore(release): update v$VERSION manifests" \
+              --body "Automated post-release sync for **v$VERSION**: generated Homebrew formula + cask, MacPorts Portfile (real sha256 of the published assets) and the installer PIN_REV pin to macports tree $TREE_SHA. Merging publishes no new version (packaging-only changes are non-releasable by policy)."
+            echo "Opened the release-manifests PR for v$VERSION."
+          fi
+
+      # Sync the formula + cask into the kodmial/homebrew-nanodictate tap (optional,
+      # needs the TAP_PAT repo secret — a Personal Access Token, classic
+      # "repo" scope, owned by the tap owner). The secret is read through the
+      # env context (steps.env), NOT the `if:` condition — the secrets context
+      # is unavailable in `if:` expressions and makes the whole workflow fail
+      # validation. Without TAP_PAT this step FAILS (exit 1) — the tap must
+      # not silently skip a version on a green run.
+      - name: Update tap repo kodmial/homebrew-nanodictate
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          TAP_PAT: ${{ secrets.TAP_PAT }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$TAP_PAT" ]]; then
+            echo "::error::TAP_PAT secret is not set — the kodmial/homebrew-nanodictate tap update FAILED. To enable it, create a repo secret TAP_PAT holding a Personal Access Token (classic, 'repo' scope) owned by the tap owner, then re-run the release workflow (the build/release jobs are idempotent)."
+            exit 1
+          fi
+          printf '%s' "$TAP_PAT" | gh auth login --with-token
+          gh auth setup-git
+          gh repo clone kodmial/homebrew-nanodictate /tmp/tap
+          cp packaging/homebrew/nanodictate.rb /tmp/tap/nanodictate.rb
+          mkdir -p /tmp/tap/Casks
+          cp packaging/homebrew/Casks/nanodictate.rb /tmp/tap/Casks/nanodictate.rb
+          cd /tmp/tap
+          git config user.name "kodmial"
+          git config user.email "kodmial@gmail.com"
+          git add nanodictate.rb Casks/nanodictate.rb
+          if git diff --cached --quiet; then
+            echo "Tap formula unchanged since the last release — nothing to commit."
+          else
+            git commit -m "chore(release): update v$VERSION formula"
+            git push origin main
+          fi
+
+      # The in-repo release writes above land on a feature branch (the
+      # release-manifests PR), and the tap/tree syncs push to EXTERNAL repos —
+      # none of them is a GITHUB_TOKEN push to this repo's `main`, so the push
+      # that merged the Release PR already fanned out normally. Still, wake the
+      # auto-merge reconciler explicitly once the complete release
+      # synchronization has succeeded, so the new manifests PR is picked up
+      # promptly and open PRs are immediately rebased onto the final
+      # post-release main tip and revalidated.
+      - name: Wake auto-merge reconciler after release writes
+        env:
+          TAP_PAT: ${{ secrets.TAP_PAT }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$TAP_PAT" ]]; then
+            echo "::error::TAP_PAT secret is not set — cannot dispatch auto-merge reconciliation after release writes."
+            exit 1
+          fi
+          GH_TOKEN="$TAP_PAT" gh api \
+            --method POST \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/auto-merge.yml/dispatches" \
+            -f ref=main
+          echo "::notice::Dispatched auto-merge reconciliation after successful release writes."
+
