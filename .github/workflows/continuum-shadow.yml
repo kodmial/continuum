@@ -110,16 +110,6 @@ on:
       approval_path:
         description: cutover; the human approval document inside the window
         type: string
-      authorization_path:
-        description: cutover; the trusted controller's authorization document inside the window
-        type: string
-      change_set_path:
-        description: cutover; the atomic cutover's change-set document inside the window
-        type: string
-      phase:
-        description: cutover; phase-a replaces the control-plane writers only, phase-b every writer
-        type: string
-        default: "phase-b"
         default: ""
       authorization_path:
         description: cutover; the trusted controller's authorization document inside the window
@@ -215,6 +205,16 @@ on:
       approval_path:
         description: cutover; the human approval document inside the window
         type: string
+      authorization_path:
+        description: cutover; the trusted controller's authorization document inside the window
+        type: string
+      change_set_path:
+        description: cutover; the atomic cutover's change-set document inside the window
+        type: string
+      phase:
+        description: cutover; phase-a replaces the control-plane writers only, phase-b every writer
+        type: string
+        default: "phase-b"
       canary_path:
         description: cutover; the canary evidence document inside the window
         type: string
