@@ -446,6 +446,30 @@ the input.
 | `AUTOMATION_TRUSTED_ACTORS` must not include bots: a bot-authored comment or dispatch can never satisfy the author gate. |
 
 
+## Shadow validation
+
+Before Continuum is allowed to decide anything in a consumer repository, it runs
+in a shadow plane: the same planner, the same controllers and the same guards,
+deciding about real lifecycle events, recording what they *would* have done, and
+performing nothing. NanoDictate stays the production authority throughout, which
+is what makes the comparison meaningful — a separate scheduler on synthetic data
+would prove only that the separate scheduler works.
+
+The plane is structurally read-only. The workflow grants no write scope, installs
+a process-level write barrier before it reads anything, pins the engine to a
+commit SHA and refuses to run if the working tree is not that commit, and
+uploads its evidence even when a step failed. A validation plane that *could*
+write would not be one.
+
+Cutover is a separate, human decision. It requires live evidence for all eight
+scenario classes, no unresolved divergence, no liveness failure, a declared
+window, canary and rollback evidence, and an approval bound to that window's
+evidence digest — and a complete approval is still refused when the window has
+blockers, because a signature does not make the evidence sufficient.
+
+Install the bridge, read the evidence, and judge a window:
+[docs/shadow-validation.md](docs/shadow-validation.md).
+
 ## Roadmap
 
 GitHub Issues are the execution plan. Native `blocked by` relationships define

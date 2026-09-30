@@ -86,6 +86,10 @@ AGENT_PLANE = (
 #: strict shell mode, no residue of the disabled CodeRabbit path, and a
 #: tokenless privileged checkout.
 NOT_AGENT_PLANE = (
+    # The validation plane: read-only by permission block, entered through
+    # `workflow_call` or an explicit dispatch, and unable to acquire a write
+    # scope even if a future edit tried to.
+    "continuum-shadow.yml",
     "consumer-auto-merge.yml",
     "consumer-child-dispatcher.yml",
     "consumer-child-review.yml",

@@ -1,0 +1,651 @@
+name: Continuum shadow
+
+# The validation plane. It decides what Continuum *would* do about a real
+# lifecycle event, records the answer as evidence, and never acts on it.
+#
+# A bridge on the NanoDictate side forwards events here through `workflow_call`;
+# an operator re-judges a recorded window through `workflow_dispatch`. Every
+# path is read-only by construction:
+#
+#   * the permission block grants reads and nothing else;
+#   * the engine is checked out at the full commit SHA the caller pinned in its
+#     `uses:` line, and the run refuses to continue if the working tree is not
+#     that commit, so the evidence names the code that produced it;
+#   * the shadow process installs the process-level write barrier before it
+#     reads anything, so a bypassed adapter, a network call, a subprocess, or a
+#     stray filesystem write fails the run instead of reaching GitHub;
+#   * the acceptance record is written *before* the run, so a run that dies
+#     leaves an orphan the window can see rather than an event that silently
+#     never happened;
+#   * artifacts upload with `if: always()`, because a crashed run is evidence.
+#
+# Nothing here may acquire a write scope. A validation plane that can write is
+# no longer a validation plane.
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: run, replay, or cutover
+        type: string
+        default: run
+      repository:
+        description: owner/name of the repository whose events are being shadowed
+        type: string
+      event_json:
+        description: the immutable event context the bridge forwarded, as JSON
+        type: string
+      observed_json:
+        description: what NanoDictate actually did, as JSON; without it parity is unevaluated
+        type: string
+      state_json:
+        description: a captured state document; omit to read live state from GitHub
+        type: string
+      capture_live:
+        description: read the state from GitHub instead of using the forwarded state
+        type: boolean
+        default: true
+      run_url:
+        description: the bridge's own run URL, recorded for provenance
+        type: string
+      delivery_id:
+        description: the webhook delivery id, recorded for provenance
+        type: string
+      trusted_actors:
+        description: AUTOMATION_TRUSTED_ACTORS for the shadowed repository
+        type: string
+        default: ""
+      token:
+        description: a read-only token for the shadowed repository; required for a cross-repository call
+        type: string
+        default: ""
+      budget_ms:
+        description: how long a run may take before it counts as stalled
+        type: number
+        default: 300000
+      save_case:
+        description: also write a replayable case for this run
+        type: boolean
+        default: true
+      engine_ref:
+        description: dispatch only; the full commit SHA of Continuum to judge with
+        type: string
+        default: ""
+      artifact_run_id:
+        description: replay/cutover; the run holding the recorded window's artifact
+        type: string
+        default: ""
+      artifact_name:
+        description: replay/cutover; the artifact to download
+        type: string
+        default: ""
+      window_dir:
+        description: replay/cutover; the window's directory inside the artifact
+        type: string
+        default: ""
+      case_path:
+        description: replay; the case document inside the window
+        type: string
+        default: ""
+      compare_path:
+        description: replay; a replay document from another Continuum
+        type: string
+        default: ""
+      parity_paths:
+        description: cutover; newline-separated parity result documents
+        type: string
+        default: ""
+      liveness_path:
+        description: cutover; the window's liveness report
+        type: string
+        default: ""
+      resolutions_path:
+        description: cutover; newline-separated divergence resolution documents
+        type: string
+        default: ""
+      origins:
+        description: cutover; correlation id to origin mapping, as JSON
+        type: string
+        default: ""
+      approval_path:
+        description: cutover; the human approval document inside the window
+        type: string
+        default: ""
+      canary_path:
+        description: cutover; the canary evidence document inside the window
+        type: string
+        default: ""
+      rollback_path:
+        description: cutover; the rollback evidence document inside the window
+        type: string
+        default: ""
+      window_start:
+        description: cutover; the first instant of the observation window (ISO 8601)
+        type: string
+        default: ""
+      window_end:
+        description: cutover; the last instant of the observation window (ISO 8601)
+        type: string
+        default: ""
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: run, replay, or cutover
+        type: choice
+        default: cutover
+        options: [run, replay, cutover]
+      repository:
+        description: owner/name of the repository whose events are being shadowed
+        type: string
+      event_json:
+        description: the event context to judge, as JSON
+        type: string
+      observed_json:
+        description: what NanoDictate actually did, as JSON
+        type: string
+      state_json:
+        description: a captured state document
+        type: string
+      capture_live:
+        description: read the state from GitHub
+        type: boolean
+        default: false
+      run_url:
+        description: provenance; the run this evidence belongs to
+        type: string
+      delivery_id:
+        description: provenance; the webhook delivery id
+        type: string
+      trusted_actors:
+        description: AUTOMATION_TRUSTED_ACTORS for the shadowed repository
+        type: string
+        default: ""
+      token:
+        description: a read-only token for the shadowed repository
+        type: string
+        default: ""
+      budget_ms:
+        description: how long a run may take before it counts as stalled
+        type: string
+        default: "300000"
+      save_case:
+        description: also write a replayable case
+        type: boolean
+        default: true
+      engine_ref:
+        description: the full commit SHA of Continuum to judge with
+        type: string
+      artifact_run_id:
+        description: the run holding the recorded window's artifact
+        type: string
+      artifact_name:
+        description: the artifact to download
+        type: string
+      window_dir:
+        description: the window's directory inside the artifact
+        type: string
+      case_path:
+        description: replay; the case document inside the window
+        type: string
+      compare_path:
+        description: replay; a replay document from another Continuum
+        type: string
+      parity_paths:
+        description: cutover; newline-separated parity result documents
+        type: string
+      default: ""
+      liveness_path:
+        description: cutover; the window's liveness report
+        type: string
+      resolutions_path:
+        description: cutover; newline-separated divergence resolution documents
+        type: string
+      default: ""
+      origins:
+        description: cutover; correlation id to origin mapping, as JSON
+        type: string
+        default: ""
+      approval_path:
+        description: cutover; the human approval document inside the window
+        type: string
+      canary_path:
+        description: cutover; the canary evidence document inside the window
+        type: string
+      rollback_path:
+        description: cutover; the rollback evidence document inside the window
+        type: string
+      window_start:
+        description: cutover; the first instant of the observation window (ISO 8601)
+        type: string
+      window_end:
+        description: cutover; the last instant of the observation window (ISO 8601)
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+  checks: read
+  statuses: read
+  actions: read
+
+concurrency:
+  group: continuum-shadow-${{ inputs.repository || github.repository }}-${{ inputs.delivery_id || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  shadow:
+    name: Decide and record
+    if: inputs.mode == 'run' || inputs.mode == ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      checks: read
+      statuses: read
+      actions: read
+    env:
+      GITHUB_TOKEN: ${{ inputs.token || github.token }}
+      SHADOWED_REPOSITORY: ${{ inputs.repository || github.repository }}
+      EVENT_JSON: ${{ inputs.event_json }}
+      OBSERVED_JSON: ${{ inputs.observed_json }}
+      STATE_JSON: ${{ inputs.state_json }}
+      CAPTURE_LIVE: ${{ inputs.capture_live }}
+      TRUSTED_ACTORS: ${{ inputs.trusted_actors }}
+      BRIDGE_RUN_URL: ${{ inputs.run_url }}
+      DELIVERY_ID: ${{ inputs.delivery_id }}
+      BUDGET_MS: ${{ inputs.budget_ms }}
+      SAVE_CASE: ${{ inputs.save_case }}
+      JOB_WORKFLOW_REF: ${{ github.job_workflow_ref }}
+      ENGINE_REF_INPUT: ${{ inputs.engine_ref }}
+      RUN_ATTEMPT: ${{ github.run_attempt }}
+      RUN_ID: ${{ github.run_id }}
+      SERVER_URL: ${{ github.server_url }}
+      HOST_REPOSITORY: ${{ github.repository }}
+    steps:
+      - name: Resolve the pinned engine
+        id: engine
+        run: |
+          set -euo pipefail
+          # The pin lives in the caller's `uses:` line, so a called run derives
+          # the ref from this workflow's own reference rather than trusting an
+          # input. A dispatch has no `uses:` line and must name the commit
+          # explicitly, because evidence has to name the code that made it.
+          if [ -n "${JOB_WORKFLOW_REF:-}" ] && [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]; then
+            ref="${JOB_WORKFLOW_REF#*@}"
+          else
+            ref="${ENGINE_REF_INPUT:-}"
+          fi
+          if ! printf '%s' "$ref" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::the engine ref must be a full commit sha, got '${ref}'"
+            exit 1
+          fi
+          echo "sha=$ref" >>"$GITHUB_OUTPUT"
+          echo "engine $ref"
+      - name: Check out the pinned engine
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: kodmial/continuum
+          ref: ${{ steps.engine.outputs.sha }}
+          path: engine
+          persist-credentials: false
+      - name: Refuse anything but the pinned commit
+        run: |
+          set -euo pipefail
+          head="$(git -C engine rev-parse HEAD)"
+          if [ "$head" != "$ENGINE_SHA" ]; then
+            echo "::error::engine checked out at $head, expected $ENGINE_SHA"
+            exit 1
+          fi
+          echo "engine $head is the pinned commit"
+        env:
+          ENGINE_SHA: ${{ steps.engine.outputs.sha }}
+      - name: Check the runner can run the engine
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import sys
+          if sys.version_info < (3, 10):
+              raise SystemExit("Continuum needs Python 3.10 or newer, found %s" % sys.version)
+          print("python %d.%d.%d" % sys.version_info[:3])
+          PY
+      - name: Materialise the forwarded context
+        run: |
+          set -euo pipefail
+          # A cross-repository call receives its read-only token as an input, and
+          # an input is visible in the run's own metadata. Masking it here means a
+          # later mistake cannot put it in a log line.
+          echo "::add-mask::${GITHUB_TOKEN}"
+          mkdir -p shadow-out
+          if [ -z "${EVENT_JSON:-}" ]; then
+            echo "::error::no event context was forwarded; the bridge decides what to forward, this plane does not"
+            exit 2
+          fi
+          printf '%s' "$EVENT_JSON" >shadow-out/event.json
+          if [ -n "${STATE_JSON:-}" ]; then
+            printf '%s' "$STATE_JSON" >shadow-out/state.json
+          fi
+          if [ -n "${OBSERVED_JSON:-}" ]; then
+            printf '%s' "$OBSERVED_JSON" >shadow-out/observed.json
+          fi
+          printf '%s' "$SHADOWED_REPOSITORY" >shadow-out/repository.txt
+          printf '%s' "${BRIDGE_RUN_URL:-}" >shadow-out/bridge-run-url.txt
+          printf '%s' "${DELIVERY_ID:-}" >shadow-out/delivery-id.txt
+          printf '%s' "$BUDGET_MS" >shadow-out/budget-ms.txt
+          printf '%s' "$SERVER_URL/$HOST_REPOSITORY/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT" \
+            >shadow-out/shadow-run-url.txt
+          printf '%s' "$JOB_WORKFLOW_REF" >shadow-out/engine-ref.txt
+          printf '%s' "$ENGINE_SHA" >shadow-out/engine-sha.txt
+          printf '%s' "$(python3 -c 'import platform; print(platform.python_version())')" \
+            >shadow-out/python-version.txt
+          printf '%s' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >shadow-out/recorded-at.txt
+        env:
+          ENGINE_SHA: ${{ steps.engine.outputs.sha }}
+      - name: Prove the barrier holds before deciding anything
+        run: |
+          set -euo pipefail
+          PYTHONPATH=engine/src python3 -m continuum.shadow.cli barrier-check --out shadow-out
+      - name: Record the acceptance
+        run: |
+          set -euo pipefail
+          # Written before the run so a run that dies is an orphan the window
+          # can account for, not an event that quietly never happened.
+          PYTHONPATH=engine/src python3 - <<'PY'
+          import json
+          import pathlib
+          import time
+
+          now_ms = int(time.time() * 1000)
+          event = json.loads(pathlib.Path("shadow-out/event.json").read_text())
+          repository = pathlib.Path("shadow-out/repository.txt").read_text().strip()
+          delivery = pathlib.Path("shadow-out/delivery-id.txt").read_text().strip()
+          run_url = pathlib.Path("shadow-out/bridge-run-url.txt").read_text().strip()
+          acceptance = {
+              "correlation_id": event.get("event_id") or delivery
+              or "{}/{}".format(repository, now_ms),
+              "event_type": event.get("event_type"),
+              "scenario": event.get("scenario", "unspecified"),
+              "repository": repository,
+              "origin": "live",
+              "accepted_at_ms": now_ms,
+              "abandoned_reason": None,
+              "run_url": run_url or None,
+          }
+          pathlib.Path("shadow-out/acceptance.json").write_text(
+              json.dumps(acceptance, indent=2, sort_keys=True) + "\n"
+          )
+          print("accepted {} at {}".format(acceptance["correlation_id"], now_ms))
+          PY
+      - name: Decide the event
+        run: |
+          set -euo pipefail
+          args=(run --event shadow-out/event.json --out shadow-out --budget-ms "$BUDGET_MS")
+          if [ "$CAPTURE_LIVE" = "true" ]; then
+            args+=(--capture-live --repo "$SHADOWED_REPOSITORY")
+          elif [ -f shadow-out/state.json ]; then
+            args+=(--state shadow-out/state.json)
+          else
+            echo "::error::nothing to decide from: set capture_live or forward a state"
+            exit 2
+          fi
+          if [ "$SAVE_CASE" = "true" ]; then
+            args+=(--save-case)
+          fi
+          if [ -n "${TRUSTED_ACTORS:-}" ]; then
+            args+=(--trusted-actors "$TRUSTED_ACTORS")
+          fi
+          PYTHONPATH=engine/src python3 -m continuum.shadow.cli "${args[@]}"
+      - name: Compare against what NanoDictate did
+        run: |
+          set -euo pipefail
+          if [ ! -f shadow-out/observed.json ]; then
+            # Honest rather than convenient: without the production outcome this
+            # run is liveness evidence only, and the window says so.
+            echo "::notice::no observed outcome was forwarded, so parity is unevaluated"
+            exit 0
+          fi
+          divergences=0
+          for journal in shadow-out/journals/*.json; do
+            if [ ! -e "$journal" ]; then
+              echo "::error::the run wrote no journal, so there is nothing to compare"
+              exit 3
+            fi
+            # 1 means the decisions differ, which is the finding. Anything else
+            # is the plane failing and must not be counted as a divergence.
+            if python3 -m continuum.shadow.cli parity \
+                 --journal "$journal" \
+                 --observed shadow-out/observed.json \
+                 --out shadow-out
+            then
+              continue
+            else
+              code=$?
+              if [ "$code" -ne 1 ]; then
+                exit "$code"
+              fi
+              divergences=$((divergences + 1))
+            fi
+          done
+          if [ "$divergences" -ne 0 ]; then
+            echo "::error::$divergences run(s) diverged from the production outcome"
+            exit 1
+          fi
+          echo "every run matched the production outcome"
+        env:
+          PYTHONPATH: engine/src
+      - name: Account for the run
+        run: |
+          set -euo pipefail
+          # 1 means this run is not accounted for as live evidence; anything else
+          # is the plane failing. Either way the step fails loudly.
+          python3 -m continuum.shadow.cli liveness \
+            --acceptances shadow-out/acceptance.json \
+            --journals shadow-out/journals/*.json \
+            --out shadow-out \
+            --now-ms "$(python3 -c 'import time; print(int(time.time() * 1000))')" \
+            --budget-ms "$(cat shadow-out/budget-ms.txt)"
+        env:
+          PYTHONPATH: engine/src
+      - name: Summarise the run
+        if: always()
+        # Renders the run's own documents into the job summary, so the decision,
+        # the parity verdict and the liveness verdict are readable without
+        # downloading the artifact -- and, because it reads the same documents the
+        # cutover judge reads, without a second opinion that could differ.
+        env:
+          # Declared here and read as a shell variable: the runner substitutes an
+          # expression before the shell parses anything, so an expression inside
+          # a `run:` body is text the shell would treat as code.
+          ARTIFACT: shadow-run-${{ inputs.delivery_id || github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          PYTHONPATH=engine/src python3 -m continuum.shadow.cli summary \
+            --out shadow-out \
+            --artifact "$ARTIFACT" \
+            >>"$GITHUB_STEP_SUMMARY"
+      - name: Upload the run's evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: shadow-run-${{ inputs.delivery_id || github.run_id }}-${{ github.run_attempt }}
+          path: shadow-out
+          retention-days: 30
+          if-no-files-found: warn
+
+  evidence:
+    name: Re-judge a case or judge a window
+    if: inputs.mode == 'replay' || inputs.mode == 'cutover'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      checks: read
+      statuses: read
+      actions: read
+    env:
+      GITHUB_TOKEN: ${{ inputs.token || github.token }}
+      MODE: ${{ inputs.mode }}
+      ARTIFACT_RUN_ID: ${{ inputs.artifact_run_id }}
+      ARTIFACT_NAME: ${{ inputs.artifact_name }}
+      WINDOW_DIR: ${{ inputs.window_dir }}
+      CASE_PATH: ${{ inputs.case_path }}
+      COMPARE_PATH: ${{ inputs.compare_path }}
+      PARITY_PATHS: ${{ inputs.parity_paths }}
+      LIVENESS_PATH: ${{ inputs.liveness_path }}
+      RESOLUTIONS_PATH: ${{ inputs.resolutions_path }}
+      ORIGINS: ${{ inputs.origins }}
+      APPROVAL_PATH: ${{ inputs.approval_path }}
+      CANARY_PATH: ${{ inputs.canary_path }}
+      ROLLBACK_PATH: ${{ inputs.rollback_path }}
+      WINDOW_START: ${{ inputs.window_start }}
+      WINDOW_END: ${{ inputs.window_end }}
+      JOB_WORKFLOW_REF: ${{ github.job_workflow_ref }}
+      ENGINE_REF_INPUT: ${{ inputs.engine_ref }}
+    steps:
+      - name: Resolve the pinned engine
+        id: engine
+        run: |
+          set -euo pipefail
+          if [ -n "${JOB_WORKFLOW_REF:-}" ] && [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]; then
+            ref="${JOB_WORKFLOW_REF#*@}"
+          else
+            ref="${ENGINE_REF_INPUT:-}"
+          fi
+          if ! printf '%s' "$ref" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::the engine ref must be a full commit sha, got '${ref}'"
+            exit 1
+          fi
+          echo "sha=$ref" >>"$GITHUB_OUTPUT"
+          echo "engine $ref"
+      - name: Check out the pinned engine
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: kodmial/continuum
+          ref: ${{ steps.engine.outputs.sha }}
+          path: engine
+          persist-credentials: false
+      - name: Refuse anything but the pinned commit
+        run: |
+          set -euo pipefail
+          head="$(git -C engine rev-parse HEAD)"
+          if [ "$head" != "$ENGINE_SHA" ]; then
+            echo "::error::engine checked out at $head, expected $ENGINE_SHA"
+            exit 1
+          fi
+          echo "engine $head is the pinned commit"
+        env:
+          ENGINE_SHA: ${{ steps.engine.outputs.sha }}
+      - name: Download the recorded window
+        run: |
+          set -euo pipefail
+          if [ -z "${ARTIFACT_RUN_ID:-}" ] || [ -z "${ARTIFACT_NAME:-}" ]; then
+            echo "::error::name the run and artifact holding the window"
+            exit 2
+          fi
+          if ! printf '%s' "$ARTIFACT_RUN_ID" | grep -Eq '^[0-9]+$'; then
+            echo "::error::artifact_run_id must be a run id, got '${ARTIFACT_RUN_ID}'"
+            exit 2
+          fi
+          case "${WINDOW_DIR:-}" in
+            /*|*..*) echo "::error::window_dir must be a relative path inside the artifact"; exit 2 ;;
+          esac
+          mkdir -p replay-out window
+          gh run download "$ARTIFACT_RUN_ID" --name "$ARTIFACT_NAME" --dir window
+          # Every later step reads the window through this root, so a document
+          # path is interpreted once here rather than in every call site.
+          if [ -n "${WINDOW_DIR:-}" ] && [ ! -d "window/$WINDOW_DIR" ]; then
+            echo "::error::the artifact has no window at window/$WINDOW_DIR"
+            exit 2
+          fi
+          echo "WINDOW_ROOT=window/${WINDOW_DIR:-}" >>"$GITHUB_ENV"
+          printf '%s' "$ARTIFACT_RUN_ID" >replay-out/window-run-id.txt
+          printf '%s' "$ARTIFACT_NAME" >replay-out/window-artifact.txt
+          printf '%s' "$ENGINE_SHA" >replay-out/engine-sha.txt
+          printf '%s' "$JOB_WORKFLOW_REF" >replay-out/engine-ref.txt
+          printf '%s' "$(python3 -c 'import platform; print(platform.python_version())')" \
+            >replay-out/python-version.txt
+          printf '%s' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >replay-out/rejudged-at.txt
+        env:
+          ENGINE_SHA: ${{ steps.engine.outputs.sha }}
+      - name: Replay the captured case
+        if: inputs.mode == 'replay'
+        run: |
+          set -euo pipefail
+          if [ -z "${CASE_PATH:-}" ]; then
+            echo "::error::name the case to replay with case_path"
+            exit 2
+          fi
+          args=(replay --case "$WINDOW_ROOT/$CASE_PATH" --out replay-out)
+          if [ -n "${COMPARE_PATH:-}" ]; then
+            args+=(--compare "$WINDOW_ROOT/$COMPARE_PATH")
+          fi
+          PYTHONPATH=engine/src python3 -m continuum.shadow.cli "${args[@]}"
+      - name: Judge the window against the cutover requirements
+        if: inputs.mode == 'cutover'
+        run: |
+          set -euo pipefail
+          if [ -z "${WINDOW_START:-}" ] || [ -z "${WINDOW_END:-}" ]; then
+            echo "::error::a window needs both bounds: window_start and window_end"
+            exit 2
+          fi
+          if [ -z "${LIVENESS_PATH:-}" ]; then
+            echo "::error::name the window's liveness report with liveness_path"
+            exit 2
+          fi
+          args=(cutover --out replay-out
+            --liveness "$WINDOW_ROOT/$LIVENESS_PATH"
+            --window-start "$WINDOW_START"
+            --window-end "$WINDOW_END")
+          while IFS= read -r path; do
+            [ -n "$path" ] || continue
+            args+=(--parity "$WINDOW_ROOT/$path")
+          done <<<"${PARITY_PATHS:-}"
+          while IFS= read -r path; do
+            [ -n "$path" ] || continue
+            args+=(--resolutions "$WINDOW_ROOT/$path")
+          done <<<"${RESOLUTIONS_PATH:-}"
+          if [ -n "${ORIGINS:-}" ]; then
+            args+=(--origins "$WINDOW_ROOT/$ORIGINS")
+          fi
+          if [ -n "${APPROVAL_PATH:-}" ]; then
+            args+=(--approval "$WINDOW_ROOT/$APPROVAL_PATH")
+          fi
+          if [ -n "${CANARY_PATH:-}" ]; then
+            args+=(--canary "$(cat "$WINDOW_ROOT/$CANARY_PATH")")
+          fi
+          if [ -n "${ROLLBACK_PATH:-}" ]; then
+            args+=(--rollback "$(cat "$WINDOW_ROOT/$ROLLBACK_PATH")")
+          fi
+          PYTHONPATH=engine/src python3 -m continuum.shadow.cli "${args[@]}"
+      - name: Summarise the decision
+        if: always()
+        # The gate's own decision document, rendered: the verdict, the blockers
+        # behind it, and the coverage that produced them. The JSON is still
+        # printed after it, so a reviewer can see the unrendered evidence too.
+        env:
+          ARTIFACT: shadow-${{ inputs.mode }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          PYTHONPATH=engine/src python3 -m continuum.shadow.cli summary \
+            --out replay-out \
+            --window \
+            --artifact "$ARTIFACT" \
+            >>"$GITHUB_STEP_SUMMARY"
+          for document in replay-out/*.json; do
+            [ -e "$document" ] || continue
+            printf '== %s\n' "$document"
+            python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])), indent=2)[:4000])' \
+              "$document"
+          done
+      - name: Upload the window's evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: shadow-${{ inputs.mode }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: replay-out
+          retention-days: 90
+          if-no-files-found: warn
