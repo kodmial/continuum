@@ -78,23 +78,23 @@ jobs:
             PARENT_CONFIG=.continuum.yml CHILD_REPOSITORIES="$CHILD_REPOSITORIES"               bash "$resolver" validation "$child_repo"
           )"
 
-          pr_json="$(gh pr view "$PR_NUMBER" --repo "$child_repo"             --json state,isDraft,author,headRefName,headRepository,baseRefName,title,body,mergedAt 2>/dev/null)"
+          pr_json="$(gh api "repos/$child_repo/pulls/$PR_NUMBER" 2>/dev/null)"
           state="$(jq -r '.state' <<<"$pr_json")"
-          merged_at="$(jq -r '.mergedAt // ""' <<<"$pr_json")"
+          merged_at="$(jq -r '.merged_at // ""' <<<"$pr_json")"
           [[ -z "$merged_at" ]] || { echo "PR #$PR_NUMBER is already merged."; exit 0; }
-          [[ "$state" == "OPEN" ]] || { echo "PR #$PR_NUMBER is not open."; exit 0; }
-          [[ "$(jq -r '.isDraft' <<<"$pr_json")" == "false" ]] || { echo "PR #$PR_NUMBER is draft."; exit 0; }
+          [[ "$state" == "open" ]] || { echo "PR #$PR_NUMBER is not open."; exit 0; }
+          [[ "$(jq -r '.draft // false' <<<"$pr_json")" == "false" ]] || { echo "PR #$PR_NUMBER is draft."; exit 0; }
 
           child_owner="${child_repo%%/*}"
-          author="$(jq -r '.author.login // ""' <<<"$pr_json")"
-          head_owner="$(jq -r '.headRepository.owner.login // ""' <<<"$pr_json")"
-          [[ "$author" == "$child_owner" && "$head_owner" == "$child_owner" ]] || {
+          author="$(jq -r '.user.login // ""' <<<"$pr_json")"
+          head_repo="$(jq -r '.head.repo.full_name // ""' <<<"$pr_json")"
+          [[ "$author" == "$child_owner" && "$head_repo" == "$child_repo" ]] || {
             echo "PR #$PR_NUMBER is not an owner-created same-repository pull request; ignoring."
             exit 0
           }
 
-          head_ref="$(jq -r '.headRefName' <<<"$pr_json")"
-          base_ref="$(jq -r '.baseRefName' <<<"$pr_json")"
+          head_ref="$(jq -r '.head.ref' <<<"$pr_json")"
+          base_ref="$(jq -r '.base.ref' <<<"$pr_json")"
           title="$(jq -r '.title' <<<"$pr_json")"
           body="$(jq -r '.body // ""' <<<"$pr_json")"
 
