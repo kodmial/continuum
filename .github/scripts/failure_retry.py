@@ -24,7 +24,8 @@ INFRA_RETRY_MARKER_RE = re.compile(
     r"<!--\s*continuum-infra-retry:\s*attempt=(\d+)\s+"
     r"next_retry_at=([^\s]+)\s+code=([A-Za-z0-9_.-]+)\s+run=(\d+)\s*-->"
 )
-INFRA_RETRY_EXHAUSTED_MARKER = "<!-- continuum-infra-retry-exhausted -->"\nINFRA_RETRY_RESET_MARKER = "<!-- continuum-infra-retry-reset -->"
+INFRA_RETRY_EXHAUSTED_MARKER = "<!-- continuum-infra-retry-exhausted -->"
+INFRA_RETRY_RESET_MARKER = "<!-- continuum-infra-retry-reset -->"
 
 _INFRA_SIGNATURES = (
     ("dns_resolution_failed", re.compile(r"(could not resolve host|temporary failure in name resolution|name or service not known)", re.I)),
