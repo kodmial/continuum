@@ -346,7 +346,7 @@ jobs:
           printf '%s' "$BUDGET_MS" >shadow-out/budget-ms.txt
           printf '%s' "$SERVER_URL/$HOST_REPOSITORY/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT" \
             >shadow-out/shadow-run-url.txt
-          printf '%s' "$JOB_WORKFLOW_REF" >shadow-out/engine-ref.txt
+          printf '%s' "$ENGINE_SHA" >shadow-out/engine-ref.txt
           printf '%s' "$ENGINE_SHA" >shadow-out/engine-sha.txt
           printf '%s' "$(python3 -c 'import platform; print(platform.python_version())')" \
             >shadow-out/python-version.txt
@@ -581,7 +581,7 @@ jobs:
           printf '%s' "$ARTIFACT_RUN_ID" >replay-out/window-run-id.txt
           printf '%s' "$ARTIFACT_NAME" >replay-out/window-artifact.txt
           printf '%s' "$ENGINE_SHA" >replay-out/engine-sha.txt
-          printf '%s' "$JOB_WORKFLOW_REF" >replay-out/engine-ref.txt
+          printf '%s' "$ENGINE_SHA" >replay-out/engine-ref.txt
           printf '%s' "$(python3 -c 'import platform; print(platform.python_version())')" \
             >replay-out/python-version.txt
           printf '%s' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >replay-out/rejudged-at.txt
