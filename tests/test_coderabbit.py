@@ -446,6 +446,106 @@ class ReplyClassificationTests(unittest.TestCase):
         )
 
 
+class QuotationTests(unittest.TestCase):
+    """A verdict has to be stated, not merely present somewhere in the reply.
+
+    CodeRabbit re-quotes the finding it is re-checking, so the original comment's
+    text arrives in the same reply as the new verdict about it. Searching the
+    whole body reads the quotation as the verdict, and it fails in whichever
+    direction the quotation points -- one of which silently drops a live finding.
+    """
+
+    def test_a_quoted_earlier_verdict_does_not_outvote_the_current_one(self) -> None:
+        self.assertEqual(
+            coderabbit.classify_reply(
+                "Earlier this thread said: unresolved.\n"
+                "I re-checked the head and the function now guards the empty case.\n"
+                "resolved"
+            ),
+            coderabbit.REPLY_RESOLVED,
+        )
+
+    def test_a_collapsed_details_block_is_a_quotation(self) -> None:
+        self.assertEqual(
+            coderabbit.classify_reply(
+                "<details><summary>previous comment</summary>\n\n"
+                "unresolved\n\n"
+                "</details>\n\n"
+                "The comment no longer applies. resolved"
+            ),
+            coderabbit.REPLY_RESOLVED,
+        )
+
+    def test_fenced_code_is_not_prose(self) -> None:
+        self.assertEqual(
+            coderabbit.classify_reply(
+                "```python\n"
+                "# resolved: set when the retry succeeds\n"
+                "def mark():\n"
+                "    pass\n"
+                "```\n\n"
+                "I applied the fix. resolved"
+            ),
+            coderabbit.REPLY_RESOLVED,
+        )
+
+    def test_indented_code_is_a_quotation(self) -> None:
+        self.assertEqual(
+            coderabbit.classify_reply(
+                "Previously:\n\n    unresolved\n\nFixed now. resolved"
+            ),
+            coderabbit.REPLY_RESOLVED,
+        )
+
+    def test_a_block_quote_is_not_prose(self) -> None:
+        self.assertEqual(
+            coderabbit.classify_reply(
+                "> a finding counts as resolved only when the provider says so\n"
+                "I applied the fix. resolved"
+            ),
+            coderabbit.REPLY_RESOLVED,
+        )
+
+    def test_inline_code_mentions_the_word_without_stating_it(self) -> None:
+        # The flag name is not a verdict. Reading it as one would settle every
+        # thread whose client happens to use these identifiers.
+        self.assertEqual(
+            coderabbit.classify_reply("`resolved` is set in the client once it passes."),
+            "",
+        )
+
+    def test_inline_code_does_not_hide_a_verdict_stated_alongside_it(self) -> None:
+        self.assertEqual(
+            coderabbit.classify_reply(
+                "Removed `unresolved_ok`; the finding is resolved."
+            ),
+            coderabbit.REPLY_RESOLVED,
+        )
+
+    def test_a_quotation_never_substitutes_for_a_stated_verdict(self) -> None:
+        # Everything in this reply is code or quotation, so the reply states no
+        # verdict at all and the thread stays exactly as it was.
+        self.assertEqual(
+            coderabbit.classify_reply(
+                "```text\nresolved\n```\n\n> unresolved\n\n`resolved`"
+            ),
+            "",
+        )
+
+    def test_an_unterminated_fence_is_read_as_code_to_the_end(self) -> None:
+        # Truncated replies happen. Treating the remainder as prose would let a
+        # half-quoted block decide a finding.
+        self.assertEqual(coderabbit.classify_reply("```text\nresolved\n"), "")
+
+    def test_a_self_contradicting_line_stays_blocking(self) -> None:
+        # Both forms on one line: the line has not settled it, and the gate can
+        # recover from an over-reported finding but not from a dropped one.
+        self.assertEqual(
+            coderabbit.classify_reply("I fixed it but it is unresolved for now."),
+            coderabbit.REPLY_UNRESOLVED,
+        )
+
+
 class QuotaBehaviourTests(unittest.TestCase):
     """A settled thread and a cleared head must not spend more quota."""
 

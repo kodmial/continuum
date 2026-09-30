@@ -96,11 +96,20 @@ on:
 
 permissions: {}
 
-# One controller at a time decides who gets the next shared provider slot. A new
-# wake-up supersedes a run that is only waiting out a cooldown.
+# One controller at a time decides who gets the next shared provider slot.
+#
+# `cancel-in-progress` is false, and that is a correctness requirement rather than
+# a scheduling preference. A run that finds a provider cooldown sleeps until it
+# expires. With cancellation on, every new wake-up -- a label, a check, a review,
+# a push -- kills that sleep before it finishes, and the replacement run starts
+# from the same cooldown it just re-read. Wake-ups arrive far more often than a
+# provider cooldown expires, so the controller can spend an entire review window
+# being restarted and never issue a request. The waiting run is the only one that
+# knows when the slot frees, so it is allowed to finish; a wake-up that arrives
+# meanwhile queues behind it and reconciles fresh state when it starts.
 concurrency:
   group: continuum-review-queue
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   reconcile:

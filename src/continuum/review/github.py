@@ -17,6 +17,11 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set
 DEFAULT_API_BASE = "https://api.github.com"
 USER_AGENT = "continuum-review-gate"
 
+#: The only directory whose contents this repository treats as active automation
+#: surface. Named here rather than at each call site because a reader of
+#: ``workflow_inventory`` needs to know what the inventory is *not* claiming.
+WORKFLOW_DIR = ".github/workflows"
+
 REVIEW_THREADS_QUERY = (
     "query($owner: String!, $name: String!, $pr: Int!, $after: String) {"
     " repository(owner: $owner, name: $name) {"
@@ -169,6 +174,81 @@ class GitHubClient:
         return self.request(
             "GET", f"/repos/{self.owner}/{self.name}/commits/{quoted}/status"
         )
+
+    def repository_document(self) -> Dict[str, Any]:
+        """The repository record, whose ``default_branch`` names the live head."""
+
+        return self.request("GET", f"/repos/{self.owner}/{self.name}")
+
+    def default_branch(self) -> str:
+        document = self.repository_document()
+        if not isinstance(document, dict):
+            raise GitHubError("Repository document was not an object")
+        branch = str(document.get("default_branch") or "")
+        if not branch:
+            raise GitHubError("Repository document named no default branch")
+        return branch
+
+    def ref_sha(self, ref: str) -> str:
+        """The commit a ref points at, read from the ref itself.
+
+        The commit's own sha is read as well, so a tag resolving to a tag object
+        still resolves to a commit. Reporting the tag object would be a head
+        nothing else in the system could check out.
+        """
+
+        quoted = urllib.parse.quote(str(ref), safe="")
+        payload = self.request("GET", f"/repos/{self.owner}/{self.name}/git/ref/{quoted}")
+        if not isinstance(payload, dict):
+            raise GitHubError(f"Ref {ref!r} did not resolve to an object")
+        target = payload.get("object") or {}
+        kind = str(target.get("type") or "commit")
+        sha = str(target.get("sha") or "")
+        if not sha:
+            raise GitHubError(f"Ref {ref!r} resolved to no object")
+        if kind != "commit":
+            quoted_sha = urllib.parse.quote(sha, safe="")
+            tag = self.request("GET", f"/repos/{self.owner}/{self.name}/git/tags/{quoted_sha}")
+            if not isinstance(tag, dict):
+                raise GitHubError(f"Tag {sha!r} did not resolve to an object")
+            inner = tag.get("object") or {}
+            if str(inner.get("type") or "commit") != "commit" or not inner.get("sha"):
+                raise GitHubError(f"Tag {sha!r} does not resolve to a commit")
+            sha = str(inner["sha"])
+        return sha
+
+    def workflow_inventory(self, ref: str) -> Dict[str, str]:
+        """Every active ``.github/workflows`` file at ``ref``, by blob SHA.
+
+        The blob SHA is the only identifier that says what a file *contains*: a
+        path says where it is and a commit says when it moved, and neither says
+        whether the bytes that were audited are the bytes that will run. The tree
+        is read recursively because a workflow can live in a subdirectory, and a
+        workflow in a subdirectory is still active.
+        """
+
+        quoted = urllib.parse.quote(str(ref), safe="")
+        tree = self.request("GET", f"/repos/{self.owner}/{self.name}/git/trees/{quoted}?recursive=1")
+        if not isinstance(tree, dict):
+            raise GitHubError(f"Tree {ref!r} was not an object")
+        if tree.get("truncated"):
+            raise GitHubError(
+                f"Tree {ref!r} was truncated by the API, so the workflow inventory "
+                "would be a partial reading"
+            )
+        inventory: Dict[str, str] = {}
+        for entry in tree.get("tree") or []:
+            if not isinstance(entry, dict) or entry.get("type") != "blob":
+                continue
+            path = str(entry.get("path") or "")
+            if not path.startswith(WORKFLOW_DIR + "/"):
+                continue
+            if not path.endswith((".yml", ".yaml")):
+                continue
+            sha = str(entry.get("sha") or "")
+            if sha:
+                inventory[path] = sha
+        return inventory
 
     def file_at_ref(self, path: str, ref: str) -> Optional[str]:
         quoted = urllib.parse.quote(path)

@@ -346,22 +346,104 @@ def status_reason(status: Optional[Dict[str, Any]], context: str) -> Optional[st
     return f"the {context!r} status for this HEAD is {state or 'unknown'}: {description[:200]}"
 
 
-def classify_reply(body: str) -> str:
-    """One verdict token for a provider reply, or `""` when it states none.
+#: A run of fenced-code markers, as in ```` ```python ````. Matched on its own so
+#: an ordinary backtick in prose cannot open or close a fence.
+_FENCE_RE = re.compile(r"^\s*(?:```|~~~)")
+_DETAILS_OPEN_RE = re.compile(r"^\s*<details\b", re.I)
+_DETAILS_CLOSE_RE = re.compile(r"^\s*</details\s*>", re.I)
+#: An inline code span, which is code even in the middle of a sentence.
+_INLINE_CODE_RE = re.compile(r"`+[^`]*`+")
 
-    A reply that only *asks* whether something is resolved states no verdict, so
-    the lines that carry a question are dropped before the positive form is
-    accepted. Guessing in that direction would let a fixed-looking finding be
-    dropped, which is the one failure mode the gate cannot recover from.
+
+def _verdict_text(body: str) -> str:
+    """The part of a reply that states a verdict, and nothing else.
+
+    A provider reply is Markdown, and Markdown has places where a reader expects
+    a *quotation* rather than a statement: fenced code, indented code, inline
+    code, block quotes, and collapsible ``<details>`` blocks. A finding body
+    quoted inside any of them is evidence about the finding, not about whether it
+    is fixed. CodeRabbit re-quotes the original comment when it re-checks one, so
+    the same word can appear in the same reply in both roles.
+
+    Searching the whole body therefore makes the parser read a quotation as a
+    verdict, and it fails in whichever direction the quote happens to point: an
+    old `unresolved` quoted above a real resolution reads as blocking, and a
+    `resolved` inside a fenced diff reads as a fix. Neither is a decision the
+    provider made, and one of them can drop a live finding.
     """
 
     text = body or ""
-    if UNRESOLVED_REPLY_RE.search(text):
+    kept: List[str] = []
+    in_fence = False
+    in_details = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if _FENCE_RE.match(line):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        if _DETAILS_OPEN_RE.match(line):
+            in_details = True
+            continue
+        if in_details:
+            # The closing tag is the only part of the block worth acting on.
+            if _DETAILS_CLOSE_RE.match(line):
+                in_details = False
+            continue
+        # A block quote and an indented block are quotations in their entirety, so
+        # the line is dropped rather than unmarked: stripping the `>` would leave
+        # the quoted verdict looking like the reply's own statement, which is the
+        # mistake this function exists to prevent.
+        quoted = raw.lstrip()
+        if quoted.startswith(">") or quoted.startswith("    "):
+            continue
+        # Inline code anywhere in the line is code, not a verdict, and removing
+        # only a surrounding pair would leave `resolved` mid-sentence reading as
+        # a statement.
+        stripped = _INLINE_CODE_RE.sub(" ", raw).strip()
+        if stripped:
+            kept.append(stripped)
+    return "\n".join(kept)
+
+
+def classify_reply(body: str) -> str:
+    """One verdict token for a provider reply, or `""` when it states none.
+
+    Three rules, and each is about refusing to over-read:
+
+    * Only the reply's own prose is searched. See :func:`_verdict_text` for why a
+      quoted, fenced or inline `unresolved` must not read as a verdict.
+
+    * A reply that only *asks* whether something is resolved states no verdict, so
+      the lines that carry a question are dropped before the positive form is
+      accepted. Guessing in that direction would let a fixed-looking finding be
+      dropped, which is the one failure mode the gate cannot recover from.
+
+    * The *last* verdict in the prose wins. A re-check quotes the earlier verdict
+      and then states the current one, so reading first-match would let the
+      quotation decide instead of the reply. Where a single statement carries both
+      forms ("fixed, but unresolved for now") the negative wins, because a reply
+      that contradicts itself has not settled it and an over-reported finding is
+      recoverable while a dropped one is not.
+    """
+
+    verdicts: List[str] = []
+    for line in _verdict_text(body).splitlines():
+        if "?" in line:
+            continue
+        if UNRESOLVED_REPLY_RE.search(line):
+            verdicts.append(REPLY_UNRESOLVED)
+        elif RESOLVED_REPLY_RE.search(line):
+            verdicts.append(REPLY_RESOLVED)
+    if not verdicts:
+        return ""
+    if verdicts[-1] == REPLY_UNRESOLVED:
+        # A self-contradicting final line stays blocking. Checked against the
+        # whole line rather than the last match, so "fixed but unresolved" is not
+        # read as a fix on the strength of the first word.
         return REPLY_UNRESOLVED
-    statements = "\n".join(line for line in text.splitlines() if "?" not in line)
-    if RESOLVED_REPLY_RE.search(statements):
-        return REPLY_RESOLVED
-    return ""
+    return REPLY_RESOLVED
 
 
 def thread_reply_verdict(

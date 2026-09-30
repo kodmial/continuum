@@ -541,6 +541,221 @@ class CutoverCommand(unittest.TestCase):
         self.assertEqual(result.returncode, cli.USAGE_ERROR)
 
 
+class BaselineCommand(unittest.TestCase):
+    """The rolling gate, reached the way CI reaches it.
+
+    The failure modes worth testing here are the ones a CI job would otherwise
+    discover for itself: a reading it could not take reporting itself clean, and a
+    ledger refreshed from a partial reading.
+    """
+
+    LEDGER_BLOB = "b" * 40
+
+    def setUp(self) -> None:
+        from continuum.shadow import baseline as baseline_plane
+
+        self.dir = Path(ARTIFACTS) / "baseline"
+        self.ledger_path = self.dir / "parity-ledger.json"
+        self.ledger = baseline_plane.ParityLedger(
+            repository="example/consumer",
+            audited_head="a" * 40,
+            audited_at="2026-03-01",
+            workflows=(
+                baseline_plane.LedgerEntry(
+                    path=".github/workflows/ci.yml",
+                    blob_sha=self.LEDGER_BLOB,
+                    classification="absorbed",
+                    owner="#11",
+                    rationale="audited",
+                ),
+            ),
+        )
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.ledger_path.write_text(
+            baseline_plane.dump_ledger(self.ledger), encoding="utf-8"
+        )
+
+    def tearDown(self) -> None:
+        _remove(REPO_ROOT / ARTIFACTS / "baseline")
+
+    def _live(self, **overrides):
+        from continuum.shadow import baseline as baseline_plane
+
+        document = {
+            "repository": "example/consumer",
+            "default_branch": "main",
+            "head_sha": "a" * 40,
+            "workflows": [{"path": ".github/workflows/ci.yml", "blob_sha": self.LEDGER_BLOB}],
+            "open_pull_requests": [],
+            "complete": True,
+            "limits": [],
+        }
+        document.update(overrides)
+        return _write(self.dir / "live-head.json", document)
+
+    def test_a_ledger_matching_the_live_head_passes(self) -> None:
+        result = _cli(
+            "baseline",
+            "--ledger", str(self.ledger_path),
+            "--live-head", str(self._live()),
+            "--out", str(self.dir / "out"),
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("clean", result.stdout)
+        report = json.loads((self.dir / "out" / "baseline" / "report.json").read_text())
+        self.assertTrue(report["ready"])
+        self.assertEqual(report["differences"], [])
+        # The reading itself is an artifact, so a "drifted" report can be
+        # re-audited from the bytes it was decided on.
+        self.assertTrue((self.dir / "out" / "baseline" / "live-head.json").exists())
+
+    def test_a_workflow_that_moved_fails_ci(self) -> None:
+        head = self._live(
+            workflows=[{"path": ".github/workflows/ci.yml", "blob_sha": "c" * 40}]
+        )
+        result = _cli(
+            "baseline",
+            "--ledger", str(self.ledger_path),
+            "--live-head", str(head),
+            "--out", str(self.dir / "out"),
+        )
+        self.assertEqual(result.returncode, cli.VALIDATION_FAILED)
+        report = json.loads((self.dir / "out" / "baseline" / "report.json").read_text())
+        self.assertEqual(report["verdict"], "drifted")
+        self.assertIn("workflow_blob_changed", {b["code"] for b in report["blockers"]})
+
+    def test_a_head_that_moved_without_touching_workflows_still_passes(self) -> None:
+        # A commit outside .github/** is not a change to the audited surface. The
+        # two SHAs are both recorded so a reader can see the head did move; the
+        # verdict stays clean because no workflow blob moved.
+        head = self._live(head_sha="e" * 40)
+        result = _cli(
+            "baseline",
+            "--ledger", str(self.ledger_path),
+            "--live-head", str(head),
+            "--out", str(self.dir / "out"),
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        report = json.loads((self.dir / "out" / "baseline" / "report.json").read_text())
+        self.assertEqual(report["live_head"], "e" * 40)
+        self.assertEqual(report["audited_head"], "a" * 40)
+
+    def test_an_unreadable_repository_is_never_reported_clean(self) -> None:
+        head = self._live(
+            complete=False,
+            limits=["workflow inventory could not be read: HTTP 403 rate limited"],
+        )
+        result = _cli(
+            "baseline",
+            "--ledger", str(self.ledger_path),
+            "--live-head", str(head),
+            "--out", str(self.dir / "out"),
+        )
+        self.assertEqual(result.returncode, cli.VALIDATION_FAILED)
+        report = json.loads((self.dir / "out" / "baseline" / "report.json").read_text())
+        self.assertEqual(report["verdict"], "incomplete")
+        self.assertFalse(report["ready"])
+
+    def test_the_ledger_is_not_rewritten_from_a_partial_reading(self) -> None:
+        before = self.ledger_path.read_text()
+        result = _cli(
+            "baseline",
+            "--ledger", str(self.ledger_path),
+            "--live-head", str(self._live(complete=False, limits=["pull requests unreadable"])),
+            "--write-ledger",
+            "--out", str(self.dir / "out"),
+        )
+        self.assertEqual(result.returncode, cli.PLANE_FAILURE)
+        self.assertIn("incomplete_live_head", result.stderr)
+        self.assertEqual(self.ledger_path.read_text(), before)
+
+    def test_repinning_moves_the_blob_forward_and_keeps_the_verdict(self) -> None:
+        moved = self._live(
+            head_sha="e" * 40,
+            workflows=[{"path": ".github/workflows/ci.yml", "blob_sha": "c" * 40}],
+        )
+        result = _cli(
+            "baseline",
+            "--ledger", str(self.ledger_path),
+            "--live-head", str(moved),
+            "--write-ledger",
+            "--out", str(self.dir / "out"),
+        )
+        # The verdict describes the audit as it was handed over, not as it was
+        # rewritten. A re-pin that printed "clean" would be claiming the drift it
+        # was asked to resolve never existed.
+        self.assertEqual(result.returncode, cli.VALIDATION_FAILED)
+        report = json.loads((self.dir / "out" / "baseline" / "report.json").read_text())
+        self.assertIn("workflow_blob_changed", {b["code"] for b in report["blockers"]})
+        from continuum.shadow import baseline as baseline_plane
+
+        refreshed = baseline_plane.load_ledger(str(self.ledger_path))
+        entry = refreshed.workflow_map[".github/workflows/ci.yml"]
+        self.assertEqual(entry.blob_sha, "c" * 40)
+        # Re-pinning records new bytes, it does not re-decide them: the human
+        # classification and its owner survive untouched.
+        self.assertEqual(entry.classification, "absorbed")
+        self.assertEqual(entry.owner, "#11")
+        self.assertEqual(refreshed.audited_head, "e" * 40)
+        # The rendered table is regenerated from the same object, so the document
+        # and the comparison cannot disagree about what was audited.
+        rendered = self.ledger_path.with_suffix(".md").read_text()
+        self.assertIn("`" + "c" * 40 + "`", rendered)
+        self.assertEqual(
+            baseline_plane.load_ledger(str(self.ledger_path)).digest, refreshed.digest
+        )
+        # Re-running against the refreshed ledger is now clean, which is the whole
+        # point of the refresh.
+        again = _cli(
+            "baseline", "--ledger", str(self.ledger_path),
+            "--live-head", str(moved), "--out", str(self.dir / "again"),
+        )
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+
+    def test_repinning_will_not_classify_a_file_nobody_audited(self) -> None:
+        result = _cli(
+            "baseline",
+            "--ledger", str(self.ledger_path),
+            "--live-head", str(
+                self._live(
+                    workflows=[
+                        {"path": ".github/workflows/ci.yml", "blob_sha": self.LEDGER_BLOB},
+                        {"path": ".github/workflows/brand-new.yml", "blob_sha": "d" * 40},
+                    ]
+                )
+            ),
+            "--write-ledger",
+            "--out", str(self.dir / "out"),
+        )
+        self.assertEqual(result.returncode, cli.PLANE_FAILURE)
+        self.assertIn("brand-new.yml", result.stderr)
+        self.assertNotIn("brand-new.yml", self.ledger_path.read_text())
+
+    def test_no_reading_at_all_is_a_plane_failure_not_a_clean_run(self) -> None:
+        result = _cli(
+            "baseline", "--ledger", str(self.ledger_path), "--out", str(self.dir / "out")
+        )
+        self.assertEqual(result.returncode, cli.PLANE_FAILURE)
+        self.assertIn("missing_live_head", result.stderr)
+        self.assertFalse((self.dir / "out" / "baseline" / "report.json").exists())
+
+    def test_a_captured_reading_can_be_reused_without_a_token(self) -> None:
+        # The reading is an artifact, so the gate is re-runnable by a reviewer
+        # with no credentials and produces the same answer.
+        head = self._live()
+        first = _cli(
+            "baseline", "--ledger", str(self.ledger_path),
+            "--live-head", str(head), "--out", str(self.dir / "out"),
+        )
+        captured = self.dir / "out" / "baseline" / "live-head.json"
+        second = _cli(
+            "baseline", "--ledger", str(self.ledger_path),
+            "--live-head", str(captured), "--out", str(self.dir / "again"),
+        )
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertEqual(first.stdout.split("(")[0], second.stdout.split("(")[0])
+
+
 class BarrierCheck(unittest.TestCase):
     def setUp(self) -> None:
         self.dir = Path(ARTIFACTS) / "barrier"

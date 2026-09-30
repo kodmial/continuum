@@ -140,7 +140,13 @@ class WakeUpTriggerTests(unittest.TestCase):
     def test_the_reconciler_is_single_flight(self):
         for name, text in (("shared", self.shared), ("consumer", self.consumer)):
             self.assertIn("group: continuum-review-queue", text, name)
-            self.assertIn("cancel-in-progress: true", text, name)
+            # Single-flight, but not cancelling. A run that sleeps out a provider
+            # cooldown holds the only knowledge of when the slot frees; cancelling
+            # it on each wake-up restarts it from the same cooldown, so with wake-ups
+            # arriving more often than a cooldown expires the queue never issues a
+            # request at all. Serialisation is what the group provides.
+            self.assertIn("cancel-in-progress: false", text, name)
+            self.assertNotIn("cancel-in-progress: true", text, name)
 
     def test_the_job_runs_the_reconciler_and_its_config_gate(self):
         self.assertIn("continuum.cli config-check", self.shared)

@@ -449,6 +449,14 @@ READ_ONLY_METHODS = frozenset(
         "file_at_ref",
         "review_threads",
         "unresolved_thread_comment_ids",
+        # The rolling baseline reads the consumer's own live head so a cutover
+        # decision can be taken against the repository as it is now. Every one of
+        # these is a plain GET on the repository the shadow plane is already
+        # pointed at, and none of them can change it.
+        "repository_document",
+        "default_branch",
+        "ref_sha",
+        "workflow_inventory",
     }
 )
 

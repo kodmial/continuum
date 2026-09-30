@@ -43,6 +43,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from . import contract
+from . import placeholders
 from .contract import (
     ArtifactManifest,
     BuildRequest,
@@ -71,12 +72,14 @@ from .state import (
     assert_transition,
     channel_key,
     event_key,
+    owed_reconciliation,
     release_key,
     scopes_are_isolated,
     stage,
     stage_key,
     stage_names,
     unit_key,
+    wake_key,
 )
 from .version import (
     VersionAgreement,
@@ -107,6 +110,19 @@ DISABLED_CODE = "release-disabled"
 DUPLICATE_EVENT_CODE = "duplicate-event"
 SOURCE_CONFLICT_CODE = "source-conflict"
 UNRESUMABLE_CODE = "unresumable-manifest"
+UNFILLED_PLACEHOLDER_CODE = "unfilled-placeholder"
+
+#: The tokens a packaging template declares as unfilled. Named here rather than
+#: discovered per adapter because the whole point is that a *missed* substitution is
+#: invisible to the thing that missed it -- an adapter cannot report a token it
+#: forgot to replace. See :mod:`continuum.release.placeholders` for the scan.
+TEMPLATE_TOKENS: Tuple[str, ...] = (
+    "__VERSION__",
+    "__SHA256_",
+    "__ZIP_SHA256__",
+    "__REVISION__",
+    "__MAINTAINERS__",
+)
 
 
 def destination_of(component: Any) -> str:
@@ -422,6 +438,31 @@ class ReleaseOutcome:
         return self.failure is not None and self.failure.retryable
 
     @property
+    def owed_stage(self) -> Optional[str]:
+        """The deferred stage this release now owes, or ``None`` when nothing is.
+
+        A release-pr update that lands mid-publish is deferred rather than lost:
+        the release goes on to completion, and this is what says the deferred work
+        should be picked up again. Without it the deferral is invisible -- the run is
+        green, and the update that was waiting on it never moves.
+        """
+
+        return owed_reconciliation(self.journal)
+
+    @property
+    def reconciliation_wake(self) -> str:
+        """The idempotency key of the wake this outcome owes, or ``""``.
+
+        Keyed on the source head rather than the version, so the several deliveries
+        one completed release produces -- a re-run, a second workflow watching the same
+        branch -- are one wake rather than several competing dispatches.
+        """
+
+        if not self.owed_stage or not self.source_sha:
+            return ""
+        return wake_key(self.event.repository, self.source_sha)
+
+    @property
     def stage(self) -> str:
         return self.outcomes[-1].stage if self.outcomes else ""
 
@@ -465,6 +506,12 @@ class ReleaseOutcome:
                 payload[key] = value
         if self.failure is not None:
             payload["failure"] = self.failure.describe()
+        # Named in the outcome, not only available on demand: an owed reconciliation
+        # is a dispatch the caller has to make, so a summary that omitted it would
+        # report a green release over work that is still stranded.
+        if self.owed_stage:
+            payload["owed_stage"] = self.owed_stage
+            payload["reconciliation_wake"] = self.reconciliation_wake
         return payload
 
 
@@ -1006,7 +1053,56 @@ class ReleaseCore:
                 code="asset-name-collision",
                 **run.note(),
             )
+        unfilled = self._unfilled_placeholders(run)
+        if unfilled is not None:
+            return StageOutcome.failed(
+                "build",
+                run.key_for("build"),
+                unfilled,
+                code=UNFILLED_PLACEHOLDER_CODE,
+                **run.note(),
+            )
         return outcome
+
+    def _unfilled_placeholders(self, run: _Run) -> Optional[str]:
+        """Why a generated file still carries a template token, or None.
+
+        A generated manifest with a missed substitution is syntactically fine and
+        looks plausible, and it ships a literal ``__VERSION__`` to every user who
+        installs from it. So the built files are read back and scanned before
+        anything downstream sees them.
+
+        Asked of the whole release rather than per target, for the same reason
+        asset names are: which file is wrong does not depend on who built it, and
+        one refusal naming every offender is more useful than a serial repair.
+
+        Only files that are on disk as text are read, and a file that cannot be
+        decoded is reported rather than skipped -- a build step that produced an
+        unreadable "text" artifact has produced something nobody can vouch for.
+        """
+
+        offenders: List[str] = []
+        for manifest in run.manifests:
+            for artifact in manifest.artifacts:
+                if artifact.declared or not artifact.path:
+                    continue
+                if placeholders.suffix_of(artifact.name) not in placeholders.COMMENT_SYNTAX:
+                    continue
+                try:
+                    with open(artifact.path, "r", encoding="utf-8") as handle:
+                        text = handle.read()
+                except (OSError, UnicodeDecodeError) as exc:
+                    offenders.append(f"{artifact.name} could not be read ({exc})")
+                    continue
+                found = placeholders.find_unfilled(text, TEMPLATE_TOKENS, name=artifact.name)
+                offenders.extend(f"{artifact.name}: {item}" for item in found)
+        if not offenders:
+            return None
+        return (
+            "generated file(s) still carry an unfilled template placeholder, so a "
+            "build step did not substitute it: "
+            + "; ".join(sorted(set(offenders)))
+        )
 
     def _collision(self, run: _Run) -> Optional[str]:
         """Why this release's assets cannot be told apart, or None if they can.

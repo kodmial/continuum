@@ -1,0 +1,161 @@
+name: OpenCode repair controller
+
+on:
+  # This trusted metadata workflow never checks out or executes PR code.
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+  workflow_run:
+    workflows: ["CI", "Packaging smoke"]
+    types: [completed]
+
+permissions: {}
+
+concurrency:
+  group: opencode-repair-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.workflow_run.id || github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  sync-current-pr:
+    if: >-
+      github.event_name == 'pull_request_target' &&
+      github.event.pull_request.state == 'open' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.head.ref, 'opencode/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Update branch or dispatch conflict repair
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          gh label create opencode-conflict-repair --repo "$GITHUB_REPOSITORY" --color B60205 \
+            --description "One automatic OpenCode conflict-repair attempt per conflict episode." \
+            --force >/dev/null
+
+          remove_lock() {
+            gh api --method DELETE \
+              "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/opencode-conflict-repair" \
+              >/dev/null 2>&1 || true
+          }
+
+          behind=$(gh api "repos/$GITHUB_REPOSITORY/compare/main...$HEAD_SHA" --jq '.behind_by')
+          if [[ "$behind" -eq 0 ]]; then
+            remove_lock
+            echo "PR #$PR_NUMBER already contains the current main branch."
+            exit 0
+          fi
+
+          echo "PR #$PR_NUMBER is $behind commit(s) behind main; requesting GitHub-native branch update."
+          if output=$(gh api --method PUT \
+            "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/update-branch" \
+            -f "expected_head_sha=$HEAD_SHA" 2>&1); then
+            remove_lock
+            echo "$output"
+            exit 0
+          fi
+
+          echo "$output"
+          if ! grep -Eqi 'conflict|cannot be performed|not updateable' <<<"$output"; then
+            echo "::warning::GitHub update-branch failed for a reason other than a merge conflict."
+            exit 0
+          fi
+
+          if gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels" \
+            --jq '.[].name' | grep -Fxq opencode-conflict-repair; then
+            echo "Conflict repair was already dispatched for this unresolved conflict."
+            exit 0
+          fi
+
+          gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels" \
+            -f 'labels[]=opencode-conflict-repair' >/dev/null
+
+          if ! gh api --method POST \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/opencode.yml/dispatches" \
+            -f ref=main \
+            -f "inputs[mode]=resolve-conflict" \
+            -f "inputs[pr_number]=$PR_NUMBER" \
+            -f "inputs[head_ref]=$HEAD_REF"; then
+            remove_lock
+            echo "::error::Failed to dispatch OpenCode conflict repair; lock cleared for retry."
+            exit 1
+          fi
+
+  ci-repair:
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      (github.event.workflow_run.conclusion == 'success' ||
+       github.event.workflow_run.conclusion == 'failure' ||
+       github.event.workflow_run.conclusion == 'timed_out')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Dispatch OpenCode fix for failed blocking workflow
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_NAME: ${{ github.event.workflow_run.name }}
+          RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+        run: |
+          set -euo pipefail
+
+          case "$RUN_NAME" in
+            CI|"Packaging smoke") ;;
+            *)
+              echo "Unsupported workflow '$RUN_NAME'; nothing to repair."
+              exit 0
+              ;;
+          esac
+
+          pr=$(gh api "repos/$GITHUB_REPOSITORY/commits/$RUN_HEAD_SHA/pulls" \
+            -H "Accept: application/vnd.github+json" \
+            --jq '[.[] | select(.state == "open") | select(.base.ref == "main")][0].number // empty')
+          [[ -n "$pr" ]] || {
+            echo "No open PR found for $RUN_NAME head $RUN_HEAD_SHA; nothing to repair."
+            exit 0
+          }
+
+          read -r head_ref head_sha head_repo < <(
+            gh api "repos/$GITHUB_REPOSITORY/pulls/$pr" \
+              --jq '[.head.ref, .head.sha, .head.repo.full_name] | @tsv'
+          )
+
+          if [[ "$head_repo" != "$GITHUB_REPOSITORY" || "$head_ref" != opencode/* ]]; then
+            echo "PR #$pr is not a same-repository OpenCode PR; ignoring."
+            exit 0
+          fi
+
+          if [[ "$head_sha" != "$RUN_HEAD_SHA" ]]; then
+            echo "$RUN_NAME run $RUN_ID is stale; PR #$pr has already advanced to $head_sha."
+            exit 0
+          fi
+
+          if [[ "$CONCLUSION" == "success" ]]; then
+            echo "$RUN_NAME passed; nothing to repair."
+            exit 0
+          fi
+
+          # A completed failing workflow is itself the idempotency boundary.
+          # Do not persist a PR label as a repair lock: if the dispatched
+          # OpenCode run fails before changing HEAD (for example an installer
+          # outage), that label becomes stale and suppresses every later repair
+          # for the same HEAD. A rerun of CI/Packaging must be allowed to emit
+          # a fresh workflow_run event and dispatch repair again.
+          if ! gh api --method POST \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/opencode.yml/dispatches" \
+            -f ref=main \
+            -f "inputs[mode]=ci-fix" \
+            -f "inputs[pr_number]=$pr" \
+            -f "inputs[head_ref]=$head_ref" \
+            -f "inputs[run_id]=$RUN_ID"; then
+            echo "::error::Failed to dispatch OpenCode repair for $RUN_NAME."
+            exit 1
+          fi

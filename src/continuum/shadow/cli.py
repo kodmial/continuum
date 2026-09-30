@@ -7,6 +7,7 @@ Five subcommands, one per artifact:
 * ``parity``   -- compare a journal with a captured NanoDictate outcome.
 * ``liveness`` -- account for every accepted event in a window.
 * ``replay``   -- re-run a captured case, optionally against a second engine.
+* ``baseline`` -- read the consumer's live head and compare it with the ledger.
 * ``cutover``  -- judge a window against the scenario requirements.
 
 Two rules run through all of them:
@@ -32,7 +33,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from . import barrier, cutover, engine, liveness, parity, replay, report
+from . import barrier, baseline, cutover, engine, liveness, parity, replay, report
 from .effects import READ_ONLY_METHODS
 from .config import ConfigError, ShadowConfig
 from .config import load as load_config
@@ -66,7 +67,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return USAGE_ERROR
     try:
         return int(args.handler(args))
-    except (EventError, StateError, ConfigError, replay.ReplayError, cutover.CutoverError) as error:
+    except (
+        EventError,
+        StateError,
+        ConfigError,
+        replay.ReplayError,
+        cutover.CutoverError,
+        baseline.BaselineError,
+    ) as error:
         _fail("{}: {}".format(type(error).__name__, error))
         return PLANE_FAILURE
     except FileNotFoundError as error:
@@ -138,10 +146,41 @@ def _parser() -> argparse.ArgumentParser:
     gate.add_argument("--approval", help="an approval document")
     gate.add_argument("--canary", help="canary evidence, as JSON")
     gate.add_argument("--rollback", help="rollback evidence, as JSON")
+    gate.add_argument("--baseline", help="a live-head baseline report document")
     gate.add_argument("--window-start", required=True)
     gate.add_argument("--window-end", required=True)
     gate.add_argument("--out", default="shadow-out")
     gate.set_defaults(handler=_cutover)
+
+    read = subparsers.add_parser(
+        "baseline", help="compare the consumer's live head with the parity ledger"
+    )
+    read.add_argument("--ledger", default="docs/parity-ledger.json")
+    read.add_argument("--repo", help="owner/name; omit with --live-head")
+    read.add_argument("--live-head", help="a captured live head, as JSON")
+    read.add_argument("--token-env", default="GITHUB_TOKEN", help="read-only token variable")
+    read.add_argument(
+        "--write-ledger",
+        action="store_true",
+        help="also refresh docs/parity-ledger.json and its rendered markdown",
+    )
+    read.add_argument(
+        "--accept-removed",
+        nargs="*",
+        default=[],
+        metavar="PATH",
+        help="audited workflows confirmed gone; named so the withdrawal is a stated act",
+    )
+    read.add_argument(
+        "--accept-closed",
+        nargs="*",
+        default=[],
+        type=int,
+        metavar="NUMBER",
+        help="classified pull requests confirmed closed, without number sign",
+    )
+    read.add_argument("--out", default="shadow-out")
+    read.set_defaults(handler=_baseline)
 
     barrier_command = subparsers.add_parser(
         "barrier-check", help="prove the write barrier refuses every mutating adapter"
@@ -405,12 +444,76 @@ def _cutover(args: argparse.Namespace) -> int:
         approval_document=_read_json(args.approval) if args.approval else None,
         canary=_optional_json(args.canary),
         rollback=_optional_json(args.rollback),
+        baseline_document=_read_json(args.baseline) if args.baseline else None,
         window_started_at=args.window_start,
         window_ended_at=args.window_end,
     )
     _write(output / "cutover" / "decision.json", decision.describe())
     _summary(cutover.summarize(decision))
     return 0 if decision.approved else VALIDATION_FAILED
+
+
+# --------------------------------------------------------------------------- #
+# baseline
+# --------------------------------------------------------------------------- #
+
+
+def _baseline(args: argparse.Namespace) -> int:
+    # The barrier is deliberately not installed here. Every read this command can
+    # perform is a read, and installing the barrier would only assert something
+    # about the adapters that ``barrier-check`` proves properly.
+    from continuum.review.github import GitHubClient
+
+    output = _output_dir(args.out)
+    ledger = baseline.load_ledger(args.ledger)
+
+    if args.live_head:
+        head = baseline.read_live_head(_read_json(args.live_head))
+    elif args.repo:
+        client = GitHubClient(repository=args.repo, token=_token(args.token_env))
+        head = baseline.capture_live_head(client, repository=args.repo)
+    else:
+        raise baseline.BaselineError(
+            "missing_live_head",
+            "A baseline needs something to compare against: pass --repo owner/name to "
+            "read the live head, or --live-head <capture.json> to reuse one.",
+        )
+
+    # The reading itself is written before the comparison, so an artifact that says
+    # "drifted" can be re-audited by hand from the same bytes rather than by taking
+    # the live head again and hoping it has not moved in between.
+    _write(output / "baseline" / "live-head.json", head.describe())
+
+    if args.write_ledger:
+        # Only a complete reading may rewrite the ledger. Writing it from a
+        # partial read would record a HEAD and a file list that were never fully
+        # observed, and the next audit would then treat those absences as real
+        # findings against a repository it did not look at.
+        if not head.complete:
+            raise baseline.BaselineError(
+                "incomplete_live_head",
+                "refusing to write the ledger from an incomplete reading: {}".format(
+                    "; ".join(head.limits) or "the reading did not say why"
+                ),
+            )
+        refreshed = ledger.at(
+            head,
+            audited_at=_today(),
+            accept_removed=args.accept_removed,
+            accept_closed=args.accept_closed,
+        )
+        ledger_path = Path(args.ledger)
+        ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        ledger_path.write_text(baseline.dump_ledger(refreshed), encoding="utf-8")
+        markdown_path = ledger_path.with_suffix(".md")
+        markdown_path.write_text(
+            baseline.render_markdown(refreshed), encoding="utf-8"
+        )
+
+    report = baseline.audit(ledger, head)
+    _write(output / "baseline" / "report.json", report.describe())
+    _summary(baseline.summarize(report))
+    return 0 if report.ready else VALIDATION_FAILED
 
 
 # --------------------------------------------------------------------------- #
@@ -530,6 +633,20 @@ def _read_json(path: str) -> Dict[str, Any]:
 
 def _optional_json(path: Optional[str]) -> Optional[Dict[str, Any]]:
     return _read_json(path) if path else None
+
+
+def _today() -> str:
+    """The audit date, as a date.
+
+    Recorded on the ledger rather than a timestamp so re-pinning the same head on
+    a second attempt produces the same document: the audit is of a repository
+    state, not of a run, and a diff of two ledgers should show what was re-audited
+    and nothing else.
+    """
+
+    import datetime
+
+    return datetime.date.today().isoformat()
 
 
 def _write(path: Path, document: Mapping[str, Any]) -> Path:

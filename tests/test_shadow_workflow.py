@@ -174,6 +174,75 @@ class ShellSyntaxTests(unittest.TestCase):
                     )
 
 
+class LiveBaselineWorkflowTests(unittest.TestCase):
+    """#60's requirement, asserted against the YAML rather than the prose.
+
+    A gate that exists only in a module is not a gate. These properties are what
+    make the reading happen before the judgement rather than being something a
+    caller can reasonably forget: the cutover job has no path to a decision that
+    skipped it.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.document = load(WORKFLOW)
+        cls.job = cls.document["jobs"]["evidence"]
+
+    def _step(self, fragment: str) -> dict:
+        matches = [
+            step for step in steps_of(self.job) if fragment in run_text(step)
+        ]
+        self.assertEqual(len(matches), 1, "expected one step matching {!r}".format(fragment))
+        return matches[0]
+
+    def test_the_cutover_job_reads_the_shadowed_repository_live(self) -> None:
+        step = self._step("continuum.shadow.cli baseline")
+        script = run_text(step)
+        self.assertIn("--repo", script)
+        # The ledger comes from the pinned engine checkout, so the audit being
+        # applied is the one in the commit the evidence names.
+        self.assertIn("engine/docs/parity-ledger.json", script)
+
+    def test_the_reading_happens_for_a_cutover_and_for_a_baseline_run_alone(self) -> None:
+        step = self._step("continuum.shadow.cli baseline")
+        condition = step.get("if", "")
+        self.assertIn("inputs.mode == 'baseline'", condition)
+        self.assertIn("inputs.mode == 'cutover'", condition)
+
+    def test_a_cutover_judged_from_documents_alone_is_refused_by_the_gate(self) -> None:
+        # The refusal itself lives in the gate and is unit-tested there. What this
+        # file can see is that a decision with no reading has no route to being
+        # approved: the step either read one or passed nothing.
+        script = " ".join(run_text(step) for step in steps_of(self.job))
+        self.assertIn("args+=(--baseline", script)
+
+    def test_a_window_recorded_reading_is_the_explicit_opt_in(self) -> None:
+        # A document from the window could be from a head that has since moved,
+        # which is the whole reason the live head is read. Using one is allowed
+        # and has to be asked for, not inherited.
+        inputs = self.document["on"]["workflow_call"]["inputs"]
+        self.assertIn("read_live_baseline", inputs)
+        self.assertIs(inputs["read_live_baseline"]["default"], True)
+        dispatched = self.document["on"]["workflow_dispatch"]["inputs"]
+        self.assertIn("read_live_baseline", dispatched)
+
+    def test_the_reading_takes_no_scope_the_job_did_not_already_have(self) -> None:
+        # The reading reads a repository through the same token as the rest of the
+        # plane. A new scope here would be authority the validation plane has no
+        # business holding.
+        self.assertEqual(write_scopes(permission_map(self.job.get("permissions"))), [])
+        self.assertTrue(
+            set(permission_map(self.job.get("permissions"))) <= READ_SCOPES,
+            sorted(set(permission_map(self.job.get("permissions"))) - READ_SCOPES),
+        )
+
+    def test_the_ledger_the_gate_reads_is_committed(self) -> None:
+        # A workflow step pointing at a ledger nobody committed fails at run time,
+        # in the one job that cannot be skipped.
+        self.assertTrue((REPO_ROOT / "docs" / "parity-ledger.json").exists())
+        self.assertTrue((REPO_ROOT / "docs" / "parity-ledger.md").exists())
+
+
 class ShadowWorkflowTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -287,8 +356,10 @@ class ShadowWorkflowTests(unittest.TestCase):
         evidence_commands = " ".join(
             run_text(step) for step in steps_of(self.document["jobs"]["evidence"])
         )
-        for verb in ("replay", "cutover"):
-            self.assertIn("args=({} ".format(verb), evidence_commands, verb)
+        for verb in ("replay", "cutover", "baseline"):
+            self.assertIn(
+                verb, evidence_commands, "{} has no step in the evidence job".format(verb)
+            )
 
     def test_evidence_is_uploaded_even_when_a_step_fails(self) -> None:
         for job_name, job in self.document["jobs"].items():

@@ -643,7 +643,11 @@ def reconcile(
     Waiting is a convenience for a queue that is only held back by a provider
     cooldown. It never substitutes for event coverage: every state change that
     can change the next candidate already wakes the controller on its own, and
-    a new wake-up supersedes a sleeping run.
+    each wake-up reconciles from live state when its run starts.
+
+    A sleeping run is deliberately *not* cancelled by a later wake-up -- see the
+    `concurrency` block in `.github/workflows/review-queue.yml` for why, since
+    cancellation here turns a cooldown wait into a livelock.
     """
 
     plan = reconcile_once(client, config, wake=wake, now=now, apply=apply)

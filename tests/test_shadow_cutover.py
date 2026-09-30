@@ -12,6 +12,7 @@ from __future__ import annotations
 import dataclasses
 import unittest
 
+from continuum.shadow import baseline as baseline_plane
 from continuum.shadow import cutover, liveness, parity, planner
 from continuum.shadow.observation import outcome_from_payload
 from tests import shadow_support as fixtures
@@ -86,6 +87,293 @@ def _liveness(correlations, **kwargs):
             )
         )
     return liveness.LivenessReport(runs=tuple(runs), **kwargs)
+
+
+# --------------------------------------------------------------------------- #
+# The live reading
+# --------------------------------------------------------------------------- #
+#
+# Every window test below is about the *recorded* evidence, so each supplies the
+# one input that is not recorded: a reading of the consumer repository taken now.
+# It is built from a ledger whose blob SHAs are the reading's own, which is the
+# only way a reading can be clean -- an approved ledger and a live repository that
+# agree by construction. The tests that care about disagreement do not use this.
+
+LEDGER_HEAD = "b" * 40
+
+#: The one audited workflow these tests use. Its blob is repeated in every
+#: reading so that agreement is the default and each test can break exactly one
+#: thing.
+CI_BLOB = "b" * 40
+
+
+def _ledger(*, head: str = LEDGER_HEAD, audited_at: str = "2026-02-01"):
+    """An approved ledger for one workflow, in consumer-neutral terms."""
+
+    return baseline_plane.ParityLedger(
+        repository="example/consumer",
+        audited_head=head,
+        audited_at=audited_at,
+        workflows=(
+            baseline_plane.LedgerEntry(
+                path=".github/workflows/ci.yml",
+                blob_sha=CI_BLOB,
+                classification="absorbed",
+                owner="#11",
+                rationale="audited",
+            ),
+        ),
+    )
+
+
+def _live(
+    *,
+    head: str = "a" * 40,
+    repository: str = "example/consumer",
+    complete: bool = True,
+    limits=(),
+):
+    """A reading taken after the ledger was written, with nothing changed."""
+
+    return baseline_plane.LiveHead(
+        repository=repository,
+        default_branch="main",
+        head_sha=head,
+        workflows=(
+            baseline_plane.WorkflowFile(path=".github/workflows/ci.yml", blob_sha=CI_BLOB),
+        ),
+        complete=complete,
+        limits=tuple(limits),
+    )
+
+
+def _clean_baseline():
+    """The one reading a healthy window needs: the repository has not moved."""
+
+    ledger = _ledger()
+    return baseline_plane.audit(ledger, _live())
+
+
+class LiveReading(unittest.TestCase):
+    """#60's requirement: a historical reference snapshot must not authorize cutover.
+
+    Every other input to the gate is evidence recorded during the window. None of
+    it names the consumer repository as it is now, so a window that looks perfect
+    on its own terms still has to be checked against the live head.
+    """
+
+    def test_a_window_with_no_live_reading_is_blocked(self) -> None:
+        results, origins = _results()
+        decision = cutover.decide(
+            results,
+            _liveness([result.correlation_id for result in results]),
+            origins=origins,
+            window_started_at=WINDOW[0],
+            window_ended_at=WINDOW[1],
+        )
+        self.assertIn("no_live_baseline", decision.codes)
+        self.assertFalse(decision.ready)
+        self.assertIn("historical reference snapshot", decision.summary_line() + " ".join(
+            blocker.message for blocker in decision.blockers
+        ))
+
+    def test_a_clean_reading_clears_the_blocker(self) -> None:
+        results, origins = _results()
+        reading = _clean_baseline()
+        self.assertTrue(reading.ready)
+        decision = cutover.decide(
+            results,
+            _liveness([result.correlation_id for result in results]),
+            origins=origins,
+            baseline_report=reading,
+            window_started_at=WINDOW[0],
+            window_ended_at=WINDOW[1],
+        )
+        self.assertNotIn("no_live_baseline", decision.codes)
+        self.assertTrue(decision.ready)
+
+    def test_drift_is_reported_with_the_issue_that_owns_it(self) -> None:
+        results, origins = _results()
+        # The audited blob moved. Nothing about the recorded window changed, and
+        # the window is still refused: the parity evidence was granted against
+        # bytes that no longer exist.
+        moved = baseline_plane.LiveHead(
+            repository="example/consumer",
+            default_branch="main",
+            head_sha="a" * 40,
+            workflows=(
+                baseline_plane.WorkflowFile(path=".github/workflows/ci.yml", blob_sha="c" * 40),
+            ),
+        )
+        reading = baseline_plane.audit(_ledger(), moved)
+        self.assertFalse(reading.ready)
+        decision = cutover.decide(
+            results,
+            _liveness([result.correlation_id for result in results]),
+            origins=origins,
+            baseline_report=reading,
+            window_started_at=WINDOW[0],
+            window_ended_at=WINDOW[1],
+        )
+        self.assertIn("workflow_blob_changed", decision.codes)
+        # The routing survives into the cutover artifact, so whoever has to fix
+        # this is named in the document that says it is broken.
+        self.assertEqual(decision.baseline.routing["#11"], (".github/workflows/ci.yml",))
+        self.assertIn("no longer evidence about this file", " ".join(
+            blocker.message for blocker in decision.blockers
+        ))
+
+    def test_a_workflow_nobody_classified_blocks_and_routes_to_discovery(self) -> None:
+        results, origins = _results()
+        appeared = baseline_plane.LiveHead(
+            repository="example/consumer",
+            default_branch="main",
+            head_sha="a" * 40,
+            workflows=(
+                baseline_plane.WorkflowFile(path=".github/workflows/ci.yml", blob_sha="b" * 40),
+                baseline_plane.WorkflowFile(path=".github/workflows/new-thing.yml", blob_sha="d" * 40),
+            ),
+        )
+        reading = baseline_plane.audit(_ledger(), appeared)
+        self.assertIn("unclassified_workflow", reading.codes)
+        decision = cutover.decide(
+            results,
+            _liveness([result.correlation_id for result in results]),
+            origins=origins,
+            baseline_report=reading,
+            window_started_at=WINDOW[0],
+            window_ended_at=WINDOW[1],
+        )
+        self.assertFalse(decision.ready)
+        self.assertIn(
+            ".github/workflows/new-thing.yml", decision.baseline.routing["#60"]
+        )
+
+    def test_an_unreadable_reading_blocks_without_claiming_drift(self) -> None:
+        # Absence is failure. A partial reading compared with a complete ledger
+        # would name every file it did not see as removed, which is a claim about
+        # the gap rather than about the repository.
+        results, origins = _results()
+        partial = baseline_plane.LiveHead(
+            repository="example/consumer",
+            complete=False,
+            limits=("workflow inventory could not be read: rate limited",),
+        )
+        reading = baseline_plane.audit(_ledger(), partial)
+        self.assertEqual(reading.verdict, "incomplete")
+        self.assertEqual(reading.differences, ())
+        self.assertFalse(reading.ready)
+        decision = cutover.decide(
+            results,
+            _liveness([result.correlation_id for result in results]),
+            origins=origins,
+            baseline_report=reading,
+            window_started_at=WINDOW[0],
+            window_ended_at=WINDOW[1],
+        )
+        self.assertIn(baseline_plane.INCOMPLETE_BLOCKER, decision.codes)
+        self.assertNotIn("workflow_removed", decision.codes)
+
+    def test_a_reading_of_another_repository_is_refused(self) -> None:
+        reading = baseline_plane.audit(_ledger(), _live(repository="someone/else"))
+        self.assertIn("repository_mismatch", reading.codes)
+
+    def test_a_window_collected_before_the_audit_is_refused(self) -> None:
+        # The approval digest already ties a signature to one ledger, so this is
+        # not about catching a stale signature. It is about the case where the
+        # signature is fresh and still meaningless: a difference is re-audited
+        # today, the old window is re-signed, and now the reading and the
+        # approval agree perfectly about a repository state no run in the window
+        # ever observed. Freshness has to be an order, not a digest.
+        results, origins = _results()
+        reading = baseline_plane.audit(
+            _ledger(audited_at="2026-06-01"), _live()
+        )
+        self.assertTrue(reading.ready)
+        decision = cutover.decide(
+            results,
+            _liveness([result.correlation_id for result in results]),
+            origins=origins,
+            baseline_report=reading,
+            window_started_at=WINDOW[0],
+            window_ended_at=WINDOW[1],
+        )
+        self.assertIn("window_predates_ledger", decision.codes)
+        self.assertFalse(decision.ready)
+
+    def test_a_window_starting_the_day_of_the_audit_is_accepted(self) -> None:
+        # Same-day is not stale. Only an ordering backwards is a claim this gate
+        # can support, so the boundary is inclusive and no clock is consulted.
+        results, origins = _results()
+        reading = baseline_plane.audit(_ledger(audited_at="2026-03-01"), _live())
+        decision = cutover.decide(
+            results,
+            _liveness([result.correlation_id for result in results]),
+            origins=origins,
+            baseline_report=reading,
+            window_started_at=WINDOW[0],
+            window_ended_at=WINDOW[1],
+        )
+        self.assertNotIn("window_predates_ledger", decision.codes)
+
+    def test_an_unreadable_audit_date_blocks_rather_than_defaulting(self) -> None:
+        results, origins = _results()
+        reading = baseline_plane.audit(_ledger(audited_at=""), _live())
+        decision = cutover.decide(
+            results,
+            _liveness([result.correlation_id for result in results]),
+            origins=origins,
+            baseline_report=reading,
+            window_started_at=WINDOW[0],
+            window_ended_at=WINDOW[1],
+        )
+        self.assertIn("ledger_audit_date_unreadable", decision.codes)
+
+    def test_an_unreadable_window_start_blocks_rather_than_defaulting(self) -> None:
+        results, origins = _results()
+        decision = cutover.decide(
+            results,
+            _liveness([result.correlation_id for result in results]),
+            origins=origins,
+            baseline_report=_clean_baseline(),
+            window_started_at="last Tuesday",
+            window_ended_at=WINDOW[1],
+        )
+        self.assertIn("window_start_unreadable", decision.codes)
+
+    def test_a_nonsense_audit_date_is_unreadable_not_merely_odd(self) -> None:
+        # A date that parses as a shape but not as a calendar has to be refused
+        # rather than string-compared, or "2026-13-45" sorts before everything.
+        self.assertIsNone(cutover._iso_date("2026-13-45"))
+        self.assertIsNone(cutover._iso_date(""))
+        self.assertIsNone(cutover._iso_date(None))
+        self.assertEqual(cutover._iso_date("2026-03-15T09:00:00Z"), "2026-03-15")
+
+    def test_the_reading_is_part_of_the_evidence_an_approval_is_bound_to(self) -> None:
+        results, origins = _results()
+        live = _liveness([result.correlation_id for result in results])
+        first = cutover.decide(
+            results, live, origins=origins, baseline_report=_clean_baseline(),
+            window_started_at=WINDOW[0], window_ended_at=WINDOW[1],
+        )
+        second = cutover.decide(
+            results, live, origins=origins,
+            baseline_report=baseline_plane.audit(
+                _ledger(),
+                baseline_plane.LiveHead(
+                    repository="example/consumer",
+                    default_branch="main",
+                    head_sha="e" * 40,
+                    workflows=(
+                        baseline_plane.WorkflowFile(path=".github/workflows/ci.yml", blob_sha="b" * 40),
+                    ),
+                ),
+            ),
+            window_started_at=WINDOW[0], window_ended_at=WINDOW[1],
+        )
+        # Same window, same verdicts, different reading: the digests must differ,
+        # so an approval granted against the earlier reading cannot carry over.
+        self.assertNotEqual(first.evidence_digest, second.evidence_digest)
 
 
 class ScenarioRequirements(unittest.TestCase):
@@ -173,6 +461,7 @@ class Gate(unittest.TestCase):
             results,
             _liveness([result.correlation_id for result in results]),
             origins=origins,
+            baseline_report=_clean_baseline(),
             window_started_at=WINDOW[0],
             window_ended_at=WINDOW[1],
         )
@@ -193,6 +482,7 @@ class Gate(unittest.TestCase):
             results,
             _liveness(["corr-merge-decision"]),
             origins=origins,
+            baseline_report=_clean_baseline(),
             window_started_at=WINDOW[0],
             window_ended_at=WINDOW[1],
         )
@@ -220,6 +510,7 @@ class Gate(unittest.TestCase):
             results,
             _liveness([result.correlation_id for result in results]),
             origins=origins,
+            baseline_report=_clean_baseline(),
             window_started_at=WINDOW[0],
             window_ended_at=WINDOW[1],
         )
@@ -245,6 +536,7 @@ class Gate(unittest.TestCase):
             _liveness([result.correlation_id for result in results]),
             origins=origins,
             resolutions=[resolution],
+            baseline_report=_clean_baseline(),
             window_started_at=WINDOW[0],
             window_ended_at=WINDOW[1],
         )
@@ -262,6 +554,7 @@ class Gate(unittest.TestCase):
             _liveness([result.correlation_id for result in results]),
             origins=origins,
             resolutions=[cutover.Resolution(correlation_id="corr-diverged", resolution="  ")],
+            baseline_report=_clean_baseline(),
             window_started_at=WINDOW[0],
             window_ended_at=WINDOW[1],
         )
@@ -285,6 +578,7 @@ class Gate(unittest.TestCase):
             results,
             report,
             origins=origins,
+            baseline_report=_clean_baseline(),
             window_started_at=WINDOW[0],
             window_ended_at=WINDOW[1],
         )
@@ -294,6 +588,7 @@ class Gate(unittest.TestCase):
         results, origins = _results()
         decision = cutover.decide(
             results, None, origins=origins,
+            baseline_report=_clean_baseline(),
             window_started_at=WINDOW[0], window_ended_at=WINDOW[1],
         )
         self.assertIn("no_liveness_evidence", decision.codes)
@@ -304,6 +599,7 @@ class Gate(unittest.TestCase):
             results,
             liveness.LivenessReport(),
             origins=origins,
+            baseline_report=_clean_baseline(),
             window_started_at=WINDOW[0],
             window_ended_at=WINDOW[1],
         )
@@ -317,6 +613,7 @@ class Approval(unittest.TestCase):
             results,
             _liveness([result.correlation_id for result in results]),
             origins=origins,
+            baseline_report=_clean_baseline(),
             window_started_at=WINDOW[0],
             window_ended_at=WINDOW[1],
         )
@@ -339,6 +636,7 @@ class Approval(unittest.TestCase):
             results,
             _liveness([result.correlation_id for result in results]),
             origins=origins,
+            baseline_report=_clean_baseline(),
             window_started_at=WINDOW[0],
             window_ended_at=WINDOW[1],
         )
@@ -348,6 +646,7 @@ class Approval(unittest.TestCase):
             origins=origins,
             approval=self._approval(base),
             canary={"run": "runs/canary-1"},
+            baseline_report=_clean_baseline(),
             window_started_at=WINDOW[0],
             window_ended_at=WINDOW[1],
         )
@@ -360,6 +659,7 @@ class Approval(unittest.TestCase):
         live = _liveness([result.correlation_id for result in results])
         base = cutover.decide(
             results, live, origins=origins,
+            baseline_report=_clean_baseline(),
             window_started_at=WINDOW[0], window_ended_at=WINDOW[1],
         )
         decision = cutover.decide(
@@ -369,6 +669,7 @@ class Approval(unittest.TestCase):
             approval=self._approval(base),
             canary={"run": "runs/canary-1", "result": "clean"},
             rollback={"reference": "workflows/opencode.yml@revert-9f2"},
+            baseline_report=_clean_baseline(),
             window_started_at=WINDOW[0],
             window_ended_at=WINDOW[1],
         )
@@ -382,6 +683,7 @@ class Approval(unittest.TestCase):
         live = _liveness([result.correlation_id for result in results])
         base = cutover.decide(
             results, live, origins=origins,
+            baseline_report=_clean_baseline(),
             window_started_at=WINDOW[0], window_ended_at=WINDOW[1],
         )
         # The window gains an event after the approval was granted.
@@ -394,6 +696,7 @@ class Approval(unittest.TestCase):
             approval=self._approval(base),
             canary={"run": "runs/canary-1"},
             rollback={"reference": "workflows/opencode.yml@revert-9f2"},
+            baseline_report=_clean_baseline(),
             window_started_at=WINDOW[0],
             window_ended_at=WINDOW[1],
         )
@@ -430,6 +733,7 @@ class Approval(unittest.TestCase):
         # The approval is signed against this very window, stall and all.
         base = cutover.decide(
             results, stalled, origins=origins,
+            baseline_report=_clean_baseline(),
             window_started_at=WINDOW[0], window_ended_at=WINDOW[1],
         )
         decision = cutover.decide(
@@ -439,6 +743,7 @@ class Approval(unittest.TestCase):
             approval=self._approval(base),
             canary={"run": "runs/canary-1"},
             rollback={"reference": "workflows/opencode.yml@revert-9f2"},
+            baseline_report=_clean_baseline(),
             window_started_at=WINDOW[0],
             window_ended_at=WINDOW[1],
         )
@@ -457,6 +762,7 @@ class Approval(unittest.TestCase):
             approval=cutover.Approval(approved_by="maintainer"),
             canary={"run": "runs/canary-1"},
             rollback={"reference": "workflows/opencode.yml@revert-9f2"},
+            baseline_report=_clean_baseline(),
             window_started_at=WINDOW[0],
             window_ended_at=WINDOW[1],
         )
@@ -472,6 +778,7 @@ class FromArtifacts(unittest.TestCase):
             [result.describe() for result in results],
             live.describe(),
             origins=origins,
+            baseline_document=_clean_baseline().describe(),
             window_started_at=WINDOW[0],
             window_ended_at=WINDOW[1],
         )
@@ -486,6 +793,7 @@ class FromArtifacts(unittest.TestCase):
                 documents,
                 _liveness([result.correlation_id for result in results]).describe(),
                 origins=origins,
+                baseline_document=_clean_baseline().describe(),
                 window_started_at=WINDOW[0],
                 window_ended_at=WINDOW[1],
             )
@@ -496,6 +804,7 @@ class FromArtifacts(unittest.TestCase):
         live = _liveness([result.correlation_id for result in results])
         decision = cutover.decide(
             results, live, origins=origins,
+            baseline_report=_clean_baseline(),
             window_started_at=WINDOW[0], window_ended_at=WINDOW[1],
         )
         document = decision.describe()
@@ -514,6 +823,7 @@ class FromArtifacts(unittest.TestCase):
         results, origins = _results()
         first = cutover.decide(
             results, _liveness([r.correlation_id for r in results]), origins=origins,
+            baseline_report=_clean_baseline(),
             window_started_at=WINDOW[0], window_ended_at=WINDOW[1],
         )
         # Same event, same classification, different substance: the summary names
@@ -527,6 +837,7 @@ class FromArtifacts(unittest.TestCase):
         ]
         second = cutover.decide(
             retitled, _liveness([r.correlation_id for r in results]), origins=origins,
+            baseline_report=_clean_baseline(),
             window_started_at=WINDOW[0], window_ended_at=WINDOW[1],
         )
         self.assertNotEqual(first.evidence_digest, second.evidence_digest)
@@ -535,12 +846,14 @@ class FromArtifacts(unittest.TestCase):
         results, origins = _results()
         forward = cutover.decide(
             results, _liveness([r.correlation_id for r in results]), origins=origins,
+            baseline_report=_clean_baseline(),
             window_started_at=WINDOW[0], window_ended_at=WINDOW[1],
         )
         backward = cutover.decide(
             list(reversed(results)),
             _liveness([r.correlation_id for r in results]),
             origins=origins,
+            baseline_report=_clean_baseline(),
             window_started_at=WINDOW[0],
             window_ended_at=WINDOW[1],
         )

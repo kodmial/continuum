@@ -25,12 +25,23 @@ from continuum.release.core import (
     PLANNED,
     RELEASED,
     SOURCE_CONFLICT_CODE,
+    UNFILLED_PLACEHOLDER_CODE,
     UNRESUMABLE_CODE,
     ReleaseComponents,
     ReleaseCore,
+    ReleaseOutcome,
     ReleaseRequest,
 )
-from continuum.release.state import Journal, stage_names
+from continuum.release.state import (
+    BLOCKED,
+    COMPLETED,
+    Journal,
+    StageOutcome,
+    release_key,
+    stage_key,
+    stage_names,
+    wake_key,
+)
 from continuum.release.version import ExplicitVersion, ProjectFileVersion, VersionPolicy
 
 from . import release_core_support as support
@@ -277,6 +288,70 @@ class ChainTests(ReleaseTestCase):
         self.assertEqual(outcome.failure.code, SOURCE_CONFLICT_CODE)
         self.assertEqual(self.destination_calls(), [])
 
+    def test_a_generated_file_with_an_unfilled_token_is_refused_before_it_is_published(self):
+        # A missed substitution produces a file that is syntactically fine and
+        # looks plausible, and it ships a literal token to every user who installs
+        # from it. Nothing downstream would notice, so the build stage reads the
+        # files back.
+        self.adapter.artifact_suffix = ".rb"
+        self.adapter.leftover_token = 'version = "__VERSION__"\n'
+        outcome = self.core.execute(self.request())
+        self.assertTrue(outcome.failed)
+        self.assertEqual(outcome.failure.code, UNFILLED_PLACEHOLDER_CODE)
+        self.assertEqual(outcome.failure.stage, "build")
+        self.assertIn("__VERSION__", outcome.failure.summary)
+        # Refused before signing and before anything left the job.
+        self.assertEqual(self.adapter.signed, [])
+        self.assertEqual(self.destination_calls(), [])
+
+    def test_a_token_named_in_a_generated_file_comment_is_not_a_defect(self):
+        # The consumer's own templates document the tokens they substitute. A scan
+        # that flagged those would block correct releases until the documentation
+        # was rewritten, which is how a check teaches everyone to ignore it.
+        self.adapter.artifact_suffix = ".rb"
+        self.adapter.leftover_token = '# substituted for __VERSION__ by the generator\n'
+        outcome = self.core.execute(self.request())
+        self.assertTrue(outcome.released)
+        self.assertEqual(outcome.failure, None)
+
+    def test_a_binary_artifact_is_not_scanned_for_placeholders(self):
+        # The scan only claims to read text it can name a comment convention for.
+        # A `.zip` in the manifest is none of this module's business, and reading
+        # it as text would either fail or invent findings.
+        self.adapter.artifact_suffix = ".zip"
+        self.adapter.leftover_token = "__VERSION__"
+        outcome = self.core.execute(self.request())
+        self.assertTrue(outcome.released)
+
+    def test_a_declared_artifact_is_not_scanned(self):
+        # A dry run declares what would exist rather than building it, so there is
+        # no file to read and no substitution to have missed.
+        self.adapter.artifact_suffix = ".rb"
+        outcome = self.core.execute(self.request(dry_run=True))
+        self.assertTrue(outcome.planned)
+
+    def test_every_offending_file_is_named_rather_than_only_the_first(self):
+        # A serial repair is the wrong shape here: which file is wrong does not
+        # depend on who built it, and one refusal naming all of them is what lets
+        # a person fix the generator once.
+        self.adapter.artifact_suffix = ".rb"
+        self.adapter.leftover_token = 'a = "__VERSION__"\nb = "__SHA256_"\n'
+        outcome = self.core.execute(self.request())
+        self.assertTrue(outcome.failed)
+        self.assertIn("__VERSION__", outcome.failure.summary)
+        self.assertIn("__SHA256_", outcome.failure.summary)
+
+    def test_a_generated_file_that_cannot_be_decoded_is_reported(self):
+        # A build step that produced an unreadable "text" artifact has produced
+        # something nobody can vouch for, which is not the same as a clean scan.
+        self.adapter.artifact_suffix = ".rb"
+        self.adapter.body_bytes = b"\xff\xfe\x00not utf-8 at all"
+        outcome = self.core.execute(self.request())
+        self.assertTrue(outcome.failed)
+        self.assertEqual(outcome.failure.code, UNFILLED_PLACEHOLDER_CODE)
+        self.assertIn("could not be read", outcome.failure.summary)
+        self.assertEqual(self.destination_calls(), [])
+
     def test_a_published_manifest_records_who_verified_it(self):
         outcome = self.core.execute(self.request())
         manifest = outcome.manifests[0]
@@ -471,6 +546,68 @@ class ResumabilityTests(ReleaseTestCase):
         self.repository.fail_publish = RuntimeError("down")
         first = self.core.execute(self.request())
         self.assertEqual(first.journal.resume_point(), "publish")
+
+    def test_a_clean_release_owes_no_reconciliation(self):
+        outcome = self.core.execute(self.request())
+        self.assertTrue(outcome.released)
+        self.assertIsNone(outcome.owed_stage)
+        self.assertEqual(outcome.reconciliation_wake, "")
+        # Absent rather than empty in the artifact, so a reader cannot mistake an
+        # owed wake for one that was considered and found unnecessary.
+        self.assertNotIn("owed_stage", outcome.describe())
+        self.assertNotIn("reconciliation_wake", outcome.describe())
+
+    def test_a_deferred_stage_is_named_in_the_outcome_and_its_wake_is_keyed_on_the_head(self):
+        # A release-pr update that lands mid-publish is deferred rather than lost.
+        # Without the wake the release is green and the update is stranded, so the
+        # outcome has to say what is owed even when everything it did succeeded.
+        journal = Journal().extend(
+            [
+                StageOutcome(
+                    stage=name,
+                    key=stage_key(release_key(support.REPOSITORY, VERSION), name),
+                    outcome=BLOCKED if name == "draft" else COMPLETED,
+                    summary="deferred" if name == "draft" else "done",
+                    code="release-in-flight" if name == "draft" else "",
+                )
+                for name in stage_names()
+            ]
+        )
+        outcome = ReleaseOutcome(
+            status=RELEASED,
+            event=support.event(),
+            outcomes=(),
+            journal=journal,
+            source_sha=support.SHA,
+        )
+        self.assertEqual(outcome.owed_stage, "draft")
+        self.assertEqual(
+            outcome.reconciliation_wake, wake_key(support.REPOSITORY, support.SHA)
+        )
+        described = outcome.describe()
+        self.assertEqual(described["owed_stage"], "draft")
+        self.assertEqual(described["reconciliation_wake"], outcome.reconciliation_wake)
+
+    def test_a_wake_needs_a_head_and_is_absent_without_one(self):
+        # An outcome with no source SHA cannot name which head to reconcile, and a
+        # wake keyed on the wrong head would reconcile something nobody asked for.
+        journal = Journal().extend(
+            [
+                StageOutcome(
+                    stage=name,
+                    key=stage_key(release_key(support.REPOSITORY, VERSION), name),
+                    outcome=BLOCKED if name == "draft" else COMPLETED,
+                    summary="deferred" if name == "draft" else "done",
+                    code="release-in-flight" if name == "draft" else "",
+                )
+                for name in stage_names()
+            ]
+        )
+        outcome = ReleaseOutcome(
+            status=RELEASED, event=support.event(), journal=journal, source_sha=""
+        )
+        self.assertEqual(outcome.owed_stage, "draft")
+        self.assertEqual(outcome.reconciliation_wake, "")
 
     def test_a_run_that_cannot_see_its_artifacts_refuses_to_publish_them(self):
         first = self.core.execute(self.request())

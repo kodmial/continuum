@@ -921,6 +921,50 @@ class ControllerTests(unittest.TestCase):
         self.assertTrue(slept)
         self.assertEqual(len(client.provider_commands()), 1)
 
+    def test_the_wait_is_bounded_so_a_run_cannot_outlive_its_job(self):
+        # The sleep is real time, so it has to be bounded by the caller's budget
+        # and by the job's timeout. Unbounded, a stale cooldown turns every event
+        # into a job that never ends, which is what the workflow test asserts
+        # against the YAML.
+        client = self._repository(
+            pulls=[self._ready_pull(57)],
+            comments={
+                57: [
+                    support.issue_comment(
+                        "Review rate limited. Your next included review will be available "
+                        "in 5 minutes.",
+                        login="coderabbitai[bot]",
+                        created_at=iso(NOW),
+                        updated_at=iso(NOW),
+                    )
+                ]
+            },
+        )
+        self._green(client, 57)
+
+        slept: list = []
+        clock_value = {"now": NOW}
+        controller.reconcile(
+            client,
+            support.queue_config(),
+            wake=queue.WakeUp(event="schedule"),
+            now=NOW,
+            # Shorter than the cooldown, so the budget runs out mid-wait.
+            wait_ms=30_000,
+            max_passes=8,
+            sleep=lambda seconds: (
+                slept.append(seconds),
+                clock_value.update(now=NOW + int(seconds * 1000)),
+            )
+            and None,
+            clock=lambda: clock_value["now"],
+        )
+        # One wait, and it was no longer than the budget: the run gives up rather
+        # than sleeping out a cooldown that outlives its job.
+        self.assertEqual(len(slept), 1)
+        self.assertLessEqual(sum(slept), 30)
+        self.assertEqual(client.provider_commands(), [])
+
     def test_a_source_issue_priority_label_orders_the_queue(self):
         client = self._repository(
             pulls=[self._ready_pull(57, ""), self._ready_pull(59, "")]

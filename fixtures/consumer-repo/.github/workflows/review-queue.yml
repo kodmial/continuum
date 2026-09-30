@@ -53,9 +53,13 @@ permissions:
   pull-requests: write
   statuses: read
 
+# One controller at a time, and a run waiting out a provider cooldown is allowed
+# to finish. Cancelling it turns the wait into a livelock: every new wake-up
+# restarts it from the same cooldown it just re-read. See the shared controller
+# for the full argument.
 concurrency:
   group: continuum-review-queue
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   reconcile:

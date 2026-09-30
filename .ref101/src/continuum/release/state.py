@@ -719,7 +719,7 @@ EMPTY_JOURNAL = Journal()
 
 
 #: The stages whose completion is terminal for a release, and therefore the point
-#: after which anything the release deferred is owed a re-run. Read off ``STAGES``
+#: after which anything the release deferred is owed a re-run. Read off `STAGES`
 #: rather than restated, so a stage added to the chain cannot be silently left out
 #: of the rule about when deferred work becomes owed.
 TERMINAL_STAGES: Tuple[str, ...] = tuple(
@@ -730,11 +730,11 @@ TERMINAL_STAGES: Tuple[str, ...] = tuple(
 def wake_key(repository: str, source_sha: str) -> str:
     """The idempotency key for one release-completion wake.
 
-    Keyed on the source head rather than on the release version, because the thing a
-    wake re-runs is *reconciliation of the head*, not publication of a version. Two
-    deliveries of one completed run, a re-run of a failed job, and a second workflow
-    watching the same branch are three deliveries and one wake; the same head
-    genuinely released twice is one head and still one wake.
+    Keyed on the source head rather than on the release version, because the thing
+    a wake re-runs is *reconciliation of the head*, not publication of a version.
+    Two deliveries of one completed run, a re-run of a failed job, and a second
+    workflow watching the same branch are three deliveries and one wake; the same
+    head genuinely released twice is one head and still one wake.
     """
 
     if not (source_sha or "").strip():
@@ -786,6 +786,9 @@ __all__ = [
     "BLOCKED",
     "COMPLETED",
     "EMPTY_JOURNAL",
+    "TERMINAL_STAGES",
+    "owed_reconciliation",
+    "wake_key",
     "FAILED",
     "FIRST_STAGE",
     "GREEN_OUTCOMES",
@@ -800,7 +803,6 @@ __all__ = [
     "SKIPPED",
     "STAGES",
     "SUPPORTED_OUTCOMES",
-    "TERMINAL_STAGES",
     "TRANSITIONS",
     "Stage",
     "StageOutcome",
@@ -810,12 +812,10 @@ __all__ = [
     "digest_key",
     "event_key",
     "next_stage",
-    "owed_reconciliation",
     "release_key",
     "scopes_are_isolated",
     "stage",
     "stage_key",
     "stage_names",
     "unit_key",
-    "wake_key",
 ]

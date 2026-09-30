@@ -27,16 +27,38 @@ Three properties make the answer trustworthy rather than merely computed:
   the digest of the evidence it was granted against. An approval whose digest no
   longer matches is refused, so a decision cannot be carried over to a window
   that has moved on since it was made.
+
+* **A window says nothing about the repository today.** Every argument to
+  :func:`decide` is evidence recorded during the window. None of it names the
+  consumer's current default-branch HEAD, its active workflow blobs, or the open
+  pull requests that could reintroduce an orchestration writer the cutover
+  removes. That is the reading :mod:`continuum.shadow.baseline` takes, and the
+  gate requires one: an audit of the live head is the only thing that can tell a
+  cutover that the world has not moved under it. The baseline's own evidence
+  digest is folded into the approval digest, so a drift found after the approval
+  was granted invalidates that approval rather than sitting beside it.
+
+* **Fresh evidence means after the audit, not merely bound to it.** A clean
+  reading says the repository still matches the ledger. It does not say the
+  window observed that state: a ledger re-pinned today makes an old window
+  *agree* with the present without ever having seen it. So the window must start
+  on or after the ledger's audit date, and an unreadable date on either side
+  blocks rather than defaulting to acceptable.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import datetime
 import hashlib
 import json
+import re
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from . import baseline as baseline_plane
 from . import liveness, parity
+
+_DATE_PREFIX = re.compile(r"^(\d{4})-(\d{2})-(\d{2})")
 
 CUTOVER_SCHEMA = "continuum.shadow-cutover/v1"
 
@@ -262,6 +284,81 @@ class Coverage:
         }
 
 
+def _iso_date(value: str) -> Optional[str]:
+    """The ``YYYY-MM-DD`` prefix of an ISO timestamp, or None if there is not one.
+
+    Deliberately a prefix match rather than a full parse. These are human-supplied
+    records whose exact format is not this gate's to decide, and the question being
+    asked -- did the window start before the ledger was audited -- is a question
+    about days. Anything with no leading date is returned as unreadable, so the
+    caller blocks on it instead of guessing an order it cannot justify.
+    """
+
+    text = str(value or "").strip()
+    match = _DATE_PREFIX.match(text)
+    if match is None:
+        return None
+    try:
+        datetime.date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    except ValueError:
+        return None
+    return text[:10]
+
+
+def _freshness_blockers(
+    report: baseline_plane.BaselineReport, window_started_at: str
+) -> List[Blocker]:
+    """Require the window to postdate the ledger the evidence is judged against.
+
+    The approval digest already ties an approval to one ledger. What it cannot do
+    is notice that the window was collected *before* that ledger existed, which is
+    exactly what happens when a difference is re-audited and the old window is
+    re-signed: the reading and the approval then agree perfectly about a repository
+    state no run in the window ever observed. Fresh evidence has to be evidence
+    collected after the audit, so the order is checked rather than assumed.
+    """
+
+    audited = _iso_date(report.audited_at)
+    if audited is None:
+        return [
+            Blocker(
+                code="ledger_audit_date_unreadable",
+                message=(
+                    "the parity ledger records no usable audit date (found {!r}); the "
+                    "window cannot be shown to postdate the audit, so the evidence is "
+                    "not shown to be fresh".format(report.audited_at or "nothing")
+                ),
+            )
+        ]
+
+    started = _iso_date(window_started_at)
+    if started is None:
+        return [
+            Blocker(
+                code="window_start_unreadable",
+                message=(
+                    "the window's start ({!r}) is not an ISO timestamp, so it cannot be "
+                    "compared with the ledger's audit date {}".format(
+                        window_started_at or "nothing", audited
+                    )
+                ),
+            )
+        ]
+
+    if started < audited:
+        return [
+            Blocker(
+                code="window_predates_ledger",
+                message=(
+                    "the window began {} but the parity ledger was audited {}; evidence "
+                    "collected before the audit cannot show what the audited state "
+                    "does".format(started, audited)
+                ),
+            )
+        ]
+    return []
+
+
 def coverage(
     results: Sequence[parity.ParityResult],
     *,
@@ -398,6 +495,11 @@ class CutoverDecision:
     unresolved: Tuple[Mapping[str, Any], ...] = ()
     canary: Mapping[str, Any] = dataclasses.field(default_factory=dict)
     rollback: Mapping[str, Any] = dataclasses.field(default_factory=dict)
+    #: The live-head reading the window was judged against, and every difference
+    #: it found. Kept on the decision rather than only in the gate's blockers so
+    #: a reader of the artifact can see *what was compared*, not just that the
+    #: comparison failed.
+    baseline: Optional[baseline_plane.BaselineReport] = None
 
     @property
     def codes(self) -> Tuple[str, ...]:
@@ -418,6 +520,7 @@ class CutoverDecision:
             "coverage": self.coverage.describe() if self.coverage is not None else None,
             "canary": dict(self.canary),
             "rollback": dict(self.rollback),
+            "baseline": self.baseline.describe() if self.baseline is not None else None,
             "approval": self.approval.describe() if self.approval is not None else None,
         }
 
@@ -443,6 +546,7 @@ def decide(
     approval: Optional[Approval] = None,
     canary: Optional[Mapping[str, Any]] = None,
     rollback: Optional[Mapping[str, Any]] = None,
+    baseline_report: Optional[baseline_plane.BaselineReport] = None,
     window_started_at: str = "",
     window_ended_at: str = "",
     generated_from: str = "",
@@ -554,10 +658,48 @@ def decide(
             )
 
     digest = evidence_digest(
-        report, results, liveness_report, resolutions, window_started_at, window_ended_at
+        report,
+        results,
+        liveness_report,
+        resolutions,
+        window_started_at,
+        window_ended_at,
+        baseline_report,
     )
 
-    # 4. The canary and the rollback path, then the human decision.
+    # 4. The live head, read now rather than remembered from the window. Placed
+    # after coverage and liveness and before the approval so that a drift and an
+    # uncovered scenario are reported together: fixing one and re-running would
+    # otherwise look like progress when the other was the thing that mattered.
+    if baseline_report is None:
+        blockers.append(
+            Blocker(
+                code="no_live_baseline",
+                message=(
+                    "no live-head reading was supplied. Every other input to this "
+                    "decision was recorded during the window and says nothing about "
+                    "the consumer repository as it is now: a historical reference "
+                    "snapshot can never authorize a cutover"
+                ),
+            )
+        )
+    else:
+        # The baseline's blockers are forwarded rather than summarised, so the
+        # cutover artifact names the exact file or pull request that moved and the
+        # issue that has to resolve it. Collapsing them into one code would make
+        # a reader fetch a second document to learn what to do next.
+        for blocker in baseline_report.blockers:
+            blockers.append(
+                Blocker(
+                    code=blocker.code,
+                    message="live head: {}".format(blocker.message),
+                    scenario=blocker.subject,
+                    correlation_ids=(blocker.subject,) if blocker.subject else (),
+                )
+            )
+        blockers.extend(_freshness_blockers(baseline_report, window_started_at))
+
+    # 5. The canary and the rollback path, then the human decision.
     approved = False
     if approval is not None:
         if not approval.complete:
@@ -627,6 +769,7 @@ def decide(
         unresolved=tuple(unresolved),
         canary=dict(canary or {}),
         rollback=dict(rollback or {}),
+        baseline=baseline_report,
     )
 
 
@@ -637,14 +780,16 @@ def evidence_digest(
     resolutions: Sequence[Resolution],
     window_started_at: str,
     window_ended_at: str,
+    baseline_report: Optional["baseline_plane.BaselineReport"] = None,
 ) -> str:
     """A digest of the evidence an approval is granted against.
 
     Covers the verdicts, the coverage, the liveness verdicts, the resolutions,
-    and the window's dates -- so an approval cannot be carried over to a window
-    that has gained an event, lost a resolution, or moved its dates. Ordering is
-    canonicalised first, so two runs that saw the same events in a different
-    delivery order produce the same digest.
+    the window's dates, and the live-head reading -- so an approval cannot be
+    carried over to a window that has gained an event, lost a resolution, or
+    moved its dates, and cannot survive a workflow that changed after it was
+    granted. Ordering is canonicalised first, so two runs that saw the same
+    events in a different delivery order produce the same digest.
     """
 
     payload = {
@@ -672,6 +817,12 @@ def evidence_digest(
         "resolutions": sorted(
             (record.correlation_id, record.resolution) for record in resolutions
         ),
+        # The live reading is part of the evidence, not a footnote to it. Reading
+        # it through its own digest is enough and is what makes the omission
+        # loud: a cutover judged against a drifted head carries a digest that no
+        # existing approval can match, so the approval has to be granted again
+        # against the head that exists when it is granted.
+        "baseline": baseline_report.evidence_digest if baseline_report is not None else None,
     }
     return "ev-" + hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
@@ -701,6 +852,7 @@ def from_documents(
     approval_document: Optional[Mapping[str, Any]] = None,
     canary: Optional[Mapping[str, Any]] = None,
     rollback: Optional[Mapping[str, Any]] = None,
+    baseline_document: Optional[Mapping[str, Any]] = None,
     window_started_at: str = "",
     window_ended_at: str = "",
     generated_from: str = "",
@@ -744,6 +896,13 @@ def from_documents(
             rollback_reference=str(approval_document.get("rollback_reference", "")),
             note=str(approval_document.get("note", "")),
         )
+    baseline_report = None
+    if baseline_document is not None:
+        # Parsed through the baseline's own reader rather than indexed here, so a
+        # report the gate cannot vouch for -- an incoherent one, or one that lost
+        # its evidence digest in transit -- fails here instead of reading as a
+        # clean audit.
+        baseline_report = baseline_plane.read_report(baseline_document)
     return decide(
         results,
         report,
@@ -760,6 +919,7 @@ def from_documents(
         approval=approval,
         canary=canary,
         rollback=rollback,
+        baseline_report=baseline_report,
         window_started_at=window_started_at or str((liveness_document or {}).get("window_started_at", "")),
         window_ended_at=window_ended_at or str((liveness_document or {}).get("window_ended_at", "")),
         generated_from=generated_from,

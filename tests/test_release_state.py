@@ -29,12 +29,14 @@ from continuum.release.state import (
     channel_key,
     event_key,
     next_stage,
+    owed_reconciliation,
     release_key,
     scopes_are_isolated,
     stage,
     stage_key,
     stage_names,
     unit_key,
+    wake_key,
 )
 
 from . import release_core_support as support
@@ -365,6 +367,118 @@ class JournalTests(unittest.TestCase):
     def test_a_summary_is_one_line_per_transition(self):
         journal = Journal().record(StageOutcome.noop("sync", "k", "no sync configured"))
         self.assertEqual(journal.summaries(), ["sync: noop — no sync configured"])
+
+
+class ReconciliationWakes(unittest.TestCase):
+    """A deferral that nothing ever picks up again.
+
+    A release-pr update that lands while a release is publishing is deferred, not
+    skipped: the version in the tree is already ahead of what has been published, so
+    acting on it immediately would compute the same answer twice. That leaves the
+    release green and the update stranded, unless something re-opens the deferral
+    when the release finishes.
+    """
+
+    def _journal(self, *entries):
+        return Journal().extend(
+            [
+                StageOutcome(
+                    stage=name,
+                    key=stage_key(RELEASE, name),
+                    outcome=outcome,
+                    summary=summary,
+                    code=code,
+                )
+                for name, outcome, summary, code in entries
+            ]
+        )
+
+    def test_a_completion_re_opens_the_deferred_stage(self):
+        journal = self._journal(
+            ("source", COMPLETED, "head read", ""),
+            ("draft", BLOCKED, "a release for this head is in flight", "release-in-flight"),
+            ("publish", COMPLETED, "published", ""),
+        )
+        self.assertEqual(owed_reconciliation(journal), "draft")
+
+    def test_a_deferral_mid_flight_is_owed_nothing_yet(self):
+        # The thing that has to change is the release finishing. Reporting a debt
+        # here would dispatch work that is correct to refuse until the publish
+        # stage has actually completed.
+        journal = self._journal(
+            ("source", COMPLETED, "head read", ""),
+            ("draft", BLOCKED, "a release for this head is in flight", "release-in-flight"),
+        )
+        self.assertIsNone(owed_reconciliation(journal))
+
+    def test_a_failure_is_not_a_deferral_and_does_not_loop(self):
+        # A fatal failure has to change something before it can be retried, so
+        # re-opening it on an unrelated completion would loop forever.
+        journal = self._journal(
+            ("source", COMPLETED, "head read", ""),
+            ("draft", FAILED, "the draft pull request was rejected", "rejected"),
+            ("publish", COMPLETED, "published", ""),
+        )
+        self.assertIsNone(owed_reconciliation(journal))
+
+    def test_a_clean_release_owes_nothing(self):
+        journal = self._journal(
+            *((name, COMPLETED, "done", "") for name in stage_names())
+        )
+        self.assertIsNone(owed_reconciliation(journal))
+
+    def test_an_empty_journal_owes_nothing(self):
+        self.assertIsNone(owed_reconciliation(EMPTY_JOURNAL))
+
+    def test_the_earliest_deferral_on_the_chain_is_re_opened(self):
+        # Two deferrals: re-opening the last would leave the first stranded behind
+        # a green release that reported a debt it had not discharged.
+        journal = self._journal(
+            ("source", COMPLETED, "head read", ""),
+            ("draft", BLOCKED, "deferred", "release-in-flight"),
+            ("sync", BLOCKED, "deferred", "release-in-flight"),
+            ("publish", COMPLETED, "published", ""),
+        )
+        self.assertEqual(owed_reconciliation(journal), "draft")
+
+    def test_the_terminal_stages_are_read_off_the_chain(self):
+        # Not restated, so a stage added to the chain cannot be silently left out
+        # of the rule about when deferred work becomes owed.
+        self.assertEqual(
+            set(state.TERMINAL_STAGES),
+            {item.name for item in STAGES if item.terminal},
+        )
+        self.assertTrue(set(state.TERMINAL_STAGES))
+
+    def test_one_completed_head_is_one_wake_however_it_is_delivered(self):
+        # A re-run, a second workflow watching the same branch, and a duplicate
+        # dispatch are three deliveries of one reconciliation.
+        keys = {
+            wake_key(support.REPOSITORY, "a" * 40),
+            wake_key(support.REPOSITORY, "A" * 40),
+            wake_key(support.REPOSITORY, "  {}  ".format("a" * 40)),
+        }
+        self.assertEqual(len(keys), 1)
+
+    def test_two_heads_are_two_wakes(self):
+        self.assertNotEqual(
+            wake_key(support.REPOSITORY, "a" * 40),
+            wake_key(support.REPOSITORY, "b" * 40),
+        )
+
+    def test_two_repositories_wake_separately(self):
+        # The key is scoped, so the same commit in a fork cannot suppress the
+        # consumer's own reconciliation.
+        self.assertNotEqual(
+            wake_key(support.REPOSITORY, "a" * 40),
+            wake_key("someone/else", "a" * 40),
+        )
+
+    def test_a_wake_without_a_head_is_refused(self):
+        for value in ("", "   ", None):
+            with self.assertRaises(ReleaseStateError) as caught:
+                wake_key(support.REPOSITORY, value)
+            self.assertEqual(caught.exception.code, "missing-source-sha")
 
 
 if __name__ == "__main__":

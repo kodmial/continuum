@@ -1,0 +1,97 @@
+name: Continuum migration preflight
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/continuum-migration-preflight.yml'
+      - '.github/workflows/continuum-shadow-bridge.yml'
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  preflight:
+    name: Continuum migration readiness
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      HAS_TAP_PAT: ${{ secrets.TAP_PAT != '' && 'true' || 'false' }}
+      HAS_OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY != '' && 'true' || 'false' }}
+      HAS_SIGNING_P12: ${{ secrets.NANODICTATE_SIGNING_P12 != '' && 'true' || 'false' }}
+      HAS_SIGNING_PASSWORD: ${{ secrets.NANODICTATE_SIGNING_PASSWORD != '' && 'true' || 'false' }}
+      WIP_LIMIT: ${{ vars.AUTOMATION_WIP_LIMIT || '2' }}
+      LEASE_MINUTES: ${{ vars.AUTOMATION_LEASE_MINUTES || '45' }}
+      MAX_DISPATCH_ATTEMPTS: ${{ vars.AUTOMATION_MAX_DISPATCH_ATTEMPTS || '2' }}
+      OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/big-pickle' }}
+      MAINTAINERS: ${{ vars.MAINTAINERS != '' && vars.MAINTAINERS || '@kodmial' }}
+      REVISION: ${{ vars.REVISION != '' && vars.REVISION || '0' }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Validate migration prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          missing=()
+          [[ "$HAS_TAP_PAT" == "true" ]] || missing+=("TAP_PAT")
+          [[ "$HAS_SIGNING_P12" == "true" ]] || missing+=("NANODICTATE_SIGNING_P12")
+          [[ "$HAS_SIGNING_PASSWORD" == "true" ]] || missing+=("NANODICTATE_SIGNING_PASSWORD")
+
+          [[ "$WIP_LIMIT" =~ ^[1-9][0-9]*$ ]] || { echo "::error::AUTOMATION_WIP_LIMIT resolves to an invalid value."; exit 1; }
+          [[ "$LEASE_MINUTES" =~ ^[1-9][0-9]*$ ]] || { echo "::error::AUTOMATION_LEASE_MINUTES resolves to an invalid value."; exit 1; }
+          [[ "$MAX_DISPATCH_ATTEMPTS" =~ ^[1-9][0-9]*$ ]] || { echo "::error::AUTOMATION_MAX_DISPATCH_ATTEMPTS resolves to an invalid value."; exit 1; }
+          [[ -n "$OPENCODE_MODEL" ]] || { echo "::error::OPENCODE_MODEL resolves to an empty value."; exit 1; }
+          [[ "$REVISION" =~ ^[0-9]+$ ]] || { echo "::error::REVISION resolves to an invalid value."; exit 1; }
+
+          default_branch="$(gh api "repos/$GITHUB_REPOSITORY" --jq '.default_branch')"
+          [[ -n "$default_branch" ]] || { echo "::error::Unable to resolve default branch."; exit 1; }
+
+          {
+            echo "## Continuum migration preflight"
+            echo
+            echo "- repository: `$GITHUB_REPOSITORY`"
+            echo "- default branch: `$default_branch`"
+            echo "- WIP limit: `$WIP_LIMIT`"
+            echo "- lease minutes: `$LEASE_MINUTES`"
+            echo "- max dispatch attempts: `$MAX_DISPATCH_ATTEMPTS`"
+            echo "- OpenCode model: `$OPENCODE_MODEL`"
+            echo "- maintainers: `$MAINTAINERS`"
+            echo "- release revision: `$REVISION`"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if (( ${#missing[@]} > 0 )); then
+            printf 'Missing required existing repository secret(s): %s\n' "${missing[*]}" >&2
+            {
+              echo "### Result: NOT READY"
+              echo
+              echo "Missing repository secret metadata: `${missing[*]}`."
+              echo "No secret value was read or printed."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          {
+            echo "### Result: READY"
+            echo
+            echo "All mandatory existing repository secrets for cutover are present."
+            if [[ "$HAS_OPENCODE_API_KEY" == "true" ]]; then
+              echo "Optional OPENCODE_API_KEY is present."
+            else
+              echo "Optional OPENCODE_API_KEY is absent; this is not a blocker because the current NanoDictate OpenCode issue run succeeds with the configured OpenCode free model without it."
+            fi
+            echo "No new secret provisioning is required for the current cutover design."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify GitHub dependency API is readable
+        shell: bash
+        run: |
+          set -euo pipefail
+          issue="$(gh api "repos/$GITHUB_REPOSITORY/issues?state=open&per_page=1" --jq '.[0].number // empty')"
+          if [[ -n "$issue" ]]; then
+            gh api -H "X-GitHub-Api-Version: 2026-03-10"               "repos/$GITHUB_REPOSITORY/issues/$issue/dependencies/blocked_by" >/dev/null
+          fi

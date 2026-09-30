@@ -1,0 +1,653 @@
+name: Retry CodeRabbit after rate limit
+
+on:
+  # Any new/edited CodeRabbit rate-limit response wakes the global controller.
+  issue_comment:
+    types: [created, edited]
+
+  # A completed CodeRabbit review consumes the shared included-review quota.
+  # Wake the controller so it can move the next queued PR behind the global
+  # cooldown instead of immediately burning another retry.
+  pull_request_review:
+    types: [submitted]
+
+  # Manual/safety-net reconciliation.
+  workflow_dispatch:
+
+permissions: {}
+
+# CodeRabbit's included full-review quota is shared across PRs. There must be
+# exactly one controller deciding which PR gets the next review slot.
+concurrency:
+  group: nanodictate-coderabbit-rate-limit-controller
+  # This controller deliberately sleeps until the next shared quota slot.
+  # Cancelling it on every wake-up resets that timer and can starve the queue
+  # forever when status/review events keep arriving. Keep one runner alive;
+  # GitHub concurrency retains at most one pending successor behind it.
+  cancel-in-progress: false
+
+jobs:
+  controller:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request != null &&
+       github.event.comment.user.login == 'coderabbitai[bot]' &&
+       (contains(github.event.comment.body, 'Review rate limited') ||
+        contains(github.event.comment.body, 'Review limit reached'))) ||
+      (github.event_name == 'pull_request_review' &&
+       github.event.review.user.login == 'coderabbitai[bot]' &&
+       github.event.pull_request.state == 'open')
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+      pull-requests: read
+      statuses: read
+
+    steps:
+      - name: Reconcile global CodeRabbit review queue
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const repoFullName = `${owner}/${repo}`;
+
+            const RATE_LIMIT_RE =
+              /Review rate limited|Review limit reached/i;
+            const REQUESTED_LABEL = 'coderabbit-review-requested';
+            const FULL_REVIEW_COMMAND_RE =
+              /^@coderabbitai\s+(?:full\s+)?review\s*$/i;
+            const priorityRank = new Map([
+              ['priority:p0', 0],
+              ['priority:p1', 1],
+              ['priority:p2', 2],
+            ]);
+
+            // CodeRabbit currently provides one included full review per hour.
+            // A completed full review therefore moves the shared controller
+            // window for every other PR, even if their old per-PR timer expired.
+            const REVIEW_COOLDOWN_MS = 60 * 60_000;
+            const SAFETY_MARGIN_MS = 30_000;
+            const MAX_WAIT_MS = 5 * 60 * 60_000 + 45 * 60_000;
+            const IN_FLIGHT_TIMEOUT_MS = 30 * 60_000;
+
+            function retryWindowText(body = '') {
+              const patterns = [
+                /next\s+(?:included\s+)?review\b[^\n<.]{0,120}?\bavailable\b[^\n<.]{0,40}?\b(?:in|after)\s+([^\n<.]+)/i,
+                /(?:try|retry)\s+again\b[^\n<.]{0,40}?\b(?:in|after)\s+([^\n<.]+)/i,
+              ];
+              for (const pattern of patterns) {
+                const match = body.match(pattern);
+                if (match) return match[1];
+              }
+              return null;
+            }
+
+            function parseDurationMs(text = '') {
+              if (/less than\s+(?:a|one)\s+minute/i.test(text)) {
+                return 60_000;
+              }
+
+              let totalMs = 0;
+              let found = false;
+              for (const part of text.matchAll(
+                /(\d+)\s*(hours?|hrs?|minutes?|mins?|seconds?|secs?)/gi
+              )) {
+                found = true;
+                const value = Number(part[1]);
+                const unit = part[2].toLowerCase();
+                if (unit.startsWith('hour') || unit.startsWith('hr')) {
+                  totalMs += value * 60 * 60_000;
+                } else if (
+                  unit.startsWith('minute') ||
+                  unit.startsWith('min')
+                ) {
+                  totalMs += value * 60_000;
+                } else {
+                  totalMs += value * 1_000;
+                }
+              }
+              return found ? totalMs : null;
+            }
+
+            function parseRetryDelayMs(body = '') {
+              const windowText = retryWindowText(body);
+              const parsed = windowText === null
+                ? null
+                : parseDurationMs(windowText);
+              if (parsed !== null) return parsed;
+
+              if (RATE_LIMIT_RE.test(body)) {
+                core.warning(
+                  'Could not parse CodeRabbit quota countdown; using 65-minute fallback.'
+                );
+                return 65 * 60_000;
+              }
+              return null;
+            }
+
+            // Keep parser behavior executable and visible inside the controller.
+            const parserCases = [
+              [
+                'Review rate limited. Next included review available in 13 minutes.',
+                13 * 60_000,
+              ],
+              [
+                'Review rate limited. Your next included review will be available in 13 minutes.',
+                13 * 60_000,
+              ],
+              [
+                'Review limit reached. Your next review is available after 1 hour 5 minutes.',
+                65 * 60_000,
+              ],
+              [
+                'Review rate limited. Try again in less than a minute.',
+                60_000,
+              ],
+            ];
+            for (const [sample, expected] of parserCases) {
+              const actual = parseRetryDelayMs(sample);
+              if (actual !== expected) {
+                throw new Error(
+                  `CodeRabbit retry parser regression: expected ${expected}, got ${actual} for "${sample}"`
+                );
+              }
+            }
+
+            async function currentHeadHasGreenCi(pr) {
+              const runs = await github.paginate(
+                github.rest.actions.listWorkflowRunsForRepo,
+                {
+                  owner,
+                  repo,
+                  branch: pr.head.ref,
+                  event: 'pull_request',
+                  per_page: 100,
+                }
+              );
+
+              const current = runs
+                .filter(run =>
+                  run.name === 'CI' &&
+                  run.head_sha === pr.head.sha
+                )
+                .sort(
+                  (a, b) =>
+                    new Date(b.created_at).getTime() -
+                    new Date(a.created_at).getTime()
+                )[0];
+
+              return Boolean(
+                current &&
+                current.status === 'completed' &&
+                current.conclusion === 'success'
+              );
+            }
+
+            function sourceIssueNumber(pr) {
+              const branchMatch =
+                (pr.head.ref || '').match(/^opencode\/issue(\d+)-/);
+              if (branchMatch) return Number(branchMatch[1]);
+
+              const bodyMatch =
+                (pr.body || '').match(/\b(?:Closes|Fixes|Resolves)\s+#(\d+)\b/i);
+              return bodyMatch ? Number(bodyMatch[1]) : null;
+            }
+
+            async function sourcePriority(pr) {
+              const issueNumber = sourceIssueNumber(pr);
+              if (!issueNumber) {
+                return {
+                  issueNumber: Number.MAX_SAFE_INTEGER,
+                  priority: 'unprioritized',
+                  rank: Number.MAX_SAFE_INTEGER,
+                };
+              }
+
+              try {
+                const { data: issue } = await github.rest.issues.get({
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                });
+                const labels = new Set(
+                  (issue.labels || []).map(label =>
+                    typeof label === 'string' ? label : label.name
+                  )
+                );
+                for (const name of ['priority:p0', 'priority:p1', 'priority:p2']) {
+                  if (labels.has(name)) {
+                    return {
+                      issueNumber,
+                      priority: name,
+                      rank: priorityRank.get(name),
+                    };
+                  }
+                }
+              } catch (err) {
+                if (err.status !== 404) throw err;
+              }
+
+              return {
+                issueNumber,
+                priority: 'unprioritized',
+                rank: Number.MAX_SAFE_INTEGER,
+              };
+            }
+
+            async function latestCodeRabbitStatus(pr) {
+              const { data: combined } =
+                await github.rest.repos.getCombinedStatusForRef({
+                  owner,
+                  repo,
+                  ref: pr.head.sha,
+                });
+
+              return (combined.statuses || [])
+                .filter(status => status.context === 'CodeRabbit')
+                .sort(
+                  (a, b) =>
+                    new Date(b.updated_at || b.created_at).getTime() -
+                    new Date(a.updated_at || a.created_at).getTime()
+                )[0] || null;
+            }
+
+            async function collectState() {
+              const pulls = await github.paginate(github.rest.pulls.list, {
+                owner,
+                repo,
+                state: 'open',
+                base: 'main',
+                per_page: 100,
+              });
+
+              let latestCompletedReviewAt = 0;
+              let latestInFlightCommand = null;
+              const candidates = [];
+
+              for (const listed of pulls) {
+                const { data: pr } = await github.rest.pulls.get({
+                  owner,
+                  repo,
+                  pull_number: listed.number,
+                });
+
+                if (
+                  pr.state !== 'open' ||
+                  pr.draft ||
+                  pr.head.repo?.full_name !== repoFullName
+                ) {
+                  continue;
+                }
+
+                const reviews = await github.paginate(
+                  github.rest.pulls.listReviews,
+                  {
+                    owner,
+                    repo,
+                    pull_number: pr.number,
+                    per_page: 100,
+                  }
+                );
+
+                const comments = await github.paginate(
+                  github.rest.issues.listComments,
+                  {
+                    owner,
+                    repo,
+                    issue_number: pr.number,
+                    per_page: 100,
+                  }
+                );
+
+                const carriedApprovalMarker = comments.some(comment =>
+                  comment.user?.login === owner &&
+                  (comment.body || '').includes(
+                    `<!-- auto-main-sync head=${pr.head.sha}`
+                  )
+                );
+
+                // A repository-wide review slot remains occupied from the
+                // instant the controller posts a full-review command until
+                // CodeRabbit either rejects it with a rate-limit response or
+                // submits a full review decision. This closes the race where
+                // several controller wake-ups could spend the same shared slot
+                // before CodeRabbit had time to respond to the first command.
+                const commands = comments
+                  .filter(comment =>
+                    comment.user?.login !== 'coderabbitai[bot]' &&
+                    FULL_REVIEW_COMMAND_RE.test(comment.body?.trim() || '')
+                  )
+                  .sort(
+                    (a, b) =>
+                      new Date(b.created_at).getTime() -
+                      new Date(a.created_at).getTime()
+                  );
+
+                for (const command of commands) {
+                  const commandAt = new Date(command.created_at).getTime();
+                  const rateLimitedAfter = comments.some(comment =>
+                    comment.user?.login === 'coderabbitai[bot]' &&
+                    RATE_LIMIT_RE.test(comment.body || '') &&
+                    new Date(
+                      comment.updated_at || comment.created_at
+                    ).getTime() > commandAt
+                  );
+                  const reviewedAfter = reviews.some(review => {
+                    if (
+                      !review.user?.login?.startsWith('coderabbitai') ||
+                      !review.submitted_at
+                    ) {
+                      return false;
+                    }
+                    const fullReview =
+                      review.state === 'APPROVED' ||
+                      review.state === 'CHANGES_REQUESTED' ||
+                      (
+                        review.state === 'COMMENTED' &&
+                        Boolean((review.body || '').trim())
+                      );
+                    return (
+                      fullReview &&
+                      new Date(review.submitted_at).getTime() > commandAt
+                    );
+                  });
+
+                  if (!rateLimitedAfter && !reviewedAfter) {
+                    if (
+                      !latestInFlightCommand ||
+                      commandAt > latestInFlightCommand.at
+                    ) {
+                      latestInFlightCommand = {
+                        prNumber: pr.number,
+                        at: commandAt,
+                        headSha: pr.head.sha,
+                      };
+                    }
+                    break;
+                  }
+                }
+
+                let fullReviewCount = 0;
+                for (const review of reviews) {
+                  if (
+                    !review.user?.login?.startsWith('coderabbitai') ||
+                    !review.submitted_at
+                  ) {
+                    continue;
+                  }
+
+                  // APPROVED / CHANGES_REQUESTED are full review decisions.
+                  // COMMENTED is counted only when it has a non-empty body,
+                  // which covers full-review nitpick summaries but avoids
+                  // treating empty thread-verification shells as quota use.
+                  const fullReview =
+                    review.state === 'APPROVED' ||
+                    review.state === 'CHANGES_REQUESTED' ||
+                    (
+                      review.state === 'COMMENTED' &&
+                      Boolean((review.body || '').trim())
+                    );
+                  if (!fullReview) continue;
+
+                  fullReviewCount += 1;
+                  latestCompletedReviewAt = Math.max(
+                    latestCompletedReviewAt,
+                    new Date(review.submitted_at).getTime()
+                  );
+                }
+
+                const labels = new Set(
+                  (pr.labels || []).map(label =>
+                    typeof label === 'string' ? label : label.name
+                  )
+                );
+                if (!labels.has('review-ready')) continue;
+                if (!(await currentHeadHasGreenCi(pr))) continue;
+
+                const requested = labels.has(REQUESTED_LABEL);
+                const rabbitStatus = await latestCodeRabbitStatus(pr);
+
+                let dueAt = 0;
+                let kind = 'initial';
+
+                if (
+                  rabbitStatus &&
+                  RATE_LIMIT_RE.test(rabbitStatus.description || '')
+                ) {
+                  const latestLimit = comments
+                    .filter(comment =>
+                      comment.user?.login === 'coderabbitai[bot]' &&
+                      RATE_LIMIT_RE.test(comment.body || '')
+                    )
+                    .map(comment => {
+                      const delayMs = parseRetryDelayMs(comment.body || '');
+                      if (delayMs === null) return null;
+                      return {
+                        comment,
+                        delayMs,
+                        at: new Date(
+                          comment.updated_at || comment.created_at
+                        ).getTime(),
+                      };
+                    })
+                    .filter(Boolean)
+                    .sort((a, b) => b.at - a.at)[0];
+
+                  if (!latestLimit) continue;
+
+                  const commandAfterLimit = comments.some(comment =>
+                    comment.user?.login !== 'coderabbitai[bot]' &&
+                    FULL_REVIEW_COMMAND_RE.test(comment.body?.trim() || '') &&
+                    new Date(comment.created_at).getTime() > latestLimit.at
+                  );
+                  if (commandAfterLimit) continue;
+
+                  dueAt =
+                    latestLimit.at +
+                    latestLimit.delayMs +
+                    SAFETY_MARGIN_MS;
+                  kind = 'retry';
+                } else {
+                  // Initial full reviews are also globally serialized. The
+                  // requested label is acquired only by this controller when it
+                  // actually emits the command for the current head.
+                  if (requested) {
+                    // A carried approval intentionally has the requested label
+                    // without a new CodeRabbit command for this HEAD.
+                    if (carriedApprovalMarker) continue;
+
+                    // The requested label is a lock, not a permanent terminal
+                    // state. If CodeRabbit never produced a full review or a
+                    // rate-limit response, retry the current head after the
+                    // in-flight timeout. This recovers from terminal command
+                    // failures such as "Pull request base or head changed" and
+                    // from lost webhook/status wake-ups.
+                    const latestCommand = commands[0] || null;
+                    if (latestCommand) {
+                      dueAt =
+                        new Date(latestCommand.created_at).getTime() +
+                        IN_FLIGHT_TIMEOUT_MS;
+                      kind = 'stale-retry';
+                    } else {
+                      // Defensive recovery for a lock label left behind without
+                      // any matching review command.
+                      dueAt = 0;
+                      kind = 'orphan-lock-retry';
+                    }
+                  }
+                }
+
+                const priority = await sourcePriority(pr);
+                candidates.push({
+                  prNumber: pr.number,
+                  headSha: pr.head.sha,
+                  dueAt,
+                  kind,
+                  fullReviewCount,
+                  ...priority,
+                });
+              }
+
+              const globalNotBefore = latestCompletedReviewAt
+                ? latestCompletedReviewAt +
+                  REVIEW_COOLDOWN_MS +
+                  SAFETY_MARGIN_MS
+                : 0;
+
+              for (const candidate of candidates) {
+                candidate.effectiveDueAt = Math.max(
+                  candidate.dueAt,
+                  globalNotBefore
+                );
+              }
+
+              return {
+                candidates,
+                latestCompletedReviewAt,
+                globalNotBefore,
+                latestInFlightCommand,
+              };
+            }
+
+            function candidateOrder(a, b) {
+              // Priority is the hard primary key and must never be bypassed:
+              // P0 > P1 > P2 > unprioritized. Fairness is allowed only
+              // *within the same priority class* so it cannot move a lower
+              // priority PR ahead of a higher-priority re-review.
+              return (
+                a.rank - b.rank ||
+                a.fullReviewCount - b.fullReviewCount ||
+                a.issueNumber - b.issueNumber ||
+                a.prNumber - b.prNumber
+              );
+            }
+
+            async function chooseDueCandidate(state) {
+              const now = Date.now();
+              return state.candidates
+                .filter(candidate => candidate.effectiveDueAt <= now)
+                .sort(candidateOrder)[0] || null;
+            }
+
+            async function waitForNextCandidate(state) {
+              if (state.candidates.length === 0) {
+                core.notice('No CodeRabbit review is currently queued.');
+                return false;
+              }
+
+              const nextAt = Math.min(
+                ...state.candidates.map(candidate => candidate.effectiveDueAt)
+              );
+              const waitMs = Math.max(0, nextAt - Date.now());
+
+              if (waitMs === 0) return true;
+              if (waitMs > MAX_WAIT_MS) {
+                throw new Error(
+                  `Next CodeRabbit retry is ${Math.ceil(waitMs / 1000)}s away, beyond the supported controller window.`
+                );
+              }
+
+              const queue = [...state.candidates]
+                .sort(candidateOrder)
+                .map(candidate =>
+                  `#${candidate.prNumber}/issue#${candidate.issueNumber === Number.MAX_SAFE_INTEGER ? '?' : candidate.issueNumber} ${candidate.priority} reviews=${candidate.fullReviewCount} due=${new Date(candidate.effectiveDueAt).toISOString()}`
+                )
+                .join(', ');
+
+              core.notice(
+                `CodeRabbit queue: ${queue}. Sleeping until ${new Date(nextAt).toISOString()}.`
+              );
+              await new Promise(resolve => setTimeout(resolve, waitMs));
+              return true;
+            }
+
+            // Reconcile, wait for the earliest legal shared-quota slot if
+            // necessary, then rebuild state before making exactly one write.
+            let state = await collectState();
+
+            if (state.latestInFlightCommand) {
+              const ageMs =
+                Date.now() - state.latestInFlightCommand.at;
+              if (ageMs < IN_FLIGHT_TIMEOUT_MS) {
+                core.notice(
+                  `CodeRabbit slot is already in flight for PR #${state.latestInFlightCommand.prNumber} at head ${state.latestInFlightCommand.headSha}; no second review command will be emitted.`
+                );
+                return;
+              }
+              core.warning(
+                `CodeRabbit command for PR #${state.latestInFlightCommand.prNumber} has had no rate-limit response or full review for ${Math.ceil(ageMs / 60_000)} minutes; treating the slot lock as stale.`
+              );
+            }
+
+            let selected = await chooseDueCandidate(state);
+
+            if (!selected) {
+              if (!(await waitForNextCandidate(state))) return;
+              state = await collectState();
+
+              if (state.latestInFlightCommand) {
+                const ageMs =
+                  Date.now() - state.latestInFlightCommand.at;
+                if (ageMs < IN_FLIGHT_TIMEOUT_MS) {
+                  core.notice(
+                    `CodeRabbit slot became occupied by PR #${state.latestInFlightCommand.prNumber} while this controller was waiting; no second command will be emitted.`
+                  );
+                  return;
+                }
+              }
+
+              selected = await chooseDueCandidate(state);
+            }
+
+            if (!selected) {
+              core.notice(
+                'Queue changed while waiting; a newer event will reconcile it.'
+              );
+              return;
+            }
+
+            // Final exact-head/status/comment revalidation is implicit in the
+            // fresh collectState() result above. Rank only candidates that are
+            // legally due; P0 beats P1 beats P2, then lower source issue number.
+            let acquiredInitialLock = false;
+            if (selected.kind === 'initial') {
+              await github.rest.issues.addLabels({
+                owner,
+                repo,
+                issue_number: selected.prNumber,
+                labels: [REQUESTED_LABEL],
+              });
+              acquiredInitialLock = true;
+            }
+
+            try {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: selected.prNumber,
+                body: '@coderabbitai full review',
+              });
+            } catch (err) {
+              if (acquiredInitialLock) {
+                try {
+                  await github.rest.issues.removeLabel({
+                    owner,
+                    repo,
+                    issue_number: selected.prNumber,
+                    name: REQUESTED_LABEL,
+                  });
+                } catch (_) {}
+              }
+              throw err;
+            }
+
+            core.notice(
+              `Selected PR #${selected.prNumber} from issue #${selected.issueNumber === Number.MAX_SAFE_INTEGER ? '?' : selected.issueNumber} (${selected.priority}, ${selected.kind}) for the next CodeRabbit slot at head ${selected.headSha}.`
+            );

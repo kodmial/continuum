@@ -1,0 +1,144 @@
+{
+  "schema": "continuum.parity-ledger/v1",
+  "repository": "kodmial/nanodictate",
+  "audited_head": "d9e6dcc2e0c9c43bc87cd1963b75c097dec7ea1c",
+  "audited_at": "2026-09-30",
+  "discovery_issue": "#60",
+  "workflows": [
+    {
+      "path": ".github/workflows/add-review-label.yml",
+      "blob_sha": "6d0967539a12e72adf7675dc0f608601ee1b6dd2",
+      "classification": "absorbed",
+      "owner": "#11",
+      "rationale": "Per-head review locks and the exact-head carry-forward proof exist in the CodeRabbit adapter and the queue controller. Continuum's slot lock is the request-record comment rather than a label; the per-head property is the same."
+    },
+    {
+      "path": ".github/workflows/auto-merge.yml",
+      "blob_sha": "f641a89943c58cac62d783fa04c1c6dc98c7d1df",
+      "classification": "absorbed",
+      "owner": "#11",
+      "rationale": "Exact-head verdict binding, decisive-review supersession of nitpick-only COMMENTED reviews, status-as-operational-state, and a latest-state reconciler with full pre-write revalidation are all in the review adapter and queue controller. Loop prevention for generated release pull requests is retained through a trusted-automation policy rather than a status check."
+    },
+    {
+      "path": ".github/workflows/bootstrap-runtime-secret.yml",
+      "blob_sha": "e6295c930867472d88b30e98c208b24427258129",
+      "classification": "consumer-local",
+      "owner": "#60",
+      "rationale": "A migration-era diagnostic that reads this consumer's own secret metadata. It is not a runtime parity surface and must not be adopted as production Continuum while its diagnostic use is still needed."
+    },
+    {
+      "path": ".github/workflows/ci.yml",
+      "blob_sha": "86b9a651e101f13b6fb31e8268225c93e05e6c66",
+      "classification": "consumer-local",
+      "owner": "#60",
+      "rationale": "Product CI with a consumer-specific line-coverage threshold over the consumer's own sources. The generic half - a coverage threshold expressed as data and an exact-head blocking gate - is absorbed; the threshold value and the sources are the consumer's."
+    },
+    {
+      "path": ".github/workflows/coderabbit-retry.yml",
+      "blob_sha": "a03f3431347b60000733b9c3ea94c0ea1d2f1984",
+      "classification": "absorbed",
+      "owner": "#11",
+      "rationale": "The global serialized quota controller exists in the queue controller with priority-first ordering and an in-flight timeout that releases a stale slot lock. Continuum's controller concurrency is now non-cancelling so a sleeping run is not reset by repeated wake-ups."
+    },
+    {
+      "path": ".github/workflows/coderabbit-unresolved.yml",
+      "blob_sha": "67a2df34d7e902441ce7c0d633accf52a2ed9471",
+      "classification": "absorbed",
+      "owner": "#11",
+      "rationale": "Canonical verdict parsing, prose verdicts, old marker compatibility and the no-retry-loop guards are absorbed by the adapter's reply parser and the review repair ladder. Continuum has one implementation where this file duplicates it in two workflows."
+    },
+    {
+      "path": ".github/workflows/continuum-migration-preflight.yml",
+      "blob_sha": "7b00e14db22d1e42981d6605436be34adfe15a2b",
+      "classification": "consumer-local",
+      "owner": "#60",
+      "rationale": "A migration readiness check that names this consumer's own secret and variable names. It is a cutover aid, not a runtime parity surface, and it is not part of production Continuum."
+    },
+    {
+      "path": ".github/workflows/continuum-shadow-bridge.yml",
+      "blob_sha": "34cc3ebbb8cb21a3e892158ec3bbe21b0a024bc9",
+      "classification": "absorbed",
+      "owner": "#60",
+      "rationale": "The bridge Continuum itself ships as a reference copy. It is the consumer's forwarding shim and must stay thin: no token, no permissions, no retry, no decision."
+    },
+    {
+      "path": ".github/workflows/issue-scheduler.yml",
+      "blob_sha": "bc3f8c175210ab26c1f6033572e678356ec4d788",
+      "classification": "absorbed",
+      "owner": "#27",
+      "rationale": "Priority ordering with deterministic tie-breaking, a bounded work-in-progress limit, lease reconciliation, attempt limits, blocked-by gating and a non-cancelling single global concurrency group are all generic scheduler semantics Continuum already reconciles from live state."
+    },
+    {
+      "path": ".github/workflows/opencode-repair.yml",
+      "blob_sha": "56d08b852ed6f4c1c1b0456eee6d313a34e79a45",
+      "classification": "absorbed",
+      "owner": "#27",
+      "rationale": "CI and packaging repair with a stale-lock age check, a lock released on every success, failure and abort path, and no persistent label that would suppress a later repair of the same head."
+    },
+    {
+      "path": ".github/workflows/opencode.yml",
+      "blob_sha": "e5656c07b5758d4974540912f52a60525be889f8",
+      "classification": "must-port",
+      "owner": "#27",
+      "rationale": "The agent lifecycle is generic, but the runner label is hard-coded here to a macOS image and the installer is retried inline. Continuum expresses both as configuration so the lifecycle stays generic and the execution capability stays a consumer choice."
+    },
+    {
+      "path": ".github/workflows/packaging-smoke.yml",
+      "blob_sha": "c6b99cc0e6c2ed11cf2e1b9886eac86c47272429",
+      "classification": "consumer-local",
+      "owner": "#60",
+      "rationale": "Candidate, post-publish and canary production smoke for this consumer's packages, plus a production incident lifecycle expressed in this consumer's own channels. Continuum treats it as an exact-head blocking gate and a release-candidate artifact source, and creates no incident channel of its own."
+    },
+    {
+      "path": ".github/workflows/pr-agent.yml",
+      "blob_sha": "53485dcafb1e06318c56b4dd1f2e64c22cedd5c0",
+      "classification": "consumer-local",
+      "owner": "#60",
+      "rationale": "A manual auxiliary reviewer outside the MVP orchestration contract. Retained in the consumer during cutover rather than deleted, because the issue of whether PR-Agent belongs in Continuum at all is separate from this audit."
+    },
+    {
+      "path": ".github/workflows/release-automation-merge.yml",
+      "blob_sha": "75ae83ffd55b11c2e9b49bc91e1920bf24e83484",
+      "classification": "absorbed",
+      "owner": "#60",
+      "rationale": "Generated-file validation, the main wake-up, loop prevention and the trusted merge policy are generic, and the one specific rule is now ported too: a generated manifest is scanned for unfilled template tokens before anything downstream sees it, and a token named in a comment is read as documentation while a token on an active line refuses the build. See continuum.release.placeholders."
+    },
+    {
+      "path": ".github/workflows/release-pr.yml",
+      "blob_sha": "c0870464a47c698a22acc206aa77eee068cb8b44",
+      "classification": "absorbed",
+      "owner": "#60",
+      "rationale": "A serialized release lifecycle with a non-cancelling concurrency group is generic, and the recovery wake-up is now ported: a release-pr update deferred mid-publish is recorded as blocked rather than failed, and a terminal stage completing re-opens it by name with a wake keyed on the source head. See state.owed_reconciliation and ReleaseOutcome.reconciliation_wake."
+    },
+    {
+      "path": ".github/workflows/release.yml",
+      "blob_sha": "f699aaa4ea70d431962daae48ca4a8c6842088e7",
+      "classification": "must-port",
+      "owner": "#21",
+      "rationale": "Version identity, stable signing, publication and package-channel sync are absorbed by the release core and its adapters. Reuse of the exact bytes an upstream gate validated for the same immutable source head is not expressible: the journal records a manifest digest, never the artifact bytes or the gate that tested them."
+    },
+    {
+      "path": ".github/workflows/remove-review-label.yml",
+      "blob_sha": "26f05b0c80934195f2d9c52663c3a059fd902210",
+      "classification": "absorbed",
+      "owner": "#11",
+      "rationale": "Per-head review and repair lock reset on a new head. Continuum's equivalent is that a moved head settles the outstanding request record, so the slot is returned without any persistent label to clear."
+    }
+  ],
+  "open_pull_requests": [
+    {
+      "number": 67,
+      "head_sha": "56a70c152bb53fcb8fa7408935a11785cf8a9048",
+      "paths": [
+        ".github/pull_request_template.md",
+        ".github/workflows/ci.yml",
+        ".github/workflows/packaging-smoke.yml",
+        ".github/workflows/release.yml",
+        ".github/workflows/rust.yml"
+      ],
+      "classification": "consumer-local",
+      "owner": "#60",
+      "rationale": "Adds the shared engine build, static linking, a portability gate and a checkout hardening flag to three consumer-local workflows, and adds one new consumer-local workflow. No scheduler, review, repair, merge or release writer is added or restored, so it cannot reintroduce removed orchestration after cutover."
+    }
+  ]
+}

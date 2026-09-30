@@ -217,6 +217,68 @@ destination: a release with two colliding targets is ambiguous whether or not a
 destination is configured, so it is refused at the build rather than at the
 first upload that happens to notice.
 
+### A generated file may not still carry a template token
+
+A packaging manifest is produced by substituting a version, a digest and a set of
+maintainers into a template. A missed substitution produces a file that is
+syntactically fine and looks plausible, and it ships a literal `__VERSION__` to
+every user who installs from it. Nothing downstream would notice, and the thing
+that missed it cannot report it, so the built files are read back at the build
+stage and refused under `unfilled-placeholder`:
+
+```
+generated file(s) still carry an unfilled template placeholder, so a build step
+did not substitute it: nanodictate.rb: __VERSION__ on line 7:   version "__VERSION__"
+```
+
+The scan lives in `continuum.release.placeholders` and it ignores comments. The
+consumer's own templates document the tokens they substitute — a Ruby or Portfile
+comment, a C block comment, an XML comment — and a naive substring scan reads that
+documentation as unfilled work. So a token named in a comment is documentation and
+a token on a line that does something is a defect. That distinction is the whole
+reason it is a module rather than a regex: a check that flags the documentation
+either blocks correct releases until someone rewrites it, or teaches everyone to
+ignore it.
+
+Three consequences worth stating:
+
+- **Only files with a known comment convention are read**, by suffix. A `.zip` in
+  a manifest is none of this module's business, and an unknown suffix gets only
+  the `#` convention rather than a guessed block-comment syntax — a guess would
+  strip code from the scan and hide a real defect.
+- **A file that cannot be decoded is reported, not skipped.** A build step that
+  produced an unreadable "text" artifact has produced something nobody can vouch
+  for, which is not the same as a clean scan.
+- **A declared artifact is not scanned.** A dry run declares what would exist; there
+  are no bytes and no substitution to have missed.
+
+### A deferred release-pr update is re-opened when the release completes
+
+A release-pr update that lands while a release is publishing is deferred, not
+skipped: the version in the tree is already ahead of what has been published, so
+acting on it immediately would compute the same answer twice. The deferral is
+recorded as `blocked` rather than `failed`, because it is not an error and
+re-running it alone would fail the same way — the thing that has to change is the
+release finishing.
+
+Which makes the deferral invisible downstream. The release completes, the run is
+green, and the code waiting on it is never picked up again. So
+`state.owed_reconciliation()` asks a journal whether a terminal stage completed
+after something was blocked, and names the earliest such stage on the chain:
+
+```python
+outcome.owed_stage            # 'draft' — deferred, and now owed again
+outcome.reconciliation_wake   # the idempotency key of the wake that re-opens it
+```
+
+Only `blocked` counts. A stage that failed fatally has to change something before
+it can be retried, and re-opening it on an unrelated completion would loop.
+
+The wake key is on the **source head**, not the release version, because the thing
+a wake re-runs is *reconciliation of the head*, not publication of a version. Two
+deliveries of one completed run, a re-run of a failed job, and a second workflow
+watching the same branch are three deliveries and one wake.
+
 ## The GitHub destination
 
 `github.GitHubReleasePublisher` is the reference implementation and the baseline
@@ -271,10 +333,17 @@ outcome.planned     # was this a dry run?
 outcome.no_op       # was there correctly nothing to do, and why?
 outcome.failed      # which stage, and is it resumable?
 outcome.resumable   # could running this again succeed without doubling anything?
+outcome.owed_stage  # which deferred stage this completion owes, if any
 ```
 
 `ok` and `published` are different claims: a plan is green, a release with no
 destination configured is green, and neither has published anything.
+
+`owed_stage` is in the described artifact too, not only available on demand. An
+owed reconciliation is a dispatch the caller has to make, so a job summary that
+omitted it would report a green release over work that is still stranded. It is
+absent when nothing is owed, rather than present and empty, so a reader cannot
+mistake a considered-and-unnecessary wake for one nobody looked for.
 
 ## Tests
 

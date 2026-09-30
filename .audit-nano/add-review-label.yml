@@ -1,0 +1,313 @@
+name: mark-ready-for-coderabbit
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+permissions:
+  actions: write
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  add-label:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const repoFullName = `${owner}/${repo}`;
+            const run = context.payload.workflow_run;
+            const REQUESTED_LABEL = 'coderabbit-review-requested';
+            const RELEASE_FILES = new Set([
+              '.release-please-manifest.json',
+              'CHANGELOG.md',
+              'Sources/NanoDictateCore/Version.swift',
+            ]);
+            const MANIFEST_FILES = new Set([
+              'nanodictate.rb',
+              'packaging/homebrew/nanodictate.rb',
+              'packaging/homebrew/Casks/nanodictate.rb',
+              'packaging/macports/Portfile',
+              'scripts/install-macports.sh',
+            ]);
+
+            async function trustedReleaseAutomation(pr) {
+              if (
+                pr.base.ref !== 'main' ||
+                pr.head.repo?.full_name !== repoFullName
+              ) {
+                return false;
+              }
+
+              const files = await github.paginate(github.rest.pulls.listFiles, {
+                owner,
+                repo,
+                pull_number: pr.number,
+                per_page: 100,
+              });
+              const names = files.map(file => file.filename);
+              const onlyAllowed = allowed =>
+                names.length > 0 && names.every(name => allowed.has(name));
+
+              if (pr.head.ref === 'release-please--branches--main') {
+                const labels = new Set((pr.labels || []).map(label => label.name));
+                return labels.has('autorelease: pending') && onlyAllowed(RELEASE_FILES);
+              }
+
+              return (
+                pr.head.ref.startsWith('chore/release-manifests-v') &&
+                onlyAllowed(MANIFEST_FILES)
+              );
+            }
+
+            async function carriedApprovalSource(pr) {
+              const { data: commit } = await github.rest.repos.getCommit({
+                owner,
+                repo,
+                ref: pr.head.sha,
+              });
+              const parents = (commit.parents || []).map(parent => parent.sha);
+              if (parents.length !== 2) return null;
+
+              const comments = await github.paginate(
+                github.rest.issues.listComments,
+                {
+                  owner,
+                  repo,
+                  issue_number: pr.number,
+                  per_page: 100,
+                }
+              );
+
+              const markerPattern =
+                /<!-- auto-main-sync head=([0-9a-f]{40}) from=([0-9a-f]{40}) main=([0-9a-f]{40}) carry=([0-9a-f]{40}) -->/i;
+
+              const marker = comments
+                .filter(comment => comment.user?.login === owner)
+                .map(comment => {
+                  const match = (comment.body || '').match(markerPattern);
+                  if (!match) return null;
+                  return {
+                    head: match[1].toLowerCase(),
+                    from: match[2].toLowerCase(),
+                    main: match[3].toLowerCase(),
+                    carry: match[4].toLowerCase(),
+                    createdAt: new Date(comment.created_at || 0).getTime(),
+                  };
+                })
+                .filter(Boolean)
+                .filter(item => item.head === pr.head.sha.toLowerCase())
+                .sort((a, b) => b.createdAt - a.createdAt)[0];
+
+              if (!marker) return null;
+
+              const parentSet = new Set(parents.map(sha => sha.toLowerCase()));
+              if (
+                !parentSet.has(marker.from) ||
+                !parentSet.has(marker.main)
+              ) {
+                return null;
+              }
+
+              const reviews = await github.paginate(
+                github.rest.pulls.listReviews,
+                {
+                  owner,
+                  repo,
+                  pull_number: pr.number,
+                  per_page: 100,
+                }
+              );
+
+              const sourceReviews = reviews
+                .filter(review =>
+                  review.user?.login?.startsWith('coderabbitai') &&
+                  review.commit_id?.toLowerCase() === marker.carry &&
+                  (review.state === 'APPROVED' ||
+                   review.state === 'CHANGES_REQUESTED')
+                )
+                .sort((a, b) => {
+                  const time =
+                    new Date(a.submitted_at || 0).getTime() -
+                    new Date(b.submitted_at || 0).getTime();
+                  return time || Number(a.id) - Number(b.id);
+                });
+
+              const decision = sourceReviews.at(-1);
+              if (!decision || decision.state !== 'APPROVED') return null;
+
+              const nitpicks = reviews.filter(review =>
+                review.user?.login?.startsWith('coderabbitai') &&
+                review.commit_id?.toLowerCase() === marker.carry &&
+                review.state === 'COMMENTED' &&
+                /comments?\s*\(\s*[1-9]\d*\s*\)/i.test(review.body || '')
+              );
+              if (nitpicks.length > 0) return null;
+
+              const { data: combined } =
+                await github.rest.repos.getCombinedStatusForRef({
+                  owner,
+                  repo,
+                  ref: marker.carry,
+                });
+              const completed = (combined.statuses || []).some(status =>
+                status.context === 'CodeRabbit' &&
+                status.state === 'success' &&
+                /Review completed/i.test(status.description || '')
+              );
+              if (!completed) return null;
+
+              return marker.carry;
+            }
+
+            const prs = await github.paginate(github.rest.pulls.list, {
+              owner,
+              repo,
+              state: 'open',
+              per_page: 100,
+            });
+
+            // Match only a non-draft same-repository PR whose current head is
+            // exactly the commit tested by this completed CI run.
+            const matched = prs.filter((pr) =>
+              !pr.draft &&
+              pr.head.sha === run.head_sha &&
+              pr.head.repo.full_name === repoFullName
+            );
+            const ours = [];
+            for (const pr of matched) {
+              if (await trustedReleaseAutomation(pr)) {
+                core.notice(
+                  `PR #${pr.number}: trusted generated release automation; CodeRabbit review intentionally skipped.`
+                );
+                continue;
+              }
+              ours.push(pr);
+            }
+
+            core.info(
+              `Matched ${ours.length} ordinary open same-repository PR(s) for CI head ${run.head_sha}; ${matched.length - ours.length} trusted automation PR(s) bypass CodeRabbit.`
+            );
+
+            if (run.conclusion !== 'success') {
+              for (const pr of ours) {
+                for (const name of ['review-ready', REQUESTED_LABEL]) {
+                  try {
+                    await github.rest.issues.removeLabel({
+                      owner,
+                      repo,
+                      issue_number: pr.number,
+                      name,
+                    });
+                  } catch (err) {
+                    if (err.status !== 404) throw err;
+                  }
+                }
+              }
+              return;
+            }
+
+            // A visible lock label makes the request idempotent across workflow
+            // reruns for the same head. It is removed on every PR synchronize.
+            try {
+              await github.rest.issues.createLabel({
+                owner,
+                repo,
+                name: REQUESTED_LABEL,
+                color: 'C5DEF5',
+                description: 'CodeRabbit review requested or safely carried for the current PR head.',
+              });
+            } catch (err) {
+              if (err.status !== 422) throw err; // already exists
+            }
+
+            let queuedForCodeRabbit = false;
+
+            for (const pr of ours) {
+              await github.rest.issues.addLabels({
+                owner,
+                repo,
+                issue_number: pr.number,
+                labels: ['review-ready'],
+              });
+
+              const labels = await github.paginate(
+                github.rest.issues.listLabelsOnIssue,
+                {
+                  owner,
+                  repo,
+                  issue_number: pr.number,
+                  per_page: 100,
+                }
+              );
+
+              if (labels.some(label => label.name === REQUESTED_LABEL)) {
+                core.info(
+                  `PR #${pr.number}: CodeRabbit review was already requested for head ${pr.head.sha}.`
+                );
+                continue;
+              }
+
+              // A clean controller-generated merge of main may carry forward a
+              // previously completed APPROVED CodeRabbit review. The marker is
+              // accepted only when this exact HEAD is a two-parent merge of the
+              // recorded old PR head and recorded main SHA, and the carried SHA
+              // still has a completed APPROVED review with no nitpick review.
+              const carriedSource = await carriedApprovalSource(pr);
+              if (carriedSource) {
+                await github.rest.issues.addLabels({
+                  owner,
+                  repo,
+                  issue_number: pr.number,
+                  labels: [REQUESTED_LABEL],
+                });
+                core.notice(
+                  `PR #${pr.number}: carried CodeRabbit approval from ${carriedSource} across clean main sync to ${pr.head.sha}; no duplicate full review requested.`
+                );
+                continue;
+              }
+
+              // Do not post CodeRabbit commands here. The included-review quota
+              // is repository-wide, so all initial reviews and retries must go
+              // through the single priority controller.
+              queuedForCodeRabbit = true;
+              core.notice(
+                `PR #${pr.number}: green head ${pr.head.sha} queued for the global CodeRabbit priority controller.`
+              );
+            }
+
+            if (queuedForCodeRabbit) {
+              await github.rest.actions.createWorkflowDispatch({
+                owner,
+                repo,
+                workflow_id: 'coderabbit-retry.yml',
+                ref: 'main',
+              });
+              core.notice(
+                `Dispatched the global CodeRabbit priority controller after CI run ${run.id}.`
+              );
+            }
+
+            // CI completion is now the primary wake-up hook for the reconciler.
+            // Dispatch once per completed CI workflow (not once per PR). The
+            // auto-merge workflow is a latest-state reconciler with a single
+            // concurrency group and full pre-write revalidation, so duplicate
+            // wake-ups from status/review/push/cron remain harmless.
+            if (ours.length > 0) {
+              await github.rest.actions.createWorkflowDispatch({
+                owner,
+                repo,
+                workflow_id: 'auto-merge.yml',
+                ref: 'main',
+              });
+              core.notice(
+                `Dispatched auto-merge reconciliation after successful CI run ${run.id} for head ${run.head_sha}.`
+              );
+            }

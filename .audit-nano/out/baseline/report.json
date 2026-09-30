@@ -1,0 +1,18 @@
+{
+  "audited_head": "d9e6dcc2e0c9c43bc87cd1963b75c097dec7ea1c",
+  "blockers": [],
+  "complete": true,
+  "differences": [],
+  "evidence_digest": "bl-6ac5b9379b218f02",
+  "generated_from": "",
+  "kind": "report",
+  "ledger_digest": "pl-e79d703d9795e94b",
+  "limits": [],
+  "live_digest": "lh-e7a6b5bc9636157d",
+  "live_head": "d9e6dcc2e0c9c43bc87cd1963b75c097dec7ea1c",
+  "ready": true,
+  "repository": "kodmial/nanodictate",
+  "routing": {},
+  "schema": "continuum.shadow-baseline/v1",
+  "verdict": "clean"
+}

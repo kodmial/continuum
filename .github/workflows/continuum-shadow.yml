@@ -26,7 +26,7 @@ on:
   workflow_call:
     inputs:
       mode:
-        description: run, replay, or cutover
+        description: run, replay, baseline, or cutover
         type: string
         default: run
       repository:
@@ -107,6 +107,14 @@ on:
         description: cutover; correlation id to origin mapping, as JSON
         type: string
         default: ""
+      baseline_path:
+        description: cutover; the live-head baseline report inside the window
+        type: string
+        default: ""
+      read_live_baseline:
+        description: cutover; read the shadowed repository's live head instead of using a document
+        type: boolean
+        default: true
       approval_path:
         description: cutover; the human approval document inside the window
         type: string
@@ -130,10 +138,10 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: run, replay, or cutover
+        description: run, replay, baseline, or cutover
         type: choice
         default: cutover
-        options: [run, replay, cutover]
+        options: [run, replay, baseline, cutover]
       repository:
         description: owner/name of the repository whose events are being shadowed
         type: string
@@ -195,6 +203,14 @@ on:
         description: cutover; correlation id to origin mapping, as JSON
         type: string
         default: ""
+      baseline_path:
+        description: cutover; the live-head baseline report inside the window
+        type: string
+        default: ""
+      read_live_baseline:
+        description: cutover; read the shadowed repository's live head instead of using a document
+        type: boolean
+        default: true
       approval_path:
         description: cutover; the human approval document inside the window
         type: string
@@ -466,7 +482,7 @@ jobs:
 
   evidence:
     name: Re-judge a case or judge a window
-    if: inputs.mode == 'replay' || inputs.mode == 'cutover'
+    if: inputs.mode == 'replay' || inputs.mode == 'cutover' || inputs.mode == 'baseline'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -488,12 +504,15 @@ jobs:
       LIVENESS_PATH: ${{ inputs.liveness_path }}
       RESOLUTIONS_PATH: ${{ inputs.resolutions_path }}
       ORIGINS: ${{ inputs.origins }}
+      BASELINE_PATH: ${{ inputs.baseline_path }}
+      READ_LIVE_BASELINE: ${{ inputs.read_live_baseline }}
       APPROVAL_PATH: ${{ inputs.approval_path }}
       CANARY_PATH: ${{ inputs.canary_path }}
       ROLLBACK_PATH: ${{ inputs.rollback_path }}
       WINDOW_START: ${{ inputs.window_start }}
       WINDOW_END: ${{ inputs.window_end }}
       ENGINE_REF_INPUT: ${{ inputs.engine_ref }}
+      SHADOWED_REPOSITORY: ${{ inputs.repository || github.repository }}
     steps:
       - name: Resolve the pinned engine
         id: engine
@@ -562,6 +581,27 @@ jobs:
           printf '%s' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >replay-out/rejudged-at.txt
         env:
           ENGINE_SHA: ${{ steps.engine.outputs.sha }}
+      - name: Read the shadowed repository's live head
+        # The reading is taken here, in this run, from the shadowed repository --
+        # never from a document committed alongside the window. Every other input
+        # to the cutover decision is evidence recorded during the window, and all
+        # of them together say nothing about the repository as it is now.
+        #
+        # A non-zero exit is deliberately not tolerated here: a window judged
+        # without a reading is a `no_live_baseline` refusal, which the judging
+        # step reports properly, with the difference named. Swallowing the failure
+        # would hide the reason the gate could not run.
+        if: inputs.mode == 'baseline' || (inputs.mode == 'cutover' && inputs.read_live_baseline)
+        run: |
+          set -euo pipefail
+          if [ -z "${SHADOWED_REPOSITORY:-}" ]; then
+            echo "::error::name the repository to read with repository=owner/name"
+            exit 2
+          fi
+          PYTHONPATH=engine/src python3 -m continuum.shadow.cli baseline \
+            --ledger engine/docs/parity-ledger.json \
+            --repo "$SHADOWED_REPOSITORY" \
+            --out replay-out
       - name: Replay the captured case
         if: inputs.mode == 'replay'
         run: |
@@ -601,6 +641,15 @@ jobs:
           done <<<"${RESOLUTIONS_PATH:-}"
           if [ -n "${ORIGINS:-}" ]; then
             args+=(--origins "$WINDOW_ROOT/$ORIGINS")
+          fi
+          # The reading this run took, unless one was recorded in the window. A
+          # document from the window is refused in favour of a fresh reading by
+          # default, because a window artifact could be from a head that has since
+          # moved -- which is the whole reason the gate reads the live head.
+          if [ -n "${BASELINE_PATH:-}" ]; then
+            args+=(--baseline "$WINDOW_ROOT/$BASELINE_PATH")
+          elif [ -f replay-out/baseline/report.json ]; then
+            args+=(--baseline replay-out/baseline/report.json)
           fi
           if [ -n "${APPROVAL_PATH:-}" ]; then
             args+=(--approval "$WINDOW_ROOT/$APPROVAL_PATH")

@@ -181,10 +181,89 @@ PYTHONPATH=src python3 -m continuum.shadow.cli liveness \
   --budget-ms 300000
 ```
 
+## Reading the consumer's live head
+
+Every other input to a cutover decision is evidence recorded during the window.
+None of it says what the consumer repository looks like *now*, so a window
+recorded last week answers nothing about the two repositories since. A baseline
+is that reading, taken immediately before the decision:
+
+```
+PYTHONPATH=src python3 -m continuum.shadow.cli baseline \
+  --ledger docs/parity-ledger.json \
+  --repo kodmial/nanodictate \
+  --out window
+```
+
+It reads three things through the same read-only client the shadow plane uses:
+the current default-branch HEAD, every active `.github/workflows/*` file with its
+blob SHA, and every open pull request touching `.github/**`. Those are compared
+against `docs/parity-ledger.json`, and each difference is routed to the issue
+that owns it — `#60` for something discovered rather than audited, otherwise the
+owner the ledger recorded.
+
+The verdicts are three, not two. `clean` and `drifted` are the expected pair;
+`incomplete` is what you get when the HEAD, the inventory, or the pull request
+list could not be read in full. An incomplete reading reports **no differences at
+all**, because comparing a partial reading against a complete ledger would name
+every file it did not happen to see as removed — a claim about the gap rather
+than about the repository. A capture that did not read everything says so, and
+that is what blocks.
+
+Three properties are worth stating because they are what make the answer worth
+reading:
+
+- **A historical snapshot can never authorize cutover.** The ledger records what
+  was audited; the reading records what is true now. A commit outside
+  `.github/**` moves the HEAD without changing the audit, so the verdict stays
+  `clean` and both SHAs are recorded — but a workflow blob that moved is
+  `workflow_blob_changed`, because the parity evidence was granted against bytes
+  that no longer exist.
+- **An unknown file is a finding, not a pass.** A workflow nobody classified is
+  `unclassified_workflow`. Ignoring entries with no ledger row would make the
+  ledger's own completeness the thing being measured.
+- **Open pull requests are audited on the same footing as blobs.** One touching
+  `.github/**` can restore a writer the cutover removes, so an unclassified one is
+  `unclassified_open_pull_request`. A classified one has two independent ways of
+  going stale, and both block: `open_pull_request_drift` when its `.github/**`
+  paths changed, and `open_pull_request_head_moved` when the paths are identical
+  but its head commit moved. The second is the one a path comparison cannot see —
+  a pull request can rewrite every file it already touched and add the writer
+  this gate removes, which is a content change and not a path change. So the
+  ledger records `head_sha` for each classified pull request, `read_ledger` refuses
+  a classification that does not have one, and re-pinning moves it forward only
+  alongside the paths.
+
+### After re-auditing a difference
+
+Re-pinning moves recorded SHAs forward. It is a human act and deliberately a
+narrow one: it cannot classify anything new, so `--write-ledger` refuses when the
+live repository has a workflow or a pull request the ledger does not audit.
+Removals have to be named, so a withdrawal is a stated decision rather than
+something that happened while refreshing a file:
+
+```
+PYTHONPATH=src python3 -m continuum.shadow.cli baseline \
+  --ledger docs/parity-ledger.json \
+  --repo kodmial/nanodictate \
+  --write-ledger \
+  --accept-removed .github/workflows/pr-agent.yml \
+  --accept-closed 67 \
+  --out window
+```
+
+The verdict that command prints still describes the audit as it was handed over,
+not as it was rewritten: a re-pin that printed `clean` would be claiming the
+drift it was asked to resolve never existed. Re-running afterwards is clean.
+
+`docs/parity-ledger.md` is generated from the JSON and is not edited by hand. The
+generator takes the repository name from the ledger, so no consumer name is baked
+into the code that has to resolve them all.
+
 ## Judging a window
 
 Collect the window's parity results, its liveness report, any recorded
-resolutions, and the human approval, then:
+resolutions, the live-head reading, and the human approval, then:
 
 ```
 PYTHONPATH=src python3 -m continuum.shadow.cli cutover \
@@ -192,6 +271,7 @@ PYTHONPATH=src python3 -m continuum.shadow.cli cutover \
   --liveness window/liveness/report.json \
   --resolutions window/resolutions/*.json \
   --origins window/origins.json \
+  --baseline window/baseline/report.json \
   --approval window/approval.json \
   --canary window/canary.json \
   --rollback window/rollback.json \
@@ -200,14 +280,21 @@ PYTHONPATH=src python3 -m continuum.shadow.cli cutover \
   --out window
 ```
 
+`--baseline` is not optional in practice. Omitting it is
+`no_live_baseline`, and the gate blocks: a window that looks perfect on its own
+terms still has to be checked against the repository it is about to be handed to.
+
 Exit code `0` means approved, `1` means the gate is not satisfied, and `3` means
 the gate could not run — three states a CI job must not conflate.
 
-The gate blocks on, among others: `uncovered_scenario`,
+The gate blocks on, among others: `no_live_baseline`, `uncovered_scenario`,
 `replayed_only_coverage`, `unresolved_divergence`, `no_liveness_evidence`,
 `liveness_stalled` / `liveness_orphaned` / `liveness_crashed`,
-`incomplete_approval`, `stale_approval`, `no_rollback`, and
-`approval_over_blocked_window`.
+`workflow_blob_changed`, `unclassified_workflow`, `workflow_removed`,
+`unclassified_open_pull_request`, `open_pull_request_drift`,
+`open_pull_request_head_moved`, `live_head_incomplete`, `window_predates_ledger`,
+`ledger_audit_date_unreadable`, `window_start_unreadable`, `incomplete_approval`,
+`stale_approval`, `no_rollback`, and `approval_over_blocked_window`.
 
 That last one deserves its own note, because it is the failure this whole plane
 exists to prevent. A complete, digest-matching approval is still refused when
@@ -215,13 +302,28 @@ the window has blockers. A signature on the evidence does not make the evidence
 sufficient, and an operator who is told otherwise will learn it at the worst
 possible moment.
 
-### The approval is bound to one window
+### The approval is bound to one window, and to one reading of the repository
 
 An approval carries an `evidence_digest` over the window's verdicts and linked
 actions. If the window moves — one more run, one more divergence — the digest
 changes, and the old approval becomes `stale_approval`. Approving a window and
 then adding evidence to it invalidates the approval, deliberately: the point of
 an approval is to say *this specific evidence was good enough*.
+
+The digest covers the baseline's own digest too. An approval granted against a
+reading that was then overtaken by a workflow change no longer matches, so the
+drift is discovered by the approval rather than sitting beside it as a stale
+artifact nobody re-read.
+
+Freshness is also an *order*, not only a digest, because a digest cannot catch the
+case where everything agrees. Re-audit a difference today, re-sign yesterday's
+window, and the reading and the approval now agree perfectly about a repository
+state no run in that window ever observed. So the window must start on or after
+the ledger's `audited_at`: `window_predates_ledger` otherwise. Same-day is fine —
+only a backwards ordering is a claim the gate can support. An audit date or a
+window start it cannot read as a date blocks as
+`ledger_audit_date_unreadable` or `window_start_unreadable` rather than defaulting
+to acceptable, because "could not tell" and "fine" are different answers.
 
 A complete approval also names who approved, when, the canary evidence and the
 rollback path. NanoDictate must remain able to resume ownership; a cutover with

@@ -327,6 +327,116 @@ class FileContentTests(unittest.TestCase):
         self.assertIsNone(client.file_at_ref("src/a.py", "deadbeef"))
 
 
+class LiveHeadReadTests(unittest.TestCase):
+    """The reads #60's rolling baseline needs.
+
+    These four methods are what stand between a cutover decision and the
+    repository as it actually is, so what each one returns matters more than that
+    it exists: a partial answer here becomes a clean cutover elsewhere.
+    """
+
+    def _client(self, opener):
+        return GitHubClient("token", "o/r", opener=opener)
+
+    def test_the_default_branch_comes_from_the_repository_not_a_convention(self) -> None:
+        client = self._client(
+            lambda request, timeout: ({"default_branch": "trunk", "full_name": "o/r"}, "")
+        )
+        self.assertEqual(client.default_branch(), "trunk")
+
+    def test_a_repository_with_no_default_branch_is_an_error(self) -> None:
+        # An empty string would resolve as "the branch called ''", which is a
+        # ref read that fails somewhere less obvious than here.
+        client = self._client(lambda request, timeout: ({"full_name": "o/r"}, ""))
+        with self.assertRaises(GitHubError):
+            client.default_branch()
+
+    def test_ref_sha_is_the_commit_a_ref_points_at(self) -> None:
+        seen = []
+
+        def opener(request, timeout):
+            seen.append(request.full_url)
+            return ({"object": {"sha": "c" * 40, "type": "commit"}}, "")
+
+        self.assertEqual(self._client(opener).ref_sha("main"), "c" * 40)
+        self.assertIn("/git/ref/main", seen[0])
+
+    def test_a_ref_that_does_not_resolve_is_an_error(self) -> None:
+        client = self._client(lambda request, timeout: ({"object": {}}, ""))
+        with self.assertRaises(GitHubError):
+            client.ref_sha("gone")
+
+    def test_a_tag_is_resolved_to_the_commit_it_points_at(self) -> None:
+        # An annotated tag resolves to a tag object, and a tag object's SHA is not
+        # a commit SHA. Reporting it would pin the baseline to a head nothing else
+        # in the system could check out.
+        def opener(request, timeout):
+            if "/git/tags/" in request.full_url:
+                return ({"object": {"sha": "c" * 40, "type": "commit"}}, "")
+            return ({"object": {"sha": "t" * 40, "type": "tag"}}, "")
+
+        self.assertEqual(self._client(opener).ref_sha("v1.0"), "c" * 40)
+
+    def test_a_tag_that_does_not_resolve_to_a_commit_is_an_error(self) -> None:
+        def opener(request, timeout):
+            if "/git/tags/" in request.full_url:
+                return ({"object": {"sha": "b" * 40, "type": "blob"}}, "")
+            return ({"object": {"sha": "t" * 40, "type": "tag"}}, "")
+
+        with self.assertRaises(GitHubError):
+            self._client(opener).ref_sha("v1.0")
+
+    def test_the_inventory_lists_workflows_by_blob_sha(self) -> None:
+        tree = {
+            "tree": [
+                {"type": "blob", "path": ".github/workflows/ci.yml", "sha": "1" * 40},
+                {"type": "blob", "path": ".github/workflows/release.yaml", "sha": "2" * 40},
+                # A subdirectory workflow is still an active workflow.
+                {"type": "blob", "path": ".github/workflows/sub/extra.yml", "sha": "3" * 40},
+                # Not workflows, and not blobs either.
+                {"type": "blob", "path": ".github/dependabot.yml", "sha": "4" * 40},
+                {"type": "blob", "path": ".github/workflows/README.md", "sha": "5" * 40},
+                {"type": "tree", "path": ".github/workflows/dir.yml", "sha": "6" * 40},
+            ]
+        }
+        client = self._client(lambda request, timeout: (tree, ""))
+        self.assertEqual(
+            client.workflow_inventory("main"),
+            {
+                ".github/workflows/ci.yml": "1" * 40,
+                ".github/workflows/release.yaml": "2" * 40,
+                ".github/workflows/sub/extra.yml": "3" * 40,
+            },
+        )
+
+    def test_a_truncated_tree_is_refused_rather_than_partially_read(self) -> None:
+        # The tree is the one read that can silently return less than exists. A
+        # partial inventory compares equal to a repository with fewer workflows,
+        # so it has to be an error instead of a short answer.
+        client = self._client(lambda request, timeout: ({"truncated": True, "tree": []}, ""))
+        with self.assertRaises(GitHubError) as caught:
+            client.workflow_inventory("main")
+        self.assertIn("partial reading", str(caught.exception))
+
+    def test_the_repository_document_names_the_repository(self) -> None:
+        client = self._client(lambda request, timeout: ({"full_name": "o/r", "id": 1}, ""))
+        self.assertEqual(client.repository_document()["full_name"], "o/r")
+
+    def test_every_new_read_is_on_the_read_only_allowlist(self) -> None:
+        # The shadow plane's barrier refuses any adapter call outside the
+        # allowlist, so a new read that is not listed would be treated as a
+        # mutation and fail the audit hook rather than the intent.
+        from continuum.shadow.effects import READ_ONLY_METHODS
+
+        for name in (
+            "repository_document",
+            "default_branch",
+            "ref_sha",
+            "workflow_inventory",
+        ):
+            self.assertIn(name, READ_ONLY_METHODS)
+
+
 class ReviewWriteTests(unittest.TestCase):
     def test_create_review_sends_the_expected_body(self):
         captured = {}

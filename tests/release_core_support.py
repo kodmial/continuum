@@ -194,6 +194,16 @@ class FixtureAdapter:
     report_unverified: bool = False
     wrong_source: bool = False
     drop_signature: bool = False
+    #: Suffix for the produced artifact name, so a test can ask for a file whose
+    #: extension selects a comment convention (`.rb`, `.plist`) instead of the
+    #: plain text fixture.
+    artifact_suffix: str = ".txt"
+    #: Appended to the artifact body verbatim. Used to leave a template token in a
+    #: generated file, which is the one defect the build stage must refuse.
+    leftover_token: str = ""
+    #: When set, written verbatim as the artifact body instead of the usual text,
+    #: so a test can ask for a file the placeholder reader cannot decode.
+    body_bytes: bytes = b""
 
     def intent(self) -> str:
         return "build, sign, and verify one text artifact per target"
@@ -210,7 +220,7 @@ class FixtureAdapter:
     def _name(self, request: BuildRequest) -> str:
         if self.artifact_name:
             return self.artifact_name
-        return f"{request.target.id}-{request.version}-{CLASSIFIER}.txt"
+        return f"{request.target.id}-{request.version}-{CLASSIFIER}{self.artifact_suffix}"
 
     def _checksums_name(self, request: BuildRequest) -> str:
         return f"{request.target.id}-{request.version}-SHA256SUMS.txt"
@@ -219,9 +229,12 @@ class FixtureAdapter:
         return f"signed-by:{self.identity}:{request.source_sha}\n".encode("utf-8")
 
     def _body(self, request: BuildRequest, source_sha: str) -> bytes:
+        if self.body_bytes:
+            return self.body_bytes
         return (
             f"target={request.target.id}\nversion={request.version}\n"
             f"source={source_sha}\nclassifier={CLASSIFIER}\n"
+            f"{self.leftover_token}"
         ).encode("utf-8")
 
     def _record_checksums(
