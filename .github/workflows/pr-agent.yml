@@ -1,6 +1,8 @@
 name: PR Agent (manual, Groq)
 
 on:
+  workflow_call:
+    secrets: inherit
   issue_comment:
     types: [created]
 

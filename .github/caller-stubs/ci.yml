@@ -1,0 +1,19 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    # A documentation-only merge does not need a macOS build on main.
+    paths-ignore:
+      - '*.md'
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE'
+  pull_request:
+
+permissions: read-all
+
+jobs:
+  call:
+    uses: kodmial/continuum/.github/workflows/ci.yml@main
+    secrets: inherit

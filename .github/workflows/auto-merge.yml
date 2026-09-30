@@ -1,6 +1,8 @@
 name: Auto-merge reviewed pull requests
 
 on:
+  workflow_call:
+    secrets: inherit
   # Successful PR CI explicitly dispatches this reconciler from
   # mark-ready-for-coderabbit. CodeRabbit status/review and main pushes are
   # additional event-driven wake-ups; no critical transition depends on cron.

@@ -26,6 +26,8 @@ name: Packaging smoke
 # runner-image changes are detected before they become the baseline.
 
 on:
+  workflow_call:
+    secrets: inherit
   pull_request:
     paths:
       - 'Sources/**'
@@ -293,6 +295,13 @@ jobs:
       - name: Derive candidate Cask and run the Homebrew lifecycle
         run: |
           set -euo pipefail
+          if [[ ! -f scripts/packaging-smoke/common.sh ]]; then
+            if [[ -d .continuum ]]; then ln -sf .continuum/scripts scripts 2>/dev/null || true; fi
+            if [[ ! -f scripts/packaging-smoke/common.sh ]]; then
+              git clone --depth 1 https://github.com/kodmial/continuum.git .continuum 2>/dev/null || true
+              ln -sf .continuum/scripts scripts 2>/dev/null || true
+            fi
+          fi
           chmod +x scripts/packaging-smoke/*.sh
           VERSION="$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' Sources/NanoDictateCore/Version.swift)"
           echo "Candidate version: $VERSION"
@@ -340,6 +349,13 @@ jobs:
       - name: Derive candidate Portfile and run the MacPorts lifecycle
         run: |
           set -euo pipefail
+          if [[ ! -f scripts/packaging-smoke/common.sh ]]; then
+            if [[ -d .continuum ]]; then ln -sf .continuum/scripts scripts 2>/dev/null || true; fi
+            if [[ ! -f scripts/packaging-smoke/common.sh ]]; then
+              git clone --depth 1 https://github.com/kodmial/continuum.git .continuum 2>/dev/null || true
+              ln -sf .continuum/scripts scripts 2>/dev/null || true
+            fi
+          fi
           chmod +x scripts/packaging-smoke/*.sh
           VERSION="$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' Sources/NanoDictateCore/Version.swift)"
           echo "Candidate version: $VERSION"
@@ -383,6 +399,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          if [[ ! -f scripts/packaging-smoke/common.sh ]]; then
+            if [[ -d .continuum ]]; then ln -sf .continuum/scripts scripts 2>/dev/null || true; fi
+            if [[ ! -f scripts/packaging-smoke/common.sh ]]; then
+              git clone --depth 1 https://github.com/kodmial/continuum.git .continuum 2>/dev/null || true
+              ln -sf .continuum/scripts scripts 2>/dev/null || true
+            fi
+          fi
           chmod +x scripts/packaging-smoke/*.sh
           if [ -n "${INPUT_VERSION:-}" ]; then
             VERSION="${INPUT_VERSION#v}"
@@ -431,6 +454,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          if [[ ! -f scripts/packaging-smoke/common.sh ]]; then
+            if [[ -d .continuum ]]; then ln -sf .continuum/scripts scripts 2>/dev/null || true; fi
+            if [[ ! -f scripts/packaging-smoke/common.sh ]]; then
+              git clone --depth 1 https://github.com/kodmial/continuum.git .continuum 2>/dev/null || true
+              ln -sf .continuum/scripts scripts 2>/dev/null || true
+            fi
+          fi
           chmod +x scripts/packaging-smoke/*.sh
           if [ -n "${INPUT_VERSION:-}" ]; then
             VERSION="${INPUT_VERSION#v}"

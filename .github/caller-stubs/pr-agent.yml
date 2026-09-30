@@ -1,0 +1,12 @@
+name: pr-agent
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions: read-all
+
+jobs:
+  call:
+    uses: kodmial/continuum/.github/workflows/pr-agent.yml@main
+    secrets: inherit

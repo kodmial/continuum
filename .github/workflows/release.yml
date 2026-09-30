@@ -18,6 +18,8 @@ name: Release
 # there is no tag-trigger round trip.
 
 on:
+  workflow_call:
+    secrets: inherit
   push:
     tags:
       - 'v*'
@@ -978,6 +980,17 @@ jobs:
           VERSION: ${{ needs.preflight.outputs.version }}
           MAINTAINERS: ${{ vars.MAINTAINERS != '' && vars.MAINTAINERS || '@kodmial' }}
           REVISION: ${{ vars.REVISION != '' && vars.REVISION || '0' }}
+      - name: Ensure Continuum scripts available
+        if: hashFiles('scripts/release-prep.rb') == ''
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: kodmial/continuum
+          path: .continuum
+          persist-credentials: false
+      - name: Link Continuum scripts if needed
+        if: hashFiles('scripts/release-prep.rb') == ''
+        run: ln -sf .continuum/scripts scripts
+      - name: Prepare release manifests
         run: ruby scripts/release-prep.rb "v$VERSION"
 
       - name: Sync root formula copy

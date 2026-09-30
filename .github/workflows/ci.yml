@@ -1,6 +1,8 @@
 name: CI
 
 on:
+  workflow_call:
+    secrets: inherit
   push:
     branches: [main]
     # A documentation-only merge does not need a macOS build on main.
@@ -127,6 +129,18 @@ jobs:
           # that code could reuse it (CWE-522).
           persist-credentials: false
 
+      - name: Ensure Continuum scripts available
+        if: hashFiles('scripts/release-policy.sh') == ''
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: kodmial/continuum
+          path: .continuum
+          persist-credentials: false
+
+      - name: Link Continuum scripts if needed
+        if: hashFiles('scripts/release-policy.sh') == ''
+        run: ln -sf .continuum/scripts scripts
+
       - name: Test the release policy
         run: bash scripts/test-release-policy.sh
 
@@ -149,6 +163,18 @@ jobs:
           # The checked-out PR code is only diffed here, so the token must not
           # stay in .git/config where that code could reuse it (CWE-522).
           persist-credentials: false
+
+      - name: Ensure Continuum scripts available
+        if: hashFiles('scripts/release-policy.sh') == ''
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: kodmial/continuum
+          path: .continuum
+          persist-credentials: false
+
+      - name: Link Continuum scripts if needed
+        if: hashFiles('scripts/release-policy.sh') == ''
+        run: ln -sf .continuum/scripts scripts
 
       - name: Reject hand-written version bumps
         env:

@@ -1,0 +1,58 @@
+name: packaging-smoke
+
+on:
+  pull_request:
+    paths:
+      - 'Sources/**'
+      - 'Package.swift'
+      - 'packaging/**'
+      - 'scripts/**'
+      - 'Resources/**'
+      - 'config.example.toml'
+      - '.github/workflows/packaging-smoke.yml'
+      - '.github/workflows/release.yml'
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+    paths:
+      - 'Sources/**'
+      - 'Package.swift'
+      - 'packaging/**'
+      - 'scripts/**'
+      - 'Resources/**'
+      - 'config.example.toml'
+      - '.github/workflows/packaging-smoke.yml'
+      - '.github/workflows/release.yml'
+  workflow_run:
+    workflows:
+      - Release
+    types:
+      - completed
+  schedule:
+    # Non-round daily canary time (03:17 UTC), not the top of the hour.
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Which smoke mode to run'
+        required: false
+        type: choice
+        default: both
+        options:
+          - both
+          - candidate
+          - production
+      version:
+        description: 'Production version to verify (e.g. 0.1.7). Empty = latest stable release.'
+        required: false
+        type: string
+        default: ''
+
+permissions: read-all
+
+jobs:
+  call:
+    uses: kodmial/continuum/.github/workflows/packaging-smoke.yml@main
+    secrets: inherit

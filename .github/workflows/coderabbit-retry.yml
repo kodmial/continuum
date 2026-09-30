@@ -1,6 +1,8 @@
 name: Retry CodeRabbit after rate limit
 
 on:
+  workflow_call:
+    secrets: inherit
   # Any new/edited CodeRabbit rate-limit response wakes the global controller.
   issue_comment:
     types: [created, edited]

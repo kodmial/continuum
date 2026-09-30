@@ -1,0 +1,17 @@
+name: issue-scheduler
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/15 * * * *"
+  issues:
+    types: [opened, reopened, closed, labeled, unlabeled]
+  pull_request_target:
+    types: [closed]
+
+permissions: read-all
+
+jobs:
+  call:
+    uses: kodmial/continuum/.github/workflows/issue-scheduler.yml@main
+    secrets: inherit

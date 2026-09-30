@@ -1,6 +1,8 @@
 name: mark-ready-for-coderabbit
 
 on:
+  workflow_call:
+    secrets: inherit
   workflow_run:
     workflows: ["CI"]
     types: [completed]

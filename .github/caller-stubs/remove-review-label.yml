@@ -1,0 +1,12 @@
+name: remove-review-label
+
+on:
+  pull_request:
+    types: [synchronize]
+
+permissions: read-all
+
+jobs:
+  call:
+    uses: kodmial/continuum/.github/workflows/remove-review-label.yml@main
+    secrets: inherit

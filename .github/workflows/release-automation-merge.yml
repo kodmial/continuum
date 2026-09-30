@@ -1,6 +1,8 @@
 name: Merge trusted release automation PRs
 
 on:
+  workflow_call:
+    secrets: inherit
   workflow_run:
     workflows: ["CI"]
     types: [completed]

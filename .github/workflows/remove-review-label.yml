@@ -5,6 +5,8 @@
 name: remove-review-ready-on-sync
 
 on:
+  workflow_call:
+    secrets: inherit
   pull_request:
     types: [synchronize]
 

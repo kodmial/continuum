@@ -1,0 +1,38 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+    branches:
+      - main
+    paths:
+      - 'Sources/**'
+      - 'Package.swift'
+      - 'packaging/**'
+      - 'scripts/**'
+      - 'Resources/**'
+      - 'config.example.toml'
+      - '.github/workflows/packaging-smoke.yml'
+      - '.github/workflows/release.yml'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: >-
+          Version to publish (e.g. 0.0.2 or v0.0.2). Leave empty to derive it
+          from Sources/NanoDictateCore/Version.swift.
+        required: false
+        type: string
+        default: ''
+      dry_run:
+        description: 'Only print what would be released — do not create a release or touch manifests.'
+        required: false
+        type: boolean
+        default: false
+
+permissions: read-all
+
+jobs:
+  call:
+    uses: kodmial/continuum/.github/workflows/release.yml@main
+    secrets: inherit

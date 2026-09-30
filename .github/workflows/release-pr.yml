@@ -67,6 +67,8 @@ name: Release PR
 # re-trigger it. The Release PR merge itself is a green no-op (loop guard).
 
 on:
+  workflow_call:
+    secrets: inherit
   pull_request:
     types: [closed]
   # Recovery/reconciliation wake-up: a normal code PR can merge while the
@@ -132,6 +134,8 @@ jobs:
         run: |
           set -euo pipefail
 
+          if [[ ! -f scripts/release-policy.sh && -d .continuum ]]; then ln -sf .continuum/scripts scripts 2>/dev/null || true; fi
+          if [[ ! -f scripts/release-policy.sh ]]; then git clone --depth 1 https://github.com/kodmial/continuum.git .continuum 2>/dev/null || true; ln -sf .continuum/scripts scripts 2>/dev/null || true; fi
           # shellcheck source=scripts/release-policy.sh
           source scripts/release-policy.sh
 
@@ -319,6 +323,8 @@ jobs:
         run: |
           set -euo pipefail
 
+          if [[ ! -f scripts/release-policy.sh && -d .continuum ]]; then ln -sf .continuum/scripts scripts 2>/dev/null || true; fi
+          if [[ ! -f scripts/release-policy.sh ]]; then git clone --depth 1 https://github.com/kodmial/continuum.git .continuum 2>/dev/null || true; ln -sf .continuum/scripts scripts 2>/dev/null || true; fi
           # shellcheck source=scripts/release-policy.sh
           source scripts/release-policy.sh
 
@@ -435,6 +441,8 @@ jobs:
           PROPOSED: ${{ steps.changelog.outputs.proposed }}
         run: |
           set -euo pipefail
+          if [[ ! -f scripts/release-policy.sh && -d .continuum ]]; then ln -sf .continuum/scripts scripts 2>/dev/null || true; fi
+          if [[ ! -f scripts/release-policy.sh ]]; then git clone --depth 1 https://github.com/kodmial/continuum.git .continuum 2>/dev/null || true; ln -sf .continuum/scripts scripts 2>/dev/null || true; fi
           # shellcheck source=scripts/release-policy.sh
           source scripts/release-policy.sh
           {

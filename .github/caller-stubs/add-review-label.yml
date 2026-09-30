@@ -1,0 +1,13 @@
+name: add-review-label
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+permissions: read-all
+
+jobs:
+  call:
+    uses: kodmial/continuum/.github/workflows/add-review-label.yml@main
+    secrets: inherit

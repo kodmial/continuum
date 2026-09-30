@@ -1,0 +1,16 @@
+name: opencode-repair
+
+on:
+  # This trusted metadata workflow never checks out or executes PR code.
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+  workflow_run:
+    workflows: ["CI", "Packaging smoke"]
+    types: [completed]
+
+permissions: read-all
+
+jobs:
+  call:
+    uses: kodmial/continuum/.github/workflows/opencode-repair.yml@main
+    secrets: inherit

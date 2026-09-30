@@ -1,0 +1,12 @@
+name: opencode-unresolved
+
+on:
+  pull_request_review_comment:
+    types: [created]
+
+permissions: read-all
+
+jobs:
+  call:
+    uses: kodmial/continuum/.github/workflows/opencode-unresolved.yml@main
+    secrets: inherit

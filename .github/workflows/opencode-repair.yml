@@ -1,6 +1,8 @@
 name: OpenCode repair controller
 
 on:
+  workflow_call:
+    secrets: inherit
   # This trusted metadata workflow never checks out or executes PR code.
   pull_request_target:
     types: [opened, reopened, synchronize]
