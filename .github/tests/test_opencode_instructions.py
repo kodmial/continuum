@@ -46,6 +46,7 @@ import opencode_instructions as instructions  # noqa: E402
 #: this is exactly the set the workflows actually contain, so the declaration
 #: cannot drift into being a smaller, comfortable list.
 EXECUTION_PATHS = (
+    "consumer-child-pr-review.yml",
     "consumer-child-review.yml",
     "consumer-child-worker.yml",
     "consumer-opencode.yml",
