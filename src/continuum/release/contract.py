@@ -759,7 +759,10 @@ class ManifestBuilder:
 
         Only the shape is known, so only the shape is claimed: the digest is the
         digest of no bytes, the verification is `unverified`, and `declared` is
-        set so nothing downstream can mistake this row for a shipped one.
+        set so nothing downstream can mistake this row for a shipped one. The
+        signing state cannot be claimed either, and `Artifact` refuses the row if
+        a caller tries: a plan that reported an archive as signed would be
+        reporting a signature that has not happened yet.
         """
 
         artifact = Artifact(
