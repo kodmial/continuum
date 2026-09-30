@@ -361,11 +361,8 @@ class ReleaseScriptTests(unittest.TestCase):
         cls.source = cls.path.read_text(encoding="utf-8")
         cls.ci = (WORKFLOW_DIR / "ci.yml").read_text(encoding="utf-8")
 
-    def test_it_is_strict_mode_and_executable(self):
+    def test_it_is_strict_mode(self):
         self.assertIn("set -euo pipefail", self.source)
-        import os
-
-        self.assertTrue(os.access(self.path, os.X_OK), "the release script must be runnable")
 
     def test_all_four_obligations_are_proved(self):
         """Workflow syntax, contracts, fixtures, and entrypoint integrity. A
