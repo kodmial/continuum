@@ -411,23 +411,16 @@ def status_reason(status: Optional[Dict[str, Any]], context: str) -> Optional[st
     return f"the {context!r} status for this HEAD is {state or 'unknown'}: {description[:200]}"
 
 
-#: Fenced code blocks, collapsed on one line or spanning several. A bot quoting its
-#: own earlier verdict inside a fence is quoting history, not stating a new one.
-_CODE_FENCE_RE = re.compile(r"```[\\s\\S]*?(?:```|\\Z)")
-#: A collapsed `<details>` block, which is where a provider puts the prior thread
-#: body and its own "Review details" transcript.
-_DETAILS_RE = re.compile(r"<details\\b[\\s\\S]*?</details\\s*>", re.I)
-#: The same block with the closing tag missing, which happens when a provider
-#: truncates its own reply. Left in place the block would swallow the visible
-#: verdict, so an unterminated block runs to the end of the body.
-_DETAILS_UNTERMINATED_RE = re.compile(r"<details\\b[\\s\\S]*\\Z", re.I)
-#: A block-quoted line. The whole line goes, not just the marker: stripping only
-#: the ``>`` would promote somebody else's statement to the provider's own.
-_QUOTE_LINE_RE = re.compile(r"(?m)^[ \\t]*>+[^\\n]*(?:\\n|\\Z)")
+#: Fenced code blocks can quote an earlier verdict; quoted history is not
+#: the provider's current conclusion.
+_CODE_FENCE_RE = re.compile(r"```[\s\S]*?(?:```|\Z)")
+_DETAILS_RE = re.compile(r"<details\b[\s\S]*?</details\s*>", re.I)
+_DETAILS_UNTERMINATED_RE = re.compile(r"<details\b[\s\S]*\Z", re.I)
+_QUOTE_LINE_RE = re.compile(r"(?m)^[ \t]*>+[^\n]*(?:\n|\Z)")
 
 
 def _visible_conclusion(body: str) -> str:
-    """Return only the provider's visible conclusion, without quoted history."""
+    """Remove quoted/history containers before reading the current verdict."""
 
     text = body or ""
     text = _DETAILS_RE.sub("", text)
@@ -440,8 +433,10 @@ def _visible_conclusion(body: str) -> str:
 def classify_reply(body: str) -> str:
     """One verdict token for a provider reply, or `""` when it states none.
 
-    Only the visible conclusion counts. Quoted/collapsed/fenced history cannot
-    turn a reopened finding into a false RESOLVED verdict.
+    A reply that only *asks* whether something is resolved states no verdict, so
+    the lines that carry a question are dropped before the positive form is
+    accepted. Guessing in that direction would let a fixed-looking finding be
+    dropped, which is the one failure mode the gate cannot recover from.
     """
 
     text = _visible_conclusion(body)
