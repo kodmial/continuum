@@ -411,6 +411,25 @@ def status_reason(status: Optional[Dict[str, Any]], context: str) -> Optional[st
     return f"the {context!r} status for this HEAD is {state or 'unknown'}: {description[:200]}"
 
 
+#: Fenced code blocks can quote an earlier verdict; quoted history is not
+#: the provider's current conclusion.
+_CODE_FENCE_RE = re.compile(r"```[\\s\\S]*?(?:```|\\Z)")
+_DETAILS_RE = re.compile(r"<details\\b[\\s\\S]*?</details\\s*>", re.I)
+_DETAILS_UNTERMINATED_RE = re.compile(r"<details\\b[\\s\\S]*\\Z", re.I)
+_QUOTE_LINE_RE = re.compile(r"(?m)^[ \\t]*>+[^\\n]*(?:\\n|\\Z)")
+
+
+def _visible_conclusion(body: str) -> str:
+    """Remove quoted/history containers before reading the current verdict."""
+
+    text = body or ""
+    text = _DETAILS_RE.sub("", text)
+    text = _DETAILS_UNTERMINATED_RE.sub("", text)
+    text = _CODE_FENCE_RE.sub("", text)
+    text = _QUOTE_LINE_RE.sub("", text)
+    return text
+
+
 def classify_reply(body: str) -> str:
     """One verdict token for a provider reply, or `""` when it states none.
 
@@ -420,7 +439,7 @@ def classify_reply(body: str) -> str:
     dropped, which is the one failure mode the gate cannot recover from.
     """
 
-    text = body or ""
+    text = _visible_conclusion(body)
     if UNRESOLVED_REPLY_RE.search(text):
         return REPLY_UNRESOLVED
     statements = "\n".join(line for line in text.splitlines() if "?" not in line)
