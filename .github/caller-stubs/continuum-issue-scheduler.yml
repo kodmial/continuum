@@ -73,6 +73,7 @@ on:
         type: string
       child_dispatch_workflow:
         description: "Downstream dispatcher woken after each reconcile pass"
+        type: string
       count_open_prs_as_wip:
         description: "Count open implementation PRs against WIP"
         required: false
