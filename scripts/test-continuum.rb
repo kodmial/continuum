@@ -1026,6 +1026,75 @@ class ContinuumTest < Minitest::Test
     end
   end
 
+  # ------------------------------------------------- bootstrap secret target
+
+  # The bootstrap callee ships to every consumer, so the repository it
+  # bootstraps the secret into is a per-consumer decision. A literal written
+  # into the `gh api` path made a caller installed in any other repository
+  # write that secret into the wrong repository — a silent cross-repository
+  # write that no other assertion can see, because the file still parses, the
+  # job still goes green, and the public key really is fetched.
+  #
+  # The check is structural, not a list of known consumer names: every
+  # `owner/repo` literal in this callee must be Continuum's own repository or
+  # absent entirely, so a consumer nobody has enumerated yet fails the same way
+  # a known one does.
+  def test_bootstrap_runtime_secret_callee_bootstraps_no_named_repository
+    own_repo = 'kodmial/continuum'
+    base = 'continuum-bootstrap-runtime-secret.yml'
+    body = workflow_body(base)
+    # `github.com/owner/repo`, stripped before the bare-literal scan so the two
+    # never overlap. The bare form's owner segment must start lowercase, as
+    # every reference Continuum ships is written, which keeps prose such as
+    # "Recovery/reconciliation" out of the matches.
+    url = %r{github\.com/([A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9_.-]*(?:/[A-Za-z0-9._-]+)*)}i
+    owner_repo = %r{(?<![\w./-])([a-z0-9][a-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9_.-]*(?:/[A-Za-z0-9._-]+)*)}
+
+    references = body.scan(url).flatten.map { |ref| ref.split('#').first }
+    references += body.gsub(url, '').scan(owner_repo).flatten
+    foreign = references.reject { |ref| ref.downcase.start_with?("#{own_repo}/") }
+    assert_empty foreign, "#{base}: names a repository other than #{own_repo}: #{foreign.uniq.join(', ')} — " \
+                         'the secret target must come from an input, not a literal'
+
+    # …and the target must be resolved, not merely absent: an unparameterized
+    # `gh api` path built from a shell variable is the only shape that reaches
+    # the caller's own repository.
+    assert_includes body,
+                    'TARGET_REPOSITORY: ${{ inputs.repository || vars.CONTINUUM_TARGET_REPOSITORY || github.repository }}',
+                    "#{base}: the target must be the input, then the repository variable, then the calling repository"
+    assert_includes body, 'gh api "repos/$TARGET_REPOSITORY/actions/secrets/public-key"'
+  end
+
+  # A target that resolves to nothing, or to something that is not `owner/repo`,
+  # must fail before `gh api` is reached: an empty `repos//…` is not an error
+  # the API reports as one.
+  def test_bootstrap_runtime_secret_fails_loudly_on_an_unusable_target
+    base = 'continuum-bootstrap-runtime-secret.yml'
+    body = workflow_body(base)
+    assert_includes body, '[[ "$TARGET_REPOSITORY" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || {'
+    assert_includes body, '::error::No usable target repository:'
+    assert_operator body.index('exit 2'), :<, body.index('gh api "repos/$TARGET_REPOSITORY'),
+                    "#{base}: the guard must run before the API call"
+  end
+
+  # The stub is installed verbatim into every consumer, so it must be able to
+  # forward the target without ever naming one: a bare passthrough is what lets
+  # the callee fall through to `vars.CONTINUUM_TARGET_REPOSITORY` and then to
+  # `github.repository`, which is the repository the stub was installed into.
+  def test_bootstrap_runtime_secret_stub_forwards_an_unpinned_target
+    stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-bootstrap-runtime-secret.yml'))
+    callee = events(yaml(File.join(ROOT, '.github/workflows/continuum-bootstrap-runtime-secret.yml')))
+                 .fetch('workflow_call').fetch('inputs')
+
+    repository = callee.fetch('repository')
+    assert_equal 'string', repository.fetch('type')
+    assert_equal '', repository.fetch('default')
+    assert_equal false, repository.fetch('required')
+
+    with = stub.fetch('jobs').fetch('call').fetch('with')
+    assert_equal '${{ inputs.repository }}', with.fetch('repository')
+  end
+
   def test_manifest_environment_belongs_to_executable_step
     release = yaml(File.join(ROOT, '.github/workflows/continuum-tech-swift-release.yml'))
     steps = release.fetch('jobs').fetch('manifests').fetch('steps')
@@ -2669,7 +2738,7 @@ class ContinuumTest < Minitest::Test
   STUB_INPUT_WHITELIST = {
     'continuum-add-review-label.yml' => %w[continuum_ref],
     'continuum-auto-merge.yml' => %w[continuum_ref post_merge_wakeups post_merge_wakeup_ref],
-    'continuum-bootstrap-runtime-secret.yml' => %w[continuum_ref],
+    'continuum-bootstrap-runtime-secret.yml' => %w[continuum_ref repository],
     'continuum-coderabbit-retry.yml' => %w[continuum_ref],
     'continuum-coderabbit-unresolved.yml' => %w[continuum_ref],
     'continuum-docker-qualification.yml' => %w[
