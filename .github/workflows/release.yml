@@ -448,6 +448,15 @@ jobs:
             arch: arm64
             swift: "6.1"
 
+    env:
+      # Consumer-configurable identity (defaults preserve NanoDictate behavior).
+      APP_NAME: ${{ vars.CONTINUUM_APP_NAME || 'NanoDictate' }}
+      CLI_NAME: ${{ vars.CONTINUUM_CLI_NAME || 'nanodictate' }}
+      AGENT_NAME: ${{ vars.CONTINUUM_AGENT_NAME || 'NanoDictateAgent' }}
+      BUNDLE_AGENT: ${{ vars.CONTINUUM_BUNDLE_AGENT || 'com.nanodictate.agent' }}
+      BUNDLE_CTL: ${{ vars.CONTINUUM_BUNDLE_CTL || 'com.nanodictate.ctl' }}
+      SIGNING_IDENTITY: ${{ vars.CONTINUUM_SIGNING_IDENTITY || 'NanoDictate CI Signing' }}
+
     steps:
       - name: Checkout
         # actions/checkout@v4 = 11d5960a326750d5838078e36cf38b85af677262
@@ -473,14 +482,14 @@ jobs:
         run: |
           # Invariant: CFBundleIdentifier in each Info.*.plist must match the codesign
           # --identifier for the same product (tccd reads both):
-          #   packaging/Info.NanoDictateAgent.plist -> com.nanodictate.agent
-          #   packaging/Info.nanodictate.plist       -> com.nanodictate.ctl
-          swift build -c release --product NanoDictateAgent \
+          #   packaging/Info.<agent>.plist -> <agent bundle id>
+          #   packaging/Info.<cli>.plist   -> <cli bundle id>
+          swift build -c release --product "$AGENT_NAME" \
             -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist \
-            -Xlinker packaging/Info.NanoDictateAgent.plist
-          swift build -c release --product nanodictate \
+            -Xlinker "packaging/Info.$AGENT_NAME.plist"
+          swift build -c release --product "$CLI_NAME" \
             -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist \
-            -Xlinker packaging/Info.nanodictate.plist
+            -Xlinker "packaging/Info.$CLI_NAME.plist"
 
       - name: Code-sign binaries, assemble & sign the .app bundle
         # Signed with a purpose-made self-signed "NanoDictate CI Signing"
@@ -517,42 +526,41 @@ jobs:
         run: |
           set -euo pipefail
           if [ -n "$P12_B64" ] && [ -n "$P12_PASS" ]; then
-            KC="/tmp/nanodictate-signing.keychain"
-            KC_PASS="nanodictate"
+            KC="/tmp/$CLI_NAME-signing.keychain"
+            KC_PASS="$CLI_NAME"
             security create-keychain -p "$KC_PASS" "$KC"
             security set-keychain-settings -lut 21600 "$KC"
             security list-keychains -d user -s "$KC"
             security default-keychain -s "$KC"
             security unlock-keychain -p "$KC_PASS" "$KC"
-            echo "$P12_B64" | base64 --decode > /tmp/nanodictate-ci.p12
-            security import /tmp/nanodictate-ci.p12 -k "$KC" -P "$P12_PASS" \
+            echo "$P12_B64" | base64 --decode > "/tmp/$CLI_NAME-ci.p12"
+            security import "/tmp/$CLI_NAME-ci.p12" -k "$KC" -P "$P12_PASS" \
               -T /usr/bin/codesign
             security set-key-partition-list -S apple-tool:,apple: \
               -s -k "$KC_PASS" "$KC"
-            SIGN_CERT="NanoDictate CI Signing"
+            SIGN_CERT="$SIGNING_IDENTITY"
             # No --timestamp: RSA PKCS#1v1.5 signatures are deterministic, so a re-run of
             # the same rev produces byte-identical binaries and the sha256 committed to the
             # release manifests stays valid. Adding --timestamp would silently break that.
             codesign --force --sign "$SIGN_CERT" --keychain "$KC" \
-              --identifier com.nanodictate.agent --options runtime \
-              --entitlements Resources/com.nanodictate.agent.entitlements \
-              .build/release/NanoDictateAgent
+              --identifier "$BUNDLE_AGENT" --options runtime \
+              --entitlements "Resources/$BUNDLE_AGENT.entitlements" \
+              ".build/release/$AGENT_NAME"
             codesign --force --sign "$SIGN_CERT" --keychain "$KC" \
-              --identifier com.nanodictate.ctl --options runtime \
-              --entitlements Resources/com.nanodictate.ctl.entitlements \
-              .build/release/nanodictate
-            # --- Assemble NanoDictate.app. The bundle reuses the SAME two
-            # binaries (Contents/MacOS/{NanoDictateAgent,nanodictate}) and the
-            # SAME com.nanodictate.agent identifier as the CLI tarball — the
-            # cask install and the formula install are two faces of one daemon
-            # behind one canonical LaunchAgent plist (see
-            # packaging/homebrew/Casks/nanodictate.rb.tpl). Resources/ ships
+              --identifier "$BUNDLE_CTL" --options runtime \
+              --entitlements "Resources/$BUNDLE_CTL.entitlements" \
+              ".build/release/$CLI_NAME"
+            # --- Assemble the app bundle. It reuses the SAME two binaries
+            # (Contents/MacOS/{$AGENT_NAME,$CLI_NAME}) and the SAME agent
+            # bundle identifier as the CLI tarball — the cask install and the
+            # formula install are two faces of one daemon behind one canonical
+            # LaunchAgent plist (see Casks/$CLI_NAME.rb.tpl). Resources/ ships
             # inside the bundle for reference; the agent's plist is generated
-            # by the CLI at `nanodictate start` time.
-            APP=".build/release/NanoDictate.app"
+            # by the CLI at `$CLI_NAME start` time.
+            APP=".build/release/$APP_NAME.app"
             mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-            cp .build/release/NanoDictateAgent .build/release/nanodictate "$APP/Contents/MacOS/"
-            cp packaging/Info.NanoDictateApp.plist "$APP/Contents/Info.plist"
+            cp ".build/release/$AGENT_NAME" ".build/release/$CLI_NAME" "$APP/Contents/MacOS/"
+            cp "packaging/Info.${APP_NAME}App.plist" "$APP/Contents/Info.plist"
             # Real version into the bundle's Info.plist. MUST run before the
             # bundle codesign — the signature seals Info.plist, so an injection
             # afterwards would invalidate the seal.
@@ -567,24 +575,24 @@ jobs:
             # right after executableDir/prefixDir and finds the canon here as
             # the bundle's first existing candidate.
             cp config.example.toml "$APP/Contents/Resources/"
-            cp Resources/com.nanodictate.agent.entitlements \
-               Resources/com.nanodictate.ctl.entitlements \
-               Resources/nanodictate-agent.plist.template \
+            cp "Resources/$BUNDLE_AGENT.entitlements" \
+               "Resources/$BUNDLE_CTL.entitlements" \
+               "Resources/$CLI_NAME-agent.plist.template" \
                "$APP/Contents/Resources/"
             # Sign the bundle with the SAME identity, identifier and
             # entitlements as the agent binary: no --deep (that would re-seal
             # the nested CLI and change its cdhash), no --timestamp (keeps the
             # bundle byte-identical on a re-run of the same rev). The bundle
             # sign replaces the main executable's signature and enumerates the
-            # nested nanodictate CLI (already signed above) — tccd keys the
-            # TCC grants to the cdhash of Contents/MacOS/NanoDictateAgent, and
-            # identical sign inputs keep that cdhash stable.
+            # nested CLI (already signed above) — tccd keys the TCC grants to
+            # the cdhash of Contents/MacOS/$AGENT_NAME, and identical sign
+            # inputs keep that cdhash stable.
             codesign --force --sign "$SIGN_CERT" --keychain "$KC" \
-              --identifier com.nanodictate.agent --options runtime \
-              --entitlements "$APP/Contents/Resources/com.nanodictate.agent.entitlements" \
+              --identifier "$BUNDLE_AGENT" --options runtime \
+              --entitlements "$APP/Contents/Resources/$BUNDLE_AGENT.entitlements" \
               "$APP"
             # Signing material lives only for this job; drop the p12 and the temp keychain.
-            rm -f /tmp/nanodictate-ci.p12
+            rm -f "/tmp/$CLI_NAME-ci.p12"
             security delete-keychain "$KC"
             # Authority pin (main branch only): an ad-hoc signature
             # (codesign -s -) prints no Authority= line at all — only
@@ -594,50 +602,50 @@ jobs:
             # carry the CI identity's leaf as signer — a wrong certificate
             # would change the cdhash and reset TCC grants on the next
             # release.
-            codesign -dv --verbose=4 .build/release/NanoDictateAgent 2>&1 \
-              | grep -q "Authority=NanoDictate CI Signing"
-            codesign -dv --verbose=4 .build/release/nanodictate 2>&1 \
-              | grep -q "Authority=NanoDictate CI Signing"
+            codesign -dv --verbose=4 ".build/release/$AGENT_NAME" 2>&1 \
+              | grep -q "Authority=$SIGN_CERT"
+            codesign -dv --verbose=4 ".build/release/$CLI_NAME" 2>&1 \
+              | grep -q "Authority=$SIGN_CERT"
             codesign -dv --verbose=4 "$APP" 2>&1 \
-              | grep -q "Authority=NanoDictate CI Signing"
+              | grep -q "Authority=$SIGN_CERT"
           else
             # No CI signing secrets configured (manual run on a fork, or the
             # secrets were not uploaded yet): fall back to ad-hoc so the
             # release still builds — TCC stability is lost, and the loss is
-            # loud in the log. Upload NANODICTATE_SIGNING_P12 (base64 p12)
-            # + NANODICTATE_SIGNING_PASSWORD to kill the warning.
-            echo "WARNING: NANODICTATE_SIGNING_P12/PASSWORD not set — " \
+            # loud in the log. Upload the signing p12 (base64) and its
+            # password secret to kill the warning.
+            echo "WARNING: signing p12/password secrets not set — " \
                  "falling back to ad-hoc signature (no stable TCC DR)"
-            codesign --force -s - --identifier com.nanodictate.agent \
+            codesign --force -s - --identifier "$BUNDLE_AGENT" \
               --options runtime \
-              --entitlements Resources/com.nanodictate.agent.entitlements \
-              .build/release/NanoDictateAgent
-            codesign --force -s - --identifier com.nanodictate.ctl \
+              --entitlements "Resources/$BUNDLE_AGENT.entitlements" \
+              ".build/release/$AGENT_NAME"
+            codesign --force -s - --identifier "$BUNDLE_CTL" \
               --options runtime \
-              --entitlements Resources/com.nanodictate.ctl.entitlements \
-              .build/release/nanodictate
+              --entitlements "Resources/$BUNDLE_CTL.entitlements" \
+              ".build/release/$CLI_NAME"
             # Same bundle assembly + version injection as the CI branch
             # (ad-hoc seal; no TCC stability, same loud warning above).
-            APP=".build/release/NanoDictate.app"
+            APP=".build/release/$APP_NAME.app"
             mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-            cp .build/release/NanoDictateAgent .build/release/nanodictate "$APP/Contents/MacOS/"
-            cp packaging/Info.NanoDictateApp.plist "$APP/Contents/Info.plist"
+            cp ".build/release/$AGENT_NAME" ".build/release/$CLI_NAME" "$APP/Contents/MacOS/"
+            cp "packaging/Info.${APP_NAME}App.plist" "$APP/Contents/Info.plist"
             RELEASE_VERSION="${RELEASE_VERSION#v}"
             /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $RELEASE_VERSION" "$APP/Contents/Info.plist"
             /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $RELEASE_VERSION" "$APP/Contents/Info.plist"
             cp config.example.toml "$APP/Contents/Resources/"
-            cp Resources/com.nanodictate.agent.entitlements \
-               Resources/com.nanodictate.ctl.entitlements \
-               Resources/nanodictate-agent.plist.template \
+            cp "Resources/$BUNDLE_AGENT.entitlements" \
+               "Resources/$BUNDLE_CTL.entitlements" \
+               "Resources/$CLI_NAME-agent.plist.template" \
                "$APP/Contents/Resources/"
-            codesign --force -s - --identifier com.nanodictate.agent \
+            codesign --force -s - --identifier "$BUNDLE_AGENT" \
               --options runtime \
-              --entitlements "$APP/Contents/Resources/com.nanodictate.agent.entitlements" \
+              --entitlements "$APP/Contents/Resources/$BUNDLE_AGENT.entitlements" \
               "$APP"
           fi
-          codesign --verify --strict .build/release/NanoDictateAgent
-          codesign --verify --strict .build/release/nanodictate
-          codesign --verify --strict --deep .build/release/NanoDictate.app
+          codesign --verify --strict ".build/release/$AGENT_NAME"
+          codesign --verify --strict ".build/release/$CLI_NAME"
+          codesign --verify --strict --deep ".build/release/$APP_NAME.app"
 
       - name: Package tarball
         env:
@@ -655,10 +663,10 @@ jobs:
           # start` writes the canonical
           # ~/Library/LaunchAgents/com.nanodictate.agent.plist). The runtime
           # needs none of these — formulae/ports ship binaries + config only.
-          cp .build/release/NanoDictateAgent .build/release/nanodictate config.example.toml "$DIST"/
+          cp ".build/release/$AGENT_NAME" ".build/release/$CLI_NAME" config.example.toml "$DIST"/
           cp -R Resources "$DIST"/
-          cp -R .build/release/NanoDictate.app "$DIST"/
-          ARCHIVE="$DIST/nanodictate-$RELEASE_VERSION-macos-${{ matrix.arch }}.tar.gz"
+          cp -R ".build/release/$APP_NAME.app" "$DIST"/
+          ARCHIVE="$DIST/$CLI_NAME-$RELEASE_VERSION-macos-${{ matrix.arch }}.tar.gz"
           # Deterministic archive so a re-run of the same version produces a
           # byte-identical tarball (and thus the same sha256 as the committed
           # manifests):
@@ -690,11 +698,11 @@ jobs:
           # too — the CLI tarball's composition stays identical to previous
           # releases (binaries + config + Resources), so its sha256 semantics
           # never drift; the app bundle travels in the zip only.
-          (cd "$DIST" && find . -type f ! -path '*/NanoDictate.app/*' ! -name 'nanodictate-*.tar.gz' | sed 's|^\./||' | sort > /tmp/nanodictate-members.txt)
+          (cd "$DIST" && find . -type f ! -path "*/$APP_NAME.app/*" ! -name "$CLI_NAME-*.tar.gz" | sed 's|^\./||' | sort > "/tmp/$CLI_NAME-members.txt")
           COPYFILE_DISABLE=1 tar -c \
             --uid 0 --gid 0 --numeric-owner \
             --no-xattrs --no-acls --no-fflags --no-mac-metadata \
-            -C "$DIST" -T /tmp/nanodictate-members.txt \
+            -C "$DIST" -T "/tmp/$CLI_NAME-members.txt" \
             | gzip -n > "$ARCHIVE"
           ls -l "$ARCHIVE"
 
@@ -715,20 +723,20 @@ jobs:
           # binaries, config + Resources. The
           # zip itself and the tarball are excluded, so a re-pack
           # on a reused dir cannot swallow stale archives.
-          ZIP_ARCHIVE="$DIST/nanodictate-$RELEASE_VERSION-macos-${{ matrix.arch }}.zip"
+          ZIP_ARCHIVE="$DIST/$CLI_NAME-$RELEASE_VERSION-macos-${{ matrix.arch }}.zip"
           ZIP_PATH="$(pwd)/$ZIP_ARCHIVE"
-          (cd "$DIST" && find . -type f ! -name 'nanodictate-*.tar.gz' ! -name 'nanodictate-*.zip' | sed 's|^\./||' | sort > /tmp/nanodictate-zip-members.txt)
-          (cd "$DIST" && TZ=UTC SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" COPYFILE_DISABLE=1 zip -Xr -y -q "$ZIP_PATH" -@ < /tmp/nanodictate-zip-members.txt)
+          (cd "$DIST" && find . -type f ! -name "$CLI_NAME-*.tar.gz" ! -name "$CLI_NAME-*.zip" | sed 's|^\./||' | sort > "/tmp/$CLI_NAME-zip-members.txt")
+          (cd "$DIST" && TZ=UTC SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" COPYFILE_DISABLE=1 zip -Xr -y -q "$ZIP_PATH" -@ < "/tmp/$CLI_NAME-zip-members.txt")
           ls -l "$ZIP_ARCHIVE"
 
       - name: Upload tarball + app-bundle zip
         # actions/upload-artifact@v4 = ea165f8d65b6e75b540449e92b4886f43607fa02
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: nanodictate-release-${{ matrix.arch }}
+          name: ${{ env.CLI_NAME }}-release-${{ matrix.arch }}
           path: |
-            dist/nanodictate-*.tar.gz
-            dist/nanodictate-*.zip
+            dist/${{ env.CLI_NAME }}-*.tar.gz
+            dist/${{ env.CLI_NAME }}-*.zip
           if-no-files-found: error
 
   # Aggregation: collect both tarballs, print names/checksums, create the
