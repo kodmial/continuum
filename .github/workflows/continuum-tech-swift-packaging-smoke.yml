@@ -61,14 +61,25 @@ on:
 permissions:
   contents: read
 
+# Keep only the newest run for a given PR/ref. This prevents repeated
+# synchronize/push events from stacking expensive macOS jobs.
+concurrency:
+  group: continuum-packaging-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  # Decide which modes run for this event. Documentation-only changes never
-  # reach this workflow (path filters above); the candidate gate is required
-  # for deliverable-affecting PRs and main pushes.
+  # Decide which modes run for this event. Source-only PRs still report a
+  # successful Packaging smoke workflow, but defer the expensive full macOS
+  # package lifecycle to the exact-head main gate immediately before release.
+  # Packaging-surface PRs and every main push keep the full candidate gate.
   resolve:
     name: Resolve smoke modes
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: write
     outputs:
       run_candidate: ${{ steps.modes.outputs.run_candidate }}
       run_production: ${{ steps.modes.outputs.run_production }}
@@ -79,10 +90,109 @@ jobs:
         with:
           script: |
             const event = context.eventName;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
             let runCandidate = 'false';
             let runProduction = 'false';
-            if (event === 'pull_request' || event === 'push') {
+
+            const packagingSensitive = (file) =>
+              file === 'Package.swift' ||
+              file === 'config.example.toml' ||
+              file === 'scripts/release-prep.rb' ||
+              file === 'scripts/install-macports.sh' ||
+              file.startsWith('scripts/packaging-smoke/') ||
+              file.startsWith('packaging/') ||
+              file.startsWith('Resources/') ||
+              file === '.github/workflows/continuum-tech-swift-packaging-smoke.yml' ||
+              file === '.github/workflows/continuum-tech-swift-release.yml';
+
+            const prCandidateCache = new Map();
+            async function prNeedsFullCandidate(number) {
+              if (prCandidateCache.has(number)) return prCandidateCache.get(number);
+              const files = await github.paginate(github.rest.pulls.listFiles, {
+                owner, repo, pull_number: number, per_page: 100,
+              });
+              const sensitive = files.map((f) => f.filename).filter(packagingSensitive);
+              const needed = sensitive.length > 0;
+              prCandidateCache.set(number, needed);
+              if (needed) {
+                core.notice('PR #' + number + ' touches packaging surface: ' + sensitive.slice(0, 20).join(', '));
+              } else {
+                core.notice('PR #' + number + ' is source/non-packaging only; full macOS packaging is deferred to the exact-head main release gate.');
+              }
+              return needed;
+            }
+
+            async function cancelRun(run, reason) {
+              try {
+                await github.rest.actions.cancelWorkflowRun({
+                  owner, repo, run_id: run.id,
+                });
+                core.notice('Cancelled stale Packaging smoke run ' + run.id + ': ' + reason);
+              } catch (error) {
+                // A run may finish between listing and cancellation.
+                if (error.status === 409 || error.status === 422) {
+                  core.notice('Packaging smoke run ' + run.id + ' was already finishing; cancellation no longer needed.');
+                } else {
+                  core.warning('Could not cancel Packaging smoke run ' + run.id + ': ' + error.message);
+                }
+              }
+            }
+
+            async function pruneObsoletePackagingRuns() {
+              const statuses = ['in_progress', 'queued', 'pending', 'waiting'];
+              const active = [];
+              for (const status of statuses) {
+                try {
+                  const runs = await github.paginate(github.rest.actions.listWorkflowRunsForRepo, {
+                    owner, repo, status, per_page: 100,
+                  });
+                  active.push(...runs);
+                } catch (error) {
+                  // GitHub's status enum can vary; unsupported states are harmless.
+                  if (error.status !== 422) throw error;
+                }
+              }
+              const unique = new Map(active.map((run) => [run.id, run]));
+              const packagingRuns = [...unique.values()]
+                .filter((run) =>
+                  run.id !== context.runId &&
+                  run.path === '.github/workflows/continuum-tech-swift-packaging-smoke.yml')
+                .sort((a, b) => b.id - a.id);
+
+              const newestPackagingPR = new Set();
+              for (const run of packagingRuns) {
+                if (run.event === 'push' && run.head_branch === 'main') {
+                  await cancelRun(run, 'superseded by exact-head main run ' + context.runId);
+                  continue;
+                }
+                if (run.event !== 'pull_request') continue;
+                const number = run.pull_requests && run.pull_requests[0] && run.pull_requests[0].number;
+                if (!number) continue;
+
+                if (!(await prNeedsFullCandidate(number))) {
+                  await cancelRun(run, 'source/non-packaging PR #' + number + ' no longer needs the full macOS gate');
+                  continue;
+                }
+                if (newestPackagingPR.has(number)) {
+                  await cancelRun(run, 'superseded by a newer Packaging smoke run for PR #' + number);
+                  continue;
+                }
+                newestPackagingPR.add(number);
+              }
+            }
+
+            if (event === 'pull_request') {
+              const number = context.payload.pull_request && context.payload.pull_request.number;
+              runCandidate = number && await prNeedsFullCandidate(number) ? 'true' : 'false';
+            } else if (event === 'push') {
               runCandidate = 'true';
+              if (context.ref === 'refs/heads/main') {
+                // Main's release candidate is the publication gate. Reclaim scarce
+                // macOS runner slots from obsolete source-only PR smoke runs and
+                // older main candidates before queueing the exact-head candidate.
+                await pruneObsoletePackagingRuns();
+              }
             } else if (event === 'schedule') {
               runProduction = 'true';
             } else if (event === 'workflow_run') {
