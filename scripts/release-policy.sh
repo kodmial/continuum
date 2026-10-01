@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Release policy for the automated Release PR flow
-# (.github/workflows/continuum-release-pr.yml).
+# (.github/workflows/continuum-tech-swift-release-pr.yml).
 #
 # This file is a SOURCEABLE library, not an executable: the workflow does
 #   source scripts/release-policy.sh
 # so that every decision that answers "does this merge need a Release PR
 # update?" is plain, testable shell instead of inline YAML. The test suite is
-# scripts/test-release-policy.sh (run by .github/workflows/continuum-ci.yml).
+# scripts/test-release-policy.sh (run by .github/workflows/continuum-tech-swift-ci.yml).
 #
 # Two INDEPENDENT gates decide the outcome, in this order:
 #
@@ -292,7 +292,7 @@ policy_is_version_seeding() {
 #         `## [Unreleased]` reopened above it, and the compare links
 #         (`[Unreleased]`, `[<version>]`) refreshed.
 #
-# The bump step in .github/workflows/continuum-release-pr.yml calls this together with
+# The bump step in .github/workflows/continuum-tech-swift-release-pr.yml calls this together with
 # the Version.swift rewrite, because the two are one release: a version bump
 # without the matching changelog section is what makes
 # VersionTests.testVersionStringEqualsCurrentRelease fail — the test compares

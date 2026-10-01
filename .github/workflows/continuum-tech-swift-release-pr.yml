@@ -1,3 +1,6 @@
+# This is a technology-layer workflow (opt-in, library). It is NOT triggered by Continuum itself.
+# Naming: continuum-tech-<tech>-<name>.yml (the `continuum-tech-<tech>-` prefix marks the library).
+
 name: Release PR
 
 # Maintains the single automated Release PR from what has actually landed in
@@ -39,7 +42,7 @@ name: Release PR
 # Only a broken policy input (unparsable or out-of-series version) fails the
 # workflow: a human error must be surfaced, not silently swallowed.
 # The decisions themselves live in scripts/release-policy.sh and are covered by
-# scripts/test-release-policy.sh (run by .github/workflows/continuum-ci.yml).
+# scripts/test-release-policy.sh (run by .github/workflows/continuum-tech-swift-ci.yml).
 #
 # Versioning: release-please is configured with `versioning: always-bump-patch`
 # (see release-please-config.json), which preserves NanoDictate's patch-only

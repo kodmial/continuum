@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   call:
-    uses: kodmial/continuum/.github/workflows/ci.yml@main
+    uses: kodmial/continuum/.github/workflows/continuum-tech-swift-ci.yml@main
     secrets: inherit
     with:
       continuum_ref: main

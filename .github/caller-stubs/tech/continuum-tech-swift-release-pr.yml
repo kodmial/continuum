@@ -20,7 +20,7 @@ permissions:
 
 jobs:
   call:
-    uses: kodmial/continuum/.github/workflows/release-pr.yml@main
+    uses: kodmial/continuum/.github/workflows/continuum-tech-swift-release-pr.yml@main
     secrets: inherit
     with:
       continuum_ref: main

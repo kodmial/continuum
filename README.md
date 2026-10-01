@@ -11,9 +11,10 @@ engine.
 | Path | Purpose |
 | --- | --- |
 | `.github/workflows/*.yml` | Reusable (`on: workflow_call`) workflows — the engine. |
-| `.github/caller-stubs/*.yml` | Thin callers installed by the `swift` profile (technology-oriented). |
-| `.github/caller-stubs/parent/*.yml` | Thin callers installed by the `parent` profile. |
-| `install.sh` | Installs a profile into a consumer repository. |
+| `.github/caller-stubs/*.yml` | Thin core callers installed by the default `core` set (task-domain). |
+| `.github/caller-stubs/tech/*.yml` | Thin callers for the opt-in technology library (`tech` set). |
+| `.github/caller-stubs/parent/*.yml` | Thin callers installed by the `parent` set. |
+| `install.sh` | Installs one set into a consumer repository. |
 | `src/continuum/` | Dependency-free Python engine (config + YAML subset). |
 | `.github/scripts/` | Delegation resolver/runtime and the global instructions installer. |
 | `scripts/` | Contract tests, release policy, and packaging-smoke fallback scripts. |
@@ -37,24 +38,34 @@ engine.
 These names are the interface and never change per consumer:
 
 - the `TAP_PAT` repository secret (classic PAT, `repo` + `workflow` scopes) —
-  every profile expects a secret with exactly this name;
-- the `continuum-` prefix on installed callers;
-- the installer profiles (`swift` and `parent`);
+  every set expects a secret with exactly this name;
+- the `continuum-` prefix on installed callers, and the `continuum-tech-<tech>-`
+  prefix for opt-in library callers;
+- the installer sets (`core`, `tech`, and `parent`);
 - the `CONTINUUM_*` repository-variable names.
 
-Continuum is technology-neutral: `swift` is the profile for Swift
-applications, `parent` drives delegated execution for any technology, and the
-generic controllers (issue scheduling, OpenCode, review bots, auto-merge) work
-the same in every repository.
+Continuum is technology-neutral: `core` ships the task-domain controllers
+(issue scheduling, PR creation/repair/recovery, PR review, PR analysis,
+auto-merge, delegation) every project needs; `tech` is a separate, opt-in
+library of technology-specific workflows — the `continuum-tech-<tech>-` prefix
+(`continuum-tech-<tech>-<name>.yml`) marks them as a library that Continuum
+itself never triggers; `parent` drives delegated execution for any technology.
+
+New core workflow files should be named `continuum-<name>.yml`. The core files
+shipped today keep their historical unprefixed names (`opencode.yml`,
+`pr-agent.yml`, …), which are listed explicitly in `scripts/test-continuum.rb`.
 
 ## Install
 
 ```sh
-# Local working tree (default profile: swift)
+# Local working tree (default set: core)
 bash install.sh /path/to/consumer
 
 # Pin a specific revision (branch, tag, or full commit SHA)
-bash install.sh /path/to/consumer <ref> swift
+bash install.sh /path/to/consumer <ref> core
+
+# Opt into the technology library (Swift build/release/packaging)
+bash install.sh /path/to/consumer <ref> tech
 
 # Add parent/child delegated execution to any repository
 bash install.sh /path/to/consumer <ref> parent
@@ -65,13 +76,51 @@ templates at that revision so the caller and its fallback scripts match, and it
 copies fallback scripts into the consumer's `scripts/` without overwriting
 existing files.
 
-| Profile | Installs |
+| Set | Installs |
 | --- | --- |
-| `swift` | 16 callers covering CI, release, packaging smoke, OpenCode, issue scheduling, CodeRabbit, PR Agent, and auto-merge. |
+| `core` (default) | 11 callers covering OpenCode, issue scheduling, CodeRabbit, PR Agent, and auto-merge. |
+| `tech` | 5 callers in the opt-in technology library: CI, release, release PR, release-automation merge, and packaging smoke. |
 | `parent` | 4 callers: `continuum-child-dispatcher.yml`, `continuum-child-worker.yml`, `continuum-child-review.yml`, `continuum-child-pr-review.yml`. |
 
-The `parent` profile adds **only** child-execution callers; it preserves the
-consumer's own CI, release, and scheduling workflows.
+The `parent` and `tech` sets add **only** their own callers; each preserves
+the consumer's own CI, release, and scheduling workflows. Any value other than
+`core`, `tech`, or `parent` is rejected.
+
+## Upgrading
+
+The technology set was renamed from `swift` to `tech`. Replace
+
+```sh
+bash install.sh <path-to-consumer-repo> <ref> swift
+```
+
+with
+
+```sh
+bash install.sh <path-to-consumer-repo> <ref> tech
+```
+
+`core` is the new default set, so `bash install.sh <path-to-consumer-repo> <ref>`
+now installs the core layer where the old command installed the technology
+library. `core` and `tech` are separate installs: installing `core` does not
+install `tech`, and a consumer that wants the technology library runs the `tech`
+command as well. Passing the old `swift` value is rejected with
+`invalid set: swift (the old 'swift' set is now 'tech')`.
+
+The installed technology files were renamed at the same time, so an already
+installed technology layer does not update itself: before updating Continuum, a
+consumer must reinstall **both** sets,
+
+```sh
+bash install.sh <path-to-consumer-repo> <ref> core
+bash install.sh <path-to-consumer-repo> <ref> tech
+```
+
+Otherwise the stubs already in the consumer keep their old `uses:` references and
+fail with `workflow not found` after the merge. Reinstalling rewrites those stubs;
+they must never be patched by hand. Every installed stub is a `continuum-*.yml`
+file carrying a `uses:` line, is owned by Continuum, and hand-editing one in a
+consumer repository is forbidden.
 
 ## Reusable workflows
 
@@ -79,11 +128,11 @@ Workflow names are identical to the reusable file names unless noted.
 
 | Workflow | Purpose | Notable extra inputs |
 | --- | --- | --- |
-| `ci.yml` | Build, test, and classify whether a macOS build is required. | — |
-| `release.yml` | Tag, GitHub Release, and manifest generation. | `version`, `dry_run` |
-| `release-pr.yml` | Maintains the single automated Release PR (release-please). | — |
-| `release-automation-merge.yml` | Merges trusted release-automation PRs. | — |
-| `packaging-smoke.yml` | Homebrew/MacPorts install lifecycle smoke test. | `mode`, `version` |
+| `continuum-tech-swift-ci.yml` | Build, test, and classify whether a macOS build is required. (tech) | — |
+| `continuum-tech-swift-release.yml` | Tag, GitHub Release, and manifest generation. (tech) | `version`, `dry_run` |
+| `continuum-tech-swift-release-pr.yml` | Maintains the single automated Release PR (release-please). (tech) | — |
+| `continuum-tech-swift-release-automation-merge.yml` | Merges trusted release-automation PRs. (tech) | — |
+| `continuum-tech-swift-packaging-smoke.yml` | Homebrew/MacPorts install lifecycle smoke test. (tech) | `mode`, `version` |
 | `opencode.yml` | OpenCode agent (`name: OpenCode agent`). | `mode`, `pr_number`, `head_ref`, `review_id`, `run_id` |
 | `opencode-repair.yml` | OpenCode repair controller. | — |
 | `opencode-unresolved.yml` | Retry OpenCode on unresolved CodeRabbit findings. | — |
@@ -110,11 +159,11 @@ part of the contract and never change per consumer):
 
 | Secret | Used by | Purpose |
 | --- | --- | --- |
-| `TAP_PAT` | review, release, opencode, delegation | Classic PAT (`repo` + `workflow` scopes) for checkout/push/API. Also the child-runtime token for the `parent` profile. |
+| `TAP_PAT` | review, release, opencode, delegation | Classic PAT (`repo` + `workflow` scopes) for checkout/push/API. Also the child-runtime token for the `parent` set. |
 | `OPENCODE_API_KEY` | OpenCode workflows | Model provider access. |
-| `RELEASE_PR_TOKEN` | `release-pr.yml` (optional) | Fine-grained PAT (`Contents: write`, `Pull requests: write`); falls back to `TAP_PAT`. |
-| `NANODICTATE_SIGNING_P12` | `release.yml`, `packaging-smoke.yml` | Base64 macOS signing certificate (`.p12`). |
-| `NANODICTATE_SIGNING_PASSWORD` | `release.yml`, `packaging-smoke.yml` | Password for the signing certificate. |
+| `RELEASE_PR_TOKEN` | `continuum-tech-swift-release-pr.yml` (optional) | Fine-grained PAT (`Contents: write`, `Pull requests: write`); falls back to `TAP_PAT`. |
+| `NANODICTATE_SIGNING_P12` | tech release and packaging-smoke workflows | Base64 macOS signing certificate (`.p12`). |
+| `NANODICTATE_SIGNING_PASSWORD` | tech release and packaging-smoke workflows | Password for the signing certificate. |
 | `GROQ_API_KEY` | `pr-agent.yml` | PR Agent model provider. |
 | `CHILD_RUNTIME_TOKEN` | `consumer-child-*` | Parent delegation token; caller stubs map it from `TAP_PAT`. |
 
@@ -143,12 +192,13 @@ contract.
 ### Swift application consumer (example: any Swift app repository)
 
 ```sh
-bash install.sh /path/to/myapp <sha> swift
+bash install.sh /path/to/myapp <sha> core
+bash install.sh /path/to/myapp <sha> tech
 ```
 
 - Keep the consumer's own `.continuum.yml` (the neutral `version: 1` file is
   sufficient when there is no tracked relationship).
-- Provide the signing and model secrets the installed profile uses
+- Provide the signing and model secrets the installed sets use
   (see the secrets table above), plus the `CONTINUUM_*` repository variables
   listed in [Consumer configuration variables](docs/consumer-variables.md).
 - The consumer keeps its own `release-please-config.json`,
@@ -188,7 +238,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the full list. Quick version:
 ```sh
 ruby -E UTF-8 scripts/test-continuum.rb
 bash -n install.sh
-actionlint -shellcheck= -pyflakes= .github/workflows/*.yml .github/caller-stubs/*.yml .github/caller-stubs/parent/*.yml
+actionlint -shellcheck= -pyflakes= .github/workflows/*.yml .github/caller-stubs/*.yml .github/caller-stubs/tech/*.yml .github/caller-stubs/parent/*.yml
 
 mkdir -p .opencode-tmp
 export TMPDIR="$PWD/.opencode-tmp"

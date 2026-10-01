@@ -39,7 +39,7 @@ ROOT = File.expand_path("..", __dir__)
 
 # Binary tarballs attached to the GitHub Release. The tag in the download path
 # keeps the "v" prefix; the archive filename does not. Contract fixed in
-# .github/workflows/release.yml — keep this in sync with it.
+# .github/workflows/continuum-tech-swift-release.yml — keep this in sync with it.
 def binary_url(arch)
   "https://github.com/kodmial/nanodictate/releases/download/#{TAG}/" \
     "nanodictate-#{VERSION}-macos-#{arch}.tar.gz"

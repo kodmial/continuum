@@ -1,6 +1,6 @@
 # Contributing to Continuum
 
-Continuum provides reusable GitHub Actions workflows for NanoDictate and parent/child delegated execution. Keep `.github/caller-stubs/` compatible with the workflow interfaces and preserve workflow names used by controllers and `workflow_run` triggers.
+Continuum provides reusable GitHub Actions workflows and parent/child delegated execution. It ships two layers: a core layer of task-domain workflows every project needs, and an opt-in technology library (Swift build/release/packaging) that Continuum never triggers itself. The two layers are distinguished by file name — new core files are `continuum-<name>.yml`, the technology library is `continuum-tech-<tech>-<name>.yml` (the `continuum-tech-<tech>-` prefix marks the library). Keep `.github/caller-stubs/` compatible with the workflow interfaces and preserve workflow names used by controllers and `workflow_run` triggers.
 
 ## Verification
 
@@ -9,7 +9,7 @@ Run from the repository root:
 ```sh
 ruby -E UTF-8 scripts/test-continuum.rb
 bash -n install.sh
-actionlint -shellcheck= -pyflakes= .github/workflows/*.yml .github/caller-stubs/*.yml .github/caller-stubs/parent/*.yml
+actionlint -shellcheck= -pyflakes= .github/workflows/*.yml .github/caller-stubs/*.yml .github/caller-stubs/tech/*.yml .github/caller-stubs/parent/*.yml
 ```
 
 Use actionlint 1.7.12 or newer. The validation workflow runs the contract tests and actionlint on pushes and pull requests. Contract tests use temporary directories under `.opencode-tmp/` and remove their own fixtures.
@@ -38,7 +38,7 @@ Fallback scripts are copied into the consumer's `scripts/` directory without ove
 
 See [Parent/child delegated execution](docs/parent-child-delegation.md) for the
 repository variables, opt-in task markers, validation gate, and `parent`
-installer profile. Parent installation adds only child execution workflows;
+installer set. Parent installation adds only child execution workflows;
 project CI and release workflows remain owned by the consumer.
 
 Run the Python suites with temporary files inside the worktree:
