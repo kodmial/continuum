@@ -646,7 +646,7 @@ jobs:
       github.event_name == 'workflow_dispatch' &&
       inputs.mode == 'ci-fix'
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: ${{ fromJSON(vars.AUTOMATION_DISPATCH_TIMEOUT_MINUTES || '5') }}
 
     permissions:
       actions: read
