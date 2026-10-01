@@ -61,11 +61,9 @@ on:
 permissions:
   contents: read
 
-# Keep only the newest run for a given PR/ref. This prevents repeated
-# synchronize/push events from stacking expensive macOS jobs.
-concurrency:
-  group: continuum-packaging-${{ github.repository }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref || github.run_id }}
-  cancel-in-progress: true
+# No `concurrency` here on purpose: the caller stub already gates the consumer's
+# whole run, including this reusable workflow, so a second block would only
+# duplicate the lock and let the two group names drift apart.
 
 jobs:
   # Decide which modes run for this event. Source-only PRs still report a

@@ -959,11 +959,12 @@ class ContinuumTest < Minitest::Test
   # cancelling frees the scarce macOS runner slots themselves, whereas the same
   # block inside the callee can only gate the callee.
   #
-  # The group must therefore be generic AND repository-scoped. A bare product
-  # literal is the exact drift this test exists to catch: it would make two
-  # different repositories' runs contend for one group and cancel each other.
-  # Each caller's group is distinct for the same reason — CI must not cancel a
-  # packaging-smoke run on the same PR.
+  # The group name must stay Continuum's own: a shipped stub must never carry a
+  # consumer's product name. Each caller's group is distinct so that CI cannot
+  # cancel a packaging-smoke run on the same PR. The repository is part of the
+  # group so the name identifies the run unambiguously in the Actions UI;
+  # concurrency groups are already scoped per repository, so it is not what
+  # keeps two repositories apart.
   def test_tech_swift_callers_gate_on_a_repository_scoped_concurrency_group
     cancelling = {
       'continuum-tech-swift-ci.yml' => 'continuum-swift-ci',
@@ -986,19 +987,42 @@ class ContinuumTest < Minitest::Test
     groups['continuum-tech-swift-release.yml'] = release.fetch('group')
     assert_equal groups.size, groups.values.uniq.size, 'two tech callers share a concurrency group and would cancel each other'
     groups.each do |base, group|
-      assert_includes group, '${{ github.repository }}', "#{base}: an unscoped group lets two repositories cancel each other"
+      assert_includes group, '${{ github.repository }}', "#{base}: the group must name the repository so the run is unambiguous in the Actions UI"
     end
   end
 
   # The templates ship to every consumer, so a consumer's own name hardcoded
   # into one is a defect a reviewer cannot see from the file's purpose. This is
   # the drift guard for the whole tech layer, beyond the groups above.
-  def test_tech_stubs_name_no_consumer_repository
-    TECH_STUBS.each do |path|
-      body = File.read(path)
-      %w[nanodictate runtime-lab macports-nanodictate homebrew-nanodictate].each do |consumer|
-        refute_includes body, consumer, "#{File.basename(path)}: hardcoded consumer name #{consumer}"
+  #
+  # The check is structural rather than a list of known consumer names: every
+  # repository reference in a tech stub — each `uses:` target and each
+  # `owner/repo` or `github.com/owner/repo` literal, comments included — must
+  # name Continuum itself. A consumer nobody has enumerated yet then fails the
+  # same way a known one does.
+  def test_tech_stubs_reference_only_continuum_itself
+    own_repo = 'kodmial/continuum'
+    # `github.com/owner/repo`, matched case-insensitively because GitHub owners
+    # are not case-sensitive and a template may spell one any way. This is
+    # stripped before the bare-literal scan so the two never overlap.
+    url = %r{github\.com/([A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9_.-]*(?:/[A-Za-z0-9._-]+)*)}i
+    # A bare `owner/repo` literal in the YAML itself. The owner segment must
+    # start lowercase, as every reference Continuum ships is written, which
+    # keeps prose such as "Recovery/reconciliation" out of the matches.
+    owner_repo = %r{(?<![\w./-])([a-z0-9][a-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9_.-]*(?:/[A-Za-z0-9._-]+)*)}
+    refute_empty TECH_STUBS
+    TECH_STUBS.each do |stub|
+      base = File.basename(stub)
+      body = File.read(stub)
+
+      body.scan(/^[[:space:]]*-?[[:space:]]*uses:[[:space:]]*["']?([^"'\s]+)/) do |(target)|
+        assert target.start_with?("#{own_repo}/"), "#{base}: uses #{target}, which is not a Continuum workflow"
       end
+
+      references = body.scan(url).flatten.map { |ref| ref.split('#').first }
+      references += body.gsub(url, '').scan(owner_repo).flatten
+      foreign = references.reject { |ref| ref.downcase.start_with?("#{own_repo}/") }
+      assert_empty foreign, "#{base}: references a repository other than #{own_repo}: #{foreign.join(', ')}"
     end
   end
 

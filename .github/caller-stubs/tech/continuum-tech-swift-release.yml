@@ -38,7 +38,10 @@ permissions:
 
 # Serialize release runs per ref: two releases racing on one tag or branch
 # produce duplicate or conflicting tags and manifests. Cancellation is
-# deliberately absent — a release that is already publishing must finish.
+# deliberately absent — a release that is already publishing must finish. The
+# group name stays Continuum's own, so a shipped stub never carries a
+# consumer's product name; the repository part keeps it unambiguous in the
+# Actions UI.
 concurrency:
   group: continuum-swift-release-${{ github.repository }}-${{ github.ref }}
 

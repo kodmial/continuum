@@ -18,8 +18,10 @@ permissions:
 # A superseded PR head cannot satisfy required checks, so cancel its CI run
 # immediately instead of letting stale macOS jobs occupy the shared queue. This
 # lives in the caller, not the callee: the caller gates the consumer's whole
-# run, so cancellation drops the macOS jobs themselves. The repository is part
-# of the group so two consumers never cancel each other's runs.
+# run, so cancellation drops the macOS jobs themselves. The group name stays
+# Continuum's own — a shipped stub must not carry a consumer's product name —
+# and carries the repository so the group reads unambiguously in the Actions
+# UI.
 concurrency:
   group: continuum-swift-ci-${{ github.repository }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref || github.run_id }}
   cancel-in-progress: true
