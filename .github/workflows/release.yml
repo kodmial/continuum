@@ -371,8 +371,14 @@ jobs:
           for _ in {1..40}; do
             while read -r CANDIDATE_ID; do
               [[ -n "$CANDIDATE_ID" ]] || continue
+              # Jobs from a reusable workflow are exposed by GitHub as
+              # "<caller job id> / <called job name>" (for NanoDictate today:
+              # "call / Candidate build (...)"). Normalize to the called job
+              # name before applying the strict contract so this gate works for
+              # both direct and reusable workflow runs and does not depend on
+              # the caller job id chosen by each consumer.
               JOB_NAMES="$(gh api "repos/$REPO/actions/runs/$CANDIDATE_ID/jobs?per_page=100" \
-                --jq '.jobs[].name')"
+                --jq '.jobs[].name | split(" / ") | last')"
               if grep -qxF 'Candidate build (x86_64)' <<<"$JOB_NAMES" && \
                  grep -qxF 'Candidate build (arm64)' <<<"$JOB_NAMES"; then
                 RUN_ID="$CANDIDATE_ID"
