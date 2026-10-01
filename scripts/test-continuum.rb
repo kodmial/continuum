@@ -324,6 +324,10 @@ class ContinuumTest < Minitest::Test
   # layer must carry it; a file added without the prefix fails here the moment
   # it lands, before any consumer installs it.
   def test_every_workflow_and_stub_is_continuum_prefixed
+    # An empty tree would make every loop below and every assertion after it
+    # pass vacuously, so the population is asserted before it is inspected.
+    refute_empty WORKFLOWS, 'no workflows found: the tree is empty or the path is wrong'
+    refute_empty ALL_STUBS, 'no caller stubs found: the tree is empty or the path is wrong'
     unprefixed = (WORKFLOWS + ALL_STUBS).reject do |path|
       File.basename(path).start_with?('continuum-')
     end.map { |path| File.basename(path) }
@@ -350,25 +354,283 @@ class ContinuumTest < Minitest::Test
                  'install.sh must write the stored stub name verbatim')
   end
 
-  # A caller name that Continuum no longer ships must not survive in the
+  # `install.sh` fetches stubs over `curl` whenever two or more positional
+  # arguments are given, so a remote-path test must not touch the network. This
+  # puts a `curl` on PATH that serves the repository's real stub for the
+  # requested name, or an override when the test needs a body the repository
+  # does not ship.
+  # The variable names are prefixed so they cannot collide with install.sh's own
+  # internals: it assigns an ARRAY to a variable named `STUBS`, and a colliding
+  # exported value is replaced by it rather than passed through to the child.
+  def fake_curl(dir, overrides = {})
+    bin = File.join(dir, 'bin')
+    overrides_dir = File.join(dir, 'curl-overrides')
+    FileUtils.mkdir_p([bin, overrides_dir])
+    overrides.each do |name, body|
+      File.write(File.join(overrides_dir, name), body)
+    end
+    File.write(File.join(bin, 'curl'), <<~SH)
+      #!/usr/bin/env bash
+      set -eu
+      name="${@: -1}"
+      name="${name##*/}"
+      if [ -f "$CURL_OVERRIDES/$name" ]; then
+        cat "$CURL_OVERRIDES/$name"
+      else
+        for dir in "$CURL_STUB_DIR" "$CURL_STUB_DIR/tech" "$CURL_STUB_DIR/parent"; do
+          if [ -f "$dir/$name" ]; then cat "$dir/$name"; exit 0; fi
+        done
+        exit 22
+      fi
+    SH
+    FileUtils.chmod(0755, File.join(bin, 'curl'))
+    {'PATH' => "#{bin}:#{ENV['PATH']}",
+     'CURL_OVERRIDES' => overrides_dir,
+     'CURL_STUB_DIR' => File.join(ROOT, '.github/caller-stubs')}
+  end
+
+  # A caller name that Continuum no longer ships must not survive forever in the
   # consumer: a renamed stub that leaves its predecessor behind gives the
-  # consumer two files where the dispatchers only know one.
+  # consumer two files where the dispatchers only know one. Deletion is still
+  # destructive, so it is fenced — see test_installer_prune_requires_ownership.
+  #
+  # This helper writes a body that looks like a real installed caller, which is
+  # what makes it a prune candidate: the `kodmial/continuum/` reference inside
+  # it is the ownership evidence, not its name.
+  def superseded_caller(name)
+    <<~YAML
+      name: #{name}
+      on:
+        workflow_call:
+          inputs: {}
+      jobs:
+        call:
+          uses: kodmial/continuum/.github/workflows/#{name}
+          secrets: inherit
+    YAML
+  end
+
   def test_installer_prunes_superseded_callers
     fixture do |dir|
       target = File.join(dir, 'superseded')
       stale = File.join(target, '.github/workflows/continuum-removed-caller.yml')
       FileUtils.mkdir_p(File.dirname(stale))
-      File.write(stale, "name: Removed caller\n")
-      output, status = Open3.capture2e('bash', File.join(ROOT, 'install.sh'), target)
+      File.write(stale, superseded_caller('continuum-removed-caller.yml'))
+      output, status = Open3.capture2e('bash', File.join(ROOT, 'install.sh'), target, '--yes')
       assert status.success?, output
       refute File.exist?(stale), 'a caller Continuum no longer ships must be removed on install'
       assert_includes output, 'removed superseded Continuum caller: continuum-removed-caller.yml'
       # A project-owned workflow is never Continuum's to delete.
       project = File.join(target, '.github/workflows/ci.yml')
       File.write(project, "name: CI\n")
-      output, status = Open3.capture2e('bash', File.join(ROOT, 'install.sh'), target)
+      output, status = Open3.capture2e('bash', File.join(ROOT, 'install.sh'), target, '--yes')
       assert status.success?, output
       assert File.exist?(project), 'install.sh must not remove a project-owned workflow'
+    end
+  end
+
+  # A `uses:` line is legal at two levels in a workflow: job-level, and
+  # step-level as a list item (`- uses: ...`). The ref parameter exists to pin
+  # an installed caller to the requested revision, so BOTH forms must be
+  # rewritten. A sed anchored only on `^[[:space:]]*uses:` matches only the
+  # job-level form and silently leaves every step-level reference on `main`,
+  # which is the exact guarantee the parameter promises. Every caller is
+  # job-level today, so this is latent, not yet observed.
+  def test_installer_rewrites_step_level_uses_at_the_requested_ref
+    fixture do |dir|
+      stub = <<~YAML
+        name: Continuum reusable child worker
+        on:
+          workflow_call:
+            inputs: {}
+        jobs:
+          joblevel:
+            uses: kodmial/continuum/.github/workflows/continuum-opencode.yml@main
+          steplevel:
+            runs-on: ubuntu-latest
+            steps:
+              - uses: kodmial/continuum/.github/workflows/continuum-opencode.yml@main
+              - uses: kodmial/continuum/.github/workflows/continuum-opencode.yml@main # trailing comment
+              - uses: kodmial/continuum/.github/workflows/continuum-opencode.yml@abc123
+              - uses: actions/checkout@v4
+              - run: echo "an unrelated main mention"
+      YAML
+      # Three positionals force the remote path, so the rewrite is exercised on a
+      # fetched template exactly as a `curl | bash` consumer would see it.
+      env = fake_curl(dir, 'continuum-opencode.yml' => stub)
+      target = File.join(dir, 'consumer')
+      output, status = Open3.capture2e(env, 'bash', File.join(ROOT, 'install.sh'), target, 'v9.9.9', 'core')
+      assert status.success?, output
+
+      body = File.read(File.join(target, '.github/workflows/continuum-opencode.yml'))
+      job_level = body[/^    uses: (.*)$/, 1]
+      step_lines = body.scan(/^      - uses: (.*)$/).flatten
+
+      assert_equal 'kodmial/continuum/.github/workflows/continuum-opencode.yml@v9.9.9', job_level,
+                   'job-level uses: must be rewritten to the requested ref'
+      assert_equal 'kodmial/continuum/.github/workflows/continuum-opencode.yml@v9.9.9', step_lines[0],
+                   'step-level `- uses:` must be rewritten to the requested ref, not left on main'
+      assert_equal 'kodmial/continuum/.github/workflows/continuum-opencode.yml@v9.9.9 # trailing comment',
+                   step_lines[1],
+                   'a trailing comment must not stop the rewrite, and must be preserved'
+      # The ref substitution is still an exact-match rewrite, not a sweep:
+      # a third-party action, an already-pinned Continuum ref, and an unrelated
+      # `main` in prose all have to survive untouched.
+      assert_equal 'kodmial/continuum/.github/workflows/continuum-opencode.yml@abc123', step_lines[2],
+                   'only a @main ref is rewritten; an already-pinned ref is left alone'
+      assert_equal 'actions/checkout@v4', step_lines[3], 'a third-party action must not be rewritten'
+      assert_includes body, 'echo "an unrelated main mention"',
+                      'an unrelated `main` must never be rewritten'
+      # And the result is still parseable YAML.
+      parsed = yaml(File.join(target, '.github/workflows/continuum-opencode.yml'))
+      assert_equal 'ubuntu-latest', parsed.fetch('jobs').fetch('steplevel').fetch('runs-on')
+    end
+  end
+
+  # Deletion is the only destructive thing the installer does, so the uniform
+  # `continuum-` prefix alone must never be enough to qualify a file for it. A
+  # consumer is entitled to name its own workflow `continuum-experiment.yml`;
+  # deleting it would lose work the installer never wrote and cannot restore.
+  def test_installer_prune_requires_ownership_not_just_the_prefix
+    fixture do |dir|
+      target = File.join(dir, 'consumer')
+      hand_written = File.join(target, '.github/workflows/continuum-experiment.yml')
+      FileUtils.mkdir_p(File.dirname(hand_written))
+      # Carries the uniform prefix but no reference back to this repository:
+      # it is a project-owned file that borrows the naming convention.
+      File.write(hand_written, <<~YAML)
+        name: My experiment
+        on:
+          workflow_dispatch:
+        jobs:
+          probe:
+            runs-on: ubuntu-latest
+            steps:
+              - run: echo hi
+      YAML
+      output, status = Open3.capture2e('bash', File.join(ROOT, 'install.sh'), target, '--yes')
+      assert status.success?, output
+      assert File.exist?(hand_written),
+             'a continuum- prefixed file Continuum did not write must never be pruned'
+      refute_includes output, 'removed superseded Continuum caller: continuum-experiment.yml'
+    end
+  end
+
+  # Deleting files unattended is how an install turns into data loss. The
+  # default non-interactive path must therefore never delete: it reports what
+  # it would remove and leaves the decision to the operator. `--yes` and
+  # CONTINUUM_INSTALL_ASSUME_YES are the explicit opt-outs for CI.
+  def test_installer_prune_is_non_destructive_unless_confirmed
+    fixture do |dir|
+      target = File.join(dir, 'consumer')
+      stale = File.join(target, '.github/workflows/continuum-removed-caller.yml')
+      FileUtils.mkdir_p(File.dirname(stale))
+      File.write(stale, superseded_caller('continuum-removed-caller.yml'))
+
+      # Open3 gives the child no terminal, which is exactly the CI shape.
+      output, status = Open3.capture2e('bash', File.join(ROOT, 'install.sh'), target)
+      assert status.success?, output
+      assert File.exist?(stale),
+             'a non-interactive install must not delete anything without confirmation'
+      assert_includes output, 'not removing superseded Continuum callers'
+      assert_includes output, 'continuum-removed-caller.yml',
+                      'the operator must be told exactly which files are candidates'
+      assert_includes output, '--yes', 'the message must name the opt-out'
+
+      # The environment escape hatch is equivalent to the flag, so an
+      # unattended install can opt in without rewriting its command line.
+      output, status = Open3.capture2e(
+        { 'CONTINUUM_INSTALL_ASSUME_YES' => '1' }, 'bash', File.join(ROOT, 'install.sh'), target
+      )
+      assert status.success?, output
+      refute File.exist?(stale), 'CONTINUUM_INSTALL_ASSUME_YES=1 must permit the prune'
+      assert_includes output, 'removed superseded Continuum caller: continuum-removed-caller.yml'
+    end
+  end
+
+  # Installing one layer must never remove another layer's callers. Today the
+  # three sets are independent files in one directory, so a one-line edit to the
+  # prune candidate list — or a future edit to `"${STUBS[@]}"` — could delete a
+  # consumer's whole tech or parent layer with no warning. The growth
+  # 14 -> 19 -> 23 is the observable form of that guarantee.
+  def test_installing_one_set_does_not_delete_another_sets_callers
+    fixture do |dir|
+      target = File.join(dir, 'consumer')
+      env = fake_curl(dir).merge('CONTINUUM_INSTALL_ASSUME_YES' => '1')
+      workflows = File.join(target, '.github/workflows')
+      counts = {}
+      %w[core tech parent].each do |set|
+        output, status = Open3.capture2e(env, 'bash', File.join(ROOT, 'install.sh'), target, 'main', set)
+        assert status.success?, output
+        installed = Dir[File.join(workflows, '*.yml')].map { |f| File.basename(f) }
+        counts[set] = installed.size
+        # Every layer installed so far must still be present, in full.
+        CORE_STUBS.each do |stub|
+          base = File.basename(stub)
+          next unless set == 'core' || installed.include?(base)
+          assert_includes installed, base, "#{set} install removed the core caller #{base}"
+        end
+        if set == 'tech'
+          TECH_STUBS.each { |stub| assert_includes installed, File.basename(stub) }
+        end
+        if set == 'parent'
+          PARENT_STUBS.each { |stub| assert_includes installed, File.basename(stub) }
+        end
+      end
+      # Each set adds exactly its own files: 14 core, +5 tech, +4 parent.
+      assert_equal CORE_STUBS.size, counts['core']
+      assert_equal CORE_STUBS.size + TECH_STUBS.size, counts['tech']
+      assert_equal ALL_STUBS.size, counts['parent']
+      assert_equal 23, ALL_STUBS.size,
+                   'every caller Continuum ships, across all three layers'
+    end
+  end
+
+  # Installing into Continuum's own checkout is never a consumer install. The
+  # prune is skipped there so a stray `install.sh .` cannot delete the
+  # repository's own workflows, for every set.
+  def test_installer_prune_is_skipped_when_targeting_continuum_itself
+    fixture do |dir|
+      # The installer resolves "self" from its own location, so the guard is
+      # exercised by running a copy of it that sits next to a workflows
+      # directory it must refuse to prune.
+      checkout = File.join(dir, 'continuum')
+      workflows = File.join(checkout, '.github/workflows')
+      FileUtils.mkdir_p(workflows)
+      FileUtils.cp(File.join(ROOT, 'install.sh'), File.join(checkout, 'install.sh'))
+      env = fake_curl(dir).merge('CONTINUUM_INSTALL_ASSUME_YES' => '1')
+      %w[core tech parent].each do |set|
+        # A file that satisfies BOTH prune conditions — the `continuum-` prefix
+        # and the repository marker inside it, and a name Continuum does not
+        # ship. Against any other directory this is deleted. Here it must
+        # survive, which is the only way this test can fail if the self-install
+        # guard is ever removed.
+        own = File.join(workflows, 'continuum-validate-continuum.yml')
+        File.write(own, <<~YAML)
+          name: Validate Continuum
+          on:
+            workflow_call:
+            workflow_dispatch:
+          jobs:
+            ci:
+              runs-on: ubuntu-latest
+              steps:
+                - run: echo own
+                - uses: kodmial/continuum/.github/workflows/continuum-opencode.yml@main
+        YAML
+        refute_includes ALL_STUBS, 'continuum-validate-continuum.yml',
+                        'the fixture must be a file Continuum no longer ships'
+        output, status = Open3.capture2e(
+          env, 'bash', File.join(checkout, 'install.sh'), checkout, 'main', set
+        )
+        assert status.success?, output
+        assert_includes output, 'skipping superseded-caller prune',
+                        "#{set}: a self-install must skip the prune entirely"
+        assert File.exist?(own),
+               "#{set}: installing into Continuum's own checkout must not delete its workflows"
+        refute_includes output, 'removed superseded Continuum caller',
+                        "#{set}: a self-install must not prune at all"
+      end
     end
   end
 
@@ -463,12 +725,16 @@ class ContinuumTest < Minitest::Test
     base.start_with?('continuum-') && segments[1] == 'tech' && segments.size >= 4
   end
 
-  CORE_COUNT = WORKFLOWS
-                  .map { |path| File.basename(path) }
-                  .reject { |base| ContinuumTest.tech_name?(base) ||
-                                    CORE_CALLEE_WORKFLOWS.include?(base) ||
-                                    REPO_OWNED_WORKFLOWS.include?(base) }
-                  .size
+  # The number of core callers Continuum ships, stated as a literal and not
+  # derived from either tree.
+  #
+  # Computing it from `WORKFLOWS` made the check that uses it circular: the
+  # count was taken from the workflow tree and then compared against the stub
+  # tree, so adding a workflow and its stub together — exactly what a new
+  # feature does — moved both sides and passed. A literal is the third,
+  # independent source: to ship a fifteenth core caller someone has to say so
+  # here, which is where a reviewer sees it.
+  CORE_COUNT = 14
 
   # Every core workflow is either called by a stub in one of the three layers
   # or is Continuum's own CI. A workflow nobody calls is a dead file that
@@ -500,6 +766,16 @@ class ContinuumTest < Minitest::Test
     stubs.each do |path|
       refute_nil stub_callee_name(path), "#{File.basename(path)}: no reusable-workflow `uses:` found"
     end
+    # The four callees are reached through the `parent` layer, and only through
+    # it: a `core` install must not be enough to satisfy them, or a consumer
+    # that skipped the parent set would have callers pointing at workflows it
+    # never installed.
+    parent_called = PARENT_STUBS.map { |path| stub_callee_name(path) }.compact
+    assert_equal CORE_CALLEE_WORKFLOWS.sort, parent_called.sort,
+                 'the child-execution callees must be exactly the workflows the parent layer calls'
+    overlap = CORE_STUBS.map { |path| stub_callee_name(path) }.compact & CORE_CALLEE_WORKFLOWS
+    assert_empty overlap,
+                 "a core caller must not reach a child-execution callee; that is the parent layer's: #{overlap.join(', ')}"
   end
 
   def test_installer_local_and_explicit_ref

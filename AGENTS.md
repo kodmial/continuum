@@ -33,8 +33,18 @@ These are public interfaces and must not change silently:
 - the installer sets (`core`, `tech`, `parent`): `core` installs every stub
   under `.github/caller-stubs/`, `tech` installs only
   `.github/caller-stubs/tech/` (the `continuum-tech-` prefix marks an opt-in
-  library), `parent` installs only `.github/caller-stubs/parent/`.
-  and the `install.sh` argument shape;
+  library), `parent` installs only `.github/caller-stubs/parent/`;
+- the `install.sh` argument shape `[path] [ref] [set]`, plus the optional `--yes`
+  flag (accepted in any position, and equivalent to
+  `CONTINUUM_INSTALL_ASSUME_YES=1`);
+- the superseded-caller prune policy. Deleting is the only destructive thing the
+  installer does, so it stays fenced: a file is a candidate only if it carries the
+  `continuum-` prefix **and** references this repository in its body (the prefix
+  alone is not ownership evidence, so a consumer's own `continuum-*.yml` is never
+  a candidate); the exact list must be confirmed at a terminal, and a
+  non-interactive install deletes nothing and only reports what it would remove;
+  `--yes`/`CONTINUUM_INSTALL_ASSUME_YES=1` is the explicit opt-out; and the prune
+  is skipped entirely when the target is Continuum's own checkout;
 - the parent/child repository-variable names (`CONTINUUM_ROLE`,
   `CONTINUUM_CHILDREN`, `CONTINUUM_CHILD_ID`, `CONTINUUM_PARENT`,
   `CONTINUUM_VALIDATION_SCRIPT`);

@@ -31,7 +31,10 @@ engine.
   names are part of the interface and stay stable.
 - Callers pin a revision. `install.sh` rewrites the `@main` in `uses:` and the
   `continuum_ref`/`engine_ref` inputs to the requested ref, so one value governs
-  both the workflow and its fallback scripts.
+  both the workflow and its fallback scripts. The rewrite covers a `uses:` line
+  at either level — job-level (`call:` then `uses:`) and step-level (`- uses:`) —
+  and keeps a trailing YAML comment. An unrelated `main` elsewhere in the file,
+  a third-party action, and an already-pinned Continuum ref are all left alone.
 
 ### Fixed contracts
 
@@ -72,6 +75,9 @@ bash install.sh /path/to/consumer <ref> tech
 
 # Add parent/child delegated execution to any repository
 bash install.sh /path/to/consumer <ref> parent
+
+# Also remove callers Continuum no longer ships, without a confirmation prompt
+bash install.sh /path/to/consumer <ref> core --yes
 ```
 
 Use a **full commit SHA** as `<ref>` in production. The installer fetches the
@@ -122,12 +128,34 @@ bash install.sh <path-to-consumer-repo> <ref> tech
 bash install.sh <path-to-consumer-repo> <ref> parent
 ```
 
-Reinstalling rewrites those stubs and also deletes any `continuum-*.yml` caller
-that no layer ships any more, so a renamed or dropped workflow cannot leave a
-stale caller running beside its replacement. Stubs must never be patched by
-hand: every installed stub is a `continuum-*.yml` file carrying a `uses:` line,
-is owned by Continuum, and hand-editing one in a consumer repository is
-forbidden.
+Reinstalling rewrites those stubs and also removes any caller that no layer ships
+any more, so a renamed or dropped workflow cannot leave a stale caller running
+beside its replacement. Because that is the only destructive thing the installer
+does, it is fenced three ways:
+
+1. **Ownership.** The prefix alone is not evidence. A file is only a candidate if
+   it is named `continuum-*.yml` *and* its body references this repository. A
+   consumer's own `continuum-experiment.yml` is left alone even with `--yes`.
+2. **Confirmation.** At a terminal the exact list is printed and the install waits
+   for a `y`. Non-interactively — CI, a pipe, `< /dev/null` — the default is to
+   delete **nothing**: the install reports what it would remove and exits. A CI
+   install can never silently drop a file.
+3. **Self-install.** Installing into Continuum's own checkout is not a consumer
+   install, so the prune is skipped there entirely.
+
+To prune unattended, opt in explicitly:
+
+```sh
+bash install.sh <path> <ref> core --yes
+CONTINUUM_INSTALL_ASSUME_YES=1 bash install.sh <path> <ref> core
+```
+
+`--yes` may appear in any position and is removed before the positional
+arguments are parsed, so the documented argument shape stays `<path> <ref> <set>`.
+
+Stubs must never be patched by hand: every installed stub is a `continuum-*.yml`
+file carrying a `uses:` line, is owned by Continuum, and hand-editing one in a
+consumer repository is forbidden.
 
 ## Reusable workflows
 
