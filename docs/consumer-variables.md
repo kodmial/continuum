@@ -14,18 +14,19 @@ behavior.
 | Variable | Default | Meaning | State |
 | --- | --- | --- | --- |
 | `CONTINUUM_VERSION_FILE` | `Sources/NanoDictateCore/Version.swift` | Source file the release reads the version from. | wired |
-| `CONTINUUM_APP_NAME` | `NanoDictate` | Application name (`.app` bundle and artifacts). | planned |
-| `CONTINUUM_CLI_NAME` | `nanodictate` | Command-line binary name. | planned |
-| `CONTINUUM_AGENT_NAME` | `NanoDictateAgent` | Agent binary name. | planned |
-| `CONTINUUM_BUNDLE_AGENT` | `com.nanodictate.agent` | Agent bundle id / launchd label. | planned |
-| `CONTINUUM_BUNDLE_CTL` | `com.nanodictate.ctl` | CLI bundle id. | planned |
-| `CONTINUUM_SIGNING_IDENTITY` | `NanoDictate CI Signing` | `codesign` identity. | planned |
+| `CONTINUUM_APP_NAME` | `NanoDictate` | Application name (`.app` bundle and artifacts). | wired |
+| `CONTINUUM_CLI_NAME` | `nanodictate` | Command-line binary name. | wired |
+| `CONTINUUM_AGENT_NAME` | `NanoDictateAgent` | Agent binary name. | wired |
+| `CONTINUUM_BUNDLE_AGENT` | `com.nanodictate.agent` | Agent bundle id / launchd label. | wired |
+| `CONTINUUM_BUNDLE_CTL` | `com.nanodictate.ctl` | CLI bundle id. | wired |
+| `CONTINUUM_SIGNING_IDENTITY` | `NanoDictate CI Signing` | `codesign` identity. | wired |
 | `CONTINUUM_HOMEBREW_TAP` | `kodmial/homebrew-nanodictate` | Homebrew tap repository. | planned |
 | `CONTINUUM_MACPORTS_TREE` | `kodmial/macports-nanodictate` | MacPorts canon tree repository. | planned |
 
-`wired` means the engine already reads the variable; `planned` means the name is
-reserved here but the release workflow still carries the NanoDictate literal and
-will be switched over in a follow-up verified in CI.
+`wired` is currently scoped to `packaging-smoke.yml` and
+`scripts/packaging-smoke/common.sh`. The same variables are being threaded
+through `release.yml`, `release-pr.yml`, `ci.yml`, and
+`release-automation-merge.yml`; `planned` marks names reserved for those files.
 
 Set a value in a consumer repository:
 

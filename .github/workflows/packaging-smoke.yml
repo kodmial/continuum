@@ -111,6 +111,18 @@ jobs:
           - os: macos-15
             arch: arm64
             swift: '6.1'
+    env:
+      # Technology-oriented, consumer-configurable identity. Defaults preserve
+      # the current NanoDictate behavior; another Swift project overrides these
+      # through its own repository variables.
+      APP_NAME: ${{ vars.CONTINUUM_APP_NAME || 'NanoDictate' }}
+      CLI_NAME: ${{ vars.CONTINUUM_CLI_NAME || 'nanodictate' }}
+      AGENT_NAME: ${{ vars.CONTINUUM_AGENT_NAME || 'NanoDictateAgent' }}
+      BUNDLE_AGENT: ${{ vars.CONTINUUM_BUNDLE_AGENT || 'com.nanodictate.agent' }}
+      BUNDLE_CTL: ${{ vars.CONTINUUM_BUNDLE_CTL || 'com.nanodictate.ctl' }}
+      SIGNING_IDENTITY: ${{ vars.CONTINUUM_SIGNING_IDENTITY || 'NanoDictate CI Signing' }}
+      VERSION_FILE: ${{ vars.CONTINUUM_VERSION_FILE || 'Sources/NanoDictateCore/Version.swift' }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -124,12 +136,12 @@ jobs:
 
       - name: Build release binaries
         run: |
-          swift build -c release --product NanoDictateAgent \
+          swift build -c release --product "$AGENT_NAME" \
             -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist \
-            -Xlinker packaging/Info.NanoDictateAgent.plist
-          swift build -c release --product nanodictate \
+            -Xlinker "packaging/Info.$AGENT_NAME.plist"
+          swift build -c release --product "$CLI_NAME" \
             -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist \
-            -Xlinker packaging/Info.nanodictate.plist
+            -Xlinker "packaging/Info.$CLI_NAME.plist"
 
       - name: Code-sign binaries and assemble the .app bundle
         env:
@@ -142,63 +154,63 @@ jobs:
           P12_PASS: ${{ github.event_name != 'pull_request' && secrets.NANODICTATE_SIGNING_PASSWORD || '' }}
         run: |
           set -euo pipefail
-          VERSION="$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' Sources/NanoDictateCore/Version.swift)"
+          VERSION="$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' "$VERSION_FILE")"
           if [ -n "${P12_B64:-}" ] && [ -n "${P12_PASS:-}" ]; then
-            KC="/tmp/nanodictate-signing.keychain"
-            KC_PASS="nanodictate"
+            KC="/tmp/$CLI_NAME-signing.keychain"
+            KC_PASS="$CLI_NAME"
             security create-keychain -p "$KC_PASS" "$KC"
             security set-keychain-settings -lut 21600 "$KC"
             security list-keychains -d user -s "$KC"
             security default-keychain -s "$KC"
             security unlock-keychain -p "$KC_PASS" "$KC"
-            echo "$P12_B64" | base64 --decode > /tmp/nanodictate-ci.p12
-            security import /tmp/nanodictate-ci.p12 -k "$KC" -P "$P12_PASS" -T /usr/bin/codesign
+            echo "$P12_B64" | base64 --decode > "/tmp/$CLI_NAME-ci.p12"
+            security import "/tmp/$CLI_NAME-ci.p12" -k "$KC" -P "$P12_PASS" -T /usr/bin/codesign
             security set-key-partition-list -S apple-tool:,apple: -s -k "$KC_PASS" "$KC"
-            SIGN_ARGS=(--force --sign "NanoDictate CI Signing" --keychain "$KC")
-            rm -f /tmp/nanodictate-ci.p12
+            SIGN_ARGS=(--force --sign "$SIGNING_IDENTITY" --keychain "$KC")
+            rm -f "/tmp/$CLI_NAME-ci.p12"
           else
             echo "::warning::No CI signing secrets; ad-hoc signature for the candidate smoke only."
             SIGN_ARGS=(--force -s -)
             KC=""
           fi
-          codesign "${SIGN_ARGS[@]}" --identifier com.nanodictate.agent --options runtime \
-            --entitlements Resources/com.nanodictate.agent.entitlements \
-            .build/release/NanoDictateAgent
-          codesign "${SIGN_ARGS[@]}" --identifier com.nanodictate.ctl --options runtime \
-            --entitlements Resources/com.nanodictate.ctl.entitlements \
-            .build/release/nanodictate
-          APP=".build/release/NanoDictate.app"
+          codesign "${SIGN_ARGS[@]}" --identifier "$BUNDLE_AGENT" --options runtime \
+            --entitlements "Resources/$BUNDLE_AGENT.entitlements" \
+            ".build/release/$AGENT_NAME"
+          codesign "${SIGN_ARGS[@]}" --identifier "$BUNDLE_CTL" --options runtime \
+            --entitlements "Resources/$BUNDLE_CTL.entitlements" \
+            ".build/release/$CLI_NAME"
+          APP=".build/release/$APP_NAME.app"
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-          cp .build/release/NanoDictateAgent .build/release/nanodictate "$APP/Contents/MacOS/"
-          cp packaging/Info.NanoDictateApp.plist "$APP/Contents/Info.plist"
+          cp ".build/release/$AGENT_NAME" ".build/release/$CLI_NAME" "$APP/Contents/MacOS/"
+          cp "packaging/Info.${APP_NAME}App.plist" "$APP/Contents/Info.plist"
           /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$APP/Contents/Info.plist"
           /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist"
           cp config.example.toml "$APP/Contents/Resources/"
-          cp Resources/com.nanodictate.agent.entitlements \
-             Resources/com.nanodictate.ctl.entitlements \
-             Resources/nanodictate-agent.plist.template \
+          cp "Resources/$BUNDLE_AGENT.entitlements" \
+             "Resources/$BUNDLE_CTL.entitlements" \
+             "Resources/$CLI_NAME-agent.plist.template" \
              "$APP/Contents/Resources/"
           if [ -n "$KC" ]; then
-            codesign "${SIGN_ARGS[@]}" --identifier com.nanodictate.agent --options runtime \
-              --entitlements "$APP/Contents/Resources/com.nanodictate.agent.entitlements" "$APP"
+            codesign "${SIGN_ARGS[@]}" --identifier "$BUNDLE_AGENT" --options runtime \
+              --entitlements "$APP/Contents/Resources/$BUNDLE_AGENT.entitlements" "$APP"
             security delete-keychain "$KC"
           else
-            codesign "${SIGN_ARGS[@]}" --identifier com.nanodictate.agent --options runtime \
-              --entitlements "$APP/Contents/Resources/com.nanodictate.agent.entitlements" "$APP"
+            codesign "${SIGN_ARGS[@]}" --identifier "$BUNDLE_AGENT" --options runtime \
+              --entitlements "$APP/Contents/Resources/$BUNDLE_AGENT.entitlements" "$APP"
           fi
-          codesign --verify --strict .build/release/NanoDictateAgent
-          codesign --verify --strict .build/release/nanodictate
-          codesign --verify --strict --deep .build/release/NanoDictate.app
+          codesign --verify --strict ".build/release/$AGENT_NAME"
+          codesign --verify --strict ".build/release/$CLI_NAME"
+          codesign --verify --strict --deep ".build/release/$APP_NAME.app"
 
       - name: Package candidate tarball and app-bundle zip
         run: |
           set -euo pipefail
-          VERSION="$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' Sources/NanoDictateCore/Version.swift)"
+          VERSION="$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' "$VERSION_FILE")"
           DIST="candidate-dist"
           mkdir -p "$DIST"
-          cp .build/release/NanoDictateAgent .build/release/nanodictate config.example.toml "$DIST"/
+          cp ".build/release/$AGENT_NAME" ".build/release/$CLI_NAME" config.example.toml "$DIST"/
           cp -R Resources "$DIST"/
-          cp -R .build/release/NanoDictate.app "$DIST"/
+          cp -R ".build/release/$APP_NAME.app" "$DIST"/
 
           # These archives are release-candidate artifacts, not throwaway test
           # bundles. Make them deterministic so a retry of the same immutable
@@ -207,18 +219,18 @@ jobs:
           TAR_MTIME="$(TZ=UTC date -u -r "$SOURCE_DATE_EPOCH" +%y%m%d%H%M.%S)"
           find "$DIST" ! -type l -exec env TZ=UTC touch -m -t "$TAR_MTIME" {} +
 
-          ARCHIVE="$DIST/nanodictate-$VERSION-macos-${{ matrix.arch }}.tar.gz"
-          (cd "$DIST" && find . -type f ! -path '*/NanoDictate.app/*' ! -name 'nanodictate-*.tar.gz' ! -name 'nanodictate-*.zip' | sed 's|^\./||' | sort > /tmp/nanodictate-members.txt)
+          ARCHIVE="$DIST/$CLI_NAME-$VERSION-macos-${{ matrix.arch }}.tar.gz"
+          (cd "$DIST" && find . -type f ! -path "*/$APP_NAME.app/*" ! -name "$CLI_NAME-*.tar.gz" ! -name "$CLI_NAME-*.zip" | sed 's|^\./||' | sort > "/tmp/$CLI_NAME-members.txt")
           COPYFILE_DISABLE=1 tar -c \
             --uid 0 --gid 0 --numeric-owner \
             --no-xattrs --no-acls --no-fflags --no-mac-metadata \
-            -C "$DIST" -T /tmp/nanodictate-members.txt \
+            -C "$DIST" -T "/tmp/$CLI_NAME-members.txt" \
             | gzip -n > "$ARCHIVE"
 
-          ZIP_ARCHIVE="$DIST/nanodictate-$VERSION-macos-${{ matrix.arch }}.zip"
+          ZIP_ARCHIVE="$DIST/$CLI_NAME-$VERSION-macos-${{ matrix.arch }}.zip"
           ZIP_PATH="$(pwd)/$ZIP_ARCHIVE"
-          (cd "$DIST" && find . -type f ! -name 'nanodictate-*.tar.gz' ! -name 'nanodictate-*.zip' | sed 's|^\./||' | sort > /tmp/nanodictate-zip-members.txt)
-          (cd "$DIST" && TZ=UTC SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" COPYFILE_DISABLE=1 zip -Xr -y -q "$ZIP_PATH" -@ < /tmp/nanodictate-zip-members.txt)
+          (cd "$DIST" && find . -type f ! -name "$CLI_NAME-*.tar.gz" ! -name "$CLI_NAME-*.zip" | sed 's|^\./||' | sort > "/tmp/$CLI_NAME-zip-members.txt")
+          (cd "$DIST" && TZ=UTC SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" COPYFILE_DISABLE=1 zip -Xr -y -q "$ZIP_PATH" -@ < "/tmp/$CLI_NAME-zip-members.txt")
           shasum -a 256 "$ARCHIVE" "$ZIP_ARCHIVE"
           ls -l "$DIST"/
 
@@ -226,13 +238,13 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: candidate-dist-${{ matrix.arch }}
-          path: candidate-dist/nanodictate-*.tar.gz
+          path: candidate-dist/${{ env.CLI_NAME }}-*.tar.gz
           if-no-files-found: error
       - name: Upload candidate zips
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: candidate-zip-${{ matrix.arch }}
-          path: candidate-dist/nanodictate-*.zip
+          path: candidate-dist/${{ env.CLI_NAME }}-*.zip
           if-no-files-found: error
 
   # Candidate Homebrew leg: temporary Cask from the production Cask logic with
@@ -279,7 +291,7 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x scripts/packaging-smoke/*.sh
-          VERSION="$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' Sources/NanoDictateCore/Version.swift)"
+          VERSION="$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' "${{ vars.CONTINUUM_VERSION_FILE || 'Sources/NanoDictateCore/Version.swift' }}")"
           echo "Candidate version: $VERSION"
           ls -l candidate-dist/
           bash scripts/packaging-smoke/make-candidate.sh \
@@ -341,7 +353,7 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x scripts/packaging-smoke/*.sh
-          VERSION="$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' Sources/NanoDictateCore/Version.swift)"
+          VERSION="$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' "${{ vars.CONTINUUM_VERSION_FILE || 'Sources/NanoDictateCore/Version.swift' }}")"
           echo "Candidate version: $VERSION"
           ls -l candidate-dist/
           bash scripts/packaging-smoke/make-candidate.sh \
