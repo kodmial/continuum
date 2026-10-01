@@ -1,3 +1,6 @@
+# This is a technology-layer workflow (opt-in, library). It is NOT triggered by Continuum itself.
+# Naming: continuum-tech-<tech>-<name>.yml (three dashes after "continuum").
+
 name: Merge trusted release automation PRs
 
 on:

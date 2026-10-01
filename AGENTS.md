@@ -4,7 +4,11 @@ Continuum is a reusable GitHub Actions control plane, not an application. It shi
 `workflow_call` workflows under `.github/workflows/`, thin caller templates under
 `.github/caller-stubs/`, an installer (`install.sh`), and a dependency-free Python
 engine under `src/continuum/` and `.github/scripts/`. Consumers install the thin
-callers; they never copy engine code into their repository.
+callers; they never copy engine code into their repository. The two-layer naming
+rule: **core** workflows are either historical unprefixed names or
+`continuum-<name>.yml` (exactly two segments after `continuum`); **technology
+library** workflows are `continuum-tech-<tech>-<name>.yml` (exactly three dashes
+after `continuum`) and are opt-in (never triggered by Continuum itself).
 
 ## Source of truth
 
@@ -21,8 +25,11 @@ These are public interfaces and must not change silently:
 - the `continuum-` prefix on every installed caller (a `continuum-*.yml` file in a
   consumer repository is Continuum-owned and is never hand-edited there);
 - the `TAP_PAT` repository secret name (classic PAT, `repo` + `workflow` scopes)
-  expected by every profile;
-- the installer profiles (`swift` plus `parent`)
+  expected by every set;
+- the installer sets (`core`, `tech`, `parent`): `core` installs every stub
+  under `.github/caller-stubs/`, `tech` installs only `.github/caller-stubs/tech/`
+  (three dashes mark an opt-in library), `parent` installs only
+  `.github/caller-stubs/parent/`.
   and the `install.sh` argument shape;
 - the parent/child repository-variable names (`CONTINUUM_ROLE`,
   `CONTINUUM_CHILDREN`, `CONTINUUM_CHILD_ID`, `CONTINUUM_PARENT`,
@@ -50,7 +57,7 @@ Run the checks that match your change from the repository root:
 ```sh
 ruby -E UTF-8 scripts/test-continuum.rb   # caller/workflow/install contracts
 bash -n install.sh                        # installer syntax
-actionlint -shellcheck= -pyflakes= .github/workflows/*.yml .github/caller-stubs/*.yml .github/caller-stubs/parent/*.yml
+actionlint -shellcheck= -pyflakes= .github/workflows/*.yml .github/caller-stubs/*.yml .github/caller-stubs/tech/*.yml .github/caller-stubs/parent/*.yml
 ```
 
 The Python engine and delegation suites (keep fixtures inside the worktree):

@@ -123,18 +123,21 @@ simultaneously parent and child under this contract.
 
 ## Install alongside existing automation
 
-The installer has two explicit profiles:
+The installer has three explicit sets:
 
 ```sh
-# Existing Swift CI, review, release, and packaging callers.
-bash install.sh /path/to/myapp main swift
+# Core task-domain callers: scheduling, review, repair, auto-merge.
+bash install.sh /path/to/myapp main core
+
+# Opt-in technology library: CI, release, release PR, packaging smoke.
+bash install.sh /path/to/myapp main tech
 
 # Add parent execution to any repository without replacing its own workflows.
 bash install.sh /path/to/parent main parent
 ```
 
 For production, replace `main` with a tested full Continuum commit SHA. Both
-`uses:` and `engine_ref` are set to that revision. The parent profile installs
+`uses:` and `engine_ref` are set to that revision. The parent set installs
 only `continuum-child-dispatcher.yml`, `continuum-child-worker.yml`,
 `continuum-child-review.yml`, and `continuum-child-pr-review.yml`. It preserves
 existing CI, issue scheduling, OpenCode,
@@ -142,11 +145,11 @@ release, Render, and artifact workflows. The token is supplied through the
 parent's existing `TAP_PAT` secret; it must be able to read the relevant Actions
 repository variables and operate on the selected child repositories.
 
-Do not install the NanoDictate profile in a child repository as a migration
+Do not install the core set in a child repository as a migration
 shortcut. Its local scheduler and merge controller could compete with the
 parent. Existing children keep their opt-in ownership markers, neutral config,
 repository variables, and trusted base-branch validation script. Installing a
-parent profile does not set variables or enroll repositories automatically.
+parent set does not set variables or enroll repositories automatically.
 
 The parent dispatcher wakes on main pushes, every ten minutes, manual dispatch,
 and completion of child task/review workflows. A repository's own scheduler can
