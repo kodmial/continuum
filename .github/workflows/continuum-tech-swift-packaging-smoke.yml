@@ -172,23 +172,31 @@ jobs:
           STATIC_ARCHIVE_PATH: ${{ inputs.static_archive_path }}
         run: |
           set -euo pipefail
-          native_link=()
+          archive=""
           if [[ -n "$STATIC_ARCHIVE_PATH" ]]; then
             archive="$GITHUB_WORKSPACE/$STATIC_ARCHIVE_PATH"
             [[ -f "$archive" ]] || {
               echo "::error::Configured static archive does not exist: $archive"
               exit 1
             }
-            native_link=(-Xlinker "$archive")
           fi
-          swift build -c release --product "$AGENT_NAME" \
-            -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist \
-            -Xlinker "packaging/Info.$AGENT_NAME.plist" \
-            "${native_link[@]}"
-          swift build -c release --product "$CLI_NAME" \
-            -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist \
-            -Xlinker "packaging/Info.$CLI_NAME.plist" \
-            "${native_link[@]}"
+          if [[ -n "$archive" ]]; then
+            swift build -c release --product "$AGENT_NAME" \
+              -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist \
+              -Xlinker "packaging/Info.$AGENT_NAME.plist" \
+              -Xlinker "$archive"
+            swift build -c release --product "$CLI_NAME" \
+              -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist \
+              -Xlinker "packaging/Info.$CLI_NAME.plist" \
+              -Xlinker "$archive"
+          else
+            swift build -c release --product "$AGENT_NAME" \
+              -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist \
+              -Xlinker "packaging/Info.$AGENT_NAME.plist"
+            swift build -c release --product "$CLI_NAME" \
+              -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist \
+              -Xlinker "packaging/Info.$CLI_NAME.plist"
+          fi
 
       - name: Code-sign binaries and assemble the .app bundle
         env:
