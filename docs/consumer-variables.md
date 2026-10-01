@@ -119,6 +119,28 @@ the one the scheduler wrote. `continuum-consumer-child-dispatcher.yml` reads
 `AUTOMATION_PAUSE_LABEL`, so a renamed label stays consistent across the core
 and the parent/child pair.
 
+### Required secrets
+
+The core layer reads exactly two secrets, and they are different credentials:
+
+| Secret | Read by | Credential | Fallback |
+| --- | --- | --- | --- |
+| `TAP_PAT` | The core controllers that call the GitHub API, and the parent/child wrappers (forwarded to the child runtime) | Classic GitHub PAT (`repo` + `workflow` scopes). | `github.token` on steps that only need the built-in token. |
+| `RENDER_API_KEY` | `continuum-render-executor.yml` only | Render API key. | **None.** The controller fails explicitly when it is unset. |
+
+`TAP_PAT` and `RENDER_API_KEY` are never interchangeable: a GitHub token is not
+accepted by the Render API, and the Render key is useless against the GitHub
+API. A repository that installs the render controller must define both.
+
+The `parent` set adds one more input secret. Each wrapper declares
+`CHILD_RUNTIME_TOKEN` (required) and `CHILD_RUNTIME_REPOSITORIES` (optional, the
+pre-variables compatibility path described in
+`docs/parent-child-delegation.md`), and the installed parent stubs fill
+`CHILD_RUNTIME_TOKEN` from the parent's own `TAP_PAT`, so the same secret serves
+both layers. The opt-in `tech` set reads `NANODICTATE_SIGNING_P12` /
+`NANODICTATE_SIGNING_PASSWORD` for code signing and `RELEASE_PR_TOKEN` (falling
+back to `GITHUB_TOKEN`) for the release PR.
+
 ### Render execution controller
 
 `continuum-render-executor.yml` drives one execution of a consumer's Render
@@ -153,9 +175,23 @@ variable (or pass the `model` input) if the consumer uses this controller.
 | `RENDER_CONCURRENCY_GROUP` | `continuum-render-single-service` | Serialises the controller's runs so one run's repair cannot tear down the next run's worker. |
 | `AUTOMATION_RENDER_TIMEOUT_MINUTES` | `55` | Controller job timeout. |
 
-The controller reads the repository secret **`TAP_PAT`** for both Render API
-calls and for issue/label writes, per Continuum's secret contract. It never
-reads any other secret name.
+The controller reads **two distinct repository secrets**, and they are never
+interchangeable:
+
+- **`RENDER_API_KEY`** — the Render API key, used for every Render API call:
+  the execute step that creates the ephemeral worker and the mandatory cleanup
+  step that deletes it. A GitHub token is **not** accepted by the Render API, so
+  this key must be set as a repository secret before the capability can run.
+- **`TAP_PAT`** — the classic GitHub PAT, used on the genuine GitHub-token path:
+  the issue/label reads and writes in the classification step, with
+  `github.token` as the fallback. The steps that only need the built-in token
+  (`GH_TOKEN: ${{ github.token }}`) read no secret at all.
+
+The controller **fails explicitly** when `RENDER_API_KEY` is unset — both in the
+execute step and in the cleanup step, so a missing key can never leave an
+ephemeral worker running. It does **not** fall back to `TAP_PAT`, to
+`github.token`, or to any other credential; the failure names the exact secret to
+set rather than reporting a green no-op.
 
 ### Docker qualification controller
 

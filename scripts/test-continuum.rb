@@ -1961,6 +1961,88 @@ class ContinuumTest < Minitest::Test
                  'RENDER_API_KEY must never fall back to TAP_PAT or github.token')
   end
 
+  # The consumer-facing variables document states the render controller's secret
+  # contract. Pin the document to the code, not merely to itself: the defect
+  # this guards is a doc claiming `TAP_PAT` serves the Render API when the
+  # workflow reads `RENDER_API_KEY` there, so a test that only checked the doc
+  # for the word `TAP_PAT` would have passed the broken text.
+  def test_consumer_variables_doc_pins_the_render_secret_contract_to_the_code
+    body = render_body
+    doc = File.read(File.join(ROOT, 'docs/consumer-variables.md'))
+
+    # --- code side: the two secrets are distinct and separately wired ---------
+    assert_equal 2, body.scan(/RENDER_API_KEY: \$\{\{ secrets\.RENDER_API_KEY \}\}/).size,
+                 'the Render calls (execute + cleanup) must read secrets.RENDER_API_KEY'
+    assert_includes body, 'GH_TOKEN: ${{ secrets.TAP_PAT || github.token }}',
+                    'the GitHub path must read secrets.TAP_PAT with github.token as fallback'
+    refute_includes body, 'RENDER_API_KEY: ${{ secrets.TAP_PAT',
+                     'the Render key must never be wired from the GitHub PAT'
+
+    # The set of secrets the render controller reads, taken from the code, not
+    # hardcoded here: this is what makes the doc check below drift-proof in
+    # both directions.
+    code_secrets = body.scan(/secrets\.([A-Z][A-Z0-9_]*)/).flatten.uniq.sort
+    assert_equal %w[RENDER_API_KEY TAP_PAT], code_secrets,
+                 'the render controller must read exactly RENDER_API_KEY and TAP_PAT'
+
+    # --- doc side: the render section names every secret the code reads -------
+    section = doc[/### Render execution controller.*?(?=### Docker qualification controller)/m]
+    refute_nil section, 'the doc must keep a render-executor section before the docker one'
+    code_secrets.each do |name|
+      assert_includes section, "`#{name}`",
+                      "docs/consumer-variables.md must name #{name} in the render-controller section"
+    end
+
+    # The superseded claim: one secret serving both APIs. Reject it by its
+    # substance, not by any mention of TAP_PAT — the GitHub half of the
+    # contract still legitimately names it.
+    refute_match(/TAP_PAT\W{0,20}for both Render API/i, section,
+                 'the doc must not claim TAP_PAT serves both the Render API and the GitHub API')
+    refute_match(/never\s+reads any other secret name/i, section,
+                 'the render controller reads a second secret, so it cannot claim to read no other')
+    assert_match(/RENDER_API_KEY.{0,80}?Render API key/m, section,
+                 'the doc must say what RENDER_API_KEY actually is')
+    assert_match(/fails explicitly/i, section,
+                 'the doc must say the controller fails explicitly without RENDER_API_KEY')
+    assert_match(/does\s+\**not\**\s+fall back/i, section,
+                 'the doc must say there is no fallback credential for the Render API')
+
+    # --- the enumerated secret table must not name a secret nothing reads -----
+    table = doc[/### Required secrets.*?(?=### Render execution controller)/m]
+    refute_nil table, 'the doc must keep a secrets section enumerating the contract'
+    table.scan(/`(RENDER_API_KEY|TAP_PAT|CHILD_RUNTIME_TOKEN|CHILD_RUNTIME_REPOSITORIES)`/)
+         .flatten.uniq.each do |name|
+      next if WORKFLOWS.any? { |path| File.read(path).include?("secrets.#{name}") }
+
+      assert false, "docs/consumer-variables.md documents #{name}, which no core workflow reads"
+    end
+    assert_match(/RENDER_API_KEY.*none/i, table,
+                 'the secrets table must record that RENDER_API_KEY has no fallback')
+  end
+
+  # The docker-qualification paragraph states the same contract for a different
+  # controller. It is accurate today, so pin it rather than let it rot: this
+  # workflow has no Render usage, so a future secret added here must be
+  # documented, and `TAP_PAT` must keep its `github.token` fallback.
+  def test_docker_qualification_secret_claim_in_the_doc_matches_the_code
+    body = docker_body
+    doc = File.read(File.join(ROOT, 'docs/consumer-variables.md'))
+
+    refute_includes body, 'RENDER_API_KEY',
+                    'the docker controller has no Render usage; adding the key would make its doc claim wrong'
+    assert_equal %w[TAP_PAT], body.scan(/secrets\.([A-Z][A-Z0-9_]*)/).flatten.uniq,
+                 'the docker controller must read exactly TAP_PAT'
+
+    section = doc[/### Docker qualification controller.*?(?=### Scheduler guards)/m]
+    refute_nil section, 'the doc must keep a docker-qualification section'
+    assert_match(/TAP_PAT/, section,
+                 'the docker-qualification section must document its secret')
+    assert_match(/falling back to\s+`github\.token`/, section,
+                 'the docker-qualification section must document the github.token fallback')
+    refute_match(/Render/i, section[/The controller reads the repository secret.*?secret name\./m].to_s,
+                 'the docker-qualification secret paragraph must not mention Render')
+  end
+
   # Every value the fork hardcoded for one repository must be a knob, or a
   # second consumer inherits that repository's paths and markers.
   def test_render_executor_knobs_cover_every_fork_hardcoded_value
