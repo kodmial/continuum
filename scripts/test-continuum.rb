@@ -116,6 +116,30 @@ class ContinuumTest < Minitest::Test
     end
   end
 
+  # The `if (` openers that genuinely enclose the line at `index`, returned
+  # innermost-first. A brace-balance walk is unreliable in JavaScript embedded
+  # in YAML (template literals, braces inside strings), but the indentation of
+  # these scripts is exact, so the block structure can be recovered by walking
+  # upward and tracking the current level: a strictly-less-indented line is the
+  # head of the enclosing block, and an `if (` head is one of its gates.
+  #
+  # Taking merely the last few `if (` lines above the target is NOT equivalent:
+  # those are often already-closed siblings, which is how an ungated write can
+  # look gated.
+  def enclosing_gates(lines, index)
+    level = lines[index][/\A */].size
+    gates = []
+    (index - 1).downto(0) do |position|
+      line = lines[position]
+      next if line.strip.empty?
+      indent = line[/\A */].size
+      next if indent > level
+      gates << line if line =~ /^\s*if \(/
+      level = indent
+    end
+    gates.reverse
+  end
+
   def each_pair
     STUBS.each do |path|
       callee_path = File.join(ROOT, '.github/workflows', File.basename(path))
@@ -184,6 +208,60 @@ class ContinuumTest < Minitest::Test
     each_pair do |caller, _|
       events(caller).fetch('workflow_run', {}).fetch('workflows', []).each do |name|
         assert_includes names, name
+      end
+    end
+  end
+
+  # `workflow_run.workflows` matches a workflow's `name:` VALUE, so two
+  # workflows sharing a `name:` are indistinguishable to the filter. The
+  # watchdog is the dangerous case: give the core watchdog and its stub the
+  # OpenCode caller's `name:` and it listens for its own completed runs, which
+  # dispatches another recovery, which completes, which triggers the watchdog
+  # again — an infinite self-trigger loop that no other assertion catches.
+  #
+  # The two sets are disjoint: a core workflow's `name:` is the name of the
+  # INSTALLED stub that calls it, and Continuum's own repository runs the core
+  # files directly, so `OpenCode agent` legitimately appears in both sets.
+  # Uniqueness is therefore required *within* each set, not across them.
+  def test_workflow_names_are_unique_within_each_layer
+    {
+      'core workflows' => WORKFLOWS,
+      'core stubs' => CORE_STUBS,
+      'tech stubs' => TECH_STUBS,
+      'parent stubs' => PARENT_STUBS
+    }.each do |layer, paths|
+      names = paths.map { |path| yaml(path).fetch('name') }
+      assert_equal names, names.uniq,
+                   "#{layer}: two workflows share a `name:`, which makes a " \
+                   'workflow_run.workflows filter ambiguous'
+    end
+  end
+
+  # A workflow must never watch its own `name:`. Within a layer the names are
+  # unique, so a self-reference can only be an explicit copy of the file's own
+  # name into its filter — the exact shape of the watchdog self-trigger.
+  def test_no_workflow_run_trigger_watches_itself
+    watched_sources = WORKFLOWS + CORE_STUBS + TECH_STUBS + PARENT_STUBS
+    watched_sources.each do |path|
+      caller = yaml(path)
+      watched = events(caller).fetch('workflow_run', {}).fetch('workflows', [])
+      watched.each do |name|
+        refute_equal caller.fetch('name'), name,
+                     "#{File.basename(path)}: workflow_run watches its own `name:` " \
+                     '(infinite self-trigger)'
+      end
+    end
+
+    # Specifically: the watchdog exists to recover failed OpenCode runs, so
+    # nothing may name the watchdog in a `workflow_run` filter — least of all
+    # the watchdog itself.
+    watchdog_name = yaml(File.join(ROOT, '.github/workflows', WATCHDOG)).fetch('name')
+    watched_sources.each do |path|
+      watched = events(yaml(path)).fetch('workflow_run', {}).fetch('workflows', [])
+      watched.each do |name|
+        refute_equal watchdog_name, name,
+                     "#{File.basename(path)}: watches the OpenCode watchdog, " \
+                     'so the watchdog recovers itself'
       end
     end
   end
@@ -772,9 +850,13 @@ class ContinuumTest < Minitest::Test
     # require_priority_label gates candidate selection.
     assert_match(/if \(requirePriorityLabel && priority === null\)/, body)
 
-    # The scheduler env must be fed by the input with a matching fallback.
-    assert_includes body, "IN_PROGRESS_LABEL: ${{ inputs.in_progress_label || 'automation:in-progress' }}"
-    assert_includes body, "PAUSE_LABEL: ${{ inputs.pause_marker || 'automation:paused' }}"
+    # The scheduler env must be fed by the input with a matching fallback. The
+    # watchdog's documented promise is that its markers match the scheduler's,
+    # and both sides read the same `vars.AUTOMATION_*` value, so the fallback
+    # chain has to include it here too.
+    assert_includes body, "IN_PROGRESS_LABEL: ${{ inputs.in_progress_label || vars.AUTOMATION_IN_PROGRESS_LABEL || 'automation:in-progress' }}"
+    assert_includes body, "PAUSE_LABEL: ${{ inputs.pause_marker || vars.AUTOMATION_PAUSE_LABEL || 'automation:paused' }}"
+    assert_includes body, "DISPATCH_MARKER: ${{ inputs.dispatch_marker || vars.AUTOMATION_DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->' }}"
     assert_includes body, 'process.env.IN_PROGRESS_LABEL'
     assert_includes body, 'process.env.PAUSE_LABEL'
   end
@@ -967,6 +1049,253 @@ class ContinuumTest < Minitest::Test
     refute_match(/if: startsWith\(runner/, watchdog_body)
   end
 
+  # ------------------------------------------------- stub input contract
+
+  # Every `with:` key each core stub is allowed to pass. A stub is installed
+  # verbatim into a consumer repository, so a key added here is a decision
+  # Continuum makes on every consumer's behalf and needs a test edit.
+  STUB_INPUT_WHITELIST = {
+    'add-review-label.yml' => %w[continuum_ref],
+    'auto-merge.yml' => %w[continuum_ref],
+    'bootstrap-runtime-secret.yml' => %w[continuum_ref],
+    'coderabbit-retry.yml' => %w[continuum_ref],
+    'coderabbit-unresolved.yml' => %w[continuum_ref],
+    'continuum-opencode-watchdog.yml' => %w[continuum_ref watched_workflow],
+    'issue-scheduler.yml' => %w[
+      continuum_ref wip_limit lease_minutes max_dispatch_attempts dispatch_marker
+      in_progress_label pause_marker post_pause_comment reset_markers
+      require_priority_label
+    ],
+    'opencode.yml' => %w[
+      continuum_ref mode issue_number pr_number head_ref review_id run_id
+      ci_workflow_id conflict_strategy dispatch_marker in_progress_label
+      pause_marker max_dispatch_attempts
+    ],
+    'opencode-repair.yml' => %w[continuum_ref],
+    'opencode-unresolved.yml' => %w[continuum_ref],
+    'pr-agent.yml' => %w[continuum_ref],
+    'remove-review-label.yml' => %w[continuum_ref]
+  }.freeze
+
+  # A stub that pins an input to a literal overrides the consumer's own
+  # `vars.AUTOMATION_*` / `vars.CONTINUUM_*` value for every installed caller:
+  # `inputs.x || vars.X || 'default'` can never see the variable once `inputs.x`
+  # is a non-empty literal. Passing `require_coderabbit: 'true'` in the
+  # auto-merge stub therefore silently switches CodeRabbit on for every
+  # consumer, and passing `max_recovery_retries: '9'` in the watchdog stub
+  # silently overrides `AUTOMATION_WATCHDOG_MAX_RETRIES`. Neither is visible in
+  # the engine, so nothing else fails.
+  #
+  # Every value must therefore be a bare `inputs.*` passthrough — an empty
+  # string is what lets the callee fall through to its `vars.` default. The one
+  # exception is `watched_workflow`, which is a `name:` binding rather than a
+  # vars-backed knob: it must be pinned, and it is pinned to the OpenCode
+  # caller's own `name:` by the watchdog trigger test above.
+  def test_stubs_never_pin_a_consumer_knob
+    whitelist = STUB_INPUT_WHITELIST
+    assert_equal CORE_STUBS.map { |path| File.basename(path) }.sort,
+                 whitelist.keys.sort,
+                 'every core stub needs a `with:` whitelist entry'
+
+    whitelist.each do |base, allowed|
+      path = File.join(ROOT, '.github/caller-stubs', base)
+      with = yaml(path).fetch('jobs').fetch('call').fetch('with')
+
+      # The whitelist is the contract: a new key is a new pinned decision.
+      with.each_key do |key|
+        assert_includes allowed, key,
+                        "#{base}: passes `#{key}`, which the stub whitelist does not allow"
+      end
+
+      with.each do |key, value|
+        next if key == 'continuum_ref'
+        next if key == 'watched_workflow'
+
+        assert_match(/\A\$\{\{ inputs\.#{key}/, value.to_s,
+                     "#{base}: `#{key}` must be a bare inputs.* passthrough, got #{value.inspect} — " \
+                     'a literal silently overrides the consumer\'s repository variable')
+      end
+    end
+  end
+
+  # The passthrough whitelist is only half the contract: a stub could pin a
+  # knob to a literal *and* the engine could then ignore the variable. Assert
+  # that each stub-covered knob really does reach a `vars.` fallback, so the
+  # consumer's repository variable is the live source of truth.
+  def test_every_stub_parameterized_knob_is_backed_by_a_vars_fallback
+    scheduler = File.read(File.join(ROOT, '.github/workflows/issue-scheduler.yml'))
+    {
+      'WIP_LIMIT' => %w[wip_limit AUTOMATION_WIP_LIMIT 2],
+      'LEASE_MINUTES' => %w[lease_minutes AUTOMATION_LEASE_MINUTES 45],
+      'MAX_DISPATCH_ATTEMPTS' => %w[max_dispatch_attempts AUTOMATION_MAX_DISPATCH_ATTEMPTS 2],
+      'DISPATCH_MARKER' => ['dispatch_marker', 'AUTOMATION_DISPATCH_MARKER', '<!-- issue-scheduler-dispatch -->'],
+      'IN_PROGRESS_LABEL' => ['in_progress_label', 'AUTOMATION_IN_PROGRESS_LABEL', 'automation:in-progress'],
+      'PAUSE_LABEL' => ['pause_marker', 'AUTOMATION_PAUSE_LABEL', 'automation:paused']
+    }.each do |env_key, (input, variable, literal)|
+      assert_includes scheduler,
+                      "#{env_key}: \${{ inputs.#{input} || vars.#{variable} || '#{literal}' }}",
+                      "issue-scheduler: #{env_key} has no vars. fallback"
+    end
+
+    assert_includes auto_merge_body,
+                    "REQUIRE_CODERABBIT: ${{ inputs.require_coderabbit || vars.CONTINUUM_REQUIRE_CODERABBIT || 'false' }}"
+    assert_includes watchdog_body,
+                    "MAX_RECOVERY_RETRIES: ${{ inputs.max_recovery_retries || vars.AUTOMATION_WATCHDOG_MAX_RETRIES || '1' }}"
+  end
+
+  # Adding a `vars.` fallback to a `inputs.x || 'literal'` chain must not change
+  # the value a consumer with empty repository variables gets: the empty
+  # variable is falsy, so the chain still falls through to the same literal.
+  # Re-implement the chain in Ruby and evaluate it, so a reordered or
+  # mistyped default is caught rather than merely re-asserted.
+  def test_empty_vars_resolve_to_the_same_scheduler_defaults
+    scheduler = workflow_body('issue-scheduler.yml')
+    {
+      'DISPATCH_MARKER' => ['dispatch_marker', '<!-- issue-scheduler-dispatch -->'],
+      'IN_PROGRESS_LABEL' => ['in_progress_label', 'automation:in-progress'],
+      'PAUSE_LABEL' => ['pause_marker', 'automation:paused'],
+      'WIP_LIMIT' => ['wip_limit', '2'],
+      'LEASE_MINUTES' => ['lease_minutes', '45'],
+      'MAX_DISPATCH_ATTEMPTS' => ['max_dispatch_attempts', '2']
+    }.each do |key, (input, expected)|
+      line = scheduler.lines.find { |candidate| candidate.include?("#{key}: ${{") }
+      refute_nil line, "#{key}: no env mapping found in issue-scheduler.yml"
+
+      expression = line[/\$\{\{(.*)\}\}/, 1].strip
+      # Every term of the chain, in order: the input, then the repository
+      # variable, then the literal default.
+      terms = expression.split('||').map(&:strip)
+      assert_equal "inputs.#{input}", terms.first, "#{key}: #{expression}"
+      assert_includes terms[1], 'vars.AUTOMATION', "#{key}: the vars. fallback is missing"
+
+      resolve = lambda do |inputs_value, vars_value|
+        terms.reduce(nil) do |acc, term|
+          acc || case term
+                 when /\A'([^']*)'\z/ then Regexp.last_match(1)
+                 when /\Avars\./ then vars_value
+                 when /\Ainputs\./ then inputs_value
+                 end
+        end
+      end
+      assert_equal expected, resolve.call(nil, nil),
+                   "#{key}: empty inputs and vars must still yield #{expected.inspect}"
+      # A repository that sets the variable must win over the literal default.
+      refute_equal expected, resolve.call(nil, 'consumer-value'),
+                   "#{key}: a set vars. value must not be overridden by the default"
+    end
+  end
+
+  # The watchdog recovers a *completed* failed run. On `requested` it would
+  # wake on every in-flight run before any conclusion exists, and a run that
+  # later succeeds would have already been counted as a recovery. Pin the type
+  # list so a widening of it is a deliberate edit.
+  def test_watchdog_stub_watches_only_completed_runs
+    watched = events(watchdog_stub).fetch('workflow_run')
+    assert_equal ['completed'], watched.fetch('types'),
+                 'the watchdog must react to completed runs only — ' \
+                 '`requested` would count a still-running workflow as a failure'
+    assert_equal ['OpenCode agent'], watched.fetch('workflows')
+  end
+
+  # ------------------------------------------- add-review-label / CodeRabbit
+
+  def add_review_label_body
+    File.read(File.join(ROOT, '.github/workflows/add-review-label.yml'))
+  end
+
+  # The same optional-integration contract auto-merge.yml already honours.
+  # add-review-label.yml is the *other* half of the CodeRabbit path: it writes
+  # the two queue labels and dispatches the retry controller. A repository that
+  # never asked for CodeRabbit would get `review-ready` and
+  # `coderabbit-review-requested` on every green PR, and a 404 from a
+  # `continuum-coderabbit-retry.yml` it does not have.
+  def test_add_review_label_gates_the_coderabbit_path_behind_the_flag
+    inputs = events(yaml(File.join(ROOT, '.github/workflows/add-review-label.yml')))
+             .fetch('workflow_call').fetch('inputs')
+    knob = inputs.fetch('require_coderabbit')
+    assert_equal '', knob.fetch('default'),
+                 'require_coderabbit must default to empty so vars.CONTINUUM_REQUIRE_CODERABBIT decides'
+    assert_equal 'string', knob.fetch('type')
+    assert_equal false, knob.fetch('required')
+
+    body = add_review_label_body
+    assert_includes body, "REQUIRE_CODERABBIT: ${{ inputs.require_coderabbit || vars.CONTINUUM_REQUIRE_CODERABBIT || 'false' }}"
+    refute_includes body, "vars.CONTINUUM_REQUIRE_CODERABBIT || 'true'",
+                    'CodeRabbit must not default to on'
+    assert_match(/const REQUIRE_CODERABBIT =\s*String\(process\.env\.REQUIRE_CODERABBIT \|\| ''\)\.trim\(\)\.toLowerCase\(\);/, body)
+    assert_match(/REQUIRE_CODERABBIT === 'true' \|\| REQUIRE_CODERABBIT === '1'/, body)
+  end
+
+  # Both CodeRabbit label writes and the retry-controller dispatch must sit
+  # behind the flag. Asserting only the env string would let every gate keep
+  # reading the flag as `true` and no test would notice, so the writes are
+  # checked structurally, by the indentation of their enclosing `if (`.
+  def test_add_review_label_writes_no_coderabbit_label_and_dispatches_none_when_disabled
+    body = add_review_label_body
+    lines = body.lines
+
+    # Every CodeRabbit write site, matched on the API *argument* rather than on
+    # the label name alone: the workflow's own prose mentions both labels in
+    # the `require_coderabbit` description, and that is not a write.
+    #   * createLabel  → name: REQUESTED_LABEL
+    #   * addLabels    → labels: ['review-ready'] / labels: [REQUESTED_LABEL]
+    label_writes = lines.each_index.select do |index|
+      line = lines[index]
+      line.match?(/^\s*(name: REQUESTED_LABEL,|labels: \['review-ready'\],|labels: \[REQUESTED_LABEL\],)\s*$/)
+    end
+    assert_equal 3, label_writes.size,
+                 'expected the lock-label create and both label adds — check this test still describes them'
+
+    label_writes.each do |index|
+      guards = enclosing_gates(lines, index)
+      refute_empty guards, "the CodeRabbit label write at #{index + 1} has no enclosing gate"
+      assert guards.any? { |guard| guard.include?('requireCodeRabbit') },
+             "the CodeRabbit label write at #{index + 1} is not gated on the flag " \
+             "(enclosing gates: #{guards.map(&:strip).join(' | ')})"
+    end
+
+    # The dispatch. Exactly one site, and its own condition reads the flag —
+    # `queuedForCodeRabbit` alone would skip it but would not prove the gate
+    # exists at all.
+    assert_equal 1, body.scan("workflow_id: 'continuum-coderabbit-retry.yml'").size,
+                 'the CodeRabbit retry dispatch site changed shape'
+    # Assert against a small window around the dispatch rather than the whole
+    # embedded script: matching `body` makes a failure print all of it.
+    lines = body.lines
+    at = lines.index { |line| line.include?("workflow_id: 'continuum-coderabbit-retry.yml'") }
+    window = lines[[at - 8, 0].max..at].join
+    assert_match(/if \(requireCodeRabbit && queuedForCodeRabbit\) \{\s*\n\s*await github\.rest\.actions\.createWorkflowDispatch\(\{/, window,
+                 'the CodeRabbit retry dispatch must be gated on the flag')
+
+    # The CI-driven auto-merge wake-up is NOT part of the CodeRabbit path and
+    # must keep firing for a repository that disabled CodeRabbit.
+    assert_match(/if \(ours\.length > 0\) \{\s*\n\s*await github\.rest\.actions\.createWorkflowDispatch\(\{\s*\n\s*owner,\s*\n\s*repo,\s*\n\s*workflow_id: 'continuum-auto-merge\.yml'/, body,
+                 'the auto-merge wake-up must stay unconditional')
+  end
+
+  # No core workflow may dispatch a CodeRabbit controller unconditionally. This
+  # is the file-level version of the two tests above, so a third workflow
+  # acquiring an ungated `continuum-coderabbit-*.yml` dispatch fails here rather
+  # than having to be caught one workflow at a time.
+  def test_no_core_workflow_dispatches_a_coderabbit_controller_unconditionally
+    core = WORKFLOWS.reject { |path| File.basename(path).start_with?('continuum-tech-') }
+    sites = core.flat_map do |path|
+      lines = File.read(path).lines
+      lines.each_index
+           .select { |index| lines[index].include?("workflow_id: 'continuum-coderabbit-") }
+           .map { |index| [File.basename(path), index, lines] }
+    end
+    refute_empty sites, 'no core workflow dispatches a CodeRabbit controller at all'
+
+    sites.each do |base, index, lines|
+      guards = enclosing_gates(lines, index)
+      refute_empty guards, "#{base}:#{index + 1}: CodeRabbit dispatch has no enclosing gate"
+      assert guards.any? { |guard| guard.include?('requireCodeRabbit') },
+             "#{base}:#{index + 1}: dispatches a CodeRabbit controller without reading the flag " \
+             "(enclosing gates: #{guards.map(&:strip).join(' | ')})"
+    end
+  end
+
   # ------------------------------------------------- auto-merge / CodeRabbit
 
   def auto_merge_body
@@ -993,7 +1322,6 @@ class ContinuumTest < Minitest::Test
                     'CodeRabbit must not default to on'
   end
 
-  
   # Both branches of the flag, checked in the body that acts on them. Asserting
   # only the env string would let every gate keep reading the flag as `true`
   # and no test would notice.
@@ -1027,17 +1355,8 @@ class ContinuumTest < Minitest::Test
       next unless line.include?("workflow_id: 'continuum-coderabbit-retry.yml'")
 
       # The dispatch is only reachable when the flag is on, so an enclosing gate
-      # has to read it. Locate the gates by indentation: the `if (` openers
-      # above the dispatch that are less indented than it, innermost first. A
-      # brace-balance walk is unreliable in JavaScript template literals, and
-      # indentation is exact in this file.
-      indent = line[/\A */].size
-      guards = body.lines[0...index]
-                   .select { |candidate| candidate =~ /^\s*if \(/ }
-                   .map { |candidate| [candidate[/\A */].size, candidate] }
-                   .select { |candidate_indent, _candidate| candidate_indent < indent }
-                   .last(3)
-                   .map(&:last)
+      # has to read it.
+      guards = enclosing_gates(body.lines, index)
       refute_empty guards,
                    "the CodeRabbit retry dispatch at #{index + 1} has no enclosing gate"
       # The innermost gates may be ordinary de-duplication checks, so the flag
@@ -1055,9 +1374,10 @@ class ContinuumTest < Minitest::Test
     # The final revalidation is the last chance to cancel a merge; its
     # CodeRabbit half must be conditional too, or the merge is cancelled with
     # the flag off no matter what CI says.
-# The explanatory comment inside the condition must not make the assertion
-# miss, so match the CodeRabbit half as an ordered sequence of its terms
-# rather than as one literal stretch.
+    #
+    # The explanatory comment inside the condition must not make the assertion
+    # miss, so match the CodeRabbit half as an ordered sequence of its terms
+    # rather than as one literal stretch.
     assert_match(/requireCodeRabbit &&[\s\S]{0,400}?!\s*finalReviewBasis\s*\|\|\s*finalUnresolvedThreads\.length !== 0\s*\|\|\s*finalCurrentHeadNitpicks\.length !== 0\s*\)\s*\)\s*\)\s*\{/, body)
     assert_match(/const finalReviewBasis = requireCodeRabbit\s*\n\s*\? await codeRabbitReviewBasis/, body)
     assert_match(/const finalUnresolvedThreads = requireCodeRabbit\s*\n\s*\? await unresolvedCodeRabbitThreads/, body)

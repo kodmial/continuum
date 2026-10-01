@@ -8,6 +8,18 @@ on:
         type: string
         default: main
         required: false
+      require_coderabbit:
+        description: >-
+          Queue green PR heads for a CodeRabbit review. Empty falls back to
+          vars.CONTINUUM_REQUIRE_CODERABBIT. CodeRabbit is an optional
+          integration, so the default is OFF: this workflow still wakes the
+          auto-merge reconciler for every green head, but a project that did
+          not ask for CodeRabbit must not get its `review-ready` and
+          `coderabbit-review-requested` labels, and must not have a workflow
+          dispatched that it does not own.
+        type: string
+        default: ''
+        required: false
 
 permissions:
   actions: write
@@ -24,6 +36,7 @@ jobs:
         env:
           CONTINUUM_VERSION_FILE: ${{ vars.CONTINUUM_VERSION_FILE || 'Sources/NanoDictateCore/Version.swift' }}
           CONTINUUM_RELEASE_MANIFEST_FILES: ${{ vars.CONTINUUM_RELEASE_MANIFEST_FILES || '["nanodictate.rb","packaging/homebrew/nanodictate.rb","packaging/homebrew/Casks/nanodictate.rb","packaging/macports/Portfile","scripts/install-macports.sh"]' }}
+          REQUIRE_CODERABBIT: ${{ inputs.require_coderabbit || vars.CONTINUUM_REQUIRE_CODERABBIT || 'false' }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
@@ -32,6 +45,14 @@ jobs:
             const repoFullName = `${owner}/${repo}`;
             const run = context.payload.workflow_run;
             const REQUESTED_LABEL = 'coderabbit-review-requested';
+            // CodeRabbit is an OPTIONAL integration. With the flag off this
+            // workflow must stay a pure CI wake-up for the auto-merge
+            // reconciler: no CodeRabbit lock label, no `review-ready` label,
+            // and no dispatch of a controller the repository may not own.
+            const REQUIRE_CODERABBIT =
+              String(process.env.REQUIRE_CODERABBIT || '').trim().toLowerCase();
+            const requireCodeRabbit =
+              REQUIRE_CODERABBIT === 'true' || REQUIRE_CODERABBIT === '1';
             const RELEASE_FILES = new Set([
               '.release-please-manifest.json',
               'CHANGELOG.md',
@@ -220,85 +241,97 @@ jobs:
               return;
             }
 
-            // A visible lock label makes the request idempotent across workflow
-            // reruns for the same head. It is removed on every PR synchronize.
-            try {
-              await github.rest.issues.createLabel({
-                owner,
-                repo,
-                name: REQUESTED_LABEL,
-                color: 'C5DEF5',
-                description: 'CodeRabbit review requested or safely carried for the current PR head.',
-              });
-            } catch (err) {
-              if (err.status !== 422) throw err; // already exists
-            }
-
-            let queuedForCodeRabbit = false;
-
-            for (const pr of ours) {
-              await github.rest.issues.addLabels({
-                owner,
-                repo,
-                issue_number: pr.number,
-                labels: ['review-ready'],
-              });
-
-              const labels = await github.paginate(
-                github.rest.issues.listLabelsOnIssue,
-                {
+            // Everything below is the CodeRabbit path. Both labels it writes
+            // are read only by the CodeRabbit controllers (`review-ready` is
+            // the queue admission filter in coderabbit-retry.yml), so with the
+            // optional integration off they must not be written at all. The
+            // auto-merge wake-up stays outside this gate: it is CI-driven and
+            // belongs to the repository whether or not CodeRabbit exists.
+            if (requireCodeRabbit) {
+              // A visible lock label makes the request idempotent across workflow
+              // reruns for the same head. It is removed on every PR synchronize.
+              try {
+                await github.rest.issues.createLabel({
                   owner,
                   repo,
-                  issue_number: pr.number,
-                  per_page: 100,
-                }
-              );
-
-              if (labels.some(label => label.name === REQUESTED_LABEL)) {
-                core.info(
-                  `PR #${pr.number}: CodeRabbit review was already requested for head ${pr.head.sha}.`
-                );
-                continue;
+                  name: REQUESTED_LABEL,
+                  color: 'C5DEF5',
+                  description: 'CodeRabbit review requested or safely carried for the current PR head.',
+                });
+              } catch (err) {
+                if (err.status !== 422) throw err; // already exists
               }
 
-              // A clean controller-generated merge of main may carry forward a
-              // previously completed APPROVED CodeRabbit review. The marker is
-              // accepted only when this exact HEAD is a two-parent merge of the
-              // recorded old PR head and recorded main SHA, and the carried SHA
-              // still has a completed APPROVED review with no nitpick review.
-              const carriedSource = await carriedApprovalSource(pr);
-              if (carriedSource) {
+              let queuedForCodeRabbit = false;
+
+              for (const pr of ours) {
                 await github.rest.issues.addLabels({
                   owner,
                   repo,
                   issue_number: pr.number,
-                  labels: [REQUESTED_LABEL],
+                  labels: ['review-ready'],
                 });
-                core.notice(
-                  `PR #${pr.number}: carried CodeRabbit approval from ${carriedSource} across clean main sync to ${pr.head.sha}; no duplicate full review requested.`
+
+                const labels = await github.paginate(
+                  github.rest.issues.listLabelsOnIssue,
+                  {
+                    owner,
+                    repo,
+                    issue_number: pr.number,
+                    per_page: 100,
+                  }
                 );
-                continue;
+
+                if (labels.some(label => label.name === REQUESTED_LABEL)) {
+                  core.info(
+                    `PR #${pr.number}: CodeRabbit review was already requested for head ${pr.head.sha}.`
+                  );
+                  continue;
+                }
+
+                // A clean controller-generated merge of main may carry forward a
+                // previously completed APPROVED CodeRabbit review. The marker is
+                // accepted only when this exact HEAD is a two-parent merge of the
+                // recorded old PR head and recorded main SHA, and the carried SHA
+                // still has a completed APPROVED review with no nitpick review.
+                const carriedSource = await carriedApprovalSource(pr);
+                if (carriedSource) {
+                  await github.rest.issues.addLabels({
+                    owner,
+                    repo,
+                    issue_number: pr.number,
+                    labels: [REQUESTED_LABEL],
+                  });
+                  core.notice(
+                    `PR #${pr.number}: carried CodeRabbit approval from ${carriedSource} across clean main sync to ${pr.head.sha}; no duplicate full review requested.`
+                  );
+                  continue;
+                }
+
+                // Do not post CodeRabbit commands here. The included-review quota
+                // is repository-wide, so all initial reviews and retries must go
+                // through the single priority controller.
+                queuedForCodeRabbit = true;
+                core.notice(
+                  `PR #${pr.number}: green head ${pr.head.sha} queued for the global CodeRabbit priority controller.`
+                );
               }
 
-              // Do not post CodeRabbit commands here. The included-review quota
-              // is repository-wide, so all initial reviews and retries must go
-              // through the single priority controller.
-              queuedForCodeRabbit = true;
-              core.notice(
-                `PR #${pr.number}: green head ${pr.head.sha} queued for the global CodeRabbit priority controller.`
-              );
-            }
-
-            if (queuedForCodeRabbit) {
-              await github.rest.actions.createWorkflowDispatch({
-                owner,
-                repo,
-                workflow_id: 'continuum-coderabbit-retry.yml',
-                ref: 'main',
-              });
-              core.notice(
-                `Dispatched the global CodeRabbit priority controller after CI run ${run.id}.`
-              );
+              // `requireCodeRabbit` is checked here too, not only through
+              // `queuedForCodeRabbit`: with the flag off a repository without
+              // `continuum-coderabbit-retry.yml` would answer the dispatch with
+              // a 404.
+              if (requireCodeRabbit && queuedForCodeRabbit) {
+                await github.rest.actions.createWorkflowDispatch({
+                  owner,
+                  repo,
+                  workflow_id: 'continuum-coderabbit-retry.yml',
+                  ref: 'main',
+                });
+                core.notice(
+                  `Dispatched the global CodeRabbit priority controller after CI run ${run.id}.`
+                );
+              }
             }
 
             // CI completion is now the primary wake-up hook for the reconciler.
