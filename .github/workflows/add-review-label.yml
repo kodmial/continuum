@@ -291,7 +291,7 @@ jobs:
               await github.rest.actions.createWorkflowDispatch({
                 owner,
                 repo,
-                workflow_id: 'coderabbit-retry.yml',
+                workflow_id: 'continuum-coderabbit-retry.yml',
                 ref: 'main',
               });
               core.notice(
@@ -308,7 +308,7 @@ jobs:
               await github.rest.actions.createWorkflowDispatch({
                 owner,
                 repo,
-                workflow_id: 'auto-merge.yml',
+                workflow_id: 'continuum-auto-merge.yml',
                 ref: 'main',
               });
               core.notice(

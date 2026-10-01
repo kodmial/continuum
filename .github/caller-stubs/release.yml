@@ -13,8 +13,8 @@ on:
       - 'scripts/**'
       - 'Resources/**'
       - 'config.example.toml'
-      - '.github/workflows/packaging-smoke.yml'
-      - '.github/workflows/release.yml'
+      - '.github/workflows/continuum-packaging-smoke.yml'
+      - '.github/workflows/continuum-release.yml'
   workflow_dispatch:
     inputs:
       version:

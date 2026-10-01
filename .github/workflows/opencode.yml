@@ -58,7 +58,7 @@ jobs:
           REVIEW_ID: ${{ github.event.review.id }}
         run: |
           gh api --method POST \
-            "repos/${GITHUB_REPOSITORY}/actions/workflows/opencode.yml/dispatches" \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/continuum-opencode.yml/dispatches" \
             -f ref=main \
             -f "inputs[mode]=coderabbit-fix" \
             -f "inputs[pr_number]=${PR_NUMBER}" \
@@ -124,7 +124,7 @@ jobs:
       - name: Install Swift
         # Pin swift-actions/setup-swift@v2 to a full commit SHA (peeled from
         # the annotated v2 tag; CWE-829: mutable tag could be swapped
-        # upstream). Must stay aligned with .github/workflows/ci.yml.
+        # upstream). Must stay aligned with .github/workflows/continuum-ci.yml.
         uses: swift-actions/setup-swift@7ca6abe6b3b0e8b5421b88be48feee39cbf52c6a
         with:
           # swift.org toolchain Swift 6.1 runs in Swift 5 language mode: it

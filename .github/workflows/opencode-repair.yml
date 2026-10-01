@@ -91,7 +91,7 @@ jobs:
             -f 'labels[]=opencode-conflict-repair' >/dev/null
 
           if ! gh api --method POST \
-            "repos/$GITHUB_REPOSITORY/actions/workflows/opencode.yml/dispatches" \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/continuum-opencode.yml/dispatches" \
             -f ref=main \
             -f "inputs[mode]=resolve-conflict" \
             -f "inputs[pr_number]=$PR_NUMBER" \
@@ -182,7 +182,7 @@ jobs:
             -f "labels[]=$lock_label" >/dev/null
 
           if ! gh api --method POST \
-            "repos/$GITHUB_REPOSITORY/actions/workflows/opencode.yml/dispatches" \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/continuum-opencode.yml/dispatches" \
             -f ref=main \
             -f "inputs[mode]=ci-fix" \
             -f "inputs[pr_number]=$pr" \

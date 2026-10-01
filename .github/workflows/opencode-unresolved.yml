@@ -95,7 +95,7 @@ jobs:
         run: |
           set -euo pipefail
           gh api --method POST \
-            "repos/${GITHUB_REPOSITORY}/actions/workflows/opencode.yml/dispatches" \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/continuum-opencode.yml/dispatches" \
             -f ref=main \
             -f "inputs[mode]=coderabbit-fix" \
             -f "inputs[pr_number]=${PR_NUMBER}" \

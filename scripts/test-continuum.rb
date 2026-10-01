@@ -20,7 +20,22 @@ class ContinuumTest < Minitest::Test
 
   def each_pair
     STUBS.each do |path|
-      yield yaml(path), yaml(File.join(ROOT, '.github/workflows', File.basename(path)))
+      callee_path = File.join(ROOT, '.github/workflows', File.basename(path))
+      yield yaml(path), yaml(callee_path), path, callee_path
+    end
+  end
+
+  # Every sibling-workflow reference a workflow file makes, as "<file>:<line>".
+  # Only local references count: `kodmial/continuum/...@ref` always points at
+  # this repository's own flat filenames and is not renamed on installation.
+  def referenced_workflow_paths(workflow, path)
+    File.readlines(path).each_with_index.each_with_object([]) do |(line, index), found|
+      next unless line.include?('.github/workflows/') || line.include?("workflow_id: '")
+      next if line.include?('kodmial/continuum/')
+      names = line.scan(%r{\.github/workflows/([A-Za-z0-9._/-]+\.yml)}).flatten +
+              line.scan(/workflow_id: '([A-Za-z0-9._-]+\.yml)'/).flatten
+      unprefixed = names.reject { |name| name.start_with?('continuum-') }
+      found << "#{File.basename(path)}:#{index + 1} #{unprefixed.join(', ')}" unless unprefixed.empty?
     end
   end
 
@@ -67,6 +82,23 @@ class ContinuumTest < Minitest::Test
     each_pair do |caller, _|
       events(caller).fetch('workflow_run', {}).fetch('workflows', []).each do |name|
         assert_includes names, name
+      end
+    end
+  end
+
+  # A stub is written into a consumer repository under its `continuum-` name,
+  # so every reference it makes to a sibling workflow must carry the same
+  # prefix. `paths-ignore` filters and `workflow_id` dispatch targets are
+  # resolved by file path, not by `name:`, so an unprefixed reference would
+  # silently stop matching after installation.
+  def test_stubs_only_reference_prefixed_sibling_workflows
+    each_pair do |caller, callee, caller_path, callee_path|
+      assert_empty referenced_workflow_paths(caller, caller_path), caller['name']
+      assert_empty referenced_workflow_paths(callee, callee_path), callee['name']
+    end
+    Dir[File.join(ROOT, '.github/caller-stubs/parent/*.yml')].each do |path|
+      yaml(path).fetch('jobs').each_value do |job|
+        assert_empty referenced_workflow_paths(job, path), "#{File.basename(path)}:#{job['uses']}"
       end
     end
   end
@@ -181,8 +213,11 @@ class ContinuumTest < Minitest::Test
       output, status = Open3.capture2e(env, 'bash', File.join(ROOT, 'install.sh'), destination, ref, 'parent')
       assert status.success?, output
       preserved.each { |name| assert_equal "project-owned #{name}\n", File.read(File.join(workflows, name)) }
-      installed = Dir[File.join(workflows, 'child-*.yml')]
+      # Strict contract: every installed caller carries the `continuum-` prefix,
+      # so a project-owned `ci.yml` is never silently overwritten.
+      installed = Dir[File.join(workflows, 'continuum-*.yml')]
       assert_equal 4, installed.size
+      assert_empty Dir[File.join(workflows, 'child-*.yml')]
       installed.each do |file|
         yaml(file).fetch('jobs').each_value do |job|
           next unless job['uses']

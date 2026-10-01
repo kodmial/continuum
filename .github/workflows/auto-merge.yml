@@ -917,7 +917,7 @@ jobs:
                   {
                     owner,
                     repo,
-                    workflow_id: 'opencode.yml',
+                    workflow_id: 'continuum-opencode.yml',
                     ref: 'main',
                     inputs: {
                       mode: 'resolve-conflict',
@@ -1159,7 +1159,7 @@ jobs:
                 await github.rest.actions.createWorkflowDispatch({
                   owner,
                   repo,
-                  workflow_id: 'coderabbit-retry.yml',
+                  workflow_id: 'continuum-coderabbit-retry.yml',
                   ref: 'main',
                 });
                 codeRabbitRetryControllerDispatched = true;
@@ -1186,7 +1186,7 @@ jobs:
                   await github.rest.actions.createWorkflowDispatch({
                     owner,
                     repo,
-                    workflow_id: 'coderabbit-retry.yml',
+                    workflow_id: 'continuum-coderabbit-retry.yml',
                     ref: 'main',
                   });
                   codeRabbitRetryControllerDispatched = true;

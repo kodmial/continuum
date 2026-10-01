@@ -379,7 +379,7 @@ jobs:
                 break
               fi
             done < <(
-              gh api "repos/$REPO/actions/workflows/packaging-smoke.yml/runs?event=$EVENT&head_sha=$SHA&per_page=100" \
+              gh api "repos/$REPO/actions/workflows/continuum-packaging-smoke.yml/runs?event=$EVENT&head_sha=$SHA&per_page=100" \
                 --jq '.workflow_runs[].id'
             )
             if [[ -n "$RUN_ID" ]]; then
@@ -1631,7 +1631,7 @@ jobs:
           fi
           GH_TOKEN="$TAP_PAT" gh api \
             --method POST \
-            "repos/$GITHUB_REPOSITORY/actions/workflows/auto-merge.yml/dispatches" \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/continuum-auto-merge.yml/dispatches" \
             -f ref=main
           echo "::notice::Dispatched auto-merge reconciliation after successful release writes."
 

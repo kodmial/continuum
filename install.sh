@@ -43,6 +43,11 @@ BASE="https://raw.githubusercontent.com/kodmial/continuum/${REF}/$STUB_PATH"
 # Only use local templates when installing the default working-tree version.
 # An explicit ref must fetch that revision, even when run from a local clone.
 LOCAL_STUBS_DIR="$(dirname "${BASH_SOURCE[0]:-$0}")/$STUB_PATH"
+# Every installed caller carries the `continuum-` prefix. This is the strict
+# contract: a workflow named continuum-*.yml in a consumer repository comes
+# from Continuum and must not be hand-edited, while any other workflow in the
+# same directory is project-owned. Continuum's own dispatchers rely on these
+# exact names, so the prefix is part of the interface, not a cosmetic label.
 for f in "${STUBS[@]}"; do
   if [[ $# -lt 2 && -f "$LOCAL_STUBS_DIR/$f" ]]; then
     template="$(cat "$LOCAL_STUBS_DIR/$f")"
@@ -54,6 +59,6 @@ for f in "${STUBS[@]}"; do
     -e "s|kodmial/continuum/\\(.github/workflows/[^@ ]*\\)@main|kodmial/continuum/\\1@$REF|g" \
     -e "s|continuum_ref: main|continuum_ref: '$REF'|" \
     -e "s|engine_ref: main|engine_ref: '$REF'|" \
-    > "$DEST/.github/workflows/$f"
+    > "$DEST/.github/workflows/continuum-$f"
 done
 echo "Continuum callers installed to $DEST/.github/workflows/ (profile: $PROFILE, ref: $REF)"

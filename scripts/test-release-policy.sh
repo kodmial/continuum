@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Test suite for scripts/release-policy.sh — the release policy used by
-# .github/workflows/release-pr.yml to decide whether a merge into main
+# .github/workflows/continuum-release-pr.yml to decide whether a merge into main
 # needs a Release PR update.
 #
-# Runs on any bash + git host (CI runs it on ubuntu-latest in .github/workflows/ci.yml):
+# Runs on any bash + git host (CI runs it on ubuntu-latest in .github/workflows/continuum-ci.yml):
 #
 #   bash scripts/test-release-policy.sh
 #
@@ -159,7 +159,7 @@ assert_eq 'decide: null labels fall through to the automatic policy' \
 
 assert_eq 'paths: only excluded paths are non-releasable' \
   'non-releasable' \
-  "$(policy_decide "$EMPTY" $'CHANGELOG.md\nREADME.md\ndocs/packaging/homebrew.md\n.github/workflows/ci.yml\n.githooks/pre-commit\npackaging/homebrew/nanodictate.rb\nnanodictate.rb\nconfig.example.toml\nSECURITY.md\nCODE_OF_CONDUCT.md\nCONTRIBUTING.md\nLICENSE\n.gitignore\n.swift-format\n.swiftlint.yml\n.coderabbit.yaml\nrelease-please-config.json\n.release-please-manifest.json\nSources/NanoDictateCore/Version.swift' '')"
+  "$(policy_decide "$EMPTY" $'CHANGELOG.md\nREADME.md\ndocs/packaging/homebrew.md\n.github/workflows/continuum-ci.yml\n.githooks/pre-commit\npackaging/homebrew/nanodictate.rb\nnanodictate.rb\nconfig.example.toml\nSECURITY.md\nCODE_OF_CONDUCT.md\nCONTRIBUTING.md\nLICENSE\n.gitignore\n.swift-format\n.swiftlint.yml\n.coderabbit.yaml\nrelease-please-config.json\n.release-please-manifest.json\nSources/NanoDictateCore/Version.swift' '')"
 assert_eq 'paths: a single source change is releasable' \
   'releasable' \
   "$(policy_decide "$EMPTY" 'Sources/NanoDictateCore/Transcriber.swift' '')"
@@ -171,7 +171,7 @@ assert_eq 'paths: the new policy script itself counts as a code change' \
   "$(policy_decide "$EMPTY" $'scripts/release-policy.sh\nscripts/test-release-policy.sh' '')"
 assert_eq 'paths: .github is excluded, not a prefix-free match' \
   'non-releasable' \
-  "$(policy_decide "$EMPTY" '.github/workflows/release-pr.yml' '')"
+  "$(policy_decide "$EMPTY" '.github/workflows/continuum-release-pr.yml' '')"
 assert_eq 'paths: an unrelated nested file is not excluded' \
   'releasable' \
   "$(policy_decide "$EMPTY" 'Sources/NanoDictateCoreSupport/Helper.swift' '')"
@@ -431,7 +431,7 @@ assert_eq 'fixture: an unchanged tree is no-changes' \
   'no-changes' "$(fixture_decide "$EMPTY")"
 
 printf 'guide\n' > "$FIXTURE/docs/packaging.md"
-printf 'name: CI\n' > "$FIXTURE/.github/workflows/ci.yml"
+printf 'name: CI\n' > "$FIXTURE/.github/workflows/continuum-ci.yml"
 git -C "$FIXTURE" add -A
 git -C "$FIXTURE" commit -q -m 'docs only'
 assert_eq 'fixture: docs + .github only is non-releasable' \
