@@ -487,6 +487,73 @@ class ContinuumTest < Minitest::Test
     end
   end
 
+  # The ref rewrite anchors on the end of the line, so everything a real line
+  # can legally carry *after* the ref has to be tolerated explicitly. Each case
+  # below is a line that silently stayed on `main` when the anchor was too
+  # strict — which is the exact failure the ref parameter promises to prevent,
+  # just moved from a step-level `uses:` to a quoted or CRLF one.
+  #
+  # The negative cases matter as much as the positive ones: an anchor loosened
+  # far enough to catch them would start rewriting third-party refs.
+  def test_installer_ref_rewrite_tolerates_quotes_comments_and_crlf
+    fixture do |dir|
+      stub = <<~YAML
+        name: Continuum reusable OpenCode
+        on:
+          workflow_call:
+            inputs: {}
+        jobs:
+          job:
+            runs-on: ubuntu-latest
+            steps:
+              - uses: "kodmial/continuum/.github/workflows/continuum-opencode.yml@main"
+              - uses: 'kodmial/continuum/.github/workflows/continuum-opencode.yml@main'
+              - uses: kodmial/continuum/.github/workflows/continuum-opencode.yml@main#glued
+              - uses: kodmial/continuum/.github/workflows/continuum-opencode.yml@branch-main
+              - uses: actions/checkout@main
+              - uses: kodmial/continuum/other/thing.yml@main
+      YAML
+      env = fake_curl(dir, 'continuum-opencode.yml' => stub)
+      target = File.join(dir, 'consumer')
+      output, status = Open3.capture2e(env, 'bash', File.join(ROOT, 'install.sh'), target, 'v9.9.9', 'core')
+      assert status.success?, output
+
+      body = File.read(File.join(target, '.github/workflows/continuum-opencode.yml'))
+      lines = body.scan(/^      - uses: (.*)$/).flatten
+      base = 'kodmial/continuum/.github/workflows/continuum-opencode.yml@v9.9.9'
+
+      assert_equal %("#{base}"), lines[0], 'a double-quoted ref must be rewritten, keeping its quotes'
+      assert_equal %('#{base}'), lines[1], 'a single-quoted ref must be rewritten, keeping its quotes'
+      # YAML opens a comment only when `#` follows whitespace, so `@main#glued`
+      # is a ref literally named `main#glued`. Rewriting it would corrupt the
+      # ref; leaving it alone is correct and must be pinned by a test.
+      assert_equal 'kodmial/continuum/.github/workflows/continuum-opencode.yml@main#glued', lines[2],
+                   'a # glued to the ref is part of the ref, not a comment'
+      assert_equal 'kodmial/continuum/.github/workflows/continuum-opencode.yml@branch-main', lines[3],
+                   'only a bare @main ref is rewritten; @branch-main is a different ref'
+      assert_equal 'actions/checkout@main', lines[4], 'a third-party action ref must never be rewritten'
+      assert_equal 'kodmial/continuum/other/thing.yml@main', lines[5],
+                   'only .github/workflows/ paths are Continuum calls; other paths must not be rewritten'
+
+      # A CRLF template is rewritten too, and the CR survives so the checkout's
+      # line endings are not silently half-converted.
+      crlf_stub = "name: Continuum reusable OpenCode\r\n" \
+                  "on:\r\n  workflow_call:\r\n    inputs: {}\r\n" \
+                  "jobs:\r\n  job:\r\n    runs-on: ubuntu-latest\r\n    steps:\r\n" \
+                  "      - uses: kodmial/continuum/.github/workflows/continuum-opencode.yml@main\r\n"
+      crlf_env = fake_curl(dir, 'continuum-opencode.yml' => crlf_stub)
+      crlf_target = File.join(dir, 'crlf-consumer')
+      output, status = Open3.capture2e(crlf_env, 'bash', File.join(ROOT, 'install.sh'),
+                                       crlf_target, 'v9.9.9', 'core')
+      assert status.success?, output
+      crlf = File.read(File.join(crlf_target, '.github/workflows/continuum-opencode.yml'))
+      assert_includes crlf, "continuum-opencode.yml@v9.9.9\r\n",
+                      'a CRLF template must be rewritten to the requested ref'
+      refute_includes crlf, 'continuum-opencode.yml@main',
+                      'no ref may be left on main in a CRLF template'
+    end
+  end
+
   # Deletion is the only destructive thing the installer does, so the uniform
   # `continuum-` prefix alone must never be enough to qualify a file for it. A
   # consumer is entitled to name its own workflow `continuum-experiment.yml`;
@@ -513,6 +580,61 @@ class ContinuumTest < Minitest::Test
       assert File.exist?(hand_written),
              'a continuum- prefixed file Continuum did not write must never be pruned'
       refute_includes output, 'removed superseded Continuum caller: continuum-experiment.yml'
+    end
+  end
+
+  # Mentioning the repository is not the same as being written by it. The
+  # ownership marker is a `uses:` call to one of Continuum's workflows, and a
+  # hand-written file that merely cites the path in a comment still satisfies a
+  # bare substring grep — so a comment is exactly the shape that defeats it.
+  # Deleting such a file loses project work the installer never created, so the
+  # marker has to be anchored on the call, not on the mention.
+  def test_installer_prune_rejects_a_file_that_only_mentions_continuum_in_a_comment
+    fixture do |dir|
+      target = File.join(dir, 'consumer')
+      mention_only = File.join(target, '.github/workflows/continuum-notes.yml')
+      FileUtils.mkdir_p(File.dirname(mention_only))
+      # Every signal except the one that matters: the uniform prefix, and the
+      # repository path in the body — but only inside comments.
+      File.write(mention_only, <<~YAML)
+        # cribbed from kodmial/continuum/.github/workflows/continuum-opencode.yml
+        name: My notes
+        on:
+          workflow_dispatch:
+        jobs:
+          probe:
+            runs-on: ubuntu-latest
+            steps:
+              - run: echo "see kodmial/continuum/.github/workflows/continuum-opencode.yml"
+      YAML
+      # Control: the same shape with a real call must still be pruned, or this
+      # test would pass for the wrong reason (an ownership test that rejects
+      # everything deletes nothing).
+      real = File.join(target, '.github/workflows/continuum-dropped.yml')
+      File.write(real, superseded_caller('continuum-dropped.yml'))
+
+      output, status = Open3.capture2e('bash', File.join(ROOT, 'install.sh'), target, '--yes')
+      assert status.success?, output
+      assert File.exist?(mention_only),
+             'a file that only MENTIONS Continuum in a comment is project-owned and must not be pruned'
+      refute_includes output, 'removed superseded Continuum caller: continuum-notes.yml'
+      refute File.exist?(real),
+             'control: a file that really `uses:` a Continuum workflow must still be pruned'
+      assert_includes output, 'removed superseded Continuum caller: continuum-dropped.yml'
+    end
+  end
+
+  # Every caller Continuum ships must satisfy the installer's own ownership
+  # test, or a superseded caller could survive every future rename because the
+  # fence quietly stopped recognising the files it exists to clean up.
+  def test_every_shipped_caller_satisfies_the_installers_ownership_test
+    refute_empty ALL_STUBS
+    ALL_STUBS.each do |stub|
+      body = File.read(stub)
+      assert_match(/^[[:space:]]*-?[[:space:]]*uses:[[:space:]]*["']?kodmial\/continuum\/\.github\/workflows\//,
+                   body,
+                   "#{File.basename(stub)}: the installer would not recognise this shipped caller as its own, " \
+                   'so a rename would leave it behind forever')
     end
   end
 
@@ -586,27 +708,36 @@ class ContinuumTest < Minitest::Test
     end
   end
 
-  # Installing into Continuum's own checkout is never a consumer install. The
-  # prune is skipped there so a stray `install.sh .` cannot delete the
-  # repository's own workflows, for every set.
-  def test_installer_prune_is_skipped_when_targeting_continuum_itself
+  # Installing into Continuum's own checkout is never a consumer install, and
+  # it must never be a *partial* one either. This repository's
+  # `.github/workflows/` holds the real core workflows; the files the installer
+  # writes are thin caller stubs that `uses:` them. Installing here therefore
+  # replaces every core workflow with a caller pointing back at Continuum.
+  #
+  # Skipping the prune was not enough, because the WRITE happens first and is
+  # the destructive half: `install.sh . --yes` measured 14 files changed, 461
+  # insertions, 6413 deletions. So the installer refuses outright, for every
+  # set, and the test asserts the refusal is loud AND that not one core file was
+  # touched — the file contents below are the witness.
+  def test_installer_refuses_to_write_callers_over_continuum_its_own_workflows
     fixture do |dir|
       # The installer resolves "self" from its own location, so the guard is
-      # exercised by running a copy of it that sits next to a workflows
-      # directory it must refuse to prune.
+      # exercised by running a copy of it that sits next to the workflows
+      # directory it must refuse to overwrite.
       checkout = File.join(dir, 'continuum')
       workflows = File.join(checkout, '.github/workflows')
       FileUtils.mkdir_p(workflows)
       FileUtils.cp(File.join(ROOT, 'install.sh'), File.join(checkout, 'install.sh'))
       env = fake_curl(dir).merge('CONTINUUM_INSTALL_ASSUME_YES' => '1')
       %w[core tech parent].each do |set|
-        # A file that satisfies BOTH prune conditions — the `continuum-` prefix
-        # and the repository marker inside it, and a name Continuum does not
-        # ship. Against any other directory this is deleted. Here it must
-        # survive, which is the only way this test can fail if the self-install
-        # guard is ever removed.
-        own = File.join(workflows, 'continuum-validate-continuum.yml')
-        File.write(own, <<~YAML)
+        # One real core workflow body, plus a file that satisfies BOTH prune
+        # conditions (the prefix and a repository `uses:` call) under a name
+        # Continuum no longer ships. Against any other directory both the write
+        # and the delete would happen; here neither may.
+        real_core = File.join(workflows, 'continuum-opencode.yml')
+        File.write(real_core, "name: A real core workflow\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo core\n")
+        stale = File.join(workflows, 'continuum-validate-continuum.yml')
+        File.write(stale, <<~YAML)
           name: Validate Continuum
           on:
             workflow_call:
@@ -620,17 +751,48 @@ class ContinuumTest < Minitest::Test
         YAML
         refute_includes ALL_STUBS, 'continuum-validate-continuum.yml',
                         'the fixture must be a file Continuum no longer ships'
+        before = File.read(real_core)
+
         output, status = Open3.capture2e(
           env, 'bash', File.join(checkout, 'install.sh'), checkout, 'main', set
         )
-        assert status.success?, output
-        assert_includes output, 'skipping superseded-caller prune',
-                        "#{set}: a self-install must skip the prune entirely"
-        assert File.exist?(own),
+
+        refute status.success?, "#{set}: a self-install must fail, not report success\n#{output}"
+        assert_includes output, 'refusing to install',
+                        "#{set}: the refusal must be loud and name the reason"
+        assert_includes output, "Continuum's own checkout",
+                        "#{set}: the refusal must say what it detected"
+        # The whole point: the core workflow is byte-for-byte untouched.
+        assert_equal before, File.read(real_core),
+                     "#{set}: a self-install must not overwrite Continuum's own core workflows"
+        assert File.exist?(stale),
                "#{set}: installing into Continuum's own checkout must not delete its workflows"
         refute_includes output, 'removed superseded Continuum caller',
                         "#{set}: a self-install must not prune at all"
+        refute_includes output, 'installed to',
+                        "#{set}: a refused install must not claim it installed anything"
+        # And no stub was written into the checkout either.
+        Dir[File.join(workflows, '*.yml')].each do |file|
+          body = File.read(file)
+          next if body == before || File.read(stale) == body
+          assert_includes body, "name: A real core workflow",
+                          "#{set}: unexpected content written to #{File.basename(file)}"
+        end
       end
+    end
+  end
+
+  # The refusal must not be a trap for the legitimate case: a directory that
+  # merely *contains* a `.github/workflows` is still installable, and so is a
+  # consumer whose path is spelled differently. Only Continuum's own checkout,
+  # resolved as the directory holding this very install.sh, is refused.
+  def test_installer_still_installs_into_an_ordinary_consumer
+    fixture do |dir|
+      target = File.join(dir, 'some-consumer')
+      output, status = Open3.capture2e('bash', File.join(ROOT, 'install.sh'), target)
+      assert status.success?, "an ordinary consumer must still install\n#{output}"
+      refute_includes output, 'refusing to install'
+      assert_equal CORE_COUNT, Dir[File.join(target, '.github/workflows/*.yml')].size
     end
   end
 

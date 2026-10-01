@@ -40,7 +40,7 @@ jobs:
       WORKER_WORKFLOW: ${{ inputs.worker_workflow }}
       REVIEW_WORKFLOW: ${{ inputs.review_workflow }}
       MANUAL_PR_REVIEW_WORKFLOW: ${{ inputs.manual_pr_review_workflow }}
-      # Same default ascontinuum-issue-scheduler.yml's pause_marker, so a parent that
+      # Same default as continuum-issue-scheduler.yml's pause_marker, so a parent that
       # renames the scheduler's pause label must rename this knob too.
       AUTOMATION_PAUSE_LABEL: ${{ vars.AUTOMATION_PAUSE_LABEL || 'automation:paused' }}
     steps:

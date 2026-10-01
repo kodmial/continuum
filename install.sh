@@ -5,7 +5,10 @@ set -euo pipefail
 #    or: curl -fsSL https://raw.githubusercontent.com/kodmial/continuum/main/install.sh | bash -s -- [path] [ref] [core|parent|tech]
 #    or: bash continuum/install.sh [path-to-consumer-repo] [ref] [core|parent|tech]
 # An optional `--yes` (or CONTINUUM_INSTALL_ASSUME_YES=1) removes superseded
-# Continuum callers without the interactive confirmation.
+# Continuum callers without the interactive confirmation. The variable is
+# honoured only for an exact `1`, `true` or `yes`; any other value, including
+# empty, `0` and `false`, leaves the confirmation in place.
+# Installing into Continuum's own checkout is refused outright.
 # ref defaults to main. `core` is the task-domain layer every project needs;
 # `tech` is the opt-in technology library (the `continuum-tech-<tech>-` prefix marks the library);
 # `parent` adds only child-execution callers.
@@ -93,6 +96,37 @@ BASE="https://raw.githubusercontent.com/kodmial/continuum/${REF}/$STUB_PATH"
 # Only use local templates when installing the default working-tree version.
 # An explicit ref must fetch that revision, even when run from a local clone.
 LOCAL_STUBS_DIR="$(dirname "${BASH_SOURCE[0]:-$0}")/$STUB_PATH"
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo "$PWD")"
+TARGET_DIR="$(cd "$DEST/.github/workflows" && pwd)"
+# Installing into Continuum's own checkout is never a consumer install, and it
+# is not a harmless one. This repository's `.github/workflows/` holds the real
+# core workflows; the files this script writes are thin caller stubs that
+# `uses:` them. A `install.sh . --yes` here therefore replaces each core
+# workflow with a caller to itself — measured at 14 files changed, 461
+# insertions, 6413 deletions, i.e. the loss of every core workflow body in the
+# repository.
+#
+# Skipping the prune (below) is not enough, because the WRITE is the
+# destructive half and it happens first. So this refuses outright, before a
+# single byte is written, and says why. Refusing loudly is the only safe
+# answer: silently installing nothing would look like a success and leave the
+# operator no signal that their repository was skipped.
+if [[ "$TARGET_DIR" == "$SELF_DIR/.github/workflows" ]]; then
+  cat >&2 <<EOF
+refusing to install: the target is Continuum's own checkout ($TARGET_DIR).
+
+This repository ships the core workflows themselves; the files this installer
+writes are thin caller stubs that call them. Installing here would overwrite
+every core workflow with a stub pointing back at Continuum, destroying the
+workflow bodies this repository exists to provide.
+
+Continuum's own workflows are already in place. To install callers, point the
+installer at a consumer repository instead:
+
+  bash install.sh /path/to/consumer-repo [ref] [core|parent|tech]
+EOF
+  exit 1
+fi
 # The stored stub name is the installed name, verbatim: the loop variable is
 # written straight to the destination, so a repository file name and the
 # consumer file name are always the same string and cannot drift apart.
@@ -111,13 +145,22 @@ for f in "${STUBS[@]}"; do
   # exactly the guarantee the ref parameter exists to provide.
   #
   # Each pattern is anchored so an unrelated `main` elsewhere in the template
-  # is never rewritten, and the anchor tolerates a trailing YAML comment:
-  # `@main # pinned` pins the requested ref and keeps its comment, instead of
-  # being skipped. The ref is written as a double-quoted YAML scalar rather
-  # than a bare or single-quoted one.
+  # is never rewritten, and the anchor tolerates the things a real line can
+  # carry after the ref without treating any of them as part of it:
+  #   - a trailing YAML comment (`@main # pinned`), re-emitted verbatim;
+  #   - surrounding quotes, which are part of the YAML scalar and not of the
+  #     ref, re-emitted verbatim;
+  #   - trailing whitespace, including the CR of a CRLF checkout, re-emitted
+  #     verbatim.
+  # Each of those ends the match, so a line that merely *contains* `main` — a
+  # third-party action, an `@branch-main` tag, a `run:` body — never matches.
+  # `@main` with no space before a `#` is deliberately NOT rewritten: YAML
+  # requires whitespace to open a comment, so `#` there is part of the ref.
+  # The ref is written as a double-quoted YAML scalar rather than a bare or
+  # single-quoted one.
   printf '%s\n' "$template" | sed -E \
-    -e "s|^([[:space:]]*-?[[:space:]]*uses:[[:space:]]*kodmial/continuum/\.github/workflows/[^@[:space:]]*)@main([[:space:]]+#.*)?$|\1@$REF\2|" \
-    -e "s|^([[:space:]]*-?[[:space:]]*(continuum_ref\|engine_ref):[[:space:]]*)main([[:space:]]+#.*)?$|\1\"$REF\"\3|" \
+    -e "s|^([[:space:]]*-?[[:space:]]*uses:[[:space:]]*[\"']?kodmial/continuum/\.github/workflows/[^@[:space:]\"']*)@main([\"']?)([[:space:]]+#.*)?([[:space:]]*)$|\1@$REF\2\3\4|" \
+    -e "s|^([[:space:]]*-?[[:space:]]*(continuum_ref\|engine_ref):[[:space:]]*)main([[:space:]]+#.*)?([[:space:]]*)$|\1\"$REF\"\3\4|" \
     > "$DEST/.github/workflows/$f"
 done
 # Supersession: a renamed or dropped stub must not leave a stale caller behind
@@ -127,11 +170,13 @@ done
 # three ways.
 #
 # 1. Ownership. A file is a Continuum artifact only if its name carries the
-#    uniform `continuum-` prefix *and* its body references this repository
-#    (`kodmial/continuum/.github/workflows/`). Every caller this installer
-#    writes carries that reference, so the test never rejects a real artifact;
-#    a hand-written `continuum-experiment.yml` that merely borrows the prefix
-#    fails it and is left alone. The prefix alone is not ownership evidence.
+#    uniform `continuum-` prefix *and* it really calls one of this
+#    repository's workflows on a `uses:` line. Every caller this installer
+#    writes carries that call, so the test never rejects a real artifact; a
+#    hand-written `continuum-experiment.yml` that merely borrows the prefix —
+#    or that only mentions the repository path in a comment — fails it and is
+#    left alone. Neither the prefix nor the mention alone is ownership
+#    evidence.
 # 2. Intent. The exact list is printed and must be confirmed at a terminal.
 #    Non-interactive runs delete nothing and say so, so a CI install can never
 #    silently drop a file. `--yes` or CONTINUUM_INSTALL_ASSUME_YES=1 is the
@@ -142,15 +187,24 @@ done
 #
 # The other two layers' callers are never candidates: ALL_STUBS spans all three
 # layers, so installing one set cannot delete another set's files.
-SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo "$PWD")"
-TARGET_DIR="$(cd "$DEST/.github/workflows" && pwd)"
+# The self-install case never reaches this point: it is refused before the
+# write loop above, because writing caller stubs over this repository's own
+# core workflows is the destructive half. The branch below remains as a
+# second, independent fence on the DELETE half only.
 ALL_STUBS=("${CORE_STUBS[@]}" "${TECH_STUBS[@]}" "${PARENT_STUBS[@]}")
 # A Continuum-owned caller is one this project wrote. The marker is the
 # repository reference inside it, not the file name.
 is_continuum_artifact() {
-  local file="$1" base="${1##*/}" candidate
+  local file="$1" base="${1##*/}"
   [[ "$base" == continuum-* ]] || return 1
-  grep -q 'kodmial/continuum/\.github/workflows/' "$file" 2>/dev/null || return 1
+  # The marker must be a real `uses:` call, not merely the string somewhere in
+  # the body. A bare `grep` for the repository path also matches a hand-written
+  # file that only cites Continuum in a comment, and such a file is still
+  # project-owned work the installer never wrote. Anchoring on a `uses:` line
+  # is what makes this ownership evidence: every caller this installer writes
+  # calls one of this repository's workflows, and nothing else does.
+  grep -qE '^[[:space:]]*-?[[:space:]]*uses:[[:space:]]*["'"'"']?kodmial/continuum/\.github/workflows/' \
+    "$file" 2>/dev/null || return 1
   return 0
 }
 if [[ "$TARGET_DIR" == "$SELF_DIR/.github/workflows" ]]; then

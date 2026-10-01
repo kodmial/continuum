@@ -243,7 +243,7 @@ jobs:
 
             // Everything below is the CodeRabbit path. Both labels it writes
             // are read only by the CodeRabbit controllers (`review-ready` is
-            // the queue admission filter incontinuum-coderabbit-retry.yml), so with the
+            // the queue admission filter in continuum-coderabbit-retry.yml), so with the
             // optional integration off they must not be written at all. The
             // auto-merge wake-up stays outside this gate: it is CI-driven and
             // belongs to the repository whether or not CodeRabbit exists.

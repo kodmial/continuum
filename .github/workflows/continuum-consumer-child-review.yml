@@ -55,7 +55,7 @@ jobs:
       OPENCODE_MODEL: ${{ inputs.model }}
       MAX_REVIEW_PASSES: ${{ inputs.max_review_passes }}
       OPENCODE_CONFIG_CONTENT: '{"permission":{"bash":{"*":"allow","git *":"allow","git push *":"deny"}}}'
-      # Same defaults ascontinuum-issue-scheduler.yml's in_progress_label/pause_marker.
+      # Same defaults as continuum-issue-scheduler.yml's in_progress_label/pause_marker.
       AUTOMATION_IN_PROGRESS_LABEL: ${{ vars.AUTOMATION_IN_PROGRESS_LABEL || 'automation:in-progress' }}
       AUTOMATION_PAUSE_LABEL: ${{ vars.AUTOMATION_PAUSE_LABEL || 'automation:paused' }}
     steps:
