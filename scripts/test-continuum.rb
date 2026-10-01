@@ -115,6 +115,17 @@ class ContinuumTest < Minitest::Test
     %w[VERSION MAINTAINERS REVISION].each { |key| assert generate.fetch('env').key?(key) }
   end
 
+  def test_release_candidate_gate_normalizes_reusable_job_names
+    release = yaml(File.join(ROOT, '.github/workflows/release.yml'))
+    gate = release.fetch('jobs').fetch('candidate-gate').fetch('steps')
+                  .find { |step| step['name'] == 'Wait for exact-head Packaging smoke' }
+    run = gate.fetch('run')
+
+    assert_includes run, %q{--jq '.jobs[].name | split(" / ") | last'}
+    assert_includes run, "grep -qxF 'Candidate build (x86_64)'"
+    assert_includes run, "grep -qxF 'Candidate build (arm64)'"
+  end
+
   def test_fallback_preserves_existing_scripts_and_copies_missing_files
     fixture do |dir|
       FileUtils.mkdir_p(File.join(dir, 'scripts'))
