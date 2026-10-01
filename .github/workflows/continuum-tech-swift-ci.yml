@@ -294,16 +294,16 @@ jobs:
           STATIC_ARCHIVE_PATH: ${{ inputs.static_archive_path }}
         run: |
           set -euo pipefail
-          extra=()
           if [[ -n "$STATIC_ARCHIVE_PATH" ]]; then
             archive="$GITHUB_WORKSPACE/$STATIC_ARCHIVE_PATH"
             [[ -f "$archive" ]] || {
               echo "::error::Configured static archive does not exist: $archive"
               exit 1
             }
-            extra=(-Xlinker "$archive")
+            swift build -Xlinker "$archive"
+          else
+            swift build
           fi
-          swift build "${extra[@]}"
 
       # The tests are a plain executable product (no .xctest bundle): without
       # Xcode, `swift test` is unavailable. Build the custom runner with LLVM
@@ -318,20 +318,23 @@ jobs:
           STATIC_ARCHIVE_PATH: ${{ inputs.static_archive_path }}
         run: |
           set -euo pipefail
-          extra=()
           if [[ -n "$STATIC_ARCHIVE_PATH" ]]; then
             archive="$GITHUB_WORKSPACE/$STATIC_ARCHIVE_PATH"
             [[ -f "$archive" ]] || {
               echo "::error::Configured static archive does not exist: $archive"
               exit 1
             }
-            extra=(-Xlinker "$archive")
+            swift build \
+              -Xswiftc -profile-generate \
+              -Xswiftc -profile-coverage-mapping \
+              --product "$CORE_TEST_TARGET" \
+              -Xlinker "$archive"
+          else
+            swift build \
+              -Xswiftc -profile-generate \
+              -Xswiftc -profile-coverage-mapping \
+              --product "$CORE_TEST_TARGET"
           fi
-          swift build \
-            -Xswiftc -profile-generate \
-            -Xswiftc -profile-coverage-mapping \
-            --product "$CORE_TEST_TARGET" \
-            "${extra[@]}"
 
       - name: Run tests
         env:
