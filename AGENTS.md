@@ -20,6 +20,8 @@ These are public interfaces and must not change silently:
   secrets;
 - the `continuum-` prefix on every installed caller (a `continuum-*.yml` file in a
   consumer repository is Continuum-owned and is never hand-edited there);
+- the `TAP_PAT` repository secret name (classic PAT, `repo` + `workflow` scopes)
+  expected by every profile;
 - the installer profiles (`swift`, and its `nanodictate` alias, plus `parent`)
   and the `install.sh` argument shape;
 - the parent/child repository-variable names (`CONTINUUM_ROLE`,

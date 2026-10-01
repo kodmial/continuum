@@ -32,6 +32,21 @@ engine.
   `continuum_ref`/`engine_ref` inputs to the requested ref, so one value governs
   both the workflow and its fallback scripts.
 
+### Fixed contracts
+
+These names are the interface and never change per consumer:
+
+- the `TAP_PAT` repository secret (classic PAT, `repo` + `workflow` scopes) —
+  every profile expects a secret with exactly this name;
+- the `continuum-` prefix on installed callers;
+- the installer profiles (`swift`, with its `nanodictate` alias, and `parent`);
+- the `CONTINUUM_*` repository-variable names.
+
+Continuum is technology-neutral: `swift` is the profile for Swift
+applications, `parent` drives delegated execution for any technology, and the
+generic controllers (issue scheduling, OpenCode, review bots, auto-merge) work
+the same in every repository.
+
 ## Install
 
 ```sh
@@ -92,7 +107,8 @@ revision that supplies fallback scripts.
 
 ## Secrets and variables
 
-Secrets a consumer must provide (only those used by its installed profile):
+Secrets a consumer must provide, under exactly these names (secret names are
+part of the contract and never change per consumer):
 
 | Secret | Used by | Purpose |
 | --- | --- | --- |
