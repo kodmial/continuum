@@ -60,5 +60,7 @@ jobs:
     secrets: inherit
     with:
       continuum_ref: main
+      native_prepare_command: "${{ vars.CONTINUUM_NATIVE_PREPARE_COMMAND || '' }}"
+      static_archive_path: "${{ vars.CONTINUUM_STATIC_ARCHIVE_PATH || '' }}"
       mode: "${{ inputs.mode || 'both' }}"
       version: "${{ inputs.version || '' }}"
