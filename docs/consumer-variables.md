@@ -2,8 +2,8 @@
 
 Continuum's reusable workflows are **technology-oriented, not project-oriented**:
 anything that names a specific product — the release version file, the app and
-binary names, the signing identity, the Homebrew tap and the MacPorts tree — is
-read from a GitHub Actions **repository variable** in the calling repository.
+binary names, the signing identity — is read from a GitHub Actions **repository
+variable** in the calling repository.
 
 In a reusable (`workflow_call`) workflow the `vars` context resolves to the
 **caller repository's** variables, so each consumer sets its own values and the
@@ -14,6 +14,12 @@ step of the job. Optional knobs instead carry a **default that reproduces the
 previously hardcoded behaviour**, so a consumer that sets nothing keeps the
 behaviour it had before the split.
 
+The Swift release workflow's Homebrew tap and MacPorts canon tree are the
+exception, and are **not** variables today: they are literals in
+`.github/workflows/continuum-tech-swift-release.yml`, alongside the NanoDictate
+file layout that workflow still assumes. See
+[Not yet parameterised](#not-yet-parameterised) below.
+
 | Variable | Meaning | Example for a Swift app consumer |
 | --- | --- | --- |
 | `CONTINUUM_VERSION_FILE` | Source file the release reads the version from. | `Sources/MyCore/Version.swift` |
@@ -23,8 +29,6 @@ behaviour it had before the split.
 | `CONTINUUM_BUNDLE_AGENT` | Agent bundle id / launchd label. | `com.example.agent` |
 | `CONTINUUM_BUNDLE_CTL` | CLI bundle id. | `com.example.ctl` |
 | `CONTINUUM_SIGNING_IDENTITY` | `codesign` identity. | `MyApp CI Signing` |
-| `CONTINUUM_HOMEBREW_TAP` | Homebrew tap repository. | `owner/homebrew-myapp` |
-| `CONTINUUM_MACPORTS_TREE` | MacPorts canon tree repository. | `owner/macports-myapp` |
 | `CONTINUUM_CORE_TEST_TARGET` | Swift test-runner product for CI coverage. | `MyAppCoreTests` |
 | `CONTINUUM_CORE_IGNORE_SOURCES` | Extra consumer source dirs excluded from the coverage denominator, pipe-separated. | `Sources/AudioEngineGuard/` |
 | `CONTINUUM_RELEASE_MANIFEST_FILES` | JSON array of packaging manifest files trusted as release automation. | `["myapp.rb"]` |
@@ -121,25 +125,55 @@ and the parent/child pair.
 
 ### Required secrets
 
-The core layer reads exactly two secrets, and they are different credentials:
+A secret belongs to the installer **set** that installs the workflow reading it.
+The `core` set installs the controllers, the `parent` set the child wrappers,
+and the opt-in `tech` set the release and CI workflows, so a consumer that
+installs only `core` never needs the `parent` or `tech` secrets.
 
-| Secret | Read by | Credential | Fallback |
+| Secret | Set | Read by | Fallback |
 | --- | --- | --- | --- |
-| `TAP_PAT` | The core controllers that call the GitHub API, and the parent/child wrappers (forwarded to the child runtime) | Classic GitHub PAT (`repo` + `workflow` scopes). | `github.token` on steps that only need the built-in token. |
-| `RENDER_API_KEY` | `continuum-render-executor.yml` only | Render API key. | **None.** The controller fails explicitly when it is unset. |
+| `TAP_PAT` | `core` | The core controllers that call the GitHub API, and the installed `parent` stubs (which forward it to the child runtime as `CHILD_RUNTIME_TOKEN`). | `github.token` on steps that only need the built-in token. |
+| `RENDER_API_KEY` | `core` | `continuum-render-executor.yml` only | **None.** The controller fails explicitly when it is unset. |
+| `CHILD_RUNTIME_TOKEN` | `parent` | `continuum-consumer-child-dispatcher`, `-review`, `-worker` and `-pr-review` | **None.** Every installed parent stub fills it from the parent's own `TAP_PAT`, so the same credential serves both layers. |
+| `CHILD_RUNTIME_REPOSITORIES` | `parent` | The same four child wrappers. | None — the input is optional (the pre-variables compatibility path described in `docs/parent-child-delegation.md`). |
+| `NANODICTATE_SIGNING_P12` | `tech` | The tech release and packaging-smoke workflows. | None. |
+| `NANODICTATE_SIGNING_PASSWORD` | `tech` | The tech release and packaging-smoke workflows. | None. |
+| `RELEASE_PR_TOKEN` | `tech` | `continuum-tech-swift-release-pr.yml` | Resolved in this order: `RELEASE_PR_TOKEN`, then `TAP_PAT`, then the built-in `GITHUB_TOKEN`. |
 
-`TAP_PAT` and `RENDER_API_KEY` are never interchangeable: a GitHub token is not
-accepted by the Render API, and the Render key is useless against the GitHub
-API. A repository that installs the render controller must define both.
+Two qualifications the rows alone cannot carry:
 
-The `parent` set adds one more input secret. Each wrapper declares
-`CHILD_RUNTIME_TOKEN` (required) and `CHILD_RUNTIME_REPOSITORIES` (optional, the
-pre-variables compatibility path described in
-`docs/parent-child-delegation.md`), and the installed parent stubs fill
-`CHILD_RUNTIME_TOKEN` from the parent's own `TAP_PAT`, so the same secret serves
-both layers. The opt-in `tech` set reads `NANODICTATE_SIGNING_P12` /
-`NANODICTATE_SIGNING_PASSWORD` for code signing and `RELEASE_PR_TOKEN` (falling
-back to `GITHUB_TOKEN`) for the release PR.
+- The `core` set's consumer-defined secrets are exactly the two in its rows, and
+  they are **different credentials**: `TAP_PAT` and `RENDER_API_KEY` are never
+  interchangeable. A GitHub token is not accepted by the Render API, and the
+  Render key is useless against the GitHub API, so a repository that installs
+  the render controller must define both. The four `continuum-consumer-child-*`
+  workflows live in `.github/workflows/` next to the core ones but are installed
+  only by the `parent` set, and read only the two child-runtime secrets listed
+  above.
+- GitHub mints `secrets.GITHUB_TOKEN` automatically, so it is **not** a
+  credential a consumer defines and no row above lists it. Two workflows read
+  it: `continuum-pr-agent.yml`, which still refuses to run because no paid
+  provider key is supported (see [Model and provider keys](#model-and-provider-keys)),
+  and `continuum-tech-swift-release-pr.yml`, as the last link of the
+  `RELEASE_PR_TOKEN` chain above.
+
+### Not yet parameterised
+
+Two names in the Swift release contract are still literals in
+`.github/workflows/continuum-tech-swift-release.yml` rather than repository
+variables, so they are deliberately **absent** from the table above:
+
+- the Homebrew tap repository, pushed by the `Update tap repo` step;
+- the MacPorts canon tree repository, cloned by the `Sync MacPorts port tree`
+  step and probed by the preflight installer-pin check.
+
+A consumer cannot redirect either one today: the workflow also assumes the
+NanoDictate file layout (`packaging/homebrew/nanodictate.rb`,
+`packaging/macports/Portfile`, `audio/nanodictate/Portfile` inside the tree), so
+parameterising the two repository names alone would not make the step portable.
+Continuum therefore does not document variables that nothing reads. Until the
+whole block is parameterised, a consumer who needs a different tap or tree must
+fork the tech release workflow.
 
 ### Render execution controller
 

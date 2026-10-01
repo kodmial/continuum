@@ -193,15 +193,21 @@ revision that supplies fallback scripts.
 Secrets a consumer must provide, under exactly these names (secret names are
 part of the contract and never change per consumer):
 
-| Secret | Used by | Purpose |
-| --- | --- | --- |
-| `TAP_PAT` | review, release, opencode, delegation | Classic PAT (`repo` + `workflow` scopes) for checkout/push/API. Also the child-runtime token for the `parent` set. |
-| `OPENCODE_API_KEY` | OpenCode workflows | Model provider access. |
-| `RELEASE_PR_TOKEN` | `continuum-tech-swift-release-pr.yml` (optional) | Fine-grained PAT (`Contents: write`, `Pull requests: write`); falls back to `TAP_PAT`. |
-| `NANODICTATE_SIGNING_P12` | tech release and packaging-smoke workflows | Base64 macOS signing certificate (`.p12`). |
-| `NANODICTATE_SIGNING_PASSWORD` | tech release and packaging-smoke workflows | Password for the signing certificate. |
-| `GROQ_API_KEY` | `continuum-pr-agent.yml` | PR Agent model provider. |
-| `CHILD_RUNTIME_TOKEN` | `consumer-child-*` | Parent delegation token; caller stubs map it from `TAP_PAT`. |
+| Secret | Set | Used by | Purpose |
+| --- | --- | --- | --- |
+| `TAP_PAT` | `core`, `parent`, `tech` | review, release, opencode, delegation | Classic PAT (`repo` + `workflow` scopes) for checkout/push/API. Also the child-runtime token the `parent` stubs forward. |
+| `RENDER_API_KEY` | `core` | `continuum-render-executor.yml` | Render API key. A different credential from `TAP_PAT`, with **no** fallback: the controller fails explicitly when it is unset. |
+| `CHILD_RUNTIME_TOKEN` | `parent` | `consumer-child-*` | Parent delegation token; the caller stubs map it from `TAP_PAT`. |
+| `CHILD_RUNTIME_REPOSITORIES` | `parent` | `consumer-child-*` (optional) | Pre-variables compatibility path; see `docs/parent-child-delegation.md`. |
+| `RELEASE_PR_TOKEN` | `tech` | `continuum-tech-swift-release-pr.yml` (optional) | Fine-grained PAT (`Contents: write`, `Pull requests: write`); resolved as `RELEASE_PR_TOKEN`, then `TAP_PAT`, then the built-in `GITHUB_TOKEN`. |
+| `NANODICTATE_SIGNING_P12` | `tech` | tech release and packaging-smoke workflows | Base64 macOS signing certificate (`.p12`). |
+| `NANODICTATE_SIGNING_PASSWORD` | `tech` | tech release and packaging-smoke workflows | Password for the signing certificate. |
+
+No paid provider key is part of this contract: **no workflow reads
+`OPENCODE_API_KEY` or `GROQ_API_KEY`.** The core runs on free anonymous models
+and requires no API key; `continuum-pr-agent.yml` refuses to run rather than
+read a paid provider secret. `secrets.GITHUB_TOKEN` is minted by GitHub
+automatically, so it is not a credential a consumer defines.
 
 Repository variables:
 

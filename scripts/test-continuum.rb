@@ -1003,6 +1003,28 @@ class ContinuumTest < Minitest::Test
     nil
   end
 
+  # The repository secrets read by the workflows a given set of stubs installs.
+  #
+  # Both halves count: the stub itself, and the reusable workflow it calls. A
+  # stub reads a secret in order to forward it, so the credential a consumer
+  # must define for a set can be named only by the stub — the parent set reads
+  # `TAP_PAT` nowhere in its callees, only in the stubs that pass it on.
+  #
+  # Derived by walking stub -> callee -> `secrets.X`, never by hardcoding a name
+  # list on the test side. A guard that enumerates the names it checks is blind
+  # to a fifth secret: the new name simply is not in the pattern, so it is
+  # skipped silently and the guard reports green. Deriving the set from the code
+  # is what makes these checks fail when a secret is added, removed or moved
+  # between sets.
+  def secrets_read_by(stubs)
+    stubs.flat_map { |path| File.read(path) }
+         .concat(stubs.map { |path| stub_callee_name(path) }.compact
+                      .map { |callee| workflow_body(callee) })
+         .flat_map { |body| body.scan(/secrets\.([A-Z][A-Z0-9_]*)/).flatten }
+         .uniq
+         .sort
+  end
+
   def test_every_core_workflow_has_a_caller_or_is_repo_ci
     stubs = CORE_STUBS + TECH_STUBS + PARENT_STUBS
     called = stubs.map { |path| stub_callee_name(path) }.compact
@@ -2039,8 +2061,238 @@ class ContinuumTest < Minitest::Test
                  'the docker-qualification section must document its secret')
     assert_match(/falling back to\s+`github\.token`/, section,
                  'the docker-qualification section must document the github.token fallback')
-    refute_match(/Render/i, section[/The controller reads the repository secret.*?secret name\./m].to_s,
+
+    # The "reads exactly this secret" claim lives in its own paragraph. It is
+    # located first and asserted present, because an assertion whose subject
+    # slice came back `nil` would run against `""` and pass for any wording at
+    # all — the guard would read as coverage while checking nothing. Locating
+    # the paragraph by its lead-in and taking the whole block, rather than
+    # matching a whole phrase down to a trailing full stop, keeps the anchor
+    # from being the thing that silently rots.
+    paragraph = section.split(/\n\s*\n/).find { |block| block.start_with?('The controller reads the repository secret') }
+    refute_nil paragraph,
+                'the docker-qualification section must keep the sentence stating which repository secret it reads'
+    refute_match(/Render/i, paragraph,
                  'the docker-qualification secret paragraph must not mention Render')
+    # And the paragraph must name exactly the secret the code actually reads, so
+    # it cannot drift to a name the workflow never touches. Membership alone
+    # would not do: a paragraph naming `TAP_PAT` *and* an invented key still
+    # contains `TAP_PAT`, while claiming to read no other secret.
+    code_secrets = body.scan(/secrets\.([A-Z][A-Z0-9_]*)/).flatten.uniq
+    assert_equal 1, code_secrets.size,
+                 'the docker controller reads a single repository secret, so its doc paragraph has one name to state'
+    paragraph_secrets = paragraph.scan(/`([A-Z][A-Z0-9_]*)`/).flatten.uniq
+    assert_equal code_secrets.sort, paragraph_secrets.sort,
+                 'the docker-qualification secret paragraph must name exactly the secrets the workflow reads'
+    assert_match(/never\s+reads any other secret/i, paragraph,
+                 'the paragraph claiming a single secret must also claim it reads no other')
+  end
+
+  # docs/consumer-variables.md claimed RELEASE_PR_TOKEN falls back straight to
+  # GITHUB_TOKEN. The code resolves three links:
+  # RELEASE_PR_TOKEN -> TAP_PAT -> GITHUB_TOKEN. A consumer reading the doc
+  # would set only TAP_PAT and be told the PAT is ignored; README.md stated the
+  # chain correctly, so the two consumer-facing documents disagreed. Pin the
+  # order to the code so they cannot disagree again.
+  def test_release_pr_token_fallback_chain_in_the_doc_matches_the_code
+    # This workflow has no embedded `script: |` block; the chain is a `run: |`
+    # step, so slice that step out of the workflow body.
+    step = workflow_body('continuum-tech-swift-release-pr.yml')[/^ {6}- name: Resolve release token$.*?^ {10}fi$/m]
+    refute_nil step, 'the release-PR workflow must keep its "Resolve release token" step'
+    doc = File.read(File.join(ROOT, 'docs/consumer-variables.md'))
+
+    # The order is read out of the code, not typed here: each link records
+    # `source=<NAME>` only when it is the one that won. Branch order in the
+    # script is the resolution order, so the emitted order is the chain.
+    chain = step.scan(/echo "source=([A-Z][A-Z0-9_]*)"/).flatten
+    assert_equal %w[RELEASE_PR_TOKEN TAP_PAT GITHUB_TOKEN], chain,
+                 'the release-PR token resolves RELEASE_PR_TOKEN, then TAP_PAT, then GITHUB_TOKEN'
+
+    table = doc[/### Required secrets.*?(?=### Render execution controller)/m]
+    refute_nil table, 'the doc must keep a secrets section enumerating the contract'
+    row = table.lines.find { |line| line.include?('`RELEASE_PR_TOKEN`') }
+    refute_nil row, 'the doc must document RELEASE_PR_TOKEN in the secrets table'
+
+    # Every link of the chain appears, in the code's order. A row listing only
+    # the two ends, or listing TAP_PAT last, is a claim the code does not make.
+    # The row's first column repeats the secret's own name, so the scan is
+    # deduped — the order check is what carries the meaning.
+    documented = row.scan(/`([A-Z][A-Z0-9_]*)`/).flatten.uniq
+    assert_equal chain, documented,
+                 'the documented RELEASE_PR_TOKEN chain must list every link in the order the code resolves them'
+  end
+
+  # "The core layer reads exactly two secrets" was false as written. The four
+  # continuum-consumer-child-* workflows live beside the core ones and read the
+  # two child-runtime secrets, and continuum-pr-agent.yml reads GITHUB_TOKEN.
+  # A narrower claim is defensible — those child workflows are installed only
+  # by the `parent` set — but it has to be stated precisely and derived, so
+  # this test derives each set's secrets from its own stubs and holds the doc
+  # to the resulting numbers.
+  def test_the_documented_secret_count_per_set_matches_the_installed_code
+    doc = File.read(File.join(ROOT, 'docs/consumer-variables.md'))
+    consumer_defined = lambda do |stubs|
+      secrets_read_by(stubs).reject { |name| name == 'GITHUB_TOKEN' }
+    end
+
+    core = consumer_defined.call(CORE_STUBS)
+    parent = consumer_defined.call(PARENT_STUBS)
+    tech = consumer_defined.call(TECH_STUBS)
+
+    # Derived, so these numbers are read off the code rather than asserted from
+    # the doc that is under test.
+    assert_equal %w[RENDER_API_KEY TAP_PAT], core,
+                 'the core set reads exactly these consumer-defined secrets'
+    assert_equal %w[CHILD_RUNTIME_REPOSITORIES CHILD_RUNTIME_TOKEN TAP_PAT], parent,
+                 'the parent set reads exactly these consumer-defined secrets'
+    assert_equal %w[NANODICTATE_SIGNING_P12 NANODICTATE_SIGNING_PASSWORD RELEASE_PR_TOKEN TAP_PAT], tech,
+                 'the tech set reads exactly these consumer-defined secrets'
+
+    assert_match(/The `core` set's consumer-defined secrets are exactly the two in its rows/, doc,
+                 'the doc must state the core count in terms of its own rows')
+    refute_match(/core layer reads exactly two secrets/i, doc,
+                 'the doc must not claim the whole core layer reads two secrets: the four child workflows are installed by the parent set')
+
+    # The exception that makes the narrower claim true has to be named, so a
+    # reader can see which workflows the count excludes and why.
+    assert_match(/`continuum-consumer-child-\*`\s+workflows live in/, doc,
+                 'the doc must say where the child workflows live')
+    assert_match(/installed\s+only by the `parent` set/, doc,
+                 'the doc must say the child workflows are installed only by the parent set')
+  end
+
+  # The secrets table is guarded twice: once against the hardcoded names it
+  # always checked, and once against the set derived from the code. The
+  # hardcoded pattern cannot see a secret added later; the derived set can.
+  def test_no_documented_secret_is_unread_by_the_code
+    doc = File.read(File.join(ROOT, 'docs/consumer-variables.md'))
+    table = doc[/### Required secrets.*?(?=### Render execution controller)/m]
+    refute_nil table, 'the doc must keep a secrets section enumerating the contract'
+
+    readable = ->(name) { WORKFLOWS.any? { |path| File.read(path).include?("secrets.#{name}") } }
+
+    # The original narrow check, kept as it was.
+    table.scan(/`(RENDER_API_KEY|TAP_PAT|CHILD_RUNTIME_TOKEN|CHILD_RUNTIME_REPOSITORIES)`/)
+         .flatten.uniq.each do |name|
+      next if readable.call(name)
+
+      assert false, "docs/consumer-variables.md documents #{name}, which no core workflow reads"
+    end
+
+    # The derived check: every ALL_CAPS backticked name in the table, whatever
+    # it is, must be one the code actually reads. This is the half that catches
+    # a secret the hardcoded list never knew about.
+    names = table.scan(/`([A-Z][A-Z0-9_]*)`/).flatten.uniq
+    refute_empty names, 'the secrets table must name at least one secret'
+    # `GITHUB_TOKEN` is minted by GitHub, not defined by a consumer, and is
+    # documented as such; the rest must all be read.
+    (names - ['GITHUB_TOKEN']).each do |name|
+      assert readable.call(name),
+             "docs/consumer-variables.md documents #{name}, which no workflow reads"
+    end
+
+    # And the reverse direction, over the derived per-set sets: the table must
+    # document every consumer-defined secret each set reads, so a secret added
+    # to a workflow cannot ship undocumented.
+    { 'core' => CORE_STUBS, 'parent' => PARENT_STUBS, 'tech' => TECH_STUBS }.each do |set, stubs|
+      secrets_read_by(stubs).reject { |name| name == 'GITHUB_TOKEN' }.each do |name|
+        assert_includes table, "`#{name}`",
+                        "the #{set} set reads #{name}, so the secrets table must document it"
+      end
+    end
+  end
+
+  # "The installed parent stubs fill CHILD_RUNTIME_TOKEN from the parent's own
+  # TAP_PAT" is what makes one credential serve both layers, and it was true
+  # with nothing holding it there: repointing all four stubs at a different
+  # secret left the suite green.
+  def test_parent_stubs_forward_the_parents_own_pat_as_the_child_runtime_token
+    doc = File.read(File.join(ROOT, 'docs/consumer-variables.md'))
+
+    PARENT_STUBS.each do |path|
+      forwarded = yaml(path).fetch('jobs').each_value
+                                    .map { |job| job.is_a?(Hash) ? job['secrets'] : nil }
+                                    .compact
+      assert_equal [{ 'CHILD_RUNTIME_TOKEN' => '${{ secrets.TAP_PAT }}' }], forwarded,
+                   "#{File.basename(path)} must forward the parent's TAP_PAT as CHILD_RUNTIME_TOKEN"
+    end
+
+    assert_match(%r{Every installed parent stub fills it from the parent's own `TAP_PAT`}, doc,
+                 'the doc must say the installed parent stubs fill CHILD_RUNTIME_TOKEN from TAP_PAT')
+  end
+
+  # README.md is the first document a consumer reads, and its secrets table had
+  # drifted: it omitted RENDER_API_KEY entirely while listing the two provider
+  # keys no workflow reads and that the no-paid-provider rule forbids. Derive
+  # the whole table from the code so neither drift can recur.
+  def test_the_readme_secrets_table_matches_the_code
+    readme = File.read(File.join(ROOT, 'README.md'))
+    table = readme[/^## Secrets and variables.*?(?=^Repository variables)/m]
+    refute_nil table, 'README.md must keep a Secrets and variables section with a secrets table'
+
+    readable = ->(name) { WORKFLOWS.any? { |path| File.read(path).include?("secrets.#{name}") } }
+
+    (CORE_STUBS + PARENT_STUBS + TECH_STUBS).each do |stub|
+      secrets_read_by([stub]).reject { |name| name == 'GITHUB_TOKEN' }.each do |name|
+        assert_includes table, "`#{name}`",
+                        "#{File.basename(stub)} reads #{name}, so the README secrets table must list it"
+      end
+    end
+
+    # No paid provider key may be presented as part of the contract. The rule
+    # is that no workflow reads one, so naming one in the table would invite a
+    # consumer to define a credential nothing consumes.
+    %w[OPENCODE_API_KEY ANTHROPIC_API_KEY GROQ_API_KEY].each do |key|
+      WORKFLOWS.each do |path|
+        refute_includes File.read(path), "secrets.#{key}",
+                        "#{File.basename(path)} reads a paid provider key, which the no-paid-provider rule forbids"
+      end
+    end
+    # The table may mention them only to say they are not read.
+    table.scan(/`([A-Z][A-Z0-9_]*)`/).flatten.uniq.each do |name|
+      next if readable.call(name)
+
+      refute_match(/^\|.*`#{Regexp.escape(name)}`.*\|$/, table,
+                   "the README secrets table lists #{name} as a secret to define, but no workflow reads it")
+    end
+    assert_match(/no workflow reads/i, table,
+                 'the README must say plainly that no workflow reads a paid provider key')
+  end
+
+  # CONTINUUM_HOMEBREW_TAP and CONTINUUM_MACPORTS_TREE were documented as
+  # repository variables that nothing reads. Naming a variable a consumer
+  # cannot set is worse than not documenting it: it implies a knob that does
+  # nothing. The doc now says the opposite explicitly, and this test holds that
+  # statement to the code.
+  def test_the_unparameterised_release_repositories_are_documented_as_literals
+    doc = File.read(File.join(ROOT, 'docs/consumer-variables.md'))
+    release = workflow_body('continuum-tech-swift-release.yml')
+
+    section = doc[/### Not yet parameterised.*?(?=^### )/m]
+    refute_nil section, 'the doc must keep a section naming the release values that are not yet variables'
+
+    %w[CONTINUUM_HOMEBREW_TAP CONTINUUM_MACPORTS_TREE].each do |name|
+      # The code must not read it: the doc's claim is that these are literals.
+      refute_match(/vars\.#{name}/, release,
+                   "#{name} is documented as an unparameterised literal, so the release workflow must not read it")
+      # And it must not appear as a row in *any* table the reader would scan for
+      # variables a consumer sets. Checking only the secrets table is not enough
+      # — the main product-identity table at the top of the doc is where these
+      # two rows used to sit, so that is the table that has to be guarded.
+      offenders = doc.lines.select do |line|
+        line.start_with?('|') && line.include?("`#{name}`")
+      end
+      assert_empty offenders,
+                   "#{name} reads nothing, so it must not be listed in a variable table:\n#{offenders.join}"
+    end
+
+    # The literal it actually is: the release workflow names both repositories
+    # directly, so a reader can see the claim is about the code and not a
+    # guess about it.
+    assert_match(%r{gh repo clone \S+/macports-nanodictate}, release,
+                 'the MacPorts canon tree is a literal repository name in the release workflow')
+    assert_match(%r{gh repo clone \S+/homebrew-nanodictate}, release,
+                 'the Homebrew tap is a literal repository name in the release workflow')
   end
 
   # Every value the fork hardcoded for one repository must be a knob, or a
