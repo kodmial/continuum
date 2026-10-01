@@ -20,7 +20,7 @@ on:
       version:
         description: >-
           Version to publish (e.g. 0.0.2 or v0.0.2). Leave empty to derive it
-          from Sources/NanoDictateCore/Version.swift.
+          from the consumer's CONTINUUM_VERSION_FILE.
         required: false
         type: string
         default: ''

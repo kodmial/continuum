@@ -4,13 +4,12 @@ set -euo pipefail
 # Usage: curl -fsSL https://raw.githubusercontent.com/kodmial/continuum/main/install.sh | bash
 #    or: curl -fsSL https://raw.githubusercontent.com/kodmial/continuum/main/install.sh | bash -s -- [path] [ref] [swift|parent]
 #    or: bash continuum/install.sh [path-to-consumer-repo] [ref] [swift|parent]
-# ref defaults to main. `swift` is the technology profile; `nanodictate` is kept
-# as a backwards-compatible alias for it.
+# ref defaults to main. `swift` is the technology profile.
 DEST="${1:-.}"
 REF="${2:-main}"
 PROFILE="${3:-swift}"
 case "$PROFILE" in
-  swift|nanodictate|parent) ;;
+  swift|parent) ;;
   *) echo "invalid profile: $PROFILE" >&2; exit 1 ;;
 esac
 [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "invalid ref: $REF" >&2; exit 1; }

@@ -39,7 +39,7 @@ These names are the interface and never change per consumer:
 - the `TAP_PAT` repository secret (classic PAT, `repo` + `workflow` scopes) —
   every profile expects a secret with exactly this name;
 - the `continuum-` prefix on installed callers;
-- the installer profiles (`swift`, with its `nanodictate` alias, and `parent`);
+- the installer profiles (`swift` and `parent`);
 - the `CONTINUUM_*` repository-variable names.
 
 Continuum is technology-neutral: `swift` is the profile for Swift
@@ -69,8 +69,6 @@ existing files.
 | --- | --- |
 | `swift` | 16 callers covering CI, release, packaging smoke, OpenCode, issue scheduling, CodeRabbit, PR Agent, and auto-merge. |
 | `parent` | 4 callers: `continuum-child-dispatcher.yml`, `continuum-child-worker.yml`, `continuum-child-review.yml`, `continuum-child-pr-review.yml`. |
-
-`nanodictate` is accepted as a backwards-compatible alias of `swift`.
 
 The `parent` profile adds **only** child-execution callers; it preserves the
 consumer's own CI, release, and scheduling workflows.

@@ -126,8 +126,8 @@ simultaneously parent and child under this contract.
 The installer has two explicit profiles:
 
 ```sh
-# Existing NanoDictate CI, review, release, and packaging callers.
-bash install.sh /path/to/nanodictate main nanodictate
+# Existing Swift CI, review, release, and packaging callers.
+bash install.sh /path/to/myapp main swift
 
 # Add parent execution to any repository without replacing its own workflows.
 bash install.sh /path/to/parent main parent

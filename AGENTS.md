@@ -22,7 +22,7 @@ These are public interfaces and must not change silently:
   consumer repository is Continuum-owned and is never hand-edited there);
 - the `TAP_PAT` repository secret name (classic PAT, `repo` + `workflow` scopes)
   expected by every profile;
-- the installer profiles (`swift`, and its `nanodictate` alias, plus `parent`)
+- the installer profiles (`swift` plus `parent`)
   and the `install.sh` argument shape;
 - the parent/child repository-variable names (`CONTINUUM_ROLE`,
   `CONTINUUM_CHILDREN`, `CONTINUUM_CHILD_ID`, `CONTINUUM_PARENT`,
