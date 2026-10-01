@@ -120,10 +120,8 @@ jobs:
         include:
           - os: macos-15-intel
             arch: x86_64
-            swift: '6.1'
           - os: macos-15
             arch: arm64
-            swift: '6.1'
     env:
       # Consumer identity comes entirely from repository variables, so the
       # engine names no product. A consumer sets these in its own repository
@@ -142,10 +140,29 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Swift
-        uses: swift-actions/setup-swift@7ca6abe6b3b0e8b5421b88be48feee39cbf52c6a
-        with:
-          swift-version: ${{ matrix.swift }}
+      - name: Select preinstalled Swift 6.1
+        shell: bash
+        run: |
+          set -euo pipefail
+          selected=""
+          for xcode in /Applications/Xcode_16.4.app /Applications/Xcode_16.3.app; do
+            developer_dir="$xcode/Contents/Developer"
+            [[ -d "$developer_dir" ]] || continue
+            version="$(DEVELOPER_DIR="$developer_dir" xcrun swift --version 2>&1)"
+            echo "$xcode: $version"
+            if grep -qE 'Swift version 6\\.1([.[:space:]]|$)' <<<"$version"; then
+              selected="$developer_dir"
+              break
+            fi
+          done
+          if [[ -z "$selected" ]]; then
+            echo "::error::No preinstalled Xcode with Swift 6.1 found on $(sw_vers -productVersion). Available Xcodes:"
+            ls -1d /Applications/Xcode*.app 2>/dev/null || true
+            exit 1
+          fi
+          echo "DEVELOPER_DIR=$selected" >> "$GITHUB_ENV"
+          echo "::notice::Using preinstalled Swift toolchain from $selected (no network install)."
+          DEVELOPER_DIR="$selected" xcrun swift --version
 
       - name: Require consumer identity variables
         run: |
