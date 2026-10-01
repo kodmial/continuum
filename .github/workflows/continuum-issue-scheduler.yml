@@ -113,7 +113,54 @@ on:
         type: string
         required: false
         default: '.github/workflows/continuum-opencode.yml'
+      dispatch_ref:
+        description: >-
+          Git ref every `workflow_dispatch` from this job targets. Dispatching
+          at a branch other than the one holding the workflow avoids a self-run
+          on a consumer that pushes to main. Empty falls back to
+          vars.CONTINUUM_DISPATCH_REF, then to `main`.
+        type: string
+        required: false
+        default: 'main'
+      opencode_dispatch:
+        description: >-
+          How a ready issue reaches OpenCode: `comment` posts the owner's `/oc`
+          command on the issue (the default, and the only path that needs no
+          extra permission), `workflow` dispatches the OpenCode caller's
+          `issue` mode directly instead. Use `workflow` only when the OpenCode
+          caller is installed without an `issue_comment` trigger. Any other
+          value fails the run, because `workflow_call` cannot declare an
+          enumerated `choice` input. Empty falls back to
+          vars.CONTINUUM_OPENCODE_DISPATCH.
+        type: string
+        required: false
+        default: 'comment'
+      execution_label_routes:
+        description: >-
+          Label-driven execution routes, one per line, as
+          `<issue label>|<workflow file name>|<input>=<value>,...`. When a
+          selected issue carries one of these labels the scheduler dispatches
+          that workflow with those inputs plus `issue_number` instead of waking
+          OpenCode, and still records the dispatch marker. Empty (the default)
+          routes nothing, so no execution workflow is dispatched by label.
+          Empty falls back to vars.CONTINUUM_EXECUTION_LABEL_ROUTES.
+        type: string
+        required: false
+        default: ''
+      child_dispatch_workflow:
+        description: >-
+          Workflow file name the scheduler wakes after every reconcile pass, so
+          a parent repository's downstream dispatcher does not have to wait for
+          its own cron. Empty — the default — wakes nothing, because a parent
+          that has no dispatcher must not get a 404 dispatch. Empty falls back
+          to vars.CONTINUUM_CHILD_DISPATCH_WORKFLOW.
+        type: string
+        required: false
+        default: ''
 
+# No `actions: write` here: every dispatch in this workflow authenticates with
+# the TAP_PAT classic PAT (repo + workflow scopes), exactly like every other
+# Continuum dispatcher, so the caller's GITHUB_TOKEN keeps its narrow grant.
 permissions:
   contents: read
 
@@ -140,6 +187,10 @@ jobs:
       LEGACY_CHILD_OWNED_MARKER: ${{ inputs.legacy_child_owned_marker || vars.CONTINUUM_LEGACY_CHILD_OWNED_MARKER || '<!-- runtime-worker-owned -->' }}
       OPENCODE_WORKFLOW_NAME: ${{ inputs.opencode_workflow_name || vars.CONTINUUM_OPENCODE_WORKFLOW_NAME || 'OpenCode agent' }}
       OPENCODE_WORKFLOW_PATH: ${{ inputs.opencode_workflow_path || vars.CONTINUUM_OPENCODE_WORKFLOW_PATH || '.github/workflows/continuum-opencode.yml' }}
+      DISPATCH_REF: ${{ inputs.dispatch_ref || vars.CONTINUUM_DISPATCH_REF || 'main' }}
+      OPENCODE_DISPATCH: ${{ inputs.opencode_dispatch || vars.CONTINUUM_OPENCODE_DISPATCH || 'comment' }}
+      EXECUTION_LABEL_ROUTES: ${{ inputs.execution_label_routes || vars.CONTINUUM_EXECUTION_LABEL_ROUTES }}
+      CHILD_DISPATCH_WORKFLOW: ${{ inputs.child_dispatch_workflow || vars.CONTINUUM_CHILD_DISPATCH_WORKFLOW }}
 
     steps:
       - name: Reconcile state and dispatch ready issues
@@ -199,6 +250,71 @@ jobs:
             const opencodeWorkflowPath =
               process.env.OPENCODE_WORKFLOW_PATH ||
               '.github/workflows/continuum-opencode.yml';
+            const dispatchRef = process.env.DISPATCH_REF || 'main';
+
+            // A ready issue normally reaches OpenCode as an owner comment, the
+            // only path that needs no extra permission. A consumer whose
+            // OpenCode caller has no `issue_comment` trigger needs the
+            // workflow_dispatch form instead.
+            const opencodeDispatch = (
+              process.env.OPENCODE_DISPATCH || 'comment'
+            ).trim();
+            if (!['comment', 'workflow'].includes(opencodeDispatch)) {
+              throw new Error(
+                "Unsupported opencode_dispatch '" + opencodeDispatch +
+                  "'; expected 'comment' or 'workflow'."
+              );
+            }
+
+            // Label-driven execution routes are configuration, never a table
+            // inside core: the render and Docker qualification controllers are
+            // separate reusable workflows that a consumer may or may not
+            // install, and a consumer may route to workflows core has never
+            // heard of. Empty means "route nothing".
+            //
+            // A malformed entry fails the run instead of being dropped,
+            // because a silently ignored route looks reserved but is never
+            // executed.
+            const executionRoutes = (process.env.EXECUTION_LABEL_ROUTES || '')
+              .split('\n')
+              .map(line => line.trim())
+              .filter(line => line && !line.startsWith('#'))
+              .map(line => {
+                const parts = line.split('|').map(part => part.trim());
+                if (parts.length < 2 || parts.length > 3 || !parts[0] || !parts[1]) {
+                  throw new Error(
+                    "Invalid execution_label_routes line: '" +
+                      line +
+                      "'; expected '<issue label>|<workflow file name>|<input>=<value>,...'."
+                  );
+                }
+                const inputs = {};
+                for (const assignment of (parts[2] || '').split(',')) {
+                  const trimmed = assignment.trim();
+                  if (!trimmed) continue;
+                  const separator = trimmed.indexOf('=');
+                  if (separator <= 0) {
+                    throw new Error(
+                      "Invalid execution_label_routes input '" +
+                        trimmed +
+                        "' on line '" +
+                        line +
+                        "'; expected '<name>=<value>'."
+                    );
+                  }
+                  inputs[trimmed.slice(0, separator).trim()] = trimmed
+                    .slice(separator + 1)
+                    .trim();
+                }
+                return { label: parts[0], workflow: parts[1], inputs };
+              });
+            const executionRouteLabels = new Set(
+              executionRoutes.map(route => route.label)
+            );
+
+            const childDispatchWorkflow = (
+              process.env.CHILD_DISPATCH_WORKFLOW || ''
+            ).trim();
 
             // Issues explicitly owned by a delegated child worker must never be
             // dispatched through this repository's OpenCode Actions path. The
@@ -240,6 +356,15 @@ jobs:
               return open;
             }
 
+            // Every dispatch in this job goes through the PAT, so no
+            // `actions: write` grant is needed on the caller's token.
+            async function dispatchWorkflow(workflow, inputs) {
+              await github.request(
+                'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
+                { owner, repo, workflow_id: workflow, ref: dispatchRef, inputs }
+              );
+            }
+
             const labelSpecs = [
               {
                 name: 'priority:p0',
@@ -266,6 +391,15 @@ jobs:
                 color: 'BFDADC',
                 description: 'Automation is paused after a failed/stopped implementation; remove to retry.',
               },
+              // A configured route label is reserved before this run can see
+              // it, so create it here rather than letting a consumer's
+              // selection silently no-op on a missing label.
+              ...[...executionRouteLabels].map(name => ({
+                name,
+                color: '0E8A16',
+                description:
+                  'Routes this issue to a configured execution workflow instead of the OpenCode agent.',
+              })),
             ];
 
             for (const spec of labelSpecs) {
@@ -988,18 +1122,61 @@ jobs:
                   }
                 }
 
-                await github.rest.issues.createComment({
-                  owner,
-                  repo,
-                  issue_number: issue.number,
-                  body: [
-                    '/oc',
-                    '',
-                    dispatchMarker,
-                    'Automatically dispatched by the issue scheduler (' +
-                      (priority || 'no explicit priority') + ').',
-                  ].join('\n'),
-                });
+                const markerComment = [
+                  dispatchMarker,
+                  'Automatically dispatched by the issue scheduler (' +
+                    (priority || 'no explicit priority') + ').',
+                ].join('\n');
+
+                const route = executionRoutes.find(
+                  candidate => issue.labels.some(l => l.name === candidate.label)
+                );
+
+                if (route) {
+                  // The marker still lands on the issue so a consumer can see
+                  // the attempt in the audit trail, but the workflow is
+                  // dispatched directly: an execution workflow does not read
+                  // owner comments.
+                  await github.rest.issues.createComment({
+                    owner,
+                    repo,
+                    issue_number: issue.number,
+                    body: markerComment,
+                  });
+                  await dispatchWorkflow(route.workflow, {
+                    ...route.inputs,
+                    issue_number: String(issue.number),
+                  });
+                } else if (opencodeDispatch === 'workflow') {
+                  await github.rest.issues.createComment({
+                    owner,
+                    repo,
+                    issue_number: issue.number,
+                    body: markerComment,
+                  });
+                  // Inlined rather than routed through dispatchWorkflow so
+                  // the dispatched mode stays visible at the call site.
+                  await github.request(
+                    'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
+                    {
+                      owner,
+                      repo,
+                      workflow_id: opencodeWorkflowPath.replace(
+                        /^\.github\/workflows\//,
+                        ''
+                      ),
+                      ref: dispatchRef,
+                      inputs: { mode: 'issue', issue_number: String(issue.number) },
+                    }
+                  );
+                } else {
+                  await github.rest.issues.createComment({
+                    owner,
+                    repo,
+                    issue_number: issue.number,
+                    body: ['/oc', '', markerComment].join('\n'),
+                  });
+                }
               } catch (err) {
                 await removeLabel(issue.number, inProgressLabel);
                 throw err;
@@ -1007,6 +1184,22 @@ jobs:
 
               core.notice(
                 'Dispatched issue #' + issue.number + ' (' +
-                (priority || 'no priority') + ') to OpenCode.'
+                (priority || 'no priority') + ').'
               );
             }
+
+      - name: Wake the configured downstream dispatcher
+        if: env.CHILD_DISPATCH_WORKFLOW != ''
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          CHILD_DISPATCH_WORKFLOW: ${{ env.CHILD_DISPATCH_WORKFLOW }}
+          DISPATCH_REF: ${{ env.DISPATCH_REF }}
+        run: |
+          set -euo pipefail
+          if ! gh api --method POST \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/$CHILD_DISPATCH_WORKFLOW/dispatches" \
+            -f ref="$DISPATCH_REF" >/dev/null; then
+            echo "::warning::Could not dispatch $CHILD_DISPATCH_WORKFLOW at $DISPATCH_REF."
+          else
+            echo "Dispatched $CHILD_DISPATCH_WORKFLOW at $DISPATCH_REF."
+          fi

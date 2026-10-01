@@ -19,7 +19,24 @@ on:
         type: string
         default: ''
         required: false
-  # Successful PR CI explicitly dispatches this reconciler from
+      post_merge_wakeups:
+        description: >-
+          Workflows to wake after a successful merge, comma-separated. The fork
+          auto-merger woke a knowledge-sync workflow and re-woke the issue
+          scheduler; neither is a core workflow (`knowledge-sync.yml` does not
+          exist in Continuum at all), so the list must come from the consumer.
+          Empty — the default — wakes nothing after a merge. Empty falls back to
+          vars.CONTINUUM_POST_MERGE_WAKEUPS.
+        type: string
+        default: ''
+        required: false
+      post_merge_wakeup_ref:
+        description: >-
+          Git ref the post-merge wake-ups are dispatched at. Empty falls back to
+          vars.CONTINUUM_POST_MERGE_WAKEUP_REF, then to the main branch.
+        type: string
+        default: ''
+        required: false
   # mark-ready-for-coderabbit. CodeRabbit status/review and main pushes are
   # additional event-driven wake-ups; no critical transition depends on cron.
 
@@ -54,6 +71,8 @@ jobs:
         env:
           CONTINUUM_VERSION_FILE: ${{ vars.CONTINUUM_VERSION_FILE || 'Sources/NanoDictateCore/Version.swift' }}
           REQUIRE_CODERABBIT: ${{ inputs.require_coderabbit || vars.CONTINUUM_REQUIRE_CODERABBIT || 'false' }}
+          POST_MERGE_WAKEUPS: ${{ inputs.post_merge_wakeups || vars.CONTINUUM_POST_MERGE_WAKEUPS }}
+          POST_MERGE_WAKEUP_REF: ${{ inputs.post_merge_wakeup_ref || vars.CONTINUUM_POST_MERGE_WAKEUP_REF || github.event.repository.default_branch || 'main' }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
@@ -71,6 +90,20 @@ jobs:
               String(process.env.REQUIRE_CODERABBIT || '').trim().toLowerCase();
             const requireCodeRabbit =
               REQUIRE_CODERABBIT === 'true' || REQUIRE_CODERABBIT === '1';
+
+            // Downstream wake-ups after a merge are consumer-owned. The fork
+            // auto-merger woke `knowledge-sync.yml` (which has no core
+            // equivalent at all) and re-woke the issue scheduler, so the list
+            // is configuration and is empty unless the consumer sets it:
+            // dispatching a workflow the repository does not own is a 404 and
+            // would fail a run that did nothing wrong.
+            const postMergeWakeups = String(process.env.POST_MERGE_WAKEUPS || '')
+              .split(',')
+              .map(name => name.trim())
+              .filter(name => name.length > 0);
+            const postMergeWakeupRef = String(
+              process.env.POST_MERGE_WAKEUP_REF || ''
+            ).trim();
 
             async function ensureLabel(name, color, description) {
               try {
@@ -1402,6 +1435,24 @@ jobs:
                     : 'CI only; CodeRabbit is disabled for this repository'
                 }; merge commit ${result.sha}.`
               );
+
+              // Waking downstream workflows is best-effort and never changes the
+              // merge outcome: a merge already landed, so a wake-up that cannot
+              // be delivered must not turn the run red or stop the scheduler
+              // from being woken at all.
+              for (const workflow of postMergeWakeups) {
+                try {
+                  await github.request(
+                    'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
+                    { owner, repo, workflow_id: workflow, ref: postMergeWakeupRef }
+                  );
+                  core.notice(`Woke ${workflow} at ${postMergeWakeupRef}.`);
+                } catch (err) {
+                  core.warning(
+                    `PR #${pr.number}: could not wake ${workflow}: ${err.message}`
+                  );
+                }
+              }
 
               // Merge at most one PR per controller run. The main push triggers
               // a new run, which first refreshes every remaining branch from the

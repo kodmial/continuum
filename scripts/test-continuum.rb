@@ -44,6 +44,27 @@ class ContinuumTest < Minitest::Test
     yaml(File.join(ROOT, '.github/workflows', 'continuum-opencode-repair.yml'))
   end
 
+  # The raw YAML of one named step, from the `- name:` line up to the next
+  # step or job boundary. `script_body` only reaches the first embedded
+  # `script: |` block of a whole workflow, which cannot address an individual
+  # step of a multi-step job.
+  def step_body(body, step_name)
+    lines = body.lines
+    start = lines.index { |line| line.start_with?("      - name: #{step_name}") }
+    return nil unless start
+
+    # A top-level comment sits at the same indentation as the step's own
+    # `- name:`, so a bare indentation test would cut the step short at the
+    # comment that follows it.
+    boundary = lambda do |line|
+      (line.start_with?('      - name: ') || line =~ /^ {0,6}\S/) &&
+        !line.strip.start_with?('#')
+    end
+    rest = lines[(start + 1)..]
+    stop = rest.index(&boundary)
+    stop ? lines[start...(start + 1 + stop)].join : lines[start..].join
+  end
+
   # The modes the OpenCode engine admits on the `workflow_dispatch` path,
   # parsed out of the job's own `if` guard rather than hardcoded here.
   def dispatch_modes
@@ -58,6 +79,7 @@ class ContinuumTest < Minitest::Test
   # exactly the "green no-op" a presence-only check misses.
   DISPATCHING_WORKFLOWS = %w[
     continuum-auto-merge.yml
+    continuum-issue-scheduler.yml
     continuum-opencode-repair.yml
     continuum-opencode-unresolved.yml
     continuum-opencode.yml
@@ -1379,11 +1401,23 @@ class ContinuumTest < Minitest::Test
       'child_owned_marker' => '<!-- continuum-child-owned -->',
       'legacy_child_owned_marker' => '<!-- runtime-worker-owned -->',
       'opencode_workflow_name' => 'OpenCode agent',
-      'opencode_workflow_path' => '.github/workflows/continuum-opencode.yml'
+      'opencode_workflow_path' => '.github/workflows/continuum-opencode.yml',
+      'dispatch_ref' => 'main',
+      'opencode_dispatch' => 'comment',
+      'execution_label_routes' => '',
+      'child_dispatch_workflow' => ''
     }.each do |key, default|
       assert scheduler.key?(key), "issue-scheduler missing input #{key}"
       assert_equal default, scheduler.fetch(key).fetch('default'), key
       assert_equal 'string', scheduler.fetch(key).fetch('type'), key
+    end
+
+    auto_merge = events(yaml(File.join(ROOT, '.github/workflows/continuum-auto-merge.yml')))
+                  .fetch('workflow_call').fetch('inputs')
+    %w[post_merge_wakeups post_merge_wakeup_ref].each do |key|
+      assert auto_merge.key?(key), "auto-merge missing input #{key}"
+      assert_equal '', auto_merge.fetch(key).fetch('default'), key
+      assert_equal 'string', auto_merge.fetch(key).fetch('type'), key
     end
 
     opencode = events(yaml(File.join(ROOT, '.github/workflows/continuum-opencode.yml')))
@@ -1393,7 +1427,11 @@ class ContinuumTest < Minitest::Test
       'dispatch_marker' => '',
       'in_progress_label' => '',
       'pause_marker' => '',
-      'ci_workflow_id' => ''
+      'ci_workflow_id' => '',
+      'base_ref' => '',
+      'knowledge_protocol_path' => '',
+      'knowledge_records_dir' => '',
+      'issue_commit_prefix' => ''
     }.each do |key, default|
       assert opencode.key?(key), "opencode missing input #{key}"
       assert_equal default, opencode.fetch(key).fetch('default'), key
@@ -2516,7 +2554,7 @@ class ContinuumTest < Minitest::Test
   # Continuum makes on every consumer's behalf and needs a test edit.
   STUB_INPUT_WHITELIST = {
     'continuum-add-review-label.yml' => %w[continuum_ref],
-    'continuum-auto-merge.yml' => %w[continuum_ref],
+    'continuum-auto-merge.yml' => %w[continuum_ref post_merge_wakeups post_merge_wakeup_ref],
     'continuum-bootstrap-runtime-secret.yml' => %w[continuum_ref],
     'continuum-coderabbit-retry.yml' => %w[continuum_ref],
     'continuum-coderabbit-unresolved.yml' => %w[continuum_ref],
@@ -2541,11 +2579,14 @@ class ContinuumTest < Minitest::Test
       in_progress_label pause_marker post_pause_comment reset_markers
       require_priority_label command_grace_minutes child_owned_marker
       legacy_child_owned_marker opencode_workflow_name opencode_workflow_path
+      dispatch_ref opencode_dispatch execution_label_routes
+      child_dispatch_workflow
     ],
     'continuum-opencode.yml' => %w[
       continuum_ref mode issue_number pr_number head_ref review_id run_id
       ci_workflow_id conflict_strategy dispatch_marker in_progress_label
-      pause_marker max_dispatch_attempts
+      pause_marker max_dispatch_attempts base_ref knowledge_protocol_path
+      knowledge_records_dir issue_commit_prefix
     ],
     'continuum-opencode-repair.yml' => %w[
       continuum_ref pr_number head_sha conclusion run_id ci_repair_label
@@ -3074,6 +3115,246 @@ class ContinuumTest < Minitest::Test
     # The CI gate stays unconditional: CodeRabbit never replaced it.
     refute_match(/requireCodeRabbit[^;]*!finalCi/, body)
     assert_includes body, '!finalCi ||'
+  end
+
+  # ------------------------------------------------- promoted fork capabilities
+
+  # (a) Label-driven execution routes. The fork hardcoded three labels and
+  # three workflow file names; core parameterizes the whole table instead, so
+  # a consumer can route to any workflow it owns and a consumer with none gets
+  # nothing at all. The default must therefore be EMPTY, and the parser must be
+  # a live one that fails loudly on a malformed line rather than silently
+  # dropping a route the operator believed was installed.
+  def test_scheduler_execution_routes_are_configured_and_empty_by_default
+    inputs = events(yaml(File.join(ROOT, '.github/workflows/continuum-issue-scheduler.yml')))
+             .fetch('workflow_call').fetch('inputs')
+
+    routes = inputs.fetch('execution_label_routes')
+    assert_equal '', routes.fetch('default'),
+                 'execution_label_routes must default to empty: core ships no execution workflows'
+    assert_equal 'string', routes.fetch('type')
+    assert_equal false, routes.fetch('required')
+    assert_includes routes.fetch('description'), 'vars.CONTINUUM_EXECUTION_LABEL_ROUTES'
+
+    child = inputs.fetch('child_dispatch_workflow')
+    assert_equal '', child.fetch('default'),
+                 'child_dispatch_workflow must default to empty: no core dispatcher is guaranteed to exist'
+    assert_includes child.fetch('description'), 'vars.CONTINUUM_CHILD_DISPATCH_WORKFLOW'
+
+    dispatch = inputs.fetch('opencode_dispatch')
+    assert_equal 'comment', dispatch.fetch('default'),
+                 'opencode_dispatch must default to the comment path, which needs no extra permission'
+
+    body = workflow_body('continuum-issue-scheduler.yml')
+    # Live parser, not a hardcoded table.
+    assert_includes body, "(process.env.EXECUTION_LABEL_ROUTES || '')"
+    assert_includes body, '"Invalid execution_label_routes line: \'"'
+    assert_includes body, '"\'; expected \'<issue label>|<workflow file name>|<input>=<value>,...\'."'
+    assert_includes body, '"Invalid execution_label_routes input \'"'
+    assert_includes body, 'const executionRouteLabels = new Set('
+
+    # …and the route really dispatches, with the issue number injected so a
+    # route never has to spell out the only input every execution workflow
+    # shares.
+    helper = body[/async function dispatchWorkflow\(workflow, inputs\) \{.*?\n {14}\}/m]
+    refute_nil helper, 'the dispatchWorkflow helper is missing from the scheduler script'
+    assert_includes helper, 'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches'
+    assert_match(
+      /await dispatchWorkflow\(route\.workflow, \{\s*\.\.\.route\.inputs,\s*issue_number: String\(issue\.number\),\s*\}\);/,
+      body,
+      'a configured route must dispatch its own inputs plus the issue number'
+    )
+
+    # A configured label must exist in the repository so an operator can apply
+    # it from the issue page.
+    assert_includes body, '...executionRouteLabels].map(name => ({'
+
+    # (b) the child wake-up is one step, gated on the knob being non-empty.
+    wakeup = step_body(body, 'Wake the configured downstream dispatcher')
+    refute_nil wakeup, 'the child-dispatch wake-up step is missing'
+    assert_includes wakeup, "if: env.CHILD_DISPATCH_WORKFLOW != ''",
+                    'the child wake-up must not run when no dispatcher is configured'
+    assert_match(%r{repos/\$GITHUB_REPOSITORY/actions/workflows/\$CHILD_DISPATCH_WORKFLOW/dispatches}, wakeup)
+    assert_includes wakeup, '::warning::'
+  end
+
+  # The `workflow` dispatch form of opencode_dispatch must carry `issue`, and
+  # the issue mode itself must be admitted by the engine's mode whitelist —
+  # otherwise the route and the mode would each be half of a dead end.
+  def test_scheduler_workflow_dispatch_path_reaches_the_issue_mode
+    body = workflow_body('continuum-issue-scheduler.yml')
+    window = dispatch_calls('continuum-issue-scheduler.yml').find do |call|
+      call.include?("mode: 'issue'")
+    end
+    refute_nil window,
+               'the scheduler no longer dispatches OpenCode in `issue` mode over workflow_dispatch'
+    assert_includes window, 'opencodeWorkflowPath.replace'
+    assert_includes window, 'ref: dispatchRef'
+
+    assert_includes dispatch_modes, 'issue',
+                    'continuum-opencode.yml must admit `issue` in its dispatch whitelist'
+
+    stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-opencode.yml'))
+    options = events(stub).fetch('workflow_dispatch').fetch('inputs')
+                 .fetch('mode').fetch('options')
+    assert_equal dispatch_modes.sort, options.sort,
+                 'the caller stub must offer exactly the modes the engine admits'
+  end
+
+  # (c) Post-merge wake-ups are consumer-owned: `knowledge-sync` has no core
+  # equivalent at all, so the list must come from configuration and must be
+  # EMPTY by default. A hardcoded default would dispatch a workflow the
+  # repository does not have.
+  def test_auto_merge_post_merge_wakeups_are_configured_and_empty_by_default
+    inputs = events(yaml(File.join(ROOT, '.github/workflows/continuum-auto-merge.yml')))
+             .fetch('workflow_call').fetch('inputs')
+
+    %w[post_merge_wakeups post_merge_wakeup_ref].each do |key|
+      knob = inputs.fetch(key)
+      assert_equal '', knob.fetch('default'),
+                   "#{key} must default to empty: the downstream workflows are the consumer's, not core's"
+      assert_equal 'string', knob.fetch('type')
+      assert_equal false, knob.fetch('required')
+    end
+    assert_includes inputs.fetch('post_merge_wakeups').fetch('description'),
+                    'vars.CONTINUUM_POST_MERGE_WAKEUPS'
+    assert_includes inputs.fetch('post_merge_wakeup_ref').fetch('description'),
+                    'vars.CONTINUUM_POST_MERGE_WAKEUP_REF'
+
+    body = auto_merge_body
+    # No hardcoded workflow names in the auto-merger's logic. (The comments
+    # legitimately name them to explain why they are not there, so only
+    # executable lines are checked.)
+    script = script_body('continuum-auto-merge.yml')
+                 .lines.reject { |line| line.strip.start_with?('//') }.join
+    %w[knowledge-sync issue-scheduler].each do |name|
+      refute_match(/#{name}[-a-z_]*\.yml/, script,
+                   "#{name}.yml must not be hardcoded into the auto-merger; the list is configuration")
+    end
+
+    wakeups = dispatch_calls('continuum-auto-merge.yml').find do |call|
+      call.include?('POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches') &&
+        call.include?('workflow_id: workflow')
+    end
+    refute_nil wakeups, 'the post-merge wake-up dispatch is missing from the auto-merger'
+    assert_includes wakeups, 'ref: postMergeWakeupRef'
+
+    # Best-effort: a wake-up that cannot be delivered must not fail a run whose
+    # merge already landed.
+    assert_includes body, "for (const workflow of postMergeWakeups) {"
+    assert_match(/catch \(err\) \{\s*\n\s*core\.warning\(/, body)
+
+    # The list is parsed from configuration, split on commas, empties dropped.
+    assert_includes body, "String(process.env.POST_MERGE_WAKEUPS || '')"
+    assert_includes body, '.filter(name => name.length > 0);'
+  end
+
+  # Coordinator item 1: `/oc-cancel`. The command is a substring of `/oc`, so
+  # without an explicit negation on each agent-launching step the cancel
+  # comment starts the very agent it means to stop. Both launch sites must
+  # carry it, and no step may launch on a cancel comment.
+  def test_opencode_cancel_command_guards_every_agent_launch
+    body = File.read(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
+
+    run_step = step_body(body, 'Run OpenCode')
+    refute_nil run_step, 'the `Run OpenCode` step is missing'
+    assert_includes run_step, "!contains(github.event.comment.body, '/oc-cancel')",
+                    'Run OpenCode must not launch on an /oc-cancel comment'
+
+    recover = step_body(body, 'Recover agent-managed issue branch')
+    refute_nil recover, 'the branch-recovery step is missing'
+    assert_includes recover, "!contains(github.event.comment.body, '/oc-cancel')",
+                    'branch recovery must not run on an /oc-cancel comment'
+
+    issue_step = step_body(body, 'Implement issue')
+    refute_nil issue_step, 'the `issue` mode step is missing'
+
+    # The cancellation is a launch guard only: Continuum has no mechanism that
+    # cancels an already-running run, so nothing may claim otherwise.
+    refute_match(%r{actions/runs/\S+/cancel}, body,
+                 'no run-cancellation call is implemented; do not imply one')
+  end
+
+  # Coordinator item 2: the duplicate guard must run BEFORE the agent and the
+  # agent must be gated on it. The only other open-PR check in this workflow
+  # runs after a burnt run, so without this a second dispatch opens a second
+  # agent against an issue that already has a PR.
+  def test_opencode_skips_a_duplicate_issue_implementation
+    body = File.read(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
+
+    guard_at = body.index('      - name: Skip duplicate issue implementation')
+    refute_nil guard_at, 'the duplicate-implementation guard step is missing'
+    run_at = body.index('      - name: Run OpenCode')
+    issue_at = body.index('      - name: Implement issue')
+    refute_nil run_at
+    refute_nil issue_at
+    assert guard_at < run_at, 'the duplicate guard must run before the interactive agent launches'
+    assert guard_at < issue_at, 'the duplicate guard must run before the issue-mode agent launches'
+
+    guard = step_body(body, 'Skip duplicate issue implementation')
+    assert_includes guard, 'id: duplicate_guard'
+    assert_includes guard, "--state open"
+    assert_includes guard, 'select(.headRefName | startswith("opencode/issue'
+    assert_includes guard, '[0].number // empty'
+    assert_includes guard, 'echo "skip=true" >> "$GITHUB_OUTPUT"'
+    assert_includes guard, 'echo "skip=false" >> "$GITHUB_OUTPUT"'
+
+    # Both launch sites must consult it.
+    assert_includes body[run_at, issue_at], "steps.duplicate_guard.outputs.skip != 'true'"
+    assert_includes body[issue_at, 400], "steps.duplicate_guard.outputs.skip != 'true'"
+  end
+
+  # Coordinator item 3: run-name. The watchdog and the scheduler both find a
+  # run; without a run-name they can only match by issue title, which is not
+  # unique among open issues.
+  def test_opencode_stub_run_name_reports_the_issue_number
+    stub = File.read(File.join(ROOT, '.github/caller-stubs/continuum-opencode.yml'))
+    run_name = stub[/^run-name:.*?(?=\n\n)/m]
+    refute_nil run_name, 'the OpenCode caller stub has no run-name'
+    assert_includes run_name, "github.event_name == 'issue_comment'"
+    assert_includes run_name, "format('OpenCode issue \#{0}', github.event.issue.number)"
+    assert_includes run_name, "inputs.mode == 'issue'"
+    assert_includes run_name, "format('OpenCode issue \#{0}', inputs.issue_number)"
+  end
+
+  # (d) `issue` mode must own the whole issue -> branch -> commit -> PR
+  # lifecycle, and it must refuse to publish anything under .github/workflows,
+  # which this token cannot push.
+  def test_opencode_issue_mode_owns_the_full_issue_to_pr_lifecycle
+    body = File.read(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
+    step = step_body(body, 'Implement issue')
+    refute_nil step, 'the `issue` mode step is missing'
+
+    assert_includes step, "inputs.mode == 'issue'"
+    assert_includes step, '[[ -n "$ISSUE_NUMBER" ]]'
+    assert_includes step, 'BRANCH="opencode/issue${ISSUE_NUMBER}-${GITHUB_RUN_ID}"'
+    assert_includes step, 'opencode run --auto --model "$OPENCODE_MODEL"'
+    assert_includes step, "if [[ \"\$CURRENT_BRANCH\" != \"\$BRANCH\" ]]; then"
+    assert_includes step, 'git status --porcelain -- .github/workflows'
+    assert_includes step, 'git commit -m "${COMMIT_PREFIX}: implement issue #${ISSUE_NUMBER}"'
+    assert_includes step, 'gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs"'
+    assert_includes step, 'git push --force-with-lease="refs/heads/$BRANCH:$BASE_SHA"'
+    assert_includes step, 'gh pr create --repo "$GITHUB_REPOSITORY"'
+    assert_includes step, '--add-label "$PAUSE_LABEL" --remove-label "$IN_PROGRESS_LABEL"'
+
+    # A burnt issue-mode run must release the scheduler's reservation, exactly
+    # as an issue_comment run does, or the WIP slot leaks until the lease
+    # expires.
+    recover = body[/  recover-scheduled-issue:.*/m]
+    refute_nil recover
+    assert_includes recover, "github.event_name == 'workflow_dispatch' &&\n        inputs.issue_number != ''",
+                    'the recovery job must also cover an issue-mode workflow_dispatch run'
+    assert_includes recover, 'ISSUE_NUMBER: ${{ inputs.issue_number }}'
+    assert_includes recover, 'Number(process.env.ISSUE_NUMBER || context.payload.issue?.number || 0)'
+
+    # The knowledge handoff is consumer-owned and Continuum ships no protocol,
+    # so both halves must be OFF unless the consumer names them.
+    assert_includes step, 'KNOWLEDGE_PROTOCOL_PATH: ${{ inputs.knowledge_protocol_path }}'
+    assert_includes step, 'KNOWLEDGE_RECORDS_DIR: ${{ inputs.knowledge_records_dir }}'
+    assert_includes step, 'if [[ -n "$KNOWLEDGE_RECORDS_DIR" ]]; then'
+    assert_includes step, '[[ -f "$RECORD_PATH" ]] || {'
+    refute_includes step, 'render_lifecycle',
+                    'core ships no automation/render_lifecycle module; the validator must stay consumer-owned'
   end
 
   end

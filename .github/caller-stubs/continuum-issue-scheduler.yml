@@ -59,6 +59,22 @@ on:
         description: "Path of the local OpenCode caller"
         required: false
         type: string
+      dispatch_ref:
+        description: "Git ref every dispatch targets"
+        required: false
+        type: string
+      opencode_dispatch:
+        description: "How a ready issue reaches OpenCode: comment or workflow"
+        required: false
+        type: string
+      execution_label_routes:
+        description: "Label-driven execution routes, one per line"
+        required: false
+        type: string
+      child_dispatch_workflow:
+        description: "Downstream dispatcher woken after each reconcile pass"
+        required: false
+        type: string
   schedule:
     - cron: "*/15 * * * *"
   issues:
@@ -103,3 +119,7 @@ jobs:
       legacy_child_owned_marker: "${{ inputs.legacy_child_owned_marker }}"
       opencode_workflow_name: "${{ inputs.opencode_workflow_name }}"
       opencode_workflow_path: "${{ inputs.opencode_workflow_path }}"
+      dispatch_ref: "${{ inputs.dispatch_ref }}"
+      opencode_dispatch: "${{ inputs.opencode_dispatch }}"
+      execution_label_routes: "${{ inputs.execution_label_routes }}"
+      child_dispatch_workflow: "${{ inputs.child_dispatch_workflow }}"

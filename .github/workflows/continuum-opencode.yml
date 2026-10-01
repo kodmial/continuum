@@ -67,6 +67,39 @@ on:
         required: false
         type: string
         default: ''
+      base_ref:
+        description: >-
+          Branch `issue` mode bases its implementation branch on. Empty falls
+          back to vars.CONTINUUM_ISSUE_BASE_REF, then to `main`.
+        required: false
+        type: string
+        default: ''
+      knowledge_protocol_path:
+        description: >-
+          Repository path of the knowledge-handoff protocol `issue` mode must
+          read before changing code, for example
+          `automation/knowledge/PROTOCOL.md`. Empty — the default — imposes no
+          knowledge-handoff requirement at all, because the protocol is
+          consumer-owned and Continuum ships none.
+        required: false
+        type: string
+        default: ''
+      knowledge_records_dir:
+        description: >-
+          Directory `issue` mode must write its single run record into, named
+          `issue-<number>-run-<run id>.md`. Empty — the default — disables the
+          record requirement. When both this and knowledge_protocol_path are
+          empty, `issue` mode is a plain implementation run.
+        required: false
+        type: string
+        default: ''
+      issue_commit_prefix:
+        description: >-
+          Prefix of the task commit message `issue` mode creates. Empty falls
+          back to vars.CONTINUUM_ISSUE_COMMIT_PREFIX, then to `fix`.
+        required: false
+        type: string
+        default: ''
       conflict_strategy:
         description: >-
           How resolve-conflict settles a conflict: `merge` merges the default
@@ -123,7 +156,7 @@ jobs:
     # internal workflow_dispatch events from trusted workflows on main.
     if: >-
       (github.event_name == 'workflow_dispatch' &&
-       contains(fromJSON('["coderabbit-fix","resolve-conflict","ci-fix"]'), inputs.mode)) ||
+       contains(fromJSON('["coderabbit-fix","resolve-conflict","ci-fix","issue"]'), inputs.mode)) ||
       ((github.event_name == 'issue_comment' ||
         github.event_name == 'pull_request_review_comment') &&
        github.actor == github.repository_owner &&
@@ -199,6 +232,36 @@ jobs:
           git --version
           echo "workspace=$GITHUB_WORKSPACE revision=$(git rev-parse HEAD)"
 
+      # Pre-emptive duplicate guard. The only other open-PR check in this
+      # workflow lives in `recover-scheduled-issue`, which runs AFTER a burnt
+      # run, so without this step a second dispatch for the same issue would
+      # launch a second agent against work that already has a PR. The branch
+      # prefix is the one the scheduler, the watchdog, and the repair
+      # controller all use.
+      - name: Skip duplicate issue implementation
+        id: duplicate_guard
+        if: >-
+          (github.event_name == 'workflow_dispatch' && inputs.mode == 'issue') ||
+          (github.event_name == 'issue_comment' && !github.event.issue.pull_request)
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          ISSUE_NUMBER: ${{ inputs.issue_number || github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          [[ -n "$ISSUE_NUMBER" ]] || { echo "skip=false" >> "$GITHUB_OUTPUT"; exit 0; }
+
+          EXISTING_PR="$(gh pr list \
+            --repo "$GITHUB_REPOSITORY" \
+            --state open \
+            --json number,headRefName \
+            --jq '[.[] | select(.headRefName | startswith("opencode/issue'"$ISSUE_NUMBER"'-"))][0].number // empty')"
+          if [[ -n "$EXISTING_PR" ]]; then
+            echo "Open PR #$EXISTING_PR already implements issue #$ISSUE_NUMBER; skipping duplicate OpenCode run."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       # workflow_dispatch repair modes must NOT use "opencode github run":
       # that integration owns a branch/PR lifecycle and can open a new PR even
       # when the prompt says not to. Plain "opencode run" works in this already
@@ -239,7 +302,10 @@ jobs:
           done
 
       - name: Run OpenCode
-        if: github.event_name != 'workflow_dispatch'
+        if: >-
+          github.event_name != 'workflow_dispatch' &&
+          steps.duplicate_guard.outputs.skip != 'true' &&
+          !contains(github.event.comment.body, '/oc-cancel')
         env:
           GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
           ISSUE_NUMBER: ${{ inputs.issue_number }}
@@ -262,7 +328,8 @@ jobs:
           !github.event.issue.pull_request &&
           github.actor == github.repository_owner &&
           (contains(github.event.comment.body, '/oc') ||
-           contains(github.event.comment.body, '/opencode'))
+           contains(github.event.comment.body, '/opencode')) &&
+          !contains(github.event.comment.body, '/oc-cancel')
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           ISSUE_NUMBER: ${{ inputs.issue_number || github.event.issue.number }}
@@ -302,6 +369,158 @@ jobs:
           TITLE="$(git log -1 --format=%s)"
           BODY="$(printf 'Recovered automatically after the OpenCode agent changed branches during issue #%s execution.\n\nCloses #%s' "$ISSUE_NUMBER" "$ISSUE_NUMBER")"
           gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$CURRENT_BRANCH" --title "$TITLE" --body "$BODY"
+
+      - name: Implement issue
+        if: >-
+          github.event_name == 'workflow_dispatch' &&
+          inputs.mode == 'issue' &&
+          steps.duplicate_guard.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
+          OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          BASE_REF: ${{ inputs.base_ref || vars.CONTINUUM_ISSUE_BASE_REF || 'main' }}
+          KNOWLEDGE_PROTOCOL_PATH: ${{ inputs.knowledge_protocol_path }}
+          KNOWLEDGE_RECORDS_DIR: ${{ inputs.knowledge_records_dir }}
+          COMMIT_PREFIX: ${{ inputs.issue_commit_prefix || vars.CONTINUUM_ISSUE_COMMIT_PREFIX || 'fix' }}
+          IN_PROGRESS_LABEL: ${{ inputs.in_progress_label || vars.AUTOMATION_IN_PROGRESS_LABEL || 'automation:in-progress' }}
+          PAUSE_LABEL: ${{ inputs.pause_marker || vars.AUTOMATION_PAUSE_LABEL || 'automation:paused' }}
+          CI_WORKFLOW_ID: ${{ inputs.ci_workflow_id }}
+        run: |
+          set -euo pipefail
+          [[ -n "$ISSUE_NUMBER" ]] || { echo "::error::Missing issue number for issue mode."; exit 1; }
+
+          ISSUE_JSON="$(gh issue view "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --json title,body,url)"
+          ISSUE_TITLE="$(jq -r .title <<<"$ISSUE_JSON")"
+          ISSUE_BODY="$(jq -r '.body // ""' <<<"$ISSUE_JSON")"
+
+          git fetch origin "$BASE_REF" --quiet
+          git switch --detach "origin/$BASE_REF"
+          BRANCH="opencode/issue${ISSUE_NUMBER}-${GITHUB_RUN_ID}"
+          git switch -c "$BRANCH"
+
+          PROMPT="$(cat <<EOF
+          Implement GitHub issue #${ISSUE_NUMBER} completely.
+
+          Title:
+          ${ISSUE_TITLE}
+
+          Specification:
+          ${ISSUE_BODY}
+
+          Requirements:
+          - Treat the issue body and its Definition of Done as authoritative.
+          - Inspect the existing repository before changing code.
+          - Implement the complete task, not a partial sketch.
+          - Add or update automated tests when appropriate.
+          - Run the relevant local checks when practical.
+          - Keep all comments and commit-facing text in English.
+          - Do not add unrelated automation outside the issue scope.
+          - Do not modify .github/workflows/**. Stable workflow envelopes are provisioned separately because the Actions token cannot push workflow-file changes; put mutable automation logic under normal source files.
+          - Do not perform git commits, pushes, branch switches, rebases, resets, merges, or PR creation; the workflow owns Git state.
+          EOF
+          )"
+
+          # The knowledge handoff is consumer-owned: Continuum ships no protocol
+          # document and no validator, so both halves of the fork's mandatory
+          # handoff appear in the prompt only when the consumer names them.
+          if [[ -n "$KNOWLEDGE_PROTOCOL_PATH" ]]; then
+            PROMPT="$PROMPT
+          - Repository knowledge handoff is mandatory: before changing code, read ${KNOWLEDGE_PROTOCOL_PATH} and the prior notes and experiment records it points at.
+          - Do not repeat a previously failed experiment unless a material premise changed; record that changed premise."
+          fi
+          if [[ -n "$KNOWLEDGE_RECORDS_DIR" ]]; then
+            PROMPT="$PROMPT
+          - Before finishing, write exactly one run record at ${KNOWLEDGE_RECORDS_DIR}/issue-${ISSUE_NUMBER}-run-${GITHUB_RUN_ID}.md following the protocol. Never include secrets. The workflow validates this record and fails closed if it is missing."
+          fi
+
+          opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
+
+          if [[ -n "$KNOWLEDGE_RECORDS_DIR" ]]; then
+            RECORD_PATH="${KNOWLEDGE_RECORDS_DIR}/issue-${ISSUE_NUMBER}-run-${GITHUB_RUN_ID}.md"
+            [[ -f "$RECORD_PATH" ]] || {
+              echo "::error::Mandatory knowledge handoff record is missing: $RECORD_PATH"
+              exit 1
+            }
+            echo "Validated knowledge handoff: $RECORD_PATH"
+          fi
+
+          CURRENT_BRANCH="$(git branch --show-current)"
+          if [[ "$CURRENT_BRANCH" != "$BRANCH" ]]; then
+            echo "::error::OpenCode changed branch unexpectedly: expected '$BRANCH', got '$CURRENT_BRANCH'."
+            exit 1
+          fi
+
+          if [[ -n "$(git status --porcelain -- .github/workflows)" ]]; then
+            echo "::error::OpenCode modified .github/workflows/**, which this token cannot safely push."
+            git status --short -- .github/workflows
+            exit 1
+          fi
+
+          if [[ -z "$(git status --porcelain)" ]]; then
+            echo "OpenCode produced no repository changes."
+            gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+              --body "Automation produced no code changes; pausing this issue for manual inspection."
+            gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+              --add-label "$PAUSE_LABEL" --remove-label "$IN_PROGRESS_LABEL" >/dev/null 2>&1 || true
+            exit 0
+          fi
+
+          # Keep generated Python bytecode out of task commits even when an
+          # agent or test run created it before staging. .gitignore prevents new
+          # cache files; this also removes any tracked leftovers.
+          find . -type d -name '__pycache__' -prune -exec rm -rf {} +
+          find . -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
+
+          git add -A
+          git commit -m "${COMMIT_PREFIX}: implement issue #${ISSUE_NUMBER}"
+          TASK_COMMIT="$(git rev-parse HEAD)"
+
+          # The Actions token is a GitHub App installation token, which needs a
+          # separate Workflows permission to write .github/workflows/**. Keep
+          # the task commit outside that path, then create the remote branch
+          # from the base the agent used via the Git refs API.
+          if [[ -n "$(git diff-tree --no-commit-id --name-only -r "$TASK_COMMIT" -- .github/workflows)" ]]; then
+            echo "::error::Task commit contains .github/workflows/** changes."
+            git diff-tree --no-commit-id --name-status -r "$TASK_COMMIT" -- .github/workflows
+            exit 1
+          fi
+
+          # Publish the task commit from the exact base the agent used. Do not
+          # replay it onto a moving base here: merge/conflict reconciliation
+          # belongs to the PR controller, and conflating the two turns an
+          # ordinary conflict into a failed task.
+          BASE_SHA="$(git rev-parse "$TASK_COMMIT^")"
+          [[ -n "$BASE_SHA" ]] || { echo "::error::Could not resolve task base SHA"; exit 1; }
+
+          if [[ -n "$(git diff --name-only "$BASE_SHA"...HEAD -- .github/workflows)" ]]; then
+            echo "::error::Task differs from its branch base under .github/workflows/**."
+            exit 1
+          fi
+
+          gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+            -f ref="refs/heads/$BRANCH" \
+            -f sha="$BASE_SHA" >/dev/null
+
+          git push --force-with-lease="refs/heads/$BRANCH:$BASE_SHA" -u origin "HEAD:$BRANCH"
+
+          PR_NUMBER="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --state all \
+            --json number --jq '.[0].number // empty')"
+          if [[ -z "$PR_NUMBER" ]]; then
+            PR_URL="$(gh pr create --repo "$GITHUB_REPOSITORY" \
+              --base "$BASE_REF" \
+              --head "$BRANCH" \
+              --title "$ISSUE_TITLE" \
+              --body "$(printf 'Automated implementation for #%s.\n\nCloses #%s' "$ISSUE_NUMBER" "$ISSUE_NUMBER")")"
+            PR_NUMBER="$(gh pr view "$PR_URL" --repo "$GITHUB_REPOSITORY" --json number --jq .number)"
+          fi
+
+          if [[ -n "$CI_WORKFLOW_ID" ]]; then
+            gh workflow run "$CI_WORKFLOW_ID" --repo "$GITHUB_REPOSITORY" --ref "$BASE_REF" -f "pr_number=$PR_NUMBER" \
+              || echo "::warning::Could not dispatch $CI_WORKFLOW_ID for PR #$PR_NUMBER"
+          fi
+          echo "Created/updated PR #$PR_NUMBER for issue #$ISSUE_NUMBER."
 
       - name: Fix CodeRabbit review findings
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'coderabbit-fix'
@@ -625,10 +844,12 @@ jobs:
       always() &&
       needs.opencode.result != 'success' &&
       needs.opencode.result != 'skipped' &&
-      github.event_name == 'issue_comment' &&
-      github.actor == github.repository_owner &&
-      !github.event.issue.pull_request &&
-      contains(github.event.comment.body, inputs.dispatch_marker || vars.AUTOMATION_DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->')
+      ((github.event_name == 'issue_comment' &&
+        github.actor == github.repository_owner &&
+        !github.event.issue.pull_request &&
+        contains(github.event.comment.body, inputs.dispatch_marker || vars.AUTOMATION_DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->')) ||
+       (github.event_name == 'workflow_dispatch' &&
+        inputs.issue_number != ''))
     runs-on: ubuntu-latest
     timeout-minutes: ${{ fromJSON(vars.AUTOMATION_ATTEMPTS_TIMEOUT_MINUTES || '10') }}
 
@@ -649,6 +870,8 @@ jobs:
 
       - name: Release failed reservation or pause exhausted issue
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
         with:
           # TAP_PAT is intentional: mutations made with GITHUB_TOKEN do not
           # fan out into the issue scheduler's labeled/unlabeled triggers.
@@ -656,7 +879,14 @@ jobs:
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
-            const issueNumber = context.payload.issue.number;
+            // A `workflow_dispatch` issue run carries the issue number as an
+            // input; an issue_comment run carries it on the payload.
+            const issueNumber =
+              Number(process.env.ISSUE_NUMBER || context.payload.issue?.number || 0);
+            if (!issueNumber) {
+              core.info('No issue number in this run; nothing to recover.');
+              return;
+            }
             const marker = process.env.DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->';
             const inProgress = process.env.IN_PROGRESS_LABEL || 'automation:in-progress';
             const paused = process.env.PAUSE_LABEL || 'automation:paused';

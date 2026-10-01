@@ -331,6 +331,94 @@ enabled:
 | `opencode_workflow_name` | `OpenCode agent` |
 | `opencode_workflow_path` | `.github/workflows/continuum-opencode.yml` |
 
+### Downstream wake-ups and label-driven execution routes
+
+Every workflow Continuum wakes after a transition belongs to the consumer, not
+to Continuum: `knowledge-sync` has no core equivalent at all, and a repository
+does not necessarily install the child dispatcher. So each list below is
+**empty by default** and the enabling value lives in the consumer's repository
+variable. Nothing is dispatched until it is set.
+
+| Variable | Read by | Effect when empty |
+| --- | --- | --- |
+| `CONTINUUM_POST_MERGE_WAKEUPS` | `continuum-auto-merge.yml` | No workflow is woken after a merge |
+| `CONTINUUM_POST_MERGE_WAKEUP_REF` | `continuum-auto-merge.yml` | Falls back to the repository's default branch |
+| `CONTINUUM_EXECUTION_LABEL_ROUTES` | `continuum-issue-scheduler.yml` | No label-driven execution dispatch |
+| `CONTINUUM_CHILD_DISPATCH_WORKFLOW` | `continuum-issue-scheduler.yml` | No downstream dispatcher is woken after a reconcile pass |
+| `CONTINUUM_DISPATCH_REF` | `continuum-issue-scheduler.yml` | Falls back to `main` |
+| `CONTINUUM_OPENCODE_DISPATCH` | `continuum-issue-scheduler.yml` | Falls back to `comment` |
+| `CONTINUUM_ISSUE_BASE_REF` | `continuum-opencode.yml` | Falls back to `main` |
+| `CONTINUUM_ISSUE_COMMIT_PREFIX` | `continuum-opencode.yml` | Falls back to `fix` |
+
+- **`CONTINUUM_POST_MERGE_WAKEUPS`** is a comma-separated list of workflow file
+  names, dispatched after a successful merge. Each wake-up is best-effort: one
+  that cannot be delivered logs a warning and does not fail a run whose merge
+  already landed.
+- **`CONTINUUM_EXECUTION_LABEL_ROUTES`** is the label-driven dispatch table, one
+  entry per line:
+
+  ```text
+  <issue label>|<workflow file name>|<input>=<value>,...
+  execution:docker-qualify|continuum-docker-qualification.yml|
+  execution:render-smoke|continuum-render-executor.yml|mode=smoke
+  ```
+
+  A line may be omitted or may stop after the workflow name. Lines starting
+  with `#` and blank lines are ignored. The scheduler creates each label in the
+  repository so it can be applied from the issue page, and always supplies
+  `issue_number` to the route so no route has to spell it out. A selected issue
+  carrying a route label is dispatched to that workflow **instead of**
+  OpenCode, and never to both. A malformed line fails the run loudly rather than
+  being dropped, because a silently ignored route looks reserved but is never
+  executed.
+- **`CONTINUUM_CHILD_DISPATCH_WORKFLOW`** names one workflow file woken after
+  every reconcile pass. A parent that installs
+  `.github/caller-stubs/parent/continuum-child-dispatcher.yml` sets it to that
+  file's name.
+- **`CONTINUUM_OPENCODE_DISPATCH`** chooses how a ready issue reaches OpenCode:
+  `comment` (the default) posts the owner's `/oc` command, which needs no extra
+  permission, and `workflow` dispatches the OpenCode caller's `issue` mode
+  directly. Use `workflow` only when the OpenCode caller is installed without an
+  `issue_comment` trigger. Any other value fails the run.
+
+### OpenCode `issue` mode
+
+`mode: issue` drives a bare issue number to a pull request: it branches from the
+base ref, runs `opencode run --auto`, refuses to publish anything under
+`.github/workflows/**`, and publishes the commit refs-first so an ordinary merge
+conflict is never mistaken for a failed task. It skips a launch when the issue
+already has an open PR whose head branch starts with `opencode/issue<N>-`, and a
+burnt run releases the scheduler's reservation through the same
+`recover-scheduled-issue` job an `issue_comment` run uses.
+
+Two optional halves are **off by default** because Continuum ships neither the
+protocol document nor the validator — both belong to the consumer:
+
+- **`knowledge_protocol_path`** names the repository path of the knowledge
+  handoff protocol the agent must read before changing code. Empty imposes no
+  such requirement.
+- **`knowledge_records_dir`** names the directory the agent must write its
+  single run record into, as `issue-<number>-run-<run id>.md`. Empty disables
+  the requirement; when set, a missing record fails the run closed.
+
+`base_ref` (default `main`), `issue_commit_prefix` (default `fix`), and
+`ci_workflow_id` (default empty, meaning CI is left to the consumer's own
+machinery) complete the mode's inputs.
+
+### Cancelling and duplicate suppression
+
+- **`/oc-cancel`** in a comment suppresses the launch: neither the interactive
+  agent nor branch recovery runs for it. It is a launch guard only. Continuum
+  has no mechanism that cancels an already-running workflow run, so a comment
+  arriving after the agent has started does not stop it.
+- **Duplicate suppression** is automatic and needs no configuration: an
+  `issue_comment` run and an `issue` mode dispatch both check for an open PR
+  whose head branch starts with `opencode/issue<N>-` before the agent launches.
+
+The OpenCode caller stub sets a `run-name`, so the watchdog and the scheduler
+can find a run by issue number instead of by issue title, which is not unique
+among open issues.
+
 `continuum-opencode.yml` accepts the matching `dispatch_marker`,
 `in_progress_label`, and
 `pause_marker` inputs, plus `max_dispatch_attempts`, `issue_number` (the issue a
