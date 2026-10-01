@@ -33,28 +33,31 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - name: Check Groq secret
-        id: groq
-        env:
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-        run: |
-          # Non-blocking: Continuum automation runs on free anonymous models and
-          # must never require a paid provider token. PR-Agent is still wired to
-          # the Groq provider upstream, so without a key this workflow can only
-          # skip — it cannot fall back to a free model on its own. The `secrets`
-          # context is unavailable in a step-level `if:`, so availability is
-          # published as a step output instead of failing the run.
-          if [[ -z "$GROQ_API_KEY" ]]; then
-            echo "::notice::GROQ_API_KEY is not set; skipping the optional PR-Agent helper."
-            echo "Every other Continuum automation continues to run without a paid key."
-            echo "available=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          fi
+      # Continuum core automation runs on free anonymous OpenCode models and
+      # forbids paid providers. PR-Agent is wired to the paid Groq provider
+      # upstream and cannot fall back to a free model on its own, so it is not
+      # supported: this workflow reports an explicit failure instead of a quiet
+      # green run that did nothing. A consumer that wants PR-Agent must remove
+      # this caller or wire the action to a free provider itself.
+      - name: Report the unsupported paid provider
+        id: provider
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            core.setOutput('supported', 'false');
+            core.setFailed(
+              'The optional PR-Agent helper is disabled: its upstream action requires the ' +
+              'paid Groq provider (GROQ_API_KEY), and Continuum core supports only free ' +
+              'anonymous models — no paid provider key. Continuum therefore neither reads ' +
+              'nor forwards that secret. Remove the pr-agent caller from this repository, or ' +
+              'wire PR-Agent to a free provider, to use it.'
+            );
 
+      # Kept only so the failure above stays the single, explicit reason this
+      # helper cannot run. It is unreachable: the gate above fails the job and
+      # the paid key is deliberately not passed in.
       - name: Run PR-Agent
-        if: steps.groq.outputs.available == 'true'
+        if: steps.provider.outputs.supported == 'true'
         uses: docker://pragent/pr-agent:github_action@sha256:65e5b196e38cecd7df8a71fe29942052e081a0c6645132c2ac874df60b1760c7 # 0.46.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GROQ.KEY: ${{ secrets.GROQ_API_KEY }}

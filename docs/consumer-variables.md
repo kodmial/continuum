@@ -59,42 +59,65 @@ the input wins over the variable.
 | `AUTOMATION_DISPATCH_TIMEOUT_MINUTES` | — | `5` | OpenCode internal dispatch job timeout. |
 | `AUTOMATION_ATTEMPTS_TIMEOUT_MINUTES` | — | `10` | Failed-dispatch cleanup job timeout. |
 | `AUTOMATION_DISPATCH_BACKOFF_SECONDS` | — | `120` | Backoff before the scheduler retries a dispatch. |
+| `AUTOMATION_DISPATCH_MARKER` | `opencode.dispatch_marker` | `<!-- issue-scheduler-dispatch -->` | Dispatch marker `opencode.yml` matches and counts. |
+| `AUTOMATION_IN_PROGRESS_LABEL` | `opencode.in_progress_label` | `automation:in-progress` | Reservation label. |
+| `AUTOMATION_PAUSE_LABEL` | `opencode.pause_marker` | `automation:paused` | Pause label. |
 
 Setting `AUTOMATION_OPENCODE_RUNNER` to a non-macOS label (for example
 `ubuntu-latest`) skips the Swift toolchain setup and capability probe, which only
 apply to macOS runners.
 
+`AUTOMATION_DISPATCH_MARKER`, `AUTOMATION_IN_PROGRESS_LABEL`, and
+`AUTOMATION_PAUSE_LABEL` matter on the `issue_comment` path, where
+`opencode.yml` is invoked by an event and cannot receive `workflow_call` inputs.
+A consumer that renames the scheduler's marker or labels must set the matching
+`vars.*` knob, and pass the same value as the `issue-scheduler.yml` input, so the
+release reservation `opencode.yml` reads on failure is the one the scheduler
+wrote. `consumer-child-dispatcher.yml` reads `AUTOMATION_PAUSE_LABEL`, and
+`consumer-child-review.yml` reads `AUTOMATION_IN_PROGRESS_LABEL` and
+`AUTOMATION_PAUSE_LABEL`, so a renamed label stays consistent across the core
+and the parent/child pair.
+
 ## Model and provider keys
 
 The OpenCode agent runs on **free anonymous models** and needs **no API key**.
 The default model is `opencode/muse-spark-1.3-contributor-free`; override it with
-`vars.OPENCODE_MODEL`. No core workflow requires a paid provider token.
+`vars.OPENCODE_MODEL`. No core workflow requires a paid provider token, and paid
+providers are **not supported in the core**: no core workflow reads or forwards a
+paid provider key.
 
-The one exception is the optional `pr-agent` helper: the upstream PR-Agent
-action is still wired to the paid Groq provider, so `GROQ_API_KEY` remains a
-voluntary opt-in there. Without it the workflow logs a notice and skips — it
-never fails the run, and the rest of Continuum is unaffected.
+`pr-agent.yml` is a legacy helper that upstream wires to the paid Groq provider.
+It is **outside the supported core**: Groq is not an accepted exception. With no
+supported key the workflow fails explicitly (it never reports a silent green
+no-op), and the core never reads `GROQ_API_KEY`. A consumer that wants PR-Agent
+must remove the caller or wire the action to a free provider itself.
 
 ## Scheduler naming inputs
 
 A consumer that renames the scheduler's labels or dispatch marker must pass the
 same values to both workflows, because the marker is what the scheduler counts
-as a dispatch attempt and what `opencode.yml` matches on:
+as a dispatch attempt and what `opencode.yml` matches on. `post_pause_comment`
+is disabled only by the exact string `false`; an empty value keeps the comment
+enabled:
 
 | `issue-scheduler.yml` input | Default |
 | --- | --- |
 | `dispatch_marker` | `<!-- issue-scheduler-dispatch -->` |
 | `in_progress_label` | `automation:in-progress` |
 | `pause_marker` | `automation:paused` |
-| `post_pause_comment` | `true` |
+| `post_pause_comment` | `true` (only `false` disables) |
 | `reset_markers` | `false` |
 | `require_priority_label` | `false` |
 
-`opencode.yml` accepts the matching `dispatch_marker` and
-`max_dispatch_attempts` inputs, plus `issue_number` (the issue a dispatcher
-names — empty falls back to `github.event.issue.number`), `ci_workflow_id`, and
-`conflict_strategy` (`merge` by default).
+`opencode.yml` accepts the matching `dispatch_marker`, `in_progress_label`, and
+`pause_marker` inputs, plus `max_dispatch_attempts`, `issue_number` (the issue a
+dispatcher names — empty falls back to `github.event.issue.number`),
+`ci_workflow_id`, and `conflict_strategy` (a `merge`/`checkout` choice, `merge`
+by default).
 
 `CONTINUUM_RELEASE_MANIFEST_FILES` lists, as a JSON array, the packaging
 manifest files a consumer trusts as release automation. It defaults to the
-NanoDictate packaging layout; set it for other projects.
+NanoDictate packaging layout; set it for other projects. Because this variable
+expands the release-automation allowlist that bypasses review, a typo in its
+value silently widens that trust — review changes to it with the same care as
+the workflows themselves.

@@ -34,7 +34,12 @@ These are public interfaces and must not change silently:
   and the `install.sh` argument shape;
 - the parent/child repository-variable names (`CONTINUUM_ROLE`,
   `CONTINUUM_CHILDREN`, `CONTINUUM_CHILD_ID`, `CONTINUUM_PARENT`,
-  `CONTINUUM_VALIDATION_SCRIPT`).
+  `CONTINUUM_VALIDATION_SCRIPT`);
+- the no-paid-provider rule: core workflows run only on free anonymous models
+  and must never require, read, or forward a paid provider key
+  (`OPENCODE_API_KEY`, `ANTHROPIC_API_KEY`, `GROQ_API_KEY`, `GROQ.KEY`). A core
+  workflow that cannot run without one must fail explicitly, never pass as a
+  silent green no-op.
 
 Changing any of them requires updating the caller templates in
 `.github/caller-stubs/` and the contract tests in `scripts/test-continuum.rb` in
