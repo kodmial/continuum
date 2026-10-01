@@ -191,7 +191,7 @@ jobs:
           CURRENT=$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' "$VERSION_FILE")
           echo "Version.swift: ${CURRENT:-<none>}"
           if [[ -z "$CURRENT" ]]; then
-            echo "::error::Could not extract a version from "$VERSION_FILE"
+            echo "::error::Could not extract a version from $VERSION_FILE"
             exit 1
           fi
 

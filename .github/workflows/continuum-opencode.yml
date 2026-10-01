@@ -60,6 +60,26 @@ on:
         required: false
         type: string
         default: ''
+      pause_on_failure:
+        description: >-
+          Whether a failed scheduled issue may enter a terminal pause after
+          exhausting the configured dispatch attempts. Set false for fully
+          autonomous consumers.
+        required: false
+        type: string
+        default: 'true'
+      ci_repair_label:
+        description: >-
+          Label used as the in-flight lock for automatic CI repair.
+        required: false
+        type: string
+        default: ''
+      packaging_repair_label:
+        description: >-
+          Label used as the in-flight lock for packaging-smoke repair.
+        required: false
+        type: string
+        default: ''
       ci_workflow_id:
         description: >-
           Workflow file name ci-fix reruns (for example ci.yml). Empty
@@ -800,13 +820,13 @@ jobs:
           AFTER_SHA=$(git rev-parse HEAD)
 
           # If the agent correctly decided there is no code fix to make (for
-          # example a transient runner/network failure), give the same CI head
-          # one trusted retry instead of leaving the PR stuck forever. The
-          # opencode-ci-repair lock remains set, so a repeatedly failing rerun
-          # cannot create an unbounded same-head loop.
+          # example a transient runner/network failure), retry the evaluated
+          # workflow without changing the PR. Prefer only failed jobs, then fall
+          # back to a full rerun for cancelled/timed-out runs that have no
+          # rerunnable failed-job subset.
           if [[ "$AFTER_SHA" == "$BEFORE_SHA" ]]; then
-            echo "OpenCode produced no new commit; rerunning failed workflow jobs once."
-            gh run rerun "$RUN_ID" --failed
+            echo "OpenCode produced no new commit; retrying the evaluated workflow."
+            gh run rerun "$RUN_ID" --failed || gh run rerun "$RUN_ID"
           fi
 
       - name: Re-run the consumer blocking CI workflow for this head
@@ -837,6 +857,44 @@ jobs:
             "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/labels/opencode-conflict-repair" \
             >/dev/null 2>&1 || true
 
+  cleanup-workflow-repair-lock:
+    name: Release workflow-repair lock
+    needs: opencode
+    if: >-
+      always() &&
+      github.event_name == 'workflow_dispatch' &&
+      inputs.mode == 'ci-fix'
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(vars.AUTOMATION_DISPATCH_TIMEOUT_MINUTES || '5') }}
+
+    permissions:
+      actions: read
+      issues: write
+
+    steps:
+      - name: Release repair lock even after OpenCode timeout or cancellation
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          RUN_ID: ${{ inputs.run_id }}
+          CI_REPAIR_LABEL: ${{ inputs.ci_repair_label || vars.CONTINUUM_CI_REPAIR_LABEL || 'opencode-ci-repair' }}
+          PACKAGING_REPAIR_LABEL: ${{ inputs.packaging_repair_label || vars.CONTINUUM_PACKAGING_REPAIR_LABEL || 'opencode-packaging-smoke-repair' }}
+        run: |
+          set -euo pipefail
+          RUN_NAME="$(gh run view "$RUN_ID" --json name --jq .name 2>/dev/null || true)"
+          case "$RUN_NAME" in
+            CI) lock_label="$CI_REPAIR_LABEL" ;;
+            "Packaging smoke") lock_label="$PACKAGING_REPAIR_LABEL" ;;
+            *)
+              echo "No known workflow-repair lock for run '$RUN_NAME' ($RUN_ID)."
+              exit 0
+              ;;
+          esac
+          gh api --method DELETE \
+            "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/labels/${lock_label}" \
+            >/dev/null 2>&1 || true
+          echo "Released workflow-repair lock '$lock_label' for PR #$PR_NUMBER."
+
   recover-scheduled-issue:
     name: Recover failed scheduled issue dispatch
     needs: opencode
@@ -863,6 +921,7 @@ jobs:
       DISPATCH_BACKOFF_SECONDS: ${{ vars.AUTOMATION_DISPATCH_BACKOFF_SECONDS || '120' }}
       IN_PROGRESS_LABEL: ${{ inputs.in_progress_label || vars.AUTOMATION_IN_PROGRESS_LABEL || 'automation:in-progress' }}
       PAUSE_LABEL: ${{ inputs.pause_marker || vars.AUTOMATION_PAUSE_LABEL || 'automation:paused' }}
+      PAUSE_ON_FAILURE: ${{ inputs.pause_on_failure || vars.AUTOMATION_PAUSE_ON_FAILURE || 'true' }}
 
     steps:
       - name: Brief backoff before retrying scheduler
@@ -890,6 +949,8 @@ jobs:
             const marker = process.env.DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->';
             const inProgress = process.env.IN_PROGRESS_LABEL || 'automation:in-progress';
             const paused = process.env.PAUSE_LABEL || 'automation:paused';
+            const pauseOnFailure =
+              (process.env.PAUSE_ON_FAILURE || 'true') !== 'false';
             const maxAttempts = Number.parseInt(
               process.env.MAX_DISPATCH_ATTEMPTS || '2',
               10
@@ -959,7 +1020,7 @@ jobs:
               if (err.status !== 404) throw err;
             }
 
-            if (attempts >= maxAttempts) {
+            if (attempts >= maxAttempts && pauseOnFailure) {
               await github.rest.issues.addLabels({
                 owner,
                 repo,
@@ -972,10 +1033,23 @@ jobs:
               return;
             }
 
+            if (!pauseOnFailure) {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                  name: paused,
+                });
+              } catch (err) {
+                if (err.status !== 404) throw err;
+              }
+            }
+
             // Removing automation:in-progress with TAP_PAT emits an issue
             // event, waking issue-scheduler immediately. The scheduler then
             // re-evaluates all priorities and WIP slots from current state.
             core.notice(
-              `Released failed reservation for issue #${issueNumber} after attempt ${attempts}/${maxAttempts}; scheduler will retry from live priority state.`
+              `Released failed reservation for issue #${issueNumber} after attempt ${attempts}/${maxAttempts}; scheduler will retry from live priority state${attempts >= maxAttempts && !pauseOnFailure ? ' (terminal pause disabled)' : ''}.`
             );
 

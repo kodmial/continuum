@@ -98,6 +98,18 @@ on:
         description: "Dispatch attempts before pausing the issue"
         required: false
         type: string
+      pause_on_failure:
+        description: "Allow terminal automation pause after failed dispatches"
+        required: false
+        type: string
+      ci_repair_label:
+        description: "CI repair in-flight lock label"
+        required: false
+        type: string
+      packaging_repair_label:
+        description: "Packaging repair in-flight lock label"
+        required: false
+        type: string
 
 permissions:
   actions: write
@@ -130,3 +142,6 @@ jobs:
       in_progress_label: "${{ inputs.in_progress_label }}"
       pause_marker: "${{ inputs.pause_marker }}"
       max_dispatch_attempts: "${{ inputs.max_dispatch_attempts }}"
+      pause_on_failure: "${{ inputs.pause_on_failure }}"
+      ci_repair_label: "${{ inputs.ci_repair_label }}"
+      packaging_repair_label: "${{ inputs.packaging_repair_label }}"

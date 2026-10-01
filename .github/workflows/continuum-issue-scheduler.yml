@@ -157,6 +157,22 @@ on:
         type: string
         required: false
         default: ''
+      count_open_prs_as_wip:
+        description: >-
+          Whether an open OpenCode PR consumes an implementation WIP slot.
+          Keep true for legacy consumers that intentionally cap open PRs;
+          set false when WIP means actively running implementation only.
+        type: string
+        required: false
+        default: 'true'
+      pause_on_failure:
+        description: >-
+          Whether exhausted dispatches or closed-without-merge OpenCode PRs
+          enter a terminal automation pause. Set false for fully autonomous
+          consumers that must keep retrying without human intervention.
+        type: string
+        required: false
+        default: 'true'
 
 # No `actions: write` here: every dispatch in this workflow authenticates with
 # the TAP_PAT classic PAT (repo + workflow scopes), exactly like every other
@@ -191,6 +207,8 @@ jobs:
       OPENCODE_DISPATCH: ${{ inputs.opencode_dispatch || vars.CONTINUUM_OPENCODE_DISPATCH || 'comment' }}
       EXECUTION_LABEL_ROUTES: ${{ inputs.execution_label_routes || vars.CONTINUUM_EXECUTION_LABEL_ROUTES }}
       CHILD_DISPATCH_WORKFLOW: ${{ inputs.child_dispatch_workflow || vars.CONTINUUM_CHILD_DISPATCH_WORKFLOW }}
+      COUNT_OPEN_PRS_AS_WIP: ${{ inputs.count_open_prs_as_wip || vars.AUTOMATION_COUNT_OPEN_PRS_AS_WIP || 'true' }}
+      PAUSE_ON_FAILURE: ${{ inputs.pause_on_failure || vars.AUTOMATION_PAUSE_ON_FAILURE || 'true' }}
 
     steps:
       - name: Reconcile state and dispatch ready issues
@@ -315,6 +333,10 @@ jobs:
             const childDispatchWorkflow = (
               process.env.CHILD_DISPATCH_WORKFLOW || ''
             ).trim();
+            const countOpenPrsAsWip =
+              (process.env.COUNT_OPEN_PRS_AS_WIP || 'true') !== 'false';
+            const pauseOnFailure =
+              (process.env.PAUSE_ON_FAILURE || 'true') !== 'false';
 
             // Issues explicitly owned by a delegated child worker must never be
             // dispatched through this repository's OpenCode Actions path. The
@@ -453,6 +475,14 @@ jobs:
 
             async function pauseIssue(issueNumber, reason) {
               await removeLabel(issueNumber, inProgressLabel);
+              if (!pauseOnFailure) {
+                await removeLabel(issueNumber, pausedLabel);
+                core.warning(
+                  'Released issue #' + issueNumber +
+                  ' for automatic retry instead of pausing: ' + reason
+                );
+                return;
+              }
               await addLabel(issueNumber, pausedLabel);
               core.warning('Paused issue #' + issueNumber + ': ' + reason);
               if (postPauseComment) {
@@ -565,6 +595,19 @@ jobs:
             });
             issues = issues.filter(issue => !issue.pull_request);
             for (const issue of issues) rememberIssue(issue);
+
+            if (!pauseOnFailure) {
+              for (const issue of issues) {
+                if (labelsByIssue.get(issue.number).has(pausedLabel)) {
+                  await removeLabel(issue.number, pausedLabel);
+                  core.notice(
+                    'Cleared legacy automation pause on issue #' +
+                    issue.number +
+                    ' because pause_on_failure=false.'
+                  );
+                }
+              }
+            }
 
             // Manual owner-triggered /oc runs are real in-flight work too.
             // Reserve the issue immediately so the scheduler cannot enqueue a
@@ -711,10 +754,13 @@ jobs:
               await removeLabel(issueNumber, pausedLabel);
             }
 
-            // An open OpenCode PR is the strongest "in progress" signal. Keep
-            // the visible label synchronized with that fact.
+            // An open OpenCode PR is still visible work, but consumers may
+            // choose not to spend an implementation WIP slot while that PR is
+            // merely waiting for CI, review, hardware, or merge.
             for (const issueNumber of openPrIssues) {
-              activeIssueNumbers.add(issueNumber);
+              if (countOpenPrsAsWip) {
+                activeIssueNumbers.add(issueNumber);
+              }
               if (issueByNumber.has(issueNumber)) {
                 await addLabel(issueNumber, inProgressLabel);
                 await removeLabel(issueNumber, pausedLabel);
@@ -846,7 +892,10 @@ jobs:
 
               await removeLabel(issueNumber, inProgressLabel);
 
-              if (schedulerDispatches.length >= maxDispatchAttempts) {
+              if (
+                schedulerDispatches.length >= maxDispatchAttempts &&
+                pauseOnFailure
+              ) {
                 await addLabel(issueNumber, pausedLabel);
                 core.warning(
                   'Issue #' + issueNumber + ' produced no OpenCode PR after ' +
@@ -854,9 +903,13 @@ jobs:
                   ' scheduler dispatch attempt(s); automation paused.'
                 );
               } else {
+                await removeLabel(issueNumber, pausedLabel);
                 core.warning(
                   'Lease expired for issue #' + issueNumber +
-                  '; it is eligible for an automatic retry.'
+                  '; it is eligible for an automatic retry' +
+                  (schedulerDispatches.length >= maxDispatchAttempts
+                    ? ' because pause_on_failure=false.'
+                    : '.')
                 );
               }
             }
@@ -880,6 +933,9 @@ jobs:
             const candidates = [];
             for (const issue of issues) {
               if (activeIssueNumbers.has(issue.number)) continue;
+              // An existing implementation PR must never be duplicated even
+              // when it is configured not to consume a WIP slot.
+              if (openPrIssues.has(issue.number)) continue;
 
               if (isChildOwned(issue)) {
                 core.info(
@@ -890,7 +946,7 @@ jobs:
               }
 
               const labels = labelsByIssue.get(issue.number);
-              if (labels.has(pausedLabel)) {
+              if (pauseOnFailure && labels.has(pausedLabel)) {
                 core.info('Skipping #' + issue.number + ': automation is paused.');
                 continue;
               }
@@ -1011,7 +1067,7 @@ jobs:
 
               if (
                 freshIssue.state !== 'open' ||
-                freshLabels.has(pausedLabel) ||
+                (pauseOnFailure && freshLabels.has(pausedLabel)) ||
                 freshLabels.has(inProgressLabel)
               ) {
                 core.info(

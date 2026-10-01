@@ -73,6 +73,12 @@ on:
         type: string
       child_dispatch_workflow:
         description: "Downstream dispatcher woken after each reconcile pass"
+      count_open_prs_as_wip:
+        description: "Count open implementation PRs against WIP"
+        required: false
+        type: string
+      pause_on_failure:
+        description: "Pause after exhausted/closed failed automation"
         required: false
         type: string
   schedule:
@@ -83,6 +89,9 @@ on:
     types: [created]
   pull_request_target:
     types: [closed]
+  workflow_run:
+    workflows: ["OpenCode agent"]
+    types: [completed]
 
 permissions:
   contents: read
@@ -123,3 +132,5 @@ jobs:
       opencode_dispatch: "${{ inputs.opencode_dispatch }}"
       execution_label_routes: "${{ inputs.execution_label_routes }}"
       child_dispatch_workflow: "${{ inputs.child_dispatch_workflow }}"
+      count_open_prs_as_wip: "${{ inputs.count_open_prs_as_wip }}"
+      pause_on_failure: "${{ inputs.pause_on_failure }}"

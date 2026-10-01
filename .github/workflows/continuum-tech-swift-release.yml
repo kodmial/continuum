@@ -40,6 +40,16 @@ on:
         type: string
         default: main
         required: false
+      native_prepare_command:
+        description: Optional command that prepares a native/static dependency.
+        type: string
+        default: ''
+        required: false
+      static_archive_path:
+        description: Optional repository-relative static archive linked into Swift products.
+        type: string
+        default: ''
+        required: false
 
 # Creating the GitHub Release needs contents: write; the build job only reads
 # the repo. Permissions are set per job (least privilege).
@@ -489,6 +499,14 @@ jobs:
             exit 1
           fi
 
+      - name: Prepare consumer native dependency
+        if: inputs.native_prepare_command != ''
+        env:
+          NATIVE_PREPARE_COMMAND: ${{ inputs.native_prepare_command }}
+        run: |
+          set -euo pipefail
+          eval "$NATIVE_PREPARE_COMMAND"
+
       - name: Build release binaries
         # Each binary embeds its own Info.plist as a Mach-O __info_plist
         # section (via -sectcreate) so tccd sees a real bundle identifier
@@ -497,17 +515,36 @@ jobs:
         # Homebrew Cellar/<version> directory moves on every upgrade) and the
         # binary is addressable via `tccutil reset`. CFBundleIdentifier here
         # must match the codesign --identifier below — tccd reads both.
+        env:
+          STATIC_ARCHIVE_PATH: ${{ inputs.static_archive_path }}
         run: |
+          set -euo pipefail
           # Invariant: CFBundleIdentifier in each Info.*.plist must match the codesign
           # --identifier for the same product (tccd reads both):
           #   packaging/Info.<agent>.plist -> <agent bundle id>
           #   packaging/Info.<cli>.plist   -> <cli bundle id>
-          swift build -c release --product "$AGENT_NAME" \
-            -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist \
-            -Xlinker "packaging/Info.$AGENT_NAME.plist"
-          swift build -c release --product "$CLI_NAME" \
-            -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist \
-            -Xlinker "packaging/Info.$CLI_NAME.plist"
+          archive=""
+          if [[ -n "$STATIC_ARCHIVE_PATH" ]]; then
+            archive="$GITHUB_WORKSPACE/$STATIC_ARCHIVE_PATH"
+            [[ -f "$archive" ]] || exit 1
+          fi
+          if [[ -n "$archive" ]]; then
+            swift build -c release --product "$AGENT_NAME" \
+              -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist \
+              -Xlinker "packaging/Info.$AGENT_NAME.plist" \
+              -Xlinker "$archive"
+            swift build -c release --product "$CLI_NAME" \
+              -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist \
+              -Xlinker "packaging/Info.$CLI_NAME.plist" \
+              -Xlinker "$archive"
+          else
+            swift build -c release --product "$AGENT_NAME" \
+              -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist \
+              -Xlinker "packaging/Info.$AGENT_NAME.plist"
+            swift build -c release --product "$CLI_NAME" \
+              -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist \
+              -Xlinker "packaging/Info.$CLI_NAME.plist"
+          fi
 
       - name: Code-sign binaries, assemble & sign the .app bundle
         # Signed with a purpose-made self-signed "NanoDictate CI Signing"

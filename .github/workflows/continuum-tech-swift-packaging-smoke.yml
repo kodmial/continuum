@@ -47,6 +47,16 @@ on:
         type: string
         default: main
         required: false
+      native_prepare_command:
+        description: Optional command that prepares a native/static dependency.
+        type: string
+        default: ''
+        required: false
+      static_archive_path:
+        description: Optional repository-relative static archive linked into Swift products.
+        type: string
+        default: ''
+        required: false
 
 permissions:
   contents: read
@@ -149,14 +159,44 @@ jobs:
             exit 1
           fi
 
-      - name: Build release binaries
+      - name: Prepare consumer native dependency
+        if: inputs.native_prepare_command != ''
+        env:
+          NATIVE_PREPARE_COMMAND: ${{ inputs.native_prepare_command }}
         run: |
-          swift build -c release --product "$AGENT_NAME" \
-            -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist \
-            -Xlinker "packaging/Info.$AGENT_NAME.plist"
-          swift build -c release --product "$CLI_NAME" \
-            -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist \
-            -Xlinker "packaging/Info.$CLI_NAME.plist"
+          set -euo pipefail
+          eval "$NATIVE_PREPARE_COMMAND"
+
+      - name: Build release binaries
+        env:
+          STATIC_ARCHIVE_PATH: ${{ inputs.static_archive_path }}
+        run: |
+          set -euo pipefail
+          archive=""
+          if [[ -n "$STATIC_ARCHIVE_PATH" ]]; then
+            archive="$GITHUB_WORKSPACE/$STATIC_ARCHIVE_PATH"
+            [[ -f "$archive" ]] || {
+              echo "::error::Configured static archive does not exist: $archive"
+              exit 1
+            }
+          fi
+          if [[ -n "$archive" ]]; then
+            swift build -c release --product "$AGENT_NAME" \
+              -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist \
+              -Xlinker "packaging/Info.$AGENT_NAME.plist" \
+              -Xlinker "$archive"
+            swift build -c release --product "$CLI_NAME" \
+              -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist \
+              -Xlinker "packaging/Info.$CLI_NAME.plist" \
+              -Xlinker "$archive"
+          else
+            swift build -c release --product "$AGENT_NAME" \
+              -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist \
+              -Xlinker "packaging/Info.$AGENT_NAME.plist"
+            swift build -c release --product "$CLI_NAME" \
+              -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist \
+              -Xlinker "packaging/Info.$CLI_NAME.plist"
+          fi
 
       - name: Code-sign binaries and assemble the .app bundle
         env:

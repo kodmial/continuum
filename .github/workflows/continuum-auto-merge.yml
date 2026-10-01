@@ -37,6 +37,21 @@ on:
         type: string
         default: ''
         required: false
+      required_workflow_gate_label:
+        description: >-
+          Optional PR label that activates an additional current-head workflow
+          gate before auto-merge. Empty disables the extra gate.
+        type: string
+        default: ''
+        required: false
+      required_workflow_gate_name:
+        description: >-
+          Exact GitHub Actions workflow name required to complete successfully
+          when required_workflow_gate_label is present on a PR.
+        type: string
+        default: ''
+        required: false
+  # Successful PR CI explicitly dispatches this reconciler from
   # mark-ready-for-coderabbit. CodeRabbit status/review and main pushes are
   # additional event-driven wake-ups; no critical transition depends on cron.
 
@@ -73,6 +88,8 @@ jobs:
           REQUIRE_CODERABBIT: ${{ inputs.require_coderabbit || vars.CONTINUUM_REQUIRE_CODERABBIT || 'false' }}
           POST_MERGE_WAKEUPS: ${{ inputs.post_merge_wakeups || vars.CONTINUUM_POST_MERGE_WAKEUPS }}
           POST_MERGE_WAKEUP_REF: ${{ inputs.post_merge_wakeup_ref || vars.CONTINUUM_POST_MERGE_WAKEUP_REF || github.event.repository.default_branch || 'main' }}
+          REQUIRED_WORKFLOW_GATE_LABEL: ${{ inputs.required_workflow_gate_label || vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_LABEL || '' }}
+          REQUIRED_WORKFLOW_GATE_NAME: ${{ inputs.required_workflow_gate_name || vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_NAME || '' }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
@@ -90,6 +107,10 @@ jobs:
               String(process.env.REQUIRE_CODERABBIT || '').trim().toLowerCase();
             const requireCodeRabbit =
               REQUIRE_CODERABBIT === 'true' || REQUIRE_CODERABBIT === '1';
+            const requiredWorkflowGateLabel =
+              String(process.env.REQUIRED_WORKFLOW_GATE_LABEL || '').trim();
+            const requiredWorkflowGateName =
+              String(process.env.REQUIRED_WORKFLOW_GATE_NAME || '').trim();
 
             // Downstream wake-ups after a merge are consumer-owned. The fork
             // auto-merger woke `knowledge-sync.yml` (which has no core
@@ -126,6 +147,14 @@ jobs:
               'One automatic OpenCode conflict-repair attempt per conflict episode.'
             );
 
+            if (requiredWorkflowGateLabel) {
+              await ensureLabel(
+                requiredWorkflowGateLabel,
+                '0E8A16',
+                'Required additional workflow gate.'
+              );
+            }
+
             function hasLabel(pr, name) {
               return (pr.labels || []).some(label => label.name === name);
             }
@@ -150,6 +179,13 @@ jobs:
             }
 
             function isNonMergeCriticalMainPath(path) {
+              // Continuum caller pins are executable control-plane code. A
+              // consumer that advances its pinned Continuum revision must
+              // synchronize open PRs so their CI/review/repair semantics are
+              // evaluated against that exact revision as well.
+              if (path.startsWith('.github/workflows/continuum-')) {
+                return false;
+              }
               return (
                 path === 'LICENSE' ||
                 path === '.gitignore' ||
@@ -253,6 +289,21 @@ jobs:
 
             async function latestCurrentHeadPackagingSmoke(pr) {
               return latestWorkflowForHead(pr, pr.head.sha, 'Packaging smoke');
+            }
+
+            async function requiredWorkflowGate(pr, headSha = pr.head.sha) {
+              if (
+                !requiredWorkflowGateLabel ||
+                !requiredWorkflowGateName ||
+                !hasLabel(pr, requiredWorkflowGateLabel)
+              ) {
+                return null;
+              }
+              return latestWorkflowForHead(
+                pr,
+                headSha,
+                requiredWorkflowGateName
+              );
             }
 
             async function latestCodeRabbitStatus(headSha) {
@@ -1205,6 +1256,24 @@ jobs:
                 continue;
               }
 
+              const extraWorkflowGate =
+                await requiredWorkflowGate(pr, pr.head.sha);
+              if (
+                requiredWorkflowGateLabel &&
+                requiredWorkflowGateName &&
+                hasLabel(pr, requiredWorkflowGateLabel) &&
+                (
+                  !extraWorkflowGate ||
+                  extraWorkflowGate.status !== 'completed' ||
+                  extraWorkflowGate.conclusion !== 'success'
+                )
+              ) {
+                core.info(
+                  `PR #${pr.number}: waiting for required workflow '${requiredWorkflowGateName}' on head ${pr.head.sha}; current state=${extraWorkflowGate ? `${extraWorkflowGate.status}/${extraWorkflowGate.conclusion || 'pending'}` : 'missing'}.`
+                );
+                continue;
+              }
+
               // A clean controller-generated merge of main can reuse a prior
               // completed APPROVED review. Any other new HEAD must have its own
               // CodeRabbit review. Without CodeRabbit there is no review basis
@@ -1358,6 +1427,8 @@ jobs:
               const finalCi = await latestCurrentHeadCi(pr);
               const finalPackagingSmoke =
                 await latestCurrentHeadPackagingSmoke(pr);
+              const finalExtraWorkflowGate =
+                await requiredWorkflowGate(pr, pr.head.sha);
               const finalReviewBasis = requireCodeRabbit
                 ? await codeRabbitReviewBasis(pr, pr.head.sha)
                 : null;
@@ -1375,6 +1446,12 @@ jobs:
                 (finalPackagingSmoke &&
                  (finalPackagingSmoke.status !== 'completed' ||
                   finalPackagingSmoke.conclusion !== 'success')) ||
+                (requiredWorkflowGateLabel &&
+                 requiredWorkflowGateName &&
+                 hasLabel(pr, requiredWorkflowGateLabel) &&
+                 (!finalExtraWorkflowGate ||
+                  finalExtraWorkflowGate.status !== 'completed' ||
+                  finalExtraWorkflowGate.conclusion !== 'success')) ||
                 // The CodeRabbit half of the revalidation is itself conditional:
                 // with the integration off there is nothing to re-read, and
                 // requiring a review basis that can never exist would cancel
