@@ -85,7 +85,7 @@ jobs:
     # Capability-only: this selects where OpenCode runs, not when it must
     # build/test; scheduler, branch/commit/PR lifecycle, CI, CodeRabbit, and
     # repair/recovery are unchanged.
-    timeout-minutes: 30
+    timeout-minutes: 180
 
     permissions:
       actions: read
