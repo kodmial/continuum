@@ -113,6 +113,14 @@ jobs:
               'One automatic OpenCode conflict-repair attempt per conflict episode.'
             );
 
+            if (requiredWorkflowGateLabel) {
+              await ensureLabel(
+                requiredWorkflowGateLabel,
+                '0E8A16',
+                'Required additional workflow gate.'
+              );
+            }
+
             function hasLabel(pr, name) {
               return (pr.labels || []).some(label => label.name === name);
             }
