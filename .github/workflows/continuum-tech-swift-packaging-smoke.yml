@@ -266,7 +266,7 @@ jobs:
             [[ -d "$developer_dir" ]] || continue
             version="$(DEVELOPER_DIR="$developer_dir" xcrun swift --version 2>&1)"
             echo "$xcode: $version"
-            if grep -qE 'Swift version 6\\.1([.[:space:]]|$)' <<<"$version"; then
+            if [[ "$version" == *"Swift version 6.1"* ]]; then
               selected="$developer_dir"
               break
             fi
