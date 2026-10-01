@@ -1,5 +1,5 @@
 # This is a technology-layer workflow (opt-in, library). It is NOT triggered by Continuum itself.
-# Naming: continuum-tech-<tech>-<name>.yml (three dashes after "continuum").
+# Naming: continuum-tech-<tech>-<name>.yml (the `continuum-tech-<tech>-` prefix marks the library).
 
 name: Release PR
 

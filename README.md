@@ -107,6 +107,21 @@ install `tech`, and a consumer that wants the technology library runs the `tech`
 command as well. Passing the old `swift` value is rejected with
 `invalid set: swift (the old 'swift' set is now 'tech')`.
 
+The installed technology files were renamed at the same time, so an already
+installed technology layer does not update itself: before updating Continuum, a
+consumer must reinstall **both** sets,
+
+```sh
+bash install.sh <path-to-consumer-repo> <ref> core
+bash install.sh <path-to-consumer-repo> <ref> tech
+```
+
+Otherwise the stubs already in the consumer keep their old `uses:` references and
+fail with `workflow not found` after the merge. Reinstalling rewrites those stubs;
+they must never be patched by hand. Every installed stub is a `continuum-*.yml`
+file carrying a `uses:` line, is owned by Continuum, and hand-editing one in a
+consumer repository is forbidden.
+
 ## Reusable workflows
 
 Workflow names are identical to the reusable file names unless noted.

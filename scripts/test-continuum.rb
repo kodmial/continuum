@@ -329,7 +329,7 @@ class ContinuumTest < Minitest::Test
       output, status = Open3.capture2e('bash', File.join(ROOT, 'install.sh'), File.join(dir, 'invalid'), 'bad&ref')
       refute status.success?, output
       refute Dir.exist?(File.join(dir, 'invalid'))
-      # `swift` was the old technology-set name. Three dashes now mean "opt-in
+      # `swift` was the old technology-set name. The `continuum-tech-` prefix means "opt-in
       # library", and the value no longer exists.
       output, status = Open3.capture2e('bash', File.join(ROOT, 'install.sh'), File.join(dir, 'legacy'), 'main', 'swift')
       refute status.success?, output

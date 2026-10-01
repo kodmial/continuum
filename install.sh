@@ -5,7 +5,7 @@ set -euo pipefail
 #    or: curl -fsSL https://raw.githubusercontent.com/kodmial/continuum/main/install.sh | bash -s -- [path] [ref] [core|parent|tech]
 #    or: bash continuum/install.sh [path-to-consumer-repo] [ref] [core|parent|tech]
 # ref defaults to main. `core` is the task-domain layer every project needs;
-# `tech` is the opt-in technology library (three dashes: continuum-tech-<tech>-<name>.yml);
+# `tech` is the opt-in technology library (the `continuum-tech-<tech>-` prefix marks the library);
 # `parent` adds only child-execution callers.
 # Continuum never triggers its own technology library: consumers opt into it.
 DEST="${1:-.}"
@@ -35,8 +35,8 @@ STUBS=(
   remove-review-label.yml
 )
 if [[ "$SET" == tech ]]; then
-  # The opt-in technology library. Three dashes after `continuum` marks it as
-  # library/opt-in; Continuum itself never triggers these.
+  # The opt-in technology library (the `continuum-tech-` prefix marks it as
+  # library/opt-in); Continuum itself never triggers these.
   STUB_PATH="$STUB_PATH/tech"
   STUBS=(
     continuum-tech-swift-ci.yml
@@ -58,8 +58,8 @@ LOCAL_STUBS_DIR="$(dirname "${BASH_SOURCE[0]:-$0}")/$STUB_PATH"
 # from Continuum and must not be hand-edited, while any other workflow in the
 # same directory is project-owned. Continuum's own dispatchers rely on these
 # exact names, so the prefix is part of the interface, not a cosmetic label.
-# Tech stubs are already named `continuum-tech-<tech>-<name>.yml` (the three
-# dashes mark an opt-in library); they keep their name verbatim.
+# Tech stubs are already named `continuum-tech-<tech>-<name>.yml` (the
+# `continuum-tech-` prefix marks an opt-in library); they keep their name verbatim.
 for f in "${STUBS[@]}"; do
   if [[ $# -lt 2 && -f "$LOCAL_STUBS_DIR/$f" ]]; then
     template="$(cat "$LOCAL_STUBS_DIR/$f")"
