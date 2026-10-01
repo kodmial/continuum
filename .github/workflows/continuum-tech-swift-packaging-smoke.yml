@@ -245,7 +245,13 @@ jobs:
       BUNDLE_AGENT: ${{ vars.CONTINUUM_BUNDLE_AGENT }}
       BUNDLE_CTL: ${{ vars.CONTINUUM_BUNDLE_CTL }}
       SIGNING_IDENTITY: ${{ vars.CONTINUUM_SIGNING_IDENTITY }}
-      VERSION_FILE: ${{ vars.CONTINUUM_VERSION_FILE }}
+      # The release version file is a consumer variable, so the engine keeps
+      # only the fallback. The scripts under scripts/packaging-smoke read the
+      # same CONTINUUM_VERSION_FILE name (see smoke_repo_version in
+      # common.sh), so both spellings are exported: VERSION_FILE for the
+      # inline steps below, CONTINUUM_VERSION_FILE for the sourced scripts.
+      VERSION_FILE: ${{ vars.CONTINUUM_VERSION_FILE || 'Sources/NanoDictateCore/Version.swift' }}
+      CONTINUUM_VERSION_FILE: ${{ vars.CONTINUUM_VERSION_FILE || 'Sources/NanoDictateCore/Version.swift' }}
 
     steps:
       - name: Checkout
@@ -476,7 +482,7 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x scripts/packaging-smoke/*.sh
-          VERSION="$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' "${{ vars.CONTINUUM_VERSION_FILE }}")"
+          VERSION="$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' "${{ vars.CONTINUUM_VERSION_FILE || 'Sources/NanoDictateCore/Version.swift' }}")"
           echo "Candidate version: $VERSION"
           ls -l candidate-dist/
           bash scripts/packaging-smoke/make-candidate.sh \
@@ -538,7 +544,7 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x scripts/packaging-smoke/*.sh
-          VERSION="$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' "${{ vars.CONTINUUM_VERSION_FILE }}")"
+          VERSION="$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' "${{ vars.CONTINUUM_VERSION_FILE || 'Sources/NanoDictateCore/Version.swift' }}")"
           echo "Candidate version: $VERSION"
           ls -l candidate-dist/
           bash scripts/packaging-smoke/make-candidate.sh \
