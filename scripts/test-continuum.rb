@@ -410,9 +410,9 @@ class ContinuumTest < Minitest::Test
   end
 
   # Continuum automation runs on free anonymous OpenCode models, so no core
-  # workflow may require a paid provider token. `pr-agent` is the one
-  # exception: the upstream action is wired to the paid Groq provider, so the
-  # key stays optional there and only the hard failure is forbidden.
+  # workflow may read, require, or forward a paid provider token. There is no
+  # exception: `pr-agent` cannot run without the paid Groq provider, so it must
+  # report an explicit failure instead of a silent green no-op.
   def test_core_automation_requires_no_paid_provider_key
     core = Dir[File.join(ROOT, '.github/workflows/*.yml')].sort
     refute_empty core
@@ -421,16 +421,22 @@ class ContinuumTest < Minitest::Test
       next if name.start_with?('continuum-tech-')
 
       body = File.read(path)
-      refute_includes body, 'secrets.OPENCODE_API_KEY', name
-      refute_includes body, 'secrets.ANTHROPIC_API_KEY', name
-      refute_match(/exit 1\s*\n?\s*fi\s*\n\s*\n\s*- name: Run PR-Agent/m, body, name) if name == 'pr-agent.yml'
-      if name == 'pr-agent.yml'
-        # Optional, never blocking: the gate must not fail the run and the
-        # paid step must not execute without the key.
-        refute_includes body, '::error::Missing repository Actions secret', name
-        assert_includes body, "if: steps.groq.outputs.available == 'true'", name
+      %w[
+        secrets.OPENCODE_API_KEY
+        secrets.ANTHROPIC_API_KEY
+        secrets.GROQ_API_KEY
+        GROQ.KEY
+      ].each do |needle|
+        refute_includes body, needle, "#{name}: paid provider reference #{needle}"
       end
     end
+
+    pr_agent = File.read(File.join(ROOT, '.github/workflows/pr-agent.yml'))
+    assert_includes pr_agent, 'core.setFailed',
+                    'pr-agent must fail explicitly, not skip green'
+    assert_includes pr_agent, 'paid Groq provider',
+                    'pr-agent must explain why it is disabled'
+    refute_includes pr_agent, "if: steps.groq.outputs.available == 'true'"
   end
 
   # The free default model must be the single documented fallback everywhere an
@@ -512,8 +518,21 @@ class ContinuumTest < Minitest::Test
 
     body = File.read(File.join(ROOT, '.github/workflows/opencode.yml'))
     assert_includes body, 'inputs.issue_number || github.event.issue.number'
-    # `issue` must be dispatchable, otherwise the input is unreachable.
-    assert_includes body, 'fromJSON(\'["issue","coderabbit-fix","resolve-conflict","ci-fix"]\')'
+  end
+
+  # Every mode in the dispatch whitelist must have a step that acts on it. A
+  # mode admitted to the whitelist with no step lets the job run Checkout/Install
+  # and finish SUCCESS having done zero work — a silent green no-op.
+  def test_opencode_whitelisted_modes_all_have_dispatch_steps
+    body = File.read(File.join(ROOT, '.github/workflows/opencode.yml'))
+    modes = body[/contains\(fromJSON\('\[([^\]]+)\]'\), inputs\.mode\)/, 1]
+                .scan(/"([^"]+)"/).flatten
+    refute_empty modes
+    assert_equal modes.uniq, modes, 'dispatching whitelist has duplicates'
+    modes.each do |mode|
+      assert_includes body, "inputs.mode == '#{mode}'",
+                      "mode #{mode} is whitelisted but no step branches on it"
+    end
   end
 
   # Every new knob is an additive input with a default that reproduces the
@@ -542,12 +561,87 @@ class ContinuumTest < Minitest::Test
     {
       'max_dispatch_attempts' => '',
       'dispatch_marker' => '',
-      'ci_workflow_id' => '',
-      'conflict_strategy' => 'merge'
+      'in_progress_label' => '',
+      'pause_marker' => '',
+      'ci_workflow_id' => ''
     }.each do |key, default|
       assert opencode.key?(key), "opencode missing input #{key}"
       assert_equal default, opencode.fetch(key).fetch('default'), key
       assert_equal 'string', opencode.fetch(key).fetch('type'), key
+    end
+
+    # conflict_strategy: `workflow_call` cannot declare a `choice` input, so the
+    # stub carries the enumerated list and the engine enforces it in the step.
+    strategy = opencode.fetch('conflict_strategy')
+    assert_equal 'string', strategy.fetch('type')
+    assert_equal 'merge', strategy.fetch('default')
+    stub = events(yaml(File.join(ROOT, '.github/caller-stubs/opencode.yml')))
+           .fetch('workflow_dispatch').fetch('inputs').fetch('conflict_strategy')
+    assert_equal 'choice', stub.fetch('type')
+    assert_equal %w[merge checkout], stub.fetch('options')
+
+    body = File.read(File.join(ROOT, '.github/workflows/opencode.yml'))
+    assert_match(/case "\$CONFLICT_STRATEGY" in/, body)
+    assert_includes body, "expected 'merge' or 'checkout'"
+    # The prompt must select a whole strategy block, not interpolate one verb.
+    assert_includes body, 'STRATEGY_BLOCK'
+  end
+
+  # The scheduler's label/marker knobs must drive the code, not just be parsed.
+  # Each assertion below fails if the corresponding implementation is deleted
+  # while the input remains, which is exactly the dead-parameterisation bug.
+  def test_scheduler_naming_knobs_drive_implementation
+    body = File.read(File.join(ROOT, '.github/workflows/issue-scheduler.yml'))
+
+    # post_pause_comment gates the actual comment creation.
+    assert_match(/if \(postPauseComment\)/, body)
+    assert_includes body, 'issues.createComment'
+
+    # reset_markers gates the marker deletion.
+    assert_match(/if \(resetMarkers\)/, body)
+    assert_includes body, 'issues.deleteComment'
+
+    # require_priority_label gates candidate selection.
+    assert_match(/if \(requirePriorityLabel && priority === null\)/, body)
+
+    # The scheduler env must be fed by the input with a matching fallback.
+    assert_includes body, "IN_PROGRESS_LABEL: ${{ inputs.in_progress_label || 'automation:in-progress' }}"
+    assert_includes body, "PAUSE_LABEL: ${{ inputs.pause_marker || 'automation:paused' }}"
+    assert_includes body, 'process.env.IN_PROGRESS_LABEL'
+    assert_includes body, 'process.env.PAUSE_LABEL'
+  end
+
+  # opencode.yml must consume the same naming knobs as the scheduler on the
+  # issue_comment path, where only vars are available, and must actually run the
+  # consumer's blocking CI workflow when ci_workflow_id is set.
+  def test_opencode_naming_knobs_and_ci_rerun_drive_implementation
+    body = File.read(File.join(ROOT, '.github/workflows/opencode.yml'))
+
+    assert_includes body, "DISPATCH_MARKER: ${{ inputs.dispatch_marker || vars.AUTOMATION_DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->' }}"
+    assert_includes body, "IN_PROGRESS_LABEL: ${{ inputs.in_progress_label || vars.AUTOMATION_IN_PROGRESS_LABEL || 'automation:in-progress' }}"
+    assert_includes body, "PAUSE_LABEL: ${{ inputs.pause_marker || vars.AUTOMATION_PAUSE_LABEL || 'automation:paused' }}"
+    assert_includes body, 'process.env.DISPATCH_MARKER'
+    assert_includes body, 'process.env.IN_PROGRESS_LABEL'
+    assert_includes body, 'process.env.PAUSE_LABEL'
+
+    assert_match(/gh workflow run "\$CI_WORKFLOW_ID"/, body)
+  end
+
+  # The macOS-only toolchain steps must stay guarded twice, so a non-macOS
+  # AUTOMATION_OPENCODE_RUNNER never tries to install Swift or probe sw_vers.
+  def test_opencode_macos_steps_are_guarded
+    body = File.read(File.join(ROOT, '.github/workflows/opencode.yml'))
+    assert_equal 2,
+                 body.scan(/if: startsWith\(vars\.AUTOMATION_OPENCODE_RUNNER/).size
+  end
+
+  # A `vars.X || '0'`-style default that resolved to zero would make a job or a
+  # backoff instant; no knob may be able to produce `timeout-minutes: 0`.
+  def test_no_timeout_can_be_forced_to_zero
+    Dir[File.join(ROOT, '.github/workflows/*.yml'), File.join(ROOT, '.github/caller-stubs/**/*.yml')].each do |path|
+      next if File.basename(path).start_with?('continuum-tech-')
+
+      refute_match(/timeout-minutes: 0/, File.read(path), File.basename(path))
     end
   end
 
