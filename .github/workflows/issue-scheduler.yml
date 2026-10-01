@@ -933,7 +933,7 @@ jobs:
 
               if (
                 freshIssue.state !== 'open' ||
-                freshLabels.has(pausedLabel) ||
+                (pauseOnFailure && freshLabels.has(pausedLabel)) ||
                 freshLabels.has(inProgressLabel)
               ) {
                 core.info(
