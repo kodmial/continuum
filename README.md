@@ -78,7 +78,7 @@ existing files.
 
 | Set | Installs |
 | --- | --- |
-| `core` (default) | 11 callers covering OpenCode, issue scheduling, CodeRabbit, PR Agent, and auto-merge. |
+| `core` (default) | 12 callers covering OpenCode, issue scheduling, CodeRabbit, PR Agent, and auto-merge. |
 | `tech` | 5 callers in the opt-in technology library: CI, release, release PR, release-automation merge, and packaging smoke. |
 | `parent` | 4 callers: `continuum-child-dispatcher.yml`, `continuum-child-worker.yml`, `continuum-child-review.yml`, `continuum-child-pr-review.yml`. |
 
@@ -136,6 +136,7 @@ Workflow names are identical to the reusable file names unless noted.
 | `opencode.yml` | OpenCode agent (`name: OpenCode agent`). | `mode`, `pr_number`, `head_ref`, `review_id`, `run_id` |
 | `opencode-repair.yml` | OpenCode repair controller. | — |
 | `opencode-unresolved.yml` | Retry OpenCode on unresolved CodeRabbit findings. | — |
+| `continuum-opencode-watchdog.yml` | Recover a failed issue implementation run (`name: OpenCode watchdog`). | `watched_workflow`, `max_recovery_retries`, `retry_marker`, `in_progress_label`, `pause_marker`, `dispatch_marker`, `timeout_minutes` |
 | `issue-scheduler.yml` | Scheduled issue dispatch. | — |
 | `auto-merge.yml` | Auto-merge reviewed pull requests. | — |
 | `pr-agent.yml` | Manual PR Agent (Groq). | — |

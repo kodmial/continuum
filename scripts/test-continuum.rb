@@ -102,7 +102,13 @@ class ContinuumTest < Minitest::Test
   # project-owned and stop Continuum's dispatchers from finding it.
   def assert_core_install_names(dir)
     installed = Dir[File.join(dir, '.github/workflows/*.yml')].map { |file| File.basename(file) }.sort
-    expected = CORE_STUBS.map { |path| "continuum-#{File.basename(path, '.yml')}.yml" }.sort
+    # Mirrors install.sh: an already `continuum-`-prefixed stub (the
+    # `continuum-opencode-watchdog` one) keeps its name, every other core stub
+    # gains the prefix.
+    expected = CORE_STUBS.map { |path|
+      base = File.basename(path)
+      base.start_with?('continuum-') ? base : "continuum-#{base}"
+    }.sort
     assert_equal expected, installed
     installed.each do |name|
       assert name.start_with?('continuum-'), name
@@ -202,9 +208,10 @@ class ContinuumTest < Minitest::Test
   # Continuum ships two layers and the split is machine-checkable through the
   # file name:
   #
-  #   1. core   — `continuum-<name>.yml`, exactly two dash-separated segments
-  #               after the prefix, e.g. `continuum-auto-merge.yml`. Installed
-  #               by the default `core` set; every project needs these.
+  #   1. core   — `continuum-<name>.yml`, at least two dash-separated segments
+  #               and never a `continuum-tech-…` name, e.g.
+  #               `continuum-auto-merge.yml` or `continuum-opencode-watchdog.yml`.
+  #               Installed by the default `core` set; every project needs these.
   #   2. tech   — `continuum-tech-<tech>-<name>.yml`, marked by the
   #               `continuum-tech-<tech>-` prefix, e.g.
   #               `continuum-tech-swift-release.yml`. Installed only by the
@@ -223,12 +230,15 @@ class ContinuumTest < Minitest::Test
       category =
         if covered.include?(base)
           :historical_unprefixed_core
-        elsif base.start_with?('continuum-') && segments.size == 2
-          :core
         elsif tech_name?(base)
           :tech
+        # A core name may itself be multi-word (`continuum-opencode-watchdog`),
+        # so the split counts on the `continuum-tech-<tech>-` marker rather
+        # than on a segment count.
+        elsif base.start_with?('continuum-') && segments.size >= 2
+          :core
         else
-          flunk "#{base}: neither a core file (continuum-<name>.yml, two segments), " \
+          flunk "#{base}: neither a core file (continuum-<name>.yml, `continuum-` prefixed), " \
                 'a tech file (continuum-tech-<tech>-<name>.yml, continuum-tech-<tech>- prefix), ' \
                 'nor a listed historical unprefixed core name'
         end
@@ -307,7 +317,7 @@ class ContinuumTest < Minitest::Test
   # `parent` the child-execution stubs in `.github/caller-stubs/parent/`.
   # The tech count is derived from the stub set, so a second technology does
   # not need a test edit and a dropped stub still fails.
-  CORE_COUNT = 11
+  CORE_COUNT = 12
   TECH_COUNT = TECH_STUBS.size
   PARENT_COUNT = 4
 
@@ -811,4 +821,150 @@ class ContinuumTest < Minitest::Test
     end
   end
 
-end
+  # ---------------------------------------------------------------- watchdog
+
+  WATCHDOG = 'continuum-opencode-watchdog.yml'
+
+  def watchdog_stub
+    yaml(File.join(ROOT, '.github/caller-stubs', WATCHDOG))
+  end
+
+  def watchdog_body
+    File.read(File.join(ROOT, '.github/workflows', WATCHDOG))
+  end
+
+  # The `workflow_run` filter matches a workflow's `name:` VALUE, never a file
+  # name. Asserting the literal string "OpenCode agent" would pass even if the
+  # OpenCode caller's `name:` were renamed, which is exactly the silent
+  # breakage this guards: the filter is checked against the installed OpenCode
+  # caller's own `name:`.
+  def test_watchdog_trigger_tracks_the_watched_workflows_name
+    opencode = yaml(File.join(ROOT, '.github/caller-stubs/opencode.yml'))
+    watched = events(watchdog_stub).fetch('workflow_run').fetch('workflows')
+    assert_equal [opencode.fetch('name')], watched,
+                 'watchdog must watch the OpenCode caller by its `name:` value'
+    assert_equal opencode.fetch('name'),
+                 yaml(File.join(ROOT, '.github/workflows/opencode.yml')).fetch('name'),
+                 'caller and callee `name:` must stay in lockstep for the workflow_run filter'
+
+    # The engine must be told the same name, or its duplicate-run check would
+    # never recognise a sibling OpenCode run and would fire a second retry.
+    inputs = events(yaml(File.join(ROOT, '.github/workflows', WATCHDOG)))
+             .fetch('workflow_call').fetch('inputs')
+    assert_equal opencode.fetch('name'), watchdog_stub.fetch('jobs').fetch('call').fetch('with').fetch('watched_workflow')
+    assert_equal '', inputs.fetch('watched_workflow').fetch('default')
+
+    body = watchdog_body
+    assert_match(/WATCHED_WORKFLOW: \$\{\{ inputs\.watched_workflow \}\}/, body)
+    assert_match(/candidate\.name === watchedWorkflow/, body,
+                 'the engine must use the configured workflow name to detect a retry already in flight')
+
+    # The rename hazard is documented where a future editor will hit it.
+    assert_match(/Renaming that `name:` silently disables this/, File.read(File.join(ROOT, '.github/caller-stubs', WATCHDOG)))
+  end
+
+  # The stub's permissions must cover the recovery job's writes.
+  def test_watchdog_stub_grants_the_recovery_permissions
+    rank = {'none'=>0, 'read'=>1, 'write'=>2}
+    required = yaml(File.join(ROOT, '.github/workflows', WATCHDOG)).fetch('jobs').fetch('recover').fetch('permissions')
+    granted = watchdog_stub.fetch('permissions')
+    required.each do |key, value|
+      assert_operator rank.fetch(granted.fetch(key, 'none')), :>=, rank.fetch(value), key
+    end
+  end
+
+  # Every knob that used to be hardcoded in kodmai's full fork must be a
+  # `workflow_call` input with a `vars.` fallback carrying the fork's own
+  # default, so a consumer with empty repository variables still behaves.
+  def test_watchdog_knobs_are_inputs_with_fork_default_fallbacks
+    body = watchdog_body
+    {
+      'max_recovery_retries' => "MAX_RECOVERY_RETRIES: ${{ inputs.max_recovery_retries || vars.AUTOMATION_WATCHDOG_MAX_RETRIES || '1' }}",
+      'retry_marker'         => "RETRY_MARKER: ${{ inputs.retry_marker || vars.AUTOMATION_WATCHDOG_RETRY_MARKER || '<!-- opencode-watchdog-retry -->' }}",
+      'in_progress_label'    => "IN_PROGRESS_LABEL: ${{ inputs.in_progress_label || vars.AUTOMATION_IN_PROGRESS_LABEL || 'automation:in-progress' }}",
+      'pause_marker'         => "PAUSE_LABEL: ${{ inputs.pause_marker || vars.AUTOMATION_PAUSE_LABEL || 'automation:paused' }}",
+      'dispatch_marker'      => "DISPATCH_MARKER: ${{ inputs.dispatch_marker || vars.AUTOMATION_DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->' }}",
+      'timeout_minutes'      => "fromJSON(inputs.timeout_minutes || vars.AUTOMATION_WATCHDOG_TIMEOUT_MINUTES || '5')"
+    }.each do |input, env_line|
+      assert_includes body, env_line, "#{input}: env mapping missing"
+      definition = events(yaml(File.join(ROOT, '.github/workflows', WATCHDOG)))
+                   .fetch('workflow_call').fetch('inputs').fetch(input)
+      assert_equal '', definition.fetch('default'), "#{input} must default to empty so vars can supply it"
+      assert_equal false, definition.fetch('required')
+      assert_equal 'string', definition.fetch('type')
+    end
+
+    # The label/marker knobs must reach the code that acts on them, not only be
+    # declared: a consumer setting AUTOMATION_PAUSE_LABEL to something else
+    # would otherwise be paused under a label nothing ever reads.
+    assert_match(/const pausedLabel = process\.env\.PAUSE_LABEL \|\| 'automation:paused'/, body)
+    assert_match(/const inProgressLabel = process\.env\.IN_PROGRESS_LABEL \|\| 'automation:in-progress'/, body)
+    assert_match(/const retryMarker = process\.env\.RETRY_MARKER/, body)
+    assert_match(/const dispatchMarker = process\.env\.DISPATCH_MARKER/, body)
+    assert_match(/Number\.parseInt\(\s*process\.env\.MAX_RECOVERY_RETRIES \|\| '1',/, body)
+
+    # The scheduler's own knobs must resolve to the same values, or the watchdog
+    # would unpause/reserve against a label the scheduler never checks.
+    scheduler = File.read(File.join(ROOT, '.github/workflows/opencode.yml'))
+    assert_includes scheduler, "IN_PROGRESS_LABEL: ${{ inputs.in_progress_label || vars.AUTOMATION_IN_PROGRESS_LABEL || 'automation:in-progress' }}"
+    assert_includes scheduler, "PAUSE_LABEL: ${{ inputs.pause_marker || vars.AUTOMATION_PAUSE_LABEL || 'automation:paused' }}"
+  end
+
+  # The reason the watchdog exists: `opencode.yml`'s recovery only fires on a
+  # scheduler dispatch comment, so a manual `/oc` run has no recovery path.
+  # Asserting the retry body protects that path from silently becoming a no-op.
+  def test_watchdog_recovery_body_dispatches_the_retry_comment
+    body = watchdog_body
+    # The reserve-then-retry sequence, ending at the real recovery comment.
+    retry_comment = body[/await removeLabel\(pausedLabel\);.*\z/m]
+    refute_nil retry_comment, 'the recovery dispatch step is gone'
+    assert_match(/github\.rest\.issues\.createComment\(\{/, retry_comment)
+    assert_includes retry_comment, "'/oc',"
+    assert_includes retry_comment, 'retryMarker,'
+    assert_match(/Automatic recovery retry/, retry_comment)
+    # The retry must be reservation-aware, not a bare comment.
+    assert_match(/await removeLabel\(pausedLabel\);/, retry_comment)
+    assert_match(/await addLabel\(inProgressLabel\);/, retry_comment)
+
+    # A PAT, not GITHUB_TOKEN: only a PAT fans the comment out into the
+    # OpenCode caller's own `issue_comment` trigger.
+    assert_includes body, 'github-token: ${{ secrets.TAP_PAT }}'
+
+    # The engine must actually parse the run title it is handed, and must have a
+    # fallback for consumers whose OpenCode caller sets no `run-name:` (Continuum's
+    # own opencode.yml does not, so `display_title` is the issue title there).
+    assert_match(%r{\(run\.display_title \|\| ''\)\.match\(\s*/\^OpenCode issue #\(\\d\+\)\$/\s*\)}, body,
+                 'the engine must parse the numbered run title')
+    assert_includes body, "run.event === 'issue_comment'"
+    assert_includes body, 'item.title === run.display_title'
+    assert_includes body, 'if (titleMatches.length === 1)'
+
+    # Exhausting the budget must pause, not loop forever.
+    assert_match(/if \(previousRetries >= maxRetries\) \{/, body)
+    assert_includes body, 'await addLabel(pausedLabel);'
+    assert_includes body, "'Remove the `' + pausedLabel + '` label and post `/oc` to retry manually.'"
+
+    # Everything that makes a retry unsafe must be an early return.
+    %w[
+      issue.state !== 'open'
+      issueLabels.has(pausedLabel)
+      declaredOpenBlockers.length > 0
+      openBlockers.length > 0
+      if (issuePr) {
+      if (anotherActiveRun) {
+      if (newerSchedulerDispatch) {
+    ].each do |guard|
+      assert_includes body, guard
+    end
+    assert_includes body, "retryableConclusions.has(run.conclusion)"
+    assert_equal %w[action_required failure stale startup_failure timed_out],
+                 body[/const retryableConclusions = new Set\(\[(.*?)\]\);/m, 1].scan(/'(\w+)'/).flatten.sort
+  end
+
+  # The watchdog core file must never contain a runner-pinned condition: core
+  # is capability-only.
+  def test_watchdog_has_no_runner_pinned_guard
+    refute_match(/if: startsWith\(runner/, watchdog_body)
+  end
+
+  end

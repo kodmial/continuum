@@ -1,0 +1,495 @@
+name: OpenCode watchdog
+
+on:
+  workflow_call:
+    inputs:
+      continuum_ref:
+        description: Continuum revision supplying fallback scripts
+        type: string
+        default: main
+        required: false
+      timeout_minutes:
+        description: >-
+          Job timeout for the recovery. Empty falls back to
+          AUTOMATION_WATCHDOG_TIMEOUT_MINUTES.
+        required: false
+        type: string
+        default: ''
+      watched_workflow:
+        description: >-
+          `name:` of the workflow whose completed runs this watchdog recovers.
+          It must match the `name:` of the consumer's OpenCode caller, because
+          GitHub's `workflow_run.workflows` filter matches on the workflow
+          `name:` and never on a file name. The caller stub hardcodes the same
+          value in its own `workflow_run:` block; this input only lets the
+          engine recognise sibling runs of that workflow when it decides
+          whether a retry is already in flight.
+        required: false
+        type: string
+        default: ''
+      max_recovery_retries:
+        description: >-
+          Automatic recovery retries before the issue is paused. Empty falls
+          back to AUTOMATION_WATCHDOG_MAX_RETRIES.
+        required: false
+        type: string
+        default: ''
+      retry_marker:
+        description: >-
+          Hidden HTML marker counted to decide how many recovery retries an
+          issue already consumed. Empty falls back to
+          AUTOMATION_WATCHDOG_RETRY_MARKER.
+        required: false
+        type: string
+        default: ''
+      in_progress_label:
+        description: >-
+          Label holding an automation reservation. Empty falls back to
+          AUTOMATION_IN_PROGRESS_LABEL. Must match the scheduler's
+          in_progress_label.
+        required: false
+        type: string
+        default: ''
+      pause_marker:
+        description: >-
+          Label that pauses automation. Empty falls back to
+          AUTOMATION_PAUSE_LABEL. Must match the scheduler's pause_marker.
+        required: false
+        type: string
+        default: ''
+      dispatch_marker:
+        description: >-
+          Hidden HTML marker the scheduler writes into its dispatch comments.
+          Empty falls back to AUTOMATION_DISPATCH_MARKER. The watchdog uses it
+          to detect that a *newer* automated attempt already owns the issue, in
+          which case it stands down instead of racing that attempt.
+        required: false
+        type: string
+        default: ''
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-opencode-watchdog-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    # Capability-only: recovery is pure issue/label/comment bookkeeping, so it
+    # runs anywhere. This job never checks out or executes issue code.
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || vars.AUTOMATION_WATCHDOG_TIMEOUT_MINUTES || '5') }}
+
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+      pull-requests: read
+
+    env:
+      WATCHED_WORKFLOW: ${{ inputs.watched_workflow }}
+      MAX_RECOVERY_RETRIES: ${{ inputs.max_recovery_retries || vars.AUTOMATION_WATCHDOG_MAX_RETRIES || '1' }}
+      RETRY_MARKER: ${{ inputs.retry_marker || vars.AUTOMATION_WATCHDOG_RETRY_MARKER || '<!-- opencode-watchdog-retry -->' }}
+      IN_PROGRESS_LABEL: ${{ inputs.in_progress_label || vars.AUTOMATION_IN_PROGRESS_LABEL || 'automation:in-progress' }}
+      PAUSE_LABEL: ${{ inputs.pause_marker || vars.AUTOMATION_PAUSE_LABEL || 'automation:paused' }}
+      DISPATCH_MARKER: ${{ inputs.dispatch_marker || vars.AUTOMATION_DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->' }}
+
+    steps:
+      - name: Recover failed OpenCode issue run
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          # TAP_PAT is intentional: the recovery writes labels and comments,
+          # and only a PAT (not GITHUB_TOKEN) reliably fans those writes out
+          # into the scheduler's and OpenCode's own event triggers.
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const run = context.payload.workflow_run;
+            const repoFullName = owner + '/' + repo;
+            const watchedWorkflow = process.env.WATCHED_WORKFLOW || '';
+            const retryMarker = process.env.RETRY_MARKER || '<!-- opencode-watchdog-retry -->';
+            const inProgressLabel = process.env.IN_PROGRESS_LABEL || 'automation:in-progress';
+            const pausedLabel = process.env.PAUSE_LABEL || 'automation:paused';
+            const dispatchMarker = process.env.DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->';
+
+            let issueNumber = null;
+            // Consumers that give their OpenCode caller a `run-name` of
+            // `OpenCode issue #<n>` get an exact, unambiguous issue number here.
+            const numberedRun = (run.display_title || '').match(
+              /^OpenCode issue #(\d+)$/
+            );
+            if (numberedRun) {
+              issueNumber = Number(numberedRun[1]);
+            } else if (run.event === 'issue_comment') {
+              // Without a `run-name`, GitHub uses the issue title as
+              // display_title. Only accept an exact, unique open-issue match so
+              // an unrelated run can never be mapped onto an issue.
+              const openIssues = await github.paginate(
+                github.rest.issues.listForRepo,
+                {
+                  owner,
+                  repo,
+                  state: 'open',
+                  per_page: 100,
+                }
+              );
+              const titleMatches = openIssues.filter(item =>
+                !item.pull_request &&
+                item.title === run.display_title
+              );
+              if (titleMatches.length === 1) {
+                issueNumber = titleMatches[0].number;
+                core.notice(
+                  'Mapped legacy OpenCode run ' + run.id + ' to issue #' +
+                  issueNumber + ' by exact title.'
+                );
+              }
+            }
+
+            if (issueNumber === null) {
+              core.info(
+                'Run is not an identifiable issue implementation run; watchdog does nothing.'
+              );
+              return;
+            }
+            const retryableConclusions = new Set([
+              'failure',
+              'timed_out',
+              'startup_failure',
+              'action_required',
+              'stale',
+            ]);
+
+            const issueResponse = await github.rest.issues.get({
+              owner,
+              repo,
+              issue_number: issueNumber,
+            });
+            const issue = issueResponse.data;
+
+            if (issue.state !== 'open') {
+              core.info('Issue #' + issueNumber + ' is already closed.');
+              return;
+            }
+
+            const issueLabels = new Set(
+              (issue.labels || []).map(label =>
+                typeof label === 'string' ? label : label.name
+              )
+            );
+
+            // Explicit pause always wins over automatic recovery.
+            if (issueLabels.has(pausedLabel)) {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                  name: inProgressLabel,
+                });
+              } catch (err) {
+                if (err.status !== 404) throw err;
+              }
+              core.notice(
+                'Issue #' + issueNumber +
+                ' is ' + pausedLabel + '; watchdog will not retry it.'
+              );
+              return;
+            }
+
+            const declaredDependencyMatch = (issue.body || '').match(
+              /<!--\s*automation-blocked-by:\s*([0-9#\s,]+?)\s*-->/i
+            );
+            const declaredDependencyNumbers = declaredDependencyMatch
+              ? [...new Set(
+                  [...declaredDependencyMatch[1].matchAll(/\d+/g)]
+                    .map(item => Number.parseInt(item[0], 10))
+                    .filter(Number.isInteger)
+                )]
+              : [];
+            const declaredOpenBlockers = [];
+            for (const blockerNumber of declaredDependencyNumbers) {
+              if (blockerNumber === issueNumber) continue;
+              const blocker = await github.rest.issues.get({
+                owner,
+                repo,
+                issue_number: blockerNumber,
+              });
+              if (blocker.data.state === 'open') declaredOpenBlockers.push(blocker.data);
+            }
+            if (declaredOpenBlockers.length > 0) {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                  name: inProgressLabel,
+                });
+              } catch (err) {
+                if (err.status !== 404) throw err;
+              }
+              core.notice(
+                'Issue #' + issueNumber + ' is declared blocked by ' +
+                declaredOpenBlockers.map(blocker => '#' + blocker.number).join(', ') +
+                '; watchdog will not retry it.'
+              );
+              return;
+            }
+
+            // Native GitHub issue dependencies are authoritative. A cancelled
+            // or failed run for an issue that is currently blocked must not be
+            // resurrected by the watchdog before its blockers are completed.
+            const blockers = await github.paginate(
+              'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
+              {
+                owner,
+                repo,
+                issue_number: issueNumber,
+                per_page: 100,
+                headers: {
+                  'X-GitHub-Api-Version': '2026-03-10',
+                },
+              }
+            );
+            const openBlockers = blockers.filter(
+              blocker => blocker.state === 'open'
+            );
+            if (openBlockers.length > 0) {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                  name: inProgressLabel,
+                });
+              } catch (err) {
+                if (err.status !== 404) throw err;
+              }
+              core.notice(
+                'Issue #' + issueNumber + ' is blocked by ' +
+                openBlockers.map(blocker => '#' + blocker.number).join(', ') +
+                '; watchdog will not retry it.'
+              );
+              return;
+            }
+
+            const failedRun = retryableConclusions.has(run.conclusion);
+            const successfulRunWithoutPr = run.conclusion === 'success';
+
+            if (!failedRun && !successfulRunWithoutPr) {
+              core.info(
+                'Issue #' + issueNumber + ' run completed with conclusion=' +
+                run.conclusion + '; watchdog does not retry this conclusion.'
+              );
+              return;
+            }
+
+            // If OpenCode managed to create a PR before the workflow failed,
+            // that PR is authoritative. Do not start another implementation.
+            const pulls = await github.paginate(github.rest.pulls.list, {
+              owner,
+              repo,
+              state: 'open',
+              per_page: 100,
+            });
+
+            const issuePr = pulls.find(pr =>
+              pr.head?.repo?.full_name === repoFullName &&
+              (pr.head.ref || '').startsWith('opencode/issue' + issueNumber + '-')
+            );
+
+            if (issuePr) {
+              core.notice(
+                'Issue #' + issueNumber + ' already has open PR #' +
+                issuePr.number + '; watchdog will not retry.'
+              );
+              return;
+            }
+
+            // A manually queued/restarted run may already exist. Never add a
+            // second retry when another run for the same issue is active.
+            const runs = await github.paginate(
+              github.rest.actions.listWorkflowRunsForRepo,
+              {
+                owner,
+                repo,
+                per_page: 100,
+              }
+            );
+
+            const sameTitle = 'OpenCode issue #' + issueNumber;
+            const legacyTitle = issue.title;
+            const anotherActiveRun = runs.find(candidate => {
+              // `run.path` is the workflow that produced this run, and the
+              // watched workflow's `name:` is the same identity GitHub's
+              // `workflow_run` filter uses. Matching on either keeps this
+              // correct for a consumer that renamed the file but not the
+              // workflow, and vice versa.
+              const sameWorkflow =
+                candidate.path === run.path ||
+                (watchedWorkflow !== '' && candidate.name === watchedWorkflow);
+
+              return (
+                candidate.id !== run.id &&
+                sameWorkflow &&
+                candidate.status !== 'completed' &&
+                (
+                  candidate.display_title === sameTitle ||
+                  (
+                    candidate.event === 'issue_comment' &&
+                    candidate.display_title === legacyTitle
+                  )
+                )
+              );
+            });
+
+            if (anotherActiveRun) {
+              core.notice(
+                'Issue #' + issueNumber + ' already has active OpenCode run ' +
+                anotherActiveRun.id + ' (' + anotherActiveRun.status +
+                '); watchdog will not duplicate it.'
+              );
+              return;
+            }
+
+            const comments = await github.paginate(
+              github.rest.issues.listComments,
+              {
+                owner,
+                repo,
+                issue_number: issueNumber,
+                per_page: 100,
+              }
+            );
+
+            const previousRetries = comments.filter(comment =>
+              (comment.body || '').includes(retryMarker)
+            ).length;
+
+            // A scheduler dispatch comment newer than this run means a *newer*
+            // automated attempt already owns the issue. Retrying here would race
+            // it, so the watchdog stands down and lets the newer attempt win.
+            // Manual `/oc` runs, which carry no dispatch marker at all, are
+            // exactly the runs this watchdog exists to recover.
+            const runStartedAt =
+              new Date(run.run_started_at || run.created_at || 0).getTime();
+            const newerSchedulerDispatch = comments.find(comment =>
+              (comment.body || '').includes(dispatchMarker) &&
+              new Date(comment.created_at || 0).getTime() > runStartedAt
+            );
+            if (newerSchedulerDispatch) {
+              core.notice(
+                'Issue #' + issueNumber +
+                ' has a newer scheduler dispatch (comment ' +
+                newerSchedulerDispatch.id +
+                '); watchdog will not race it.'
+              );
+              return;
+            }
+
+            const maxRetries = Number.parseInt(
+              process.env.MAX_RECOVERY_RETRIES || '1',
+              10
+            );
+            if (!Number.isInteger(maxRetries) || maxRetries < 0) {
+              throw new Error(
+                'Invalid MAX_RECOVERY_RETRIES: ' +
+                process.env.MAX_RECOVERY_RETRIES
+              );
+            }
+
+            async function ensureLabel(name, color, description) {
+              try {
+                await github.rest.issues.createLabel({
+                  owner,
+                  repo,
+                  name,
+                  color,
+                  description,
+                });
+              } catch (err) {
+                if (err.status !== 422) throw err;
+              }
+            }
+
+            async function addLabel(name) {
+              await github.rest.issues.addLabels({
+                owner,
+                repo,
+                issue_number: issueNumber,
+                labels: [name],
+              });
+            }
+
+            async function removeLabel(name) {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                  name,
+                });
+              } catch (err) {
+                if (err.status !== 404) throw err;
+              }
+            }
+
+            await ensureLabel(
+              inProgressLabel,
+              '5319E7',
+              'Actively reserved or implemented by the automatic issue scheduler.'
+            );
+            await ensureLabel(
+              pausedLabel,
+              'BFDADC',
+              'Automation is paused after a failed/stopped implementation; remove to retry.'
+            );
+
+            if (previousRetries >= maxRetries) {
+              await removeLabel(inProgressLabel);
+              await addLabel(pausedLabel);
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: issueNumber,
+                body: [
+                  'OpenCode automation paused after ' + previousRetries +
+                    ' automatic recovery retries.',
+                  '',
+                  'Last run: ' + run.html_url,
+                  'Conclusion: ' + run.conclusion,
+                  '',
+                  'Remove the `' + pausedLabel + '` label and post `/oc` to retry manually.',
+                ].join('\n'),
+              });
+              core.warning(
+                'Issue #' + issueNumber + ' exhausted automatic OpenCode recovery.'
+              );
+              return;
+            }
+
+            await removeLabel(pausedLabel);
+            await addLabel(inProgressLabel);
+
+            // The actual recovery: a fresh `/oc` comment, which the consumer's
+            // OpenCode caller admits on an owner-authored issue comment.
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number: issueNumber,
+              body: [
+                '/oc',
+                '',
+                retryMarker,
+                'Automatic recovery retry ' + (previousRetries + 1) +
+                  '/' + maxRetries + ' after OpenCode run ' + run.id +
+                  ' ended with ' + run.conclusion +
+                  (run.conclusion === 'success' ? ' but produced no PR.' : '.') ,
+              ].join('\n'),
+            });
+
+            core.notice(
+              'Immediately retried issue #' + issueNumber +
+              ' after failed OpenCode run ' + run.id + '.'
+            );

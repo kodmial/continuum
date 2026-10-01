@@ -31,6 +31,7 @@ STUBS=(
   opencode-repair.yml
   opencode-unresolved.yml
   opencode.yml
+  continuum-opencode-watchdog.yml
   pr-agent.yml
   remove-review-label.yml
 )
