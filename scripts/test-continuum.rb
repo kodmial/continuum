@@ -30,10 +30,14 @@ class ContinuumTest < Minitest::Test
   # this repository's own flat filenames and is not renamed on installation.
   def referenced_workflow_paths(workflow, path)
     File.readlines(path).each_with_index.each_with_object([]) do |(line, index), found|
-      next unless line.include?('.github/workflows/') || line.include?("workflow_id: '")
+      next unless line.match?(%r{\.github/workflows/|workflow_id: '|\w+_workflow:})
       next if line.include?('kodmial/continuum/')
       names = line.scan(%r{\.github/workflows/([A-Za-z0-9._/-]+\.yml)}).flatten +
-              line.scan(/workflow_id: '([A-Za-z0-9._-]+\.yml)'/).flatten
+              line.scan(/workflow_id: '([A-Za-z0-9._-]+\.yml)'/).flatten +
+              # `<name>_workflow: <file>.yml` — a bare filename handed to
+              # `gh workflow run`, which resolves by path, not by `name:`.
+              # An interpolated value is not a sibling reference.
+              line.scan(/(?:\w+_workflow|WORKER_WORKFLOW|REVIEW_WORKFLOW|MANUAL_PR_REVIEW_WORKFLOW):\s*'?([A-Za-z0-9._-]+\.yml)'?(?!\s*\$)/).flatten
       unprefixed = names.reject { |name| name.start_with?('continuum-') }
       found << "#{File.basename(path)}:#{index + 1} #{unprefixed.join(', ')}" unless unprefixed.empty?
     end

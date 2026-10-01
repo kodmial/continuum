@@ -135,8 +135,9 @@ bash install.sh /path/to/parent main parent
 
 For production, replace `main` with a tested full Continuum commit SHA. Both
 `uses:` and `engine_ref` are set to that revision. The parent profile installs
-only `child-dispatcher.yml`, `child-worker.yml`, `child-review.yml`, and
-`child-pr-review.yml`. It preserves existing CI, issue scheduling, OpenCode,
+only `continuum-child-dispatcher.yml`, `continuum-child-worker.yml`,
+`continuum-child-review.yml`, and `continuum-child-pr-review.yml`. It preserves
+existing CI, issue scheduling, OpenCode,
 release, Render, and artifact workflows. The token is supplied through the
 parent's existing `TAP_PAT` secret; it must be able to read the relevant Actions
 repository variables and operate on the selected child repositories.
@@ -149,7 +150,7 @@ parent profile does not set variables or enroll repositories automatically.
 
 The parent dispatcher wakes on main pushes, every ten minutes, manual dispatch,
 and completion of child task/review workflows. A repository's own scheduler can
-also dispatch `child-dispatcher.yml`; Runtime Lab already does this. Task
+also dispatch `continuum-child-dispatcher.yml`; Runtime Lab already does this. Task
 execution and independent review remain separate; completed tasks are not
 resurrected, dependency-blocked tasks stay blocked, and owner-created PRs use
 the independent PR review workflow.
