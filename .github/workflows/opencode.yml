@@ -628,8 +628,32 @@ jobs:
           gh workflow run "$CI_WORKFLOW_ID" --ref "$HEAD_REF" \
             || echo "::warning::Could not dispatch $CI_WORKFLOW_ID for $HEAD_REF"
 
-      - name: Clear workflow-repair lock
-        if: always() && github.event_name == 'workflow_dispatch' && inputs.mode == 'ci-fix'
+      - name: Clear conflict-repair lock
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.mode == 'resolve-conflict'
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          gh api --method DELETE \
+            "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/labels/opencode-conflict-repair" \
+            >/dev/null 2>&1 || true
+
+  cleanup-workflow-repair-lock:
+    name: Release workflow-repair lock
+    needs: opencode
+    if: >-
+      always() &&
+      github.event_name == 'workflow_dispatch' &&
+      inputs.mode == 'ci-fix'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    permissions:
+      actions: read
+      issues: write
+
+    steps:
+      - name: Release repair lock even after OpenCode timeout or cancellation
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ inputs.pr_number }}
@@ -650,17 +674,7 @@ jobs:
           gh api --method DELETE \
             "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/labels/${lock_label}" \
             >/dev/null 2>&1 || true
-          echo "Cleared workflow-repair lock '$lock_label' for PR #$PR_NUMBER."
-
-      - name: Clear conflict-repair lock
-        if: always() && github.event_name == 'workflow_dispatch' && inputs.mode == 'resolve-conflict'
-        env:
-          GH_TOKEN: ${{ secrets.TAP_PAT }}
-          PR_NUMBER: ${{ inputs.pr_number }}
-        run: |
-          gh api --method DELETE \
-            "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/labels/opencode-conflict-repair" \
-            >/dev/null 2>&1 || true
+          echo "Released workflow-repair lock '$lock_label' for PR #$PR_NUMBER."
 
   recover-scheduled-issue:
     name: Recover failed scheduled issue dispatch
