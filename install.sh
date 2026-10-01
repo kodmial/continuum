@@ -2,14 +2,15 @@
 set -euo pipefail
 # Install Continuum reusable workflows into a consumer repo (one command).
 # Usage: curl -fsSL https://raw.githubusercontent.com/kodmial/continuum/main/install.sh | bash
-#    or: curl -fsSL https://raw.githubusercontent.com/kodmial/continuum/main/install.sh | bash -s -- [path] [ref] [nanodictate|parent]
-#    or: bash continuum/install.sh [path-to-consumer-repo] [ref] [nanodictate|parent]
-# ref defaults to main.
+#    or: curl -fsSL https://raw.githubusercontent.com/kodmial/continuum/main/install.sh | bash -s -- [path] [ref] [swift|parent]
+#    or: bash continuum/install.sh [path-to-consumer-repo] [ref] [swift|parent]
+# ref defaults to main. `swift` is the technology profile; `nanodictate` is kept
+# as a backwards-compatible alias for it.
 DEST="${1:-.}"
 REF="${2:-main}"
-PROFILE="${3:-nanodictate}"
+PROFILE="${3:-swift}"
 case "$PROFILE" in
-  nanodictate|parent) ;;
+  swift|nanodictate|parent) ;;
   *) echo "invalid profile: $PROFILE" >&2; exit 1 ;;
 esac
 [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "invalid ref: $REF" >&2; exit 1; }

@@ -41,9 +41,13 @@ smoke_fail() {
   exit 1
 }
 
-# Extract the version from Sources/NanoDictateCore/Version.swift.
+# Source file that carries the release version. Technology-oriented default;
+# a consumer overrides it with the CONTINUUM_VERSION_FILE repository variable.
+CONTINUUM_VERSION_FILE="${CONTINUUM_VERSION_FILE:-Sources/NanoDictateCore/Version.swift}"
+
+# Extract the version from the consumer's version source file.
 smoke_repo_version() {
-  grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' Sources/NanoDictateCore/Version.swift
+  grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' "$CONTINUUM_VERSION_FILE"
 }
 
 # Assert that `nanodictate --version` exits 0 and carries $1 as a whole token.

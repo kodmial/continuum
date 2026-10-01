@@ -1,14 +1,93 @@
-# OpenCode project instructions
+# Continuum project instructions
 
-- Treat the GitHub issue or pull request request as the task specification. Complete all applicable acceptance criteria and keep changes scoped to that task; do not introduce unrelated refactors.
-- Continue through implementation and relevant verification until the task is complete. If a required check cannot run in the available execution environment, report the exact limitation instead of substituting an unrelated check or claiming success.
-- The invoking workflow owns the Git lifecycle. Do not create or switch branches or open another pull request unless explicitly instructed. When a repair task explicitly requires commit/push, update only the current PR branch.
-- GitHub Actions runs are headless. Never request interactive approval or wait for user input.
-- Use `CONTRIBUTING.md` as the source of truth for project build, test, and release mechanics. Before completing any task that changes production code, run `swift build` and `swift run NanoDictateCoreTests`; do not use `swift test`. If either check fails, fix the cause and rerun the checks until they pass. Do not claim successful completion without passing checks. If a required check cannot run in the available environment, report the exact limitation instead of claiming success.
-- New or changed behavior must include focused automated tests. Do not weaken or remove existing tests or coverage checks merely to make validation pass. CI is the source of truth for the minimum coverage threshold.
-- Ordinary feature and fix tasks must not bump `Sources/NanoDictateCore/Version.swift` or `.release-please-manifest.json`; release automation owns version changes unless the task explicitly concerns release machinery.
-- When a change depends on current provider, API, platform, or tooling behavior, verify the relevant current upstream documentation rather than relying on remembered behavior.
-- For signing, deployment, TCC, Accessibility, or microphone-specific workflow rules, consult the relevant project documentation only when the task touches those areas.
-- Keep agent-created temporary files and test fixtures inside the repository worktree. If temporary storage is needed, use `.opencode-tmp/`, remove it before finishing, and never commit it. Do not use `/tmp`, `/var/tmp`, the runner home directory, or other paths outside the worktree.
-- If a command is blocked because it would access an external directory, rewrite it to operate entirely inside the repository and continue; do not retry the blocked path.
-- All code comments, commit messages, pull-request text, and agent-authored repository documentation must be in English unless the task explicitly requires another language.
+Continuum is a reusable GitHub Actions control plane, not an application. It ships
+`workflow_call` workflows under `.github/workflows/`, thin caller templates under
+`.github/caller-stubs/`, an installer (`install.sh`), and a dependency-free Python
+engine under `src/continuum/` and `.github/scripts/`. Consumers install the thin
+callers; they never copy engine code into their repository.
+
+## Source of truth
+
+`CONTRIBUTING.md` owns build, test, and release mechanics for this repository and
+is authoritative. When this file and `CONTRIBUTING.md` disagree, follow
+`CONTRIBUTING.md`.
+
+## Interfaces are contracts
+
+These are public interfaces and must not change silently:
+
+- the reusable-workflow file names and their `workflow_call` inputs, defaults, and
+  secrets;
+- the `continuum-` prefix on every installed caller (a `continuum-*.yml` file in a
+  consumer repository is Continuum-owned and is never hand-edited there);
+- the installer profiles (`swift`, and its `nanodictate` alias, plus `parent`)
+  and the `install.sh` argument shape;
+- the parent/child repository-variable names (`CONTINUUM_ROLE`,
+  `CONTINUUM_CHILDREN`, `CONTINUUM_CHILD_ID`, `CONTINUUM_PARENT`,
+  `CONTINUUM_VALIDATION_SCRIPT`).
+
+Changing any of them requires updating the caller templates in
+`.github/caller-stubs/` and the contract tests in `scripts/test-continuum.rb` in
+the same change. Keep workflow `name:` values stable: controllers and
+`workflow_run` triggers match on them.
+
+## Task and scope
+
+- The GitHub issue or pull request request is the task specification. Complete
+  every applicable acceptance criterion and keep the change scoped to that task;
+  do not introduce unrelated refactors.
+
+## Verification
+
+There is no Swift package here. Do not run `swift build`, `swift test`, or
+`swift run` in this repository; those commands apply to a NanoDictate checkout,
+not to Continuum.
+
+Run the checks that match your change from the repository root:
+
+```sh
+ruby -E UTF-8 scripts/test-continuum.rb   # caller/workflow/install contracts
+bash -n install.sh                        # installer syntax
+actionlint -shellcheck= -pyflakes= .github/workflows/*.yml .github/caller-stubs/*.yml .github/caller-stubs/parent/*.yml
+```
+
+The Python engine and delegation suites (keep fixtures inside the worktree):
+
+```sh
+mkdir -p .opencode-tmp
+export TMPDIR="$PWD/.opencode-tmp"
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s .github/scripts -p 'test_delegation_runtime.py'
+```
+
+Use `actionlint` 1.7.12 or newer. New or changed behavior requires focused
+automated tests; never weaken or delete an existing test or coverage check to make
+validation pass. If a required check cannot run here, report the exact limitation
+instead of substituting an unrelated check or claiming success.
+
+## Release machinery
+
+`release-please-config.json`, `.release-please-manifest.json`, and
+`scripts/release-policy.sh` describe the NanoDictate release contract that the
+release workflows enforce inside a consumer repository. Do not hand-edit versions
+or these files outside a task that explicitly concerns release automation.
+
+## Git lifecycle
+
+The invoking workflow owns the Git lifecycle: do not create or switch branches and
+do not open another pull request unless the task explicitly requires it. A repair
+task that explicitly requires commit/push updates only the current pull-request
+branch.
+
+## Execution environment
+
+Runs are headless: never request interactive approval and never wait for user
+input. Keep agent-created temporary files and fixtures inside the worktree under
+`.opencode-tmp/`, remove them before finishing, and never commit them. Do not use
+`/tmp`, `/var/tmp`, the runner home directory, or other paths outside the worktree.
+
+## Language
+
+Code comments, commit messages, pull-request text, and agent-authored repository
+documentation are in English unless the task explicitly requires another language.
+

@@ -1,23 +1,26 @@
-## Что сделано
+## What changed
 
 -
 
-## Почему
+## Why
 
 -
 
-## Как проверял
+## How it was verified
 
-- [ ] `swift build` (debug/release)
-- [ ] `swift run NanoDictateCoreTests`
-- [ ] Ручная проверка (опиши):
+- [ ] `ruby -E UTF-8 scripts/test-continuum.rb`
+- [ ] `bash -n install.sh`
+- [ ] `actionlint -shellcheck= -pyflakes= .github/workflows/*.yml .github/caller-stubs/*.yml .github/caller-stubs/parent/*.yml`
+- [ ] `PYTHONPATH=src python3 -m unittest discover -s tests`
+- [ ] Manual check (describe):
 
-## Чек-лист
+## Checklist
 
-- [ ] Ветка от `main`, цель — `main`
-- [ ] Нет секретов/ключей в diff
-- [ ] TCC/Accessibility/микрофон не затронуты или подписано через MCP `dictation_deploy`
-- [ ] Доки/README обновлены, если менялось поведение
-- [ ] Release: this PR does NOT bump the version (the automated Release PR owns `Version.swift`; see `CONTRIBUTING.md` → Releases). If it must merge WITHOUT triggering a Release PR update, add the `skip-release` label before merging.
+- [ ] Branch from `main`, targeting `main`
+- [ ] No secrets/keys in the diff
+- [ ] Caller templates in `.github/caller-stubs/` and the contract tests in `scripts/test-continuum.rb` updated if a workflow interface changed
+- [ ] Workflow `name:` values unchanged (controllers and `workflow_run` triggers match on them)
+- [ ] Docs updated if behavior changed
 
-Связанные issues: Closes #
+Related issues: Closes #
+
