@@ -93,10 +93,25 @@ case "$SET" in
     ;;
 esac
 BASE="https://raw.githubusercontent.com/kodmial/continuum/${REF}/$STUB_PATH"
-# Only use local templates when installing the default working-tree version.
-# An explicit ref must fetch that revision, even when run from a local clone.
-LOCAL_STUBS_DIR="$(dirname "${BASH_SOURCE[0]:-$0}")/$STUB_PATH"
-SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo "$PWD")"
+# The script's own path. It is empty when the script is not run as a file, which
+# is exactly the documented `curl … | bash -s` invocation: there `BASH_SOURCE` is
+# unset and `$0` is the shell itself, so `dirname` of either collapses to `.`
+# and names the *consumer's* directory. Falling back to `$0` therefore made a
+# piped install look like a self-install, and the guard below refused it.
+#
+# A piped run has no checkout behind it, so it neither reads local templates nor
+# has a checkout to protect: both fall back to the remote ref, which is the
+# correct behaviour for the documented one-liner.
+SCRIPT_PATH="${BASH_SOURCE[0]:-}"
+if [[ -n "$SCRIPT_PATH" ]]; then
+  LOCAL_STUBS_DIR="$(dirname "$SCRIPT_PATH")/$STUB_PATH"
+  # Only use local templates when installing the default working-tree version.
+  # An explicit ref must fetch that revision, even when run from a local clone.
+  SELF_DIR="$(cd "$(dirname "$SCRIPT_PATH")" 2>/dev/null && pwd || echo "$PWD")"
+else
+  LOCAL_STUBS_DIR=""
+  SELF_DIR=""
+fi
 TARGET_DIR="$(cd "$DEST/.github/workflows" && pwd)"
 # Installing into Continuum's own checkout is never a consumer install, and it
 # is not a harmless one. This repository's `.github/workflows/` holds the real
@@ -111,7 +126,7 @@ TARGET_DIR="$(cd "$DEST/.github/workflows" && pwd)"
 # single byte is written, and says why. Refusing loudly is the only safe
 # answer: silently installing nothing would look like a success and leave the
 # operator no signal that their repository was skipped.
-if [[ "$TARGET_DIR" == "$SELF_DIR/.github/workflows" ]]; then
+if [[ -n "$SELF_DIR" && "$TARGET_DIR" == "$SELF_DIR/.github/workflows" ]]; then
   cat >&2 <<EOF
 refusing to install: the target is Continuum's own checkout ($TARGET_DIR).
 
@@ -207,7 +222,7 @@ is_continuum_artifact() {
     "$file" 2>/dev/null || return 1
   return 0
 }
-if [[ "$TARGET_DIR" == "$SELF_DIR/.github/workflows" ]]; then
+if [[ -n "$SELF_DIR" && "$TARGET_DIR" == "$SELF_DIR/.github/workflows" ]]; then
   echo "target is Continuum's own checkout: skipping superseded-caller prune"
 else
   superseded=()

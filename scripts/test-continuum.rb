@@ -670,6 +670,51 @@ class ContinuumTest < Minitest::Test
     end
   end
 
+  # The environment escape hatch accepts `1`, `true` and `yes` — three spellings
+  # of one explicit opt-in, so a CI runner configured with the human-readable
+  # one behaves exactly like the numeric one. Nothing else may: this variable
+  # authorises deletion, so it is matched in full, case-sensitively, and an
+  # empty or near-miss value has to leave the confirmation in place.
+  #
+  # Every other fixture here sets `=1`, which is why narrowing the match back to
+  # `== 1` left the suite green: the other two spellings were shipped untested.
+  # This table is what catches that, and its rejected column is what stops the
+  # accepted column from being widened into something unguarded.
+  def test_assume_yes_environment_variable_accepts_only_its_three_spellings
+    fixture do |dir|
+      accepted = %w[1 true yes]
+      rejected = ['', '0', 'false', 'TRUE', 'True', 'Yes', 'y', 'on', '2', '1 ', ' 1', '11']
+      accepted.each do |value|
+        target = File.join(dir, "consumer-accepted-#{value.inspect}")
+        stale = File.join(target, '.github/workflows/continuum-removed-caller.yml')
+        FileUtils.mkdir_p(File.dirname(stale))
+        File.write(stale, superseded_caller('continuum-removed-caller.yml'))
+
+        output, status = Open3.capture2e(
+          { 'CONTINUUM_INSTALL_ASSUME_YES' => value }, 'bash', File.join(ROOT, 'install.sh'), target
+        )
+        assert status.success?, "CONTINUUM_INSTALL_ASSUME_YES=#{value.inspect}: #{output}"
+        refute File.exist?(stale),
+               "CONTINUUM_INSTALL_ASSUME_YES=#{value.inspect} is an accepted opt-in and must permit the prune"
+        assert_includes output, 'removed superseded Continuum caller: continuum-removed-caller.yml'
+      end
+      rejected.each do |value|
+        target = File.join(dir, "consumer-rejected-#{value.inspect}")
+        stale = File.join(target, '.github/workflows/continuum-removed-caller.yml')
+        FileUtils.mkdir_p(File.dirname(stale))
+        File.write(stale, superseded_caller('continuum-removed-caller.yml'))
+
+        output, status = Open3.capture2e(
+          { 'CONTINUUM_INSTALL_ASSUME_YES' => value }, 'bash', File.join(ROOT, 'install.sh'), target
+        )
+        assert status.success?, "CONTINUUM_INSTALL_ASSUME_YES=#{value.inspect}: #{output}"
+        assert File.exist?(stale),
+               "CONTINUUM_INSTALL_ASSUME_YES=#{value.inspect} is not an opt-in and must leave the prune confirmed"
+        assert_includes output, 'not removing superseded Continuum callers'
+      end
+    end
+  end
+
   # Installing one layer must never remove another layer's callers. Today the
   # three sets are independent files in one directory, so a one-line edit to the
   # prune candidate list — or a future edit to `"${STUBS[@]}"` — could delete a
@@ -796,6 +841,36 @@ class ContinuumTest < Minitest::Test
     end
   end
 
+  # The documented installation is a pipe: `curl …/install.sh | bash -s`. Under a
+  # pipe there is no script file at all — `BASH_SOURCE` is unset and `$0` is the
+  # shell itself — so resolving "self" from either value makes `dirname` yield
+  # `.`, collapses the self-install directory onto the *consumer's* own
+  # directory, and turns every piped install into a false self-install refusal:
+  # exit 1, zero files written, in the consumer's own checkout.
+  #
+  # Every other installer fixture here runs `bash <absolute-path>/install.sh`,
+  # where `BASH_SOURCE` IS set, so none of them can see this. This fixture is
+  # the only one that hands the script to bash on stdin, which is exactly the
+  # shape the installer documents in its own header.
+  def test_piped_install_from_stdin_is_not_mistaken_for_a_self_install
+    fixture do |dir|
+      target = File.join(dir, 'consumer')
+      FileUtils.mkdir_p(target)
+      output, status = Open3.capture2e(
+        fake_curl(dir), 'bash',
+        stdin_data: File.binread(File.join(ROOT, 'install.sh')), chdir: target
+      )
+      assert status.success?,
+             "the documented `curl … | bash -s` must install\n#{output}"
+      refute_includes output, 'refusing to install',
+                      'a piped run has no checkout behind it, so it cannot be a self-install'
+      assert_includes output, 'installed to'
+      assert_equal CORE_COUNT, Dir[File.join(target, '.github/workflows/*.yml')].size,
+                   'the piped install must write the whole core caller set'
+      assert_core_install_names(target)
+    end
+  end
+
   # The `continuum-tech-` prefix means "opt-in library". A tech workflow that any
   # other trigger could fire on would let Continuum trigger its own technology
   # library, which is exactly what the split exists to prevent.
@@ -875,8 +950,21 @@ class ContinuumTest < Minitest::Test
     continuum-consumer-child-worker.yml
   ].freeze
   REPO_OWNED_WORKFLOWS = %w[continuum-validate-continuum.yml].freeze
-  TECH_COUNT = TECH_STUBS.size
-  PARENT_COUNT = PARENT_STUBS.size
+
+  # The number of callers Continuum ships in the `tech` and `parent` layers,
+  # stated as literals for the same reason as `CORE_COUNT` below.
+  #
+  # These were once `TECH_STUBS.size` and `PARENT_STUBS.size`, which made every
+  # check that used them compare a value against itself: `assert_equal
+  # TECH_COUNT, <installed file count>` reduced to `<installed> == <installed>`
+  # and could not fail. A literal is the third, independent source, so shipping
+  # a sixth tech caller or a fifth parent caller has to be said out loud here,
+  # in the same file and in the same commit as the new stub, where a reviewer
+  # sees it. `assert_tech_layers_agree` remains the check that needs no literal:
+  # it compares the two trees against each other by name, so adding a
+  # technology still needs no edit — only changing the *size* of a layer does.
+  TECH_COUNT = 5
+  PARENT_COUNT = 4
 
   # The same `tech_name?` rule as the instance helper, hoisted so the constant
   # table above can use it. A tech name has a `tech` segment plus at least two
