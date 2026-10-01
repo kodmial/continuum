@@ -71,11 +71,48 @@ on:
         default: 'false'
       require_priority_label:
         description: >-
-          Dispatch only issues carrying a priority label. Empty keeps the
-          current behaviour of dispatching unlabelled issues too.
+          Dispatch only issues carrying a priority label. Empty falls back to
+          AUTOMATION_REQUIRE_PRIORITY_LABEL.
         type: string
         required: false
         default: 'false'
+      command_grace_minutes:
+        description: >-
+          Race window after a manual owner `/oc` in which the scheduler will not
+          enqueue a second OpenCode run. Empty falls back to
+          AUTOMATION_COMMAND_GRACE_MINUTES.
+        type: string
+        required: false
+        default: '5'
+      child_owned_marker:
+        description: >-
+          Hidden body marker reserving an issue for a delegated child worker, so
+          the local scheduler never dispatches it. Empty falls back to
+          CONTINUUM_CHILD_OWNED_MARKER.
+        type: string
+        required: false
+        default: '<!-- continuum-child-owned -->'
+      legacy_child_owned_marker:
+        description: >-
+          Legacy spelling of child_owned_marker, still accepted while a consumer
+          migrates. Empty falls back to CONTINUUM_LEGACY_CHILD_OWNED_MARKER.
+        type: string
+        required: false
+        default: '<!-- runtime-worker-owned -->'
+      opencode_workflow_name:
+        description: >-
+          `name:` of the consumer's OpenCode caller whose in-flight runs count as
+          active work. Empty falls back to CONTINUUM_OPENCODE_WORKFLOW_NAME.
+        type: string
+        required: false
+        default: 'OpenCode agent'
+      opencode_workflow_path:
+        description: >-
+          Path of the consumer's OpenCode caller, for callers whose runs predate
+          `run-name:`. Empty falls back to CONTINUUM_OPENCODE_WORKFLOW_PATH.
+        type: string
+        required: false
+        default: '.github/workflows/continuum-opencode.yml'
 
 permissions:
   contents: read
@@ -97,7 +134,12 @@ jobs:
       PAUSE_LABEL: ${{ inputs.pause_marker || vars.AUTOMATION_PAUSE_LABEL || 'automation:paused' }}
       POST_PAUSE_COMMENT: ${{ inputs.post_pause_comment || 'true' }}
       RESET_MARKERS: ${{ inputs.reset_markers || 'false' }}
-      REQUIRE_PRIORITY_LABEL: ${{ inputs.require_priority_label || 'false' }}
+      REQUIRE_PRIORITY_LABEL: ${{ inputs.require_priority_label || vars.AUTOMATION_REQUIRE_PRIORITY_LABEL || 'false' }}
+      COMMAND_GRACE_MINUTES: ${{ inputs.command_grace_minutes || vars.AUTOMATION_COMMAND_GRACE_MINUTES || '5' }}
+      CHILD_OWNED_MARKER: ${{ inputs.child_owned_marker || vars.CONTINUUM_CHILD_OWNED_MARKER || '<!-- continuum-child-owned -->' }}
+      LEGACY_CHILD_OWNED_MARKER: ${{ inputs.legacy_child_owned_marker || vars.CONTINUUM_LEGACY_CHILD_OWNED_MARKER || '<!-- runtime-worker-owned -->' }}
+      OPENCODE_WORKFLOW_NAME: ${{ inputs.opencode_workflow_name || vars.CONTINUUM_OPENCODE_WORKFLOW_NAME || 'OpenCode agent' }}
+      OPENCODE_WORKFLOW_PATH: ${{ inputs.opencode_workflow_path || vars.CONTINUUM_OPENCODE_WORKFLOW_PATH || '.github/workflows/continuum-opencode.yml' }}
 
     steps:
       - name: Reconcile state and dispatch ready issues
@@ -124,6 +166,12 @@ jobs:
             const leaseMinutes = positiveInt('LEASE_MINUTES', 45);
             const maxDispatchAttempts = positiveInt('MAX_DISPATCH_ATTEMPTS', 2);
             const leaseMs = leaseMinutes * 60 * 1000;
+            // A recent owner /oc is only a race guard while GitHub starts the
+            // corresponding workflow. It must not inherit the full work lease:
+            // cancelled/premature runs may legitimately become eligible again
+            // as soon as their native blockers close.
+            const commandGraceMinutes = positiveInt('COMMAND_GRACE_MINUTES', 5);
+            const commandGraceMs = commandGraceMinutes * 60 * 1000;
 
             const priorityOrder = [
               'priority:p0',
@@ -142,6 +190,55 @@ jobs:
               (process.env.RESET_MARKERS || 'false') === 'true';
             const requirePriorityLabel =
               (process.env.REQUIRE_PRIORITY_LABEL || 'false') === 'true';
+            const childOwnedMarker =
+              process.env.CHILD_OWNED_MARKER || '<!-- continuum-child-owned -->';
+            const legacyChildOwnedMarker =
+              process.env.LEGACY_CHILD_OWNED_MARKER || '<!-- runtime-worker-owned -->';
+            const opencodeWorkflowName =
+              process.env.OPENCODE_WORKFLOW_NAME || 'OpenCode agent';
+            const opencodeWorkflowPath =
+              process.env.OPENCODE_WORKFLOW_PATH ||
+              '.github/workflows/continuum-opencode.yml';
+
+            // Issues explicitly owned by a delegated child worker must never be
+            // dispatched through this repository's OpenCode Actions path. The
+            // control plane intentionally knows only the markers; which child
+            // owns them is the consumer's repository-variable business.
+            function isChildOwned(issue) {
+              const body = issue.body || '';
+              return (
+                body.includes(childOwnedMarker) ||
+                body.includes(legacyChildOwnedMarker)
+              );
+            }
+
+            // Byte-for-byte the marker the watchdog parses. A doubled backslash
+            // here would silently disable declared-dependency blocking.
+            function declaredDependencyNumbers(issue) {
+              const match = (issue.body || '').match(
+                /<!--\s*automation-blocked-by:\s*([0-9#\s,]+?)\s*-->/i
+              );
+              if (!match) return [];
+              return [...new Set(
+                [...match[1].matchAll(/\d+/g)]
+                  .map(item => Number.parseInt(item[0], 10))
+                  .filter(Number.isInteger)
+              )];
+            }
+
+            async function openDeclaredBlockers(issue) {
+              const open = [];
+              for (const blockerNumber of declaredDependencyNumbers(issue)) {
+                if (blockerNumber === issue.number) continue;
+                const response = await github.rest.issues.get({
+                  owner,
+                  repo,
+                  issue_number: blockerNumber,
+                });
+                if (response.data.state === 'open') open.push(response.data);
+              }
+              return open;
+            }
 
             const labelSpecs = [
               {
@@ -282,10 +379,42 @@ jobs:
                         ' completed issue #' + issueNumber + '.'
                       );
                     } else {
-                      await pauseIssue(
-                        issueNumber,
-                        'OpenCode PR #' + pr.number + ' was closed without merge.'
+                      const blockers = await github.paginate(
+                        'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
+                        {
+                          owner,
+                          repo,
+                          issue_number: issueNumber,
+                          per_page: 100,
+                          headers: {
+                            'X-GitHub-Api-Version': '2022-11-28',
+                          },
+                        }
                       );
+                      const openBlockers = blockers.filter(
+                        blocker => blocker.state === 'open'
+                      );
+
+                      // A rejected run against a blocked issue is not a
+                      // failure of the implementation; it is work that was not
+                      // eligible yet. Release the reservation and let the
+                      // dependency, not the pause label, decide readiness.
+                      if (openBlockers.length > 0) {
+                        await removeLabel(issueNumber, inProgressLabel);
+                        await removeLabel(issueNumber, pausedLabel);
+                        core.notice(
+                          'OpenCode PR #' + pr.number +
+                          ' closed without merge for blocked issue #' +
+                          issueNumber + '; reservation released, issue remains ' +
+                          'eligible after blockers complete.'
+                        );
+                      } else {
+                        await pauseIssue(
+                          issueNumber,
+                          'OpenCode PR #' + pr.number +
+                          ' was closed without merge.'
+                        );
+                      }
                     }
                   } catch (err) {
                     if (err.status !== 404) throw err;
@@ -302,6 +431,34 @@ jobs:
             });
             issues = issues.filter(issue => !issue.pull_request);
             for (const issue of issues) rememberIssue(issue);
+
+            // Manual owner-triggered /oc runs are real in-flight work too.
+            // Reserve the issue immediately so the scheduler cannot enqueue a
+            // second OpenCode run before the first one creates its PR.
+            if (context.eventName === 'issue_comment') {
+              const eventIssue = context.payload.issue;
+              const comment = context.payload.comment;
+              const body = comment?.body || '';
+              const isOwnerCommand =
+                comment?.user?.login === owner &&
+                (body.includes('/oc') || body.includes('/opencode'));
+
+              if (
+                eventIssue &&
+                !eventIssue.pull_request &&
+                eventIssue.state === 'open' &&
+                isOwnerCommand
+              ) {
+                if (!labelsByIssue.has(eventIssue.number)) {
+                  rememberIssue(eventIssue);
+                }
+                await addLabel(eventIssue.number, inProgressLabel);
+                core.notice(
+                  'Reserved issue #' + eventIssue.number +
+                  ' for manually triggered OpenCode work.'
+                );
+              }
+            }
 
             // One-time migration for the current backlog only. After this,
             // priority labels are the source of truth. No default priority is
@@ -362,7 +519,63 @@ jobs:
             }
 
             const issueByNumber = new Map(issues.map(issue => [issue.number, issue]));
+            const issueNumbersByTitle = new Map();
+            for (const issue of issues) {
+              if (!issueNumbersByTitle.has(issue.title)) {
+                issueNumbersByTitle.set(issue.title, []);
+              }
+              issueNumbersByTitle.get(issue.title).push(issue.number);
+            }
+
             const activeIssueNumbers = new Set();
+
+            // Active/pending OpenCode Actions are authoritative in-flight work.
+            // Without this, lease expiry releases an issue while GitHub is still
+            // running or queueing its implementation.
+            const workflowRuns = await github.paginate(
+              github.rest.actions.listWorkflowRunsForRepo,
+              {
+                owner,
+                repo,
+                per_page: 100,
+              }
+            );
+
+            const activeRunIssues = new Set();
+            for (const run of workflowRuns) {
+              const isOpenCodeWorkflow =
+                run.path === opencodeWorkflowPath ||
+                run.name === opencodeWorkflowName;
+              if (
+                !isOpenCodeWorkflow ||
+                run.status === 'completed' ||
+                run.event !== 'issue_comment'
+              ) {
+                continue;
+              }
+
+              const numbered = (run.display_title || '').match(
+                /^OpenCode issue #(\d+)$/
+              );
+              if (numbered) {
+                activeRunIssues.add(Number(numbered[1]));
+                continue;
+              }
+
+              // A caller without `run-name:` reports the issue title instead,
+              // which is only unambiguous while exactly one issue carries it.
+              const matches = issueNumbersByTitle.get(run.display_title || '') || [];
+              if (matches.length === 1) {
+                activeRunIssues.add(matches[0]);
+              }
+            }
+
+            for (const issueNumber of activeRunIssues) {
+              if (!issueByNumber.has(issueNumber)) continue;
+              activeIssueNumbers.add(issueNumber);
+              await addLabel(issueNumber, inProgressLabel);
+              await removeLabel(issueNumber, pausedLabel);
+            }
 
             // An open OpenCode PR is the strongest "in progress" signal. Keep
             // the visible label synchronized with that fact.
@@ -379,10 +592,44 @@ jobs:
             // never blocks an issue forever.
             for (const issue of issues) {
               const issueNumber = issue.number;
-              if (openPrIssues.has(issueNumber)) continue;
+              if (
+                openPrIssues.has(issueNumber) ||
+                activeRunIssues.has(issueNumber)
+              ) continue;
 
               const labels = labelsByIssue.get(issueNumber);
               if (!labels.has(inProgressLabel)) continue;
+
+              // A native open dependency is authoritative even when an older
+              // dispatch lease still exists. Once the actual OpenCode run is
+              // gone, release the reservation immediately so blocked work does
+              // not consume WIP capacity or get resurrected from old comments.
+              const reservationBlockers = await github.paginate(
+                'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
+                {
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                  per_page: 100,
+                  headers: {
+                    'X-GitHub-Api-Version': '2022-11-28',
+                  },
+                }
+              );
+              const openReservationBlockers = reservationBlockers.filter(
+                blocker => blocker.state === 'open'
+              );
+              if (openReservationBlockers.length > 0) {
+                await removeLabel(issueNumber, inProgressLabel);
+                core.notice(
+                  'Released reservation on issue #' + issueNumber +
+                  ': blocked by ' +
+                  openReservationBlockers
+                    .map(blocker => '#' + blocker.number)
+                    .join(', ') + '.'
+                );
+                continue;
+              }
 
               const comments = await github.paginate(
                 github.rest.issues.listComments,
@@ -394,12 +641,23 @@ jobs:
                 }
               );
               const dispatches = comments
-                .filter(comment => (comment.body || '').includes(dispatchMarker))
+                .filter(comment => {
+                  const body = comment.body || '';
+                  const ownerOpenCodeCommand =
+                    comment.user?.login === owner &&
+                    (body.includes('/oc') || body.includes('/opencode'));
+                  return body.includes(dispatchMarker) || ownerOpenCodeCommand;
+                })
                 .sort(
                   (a, b) =>
                     new Date(a.created_at).getTime() -
                     new Date(b.created_at).getTime()
                 );
+              // Only the scheduler's own dispatches consume the attempt budget;
+              // a manual owner /oc must never burn one.
+              const schedulerDispatches = comments.filter(comment =>
+                (comment.body || '').includes(dispatchMarker)
+              );
               const latestDispatch = dispatches.at(-1);
               const latestPr = latestPrByIssue.get(issueNumber);
 
@@ -454,11 +712,12 @@ jobs:
 
               await removeLabel(issueNumber, inProgressLabel);
 
-              if (dispatches.length >= maxDispatchAttempts) {
+              if (schedulerDispatches.length >= maxDispatchAttempts) {
                 await addLabel(issueNumber, pausedLabel);
                 core.warning(
                   'Issue #' + issueNumber + ' produced no OpenCode PR after ' +
-                  dispatches.length + ' dispatch attempt(s); automation paused.'
+                  schedulerDispatches.length +
+                  ' scheduler dispatch attempt(s); automation paused.'
                 );
               } else {
                 core.warning(
@@ -487,6 +746,14 @@ jobs:
             const candidates = [];
             for (const issue of issues) {
               if (activeIssueNumbers.has(issue.number)) continue;
+
+              if (isChildOwned(issue)) {
+                core.info(
+                  'Skipping #' + issue.number +
+                  ': reserved for a delegated child worker.'
+                );
+                continue;
+              }
 
               const labels = labelsByIssue.get(issue.number);
               if (labels.has(pausedLabel)) {
@@ -532,6 +799,15 @@ jobs:
               if (selected.length >= freeSlots) break;
 
               const issue = candidate.issue;
+              const declaredOpenBlockers = await openDeclaredBlockers(issue);
+              if (declaredOpenBlockers.length > 0) {
+                core.info(
+                  'Skipping #' + issue.number + ': declared blocked by ' +
+                  declaredOpenBlockers.map(blocker => '#' + blocker.number).join(', ') + '.'
+                );
+                continue;
+              }
+
               const blockers = await github.paginate(
                 'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
                 {
@@ -574,6 +850,114 @@ jobs:
             );
 
             for (const { issue, priority } of selected) {
+              // Re-check mutable state immediately before dispatch. Another
+              // owner /oc, dependency update, pause, or reservation may have
+              // landed while this scheduler run was already evaluating the
+              // backlog. Without this JIT guard an older scheduler run can
+              // enqueue a duplicate OpenCode run after a manual /oc.
+              const freshIssueResponse = await github.rest.issues.get({
+                owner,
+                repo,
+                issue_number: issue.number,
+              });
+              const freshIssue = freshIssueResponse.data;
+              const freshLabels = new Set(
+                (freshIssue.labels || []).map(label =>
+                  typeof label === 'string' ? label : label.name
+                )
+              );
+
+              if (isChildOwned(freshIssue)) {
+                core.info(
+                  'Skipping #' + issue.number +
+                  ': child-worker ownership appeared before dispatch.'
+                );
+                continue;
+              }
+
+              if (
+                freshIssue.state !== 'open' ||
+                freshLabels.has(pausedLabel) ||
+                freshLabels.has(inProgressLabel)
+              ) {
+                core.info(
+                  'Skipping #' + issue.number +
+                  ': state changed before dispatch.'
+                );
+                continue;
+              }
+
+              const freshDeclaredBlockers = await openDeclaredBlockers(freshIssue);
+              if (freshDeclaredBlockers.length > 0) {
+                core.info(
+                  'Skipping #' + issue.number + ': declared blocker appeared before dispatch: ' +
+                  freshDeclaredBlockers.map(blocker => '#' + blocker.number).join(', ') + '.'
+                );
+                continue;
+              }
+
+              const freshBlockers = await github.paginate(
+                'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
+                {
+                  owner,
+                  repo,
+                  issue_number: issue.number,
+                  per_page: 100,
+                  headers: {
+                    'X-GitHub-Api-Version': '2022-11-28',
+                  },
+                }
+              );
+              const freshOpenBlockers = freshBlockers.filter(
+                blocker => blocker.state === 'open'
+              );
+              if (freshOpenBlockers.length > 0) {
+                core.info(
+                  'Skipping #' + issue.number +
+                  ': blocker appeared before dispatch: ' +
+                  freshOpenBlockers
+                    .map(blocker => '#' + blocker.number)
+                    .join(', ') + '.'
+                );
+                continue;
+              }
+
+              const freshComments = await github.paginate(
+                github.rest.issues.listComments,
+                {
+                  owner,
+                  repo,
+                  issue_number: issue.number,
+                  per_page: 100,
+                }
+              );
+              const latestOpenCodeCommand = freshComments
+                .filter(comment => {
+                  const body = comment.body || '';
+                  return comment.user?.login === owner &&
+                    (body.includes('/oc') || body.includes('/opencode'));
+                })
+                .sort(
+                  (a, b) =>
+                    new Date(a.created_at).getTime() -
+                    new Date(b.created_at).getTime()
+                )
+                .at(-1);
+
+              if (latestOpenCodeCommand) {
+                const commandAgeMs =
+                  Date.now() -
+                  new Date(latestOpenCodeCommand.created_at).getTime();
+                if (commandAgeMs < commandGraceMs) {
+                  core.info(
+                    'Skipping #' + issue.number +
+                    ': an owner OpenCode command was posted within the ' +
+                    'short dispatch race window.'
+                  );
+                  continue;
+                }
+              }
+
               // A label acts as a short lease/reservation while OpenCode starts.
               // It is rolled back immediately if posting /oc fails, expires
               // automatically if no PR appears, and is reconciled from PR state.

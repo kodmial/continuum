@@ -62,6 +62,12 @@ the input wins over the variable.
 | `AUTOMATION_DISPATCH_MARKER` | `opencode.dispatch_marker` | `<!-- issue-scheduler-dispatch -->` | Dispatch marker `opencode.yml` matches and counts. |
 | `AUTOMATION_IN_PROGRESS_LABEL` | `opencode.in_progress_label` | `automation:in-progress` | Reservation label. |
 | `AUTOMATION_PAUSE_LABEL` | `opencode.pause_marker` | `automation:paused` | Pause label. |
+| `AUTOMATION_REQUIRE_PRIORITY_LABEL` | `issue-scheduler.require_priority_label` | `false` | Dispatch only issues carrying a priority label. |
+| `AUTOMATION_COMMAND_GRACE_MINUTES` | `issue-scheduler.command_grace_minutes` | `5` | Race window after a manual owner `/oc` during which the scheduler does not enqueue a second OpenCode run. |
+| `CONTINUUM_CHILD_OWNED_MARKER` | `issue-scheduler.child_owned_marker` | `<!-- continuum-child-owned -->` | Body marker reserving an issue for a delegated child worker; the local scheduler never dispatches it. |
+| `CONTINUUM_LEGACY_CHILD_OWNED_MARKER` | `issue-scheduler.legacy_child_owned_marker` | `<!-- runtime-worker-owned -->` | Legacy spelling of the child-owned marker, still accepted while a consumer migrates. |
+| `CONTINUUM_OPENCODE_WORKFLOW_NAME` | `issue-scheduler.opencode_workflow_name` | `OpenCode agent` | `name:` of the local OpenCode caller whose in-flight runs count as active work. |
+| `CONTINUUM_OPENCODE_WORKFLOW_PATH` | `issue-scheduler.opencode_workflow_path` | `.github/workflows/continuum-opencode.yml` | Path of the local OpenCode caller, for runs that predate `run-name:`. The default names the prefixed file the installer writes. |
 | `AUTOMATION_WATCHDOG_MAX_RETRIES` | `continuum-opencode-watchdog.max_recovery_retries` | `1` | Automatic recovery retries before the issue is paused. |
 | `AUTOMATION_WATCHDOG_RETRY_MARKER` | `continuum-opencode-watchdog.retry_marker` | `<!-- opencode-watchdog-retry -->` | Hidden marker the watchdog counts. |
 | `AUTOMATION_WATCHDOG_TIMEOUT_MINUTES` | `continuum-opencode-watchdog.timeout_minutes` | `5` | Watchdog job timeout. |
@@ -110,6 +116,30 @@ wrote. `consumer-child-dispatcher.yml` reads `AUTOMATION_PAUSE_LABEL`, and
 `AUTOMATION_PAUSE_LABEL`, so a renamed label stays consistent across the core
 and the parent/child pair.
 
+### Scheduler guards
+
+The scheduler reconciles more than the dispatch marker. Every guard below is
+part of the core engine, so a consumer gets it without a fork:
+
+- an **active OpenCode run** (`CONTINUUM_OPENCODE_WORKFLOW_NAME` /
+  `CONTINUUM_OPENCODE_WORKFLOW_PATH`) counts as in-flight work, so a lease
+  never expires while GitHub is still running or queueing the implementation;
+- a **manual owner `/oc`** reserves the issue immediately, and
+  `AUTOMATION_COMMAND_GRACE_MINUTES` suppresses a duplicate scheduler dispatch
+  for that short window;
+- a **closed-without-merge OpenCode PR** pauses the issue only when it has no
+  open native blocker — blocked work is released, not paused;
+- a **native open dependency** releases an existing reservation rather than
+  letting an old lease hold WIP capacity;
+- a **child-owned marker** in the issue body excludes it from local dispatch;
+- **declared `<!-- automation-blocked-by: -->` markers** are honoured in both
+  candidate selection and the just-in-time re-check before dispatch.
+
+All six are consumer-visible knobs: the owner-command grace window, the two
+child-owned markers, and the two OpenCode-caller identity inputs a consumer
+needs when its OpenCode caller is renamed. The rest are unconditional engine
+behaviour.
+
 ## Model and provider keys
 
 The OpenCode agent runs on **free anonymous models** and needs **no API key**.
@@ -140,6 +170,11 @@ enabled:
 | `post_pause_comment` | `true` (only `false` disables) |
 | `reset_markers` | `false` |
 | `require_priority_label` | `false` |
+| `command_grace_minutes` | `5` |
+| `child_owned_marker` | `<!-- continuum-child-owned -->` |
+| `legacy_child_owned_marker` | `<!-- runtime-worker-owned -->` |
+| `opencode_workflow_name` | `OpenCode agent` |
+| `opencode_workflow_path` | `.github/workflows/continuum-opencode.yml` |
 
 `opencode.yml` accepts the matching `dispatch_marker`, `in_progress_label`, and
 `pause_marker` inputs, plus `max_dispatch_attempts`, `issue_number` (the issue a

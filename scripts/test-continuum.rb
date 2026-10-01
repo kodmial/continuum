@@ -44,6 +44,20 @@ class ContinuumTest < Minitest::Test
     File.read(File.join(ROOT, '.github/workflows', name))
   end
 
+  # Only the embedded `script: |` block. Assertions about *engine* literals must
+  # not see the `workflow_call.inputs` defaults, which legitimately name the
+  # same values as the fallback chain.
+  def script_body(name)
+    lines = workflow_body(name).lines
+    start = lines.index { |line| line =~ /^\s*script: \|\s*$/ }
+    refute_nil start, "#{name}: no embedded script block"
+    indent = lines[start][/\A */].size + 2
+    rest = lines[(start + 1)..]
+    stop = rest.index { |line| !line.strip.empty? && line[/\A */].size < indent }
+    block = stop ? rest[0...stop] : rest
+    block.map { |line| line[/\A */].size >= indent ? line[indent..] : line }.join
+  end
+
   # The parsed core workflow behind a caller stub of the same base name.
   def workflow_stub_callee
     yaml(File.join(ROOT, '.github/workflows', 'opencode-repair.yml'))
@@ -724,7 +738,12 @@ class ContinuumTest < Minitest::Test
       'pause_marker' => 'automation:paused',
       'post_pause_comment' => 'true',
       'reset_markers' => 'false',
-      'require_priority_label' => 'false'
+      'require_priority_label' => 'false',
+      'command_grace_minutes' => '5',
+      'child_owned_marker' => '<!-- continuum-child-owned -->',
+      'legacy_child_owned_marker' => '<!-- runtime-worker-owned -->',
+      'opencode_workflow_name' => 'OpenCode agent',
+      'opencode_workflow_path' => '.github/workflows/continuum-opencode.yml'
     }.each do |key, default|
       assert scheduler.key?(key), "issue-scheduler missing input #{key}"
       assert_equal default, scheduler.fetch(key).fetch('default'), key
@@ -1267,7 +1286,8 @@ class ContinuumTest < Minitest::Test
     'issue-scheduler.yml' => %w[
       continuum_ref wip_limit lease_minutes max_dispatch_attempts dispatch_marker
       in_progress_label pause_marker post_pause_comment reset_markers
-      require_priority_label
+      require_priority_label command_grace_minutes child_owned_marker
+      legacy_child_owned_marker opencode_workflow_name opencode_workflow_path
     ],
     'opencode.yml' => %w[
       continuum_ref mode issue_number pr_number head_ref review_id run_id
@@ -1354,16 +1374,198 @@ class ContinuumTest < Minitest::Test
   # variable is falsy, so the chain still falls through to the same literal.
   # Re-implement the chain in Ruby and evaluate it, so a reordered or
   # mistyped default is caught rather than merely re-asserted.
+  # ------------------------------------------ scheduler guards from the fork
+  #
+  # These guards lived only in the consumer's full fork of the scheduler. They
+  # are now core behaviour, so each one is asserted on the code that acts on it:
+  # deleting the guard while leaving the knob (or the marker) in place is the
+  # silent regression this test exists to catch.
+
+  # The declared-dependency marker is parsed by the scheduler AND by the
+  # watchdog. A doubled backslash in a YAML-embedded regex literal is a legal,
+  # silently non-matching regex — the guard would look present and block
+  # nothing. Assert the single-backslash form in both files.
+  def test_scheduler_declared_blocker_regex_is_not_double_escaped
+    { 'issue-scheduler.yml' => workflow_body('issue-scheduler.yml'),
+      WATCHDOG => watchdog_body }.each do |name, body|
+      assert_includes body, '/<!--\s*automation-blocked-by:\s*([0-9#\s,]+?)\s*-->/i',
+                      "#{name}: the automation-blocked-by regex must use single backslashes"
+      # The doubled form is spelled as raw bytes, not as one of Ruby's own
+      # escape spellings: `'\\s'` in a single-quoted string is the CORRECT
+      # single-backslash regex, so asserting against it would fire on good code.
+      doubled = 'automation-blocked-by:' + ('\\' * 2) + 's'
+      refute_includes body, doubled,
+                      "#{name}: doubled backslash in the automation-blocked-by regex matches nothing"
+    end
+
+    scheduler = workflow_body('issue-scheduler.yml')
+    # It must be a live parser, not a literal: numbers are extracted and read.
+    assert_includes scheduler, '[...match[1].matchAll(/\d+/g)]'
+    assert_includes scheduler, 'async function openDeclaredBlockers(issue) {'
+    # …and it must actually gate candidate selection.
+    assert_includes scheduler, 'const declaredOpenBlockers = await openDeclaredBlockers(issue);'
+    assert_includes scheduler, "': declared blocked by '"
+  end
+
+  # An issue carrying a child-owned marker belongs to a delegated worker. Both
+  # the candidate filter and the just-in-time re-check must skip it, and the
+  # marker must come from a knob rather than a literal.
+  def test_scheduler_skips_child_owned_issues_everywhere
+    scheduler = workflow_body('issue-scheduler.yml')
+    assert_match(/function isChildOwned\(issue\) \{\s*\n\s*const body = issue\.body \|\| '';\s*\n\s*return \(\s*\n\s*body\.includes\(childOwnedMarker\) \|\|\s*\n\s*body\.includes\(legacyChildOwnedMarker\)/, scheduler,
+                 'isChildOwned must honour both the current and the legacy marker')
+
+    assert_includes scheduler, "CHILD_OWNED_MARKER: ${{ inputs.child_owned_marker || vars.CONTINUUM_CHILD_OWNED_MARKER || '<!-- continuum-child-owned -->' }}"
+    assert_includes scheduler, "LEGACY_CHILD_OWNED_MARKER: ${{ inputs.legacy_child_owned_marker || vars.CONTINUUM_LEGACY_CHILD_OWNED_MARKER || '<!-- runtime-worker-owned -->' }}"
+
+    # Call sites only — the `function isChildOwned(issue)` definition line is not
+    # a filter, it is the helper itself.
+    calls = scheduler.scan(/(?<!function )isChildOwned\((issue|freshIssue)\)/).flatten
+    assert_equal %w[freshIssue issue], calls.sort,
+                 'the child-owned filter must run both at selection time and just before dispatch'
+
+    # The marker literals must live only in the fallback chain, not inline in
+    # the skip logic, or a consumer renaming its marker would be ignored. The
+    # assertion runs over the embedded script only — the `workflow_call`
+    # defaults are supposed to name these values.
+    engine = script_body('issue-scheduler.yml')
+    engine.lines.grep(/<!-- (continuum|runtime-worker)-(child-owned|owned) -->/).each do |line|
+      # A marker may appear in the engine only as the tail of a fallback chain
+      # (env, then `||` literal). Anywhere else — in isChildOwned, in the
+      # candidate filter, in the dispatch re-check — it would silently ignore a
+      # consumer that renamed its marker.
+      assert_match(/\|\|\s*'<!--\s/, line,
+                   "marker literal used outside a fallback chain: #{line.strip}")
+    end
+    assert_includes engine, 'function isChildOwned(issue) {'
+  end
+
+  # A manual owner `/oc` is real in-flight work: reserve it at once, and keep a
+  # short grace window so this run cannot enqueue a duplicate right behind it.
+  def test_scheduler_reserves_owner_commands_and_honours_the_grace_window
+    scheduler = workflow_body('issue-scheduler.yml')
+
+    assert_includes scheduler, "COMMAND_GRACE_MINUTES: ${{ inputs.command_grace_minutes || vars.AUTOMATION_COMMAND_GRACE_MINUTES || '5' }}"
+    assert_includes scheduler, "const commandGraceMinutes = positiveInt('COMMAND_GRACE_MINUTES', 5);"
+    assert_includes scheduler, 'const commandGraceMs = commandGraceMinutes * 60 * 1000;'
+    # The grace window must not inherit the full lease, and it must be the
+    # grace value the guard actually compares against.
+    assert_includes scheduler, 'if (commandAgeMs < commandGraceMs) {'
+    refute_includes scheduler, 'if (commandAgeMs < leaseMs) {',
+                    'the owner-command guard must use the grace window, not the work lease'
+
+    reservation = scheduler[/if \(context\.eventName === 'issue_comment'\) \{\s*\n\s*const eventIssue.*?\n            \}/m]
+    refute_nil reservation, 'the owner-command reservation block is gone'
+    assert_includes reservation, 'comment?.user?.login === owner'
+    assert_includes reservation, "body.includes('/oc') || body.includes('/opencode')"
+    assert_includes reservation, 'await addLabel(eventIssue.number, inProgressLabel);'
+    assert_includes reservation, 'Reserved issue #'
+
+    # A manual command must not consume the scheduler's own attempt budget, or
+    # two manual runs would pause an issue the scheduler never dispatched.
+    assert_includes scheduler, 'const schedulerDispatches = comments.filter(comment =>'
+    assert_includes scheduler, 'if (schedulerDispatches.length >= maxDispatchAttempts) {'
+    refute_includes scheduler, 'if (dispatches.length >= maxDispatchAttempts) {'
+  end
+
+  # The just-in-time re-check is the guard against a duplicate OpenCode run: it
+  # runs after selection and before the reservation/comment, and every unsafe
+  # condition has to be a skip.
+  def test_scheduler_rechecks_state_just_before_dispatch
+    scheduler = workflow_body('issue-scheduler.yml')
+    dispatch = scheduler[/for \(const \{ issue, priority \} of selected\) \{\n(.*?)\n              await addLabel\(issue\.number, inProgressLabel\);/m, 1]
+    refute_nil dispatch, 'the just-in-time re-check block is gone'
+
+    [
+      'const freshIssueResponse = await github.rest.issues.get({',
+      "freshIssue.state !== 'open'",
+      'freshLabels.has(pausedLabel)',
+      'freshLabels.has(inProgressLabel)',
+      'const freshDeclaredBlockers = await openDeclaredBlockers(freshIssue);',
+      'freshOpenBlockers.length > 0',
+      'if (commandAgeMs < commandGraceMs) {'
+    ].each { |guard| assert_includes dispatch, guard, "missing just-in-time guard: #{guard}" }
+    assert_equal 5, dispatch.scan(/^\s+continue;\s*$/).size,
+                 'every just-in-time guard must be a skip, not a fall-through'
+  end
+
+  # A blocked issue whose OpenCode PR was closed unmerged is not a failed
+  # implementation, and a native blocker is authoritative over an old
+  # reservation lease. Both must release, not pause.
+  def test_scheduler_releases_native_blockers_instead_of_pausing
+    scheduler = workflow_body('issue-scheduler.yml')
+
+    # pull_request_target reconciliation.
+    pr_close = scheduler[/if \(context\.eventName === 'pull_request_target'\).*?\n            \}\n/m]
+    refute_nil pr_close, 'the pull_request_target reconciliation block is gone'
+    assert_includes pr_close, 'const openBlockers = blockers.filter('
+    assert_includes pr_close, 'if (openBlockers.length > 0) {'
+    assert_includes pr_close, 'reservation released, issue remains '
+    assert_includes pr_close, 'await pauseIssue('
+    # The release must come before the pause, or blocked work still pauses.
+    assert_operator pr_close.index('reservation released'), :<, pr_close.index('await pauseIssue(')
+
+    # Lease reconciliation.
+    lease = scheduler[/const openReservationBlockers = reservationBlockers\.filter\(.*?\n            \}/m]
+    refute_nil lease, 'the native-blocker reservation release is gone'
+    assert_includes lease, 'await removeLabel(issueNumber, inProgressLabel);'
+    assert_includes lease, ': blocked by '
+
+    # An active OpenCode run is authoritative too, or the lease would release
+    # an issue GitHub is still implementing.
+    assert_includes scheduler, 'const workflowRuns = await github.paginate('
+    assert_includes scheduler, "run.event !== 'issue_comment'"
+    assert_includes scheduler, 'run.path === opencodeWorkflowPath ||'
+    assert_includes scheduler, 'run.name === opencodeWorkflowName'
+    assert_includes scheduler, "if (\n                openPrIssues.has(issueNumber) ||\n                activeRunIssues.has(issueNumber)\n              ) continue;"
+    assert_includes scheduler, "OPENCODE_WORKFLOW_NAME: ${{ inputs.opencode_workflow_name || vars.CONTINUUM_OPENCODE_WORKFLOW_NAME || 'OpenCode agent' }}"
+    assert_includes scheduler, "OPENCODE_WORKFLOW_PATH: ${{ inputs.opencode_workflow_path || vars.CONTINUUM_OPENCODE_WORKFLOW_PATH || '.github/workflows/continuum-opencode.yml' }}"
+  end
+
+  # The `P[0-2]:` title migration is a one-time backlog conversion. It must keep
+  # the digit-class regexp and the title rewrite together: a mutation that
+  # strips the label but keeps the rename (or vice versa) silently corrupts the
+  # backlog.
+  def test_scheduler_priority_title_migration_is_intact
+    scheduler = workflow_body('issue-scheduler.yml')
+    migration = scheduler[/One-time migration.*?\n            \}/m]
+    refute_nil migration, 'the P[0-2]: title migration block is gone'
+    assert_includes migration, 'if (currentPriorities.length !== 0) continue;'
+    assert_includes migration, 'issue.title.match(/^P([0-2]):\s+/i)'
+    assert_includes migration, "const priority = ('priority:p' + match[1]).toLowerCase();"
+    assert_includes migration, 'await addLabel(issue.number, priority);'
+    assert_includes migration, 'issue.title.replace(/^P[0-2]:\s+/i, \'\')'
+    assert_includes migration, 'title: cleanTitle,'
+  end
+
+  # The scheduler must be the one place that reserves the owner command, and it
+  # must only fire on the owner's own comment — a stranger's `/oc` must not
+  # consume WIP capacity.
+  def test_scheduler_stub_triggers_the_owner_command_path
+    stub = yaml(File.join(ROOT, '.github/caller-stubs/issue-scheduler.yml'))
+    assert_equal ['created'], events(stub).fetch('issue_comment').fetch('types')
+    gate = stub.fetch('jobs').fetch('call').fetch('if')
+    assert_includes gate, "github.event_name != 'issue_comment'"
+    assert_includes gate, 'github.actor == github.repository_owner'
+    assert_includes gate, "contains(github.event.comment.body, '/oc')"
+  end
+
   def test_empty_vars_resolve_to_the_same_scheduler_defaults
     scheduler = workflow_body('issue-scheduler.yml')
     {
-      'DISPATCH_MARKER' => ['dispatch_marker', '<!-- issue-scheduler-dispatch -->'],
-      'IN_PROGRESS_LABEL' => ['in_progress_label', 'automation:in-progress'],
-      'PAUSE_LABEL' => ['pause_marker', 'automation:paused'],
-      'WIP_LIMIT' => ['wip_limit', '2'],
-      'LEASE_MINUTES' => ['lease_minutes', '45'],
-      'MAX_DISPATCH_ATTEMPTS' => ['max_dispatch_attempts', '2']
-    }.each do |key, (input, expected)|
+      'DISPATCH_MARKER' => ['dispatch_marker', '<!-- issue-scheduler-dispatch -->', 'AUTOMATION_DISPATCH_MARKER'],
+      'IN_PROGRESS_LABEL' => ['in_progress_label', 'automation:in-progress', 'AUTOMATION_IN_PROGRESS_LABEL'],
+      'PAUSE_LABEL' => ['pause_marker', 'automation:paused', 'AUTOMATION_PAUSE_LABEL'],
+      'WIP_LIMIT' => ['wip_limit', '2', 'AUTOMATION_WIP_LIMIT'],
+      'LEASE_MINUTES' => ['lease_minutes', '45', 'AUTOMATION_LEASE_MINUTES'],
+      'MAX_DISPATCH_ATTEMPTS' => ['max_dispatch_attempts', '2', 'AUTOMATION_MAX_DISPATCH_ATTEMPTS'],
+      'REQUIRE_PRIORITY_LABEL' => ['require_priority_label', 'false', 'AUTOMATION_REQUIRE_PRIORITY_LABEL'],
+      'COMMAND_GRACE_MINUTES' => ['command_grace_minutes', '5', 'AUTOMATION_COMMAND_GRACE_MINUTES'],
+      'CHILD_OWNED_MARKER' => ['child_owned_marker', '<!-- continuum-child-owned -->', 'CONTINUUM_CHILD_OWNED_MARKER'],
+      'LEGACY_CHILD_OWNED_MARKER' => ['legacy_child_owned_marker', '<!-- runtime-worker-owned -->', 'CONTINUUM_LEGACY_CHILD_OWNED_MARKER'],
+      'OPENCODE_WORKFLOW_NAME' => ['opencode_workflow_name', 'OpenCode agent', 'CONTINUUM_OPENCODE_WORKFLOW_NAME'],
+      'OPENCODE_WORKFLOW_PATH' => ['opencode_workflow_path', '.github/workflows/continuum-opencode.yml', 'CONTINUUM_OPENCODE_WORKFLOW_PATH']
+    }.each do |key, (input, expected, variable)|
       line = scheduler.lines.find { |candidate| candidate.include?("#{key}: ${{") }
       refute_nil line, "#{key}: no env mapping found in issue-scheduler.yml"
 
@@ -1372,7 +1574,7 @@ class ContinuumTest < Minitest::Test
       # variable, then the literal default.
       terms = expression.split('||').map(&:strip)
       assert_equal "inputs.#{input}", terms.first, "#{key}: #{expression}"
-      assert_includes terms[1], 'vars.AUTOMATION', "#{key}: the vars. fallback is missing"
+      assert_equal "vars.#{variable}", terms[1], "#{key}: the vars. fallback is missing"
 
       resolve = lambda do |inputs_value, vars_value|
         terms.reduce(nil) do |acc, term|

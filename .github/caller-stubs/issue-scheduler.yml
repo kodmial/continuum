@@ -39,10 +39,32 @@ on:
         description: "Dispatch only labelled issues"
         required: false
         type: string
+      command_grace_minutes:
+        description: "Race window after a manual owner command"
+        required: false
+        type: string
+      child_owned_marker:
+        description: "Marker reserving an issue for a child worker"
+        required: false
+        type: string
+      legacy_child_owned_marker:
+        description: "Legacy child-worker marker"
+        required: false
+        type: string
+      opencode_workflow_name:
+        description: "`name:` of the local OpenCode caller"
+        required: false
+        type: string
+      opencode_workflow_path:
+        description: "Path of the local OpenCode caller"
+        required: false
+        type: string
   schedule:
     - cron: "*/15 * * * *"
   issues:
     types: [opened, reopened, closed, labeled, unlabeled]
+  issue_comment:
+    types: [created]
   pull_request_target:
     types: [closed]
 
@@ -51,6 +73,14 @@ permissions:
 
 jobs:
   call:
+    # A manual owner `/oc` is in-flight work the scheduler must reserve. Gate the
+    # event trigger the way the engine's own `issue_comment` branch expects, so an
+    # unrelated comment costs a skipped run and not a full reconciliation.
+    if: >-
+      github.event_name != 'issue_comment' ||
+      (github.actor == github.repository_owner &&
+       (contains(github.event.comment.body, '/oc') ||
+        contains(github.event.comment.body, '/opencode')))
     uses: kodmial/continuum/.github/workflows/issue-scheduler.yml@main
     secrets: inherit
     with:
@@ -68,3 +98,8 @@ jobs:
       post_pause_comment: "${{ inputs.post_pause_comment }}"
       reset_markers: "${{ inputs.reset_markers }}"
       require_priority_label: "${{ inputs.require_priority_label }}"
+      command_grace_minutes: "${{ inputs.command_grace_minutes }}"
+      child_owned_marker: "${{ inputs.child_owned_marker }}"
+      legacy_child_owned_marker: "${{ inputs.legacy_child_owned_marker }}"
+      opencode_workflow_name: "${{ inputs.opencode_workflow_name }}"
+      opencode_workflow_path: "${{ inputs.opencode_workflow_path }}"
