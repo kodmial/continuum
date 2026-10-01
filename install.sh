@@ -13,7 +13,7 @@ REF="${2:-main}"
 SET="${3:-core}"
 case "$SET" in
   core|parent|tech) ;;
-  *) echo "invalid set: $SET" >&2; exit 1 ;;
+  *) echo "invalid set: $SET (the old 'swift' set is now 'tech')" >&2; exit 1 ;;
 esac
 [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "invalid ref: $REF" >&2; exit 1; }
 if [[ ! -d "$DEST/.github/workflows" ]]; then

@@ -44,12 +44,37 @@ class ContinuumTest < Minitest::Test
     workflow['on'] || workflow[true]
   end
 
-  # Three dashes after `continuum`: `continuum-tech-<tech>-<name>*.yml`.
+  # The `continuum-tech-<tech>-` prefix marks a technology-library workflow.
   # The `<name>` part may itself be multi-word, so the rule is a `tech`
-  # segment plus at least two further segments — not a fixed count.
+  # segment plus at least two further segments — not a fixed dash count.
   def tech_name?(base)
     segments = base.delete_suffix('.yml').split('-')
     base.start_with?('continuum-') && segments[1] == 'tech' && segments.size >= 4
+  end
+
+  # The technology layer exists as a pair: a caller stub and the reusable
+  # workflow it calls. The two halves must name exactly the same set of files.
+  # Neither half is pinned to a literal count, so adding a technology (or a
+  # tech workflow) needs no test edit — but dropping a stub leaves its callee
+  # orphaned and fails here.
+  def assert_tech_layers_agree
+    stubs = TECH_STUBS.map { |path| File.basename(path) }.sort
+    workflows = WORKFLOWS.map { |path| File.basename(path) }.select { |base| tech_name?(base) }.sort
+    assert_equal stubs, workflows, 'tech stubs and tech workflows must be the same set of files'
+  end
+
+  # Installed core callers must carry exactly the `continuum-` prefix on their
+  # own stub name: no more, which would let a core caller be mistaken for a
+  # tech-library caller, and no less, which would make a Continuum caller look
+  # project-owned and stop Continuum's dispatchers from finding it.
+  def assert_core_install_names(dir)
+    installed = Dir[File.join(dir, '.github/workflows/*.yml')].map { |file| File.basename(file) }.sort
+    expected = CORE_STUBS.map { |path| "continuum-#{File.basename(path, '.yml')}.yml" }.sort
+    assert_equal expected, installed
+    installed.each do |name|
+      assert name.start_with?('continuum-'), name
+      refute name.start_with?('continuum-tech-'), name
+    end
   end
 
   def each_pair
@@ -147,8 +172,9 @@ class ContinuumTest < Minitest::Test
   #   1. core   — `continuum-<name>.yml`, exactly two dash-separated segments
   #               after the prefix, e.g. `continuum-auto-merge.yml`. Installed
   #               by the default `core` set; every project needs these.
-  #   2. tech   — `continuum-tech-<tech>-<name>.yml`, exactly three dashes,
-  #               e.g. `continuum-tech-swift-release.yml`. Installed only by the
+  #   2. tech   — `continuum-tech-<tech>-<name>.yml`, marked by the
+  #               `continuum-tech-<tech>-` prefix, e.g.
+  #               `continuum-tech-swift-release.yml`. Installed only by the
   #               opt-in `tech` set; Continuum never triggers these itself.
   #
   # A third, legitimate category exists: files whose names predate the prefix
@@ -170,21 +196,21 @@ class ContinuumTest < Minitest::Test
           :tech
         else
           flunk "#{base}: neither a core file (continuum-<name>.yml, two segments), " \
-                'a tech file (continuum-tech-<tech>-<name>.yml, three dashes), ' \
+                'a tech file (continuum-tech-<tech>-<name>.yml, continuum-tech-<tech>- prefix), ' \
                 'nor a listed historical unprefixed core name'
         end
       assert_includes %i[core tech historical_unprefixed_core], category
     end
     unprefixed = WORKFLOWS.map { |path| File.basename(path) }.reject { |base| base.start_with?('continuum-') }
     assert_equal unprefixed.sort, covered.sort, 'the historical unprefixed core list is stale'
-    assert_equal 5, WORKFLOWS.count { |path| tech_name?(File.basename(path)) }
+    assert_tech_layers_agree
   end
 
-  # Three dashes mean "opt-in library". A tech workflow that any other trigger
-  # could fire on would let Continuum trigger its own technology library, which
-  # is exactly what the split exists to prevent.
+  # The `continuum-tech-` prefix means "opt-in library". A tech workflow that any
+  # other trigger could fire on would let Continuum trigger its own technology
+  # library, which is exactly what the split exists to prevent.
   def test_tech_workflows_are_only_reusable_and_never_self_triggered
-    assert_equal 5, TECH_STUBS.size, 'tech set size'
+    assert_tech_layers_agree
     TECH_STUBS.each do |stub_path|
       callee_path = File.join(ROOT, '.github/workflows', File.basename(stub_path))
       assert File.file?(callee_path), "missing callee for #{File.basename(stub_path)}"
@@ -243,11 +269,13 @@ class ContinuumTest < Minitest::Test
   end
 
   # Measured counts, not guesses: `core` installs every stub directly under
-  # `.github/caller-stubs/` (task-domain layer), `tech` the five
-  # `continuum-tech-swift-*` stubs in `.github/caller-stubs/tech/`, and
-  # `parent` the four child-execution stubs in `.github/caller-stubs/parent/`.
+  # `.github/caller-stubs/` (task-domain layer), `tech` the
+  # `continuum-tech-<tech>-*` stubs in `.github/caller-stubs/tech/`, and
+  # `parent` the child-execution stubs in `.github/caller-stubs/parent/`.
+  # The tech count is derived from the stub set, so a second technology does
+  # not need a test edit and a dropped stub still fails.
   CORE_COUNT = 11
-  TECH_COUNT = 5
+  TECH_COUNT = TECH_STUBS.size
   PARENT_COUNT = 4
 
   def test_installer_local_and_explicit_ref
@@ -256,6 +284,7 @@ class ContinuumTest < Minitest::Test
       output, status = Open3.capture2e('bash', File.join(ROOT, 'install.sh'), File.join(dir, 'local'))
       assert status.success?, output
       assert_equal CORE_COUNT, Dir[File.join(dir, 'local/.github/workflows/*.yml')].size
+      assert_core_install_names(File.join(dir, 'local'))
       bin = File.join(dir, 'bin')
       FileUtils.mkdir_p(bin)
       # Record downloads and serve templates locally, without network requests.
@@ -271,6 +300,7 @@ class ContinuumTest < Minitest::Test
       ['release/v2', 'a' * 40, '123'].each do |ref|
         output, status = Open3.capture2e(env, 'bash', File.join(ROOT, 'install.sh'), File.join(dir, 'pinned'), ref)
         assert status.success?, output
+        assert_core_install_names(File.join(dir, 'pinned'))
         Dir[File.join(dir, 'pinned/.github/workflows/*.yml')].each do |file|
           job = yaml(file).fetch('jobs').fetch('call')
           assert job['uses'].end_with?("@#{ref}")
@@ -303,7 +333,7 @@ class ContinuumTest < Minitest::Test
       # library", and the value no longer exists.
       output, status = Open3.capture2e('bash', File.join(ROOT, 'install.sh'), File.join(dir, 'legacy'), 'main', 'swift')
       refute status.success?, output
-      assert_includes output, 'invalid set: swift'
+      assert_includes output, "invalid set: swift (the old 'swift' set is now 'tech')"
       refute Dir.exist?(File.join(dir, 'legacy'))
     end
   end

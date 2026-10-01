@@ -5,10 +5,11 @@ Continuum is a reusable GitHub Actions control plane, not an application. It shi
 `.github/caller-stubs/`, an installer (`install.sh`), and a dependency-free Python
 engine under `src/continuum/` and `.github/scripts/`. Consumers install the thin
 callers; they never copy engine code into their repository. The two-layer naming
-rule: **core** workflows are either historical unprefixed names or
-`continuum-<name>.yml` (exactly two segments after `continuum`); **technology
-library** workflows are `continuum-tech-<tech>-<name>.yml` (exactly three dashes
-after `continuum`) and are opt-in (never triggered by Continuum itself).
+rule: new **core** workflow files are named `continuum-<name>.yml`; the core
+files shipped today keep their historical unprefixed names and are listed
+explicitly in the contract test. **Technology library** workflows are named
+`continuum-tech-<tech>-<name>.yml` — the `continuum-tech-<tech>-` prefix marks
+them — and are opt-in (never triggered by Continuum itself).
 
 ## Source of truth
 
@@ -27,9 +28,9 @@ These are public interfaces and must not change silently:
 - the `TAP_PAT` repository secret name (classic PAT, `repo` + `workflow` scopes)
   expected by every set;
 - the installer sets (`core`, `tech`, `parent`): `core` installs every stub
-  under `.github/caller-stubs/`, `tech` installs only `.github/caller-stubs/tech/`
-  (three dashes mark an opt-in library), `parent` installs only
-  `.github/caller-stubs/parent/`.
+  under `.github/caller-stubs/`, `tech` installs only
+  `.github/caller-stubs/tech/` (the `continuum-tech-` prefix marks an opt-in
+  library), `parent` installs only `.github/caller-stubs/parent/`.
   and the `install.sh` argument shape;
 - the parent/child repository-variable names (`CONTINUUM_ROLE`,
   `CONTINUUM_CHILDREN`, `CONTINUUM_CHILD_ID`, `CONTINUUM_PARENT`,

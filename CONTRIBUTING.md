@@ -1,6 +1,6 @@
 # Contributing to Continuum
 
-Continuum provides reusable GitHub Actions workflows and parent/child delegated execution. It ships two layers: a core layer of task-domain workflows every project needs, and an opt-in technology library (Swift build/release/packaging) that Continuum never triggers itself. The two layers are distinguished by file name — core is `continuum-<name>.yml`, the technology library is `continuum-tech-<tech>-<name>.yml` (three dashes after `continuum`). Keep `.github/caller-stubs/` compatible with the workflow interfaces and preserve workflow names used by controllers and `workflow_run` triggers.
+Continuum provides reusable GitHub Actions workflows and parent/child delegated execution. It ships two layers: a core layer of task-domain workflows every project needs, and an opt-in technology library (Swift build/release/packaging) that Continuum never triggers itself. The two layers are distinguished by file name — new core files are `continuum-<name>.yml`, the technology library is `continuum-tech-<tech>-<name>.yml` (the `continuum-tech-<tech>-` prefix marks the library). Keep `.github/caller-stubs/` compatible with the workflow interfaces and preserve workflow names used by controllers and `workflow_run` triggers.
 
 ## Verification
 

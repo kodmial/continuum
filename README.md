@@ -39,17 +39,21 @@ These names are the interface and never change per consumer:
 
 - the `TAP_PAT` repository secret (classic PAT, `repo` + `workflow` scopes) —
   every set expects a secret with exactly this name;
-- the `continuum-` prefix on installed callers, and the `continuum-tech-`
-  three-dash marker for opt-in library callers;
+- the `continuum-` prefix on installed callers, and the `continuum-tech-<tech>-`
+  prefix for opt-in library callers;
 - the installer sets (`core`, `tech`, and `parent`);
 - the `CONTINUUM_*` repository-variable names.
 
 Continuum is technology-neutral: `core` ships the task-domain controllers
 (issue scheduling, PR creation/repair/recovery, PR review, PR analysis,
 auto-merge, delegation) every project needs; `tech` is a separate, opt-in
-library of technology-specific workflows — three dashes after `continuum`
-(`continuum-tech-<tech>-<name>.yml`) mark them as a library that Continuum
+library of technology-specific workflows — the `continuum-tech-<tech>-` prefix
+(`continuum-tech-<tech>-<name>.yml`) marks them as a library that Continuum
 itself never triggers; `parent` drives delegated execution for any technology.
+
+New core workflow files should be named `continuum-<name>.yml`. The core files
+shipped today keep their historical unprefixed names (`opencode.yml`,
+`pr-agent.yml`, …), which are listed explicitly in `scripts/test-continuum.rb`.
 
 ## Install
 
@@ -81,6 +85,27 @@ existing files.
 The `parent` and `tech` sets add **only** their own callers; each preserves
 the consumer's own CI, release, and scheduling workflows. Any value other than
 `core`, `tech`, or `parent` is rejected.
+
+## Upgrading
+
+The technology set was renamed from `swift` to `tech`. Replace
+
+```sh
+bash install.sh <path-to-consumer-repo> <ref> swift
+```
+
+with
+
+```sh
+bash install.sh <path-to-consumer-repo> <ref> tech
+```
+
+`core` is the new default set, so `bash install.sh <path-to-consumer-repo> <ref>`
+now installs the core layer where the old command installed the technology
+library. `core` and `tech` are separate installs: installing `core` does not
+install `tech`, and a consumer that wants the technology library runs the `tech`
+command as well. Passing the old `swift` value is rejected with
+`invalid set: swift (the old 'swift' set is now 'tech')`.
 
 ## Reusable workflows
 
@@ -119,7 +144,7 @@ part of the contract and never change per consumer):
 
 | Secret | Used by | Purpose |
 | --- | --- | --- |
-| `TAP_PAT` | review, release, opencode, delegation | Classic PAT (`repo` + `workflow` scopes) for checkout/push/API. Also the child-runtime token for the `parent` profile. |
+| `TAP_PAT` | review, release, opencode, delegation | Classic PAT (`repo` + `workflow` scopes) for checkout/push/API. Also the child-runtime token for the `parent` set. |
 | `OPENCODE_API_KEY` | OpenCode workflows | Model provider access. |
 | `RELEASE_PR_TOKEN` | `continuum-tech-swift-release-pr.yml` (optional) | Fine-grained PAT (`Contents: write`, `Pull requests: write`); falls back to `TAP_PAT`. |
 | `NANODICTATE_SIGNING_P12` | tech release and packaging-smoke workflows | Base64 macOS signing certificate (`.p12`). |
@@ -158,7 +183,7 @@ bash install.sh /path/to/myapp <sha> tech
 
 - Keep the consumer's own `.continuum.yml` (the neutral `version: 1` file is
   sufficient when there is no tracked relationship).
-- Provide the signing and model secrets the installed profile uses
+- Provide the signing and model secrets the installed sets use
   (see the secrets table above), plus the `CONTINUUM_*` repository variables
   listed in [Consumer configuration variables](docs/consumer-variables.md).
 - The consumer keeps its own `release-please-config.json`,
