@@ -95,6 +95,47 @@ class ContinuumTest < Minitest::Test
     DISPATCHING_WORKFLOWS.flat_map { |name| dispatch_calls(name) }
   end
 
+  # The exact `{ … }` block opened by `header`, matched by brace depth rather
+  # than by indentation. A guard whose condition was neutered (`if (false)`)
+  # keeps its error text somewhere in the file, so the only way to prove the
+  # text is *inside* the guard is to extract the guard's own body.
+  def js_block(body, header)
+    start = body.index(header)
+    return nil if start.nil?
+
+    opening = body.index('{', start + header.length)
+    return nil if opening.nil?
+
+    depth = 0
+    index = opening
+    while index < body.length
+      case body[index]
+      when '{' then depth += 1
+      when '}'
+        depth -= 1
+        return body[start..index] if depth.zero?
+      end
+      index += 1
+    end
+    nil
+  end
+
+  # The `if [[ -n "$VAR" ]]; then … fi` block that gates one shell variable,
+  # from the `if` line through its `fi` at the same indentation. Scoping an
+  # assertion to the gated body is what distinguishes a live gate from the
+  # same literal text left behind by a neutered one.
+  def shell_if_gate(step, variable)
+    header = %(if [[ -n "$#{variable}" ]]; then)
+    lines = step.lines
+    start = lines.index { |line| line.strip == header }
+    return nil if start.nil?
+
+    indent = lines[start][/\A */].size
+    rest = lines[(start + 1)..]
+    stop = rest.index { |line| line.strip == 'fi' && line[/\A */].size == indent }
+    stop ? lines[start..(start + stop)].join : nil
+  end
+
   def events(workflow)
     workflow['on'] || workflow[true]
   end
@@ -3178,6 +3219,108 @@ class ContinuumTest < Minitest::Test
     assert_includes wakeup, '::warning::'
   end
 
+  # The route-line guard must be LIVE, not merely present. Asserting that the
+  # error text exists somewhere in the workflow cannot tell a working guard
+  # from `if (false) {` with the throw left inside: the text is identical in
+  # both, so the malformed-route protection would silently vanish while every
+  # assertion about the strings still passed. Scope each error text to the
+  # guard's own brace-matched body, so neutering the condition drops the text
+  # out of the extracted block and the test fails.
+  def test_scheduler_route_line_guard_is_live_and_owns_its_error_text
+    body = workflow_body('continuum-issue-scheduler.yml')
+
+    guard = js_block(body, 'if (parts.length < 2 || parts.length > 3 || !parts[0] || !parts[1])')
+    refute_nil guard, 'the malformed route-line guard is missing from the scheduler script'
+    assert_includes guard, 'parts.length < 2'
+    assert_includes guard, 'parts.length > 3'
+    assert_includes guard, '!parts[0]'
+    assert_includes guard, '!parts[1]'
+    assert_includes guard, 'throw new Error('
+    assert_includes guard, '"Invalid execution_label_routes line: \'"',
+                    'the line-level error must be raised by the guard, not merely present in the file'
+    assert_includes guard, '"\'; expected \'<issue label>|<workflow file name>|<input>=<value>,...\'."'
+
+    # The input-level guard has the same weakness: its error text exists only
+    # once in the file, so pinning it to the `separator <= 0` body is what
+    # proves a malformed `<input>=<value>` assignment still fails the run.
+    input_guard = js_block(body, 'if (separator <= 0)')
+    refute_nil input_guard, 'the malformed route-input guard is missing from the scheduler script'
+    assert_includes input_guard, 'throw new Error('
+    assert_includes input_guard, '"Invalid execution_label_routes input \'"',
+                    'the input-level error must be raised by the guard, not merely present in the file'
+    assert_includes input_guard, '"\'; expected \'<name>=<value>\'."'
+  end
+
+  # `opencode_dispatch` selects between two real dispatch forms, so an
+  # unrecognized value must fail loudly rather than fall through to a form the
+  # consumer's OpenCode caller cannot accept. Both halves of that contract —
+  # the two-value enum and the error text — live under one live guard.
+  def test_scheduler_opencode_dispatch_enum_is_validated_under_a_live_guard
+    body = workflow_body('continuum-issue-scheduler.yml')
+
+    guard = js_block(body, "if (!['comment', 'workflow'].includes(opencodeDispatch))")
+    refute_nil guard, 'the opencode_dispatch enum guard is missing from the scheduler script'
+    assert_includes guard, "'comment'",
+                    'the enum must admit the comment form, which is the permissionless default'
+    assert_includes guard, "'workflow'",
+                    'the enum must admit the workflow form, for callers without an issue_comment trigger'
+    assert_includes guard, 'throw new Error('
+    assert_includes guard, '"Unsupported opencode_dispatch \'"',
+                    'the enum error must be raised by the guard, not merely present in the file'
+    assert_includes guard, '"\'; expected \'comment\' or \'workflow\'."'
+
+    # The guard must read the same value the dispatch later branches on, so a
+    # validated-but-unused variable would pass the enum check and still
+    # dispatch the wrong form.
+    assert_includes body, 'const opencodeDispatch = ('
+    assert_includes body, 'process.env.OPENCODE_DISPATCH'
+  end
+
+  # Every dispatch in this job must target the configured ref. The
+  # `opencode_dispatch: workflow` window is covered elsewhere; the route
+  # helper is a separate call site and had no assertion of its own, so a
+  # hardcoded `ref: 'main'` there would dispatch routes at main regardless of
+  # the consumer's `dispatch_ref`.
+  def test_scheduler_route_helper_dispatches_at_the_configured_ref
+    body = workflow_body('continuum-issue-scheduler.yml')
+
+    helper = js_block(body, 'async function dispatchWorkflow(workflow, inputs)')
+    refute_nil helper, 'the dispatchWorkflow helper is missing from the scheduler script'
+    assert_includes helper, 'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches'
+    assert_includes helper, 'ref: dispatchRef',
+                    'the route helper must dispatch at the configured ref, not a hardcoded one'
+    refute_includes helper, "ref: 'main'",
+                   'the route helper must not hardcode a ref; it exists only as the env fallback'
+
+    # The value it forwards must itself come from the configurable env, not a
+    # second hardcoded default inside the script.
+    assert_includes body, "const dispatchRef = process.env.DISPATCH_REF || 'main';"
+  end
+
+  # The scheduler's own env binding for DISPATCH_REF is what makes
+  # `dispatch_ref` / vars.CONTINUUM_DISPATCH_REF reach the script at all. Other
+  # workflows have their own DISPATCH_REF bindings, so an assertion on the
+  # whole file or on another workflow cannot pin this one.
+  def test_scheduler_dispatch_ref_env_binding_follows_the_consumer_knob
+    body = workflow_body('continuum-issue-scheduler.yml')
+
+    # The scheduler job's own env block, not some other workflow's table.
+    env_block = body[/^jobs:\n  schedule:.*?\n {4}steps:/m]
+    refute_nil env_block, 'the schedule job env block is missing from the scheduler'
+
+    assert_includes env_block,
+                    "DISPATCH_REF: ${{ inputs.dispatch_ref || vars.CONTINUUM_DISPATCH_REF || 'main' }}",
+                    'the scheduler must expose dispatch_ref through DISPATCH_REF for its script'
+
+    # The fallback chain and the declared default must agree, or the input is
+    # documented as one thing and bound as another.
+    inputs = events(yaml(File.join(ROOT, '.github/workflows/continuum-issue-scheduler.yml')))
+             .fetch('workflow_call').fetch('inputs')
+    assert_equal 'main', inputs.fetch('dispatch_ref').fetch('default')
+    assert_includes inputs.fetch('dispatch_ref').fetch('description'),
+                    'vars.CONTINUUM_DISPATCH_REF'
+  end
+
   # The `workflow` dispatch form of opencode_dispatch must carry `issue`, and
   # the issue mode itself must be admitted by the engine's mode whitelist —
   # otherwise the route and the mode would each be half of a dead end.
@@ -3247,6 +3390,61 @@ class ContinuumTest < Minitest::Test
     # The list is parsed from configuration, split on commas, empties dropped.
     assert_includes body, "String(process.env.POST_MERGE_WAKEUPS || '')"
     assert_includes body, '.filter(name => name.length > 0);'
+  end
+
+  # `core.warning` appears five times in the auto-merger, so a regex anchored
+  # only to its own text matches the FIRST occurrence — the review-thread
+  # handler — and says nothing about the post-merge wake-up. Extracting the
+  # wake-up loop and pinning the catch inside it is what actually asserts the
+  # best-effort contract: a wake-up that cannot be delivered warns, and never
+  # fails a run whose merge already landed.
+  def test_auto_merge_wakeup_catch_warns_inside_the_wakeup_loop
+    body = auto_merge_body
+
+    loop_block = js_block(body, 'for (const workflow of postMergeWakeups)')
+    refute_nil loop_block, 'the post-merge wake-up loop is missing from the auto-merger'
+    assert_includes loop_block, 'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches'
+    assert_includes loop_block, 'ref: postMergeWakeupRef'
+
+    catch_block = loop_block[/catch \(err\) \{.*?\n {16}\}/m]
+    refute_nil catch_block,
+               'a failed wake-up dispatch must be caught inside the loop, not left to reject the run'
+    assert_includes catch_block, 'core.warning(',
+                    'the caught wake-up failure must warn, not rethrow'
+    assert_includes catch_block, 'could not wake ${workflow}',
+                    'the warning must name the workflow that could not be woken'
+
+    # Best-effort means best-effort: the loop must not escalate to a red run.
+    refute_includes loop_block, 'core.setFailed'
+    refute_includes loop_block, 'process.exitCode'
+  end
+
+  # The empty-name filter must apply to the list BEFORE the dispatch loop
+  # iterates it, not merely appear somewhere in the file. Asserting the filter
+  # line exists in isolation passes even if the filter were dropped from the
+  # chain, in which case a trailing comma in POST_MERGE_WAKEUPS dispatches the
+  # empty workflow name and 404s the run — exactly the failure the comment
+  # above the declaration says the list must not have.
+  def test_auto_merge_wakeup_list_drops_empty_names_before_dispatch
+    body = auto_merge_body
+
+    declaration = body[/const postMergeWakeups = .*?\.filter\(name => name\.length > 0\);/m]
+    refute_nil declaration,
+               'the wake-up list must end its parse chain with the empty-name filter'
+    assert_includes declaration, "String(process.env.POST_MERGE_WAKEUPS || '')"
+    assert_includes declaration, ".split(',')"
+    assert_includes declaration, '.map(name => name.trim())'
+    assert_includes declaration, '.filter(name => name.length > 0)',
+                    'the empty-name filter must be part of the list declaration, not a stray statement'
+
+    # Order is the whole point: the filter has to run while the list is built,
+    # before the loop consumes it. Assert on real positions rather than on a
+    # first-occurrence match.
+    declare_at = body.index('const postMergeWakeups')
+    loop_at = body.index('for (const workflow of postMergeWakeups)')
+    refute_nil loop_at, 'the post-merge wake-up loop is missing from the auto-merger'
+    assert declare_at < loop_at,
+           'the wake-up list must be declared, and filtered, before the loop dispatches it'
   end
 
   # Coordinator item 1: `/oc-cancel`. The command is a substring of `/oc`, so
@@ -3355,6 +3553,67 @@ class ContinuumTest < Minitest::Test
     assert_includes step, '[[ -f "$RECORD_PATH" ]] || {'
     refute_includes step, 'render_lifecycle',
                     'core ships no automation/render_lifecycle module; the validator must stay consumer-owned'
+  end
+
+  # The knowledge handoff has two halves and BOTH must be off unless the
+  # consumer names them. The env bindings were pinned but the gates were not:
+  # the RECORDS_DIR half was checked, the PROTOCOL_PATH half was not, so
+  # `if true` on the protocol gate would emit a mandatory handoff for a
+  # consumer that named no protocol — an asymmetry that hides a broken gate.
+  def test_opencode_knowledge_handoff_halves_are_each_behind_a_live_gate
+    body = File.read(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
+    step = step_body(body, 'Implement issue')
+    refute_nil step, 'the `issue` mode step is missing'
+
+    protocol_gate = shell_if_gate(step, 'KNOWLEDGE_PROTOCOL_PATH')
+    refute_nil protocol_gate,
+               'the KNOWLEDGE_PROTOCOL_PATH gate is missing: the handoff prompt must be conditional'
+    assert_includes protocol_gate, 'read ${KNOWLEDGE_PROTOCOL_PATH}',
+                    'the mandatory-handoff line must live inside the protocol gate'
+    assert_includes protocol_gate, 'PROMPT="$PROMPT'
+
+    records_gate = shell_if_gate(step, 'KNOWLEDGE_RECORDS_DIR')
+    refute_nil records_gate,
+               'the KNOWLEDGE_RECORDS_DIR gate is missing: the run-record line must be conditional'
+    assert_includes records_gate, 'write exactly one run record at ${KNOWLEDGE_RECORDS_DIR}/issue-'
+
+    # The two halves are independent: neither gate may read the other's
+    # variable, or naming only one would drag in the other half too.
+    refute_includes protocol_gate, 'KNOWLEDGE_RECORDS_DIR'
+    refute_includes records_gate, 'KNOWLEDGE_PROTOCOL_PATH'
+
+    # The env bindings the gates read must still be the plain, undefaulted
+    # inputs: a hardcoded default here would make the gate always true.
+    assert_includes step, 'KNOWLEDGE_PROTOCOL_PATH: ${{ inputs.knowledge_protocol_path }}'
+    assert_includes step, 'KNOWLEDGE_RECORDS_DIR: ${{ inputs.knowledge_records_dir }}'
+    refute_match(/KNOWLEDGE_PROTOCOL_PATH:.*\|\| *'[^']+'/, step,
+                 'the protocol path must not carry a fallback default; the gate supplies the off state')
+  end
+
+  # COMMIT_PREFIX is what names the task commit `issue` mode creates. The
+  # consumer of the variable was pinned (`git commit -m "${COMMIT_PREFIX}…"`)
+  # but the binding that supplies it was not, so an empty or hardcoded
+  # COMMIT_PREFIX would produce commits like `: implement issue #12`.
+  def test_opencode_commit_prefix_env_binding_follows_the_consumer_knob
+    body = File.read(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
+    step = step_body(body, 'Implement issue')
+    refute_nil step, 'the `issue` mode step is missing'
+
+    binding_line = "COMMIT_PREFIX: ${{ inputs.issue_commit_prefix || vars.CONTINUUM_ISSUE_COMMIT_PREFIX || 'fix' }}"
+    assert_includes step, binding_line,
+                    'COMMIT_PREFIX must fall back from input to repository variable to `fix`'
+    assert_includes step, 'git commit -m "${COMMIT_PREFIX}: implement issue #${ISSUE_NUMBER}"',
+                    'the commit subject must actually consume COMMIT_PREFIX'
+
+    # The declared default and the documented fallback chain must agree with
+    # the binding, so the input is not advertised as one thing and bound as
+    # another.
+    inputs = events(yaml(File.join(ROOT, '.github/workflows/continuum-opencode.yml')))
+             .fetch('workflow_call').fetch('inputs')
+    prefix = inputs.fetch('issue_commit_prefix')
+    assert_equal '', prefix.fetch('default'),
+                 'the fallback chain supplies `fix`, so the input itself must default to empty'
+    assert_includes prefix.fetch('description'), 'vars.CONTINUUM_ISSUE_COMMIT_PREFIX'
   end
 
   end
