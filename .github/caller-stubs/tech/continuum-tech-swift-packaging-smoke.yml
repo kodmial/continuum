@@ -50,9 +50,13 @@ on:
         type: string
         default: ''
 
+# Mirrors the union of the callee's real API surface: the resolve job reads PR
+# files and cancels superseded runs, the production-incident job writes issues.
 permissions:
   contents: read
   issues: write
+  pull-requests: read
+  actions: write
 
 jobs:
   call:

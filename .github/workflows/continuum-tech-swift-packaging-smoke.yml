@@ -176,7 +176,6 @@ jobs:
               // them run only burns one of GitHub's scarce macOS slots.
               const staleMacPaths = new Set([
                 '.github/workflows/continuum-tech-swift-ci.yml',
-                '.github/workflows/macos-12-compat.yml',
               ]);
               for (const run of runs) {
                 if (!staleMacPaths.has(run.path) || run.event !== 'pull_request') continue;
