@@ -112,16 +112,16 @@ jobs:
             arch: arm64
             swift: '6.1'
     env:
-      # Technology-oriented, consumer-configurable identity. Defaults preserve
-      # the current NanoDictate behavior; another Swift project overrides these
-      # through its own repository variables.
-      APP_NAME: ${{ vars.CONTINUUM_APP_NAME || 'NanoDictate' }}
-      CLI_NAME: ${{ vars.CONTINUUM_CLI_NAME || 'nanodictate' }}
-      AGENT_NAME: ${{ vars.CONTINUUM_AGENT_NAME || 'NanoDictateAgent' }}
-      BUNDLE_AGENT: ${{ vars.CONTINUUM_BUNDLE_AGENT || 'com.nanodictate.agent' }}
-      BUNDLE_CTL: ${{ vars.CONTINUUM_BUNDLE_CTL || 'com.nanodictate.ctl' }}
-      SIGNING_IDENTITY: ${{ vars.CONTINUUM_SIGNING_IDENTITY || 'NanoDictate CI Signing' }}
-      VERSION_FILE: ${{ vars.CONTINUUM_VERSION_FILE || 'Sources/NanoDictateCore/Version.swift' }}
+      # Consumer identity comes entirely from repository variables, so the
+      # engine names no product. A consumer sets these in its own repository
+      # and the workflow fails fast when one is missing.
+      APP_NAME: ${{ vars.CONTINUUM_APP_NAME }}
+      CLI_NAME: ${{ vars.CONTINUUM_CLI_NAME }}
+      AGENT_NAME: ${{ vars.CONTINUUM_AGENT_NAME }}
+      BUNDLE_AGENT: ${{ vars.CONTINUUM_BUNDLE_AGENT }}
+      BUNDLE_CTL: ${{ vars.CONTINUUM_BUNDLE_CTL }}
+      SIGNING_IDENTITY: ${{ vars.CONTINUUM_SIGNING_IDENTITY }}
+      VERSION_FILE: ${{ vars.CONTINUUM_VERSION_FILE }}
 
     steps:
       - name: Checkout
@@ -133,6 +133,18 @@ jobs:
         uses: swift-actions/setup-swift@7ca6abe6b3b0e8b5421b88be48feee39cbf52c6a
         with:
           swift-version: ${{ matrix.swift }}
+
+      - name: Require consumer identity variables
+        run: |
+          set -euo pipefail
+          missing=()
+          for name in APP_NAME CLI_NAME AGENT_NAME BUNDLE_AGENT BUNDLE_CTL SIGNING_IDENTITY VERSION_FILE; do
+            [[ -n "${!name:-}" ]] || missing+=("CONTINUUM_$name")
+          done
+          if (( ${#missing[@]} > 0 )); then
+            echo "::error::Missing repository variables: ${missing[*]}" >&2
+            exit 1
+          fi
 
       - name: Build release binaries
         run: |
@@ -291,7 +303,7 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x scripts/packaging-smoke/*.sh
-          VERSION="$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' "${{ vars.CONTINUUM_VERSION_FILE || 'Sources/NanoDictateCore/Version.swift' }}")"
+          VERSION="$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' "${{ vars.CONTINUUM_VERSION_FILE }}")"
           echo "Candidate version: $VERSION"
           ls -l candidate-dist/
           bash scripts/packaging-smoke/make-candidate.sh \
@@ -353,7 +365,7 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x scripts/packaging-smoke/*.sh
-          VERSION="$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' "${{ vars.CONTINUUM_VERSION_FILE || 'Sources/NanoDictateCore/Version.swift' }}")"
+          VERSION="$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' "${{ vars.CONTINUUM_VERSION_FILE }}")"
           echo "Candidate version: $VERSION"
           ls -l candidate-dist/
           bash scripts/packaging-smoke/make-candidate.sh \

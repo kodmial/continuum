@@ -57,7 +57,7 @@ jobs:
       skip_release: ${{ steps.guard.outputs.skip_release }}
       skip_manifests: ${{ steps.guard.outputs.skip_manifests }}
     env:
-      VERSION_FILE: ${{ vars.CONTINUUM_VERSION_FILE || 'Sources/NanoDictateCore/Version.swift' }}
+      VERSION_FILE: ${{ vars.CONTINUUM_VERSION_FILE }}
 
     steps:
       - name: Checkout
@@ -453,12 +453,12 @@ jobs:
 
     env:
       # Consumer-configurable identity (defaults preserve NanoDictate behavior).
-      APP_NAME: ${{ vars.CONTINUUM_APP_NAME || 'NanoDictate' }}
-      CLI_NAME: ${{ vars.CONTINUUM_CLI_NAME || 'nanodictate' }}
-      AGENT_NAME: ${{ vars.CONTINUUM_AGENT_NAME || 'NanoDictateAgent' }}
-      BUNDLE_AGENT: ${{ vars.CONTINUUM_BUNDLE_AGENT || 'com.nanodictate.agent' }}
-      BUNDLE_CTL: ${{ vars.CONTINUUM_BUNDLE_CTL || 'com.nanodictate.ctl' }}
-      SIGNING_IDENTITY: ${{ vars.CONTINUUM_SIGNING_IDENTITY || 'NanoDictate CI Signing' }}
+      APP_NAME: ${{ vars.CONTINUUM_APP_NAME }}
+      CLI_NAME: ${{ vars.CONTINUUM_CLI_NAME }}
+      AGENT_NAME: ${{ vars.CONTINUUM_AGENT_NAME }}
+      BUNDLE_AGENT: ${{ vars.CONTINUUM_BUNDLE_AGENT }}
+      BUNDLE_CTL: ${{ vars.CONTINUUM_BUNDLE_CTL }}
+      SIGNING_IDENTITY: ${{ vars.CONTINUUM_SIGNING_IDENTITY }}
 
     steps:
       - name: Checkout
@@ -473,6 +473,18 @@ jobs:
           # explicitly per matrix entry: macOS 15 runner images ship a newer
           # Xcode/Swift by default.
           swift-version: "${{ matrix.swift }}"
+
+      - name: Require consumer identity variables
+        run: |
+          set -euo pipefail
+          missing=()
+          for name in APP_NAME CLI_NAME AGENT_NAME BUNDLE_AGENT BUNDLE_CTL SIGNING_IDENTITY; do
+            [[ -n "${!name:-}" ]] || missing+=("CONTINUUM_$name")
+          done
+          if (( ${#missing[@]} > 0 )); then
+            echo "::error::Missing repository variables: ${missing[*]}" >&2
+            exit 1
+          fi
 
       - name: Build release binaries
         # Each binary embeds its own Info.plist as a Mach-O __info_plist
@@ -761,7 +773,7 @@ jobs:
       issues: write
       pull-requests: write
     env:
-      CLI_NAME: ${{ vars.CONTINUUM_CLI_NAME || 'nanodictate' }}
+      CLI_NAME: ${{ vars.CONTINUUM_CLI_NAME }}
 
     steps:
       - name: No-op — version already released / dry run

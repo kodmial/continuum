@@ -15,7 +15,7 @@ permissions: {}
 # CodeRabbit's included full-review quota is shared across PRs. There must be
 # exactly one controller deciding which PR gets the next review slot.
 concurrency:
-  group: nanodictate-coderabbit-rate-limit-controller
+  group: ${{ github.workflow }}-coderabbit-rate-limit-controller
   # This controller deliberately sleeps until the next shared quota slot.
   # Cancelling it on every wake-up resets that timer and can starve the queue
   # forever when status/review events keep arriving. Keep one runner alive;

@@ -19,7 +19,7 @@ concurrency:
   # same pure latest-state reconciler. It revalidates every gate immediately
   # before each write. A newer wake-up makes an older queued/in-flight run
   # obsolete, so at most one reconciliation owns side effects at a time.
-  group: nanodictate-auto-merge
+  group: ${{ github.workflow }}-auto-merge
   cancel-in-progress: true
 
 jobs:

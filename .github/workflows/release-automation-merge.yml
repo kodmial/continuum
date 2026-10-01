@@ -20,7 +20,7 @@ permissions:
   pull-requests: write
 
 concurrency:
-  group: nanodictate-release-automation-merge
+  group: ${{ github.workflow }}-release-automation-merge
   cancel-in-progress: false
 
 jobs:

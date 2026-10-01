@@ -11,7 +11,7 @@ engine.
 | Path | Purpose |
 | --- | --- |
 | `.github/workflows/*.yml` | Reusable (`on: workflow_call`) workflows — the engine. |
-| `.github/caller-stubs/*.yml` | Thin callers installed by the `nanodictate` profile. |
+| `.github/caller-stubs/*.yml` | Thin callers installed by the `swift` profile (technology-oriented). |
 | `.github/caller-stubs/parent/*.yml` | Thin callers installed by the `parent` profile. |
 | `install.sh` | Installs a profile into a consumer repository. |
 | `src/continuum/` | Dependency-free Python engine (config + YAML subset). |
@@ -81,7 +81,7 @@ Workflow names are identical to the reusable file names unless noted.
 | `remove-review-label.yml` | Remove the ready label on sync. | — |
 | `coderabbit-retry.yml` | Retry CodeRabbit after a rate limit. | — |
 | `coderabbit-unresolved.yml` | Retry unresolved CodeRabbit findings. | — |
-| `bootstrap-runtime-secret.yml` | Fetch the runtime-lab Actions secrets public key. | — |
+| `bootstrap-runtime-secret.yml` | Fetch an Actions secrets public key for secret bootstrapping. | — |
 | `consumer-child-dispatcher.yml` | Parent scheduler for child tasks/reviews. | `worker_workflow`, `review_workflow`, `manual_pr_review_workflow`, `engine_ref` |
 | `consumer-child-worker.yml` | Execute one delegated child task. | `child_id`, `task_number`, `model`, `max_agent_passes`, `python_version`, `engine_ref` |
 | `consumer-child-review.yml` | Independent review of a delegated child task. | `child_id`, `task_number`, `pr_number`, `model`, `max_review_passes`, `python_version`, `engine_ref` |
@@ -126,35 +126,35 @@ live in GitHub Actions **repository variables**. See
 [docs/parent-child-delegation.md](docs/parent-child-delegation.md) for the full
 contract.
 
-### Application consumer (e.g. NanoDictate)
+### Swift application consumer (example: any Swift app repository)
 
 ```sh
-bash install.sh /path/to/nanodictate <sha> swift
+bash install.sh /path/to/myapp <sha> swift
 ```
 
 - Keep the consumer's own `.continuum.yml` (the neutral `version: 1` file is
   sufficient when there is no tracked relationship).
-- Provide `TAP_PAT`, `OPENCODE_API_KEY`, `NANODICTATE_SIGNING_P12`, and
-  `NANODICTATE_SIGNING_PASSWORD` (plus `RELEASE_PR_TOKEN`/`GROQ_API_KEY` if those
-  workflows run).
+- Provide the signing and model secrets the installed profile uses
+  (see the secrets table above), plus the `CONTINUUM_*` repository variables
+  listed in [Consumer configuration variables](docs/consumer-variables.md).
 - The consumer keeps its own `release-please-config.json`,
   `.release-please-manifest.json`, and `CHANGELOG.md`; release-please runs **in
   the consumer**, not here.
 
-### Parent (e.g. runtime-lab)
+### Parent (delegation control plane, one example per child id)
 
 ```sh
-bash install.sh /path/to/runtime-lab <sha> parent
+bash install.sh /path/to/parent-plane <sha> parent
 ```
 
 - Repository variables: `CONTINUUM_ROLE=parent`,
   `CONTINUUM_CHILDREN=["<child-id>", ...]` (a JSON array of opaque child ids).
-- Provide the `TAP_PAT` secret with access to the child repositories and to their
+- Provide a runtime PAT secret with access to the child repositories and to their
   Actions variables.
 - The parent dispatcher wakes on main pushes, every ten minutes, manual dispatch,
   and completion of child task/review workflows.
 
-### Child (e.g. kodmai)
+### Child (a delegated repository, one id per child)
 
 - A neutral `.continuum.yml` (`version: 1`).
 - Repository variables: `CONTINUUM_ROLE=child`, `CONTINUUM_CHILD_ID=<id>` (must
