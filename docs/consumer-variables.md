@@ -62,6 +62,38 @@ the input wins over the variable.
 | `AUTOMATION_DISPATCH_MARKER` | `opencode.dispatch_marker` | `<!-- issue-scheduler-dispatch -->` | Dispatch marker `opencode.yml` matches and counts. |
 | `AUTOMATION_IN_PROGRESS_LABEL` | `opencode.in_progress_label` | `automation:in-progress` | Reservation label. |
 | `AUTOMATION_PAUSE_LABEL` | `opencode.pause_marker` | `automation:paused` | Pause label. |
+| `AUTOMATION_WATCHDOG_MAX_RETRIES` | `continuum-opencode-watchdog.max_recovery_retries` | `1` | Automatic recovery retries before the issue is paused. |
+| `AUTOMATION_WATCHDOG_RETRY_MARKER` | `continuum-opencode-watchdog.retry_marker` | `<!-- opencode-watchdog-retry -->` | Hidden marker the watchdog counts. |
+| `AUTOMATION_WATCHDOG_TIMEOUT_MINUTES` | `continuum-opencode-watchdog.timeout_minutes` | `5` | Watchdog job timeout. |
+| `CONTINUUM_REQUIRE_CODERABBIT` | `auto-merge.require_coderabbit` | `false` | Require a CodeRabbit approval before merging. |
+
+### Optional integrations are off by default
+
+`CONTINUUM_REQUIRE_CODERABBIT` and the `continuum-opencode-watchdog` caller are
+optional integrations, so neither has a default that reproduces the behaviour a
+consumer had before it adopted Continuum. Set the value in the repository
+variable of the consumer that asked for the integration; every other consumer
+keeps the disabled behaviour with no extra configuration.
+
+- **`CONTINUUM_REQUIRE_CODERABBIT`** defaults to `false`. Only a consumer that
+  actually uses CodeRabbit sets it to `true`. With it off, `auto-merge.yml`
+  neither waits for a CodeRabbit approval nor dispatches
+  `continuum-coderabbit-retry.yml`, so a repository without that caller cannot
+  get a 404 dispatch or a merge that never lands. With it on, the previous
+  behaviour is unchanged.
+- **The watchdog** is opt-in in the sense that it only fires on
+  `workflow_run: completed`. Install it when the consumer wants a failed
+  `/oc` run recovered — Continuum's own `recover-scheduled-issue` job in
+  `opencode.yml` only fires for scheduler dispatch comments, so a manual run has
+  no recovery path without it. Its `watched_workflow` input must equal the
+  `name:` of the consumer's OpenCode caller, because GitHub's
+  `workflow_run.workflows` filter matches on the workflow `name:` and never on
+  the file name.
+
+The watchdog reads the same three markers and labels as `opencode.yml`
+(`AUTOMATION_DISPATCH_MARKER`, `AUTOMATION_IN_PROGRESS_LABEL`,
+`AUTOMATION_PAUSE_LABEL`), so a renamed label stays consistent across the
+scheduler, the agent, and the recovery.
 
 Setting `AUTOMATION_OPENCODE_RUNNER` to a non-macOS label (for example
 `ubuntu-latest`) skips the Swift toolchain setup and capability probe, which only

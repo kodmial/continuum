@@ -8,6 +8,17 @@ on:
         type: string
         default: main
         required: false
+      require_coderabbit:
+        description: >-
+          Require a CodeRabbit approval before merging and delegate rate-limited
+          reviews to the CodeRabbit retry controller. Empty falls back to
+          vars.CONTINUUM_REQUIRE_CODERABBIT. CodeRabbit is an optional
+          integration, so the default is OFF: a project that did not ask for
+          CodeRabbit must not be made to wait for an approval nobody will ever
+          give, and must not have a workflow dispatched it does not own.
+        type: string
+        default: ''
+        required: false
   # Successful PR CI explicitly dispatches this reconciler from
   # mark-ready-for-coderabbit. CodeRabbit status/review and main pushes are
   # additional event-driven wake-ups; no critical transition depends on cron.
@@ -42,6 +53,7 @@ jobs:
         # push/merge workflows (version bump, release, PR reconciliation).
         env:
           CONTINUUM_VERSION_FILE: ${{ vars.CONTINUUM_VERSION_FILE || 'Sources/NanoDictateCore/Version.swift' }}
+          REQUIRE_CODERABBIT: ${{ inputs.require_coderabbit || vars.CONTINUUM_REQUIRE_CODERABBIT || 'false' }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
@@ -50,6 +62,15 @@ jobs:
             const repoFullName = `${owner}/${repo}`;
             const AUTO_MERGE_BLOCK_LABEL = 'no-auto-merge';
             const CONFLICT_LOCK_LABEL = 'opencode-conflict-repair';
+            // CodeRabbit is an optional integration. When this project did not
+            // ask for it, every CodeRabbit gate below is skipped and no
+            // CodeRabbit workflow is ever dispatched: requiring an approval
+            // nobody will give would hang the PR forever, and dispatching a
+            // workflow the repository does not have is a 404.
+            const REQUIRE_CODERABBIT =
+              String(process.env.REQUIRE_CODERABBIT || '').trim().toLowerCase();
+            const requireCodeRabbit =
+              REQUIRE_CODERABBIT === 'true' || REQUIRE_CODERABBIT === '1';
 
             async function ensureLabel(name, color, description) {
               try {
@@ -958,11 +979,17 @@ jobs:
               // hits a conflict, no marker is ever written; OpenCode's conflict
               // resolution therefore becomes an ordinary new commit that must be
               // reviewed again.
-              const unresolvedBeforeSync =
-                await unresolvedCodeRabbitThreads(pr);
-              const reviewBasis = unresolvedBeforeSync.length === 0
-                ? await codeRabbitReviewBasis(pr, oldHead)
-                : null;
+              // Carry exists only to reuse a CodeRabbit approval across a
+              // controller-generated sync. With CodeRabbit disabled there is no
+              // approval to carry, so no marker is written and the
+              // GraphQL thread queries are skipped entirely.
+              const unresolvedBeforeSync = requireCodeRabbit
+                ? await unresolvedCodeRabbitThreads(pr)
+                : [];
+              const reviewBasis =
+                requireCodeRabbit && unresolvedBeforeSync.length === 0
+                  ? await codeRabbitReviewBasis(pr, oldHead)
+                  : null;
 
               try {
                 await github.request(
@@ -1147,17 +1174,26 @@ jobs:
 
               // A clean controller-generated merge of main can reuse a prior
               // completed APPROVED review. Any other new HEAD must have its own
-              // CodeRabbit review.
-              const reviewBasis =
-                await codeRabbitReviewBasis(pr, pr.head.sha);
-              const rabbitStatus = await latestCodeRabbitStatus(pr.head.sha);
+              // CodeRabbit review. Without CodeRabbit there is no review basis
+              // to establish and nothing to wait for.
+              const reviewBasis = requireCodeRabbit
+                ? await codeRabbitReviewBasis(pr, pr.head.sha)
+                : null;
+              const rabbitStatus = requireCodeRabbit
+                ? await latestCodeRabbitStatus(pr.head.sha)
+                : null;
 
               // Any green current HEAD that still lacks a valid CodeRabbit
               // approval belongs to the global serialized review queue. Wake
               // that controller even when CodeRabbit reports "review skipped",
               // a stale success status, or no status at all. The controller
               // owns quota timing and de-duplicates in-flight commands.
-              if (!reviewBasis && !codeRabbitRetryControllerDispatched) {
+              //
+              // `requireCodeRabbit` is checked here, not only through
+              // `!reviewBasis`: with the flag off there is no review queue to
+              // wake, and a repository without `continuum-coderabbit-retry.yml`
+              // would answer the dispatch with a 404.
+              if (requireCodeRabbit && !reviewBasis && !codeRabbitRetryControllerDispatched) {
                 await github.rest.actions.createWorkflowDispatch({
                   owner,
                   repo,
@@ -1174,6 +1210,7 @@ jobs:
               // own review. A safely carried approval must not burn another
               // included CodeRabbit review merely because the merge SHA changed.
               if (
+                requireCodeRabbit &&
                 !reviewBasis &&
                 rabbitStatus &&
                 /Review rate limited|Review limit reached/i.test(
@@ -1200,6 +1237,7 @@ jobs:
               }
 
               if (
+                requireCodeRabbit &&
                 !reviewBasis &&
                 (
                   !rabbitStatus ||
@@ -1216,8 +1254,9 @@ jobs:
               // Never lose an old CodeRabbit finding just because its diff is
               // now outdated. Every CodeRabbit-authored inline thread must be
               // resolved by CodeRabbit before merge.
-              const unresolvedThreads =
-                await unresolvedCodeRabbitThreads(pr);
+              const unresolvedThreads = requireCodeRabbit
+                ? await unresolvedCodeRabbitThreads(pr)
+                : [];
               if (unresolvedThreads.length > 0) {
                 const requested = await requestCodeRabbitThreadVerification(
                   pr,
@@ -1237,8 +1276,9 @@ jobs:
               // If CodeRabbit happened to comment on the synchronized current
               // head, do not ignore those findings merely because the approval
               // basis came from an older cleanly-carried head.
-              const currentHeadNitpicks =
-                await codeRabbitNitpickReviews(pr);
+              const currentHeadNitpicks = requireCodeRabbit
+                ? await codeRabbitNitpickReviews(pr)
+                : [];
               if (currentHeadNitpicks.length > 0) {
                 core.info(
                   `PR #${pr.number}: waiting for ${currentHeadNitpicks.length} current-head CodeRabbit nitpick review(s) to be addressed.`
@@ -1246,7 +1286,7 @@ jobs:
                 continue;
               }
 
-              if (!reviewBasis) {
+              if (requireCodeRabbit && !reviewBasis) {
                 const decision = await latestCodeRabbitDecision(pr);
                 core.info(
                   `PR #${pr.number}: current-head CodeRabbit decision is ${decision?.state || 'missing'}; not mergeable yet.`
@@ -1254,7 +1294,7 @@ jobs:
                 continue;
               }
 
-              if (reviewBasis.carried) {
+              if (reviewBasis && reviewBasis.carried) {
                 core.info(
                   `PR #${pr.number}: using CodeRabbit approval from ${reviewBasis.sourceSha} for clean main-sync head ${pr.head.sha}; current-head CI remains mandatory.`
                 );
@@ -1285,12 +1325,15 @@ jobs:
               const finalCi = await latestCurrentHeadCi(pr);
               const finalPackagingSmoke =
                 await latestCurrentHeadPackagingSmoke(pr);
-              const finalReviewBasis =
-                await codeRabbitReviewBasis(pr, pr.head.sha);
-              const finalUnresolvedThreads =
-                await unresolvedCodeRabbitThreads(pr);
-              const finalCurrentHeadNitpicks =
-                await codeRabbitNitpickReviews(pr);
+              const finalReviewBasis = requireCodeRabbit
+                ? await codeRabbitReviewBasis(pr, pr.head.sha)
+                : null;
+              const finalUnresolvedThreads = requireCodeRabbit
+                ? await unresolvedCodeRabbitThreads(pr)
+                : [];
+              const finalCurrentHeadNitpicks = requireCodeRabbit
+                ? await codeRabbitNitpickReviews(pr)
+                : [];
 
               if (
                 !finalCi ||
@@ -1299,9 +1342,14 @@ jobs:
                 (finalPackagingSmoke &&
                  (finalPackagingSmoke.status !== 'completed' ||
                   finalPackagingSmoke.conclusion !== 'success')) ||
-                !finalReviewBasis ||
-                finalUnresolvedThreads.length !== 0 ||
-                finalCurrentHeadNitpicks.length !== 0
+                // The CodeRabbit half of the revalidation is itself conditional:
+                // with the integration off there is nothing to re-read, and
+                // requiring a review basis that can never exist would cancel
+                // every merge.
+                (requireCodeRabbit &&
+                  (!finalReviewBasis ||
+                   finalUnresolvedThreads.length !== 0 ||
+                   finalCurrentHeadNitpicks.length !== 0))
               ) {
                 core.info(
                   `PR #${pr.number}: gate changed during final revalidation; merge cancelled.`
@@ -1348,7 +1396,11 @@ jobs:
               }
 
               core.notice(
-                `PR #${pr.number}: auto-merged head ${pr.head.sha} using CodeRabbit approval from ${finalReviewBasis.sourceSha}; merge commit ${result.sha}.`
+                `PR #${pr.number}: auto-merged head ${pr.head.sha} using ${
+                  requireCodeRabbit
+                    ? `CodeRabbit approval from ${finalReviewBasis.sourceSha}`
+                    : 'CI only; CodeRabbit is disabled for this repository'
+                }; merge commit ${result.sha}.`
               );
 
               // Merge at most one PR per controller run. The main push triggers

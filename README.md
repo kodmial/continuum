@@ -138,7 +138,7 @@ Workflow names are identical to the reusable file names unless noted.
 | `opencode-unresolved.yml` | Retry OpenCode on unresolved CodeRabbit findings. | — |
 | `continuum-opencode-watchdog.yml` | Recover a failed issue implementation run (`name: OpenCode watchdog`). | `watched_workflow`, `max_recovery_retries`, `retry_marker`, `in_progress_label`, `pause_marker`, `dispatch_marker`, `timeout_minutes` |
 | `issue-scheduler.yml` | Scheduled issue dispatch. | — |
-| `auto-merge.yml` | Auto-merge reviewed pull requests. | — |
+| `auto-merge.yml` | Auto-merge reviewed pull requests. | `require_coderabbit` |
 | `pr-agent.yml` | Manual PR Agent (Groq). | — |
 | `add-review-label.yml` | Mark a PR ready for CodeRabbit. | — |
 | `remove-review-label.yml` | Remove the ready label on sync. | — |

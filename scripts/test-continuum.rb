@@ -967,4 +967,132 @@ class ContinuumTest < Minitest::Test
     refute_match(/if: startsWith\(runner/, watchdog_body)
   end
 
+  # ------------------------------------------------- auto-merge / CodeRabbit
+
+  def auto_merge_body
+    File.read(File.join(ROOT, '.github/workflows/auto-merge.yml'))
+  end
+
+  # CodeRabbit is an OPTIONAL integration, so Continuum's default is off. A
+  # `true` default "so current consumers do not change" would make every
+  # project without CodeRabbit wait forever for an approval nobody will give,
+  # and would dispatch a workflow it does not have. The enabling value belongs
+  # in the one repository that asked for CodeRabbit.
+  def test_coderabbit_gate_is_off_by_default_and_variable_driven
+    inputs = events(yaml(File.join(ROOT, '.github/workflows/auto-merge.yml')))
+             .fetch('workflow_call').fetch('inputs')
+    knob = inputs.fetch('require_coderabbit')
+    assert_equal '', knob.fetch('default'),
+                 'require_coderabbit must default to empty so vars.CONTINUUM_REQUIRE_CODERABBIT decides'
+    assert_equal 'string', knob.fetch('type')
+    assert_equal false, knob.fetch('required')
+
+    body = auto_merge_body
+    assert_includes body, "REQUIRE_CODERABBIT: ${{ inputs.require_coderabbit || vars.CONTINUUM_REQUIRE_CODERABBIT || 'false' }}"
+    refute_includes body, "vars.CONTINUUM_REQUIRE_CODERABBIT || 'true'",
+                    'CodeRabbit must not default to on'
+  end
+
+  
+  # Both branches of the flag, checked in the body that acts on them. Asserting
+  # only the env string would let every gate keep reading the flag as `true`
+  # and no test would notice.
+  def test_auto_merge_skips_every_coderabbit_gate_when_disabled
+    body = auto_merge_body
+
+    # The flag is parsed once, and the only truthy spellings are explicit.
+    assert_match(/const REQUIRE_CODERABBIT =\s*String\(process\.env\.REQUIRE_CODERABBIT \|\| ''\)\.trim\(\)\.toLowerCase\(\);/, body)
+    assert_match(/REQUIRE_CODERABBIT === 'true' \|\| REQUIRE_CODERABBIT === '1'/, body)
+
+    # Every CodeRabbit query that decides whether a PR merges is conditional,
+    # so a repository without CodeRabbit never waits on one. Each call site is
+    # asserted by its own `requireCodeRabbit ? … : …` shape.
+    [
+      /const reviewBasis = requireCodeRabbit\s*\n\s*\? await codeRabbitReviewBasis\(pr, pr\.head\.sha\)\s*\n\s*: null;/,
+      /const rabbitStatus = requireCodeRabbit\s*\n\s*\? await latestCodeRabbitStatus\(pr\.head\.sha\)\s*\n\s*: null;/,
+      /const unresolvedThreads = requireCodeRabbit\s*\n\s*\? await unresolvedCodeRabbitThreads\(pr\)\s*\n\s*: \[\];/,
+      /const currentHeadNitpicks = requireCodeRabbit\s*\n\s*\? await codeRabbitNitpickReviews\(pr\)\s*\n\s*: \[\];/
+    ].each do |shape|
+      assert_match shape, body, "an unguarded CodeRabbit query is left in the merge loop"
+    end
+
+    # The dispatch is the failure mode that matters: with the flag off, a
+    # repository without `continuum-coderabbit-retry.yml` gets a 404 and a PR
+    # that never merges. Both dispatch sites must sit inside a gate that reads
+    # the flag. Take the guard text between the previous dispatch and this one,
+    # up to the enclosing `if`, and require the flag there.
+    dispatch_count = body.scan("workflow_id: 'continuum-coderabbit-retry.yml'").size
+    assert_equal 2, dispatch_count, 'the two CodeRabbit retry dispatch sites changed shape'
+    body.lines.each_with_index do |line, index|
+      next unless line.include?("workflow_id: 'continuum-coderabbit-retry.yml'")
+
+      # The dispatch is only reachable when the flag is on, so an enclosing gate
+      # has to read it. Locate the gates by indentation: the `if (` openers
+      # above the dispatch that are less indented than it, innermost first. A
+      # brace-balance walk is unreliable in JavaScript template literals, and
+      # indentation is exact in this file.
+      indent = line[/\A */].size
+      guards = body.lines[0...index]
+                   .select { |candidate| candidate =~ /^\s*if \(/ }
+                   .map { |candidate| [candidate[/\A */].size, candidate] }
+                   .select { |candidate_indent, _candidate| candidate_indent < indent }
+                   .last(3)
+                   .map(&:last)
+      refute_empty guards,
+                   "the CodeRabbit retry dispatch at #{index + 1} has no enclosing gate"
+      # The innermost gates may be ordinary de-duplication checks, so the flag
+      # must appear in one of the gates that actually decide reachability.
+      assert guards.any? { |guard| guard.include?('requireCodeRabbit') },
+             "the CodeRabbit retry dispatch at #{index + 1} is not gated on the flag " \
+             "(enclosing gates: #{guards.map(&:strip).join(' | ')})"
+    end
+    assert_match(/requireCodeRabbit &&\s*\n\s*!reviewBasis &&\s*\n\s*rabbitStatus &&/, body,
+                 'the rate-limit delegation must be gated on the flag')
+    assert_match(/if \(\s*\n\s*requireCodeRabbit &&\s*\n\s*!reviewBasis &&/, body,
+                 'the "waiting for completed CodeRabbit review" gate must be gated on the flag')
+    assert_match(/if \(requireCodeRabbit && !reviewBasis\) \{\s*\n\s*const decision = await latestCodeRabbitDecision/, body)
+
+    # The final revalidation is the last chance to cancel a merge; its
+    # CodeRabbit half must be conditional too, or the merge is cancelled with
+    # the flag off no matter what CI says.
+# The explanatory comment inside the condition must not make the assertion
+# miss, so match the CodeRabbit half as an ordered sequence of its terms
+# rather than as one literal stretch.
+    assert_match(/requireCodeRabbit &&[\s\S]{0,400}?!\s*finalReviewBasis\s*\|\|\s*finalUnresolvedThreads\.length !== 0\s*\|\|\s*finalCurrentHeadNitpicks\.length !== 0\s*\)\s*\)\s*\)\s*\{/, body)
+    assert_match(/const finalReviewBasis = requireCodeRabbit\s*\n\s*\? await codeRabbitReviewBasis/, body)
+    assert_match(/const finalUnresolvedThreads = requireCodeRabbit\s*\n\s*\? await unresolvedCodeRabbitThreads/, body)
+    assert_match(/const finalCurrentHeadNitpicks = requireCodeRabbit\s*\n\s*\? await codeRabbitNitpickReviews/, body)
+
+    # The merge log must not read `null.sourceSha` when the flag is off.
+    assert_match(/requireCodeRabbit\s*\n\s*\? `CodeRabbit approval from \$\{finalReviewBasis\.sourceSha\}`\s*\n\s*: 'CI only; CodeRabbit is disabled/, body)
+
+    # updateFromMain writes a carry marker only from a CodeRabbit review basis.
+    # With the flag off there is no approval to carry, so no marker and no
+    # GraphQL thread queries.
+    assert_match(/const unresolvedBeforeSync = requireCodeRabbit\s*\n\s*\? await unresolvedCodeRabbitThreads\(pr\)\s*\n\s*: \[\];/, body)
+    assert_match(/const reviewBasis =\s*\n\s*requireCodeRabbit && unresolvedBeforeSync\.length === 0\s*\n\s*\? await codeRabbitReviewBasis\(pr, oldHead\)\s*\n\s*: null;/, body)
+  end
+
+  # With the flag ON the previous behaviour must be exactly preserved: the
+  # approval gate, the rate-limit delegation, the thread/nitpick gates and the
+  # final revalidation all still run.
+  def test_auto_merge_keeps_the_coderabbit_gates_when_enabled
+    body = auto_merge_body
+
+    # Every gate the flag guards is reachable again when it is on, because each
+    # guard is a conjunction with `requireCodeRabbit` and nothing else replaced
+    # the original condition.
+    assert_includes body, 'const reviewBasis = requireCodeRabbit'
+    assert_includes body, 'const rabbitStatus = requireCodeRabbit'
+    assert_includes body, 'const unresolvedThreads = requireCodeRabbit'
+    assert_includes body, 'const currentHeadNitpicks = requireCodeRabbit'
+
+    # The `true` spelling must switch every gate on.
+    assert_match(/REQUIRE_CODERABBIT === 'true' \|\| REQUIRE_CODERABBIT === '1'/, body)
+
+    # The CI gate stays unconditional: CodeRabbit never replaced it.
+    refute_match(/requireCodeRabbit[^;]*!finalCi/, body)
+    assert_includes body, '!finalCi ||'
+  end
+
   end
