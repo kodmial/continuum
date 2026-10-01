@@ -4,12 +4,14 @@ Continuum is a reusable GitHub Actions control plane, not an application. It shi
 `workflow_call` workflows under `.github/workflows/`, thin caller templates under
 `.github/caller-stubs/`, an installer (`install.sh`), and a dependency-free Python
 engine under `src/continuum/` and `.github/scripts/`. Consumers install the thin
-callers; they never copy engine code into their repository. The two-layer naming
-rule: new **core** workflow files are named `continuum-<name>.yml`; the core
-files shipped today keep their historical unprefixed names and are listed
-explicitly in the contract test. **Technology library** workflows are named
-`continuum-tech-<tech>-<name>.yml` — the `continuum-tech-<tech>-` prefix marks
-them — and are opt-in (never triggered by Continuum itself).
+callers; they never copy engine code into their repository. The naming rule is
+uniform: **every** workflow file and **every** caller stub is named
+`continuum-<name>.yml`, and the installer writes each stub's stored file name
+verbatim — it never adds a prefix at install time. The layers differ only in
+their marker: a **core** workflow is `continuum-<name>.yml`, and a **technology
+library** workflow is `continuum-tech-<tech>-<name>.yml`, where the
+`continuum-tech-<tech>-` prefix marks an opt-in library that Continuum never
+triggers itself. There is no unprefixed file and no exception list.
 
 ## Source of truth
 
@@ -23,8 +25,9 @@ These are public interfaces and must not change silently:
 
 - the reusable-workflow file names and their `workflow_call` inputs, defaults, and
   secrets;
-- the `continuum-` prefix on every installed caller (a `continuum-*.yml` file in a
-  consumer repository is Continuum-owned and is never hand-edited there);
+- the `continuum-` prefix on every workflow file and every caller stub, and the
+  installer's verbatim copy of each stored stub name (a `continuum-*.yml` file in
+  a consumer repository is Continuum-owned and is never hand-edited there);
 - the `TAP_PAT` repository secret name (classic PAT, `repo` + `workflow` scopes)
   expected by every set;
 - the installer sets (`core`, `tech`, `parent`): `core` installs every stub

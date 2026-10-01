@@ -39,8 +39,8 @@ These names are the interface and never change per consumer:
 
 - the `TAP_PAT` repository secret (classic PAT, `repo` + `workflow` scopes) —
   every set expects a secret with exactly this name;
-- the `continuum-` prefix on installed callers, and the `continuum-tech-<tech>-`
-  prefix for opt-in library callers;
+- the `continuum-` prefix on every workflow file and caller stub, and the
+  `continuum-tech-<tech>-` prefix for opt-in library callers;
 - the installer sets (`core`, `tech`, and `parent`);
 - the `CONTINUUM_*` repository-variable names.
 
@@ -51,9 +51,12 @@ library of technology-specific workflows — the `continuum-tech-<tech>-` prefix
 (`continuum-tech-<tech>-<name>.yml`) marks them as a library that Continuum
 itself never triggers; `parent` drives delegated execution for any technology.
 
-New core workflow files should be named `continuum-<name>.yml`. The core files
-shipped today keep their historical unprefixed names (`opencode.yml`,
-`pr-agent.yml`, …), which are listed explicitly in `scripts/test-continuum.rb`.
+Every workflow file and every caller stub is named `continuum-<name>.yml`, and
+the installer writes each stub's stored name verbatim — it adds no prefix of
+its own. The technology library uses the longer
+`continuum-tech-<tech>-<name>.yml` name, where the `continuum-tech-<tech>-`
+prefix marks the opt-in layer. There is no unprefixed file and no exception
+list.
 
 ## Install
 
@@ -107,20 +110,24 @@ install `tech`, and a consumer that wants the technology library runs the `tech`
 command as well. Passing the old `swift` value is rejected with
 `invalid set: swift (the old 'swift' set is now 'tech')`.
 
-The installed technology files were renamed at the same time, so an already
-installed technology layer does not update itself: before updating Continuum, a
-consumer must reinstall **both** sets,
+Every core and parent workflow file now carries the `continuum-` prefix, so an
+already installed layer does not update itself: the stubs in the consumer still
+carry `uses:` lines pointing at the old unprefixed file names and would fail with
+`workflow not found` after the merge. Before updating Continuum, a consumer must
+reinstall every set it uses,
 
 ```sh
 bash install.sh <path-to-consumer-repo> <ref> core
 bash install.sh <path-to-consumer-repo> <ref> tech
+bash install.sh <path-to-consumer-repo> <ref> parent
 ```
 
-Otherwise the stubs already in the consumer keep their old `uses:` references and
-fail with `workflow not found` after the merge. Reinstalling rewrites those stubs;
-they must never be patched by hand. Every installed stub is a `continuum-*.yml`
-file carrying a `uses:` line, is owned by Continuum, and hand-editing one in a
-consumer repository is forbidden.
+Reinstalling rewrites those stubs and also deletes any `continuum-*.yml` caller
+that no layer ships any more, so a renamed or dropped workflow cannot leave a
+stale caller running beside its replacement. Stubs must never be patched by
+hand: every installed stub is a `continuum-*.yml` file carrying a `uses:` line,
+is owned by Continuum, and hand-editing one in a consumer repository is
+forbidden.
 
 ## Reusable workflows
 
@@ -133,22 +140,22 @@ Workflow names are identical to the reusable file names unless noted.
 | `continuum-tech-swift-release-pr.yml` | Maintains the single automated Release PR (release-please). (tech) | — |
 | `continuum-tech-swift-release-automation-merge.yml` | Merges trusted release-automation PRs. (tech) | — |
 | `continuum-tech-swift-packaging-smoke.yml` | Homebrew/MacPorts install lifecycle smoke test. (tech) | `mode`, `version` |
-| `opencode.yml` | OpenCode agent (`name: OpenCode agent`). | `mode`, `pr_number`, `head_ref`, `review_id`, `run_id` |
-| `opencode-repair.yml` | OpenCode repair controller. | — |
-| `opencode-unresolved.yml` | Retry OpenCode on unresolved CodeRabbit findings. | — |
+| `continuum-opencode.yml` | OpenCode agent (`name: OpenCode agent`). | `mode`, `pr_number`, `head_ref`, `review_id`, `run_id` |
+| `continuum-opencode-repair.yml` | OpenCode repair controller. | — |
+| `continuum-opencode-unresolved.yml` | Retry OpenCode on unresolved CodeRabbit findings. | — |
 | `continuum-opencode-watchdog.yml` | Recover a failed issue implementation run (`name: OpenCode watchdog`). | `watched_workflow`, `max_recovery_retries`, `retry_marker`, `in_progress_label`, `pause_marker`, `dispatch_marker`, `timeout_minutes` |
-| `issue-scheduler.yml` | Scheduled issue dispatch. | — |
-| `auto-merge.yml` | Auto-merge reviewed pull requests. | `require_coderabbit` |
-| `pr-agent.yml` | Manual PR Agent (Groq). | — |
-| `add-review-label.yml` | Mark a PR ready for CodeRabbit. | — |
-| `remove-review-label.yml` | Remove the ready label on sync. | — |
-| `coderabbit-retry.yml` | Retry CodeRabbit after a rate limit. | — |
-| `coderabbit-unresolved.yml` | Retry unresolved CodeRabbit findings. | — |
-| `bootstrap-runtime-secret.yml` | Fetch an Actions secrets public key for secret bootstrapping. | — |
-| `consumer-child-dispatcher.yml` | Parent scheduler for child tasks/reviews. | `worker_workflow`, `review_workflow`, `manual_pr_review_workflow`, `engine_ref` |
-| `consumer-child-worker.yml` | Execute one delegated child task. | `child_id`, `task_number`, `model`, `max_agent_passes`, `python_version`, `engine_ref` |
-| `consumer-child-review.yml` | Independent review of a delegated child task. | `child_id`, `task_number`, `pr_number`, `model`, `max_review_passes`, `python_version`, `engine_ref` |
-| `consumer-child-pr-review.yml` | Independent review of a child pull request. | `child_id`, `pr_number`, `model`, `max_review_passes`, `python_version`, `engine_ref` |
+| `continuum-issue-scheduler.yml` | Scheduled issue dispatch. | — |
+| `continuum-auto-merge.yml` | Auto-merge reviewed pull requests. | `require_coderabbit` |
+| `continuum-pr-agent.yml` | Manual PR Agent (Groq). | — |
+| `continuum-add-review-label.yml` | Mark a PR ready for CodeRabbit. | — |
+| `continuum-remove-review-label.yml` | Remove the ready label on sync. | — |
+| `continuum-coderabbit-retry.yml` | Retry CodeRabbit after a rate limit. | — |
+| `continuum-coderabbit-unresolved.yml` | Retry unresolved CodeRabbit findings. | — |
+| `continuum-bootstrap-runtime-secret.yml` | Fetch an Actions secrets public key for secret bootstrapping. | — |
+| `continuum-consumer-child-dispatcher.yml` | Parent scheduler for child tasks/reviews. | `worker_workflow`, `review_workflow`, `manual_pr_review_workflow`, `engine_ref` |
+| `continuum-consumer-child-worker.yml` | Execute one delegated child task. | `child_id`, `task_number`, `model`, `max_agent_passes`, `python_version`, `engine_ref` |
+| `continuum-consumer-child-review.yml` | Independent review of a delegated child task. | `child_id`, `task_number`, `pr_number`, `model`, `max_review_passes`, `python_version`, `engine_ref` |
+| `continuum-consumer-child-pr-review.yml` | Independent review of a child pull request. | `child_id`, `pr_number`, `model`, `max_review_passes`, `python_version`, `engine_ref` |
 
 Every reusable workflow also accepts `continuum_ref` (default `main`), the
 revision that supplies fallback scripts.
@@ -165,7 +172,7 @@ part of the contract and never change per consumer):
 | `RELEASE_PR_TOKEN` | `continuum-tech-swift-release-pr.yml` (optional) | Fine-grained PAT (`Contents: write`, `Pull requests: write`); falls back to `TAP_PAT`. |
 | `NANODICTATE_SIGNING_P12` | tech release and packaging-smoke workflows | Base64 macOS signing certificate (`.p12`). |
 | `NANODICTATE_SIGNING_PASSWORD` | tech release and packaging-smoke workflows | Password for the signing certificate. |
-| `GROQ_API_KEY` | `pr-agent.yml` | PR Agent model provider. |
+| `GROQ_API_KEY` | `continuum-pr-agent.yml` | PR Agent model provider. |
 | `CHILD_RUNTIME_TOKEN` | `consumer-child-*` | Parent delegation token; caller stubs map it from `TAP_PAT`. |
 
 Repository variables:

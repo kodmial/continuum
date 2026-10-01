@@ -43,8 +43,8 @@ Automation capacity and timing are consumer policy, not engine constants. Every
 limit has a `vars.AUTOMATION_*` knob whose default reproduces the value the
 engine hardcoded before the split, so a consumer that sets nothing keeps the
 previous behaviour. The same knob is also exposed as a `workflow_call` input on
-`issue-scheduler.yml` and `opencode.yml` for a caller that wants per-run control;
-the input wins over the variable.
+`continuum-issue-scheduler.yml` and `continuum-opencode.yml` for a caller that
+wants per-run control; the input wins over the variable.
 
 | Variable | Input | Default | Meaning |
 | --- | --- | --- | --- |
@@ -59,7 +59,7 @@ the input wins over the variable.
 | `AUTOMATION_DISPATCH_TIMEOUT_MINUTES` | — | `5` | OpenCode internal dispatch job timeout. |
 | `AUTOMATION_ATTEMPTS_TIMEOUT_MINUTES` | — | `10` | Failed-dispatch cleanup job timeout. |
 | `AUTOMATION_DISPATCH_BACKOFF_SECONDS` | — | `120` | Backoff before the scheduler retries a dispatch. |
-| `AUTOMATION_DISPATCH_MARKER` | `opencode.dispatch_marker` | `<!-- issue-scheduler-dispatch -->` | Dispatch marker `opencode.yml` matches and counts. |
+| `AUTOMATION_DISPATCH_MARKER` | `opencode.dispatch_marker` | `<!-- issue-scheduler-dispatch -->` | Dispatch marker `continuum-opencode.yml` matches and counts. |
 | `AUTOMATION_IN_PROGRESS_LABEL` | `opencode.in_progress_label` | `automation:in-progress` | Reservation label. |
 | `AUTOMATION_PAUSE_LABEL` | `opencode.pause_marker` | `automation:paused` | Pause label. |
 | `AUTOMATION_REQUIRE_PRIORITY_LABEL` | `issue-scheduler.require_priority_label` | `false` | Dispatch only issues carrying a priority label. |
@@ -82,21 +82,22 @@ variable of the consumer that asked for the integration; every other consumer
 keeps the disabled behaviour with no extra configuration.
 
 - **`CONTINUUM_REQUIRE_CODERABBIT`** defaults to `false`. Only a consumer that
-  actually uses CodeRabbit sets it to `true`. With it off, `auto-merge.yml`
-  neither waits for a CodeRabbit approval nor dispatches
+  actually uses CodeRabbit sets it to `true`. With it off,
+  `continuum-auto-merge.yml` neither waits for a CodeRabbit approval nor
+  dispatches
   `continuum-coderabbit-retry.yml`, so a repository without that caller cannot
   get a 404 dispatch or a merge that never lands. With it on, the previous
   behaviour is unchanged.
 - **The watchdog** is opt-in in the sense that it only fires on
   `workflow_run: completed`. Install it when the consumer wants a failed
   `/oc` run recovered — Continuum's own `recover-scheduled-issue` job in
-  `opencode.yml` only fires for scheduler dispatch comments, so a manual run has
-  no recovery path without it. Its `watched_workflow` input must equal the
-  `name:` of the consumer's OpenCode caller, because GitHub's
+  `continuum-opencode.yml` only fires for scheduler dispatch comments, so a
+  manual run has no recovery path without it. Its `watched_workflow` input must
+  equal the `name:` of the consumer's OpenCode caller, because GitHub's
   `workflow_run.workflows` filter matches on the workflow `name:` and never on
   the file name.
 
-The watchdog reads the same three markers and labels as `opencode.yml`
+The watchdog reads the same three markers and labels as `continuum-opencode.yml`
 (`AUTOMATION_DISPATCH_MARKER`, `AUTOMATION_IN_PROGRESS_LABEL`,
 `AUTOMATION_PAUSE_LABEL`), so a renamed label stays consistent across the
 scheduler, the agent, and the recovery.
@@ -107,12 +108,14 @@ apply to macOS runners.
 
 `AUTOMATION_DISPATCH_MARKER`, `AUTOMATION_IN_PROGRESS_LABEL`, and
 `AUTOMATION_PAUSE_LABEL` matter on the `issue_comment` path, where
-`opencode.yml` is invoked by an event and cannot receive `workflow_call` inputs.
+`continuum-opencode.yml` is invoked by an event and cannot receive
+`workflow_call` inputs.
 A consumer that renames the scheduler's marker or labels must set the matching
-`vars.*` knob, and pass the same value as the `issue-scheduler.yml` input, so the
-release reservation `opencode.yml` reads on failure is the one the scheduler
-wrote. `consumer-child-dispatcher.yml` reads `AUTOMATION_PAUSE_LABEL`, and
-`consumer-child-review.yml` reads `AUTOMATION_IN_PROGRESS_LABEL` and
+`vars.*` knob, and pass the same value as the `continuum-issue-scheduler.yml`
+input, so the release reservation `continuum-opencode.yml` reads on failure is
+the one the scheduler wrote. `continuum-consumer-child-dispatcher.yml` reads
+`AUTOMATION_PAUSE_LABEL`, and
+`continuum-consumer-child-review.yml` reads `AUTOMATION_IN_PROGRESS_LABEL` and
 `AUTOMATION_PAUSE_LABEL`, so a renamed label stays consistent across the core
 and the parent/child pair.
 
@@ -228,7 +231,8 @@ The default model is `opencode/muse-spark-1.3-contributor-free`; override it wit
 providers are **not supported in the core**: no core workflow reads or forwards a
 paid provider key.
 
-`pr-agent.yml` is a legacy helper that upstream wires to the paid Groq provider.
+`continuum-pr-agent.yml` is a legacy helper that upstream wires to the paid Groq
+provider.
 It is **outside the supported core**: Groq is not an accepted exception. With no
 supported key the workflow fails explicitly (it never reports a silent green
 no-op), and the core never reads `GROQ_API_KEY`. A consumer that wants PR-Agent
@@ -238,11 +242,12 @@ must remove the caller or wire the action to a free provider itself.
 
 A consumer that renames the scheduler's labels or dispatch marker must pass the
 same values to both workflows, because the marker is what the scheduler counts
-as a dispatch attempt and what `opencode.yml` matches on. `post_pause_comment`
+as a dispatch attempt and what `continuum-opencode.yml` matches on.
+`post_pause_comment`
 is disabled only by the exact string `false`; an empty value keeps the comment
 enabled:
 
-| `issue-scheduler.yml` input | Default |
+| `continuum-issue-scheduler.yml` input | Default |
 | --- | --- |
 | `dispatch_marker` | `<!-- issue-scheduler-dispatch -->` |
 | `in_progress_label` | `automation:in-progress` |
@@ -256,7 +261,8 @@ enabled:
 | `opencode_workflow_name` | `OpenCode agent` |
 | `opencode_workflow_path` | `.github/workflows/continuum-opencode.yml` |
 
-`opencode.yml` accepts the matching `dispatch_marker`, `in_progress_label`, and
+`continuum-opencode.yml` accepts the matching `dispatch_marker`,
+`in_progress_label`, and
 `pause_marker` inputs, plus `max_dispatch_attempts`, `issue_number` (the issue a
 dispatcher names — empty falls back to `github.event.issue.number`),
 `ci_workflow_id`, and `conflict_strategy` (a `merge`/`checkout` choice, `merge`

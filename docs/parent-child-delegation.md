@@ -61,10 +61,10 @@ variables.
 Use the four thin entry workflows in
 `.github/caller-stubs/parent/`. They call:
 
-- `consumer-child-dispatcher.yml`
-- `consumer-child-worker.yml`
-- `consumer-child-review.yml`
-- `consumer-child-pr-review.yml`
+- `continuum-consumer-child-dispatcher.yml`
+- `continuum-consumer-child-worker.yml`
+- `continuum-consumer-child-review.yml`
+- `continuum-consumer-child-pr-review.yml`
 
 The wrapper passes no parent/child relationship values. Continuum reads
 `CONTINUUM_ROLE` and `CONTINUUM_CHILDREN` directly from the parent repository
