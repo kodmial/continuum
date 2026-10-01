@@ -40,6 +40,39 @@ class ContinuumTest < Minitest::Test
     YAML.load_file(path)
   end
 
+  def workflow_body(name)
+    File.read(File.join(ROOT, '.github/workflows', name))
+  end
+
+  # The modes the OpenCode engine admits on the `workflow_dispatch` path,
+  # parsed out of the job's own `if` guard rather than hardcoded here.
+  def dispatch_modes
+    body = workflow_body('opencode.yml')
+    body[/contains\(fromJSON\('\[([^\]]+)\]'\), inputs\.mode\)/, 1].to_s
+        .scan(/"([^"]+)"/).flatten
+  end
+
+  # Every `.../dispatches` call site, captured together with the lines that
+  # follow it, so a test can prove the call is really made and really carries
+  # the payload. A call replaced by an `echo` leaves no window at all, which is
+  # exactly the "green no-op" a presence-only check misses.
+  DISPATCHING_WORKFLOWS = %w[
+    auto-merge.yml
+    opencode-repair.yml
+    opencode-unresolved.yml
+    opencode.yml
+  ].freeze
+
+  def dispatch_calls(name)
+    lines = workflow_body(name).lines
+    lines.each_index.select { |index| lines[index].include?('/dispatches') }
+         .map { |index| lines[[index - 2, 0].max, 12].join }
+  end
+
+  def all_dispatch_calls
+    DISPATCHING_WORKFLOWS.flat_map { |name| dispatch_calls(name) }
+  end
+
   def events(workflow)
     workflow['on'] || workflow[true]
   end
@@ -520,18 +553,67 @@ class ContinuumTest < Minitest::Test
     assert_includes body, 'inputs.issue_number || github.event.issue.number'
   end
 
-  # Every mode in the dispatch whitelist must have a step that acts on it. A
-  # mode admitted to the whitelist with no step lets the job run Checkout/Install
-  # and finish SUCCESS having done zero work — a silent green no-op.
+  # Every mode in the dispatch whitelist must have a step that acts on it, and
+  # must actually be dispatched. A mode admitted to the whitelist with a
+  # no-op body lets the job run Checkout/Install and finish SUCCESS having done
+  # zero work — a silent green no-op. Matching the comparison string alone
+  # cannot tell a real branch from `if: always() && inputs.mode == 'x'` +
+  # `run: echo noop`, so the body of the branching step is checked too.
+  INERT_BODY = /\A\s*(set\s+-[a-z]+\s*|:\s*|true\s*|exit\s+0\s*|echo\s+(noop|no-op|skip|done)?\s*)*\z/
+
   def test_opencode_whitelisted_modes_all_have_dispatch_steps
-    body = File.read(File.join(ROOT, '.github/workflows/opencode.yml'))
-    modes = body[/contains\(fromJSON\('\[([^\]]+)\]'\), inputs\.mode\)/, 1]
-                .scan(/"([^"]+)"/).flatten
+    body = workflow_body('opencode.yml')
+    modes = dispatch_modes
     refute_empty modes
     assert_equal modes.uniq, modes, 'dispatching whitelist has duplicates'
     modes.each do |mode|
       assert_includes body, "inputs.mode == '#{mode}'",
                       "mode #{mode} is whitelisted but no step branches on it"
+    end
+
+    # Parse the dispatch job and require each whitelisted mode to own at least
+    # one step that really does work, not just one that compares the mode.
+    steps = yaml(File.join(ROOT, '.github/workflows/opencode.yml'))
+              .fetch('jobs').fetch('opencode').fetch('steps')
+    modes.each do |mode|
+      branching = steps.select { |step| step['if'].to_s.include?("inputs.mode == '#{mode}'") }
+      refute_empty branching, "mode #{mode} is whitelisted but has no branching step in the dispatch job"
+      acts = branching.any? do |step|
+        next true if step['uses']
+
+        run = step['run'].to_s
+        !run.strip.empty? && !run.match?(INERT_BODY)
+      end
+      assert acts, "mode #{mode} branches only on no-op steps — the job would finish SUCCESS having done nothing"
+    end
+  end
+
+  # The whitelist is a contract with the callers: a mode nobody ever dispatches
+  # is dead, and a dispatched mode the stub does not offer is rejected by
+  # GitHub at run time, long after these tests went green.
+  def test_every_whitelisted_mode_is_dispatched_by_a_core_workflow
+    modes = dispatch_modes
+    refute_empty modes
+    calls = all_dispatch_calls
+    refute_empty calls, 'no core workflow performs a /dispatches call'
+    modes.each do |mode|
+      dispatched = calls.any? do |call|
+        call.include?(%(-f "inputs[mode]=#{mode}")) || call.include?(%(mode: '#{mode}'))
+      end
+      assert dispatched, "mode #{mode} is whitelisted but no core workflow dispatches it"
+    end
+  end
+
+  # Each workflow that owns a dispatch call must still perform it. A call
+  # swapped for `echo` leaves the file with no `/dispatches` window, so this
+  # fails even though every other test still passes.
+  def test_dispatching_workflows_still_perform_their_dispatch_call
+    DISPATCHING_WORKFLOWS.each do |name|
+      calls = dispatch_calls(name)
+      refute_empty calls, "#{name} no longer performs a /dispatches call — the dispatch is a green no-op"
+      calls.each do |call|
+        assert_match(/--method POST|['"]POST \/repos|method:\s*'POST'/, call, "#{name}: dispatch call is not a POST")
+      end
     end
   end
 
@@ -580,11 +662,87 @@ class ContinuumTest < Minitest::Test
     assert_equal 'choice', stub.fetch('type')
     assert_equal %w[merge checkout], stub.fetch('options')
 
+    # The `mode` choice is the same kind of contract, and just as invisible: an
+    # extra stub option is accepted by these tests but rejected by GitHub when
+    # the call is actually made, and a missing one makes a whitelisted mode
+    # unreachable for the operator.
+    dispatch_inputs = events(yaml(File.join(ROOT, '.github/caller-stubs/opencode.yml')))
+                     .fetch('workflow_dispatch').fetch('inputs').fetch('mode')
+    assert_equal 'choice', dispatch_inputs.fetch('type')
+    assert_equal dispatch_modes.sort, dispatch_inputs.fetch('options').sort,
+                 'the stub mode choice and the engine dispatch whitelist must be the same set'
+
     body = File.read(File.join(ROOT, '.github/workflows/opencode.yml'))
     assert_match(/case "\$CONFLICT_STRATEGY" in/, body)
     assert_includes body, "expected 'merge' or 'checkout'"
     # The prompt must select a whole strategy block, not interpolate one verb.
     assert_includes body, 'STRATEGY_BLOCK'
+  end
+
+  # The parent/child workflows were parameterised in the same change as the
+  # scheduler. They are the propagation edge, so a hardcoded label reappearing
+  # in either file must fail here the same way it would fail in the scheduler.
+  def test_parent_child_workflows_use_the_configured_labels
+    dispatcher = workflow_body('consumer-child-dispatcher.yml')
+    assert_includes dispatcher, "AUTOMATION_PAUSE_LABEL: ${{ vars.AUTOMATION_PAUSE_LABEL || 'automation:paused' }}"
+    refute_match(/labels\/automation%3Apaused/, dispatcher,
+                 'dispatcher must not hardcode the default pause label in a request URL')
+    # The knob has to reach the actual label write, not only the env block.
+    assert_match(%r{\$\{AUTOMATION_PAUSE_LABEL//:/%3A\}}, dispatcher,
+                 'dispatcher must use the configured pause label in the label URL')
+    assert_match(/--arg pause "\$AUTOMATION_PAUSE_LABEL"/, dispatcher,
+                 'dispatcher must select stale pause labels by the configured label')
+
+    review = workflow_body('consumer-child-review.yml')
+    assert_includes review, "AUTOMATION_IN_PROGRESS_LABEL: ${{ vars.AUTOMATION_IN_PROGRESS_LABEL || 'automation:in-progress' }}"
+    assert_includes review, "AUTOMATION_PAUSE_LABEL: ${{ vars.AUTOMATION_PAUSE_LABEL || 'automation:paused' }}"
+    # Both labels are cleared in one loop; a hardcoded `for label in ...` list
+    # would leave the consumer's own labels on every completed child issue.
+    assert_match(/for label in "\$AUTOMATION_IN_PROGRESS_LABEL" "\$AUTOMATION_PAUSE_LABEL"; do/, review,
+                 'child review must clear both configured labels, not a hardcoded list')
+    assert_match(%r{\$\{label//:/%3A\}}, review,
+                 'child review must use the configured label in the label URL')
+  end
+
+  # The documented semantics of post_pause_comment are subtle and the workflow
+  # comment is the only place they are written down: an unset/empty value keeps
+  # the comment, and only the exact string `false` disables it. Assert them on
+  # the implementation rather than on the prose, so a mutated description or a
+  # mutated comparison is both caught.
+  def test_post_pause_comment_only_exact_false_disables_the_comment
+    scheduler = events(yaml(File.join(ROOT, '.github/workflows/issue-scheduler.yml')))
+                  .fetch('workflow_call').fetch('inputs').fetch('post_pause_comment')
+    description = scheduler.fetch('description')
+    assert_includes description, 'false',
+                    'the description must name the exact value that disables the comment'
+    assert_includes description, 'disables',
+                    'the description must say which value turns the comment off'
+
+    body = workflow_body('issue-scheduler.yml')
+    expression = body[/postPauseComment\s*=\s*\n?\s*(\(process\.env\.POST_PAUSE_COMMENT \|\| '[^']*'\) [!==]+ '[^']*')/m, 1]
+    refute_nil expression, 'postPauseComment is not derived from POST_PAUSE_COMMENT'
+    # The env default must not itself be the disabling value, or an empty input
+    # would silence the comment.
+    fallback = expression[/process\.env\.POST_PAUSE_COMMENT \|\| '([^']*)'/, 1]
+    refute_equal 'false', fallback,
+                 'an empty POST_PAUSE_COMMENT must keep the comment enabled'
+    refute_equal '', fallback, 'POST_PAUSE_COMMENT has no fallback default'
+
+    # Re-implement the parsed expression in Ruby and run the documented cases
+    # through it, so the assertion is on behaviour rather than on the wording.
+    operator = expression[/\) (\S+) /, 1]
+    expected = expression[/\) \S+ '([^']*)'/, 1]
+    assert_includes %w[=== !==], operator, "unexpected comparison #{operator}"
+    enabled = lambda do |value|
+      subject = value.to_s.empty? ? fallback : value.to_s
+      operator == '===' ? subject == expected : subject != expected
+    end
+    # The comment stays on for every value except the exact string `false`:
+    # an empty input, an explicit true, and any other text all keep it enabled.
+    ['', 'true', 'anything', 'False', 'FALSE', '0', 'no'].each do |value|
+      assert enabled.call(value), "POST_PAUSE_COMMENT=#{value.inspect} must keep the pause comment enabled"
+    end
+    refute enabled.call('false'), "POST_PAUSE_COMMENT='false' must disable the pause comment"
   end
 
   # The scheduler's label/marker knobs must drive the code, not just be parsed.
@@ -623,6 +781,14 @@ class ContinuumTest < Minitest::Test
     assert_includes body, 'process.env.DISPATCH_MARKER'
     assert_includes body, 'process.env.IN_PROGRESS_LABEL'
     assert_includes body, 'process.env.PAUSE_LABEL'
+
+    # The env mapping above is only half the contract: the recovery job's `if:`
+    # filters on the same value. Asserting only the env string would let a guard
+    # that reads the old hardcoded default pass, and a consumer that set
+    # AUTOMATION_DISPATCH_MARKER would get a job that never filters true.
+    assert_includes body,
+                    "contains(github.event.comment.body, inputs.dispatch_marker || vars.AUTOMATION_DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->')",
+                    'recover-scheduled-issue must filter on the consumer-configured dispatch marker'
 
     assert_match(/gh workflow run "\$CI_WORKFLOW_ID"/, body)
   end
