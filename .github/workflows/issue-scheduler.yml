@@ -8,6 +8,66 @@ on:
         type: string
         default: main
         required: false
+      wip_limit:
+        description: >-
+          Concurrent in-progress issues the scheduler may hold. Empty falls
+          back to AUTOMATION_WIP_LIMIT.
+        type: string
+        required: false
+        default: ''
+      lease_minutes:
+        description: >-
+          Minutes a reservation stays valid without a PR appearing. Empty falls
+          back to AUTOMATION_LEASE_MINUTES.
+        type: string
+        required: false
+        default: ''
+      max_dispatch_attempts:
+        description: >-
+          Dispatch attempts before an issue is paused. Empty falls back to
+          AUTOMATION_MAX_DISPATCH_ATTEMPTS.
+        type: string
+        required: false
+        default: ''
+      dispatch_marker:
+        description: >-
+          Hidden HTML marker written into each dispatch comment and counted
+          towards max_dispatch_attempts. Must match the marker the consumer's
+          OpenCode workflow is called with.
+        type: string
+        required: false
+        default: '<!-- issue-scheduler-dispatch -->'
+      in_progress_label:
+        description: Label holding a reservation while OpenCode starts.
+        type: string
+        required: false
+        default: 'automation:in-progress'
+      pause_marker:
+        description: Label that pauses automation until removed by a human.
+        type: string
+        required: false
+        default: 'automation:paused'
+      post_pause_comment:
+        description: >-
+          Post a comment on an issue when the scheduler pauses it. Empty
+          disables the comment and keeps only the label.
+        type: string
+        required: false
+        default: 'true'
+      reset_markers:
+        description: >-
+          Clear existing dispatch markers before dispatching, so a consumer
+          restarting automation does not inherit a spent attempt budget.
+        type: string
+        required: false
+        default: 'false'
+      require_priority_label:
+        description: >-
+          Dispatch only issues carrying a priority label. Empty keeps the
+          current behaviour of dispatching unlabelled issues too.
+        type: string
+        required: false
+        default: 'false'
 
 permissions:
   contents: read
@@ -19,11 +79,17 @@ concurrency:
 jobs:
   schedule:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: ${{ fromJSON(vars.AUTOMATION_SCHEDULER_TIMEOUT_MINUTES || '5') }}
     env:
-      WIP_LIMIT: ${{ vars.AUTOMATION_WIP_LIMIT || '2' }}
-      LEASE_MINUTES: ${{ vars.AUTOMATION_LEASE_MINUTES || '45' }}
-      MAX_DISPATCH_ATTEMPTS: ${{ vars.AUTOMATION_MAX_DISPATCH_ATTEMPTS || '2' }}
+      WIP_LIMIT: ${{ inputs.wip_limit || vars.AUTOMATION_WIP_LIMIT || '2' }}
+      LEASE_MINUTES: ${{ inputs.lease_minutes || vars.AUTOMATION_LEASE_MINUTES || '45' }}
+      MAX_DISPATCH_ATTEMPTS: ${{ inputs.max_dispatch_attempts || vars.AUTOMATION_MAX_DISPATCH_ATTEMPTS || '2' }}
+      DISPATCH_MARKER: ${{ inputs.dispatch_marker || '<!-- issue-scheduler-dispatch -->' }}
+      IN_PROGRESS_LABEL: ${{ inputs.in_progress_label || 'automation:in-progress' }}
+      PAUSE_LABEL: ${{ inputs.pause_marker || 'automation:paused' }}
+      POST_PAUSE_COMMENT: ${{ inputs.post_pause_comment || 'true' }}
+      RESET_MARKERS: ${{ inputs.reset_markers || 'false' }}
+      REQUIRE_PRIORITY_LABEL: ${{ inputs.require_priority_label || 'false' }}
 
     steps:
       - name: Reconcile state and dispatch ready issues
@@ -59,9 +125,15 @@ jobs:
             const priorityRank = new Map(
               priorityOrder.map((name, index) => [name, index])
             );
-            const inProgressLabel = 'automation:in-progress';
-            const pausedLabel = 'automation:paused';
-            const dispatchMarker = '<!-- issue-scheduler-dispatch -->';
+            const inProgressLabel = process.env.IN_PROGRESS_LABEL || 'automation:in-progress';
+            const pausedLabel = process.env.PAUSE_LABEL || 'automation:paused';
+            const dispatchMarker = process.env.DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->';
+            const postPauseComment =
+              (process.env.POST_PAUSE_COMMENT || 'true') !== 'false';
+            const resetMarkers =
+              (process.env.RESET_MARKERS || 'false') === 'true';
+            const requirePriorityLabel =
+              (process.env.REQUIRE_PRIORITY_LABEL || 'false') === 'true';
 
             const labelSpecs = [
               {
@@ -144,6 +216,27 @@ jobs:
               await removeLabel(issueNumber, inProgressLabel);
               await addLabel(issueNumber, pausedLabel);
               core.warning('Paused issue #' + issueNumber + ': ' + reason);
+              if (postPauseComment) {
+                try {
+                  await github.rest.issues.createComment({
+                    owner,
+                    repo,
+                    issue_number: issueNumber,
+                    body: [
+                      'Automation paused: ' + reason + '.',
+                      '',
+                      'Remove the `' + pausedLabel + '` label to retry.',
+                    ].join('\n'),
+                  });
+                } catch (err) {
+                  core.warning(
+                    'Could not post the pause comment for #' +
+                      issueNumber +
+                      ': ' +
+                      err.message
+                  );
+                }
+              }
             }
 
             // A closed OpenCode PR is authoritative:
@@ -402,6 +495,13 @@ jobs:
               // Multiple priority labels are not a reason to deadlock an issue.
               // Highest priority wins deterministically; the anomaly is logged.
               const priority = priorities[0] || null;
+              if (requirePriorityLabel && priority === null) {
+                core.info(
+                  'Skipping #' + issue.number + ': no priority label and ' +
+                    'require_priority_label is enabled.'
+                );
+                continue;
+              }
               const rank = priority === null ? priorityOrder.length : priorityRank.get(priority);
               if (priorities.length > 1) {
                 core.warning(
@@ -472,6 +572,30 @@ jobs:
               await addLabel(issue.number, inProgressLabel);
 
               try {
+                if (resetMarkers) {
+                  // Opt-in: drop previously recorded dispatch markers so the
+                  // issue starts from a fresh attempt budget. Consumers that
+                  // rely on markers as an audit trail leave this off.
+                  const previous = await github.paginate(
+                    'GET /repos/{owner}/{repo}/issues/{issue_number}/comments',
+                    {
+                      owner,
+                      repo,
+                      issue_number: issue.number,
+                      per_page: 100,
+                    }
+                  );
+                  for (const comment of previous) {
+                    if ((comment.body || '').includes(dispatchMarker)) {
+                      await github.rest.issues.deleteComment({
+                        owner,
+                        repo,
+                        comment_id: comment.id,
+                      });
+                    }
+                  }
+                }
+
                 await github.rest.issues.createComment({
                   owner,
                   repo,

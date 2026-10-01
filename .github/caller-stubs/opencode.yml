@@ -12,6 +12,15 @@ on:
       mode:
         description: "Invocation mode"
         required: true
+        type: choice
+        options:
+          - issue
+          - coderabbit-fix
+          - resolve-conflict
+          - ci-fix
+      issue_number:
+        description: "Issue number for issue mode"
+        required: false
         type: string
       pr_number:
         description: "Pull request number"
@@ -29,6 +38,26 @@ on:
         description: "Source failed workflow run id"
         required: false
         type: string
+      ci_workflow_id:
+        description: "CI workflow file to re-run after a ci-fix"
+        required: false
+        type: string
+      conflict_strategy:
+        description: "How resolve-conflict settles a conflict"
+        required: false
+        type: choice
+        default: merge
+        options:
+          - merge
+          - checkout
+      dispatch_marker:
+        description: "Dispatch marker this repository's scheduler writes"
+        required: false
+        type: string
+      max_dispatch_attempts:
+        description: "Dispatch attempts before pausing the issue"
+        required: false
+        type: string
 
 permissions:
   actions: write
@@ -43,7 +72,12 @@ jobs:
     with:
       continuum_ref: main
       mode: "${{ inputs.mode }}"
+      issue_number: "${{ inputs.issue_number }}"
       pr_number: "${{ inputs.pr_number }}"
       head_ref: "${{ inputs.head_ref }}"
       review_id: "${{ inputs.review_id }}"
       run_id: "${{ inputs.run_id }}"
+      ci_workflow_id: "${{ inputs.ci_workflow_id }}"
+      conflict_strategy: "${{ inputs.conflict_strategy }}"
+      dispatch_marker: "${{ inputs.dispatch_marker }}"
+      max_dispatch_attempts: "${{ inputs.max_dispatch_attempts }}"

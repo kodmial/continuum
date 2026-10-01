@@ -34,16 +34,26 @@ jobs:
 
     steps:
       - name: Check Groq secret
+        id: groq
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: |
+          # Non-blocking: Continuum automation runs on free anonymous models and
+          # must never require a paid provider token. PR-Agent is still wired to
+          # the Groq provider upstream, so without a key this workflow can only
+          # skip — it cannot fall back to a free model on its own. The `secrets`
+          # context is unavailable in a step-level `if:`, so availability is
+          # published as a step output instead of failing the run.
           if [[ -z "$GROQ_API_KEY" ]]; then
-            echo "::error::Missing repository Actions secret GROQ_API_KEY"
-            echo "Add it under Settings > Secrets and variables > Actions > Repository secrets."
-            exit 1
+            echo "::notice::GROQ_API_KEY is not set; skipping the optional PR-Agent helper."
+            echo "Every other Continuum automation continues to run without a paid key."
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Run PR-Agent
+        if: steps.groq.outputs.available == 'true'
         uses: docker://pragent/pr-agent:github_action@sha256:65e5b196e38cecd7df8a71fe29942052e081a0c6645132c2ac874df60b1760c7 # 0.46.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

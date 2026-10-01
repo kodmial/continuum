@@ -32,7 +32,7 @@ permissions:
 jobs:
   dispatch:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: ${{ fromJSON(vars.AUTOMATION_CHILD_DISPATCH_TIMEOUT_MINUTES || '8') }}
     env:
       GH_TOKEN: ${{ secrets.CHILD_RUNTIME_TOKEN }}
       GITHUB_TOKEN: ${{ secrets.CHILD_RUNTIME_TOKEN }}

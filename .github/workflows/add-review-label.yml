@@ -21,6 +21,9 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          CONTINUUM_VERSION_FILE: ${{ vars.CONTINUUM_VERSION_FILE || 'Sources/NanoDictateCore/Version.swift' }}
+          CONTINUUM_RELEASE_MANIFEST_FILES: ${{ vars.CONTINUUM_RELEASE_MANIFEST_FILES || '["nanodictate.rb","packaging/homebrew/nanodictate.rb","packaging/homebrew/Casks/nanodictate.rb","packaging/macports/Portfile","scripts/install-macports.sh"]' }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
@@ -32,15 +35,14 @@ jobs:
             const RELEASE_FILES = new Set([
               '.release-please-manifest.json',
               'CHANGELOG.md',
-              'Sources/NanoDictateCore/Version.swift',
+              process.env.CONTINUUM_VERSION_FILE,
             ]);
-            const MANIFEST_FILES = new Set([
-              'nanodictate.rb',
-              'packaging/homebrew/nanodictate.rb',
-              'packaging/homebrew/Casks/nanodictate.rb',
-              'packaging/macports/Portfile',
-              'scripts/install-macports.sh',
-            ]);
+            const MANIFEST_FILES = new Set(
+              JSON.parse(
+                process.env.CONTINUUM_RELEASE_MANIFEST_FILES ||
+                  '[]'
+              )
+            );
 
             async function trustedReleaseAutomation(pr) {
               if (

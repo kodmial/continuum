@@ -2,6 +2,43 @@ name: Issue scheduler
 
 on:
   workflow_dispatch:
+    inputs:
+      wip_limit:
+        description: "Concurrent in-progress issues"
+        required: false
+        type: string
+      lease_minutes:
+        description: "Reservation lease in minutes"
+        required: false
+        type: string
+      max_dispatch_attempts:
+        description: "Dispatch attempts before pausing"
+        required: false
+        type: string
+      dispatch_marker:
+        description: "Dispatch comment marker"
+        required: false
+        type: string
+      in_progress_label:
+        description: "Reservation label"
+        required: false
+        type: string
+      pause_marker:
+        description: "Pause label"
+        required: false
+        type: string
+      post_pause_comment:
+        description: "Comment when pausing an issue"
+        required: false
+        type: string
+      reset_markers:
+        description: "Clear dispatch markers before dispatching"
+        required: false
+        type: string
+      require_priority_label:
+        description: "Dispatch only labelled issues"
+        required: false
+        type: string
   schedule:
     - cron: "*/15 * * * *"
   issues:
@@ -18,3 +55,12 @@ jobs:
     secrets: inherit
     with:
       continuum_ref: main
+      wip_limit: "${{ inputs.wip_limit }}"
+      lease_minutes: "${{ inputs.lease_minutes }}"
+      max_dispatch_attempts: "${{ inputs.max_dispatch_attempts }}"
+      dispatch_marker: "${{ inputs.dispatch_marker }}"
+      in_progress_label: "${{ inputs.in_progress_label }}"
+      pause_marker: "${{ inputs.pause_marker }}"
+      post_pause_comment: "${{ inputs.post_pause_comment }}"
+      reset_markers: "${{ inputs.reset_markers }}"
+      require_priority_label: "${{ inputs.require_priority_label }}"

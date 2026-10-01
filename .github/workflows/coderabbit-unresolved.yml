@@ -178,8 +178,7 @@ jobs:
         id: fix
         if: steps.context.outputs.should_run == 'true'
         env:
-          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
-          OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/big-pickle' }}
+          OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
           GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ steps.context.outputs.pr_number }}

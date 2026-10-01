@@ -23,6 +23,41 @@ on:
         description: Source failed workflow run id
         required: false
         type: string
+      issue_number:
+        description: >-
+          Issue number supplied by the dispatcher. Empty means "read
+          github.event.issue.number", so an issue_comment run is unchanged.
+        required: false
+        type: string
+        default: ''
+      max_dispatch_attempts:
+        description: >-
+          Dispatch attempts this run tolerates before the issue is paused.
+          Empty falls back to AUTOMATION_MAX_DISPATCH_ATTEMPTS.
+        required: false
+        type: string
+        default: ''
+      dispatch_marker:
+        description: >-
+          Hidden HTML marker the scheduler writes into its dispatch comments.
+          Must match the marker the consumer's scheduler uses.
+        required: false
+        type: string
+        default: ''
+      ci_workflow_id:
+        description: >-
+          Workflow file name ci-fix reruns (for example ci.yml). Empty
+          disables the rerun.
+        required: false
+        type: string
+        default: ''
+      conflict_strategy:
+        description: >-
+          How resolve-conflict settles a conflict: `merge` rebases/merges the
+          default branch, `checkout` re-checks it out over the work.
+        required: false
+        type: string
+        default: 'merge'
       continuum_ref:
         description: Continuum revision supplying fallback scripts
         type: string
@@ -43,7 +78,7 @@ jobs:
       github.event.pull_request.state == 'open' &&
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: ${{ fromJSON(vars.AUTOMATION_DISPATCH_TIMEOUT_MINUTES || '5') }}
 
     permissions:
       actions: write
@@ -70,22 +105,23 @@ jobs:
     # internal workflow_dispatch events from trusted workflows on main.
     if: >-
       (github.event_name == 'workflow_dispatch' &&
-       contains(fromJSON('["coderabbit-fix","resolve-conflict","ci-fix"]'), inputs.mode)) ||
+       contains(fromJSON('["issue","coderabbit-fix","resolve-conflict","ci-fix"]'), inputs.mode)) ||
       ((github.event_name == 'issue_comment' ||
         github.event_name == 'pull_request_review_comment') &&
        github.actor == github.repository_owner &&
        (contains(github.event.comment.body, '/oc') ||
         contains(github.event.comment.body, '/opencode')))
-    runs-on: macos-15
-    # macOS execution environment (P0): NanoDictate's AVFoundation code only
-    # compiles and its tests only run on macOS. The OpenCode GitHub action is
-    # a composite bash action (curl install + `opencode github run`) with a
-    # runner.os-aware cache key, so the existing implementation job runs
-    # directly on a GitHub-hosted macOS runner with the repo checkout below.
+    runs-on: ${{ vars.AUTOMATION_OPENCODE_RUNNER || 'macos-15' }}
+    # Execution environment is a consumer decision: the runner label comes from
+    # AUTOMATION_OPENCODE_RUNNER (default `macos-15`, which suits Swift/AVFoundation
+    # projects whose tests only run on macOS). The OpenCode GitHub action is a
+    # composite bash action (curl install + `opencode github run`) with a
+    # runner.os-aware cache key, so the implementation job runs directly on the
+    # selected GitHub-hosted runner with the repo checkout below.
     # Capability-only: this selects where OpenCode runs, not when it must
     # build/test; scheduler, branch/commit/PR lifecycle, CI, CodeRabbit, and
     # repair/recovery are unchanged.
-    timeout-minutes: 180
+    timeout-minutes: ${{ fromJSON(vars.AUTOMATION_OPENCODE_TIMEOUT_MINUTES || '180') }}
 
     permissions:
       actions: read
@@ -94,7 +130,7 @@ jobs:
       pull-requests: write
 
     concurrency:
-      group: opencode-${{ inputs.pr_number || github.event.issue.number || github.event.pull_request.number || github.run_id }}
+      group: opencode-${{ inputs.pr_number || inputs.issue_number || github.event.issue.number || github.event.pull_request.number || github.run_id }}
       cancel-in-progress: false
 
     steps:
@@ -116,12 +152,13 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      # macOS execution capability: same Swift 6.1 toolchain as CI's
-      # Build & Test (macOS) job, so OpenCode can invoke the real
-      # compilation (`swift build`) and test (`swift run
-      # NanoDictateCoreTests`) tooling from the checked-out working tree.
+      # Build capability for the agent, installed only when the selected runner is a
+      # macOS runner (see AUTOMATION_OPENCODE_RUNNER): it provides the same Swift
+      # toolchain CI uses, so OpenCode can invoke the real compilation
+      # (`swift build`) and test tooling from the checked-out working tree.
       # Installing the toolchain does not run builds/tests by itself.
       - name: Install Swift
+        if: startsWith(vars.AUTOMATION_OPENCODE_RUNNER || 'macos-15', 'macos')
         # Pin swift-actions/setup-swift@v2 to a full commit SHA (peeled from
         # the annotated v2 tag; CWE-829: mutable tag could be swapped
         # upstream). Must stay aligned with .github/workflows/continuum-tech-swift-ci.yml.
@@ -132,10 +169,11 @@ jobs:
           # 5.10.1 crashes its swift-frontend on the macOS 15.5 SDK.
           swift-version: "6.1"
 
-      # Read-only capability probe: proves per-run that the macOS
+      # Read-only capability probe: proves per-run that the selected macOS
       # environment, working tree, and real tooling are invocable without
       # building, testing, or changing CI/recovery semantics.
       - name: Verify macOS execution capability
+        if: startsWith(vars.AUTOMATION_OPENCODE_RUNNER || 'macos-15', 'macos')
         run: |
           set -euo pipefail
           sw_vers
@@ -186,8 +224,9 @@ jobs:
         if: github.event_name != 'workflow_dispatch'
         env:
           GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
-          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
-          MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/big-pickle' }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          EVENT_ISSUE_NUMBER: ${{ github.event.issue.number }}
+          MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
           USE_GITHUB_TOKEN: "true"
           SHARE: "false"
           OPENCODE_CONFIG_CONTENT: >-
@@ -208,7 +247,7 @@ jobs:
            contains(github.event.comment.body, '/opencode'))
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_NUMBER: ${{ inputs.issue_number || github.event.issue.number }}
         run: |
           set -euo pipefail
 
@@ -249,8 +288,7 @@ jobs:
       - name: Fix CodeRabbit review findings
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'coderabbit-fix'
         env:
-          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
-          OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/big-pickle' }}
+          OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
           GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ inputs.pr_number }}
@@ -425,12 +463,12 @@ jobs:
       - name: Resolve merge conflict with main
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'resolve-conflict'
         env:
-          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
-          OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/big-pickle' }}
+          OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
           GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ inputs.pr_number }}
           HEAD_REF: ${{ inputs.head_ref }}
+          CONFLICT_STRATEGY: ${{ inputs.conflict_strategy || 'merge' }}
         run: |
           set -euo pipefail
           PROMPT=$(cat <<EOF
@@ -440,9 +478,10 @@ jobs:
           - The current checkout is the existing PR head branch: ${HEAD_REF}.
           - This workflow was dispatched only after GitHub reported that the PR cannot
             be updated cleanly from main.
+          - The consumer selected the conflict strategy: ${CONFLICT_STRATEGY}.
 
           Requirements:
-          - Fetch the current origin/main and merge it into the current PR branch.
+          - Fetch the current origin/main and ${CONFLICT_STRATEGY} it into the current PR branch.
           - Resolve every merge conflict while preserving the intended behavior from both
             the PR and main; do not discard unrelated changes from either side.
           - Work only in the current checked-out PR branch. Do not create or switch to
@@ -458,8 +497,7 @@ jobs:
       - name: Fix failed blocking workflow
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'ci-fix'
         env:
-          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
-          OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/big-pickle' }}
+          OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
           GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ inputs.pr_number }}
@@ -501,6 +539,24 @@ jobs:
             gh run rerun "$RUN_ID" --failed
           fi
 
+      - name: Re-run the consumer blocking CI workflow for this head
+        if: >-
+          github.event_name == 'workflow_dispatch' &&
+          inputs.mode == 'ci-fix' &&
+          inputs.ci_workflow_id != ''
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          CI_WORKFLOW_ID: ${{ inputs.ci_workflow_id }}
+          HEAD_REF: ${{ inputs.head_ref }}
+        run: |
+          set -euo pipefail
+          # Consumer-driven counterpart to the `--failed` rerun above: when the
+          # agent committed a fix, the original run stays failed and would block
+          # the PR, so the consumer names the CI workflow file to re-run for the
+          # new head. Empty input leaves CI to the consumer's own machinery.
+          gh workflow run "$CI_WORKFLOW_ID" --ref "$HEAD_REF" \
+            || echo "::warning::Could not dispatch $CI_WORKFLOW_ID for $HEAD_REF"
+
       - name: Clear conflict-repair lock
         if: always() && github.event_name == 'workflow_dispatch' && inputs.mode == 'resolve-conflict'
         env:
@@ -521,20 +577,22 @@ jobs:
       github.event_name == 'issue_comment' &&
       github.actor == github.repository_owner &&
       !github.event.issue.pull_request &&
-      contains(github.event.comment.body, '<!-- issue-scheduler-dispatch -->')
+      contains(github.event.comment.body, inputs.dispatch_marker || '<!-- issue-scheduler-dispatch -->')
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: ${{ fromJSON(vars.AUTOMATION_ATTEMPTS_TIMEOUT_MINUTES || '10') }}
 
     permissions:
       issues: write
       pull-requests: read
 
     env:
-      MAX_DISPATCH_ATTEMPTS: ${{ vars.AUTOMATION_MAX_DISPATCH_ATTEMPTS || '2' }}
+      MAX_DISPATCH_ATTEMPTS: ${{ inputs.max_dispatch_attempts || vars.AUTOMATION_MAX_DISPATCH_ATTEMPTS || '2' }}
+      DISPATCH_MARKER: ${{ inputs.dispatch_marker || '<!-- issue-scheduler-dispatch -->' }}
+      DISPATCH_BACKOFF_SECONDS: ${{ vars.AUTOMATION_DISPATCH_BACKOFF_SECONDS || '120' }}
 
     steps:
       - name: Brief backoff before retrying scheduler
-        run: sleep 120
+        run: sleep "$DISPATCH_BACKOFF_SECONDS"
 
       - name: Release failed reservation or pause exhausted issue
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
@@ -546,7 +604,7 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const issueNumber = context.payload.issue.number;
-            const marker = '<!-- issue-scheduler-dispatch -->';
+            const marker = process.env.DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->';
             const inProgress = 'automation:in-progress';
             const paused = 'automation:paused';
             const maxAttempts = Number.parseInt(

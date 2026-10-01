@@ -409,4 +409,146 @@ class ContinuumTest < Minitest::Test
     end
   end
 
+  # Continuum automation runs on free anonymous OpenCode models, so no core
+  # workflow may require a paid provider token. `pr-agent` is the one
+  # exception: the upstream action is wired to the paid Groq provider, so the
+  # key stays optional there and only the hard failure is forbidden.
+  def test_core_automation_requires_no_paid_provider_key
+    core = Dir[File.join(ROOT, '.github/workflows/*.yml')].sort
+    refute_empty core
+    core.each do |path|
+      name = File.basename(path)
+      next if name.start_with?('continuum-tech-')
+
+      body = File.read(path)
+      refute_includes body, 'secrets.OPENCODE_API_KEY', name
+      refute_includes body, 'secrets.ANTHROPIC_API_KEY', name
+      refute_match(/exit 1\s*\n?\s*fi\s*\n\s*\n\s*- name: Run PR-Agent/m, body, name) if name == 'pr-agent.yml'
+      if name == 'pr-agent.yml'
+        # Optional, never blocking: the gate must not fail the run and the
+        # paid step must not execute without the key.
+        refute_includes body, '::error::Missing repository Actions secret', name
+        assert_includes body, "if: steps.groq.outputs.available == 'true'", name
+      end
+    end
+  end
+
+  # The free default model must be the single documented fallback everywhere an
+  # OpenCode model is named, otherwise a consumer without OPENCODE_MODEL
+  # silently runs a paid model.
+  def test_opencode_model_default_is_the_free_model
+    files = Dir[File.join(ROOT, '.github/workflows/*.yml')] +
+            Dir[File.join(ROOT, '.github/caller-stubs/**/*.yml')]
+    named = files.select { |path| File.read(path).include?('opencode/') }
+    refute_empty named
+    named.each do |path|
+      next if File.basename(path).start_with?('continuum-tech-')
+
+      body = File.read(path)
+      refute_includes body, 'big-pickle', File.basename(path)
+    end
+    assert_includes File.read(File.join(ROOT, '.github/workflows/opencode.yml')),
+                    "vars.OPENCODE_MODEL || 'opencode/muse-spark-1.3-contributor-free'"
+  end
+
+  # Automation limits are consumer policy: every hardcoded timeout/runner in a
+  # core workflow must be overridable through a vars.AUTOMATION_* knob whose
+  # default preserves the previously hardcoded value.
+  def test_automation_limits_are_variable_driven
+    core = Dir[File.join(ROOT, '.github/workflows/*.yml')].sort
+    targets = %w[issue-scheduler.yml opencode.yml auto-merge.yml consumer-child-dispatcher.yml]
+    targets.each do |name|
+      path = File.join(ROOT, '.github/workflows', name)
+      assert File.exist?(path), name
+      body = File.read(path)
+      body.scan(/^(\s*)timeout-minutes: (\d+)$/).each do |indent, minutes|
+        flunk "#{name}: hardcoded timeout-minutes: #{minutes}"
+      end
+      assert_match(/vars\.AUTOMATION_\w+/, body, "#{name}: no AUTOMATION_* knob")
+    end
+
+    opencode = File.read(File.join(ROOT, '.github/workflows/opencode.yml'))
+    assert_includes opencode, "vars.AUTOMATION_OPENCODE_RUNNER || 'macos-15'"
+    assert_includes opencode, "vars.AUTOMATION_OPENCODE_TIMEOUT_MINUTES || '180'"
+
+    scheduler = File.read(File.join(ROOT, '.github/workflows/issue-scheduler.yml'))
+    assert_includes scheduler, "vars.AUTOMATION_WIP_LIMIT || '2'"
+    assert_includes scheduler, "vars.AUTOMATION_LEASE_MINUTES || '45'"
+    assert_includes scheduler, "vars.AUTOMATION_MAX_DISPATCH_ATTEMPTS || '2'"
+  end
+
+  # Core workflows must carry no product-specific path outside the opt-in
+  # tech layer; the release version file is a consumer variable.
+  def test_core_workflows_expose_no_product_paths
+    core = Dir[File.join(ROOT, '.github/workflows/*.yml')].sort
+    core.each do |path|
+      name = File.basename(path)
+      next if name.start_with?('continuum-tech-')
+
+      body = File.read(path)
+      # The version file may appear only as the fallback of a consumer
+      # variable, never as a literal the engine acts on unconditionally.
+      without_defaults = body
+                        .gsub(/vars\.CONTINUUM_VERSION_FILE \|\| '[^']*'/, 'vars.CONTINUUM_VERSION_FILE')
+                        .gsub(/vars\.CONTINUUM_RELEASE_MANIFEST_FILES \|\| '[^']*'/, 'vars.CONTINUUM_RELEASE_MANIFEST_FILES')
+      refute_match(/Sources\/NanoDictateCore/, without_defaults, name)
+      refute_match(/'nanodictate\.rb'/, without_defaults, name)
+    end
+
+    %w[auto-merge.yml add-review-label.yml].each do |name|
+      body = File.read(File.join(ROOT, '.github/workflows', name))
+      assert_includes body, "vars.CONTINUUM_VERSION_FILE || 'Sources/NanoDictateCore/Version.swift'", name
+    end
+  end
+
+  # The dispatcher supplies the issue number; an issue_comment run must keep
+  # reading the event, so the input defaults to empty and is only a fallback.
+  def test_opencode_issue_number_input_is_optional_and_falls_back
+    inputs = events(yaml(File.join(ROOT, '.github/workflows/opencode.yml')))
+             .fetch('workflow_call').fetch('inputs')
+    issue = inputs.fetch('issue_number')
+    assert_equal '', issue.fetch('default')
+    assert_equal false, issue.fetch('required')
+
+    body = File.read(File.join(ROOT, '.github/workflows/opencode.yml'))
+    assert_includes body, 'inputs.issue_number || github.event.issue.number'
+    # `issue` must be dispatchable, otherwise the input is unreachable.
+    assert_includes body, 'fromJSON(\'["issue","coderabbit-fix","resolve-conflict","ci-fix"]\')'
+  end
+
+  # Every new knob is an additive input with a default that reproduces the
+  # pre-existing behaviour, so existing stubs keep working untouched.
+  def test_new_consumer_knobs_are_additive_with_safe_defaults
+    scheduler = events(yaml(File.join(ROOT, '.github/workflows/issue-scheduler.yml')))
+                  .fetch('workflow_call').fetch('inputs')
+    {
+      'wip_limit' => '',
+      'lease_minutes' => '',
+      'max_dispatch_attempts' => '',
+      'dispatch_marker' => '<!-- issue-scheduler-dispatch -->',
+      'in_progress_label' => 'automation:in-progress',
+      'pause_marker' => 'automation:paused',
+      'post_pause_comment' => 'true',
+      'reset_markers' => 'false',
+      'require_priority_label' => 'false'
+    }.each do |key, default|
+      assert scheduler.key?(key), "issue-scheduler missing input #{key}"
+      assert_equal default, scheduler.fetch(key).fetch('default'), key
+      assert_equal 'string', scheduler.fetch(key).fetch('type'), key
+    end
+
+    opencode = events(yaml(File.join(ROOT, '.github/workflows/opencode.yml')))
+               .fetch('workflow_call').fetch('inputs')
+    {
+      'max_dispatch_attempts' => '',
+      'dispatch_marker' => '',
+      'ci_workflow_id' => '',
+      'conflict_strategy' => 'merge'
+    }.each do |key, default|
+      assert opencode.key?(key), "opencode missing input #{key}"
+      assert_equal default, opencode.fetch(key).fetch('default'), key
+      assert_equal 'string', opencode.fetch(key).fetch('type'), key
+    end
+  end
+
 end
