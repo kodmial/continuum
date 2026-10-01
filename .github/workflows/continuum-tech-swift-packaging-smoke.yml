@@ -153,32 +153,38 @@ jobs:
                   if (error.status !== 422) throw error;
                 }
               }
-              const unique = new Map(active.map((run) => [run.id, run]));
-              const packagingRuns = [...unique.values()]
-                .filter((run) =>
-                  run.id !== context.runId &&
-                  run.path === '.github/workflows/continuum-tech-swift-packaging-smoke.yml')
+              const runs = [...new Map(active.map((run) => [run.id, run])).values()]
+                .filter((run) => run.id !== context.runId)
                 .sort((a, b) => b.id - a.id);
 
-              const newestPackagingPR = new Set();
-              for (const run of packagingRuns) {
+              // The exact-head main candidate is the publication gate and has
+              // priority over speculative PR packaging. Cancel any older main
+              // candidate and any PR Packaging smoke currently consuming or
+              // waiting for macOS capacity. Open PRs are rebased/revalidated by
+              // the normal reconciler after main advances.
+              for (const run of runs) {
+                if (run.path !== '.github/workflows/continuum-tech-swift-packaging-smoke.yml') continue;
                 if (run.event === 'push' && run.head_branch === 'main') {
                   await cancelRun(run, 'superseded by exact-head main run ' + context.runId);
-                  continue;
+                } else if (run.event === 'pull_request') {
+                  await cancelRun(run, 'main release candidate has priority over PR packaging');
                 }
-                if (run.event !== 'pull_request') continue;
-                const number = run.pull_requests && run.pull_requests[0] && run.pull_requests[0].number;
-                if (!number) continue;
+              }
 
-                if (!(await prNeedsFullCandidate(number))) {
-                  await cancelRun(run, 'source/non-packaging PR #' + number + ' no longer needs the full macOS gate');
-                  continue;
+              // Also purge stale macOS checks whose PR head has already moved.
+              // Their result can no longer satisfy the current PR and letting
+              // them run only burns one of GitHub's scarce macOS slots.
+              const staleMacPaths = new Set([
+                '.github/workflows/continuum-tech-swift-ci.yml',
+                '.github/workflows/macos-12-compat.yml',
+              ]);
+              for (const run of runs) {
+                if (!staleMacPaths.has(run.path) || run.event !== 'pull_request') continue;
+                const pr = run.pull_requests && run.pull_requests[0];
+                const currentHead = pr && pr.head && pr.head.sha;
+                if (currentHead && run.head_sha && currentHead !== run.head_sha) {
+                  await cancelRun(run, 'stale PR head ' + run.head_sha.slice(0, 12) + '; current head is ' + currentHead.slice(0, 12));
                 }
-                if (newestPackagingPR.has(number)) {
-                  await cancelRun(run, 'superseded by a newer Packaging smoke run for PR #' + number);
-                  continue;
-                }
-                newestPackagingPR.add(number);
               }
             }
 
@@ -189,8 +195,8 @@ jobs:
               runCandidate = 'true';
               if (context.ref === 'refs/heads/main') {
                 // Main's release candidate is the publication gate. Reclaim scarce
-                // macOS runner slots from obsolete source-only PR smoke runs and
-                // older main candidates before queueing the exact-head candidate.
+                // macOS runner slots from PR packaging, stale PR checks and older
+                // main candidates before queueing the exact-head candidate.
                 await pruneObsoletePackagingRuns();
               }
             } else if (event === 'schedule') {
