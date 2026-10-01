@@ -55,6 +55,9 @@ jobs:
       OPENCODE_MODEL: ${{ inputs.model }}
       MAX_REVIEW_PASSES: ${{ inputs.max_review_passes }}
       OPENCODE_CONFIG_CONTENT: '{"permission":{"bash":{"*":"allow","git *":"allow","git push *":"deny"}}}'
+      # Same defaults as issue-scheduler.yml's in_progress_label/pause_marker.
+      AUTOMATION_IN_PROGRESS_LABEL: ${{ vars.AUTOMATION_IN_PROGRESS_LABEL || 'automation:in-progress' }}
+      AUTOMATION_PAUSE_LABEL: ${{ vars.AUTOMATION_PAUSE_LABEL || 'automation:paused' }}
     steps:
       - name: Checkout parent control plane
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -355,7 +358,7 @@ jobs:
           # and cause the dispatcher to review/merge a second stale PR.
           gh api --method PATCH "repos/$child_repo/issues/$TASK_NUMBER" \
             -f state=closed -f state_reason=completed >/dev/null
-          for label in automation:in-progress automation:paused; do
+          for label in "$AUTOMATION_IN_PROGRESS_LABEL" "$AUTOMATION_PAUSE_LABEL"; do
             gh api --method DELETE \
               "repos/$child_repo/issues/$TASK_NUMBER/labels/${label//:/%3A}" \
               >/dev/null 2>&1 || true

@@ -40,6 +40,9 @@ jobs:
       WORKER_WORKFLOW: ${{ inputs.worker_workflow }}
       REVIEW_WORKFLOW: ${{ inputs.review_workflow }}
       MANUAL_PR_REVIEW_WORKFLOW: ${{ inputs.manual_pr_review_workflow }}
+      # Same default as issue-scheduler.yml's pause_marker, so a parent that
+      # renames the scheduler's pause label must rename this knob too.
+      AUTOMATION_PAUSE_LABEL: ${{ vars.AUTOMATION_PAUSE_LABEL || 'automation:paused' }}
     steps:
       - name: Checkout parent control plane
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -239,20 +242,20 @@ jobs:
               gh api --paginate "repos/$child_repo/issues?state=open&per_page=100" 2>/dev/null
             )"
 
-            # A delegated technical failure must never turn automation:paused
-            # into a terminal state. Clear stale pause labels on automation-
+            # A delegated technical failure must never turn the scheduler's pause
+            # label into a terminal state. Clear stale pause labels on automation-
             # owned child tasks and let dependency markers decide readiness.
             while IFS= read -r paused_task; do
               [[ -n "$paused_task" ]] || continue
               gh api --method DELETE \
-                "repos/$child_repo/issues/$paused_task/labels/automation%3Apaused" \
+                "repos/$child_repo/issues/$paused_task/labels/${AUTOMATION_PAUSE_LABEL//:/%3A}" \
                 >/dev/null 2>&1 || true
-              echo "Cleared stale automation:paused on child task #$paused_task."
+              echo "Cleared stale $AUTOMATION_PAUSE_LABEL on child task #$paused_task."
             done < <(
-              jq -r '
+              jq -r --arg pause "$AUTOMATION_PAUSE_LABEL" '
                 .[]
                 | select(.pull_request == null)
-                | select(any(.labels[]?.name; . == "automation:paused"))
+                | select(any(.labels[]?.name; . == $pause))
                 | select(
                     ((.body // "") | contains("<!-- continuum-child-owned -->")) or
                     ((.body // "") | contains("<!-- runtime-worker-owned -->"))
@@ -261,13 +264,13 @@ jobs:
               ' <<<"$issues_json"
             )
             issues_json="$(
-              jq '
+              jq --arg pause "$AUTOMATION_PAUSE_LABEL" '
                 map(
                   if (
                     ((.body // "") | contains("<!-- continuum-child-owned -->")) or
                     ((.body // "") | contains("<!-- runtime-worker-owned -->"))
                   )
-                  then .labels = [(.labels[]? | select(.name != "automation:paused"))]
+                  then .labels = [(.labels[]? | select(.name != $pause))]
                   else .
                   end
                 )
@@ -306,11 +309,11 @@ jobs:
                 gh workflow run "$WORKER_WORKFLOW" --repo "$GITHUB_REPOSITORY"                   -f child_id="$child_id"                   -f task_number="$task_number" >/dev/null
                 dispatched=$((dispatched + 1))
               done < <(
-                jq -r --arg p "$priority" '
+                jq -r --arg p "$priority" --arg pause "$AUTOMATION_PAUSE_LABEL" '
                   .[]
                   | select(.pull_request == null)
                   | select(any(.labels[]?.name; . == $p))
-                  | select(all(.labels[]?.name; . != "automation:paused"))
+                  | select(all(.labels[]?.name; . != $pause))
                   | select(
                       ((.body // "") | contains("<!-- continuum-child-owned -->")) or
                       ((.body // "") | contains("<!-- runtime-worker-owned -->"))

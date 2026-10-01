@@ -40,7 +40,23 @@ on:
       dispatch_marker:
         description: >-
           Hidden HTML marker the scheduler writes into its dispatch comments.
-          Must match the marker the consumer's scheduler uses.
+          Empty falls back to AUTOMATION_DISPATCH_MARKER. It must match the
+          marker the consumer's scheduler uses.
+        required: false
+        type: string
+        default: ''
+      in_progress_label:
+        description: >-
+          Label holding an automation reservation. Empty falls back to
+          AUTOMATION_IN_PROGRESS_LABEL. Must match the scheduler's
+          in_progress_label.
+        required: false
+        type: string
+        default: ''
+      pause_marker:
+        description: >-
+          Label that pauses automation after a failed dispatch. Empty falls back
+          to AUTOMATION_PAUSE_LABEL. Must match the scheduler's pause_marker.
         required: false
         type: string
         default: ''
@@ -53,8 +69,10 @@ on:
         default: ''
       conflict_strategy:
         description: >-
-          How resolve-conflict settles a conflict: `merge` rebases/merges the
-          default branch, `checkout` re-checks it out over the work.
+          How resolve-conflict settles a conflict: `merge` merges the default
+          branch into the PR branch, `checkout` re-checks it out over the work.
+          Any other value fails the step; `workflow_call` cannot declare an
+          enumerated `choice` input, so the allowed set is enforced in code.
         required: false
         type: string
         default: 'merge'
@@ -105,7 +123,7 @@ jobs:
     # internal workflow_dispatch events from trusted workflows on main.
     if: >-
       (github.event_name == 'workflow_dispatch' &&
-       contains(fromJSON('["issue","coderabbit-fix","resolve-conflict","ci-fix"]'), inputs.mode)) ||
+       contains(fromJSON('["coderabbit-fix","resolve-conflict","ci-fix"]'), inputs.mode)) ||
       ((github.event_name == 'issue_comment' ||
         github.event_name == 'pull_request_review_comment') &&
        github.actor == github.repository_owner &&
@@ -471,6 +489,43 @@ jobs:
           CONFLICT_STRATEGY: ${{ inputs.conflict_strategy || 'merge' }}
         run: |
           set -euo pipefail
+          # `workflow_call` cannot declare an enumerated input, so validate the
+          # strategy here rather than interpolating an unvalidated value.
+          case "$CONFLICT_STRATEGY" in
+            merge | checkout) ;;
+            *)
+              echo "::error::Unsupported conflict_strategy '$CONFLICT_STRATEGY'; expected 'merge' or 'checkout'."
+              exit 1
+              ;;
+          esac
+
+          # The two strategies need genuinely different instructions, so the
+          # whole strategy-dependent block is chosen, not a single interpolated
+          # verb. `merge` must not rebase; `checkout` re-checks main over the
+          # branch and therefore has to be pushed with force-with-lease.
+          if [[ "$CONFLICT_STRATEGY" == "checkout" ]]; then
+            read -r -d '' STRATEGY_BLOCK <<'BLOCK' || true
+            - Fetch the current origin/main and check it out over the current PR
+              branch (`git checkout origin/main -- .`), then re-apply the PR's own
+              intent on top of that tree by hand.
+            - Every file that both sides changed must end up containing the
+              intended behavior from BOTH the PR and main; resolving a conflict
+              by taking either side wholesale is a failure.
+            - Push the result to the current PR branch with
+              `git push --force-with-lease`, because re-checking out rewrites the
+              commits the branch already had.
+          BLOCK
+          else
+            read -r -d '' STRATEGY_BLOCK <<'BLOCK' || true
+            - Fetch the current origin/main and merge it into the current PR
+              branch, resolving the conflicts as part of that merge.
+            - Resolve every merge conflict while preserving the intended behavior
+              from both the PR and main; do not discard unrelated changes from
+              either side.
+            - Commit the merge and push it to the current PR branch. Never rebase,
+              force-push, or reset away either side.
+          BLOCK
+          fi
           PROMPT=$(cat <<EOF
           Resolve the merge conflict between pull request #${PR_NUMBER} and the current main branch.
 
@@ -481,14 +536,10 @@ jobs:
           - The consumer selected the conflict strategy: ${CONFLICT_STRATEGY}.
 
           Requirements:
-          - Fetch the current origin/main and ${CONFLICT_STRATEGY} it into the current PR branch.
-          - Resolve every merge conflict while preserving the intended behavior from both
-            the PR and main; do not discard unrelated changes from either side.
+          ${STRATEGY_BLOCK}
           - Work only in the current checked-out PR branch. Do not create or switch to
             another branch and do not create a new pull request.
-          - Do not rebase, force-push, or reset away either side.
           - Run the relevant tests, linters, or validation after resolving the conflicts.
-          - Commit the merge/conflict resolution and push it to the current PR branch.
           - Keep all comments and commit messages in English.
           EOF
           )
@@ -577,7 +628,7 @@ jobs:
       github.event_name == 'issue_comment' &&
       github.actor == github.repository_owner &&
       !github.event.issue.pull_request &&
-      contains(github.event.comment.body, inputs.dispatch_marker || '<!-- issue-scheduler-dispatch -->')
+      contains(github.event.comment.body, inputs.dispatch_marker || vars.AUTOMATION_DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->')
     runs-on: ubuntu-latest
     timeout-minutes: ${{ fromJSON(vars.AUTOMATION_ATTEMPTS_TIMEOUT_MINUTES || '10') }}
 
@@ -587,8 +638,10 @@ jobs:
 
     env:
       MAX_DISPATCH_ATTEMPTS: ${{ inputs.max_dispatch_attempts || vars.AUTOMATION_MAX_DISPATCH_ATTEMPTS || '2' }}
-      DISPATCH_MARKER: ${{ inputs.dispatch_marker || '<!-- issue-scheduler-dispatch -->' }}
+      DISPATCH_MARKER: ${{ inputs.dispatch_marker || vars.AUTOMATION_DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->' }}
       DISPATCH_BACKOFF_SECONDS: ${{ vars.AUTOMATION_DISPATCH_BACKOFF_SECONDS || '120' }}
+      IN_PROGRESS_LABEL: ${{ inputs.in_progress_label || vars.AUTOMATION_IN_PROGRESS_LABEL || 'automation:in-progress' }}
+      PAUSE_LABEL: ${{ inputs.pause_marker || vars.AUTOMATION_PAUSE_LABEL || 'automation:paused' }}
 
     steps:
       - name: Brief backoff before retrying scheduler
@@ -605,8 +658,8 @@ jobs:
             const repo = context.repo.repo;
             const issueNumber = context.payload.issue.number;
             const marker = process.env.DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->';
-            const inProgress = 'automation:in-progress';
-            const paused = 'automation:paused';
+            const inProgress = process.env.IN_PROGRESS_LABEL || 'automation:in-progress';
+            const paused = process.env.PAUSE_LABEL || 'automation:paused';
             const maxAttempts = Number.parseInt(
               process.env.MAX_DISPATCH_ATTEMPTS || '2',
               10

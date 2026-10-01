@@ -41,7 +41,7 @@ jobs:
         # ephemeral GITHUB_TOKEN does not reliably fan out into the downstream
         # push/merge workflows (version bump, release, PR reconciliation).
         env:
-            CONTINUUM_VERSION_FILE: ${{ vars.CONTINUUM_VERSION_FILE || 'Sources/NanoDictateCore/Version.swift' }}
+          CONTINUUM_VERSION_FILE: ${{ vars.CONTINUUM_VERSION_FILE || 'Sources/NanoDictateCore/Version.swift' }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |

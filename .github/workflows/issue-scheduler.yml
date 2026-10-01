@@ -49,8 +49,9 @@ on:
         default: 'automation:paused'
       post_pause_comment:
         description: >-
-          Post a comment on an issue when the scheduler pauses it. Empty
-          disables the comment and keeps only the label.
+          Post a comment on an issue when the scheduler pauses it. Only the
+          exact string `false` disables the comment; any other value, empty
+          included, keeps it enabled.
         type: string
         required: false
         default: 'true'
