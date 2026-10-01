@@ -953,6 +953,55 @@ class ContinuumTest < Minitest::Test
     end
   end
 
+  # Concurrency on the macOS-backed tech callers belongs to the shared template,
+  # not to a consumer's hand-edited copy: `concurrency` in a caller gates the
+  # consumer's whole run together with the reusable workflow it calls, so
+  # cancelling frees the scarce macOS runner slots themselves, whereas the same
+  # block inside the callee can only gate the callee.
+  #
+  # The group must therefore be generic AND repository-scoped. A bare product
+  # literal is the exact drift this test exists to catch: it would make two
+  # different repositories' runs contend for one group and cancel each other.
+  # Each caller's group is distinct for the same reason — CI must not cancel a
+  # packaging-smoke run on the same PR.
+  def test_tech_swift_callers_gate_on_a_repository_scoped_concurrency_group
+    cancelling = {
+      'continuum-tech-swift-ci.yml' => 'continuum-swift-ci',
+      'continuum-tech-swift-packaging-smoke.yml' => 'continuum-swift-packaging-smoke'
+    }
+    cancelling.each do |base, prefix|
+      concurrency = yaml(File.join(ROOT, '.github/caller-stubs/tech', base)).fetch('concurrency')
+      assert_equal true, concurrency['cancel-in-progress'], "#{base}: a superseded head must be cancelled"
+      assert concurrency.fetch('group').start_with?("#{prefix}-"), base
+    end
+
+    # Release serializes instead of cancelling: two runs publishing the same ref
+    # would race on the tag and the manifests, and cancelling a release that is
+    # already publishing is never the safe choice.
+    release = yaml(File.join(ROOT, '.github/caller-stubs/tech/continuum-tech-swift-release.yml')).fetch('concurrency')
+    refute release.key?('cancel-in-progress'), 'release must not cancel: it serializes instead'
+    assert_includes release.fetch('group'), 'github.ref'
+
+    groups = cancelling.keys.to_h { |base| [base, yaml(File.join(ROOT, '.github/caller-stubs/tech', base)).fetch('concurrency').fetch('group')] }
+    groups['continuum-tech-swift-release.yml'] = release.fetch('group')
+    assert_equal groups.size, groups.values.uniq.size, 'two tech callers share a concurrency group and would cancel each other'
+    groups.each do |base, group|
+      assert_includes group, '${{ github.repository }}', "#{base}: an unscoped group lets two repositories cancel each other"
+    end
+  end
+
+  # The templates ship to every consumer, so a consumer's own name hardcoded
+  # into one is a defect a reviewer cannot see from the file's purpose. This is
+  # the drift guard for the whole tech layer, beyond the groups above.
+  def test_tech_stubs_name_no_consumer_repository
+    TECH_STUBS.each do |path|
+      body = File.read(path)
+      %w[nanodictate runtime-lab macports-nanodictate homebrew-nanodictate].each do |consumer|
+        refute_includes body, consumer, "#{File.basename(path)}: hardcoded consumer name #{consumer}"
+      end
+    end
+  end
+
   def test_manifest_environment_belongs_to_executable_step
     release = yaml(File.join(ROOT, '.github/workflows/continuum-tech-swift-release.yml'))
     steps = release.fetch('jobs').fetch('manifests').fetch('steps')

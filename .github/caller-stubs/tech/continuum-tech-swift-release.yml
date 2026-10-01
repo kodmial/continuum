@@ -36,6 +36,12 @@ permissions:
   issues: write
   pull-requests: write
 
+# Serialize release runs per ref: two releases racing on one tag or branch
+# produce duplicate or conflicting tags and manifests. Cancellation is
+# deliberately absent — a release that is already publishing must finish.
+concurrency:
+  group: continuum-swift-release-${{ github.repository }}-${{ github.ref }}
+
 jobs:
   call:
     uses: kodmial/continuum/.github/workflows/continuum-tech-swift-release.yml@main

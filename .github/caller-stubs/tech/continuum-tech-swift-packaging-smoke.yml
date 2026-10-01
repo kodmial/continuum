@@ -58,6 +58,14 @@ permissions:
   pull-requests: read
   actions: write
 
+# Packaging macOS runners are scarce, so collapse repeated runs for the same
+# PR/ref before they can queue. Gating here rather than in the callee is what
+# actually frees the runner slots, and the repository keeps independent
+# consumers out of each other's group.
+concurrency:
+  group: continuum-swift-packaging-smoke-${{ github.repository }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   call:
     uses: kodmial/continuum/.github/workflows/continuum-tech-swift-packaging-smoke.yml@main
