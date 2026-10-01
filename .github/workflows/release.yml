@@ -56,9 +56,12 @@ jobs:
       version: ${{ steps.ver.outputs.version }}
       skip_release: ${{ steps.guard.outputs.skip_release }}
       skip_manifests: ${{ steps.guard.outputs.skip_manifests }}
+    env:
+      VERSION_FILE: ${{ vars.CONTINUUM_VERSION_FILE || 'Sources/NanoDictateCore/Version.swift' }}
+
     steps:
       - name: Checkout
-        # Needed to read Sources/NanoDictateCore/Version.swift on the
+        # Needed to read $VERSION_FILE on the
         # merge/manual paths (the tag path uses github.ref_name instead).
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
@@ -66,7 +69,7 @@ jobs:
         id: ver
         # Three version sources, resolved from the event type:
         #   push v* tag            -> the pushed tag (v-prefix stripped)
-        #   push main (merge path) -> Sources/NanoDictateCore/Version.swift
+        #   push main (merge path) -> $VERSION_FILE
         #   workflow_dispatch      -> inputs.version if provided, else Version.swift
         run: |
           set -euo pipefail
@@ -79,13 +82,13 @@ jobs:
                 # and the Homebrew/MacPorts manifests would say v$VERSION while
                 # the binary prints the Version.swift value — refuse instead of
                 # publishing a release that disagrees with its own binaries.
-                FILE_VERSION=$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' Sources/NanoDictateCore/Version.swift)
+                FILE_VERSION=$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' $VERSION_FILE)
                 if [[ "$VERSION" != "$FILE_VERSION" ]]; then
-                  echo "::error::Input version $VERSION does not match Sources/NanoDictateCore/Version.swift ($FILE_VERSION) — the release tag/formula would say v$VERSION while the binary prints $FILE_VERSION. Bump Version.swift in a PR first, or pass the matching version."
+                  echo "::error::Input version $VERSION does not match $VERSION_FILE ($FILE_VERSION) — the release tag/formula would say v$VERSION while the binary prints $FILE_VERSION. Bump Version.swift in a PR first, or pass the matching version."
                   exit 1
                 fi
               else
-                VERSION=$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' Sources/NanoDictateCore/Version.swift)
+                VERSION=$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' $VERSION_FILE)
               fi
               ;;
             push)
@@ -96,21 +99,21 @@ jobs:
                 # CFBundleShortVersionString would say v$VERSION while the
                 # overlay header prints the Version.swift value — refuse
                 # instead of publishing a release that disagrees with itself.
-                FILE_VERSION=$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' Sources/NanoDictateCore/Version.swift)
+                FILE_VERSION=$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' $VERSION_FILE)
                 if [[ "$VERSION" != "$FILE_VERSION" ]]; then
-                  echo "::error::Tag version $VERSION does not match Sources/NanoDictateCore/Version.swift ($FILE_VERSION) — the release tag would say v$VERSION while the binary prints $FILE_VERSION. Push a tag matching Version.swift instead."
+                  echo "::error::Tag version $VERSION does not match $VERSION_FILE ($FILE_VERSION) — the release tag would say v$VERSION while the binary prints $FILE_VERSION. Push a tag matching Version.swift instead."
                   exit 1
                 fi
               else
-                VERSION=$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' Sources/NanoDictateCore/Version.swift)
+                VERSION=$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' $VERSION_FILE)
               fi
               ;;
             *)
-              VERSION=$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' Sources/NanoDictateCore/Version.swift)
+              VERSION=$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' $VERSION_FILE)
               ;;
           esac
           if [[ -z "$VERSION" ]]; then
-            echo "::error::Could not extract a semver from Sources/NanoDictateCore/Version.swift (and no tag/input version was provided)."
+            echo "::error::Could not extract a semver from $VERSION_FILE (and no tag/input version was provided)."
             exit 1
           fi
           # User version policy: only the 0.0.x and 0.1.x series may be
@@ -757,6 +760,9 @@ jobs:
       # this job transitions the merged Release PR to tagged after publication.
       issues: write
       pull-requests: write
+    env:
+      CLI_NAME: ${{ vars.CONTINUUM_CLI_NAME || 'nanodictate' }}
+
     steps:
       - name: No-op — version already released / dry run
         if: ${{ needs.preflight.outputs.skip_release == 'true' }}
@@ -787,10 +793,10 @@ jobs:
           done
 
           EXPECTED=(
-            "nanodictate-$VERSION-macos-x86_64.tar.gz"
-            "nanodictate-$VERSION-macos-arm64.tar.gz"
-            "nanodictate-$VERSION-macos-x86_64.zip"
-            "nanodictate-$VERSION-macos-arm64.zip"
+            "$CLI_NAME-$VERSION-macos-x86_64.tar.gz"
+            "$CLI_NAME-$VERSION-macos-arm64.tar.gz"
+            "$CLI_NAME-$VERSION-macos-x86_64.zip"
+            "$CLI_NAME-$VERSION-macos-arm64.zip"
           )
           for file in "${EXPECTED[@]}"; do
             if [[ ! -f "dist/$file" ]]; then
@@ -808,12 +814,12 @@ jobs:
         run: |
           set -euo pipefail
           echo "version=${RELEASE_VERSION}" >> "$GITHUB_OUTPUT"
-          ls -1 dist/nanodictate-*.tar.gz dist/nanodictate-*.zip
+          ls -1 dist/$CLI_NAME-*.tar.gz dist/$CLI_NAME-*.zip
 
       - name: Generate SHA256SUMS.txt
         if: ${{ needs.preflight.outputs.skip_release != 'true' }}
         working-directory: dist
-        run: sha256sum nanodictate-*.tar.gz nanodictate-*.zip | tee SHA256SUMS.txt
+        run: sha256sum $CLI_NAME-*.tar.gz $CLI_NAME-*.zip | tee SHA256SUMS.txt
 
       - name: Create release & upload assets
         if: ${{ needs.preflight.outputs.skip_release != 'true' }}
@@ -844,8 +850,8 @@ jobs:
           See [CHANGELOG.md](https://github.com/$REPO/blob/$REF/CHANGELOG.md) for the full release notes.
           Generated by the release workflow."
           if gh release create "$TAG" \
-            dist/nanodictate-*.tar.gz \
-            dist/nanodictate-*.zip \
+            dist/$CLI_NAME-*.tar.gz \
+            dist/$CLI_NAME-*.zip \
             dist/SHA256SUMS.txt \
             --title "v$RELEASE_VERSION" \
             --notes "$NOTES"; then
@@ -867,7 +873,7 @@ jobs:
             # are missing; every already-published byte stays untouched.
             if gh release view "$TAG" --json assets --jq '.assets[].name' > /tmp/existing-assets.txt 2>/dev/null; then
               MISSING=()
-              for f in dist/nanodictate-*.tar.gz dist/nanodictate-*.zip dist/SHA256SUMS.txt; do
+              for f in dist/$CLI_NAME-*.tar.gz dist/$CLI_NAME-*.zip dist/SHA256SUMS.txt; do
                 if grep -qxF "$(basename "$f")" /tmp/existing-assets.txt; then
                   echo "Asset $(basename "$f") is already attached to $TAG — keeping the existing bytes (no --clobber)."
                 else
