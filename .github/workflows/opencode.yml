@@ -152,7 +152,26 @@ jobs:
         run: |
           set -euo pipefail
           for attempt in 1 2 3; do
-            if curl -fsSL --retry 3 --retry-delay 2 https://opencode.ai/install | bash; then
+            if curl -fsSL --retry 3 --retry-delay 2 https://opencode.ai/install | bash -s -- --version 1.18.34; then
+              echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+              exit 0
+            fi
+            if [[ "$attempt" -eq 3 ]]; then
+              echo "::error::OpenCode installer failed after 3 attempts."
+              exit 1
+            fi
+            sleep $((attempt * 15))
+          done
+
+      # The upstream composite action resolves releases/latest before doing
+      # any useful work. Pin the CLI instead so GitHub API availability or
+      # rate limiting cannot prevent issue/PR-comment sessions from starting.
+      - name: Install OpenCode CLI for interactive agent
+        if: github.event_name != 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if curl -fsSL --retry 3 --retry-delay 2 https://opencode.ai/install | bash -s -- --version 1.18.34; then
               echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
               exit 0
             fi
@@ -165,23 +184,15 @@ jobs:
 
       - name: Run OpenCode
         if: github.event_name != 'workflow_dispatch'
-        uses: anomalyco/opencode/github@545f51d26cc39a907d2867492d498d9607ea5fa4
         env:
-          # use_github_token=true below tells OpenCode to use this exact env
-          # credential for GitHub API operations. Keep it aligned with the
-          # checkout credential so both gh calls and git push use TAP_PAT.
           GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
-          # The GitHub integration owns the branch/commit/push/PR lifecycle for
-          # issue and PR-comment sessions. Prevent the LLM from changing Git
-          # state underneath that lifecycle. OpenCode evaluates explicit deny
-          # rules even in auto mode; read-only Git inspection remains allowed.
+          MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/big-pickle' }}
+          USE_GITHUB_TOKEN: "true"
+          SHARE: "false"
           OPENCODE_CONFIG_CONTENT: >-
             {"permission":{"bash":{"*":"allow","git *":"deny","git status":"allow","git status *":"allow","git diff":"allow","git diff *":"allow","git log":"allow","git log *":"allow","git show":"allow","git show *":"allow","git rev-parse *":"allow","git ls-files":"allow","git ls-files *":"allow","git grep *":"allow","git blame *":"allow","git branch --show-current":"allow","git remote -v":"allow","git tag":"allow","git tag --list *":"allow","git tag -l *":"allow","git describe *":"allow"}}}
-        with:
-          model: ${{ vars.OPENCODE_MODEL || 'opencode/big-pickle' }}
-          use_github_token: true
-          share: false
+        run: opencode github run
 
       # Upstream OpenCode deliberately skips its infrastructure push/PR when
       # the agent leaves the branch that OpenCode created for an issue. The
