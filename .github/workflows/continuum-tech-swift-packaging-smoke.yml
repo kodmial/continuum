@@ -64,7 +64,7 @@ permissions:
 # Keep only the newest run for a given PR/ref. This prevents repeated
 # synchronize/push events from stacking expensive macOS jobs.
 concurrency:
-  group: continuum-packaging-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}
+  group: continuum-packaging-${{ github.repository }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref || github.run_id }}
   cancel-in-progress: true
 
 jobs:
