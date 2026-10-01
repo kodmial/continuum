@@ -1564,11 +1564,13 @@ class ContinuumTest < Minitest::Test
       in_progress_label pause_marker post_pause_comment reset_markers
       require_priority_label command_grace_minutes child_owned_marker
       legacy_child_owned_marker opencode_workflow_name opencode_workflow_path
+      count_open_prs_as_wip pause_on_failure
     ],
     'opencode.yml' => %w[
       continuum_ref mode issue_number pr_number head_ref review_id run_id
       ci_workflow_id conflict_strategy dispatch_marker in_progress_label
-      pause_marker max_dispatch_attempts
+      pause_marker max_dispatch_attempts pause_on_failure ci_repair_label
+      packaging_repair_label
     ],
     'opencode-repair.yml' => %w[
       continuum_ref pr_number head_sha conclusion run_id ci_repair_label
@@ -1632,7 +1634,9 @@ class ContinuumTest < Minitest::Test
       'MAX_DISPATCH_ATTEMPTS' => %w[max_dispatch_attempts AUTOMATION_MAX_DISPATCH_ATTEMPTS 2],
       'DISPATCH_MARKER' => ['dispatch_marker', 'AUTOMATION_DISPATCH_MARKER', '<!-- issue-scheduler-dispatch -->'],
       'IN_PROGRESS_LABEL' => ['in_progress_label', 'AUTOMATION_IN_PROGRESS_LABEL', 'automation:in-progress'],
-      'PAUSE_LABEL' => ['pause_marker', 'AUTOMATION_PAUSE_LABEL', 'automation:paused']
+      'PAUSE_LABEL' => ['pause_marker', 'AUTOMATION_PAUSE_LABEL', 'automation:paused'],
+      'COUNT_OPEN_PRS_AS_WIP' => ['count_open_prs_as_wip', 'AUTOMATION_COUNT_OPEN_PRS_AS_WIP', 'true'],
+      'PAUSE_ON_FAILURE' => ['pause_on_failure', 'AUTOMATION_PAUSE_ON_FAILURE', 'true']
     }.each do |env_key, (input, variable, literal)|
       assert_includes scheduler,
                       "#{env_key}: \${{ inputs.#{input} || vars.#{variable} || '#{literal}' }}",
@@ -1740,7 +1744,8 @@ class ContinuumTest < Minitest::Test
     # A manual command must not consume the scheduler's own attempt budget, or
     # two manual runs would pause an issue the scheduler never dispatched.
     assert_includes scheduler, 'const schedulerDispatches = comments.filter(comment =>'
-    assert_includes scheduler, 'if (schedulerDispatches.length >= maxDispatchAttempts) {'
+    assert_includes scheduler, 'schedulerDispatches.length >= maxDispatchAttempts'
+    assert_includes scheduler, 'pauseOnFailure'
     refute_includes scheduler, 'if (dispatches.length >= maxDispatchAttempts) {'
   end
 
@@ -1755,7 +1760,7 @@ class ContinuumTest < Minitest::Test
     [
       'const freshIssueResponse = await github.rest.issues.get({',
       "freshIssue.state !== 'open'",
-      'freshLabels.has(pausedLabel)',
+      '(pauseOnFailure && freshLabels.has(pausedLabel))',
       'freshLabels.has(inProgressLabel)',
       'const freshDeclaredBlockers = await openDeclaredBlockers(freshIssue);',
       'freshOpenBlockers.length > 0',
