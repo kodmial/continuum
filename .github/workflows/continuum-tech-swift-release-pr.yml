@@ -358,6 +358,7 @@ jobs:
         env:
           RELEASE_TOKEN: ${{ steps.release-token.outputs.token }}
           REPO: ${{ github.repository }}
+          VERSION_FILE: ${{ vars.CONTINUUM_VERSION_FILE }}
         run: |
           set -euo pipefail
 
@@ -374,7 +375,7 @@ jobs:
 
           PROPOSED=$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' "$VERSION_FILE")
           if [[ -z "$PROPOSED" ]]; then
-            echo "::error::Could not extract a version from "$VERSION_FILE" on $BRANCH"
+            echo "::error::Could not extract a version from $VERSION_FILE on $BRANCH"
             exit 1
           fi
           if ! policy_version_is_allowed "$PROPOSED"; then
