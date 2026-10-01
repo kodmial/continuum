@@ -44,6 +44,11 @@ class ContinuumTest < Minitest::Test
     File.read(File.join(ROOT, '.github/workflows', name))
   end
 
+  # The parsed core workflow behind a caller stub of the same base name.
+  def workflow_stub_callee
+    yaml(File.join(ROOT, '.github/workflows', 'opencode-repair.yml'))
+  end
+
   # The modes the OpenCode engine admits on the `workflow_dispatch` path,
   # parsed out of the job's own `if` guard rather than hardcoded here.
   def dispatch_modes
@@ -1049,6 +1054,204 @@ class ContinuumTest < Minitest::Test
     refute_match(/if: startsWith\(runner/, watchdog_body)
   end
 
+  # ------------------------------------------------- opencode-repair dispatch
+
+  # A consumer's own CI reports its result by dispatching the installed
+  # `continuum-opencode-repair.yml` caller with `gh workflow run`. Before this
+  # path existed neither the core workflow nor its stub declared
+  # `workflow_dispatch` at all, so that dispatch died with "Unexpected inputs"
+  # and the only reason CI recovery appeared to work was a surviving fork in
+  # the consumer repository.
+  #
+  # The four inputs are required on the stub and optional on the callee, and
+  # both halves of that asymmetry are asserted: the stub must reject a partial
+  # report, and the callee must still be callable with the four empty, because
+  # its pull_request_target and workflow_run paths never supply them.
+  REPORTED_CI_INPUTS = %w[pr_number head_sha conclusion run_id].freeze
+
+  def test_opencode_repair_stub_accepts_a_reported_ci_result
+    stub = yaml(File.join(ROOT, '.github/caller-stubs/opencode-repair.yml'))
+    dispatch = events(stub).fetch('workflow_dispatch', nil)
+    refute_nil dispatch,
+                'the repair stub declares no workflow_dispatch: a consumer\'s CI report would be ' \
+                'rejected with "Unexpected inputs", which is the bug this path fixes'
+    assert_equal (REPORTED_CI_INPUTS + %w[ci_repair_label head_ref_pattern
+                                          auto_merge_workflow opencode_workflow]).sort,
+                 dispatch.fetch('inputs').keys.sort,
+                 'the reported-CI-result dispatch contract plus its optional knobs'
+
+    REPORTED_CI_INPUTS.each do |key|
+      definition = dispatch.fetch('inputs').fetch(key)
+      # Required on the stub: a result without the head it was measured on, or
+      # without the PR it belongs to, is not actionable and would otherwise be
+      # accepted and silently ignored.
+      assert_equal true, definition.fetch('required'), "#{key}: a partial CI report must be rejected"
+      assert_equal 'string', definition.fetch('type'), key
+      refute_empty definition.fetch('description').to_s, "#{key}: the input must be documented"
+    end
+
+    # The knobs stay optional: the same stub is also triggered by
+    # pull_request_target and workflow_run, where they have no value to carry.
+    %w[ci_repair_label head_ref_pattern auto_merge_workflow opencode_workflow].each do |key|
+      definition = dispatch.fetch('inputs').fetch(key)
+      assert_equal false, definition.fetch('required'), "#{key}: a knob must not gate the dispatch"
+      assert_equal 'string', definition.fetch('type'), key
+    end
+
+    callee_inputs = events(workflow_stub_callee).fetch('workflow_call').fetch('inputs')
+    REPORTED_CI_INPUTS.each do |key|
+      definition = callee_inputs.fetch(key)
+      # Empty, not required: the two non-dispatch paths call this workflow with
+      # no CI report at all, and a required callee input would reject them.
+      assert_equal '', definition.fetch('default'), "#{key}: the callee input must default to empty"
+      assert_equal false, definition.fetch('required'), "#{key}: the callee input must stay optional"
+      assert_equal 'string', definition.fetch('type'), key
+    end
+
+    body = workflow_body('opencode-repair.yml')
+    job = body[/^  ci-repair-dispatch:\n(.*?)(?=^  \S|\z)/m, 1]
+    refute_nil job, 'opencode-repair.yml has no ci-repair-dispatch job'
+    assert_includes job, "github.event_name == 'workflow_dispatch'",
+                    'the dispatch job must be gated on the dispatch event alone'
+    %w[pr_number head_sha conclusion].each do |key|
+      assert_includes job, "inputs.#{key} != ''", "inputs.#{key} must gate the job against a partial report"
+    end
+  end
+
+  # The dispatch path's guards, stale check, lock, and repair dispatch are the
+  # whole mechanism this change ports. Assert the behaviour, not the shape: a
+  # body that merely compares the conclusion and then falls through would pass
+  # a presence check while burning nothing and repairing nothing.
+  def test_opencode_repair_dispatch_body_guards_locks_and_repairs
+    body = workflow_body('opencode-repair.yml')
+    job = body[/^  ci-repair-dispatch:\n(.*?)(?=^  \S|\z)/m, 1]
+    refute_nil job, 'opencode-repair.yml has no ci-repair-dispatch job'
+    script = job[/run: \|\n(.*?)(?=^  \S|\z)/m, 1]
+    refute_nil script, 'the dispatch job has no shell body'
+
+    # Every guard must be an early exit, so a stale or foreign report costs
+    # nothing. Guards, in the fork's order: state, repository, branch, staleness.
+    [
+      '"$pr_state" != "open"',
+      '"$head_repo" != "$GITHUB_REPOSITORY"',
+      '"$head_ref" =~ $HEAD_REF_PATTERN',
+      '"$head_sha" != "$REPORTED_HEAD_SHA"'
+    ].each { |guard| assert_includes script, guard, "missing guard: #{guard}" }
+    assert_operator 4, :<=, script.scan('exit 0').size,
+                    'each guard must be a skip, not a fall-through'
+
+    # The lock is one attempt per head: check before add, and the ci-fix
+    # dispatch happens only after the label is on the PR.
+    lock_check = script.index('grep -Fxq "$CI_REPAIR_LABEL"')
+    lock_add = script.index(%(-f "labels[]=$CI_REPAIR_LABEL"))
+    ci_fix = script.index('inputs[mode]=ci-fix')
+    refute_nil lock_check, 'the lock check is gone: repair would repeat on every report'
+    refute_nil lock_add, 'the lock is never taken'
+    refute_nil ci_fix, 'no ci-fix dispatch remains on the dispatch path'
+    assert_operator lock_check, :<, ci_fix, 'the lock must be checked before repair is dispatched'
+    assert_operator lock_add, :<, ci_fix, 'the lock must be taken before repair is dispatched'
+
+    # Success clears the lock and wakes the reconciler; it must never dispatch
+    # a repair, which is the one ordering that would auto-fix a green PR.
+    success = script.index('"$REPORTED_CONCLUSION" == "success"')
+    assert_operator success, :<, ci_fix, 'success must be handled before the repair dispatch'
+    between = script[success...ci_fix]
+    assert_includes between, 'labels/$CI_REPAIR_LABEL', 'success must clear the repair lock'
+    assert_includes between, 'actions/workflows/$AUTO_MERGE_WORKFLOW/dispatches',
+                    'success must wake the auto-merge reconciler'
+
+    # A non-repairable conclusion must not consume the one attempt the head has.
+    assert_includes script, '"$REPORTED_CONCLUSION" != "failure" && "$REPORTED_CONCLUSION" != "timed_out"'
+
+    # A failed dispatch must release the lock, or the head can never retry.
+    tail = script[ci_fix..]
+    assert_includes tail, 'labels/$CI_REPAIR_LABEL', 'a failed repair dispatch must clear the lock'
+
+    # The reported run id is what ci-fix reruns; dropping it turns the dispatch
+    # into a repair with no run to point at.
+    assert_includes script, '-f "inputs[run_id]=$REPORTED_RUN_ID"'
+
+    # The PAT, not GITHUB_TOKEN: the whole point of this path is that the
+    # reporting CI may live outside this repository's default token scope.
+    assert_includes job, 'GH_TOKEN: ${{ secrets.TAP_PAT }}'
+
+    # A dispatch target reached by path must be an env var, never a literal file
+    # name, so it can carry the `continuum-` prefix that survives installation.
+    %w[$OPENCODE_WORKFLOW $AUTO_MERGE_WORKFLOW].each do |target|
+      bare = target.delete('$')
+      assert_includes script, "actions/workflows/#{target}/dispatches", "#{target} is never dispatched"
+      assert_match(/^\s+#{bare}: \$\{\{ inputs\./, job, "#{target} must be an env var bound to an input")
+    end
+  end
+
+  # Every knob the dispatch path introduced must fall back to the value this
+  # controller used before it was parameterized, so a consumer with empty
+  # repository variables is unaffected.
+  def test_opencode_repair_knobs_are_additive_with_safe_defaults
+    inputs = events(workflow_stub_callee).fetch('workflow_call').fetch('inputs')
+    {
+      'ci_repair_label' => '',
+      'head_ref_pattern' => '',
+      'auto_merge_workflow' => '',
+      'opencode_workflow' => ''
+    }.each do |key, default|
+      assert inputs.key?(key), "opencode-repair missing input #{key}"
+      assert_equal default, inputs.fetch(key).fetch('default'), key
+      assert_equal 'string', inputs.fetch(key).fetch('type'), key
+      assert_equal false, inputs.fetch(key).fetch('required'), key
+    end
+
+    body = workflow_body('opencode-repair.yml')
+    {
+      'CI_REPAIR_LABEL' => ['ci_repair_label', 'CONTINUUM_CI_REPAIR_LABEL', 'opencode-ci-repair'],
+      'HEAD_REF_PATTERN' => ['head_ref_pattern', 'CONTINUUM_HEAD_REF_PATTERN', '^opencode/issue[0-9]+-'],
+      'AUTO_MERGE_WORKFLOW' => ['auto_merge_workflow', 'CONTINUUM_AUTO_MERGE_WORKFLOW', 'continuum-auto-merge.yml'],
+      'OPENCODE_WORKFLOW' => ['opencode_workflow', 'CONTINUUM_OPENCODE_WORKFLOW', 'continuum-opencode.yml']
+    }.each do |key, (input, variable, literal)|
+      assert_includes body, "#{key}: \${{ inputs.#{input} || vars.#{variable} || '#{literal}' }}",
+                      "#{key}: missing inputs/vars/literal fallback"
+    end
+
+    # Re-evaluate the chain rather than re-asserting it: a reordered or
+    # mistyped default that still contains the right literal would otherwise
+    # pass this test and change every consumer's behaviour.
+    body.lines.select { |line| line.include?('CI_REPAIR_LABEL: ${{') }.each do |line|
+      terms = line[/\$\{\{(.*)\}\}/, 1].split('||').map(&:strip)
+      assert_equal 'inputs.ci_repair_label', terms.first, line
+      assert_includes terms[1], 'vars.CONTINUUM', line
+      resolve = lambda do |inputs_value, vars_value|
+        terms.reduce(nil) do |acc, term|
+          acc || case term
+                 when /\A'([^']*)'\z/ then Regexp.last_match(1)
+                 when /\Avars\./ then vars_value
+                 when /\Ainputs\./ then inputs_value
+                 end
+        end
+      end
+      assert_equal 'opencode-ci-repair', resolve.call(nil, nil),
+                   'empty inputs and vars must still yield the pre-existing label'
+      refute_equal 'opencode-ci-repair', resolve.call(nil, 'consumer-value'),
+                   'a set vars. value must win over the default'
+    end
+
+    # The stub must pass every knob through bare, or a pinned literal would
+    # silently override the consumer's variable for all installed callers.
+    with = yaml(File.join(ROOT, '.github/caller-stubs/opencode-repair.yml'))
+           .fetch('jobs').fetch('call').fetch('with')
+    %w[pr_number head_sha conclusion run_id ci_repair_label head_ref_pattern
+       auto_merge_workflow opencode_workflow].each do |key|
+      assert_equal "\${{ inputs.#{key} }}", with.fetch(key), "#{key} must be a bare passthrough"
+    end
+
+    # The lock the dispatch path writes is the same one the pre-existing
+    # synchronize reset already clears, or a new head could not repair.
+    assert_includes body, 'for label in "$CI_REPAIR_LABEL" opencode-packaging-smoke-repair; do',
+                    'the per-head reset must clear the configured lock, not a hardcoded one'
+    # The workflow_run path keeps its looser `opencode/*` guard: tightening it
+    # would stop repairing heads this controller repaired before.
+    assert_includes body, '"$head_ref" != opencode/*'
+  end
+
   # ------------------------------------------------- stub input contract
 
   # Every `with:` key each core stub is allowed to pass. A stub is installed
@@ -1071,7 +1274,10 @@ class ContinuumTest < Minitest::Test
       ci_workflow_id conflict_strategy dispatch_marker in_progress_label
       pause_marker max_dispatch_attempts
     ],
-    'opencode-repair.yml' => %w[continuum_ref],
+    'opencode-repair.yml' => %w[
+      continuum_ref pr_number head_sha conclusion run_id ci_repair_label
+      head_ref_pattern auto_merge_workflow opencode_workflow
+    ],
     'opencode-unresolved.yml' => %w[continuum_ref],
     'pr-agent.yml' => %w[continuum_ref],
     'remove-review-label.yml' => %w[continuum_ref]

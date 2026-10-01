@@ -8,12 +8,74 @@ on:
         type: string
         default: main
         required: false
+      # The four inputs below are how a consumer's own CI reports a result.
+      # The caller stub declares them `required: true` on `workflow_dispatch`,
+      # so an operator or a CI job cannot report a partial result; here they
+      # must stay optional and empty, because the pull_request_target and
+      # workflow_run paths call this workflow without them.
+      pr_number:
+        description: >-
+          Pull request whose CI result is being reported. Empty unless the
+          caller was dispatched.
+        type: string
+        default: ''
+        required: false
+      head_sha:
+        description: >-
+          PR head SHA the reporting CI run evaluated. Empty unless the caller
+          was dispatched.
+        type: string
+        default: ''
+        required: false
+      conclusion:
+        description: >-
+          Conclusion the reporting CI run produced for that head (success,
+          failure, or timed_out). Empty unless the caller was dispatched.
+        type: string
+        default: ''
+        required: false
+      run_id:
+        description: >-
+          Id of the reporting CI workflow run, forwarded to the ci-fix
+          dispatch. Empty unless the caller was dispatched.
+        type: string
+        default: ''
+        required: false
+      ci_repair_label:
+        description: >-
+          Label holding the one-automatic-attempt-per-head CI repair lock.
+          Empty falls back to CONTINUUM_CI_REPAIR_LABEL.
+        type: string
+        default: ''
+        required: false
+      head_ref_pattern:
+        description: >-
+          Extended regular expression an OpenCode branch head must match
+          before this controller touches it. Empty falls back to
+          CONTINUUM_HEAD_REF_PATTERN.
+        type: string
+        default: ''
+        required: false
+      auto_merge_workflow:
+        description: >-
+          Workflow file name the reconciler is woken on after a successful CI
+          report. Empty falls back to CONTINUUM_AUTO_MERGE_WORKFLOW.
+        type: string
+        default: ''
+        required: false
+      opencode_workflow:
+        description: >-
+          Workflow file name a ci-fix is dispatched to. Empty falls back to
+          CONTINUUM_OPENCODE_WORKFLOW.
+        type: string
+        default: ''
+        required: false
   # This trusted metadata workflow never checks out or executes PR code.
 
 permissions: {}
 
 concurrency:
-  group: opencode-repair-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.workflow_run.id || github.sha }}
+  group: opencode-repair-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.workflow_run.id || inputs.pr_number || github.sha }}
   cancel-in-progress: false
 
 jobs:
@@ -34,6 +96,8 @@ jobs:
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_ACTION: ${{ github.event.action }}
+          CI_REPAIR_LABEL: ${{ inputs.ci_repair_label || vars.CONTINUUM_CI_REPAIR_LABEL || 'opencode-ci-repair' }}
+          OPENCODE_WORKFLOW: ${{ inputs.opencode_workflow || vars.CONTINUUM_OPENCODE_WORKFLOW || 'continuum-opencode.yml' }}
         run: |
           set -euo pipefail
 
@@ -43,7 +107,7 @@ jobs:
           # suppress repair of a fresh failure on this head. Reopened PRs also
           # get a clean repair budget.
           if [[ "$PR_ACTION" == "synchronize" || "$PR_ACTION" == "reopened" ]]; then
-            for label in opencode-ci-repair opencode-packaging-smoke-repair; do
+            for label in "$CI_REPAIR_LABEL" opencode-packaging-smoke-repair; do
               gh api --method DELETE                 "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/$label"                 >/dev/null 2>&1 || true
             done
             echo "Reset per-head workflow-repair locks for PR #$PR_NUMBER ($PR_ACTION)."
@@ -91,13 +155,120 @@ jobs:
             -f 'labels[]=opencode-conflict-repair' >/dev/null
 
           if ! gh api --method POST \
-            "repos/$GITHUB_REPOSITORY/actions/workflows/continuum-opencode.yml/dispatches" \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/$OPENCODE_WORKFLOW/dispatches" \
             -f ref=main \
             -f "inputs[mode]=resolve-conflict" \
             -f "inputs[pr_number]=$PR_NUMBER" \
             -f "inputs[head_ref]=$HEAD_REF"; then
             remove_lock
             echo "::error::Failed to dispatch OpenCode conflict repair; lock cleared for retry."
+            exit 1
+          fi
+
+  # The consumer's own CI reports its result here: it dispatches this workflow
+  # on its installed `continuum-opencode-repair.yml` caller with the PR number,
+  # the evaluated head SHA, the conclusion, and its run id. That is the path a
+  # consumer with its own CI stack uses, because `workflow_run` can only observe
+  # runs of workflows in the same repository — a consumer whose CI lives behind
+  # its own reusable file still emits a `workflow_run`, but a consumer whose CI
+  # reports through a status/API has no run for Continuum to watch at all.
+  ci-repair-dispatch:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      inputs.pr_number != '' && inputs.head_sha != '' && inputs.conclusion != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Reconcile one CI result reported by the consumer's own CI
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          REPORTED_HEAD_SHA: ${{ inputs.head_sha }}
+          REPORTED_CONCLUSION: ${{ inputs.conclusion }}
+          REPORTED_RUN_ID: ${{ inputs.run_id }}
+          CI_REPAIR_LABEL: ${{ inputs.ci_repair_label || vars.CONTINUUM_CI_REPAIR_LABEL || 'opencode-ci-repair' }}
+          HEAD_REF_PATTERN: ${{ inputs.head_ref_pattern || vars.CONTINUUM_HEAD_REF_PATTERN || '^opencode/issue[0-9]+-' }}
+          AUTO_MERGE_WORKFLOW: ${{ inputs.auto_merge_workflow || vars.CONTINUUM_AUTO_MERGE_WORKFLOW || 'continuum-auto-merge.yml' }}
+          OPENCODE_WORKFLOW: ${{ inputs.opencode_workflow || vars.CONTINUUM_OPENCODE_WORKFLOW || 'continuum-opencode.yml' }}
+        run: |
+          set -euo pipefail
+
+          # Guards run before any write, in the same order as the fork this
+          # replaces: the PR must still be open, must still live in this
+          # repository (a fork's head means the reporting CI is not ours), and
+          # its head must still be an OpenCode branch. Everything after a guard
+          # is skipped rather than failed, because a stale report is a normal
+          # outcome of a CI run racing a push, not an error.
+          read -r pr_state head_ref head_sha head_repo < <(
+            gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" \
+              --jq '[.state, .head.ref, .head.sha, .head.repo.full_name] | @tsv'
+          )
+
+          if [[ "$pr_state" != "open" || "$head_repo" != "$GITHUB_REPOSITORY" ]]; then
+            echo "PR #$PR_NUMBER is not an open same-repository PR; ignoring the reported CI result."
+            exit 0
+          fi
+
+          if [[ ! "$head_ref" =~ $HEAD_REF_PATTERN ]]; then
+            echo "PR #$PR_NUMBER head '$head_ref' is not an OpenCode branch; ignoring the reported CI result."
+            exit 0
+          fi
+
+          # Stale check: CI reported on a head the PR has already left behind.
+          # Repairing that head would spend the one-attempt budget of a commit
+          # nobody is going to merge.
+          if [[ "$head_sha" != "$REPORTED_HEAD_SHA" ]]; then
+            echo "Reported CI result for $REPORTED_HEAD_SHA is stale; PR #$PR_NUMBER is now $head_sha."
+            exit 0
+          fi
+
+          gh label create "$CI_REPAIR_LABEL" --repo "$GITHUB_REPOSITORY" --color FBCA04 \
+            --description "One automatic OpenCode CI repair attempt per failing PR head." \
+            --force >/dev/null
+
+          # A green head clears the lock so a later red head on a new commit
+          # gets a fresh attempt, and wakes the merge reconciler. This is the
+          # dispatch path's only success action: there is nothing to repair.
+          if [[ "$REPORTED_CONCLUSION" == "success" ]]; then
+            gh api --method DELETE \
+              "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/$CI_REPAIR_LABEL" \
+              >/dev/null 2>&1 || true
+            gh api --method POST \
+              "repos/$GITHUB_REPOSITORY/actions/workflows/$AUTO_MERGE_WORKFLOW/dispatches" \
+              -f ref=main >/dev/null
+            echo "PR #$PR_NUMBER reported CI success; repair lock cleared and auto-merge reconciler woken."
+            exit 0
+          fi
+
+          # Only the conclusions this controller repairs consume the lock. A
+          # cancelled or skipped run is not a defect to fix, and must not burn
+          # the one attempt this head is allowed.
+          if [[ "$REPORTED_CONCLUSION" != "failure" && "$REPORTED_CONCLUSION" != "timed_out" ]]; then
+            echo "Conclusion '$REPORTED_CONCLUSION' is not a repairable CI failure; ignoring."
+            exit 0
+          fi
+
+          if gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels" \
+            --jq '.[].name' | grep -Fxq "$CI_REPAIR_LABEL"; then
+            echo "An automatic CI repair was already attempted for this exact PR head; waiting for a new head or a successful rerun."
+            exit 0
+          fi
+
+          gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels" \
+            -f "labels[]=$CI_REPAIR_LABEL" >/dev/null
+
+          if ! gh api --method POST \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/$OPENCODE_WORKFLOW/dispatches" \
+            -f ref=main \
+            -f "inputs[mode]=ci-fix" \
+            -f "inputs[pr_number]=$PR_NUMBER" \
+            -f "inputs[head_ref]=$head_ref" \
+            -f "inputs[run_id]=$REPORTED_RUN_ID"; then
+            gh api --method DELETE \
+              "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/$CI_REPAIR_LABEL" \
+              >/dev/null 2>&1 || true
+            echo "::error::Failed to dispatch OpenCode repair for reported CI run; lock cleared for retry."
             exit 1
           fi
 
@@ -119,12 +290,15 @@ jobs:
           RUN_NAME: ${{ github.event.workflow_run.name }}
           RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          CI_REPAIR_LABEL: ${{ inputs.ci_repair_label || vars.CONTINUUM_CI_REPAIR_LABEL || 'opencode-ci-repair' }}
+          AUTO_MERGE_WORKFLOW: ${{ inputs.auto_merge_workflow || vars.CONTINUUM_AUTO_MERGE_WORKFLOW || 'continuum-auto-merge.yml' }}
+          OPENCODE_WORKFLOW: ${{ inputs.opencode_workflow || vars.CONTINUUM_OPENCODE_WORKFLOW || 'continuum-opencode.yml' }}
         run: |
           set -euo pipefail
 
           case "$RUN_NAME" in
             CI)
-              lock_label="opencode-ci-repair"
+              lock_label="$CI_REPAIR_LABEL"
               lock_description="One automatic OpenCode CI repair attempt per failing PR head."
               ;;
             "Packaging smoke")
@@ -150,6 +324,10 @@ jobs:
               --jq '[.head.ref, .head.sha, .head.repo.full_name] | @tsv'
           )
 
+          # Unchanged on purpose: the workflow_run path has always accepted any
+          # `opencode/*` branch. The stricter OpenCode issue-branch pattern is
+          # the dispatch path's default, and applying it here would silently
+          # stop repairing a head this job repaired before.
           if [[ "$head_repo" != "$GITHUB_REPOSITORY" || "$head_ref" != opencode/* ]]; then
             echo "PR #$pr is not a same-repository OpenCode PR; ignoring."
             exit 0
@@ -182,7 +360,7 @@ jobs:
             -f "labels[]=$lock_label" >/dev/null
 
           if ! gh api --method POST \
-            "repos/$GITHUB_REPOSITORY/actions/workflows/continuum-opencode.yml/dispatches" \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/$OPENCODE_WORKFLOW/dispatches" \
             -f ref=main \
             -f "inputs[mode]=ci-fix" \
             -f "inputs[pr_number]=$pr" \
