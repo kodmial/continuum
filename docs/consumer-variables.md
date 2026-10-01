@@ -154,6 +154,48 @@ The controller reads the repository secret **`TAP_PAT`** for both Render API
 calls and for issue/label writes, per Continuum's secret contract. It never
 reads any other secret name.
 
+### Docker qualification controller
+
+`continuum-docker-qualification.yml` runs the artifact under test inside a
+fixed no-swap memory ceiling and classifies the result as `pass`, `memory`,
+`correctness` or `infrastructure`. The artifact store it pulls from, the binary
+name inside the archive, the memory ceiling and the payload schema were all
+literals in the fork; each is an input with a `vars.` fallback here.
+
+`OPENCODE_MODEL` is the one value with **no literal default anywhere in the
+chain**. A trial that runs no model leaves the task unchanged and would be
+recorded as a correctness failure, blaming a configuration gap on the binary.
+Set the variable (or pass the `model` input) if the consumer uses this
+controller.
+
+The controller reads the repository secret **`TAP_PAT`**, falling back to
+`github.token`, for the artifact download and the issue/label writes. It never
+reads any other secret name.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `ARTIFACT_REPOSITORY` | the consumer's own repository | Repository whose Actions artifact store holds the artifact under test. |
+| `DOCKER_QUALIFICATION_BINARY_NAME` | `opencode-coding-linux-x64` | File name of the binary inside the archive, and of its `.sha256` sidecar. |
+| `DOCKER_QUALIFICATION_IMAGE` | `ubuntu:22.04` | Container image the binary runs in. |
+| `DOCKER_QUALIFICATION_MEMORY_MIB` | `512` | Memory ceiling in MiB, applied as **both** `--memory` and `--memory-swap` so a trial cannot swap. One value drives the flags and the classifier, so they cannot disagree. |
+| `DOCKER_QUALIFICATION_MIN_HEADROOM_MIB` | `32` | Headroom the peak must leave below the ceiling. |
+| `DOCKER_QUALIFICATION_TRIALS` | `2` | Independent coding trials. A `pass` requires every trial to pass. |
+| `DOCKER_QUALIFICATION_RESULT_SCHEMA` | `continuum-qualification-result/v1` | Schema name written into the payload. |
+| `DOCKER_QUALIFICATION_RESULT_KIND` | `docker` | Kind written into the payload. |
+| `DOCKER_QUALIFICATION_RESULT_MARKER` | `<!-- continuum-docker-qualification-result -->` | Hidden marker prefixed to the recorded result comment. |
+| `DOCKER_QUALIFICATION_RESULT_FILE` | `/tmp/continuum-docker-qualification-result.json` | Result file. |
+| `DOCKER_QUALIFICATION_EVIDENCE_DIR` | `/tmp/continuum-docker-qualification-evidence` | Directory the collected evidence is written to. |
+| `DOCKER_QUALIFICATION_ARTIFACT_PREFIX` | `docker-qualification` | Prefix of the uploaded evidence artifact name. |
+| `DOCKER_QUALIFICATION_DISPATCH_REF` | `main` | Revision the controller checks out and dispatches the chain at. |
+| `DOCKER_QUALIFICATION_CHAIN_WORKFLOW` | *(empty)* | Optional follow-up workflow. Empty means the wake is skipped, not that a file is dispatched. |
+| `DOCKER_QUALIFICATION_CONCURRENCY_GROUP` | `continuum-docker-qualification` | Serialises runs, which share one evidence directory and one result file. |
+| `AUTOMATION_DOCKER_QUALIFICATION_TIMEOUT_MINUTES` | `45` | Controller job timeout. |
+
+Every result pauses the issue: `DOCKER_QUALIFICATION_RESULT_MARKER` decides
+whether the recorded comment is machine-readable, and the label pair is the same
+`AUTOMATION_IN_PROGRESS_LABEL` / `AUTOMATION_PAUSE_LABEL` pair the scheduler and
+the render controller use.
+
 ### Scheduler guards
 
 The scheduler reconciles more than the dispatch marker. Every guard below is

@@ -1,0 +1,527 @@
+name: Docker qualification
+
+on:
+  workflow_call:
+    inputs:
+      continuum_ref:
+        description: Continuum revision supplying fallback scripts
+        type: string
+        default: main
+        required: false
+      # ----------------------------------------------------------------
+      # What to execute. Required on the caller stub, optional (empty)
+      # here, because the engine re-checks: a reusable workflow can also be
+      # called by another workflow that supplies nothing, and a run with no
+      # target would act on an empty issue number.
+      # ----------------------------------------------------------------
+      issue_number:
+        description: >-
+          Reusable qualification issue whose body carries the artifact
+          identity. Empty unless the caller was dispatched; an empty value
+          fails this job explicitly.
+        type: string
+        default: ''
+        required: false
+      # ----------------------------------------------------------------
+      # Knobs. Every value the consumer's fork used to hardcode is an
+      # input with a `vars.` fallback carrying the fork's own default, so
+      # a consumer that sets nothing keeps the behaviour it had.
+      # ----------------------------------------------------------------
+      artifact_repository:
+        description: >-
+          Repository whose Actions artifact store holds the artifact under
+          test. Empty falls back to ARTIFACT_REPOSITORY and, still empty,
+          to this repository.
+        type: string
+        default: ''
+        required: false
+      binary_name:
+        description: >-
+          File name of the binary inside the artifact archive and of its
+          checksum sidecar. Empty falls back to
+          DOCKER_QUALIFICATION_BINARY_NAME.
+        type: string
+        default: ''
+        required: false
+      model:
+        description: >-
+          OpenCode model the qualified binary runs on inside the container.
+          Empty falls back to OPENCODE_MODEL; it has no literal default,
+          because a trial run with no model changes nothing and would be
+          recorded as a correctness failure instead of a configuration one.
+        type: string
+        default: ''
+        required: false
+      docker_image:
+        description: Container image the binary runs in. Empty falls back to
+          DOCKER_QUALIFICATION_IMAGE.
+        type: string
+        default: ''
+        required: false
+      memory_mib:
+        description: >-
+          Container memory limit, in MiB, applied as both --memory and
+          --memory-swap so the trial cannot swap. Empty falls back to
+          DOCKER_QUALIFICATION_MEMORY_MIB.
+        type: string
+        default: ''
+        required: false
+      min_headroom_mib:
+        description: >-
+          Headroom the peak must leave below the limit. Empty falls back to
+          DOCKER_QUALIFICATION_MIN_HEADROOM_MIB.
+        type: string
+        default: ''
+        required: false
+      trials:
+        description: Independent coding trials run against the same binary.
+          Empty falls back to DOCKER_QUALIFICATION_TRIALS.
+        type: string
+        default: ''
+        required: false
+      result_schema:
+        description: Schema name written into the result payload. Empty
+          falls back to DOCKER_QUALIFICATION_RESULT_SCHEMA.
+        type: string
+        default: ''
+        required: false
+      result_kind:
+        description: Kind written into the result payload. Empty falls back
+          to DOCKER_QUALIFICATION_RESULT_KIND.
+        type: string
+        default: ''
+        required: false
+      result_marker:
+        description: Hidden HTML marker prefixed to the recorded result
+          comment. Empty falls back to DOCKER_QUALIFICATION_RESULT_MARKER.
+        type: string
+        default: ''
+        required: false
+      result_file:
+        description: Path of the qualification result file. Empty falls back
+          to DOCKER_QUALIFICATION_RESULT_FILE.
+        type: string
+        default: ''
+        required: false
+      evidence_dir:
+        description: Directory the collected run evidence is written to.
+          Empty falls back to DOCKER_QUALIFICATION_EVIDENCE_DIR.
+        type: string
+        default: ''
+        required: false
+      artifact_prefix:
+        description: Prefix of the uploaded evidence artifact name. Empty
+          falls back to DOCKER_QUALIFICATION_ARTIFACT_PREFIX.
+        type: string
+        default: ''
+        required: false
+      dispatch_ref:
+        description: >-
+          Revision this controller checks out and dispatches subsequent
+          workflows at. Empty falls back to DOCKER_QUALIFICATION_DISPATCH_REF.
+        type: string
+        default: ''
+        required: false
+      in_progress_label:
+        description: Reservation label removed when the run finishes. Empty
+          falls back to AUTOMATION_IN_PROGRESS_LABEL.
+        type: string
+        default: ''
+        required: false
+      pause_label:
+        description: Label that pauses automation. Empty falls back to
+          AUTOMATION_PAUSE_LABEL.
+        type: string
+        default: ''
+        required: false
+      chain_workflow:
+        description: >-
+          Workflow woken after the result is recorded. Empty falls back to
+          DOCKER_QUALIFICATION_CHAIN_WORKFLOW and, still empty, skips the
+          wake instead of dispatching a file the consumer may not have.
+        type: string
+        default: ''
+        required: false
+      concurrency_group:
+        description: Concurrency group serialising this controller's runs.
+          Empty falls back to DOCKER_QUALIFICATION_CONCURRENCY_GROUP.
+        type: string
+        default: ''
+        required: false
+      timeout_minutes:
+        description: Job timeout. Empty falls back to
+          AUTOMATION_DOCKER_QUALIFICATION_TIMEOUT_MINUTES.
+        type: string
+        default: ''
+        required: false
+
+permissions: {}
+
+concurrency:
+  # The trials write into a shared evidence directory and a shared result
+  # file, so two runs of the same qualification must not overlap.
+  group: ${{ inputs.concurrency_group || vars.DOCKER_QUALIFICATION_CONCURRENCY_GROUP || 'continuum-docker-qualification' }}
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || vars.AUTOMATION_DOCKER_QUALIFICATION_TIMEOUT_MINUTES || '45') }}
+
+    permissions:
+      actions: write
+      contents: read
+      issues: write
+
+    env:
+      ISSUE_NUMBER: ${{ inputs.issue_number }}
+      # The artifact store is a property of whichever pipeline produced the
+      # binary, not of this controller, so it is a knob and defaults to the
+      # consumer's own repository rather than to any fork's.
+      ARTIFACT_REPOSITORY: ${{ inputs.artifact_repository || vars.ARTIFACT_REPOSITORY || github.repository }}
+      BINARY_NAME: ${{ inputs.binary_name || vars.DOCKER_QUALIFICATION_BINARY_NAME || 'opencode-coding-linux-x64' }}
+      DOCKER_IMAGE: ${{ inputs.docker_image || vars.DOCKER_QUALIFICATION_IMAGE || 'ubuntu:22.04' }}
+      # One knob for both flags: the contract is a fixed ceiling with no
+      # swap, so the limit and the swap allowance must never disagree.
+      MEMORY_MIB: ${{ inputs.memory_mib || vars.DOCKER_QUALIFICATION_MEMORY_MIB || '512' }}
+      MIN_HEADROOM_MIB: ${{ inputs.min_headroom_mib || vars.DOCKER_QUALIFICATION_MIN_HEADROOM_MIB || '32' }}
+      TRIALS: ${{ inputs.trials || vars.DOCKER_QUALIFICATION_TRIALS || '2' }}
+      # No literal default: a trial that runs no model leaves the task
+      # unchanged and would be recorded as a correctness failure, blaming a
+      # configuration gap on the binary.
+      OPENCODE_MODEL: ${{ inputs.model || vars.OPENCODE_MODEL }}
+      RESULT_SCHEMA: ${{ inputs.result_schema || vars.DOCKER_QUALIFICATION_RESULT_SCHEMA || 'continuum-qualification-result/v1' }}
+      RESULT_KIND: ${{ inputs.result_kind || vars.DOCKER_QUALIFICATION_RESULT_KIND || 'docker' }}
+      RESULT_MARKER: ${{ inputs.result_marker || vars.DOCKER_QUALIFICATION_RESULT_MARKER || '<!-- continuum-docker-qualification-result -->' }}
+      RESULT_FILE: ${{ inputs.result_file || vars.DOCKER_QUALIFICATION_RESULT_FILE || '/tmp/continuum-docker-qualification-result.json' }}
+      EVIDENCE_DIR: ${{ inputs.evidence_dir || vars.DOCKER_QUALIFICATION_EVIDENCE_DIR || '/tmp/continuum-docker-qualification-evidence' }}
+      ARTIFACT_PREFIX: ${{ inputs.artifact_prefix || vars.DOCKER_QUALIFICATION_ARTIFACT_PREFIX || 'docker-qualification' }}
+      DISPATCH_REF: ${{ inputs.dispatch_ref || vars.DOCKER_QUALIFICATION_DISPATCH_REF || 'main' }}
+      IN_PROGRESS_LABEL: ${{ inputs.in_progress_label || vars.AUTOMATION_IN_PROGRESS_LABEL || 'automation:in-progress' }}
+      PAUSE_LABEL: ${{ inputs.pause_label || vars.AUTOMATION_PAUSE_LABEL || 'automation:paused' }}
+      CHAIN_WORKFLOW: ${{ inputs.chain_workflow || vars.DOCKER_QUALIFICATION_CHAIN_WORKFLOW }}
+      # Mounted under a name of this workflow's own: the archive member is the
+      # consumer's, and the harness must not depend on its spelling.
+      MOUNTED_BINARY: /usr/local/bin/continuum-qualification-binary
+
+    steps:
+      - name: Checkout trusted controller
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.DISPATCH_REF }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Run exact artifact under the fixed no-swap ceiling
+        id: qualify
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT || github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Every precondition the fork checked is still checked here, and
+          # each one is an explicit failure: `continue-on-error` lets the
+          # record and upload steps still run, it does not make a broken
+          # qualification look like a passing one.
+          [[ -n "$ISSUE_NUMBER" ]] || {
+            echo "::error::issue_number is required: no qualification issue to run"
+            exit 2
+          }
+          [[ -n "$ARTIFACT_REPOSITORY" ]] || {
+            echo "::error::No artifact repository configured: set vars.ARTIFACT_REPOSITORY or pass the artifact_repository input."
+            exit 2
+          }
+          [[ -n "$OPENCODE_MODEL" ]] || {
+            echo "::error::No OpenCode model configured: set vars.OPENCODE_MODEL or pass the model input."
+            echo "::error::A trial that runs no model leaves the task unchanged and would be recorded as a correctness failure against the binary, so this run fails instead."
+            exit 2
+          }
+          [[ "$MEMORY_MIB" =~ ^[0-9]+$ && "$MEMORY_MIB" -gt 0 ]] || {
+            echo "::error::memory_mib must be a positive integer: $MEMORY_MIB"
+            exit 2
+          }
+          [[ "$MIN_HEADROOM_MIB" =~ ^[0-9]+$ ]] || {
+            echo "::error::min_headroom_mib must be a non-negative integer: $MIN_HEADROOM_MIB"
+            exit 2
+          }
+          [[ "$TRIALS" =~ ^[0-9]+$ && "$TRIALS" -gt 0 ]] || {
+            echo "::error::trials must be a positive integer: $TRIALS"
+            exit 2
+          }
+
+          mkdir -p "$EVIDENCE_DIR"
+          ISSUE_BODY="$EVIDENCE_DIR/issue.md"
+          gh issue view "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --json body --jq '.body // ""' > "$ISSUE_BODY"
+
+          value() {
+            local label="$1"
+            sed -n "s/^- $label: //p" "$ISSUE_BODY" | tail -n 1 | tr -d '\`'
+          }
+
+          ARTIFACT_ID="$(value 'Artifact ID')"
+          RUN_ID="$(value 'Source workflow run')"
+          HEAD_SHA="$(value 'Source/head SHA')"
+          ARCHIVE="$(value 'Artifact archive digest' | sed 's/^sha256://')"
+          BINARY_SHA="$(value 'Expected binary SHA-256')"
+          VERSION="$(value 'Expected --version')"
+
+          [[ "$ARTIFACT_ID" =~ ^[0-9]+$ ]]
+          [[ "$RUN_ID" =~ ^[0-9]+$ ]]
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$ARCHIVE" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$BINARY_SHA" =~ ^[0-9a-f]{64}$ ]]
+          [[ -n "$VERSION" ]]
+
+          gh api "repos/$ARTIFACT_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" > "$EVIDENCE_DIR/artifact.zip"
+          echo "$ARCHIVE  $EVIDENCE_DIR/artifact.zip" | sha256sum -c -
+          unzip -q "$EVIDENCE_DIR/artifact.zip" -d "$EVIDENCE_DIR/artifact"
+          BIN="$EVIDENCE_DIR/artifact/$BINARY_NAME"
+          [[ -f "$BIN" ]] || {
+            echo "::error::$EVIDENCE_DIR/artifact holds no $BINARY_NAME"
+            exit 1
+          }
+          chmod +x "$BIN"
+          (
+            cd "$EVIDENCE_DIR/artifact"
+            sha256sum -c "$BINARY_NAME.sha256"
+          )
+          ACTUAL_SHA="$(sha256sum "$BIN" | awk '{print $1}')"
+          [[ "$ACTUAL_SHA" == "$BINARY_SHA" ]]
+          ACTUAL_VERSION="$("$BIN" --version | tr -d '\r\n')"
+          [[ "$ACTUAL_VERSION" == "$VERSION" ]]
+          BINARY_BYTES="$(stat -c %s "$BIN")"
+
+          {
+            echo "artifact_id=$ARTIFACT_ID"
+            echo "artifact_repository=$ARTIFACT_REPOSITORY"
+            echo "workflow_run_id=$RUN_ID"
+            echo "head_sha=$HEAD_SHA"
+            echo "archive_sha256=$ARCHIVE"
+            echo "binary_sha256=$ACTUAL_SHA"
+            echo "version=$ACTUAL_VERSION"
+          } > "$EVIDENCE_DIR/identity.txt"
+
+          for TRIAL in $(seq 1 "$TRIALS"); do
+            REPO="$EVIDENCE_DIR/repo-$TRIAL"
+            mkdir -p "$REPO"
+            cat > "$REPO/foo_module.py" <<'PY'
+          FOO_LIMIT = 10
+
+          def within_limit(n):
+              return 0 <= n <= FOO_LIMIT
+          PY
+            cat > "$REPO/test_foo_module.py" <<'PY'
+          from foo_module import FOO_LIMIT, within_limit
+
+          def test_value():
+              assert FOO_LIMIT == 20
+              assert within_limit(20)
+              assert not within_limit(21)
+          PY
+            git -C "$REPO" init -q
+            git -C "$REPO" config user.email test@example.invalid
+            git -C "$REPO" config user.name qualification
+            git -C "$REPO" add -A
+            git -C "$REPO" commit -qm baseline
+
+            LOG="$EVIDENCE_DIR/trial-$TRIAL.log"
+            START="$(date +%s)"
+            set +e
+            docker run --rm --memory="${MEMORY_MIB}m" --memory-swap="${MEMORY_MIB}m" \
+              -e QUALIFICATION_BINARY="$MOUNTED_BINARY" \
+              -e QUALIFICATION_MODEL="$OPENCODE_MODEL" \
+              -v "$BIN:$MOUNTED_BINARY:ro" \
+              -v "$REPO:/work:rw" -w /work "$DOCKER_IMAGE" bash -c '
+                set +e
+                "$QUALIFICATION_BINARY" run --auto \
+                  --model "$QUALIFICATION_MODEL" \
+                  "Search this repository for FOO_LIMIT, read the surrounding code, change it from 10 to 20, run a real check/test, fix any failure caused by the change, and finish only after the repository is correct."
+                agent_exit=$?
+                echo "agent_exit=$agent_exit"
+                echo "memory_current=$(cat /sys/fs/cgroup/memory.current 2>/dev/null || echo 0)"
+                echo "memory_peak=$(cat /sys/fs/cgroup/memory.peak 2>/dev/null || echo 0)"
+                echo "swap_current=$(cat /sys/fs/cgroup/memory.swap.current 2>/dev/null || echo 0)"
+                echo "swap_max=$(cat /sys/fs/cgroup/memory.swap.max 2>/dev/null || echo 0)"
+                cat /sys/fs/cgroup/memory.events 2>/dev/null || true
+                exit 0
+              ' >"$LOG" 2>&1
+            DOCKER_EXIT=$?
+            set -e
+            END="$(date +%s)"
+            WALL=$((END - START))
+            echo "docker_exit=$DOCKER_EXIT" >> "$LOG"
+            echo "wall_seconds=$WALL" >> "$LOG"
+
+            CORRECTNESS="fail"
+            if python3 - "$REPO" <<'PY'
+          import importlib.util, pathlib, sys
+          root = pathlib.Path(sys.argv[1])
+          spec = importlib.util.spec_from_file_location("foo_module", root / "foo_module.py")
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          assert module.FOO_LIMIT == 20
+          assert module.within_limit(20)
+          assert not module.within_limit(21)
+          PY
+            then
+              CORRECTNESS="pass"
+            fi
+            echo "correctness=$CORRECTNESS" >> "$LOG"
+            git -C "$REPO" diff > "$EVIDENCE_DIR/trial-$TRIAL.diff" || true
+          done
+
+          python3 - "$EVIDENCE_DIR" "$RESULT_FILE" "$ARTIFACT_ID" "$HEAD_SHA" \
+            "$ACTUAL_SHA" "$ACTUAL_VERSION" "$BINARY_BYTES" \
+            "$MEMORY_MIB" "$MIN_HEADROOM_MIB" "$TRIALS" "$RESULT_SCHEMA" "$RESULT_KIND" <<'PY'
+          import hashlib, json, pathlib, re, sys
+          evidence = pathlib.Path(sys.argv[1])
+          out = pathlib.Path(sys.argv[2])
+          artifact_id = int(sys.argv[3])
+          head_sha = sys.argv[4]
+          binary_sha = sys.argv[5]
+          version = sys.argv[6]
+          binary_bytes = int(sys.argv[7])
+          limit = int(sys.argv[8]) * 1024 * 1024
+          min_headroom = int(sys.argv[9]) * 1024 * 1024
+          trials_wanted = int(sys.argv[10])
+          schema = sys.argv[11]
+          kind = sys.argv[12]
+          max_peak_allowed = limit - min_headroom
+
+          trials = []
+          for n in range(1, trials_wanted + 1):
+              text = (evidence / ("trial-%d.log" % n)).read_text(errors="replace")
+              def num(pattern, default=None):
+                  m = re.search(pattern, text, re.M)
+                  return int(m.group(1)) if m else default
+              events = {}
+              for name in ("high", "max", "oom", "oom_kill", "oom_group_kill"):
+                  events[name] = num(r"^%s\s+(\d+)$" % name, 0)
+              peak = num(r"^memory_peak=(\d+)$", 0)
+              current = num(r"^memory_current=(\d+)$", 0)
+              agent_exit = num(r"^agent_exit=(-?\d+)$", 127)
+              wall = num(r"^wall_seconds=(\d+)$", 0)
+              correctness = "pass" if re.search(r"^correctness=pass$", text, re.M) else "fail"
+              trials.append({
+                  "trial": n,
+                  "binary_sha256": binary_sha,
+                  "binary_bytes": binary_bytes,
+                  "peak_bytes": peak,
+                  "memory_current_bytes": current,
+                  "memory_peak_bytes": peak,
+                  "memory_events": events,
+                  "swap_current_bytes": num(r"^swap_current=(\d+)$", 0),
+                  "swap_max_bytes": num(r"^swap_max=(\d+)$", 0),
+                  "wall_seconds": wall,
+                  "exit_code": agent_exit,
+                  "correctness": correctness,
+                  "headroom_bytes": limit - peak if peak else None,
+              })
+
+          passes = [
+              t for t in trials
+              if t["exit_code"] == 0
+              and t["correctness"] == "pass"
+              and t["peak_bytes"] > 0
+              and t["peak_bytes"] <= max_peak_allowed
+              and t["memory_events"]["max"] == 0
+              and t["memory_events"]["oom"] == 0
+              and t["memory_events"]["oom_kill"] == 0
+          ]
+          any_memory = any(
+              t["memory_events"]["oom"] > 0
+              or t["memory_events"]["oom_kill"] > 0
+              or (t["peak_bytes"] and t["peak_bytes"] > max_peak_allowed)
+              or t["exit_code"] in (137, -9)
+              for t in trials
+          )
+          any_correctness = any(t["correctness"] != "pass" for t in trials)
+
+          if len(passes) == trials_wanted:
+              classification = "pass"
+              reason = "%d independent coding trials passed with at least %d MiB headroom and no pressure events" % (trials_wanted, int(sys.argv[9]))
+          elif any_memory:
+              classification = "memory"
+              reason = "one or more trials violated the %d MiB/%d MiB-headroom memory contract" % (int(sys.argv[8]), int(sys.argv[9]))
+          elif any_correctness:
+              classification = "correctness"
+              reason = "agent run did not leave the deterministic coding task in a verified passing state"
+          else:
+              classification = "infrastructure"
+              reason = "qualification did not produce %d valid measured coding trials" % trials_wanted
+
+          payload = {
+              "schema": schema,
+              "kind": kind,
+              "classification": classification,
+              "reason": reason,
+              "artifact_id": artifact_id,
+              "head_sha": head_sha,
+              "binary_sha256": binary_sha,
+              "version": version,
+              "limit_bytes": limit,
+              "min_headroom_bytes": min_headroom,
+              "trials": trials,
+              "max_peak_bytes": max((t["peak_bytes"] for t in trials), default=0),
+              "min_observed_headroom_bytes": min((t["headroom_bytes"] for t in trials if t["headroom_bytes"] is not None), default=None),
+          }
+          fp = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+          payload["fingerprint"] = fp
+          out.write_text(json.dumps(payload, sort_keys=True, indent=2) + "\n")
+          print(json.dumps(payload, sort_keys=True, indent=2))
+          PY
+
+      - name: Record Docker result and wake chain
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT || github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # A qualification that never produced a measured result is still
+          # recorded, and recorded as infrastructure rather than as a verdict
+          # about the binary.
+          if [[ ! -s "$RESULT_FILE" ]]; then
+            ISSUE_BODY="$(gh issue view "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --json body --jq '.body // ""')"
+            ARTIFACT_ID="$(sed -n 's/^- Artifact ID: //p' <<<"$ISSUE_BODY" | tail -n1 | tr -d '\`')"
+            BINARY_SHA="$(sed -n 's/^- Expected binary SHA-256: //p' <<<"$ISSUE_BODY" | tail -n1 | tr -d '\`')"
+            [[ "$ARTIFACT_ID" =~ ^[0-9]+$ ]] || ARTIFACT_ID=0
+            [[ "$BINARY_SHA" =~ ^[0-9a-f]{64}$ ]] || BINARY_SHA="unknown"
+            jq -n \
+              --arg schema "$RESULT_SCHEMA" \
+              --arg kind "$RESULT_KIND" \
+              --argjson artifact_id "$ARTIFACT_ID" \
+              --arg binary_sha256 "$BINARY_SHA" \
+              --arg reason "Docker qualification workflow failed before a complete measured result was produced" \
+              '{schema:$schema,kind:$kind,classification:"infrastructure",reason:$reason,artifact_id:$artifact_id,binary_sha256:$binary_sha256}' \
+              > "$RESULT_FILE"
+          fi
+
+          BODY="$(jq -c . "$RESULT_FILE")"
+          gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+            --body "$(printf '%s\n%s' "$RESULT_MARKER" "$BODY")"
+          gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+            --add-label "$PAUSE_LABEL" --remove-label "$IN_PROGRESS_LABEL" >/dev/null 2>&1 || true
+
+          # A follow-up chain is optional: without one the controller still
+          # records its result and still pauses the issue, it simply does not
+          # dispatch a workflow the consumer may not have installed.
+          if [[ -z "$CHAIN_WORKFLOW" ]]; then
+            echo "No follow-up chain workflow is configured; skipping the wake."
+          else
+            gh workflow run "$CHAIN_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DISPATCH_REF"
+          fi
+
+      - name: Upload durable Docker evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ${{ env.ARTIFACT_PREFIX }}-${{ inputs.issue_number }}-${{ github.run_id }}
+          path: |
+            ${{ inputs.result_file || vars.DOCKER_QUALIFICATION_RESULT_FILE || '/tmp/continuum-docker-qualification-result.json' }}
+            ${{ inputs.evidence_dir || vars.DOCKER_QUALIFICATION_EVIDENCE_DIR || '/tmp/continuum-docker-qualification-evidence' }}/
+          if-no-files-found: warn
+          retention-days: 30

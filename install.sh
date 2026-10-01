@@ -27,6 +27,7 @@ STUBS=(
   bootstrap-runtime-secret.yml
   coderabbit-retry.yml
   coderabbit-unresolved.yml
+  continuum-docker-qualification.yml
   continuum-render-executor.yml
   issue-scheduler.yml
   opencode-repair.yml

@@ -414,7 +414,7 @@ class ContinuumTest < Minitest::Test
   # `parent` the child-execution stubs in `.github/caller-stubs/parent/`.
   # The tech count is derived from the stub set, so a second technology does
   # not need a test edit and a dropped stub still fails.
-  CORE_COUNT = 13
+  CORE_COUNT = 14
   TECH_COUNT = TECH_STUBS.size
   PARENT_COUNT = 4
 
@@ -1274,6 +1274,19 @@ class ContinuumTest < Minitest::Test
   # ------------------------------------------------- render execution controller
 
   RENDER = 'continuum-render-executor.yml'
+  DOCKER = 'continuum-docker-qualification.yml'
+
+  def docker_core
+    yaml(File.join(ROOT, '.github/workflows', DOCKER))
+  end
+
+  def docker_body
+    File.read(File.join(ROOT, '.github/workflows', DOCKER))
+  end
+
+  def docker_stub
+    yaml(File.join(ROOT, '.github/caller-stubs', DOCKER))
+  end
 
   def render_stub
     yaml(File.join(ROOT, '.github/caller-stubs', RENDER))
@@ -1353,7 +1366,9 @@ class ContinuumTest < Minitest::Test
   def test_the_ported_qualification_workflows_carry_no_fork_literal
     {
       RENDER => ['kodmial/runtime-lab', 'runtime-lab-render', '--project runtime-lab',
-                 '<!-- runtime-lab-render-qualification-result -->']
+                 '<!-- runtime-lab-render-qualification-result -->'],
+      DOCKER => ['kodmial/runtime-lab', 'repos/kodmial/opencode', 'kodmial/opencode',
+                 'runtime-lab-qualification-result', 'docker-qualification-result/v1']
     }.each do |base, needles|
       body = File.read(File.join(ROOT, '.github/workflows', base))
       needles.each do |needle|
@@ -1417,6 +1432,106 @@ class ContinuumTest < Minitest::Test
     end
   end
 
+  # ------------------------------------------------- docker qualification controller
+
+  # The artifact store, the memory ceiling and the payload schema were all
+  # fork literals. Each is an input with a `vars.` fallback, except the two
+  # that must not have one.
+  def test_docker_qualification_knobs_cover_every_fork_hardcoded_value
+    env = docker_core.fetch('jobs').fetch('qualify').fetch('env')
+    {
+      'ARTIFACT_REPOSITORY' => ['artifact_repository', 'ARTIFACT_REPOSITORY', 'github.repository'],
+      'BINARY_NAME' => ['binary_name', 'DOCKER_QUALIFICATION_BINARY_NAME', "'opencode-coding-linux-x64'"],
+      'DOCKER_IMAGE' => ['docker_image', 'DOCKER_QUALIFICATION_IMAGE', "'ubuntu:22.04'"],
+      'MEMORY_MIB' => ['memory_mib', 'DOCKER_QUALIFICATION_MEMORY_MIB', "'512'"],
+      'MIN_HEADROOM_MIB' => ['min_headroom_mib', 'DOCKER_QUALIFICATION_MIN_HEADROOM_MIB', "'32'"],
+      'TRIALS' => ['trials', 'DOCKER_QUALIFICATION_TRIALS', "'2'"],
+      # No literal: an unmodelled trial changes nothing and would be recorded
+      # as a correctness failure against the binary.
+      'OPENCODE_MODEL' => ['model', 'OPENCODE_MODEL', nil],
+      'RESULT_SCHEMA' => ['result_schema', 'DOCKER_QUALIFICATION_RESULT_SCHEMA', "'continuum-qualification-result/v1'"],
+      'RESULT_KIND' => ['result_kind', 'DOCKER_QUALIFICATION_RESULT_KIND', "'docker'"],
+      'RESULT_MARKER' => ['result_marker', 'DOCKER_QUALIFICATION_RESULT_MARKER',
+                          "'<!-- continuum-docker-qualification-result -->'"],
+      'RESULT_FILE' => ['result_file', 'DOCKER_QUALIFICATION_RESULT_FILE',
+                        "'/tmp/continuum-docker-qualification-result.json'"],
+      'EVIDENCE_DIR' => ['evidence_dir', 'DOCKER_QUALIFICATION_EVIDENCE_DIR',
+                         "'/tmp/continuum-docker-qualification-evidence'"],
+      'ARTIFACT_PREFIX' => ['artifact_prefix', 'DOCKER_QUALIFICATION_ARTIFACT_PREFIX', "'docker-qualification'"],
+      'DISPATCH_REF' => ['dispatch_ref', 'DOCKER_QUALIFICATION_DISPATCH_REF', "'main'"],
+      'IN_PROGRESS_LABEL' => ['in_progress_label', 'AUTOMATION_IN_PROGRESS_LABEL', "'automation:in-progress'"],
+      'PAUSE_LABEL' => ['pause_label', 'AUTOMATION_PAUSE_LABEL', "'automation:paused'"],
+      # Optional integration: empty means the wake is skipped, not dispatched.
+      'CHAIN_WORKFLOW' => ['chain_workflow', 'DOCKER_QUALIFICATION_CHAIN_WORKFLOW', nil]
+    }.each do |name, (input, var, literal)|
+      expected = "${{ inputs.#{input} || vars.#{var}#{literal ? " || #{literal}" : ''} }}"
+      assert_equal expected, env.fetch(name).to_s
+    end
+  end
+
+  # The fork spent its 512 MiB by writing the number twice. One knob now drives
+  # both flags, so the ceiling and the swap allowance cannot drift apart, and
+  # the same number reaches the python classifier that judges the headroom.
+  def test_docker_qualification_drives_memory_and_trials_from_the_configured_values
+    body = docker_body
+    assert_includes body, 'docker run --rm --memory="${MEMORY_MIB}m" --memory-swap="${MEMORY_MIB}m"'
+    assert_includes body, 'for TRIAL in $(seq 1 "$TRIALS"); do'
+    assert_includes body, 'if len(passes) == trials_wanted:'
+    assert_includes body, '"schema": schema,'
+    assert_includes body, '"kind": kind,'
+    # A bare 512 in the classifier would silently ignore the knob.
+    refute_includes body, 'limit = 512 * 1024 * 1024'
+    refute_includes body, 'min_headroom = 32 * 1024 * 1024'
+    # Each knob is validated, so a typo fails the run instead of classifying.
+    assert_includes body, '[[ "$MEMORY_MIB" =~ ^[0-9]+$ && "$MEMORY_MIB" -gt 0 ]] || {'
+    assert_includes body, '[[ "$TRIALS" =~ ^[0-9]+$ && "$TRIALS" -gt 0 ]] || {'
+  end
+
+  # The secret contract is TAP_PAT. `github.token` is the documented fallback
+  # for the read-only qualification steps.
+  def test_docker_qualification_reads_only_tap_pat
+    body = docker_body
+    refute_includes body, 'secrets.KEY'
+    assert_equal 2, body.scan('secrets.TAP_PAT || github.token').size
+    refute_includes body, 'GH_TOKEN: ${{ github.token }}'
+  end
+
+  # The recorded verdict must carry the configured marker and pause the issue
+  # with the configured label, or a renamed marker makes the result unreadable.
+  def test_docker_qualification_records_the_configured_marker_and_labels
+    body = docker_body
+    assert_includes body, 'printf \'%s\n%s\' "$RESULT_MARKER" "$BODY"'
+    assert_includes body, '--add-label "$PAUSE_LABEL" --remove-label "$IN_PROGRESS_LABEL"'
+    assert_includes body, 'classification:"infrastructure"'
+    # The optional chain must not dispatch a file the consumer may not have.
+    assert_includes body, 'if [[ -z "$CHAIN_WORKFLOW" ]]; then'
+    assert_includes body, 'gh workflow run "$CHAIN_WORKFLOW"'
+    assert_includes body, 'name: ${{ env.ARTIFACT_PREFIX }}-${{ inputs.issue_number }}-${{ github.run_id }}'
+  end
+
+  # A qualification with no issue to run is not a qualification.
+  def test_docker_qualification_stub_requires_its_issue_and_pins_nothing
+    dispatch = events(docker_stub).fetch('workflow_dispatch')
+    issue = dispatch.fetch('inputs').fetch('issue_number')
+    assert_equal true, issue.fetch('required')
+    assert_equal 'string', issue.fetch('type')
+    (dispatch.fetch('inputs').keys - %w[issue_number]).each do |key|
+      assert_equal false, dispatch.fetch('inputs').fetch(key).fetch('required'),
+                   "#{key} must not gate the dispatch"
+    end
+
+    callee = events(docker_core).fetch('workflow_call').fetch('inputs')
+    assert_equal '', callee.fetch('issue_number').fetch('default')
+    assert_equal false, callee.fetch('issue_number').fetch('required')
+
+    # The artifact store and the memory ceiling are the consumer's to choose,
+    # so the stub forwards them empty rather than pinning a fork's values.
+    call = docker_stub.fetch('jobs').fetch('call').fetch('with')
+    %w[artifact_repository memory_mib model binary_name trials].each do |key|
+      assert_equal "${{ inputs.#{key} }}", call.fetch(key)
+    end
+  end
+
   # ------------------------------------------------- stub input contract
 
   # Every `with:` key each core stub is allowed to pass. A stub is installed
@@ -1428,6 +1543,13 @@ class ContinuumTest < Minitest::Test
     'bootstrap-runtime-secret.yml' => %w[continuum_ref],
     'coderabbit-retry.yml' => %w[continuum_ref],
     'coderabbit-unresolved.yml' => %w[continuum_ref],
+    'continuum-docker-qualification.yml' => %w[
+      continuum_ref issue_number artifact_repository binary_name model
+      docker_image memory_mib min_headroom_mib trials result_schema
+      result_kind result_marker result_file evidence_dir artifact_prefix
+      dispatch_ref in_progress_label pause_label chain_workflow
+      concurrency_group timeout_minutes
+    ],
     'continuum-opencode-watchdog.yml' => %w[continuum_ref watched_workflow],
     'continuum-render-executor.yml' => %w[
       continuum_ref issue_number mode render_region model state_file result_file
