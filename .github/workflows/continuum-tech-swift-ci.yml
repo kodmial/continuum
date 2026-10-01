@@ -11,6 +11,20 @@ on:
         type: string
         default: main
         required: false
+      native_prepare_command:
+        description: >-
+          Optional consumer command that prepares a native/static dependency
+          before Swift builds (for example a Rust static library build).
+        type: string
+        default: ''
+        required: false
+      static_archive_path:
+        description: >-
+          Optional repository-relative static archive passed to SwiftPM via
+          -Xlinker for build and coverage-test linking.
+        type: string
+        default: ''
+        required: false
 
 permissions:
   contents: read
@@ -254,6 +268,14 @@ jobs:
           # 5.10.1 crashes its swift-frontend on the macOS 15.5 SDK.
           swift-version: "6.1"
 
+      - name: Prepare consumer native dependency
+        if: inputs.native_prepare_command != ''
+        env:
+          NATIVE_PREPARE_COMMAND: ${{ inputs.native_prepare_command }}
+        run: |
+          set -euo pipefail
+          eval "$NATIVE_PREPARE_COMMAND"
+
       # swift-format (Apple) is installed from its standard Homebrew location,
       # matching the local development setup. No source build or /tmp files.
       - name: Install swift-format
@@ -268,7 +290,20 @@ jobs:
           swiftlint lint Sources
 
       - name: Build
-        run: swift build
+        env:
+          STATIC_ARCHIVE_PATH: ${{ inputs.static_archive_path }}
+        run: |
+          set -euo pipefail
+          extra=()
+          if [[ -n "$STATIC_ARCHIVE_PATH" ]]; then
+            archive="$GITHUB_WORKSPACE/$STATIC_ARCHIVE_PATH"
+            [[ -f "$archive" ]] || {
+              echo "::error::Configured static archive does not exist: $archive"
+              exit 1
+            }
+            extra=(-Xlinker "$archive")
+          fi
+          swift build "${extra[@]}"
 
       # The tests are a plain executable product (no .xctest bundle): without
       # Xcode, `swift test` is unavailable. Build the custom runner with LLVM
@@ -280,11 +315,24 @@ jobs:
           # module name through env so the same job builds any Swift project.
           CORE_TEST_TARGET: ${{ vars.CONTINUUM_CORE_TEST_TARGET }}
           CLI_NAME: ${{ vars.CONTINUUM_CLI_NAME }}
+        env:
+          STATIC_ARCHIVE_PATH: ${{ inputs.static_archive_path }}
         run: |
+          set -euo pipefail
+          extra=()
+          if [[ -n "$STATIC_ARCHIVE_PATH" ]]; then
+            archive="$GITHUB_WORKSPACE/$STATIC_ARCHIVE_PATH"
+            [[ -f "$archive" ]] || {
+              echo "::error::Configured static archive does not exist: $archive"
+              exit 1
+            }
+            extra=(-Xlinker "$archive")
+          fi
           swift build \
             -Xswiftc -profile-generate \
             -Xswiftc -profile-coverage-mapping \
-            --product "$CORE_TEST_TARGET"
+            --product "$CORE_TEST_TARGET" \
+            "${extra[@]}"
 
       - name: Run tests
         env:
