@@ -116,6 +116,44 @@ wrote. `consumer-child-dispatcher.yml` reads `AUTOMATION_PAUSE_LABEL`, and
 `AUTOMATION_PAUSE_LABEL`, so a renamed label stays consistent across the core
 and the parent/child pair.
 
+### Render execution controller
+
+`continuum-render-executor.yml` drives one execution of a consumer's Render
+lifecycle. Everything that fork of the engine used to hardcode is an input with
+a `vars.` fallback, so a consumer that installs the workflow and sets nothing
+keeps the behaviour it had.
+
+`OPENCODE_MODEL` is the one exception: it has **no literal default anywhere in
+the chain**. A Render worker started without a model executes nothing, so the
+workflow fails the run explicitly instead of reporting a green no-op. Set the
+variable (or pass the `model` input) if the consumer uses this controller.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `RENDER_REGION` | `oregon` | Region the ephemeral Render worker is created in. |
+| `RENDER_STATE_FILE` | `/tmp/continuum-render-state.json` | Lifecycle state file the cleanup step reads. |
+| `RENDER_RESULT_FILE` | `/tmp/continuum-render-result.json` | Render run result file. |
+| `RENDER_MEMORY_SUMMARY_FILE` | `/tmp/continuum-render-memory-summary.json` | Memory summary file the classification step reads. |
+| `RENDER_QUALIFICATION_RESULT_FILE` | `/tmp/continuum-render-qualification.json` | Qualification record written from the run evidence. |
+| `MAX_RENDER_REPAIR_ATTEMPTS` | `10` | Automatic recovery issues per source issue before the controller stops creating repairs. |
+| `RENDER_QUALIFICATION_LABEL` | `qualification:render` | Issue label marking a durable qualification run. An issue without it is classified `not-chain`. |
+| `RENDER_QUALIFICATION_MARKER` | `<!-- continuum-render-qualification-result -->` | Hidden marker prefixed to the recorded result comment. |
+| `RENDER_ARTIFACT_PREFIX` | `render-qualification` | Prefix of the uploaded evidence artifact name. |
+| `RENDER_DISPATCH_REF` | `main` | Revision the controller checks out and dispatches subsequent workflows at. |
+| `RENDER_JOB_SCRIPT` | `automation/render-job.sh` | Consumer script driving the lifecycle. |
+| `RENDER_CLEANUP_SCRIPT` | `automation/render-cleanup.sh` | Consumer script deleting the ephemeral service. |
+| `RENDER_QUALIFICATION_SCRIPT` | `automation/record_render_qualification.py` | Consumer script turning measured evidence into the qualification payload. |
+| `AUTOMATION_REPAIR_LABEL` | `priority:p0` | Label applied to an automatic recovery issue. |
+| `RENDER_E2E_BRANCH_PREFIX` | `opencode/issue` | Branch-head prefix the `e2e` mode requires of a result PR. |
+| `RENDER_CHAIN_WORKFLOW` | *(empty)* | Optional follow-up workflow woken when a qualification needs one. Empty means the wake is skipped, not that a file is dispatched. |
+| `RENDER_SCHEDULER_WORKFLOW` | `continuum-issue-scheduler.yml` | Scheduler woken after the controller resolves an issue. Keep this in sync with the installed scheduler file name, which carries the `continuum-` prefix. |
+| `RENDER_CONCURRENCY_GROUP` | `continuum-render-single-service` | Serialises the controller's runs so one run's repair cannot tear down the next run's worker. |
+| `AUTOMATION_RENDER_TIMEOUT_MINUTES` | `55` | Controller job timeout. |
+
+The controller reads the repository secret **`TAP_PAT`** for both Render API
+calls and for issue/label writes, per Continuum's secret contract. It never
+reads any other secret name.
+
 ### Scheduler guards
 
 The scheduler reconciles more than the dispatch marker. Every guard below is

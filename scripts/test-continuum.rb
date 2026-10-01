@@ -414,7 +414,7 @@ class ContinuumTest < Minitest::Test
   # `parent` the child-execution stubs in `.github/caller-stubs/parent/`.
   # The tech count is derived from the stub set, so a second technology does
   # not need a test edit and a dropped stub still fails.
-  CORE_COUNT = 12
+  CORE_COUNT = 13
   TECH_COUNT = TECH_STUBS.size
   PARENT_COUNT = 4
 
@@ -1271,6 +1271,152 @@ class ContinuumTest < Minitest::Test
     assert_includes body, '"$head_ref" != opencode/*'
   end
 
+  # ------------------------------------------------- render execution controller
+
+  RENDER = 'continuum-render-executor.yml'
+
+  def render_stub
+    yaml(File.join(ROOT, '.github/caller-stubs', RENDER))
+  end
+
+  def render_core
+    yaml(File.join(ROOT, '.github/workflows', RENDER))
+  end
+
+  def render_body
+    File.read(File.join(ROOT, '.github/workflows', RENDER))
+  end
+
+  # The fork this core file was ported from hardcoded its Render API token to
+  # a `KEY` secret. No Continuum consumer is required to define that name, so
+  # the same wiring would resolve to an empty token in every installed caller.
+  # The secret contract is TAP_PAT, and this workflow may not quietly keep a
+  # second spelling.
+  def test_render_executor_reads_tap_pat_and_never_the_fork_key_secret
+    body = render_body
+    refute_includes body, 'secrets.KEY',
+                    'the fork read secrets.KEY; Continuum secrets are named TAP_PAT by contract'
+    # Both Render steps must be wired, not just one: the execute step creating
+    # the worker and the cleanup step deleting it need the same token, and a
+    # cleanup that lost it would leave an ephemeral worker running.
+    assert_equal 2, body.scan(/RENDER_API_KEY: \$\{\{ secrets\.TAP_PAT \}\}/).size,
+                 'both the execute and the mandatory cleanup step must read TAP_PAT'
+    # The classification step already used the PAT-with-token-fallback chain.
+    assert_includes body, 'GH_TOKEN: ${{ secrets.TAP_PAT || github.token }}'
+  end
+
+  # Every value the fork hardcoded for one repository must be a knob, or a
+  # second consumer inherits that repository's paths and markers.
+  def test_render_executor_knobs_cover_every_fork_hardcoded_value
+    body = render_body
+    {
+      'RENDER_REGION' => ['render_region', 'RENDER_REGION', 'oregon'],
+      'RENDER_STATE_FILE' => ['state_file', 'RENDER_STATE_FILE', '/tmp/continuum-render-state.json'],
+      'RENDER_RESULT_FILE' => ['result_file', 'RENDER_RESULT_FILE', '/tmp/continuum-render-result.json'],
+      'RENDER_MEMORY_SUMMARY_FILE' => ['memory_summary_file', 'RENDER_MEMORY_SUMMARY_FILE', '/tmp/continuum-render-memory-summary.json'],
+      'RENDER_QUAL_RESULT_FILE' => ['qualification_result_file', 'RENDER_QUALIFICATION_RESULT_FILE', '/tmp/continuum-render-qualification.json'],
+      'MAX_RENDER_REPAIR_ATTEMPTS' => ['max_repair_attempts', 'MAX_RENDER_REPAIR_ATTEMPTS', '10'],
+      'QUALIFICATION_LABEL' => ['qualification_label', 'RENDER_QUALIFICATION_LABEL', 'qualification:render'],
+      'QUALIFICATION_MARKER' => ['qualification_marker', 'RENDER_QUALIFICATION_MARKER', '<!-- continuum-render-qualification-result -->'],
+      'ARTIFACT_PREFIX' => ['artifact_prefix', 'RENDER_ARTIFACT_PREFIX', 'render-qualification'],
+      'DISPATCH_REF' => ['dispatch_ref', 'RENDER_DISPATCH_REF', 'main'],
+      'JOB_SCRIPT' => ['job_script', 'RENDER_JOB_SCRIPT', 'automation/render-job.sh'],
+      'CLEANUP_SCRIPT' => ['cleanup_script', 'RENDER_CLEANUP_SCRIPT', 'automation/render-cleanup.sh'],
+      'QUALIFICATION_SCRIPT' => ['qualification_script', 'RENDER_QUALIFICATION_SCRIPT', 'automation/record_render_qualification.py'],
+      'IN_PROGRESS_LABEL' => ['in_progress_label', 'AUTOMATION_IN_PROGRESS_LABEL', 'automation:in-progress'],
+      'PAUSE_LABEL' => ['pause_label', 'AUTOMATION_PAUSE_LABEL', 'automation:paused'],
+      'REPAIR_LABEL' => ['repair_label', 'AUTOMATION_REPAIR_LABEL', 'priority:p0'],
+      'E2E_BRANCH_PREFIX' => ['e2e_branch_prefix', 'RENDER_E2E_BRANCH_PREFIX', 'opencode/issue'],
+      'SCHEDULER_WORKFLOW' => ['scheduler_workflow', 'RENDER_SCHEDULER_WORKFLOW', 'continuum-issue-scheduler.yml'],
+      'OPENCODE_MODEL' => ['model', 'OPENCODE_MODEL', nil]
+    }.each do |env_key, (input, variable, literal)|
+      definition = events(render_core).fetch('workflow_call').fetch('inputs').fetch(input)
+      assert_equal '', definition.fetch('default'), "#{input} must default to empty so vars can supply it"
+      assert_equal false, definition.fetch('required'), input
+      assert_equal 'string', definition.fetch('type'), input
+      # The chain is `inputs.x || vars.VAR`, and only the model has no literal.
+      expected = literal ? "inputs.#{input} || vars.#{variable} || '#{literal}'" : "inputs.#{input} || vars.#{variable}"
+      assert_includes body, "#{env_key}: \${{ #{expected} }}", "#{env_key}: env mapping missing"
+    end
+
+    # The model is the one knob with no default anywhere in the chain, so the
+    # run must fail explicitly rather than start a worker that executes nothing.
+    refute_includes body, "vars.OPENCODE_MODEL || '",
+                    'OPENCODE_MODEL must have no literal default'
+    assert_includes body, '[[ -n "$OPENCODE_MODEL" ]] || {'
+    assert_includes body, 'echo "::error::No OpenCode model configured'
+  end
+
+  # The fork's region, model, paths, labels and markers all had to become
+  # inputs. This is asserted over the workflows ported out of that fork, so
+  # the next port cannot reintroduce a repository-specific literal.
+  def test_the_ported_qualification_workflows_carry_no_fork_literal
+    {
+      RENDER => ['kodmial/runtime-lab', 'runtime-lab-render', '--project runtime-lab',
+                 '<!-- runtime-lab-render-qualification-result -->']
+    }.each do |base, needles|
+      body = File.read(File.join(ROOT, '.github/workflows', base))
+      needles.each do |needle|
+        refute_includes body, needle, "#{base}: fork-specific literal #{needle}"
+      end
+    end
+  end
+
+  # `mode` is the fork's execution contract: smoke closes the issue, e2e looks
+  # for a result PR. Both halves must stay, or the run reports success having
+  # resolved nothing.
+  def test_render_executor_gates_the_mode_and_keeps_both_branches
+    body = render_body
+    assert_includes body, '[[ "$EXECUTION_MODE" == "smoke" || "$EXECUTION_MODE" == "e2e" ]] || {'
+    assert_includes body, 'echo "::error::Unsupported execution mode: $EXECUTION_MODE"'
+    assert_includes body, '[[ -n "$ISSUE_NUMBER" ]] || {'
+    assert_includes body, 'if [[ "$EXECUTION_MODE" == "smoke" ]]; then'
+    assert_includes body, 'gh issue close "$ISSUE_NUMBER"'
+    assert_includes body, '--reason completed'
+    # e2e must still require a result PR, selected by the configured prefix.
+    assert_includes body, '[[ -z "$PR_NUMBER" ]]'
+    assert_includes body, '--arg prefix "${E2E_BRANCH_PREFIX}${ISSUE_NUMBER}-"'
+    assert_includes body, 'echo "::error::E2E mode completed without the required PR"'
+
+    # The artifact name is built from the configured prefix, not a literal.
+    assert_includes body, 'name: ${{ env.ARTIFACT_PREFIX }}-${{ inputs.issue_number }}-${{ github.run_id }}'
+    # The qualification label must be read from the configured value, not
+    # matched literally, or a renamed label classifies nothing.
+    assert_includes body, "jq -r --arg label \"$QUALIFICATION_LABEL\" '[.labels[].name] | index($label) != null'"
+    assert_includes body, 'jq -e --arg label "$QUALIFICATION_LABEL"'
+    # The result marker is a variable, not the fork's literal.
+    assert_includes body, 'printf \'%s\n%s\' "$QUALIFICATION_MARKER" "$BODY"'
+    refute_includes body, '<!-- runtime-lab-render-qualification-result -->'
+  end
+
+  # The stub must reject a partial dispatch. `mode` decides whether the issue
+  # is closed or handed to a PR chain, so accepting a run without it would
+  # dispatch an execution nobody described.
+  def test_render_executor_stub_requires_its_dispatch_inputs
+    dispatch = events(render_stub).fetch('workflow_dispatch')
+    %w[issue_number mode].each do |key|
+      definition = dispatch.fetch('inputs').fetch(key)
+      assert_equal true, definition.fetch('required'), "#{key} must be required"
+      assert_equal 'string', definition.fetch('type'), key
+      refute_empty definition.fetch('description').to_s, key
+    end
+    # Every remaining input stays optional, because a scheduler dispatch names
+    # only the issue and the mode.
+    (dispatch.fetch('inputs').keys - %w[issue_number mode]).each do |key|
+      assert_equal false, dispatch.fetch('inputs').fetch(key).fetch('required'),
+                   "#{key} must not gate the dispatch"
+    end
+
+    # The callee keeps both optional and empty: the engine re-checks them, so a
+    # reusable call with neither still fails loudly instead of acting on an
+    # empty issue number.
+    callee = events(render_core).fetch('workflow_call').fetch('inputs')
+    %w[issue_number mode].each do |key|
+      assert_equal '', callee.fetch(key).fetch('default'), key
+      assert_equal false, callee.fetch(key).fetch('required'), key
+    end
+  end
+
   # ------------------------------------------------- stub input contract
 
   # Every `with:` key each core stub is allowed to pass. A stub is installed
@@ -1283,6 +1429,14 @@ class ContinuumTest < Minitest::Test
     'coderabbit-retry.yml' => %w[continuum_ref],
     'coderabbit-unresolved.yml' => %w[continuum_ref],
     'continuum-opencode-watchdog.yml' => %w[continuum_ref watched_workflow],
+    'continuum-render-executor.yml' => %w[
+      continuum_ref issue_number mode render_region model state_file result_file
+      memory_summary_file qualification_result_file max_repair_attempts
+      qualification_label qualification_marker artifact_prefix dispatch_ref
+      job_script cleanup_script qualification_script in_progress_label
+      pause_label repair_label e2e_branch_prefix chain_workflow
+      scheduler_workflow concurrency_group timeout_minutes
+    ],
     'issue-scheduler.yml' => %w[
       continuum_ref wip_limit lease_minutes max_dispatch_attempts dispatch_marker
       in_progress_label pause_marker post_pause_comment reset_markers
