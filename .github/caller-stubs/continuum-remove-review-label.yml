@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   call:
-    uses: kodmial/continuum/.github/workflows/remove-review-label.yml@main
+    uses: kodmial/continuum/.github/workflows/continuum-remove-review-label.yml@main
     secrets: inherit
     with:
       continuum_ref: main

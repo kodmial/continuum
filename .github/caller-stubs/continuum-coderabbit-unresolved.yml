@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   call:
-    uses: kodmial/continuum/.github/workflows/coderabbit-unresolved.yml@main
+    uses: kodmial/continuum/.github/workflows/continuum-coderabbit-unresolved.yml@main
     secrets: inherit
     with:
       continuum_ref: main

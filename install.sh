@@ -19,63 +19,98 @@ esac
 if [[ ! -d "$DEST/.github/workflows" ]]; then
   mkdir -p "$DEST/.github/workflows"
 fi
-STUB_PATH=".github/caller-stubs"
-# The core layer: task-domain callers every project needs.
-STUBS=(
-  add-review-label.yml
-  auto-merge.yml
-  bootstrap-runtime-secret.yml
-  coderabbit-retry.yml
-  coderabbit-unresolved.yml
+# The three layers, each stored under the exact name it installs as. There is
+# one naming rule in Continuum and no exception list: a caller is stored as
+# `continuum-<name>.yml` and installed verbatim, so the repository file name and
+# the consumer file name are always the same string.
+CORE_STUBS=(
+  continuum-add-review-label.yml
+  continuum-auto-merge.yml
+  continuum-bootstrap-runtime-secret.yml
+  continuum-coderabbit-retry.yml
+  continuum-coderabbit-unresolved.yml
   continuum-docker-qualification.yml
-  continuum-render-executor.yml
-  issue-scheduler.yml
-  opencode-repair.yml
-  opencode-unresolved.yml
-  opencode.yml
+  continuum-issue-scheduler.yml
+  continuum-opencode-repair.yml
+  continuum-opencode-unresolved.yml
   continuum-opencode-watchdog.yml
-  pr-agent.yml
-  remove-review-label.yml
+  continuum-opencode.yml
+  continuum-pr-agent.yml
+  continuum-remove-review-label.yml
+  continuum-render-executor.yml
 )
-if [[ "$SET" == tech ]]; then
-  # The opt-in technology library (the `continuum-tech-` prefix marks it as
-  # library/opt-in); Continuum itself never triggers these.
-  STUB_PATH="$STUB_PATH/tech"
-  STUBS=(
-    continuum-tech-swift-ci.yml
-    continuum-tech-swift-packaging-smoke.yml
-    continuum-tech-swift-release-pr.yml
-    continuum-tech-swift-release.yml
-    continuum-tech-swift-release-automation-merge.yml
-  )
-elif [[ "$SET" == parent ]]; then
-  STUB_PATH="$STUB_PATH/parent"
-  STUBS=(child-dispatcher.yml child-worker.yml child-review.yml child-pr-review.yml)
-fi
+TECH_STUBS=(
+  continuum-tech-swift-ci.yml
+  continuum-tech-swift-packaging-smoke.yml
+  continuum-tech-swift-release-automation-merge.yml
+  continuum-tech-swift-release-pr.yml
+  continuum-tech-swift-release.yml
+)
+PARENT_STUBS=(
+  continuum-child-dispatcher.yml
+  continuum-child-pr-review.yml
+  continuum-child-review.yml
+  continuum-child-worker.yml
+)
+case "$SET" in
+  core)
+    STUB_PATH=".github/caller-stubs"
+    STUBS=("${CORE_STUBS[@]}")
+    ;;
+  tech)
+    # The opt-in technology library (the `continuum-tech-` prefix marks it as
+    # library/opt-in); Continuum itself never triggers these.
+    STUB_PATH=".github/caller-stubs/tech"
+    STUBS=("${TECH_STUBS[@]}")
+    ;;
+  parent)
+    STUB_PATH=".github/caller-stubs/parent"
+    STUBS=("${PARENT_STUBS[@]}")
+    ;;
+esac
 BASE="https://raw.githubusercontent.com/kodmial/continuum/${REF}/$STUB_PATH"
 # Only use local templates when installing the default working-tree version.
 # An explicit ref must fetch that revision, even when run from a local clone.
 LOCAL_STUBS_DIR="$(dirname "${BASH_SOURCE[0]:-$0}")/$STUB_PATH"
-# Every installed caller carries the `continuum-` prefix. This is the strict
-# contract: a workflow named continuum-*.yml in a consumer repository comes
-# from Continuum and must not be hand-edited, while any other workflow in the
-# same directory is project-owned. Continuum's own dispatchers rely on these
-# exact names, so the prefix is part of the interface, not a cosmetic label.
-# Tech stubs are already named `continuum-tech-<tech>-<name>.yml` (the
-# `continuum-tech-` prefix marks an opt-in library); they keep their name verbatim.
+# The stored stub name is the installed name, verbatim: the loop variable is
+# written straight to the destination, so a repository file name and the
+# consumer file name are always the same string and cannot drift apart.
 for f in "${STUBS[@]}"; do
   if [[ $# -lt 2 && -f "$LOCAL_STUBS_DIR/$f" ]]; then
     template="$(cat "$LOCAL_STUBS_DIR/$f")"
   else
     template="$(curl -fsSL "$BASE/$f")"
   fi
-  name="$f"
-  [[ "$name" == continuum-* ]] || name="continuum-$name"
-  # Use the same revision for the workflow and its fallback scripts.
-  printf '%s\n' "$template" | sed \
-    -e "s|kodmial/continuum/\\(.github/workflows/[^@ ]*\\)@main|kodmial/continuum/\\1@$REF|g" \
-    -e "s|continuum_ref: main|continuum_ref: '$REF'|" \
-    -e "s|engine_ref: main|engine_ref: '$REF'|" \
-    > "$DEST/.github/workflows/$name"
+  # Use the same revision for the workflow and its fallback scripts. Both
+  # patterns are anchored to the end of a line so an unrelated `main`
+  # elsewhere in the template is never rewritten, and the ref is written as a
+  # double-quoted YAML scalar rather than a bare or single-quoted one.
+  printf '%s\n' "$template" | sed -E \
+    -e "s|^([[:space:]]*uses:[[:space:]]*kodmial/continuum/\.github/workflows/[^@[:space:]]*)@main[[:space:]]*$|\1@$REF|" \
+    -e "s|^([[:space:]]*(continuum_ref\|engine_ref):[[:space:]]*)main[[:space:]]*$|\1\"$REF\"|" \
+    > "$DEST/.github/workflows/$f"
 done
+# Supersession: a renamed or dropped stub must not leave a stale caller behind
+# in the consumer, or the old file keeps running next to its replacement. Only
+# names this installer owns are ever removed: every `continuum-*.yml` that no
+# layer ships any more is deleted, while the other two layers' callers and
+# every project-owned workflow are left alone. Installing into Continuum's own
+# checkout is never a consumer install, so pruning is skipped there and the
+# repository's own workflows stay untouched.
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo "$PWD")"
+TARGET_DIR="$(cd "$DEST/.github/workflows" && pwd)"
+ALL_STUBS=("${CORE_STUBS[@]}" "${TECH_STUBS[@]}" "${PARENT_STUBS[@]}")
+if [[ "$TARGET_DIR" != "$SELF_DIR/.github/workflows" ]]; then
+  for installed in "$DEST"/.github/workflows/continuum-*.yml; do
+    [[ -f "$installed" ]] || continue
+    stale="${installed##*/}"
+    known=no
+    for candidate in "${ALL_STUBS[@]}"; do
+      if [[ "$candidate" == "$stale" ]]; then known=yes; break; fi
+    done
+    [[ "$known" == yes ]] && continue
+    rm -f "$installed"
+    echo "removed superseded Continuum caller: $stale"
+  done
+fi
 echo "Continuum callers installed to $DEST/.github/workflows/ (set: $SET, ref: $REF)"

@@ -8,33 +8,14 @@ require 'open3'
 
 class ContinuumTest < Minitest::Test
   ROOT = File.expand_path('..', __dir__)
-  STUBS = (Dir[File.join(ROOT, '.github/caller-stubs/*.yml')] +
-           Dir[File.join(ROOT, '.github/caller-stubs/tech/*.yml')]).sort
-  TECH_STUBS = Dir[File.join(ROOT, '.github/caller-stubs/tech/*.yml')].sort
   CORE_STUBS = Dir[File.join(ROOT, '.github/caller-stubs/*.yml')].sort
+  TECH_STUBS = Dir[File.join(ROOT, '.github/caller-stubs/tech/*.yml')].sort
   PARENT_STUBS = Dir[File.join(ROOT, '.github/caller-stubs/parent/*.yml')].sort
   WORKFLOWS = Dir[File.join(ROOT, '.github/workflows/*.yml')].sort
-  # Filenames that predate the `continuum-` prefix and are part of the shipped
-  # interface. They are core-layer workflows; the prefix was never applied to
-  # them and renaming them would break every installed consumer.
-  HISTORICAL_UNPREFIXED = %w[
-    add-review-label.yml
-    auto-merge.yml
-    bootstrap-runtime-secret.yml
-    coderabbit-retry.yml
-    coderabbit-unresolved.yml
-    consumer-child-dispatcher.yml
-    consumer-child-pr-review.yml
-    consumer-child-review.yml
-    consumer-child-worker.yml
-    issue-scheduler.yml
-    opencode-repair.yml
-    opencode-unresolved.yml
-    opencode.yml
-    pr-agent.yml
-    remove-review-label.yml
-    validate-continuum.yml
-  ].freeze
+  # Every caller stub in every layer, for the checks that must not care which
+  # layer a file belongs to.
+  ALL_STUBS = (CORE_STUBS + TECH_STUBS + PARENT_STUBS).sort
+  STUBS = (CORE_STUBS + TECH_STUBS).sort
 
   def yaml(path)
     YAML.load_file(path)
@@ -60,13 +41,13 @@ class ContinuumTest < Minitest::Test
 
   # The parsed core workflow behind a caller stub of the same base name.
   def workflow_stub_callee
-    yaml(File.join(ROOT, '.github/workflows', 'opencode-repair.yml'))
+    yaml(File.join(ROOT, '.github/workflows', 'continuum-opencode-repair.yml'))
   end
 
   # The modes the OpenCode engine admits on the `workflow_dispatch` path,
   # parsed out of the job's own `if` guard rather than hardcoded here.
   def dispatch_modes
-    body = workflow_body('opencode.yml')
+    body = workflow_body('continuum-opencode.yml')
     body[/contains\(fromJSON\('\[([^\]]+)\]'\), inputs\.mode\)/, 1].to_s
         .scan(/"([^"]+)"/).flatten
   end
@@ -76,10 +57,10 @@ class ContinuumTest < Minitest::Test
   # the payload. A call replaced by an `echo` leaves no window at all, which is
   # exactly the "green no-op" a presence-only check misses.
   DISPATCHING_WORKFLOWS = %w[
-    auto-merge.yml
-    opencode-repair.yml
-    opencode-unresolved.yml
-    opencode.yml
+    continuum-auto-merge.yml
+    continuum-opencode-repair.yml
+    continuum-opencode-unresolved.yml
+    continuum-opencode.yml
   ].freeze
 
   def dispatch_calls(name)
@@ -119,15 +100,14 @@ class ContinuumTest < Minitest::Test
   # own stub name: no more, which would let a core caller be mistaken for a
   # tech-library caller, and no less, which would make a Continuum caller look
   # project-owned and stop Continuum's dispatchers from finding it.
+  #
+  # install.sh writes the stored stub name verbatim, so the installed name is
+  # the stub name — not a name computed from it. That is the whole point of the
+  # uniform rule: the repository file name and the consumer file name are the
+  # same string, so no install-time rewrite can drift from either.
   def assert_core_install_names(dir)
     installed = Dir[File.join(dir, '.github/workflows/*.yml')].map { |file| File.basename(file) }.sort
-    # Mirrors install.sh: an already `continuum-`-prefixed stub (the
-    # `continuum-opencode-watchdog` one) keeps its name, every other core stub
-    # gains the prefix.
-    expected = CORE_STUBS.map { |path|
-      base = File.basename(path)
-      base.start_with?('continuum-') ? base : "continuum-#{base}"
-    }.sort
+    expected = CORE_STUBS.map { |path| File.basename(path) }.sort
     assert_equal expected, installed
     installed.each do |name|
       assert name.start_with?('continuum-'), name
@@ -314,20 +294,16 @@ class ContinuumTest < Minitest::Test
   #               `continuum-tech-swift-release.yml`. Installed only by the
   #               opt-in `tech` set; Continuum never triggers these itself.
   #
-  # A third, legitimate category exists: files whose names predate the prefix
-  # (`add-review-label.yml`, `consumer-child-*.yml`, `validate-continuum.yml`).
-  # They are core-layer workflows shipped under their historical names; the
-  # prefix was never applied to them and renaming them would break every
-  # installed consumer, so the split must not "fix" them.
+  # There is no exception list. A core file that is not `continuum-` prefixed
+  # is a defect: the prefix is what tells a consumer which workflows are
+  # Continuum-owned, so a bare name both loses that ownership signal and
+  # installs under a name Continuum's own dispatchers never look for.
   def test_workflow_files_obey_the_two_layer_naming_rule
-    covered = HISTORICAL_UNPREFIXED
     WORKFLOWS.each do |path|
       base = File.basename(path)
       segments = base.delete_suffix('.yml').split('-')
       category =
-        if covered.include?(base)
-          :historical_unprefixed_core
-        elsif tech_name?(base)
+        if tech_name?(base)
           :tech
         # A core name may itself be multi-word (`continuum-opencode-watchdog`),
         # so the split counts on the `continuum-tech-<tech>-` marker rather
@@ -335,15 +311,65 @@ class ContinuumTest < Minitest::Test
         elsif base.start_with?('continuum-') && segments.size >= 2
           :core
         else
-          flunk "#{base}: neither a core file (continuum-<name>.yml, `continuum-` prefixed), " \
-                'a tech file (continuum-tech-<tech>-<name>.yml, continuum-tech-<tech>- prefix), ' \
-                'nor a listed historical unprefixed core name'
+          flunk "#{base}: neither a core file (continuum-<name>.yml, `continuum-` prefixed) " \
+                'nor a tech file (continuum-tech-<tech>-<name>.yml, continuum-tech-<tech>- prefix)'
         end
-      assert_includes %i[core tech historical_unprefixed_core], category
+      assert_includes %i[core tech], category
     end
-    unprefixed = WORKFLOWS.map { |path| File.basename(path) }.reject { |base| base.start_with?('continuum-') }
-    assert_equal unprefixed.sort, covered.sort, 'the historical unprefixed core list is stale'
     assert_tech_layers_agree
+  end
+
+  # The prefix is one rule applied to every layer, not a convention that the
+  # core happens to satisfy. Every workflow and every caller stub in every
+  # layer must carry it; a file added without the prefix fails here the moment
+  # it lands, before any consumer installs it.
+  def test_every_workflow_and_stub_is_continuum_prefixed
+    unprefixed = (WORKFLOWS + ALL_STUBS).reject do |path|
+      File.basename(path).start_with?('continuum-')
+    end.map { |path| File.basename(path) }
+    assert_empty unprefixed,
+                 "these files are not `continuum-` prefixed and must be renamed: #{unprefixed.sort.join(', ')}"
+    (WORKFLOWS + ALL_STUBS).each do |path|
+      base = File.basename(path)
+      segments = base.delete_suffix('.yml').split('-')
+      assert_operator segments.size, :>=, 2, "#{base}: a continuum- name must name something after the prefix"
+    end
+  end
+
+  # install.sh installs the stored stub name verbatim. A prefix computed at
+  # install time is what this repository removed: it makes the name a consumer
+  # ends up with differ from the name Continuum ships, so a renamed stub keeps
+  # installing under a name nothing else in the repository knows.
+  def test_installer_does_not_prefix_names_at_install_time
+    body = File.read(File.join(ROOT, 'install.sh'))
+    refute_match(/continuum-\$\{?name/, body,
+                 'install.sh must not build an installed name by prepending the prefix')
+    refute_match(/\|\|\s*name="continuum-/, body,
+                 'install.sh must not fall back to prefixing the stub name')
+    refute_match(/name="continuum-\$f"/, body,
+                 'install.sh must write the stored stub name verbatim')
+  end
+
+  # A caller name that Continuum no longer ships must not survive in the
+  # consumer: a renamed stub that leaves its predecessor behind gives the
+  # consumer two files where the dispatchers only know one.
+  def test_installer_prunes_superseded_callers
+    fixture do |dir|
+      target = File.join(dir, 'superseded')
+      stale = File.join(target, '.github/workflows/continuum-removed-caller.yml')
+      FileUtils.mkdir_p(File.dirname(stale))
+      File.write(stale, "name: Removed caller\n")
+      output, status = Open3.capture2e('bash', File.join(ROOT, 'install.sh'), target)
+      assert status.success?, output
+      refute File.exist?(stale), 'a caller Continuum no longer ships must be removed on install'
+      assert_includes output, 'removed superseded Continuum caller: continuum-removed-caller.yml'
+      # A project-owned workflow is never Continuum's to delete.
+      project = File.join(target, '.github/workflows/ci.yml')
+      File.write(project, "name: CI\n")
+      output, status = Open3.capture2e('bash', File.join(ROOT, 'install.sh'), target)
+      assert status.success?, output
+      assert File.exist?(project), 'install.sh must not remove a project-owned workflow'
+    end
   end
 
   # The `continuum-tech-` prefix means "opt-in library". A tech workflow that any
@@ -408,15 +434,73 @@ class ContinuumTest < Minitest::Test
     end
   end
 
-  # Measured counts, not guesses: `core` installs every stub directly under
-  # `.github/caller-stubs/` (task-domain layer), `tech` the
-  # `continuum-tech-<tech>-*` stubs in `.github/caller-stubs/tech/`, and
-  # `parent` the child-execution stubs in `.github/caller-stubs/parent/`.
-  # The tech count is derived from the stub set, so a second technology does
-  # not need a test edit and a dropped stub still fails.
-  CORE_COUNT = 14
+  # Measured from the tree, never from a literal, so a stub added or dropped
+  # needs no test edit and cannot drift. The `core` set installs every stub
+  # directly under `.github/caller-stubs/` (task-domain layer); `tech` the
+  # `continuum-tech-<tech>-*` stubs in `.github/caller-stubs/tech/`; `parent`
+  # the child-execution stubs in `.github/caller-stubs/parent/`.
+  #
+  # A core workflow with no stub is legitimate in exactly two cases, both
+  # named here so a third one fails instead of passing unnoticed: the four
+  # child-execution callees, which the `parent` set installs, and
+  # Continuum's own CI, which is not a caller at all.
+  CORE_CALLEE_WORKFLOWS = %w[
+    continuum-consumer-child-dispatcher.yml
+    continuum-consumer-child-pr-review.yml
+    continuum-consumer-child-review.yml
+    continuum-consumer-child-worker.yml
+  ].freeze
+  REPO_OWNED_WORKFLOWS = %w[continuum-validate-continuum.yml].freeze
   TECH_COUNT = TECH_STUBS.size
-  PARENT_COUNT = 4
+  PARENT_COUNT = PARENT_STUBS.size
+
+  # The same `tech_name?` rule as the instance helper, hoisted so the constant
+  # table above can use it. A tech name has a `tech` segment plus at least two
+  # further segments, so `continuum-tech-swift-release` counts and a bare
+  # `continuum-tech` does not.
+  def self.tech_name?(base)
+    segments = base.delete_suffix('.yml').split('-')
+    base.start_with?('continuum-') && segments[1] == 'tech' && segments.size >= 4
+  end
+
+  CORE_COUNT = WORKFLOWS
+                  .map { |path| File.basename(path) }
+                  .reject { |base| ContinuumTest.tech_name?(base) ||
+                                    CORE_CALLEE_WORKFLOWS.include?(base) ||
+                                    REPO_OWNED_WORKFLOWS.include?(base) }
+                  .size
+
+  # Every core workflow is either called by a stub in one of the three layers
+  # or is Continuum's own CI. A workflow nobody calls is a dead file that
+  # still costs a consumer a `continuum-*.yml` name.
+  #
+  # The callee is resolved from the stub's own `uses:` line rather than from
+  # the stub's file name: the parent layer installs `continuum-child-*.yml`
+  # while calling `continuum-consumer-child-*.yml`, and that difference is
+  # deliberate, not a mismatch to be papered over.
+  def stub_callee_name(stub_path)
+    yaml(stub_path).fetch('jobs').each_value do |job|
+      next unless job['uses']
+      match = job['uses'].match(%r{kodmial/continuum/\.github/workflows/([^@]+)@})
+      return match[1] if match
+    end
+    nil
+  end
+
+  def test_every_core_workflow_has_a_caller_or_is_repo_ci
+    stubs = CORE_STUBS + TECH_STUBS + PARENT_STUBS
+    called = stubs.map { |path| stub_callee_name(path) }.compact
+    workflows = WORKFLOWS.map { |path| File.basename(path) }
+    uncalled = workflows.reject { |base| called.include?(base) || REPO_OWNED_WORKFLOWS.include?(base) }
+    assert_empty uncalled, "core workflows with no caller stub: #{uncalled.join(', ')}"
+    # And the reverse: a stub whose callee is gone is a caller that 404s at
+    # run time, which only the workflow_run path would ever discover.
+    missing = called.reject { |base| workflows.include?(base) }
+    assert_empty missing, "stubs calling a workflow that does not exist: #{missing.join(', ')}"
+    stubs.each do |path|
+      refute_nil stub_callee_name(path), "#{File.basename(path)}: no reusable-workflow `uses:` found"
+    end
+  end
 
   def test_installer_local_and_explicit_ref
     fixture do |dir|
@@ -506,7 +590,7 @@ class ContinuumTest < Minitest::Test
       destination = File.join(dir, 'consumer')
       workflows = File.join(destination, '.github/workflows')
       FileUtils.mkdir_p(workflows)
-      preserved = %w[ci.yml release.yml issue-scheduler.yml opencode.yml]
+      preserved = %w[ci.yml release.yml continuum-issue-scheduler.yml continuum-opencode.yml]
       preserved.each { |name| File.write(File.join(workflows, name), "project-owned #{name}\n") }
       bin = File.join(dir, 'bin')
       FileUtils.mkdir_p(bin)
@@ -526,7 +610,11 @@ class ContinuumTest < Minitest::Test
       # Strict contract: every installed caller carries the `continuum-` prefix,
       # so a project-owned `ci.yml` is never silently overwritten.
       assert_equal PARENT_COUNT, PARENT_STUBS.size, 'parent stub set drifted'
-      installed = Dir[File.join(workflows, 'continuum-*.yml')]
+      # The `preserved` files above are themselves `continuum-`-prefixed, so the
+      # installed set is selected by the parent stub names rather than by the
+      # bare prefix glob, which would count the preserved project-owned files.
+      installed = PARENT_STUBS.map { |stub| File.join(workflows, File.basename(stub)) }
+                              .select { |file| File.exist?(file) }
       assert_equal PARENT_COUNT, installed.size
       assert_empty Dir[File.join(workflows, 'child-*.yml')]
       installed.each do |file|
@@ -571,7 +659,7 @@ class ContinuumTest < Minitest::Test
       end
     end
 
-    pr_agent = File.read(File.join(ROOT, '.github/workflows/pr-agent.yml'))
+    pr_agent = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent.yml'))
     assert_includes pr_agent, 'core.setFailed',
                     'pr-agent must fail explicitly, not skip green'
     assert_includes pr_agent, 'paid Groq provider',
@@ -593,7 +681,7 @@ class ContinuumTest < Minitest::Test
       body = File.read(path)
       refute_includes body, 'big-pickle', File.basename(path)
     end
-    assert_includes File.read(File.join(ROOT, '.github/workflows/opencode.yml')),
+    assert_includes File.read(File.join(ROOT, '.github/workflows/continuum-opencode.yml')),
                     "vars.OPENCODE_MODEL || 'opencode/muse-spark-1.3-contributor-free'"
   end
 
@@ -602,7 +690,7 @@ class ContinuumTest < Minitest::Test
   # default preserves the previously hardcoded value.
   def test_automation_limits_are_variable_driven
     core = Dir[File.join(ROOT, '.github/workflows/*.yml')].sort
-    targets = %w[issue-scheduler.yml opencode.yml auto-merge.yml consumer-child-dispatcher.yml]
+    targets = %w[continuum-issue-scheduler.yml continuum-opencode.yml continuum-auto-merge.yml continuum-consumer-child-dispatcher.yml]
     targets.each do |name|
       path = File.join(ROOT, '.github/workflows', name)
       assert File.exist?(path), name
@@ -613,11 +701,11 @@ class ContinuumTest < Minitest::Test
       assert_match(/vars\.AUTOMATION_\w+/, body, "#{name}: no AUTOMATION_* knob")
     end
 
-    opencode = File.read(File.join(ROOT, '.github/workflows/opencode.yml'))
+    opencode = File.read(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
     assert_includes opencode, "vars.AUTOMATION_OPENCODE_RUNNER || 'macos-15'"
     assert_includes opencode, "vars.AUTOMATION_OPENCODE_TIMEOUT_MINUTES || '180'"
 
-    scheduler = File.read(File.join(ROOT, '.github/workflows/issue-scheduler.yml'))
+    scheduler = File.read(File.join(ROOT, '.github/workflows/continuum-issue-scheduler.yml'))
     assert_includes scheduler, "vars.AUTOMATION_WIP_LIMIT || '2'"
     assert_includes scheduler, "vars.AUTOMATION_LEASE_MINUTES || '45'"
     assert_includes scheduler, "vars.AUTOMATION_MAX_DISPATCH_ATTEMPTS || '2'"
@@ -641,7 +729,7 @@ class ContinuumTest < Minitest::Test
       refute_match(/'nanodictate\.rb'/, without_defaults, name)
     end
 
-    %w[auto-merge.yml add-review-label.yml].each do |name|
+    %w[continuum-auto-merge.yml continuum-add-review-label.yml].each do |name|
       body = File.read(File.join(ROOT, '.github/workflows', name))
       assert_includes body, "vars.CONTINUUM_VERSION_FILE || 'Sources/NanoDictateCore/Version.swift'", name
     end
@@ -650,13 +738,13 @@ class ContinuumTest < Minitest::Test
   # The dispatcher supplies the issue number; an issue_comment run must keep
   # reading the event, so the input defaults to empty and is only a fallback.
   def test_opencode_issue_number_input_is_optional_and_falls_back
-    inputs = events(yaml(File.join(ROOT, '.github/workflows/opencode.yml')))
+    inputs = events(yaml(File.join(ROOT, '.github/workflows/continuum-opencode.yml')))
              .fetch('workflow_call').fetch('inputs')
     issue = inputs.fetch('issue_number')
     assert_equal '', issue.fetch('default')
     assert_equal false, issue.fetch('required')
 
-    body = File.read(File.join(ROOT, '.github/workflows/opencode.yml'))
+    body = File.read(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
     assert_includes body, 'inputs.issue_number || github.event.issue.number'
   end
 
@@ -669,7 +757,7 @@ class ContinuumTest < Minitest::Test
   INERT_BODY = /\A\s*(set\s+-[a-z]+\s*|:\s*|true\s*|exit\s+0\s*|echo\s+(noop|no-op|skip|done)?\s*)*\z/
 
   def test_opencode_whitelisted_modes_all_have_dispatch_steps
-    body = workflow_body('opencode.yml')
+    body = workflow_body('continuum-opencode.yml')
     modes = dispatch_modes
     refute_empty modes
     assert_equal modes.uniq, modes, 'dispatching whitelist has duplicates'
@@ -680,7 +768,7 @@ class ContinuumTest < Minitest::Test
 
     # Parse the dispatch job and require each whitelisted mode to own at least
     # one step that really does work, not just one that compares the mode.
-    steps = yaml(File.join(ROOT, '.github/workflows/opencode.yml'))
+    steps = yaml(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
               .fetch('jobs').fetch('opencode').fetch('steps')
     modes.each do |mode|
       branching = steps.select { |step| step['if'].to_s.include?("inputs.mode == '#{mode}'") }
@@ -727,7 +815,7 @@ class ContinuumTest < Minitest::Test
   # Every new knob is an additive input with a default that reproduces the
   # pre-existing behaviour, so existing stubs keep working untouched.
   def test_new_consumer_knobs_are_additive_with_safe_defaults
-    scheduler = events(yaml(File.join(ROOT, '.github/workflows/issue-scheduler.yml')))
+    scheduler = events(yaml(File.join(ROOT, '.github/workflows/continuum-issue-scheduler.yml')))
                   .fetch('workflow_call').fetch('inputs')
     {
       'wip_limit' => '',
@@ -750,7 +838,7 @@ class ContinuumTest < Minitest::Test
       assert_equal 'string', scheduler.fetch(key).fetch('type'), key
     end
 
-    opencode = events(yaml(File.join(ROOT, '.github/workflows/opencode.yml')))
+    opencode = events(yaml(File.join(ROOT, '.github/workflows/continuum-opencode.yml')))
                .fetch('workflow_call').fetch('inputs')
     {
       'max_dispatch_attempts' => '',
@@ -769,7 +857,7 @@ class ContinuumTest < Minitest::Test
     strategy = opencode.fetch('conflict_strategy')
     assert_equal 'string', strategy.fetch('type')
     assert_equal 'merge', strategy.fetch('default')
-    stub = events(yaml(File.join(ROOT, '.github/caller-stubs/opencode.yml')))
+    stub = events(yaml(File.join(ROOT, '.github/caller-stubs/continuum-opencode.yml')))
            .fetch('workflow_dispatch').fetch('inputs').fetch('conflict_strategy')
     assert_equal 'choice', stub.fetch('type')
     assert_equal %w[merge checkout], stub.fetch('options')
@@ -778,13 +866,13 @@ class ContinuumTest < Minitest::Test
     # extra stub option is accepted by these tests but rejected by GitHub when
     # the call is actually made, and a missing one makes a whitelisted mode
     # unreachable for the operator.
-    dispatch_inputs = events(yaml(File.join(ROOT, '.github/caller-stubs/opencode.yml')))
+    dispatch_inputs = events(yaml(File.join(ROOT, '.github/caller-stubs/continuum-opencode.yml')))
                      .fetch('workflow_dispatch').fetch('inputs').fetch('mode')
     assert_equal 'choice', dispatch_inputs.fetch('type')
     assert_equal dispatch_modes.sort, dispatch_inputs.fetch('options').sort,
                  'the stub mode choice and the engine dispatch whitelist must be the same set'
 
-    body = File.read(File.join(ROOT, '.github/workflows/opencode.yml'))
+    body = File.read(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
     assert_match(/case "\$CONFLICT_STRATEGY" in/, body)
     assert_includes body, "expected 'merge' or 'checkout'"
     # The prompt must select a whole strategy block, not interpolate one verb.
@@ -795,7 +883,7 @@ class ContinuumTest < Minitest::Test
   # scheduler. They are the propagation edge, so a hardcoded label reappearing
   # in either file must fail here the same way it would fail in the scheduler.
   def test_parent_child_workflows_use_the_configured_labels
-    dispatcher = workflow_body('consumer-child-dispatcher.yml')
+    dispatcher = workflow_body('continuum-consumer-child-dispatcher.yml')
     assert_includes dispatcher, "AUTOMATION_PAUSE_LABEL: ${{ vars.AUTOMATION_PAUSE_LABEL || 'automation:paused' }}"
     refute_match(/labels\/automation%3Apaused/, dispatcher,
                  'dispatcher must not hardcode the default pause label in a request URL')
@@ -805,7 +893,7 @@ class ContinuumTest < Minitest::Test
     assert_match(/--arg pause "\$AUTOMATION_PAUSE_LABEL"/, dispatcher,
                  'dispatcher must select stale pause labels by the configured label')
 
-    review = workflow_body('consumer-child-review.yml')
+    review = workflow_body('continuum-consumer-child-review.yml')
     assert_includes review, "AUTOMATION_IN_PROGRESS_LABEL: ${{ vars.AUTOMATION_IN_PROGRESS_LABEL || 'automation:in-progress' }}"
     assert_includes review, "AUTOMATION_PAUSE_LABEL: ${{ vars.AUTOMATION_PAUSE_LABEL || 'automation:paused' }}"
     # Both labels are cleared in one loop; a hardcoded `for label in ...` list
@@ -822,7 +910,7 @@ class ContinuumTest < Minitest::Test
   # the implementation rather than on the prose, so a mutated description or a
   # mutated comparison is both caught.
   def test_post_pause_comment_only_exact_false_disables_the_comment
-    scheduler = events(yaml(File.join(ROOT, '.github/workflows/issue-scheduler.yml')))
+    scheduler = events(yaml(File.join(ROOT, '.github/workflows/continuum-issue-scheduler.yml')))
                   .fetch('workflow_call').fetch('inputs').fetch('post_pause_comment')
     description = scheduler.fetch('description')
     assert_includes description, 'false',
@@ -830,7 +918,7 @@ class ContinuumTest < Minitest::Test
     assert_includes description, 'disables',
                     'the description must say which value turns the comment off'
 
-    body = workflow_body('issue-scheduler.yml')
+    body = workflow_body('continuum-issue-scheduler.yml')
     expression = body[/postPauseComment\s*=\s*\n?\s*(\(process\.env\.POST_PAUSE_COMMENT \|\| '[^']*'\) [!==]+ '[^']*')/m, 1]
     refute_nil expression, 'postPauseComment is not derived from POST_PAUSE_COMMENT'
     # The env default must not itself be the disabling value, or an empty input
@@ -861,7 +949,7 @@ class ContinuumTest < Minitest::Test
   # Each assertion below fails if the corresponding implementation is deleted
   # while the input remains, which is exactly the dead-parameterisation bug.
   def test_scheduler_naming_knobs_drive_implementation
-    body = File.read(File.join(ROOT, '.github/workflows/issue-scheduler.yml'))
+    body = File.read(File.join(ROOT, '.github/workflows/continuum-issue-scheduler.yml'))
 
     # post_pause_comment gates the actual comment creation.
     assert_match(/if \(postPauseComment\)/, body)
@@ -885,11 +973,11 @@ class ContinuumTest < Minitest::Test
     assert_includes body, 'process.env.PAUSE_LABEL'
   end
 
-  # opencode.yml must consume the same naming knobs as the scheduler on the
+  # continuum-opencode.yml must consume the same naming knobs as the scheduler on the
   # issue_comment path, where only vars are available, and must actually run the
   # consumer's blocking CI workflow when ci_workflow_id is set.
   def test_opencode_naming_knobs_and_ci_rerun_drive_implementation
-    body = File.read(File.join(ROOT, '.github/workflows/opencode.yml'))
+    body = File.read(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
 
     assert_includes body, "DISPATCH_MARKER: ${{ inputs.dispatch_marker || vars.AUTOMATION_DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->' }}"
     assert_includes body, "IN_PROGRESS_LABEL: ${{ inputs.in_progress_label || vars.AUTOMATION_IN_PROGRESS_LABEL || 'automation:in-progress' }}"
@@ -912,7 +1000,7 @@ class ContinuumTest < Minitest::Test
   # The macOS-only toolchain steps must stay guarded twice, so a non-macOS
   # AUTOMATION_OPENCODE_RUNNER never tries to install Swift or probe sw_vers.
   def test_opencode_macos_steps_are_guarded
-    body = File.read(File.join(ROOT, '.github/workflows/opencode.yml'))
+    body = File.read(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
     assert_equal 2,
                  body.scan(/if: startsWith\(vars\.AUTOMATION_OPENCODE_RUNNER/).size
   end
@@ -945,12 +1033,12 @@ class ContinuumTest < Minitest::Test
   # breakage this guards: the filter is checked against the installed OpenCode
   # caller's own `name:`.
   def test_watchdog_trigger_tracks_the_watched_workflows_name
-    opencode = yaml(File.join(ROOT, '.github/caller-stubs/opencode.yml'))
+    opencode = yaml(File.join(ROOT, '.github/caller-stubs/continuum-opencode.yml'))
     watched = events(watchdog_stub).fetch('workflow_run').fetch('workflows')
     assert_equal [opencode.fetch('name')], watched,
                  'watchdog must watch the OpenCode caller by its `name:` value'
     assert_equal opencode.fetch('name'),
-                 yaml(File.join(ROOT, '.github/workflows/opencode.yml')).fetch('name'),
+                 yaml(File.join(ROOT, '.github/workflows/continuum-opencode.yml')).fetch('name'),
                  'caller and callee `name:` must stay in lockstep for the workflow_run filter'
 
     # The engine must be told the same name, or its duplicate-run check would
@@ -1011,12 +1099,12 @@ class ContinuumTest < Minitest::Test
 
     # The scheduler's own knobs must resolve to the same values, or the watchdog
     # would unpause/reserve against a label the scheduler never checks.
-    scheduler = File.read(File.join(ROOT, '.github/workflows/opencode.yml'))
+    scheduler = File.read(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
     assert_includes scheduler, "IN_PROGRESS_LABEL: ${{ inputs.in_progress_label || vars.AUTOMATION_IN_PROGRESS_LABEL || 'automation:in-progress' }}"
     assert_includes scheduler, "PAUSE_LABEL: ${{ inputs.pause_marker || vars.AUTOMATION_PAUSE_LABEL || 'automation:paused' }}"
   end
 
-  # The reason the watchdog exists: `opencode.yml`'s recovery only fires on a
+  # The reason the watchdog exists: `continuum-opencode.yml`'s recovery only fires on a
   # scheduler dispatch comment, so a manual `/oc` run has no recovery path.
   # Asserting the retry body protects that path from silently becoming a no-op.
   def test_watchdog_recovery_body_dispatches_the_retry_comment
@@ -1038,7 +1126,7 @@ class ContinuumTest < Minitest::Test
 
     # The engine must actually parse the run title it is handed, and must have a
     # fallback for consumers whose OpenCode caller sets no `run-name:` (Continuum's
-    # own opencode.yml does not, so `display_title` is the issue title there).
+    # own continuum-opencode.yml does not, so `display_title` is the issue title there).
     assert_match(%r{\(run\.display_title \|\| ''\)\.match\(\s*/\^OpenCode issue #\(\\d\+\)\$/\s*\)}, body,
                  'the engine must parse the numbered run title')
     assert_includes body, "run.event === 'issue_comment'"
@@ -1089,7 +1177,7 @@ class ContinuumTest < Minitest::Test
   REPORTED_CI_INPUTS = %w[pr_number head_sha conclusion run_id].freeze
 
   def test_opencode_repair_stub_accepts_a_reported_ci_result
-    stub = yaml(File.join(ROOT, '.github/caller-stubs/opencode-repair.yml'))
+    stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-opencode-repair.yml'))
     dispatch = events(stub).fetch('workflow_dispatch', nil)
     refute_nil dispatch,
                 'the repair stub declares no workflow_dispatch: a consumer\'s CI report would be ' \
@@ -1127,9 +1215,9 @@ class ContinuumTest < Minitest::Test
       assert_equal 'string', definition.fetch('type'), key
     end
 
-    body = workflow_body('opencode-repair.yml')
+    body = workflow_body('continuum-opencode-repair.yml')
     job = body[/^  ci-repair-dispatch:\n(.*?)(?=^  \S|\z)/m, 1]
-    refute_nil job, 'opencode-repair.yml has no ci-repair-dispatch job'
+    refute_nil job, 'continuum-opencode-repair.yml has no ci-repair-dispatch job'
     assert_includes job, "github.event_name == 'workflow_dispatch'",
                     'the dispatch job must be gated on the dispatch event alone'
     %w[pr_number head_sha conclusion].each do |key|
@@ -1142,9 +1230,9 @@ class ContinuumTest < Minitest::Test
   # body that merely compares the conclusion and then falls through would pass
   # a presence check while burning nothing and repairing nothing.
   def test_opencode_repair_dispatch_body_guards_locks_and_repairs
-    body = workflow_body('opencode-repair.yml')
+    body = workflow_body('continuum-opencode-repair.yml')
     job = body[/^  ci-repair-dispatch:\n(.*?)(?=^  \S|\z)/m, 1]
-    refute_nil job, 'opencode-repair.yml has no ci-repair-dispatch job'
+    refute_nil job, 'continuum-opencode-repair.yml has no ci-repair-dispatch job'
     script = job[/run: \|\n(.*?)(?=^  \S|\z)/m, 1]
     refute_nil script, 'the dispatch job has no shell body'
 
@@ -1220,7 +1308,7 @@ class ContinuumTest < Minitest::Test
       assert_equal false, inputs.fetch(key).fetch('required'), key
     end
 
-    body = workflow_body('opencode-repair.yml')
+    body = workflow_body('continuum-opencode-repair.yml')
     {
       'CI_REPAIR_LABEL' => ['ci_repair_label', 'CONTINUUM_CI_REPAIR_LABEL', 'opencode-ci-repair'],
       'HEAD_REF_PATTERN' => ['head_ref_pattern', 'CONTINUUM_HEAD_REF_PATTERN', '^opencode/issue[0-9]+-'],
@@ -1255,7 +1343,7 @@ class ContinuumTest < Minitest::Test
 
     # The stub must pass every knob through bare, or a pinned literal would
     # silently override the consumer's variable for all installed callers.
-    with = yaml(File.join(ROOT, '.github/caller-stubs/opencode-repair.yml'))
+    with = yaml(File.join(ROOT, '.github/caller-stubs/continuum-opencode-repair.yml'))
            .fetch('jobs').fetch('call').fetch('with')
     %w[pr_number head_sha conclusion run_id ci_repair_label head_ref_pattern
        auto_merge_workflow opencode_workflow].each do |key|
@@ -1538,11 +1626,11 @@ class ContinuumTest < Minitest::Test
   # verbatim into a consumer repository, so a key added here is a decision
   # Continuum makes on every consumer's behalf and needs a test edit.
   STUB_INPUT_WHITELIST = {
-    'add-review-label.yml' => %w[continuum_ref],
-    'auto-merge.yml' => %w[continuum_ref],
-    'bootstrap-runtime-secret.yml' => %w[continuum_ref],
-    'coderabbit-retry.yml' => %w[continuum_ref],
-    'coderabbit-unresolved.yml' => %w[continuum_ref],
+    'continuum-add-review-label.yml' => %w[continuum_ref],
+    'continuum-auto-merge.yml' => %w[continuum_ref],
+    'continuum-bootstrap-runtime-secret.yml' => %w[continuum_ref],
+    'continuum-coderabbit-retry.yml' => %w[continuum_ref],
+    'continuum-coderabbit-unresolved.yml' => %w[continuum_ref],
     'continuum-docker-qualification.yml' => %w[
       continuum_ref issue_number artifact_repository binary_name model
       docker_image memory_mib min_headroom_mib trials result_schema
@@ -1559,24 +1647,24 @@ class ContinuumTest < Minitest::Test
       pause_label repair_label e2e_branch_prefix chain_workflow
       scheduler_workflow concurrency_group timeout_minutes
     ],
-    'issue-scheduler.yml' => %w[
+    'continuum-issue-scheduler.yml' => %w[
       continuum_ref wip_limit lease_minutes max_dispatch_attempts dispatch_marker
       in_progress_label pause_marker post_pause_comment reset_markers
       require_priority_label command_grace_minutes child_owned_marker
       legacy_child_owned_marker opencode_workflow_name opencode_workflow_path
     ],
-    'opencode.yml' => %w[
+    'continuum-opencode.yml' => %w[
       continuum_ref mode issue_number pr_number head_ref review_id run_id
       ci_workflow_id conflict_strategy dispatch_marker in_progress_label
       pause_marker max_dispatch_attempts
     ],
-    'opencode-repair.yml' => %w[
+    'continuum-opencode-repair.yml' => %w[
       continuum_ref pr_number head_sha conclusion run_id ci_repair_label
       head_ref_pattern auto_merge_workflow opencode_workflow
     ],
-    'opencode-unresolved.yml' => %w[continuum_ref],
-    'pr-agent.yml' => %w[continuum_ref],
-    'remove-review-label.yml' => %w[continuum_ref]
+    'continuum-opencode-unresolved.yml' => %w[continuum_ref],
+    'continuum-pr-agent.yml' => %w[continuum_ref],
+    'continuum-remove-review-label.yml' => %w[continuum_ref]
   }.freeze
 
   # A stub that pins an input to a literal overrides the consumer's own
@@ -1625,7 +1713,7 @@ class ContinuumTest < Minitest::Test
   # that each stub-covered knob really does reach a `vars.` fallback, so the
   # consumer's repository variable is the live source of truth.
   def test_every_stub_parameterized_knob_is_backed_by_a_vars_fallback
-    scheduler = File.read(File.join(ROOT, '.github/workflows/issue-scheduler.yml'))
+    scheduler = File.read(File.join(ROOT, '.github/workflows/continuum-issue-scheduler.yml'))
     {
       'WIP_LIMIT' => %w[wip_limit AUTOMATION_WIP_LIMIT 2],
       'LEASE_MINUTES' => %w[lease_minutes AUTOMATION_LEASE_MINUTES 45],
@@ -1662,7 +1750,7 @@ class ContinuumTest < Minitest::Test
   # silently non-matching regex — the guard would look present and block
   # nothing. Assert the single-backslash form in both files.
   def test_scheduler_declared_blocker_regex_is_not_double_escaped
-    { 'issue-scheduler.yml' => workflow_body('issue-scheduler.yml'),
+    { 'continuum-issue-scheduler.yml' => workflow_body('continuum-issue-scheduler.yml'),
       WATCHDOG => watchdog_body }.each do |name, body|
       assert_includes body, '/<!--\s*automation-blocked-by:\s*([0-9#\s,]+?)\s*-->/i',
                       "#{name}: the automation-blocked-by regex must use single backslashes"
@@ -1674,7 +1762,7 @@ class ContinuumTest < Minitest::Test
                       "#{name}: doubled backslash in the automation-blocked-by regex matches nothing"
     end
 
-    scheduler = workflow_body('issue-scheduler.yml')
+    scheduler = workflow_body('continuum-issue-scheduler.yml')
     # It must be a live parser, not a literal: numbers are extracted and read.
     assert_includes scheduler, '[...match[1].matchAll(/\d+/g)]'
     assert_includes scheduler, 'async function openDeclaredBlockers(issue) {'
@@ -1687,7 +1775,7 @@ class ContinuumTest < Minitest::Test
   # the candidate filter and the just-in-time re-check must skip it, and the
   # marker must come from a knob rather than a literal.
   def test_scheduler_skips_child_owned_issues_everywhere
-    scheduler = workflow_body('issue-scheduler.yml')
+    scheduler = workflow_body('continuum-issue-scheduler.yml')
     assert_match(/function isChildOwned\(issue\) \{\s*\n\s*const body = issue\.body \|\| '';\s*\n\s*return \(\s*\n\s*body\.includes\(childOwnedMarker\) \|\|\s*\n\s*body\.includes\(legacyChildOwnedMarker\)/, scheduler,
                  'isChildOwned must honour both the current and the legacy marker')
 
@@ -1704,7 +1792,7 @@ class ContinuumTest < Minitest::Test
     # the skip logic, or a consumer renaming its marker would be ignored. The
     # assertion runs over the embedded script only — the `workflow_call`
     # defaults are supposed to name these values.
-    engine = script_body('issue-scheduler.yml')
+    engine = script_body('continuum-issue-scheduler.yml')
     engine.lines.grep(/<!-- (continuum|runtime-worker)-(child-owned|owned) -->/).each do |line|
       # A marker may appear in the engine only as the tail of a fallback chain
       # (env, then `||` literal). Anywhere else — in isChildOwned, in the
@@ -1719,7 +1807,7 @@ class ContinuumTest < Minitest::Test
   # A manual owner `/oc` is real in-flight work: reserve it at once, and keep a
   # short grace window so this run cannot enqueue a duplicate right behind it.
   def test_scheduler_reserves_owner_commands_and_honours_the_grace_window
-    scheduler = workflow_body('issue-scheduler.yml')
+    scheduler = workflow_body('continuum-issue-scheduler.yml')
 
     assert_includes scheduler, "COMMAND_GRACE_MINUTES: ${{ inputs.command_grace_minutes || vars.AUTOMATION_COMMAND_GRACE_MINUTES || '5' }}"
     assert_includes scheduler, "const commandGraceMinutes = positiveInt('COMMAND_GRACE_MINUTES', 5);"
@@ -1748,7 +1836,7 @@ class ContinuumTest < Minitest::Test
   # runs after selection and before the reservation/comment, and every unsafe
   # condition has to be a skip.
   def test_scheduler_rechecks_state_just_before_dispatch
-    scheduler = workflow_body('issue-scheduler.yml')
+    scheduler = workflow_body('continuum-issue-scheduler.yml')
     dispatch = scheduler[/for \(const \{ issue, priority \} of selected\) \{\n(.*?)\n              await addLabel\(issue\.number, inProgressLabel\);/m, 1]
     refute_nil dispatch, 'the just-in-time re-check block is gone'
 
@@ -1769,7 +1857,7 @@ class ContinuumTest < Minitest::Test
   # implementation, and a native blocker is authoritative over an old
   # reservation lease. Both must release, not pause.
   def test_scheduler_releases_native_blockers_instead_of_pausing
-    scheduler = workflow_body('issue-scheduler.yml')
+    scheduler = workflow_body('continuum-issue-scheduler.yml')
 
     # pull_request_target reconciliation.
     pr_close = scheduler[/if \(context\.eventName === 'pull_request_target'\).*?\n            \}\n/m]
@@ -1803,7 +1891,7 @@ class ContinuumTest < Minitest::Test
   # strips the label but keeps the rename (or vice versa) silently corrupts the
   # backlog.
   def test_scheduler_priority_title_migration_is_intact
-    scheduler = workflow_body('issue-scheduler.yml')
+    scheduler = workflow_body('continuum-issue-scheduler.yml')
     migration = scheduler[/One-time migration.*?\n            \}/m]
     refute_nil migration, 'the P[0-2]: title migration block is gone'
     assert_includes migration, 'if (currentPriorities.length !== 0) continue;'
@@ -1818,7 +1906,7 @@ class ContinuumTest < Minitest::Test
   # must only fire on the owner's own comment — a stranger's `/oc` must not
   # consume WIP capacity.
   def test_scheduler_stub_triggers_the_owner_command_path
-    stub = yaml(File.join(ROOT, '.github/caller-stubs/issue-scheduler.yml'))
+    stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-issue-scheduler.yml'))
     assert_equal ['created'], events(stub).fetch('issue_comment').fetch('types')
     gate = stub.fetch('jobs').fetch('call').fetch('if')
     assert_includes gate, "github.event_name != 'issue_comment'"
@@ -1827,7 +1915,7 @@ class ContinuumTest < Minitest::Test
   end
 
   def test_empty_vars_resolve_to_the_same_scheduler_defaults
-    scheduler = workflow_body('issue-scheduler.yml')
+    scheduler = workflow_body('continuum-issue-scheduler.yml')
     {
       'DISPATCH_MARKER' => ['dispatch_marker', '<!-- issue-scheduler-dispatch -->', 'AUTOMATION_DISPATCH_MARKER'],
       'IN_PROGRESS_LABEL' => ['in_progress_label', 'automation:in-progress', 'AUTOMATION_IN_PROGRESS_LABEL'],
@@ -1843,7 +1931,7 @@ class ContinuumTest < Minitest::Test
       'OPENCODE_WORKFLOW_PATH' => ['opencode_workflow_path', '.github/workflows/continuum-opencode.yml', 'CONTINUUM_OPENCODE_WORKFLOW_PATH']
     }.each do |key, (input, expected, variable)|
       line = scheduler.lines.find { |candidate| candidate.include?("#{key}: ${{") }
-      refute_nil line, "#{key}: no env mapping found in issue-scheduler.yml"
+      refute_nil line, "#{key}: no env mapping found in continuum-issue-scheduler.yml"
 
       expression = line[/\$\{\{(.*)\}\}/, 1].strip
       # Every term of the chain, in order: the input, then the repository
@@ -1884,17 +1972,17 @@ class ContinuumTest < Minitest::Test
   # ------------------------------------------- add-review-label / CodeRabbit
 
   def add_review_label_body
-    File.read(File.join(ROOT, '.github/workflows/add-review-label.yml'))
+    File.read(File.join(ROOT, '.github/workflows/continuum-add-review-label.yml'))
   end
 
-  # The same optional-integration contract auto-merge.yml already honours.
-  # add-review-label.yml is the *other* half of the CodeRabbit path: it writes
+  # The same optional-integration contract continuum-auto-merge.yml already honours.
+  # continuum-add-review-label.yml is the *other* half of the CodeRabbit path: it writes
   # the two queue labels and dispatches the retry controller. A repository that
   # never asked for CodeRabbit would get `review-ready` and
   # `coderabbit-review-requested` on every green PR, and a 404 from a
   # `continuum-coderabbit-retry.yml` it does not have.
   def test_add_review_label_gates_the_coderabbit_path_behind_the_flag
-    inputs = events(yaml(File.join(ROOT, '.github/workflows/add-review-label.yml')))
+    inputs = events(yaml(File.join(ROOT, '.github/workflows/continuum-add-review-label.yml')))
              .fetch('workflow_call').fetch('inputs')
     knob = inputs.fetch('require_coderabbit')
     assert_equal '', knob.fetch('default'),
@@ -1983,7 +2071,7 @@ class ContinuumTest < Minitest::Test
   # ------------------------------------------------- auto-merge / CodeRabbit
 
   def auto_merge_body
-    File.read(File.join(ROOT, '.github/workflows/auto-merge.yml'))
+    File.read(File.join(ROOT, '.github/workflows/continuum-auto-merge.yml'))
   end
 
   # CodeRabbit is an OPTIONAL integration, so Continuum's default is off. A
@@ -1992,7 +2080,7 @@ class ContinuumTest < Minitest::Test
   # and would dispatch a workflow it does not have. The enabling value belongs
   # in the one repository that asked for CodeRabbit.
   def test_coderabbit_gate_is_off_by_default_and_variable_driven
-    inputs = events(yaml(File.join(ROOT, '.github/workflows/auto-merge.yml')))
+    inputs = events(yaml(File.join(ROOT, '.github/workflows/continuum-auto-merge.yml')))
              .fetch('workflow_call').fetch('inputs')
     knob = inputs.fetch('require_coderabbit')
     assert_equal '', knob.fetch('default'),

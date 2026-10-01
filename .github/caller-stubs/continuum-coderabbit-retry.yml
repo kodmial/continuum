@@ -23,7 +23,7 @@ permissions:
 
 jobs:
   call:
-    uses: kodmial/continuum/.github/workflows/coderabbit-retry.yml@main
+    uses: kodmial/continuum/.github/workflows/continuum-coderabbit-retry.yml@main
     secrets: inherit
     with:
       continuum_ref: main

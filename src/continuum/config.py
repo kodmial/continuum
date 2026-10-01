@@ -37,7 +37,7 @@ SUPPORTED_QUEUE_TIE_BREAKERS = ("source_issue", "pr_number", "created_at", "head
 DEFAULT_QUEUE_COOLDOWN_MINUTES = 60
 DEFAULT_QUEUE_IN_FLIGHT_TIMEOUT_MINUTES = 30
 DEFAULT_QUEUE_SAFETY_MARGIN_SECONDS = 30
-DEFAULT_QUEUE_DISPATCH_WORKFLOW = "pr-agent.yml"
+DEFAULT_QUEUE_DISPATCH_WORKFLOW = "continuum-pr-agent.yml"
 MAX_QUEUE_CANDIDATES = 200
 
 # -- release targets --------------------------------------------------------

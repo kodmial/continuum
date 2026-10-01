@@ -54,7 +54,7 @@ permissions: {}
 
 jobs:
   call:
-    uses: kodmial/continuum/.github/workflows/opencode-repair.yml@main
+    uses: kodmial/continuum/.github/workflows/continuum-opencode-repair.yml@main
     secrets: inherit
     with:
       continuum_ref: main

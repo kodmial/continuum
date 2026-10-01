@@ -1,6 +1,6 @@
 # Every fresh PR head invalidates CI readiness and the per-head review-request
-# lock. After CI succeeds, add-review-label.yml either requests a fresh full
-# CodeRabbit review or safely carries an earlier approval when auto-merge.yml
+# lock. After CI succeeds,continuum-add-review-label.yml either requests a fresh full
+# CodeRabbit review or safely carries an earlier approval whencontinuum-auto-merge.yml
 # proves that the new HEAD is only a clean controller-generated merge of main.
 name: remove-review-ready-on-sync
 
@@ -29,7 +29,7 @@ jobs:
 
             // A new head always requires fresh CI and a fresh CI-repair
             // opportunity. The review-request lock is also reset here; after
-            // green CI, add-review-label.yml recreates it either by requesting
+            // green CI,continuum-add-review-label.yml recreates it either by requesting
             // CodeRabbit or by proving a safe clean-main-sync carry-forward.
             for (const name of [
               'review-ready',

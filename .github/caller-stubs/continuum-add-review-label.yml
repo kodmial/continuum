@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   call:
-    uses: kodmial/continuum/.github/workflows/add-review-label.yml@main
+    uses: kodmial/continuum/.github/workflows/continuum-add-review-label.yml@main
     secrets: inherit
     # `require_coderabbit` is deliberately NOT pinned here. CodeRabbit is an
     # optional integration whose enabling value lives in the consumer's

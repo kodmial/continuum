@@ -25,7 +25,7 @@ permissions:
 
 jobs:
   call:
-    uses: kodmial/continuum/.github/workflows/auto-merge.yml@main
+    uses: kodmial/continuum/.github/workflows/continuum-auto-merge.yml@main
     secrets: inherit
     with:
       continuum_ref: main
