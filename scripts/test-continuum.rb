@@ -1914,22 +1914,51 @@ class ContinuumTest < Minitest::Test
     File.read(File.join(ROOT, '.github/workflows', RENDER))
   end
 
-  # The fork this core file was ported from hardcoded its Render API token to
-  # a `KEY` secret. No Continuum consumer is required to define that name, so
-  # the same wiring would resolve to an empty token in every installed caller.
-  # The secret contract is TAP_PAT, and this workflow may not quietly keep a
-  # second spelling.
-  def test_render_executor_reads_tap_pat_and_never_the_fork_key_secret
+  # The fork this core file was ported from read two different credentials:
+  # `secrets.KEY` was the Render API key and `secrets.TAP_PAT` was the GitHub
+  # PAT. They are not interchangeable — a GitHub token is not accepted by the
+  # Render API — so Continuum documents the Render key under its own name,
+  # `RENDER_API_KEY`, and this workflow may not quietly alias one onto the
+  # other.
+  def test_render_executor_reads_the_render_api_key_and_never_the_github_pat
     body = render_body
-    refute_includes body, 'secrets.KEY',
-                    'the fork read secrets.KEY; Continuum secrets are named TAP_PAT by contract'
     # Both Render steps must be wired, not just one: the execute step creating
-    # the worker and the cleanup step deleting it need the same token, and a
+    # the worker and the cleanup step deleting it need the same key, and a
     # cleanup that lost it would leave an ephemeral worker running.
-    assert_equal 2, body.scan(/RENDER_API_KEY: \$\{\{ secrets\.TAP_PAT \}\}/).size,
-                 'both the execute and the mandatory cleanup step must read TAP_PAT'
-    # The classification step already used the PAT-with-token-fallback chain.
+    assert_equal 2, body.scan(/RENDER_API_KEY: \$\{\{ secrets\.RENDER_API_KEY \}\}/).size,
+                 'both the execute and the mandatory cleanup step must read RENDER_API_KEY'
+    # The defect this pins: the GitHub PAT forwarded to the Render API.
+    refute_includes body, 'RENDER_API_KEY: ${{ secrets.TAP_PAT }}',
+                    'TAP_PAT is a GitHub PAT; the Render API key must not be wired from it'
+    # The fork spelled the Render key `KEY`, which is too generic to be a
+    # contract, so Continuum renamed rather than adopted it.
+    refute_includes body, 'secrets.KEY',
+                    'the fork read secrets.KEY; the Render key is named RENDER_API_KEY by contract'
+    # The classification step is the one place a GitHub token belongs, and it
+    # keeps the PAT-with-token-fallback chain.
     assert_includes body, 'GH_TOKEN: ${{ secrets.TAP_PAT || github.token }}'
+  end
+
+  # A missing Render key must fail the run explicitly rather than send an
+  # unauthenticated request or fall back to some other credential; the same
+  # holds for the mandatory cleanup, whose silence would leave a worker running.
+  def test_render_executor_fails_explicitly_without_a_render_api_key
+    body = render_body
+    assert_includes body, '[[ -n "$RENDER_API_KEY" ]] || {',
+                    'the execute step must guard the Render API key explicitly'
+    assert_includes body, 'echo "::error::No Render API key configured: set the RENDER_API_KEY secret."',
+                    'the execute step must name the exact secret to set'
+    assert_includes body, 'echo "::error::RENDER_API_KEY is the Render API key and is distinct from TAP_PAT; a GitHub token is not accepted by the Render API."',
+                    'the failure must record that the key is distinct from TAP_PAT'
+    # The cleanup guard sits inside the branch that actually calls Render, so a
+    # missing key fails there too instead of silently skipping the deletion.
+    assert_equal 2, body.scan('[[ -n "$RENDER_API_KEY" ]] || {').size,
+                 'the mandatory cleanup step must guard the Render API key as well'
+    assert_includes body, 'echo "::error::No Render API key configured: set the RENDER_API_KEY secret; the ephemeral Render service cannot be deleted without it."',
+                    'the cleanup step must name the exact secret to set'
+    # No fallback may smuggle a GitHub token back in as the Render credential.
+    refute_match(/RENDER_API_KEY: \$\{\{ secrets\.TAP_PAT \|\|/, body,
+                 'RENDER_API_KEY must never fall back to TAP_PAT or github.token')
   end
 
   # Every value the fork hardcoded for one repository must be a knob, or a

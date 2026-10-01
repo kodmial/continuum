@@ -241,10 +241,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_TOKEN: ${{ github.token }}
-          # TAP_PAT, by Continuum's secret contract. The consumer fork read a
-          # `KEY` secret here, which no Continuum consumer is required to
-          # define, so the same wiring would resolve to an empty token.
-          RENDER_API_KEY: ${{ secrets.TAP_PAT }}
+          # Two distinct credentials, never interchangeable: TAP_PAT is the
+          # classic GitHub PAT and reaches the GitHub API only, while
+          # RENDER_API_KEY is the Render API key and is the only credential the
+          # Render API accepts. Sending one in place of the other gets the run
+          # rejected, so the key is checked explicitly below rather than
+          # defaulted to any GitHub token.
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
         shell: bash
         run: |
           set -euo pipefail
@@ -258,6 +261,15 @@ jobs:
           }
           [[ "$EXECUTION_MODE" == "smoke" || "$EXECUTION_MODE" == "e2e" ]] || {
             echo "::error::Unsupported execution mode: $EXECUTION_MODE"
+            exit 2
+          }
+          # The Render API key is a real credential, not an optional knob: with
+          # none, the Render calls below are unauthenticated and the run fails
+          # instead of reporting a green no-op. No fallback to TAP_PAT or to
+          # github.token, because neither is a Render API key.
+          [[ -n "$RENDER_API_KEY" ]] || {
+            echo "::error::No Render API key configured: set the RENDER_API_KEY secret."
+            echo "::error::RENDER_API_KEY is the Render API key and is distinct from TAP_PAT; a GitHub token is not accepted by the Render API."
             exit 2
           }
           [[ -n "$OPENCODE_MODEL" ]] || {
@@ -278,12 +290,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_TOKEN: ${{ github.token }}
-          RENDER_API_KEY: ${{ secrets.TAP_PAT }}
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
         shell: bash
         run: |
           set -euo pipefail
 
           if [[ -f "$CLEANUP_SCRIPT" ]]; then
+            # Deleting the ephemeral worker is a real Render API call, so a
+            # missing key must fail the step rather than let it report success
+            # while the worker keeps running.
+            [[ -n "$RENDER_API_KEY" ]] || {
+              echo "::error::No Render API key configured: set the RENDER_API_KEY secret; the ephemeral Render service cannot be deleted without it."
+              exit 2
+            }
             bash "$CLEANUP_SCRIPT"
             exit 0
           fi

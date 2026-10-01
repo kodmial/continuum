@@ -30,6 +30,11 @@ These are public interfaces and must not change silently:
   a consumer repository is Continuum-owned and is never hand-edited there);
 - the `TAP_PAT` repository secret name (classic PAT, `repo` + `workflow` scopes)
   expected by every set;
+- the `RENDER_API_KEY` repository secret name — the Render API key, read only by
+  the render executor for its Render calls. It is a different credential from
+  `TAP_PAT` and the two are never interchangeable: a GitHub token is not
+  accepted by the Render API, and the render executor fails explicitly when the
+  key is unset instead of falling back to any GitHub token;
 - the installer sets (`core`, `tech`, `parent`): `core` installs every stub
   under `.github/caller-stubs/`, `tech` installs only
   `.github/caller-stubs/tech/` (the `continuum-tech-` prefix marks an opt-in
