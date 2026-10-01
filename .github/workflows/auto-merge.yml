@@ -145,6 +145,13 @@ jobs:
             }
 
             function isNonMergeCriticalMainPath(path) {
+              // Continuum caller pins are executable control-plane code. A
+              // consumer that advances its pinned Continuum revision must
+              // synchronize open PRs so their CI/review/repair semantics are
+              // evaluated against that exact revision as well.
+              if (path.startsWith('.github/workflows/continuum-')) {
+                return false;
+              }
               return (
                 path === 'LICENSE' ||
                 path === '.gitignore' ||
