@@ -315,7 +315,6 @@ jobs:
           # module name through env so the same job builds any Swift project.
           CORE_TEST_TARGET: ${{ vars.CONTINUUM_CORE_TEST_TARGET }}
           CLI_NAME: ${{ vars.CONTINUUM_CLI_NAME }}
-        env:
           STATIC_ARCHIVE_PATH: ${{ inputs.static_archive_path }}
         run: |
           set -euo pipefail
