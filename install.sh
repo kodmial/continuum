@@ -141,12 +141,25 @@ fi
 # written straight to the destination, so a repository file name and the
 # consumer file name are always the same string and cannot drift apart.
 for f in "${STUBS[@]}"; do
+  tmp_template=""
   if [[ $POSITIONAL -lt 2 && -f "$LOCAL_STUBS_DIR/$f" ]]; then
-    template="$(cat "$LOCAL_STUBS_DIR/$f")"
+    template_path="$LOCAL_STUBS_DIR/$f"
   else
-    template="$(curl -fsSL "$BASE/$f")"
+    tmp_template="$(mktemp)"
+    curl -fsSL "$BASE/$f" > "$tmp_template"
+    template_path="$tmp_template"
   fi
-  # Use the same revision for the workflow and its fallback scripts.
+
+  # The shipped templates are canonical for the live shared ref. A default
+  # main install therefore copies them byte-for-byte: it must not create a
+  # formatting-only consumer diff (quoted main, added final newline, etc.).
+  if [[ "$REF" == "main" ]]; then
+    cat "$template_path" > "$DEST/.github/workflows/$f"
+    [[ -z "$tmp_template" ]] || rm -f "$tmp_template"
+    continue
+  fi
+
+  # Use the same explicit revision for the workflow and its fallback scripts.
   #
   # A `uses:` line is legal at two levels: job-level (`  call:` then
   # `    uses: ...`) and step-level (`      - uses: ...`). The optional `-`
@@ -155,26 +168,14 @@ for f in "${STUBS[@]}"; do
   # exactly the guarantee the ref parameter exists to provide.
   #
   # Each pattern is anchored so an unrelated `main` elsewhere in the template
-  # is never rewritten, and the anchor tolerates the things a real line can
-  # carry after the ref without treating any of them as part of it:
-  #   - a trailing YAML comment (`@main # pinned`), re-emitted verbatim;
-  #   - surrounding quotes, which are part of the YAML scalar and not of the
-  #     ref, re-emitted verbatim;
-  #   - trailing whitespace, including the CR of a CRLF checkout, re-emitted
-  #     verbatim.
-  # Each of those ends the match, so a line that merely *contains* `main` — a
-  # third-party action, an `@branch-main` tag, a `run:` body — never matches.
-  # `@main` with no space before a `#` is deliberately NOT rewritten: YAML
-  # requires whitespace to open a comment, so `#` there is part of the ref.
-  # Explicit non-main refs are quoted so values such as numeric tags stay YAML
-  # strings. The default `main` ref is already canonical in every shipped stub;
-  # leave it byte-stable instead of manufacturing a `main` -> `"main"` diff.
-  REF_YAML="$REF"
-  [[ "$REF" == "main" ]] || REF_YAML="\\\"$REF\\\""
-  printf '%s\n' "$template" | sed -E \
-    -e "s|^([[:space:]]*-?[[:space:]]*uses:[[:space:]]*[\"']?kodmial/continuum/\.github/workflows/[^@[:space:]\"']*)@main([\"']?)([[:space:]]+#.*)?([[:space:]]*)$|\1@$REF\2\3\4|" \
-    -e "s|^([[:space:]]*-?[[:space:]]*(continuum_ref\|engine_ref):[[:space:]]*)main([[:space:]]+#.*)?([[:space:]]*)$|\1$REF_YAML\3\4|" \
-    > "$DEST/.github/workflows/$f"
+  # is never rewritten. Explicit refs are quoted because a numeric tag such as
+  # `123` must remain a YAML string.
+  sed -E \
+    -e "s|^([[:space:]]*-?[[:space:]]*uses:[[:space:]]*[\\"']?kodmial/continuum/\\.github/workflows/[^@[:space:]\\"']*)@main([\\"']?)([[:space:]]+#.*)?([[:space:]]*)$|\\1@$REF\\2\\3\\4|" \
+    -e "s|^([[:space:]]*-?[[:space:]]*(continuum_ref\\|engine_ref):[[:space:]]*)main([[:space:]]+#.*)?([[:space:]]*)$|\\1\\"$REF\\"\\3\\4|" \
+    "$template_path" > "$DEST/.github/workflows/$f"
+
+  [[ -z "$tmp_template" ]] || rm -f "$tmp_template"
 done
 # Supersession: a renamed or dropped stub must not leave a stale caller behind
 # in the consumer, or the old file keeps running next to its replacement.
