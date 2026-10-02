@@ -1,4 +1,4 @@
-name: CI
+name: Consumer validation
 
 on:
   pull_request:
