@@ -135,7 +135,7 @@ installs only `core` never needs the `parent` or `tech` secrets.
 | `TAP_PAT` | `core` | The core controllers that call the GitHub API, and the installed `parent` stubs (which forward it to the child runtime as `CHILD_RUNTIME_TOKEN`). | `github.token` on steps that only need the built-in token. |
 | `RENDER_API_KEY` | `core` | `continuum-render-executor.yml` only | **None.** The controller fails explicitly when it is unset. |
 | `CHILD_RUNTIME_TOKEN` | `parent` | The installed `continuum-consumer-child-review`, `-worker` and `-pr-review` entry points; the core scheduler uses `TAP_PAT` directly when it builds the child queue. | **None.** Every installed parent stub fills it from the parent's own `TAP_PAT`, so the same credential serves both layers. |
-| `CHILD_RUNTIME_REPOSITORIES` | `parent` | The three installed child entry points and the core scheduler's compatibility resolver. | None — the input is optional (the pre-variables compatibility path described in `docs/parent-child-delegation.md`). |
+| `CHILD_RUNTIME_REPOSITORIES` | `parent` | The three child runtime callees expose this optional pre-variables compatibility secret. New parent scheduling uses repository variables and does not read it. | None — legacy compatibility only; see `docs/parent-child-delegation.md`. |
 | `NANODICTATE_SIGNING_P12` | `tech` | The tech release and packaging-smoke workflows. | None. |
 | `NANODICTATE_SIGNING_PASSWORD` | `tech` | The tech release and packaging-smoke workflows. | None. |
 | `RELEASE_PR_TOKEN` | `tech` | `continuum-tech-swift-release-pr.yml` | Resolved in this order: `RELEASE_PR_TOKEN`, then `TAP_PAT`, then the built-in `GITHUB_TOKEN`. |
