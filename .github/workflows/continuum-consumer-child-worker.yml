@@ -40,7 +40,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     concurrency:
-      group: continuum-child-task-${{ inputs.child_id }}-${{ inputs.task_number }}
+      group: continuum-subtask-${{ inputs.task_number }}
       cancel-in-progress: false
     env:
       GH_TOKEN: ${{ secrets.CHILD_RUNTIME_TOKEN }}
@@ -227,4 +227,4 @@ jobs:
             gh pr create --repo "$child_repo" --base main --head "$branch"               --title "$issue_title" --body "$pr_body" 2>/dev/null
           )"
           gh issue comment "$TASK_NUMBER" --repo "$child_repo"             --body "<!-- continuum-child-pr --> Child task #$TASK_NUMBER produced an accepted implementation PR: $pr_url"             >/dev/null 2>&1 || true
-          echo "Child task [$CHILD_ID] #$TASK_NUMBER produced an implementation PR."
+          echo "SubTask #$TASK_NUMBER produced an implementation PR."

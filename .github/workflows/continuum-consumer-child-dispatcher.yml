@@ -84,12 +84,20 @@ jobs:
 
           task_active() {
             local child_id="$1" kind="$2" task="$3"
-            grep -Fxq "Child $kind [$child_id] #$task" <<<"$active_titles"
+            local neutral_title
+            if [[ "$kind" == "task" ]]; then
+              neutral_title="SubTask #$task"
+            else
+              neutral_title="SubTask review #$task"
+            fi
+            grep -Fxq "$neutral_title" <<<"$active_titles" ||
+              grep -Fxq "Child $kind [$child_id] #$task" <<<"$active_titles"
           }
 
           manual_pr_active() {
             local child_id="$1" pr="$2"
-            grep -Fxq "Child PR review [$child_id] #$pr" <<<"$active_titles"
+            grep -Fxq "SubTask PR review #$pr" <<<"$active_titles" ||
+              grep -Fxq "Child PR review [$child_id] #$pr" <<<"$active_titles"
           }
 
           invalid=0
@@ -102,7 +110,7 @@ jobs:
 
             if ! PARENT_CONFIG=.continuum.yml CHILD_REPOSITORIES="$CHILD_REPOSITORIES" \
               bash "$resolver" verify "$child_id" "$child_repo" >/dev/null 2>&1; then
-              echo "::error::Child '$child_id' relationship verification failed."
+              echo "::error::Delegated relationship verification failed."
               invalid=$((invalid + 1))
               continue
             fi

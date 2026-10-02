@@ -40,7 +40,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 70
     concurrency:
-      group: continuum-child-pr-review-${{ inputs.child_id }}-${{ inputs.pr_number }}
+      group: continuum-subtask-pr-review-${{ inputs.pr_number }}
       cancel-in-progress: false
     env:
       GH_TOKEN: ${{ secrets.CHILD_RUNTIME_TOKEN }}
@@ -294,4 +294,4 @@ jobs:
           fi
 
           gh pr comment "$PR_NUMBER" --repo "$child_repo"             --body "<!-- continuum-child-pr-review-merged --> Independent review passed and this owner-created PR was merged."             >/dev/null 2>&1 || true
-          echo "Owner-created child PR [$CHILD_ID] #$PR_NUMBER reviewed and merged."
+          echo "SubTask PR review #$PR_NUMBER reviewed and merged."
