@@ -910,47 +910,83 @@ class ContinuumTest < Minitest::Test
     end
   end
 
-  def test_core_install_is_idempotent_and_preserves_project_owned_ci
-    fixture do |dir|
-      target = File.join(dir, 'consumer')
-      workflows = File.join(target, '.github/workflows')
-      FileUtils.mkdir_p(workflows)
-      project_ci = File.join(workflows, 'ci.yml')
-      project_body = <<~YAML
-        name: CI
-        on:
-          pull_request:
-        jobs:
-          call:
-            uses: kodmial/continuum/.github/workflows/continuum-validation.yml@main
-      YAML
-      File.write(project_ci, project_body)
+  def test_core_install_is_idempotent_on_representative_consumer_layouts
+    layouts = {
+      'nanodictate' => %w[
+        ci.yml
+        nanodictate-ci-engine.yml
+        nanodictate-packaging-repair.yml
+        packaging-smoke.yml
+        release.yml
+      ],
+      'kodmai' => %w[ci.yml],
+      'kodmaiadmin' => %w[ci.yml],
+      'runtime-lab' => %w[ci.yml qualification-chain.yml knowledge-sync.yml],
+    }
 
-      env = { 'CONTINUUM_INSTALL_ASSUME_YES' => '1' }
-      first_output, first_status = Open3.capture2e(
-        env, 'bash', File.join(ROOT, 'install.sh'), target
-      )
-      assert first_status.success?, first_output
-      refute File.exist?(File.join(workflows, 'continuum-validation.yml')),
-             'core install must not create a second primary CI caller'
-      assert_equal project_body, File.read(project_ci),
-                   'install must not rewrite the project-owned CI entry point'
+    layouts.each do |consumer, project_workflows|
+      fixture do |dir|
+        target = File.join(dir, consumer)
+        workflows = File.join(target, '.github/workflows')
+        FileUtils.mkdir_p(workflows)
 
-      snapshot = Dir[File.join(workflows, '*.yml')].sort.to_h do |path|
-        [File.basename(path), File.binread(path)]
+        project_workflows.each do |name|
+          body = if name == 'ci.yml'
+                   <<~YAML
+                     name: CI
+                     on:
+                       pull_request:
+                     jobs:
+                       call:
+                         uses: kodmial/continuum/.github/workflows/continuum-validation.yml@main
+                   YAML
+                 else
+                   <<~YAML
+                     name: #{File.basename(name, '.yml')}
+                     on:
+                       workflow_dispatch:
+                     jobs:
+                       local:
+                         runs-on: ubuntu-latest
+                         steps:
+                           - run: echo project-owned
+                   YAML
+                 end
+          File.write(File.join(workflows, name), body)
+        end
+
+        project_snapshot = project_workflows.to_h do |name|
+          [name, File.binread(File.join(workflows, name))]
+        end
+
+        env = { 'CONTINUUM_INSTALL_ASSUME_YES' => '1' }
+        first_output, first_status = Open3.capture2e(
+          env, 'bash', File.join(ROOT, 'install.sh'), target
+        )
+        assert first_status.success?, "#{consumer}: #{first_output}"
+        refute File.exist?(File.join(workflows, 'continuum-validation.yml')),
+               "#{consumer}: core install must not create a second primary CI caller"
+        project_snapshot.each do |name, body|
+          assert_equal body, File.binread(File.join(workflows, name)),
+                       "#{consumer}: install must not rewrite project-owned #{name}"
+        end
+
+        snapshot = Dir[File.join(workflows, '*.yml')].sort.to_h do |path|
+          [File.basename(path), File.binread(path)]
+        end
+        second_output, second_status = Open3.capture2e(
+          env, 'bash', File.join(ROOT, 'install.sh'), target
+        )
+        assert second_status.success?, "#{consumer}: #{second_output}"
+        second = Dir[File.join(workflows, '*.yml')].sort.to_h do |path|
+          [File.basename(path), File.binread(path)]
+        end
+
+        assert_equal snapshot, second,
+                     "#{consumer}: a second core install must preserve workflow topology and bytes"
+        assert_equal 1, second.values.count { |body| body.match?(/^name:\s*CI\s*$/) },
+                     "#{consumer}: exactly one primary workflow may be named CI"
       end
-      second_output, second_status = Open3.capture2e(
-        env, 'bash', File.join(ROOT, 'install.sh'), target
-      )
-      assert second_status.success?, second_output
-      second = Dir[File.join(workflows, '*.yml')].sort.to_h do |path|
-        [File.basename(path), File.binread(path)]
-      end
-
-      assert_equal snapshot, second,
-                   'running the same core install twice must produce the same workflow topology and bytes'
-      assert_equal 1, second.values.count { |body| body.match?(/^name:\s*CI\s*$/) },
-                   'a consumer must have exactly one primary workflow named CI'
     end
   end
 
