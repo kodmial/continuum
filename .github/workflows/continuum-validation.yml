@@ -1,0 +1,379 @@
+name: Consumer validation
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: GitHub runner label selected by the consumer
+        required: false
+        type: string
+        default: ubuntu-latest
+      timeout_minutes:
+        description: Validation job timeout in minutes
+        required: false
+        type: string
+        default: '25'
+      prepare_command:
+        description: Optional preparation hook executed before build/test validation
+        required: false
+        type: string
+        default: ''
+      build_command:
+        description: Optional consumer build hook
+        required: false
+        type: string
+        default: ''
+      test_command:
+        description: Optional consumer test hook
+        required: false
+        type: string
+        default: ''
+      validation_command:
+        description: Optional additional consumer validation hook
+        required: false
+        type: string
+        default: ''
+      package_command:
+        description: Optional packaging hook
+        required: false
+        type: string
+        default: ''
+      release_command:
+        description: Optional release hook
+        required: false
+        type: string
+        default: ''
+      auto_detect:
+        description: Run standard checks for detected Python, Node, Java, Go and Rust stacks
+        required: false
+        type: boolean
+        default: true
+      artifact_paths:
+        description: Newline-separated paths uploaded after validation
+        required: false
+        type: string
+        default: ''
+      artifact_name:
+        description: Artifact bundle name when artifact_paths is non-empty
+        required: false
+        type: string
+        default: continuum-validation
+      status_context:
+        description: Commit-status context published by this validation
+        required: false
+        type: string
+        default: continuum/validation
+      publish_status:
+        description: Publish pending/final commit status for the selected target
+        required: false
+        type: boolean
+        default: true
+      dispatch_repair:
+        description: Dispatch the configured repair workflow for pull-request results
+        required: false
+        type: boolean
+        default: true
+      repair_workflow:
+        description: Consumer workflow file that owns repair decisions
+        required: false
+        type: string
+        default: continuum-opencode-repair.yml
+      pr_number:
+        description: Optional pull request number for manual validation
+        required: false
+        type: string
+        default: ''
+      skip_opencode_pull_request:
+        description: Skip duplicate pull_request runs for opencode/* branches
+        required: false
+        type: boolean
+        default: false
+      continuum_ref:
+        description: Continuum revision supplying this contract
+        required: false
+        type: string
+        default: main
+
+permissions: {}
+
+jobs:
+  validate:
+    name: Validate
+    if: >-
+      !inputs.skip_opencode_pull_request ||
+      github.event_name != 'pull_request' ||
+      !startsWith(github.head_ref, 'opencode/')
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: ${{ fromJSON(inputs.timeout_minutes) }}
+
+    permissions:
+      actions: write
+      contents: read
+      pull-requests: read
+      statuses: write
+
+    steps:
+      - name: Resolve target
+        id: target
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          MANUAL_PR_NUMBER: ${{ inputs.pr_number }}
+        with:
+          script: |
+            let sha = context.sha;
+            let ref = context.ref;
+            let prNumber = '';
+
+            if (context.eventName === 'pull_request') {
+              sha = context.payload.pull_request.head.sha;
+              ref = context.payload.pull_request.head.ref;
+              prNumber = String(context.payload.pull_request.number);
+            } else if (process.env.MANUAL_PR_NUMBER) {
+              prNumber = process.env.MANUAL_PR_NUMBER;
+              const { data: pr } = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: Number(prNumber),
+              });
+              sha = pr.head.sha;
+              ref = pr.head.ref;
+            }
+
+            core.setOutput('sha', sha);
+            core.setOutput('ref', ref);
+            core.setOutput('pr_number', prNumber);
+
+      - name: Mark validation pending
+        if: inputs.publish_status
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
+          STATUS_CONTEXT: ${{ inputs.status_context }}
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: process.env.TARGET_SHA,
+              state: 'pending',
+              context: process.env.STATUS_CONTEXT,
+              description: 'Validation is running',
+              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            });
+
+      - name: Checkout target
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ steps.target.outputs.sha }}
+          persist-credentials: false
+
+      - name: Detect project stack
+        if: inputs.auto_detect
+        id: stack
+        shell: bash
+        run: |
+          set -euo pipefail
+          python=false
+          node=false
+          java=false
+          go=false
+          rust=false
+
+          if [[ -f pyproject.toml || -f requirements.txt || -f setup.py || -f setup.cfg ]] || \
+             find . -type f -name '*.py' -not -path './.git/*' -not -path './.github/*' | grep -q .; then
+            python=true
+          fi
+          [[ -f package.json ]] && node=true
+          if [[ -f pom.xml || -f mvnw || -f build.gradle || -f build.gradle.kts || -f gradlew ]]; then
+            java=true
+          fi
+          [[ -f go.mod ]] && go=true
+          [[ -f Cargo.toml ]] && rust=true
+
+          {
+            echo "python=$python"
+            echo "node=$node"
+            echo "java=$java"
+            echo "go=$go"
+            echo "rust=$rust"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Detected: python=$python node=$node java=$java go=$go rust=$rust"
+
+      - name: Set up Python
+        if: inputs.auto_detect && steps.stack.outputs.python == 'true'
+        uses: actions/setup-python@82c7e631bb3cdc910f68e0081d67478d79c6982d # v5
+        with:
+          python-version: '3.12'
+
+      - name: Run validation contract
+        id: checks
+        shell: bash
+        env:
+          AUTO_DETECT: ${{ inputs.auto_detect }}
+          STACK_PYTHON: ${{ steps.stack.outputs.python }}
+          STACK_NODE: ${{ steps.stack.outputs.node }}
+          STACK_JAVA: ${{ steps.stack.outputs.java }}
+          STACK_GO: ${{ steps.stack.outputs.go }}
+          STACK_RUST: ${{ steps.stack.outputs.rust }}
+          PREPARE_COMMAND: ${{ inputs.prepare_command }}
+          BUILD_COMMAND: ${{ inputs.build_command }}
+          TEST_COMMAND: ${{ inputs.test_command }}
+          VALIDATION_COMMAND: ${{ inputs.validation_command }}
+          PACKAGE_COMMAND: ${{ inputs.package_command }}
+          RELEASE_COMMAND: ${{ inputs.release_command }}
+        run: |
+          set -euo pipefail
+
+          ran=false
+          run_hook() {
+            local stage="$1"
+            local command="$2"
+            [[ -n "$command" ]] || return 0
+            ran=true
+            echo "::group::$stage hook"
+            eval "$command"
+            echo "::endgroup::"
+          }
+
+          run_hook prepare "$PREPARE_COMMAND"
+
+          if [[ "$AUTO_DETECT" == "true" ]]; then
+            if [[ "$STACK_PYTHON" == "true" ]]; then
+              ran=true
+              echo "::group::Python"
+              python -m compileall -q -x '(^|/)(\.git|\.venv|venv)(/|$)' .
+              python -m pip install --upgrade pip
+              [[ ! -f requirements.txt ]] || python -m pip install -r requirements.txt
+              [[ ! -f pyproject.toml ]] || python -m pip install -e .
+              if find . -type f \( -name 'test_*.py' -o -name '*_test.py' \) -not -path './.git/*' | grep -q .; then
+                python -m pip install pytest
+                python -m pytest -q
+              else
+                echo "No Python tests detected."
+              fi
+              echo "::endgroup::"
+            fi
+
+            if [[ "$STACK_NODE" == "true" ]]; then
+              ran=true
+              echo "::group::Node"
+              node --version
+              npm --version
+              if [[ -f package-lock.json ]]; then npm ci; else npm install; fi
+              npm test --if-present
+              npm run build --if-present
+              echo "::endgroup::"
+            fi
+
+            if [[ "$STACK_JAVA" == "true" ]]; then
+              ran=true
+              echo "::group::Java"
+              java -version
+              if [[ -f mvnw ]]; then
+                chmod +x mvnw
+                ./mvnw -B verify
+              elif [[ -f pom.xml ]]; then
+                mvn -B verify
+              fi
+              if [[ -f gradlew ]]; then
+                chmod +x gradlew
+                ./gradlew build
+              elif [[ -f build.gradle || -f build.gradle.kts ]]; then
+                gradle build
+              fi
+              echo "::endgroup::"
+            fi
+
+            if [[ "$STACK_GO" == "true" ]]; then
+              ran=true
+              echo "::group::Go"
+              go version
+              go test ./...
+              go build ./...
+              echo "::endgroup::"
+            fi
+
+            if [[ "$STACK_RUST" == "true" ]]; then
+              ran=true
+              echo "::group::Rust"
+              rustc --version
+              cargo --version
+              cargo test --all-targets
+              cargo build --all-targets
+              echo "::endgroup::"
+            fi
+
+            if [[ -f Dockerfile ]]; then
+              ran=true
+              echo "::group::Docker"
+              docker build -t continuum-validation .
+              echo "::endgroup::"
+            fi
+
+            while IFS= read -r -d '' script; do
+              ran=true
+              bash -n "$script"
+            done < <(find . -type f -name '*.sh' -not -path './.git/*' -print0)
+          fi
+
+          run_hook build "$BUILD_COMMAND"
+          run_hook test "$TEST_COMMAND"
+          run_hook validation "$VALIDATION_COMMAND"
+          run_hook package "$PACKAGE_COMMAND"
+          run_hook release "$RELEASE_COMMAND"
+
+          if [[ "$ran" == "false" ]]; then
+            echo "No implementation stack or explicit hook is configured; validation has nothing to execute."
+          fi
+
+      - name: Upload declared artifacts
+        if: always() && inputs.artifact_paths != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: ${{ inputs.artifact_paths }}
+          if-no-files-found: error
+
+      - name: Publish validation result and continue repair lifecycle
+        if: always()
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
+          PR_NUMBER: ${{ steps.target.outputs.pr_number }}
+          CHECK_OUTCOME: ${{ steps.checks.outcome }}
+          STATUS_CONTEXT: ${{ inputs.status_context }}
+          PUBLISH_STATUS: ${{ inputs.publish_status }}
+          DISPATCH_REPAIR: ${{ inputs.dispatch_repair }}
+          REPAIR_WORKFLOW: ${{ inputs.repair_workflow }}
+        with:
+          script: |
+            const passed = process.env.CHECK_OUTCOME === 'success';
+            const state = passed ? 'success' : 'failure';
+
+            if (process.env.PUBLISH_STATUS === 'true') {
+              await github.rest.repos.createCommitStatus({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                sha: process.env.TARGET_SHA,
+                state,
+                context: process.env.STATUS_CONTEXT,
+                description: passed ? 'Validation passed' : 'Validation failed',
+                target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              });
+            }
+
+            if (process.env.DISPATCH_REPAIR === 'true' && process.env.PR_NUMBER) {
+              await github.rest.actions.createWorkflowDispatch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: process.env.REPAIR_WORKFLOW,
+                ref: context.payload.repository?.default_branch || 'main',
+                inputs: {
+                  pr_number: process.env.PR_NUMBER,
+                  head_sha: process.env.TARGET_SHA,
+                  conclusion: state,
+                  run_id: String(context.runId),
+                },
+              });
+            }
