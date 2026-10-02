@@ -74,19 +74,29 @@ on:
 permissions: {}
 
 concurrency:
-  group: pr-agent-${{ github.event.issue.number }}
+  group: pr-agent-${{ github.event.issue.number || github.event.pull_request.number || github.run_id }}
   cancel-in-progress: false
 
 jobs:
   pr-agent:
     if: >-
-      github.event.issue.pull_request &&
-      github.actor == github.repository_owner &&
       (
-        startsWith(github.event.comment.body, '/review') ||
-        startsWith(github.event.comment.body, '/describe') ||
-        startsWith(github.event.comment.body, '/ask') ||
-        startsWith(github.event.comment.body, '/verify')
+        github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request &&
+        github.actor == github.repository_owner &&
+        (
+          startsWith(github.event.comment.body, '/review') ||
+          startsWith(github.event.comment.body, '/describe') ||
+          startsWith(github.event.comment.body, '/ask') ||
+          startsWith(github.event.comment.body, '/verify')
+        )
+      ) ||
+      (
+        github.event_name == 'pull_request_target' &&
+        github.event.pull_request &&
+        github.event.pull_request.draft == false &&
+        github.event.pull_request.user.login == github.repository_owner &&
+        github.event.pull_request.head.repo.full_name == github.repository
       )
     runs-on: ubuntu-latest
     timeout-minutes: ${{ fromJSON(vars.AUTOMATION_PR_AGENT_TIMEOUT_MINUTES || '60') }}
@@ -120,20 +130,25 @@ jobs:
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
+            const automaticReview = context.eventName === 'pull_request_target';
             const body = String(context.payload.comment?.body || '');
-            const prNumber = context.payload.issue?.number;
+            const prNumber = automaticReview
+              ? context.payload.pull_request?.number
+              : context.payload.issue?.number;
             if (!prNumber) {
-              core.setFailed('PR-Agent runs only on pull request comments.');
+              core.setFailed('PR-Agent could not resolve a pull request number.');
               return;
             }
 
-            let command = null;
+            let command = automaticReview ? 'review' : null;
             let argument = '';
-            for (const name of ['/verify', '/review', '/describe', '/ask']) {
-              if (body.startsWith(name) && (body.length === name.length || /\s/.test(body[name.length]))) {
-                command = name.slice(1);
-                argument = body.slice(name.length).trim();
-                break;
+            if (!automaticReview) {
+              for (const name of ['/verify', '/review', '/describe', '/ask']) {
+                if (body.startsWith(name) && (body.length === name.length || /\s/.test(body[name.length]))) {
+                  command = name.slice(1);
+                  argument = body.slice(name.length).trim();
+                  break;
+                }
               }
             }
             if (!command) {
