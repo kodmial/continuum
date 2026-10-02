@@ -2373,12 +2373,12 @@ class ContinuumTest < Minitest::Test
     assert_match(/The `core` set's consumer-defined secrets are exactly the two in its rows/, doc,
                  'the doc must state the core count in terms of its own rows')
     refute_match(/core layer reads exactly two secrets/i, doc,
-                 'the doc must not claim the whole core layer reads two secrets: the four child workflows are installed by the parent set')
+                 'the doc must not claim the whole core layer reads two secrets: child execution workflows are installed by the parent set')
 
     # The exception that makes the narrower claim true has to be named, so a
     # reader can see which workflows the count excludes and why.
-    assert_match(/`continuum-consumer-child-\*`\s+workflows live in/, doc,
-                 'the doc must say where the child workflows live')
+    assert_match(/three live `continuum-consumer-child-\*` worker\/review workflows live in/, doc,
+                 'the doc must say where the live child workflows live')
     assert_match(/installed\s+only by the `parent` set/, doc,
                  'the doc must say the child workflows are installed only by the parent set')
   end
