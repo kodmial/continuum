@@ -208,7 +208,6 @@ jobs:
       OPENCODE_DISPATCH: ${{ inputs.opencode_dispatch || vars.CONTINUUM_OPENCODE_DISPATCH || 'comment' }}
       EXECUTION_LABEL_ROUTES: ${{ inputs.execution_label_routes || vars.CONTINUUM_EXECUTION_LABEL_ROUTES }}
       CHILD_DISPATCH_WORKFLOW: ${{ inputs.child_dispatch_workflow || vars.CONTINUUM_CHILD_DISPATCH_WORKFLOW }}
-      CHILD_REPOSITORIES: ${{ secrets.CHILD_RUNTIME_REPOSITORIES }}
       CHILD_WORKER_WORKFLOW: ${{ vars.CONTINUUM_CHILD_WORKER_WORKFLOW || 'continuum-child-worker.yml' }}
       CHILD_REVIEW_WORKFLOW: ${{ vars.CONTINUUM_CHILD_REVIEW_WORKFLOW || 'continuum-child-review.yml' }}
       CHILD_PR_REVIEW_WORKFLOW: ${{ vars.CONTINUUM_CHILD_PR_REVIEW_WORKFLOW || 'continuum-child-pr-review.yml' }}
@@ -245,7 +244,7 @@ jobs:
           set -euo pipefail
           export PYTHONPATH="$GITHUB_WORKSPACE/.continuum-engine/src"
           resolver="$GITHUB_WORKSPACE/.continuum-engine/.github/scripts/delegation_repository.sh"
-          plan="$(PARENT_CONFIG=.continuum.yml CHILD_REPOSITORIES="$CHILD_REPOSITORIES" bash "$resolver" plan)"
+          plan="$(PARENT_CONFIG=.continuum.yml CHILD_REPOSITORIES="" bash "$resolver" plan)"
 
           gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs?per_page=100" \
             --jq '.workflow_runs[]
@@ -303,7 +302,7 @@ jobs:
             child_id="$(jq -r '.id' <<<"$row")"
             child_repo="$(jq -r '.repository' <<<"$row")"
 
-            if ! PARENT_CONFIG=.continuum.yml CHILD_REPOSITORIES="$CHILD_REPOSITORIES" \
+            if ! PARENT_CONFIG=.continuum.yml CHILD_REPOSITORIES="" \
               bash "$resolver" verify "$child_id" "$child_repo" >/dev/null 2>&1; then
               echo "::error::Child '$child_id' relationship verification failed."
               invalid=$((invalid + 1))
