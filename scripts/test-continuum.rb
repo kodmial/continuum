@@ -266,7 +266,7 @@ class ContinuumTest < Minitest::Test
   end
 
   def test_workflow_run_dependencies_exist
-    names = STUBS.map { |path| yaml(path).fetch('name') }
+    names = ALL_STUBS.map { |path| yaml(path).fetch('name') }
     each_pair do |caller, _|
       events(caller).fetch('workflow_run', {}).fetch('workflows', []).each do |name|
         assert_includes names, name
@@ -807,11 +807,11 @@ class ContinuumTest < Minitest::Test
           PARENT_STUBS.each { |stub| assert_includes installed, File.basename(stub) }
         end
       end
-      # Each set adds exactly its own files: 14 core, +5 tech, +4 parent.
+      # Each set adds exactly its own files: 15 core, +5 tech, +3 parent.
       assert_equal CORE_STUBS.size, counts['core']
       assert_equal CORE_STUBS.size + TECH_STUBS.size, counts['tech']
       assert_equal ALL_STUBS.size, counts['parent']
-      assert_equal 24, ALL_STUBS.size,
+      assert_equal 23, ALL_STUBS.size,
                    'every caller Continuum ships, across all three layers'
     end
   end
@@ -1144,17 +1144,19 @@ class ContinuumTest < Minitest::Test
   # `continuum-tech-<tech>-*` stubs in `.github/caller-stubs/tech/`; `parent`
   # the child-execution stubs in `.github/caller-stubs/parent/`.
   #
-  # A core workflow with no stub is legitimate in exactly two cases, both
-  # named here so a third one fails instead of passing unnoticed: the four
-  # child-execution callees, which the `parent` set installs, and
+  # A core workflow with no stub is legitimate only when it is named below:
+  # the three child-execution callees installed by the `parent` set, the
+  # legacy child-dispatcher compatibility callee kept for stale callers, and
   # Continuum's own CI, which is not a caller at all.
   CORE_CALLEE_WORKFLOWS = %w[
-    continuum-consumer-child-dispatcher.yml
     continuum-consumer-child-pr-review.yml
     continuum-consumer-child-review.yml
     continuum-consumer-child-worker.yml
   ].freeze
-  REPO_OWNED_WORKFLOWS = %w[continuum-validate-continuum.yml].freeze
+  REPO_OWNED_WORKFLOWS = %w[
+    continuum-consumer-child-dispatcher.yml
+    continuum-validate-continuum.yml
+  ].freeze
 
   # The number of callers Continuum ships in the `tech` and `parent` layers,
   # stated as literals for the same reason as `CORE_COUNT` below.
@@ -1169,7 +1171,7 @@ class ContinuumTest < Minitest::Test
   # it compares the two trees against each other by name, so adding a
   # technology still needs no edit — only changing the *size* of a layer does.
   TECH_COUNT = 5
-  PARENT_COUNT = 4
+  PARENT_COUNT = 3
 
   # The same `tech_name?` rule as the instance helper, hoisted so the constant
   # table above can use it. A tech name has a `tech` segment plus at least two
@@ -1243,10 +1245,10 @@ class ContinuumTest < Minitest::Test
     stubs.each do |path|
       refute_nil stub_callee_name(path), "#{File.basename(path)}: no reusable-workflow `uses:` found"
     end
-    # The four callees are reached through the `parent` layer, and only through
-    # it: a `core` install must not be enough to satisfy them, or a consumer
-    # that skipped the parent set would have callers pointing at workflows it
-    # never installed.
+    # The three live child-execution callees are reached through the `parent`
+    # layer, and only through it. The old dispatcher callee is intentionally
+    # uncalled: it exists only so an already-installed stale caller resolves to
+    # a harmless compatibility workflow instead of a 404.
     parent_called = PARENT_STUBS.map { |path| stub_callee_name(path) }.compact
     assert_equal CORE_CALLEE_WORKFLOWS.sort, parent_called.sort,
                  'the child-execution callees must be exactly the workflows the parent layer calls'
@@ -1648,19 +1650,18 @@ class ContinuumTest < Minitest::Test
     assert_includes body, 'STRATEGY_BLOCK'
   end
 
-  # The parent/child workflows were parameterised in the same change as the
-  # scheduler. They are the propagation edge, so a hardcoded label reappearing
-  # in either file must fail here the same way it would fail in the scheduler.
+  # The unified scheduler and child review must share the configured labels.
+  # A parent clears stale child pauses in the same scheduler that selects local
+  # and delegated tasks, so a hardcoded label would split the one queue.
   def test_parent_child_workflows_use_the_configured_labels
-    dispatcher = workflow_body('continuum-consumer-child-dispatcher.yml')
-    assert_includes dispatcher, "AUTOMATION_PAUSE_LABEL: ${{ vars.AUTOMATION_PAUSE_LABEL || 'automation:paused' }}"
-    refute_match(/labels\/automation%3Apaused/, dispatcher,
-                 'dispatcher must not hardcode the default pause label in a request URL')
-    # The knob has to reach the actual label write, not only the env block.
-    assert_match(%r{\$\{AUTOMATION_PAUSE_LABEL//:/%3A\}}, dispatcher,
-                 'dispatcher must use the configured pause label in the label URL')
-    assert_match(/--arg pause "\$AUTOMATION_PAUSE_LABEL"/, dispatcher,
-                 'dispatcher must select stale pause labels by the configured label')
+    scheduler = workflow_body('continuum-issue-scheduler.yml')
+    assert_includes scheduler, "PAUSE_LABEL: ${{ inputs.pause_marker || vars.AUTOMATION_PAUSE_LABEL || 'automation:paused' }}"
+    refute_match(/labels\/automation%3Apaused/, scheduler,
+                 'scheduler must not hardcode the default pause label in a request URL')
+    assert_match(%r{\$\{PAUSE_LABEL//:/%3A\}}, scheduler,
+                 'scheduler must use the configured pause label for delegated children')
+    assert_match(/--arg pause "\$PAUSE_LABEL"/, scheduler,
+                 'scheduler must select stale child pause labels by the configured label')
 
     review = workflow_body('continuum-consumer-child-review.yml')
     assert_includes review, "AUTOMATION_IN_PROGRESS_LABEL: ${{ vars.AUTOMATION_IN_PROGRESS_LABEL || 'automation:in-progress' }}"
@@ -2914,22 +2915,28 @@ class ContinuumTest < Minitest::Test
     assert_includes inputs.fetch('legacy_child_owned_marker').fetch('description'), 'Deprecated'
   end
 
-  # The parent owns every open issue in a verified child. Priority labels only
-  # sort the queue; neither priorities nor historical body markers gate
-  # admission. Manual local OpenCode remains an explicit override.
-  def test_child_dispatcher_routes_all_open_issues_and_respects_local_override
-    dispatcher = workflow_body('continuum-consumer-child-dispatcher.yml')
+  # A parent has one scheduling queue. Local issues and verified child issues
+  # are both ranked by the same P0/P1/P2/no-priority order and consume the same
+  # WIP limit; the standalone child dispatcher is disabled for parent role.
+  def test_issue_scheduler_unifies_parent_and_child_priority_queue
+    scheduler = workflow_body('continuum-issue-scheduler.yml')
 
-    refute_includes dispatcher, 'for priority in priority:p0 priority:p1 priority:p2'
-    refute_includes dispatcher, 'contains("<!-- continuum-child-owned -->")'
-    refute_includes dispatcher, 'contains("<!-- runtime-worker-owned -->")'
-    assert_includes dispatcher, 'sort_by(._continuum_priority_rank, .number)'
-    assert_includes dispatcher, 'else 3'
-    assert_includes dispatcher, 'local_opencode_pr_tasks'
-    assert_includes dispatcher, 'local_opencode_run_tasks'
-    assert_includes dispatcher, 'local_override_active "$task_number"'
-    assert_includes dispatcher, 'COMMAND_GRACE_MINUTES: ${{ vars.AUTOMATION_COMMAND_GRACE_MINUTES || \'5\' }}'
-    assert_includes dispatcher, 'select(.pull_request == null)'
+    assert_includes scheduler, 'Build delegated child queue'
+    assert_includes scheduler, 'for (const child of childCandidates) {'
+    assert_includes scheduler, "candidates.push({ source: 'local', issue, priority, rank });"
+    assert_includes scheduler, "source: 'child'"
+    assert_includes scheduler, 'a.rank - b.rank'
+    assert_includes scheduler, 'const totalActiveWip = activeIssueNumbers.size + childActiveWip;'
+    assert_includes scheduler, 'await dispatchWorkflow(childWorkerWorkflow, {'
+    assert_includes scheduler, 'local_opencode_pr_tasks'
+    assert_includes scheduler, 'local_opencode_run_tasks'
+    assert_includes scheduler, 'local_override_active "$task_number"'
+    assert_includes scheduler, 'sort_by(._rank, .number)'
+    assert_includes scheduler, 'else 3'
+
+    legacy = yaml(File.join(ROOT, '.github/workflows', 'continuum-consumer-child-dispatcher.yml'))
+    assert_equal "vars.CONTINUUM_ROLE != 'parent'",
+                 legacy.fetch('jobs').fetch('dispatch').fetch('if')
   end
 
   # A manual owner `/oc` is real in-flight work: reserve it at once, and keep a
