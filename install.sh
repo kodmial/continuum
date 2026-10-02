@@ -62,6 +62,7 @@ CORE_STUBS=(
   continuum-pr-agent.yml
   continuum-remove-review-label.yml
   continuum-render-executor.yml
+  continuum-validation.yml
 )
 TECH_STUBS=(
   continuum-tech-swift-ci.yml
