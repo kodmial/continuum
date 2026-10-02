@@ -1,7 +1,7 @@
 # Optional consumer-neutral Swift profile over the generic validation contract.
 # Product packaging, signing and release policy belong to the consumer.
 
-name: Swift CI profile
+name: Swift CI
 
 on:
   workflow_call:
