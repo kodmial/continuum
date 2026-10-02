@@ -136,6 +136,13 @@ on:
         required: false
         type: string
         default: ''
+      timeout_minutes:
+        description: >-
+          Maximum OpenCode job runtime in minutes. Empty falls back to
+          AUTOMATION_OPENCODE_TIMEOUT_MINUTES, then 180.
+        required: false
+        type: string
+        default: ''
       continuum_ref:
         description: Continuum revision supplying fallback scripts
         type: string
@@ -298,7 +305,7 @@ jobs:
     runs-on: ${{ vars.AUTOMATION_OPENCODE_RUNNER || 'ubuntu-latest' }}
     # Execution environment is a consumer decision. Core defaults to Linux;
     # consumers select another runner and prepare its toolchain explicitly.
-    timeout-minutes: ${{ fromJSON(vars.AUTOMATION_OPENCODE_TIMEOUT_MINUTES || '180') }}
+    timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || vars.AUTOMATION_OPENCODE_TIMEOUT_MINUTES || '180') }}
 
     permissions:
       actions: read
