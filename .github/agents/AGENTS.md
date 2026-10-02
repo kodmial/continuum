@@ -55,6 +55,15 @@ repository decides what the work must satisfy.
   rewrite it to operate entirely inside the worktree and carry on. Do not retry
   the blocked path.
 
+## Automation comments
+
+- Never write the literal text `/oc`, `/opencode`, or `/oc-cancel` in an issue
+  comment, PR comment, or commit message unless the task explicitly requires
+  posting that command. Name the trigger in words ("the manual OpenCode
+  command") instead. An exact command line is admitted as a fresh
+  implementation request, so an explanatory comment that repeats the token
+  re-triggers automation against its own report and chains self-trigger runs.
+
 ## External facts
 
 - When a change depends on current provider, API, platform, or tooling

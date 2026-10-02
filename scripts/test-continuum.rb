@@ -3136,6 +3136,104 @@ class ContinuumTest < Minitest::Test
     assert_includes gate, "contains(github.event.comment.body, '/oc')"
   end
 
+  # Issue #170: the exact manual-command rule lives in one shared module, and
+  # the workflow-facing CLI delegates to it. An `if: contains(body, '/oc')`
+  # gate treats automation-authored prose as a fresh command and chains
+  # self-trigger runs; the shared rule only admits the explicit forms.
+  def opencode_command(*args)
+    script = File.join(ROOT, '.github/scripts/opencode_command.py')
+    # Never leave bytecode behind: `test_core_workflows_expose_no_product_paths`
+    # scans `src/**` as text, and a `__pycache__` directory breaks that scan.
+    output, status = Open3.capture2e(
+      { 'PYTHONDONTWRITEBYTECODE' => '1' }, 'python3', script, *args
+    )
+    assert status.success?, "opencode_command.py #{args.first} failed: #{output}"
+    output.strip
+  end
+
+  def test_manual_opencode_command_rule_is_shared_between_module_and_cli
+    helper = File.join(ROOT, '.github/scripts/opencode_command.py')
+    assert File.executable?(helper), 'the command gate must stay directly executable'
+    source = File.read(helper)
+    assert_includes source, 'from continuum.opencode_commands import',
+                    'the CLI must delegate to the canonical parser, not reimplement it'
+    assert_includes source, 'classify_issue_comment'
+
+    engine = File.read(File.join(ROOT, 'src/continuum/opencode_commands.py'))
+    assert_includes engine, "IMPLEMENT_COMMANDS = (\"/oc\", \"/opencode\")"
+    assert_includes engine, "CANCEL_COMMAND = \"/oc-cancel\""
+    assert_includes engine, 'def classify_issue_comment'
+    assert_includes engine, 'def is_owner_command'
+  end
+
+  def test_opencode_command_gate_recognizes_only_exact_manual_forms
+    assert_equal 'run', opencode_command('classify', '--body', '/oc')
+    assert_equal 'run', opencode_command('classify', '--body', '/opencode')
+    assert_equal 'run', opencode_command('classify', '--body', "  /oc  \n")
+    assert_equal 'cancel', opencode_command('classify', '--body', '/oc-cancel')
+    assert_equal 'cancel', opencode_command('classify', '--body', "  /oc-cancel  ")
+    assert_equal 'true', opencode_command('is-manual', '--body', '/oc')
+    assert_equal 'true', opencode_command('is-cancel', '--body', '/oc-cancel')
+    assert_equal 'false', opencode_command('is-manual', '--body', '/oc-cancel')
+  end
+
+  def test_opencode_command_gate_rejects_incidental_prose_and_examples
+    [
+      'Please run /oc for me',
+      'The /opencode command failed again',
+      '`/oc`',
+      'Use `/oc` to trigger',
+      '> /oc',
+      "```\n/oc\n```",
+      '    /oc',
+      "Some explanation first.\n/oc",
+      '/oc please hurry',
+      '/octopus'
+    ].each do |body|
+      assert_equal 'ignore', opencode_command('classify', '--body', body),
+                   "prose must never qualify as a command: #{body.inspect}"
+    end
+  end
+
+  def test_opencode_command_gate_preserves_intended_automation_commands
+    dispatch = "/oc\n\n<!-- issue-scheduler-dispatch -->\nAutomatically dispatched."
+    recovery = "/oc\n\n<!-- opencode-watchdog-retry -->\nAutomatic recovery retry 1/1."
+    pause = "OpenCode automation paused.\n\nRemove the `automation:paused` label and post `/oc` to retry manually."
+    prose = 'OpenCode run 37008882116 completed with no PR; the /oc token was mentioned while explaining why.'
+
+    assert_equal 'run', opencode_command('classify', '--body', dispatch)
+    assert_equal 'run', opencode_command('classify', '--body', recovery)
+    assert_equal 'true', opencode_command('is-scheduler-dispatch', '--body', dispatch)
+    assert_equal 'true', opencode_command('is-watchdog-recovery', '--body', recovery)
+    assert_equal 'ignore', opencode_command('classify', '--body', pause)
+    assert_equal 'ignore', opencode_command('classify', '--body', prose)
+  end
+
+  def test_opencode_command_conversation_dispatches_exactly_once
+    bodies = [
+      "/oc\n\n<!-- issue-scheduler-dispatch -->\nAutomatically dispatched.",
+      'OpenCode run 37008882116 completed with no PR. The /oc token was mentioned while explaining why.',
+      'Automation produced no code changes; mentioning /opencode here must not relaunch anything.',
+      "Remove the `automation:paused` label and post `/oc` to retry manually."
+    ]
+    results = bodies.map { |body| opencode_command('classify', '--body', body) }
+    assert_equal %w[run ignore ignore ignore], results
+    assert_equal 1, results.count('run'),
+                 'the live Work Lock sequence must launch exactly one run'
+  end
+
+  def test_opencode_command_gate_keeps_owner_authorization
+    assert_equal 'true',
+                 opencode_command('is-owner-command', '--body', '/oc',
+                                  '--author', 'octocat', '--owner', 'octocat')
+    assert_equal 'false',
+                 opencode_command('is-owner-command', '--body', '/oc',
+                                  '--author', 'stranger', '--owner', 'octocat')
+    assert_equal 'false',
+                 opencode_command('is-owner-command', '--body', 'prose /oc prose',
+                                  '--author', 'octocat', '--owner', 'octocat')
+  end
+
   def test_empty_vars_resolve_to_the_same_scheduler_defaults
     scheduler = workflow_body('continuum-issue-scheduler.yml')
     {
