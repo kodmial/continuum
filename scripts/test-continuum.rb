@@ -97,8 +97,10 @@ class ContinuumTest < Minitest::Test
 
   def dispatch_calls(name)
     lines = workflow_body(name).lines
-    lines.each_index.select { |index| lines[index].include?('/dispatches') }
-         .map { |index| lines[[index - 2, 0].max, 12].join }
+    lines.each_index.select do |index|
+      lines[index].include?('/dispatches') ||
+        lines[index].include?('createWorkflowDispatch')
+    end.map { |index| lines[[index - 2, 0].max, 16].join }
   end
 
   def all_dispatch_calls
@@ -1803,7 +1805,7 @@ class ContinuumTest < Minitest::Test
       calls = dispatch_calls(name)
       refute_empty calls, "#{name} no longer performs a /dispatches call — the dispatch is a green no-op"
       calls.each do |call|
-        assert_match(/--method POST|['"]POST \/repos|method:\s*'POST'/, call, "#{name}: dispatch call is not a POST")
+        assert_match(/--method POST|['"]POST \/repos|method:\s*'POST'|createWorkflowDispatch/, call, "#{name}: dispatch call is not a POST/action dispatch")
       end
     end
   end
@@ -3810,7 +3812,9 @@ class ContinuumTest < Minitest::Test
 
     # Both launch sites must consult it.
     assert_includes body[run_at, issue_at], "steps.duplicate_guard.outputs.skip != 'true'"
-    assert_includes body[issue_at, 400], "steps.duplicate_guard.outputs.skip != 'true'"
+    issue_step = step_body(body, 'Implement issue')
+    refute_nil issue_step
+    assert_includes issue_step, "steps.duplicate_guard.outputs.skip != 'true'"
   end
 
   # Coordinator item 3: run-name. The watchdog and the scheduler both find a
