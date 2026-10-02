@@ -65,9 +65,11 @@ the installer writes each stub's stored name verbatim — it adds no prefix of
 its own. The technology library uses the longer
 `continuum-tech-<tech>-<name>.yml` name, where the `continuum-tech-<tech>-`
 prefix marks the opt-in layer. Project-owned workflow entry points are outside that ownership namespace.
-In this repository, `ci.yml`, `opencode.yml`, and `automation.yml` are the minimal
-self-dogfood ingress and intentionally have no `continuum-` prefix; they call
-the same reusable engines consumers use.
+In this repository, `.github/workflows/ci.yml`, `.github/workflows/opencode.yml`,
+and `.github/workflows/automation.yml` are project-owned entry workflows forming
+the minimal self-dogfooding ingress; they deliberately carry no `continuum-`
+prefix and call the same reusable `continuum-*.yml` engines external consumers
+use. External consumer integration and caller stubs are unchanged.
 
 ## Install
 
