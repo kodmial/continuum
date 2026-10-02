@@ -110,6 +110,10 @@ on:
         description: "Packaging repair in-flight lock label"
         required: false
         type: string
+      timeout_minutes:
+        description: "Maximum OpenCode job runtime in minutes"
+        required: false
+        type: string
 
 permissions:
   actions: write
@@ -145,3 +149,4 @@ jobs:
       pause_on_failure: "${{ inputs.pause_on_failure }}"
       ci_repair_label: "${{ inputs.ci_repair_label }}"
       packaging_repair_label: "${{ inputs.packaging_repair_label }}"
+      timeout_minutes: "${{ inputs.timeout_minutes }}"
