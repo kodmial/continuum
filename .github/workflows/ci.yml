@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  actions: write
+  contents: read
+  pull-requests: read
+  statuses: write
+
+jobs:
+  validate:
+    uses: ./.github/workflows/continuum-validation.yml
+    secrets: inherit
+    with:
+      auto_detect: 'false'
+      dispatch_repair: 'false'
+      validation_command: |
+        ruby -E UTF-8 scripts/test-continuum.rb
+        mkdir -p .opencode-tmp
+        export TMPDIR="$PWD/.opencode-tmp"
+        PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests
+        PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s .github/scripts -p 'test_delegation_runtime.py'
+        mkdir -p .opencode-tmp/bin
+        GOBIN="$PWD/.opencode-tmp/bin" go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+        .opencode-tmp/bin/actionlint -shellcheck= -pyflakes= .github/workflows/*.yml .github/caller-stubs/*.yml .github/caller-stubs/tech/*.yml .github/caller-stubs/parent/*.yml
