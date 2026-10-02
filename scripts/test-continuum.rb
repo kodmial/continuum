@@ -3313,28 +3313,29 @@ class ContinuumTest < Minitest::Test
     assert_operator classifier, :<, dispatch,
                     'non-code review verdict must be classified before any OpenCode dispatch'
 
-    assert_includes job, "context: convergenceContext"
-    assert_includes job, "state: 'error'"
-    assert_includes job, "const convergenceContext = 'continuum/review-convergence';"
+    assert_includes job, 'continuum-coderabbit-no-progress head='
     assert_includes job, 'No OpenCode repair was dispatched for this unchanged HEAD.'
     assert_includes job, "if (reviewState === 'approved')"
-    assert_includes job, "state: 'success'",
-                    'a later same-head approval must clear the convergence blocker'
+    assert_includes job, 'any older no-progress marker is superseded.'
+    assert_includes job, 'github-token: ${{ github.token }}',
+                    'the classifier must stay within the existing caller permission contract'
   end
 
   # One exact HEAD plus one non-code blocker is a terminal no-progress state.
   # Both the global review queue and auto-merge reconciler must honour it rather
   # than repeatedly buying another CodeRabbit review of identical code.
-  def test_coderabbit_no_progress_status_stops_same_head_requeue
+  def test_coderabbit_no_progress_marker_stops_same_head_requeue
     retry_body = workflow_body('continuum-coderabbit-retry.yml')
     merge_body = auto_merge_body
 
-    assert_includes retry_body, "status.context === 'continuum/review-convergence'"
-    assert_includes retry_body, "if (convergenceStatus?.state === 'error')"
-    assert_includes retry_body, 'it is not eligible for automatic re-review until state changes.'
+    assert_includes retry_body, 'continuum-coderabbit-no-progress head='
+    assert_includes retry_body, "login === 'github-actions[bot]' || login === owner"
+    assert_includes retry_body, 'laterApproval'
+    assert_includes retry_body, 'it is not eligible for automatic re-review until the head changes or a later explicit approval supersedes the marker.'
 
-    assert_includes merge_body, "status.context === 'continuum/review-convergence'"
-    assert_includes merge_body, "reviewConvergenceStatus?.state === 'error'"
+    assert_includes merge_body, 'continuum-coderabbit-no-progress head='
+    assert_includes merge_body, 'codeRabbitNoProgressBlocked'
+    assert_includes merge_body, 'reviewNoProgressBlocked'
     assert_includes merge_body, 'automatic review/fix retries are suppressed.'
   end
 
