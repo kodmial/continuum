@@ -166,12 +166,20 @@ for f in "${STUBS[@]}"; do
   # third-party action, an `@branch-main` tag, a `run:` body — never matches.
   # `@main` with no space before a `#` is deliberately NOT rewritten: YAML
   # requires whitespace to open a comment, so `#` there is part of the ref.
-  # The ref is written as a double-quoted YAML scalar rather than a bare or
-  # single-quoted one.
-  printf '%s\n' "$template" | sed -E \
-    -e "s|^([[:space:]]*-?[[:space:]]*uses:[[:space:]]*[\"']?kodmial/continuum/\.github/workflows/[^@[:space:]\"']*)@main([\"']?)([[:space:]]+#.*)?([[:space:]]*)$|\1@$REF\2\3\4|" \
-    -e "s|^([[:space:]]*-?[[:space:]]*(continuum_ref\|engine_ref):[[:space:]]*)main([[:space:]]+#.*)?([[:space:]]*)$|\1\"$REF\"\3\4|" \
-    > "$DEST/.github/workflows/$f"
+  # `main` is the canonical stored form. Reinstalling the canonical ref must
+  # therefore write the template byte-for-byte; otherwise an update to the
+  # same revision creates representational drift in every consumer. Non-main
+  # refs are test/development overrides and are rewritten deliberately.
+  if [[ "$REF" == "main" ]]; then
+    printf '%s\n' "$template" > "$DEST/.github/workflows/$f"
+  else
+    # A non-main ref is written as a double-quoted YAML scalar rather than a
+    # bare or single-quoted one.
+    printf '%s\n' "$template" | sed -E \
+      -e "s|^([[:space:]]*-?[[:space:]]*uses:[[:space:]]*[\"']?kodmial/continuum/\.github/workflows/[^@[:space:]\"']*)@main([\"']?)([[:space:]]+#.*)?([[:space:]]*)$|\1@$REF\2\3\4|" \
+      -e "s|^([[:space:]]*-?[[:space:]]*(continuum_ref\|engine_ref):[[:space:]]*)main([[:space:]]+#.*)?([[:space:]]*)$|\1\"$REF\"\3\4|" \
+      > "$DEST/.github/workflows/$f"
+  fi
 done
 # Supersession: a renamed or dropped stub must not leave a stale caller behind
 # in the consumer, or the old file keeps running next to its replacement.
