@@ -19,6 +19,9 @@ class ContinuumTest < Minitest::Test
   # Transitional workflow_run aliases kept by the scheduler so already
   # installed parent callers using the pre-SubTask names still wake it.
   LEGACY_WORKFLOW_RUN_NAMES = ['Child task', 'Child review', 'Child PR review'].freeze
+  # Primary CI is deliberately project-owned. The shared validation workflow is
+  # an engine called by each consumer's ci.yml, not an install-managed caller.
+  PROJECT_OWNED_WORKFLOW_NAMES = ['CI'].freeze
 
   def yaml(path)
     YAML.load_file(path)
@@ -272,7 +275,7 @@ class ContinuumTest < Minitest::Test
     names = ALL_STUBS.map { |path| yaml(path).fetch('name') }
     each_pair do |caller, _|
       events(caller).fetch('workflow_run', {}).fetch('workflows', []).each do |name|
-        assert_includes names + LEGACY_WORKFLOW_RUN_NAMES, name
+        assert_includes names + PROJECT_OWNED_WORKFLOW_NAMES + LEGACY_WORKFLOW_RUN_NAMES, name
       end
     end
   end
@@ -785,7 +788,7 @@ class ContinuumTest < Minitest::Test
   # three sets are independent files in one directory, so a one-line edit to the
   # prune candidate list — or a future edit to `"${STUBS[@]}"` — could delete a
   # consumer's whole tech or parent layer with no warning. The growth
-  # 14 -> 19 -> 23 is the observable form of that guarantee.
+  # 14 -> 15 -> 18 is the observable form of that guarantee.
   def test_installing_one_set_does_not_delete_another_sets_callers
     fixture do |dir|
       target = File.join(dir, 'consumer')
@@ -810,11 +813,11 @@ class ContinuumTest < Minitest::Test
           PARENT_STUBS.each { |stub| assert_includes installed, File.basename(stub) }
         end
       end
-      # Each set adds exactly its own files: 15 core, +1 tech, +3 parent.
+      # Each set adds exactly its own files: 14 core, +1 tech, +3 parent.
       assert_equal CORE_STUBS.size, counts['core']
       assert_equal CORE_STUBS.size + TECH_STUBS.size, counts['tech']
       assert_equal ALL_STUBS.size, counts['parent']
-      assert_equal 19, ALL_STUBS.size,
+      assert_equal 18, ALL_STUBS.size,
                    'every caller Continuum ships, across all three layers'
     end
   end
@@ -905,6 +908,57 @@ class ContinuumTest < Minitest::Test
       refute_includes output, 'refusing to install'
       assert_equal CORE_COUNT, Dir[File.join(target, '.github/workflows/*.yml')].size
     end
+  end
+
+  def test_core_install_is_idempotent_and_preserves_project_owned_ci
+    fixture do |dir|
+      target = File.join(dir, 'consumer')
+      workflows = File.join(target, '.github/workflows')
+      FileUtils.mkdir_p(workflows)
+      project_ci = File.join(workflows, 'ci.yml')
+      project_body = <<~YAML
+        name: CI
+        on:
+          pull_request:
+        jobs:
+          call:
+            uses: kodmial/continuum/.github/workflows/continuum-validation.yml@main
+      YAML
+      File.write(project_ci, project_body)
+
+      env = { 'CONTINUUM_INSTALL_ASSUME_YES' => '1' }
+      first_output, first_status = Open3.capture2e(
+        env, 'bash', File.join(ROOT, 'install.sh'), target
+      )
+      assert first_status.success?, first_output
+      refute File.exist?(File.join(workflows, 'continuum-validation.yml')),
+             'core install must not create a second primary CI caller'
+      assert_equal project_body, File.read(project_ci),
+                   'install must not rewrite the project-owned CI entry point'
+
+      snapshot = Dir[File.join(workflows, '*.yml')].sort.to_h do |path|
+        [File.basename(path), File.binread(path)]
+      end
+      second_output, second_status = Open3.capture2e(
+        env, 'bash', File.join(ROOT, 'install.sh'), target
+      )
+      assert second_status.success?, second_output
+      second = Dir[File.join(workflows, '*.yml')].sort.to_h do |path|
+        [File.basename(path), File.binread(path)]
+      end
+
+      assert_equal snapshot, second,
+                   'running the same core install twice must produce the same workflow topology and bytes'
+      assert_equal 1, second.values.count { |body| body.match?(/^name:\s*CI\s*$/) },
+                   'a consumer must have exactly one primary workflow named CI'
+    end
+  end
+
+  def test_validation_is_shared_engine_not_core_caller
+    refute CORE_STUBS.any? { |path| File.basename(path) == 'continuum-validation.yml' },
+           'validation must be invoked from the project-owned ci.yml, not installed as a second CI'
+    assert File.file?(File.join(ROOT, '.github/workflows/continuum-validation.yml')),
+           'the shared validation engine itself must remain in Continuum'
   end
 
   # The documented installation is a pipe: `curl …/install.sh | bash -s`. Under a
@@ -1116,6 +1170,7 @@ class ContinuumTest < Minitest::Test
   ].freeze
   REPO_OWNED_WORKFLOWS = %w[
     continuum-consumer-child-dispatcher.yml
+    continuum-validation.yml
     continuum-validate-continuum.yml
   ].freeze
 
@@ -1150,12 +1205,13 @@ class ContinuumTest < Minitest::Test
   # count was taken from the workflow tree and then compared against the stub
   # tree, so adding a workflow and its stub together — exactly what a new
   # feature does — moved both sides and passed. A literal is the third,
-  # independent source: to ship a fifteenth core caller someone has to say so
+  # independent source: to change the fourteen core callers someone has to say so
   # here, which is where a reviewer sees it.
-  CORE_COUNT = 15
+  CORE_COUNT = 14
 
   # Every core workflow is either called by a stub in one of the three layers
-  # or is Continuum's own CI. A workflow nobody calls is a dead file that
+  # or is a repository-owned/shared engine intentionally invoked from a
+  # project-owned entry point. A workflow nobody calls is a dead file that
   # still costs a consumer a `continuum-*.yml` name.
   #
   # The callee is resolved from the stub's own `uses:` line rather than from
@@ -2560,8 +2616,7 @@ class ContinuumTest < Minitest::Test
     ],
     'continuum-opencode-unresolved.yml' => %w[continuum_ref],
     'continuum-pr-agent.yml' => %w[continuum_ref],
-    'continuum-remove-review-label.yml' => %w[continuum_ref],
-    'continuum-validation.yml' => %w[continuum_ref pr_number]
+    'continuum-remove-review-label.yml' => %w[continuum_ref]
   }.freeze
 
   # A stub that pins an input to a literal overrides the consumer's own
@@ -3598,18 +3653,19 @@ class ContinuumTest < Minitest::Test
     assert_equal '', inputs.fetch('repair_workflow').fetch('default')
 
     raw = workflow_body('continuum-validation.yml')
-    %w[Python Node Java Go Rust Docker].each { |stack| assert_includes raw, stack }
+    %w[Python Node PHP Java Go Rust Docker Bun].each { |stack| assert_includes raw, stack }
     assert_includes raw, 'createCommitStatus'
     assert_includes raw, 'createWorkflowDispatch'
     assert_includes raw, 'actions/upload-artifact@'
     assert_includes raw, 'eval "$command"'
     refute_match(/nanodictate|kodmai|runtime-lab/i, raw)
 
-    stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-validation.yml'))
-    call = stub.fetch('jobs').fetch('call')
-    assert_equal 'kodmial/continuum/.github/workflows/continuum-validation.yml@main', call.fetch('uses')
-    assert_equal '${{ inputs.pr_number }}', call.fetch('with').fetch('pr_number')
+    refute File.exist?(File.join(ROOT, '.github/caller-stubs/continuum-validation.yml')),
+           'validation is a shared engine; primary CI stays project-owned'
     assert_includes raw, "vars.CONTINUUM_RUNNER || 'ubuntu-latest'"
+    assert_includes raw, 'inputs.node_version || vars.CONTINUUM_NODE_VERSION'
+    assert_includes raw, 'inputs.php_version || vars.CONTINUUM_PHP_VERSION'
+    assert_includes raw, 'inputs.bun_version || vars.CONTINUUM_BUN_VERSION'
   end
 
 

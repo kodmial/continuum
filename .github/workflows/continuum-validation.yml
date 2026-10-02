@@ -48,6 +48,31 @@ on:
         required: false
         type: string
         default: ''
+      node_version:
+        description: Optional Node.js version setup; empty keeps the runner-provided Node
+        required: false
+        type: string
+        default: ''
+      php_version:
+        description: Optional PHP version setup; empty keeps the runner-provided PHP
+        required: false
+        type: string
+        default: ''
+      php_extensions:
+        description: Optional comma-separated PHP extensions when php_version is configured
+        required: false
+        type: string
+        default: ''
+      php_coverage:
+        description: Optional PHP coverage driver when php_version is configured
+        required: false
+        type: string
+        default: ''
+      bun_version:
+        description: Optional Bun version setup for consumer validation hooks
+        required: false
+        type: string
+        default: ''
       artifact_paths:
         description: Newline-separated paths uploaded after validation
         required: false
@@ -175,6 +200,7 @@ jobs:
           set -euo pipefail
           python=false
           node=false
+          php=false
           java=false
           go=false
           rust=false
@@ -184,6 +210,9 @@ jobs:
             python=true
           fi
           [[ -f package.json ]] && node=true
+          if [[ -f composer.json || -f artisan ]] ||              find . -type f -name '*.php' -not -path './.git/*' -not -path './vendor/*' | grep -q .; then
+            php=true
+          fi
           if [[ -f pom.xml || -f mvnw || -f build.gradle || -f build.gradle.kts || -f gradlew ]]; then
             java=true
           fi
@@ -193,18 +222,40 @@ jobs:
           {
             echo "python=$python"
             echo "node=$node"
+            echo "php=$php"
             echo "java=$java"
             echo "go=$go"
             echo "rust=$rust"
           } >> "$GITHUB_OUTPUT"
 
-          echo "Detected: python=$python node=$node java=$java go=$go rust=$rust"
+          echo "Detected: python=$python node=$node php=$php java=$java go=$go rust=$rust"
 
       - name: Set up Python
         if: fromJSON(inputs.auto_detect || vars.CONTINUUM_AUTO_DETECT || 'true') && steps.stack.outputs.python == 'true'
         uses: actions/setup-python@82c7e631bb3cdc910f68e0081d67478d79c6982d # v5
         with:
           python-version: '3.12'
+
+      - name: Set up Node.js
+        if: (inputs.node_version || vars.CONTINUUM_NODE_VERSION) != ''
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ inputs.node_version || vars.CONTINUUM_NODE_VERSION }}
+
+      - name: Set up PHP
+        if: (inputs.php_version || vars.CONTINUUM_PHP_VERSION) != ''
+        uses: shivammathur/setup-php@bf6b4fbd49ca58e4608c9c89fba0b8d90bd2a39f # v2
+        with:
+          php-version: ${{ inputs.php_version || vars.CONTINUUM_PHP_VERSION }}
+          extensions: ${{ inputs.php_extensions || vars.CONTINUUM_PHP_EXTENSIONS }}
+          tools: composer
+          coverage: ${{ inputs.php_coverage || vars.CONTINUUM_PHP_COVERAGE || 'none' }}
+
+      - name: Set up Bun
+        if: (inputs.bun_version || vars.CONTINUUM_BUN_VERSION) != ''
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: ${{ inputs.bun_version || vars.CONTINUUM_BUN_VERSION }}
 
       - name: Run validation contract
         id: checks
@@ -213,6 +264,7 @@ jobs:
           AUTO_DETECT: ${{ inputs.auto_detect || vars.CONTINUUM_AUTO_DETECT || 'true' }}
           STACK_PYTHON: ${{ steps.stack.outputs.python }}
           STACK_NODE: ${{ steps.stack.outputs.node }}
+          STACK_PHP: ${{ steps.stack.outputs.php }}
           STACK_JAVA: ${{ steps.stack.outputs.java }}
           STACK_GO: ${{ steps.stack.outputs.go }}
           STACK_RUST: ${{ steps.stack.outputs.rust }}
@@ -263,6 +315,24 @@ jobs:
               if [[ -f package-lock.json ]]; then npm ci; else npm install; fi
               npm test --if-present
               npm run build --if-present
+              echo "::endgroup::"
+            fi
+
+            if [[ "$STACK_PHP" == "true" ]]; then
+              ran=true
+              echo "::group::PHP"
+              php --version
+              composer --version
+              if [[ -f composer.lock ]]; then
+                composer install --prefer-dist --no-interaction --no-progress
+              elif [[ -f composer.json ]]; then
+                composer install --prefer-dist --no-interaction --no-progress
+              fi
+              if [[ -x vendor/bin/phpunit ]]; then
+                vendor/bin/phpunit
+              else
+                echo "No PHPUnit binary detected."
+              fi
               echo "::endgroup::"
             fi
 

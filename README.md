@@ -22,11 +22,16 @@ engine.
 
 ## Reuse model
 
-- Every reusable workflow is `on: workflow_call`; the same file name is reused by
-  its caller stub.
+- Reusable engines are `on: workflow_call`. Lifecycle engines that need a
+  consumer trigger have install-managed caller stubs; shared capability engines
+  such as validation may be called directly from a project-owned entry point.
 - Every installed caller carries the **`continuum-` prefix**. In a consumer
   repository, a `continuum-*.yml` file is Continuum-owned and is never hand-edited
   there; any other workflow belongs to the project.
+- The consumer's primary `.github/workflows/ci.yml` is **project-owned** and is
+  the only primary workflow named `CI`. It calls the shared
+  `continuum-validation.yml` engine and supplies project-specific hooks/tooling.
+  The core installer never creates a second CI workflow.
 - Controllers and `workflow_run` triggers match on workflow `name:` values, so
   names are part of the interface and stay stable.
 - Callers pin a revision. `install.sh` rewrites the `@main` in `uses:` and the
@@ -87,13 +92,33 @@ pinning.
 
 | Set | Installs |
 | --- | --- |
-| `core` (default) | 15 callers covering OpenCode, issue scheduling, validation, qualification, CodeRabbit, PR Agent, and auto-merge. |
+| `core` (default) | 14 callers covering OpenCode, issue scheduling, qualification, CodeRabbit, PR Agent, and auto-merge. Validation is a shared engine called by the project-owned `ci.yml`, not a second installed CI caller. |
 | `tech` | 1 caller: the optional consumer-neutral Swift CI profile. |
 | `parent` | 3 callers: `continuum-child-worker.yml`, `continuum-child-review.yml`, `continuum-child-pr-review.yml`. The ordinary core `Issue scheduler` owns parent/child dispatch. |
 
 The `parent` and `tech` sets add **only** their own callers; each preserves
-the consumer's own CI, release, and scheduling workflows. Any value other than
-`core`, `tech`, or `parent` is rejected.
+the consumer's own CI, release, and scheduling workflows. The `core` set also
+preserves `ci.yml`: validation is integrated by making that project-owned CI a
+thin caller of `kodmial/continuum/.github/workflows/continuum-validation.yml@main`.
+Any value other than `core`, `tech`, or `parent` is rejected.
+
+### CI ownership
+
+Do not hand-edit an installed `continuum-*.yml` caller. If a consumer needs a
+project-specific trigger, toolchain setup, or hook, keep that behavior in a
+project-owned file (for example `ci.yml`, `nanodictate-packaging-repair.yml`)
+and call the reusable Continuum engine from there.
+
+The primary CI contract is intentionally asymmetric:
+
+1. the consumer owns exactly one `ci.yml` / workflow named `CI`;
+2. that workflow calls the reusable `continuum-validation.yml@main` engine;
+3. project-specific commands/tool versions are inputs or repository variables;
+4. `install.sh` owns only the `continuum-*.yml` caller set and never creates
+   another primary CI.
+
+This makes a repeated core install idempotent: the installer converges its own
+callers without replacing the consumer's CI or duplicating its triggers.
 
 ## Upgrading
 
