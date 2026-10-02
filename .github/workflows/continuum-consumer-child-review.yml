@@ -43,7 +43,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     concurrency:
-      group: continuum-child-review-${{ inputs.child_id }}-${{ inputs.task_number }}
+      group: continuum-subtask-review-${{ inputs.task_number }}
       cancel-in-progress: false
     env:
       GH_TOKEN: ${{ secrets.CHILD_RUNTIME_TOKEN }}
@@ -159,7 +159,7 @@ jobs:
           base_sync_rc=$?
           set -e
           if [[ "$base_sync_rc" -ne 0 ]]; then
-            echo "Child review [$CHILD_ID] #$TASK_NUMBER detected base conflicts; review will repair them."
+            echo "SubTask review #$TASK_NUMBER detected base conflicts; review will repair them."
           fi
 
           validation_log="$RUNNER_TEMP/continuum-child-validation.log"
@@ -277,15 +277,15 @@ jobs:
               set -e
               if [[ "$validation_rc" -eq 0 ]]; then
                 if git diff --name-only --diff-filter=U | grep -q .; then
-                  echo "Child review [$CHILD_ID] #$TASK_NUMBER still has unresolved base conflicts; continuing repair."
+                  echo "SubTask review #$TASK_NUMBER still has unresolved base conflicts; continuing repair."
                 else
                   accepted=true
                   break
                 fi
               fi
-              echo "Child review [$CHILD_ID] #$TASK_NUMBER validation gate failed after pass $pass; continuing repair."
+              echo "SubTask review #$TASK_NUMBER validation gate failed after pass $pass; continuing repair."
             else
-              echo "Child review [$CHILD_ID] #$TASK_NUMBER pass $pass incomplete (agent rc=$rc); continuing."
+              echo "SubTask review #$TASK_NUMBER pass $pass incomplete (agent rc=$rc); continuing."
             fi
           done
 
@@ -348,7 +348,7 @@ jobs:
             gh issue comment "$TASK_NUMBER" --repo "$child_repo" \
               --body "<!-- continuum-child-review-merge-retry --> Child task #$TASK_NUMBER passed review, but the PR could not be merged in this cycle. The PR remains/reopens for automatic delegated retry; this is not a terminal task pause." \
               >/dev/null 2>&1 || true
-            echo "Child task [$CHILD_ID] #$TASK_NUMBER merge deferred for automatic retry."
+            echo "SubTask #$TASK_NUMBER merge deferred for automatic retry."
             exit 0
           fi
 
@@ -382,4 +382,4 @@ jobs:
           done
 
           gh issue comment "$TASK_NUMBER" --repo "$child_repo"             --body "<!-- continuum-child-review-merged --> Child task #$TASK_NUMBER passed delegated review and its PR was merged."             >/dev/null 2>&1 || true
-          echo "Child task [$CHILD_ID] #$TASK_NUMBER reviewed, merged, and closed."
+          echo "SubTask #$TASK_NUMBER reviewed, merged, and closed."
