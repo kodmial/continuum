@@ -76,22 +76,46 @@ jobs:
       github.event_name == 'pull_request_review' ||
       github.event_name == 'status' ||
       github.event_name == 'push' ||
-      (github.event_name == 'issue_comment' &&
-       github.event.issue.pull_request != null &&
-       github.actor == github.repository_owner &&
-       github.event.comment.body == '/work-lock-19-review-gate') ||
       (github.event_name == 'schedule' && github.event.schedule == '17,47 * * * *') ||
       (github.event_name == 'workflow_run' && github.event.workflow_run.name == 'CI')
     uses: ./.github/workflows/continuum-auto-merge.yml
     secrets: inherit
     with:
       continuum_ref: main
-      # Temporary Work Lock #19 live-verification ingress. Only the exact
-      # owner command on a PR turns on the existing shared CodeRabbit gate;
-      # normal self-dogfood events keep the repository's configured default.
-      require_coderabbit: >-
-        ${{ github.event_name == 'issue_comment' &&
-            github.event.issue.pull_request != null &&
-            github.actor == github.repository_owner &&
-            github.event.comment.body == '/work-lock-19-review-gate' &&
-            'true' || '' }}
+
+  # Temporary Work Lock #19 verification harness. It exists only to create a
+  # bot-authored disposable PR so the repository owner can submit a real GitHub
+  # approval. It is removed after the live review/merge proof is recorded.
+  work-lock-19-create-review-canary:
+    if: >-
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request == null &&
+      github.actor == github.repository_owner &&
+      github.event.comment.body == '/work-lock-19-create-review-canary'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Create bot-authored review canary PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CONTROL_ISSUE: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          BRANCH="work-lock-19-review-canary-${GITHUB_RUN_ID}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$BRANCH"
+          cat > docs/work-lock-19-bot-review-canary.md <<'EOF'
+          # Work Lock 19 bot-authored review canary
+
+          Temporary verification artifact used to prove that a real GitHub approval gates Continuum auto-merge.
+          EOF
+          git add docs/work-lock-19-bot-review-canary.md
+          git commit -m "test: add bot-authored review canary"
+          git push -u origin "$BRANCH"
+          PR_URL="$(gh pr create --base main --head "$BRANCH"             --title "test: bot-authored Work Lock 19 review canary"             --body "Controlled review-gate verification PR for Work Lock #19. This PR is created by github-actions[bot] so the repository owner can submit a real approval.")"
+          gh issue comment "$CONTROL_ISSUE" --body "Created bot-authored review canary: $PR_URL"
