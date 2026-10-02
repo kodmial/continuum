@@ -87,9 +87,9 @@ existing files.
 
 | Set | Installs |
 | --- | --- |
-| `core` (default) | 12 callers covering OpenCode, issue scheduling, CodeRabbit, PR Agent, and auto-merge. |
+| `core` (default) | 15 callers covering OpenCode, issue scheduling, validation, qualification, CodeRabbit, PR Agent, and auto-merge. |
 | `tech` | 5 callers in the opt-in technology library: CI, release, release PR, release-automation merge, and packaging smoke. |
-| `parent` | 4 callers: `continuum-child-dispatcher.yml`, `continuum-child-worker.yml`, `continuum-child-review.yml`, `continuum-child-pr-review.yml`. |
+| `parent` | 3 callers: `continuum-child-worker.yml`, `continuum-child-review.yml`, `continuum-child-pr-review.yml`. The ordinary core `Issue scheduler` owns parent/child dispatch. |
 
 The `parent` and `tech` sets add **only** their own callers; each preserves
 the consumer's own CI, release, and scheduling workflows. Any value other than
@@ -180,7 +180,7 @@ Workflow names are identical to the reusable file names unless noted.
 | `continuum-coderabbit-retry.yml` | Retry CodeRabbit after a rate limit. | — |
 | `continuum-coderabbit-unresolved.yml` | Retry unresolved CodeRabbit findings. | — |
 | `continuum-bootstrap-runtime-secret.yml` | Fetch an Actions secrets public key for secret bootstrapping. | — |
-| `continuum-consumer-child-dispatcher.yml` | Parent scheduler for child tasks/reviews. | `worker_workflow`, `review_workflow`, `manual_pr_review_workflow`, `engine_ref` |
+| `continuum-consumer-child-dispatcher.yml` | Legacy compatibility callee for already-installed standalone dispatchers; parent-role runs are skipped. | `worker_workflow`, `review_workflow`, `manual_pr_review_workflow`, `engine_ref` |
 | `continuum-consumer-child-worker.yml` | Execute one delegated child task. | `child_id`, `task_number`, `model`, `max_agent_passes`, `python_version`, `engine_ref` |
 | `continuum-consumer-child-review.yml` | Independent review of a delegated child task. | `child_id`, `task_number`, `pr_number`, `model`, `max_review_passes`, `python_version`, `engine_ref` |
 | `continuum-consumer-child-pr-review.yml` | Independent review of a child pull request. | `child_id`, `pr_number`, `model`, `max_review_passes`, `python_version`, `engine_ref` |
@@ -250,15 +250,20 @@ bash install.sh /path/to/myapp <sha> tech
 ### Parent (delegation control plane, one example per child id)
 
 ```sh
+bash install.sh /path/to/parent-plane <sha> core
 bash install.sh /path/to/parent-plane <sha> parent
 ```
+
+The `core` install supplies the one ordinary `Issue scheduler`; the
+`parent` install adds only the child worker and review entry points.
 
 - Repository variables: `CONTINUUM_ROLE=parent`,
   `CONTINUUM_CHILDREN=["<child-id>", ...]` (a JSON array of opaque child ids).
 - Provide a runtime PAT secret with access to the child repositories and to their
   Actions variables.
-- The parent dispatcher wakes on main pushes, every ten minutes, manual dispatch,
-  and completion of child task/review workflows.
+- The ordinary `Issue scheduler` considers the parent's own issues and all
+  verified child issues in one priority queue and one WIP budget. It wakes on
+  its normal schedule/events and on completion of child task/review workflows.
 
 ### Child (a delegated repository, one id per child)
 
