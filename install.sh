@@ -141,6 +141,19 @@ fi
 # written straight to the destination, so a repository file name and the
 # consumer file name are always the same string and cannot drift apart.
 for f in "${STUBS[@]}"; do
+  # Canonical main installs are byte copies. Do not pass them through command
+  # substitution: POSIX shells strip trailing newlines from $(...), which would
+  # manufacture a diff even when the source and destination are the same
+  # canonical caller.
+  if [[ "$REF" == "main" ]]; then
+    if [[ $POSITIONAL -lt 2 && -f "$LOCAL_STUBS_DIR/$f" ]]; then
+      cat "$LOCAL_STUBS_DIR/$f" > "$DEST/.github/workflows/$f"
+    else
+      curl -fsSL "$BASE/$f" > "$DEST/.github/workflows/$f"
+    fi
+    continue
+  fi
+
   if [[ $POSITIONAL -lt 2 && -f "$LOCAL_STUBS_DIR/$f" ]]; then
     template="$(cat "$LOCAL_STUBS_DIR/$f")"
   else
@@ -166,8 +179,8 @@ for f in "${STUBS[@]}"; do
   # third-party action, an `@branch-main` tag, a `run:` body — never matches.
   # `@main` with no space before a `#` is deliberately NOT rewritten: YAML
   # requires whitespace to open a comment, so `#` there is part of the ref.
-  # The ref is written as a double-quoted YAML scalar rather than a bare or
-  # single-quoted one.
+  # Non-main refs are test/development overrides. The ref is written as a
+  # double-quoted YAML scalar rather than a bare or single-quoted one.
   printf '%s\n' "$template" | sed -E \
     -e "s|^([[:space:]]*-?[[:space:]]*uses:[[:space:]]*[\"']?kodmial/continuum/\.github/workflows/[^@[:space:]\"']*)@main([\"']?)([[:space:]]+#.*)?([[:space:]]*)$|\1@$REF\2\3\4|" \
     -e "s|^([[:space:]]*-?[[:space:]]*(continuum_ref\|engine_ref):[[:space:]]*)main([[:space:]]+#.*)?([[:space:]]*)$|\1\"$REF\"\3\4|" \
