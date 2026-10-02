@@ -1096,6 +1096,100 @@ class ContinuumTest < Minitest::Test
     end
   end
 
+  # Measured from the tree, never from a literal, so a stub added or dropped
+  # needs no test edit and cannot drift. The `core` set installs every stub
+  # directly under `.github/caller-stubs/` (task-domain layer); `tech` the
+  # `continuum-tech-<tech>-*` stubs in `.github/caller-stubs/tech/`; `parent`
+  # the child-execution stubs in `.github/caller-stubs/parent/`.
+  #
+  # A core workflow with no stub is legitimate only when it is named below:
+  # the three child-execution callees installed by the `parent` set, the
+  # legacy child-dispatcher compatibility callee kept for stale callers, and
+  # Continuum's own CI, which is not a caller at all.
+  CORE_CALLEE_WORKFLOWS = %w[
+    continuum-consumer-child-pr-review.yml
+    continuum-consumer-child-review.yml
+    continuum-consumer-child-worker.yml
+  ].freeze
+  REPO_OWNED_WORKFLOWS = %w[
+    continuum-consumer-child-dispatcher.yml
+    continuum-validate-continuum.yml
+  ].freeze
+
+  # The number of callers Continuum ships in the `tech` and `parent` layers,
+  # stated as literals for the same reason as `CORE_COUNT` below.
+  #
+  # These were once `TECH_STUBS.size` and `PARENT_STUBS.size`, which made every
+  # check that used them compare a value against itself: `assert_equal
+  # TECH_COUNT, <installed file count>` reduced to `<installed> == <installed>`
+  # and could not fail. A literal is the third, independent source, so shipping
+  # a sixth tech caller or a fifth parent caller has to be said out loud here,
+  # in the same file and in the same commit as the new stub, where a reviewer
+  # sees it. `assert_tech_layers_agree` remains the check that needs no literal:
+  # it compares the two trees against each other by name, so adding a
+  # technology still needs no edit — only changing the *size* of a layer does.
+  TECH_COUNT = 1
+  PARENT_COUNT = 3
+
+  # The same `tech_name?` rule as the instance helper, hoisted so the constant
+  # table above can use it. A tech name has a `tech` segment plus at least two
+  # further segments, so `continuum-tech-swift-release` counts and a bare
+  # `continuum-tech` does not.
+  def self.tech_name?(base)
+    segments = base.delete_suffix('.yml').split('-')
+    base.start_with?('continuum-') && segments[1] == 'tech' && segments.size >= 4
+  end
+
+  # The number of core callers Continuum ships, stated as a literal and not
+  # derived from either tree.
+  #
+  # Computing it from `WORKFLOWS` made the check that uses it circular: the
+  # count was taken from the workflow tree and then compared against the stub
+  # tree, so adding a workflow and its stub together — exactly what a new
+  # feature does — moved both sides and passed. A literal is the third,
+  # independent source: to ship a fifteenth core caller someone has to say so
+  # here, which is where a reviewer sees it.
+  CORE_COUNT = 15
+
+  # Every core workflow is either called by a stub in one of the three layers
+  # or is Continuum's own CI. A workflow nobody calls is a dead file that
+  # still costs a consumer a `continuum-*.yml` name.
+  #
+  # The callee is resolved from the stub's own `uses:` line rather than from
+  # the stub's file name: the parent layer installs `continuum-child-*.yml`
+  # while calling `continuum-consumer-child-*.yml`, and that difference is
+  # deliberate, not a mismatch to be papered over.
+  def stub_callee_name(stub_path)
+    yaml(stub_path).fetch('jobs').each_value do |job|
+      next unless job['uses']
+      match = job['uses'].match(%r{kodmial/continuum/\.github/workflows/([^@]+)@})
+      return match[1] if match
+    end
+    nil
+  end
+
+  # The repository secrets read by the workflows a given set of stubs installs.
+  #
+  # Both halves count: the stub itself, and the reusable workflow it calls. A
+  # stub reads a secret in order to forward it, so the credential a consumer
+  # must define for a set can be named only by the stub — the parent set reads
+  # `TAP_PAT` nowhere in its callees, only in the stubs that pass it on.
+  #
+  # Derived by walking stub -> callee -> `secrets.X`, never by hardcoding a name
+  # list on the test side. A guard that enumerates the names it checks is blind
+  # to a fifth secret: the new name simply is not in the pattern, so it is
+  # skipped silently and the guard reports green. Deriving the set from the code
+  # is what makes these checks fail when a secret is added, removed or moved
+  # between sets.
+  def secrets_read_by(stubs)
+    stubs.flat_map { |path| File.read(path) }
+         .concat(stubs.map { |path| stub_callee_name(path) }.compact
+                      .map { |callee| workflow_body(callee) })
+         .flat_map { |body| body.scan(/secrets\.([A-Z][A-Z0-9_]*)/).flatten }
+         .uniq
+         .sort
+  end
+
   def test_every_core_workflow_has_a_caller_or_is_repo_ci
     stubs = CORE_STUBS + TECH_STUBS + PARENT_STUBS
     called = stubs.map { |path| stub_callee_name(path) }.compact
