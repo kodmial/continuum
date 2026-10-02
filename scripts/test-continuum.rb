@@ -2092,9 +2092,9 @@ class ContinuumTest < Minitest::Test
       assert_equal "\${{ inputs.#{key} }}", with.fetch(key), "#{key} must be a bare passthrough"
     end
 
-    # The lock the dispatch path writes is the same one the pre-existing
-    # synchronize reset already clears, or a new head could not repair.
-    assert_includes body, 'for label in "$CI_REPAIR_LABEL" opencode-packaging-smoke-repair; do',
+    # The lock the dispatch path writes is the same configured lock the
+    # synchronize reset clears, or a new head could not repair.
+    assert_includes body, '"repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/$CI_REPAIR_LABEL"',
                     'the per-head reset must clear the configured lock, not a hardcoded one'
     # The workflow_run path keeps its looser `opencode/*` guard: tightening it
     # would stop repairing heads this controller repaired before.
