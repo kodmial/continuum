@@ -1,0 +1,50 @@
+name: SubTask run cleanup
+
+on:
+  workflow_call:
+    inputs:
+      run_id:
+        description: Completed public delegated workflow run id to delete
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Delete completed delegated run
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+        env:
+          RUN_ID: ${{ inputs.run_id }}
+        with:
+          script: |
+            const runId = Number(process.env.RUN_ID);
+            if (!Number.isInteger(runId) || runId <= 0) {
+              core.setFailed('run_id must be a positive integer');
+              return;
+            }
+            const { data: run } = await github.rest.actions.getWorkflowRun({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: runId,
+            });
+            if (run.status !== 'completed') {
+              core.setFailed('refusing to delete a workflow run that is not completed');
+              return;
+            }
+            const allowed = new Set(['SubTask', 'SubTask review', 'SubTask PR review']);
+            if (!allowed.has(run.name)) {
+              core.setFailed('refusing to delete a non-delegated workflow run');
+              return;
+            }
+            await github.rest.actions.deleteWorkflowRun({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: runId,
+            });
+            core.notice('Deleted completed delegated public run.');
