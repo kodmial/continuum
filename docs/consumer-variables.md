@@ -59,7 +59,7 @@ wants per-run control; the input wins over the variable.
 | `AUTOMATION_OPENCODE_TIMEOUT_MINUTES` | — | `180` | OpenCode agent job timeout. |
 | `AUTOMATION_SCHEDULER_TIMEOUT_MINUTES` | — | `5` | Issue scheduler job timeout. |
 | `AUTOMATION_AUTOMERGE_TIMEOUT_MINUTES` | — | `10` | Auto-merge job timeout. |
-| `AUTOMATION_CHILD_DISPATCH_TIMEOUT_MINUTES` | — | `8` | Child dispatcher job timeout. |
+| `AUTOMATION_CHILD_DISPATCH_TIMEOUT_MINUTES` | — | `8` | Legacy standalone child-dispatcher timeout; retained only for already-installed compatibility callers. |
 | `AUTOMATION_DISPATCH_TIMEOUT_MINUTES` | — | `5` | OpenCode internal dispatch job timeout. |
 | `AUTOMATION_ATTEMPTS_TIMEOUT_MINUTES` | — | `10` | Failed-dispatch cleanup job timeout. |
 | `AUTOMATION_DISPATCH_BACKOFF_SECONDS` | — | `120` | Backoff before the scheduler retries a dispatch. |
@@ -117,11 +117,11 @@ apply to macOS runners.
 A consumer that renames the scheduler's marker or labels must set the matching
 `vars.*` knob, and pass the same value as the `continuum-issue-scheduler.yml`
 input, so the release reservation `continuum-opencode.yml` reads on failure is
-the one the scheduler wrote. `continuum-consumer-child-dispatcher.yml` reads
-`AUTOMATION_PAUSE_LABEL`, and
-`continuum-consumer-child-review.yml` reads `AUTOMATION_IN_PROGRESS_LABEL` and
-`AUTOMATION_PAUSE_LABEL`, so a renamed label stays consistent across the core
-and the parent/child pair.
+the one the scheduler wrote. The unified `continuum-issue-scheduler.yml` uses `AUTOMATION_PAUSE_LABEL`
+when reconciling delegated child issues, and
+`continuum-consumer-child-review.yml` reads `AUTOMATION_IN_PROGRESS_LABEL`
+and `AUTOMATION_PAUSE_LABEL`, so a renamed label stays consistent across the
+core and the parent/child review path.
 
 ### Required secrets
 
@@ -134,8 +134,8 @@ installs only `core` never needs the `parent` or `tech` secrets.
 | --- | --- | --- | --- |
 | `TAP_PAT` | `core` | The core controllers that call the GitHub API, and the installed `parent` stubs (which forward it to the child runtime as `CHILD_RUNTIME_TOKEN`). | `github.token` on steps that only need the built-in token. |
 | `RENDER_API_KEY` | `core` | `continuum-render-executor.yml` only | **None.** The controller fails explicitly when it is unset. |
-| `CHILD_RUNTIME_TOKEN` | `parent` | `continuum-consumer-child-dispatcher`, `-review`, `-worker` and `-pr-review` | **None.** Every installed parent stub fills it from the parent's own `TAP_PAT`, so the same credential serves both layers. |
-| `CHILD_RUNTIME_REPOSITORIES` | `parent` | The same four child wrappers. | None — the input is optional (the pre-variables compatibility path described in `docs/parent-child-delegation.md`). |
+| `CHILD_RUNTIME_TOKEN` | `parent` | The installed `continuum-consumer-child-review`, `-worker` and `-pr-review` entry points; the core scheduler uses `TAP_PAT` directly when it builds the child queue. | **None.** Every installed parent stub fills it from the parent's own `TAP_PAT`, so the same credential serves both layers. |
+| `CHILD_RUNTIME_REPOSITORIES` | `parent` | The three installed child entry points and the core scheduler's compatibility resolver. | None — the input is optional (the pre-variables compatibility path described in `docs/parent-child-delegation.md`). |
 | `NANODICTATE_SIGNING_P12` | `tech` | The tech release and packaging-smoke workflows. | None. |
 | `NANODICTATE_SIGNING_PASSWORD` | `tech` | The tech release and packaging-smoke workflows. | None. |
 | `RELEASE_PR_TOKEN` | `tech` | `continuum-tech-swift-release-pr.yml` | Resolved in this order: `RELEASE_PR_TOKEN`, then `TAP_PAT`, then the built-in `GITHUB_TOKEN`. |
@@ -146,10 +146,10 @@ Two qualifications the rows alone cannot carry:
   they are **different credentials**: `TAP_PAT` and `RENDER_API_KEY` are never
   interchangeable. A GitHub token is not accepted by the Render API, and the
   Render key is useless against the GitHub API, so a repository that installs
-  the render controller must define both. The four `continuum-consumer-child-*`
-  workflows live in `.github/workflows/` next to the core ones but are installed
-  only by the `parent` set, and read only the two child-runtime secrets listed
-  above.
+  the render controller must define both. The three live `continuum-consumer-child-*` worker/review workflows live in
+  `.github/workflows/` next to the core ones and are installed only by the
+  `parent` set. The legacy dispatcher callee remains only so stale installed
+  callers resolve safely; parent-role runs of it are skipped.
 - GitHub mints `secrets.GITHUB_TOKEN` automatically, so it is **not** a
   credential a consumer defines and no row above lists it. Two workflows read
   it: `continuum-pr-agent.yml`, which still refuses to run because no paid
@@ -284,7 +284,8 @@ part of the core engine, so a consumer gets it without a fork:
   open native blocker — blocked work is released, not paused;
 - a **native open dependency** releases an existing reservation rather than
   letting an old lease hold WIP capacity;
-- a **child-owned marker** in the issue body excludes it from local dispatch;
+- repository role is authoritative: `CONTINUUM_ROLE=child` disables automatic
+  local scheduling, while historical child-owned body markers have no routing role;
 - **declared `<!-- automation-blocked-by: -->` markers** are honoured in both
   candidate selection and the just-in-time re-check before dispatch.
 
@@ -344,7 +345,7 @@ variable. Nothing is dispatched until it is set.
 | `CONTINUUM_POST_MERGE_WAKEUPS` | `continuum-auto-merge.yml` | No workflow is woken after a merge |
 | `CONTINUUM_POST_MERGE_WAKEUP_REF` | `continuum-auto-merge.yml` | Falls back to the repository's default branch |
 | `CONTINUUM_EXECUTION_LABEL_ROUTES` | `continuum-issue-scheduler.yml` | No label-driven execution dispatch |
-| `CONTINUUM_CHILD_DISPATCH_WORKFLOW` | `continuum-issue-scheduler.yml` | No downstream dispatcher is woken after a reconcile pass |
+| `CONTINUUM_CHILD_DISPATCH_WORKFLOW` | `continuum-issue-scheduler.yml` | Legacy downstream wake-up only; ignored when `CONTINUUM_ROLE=parent` because child dispatch is already inside the scheduler |
 | `CONTINUUM_DISPATCH_REF` | `continuum-issue-scheduler.yml` | Falls back to `main` |
 | `CONTINUUM_OPENCODE_DISPATCH` | `continuum-issue-scheduler.yml` | Falls back to `comment` |
 | `CONTINUUM_ISSUE_BASE_REF` | `continuum-opencode.yml` | Falls back to `main` |
@@ -371,10 +372,9 @@ variable. Nothing is dispatched until it is set.
   OpenCode, and never to both. A malformed line fails the run loudly rather than
   being dropped, because a silently ignored route looks reserved but is never
   executed.
-- **`CONTINUUM_CHILD_DISPATCH_WORKFLOW`** names one workflow file woken after
-  every reconcile pass. A parent that installs
-  `.github/caller-stubs/parent/continuum-child-dispatcher.yml` sets it to that
-  file's name.
+- **`CONTINUUM_CHILD_DISPATCH_WORKFLOW`** is retained only for compatibility
+  with non-parent consumers that configured a downstream wake-up. A parent does
+  not set it: delegated issue selection is part of the ordinary scheduler.
 - **`CONTINUUM_OPENCODE_DISPATCH`** chooses how a ready issue reaches OpenCode:
   `comment` (the default) posts the owner's `/oc` command, which needs no extra
   permission, and `workflow` dispatches the OpenCode caller's `issue` mode
