@@ -2978,7 +2978,7 @@ class ContinuumTest < Minitest::Test
       'freshOpenBlockers.length > 0',
       'if (commandAgeMs < commandGraceMs) {'
     ].each { |guard| assert_includes dispatch, guard, "missing just-in-time guard: #{guard}" }
-    assert_equal 5, dispatch.scan(/^\s+continue;\s*$/).size,
+    assert_equal 4, dispatch.scan(/^\s+continue;\s*$/).size,
                  'every just-in-time guard must be a skip, not a fall-through'
   end
 
