@@ -72,7 +72,6 @@ TECH_STUBS=(
   continuum-tech-swift-release.yml
 )
 PARENT_STUBS=(
-  continuum-child-dispatcher.yml
   continuum-child-pr-review.yml
   continuum-child-review.yml
   continuum-child-worker.yml
