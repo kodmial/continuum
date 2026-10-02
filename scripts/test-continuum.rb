@@ -1281,6 +1281,11 @@ class ContinuumTest < Minitest::Test
       assert status.success?, output
       assert_equal CORE_COUNT, Dir[File.join(dir, 'local/.github/workflows/*.yml')].size
       assert_core_install_names(File.join(dir, 'local'))
+      CORE_STUBS.each do |stub|
+        installed = File.join(dir, 'local/.github/workflows', File.basename(stub))
+        assert_equal File.binread(stub), File.binread(installed),
+                     "#{File.basename(stub)}: default main install must be byte-identical to the canonical stub"
+      end
       bin = File.join(dir, 'bin')
       FileUtils.mkdir_p(bin)
       # Record downloads and serve templates locally, without network requests.
