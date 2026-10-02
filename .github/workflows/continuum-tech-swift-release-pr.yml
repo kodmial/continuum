@@ -330,6 +330,151 @@ jobs:
           manifest-file: .release-please-manifest.json
           target-branch: main
 
+      # release-please intentionally ignores non-Conventional commits. A PR
+      # merged outside Continuum's auto-merger can therefore carry real code
+      # changes while leaving release-please with nothing parseable to propose.
+      # Recover that exact case here instead of silently stranding releasable
+      # history: create the canonical Release PR branch ourselves, using the
+      # same patch-only policy and the same version-owned files. The normal
+      # changelog step below then finishes the branch exactly as it does for a
+      # release-please-created PR.
+      - name: Recover missing Release PR
+        if: steps.policy.outputs.decision == 'releasable'
+        env:
+          RELEASE_TOKEN: ${{ steps.release-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          VERSION_FILE: ${{ vars.CONTINUUM_VERSION_FILE }}
+        run: |
+          set -euo pipefail
+
+          # shellcheck source=scripts/release-policy.sh
+          source scripts/release-policy.sh
+
+          BRANCH="release-please--branches--main"
+
+          OPEN_PR=$(GH_TOKEN="$RELEASE_TOKEN" gh pr list \
+            --repo "$REPO" \
+            --state open \
+            --head "$BRANCH" \
+            --json number \
+            --jq '.[0].number // empty')
+          if [[ -n "$OPEN_PR" ]]; then
+            echo "Release PR #$OPEN_PR exists — no recovery needed."
+            exit 0
+          fi
+
+          CURRENT=$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' "$VERSION_FILE")
+          LATEST=$(GH_TOKEN="$RELEASE_TOKEN" gh release list --repo "$REPO" --limit 1 --json tagName --jq '.[0].tagName // empty' | sed 's/^v//')
+          if [[ -z "$CURRENT" || -z "$LATEST" ]]; then
+            echo "::error::Cannot recover Release PR without current and latest versions."
+            exit 1
+          fi
+          if [[ "$CURRENT" != "$LATEST" ]]; then
+            echo "::notice::Version $CURRENT already differs from latest release $LATEST — recovery is not applicable."
+            exit 0
+          fi
+
+          NEXT=$(policy_next_version "$CURRENT")
+          if ! policy_version_is_allowed "$NEXT"; then
+            echo "::error::Recovery computed forbidden version $NEXT."
+            exit 1
+          fi
+          if policy_automatic_bump_blocked "$CURRENT"; then
+            echo "::warning::Automatic recovery is blocked at version cap $CURRENT."
+            exit 0
+          fi
+
+          git fetch --quiet origin main
+          OLD_REMOTE=""
+          if git fetch --quiet origin "$BRANCH"; then
+            OLD_REMOTE=$(git rev-parse "refs/remotes/origin/$BRANCH")
+          fi
+          git checkout -B "$BRANCH" origin/main
+
+          python3 - "$VERSION_FILE" "$CURRENT" "$NEXT" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          path = pathlib.Path(sys.argv[1])
+          current, nxt = sys.argv[2], sys.argv[3]
+          text = path.read_text()
+          updated, count = re.subn(
+              rf'(?<![0-9]){re.escape(current)}(?![0-9])',
+              nxt,
+              text,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit(f"expected exactly one {current} in {path}, replaced {count}")
+          path.write_text(updated)
+          PY
+
+          python3 - "$CURRENT" "$NEXT" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          path = pathlib.Path(".release-please-manifest.json")
+          current, nxt = sys.argv[1], sys.argv[2]
+          data = json.loads(path.read_text())
+          changed = 0
+          for key, value in list(data.items()):
+              if value == current:
+                  data[key] = nxt
+                  changed += 1
+          if changed == 0:
+              raise SystemExit(
+                  f"manifest has no entry at current version {current}; refusing recovery"
+              )
+          path.write_text(json.dumps(data, indent=2) + "\n")
+          PY
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$VERSION_FILE" .release-please-manifest.json
+          git commit -m "chore(main): release $NEXT"
+
+          GH_TOKEN="$RELEASE_TOKEN" gh auth setup-git
+          if [[ -n "$OLD_REMOTE" ]]; then
+            git push \
+              --force-with-lease="refs/heads/$BRANCH:$OLD_REMOTE" \
+              origin "HEAD:refs/heads/$BRANCH"
+          else
+            git push origin "HEAD:refs/heads/$BRANCH"
+          fi
+
+          BODY=$(mktemp)
+          {
+            echo ":robot: Continuum self-healed the Release PR after releasable history contained no Conventional Commit parseable by release-please."
+            echo
+            echo "## [$NEXT]"
+            echo
+            echo "### Changed"
+            NOTES=$(git log --reverse --format='%s' "v$LATEST..origin/main" \
+              | grep -vE '^chore\(main\): release ' || true)
+            if [[ -n "${NOTES//[[:space:]]/}" ]]; then
+              while IFS= read -r subject; do
+                [[ -n "$subject" ]] && printf -- '- %s\n' "$subject"
+              done <<< "$NOTES"
+            else
+              echo "- Releasable changes merged since v$LATEST."
+            fi
+            echo
+            echo "---"
+            echo
+            echo "Recovery source: Continuum release automation."
+          } > "$BODY"
+
+          GH_TOKEN="$RELEASE_TOKEN" gh pr create \
+            --repo "$REPO" \
+            --base main \
+            --head "$BRANCH" \
+            --title "chore(main): release $NEXT" \
+            --body-file "$BODY"
+
+          echo "::notice::Recovered canonical Release PR for v$NEXT."
+
       # The version constant and the changelog are one release: the
       # VersionTests.testVersionStringEqualsCurrentRelease test compares
       # Version.swift with the first `## [<semver>]` header after
