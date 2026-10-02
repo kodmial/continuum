@@ -3094,7 +3094,12 @@ class ContinuumTest < Minitest::Test
 
     # An active OpenCode run is authoritative too, or the lease would release
     # an issue GitHub is still implementing.
-    assert_includes scheduler, 'const workflowRuns = await github.paginate('
+    assert_includes scheduler, 'for (let page = 1; page <= 3; page += 1) {'
+    assert_includes scheduler, 'github.rest.actions.listWorkflowRunsForRepo({'
+    assert_includes scheduler, 'if (data.workflow_runs.length < 100) break;'
+    refute_includes scheduler, "github.paginate(\n              github.rest.actions.listWorkflowRunsForRepo"
+    refute_includes scheduler, 'gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs?per_page=100"'
+    refute_includes scheduler, 'gh api --paginate "repos/$child_repo/actions/runs?per_page=100"'
     assert_includes scheduler, "run.event !== 'issue_comment'"
     assert_includes scheduler, 'run.path === opencodeWorkflowPath ||'
     assert_includes scheduler, 'run.name === opencodeWorkflowName'
