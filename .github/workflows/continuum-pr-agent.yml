@@ -10,10 +10,23 @@ on:
         required: false
       enabled:
         description: >-
-          Enable the optional PR-Agent review provider. Empty falls back to
-          vars.CONTINUUM_PR_AGENT_ENABLED, then to 'false'. Consumers that do
-          not enable PR-Agent are unaffected: the run posts one explicit
-          disabled notice instead of reviewing.
+          Legacy enable flag for the PR-Agent review provider. Empty falls
+          back to vars.CONTINUUM_PR_AGENT_ENABLED, then to 'false'. Prefer
+          the canonical review_provider input /
+          vars.CONTINUUM_REVIEW_PROVIDER: contradictory values fail closed.
+          Consumers that do not enable PR-Agent are unaffected: the run
+          posts one explicit disabled notice instead of reviewing.
+        type: string
+        default: ''
+        required: false
+      review_provider:
+        description: >-
+          Canonical review provider (none|coderabbit|pr-agent). Empty falls
+          back to vars.CONTINUUM_REVIEW_PROVIDER, then to legacy enabled /
+          vars.CONTINUUM_PR_AGENT_ENABLED compatibility. The selected
+          provider must be pr-agent (or empty with the legacy flag on) for
+          this workflow to review; any other selected provider skips with an
+          explicit notice.
         type: string
         default: ''
         required: false
@@ -119,7 +132,10 @@ jobs:
           INPUT_BRIDGE_PORT: ${{ inputs.bridge_port }}
           INPUT_SERVER_PORT: ${{ inputs.server_port }}
           INPUT_PR_AGENT_VERSION: ${{ inputs.pr_agent_version }}
+          INPUT_REVIEW_PROVIDER: ${{ inputs.review_provider }}
           CFG_ENABLED: ${{ vars.CONTINUUM_PR_AGENT_ENABLED }}
+          CFG_REVIEW_PROVIDER: ${{ vars.CONTINUUM_REVIEW_PROVIDER }}
+          CFG_REQUIRE_CODERABBIT: ${{ vars.CONTINUUM_REQUIRE_CODERABBIT }}
           CFG_API_BASE: ${{ vars.PR_AGENT_API_BASE }}
           CFG_MODEL: ${{ vars.PR_AGENT_MODEL }}
           CFG_MAX_TOKENS: ${{ vars.PR_AGENT_MAX_TOKENS }}
@@ -160,7 +176,33 @@ jobs:
               String(input || process.env[vars] || fallback || '').trim();
             // vars.* are read via the env snapshot below, because
             // github-script expressions cannot expand them dynamically.
-            const enabled = pick(process.env.INPUT_ENABLED, 'CFG_ENABLED', 'false').toLowerCase();
+            const enabledRaw = pick(process.env.INPUT_ENABLED, 'CFG_ENABLED', 'false').toLowerCase();
+            const legacyEnabled = enabledRaw === 'true' || enabledRaw === '1';
+            const canonical = pick(process.env.INPUT_REVIEW_PROVIDER, 'CFG_REVIEW_PROVIDER', '').toLowerCase();
+            const legacyRabbitRaw = String(process.env.CFG_REQUIRE_CODERABBIT || '').trim().toLowerCase();
+            const legacyRabbit = legacyRabbitRaw === 'true' || legacyRabbitRaw === '1';
+            if (legacyEnabled && legacyRabbit) {
+              core.setFailed(
+                'Contradictory review configuration: CONTINUUM_PR_AGENT_ENABLED and CONTINUUM_REQUIRE_CODERABBIT are both enabled; select exactly one review provider.'
+              );
+              return;
+            }
+            if (canonical && !['none', 'coderabbit', 'pr-agent'].includes(canonical)) {
+              core.setFailed(`Unknown review provider: ${canonical}`);
+              return;
+            }
+            const legacyProvider = legacyEnabled ? 'pr-agent' : (legacyRabbit ? 'coderabbit' : '');
+            if (canonical && legacyProvider && canonical !== legacyProvider) {
+              core.setFailed(
+                `Contradictory review configuration: CONTINUUM_REVIEW_PROVIDER=${canonical} disagrees with legacy selection ${legacyProvider}.`
+              );
+              return;
+            }
+            // Single canonical selector: an explicit provider wins, otherwise
+            // the legacy flag decides, otherwise no provider is required.
+            const reviewProvider = canonical || legacyProvider || 'none';
+            const enabled = reviewProvider === 'pr-agent' ? 'true' : 'false';
+            core.setOutput('review_provider', reviewProvider);
             const bridgePort = pick(process.env.INPUT_BRIDGE_PORT, 'CFG_BRIDGE_PORT', '18000');
             const apiBase = pick(
               process.env.INPUT_API_BASE, 'CFG_API_BASE', `http://127.0.0.1:${bridgePort}/v1`
@@ -484,6 +526,85 @@ jobs:
             exit 1
           fi
           echo "Checkout is unmodified: reviewer-only holds."
+
+      - name: Record review evidence and dispatch generic repair
+        if: steps.config.outputs.enabled == 'true' && steps.config.outputs.command == 'review'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          REVIEWED_SHA: ${{ steps.head.outputs.sha }}
+          REVIEW_PROVIDER: ${{ steps.config.outputs.review_provider }}
+        with:
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pullNumber = Number('${{ steps.config.outputs.pr_number }}');
+            const reviewedSha = process.env.REVIEWED_SHA;
+            const provider = process.env.REVIEW_PROVIDER || 'pr-agent';
+            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: pullNumber });
+            const headSha = pr.data.head.sha;
+            if (headSha !== reviewedSha) {
+              core.setFailed(`PR head moved during review (${reviewedSha} -> ${headSha}); the review is stale.`);
+              return;
+            }
+            // Adapter parses its own native output: PR-Agent inline findings
+            // are review comments authored by the review backend for this PR.
+            const comments = await github.paginate(
+              github.rest.pulls.listReviewComments,
+              { owner, repo, pull_number: pullNumber, per_page: 100 }
+            );
+            const findings = comments.filter((comment) =>
+              !comment.in_reply_to_id && (comment.body || '').trim().length > 0
+            );
+            const verdict = findings.length > 0 ? 'CHANGES_REQUESTED' : 'APPROVED';
+            const marker =
+              `<!-- continuum-pr-agent-review head=${headSha} verdict=${verdict} -->`;
+            const issueComments = await github.paginate(
+              github.rest.issues.listComments,
+              { owner, repo, issue_number: pullNumber, per_page: 100 }
+            );
+            if (!issueComments.some((comment) => (comment.body || '').includes(marker))) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: pullNumber,
+                body: [marker, `PR-Agent ${verdict} for exact HEAD \`${headSha}\` (${findings.length} inline finding(s)).`].join('\n'),
+              });
+            }
+            if (findings.length === 0) {
+              core.notice(`PR #${pullNumber}: PR-Agent approved exact HEAD ${headSha}; no repair dispatch needed.`);
+              return;
+            }
+            // Generic repair controller: exactly one batch dispatch per
+            // normalized review (provider/review/head/finding-set). Duplicate
+            // protection is the verification marker for the same head.
+            const batchMarker = `<!-- opencode-review-verification provider=pr-agent review=${reviewedSha} head=${headSha} -->`;
+            if (issueComments.some((comment) => (comment.body || '').includes(batchMarker))) {
+              core.info(`Repair already dispatched for PR-Agent review ${reviewedSha} at ${headSha}.`);
+              return;
+            }
+            await github.rest.issues.createComment({
+              owner, repo, issue_number: pullNumber, body: batchMarker,
+            });
+            const findingPayload = findings.slice(0, 20).map((comment) => ({
+              id: comment.id, path: comment.path, line: comment.line || comment.original_line || 0,
+            }));
+            await github.rest.actions.createWorkflowDispatch({
+              owner, repo,
+              workflow_id: 'continuum-opencode.yml',
+              ref: 'main',
+              inputs: {
+                mode: 'review-fix',
+                pr_number: String(pullNumber),
+                head_ref: pr.head.ref,
+                review_id: reviewedSha,
+                review_provider: provider,
+                reviewed_sha: reviewedSha,
+                head_sha: headSha,
+                findings_json: JSON.stringify(findingPayload),
+              },
+            });
+            core.notice(
+              `Dispatched generic OpenCode repair for PR-Agent review ${reviewedSha} on PR #${pullNumber} with ${findings.length} finding(s).`
+            );
 
       - name: Stop the review backend
         if: always()

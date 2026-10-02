@@ -13,8 +13,11 @@ permissions: {}
 
 jobs:
   dispatch-unresolved-fix:
+    # Generic unresolved-feedback entry: CodeRabbit UNRESOLVED replies arrive
+    # as coderabbitai[bot] comments, PR-Agent UNRESOLVED replies arrive as
+    # review-thread comments containing the generic verification marker.
+    # Stale heads are rejected in the match step below.
     if: >-
-      github.event.comment.user.login == 'coderabbitai[bot]' &&
       github.event.comment.in_reply_to_id != null &&
       contains(github.event.comment.body, '**UNRESOLVED**') &&
       github.event.pull_request.state == 'open' &&
@@ -41,10 +44,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          # CodeRabbit replies to the original top-level finding, not to our
+          # Providers reply to the original top-level finding, not to our
           # verification comment. Locate the verification marker for the same
           # finding and the *current* PR HEAD. This makes stale UNRESOLVED replies
-          # harmless if the branch has already advanced.
+          # harmless if the branch has already advanced. Both the legacy
+          # CodeRabbit marker and the generic review-verification marker are
+          # accepted; the provider is derived from whichever marker matched.
           COMMENTS=$(gh api --paginate --slurp \
             "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/comments?per_page=100")
 
@@ -57,7 +62,7 @@ jobs:
                 | select(.in_reply_to_id == $finding)
                 | select(.id < $unresolved)
                 | select(.user.login == $owner)
-                | select(.body | contains("<!-- opencode-coderabbit-verification "))
+                | select((.body | contains("<!-- opencode-coderabbit-verification ")) or (.body | contains("<!-- opencode-review-verification ")))
                 | select(.body | contains("finding=" + ($finding | tostring)))
                 | select(.body | contains("head=" + $head))
               ]
@@ -73,17 +78,26 @@ jobs:
 
           BODY=$(jq -r '.body' <<<"$VERIFICATION")
           REVIEW_ID=$(sed -nE \
-            's/.*opencode-coderabbit-verification review=([0-9]+) finding=.*/\1/p' \
+            's/.*opencode-(coderabbit-verification|review-verification)[^>]*review=([^ >]+) finding=.*/\2/p' \
             <<<"$BODY" | head -n 1)
+          if grep -q 'opencode-review-verification' <<<"$BODY"; then
+            PROVIDER="pr-agent"
+            if grep -q 'provider=coderabbit' <<<"$BODY"; then
+              PROVIDER="coderabbit"
+            fi
+          else
+            PROVIDER="coderabbit"
+          fi
 
-          if [[ ! "$REVIEW_ID" =~ ^[0-9]+$ ]]; then
+          if [[ -z "$REVIEW_ID" ]]; then
             echo "::error::Could not extract source review id from the verification marker."
             exit 1
           fi
 
           echo "dispatch=true" >> "$GITHUB_OUTPUT"
           echo "review_id=$REVIEW_ID" >> "$GITHUB_OUTPUT"
-          echo "Matched UNRESOLVED comment $UNRESOLVED_COMMENT_ID to finding $FINDING_ID, review $REVIEW_ID, HEAD $HEAD_SHA."
+          echo "provider=$PROVIDER" >> "$GITHUB_OUTPUT"
+          echo "Matched UNRESOLVED comment $UNRESOLVED_COMMENT_ID to finding $FINDING_ID, review $REVIEW_ID, provider $PROVIDER, HEAD $HEAD_SHA."
 
       - name: Dispatch OpenCode retry
         if: steps.context.outputs.dispatch == 'true'
@@ -91,13 +105,36 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           REVIEW_ID: ${{ steps.context.outputs.review_id }}
+          REVIEW_PROVIDER: ${{ steps.context.outputs.provider }}
+          REVIEW_PROVIDER_VAR: ${{ vars.CONTINUUM_REVIEW_PROVIDER || '' }}
         run: |
           set -euo pipefail
-          gh api --method POST \
-            "repos/${GITHUB_REPOSITORY}/actions/workflows/continuum-opencode.yml/dispatches" \
-            -f ref=main \
-            -f "inputs[mode]=coderabbit-fix" \
-            -f "inputs[pr_number]=${PR_NUMBER}" \
-            -f "inputs[head_ref]=${HEAD_REF}" \
-            -f "inputs[review_id]=${REVIEW_ID}"
+          # Bounded generic re-entry: the PR-Agent path uses the generic
+          # review-fix mode; the CodeRabbit path keeps its transitional
+          # coderabbit-fix mode. Same-head no-progress is enforced by the
+          # verification-marker match above (stale markers never dispatch).
+          # Both dispatch forms below are literal so the mode contract stays
+          # statically visible: every whitelisted mode must be dispatched by
+          # a core workflow.
+          if [[ "${REVIEW_PROVIDER:-}" == "pr-agent" ]]; then
+            gh api --method POST \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/continuum-opencode.yml/dispatches" \
+              -f ref=main \
+              -f "inputs[mode]=review-fix" \
+              -f "inputs[pr_number]=${PR_NUMBER}" \
+              -f "inputs[head_ref]=${HEAD_REF}" \
+              -f "inputs[review_id]=${REVIEW_ID}" \
+              -f "inputs[review_provider]=${REVIEW_PROVIDER_VAR:-pr-agent}" \
+              -f "inputs[reviewed_sha]=${HEAD_SHA}" \
+              -f "inputs[head_sha]=${HEAD_SHA}"
+          else
+            gh api --method POST \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/continuum-opencode.yml/dispatches" \
+              -f ref=main \
+              -f "inputs[mode]=coderabbit-fix" \
+              -f "inputs[pr_number]=${PR_NUMBER}" \
+              -f "inputs[head_ref]=${HEAD_REF}" \
+              -f "inputs[review_id]=${REVIEW_ID}"
+          fi

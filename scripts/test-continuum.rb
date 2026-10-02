@@ -2855,6 +2855,7 @@ class ContinuumTest < Minitest::Test
     ],
     'continuum-opencode.yml' => %w[
       continuum_ref mode issue_number pr_number head_ref review_id run_id
+      review_provider reviewed_sha head_sha findings_json
       ci_workflow_id conflict_strategy dispatch_marker in_progress_label
       pause_marker max_dispatch_attempts base_ref knowledge_protocol_path
       knowledge_records_dir issue_commit_prefix
@@ -3571,13 +3572,19 @@ class ContinuumTest < Minitest::Test
     # The explanatory comment inside the condition must not make the assertion
     # miss, so match the CodeRabbit half as an ordered sequence of its terms
     # rather than as one literal stretch.
-    assert_match(/requireCodeRabbit &&[\s\S]{0,400}?!\s*finalReviewBasis\s*\|\|\s*finalUnresolvedThreads\.length !== 0\s*\|\|\s*finalCurrentHeadNitpicks\.length !== 0\s*\)\s*\)\s*\)\s*\{/, body)
+    assert_match(/requireCodeRabbit &&[\s\S]{0,400}?!\s*finalReviewBasis\s*\|\|\s*finalUnresolvedThreads\.length !== 0\s*\|\|\s*finalCurrentHeadNitpicks\.length !== 0/, body)
+    assert_match(/requirePrAgent && !finalPrAgentBasis/, body)
     assert_match(/const finalReviewBasis = requireCodeRabbit\s*\n\s*\? await codeRabbitReviewBasis/, body)
     assert_match(/const finalUnresolvedThreads = requireCodeRabbit\s*\n\s*\? await unresolvedCodeRabbitThreads/, body)
     assert_match(/const finalCurrentHeadNitpicks = requireCodeRabbit\s*\n\s*\? await codeRabbitNitpickReviews/, body)
 
     # The merge log must not read `null.sourceSha` when the flag is off.
-    assert_match(/requireCodeRabbit\s*\n\s*\? `CodeRabbit approval from \$\{finalReviewBasis\.sourceSha\}`\s*\n\s*: 'CI only; CodeRabbit is disabled/, body)
+    # Normalized gate: the CodeRabbit branch is preserved and a PR-Agent
+    # branch was added alongside it, so match the CodeRabbit arm rather than
+    # the whole ternary.
+    assert_match(/requireCodeRabbit\s*\n\s*\? `CodeRabbit approval from \$\{finalReviewBasis\.sourceSha\}`/, body)
+    assert_match(/CI only; CodeRabbit is disabled/, body)
+    assert_match(/PR-Agent approval for exact HEAD/, body)
 
     # updateFromMain writes a carry marker only from a CodeRabbit review basis.
     # With the flag off there is no approval to carry, so no marker and no
@@ -4138,6 +4145,95 @@ class ContinuumTest < Minitest::Test
     assert_includes review, 'review_file="$RUNNER_TEMP/continuum-child-review-${TASK_NUMBER}.md"'
     refute_includes worker, 'automation/runtime-results'
     refute_includes review, 'automation/runtime-results'
+  end
+
+  # ------------------------------------------------- #182 review-provider parity
+
+  # One canonical selector controls review behavior. Every runtime workflow
+  # receives it through the single normalized transport; legacy booleans are
+  # migration compatibility that must agree with it.
+  def test_canonical_review_provider_is_the_single_source_of_truth
+    opencode_inputs = events(yaml(File.join(ROOT, '.github/workflows/continuum-opencode.yml')))
+                      .fetch('workflow_call').fetch('inputs')
+    assert opencode_inputs.key?('review_provider'), 'opencode missing review_provider input'
+    assert_equal 'string', opencode_inputs.fetch('review_provider').fetch('type')
+    assert_equal false, opencode_inputs.fetch('review_provider').fetch('required')
+
+    auto_merge_inputs = events(yaml(File.join(ROOT, '.github/workflows/continuum-auto-merge.yml')))
+                        .fetch('workflow_call').fetch('inputs')
+    assert auto_merge_inputs.key?('review_provider'), 'auto-merge missing review_provider input'
+
+    label_inputs = events(yaml(File.join(ROOT, '.github/workflows/continuum-add-review-label.yml')))
+                   .fetch('workflow_call').fetch('inputs')
+    assert label_inputs.key?('review_provider'), 'add-review-label missing review_provider input'
+
+    pr_agent_inputs = events(yaml(File.join(ROOT, '.github/workflows/continuum-pr-agent.yml')))
+                      .fetch('workflow_call').fetch('inputs')
+    assert pr_agent_inputs.key?('review_provider'), 'pr-agent missing review_provider input'
+
+    %w[continuum-opencode.yml continuum-auto-merge.yml continuum-add-review-label.yml continuum-pr-agent.yml].each do |name|
+      body = File.read(File.join(ROOT, '.github/workflows', name))
+      assert_includes body, 'CONTINUUM_REVIEW_PROVIDER', "#{name}: missing the normalized provider transport"
+    end
+
+    # Contradictory legacy + canonical values fail closed in every consumer.
+    %w[continuum-auto-merge.yml continuum-add-review-label.yml continuum-pr-agent.yml].each do |name|
+      body = File.read(File.join(ROOT, '.github/workflows', name))
+      assert_includes body, 'Contradictory review configuration', "#{name}: contradiction must fail closed"
+    end
+  end
+
+  # The generic repair mode exists alongside the transitional CodeRabbit mode,
+  # is offered by the stub, and is dispatched by a core workflow.
+  def test_generic_review_fix_mode_is_whitelisted_dispatched_and_stubbed
+    assert_includes dispatch_modes, 'review-fix', 'generic review-fix mode is missing from the whitelist'
+    assert_includes dispatch_modes, 'coderabbit-fix', 'transitional coderabbit-fix mode must remain'
+
+    stub_modes = events(yaml(File.join(ROOT, '.github/caller-stubs/continuum-opencode.yml')))
+                 .fetch('workflow_dispatch').fetch('inputs').fetch('mode').fetch('options')
+    assert_includes stub_modes, 'review-fix'
+
+    calls = all_dispatch_calls
+    assert calls.any? { |call| call.include?('-f "inputs[mode]=review-fix"') || call.include?("mode: 'review-fix'") },
+           'no core workflow dispatches the generic review-fix mode'
+  end
+
+  # The generic repair prompt carries only provider-neutral finding data.
+  def test_generic_review_repair_prompt_has_no_provider_specific_logic
+    body = workflow_body('continuum-opencode.yml')
+    fix_step = step_body(body, 'Fix review findings (generic provider-neutral repair)')
+    refute_nil fix_step, 'generic review-fix step is missing'
+    refute_includes fix_step, 'CodeRabbit', 'generic repair prompt must not name CodeRabbit'
+    refute_includes fix_step, 'coderabbitai', 'generic repair prompt must not name the CodeRabbit bot'
+    assert_includes fix_step, 'FINDINGS_JSON', 'generic repair must consume the normalized finding set'
+    assert_includes fix_step, 'REVIEW_PROVIDER', 'generic repair must route on the selected provider'
+  end
+
+  # PR-Agent findings enter the same automatic repair lifecycle.
+  def test_pr_agent_dispatches_generic_repair_and_records_evidence
+    body = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent.yml'))
+    assert_includes body, "mode: 'review-fix'", 'pr-agent must dispatch the generic repair mode'
+    assert_includes body, 'continuum-pr-agent-review head=', 'pr-agent must record normalized review evidence'
+    assert_includes body, 'opencode-review-verification provider=pr-agent', 'pr-agent repair must be deduplicated per head'
+  end
+
+  # Unresolved feedback re-enters the bounded generic loop for both providers.
+  def test_unresolved_controller_dispatches_both_repair_modes
+    body = workflow_body('continuum-opencode-unresolved.yml')
+    assert_includes body, '-f "inputs[mode]=review-fix"', 'unresolved must dispatch the generic repair mode'
+    assert_includes body, '-f "inputs[mode]=coderabbit-fix"', 'unresolved must keep the transitional CodeRabbit dispatch'
+    assert_includes body, 'opencode-review-verification', 'unresolved must accept the generic verification marker'
+    assert_includes body, 'opencode-coderabbit-verification', 'unresolved must keep the CodeRabbit verification marker'
+  end
+
+  # Auto-merge consumes the normalized selected-provider gate.
+  def test_auto_merge_consumes_the_normalized_provider_gate
+    body = auto_merge_body
+    assert_includes body, 'prAgentReviewBasis', 'auto-merge must evaluate the PR-Agent normalized gate'
+    assert_includes body, 'prAgentReviewEvidence', 'auto-merge must require exact-HEAD PR-Agent evidence'
+    assert_includes body, 'unresolvedPrAgentThreads', 'auto-merge must block on unresolved PR-Agent findings'
+    assert_includes body, 'requirePrAgent', 'auto-merge must gate on the selected provider'
+    assert_includes body, 'finalPrAgentBasis', 'final revalidation must include the PR-Agent gate'
   end
 
   end
