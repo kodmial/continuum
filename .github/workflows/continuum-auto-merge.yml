@@ -320,20 +320,42 @@ jobs:
                 )[0] || null;
             }
 
-            async function latestReviewConvergenceStatus(headSha) {
-              const { data } = await github.rest.repos.getCombinedStatusForRef({
-                owner, repo, ref: headSha,
-              });
-
-              return (data.statuses || [])
-                .filter(
-                  status => status.context === 'continuum/review-convergence'
-                )
+            async function codeRabbitNoProgressBlocked(pr, headSha) {
+              const comments = await github.paginate(
+                github.rest.issues.listComments,
+                {
+                  owner,
+                  repo,
+                  issue_number: pr.number,
+                  per_page: 100,
+                }
+              );
+              const markerPrefix =
+                `<!-- continuum-coderabbit-no-progress head=${headSha} `;
+              const marker = comments
+                .filter(comment => {
+                  const login = comment.user?.login || '';
+                  const trusted =
+                    login === 'github-actions[bot]' || login === owner;
+                  return trusted &&
+                    (comment.body || '').includes(markerPrefix);
+                })
                 .sort(
                   (a, b) =>
-                    new Date(b.updated_at || b.created_at).getTime() -
-                    new Date(a.updated_at || a.created_at).getTime()
+                    new Date(b.created_at || 0).getTime() -
+                    new Date(a.created_at || 0).getTime()
                 )[0] || null;
+              if (!marker) return false;
+
+              const decision = await latestCodeRabbitDecision(pr, headSha);
+              if (
+                decision?.state === 'APPROVED' &&
+                new Date(decision.submitted_at || 0).getTime() >
+                  new Date(marker.created_at || 0).getTime()
+              ) {
+                return false;
+              }
+              return true;
             }
 
             function retryWindowText(body = '') {
@@ -1300,20 +1322,17 @@ jobs:
               const rabbitStatus = requireCodeRabbit
                 ? await latestCodeRabbitStatus(pr.head.sha)
                 : null;
-              const reviewConvergenceStatus = requireCodeRabbit
-                ? await latestReviewConvergenceStatus(pr.head.sha)
-                : null;
+              const reviewNoProgressBlocked =
+                requireCodeRabbit && !reviewBasis
+                  ? await codeRabbitNoProgressBlocked(pr, pr.head.sha)
+                  : false;
 
               // A policy/task-contract verdict with no actionable code finding
               // is terminal for this exact HEAD. Re-dispatching CodeRabbit or a
               // coding agent cannot make progress and would only burn quota.
-              // A new HEAD gets a fresh status namespace automatically; a later
-              // explicit CodeRabbit approval on the same HEAD clears this status.
-              if (
-                requireCodeRabbit &&
-                !reviewBasis &&
-                reviewConvergenceStatus?.state === 'error'
-              ) {
+              // A new HEAD has no matching marker; a later explicit APPROVED
+              // review on the same HEAD also supersedes the marker.
+              if (reviewNoProgressBlocked) {
                 core.warning(
                   `PR #${pr.number}: exact HEAD ${pr.head.sha} is blocked by a non-code CodeRabbit verdict; automatic review/fix retries are suppressed.`
                 );
