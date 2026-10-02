@@ -17,7 +17,7 @@ engine.
 | `install.sh` | Installs one set into a consumer repository. |
 | `src/continuum/` | Dependency-free Python engine (config + YAML subset). |
 | `.github/scripts/` | Delegation resolver/runtime and the global instructions installer. |
-| `scripts/` | Contract tests, release policy, and packaging-smoke fallback scripts. |
+| `scripts/` | Continuum contract tests. Product build/release scripts stay in consumers. |
 | `docs/` | Design documentation (see [parent/child delegation](docs/parent-child-delegation.md)). |
 
 ## Reuse model
@@ -70,7 +70,7 @@ bash install.sh /path/to/consumer
 # Pin a specific revision (branch, tag, or full commit SHA)
 bash install.sh /path/to/consumer <ref> core
 
-# Opt into the technology library (Swift build/release/packaging)
+# Opt into the consumer-neutral Swift validation profile
 bash install.sh /path/to/consumer <ref> tech
 
 # Add parent/child delegated execution to any repository
@@ -88,7 +88,7 @@ existing files.
 | Set | Installs |
 | --- | --- |
 | `core` (default) | 15 callers covering OpenCode, issue scheduling, validation, qualification, CodeRabbit, PR Agent, and auto-merge. |
-| `tech` | 5 callers in the opt-in technology library: CI, release, release PR, release-automation merge, and packaging smoke. |
+| `tech` | 1 caller: the optional consumer-neutral Swift CI profile. |
 | `parent` | 3 callers: `continuum-child-worker.yml`, `continuum-child-review.yml`, `continuum-child-pr-review.yml`. The ordinary core `Issue scheduler` owns parent/child dispatch. |
 
 The `parent` and `tech` sets add **only** their own callers; each preserves
@@ -163,11 +163,7 @@ Workflow names are identical to the reusable file names unless noted.
 
 | Workflow | Purpose | Notable extra inputs |
 | --- | --- | --- |
-| `continuum-tech-swift-ci.yml` | Build, test, and classify whether a macOS build is required. (tech) | — |
-| `continuum-tech-swift-release.yml` | Tag, GitHub Release, and manifest generation. (tech) | `version`, `dry_run` |
-| `continuum-tech-swift-release-pr.yml` | Maintains the single automated Release PR (release-please). (tech) | — |
-| `continuum-tech-swift-release-automation-merge.yml` | Merges trusted release-automation PRs. (tech) | — |
-| `continuum-tech-swift-packaging-smoke.yml` | Homebrew/MacPorts install lifecycle smoke test. (tech) | `mode`, `version` |
+| `continuum-tech-swift-ci.yml` | Consumer-neutral Swift profile over `continuum-validation.yml`; defaults to `macos-latest`, `swift build`, and `swift test`. (tech) | runner/build/test/prepare/validation overrides |
 | `continuum-opencode.yml` | OpenCode agent (`name: OpenCode agent`). | `mode`, `pr_number`, `head_ref`, `review_id`, `run_id` |
 | `continuum-opencode-repair.yml` | OpenCode repair controller. | — |
 | `continuum-opencode-unresolved.yml` | Retry OpenCode on unresolved CodeRabbit findings. | — |
@@ -195,13 +191,10 @@ part of the contract and never change per consumer):
 
 | Secret | Set | Used by | Purpose |
 | --- | --- | --- | --- |
-| `TAP_PAT` | `core`, `parent`, `tech` | review, release, opencode, delegation | Classic PAT (`repo` + `workflow` scopes) for checkout/push/API. Also the child-runtime token the `parent` stubs forward. |
+| `TAP_PAT` | `core`, `parent` | review, opencode, delegation | Classic PAT (`repo` + `workflow` scopes) for checkout/push/API. Also the child-runtime token the `parent` stubs forward. |
 | `RENDER_API_KEY` | `core` | `continuum-render-executor.yml` | Render API key. A different credential from `TAP_PAT`, with **no** fallback: the controller fails explicitly when it is unset. |
 | `CHILD_RUNTIME_TOKEN` | `parent` | `consumer-child-*` | Parent delegation token; the caller stubs map it from `TAP_PAT`. |
 | `CHILD_RUNTIME_REPOSITORIES` | `parent` | `consumer-child-*` (optional) | Pre-variables compatibility path; see `docs/parent-child-delegation.md`. |
-| `RELEASE_PR_TOKEN` | `tech` | `continuum-tech-swift-release-pr.yml` (optional) | Fine-grained PAT (`Contents: write`, `Pull requests: write`); resolved as `RELEASE_PR_TOKEN`, then `TAP_PAT`, then the built-in `GITHUB_TOKEN`. |
-| `NANODICTATE_SIGNING_P12` | `tech` | tech release and packaging-smoke workflows | Base64 macOS signing certificate (`.p12`). |
-| `NANODICTATE_SIGNING_PASSWORD` | `tech` | tech release and packaging-smoke workflows | Password for the signing certificate. |
 
 No paid provider key is part of this contract: **no workflow reads
 `OPENCODE_API_KEY` or `GROQ_API_KEY`.** The core runs on free anonymous models
@@ -216,13 +209,26 @@ Repository variables:
 | `OPENCODE_MODEL` | optional | Default OpenCode model. |
 | `MAINTAINERS` | optional | Maintainer allow-list for controllers. |
 | `AUTOMATION_LEASE_MINUTES`, `AUTOMATION_MAX_DISPATCH_ATTEMPTS`, `AUTOMATION_WIP_LIMIT` | optional | Scheduler tuning. |
-| `REVISION` | optional | Packaging revision override. |
 
 Delegation relationships are stored as repository variables — see below.
 
-Product-identity variables (version file, app and binary names, signing identity,
-Homebrew tap, MacPorts tree) are listed in
+The complete project-agnostic validation, runner, lifecycle, delegation, and
+optional Swift-profile variables are listed in
 [Consumer configuration variables](docs/consumer-variables.md).
+
+## Unified consumer contract
+
+A new repository can install `core` and run the generic `CI` contract without
+copying lifecycle logic. Core defaults to `ubuntu-latest` and auto-detects common
+stacks; consumers can override runner plus prepare/build/test/validation/package/
+release hooks, artifacts, status publication, and repair dispatch with
+`CONTINUUM_*` variables. OpenCode also defaults to `ubuntu-latest`; projects
+that require a different agent environment set `AUTOMATION_OPENCODE_RUNNER`
+and `CONTINUUM_AGENT_PREPARE_COMMAND`.
+
+Technology-specific behavior is opt-in. The `tech` set currently contains only
+a generic Swift CI profile. Product release, signing, Homebrew/MacPorts or other
+distribution policy is deliberately outside Continuum.
 
 ## Wiring the consumers
 
@@ -240,12 +246,10 @@ bash install.sh /path/to/myapp <sha> tech
 
 - Keep the consumer's own `.continuum.yml` (the neutral `version: 1` file is
   sufficient when there is no tracked relationship).
-- Provide the signing and model secrets the installed sets use
-  (see the secrets table above), plus the `CONTINUUM_*` repository variables
-  listed in [Consumer configuration variables](docs/consumer-variables.md).
-- The consumer keeps its own `release-please-config.json`,
-  `.release-please-manifest.json`, and `CHANGELOG.md`; release-please runs **in
-  the consumer**, not here.
+- Configure only the runner/hooks the project needs; the Swift profile itself
+  contains no application identity, signing, packaging, or release policy.
+- Keep signing, package-manager manifests, publishing, release policy, and any
+  product-specific CI in the consumer repository.
 
 ### Parent (delegation control plane, one example per child id)
 
