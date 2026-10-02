@@ -208,12 +208,3686 @@ jobs:
       OPENCODE_DISPATCH: ${{ inputs.opencode_dispatch || vars.CONTINUUM_OPENCODE_DISPATCH || 'comment' }}
       EXECUTION_LABEL_ROUTES: ${{ inputs.execution_label_routes || vars.CONTINUUM_EXECUTION_LABEL_ROUTES }}
       CHILD_DISPATCH_WORKFLOW: ${{ inputs.child_dispatch_workflow || vars.CONTINUUM_CHILD_DISPATCH_WORKFLOW }}
+      CHILD_REPOSITORIES: ${{ secrets.CHILD_RUNTIME_REPOSITORIES }}
+      CHILD_WORKER_WORKFLOW: ${{ vars.CONTINUUM_CHILD_WORKER_WORKFLOW || 'continuum-child-worker.yml' }}
+      CHILD_REVIEW_WORKFLOW: ${{ vars.CONTINUUM_CHILD_REVIEW_WORKFLOW || 'continuum-child-review.yml' }}
+      CHILD_PR_REVIEW_WORKFLOW: ${{ vars.CONTINUUM_CHILD_PR_REVIEW_WORKFLOW || 'continuum-child-pr-review.yml' }}
       COUNT_OPEN_PRS_AS_WIP: ${{ inputs.count_open_prs_as_wip || vars.AUTOMATION_COUNT_OPEN_PRS_AS_WIP || 'true' }}
       PAUSE_ON_FAILURE: ${{ inputs.pause_on_failure || vars.AUTOMATION_PAUSE_ON_FAILURE || 'true' }}
 
     steps:
+      - name: Checkout parent control plane for delegated scheduling
+        if: vars.CONTINUUM_ROLE == 'parent'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout Continuum engine for delegated scheduling
+        if: vars.CONTINUUM_ROLE == 'parent'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: kodmial/continuum
+          ref: ${{ inputs.continuum_ref }}
+          path: .continuum-engine
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Build delegated child queue
+        id: child_queue
+        if: vars.CONTINUUM_ROLE == 'parent'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
+          CHILD_CANDIDATES_FILE: ${{ runner.temp }}/continuum-child-candidates.json
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$GITHUB_WORKSPACE/.continuum-engine/src"
+          resolver="$GITHUB_WORKSPACE/.continuum-engine/.github/scripts/delegation_repository.sh"
+          plan="$(PARENT_CONFIG=.continuum.yml CHILD_REPOSITORIES="$CHILD_REPOSITORIES" bash "$resolver" plan)"
+
+          # The old standalone Child dispatcher was also the public-parent
+          # metadata janitor. Keep that behaviour inside the ordinary scheduler
+          # so removing the extra workflow does not retain child source metadata.
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs?per_page=100" \
+            --jq '.workflow_runs[]
+              | select(.status == "completed")
+              | select(
+                  .name == "Child task" or
+                  .name == "Child review" or
+                  .name == "Child PR review" or
+                  .name == "Child dispatcher" or
+                  .name == "Worker task" or
+                  .name == "Worker review" or
+                  .name == "Worker dispatcher"
+                )
+              | .id' 2>/dev/null |
+          while IFS= read -r run_id; do
+            [[ -n "$run_id" ]] || continue
+            [[ "$run_id" == "$GITHUB_RUN_ID" ]] && continue
+            gh api --method DELETE \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" \
+              >/dev/null 2>&1 || true
+          done
+
+          active_titles="$(
+            gh run list --repo "$GITHUB_REPOSITORY" --limit 100 \
+              --json status,displayTitle \
+              --jq '.[] | select(.status == "queued" or .status == "in_progress" or .status == "waiting" or .status == "pending") | .displayTitle' \
+              2>/dev/null || true
+          )"
+
+          task_active() {
+            local child_id="$1" kind="$2" task="$3"
+            grep -Fxq "Child $kind [$child_id] #$task" <<<"$active_titles"
+          }
+
+          manual_pr_active() {
+            local child_id="$1" pr="$2"
+            grep -Fxq "Child PR review [$child_id] #$pr" <<<"$active_titles"
+          }
+
+          candidate_lines="$RUNNER_TEMP/continuum-child-candidates.jsonl"
+          : > "$candidate_lines"
+          declare -A active_wip_keys=()
+
+          while IFS= read -r title; do
+            if [[ "$title" =~ ^Child[[:space:]]task[[:space:]]\[([^]]+)\][[:space:]]#([0-9]+)$ ]]; then
+              active_wip_keys["${BASH_REMATCH[1]}#${BASH_REMATCH[2]}"]=1
+            fi
+          done <<<"$active_titles"
+
+          invalid=0
+          review_dispatches=0
+
+          while IFS= read -r row; do
+            [[ -n "$row" ]] || continue
+            child_id="$(jq -r '.id' <<<"$row")"
+            child_repo="$(jq -r '.repository' <<<"$row")"
+
+            if ! PARENT_CONFIG=.continuum.yml CHILD_REPOSITORIES="$CHILD_REPOSITORIES" \
+              bash "$resolver" verify "$child_id" "$child_repo" >/dev/null 2>&1; then
+              echo "::error::Child '$child_id' relationship verification failed."
+              invalid=$((invalid + 1))
+              continue
+            fi
+
+            # Recover an automation-owned PR that was closed while its issue is
+            # still open and ready. This preserves the old dispatcher recovery
+            # contract while the scheduling decision itself moves below.
+            while IFS=
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          # TAP_PAT is required because the existing OpenCode workflow accepts
+          # /oc only from the repository owner. It also makes issue-state
+          # mutations and comments created here visible as normal owner actions.
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            const fs = require('fs');
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const repoFullName = owner + '/' + repo;
+            const childWorkerWorkflow =
+              process.env.CHILD_WORKER_WORKFLOW || 'continuum-child-worker.yml';
+            const childActiveWipParsed = Number.parseInt(
+              process.env.CHILD_ACTIVE_WIP || '0',
+              10
+            );
+            if (!Number.isInteger(childActiveWipParsed) || childActiveWipParsed < 0) {
+              throw new Error(
+                'Invalid CHILD_ACTIVE_WIP: ' + process.env.CHILD_ACTIVE_WIP
+              );
+            }
+            const childActiveWip = childActiveWipParsed;
+            const childCandidatesFile = process.env.CHILD_CANDIDATES_FILE || '';
+            const childCandidates =
+              childCandidatesFile && fs.existsSync(childCandidatesFile)
+                ? JSON.parse(fs.readFileSync(childCandidatesFile, 'utf8'))
+                : [];
+            if (!Array.isArray(childCandidates)) {
+              throw new Error('Delegated child candidate payload is not an array.');
+            }
+
+            function positiveInt(name, fallback) {
+              const value = Number.parseInt(process.env[name] || String(fallback), 10);
+              if (!Number.isInteger(value) || value < 1) {
+                throw new Error('Invalid ' + name + ': ' + process.env[name]);
+              }
+              return value;
+            }
+
+            const wipLimit = positiveInt('WIP_LIMIT', 2);
+            const leaseMinutes = positiveInt('LEASE_MINUTES', 45);
+            const maxDispatchAttempts = positiveInt('MAX_DISPATCH_ATTEMPTS', 2);
+            const leaseMs = leaseMinutes * 60 * 1000;
+            // A recent owner /oc is only a race guard while GitHub starts the
+            // corresponding workflow. It must not inherit the full work lease:
+            // cancelled/premature runs may legitimately become eligible again
+            // as soon as their native blockers close.
+            const commandGraceMinutes = positiveInt('COMMAND_GRACE_MINUTES', 5);
+            const commandGraceMs = commandGraceMinutes * 60 * 1000;
+
+            const priorityOrder = [
+              'priority:p0',
+              'priority:p1',
+              'priority:p2',
+            ];
+            const priorityRank = new Map(
+              priorityOrder.map((name, index) => [name, index])
+            );
+            const inProgressLabel = process.env.IN_PROGRESS_LABEL || 'automation:in-progress';
+            const pausedLabel = process.env.PAUSE_LABEL || 'automation:paused';
+            const dispatchMarker = process.env.DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->';
+            const postPauseComment =
+              (process.env.POST_PAUSE_COMMENT || 'true') !== 'false';
+            const resetMarkers =
+              (process.env.RESET_MARKERS || 'false') === 'true';
+            const requirePriorityLabel =
+              (process.env.REQUIRE_PRIORITY_LABEL || 'false') === 'true';
+            const opencodeWorkflowName =
+              process.env.OPENCODE_WORKFLOW_NAME || 'OpenCode agent';
+            const opencodeWorkflowPath =
+              process.env.OPENCODE_WORKFLOW_PATH ||
+              '.github/workflows/continuum-opencode.yml';
+            const dispatchRef = process.env.DISPATCH_REF || 'main';
+
+            // A ready issue normally reaches OpenCode as an owner comment, the
+            // only path that needs no extra permission. A consumer whose
+            // OpenCode caller has no `issue_comment` trigger needs the
+            // workflow_dispatch form instead.
+            const opencodeDispatch = (
+              process.env.OPENCODE_DISPATCH || 'comment'
+            ).trim();
+            if (!['comment', 'workflow'].includes(opencodeDispatch)) {
+              throw new Error(
+                "Unsupported opencode_dispatch '" + opencodeDispatch +
+                  "'; expected 'comment' or 'workflow'."
+              );
+            }
+
+            // Label-driven execution routes are configuration, never a table
+            // inside core: the render and Docker qualification controllers are
+            // separate reusable workflows that a consumer may or may not
+            // install, and a consumer may route to workflows core has never
+            // heard of. Empty means "route nothing".
+            //
+            // A malformed entry fails the run instead of being dropped,
+            // because a silently ignored route looks reserved but is never
+            // executed.
+            const executionRoutes = (process.env.EXECUTION_LABEL_ROUTES || '')
+              .split('\n')
+              .map(line => line.trim())
+              .filter(line => line && !line.startsWith('#'))
+              .map(line => {
+                const parts = line.split('|').map(part => part.trim());
+                if (parts.length < 2 || parts.length > 3 || !parts[0] || !parts[1]) {
+                  throw new Error(
+                    "Invalid execution_label_routes line: '" +
+                      line +
+                      "'; expected '<issue label>|<workflow file name>|<input>=<value>,...'."
+                  );
+                }
+                const inputs = {};
+                for (const assignment of (parts[2] || '').split(',')) {
+                  const trimmed = assignment.trim();
+                  if (!trimmed) continue;
+                  const separator = trimmed.indexOf('=');
+                  if (separator <= 0) {
+                    throw new Error(
+                      "Invalid execution_label_routes input '" +
+                        trimmed +
+                        "' on line '" +
+                        line +
+                        "'; expected '<name>=<value>'."
+                    );
+                  }
+                  inputs[trimmed.slice(0, separator).trim()] = trimmed
+                    .slice(separator + 1)
+                    .trim();
+                }
+                return { label: parts[0], workflow: parts[1], inputs };
+              });
+            const executionRouteLabels = new Set(
+              executionRoutes.map(route => route.label)
+            );
+
+            const childDispatchWorkflow = (
+              process.env.CHILD_DISPATCH_WORKFLOW || ''
+            ).trim();
+            const countOpenPrsAsWip =
+              (process.env.COUNT_OPEN_PRS_AS_WIP || 'true') !== 'false';
+            const pauseOnFailure =
+              (process.env.PAUSE_ON_FAILURE || 'true') !== 'false';
+
+            // Byte-for-byte the marker the watchdog parses. A doubled backslash
+            // here would silently disable declared-dependency blocking.
+            function declaredDependencyNumbers(issue) {
+              const match = (issue.body || '').match(
+                /<!--\s*automation-blocked-by:\s*([0-9#\s,]+?)\s*-->/i
+              );
+              if (!match) return [];
+              return [...new Set(
+                [...match[1].matchAll(/\d+/g)]
+                  .map(item => Number.parseInt(item[0], 10))
+                  .filter(Number.isInteger)
+              )];
+            }
+
+            async function openDeclaredBlockers(
+              issue,
+              targetOwner = owner,
+              targetRepo = repo
+            ) {
+              const open = [];
+              for (const blockerNumber of declaredDependencyNumbers(issue)) {
+                if (blockerNumber === issue.number) continue;
+                const response = await github.rest.issues.get({
+                  owner: targetOwner,
+                  repo: targetRepo,
+                  issue_number: blockerNumber,
+                });
+                if (response.data.state === 'open') open.push(response.data);
+              }
+              return open;
+            }
+
+            // Every dispatch in this job goes through the PAT, so no
+            // `actions: write` grant is needed on the caller's token.
+            async function dispatchWorkflow(workflow, inputs) {
+              await github.request(
+                'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
+                { owner, repo, workflow_id: workflow, ref: dispatchRef, inputs }
+              );
+            }
+
+            const labelSpecs = [
+              {
+                name: 'priority:p0',
+                color: 'B60205',
+                description: 'P0 — critical work that should be handled immediately.',
+              },
+              {
+                name: 'priority:p1',
+                color: 'D93F0B',
+                description: 'P1 — high-priority planned work.',
+              },
+              {
+                name: 'priority:p2',
+                color: 'FBCA04',
+                description: 'P2 — normal planned work.',
+              },
+              {
+                name: inProgressLabel,
+                color: '5319E7',
+                description: 'Actively reserved or implemented by the automatic issue scheduler.',
+              },
+              {
+                name: pausedLabel,
+                color: 'BFDADC',
+                description: 'Automation is paused after a failed/stopped implementation; remove to retry.',
+              },
+              // A configured route label is reserved before this run can see
+              // it, so create it here rather than letting a consumer's
+              // selection silently no-op on a missing label.
+              ...[...executionRouteLabels].map(name => ({
+                name,
+                color: '0E8A16',
+                description:
+                  'Routes this issue to a configured execution workflow instead of the OpenCode agent.',
+              })),
+            ];
+
+            for (const spec of labelSpecs) {
+              try {
+                await github.rest.issues.createLabel({ owner, repo, ...spec });
+              } catch (err) {
+                if (err.status !== 422) throw err; // already exists
+              }
+            }
+
+            const labelsByIssue = new Map();
+
+            function rememberIssue(issue) {
+              labelsByIssue.set(
+                issue.number,
+                new Set(
+                  (issue.labels || []).map(label =>
+                    typeof label === 'string' ? label : label.name
+                  )
+                )
+              );
+            }
+
+            async function addLabel(issueNumber, name) {
+              const labels = labelsByIssue.get(issueNumber);
+              if (labels?.has(name)) return;
+              await github.rest.issues.addLabels({
+                owner,
+                repo,
+                issue_number: issueNumber,
+                labels: [name],
+              });
+              if (labels) labels.add(name);
+            }
+
+            async function removeLabel(issueNumber, name) {
+              const labels = labelsByIssue.get(issueNumber);
+              if (labels && !labels.has(name)) return;
+              try {
+                await github.rest.issues.removeLabel({
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                  name,
+                });
+              } catch (err) {
+                if (err.status !== 404) throw err;
+              }
+              if (labels) labels.delete(name);
+            }
+
+            async function pauseIssue(issueNumber, reason) {
+              await removeLabel(issueNumber, inProgressLabel);
+              if (!pauseOnFailure) {
+                await removeLabel(issueNumber, pausedLabel);
+                core.warning(
+                  'Released issue #' + issueNumber +
+                  ' for automatic retry instead of pausing: ' + reason
+                );
+                return;
+              }
+              await addLabel(issueNumber, pausedLabel);
+              core.warning('Paused issue #' + issueNumber + ': ' + reason);
+              if (postPauseComment) {
+                try {
+                  await github.rest.issues.createComment({
+                    owner,
+                    repo,
+                    issue_number: issueNumber,
+                    body: [
+                      'Automation paused: ' + reason + '.',
+                      '',
+                      'Remove the `' + pausedLabel + '` label to retry.',
+                    ].join('\n'),
+                  });
+                } catch (err) {
+                  core.warning(
+                    'Could not post the pause comment for #' +
+                      issueNumber +
+                      ': ' +
+                      err.message
+                  );
+                }
+              }
+            }
+
+            // A closed OpenCode PR is authoritative:
+            // - merged means the implementation is done -> close the issue;
+            // - closed without merge means the attempt was rejected/stopped ->
+            //   pause automation instead of looping and reopening PRs forever.
+            if (context.eventName === 'pull_request_target') {
+              const pr = context.payload.pull_request;
+              if (pr?.head?.repo?.full_name === repoFullName) {
+                const match = (pr.head.ref || '').match(/^opencode\/issue(\d+)-/);
+                if (match) {
+                  const issueNumber = Number(match[1]);
+                  try {
+                    const response = await github.rest.issues.get({
+                      owner,
+                      repo,
+                      issue_number: issueNumber,
+                    });
+                    rememberIssue(response.data);
+
+                    if (pr.merged) {
+                      await removeLabel(issueNumber, inProgressLabel);
+                      await removeLabel(issueNumber, pausedLabel);
+                      if (response.data.state !== 'closed') {
+                        await github.rest.issues.update({
+                          owner,
+                          repo,
+                          issue_number: issueNumber,
+                          state: 'closed',
+                          state_reason: 'completed',
+                        });
+                      }
+                      core.notice(
+                        'Merged OpenCode PR #' + pr.number +
+                        ' completed issue #' + issueNumber + '.'
+                      );
+                    } else {
+                      const blockers = await github.paginate(
+                        'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
+                        {
+                          owner,
+                          repo,
+                          issue_number: issueNumber,
+                          per_page: 100,
+                          headers: {
+                            'X-GitHub-Api-Version': '2022-11-28',
+                          },
+                        }
+                      );
+                      const openBlockers = blockers.filter(
+                        blocker => blocker.state === 'open'
+                      );
+
+                      // A rejected run against a blocked issue is not a
+                      // failure of the implementation; it is work that was not
+                      // eligible yet. Release the reservation and let the
+                      // dependency, not the pause label, decide readiness.
+                      if (openBlockers.length > 0) {
+                        await removeLabel(issueNumber, inProgressLabel);
+                        await removeLabel(issueNumber, pausedLabel);
+                        core.notice(
+                          'OpenCode PR #' + pr.number +
+                          ' closed without merge for blocked issue #' +
+                          issueNumber + '; reservation released, issue remains ' +
+                          'eligible after blockers complete.'
+                        );
+                      } else {
+                        await pauseIssue(
+                          issueNumber,
+                          'OpenCode PR #' + pr.number +
+                          ' was closed without merge.'
+                        );
+                      }
+                    }
+                  } catch (err) {
+                    if (err.status !== 404) throw err;
+                  }
+                }
+              }
+            }
+
+            // A closed issue is terminal for scheduler admission and must not
+            // retain an implementation reservation. Reconcile this in the
+            // shared engine rather than in a consumer caller so every consumer
+            // releases stale WIP immediately after an issue is closed.
+            const closedLeasedIssues = await github.paginate(
+              github.rest.issues.listForRepo,
+              {
+                owner,
+                repo,
+                state: 'closed',
+                labels: inProgressLabel,
+                per_page: 100,
+              }
+            );
+            for (const issue of closedLeasedIssues) {
+              if (issue.pull_request) continue;
+              await removeLabel(issue.number, inProgressLabel);
+              core.notice(
+                'Released stale reservation on closed issue #' +
+                  issue.number +
+                  '.'
+              );
+            }
+
+            let issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner,
+              repo,
+              state: 'open',
+              per_page: 100,
+            });
+            issues = issues.filter(issue => !issue.pull_request);
+            for (const issue of issues) rememberIssue(issue);
+
+            if (!pauseOnFailure) {
+              for (const issue of issues) {
+                if (labelsByIssue.get(issue.number).has(pausedLabel)) {
+                  await removeLabel(issue.number, pausedLabel);
+                  core.notice(
+                    'Cleared legacy automation pause on issue #' +
+                    issue.number +
+                    ' because pause_on_failure=false.'
+                  );
+                }
+              }
+            }
+
+            // Manual owner-triggered /oc runs are real in-flight work too.
+            // Reserve the issue immediately so the scheduler cannot enqueue a
+            // second OpenCode run before the first one creates its PR.
+            if (context.eventName === 'issue_comment') {
+              const eventIssue = context.payload.issue;
+              const comment = context.payload.comment;
+              const body = comment?.body || '';
+              const isOwnerCommand =
+                comment?.user?.login === owner &&
+                (body.includes('/oc') || body.includes('/opencode'));
+
+              if (
+                eventIssue &&
+                !eventIssue.pull_request &&
+                eventIssue.state === 'open' &&
+                isOwnerCommand
+              ) {
+                if (!labelsByIssue.has(eventIssue.number)) {
+                  rememberIssue(eventIssue);
+                }
+                await addLabel(eventIssue.number, inProgressLabel);
+                core.notice(
+                  'Reserved issue #' + eventIssue.number +
+                  ' for manually triggered OpenCode work.'
+                );
+              }
+            }
+
+            // One-time migration for the current backlog only. After this,
+            // priority labels are the source of truth. No default priority is
+            // assigned: an unprioritized issue is valid and sorts after P2.
+            for (const issue of issues) {
+              const labels = labelsByIssue.get(issue.number);
+              const currentPriorities = [...labels].filter(name =>
+                priorityRank.has(name)
+              );
+              if (currentPriorities.length !== 0) continue;
+
+              const match = issue.title.match(/^P([0-2]):\s+/i);
+              if (!match) continue;
+
+              const priority = ('priority:p' + match[1]).toLowerCase();
+              const cleanTitle = issue.title.replace(/^P[0-2]:\s+/i, '');
+
+              await addLabel(issue.number, priority);
+              if (cleanTitle !== issue.title) {
+                await github.rest.issues.update({
+                  owner,
+                  repo,
+                  issue_number: issue.number,
+                  title: cleanTitle,
+                });
+                issue.title = cleanTitle;
+              }
+
+              core.notice(
+                'Migrated issue #' + issue.number + ' to ' + priority + '.'
+              );
+            }
+
+            // Read every OpenCode issue PR, not just open ones. This lets the
+            // cron run reconcile missed PR-close events from current repository
+            // state rather than depending on a permanent dispatch marker.
+            const pulls = await github.paginate(github.rest.pulls.list, {
+              owner,
+              repo,
+              state: 'all',
+              per_page: 100,
+            });
+
+            const openPrIssues = new Set();
+            const latestPrByIssue = new Map();
+
+            for (const pr of pulls) {
+              if (pr.head?.repo?.full_name !== repoFullName) continue;
+              const match = (pr.head.ref || '').match(/^opencode\/issue(\d+)-/);
+              if (!match) continue;
+
+              const issueNumber = Number(match[1]);
+              const previous = latestPrByIssue.get(issueNumber);
+              if (!previous || pr.number > previous.number) {
+                latestPrByIssue.set(issueNumber, pr);
+              }
+              if (pr.state === 'open') openPrIssues.add(issueNumber);
+            }
+
+            const issueByNumber = new Map(issues.map(issue => [issue.number, issue]));
+            const issueNumbersByTitle = new Map();
+            for (const issue of issues) {
+              if (!issueNumbersByTitle.has(issue.title)) {
+                issueNumbersByTitle.set(issue.title, []);
+              }
+              issueNumbersByTitle.get(issue.title).push(issue.number);
+            }
+
+            const activeIssueNumbers = new Set();
+
+            // Active/pending OpenCode Actions are authoritative in-flight work.
+            // Without this, lease expiry releases an issue while GitHub is still
+            // running or queueing its implementation.
+            const workflowRuns = await github.paginate(
+              github.rest.actions.listWorkflowRunsForRepo,
+              {
+                owner,
+                repo,
+                per_page: 100,
+              }
+            );
+
+            const activeRunIssues = new Set();
+            for (const run of workflowRuns) {
+              const isOpenCodeWorkflow =
+                run.path === opencodeWorkflowPath ||
+                run.name === opencodeWorkflowName;
+              if (
+                !isOpenCodeWorkflow ||
+                run.status === 'completed' ||
+                run.event !== 'issue_comment'
+              ) {
+                continue;
+              }
+
+              const numbered = (run.display_title || '').match(
+                /^OpenCode issue #(\d+)$/
+              );
+              if (numbered) {
+                activeRunIssues.add(Number(numbered[1]));
+                continue;
+              }
+
+              // A caller without `run-name:` reports the issue title instead,
+              // which is only unambiguous while exactly one issue carries it.
+              const matches = issueNumbersByTitle.get(run.display_title || '') || [];
+              if (matches.length === 1) {
+                activeRunIssues.add(matches[0]);
+              }
+            }
+
+            for (const issueNumber of activeRunIssues) {
+              if (!issueByNumber.has(issueNumber)) continue;
+              activeIssueNumbers.add(issueNumber);
+              await addLabel(issueNumber, inProgressLabel);
+              await removeLabel(issueNumber, pausedLabel);
+            }
+
+            // An open OpenCode PR is still visible work, but consumers may
+            // choose not to spend an implementation WIP slot while that PR is
+            // merely waiting for CI, review, hardware, or merge.
+            for (const issueNumber of openPrIssues) {
+              if (countOpenPrsAsWip) {
+                activeIssueNumbers.add(issueNumber);
+              }
+              if (issueByNumber.has(issueNumber)) {
+                await addLabel(issueNumber, inProgressLabel);
+                await removeLabel(issueNumber, pausedLabel);
+              }
+            }
+
+            // Reconcile reservations for the gap between posting /oc and the PR
+            // appearing. The dispatch comment is audit/timing metadata only; it
+            // never blocks an issue forever.
+            for (const issue of issues) {
+              const issueNumber = issue.number;
+              if (
+                openPrIssues.has(issueNumber) ||
+                activeRunIssues.has(issueNumber)
+              ) continue;
+
+              const labels = labelsByIssue.get(issueNumber);
+              if (!labels.has(inProgressLabel)) continue;
+
+              // A native open dependency is authoritative even when an older
+              // dispatch lease still exists. Once the actual OpenCode run is
+              // gone, release the reservation immediately so blocked work does
+              // not consume WIP capacity or get resurrected from old comments.
+              const reservationBlockers = await github.paginate(
+                'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
+                {
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                  per_page: 100,
+                  headers: {
+                    'X-GitHub-Api-Version': '2022-11-28',
+                  },
+                }
+              );
+              const openReservationBlockers = reservationBlockers.filter(
+                blocker => blocker.state === 'open'
+              );
+              if (openReservationBlockers.length > 0) {
+                await removeLabel(issueNumber, inProgressLabel);
+                core.notice(
+                  'Released reservation on issue #' + issueNumber +
+                  ': blocked by ' +
+                  openReservationBlockers
+                    .map(blocker => '#' + blocker.number)
+                    .join(', ') + '.'
+                );
+                continue;
+              }
+
+              const comments = await github.paginate(
+                github.rest.issues.listComments,
+                {
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                  per_page: 100,
+                }
+              );
+              const dispatches = comments
+                .filter(comment => {
+                  const body = comment.body || '';
+                  const ownerOpenCodeCommand =
+                    comment.user?.login === owner &&
+                    (body.includes('/oc') || body.includes('/opencode'));
+                  return body.includes(dispatchMarker) || ownerOpenCodeCommand;
+                })
+                .sort(
+                  (a, b) =>
+                    new Date(a.created_at).getTime() -
+                    new Date(b.created_at).getTime()
+                );
+              // Only the scheduler's own dispatches consume the attempt budget;
+              // a manual owner /oc must never burn one.
+              const schedulerDispatches = comments.filter(comment =>
+                (comment.body || '').includes(dispatchMarker)
+              );
+              const latestDispatch = dispatches.at(-1);
+              const latestPr = latestPrByIssue.get(issueNumber);
+
+              // If a PR from the current/latest dispatch already completed but
+              // its event was missed, reconcile it here.
+              if (latestDispatch && latestPr) {
+                const dispatchAt = new Date(latestDispatch.created_at).getTime();
+                const prAt = new Date(latestPr.created_at).getTime();
+                if (prAt >= dispatchAt && latestPr.state === 'closed') {
+                  if (latestPr.merged_at) {
+                    await removeLabel(issueNumber, inProgressLabel);
+                    await removeLabel(issueNumber, pausedLabel);
+                    await github.rest.issues.update({
+                      owner,
+                      repo,
+                      issue_number: issueNumber,
+                      state: 'closed',
+                      state_reason: 'completed',
+                    });
+                    core.notice(
+                      'Reconciled merged PR #' + latestPr.number +
+                      ' -> completed issue #' + issueNumber + '.'
+                    );
+                  } else {
+                    await pauseIssue(
+                      issueNumber,
+                      'PR #' + latestPr.number + ' closed without merge.'
+                    );
+                  }
+                  continue;
+                }
+              }
+
+              if (!latestDispatch) {
+                // A stale/manual reservation with no evidence of a dispatch is
+                // safe to release immediately.
+                await removeLabel(issueNumber, inProgressLabel);
+                core.warning(
+                  'Released stale reservation on issue #' + issueNumber +
+                  ': no scheduler dispatch record exists.'
+                );
+                continue;
+              }
+
+              const ageMs =
+                Date.now() - new Date(latestDispatch.created_at).getTime();
+
+              if (ageMs < leaseMs) {
+                activeIssueNumbers.add(issueNumber);
+                continue;
+              }
+
+              await removeLabel(issueNumber, inProgressLabel);
+
+              if (
+                schedulerDispatches.length >= maxDispatchAttempts &&
+                pauseOnFailure
+              ) {
+                await addLabel(issueNumber, pausedLabel);
+                core.warning(
+                  'Issue #' + issueNumber + ' produced no OpenCode PR after ' +
+                  schedulerDispatches.length +
+                  ' scheduler dispatch attempt(s); automation paused.'
+                );
+              } else {
+                await removeLabel(issueNumber, pausedLabel);
+                core.warning(
+                  'Lease expired for issue #' + issueNumber +
+                  '; it is eligible for an automatic retry' +
+                  (schedulerDispatches.length >= maxDispatchAttempts
+                    ? ' because pause_on_failure=false.'
+                    : '.')
+                );
+              }
+            }
+
+            const totalActiveWip = activeIssueNumbers.size + childActiveWip;
+            const freeSlots = Math.max(0, wipLimit - totalActiveWip);
+            core.notice(
+              'WIP: ' + totalActiveWip + '/' + wipLimit +
+              ' (local ' + activeIssueNumbers.size +
+              ', delegated ' + childActiveWip + ')' +
+              '; free slots: ' + freeSlots +
+              '; active local issues: ' +
+              ([...activeIssueNumbers]
+                .sort((a, b) => a - b)
+                .map(n => '#' + n)
+                .join(', ') || 'none') + '.'
+            );
+
+            if (freeSlots === 0) {
+              core.info('No free WIP slots; nothing will be dispatched.');
+              return;
+            }
+
+            const candidates = [];
+            for (const issue of issues) {
+              if (activeIssueNumbers.has(issue.number)) continue;
+              // An existing implementation PR must never be duplicated even
+              // when it is configured not to consume a WIP slot.
+              if (openPrIssues.has(issue.number)) continue;
+
+              const labels = labelsByIssue.get(issue.number);
+              if (pauseOnFailure && labels.has(pausedLabel)) {
+                core.info('Skipping #' + issue.number + ': automation is paused.');
+                continue;
+              }
+
+              const priorities = [...labels]
+                .filter(name => priorityRank.has(name))
+                .sort(
+                  (a, b) => priorityRank.get(a) - priorityRank.get(b)
+                );
+
+              // Multiple priority labels are not a reason to deadlock an issue.
+              // Highest priority wins deterministically; the anomaly is logged.
+              const priority = priorities[0] || null;
+              if (requirePriorityLabel && priority === null) {
+                core.info(
+                  'Skipping #' + issue.number + ': no priority label and ' +
+                    'require_priority_label is enabled.'
+                );
+                continue;
+              }
+              const rank = priority === null ? priorityOrder.length : priorityRank.get(priority);
+              if (priorities.length > 1) {
+                core.warning(
+                  'Issue #' + issue.number + ' has multiple priority labels (' +
+                  priorities.join(', ') + '); using ' + priority + '.'
+                );
+              }
+
+              candidates.push({ source: 'local', issue, priority, rank });
+            }
+
+            for (const child of childCandidates) {
+              const taskNumber = Number.parseInt(String(child.task_number), 10);
+              const rank = Number.parseInt(String(child.rank), 10);
+              if (
+                !child.child_id ||
+                !child.repository ||
+                !Number.isInteger(taskNumber) ||
+                taskNumber < 1 ||
+                !Number.isInteger(rank) ||
+                rank < 0
+              ) {
+                throw new Error(
+                  'Invalid delegated child candidate: ' + JSON.stringify(child)
+                );
+              }
+              candidates.push({
+                source: 'child',
+                issue: {
+                  number: taskNumber,
+                  title: child.title || '',
+                  body: '',
+                },
+                priority: child.priority || null,
+                rank,
+                child: {
+                  child_id: String(child.child_id),
+                  repository: String(child.repository),
+                  task_number: taskNumber,
+                },
+              });
+            }
+
+            candidates.sort(
+              (a, b) =>
+                a.rank - b.rank ||
+                a.issue.number - b.issue.number ||
+                a.source.localeCompare(b.source) ||
+                String(a.child?.repository || '').localeCompare(
+                  String(b.child?.repository || '')
+                )
+            );
+
+            const selected = [];
+            for (const candidate of candidates) {
+              if (selected.length >= freeSlots) break;
+
+              const issue = candidate.issue;
+              if (candidate.source === 'child') {
+                selected.push(candidate);
+                continue;
+              }
+
+              const declaredOpenBlockers = await openDeclaredBlockers(issue);
+              if (declaredOpenBlockers.length > 0) {
+                core.info(
+                  'Skipping #' + issue.number + ': declared blocked by ' +
+                  declaredOpenBlockers.map(blocker => '#' + blocker.number).join(', ') + '.'
+                );
+                continue;
+              }
+
+              const blockers = await github.paginate(
+                'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
+                {
+                  owner,
+                  repo,
+                  issue_number: issue.number,
+                  per_page: 100,
+                  headers: {
+                    'X-GitHub-Api-Version': '2022-11-28',
+                  },
+                }
+              );
+              const openBlockers = blockers.filter(
+                blocker => blocker.state === 'open'
+              );
+              if (openBlockers.length > 0) {
+                core.info(
+                  'Skipping #' + issue.number + ': blocked by ' +
+                  openBlockers.map(blocker => '#' + blocker.number).join(', ') + '.'
+                );
+                continue;
+              }
+
+              selected.push(candidate);
+            }
+
+            if (selected.length === 0) {
+              core.notice('No eligible unblocked issues are ready.');
+              return;
+            }
+
+            core.notice(
+              'Selected: ' +
+              selected
+                .map(item =>
+                  (item.source === 'child'
+                    ? '[' + item.child.child_id + ']#' + item.issue.number
+                    : '#' + item.issue.number) +
+                  ' (' + (item.priority || 'no priority') + ')'
+                )
+                .join(', ') + '.'
+            );
+
+            for (const candidate of selected) {
+              const { issue, priority } = candidate;
+
+              if (candidate.source === 'child') {
+                const child = candidate.child;
+                const parts = child.repository.split('/');
+                if (parts.length !== 2 || !parts[0] || !parts[1]) {
+                  throw new Error(
+                    'Invalid delegated child repository: ' + child.repository
+                  );
+                }
+                const [childOwner, childRepo] = parts;
+                const freshResponse = await github.rest.issues.get({
+                  owner: childOwner,
+                  repo: childRepo,
+                  issue_number: child.task_number,
+                });
+                const freshChildIssue = freshResponse.data;
+                if (
+                  freshChildIssue.state !== 'open' ||
+                  freshChildIssue.pull_request
+                ) {
+                  core.info(
+                    'Skipping delegated [' + child.child_id + ']#' +
+                    child.task_number + ': state changed before dispatch.'
+                  );
+                  continue;
+                }
+
+                const childDeclaredBlockers = await openDeclaredBlockers(
+                  freshChildIssue,
+                  childOwner,
+                  childRepo
+                );
+                if (childDeclaredBlockers.length > 0) {
+                  core.info(
+                    'Skipping delegated [' + child.child_id + ']#' +
+                    child.task_number +
+                    ': declared blocker appeared before dispatch.'
+                  );
+                  continue;
+                }
+
+                const childNativeBlockers = await github.paginate(
+                  'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
+                  {
+                    owner: childOwner,
+                    repo: childRepo,
+                    issue_number: child.task_number,
+                    per_page: 100,
+                    headers: {
+                      'X-GitHub-Api-Version': '2022-11-28',
+                    },
+                  }
+                );
+                if (
+                  childNativeBlockers.some(blocker => blocker.state === 'open')
+                ) {
+                  core.info(
+                    'Skipping delegated [' + child.child_id + ']#' +
+                    child.task_number +
+                    ': native blocker appeared before dispatch.'
+                  );
+                  continue;
+                }
+
+                await dispatchWorkflow(childWorkerWorkflow, {
+                  child_id: child.child_id,
+                  task_number: String(child.task_number),
+                });
+                core.notice(
+                  'Dispatched delegated [' + child.child_id + ']#' +
+                  child.task_number + ' (' +
+                  (priority || 'no priority') + ').'
+                );
+                continue;
+              }
+              // Re-check mutable state immediately before dispatch. Another
+              // owner /oc, dependency update, pause, or reservation may have
+              // landed while this scheduler run was already evaluating the
+              // backlog. Without this JIT guard an older scheduler run can
+              // enqueue a duplicate OpenCode run after a manual /oc.
+              const freshIssueResponse = await github.rest.issues.get({
+                owner,
+                repo,
+                issue_number: issue.number,
+              });
+              const freshIssue = freshIssueResponse.data;
+              const freshLabels = new Set(
+                (freshIssue.labels || []).map(label =>
+                  typeof label === 'string' ? label : label.name
+                )
+              );
+
+              if (
+                freshIssue.state !== 'open' ||
+                (pauseOnFailure && freshLabels.has(pausedLabel)) ||
+                freshLabels.has(inProgressLabel)
+              ) {
+                core.info(
+                  'Skipping #' + issue.number +
+                  ': state changed before dispatch.'
+                );
+                continue;
+              }
+
+              const freshDeclaredBlockers = await openDeclaredBlockers(freshIssue);
+              if (freshDeclaredBlockers.length > 0) {
+                core.info(
+                  'Skipping #' + issue.number + ': declared blocker appeared before dispatch: ' +
+                  freshDeclaredBlockers.map(blocker => '#' + blocker.number).join(', ') + '.'
+                );
+                continue;
+              }
+
+              const freshBlockers = await github.paginate(
+                'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
+                {
+                  owner,
+                  repo,
+                  issue_number: issue.number,
+                  per_page: 100,
+                  headers: {
+                    'X-GitHub-Api-Version': '2022-11-28',
+                  },
+                }
+              );
+              const freshOpenBlockers = freshBlockers.filter(
+                blocker => blocker.state === 'open'
+              );
+              if (freshOpenBlockers.length > 0) {
+                core.info(
+                  'Skipping #' + issue.number +
+                  ': blocker appeared before dispatch: ' +
+                  freshOpenBlockers
+                    .map(blocker => '#' + blocker.number)
+                    .join(', ') + '.'
+                );
+                continue;
+              }
+
+              const freshComments = await github.paginate(
+                github.rest.issues.listComments,
+                {
+                  owner,
+                  repo,
+                  issue_number: issue.number,
+                  per_page: 100,
+                }
+              );
+              const latestOpenCodeCommand = freshComments
+                .filter(comment => {
+                  const body = comment.body || '';
+                  return comment.user?.login === owner &&
+                    (body.includes('/oc') || body.includes('/opencode'));
+                })
+                .sort(
+                  (a, b) =>
+                    new Date(a.created_at).getTime() -
+                    new Date(b.created_at).getTime()
+                )
+                .at(-1);
+
+              if (latestOpenCodeCommand) {
+                const commandAgeMs =
+                  Date.now() -
+                  new Date(latestOpenCodeCommand.created_at).getTime();
+                if (commandAgeMs < commandGraceMs) {
+                  core.info(
+                    'Skipping #' + issue.number +
+                    ': an owner OpenCode command was posted within the ' +
+                    'short dispatch race window.'
+                  );
+                  continue;
+                }
+              }
+
+              // A label acts as a short lease/reservation while OpenCode starts.
+              // It is rolled back immediately if posting /oc fails, expires
+              // automatically if no PR appears, and is reconciled from PR state.
+              await addLabel(issue.number, inProgressLabel);
+
+              try {
+                if (resetMarkers) {
+                  // Opt-in: drop previously recorded dispatch markers so the
+                  // issue starts from a fresh attempt budget. Consumers that
+                  // rely on markers as an audit trail leave this off.
+                  const previous = await github.paginate(
+                    'GET /repos/{owner}/{repo}/issues/{issue_number}/comments',
+                    {
+                      owner,
+                      repo,
+                      issue_number: issue.number,
+                      per_page: 100,
+                    }
+                  );
+                  for (const comment of previous) {
+                    if ((comment.body || '').includes(dispatchMarker)) {
+                      await github.rest.issues.deleteComment({
+                        owner,
+                        repo,
+                        comment_id: comment.id,
+                      });
+                    }
+                  }
+                }
+
+                const markerComment = [
+                  dispatchMarker,
+                  'Automatically dispatched by the issue scheduler (' +
+                    (priority || 'no explicit priority') + ').',
+                ].join('\n');
+
+                const route = executionRoutes.find(
+                  candidate => issue.labels.some(l => l.name === candidate.label)
+                );
+
+                if (route) {
+                  // The marker still lands on the issue so a consumer can see
+                  // the attempt in the audit trail, but the workflow is
+                  // dispatched directly: an execution workflow does not read
+                  // owner comments.
+                  await github.rest.issues.createComment({
+                    owner,
+                    repo,
+                    issue_number: issue.number,
+                    body: markerComment,
+                  });
+                  await dispatchWorkflow(route.workflow, {
+                    ...route.inputs,
+                    issue_number: String(issue.number),
+                  });
+                } else if (opencodeDispatch === 'workflow') {
+                  await github.rest.issues.createComment({
+                    owner,
+                    repo,
+                    issue_number: issue.number,
+                    body: markerComment,
+                  });
+                  // Inlined rather than routed through dispatchWorkflow so
+                  // the dispatched mode stays visible at the call site.
+                  await github.request(
+                    'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
+                    {
+                      owner,
+                      repo,
+                      workflow_id: opencodeWorkflowPath.replace(
+                        /^\.github\/workflows\//,
+                        ''
+                      ),
+                      ref: dispatchRef,
+                      inputs: { mode: 'issue', issue_number: String(issue.number) },
+                    }
+                  );
+                } else {
+                  await github.rest.issues.createComment({
+                    owner,
+                    repo,
+                    issue_number: issue.number,
+                    body: ['/oc', '', markerComment].join('\n'),
+                  });
+                }
+              } catch (err) {
+                await removeLabel(issue.number, inProgressLabel);
+                throw err;
+              }
+
+              core.notice(
+                'Dispatched issue #' + issue.number + ' (' +
+                (priority || 'no priority') + ').'
+              );
+            }
+
+      - name: Wake the configured downstream dispatcher
+        if: env.CHILD_DISPATCH_WORKFLOW != '' && vars.CONTINUUM_ROLE != 'parent'
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          CHILD_DISPATCH_WORKFLOW: ${{ env.CHILD_DISPATCH_WORKFLOW }}
+          DISPATCH_REF: ${{ env.DISPATCH_REF }}
+        run: |
+          set -euo pipefail
+          if ! gh api --method POST \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/$CHILD_DISPATCH_WORKFLOW/dispatches" \
+            -f ref="$DISPATCH_REF" >/dev/null; then
+            echo "::warning::Could not dispatch $CHILD_DISPATCH_WORKFLOW at $DISPATCH_REF."
+          else
+            echo "Dispatched $CHILD_DISPATCH_WORKFLOW at $DISPATCH_REF."
+          fi
+\t' read -r stale_pr stale_head; do
+              [[ -n "$stale_pr" && -n "$stale_head" ]] || continue
+              stale_task="$(
+                sed -nE 's#^(continuum-child|runtime-worker)/task-([0-9]+)-.*#\2#p' <<<"$stale_head"
+              )"
+              [[ -n "$stale_task" ]] || continue
+              stale_issue_json="$(gh api "repos/$child_repo/issues/$stale_task" 2>/dev/null || true)"
+              [[ "$(jq -r '.state // "closed"' <<<"$stale_issue_json")" == "open" ]] || continue
+
+              stale_ready=true
+              stale_body="$(jq -r '.body // ""' <<<"$stale_issue_json")"
+              stale_deps="$(
+                sed -nE 's/.*<!-- *automation-blocked-by: *([^>]*) *-->.*/\1/p' \
+                  <<<"$stale_body" | head -1 | tr ',' ' '
+              )"
+              for stale_dep in $stale_deps; do
+                stale_dep="${stale_dep//#/}"
+                stale_dep="${stale_dep//[[:space:]]/}"
+                [[ "$stale_dep" =~ ^[0-9]+$ ]] || continue
+                stale_dep_state="$(
+                  gh api "repos/$child_repo/issues/$stale_dep" --jq '.state' 2>/dev/null || echo open
+                )"
+                if [[ "$stale_dep_state" != "closed" ]]; then
+                  stale_ready=false
+                  break
+                fi
+              done
+              [[ "$stale_ready" == true ]] || continue
+
+              if gh pr reopen "$stale_pr" --repo "$child_repo" >/dev/null 2>&1; then
+                echo "Reopened stale delegated PR #$stale_pr for child task #$stale_task."
+              fi
+            done < <(
+              gh pr list --repo "$child_repo" --state closed --limit 100 \
+                --json number,headRefName,mergedAt \
+                --jq '.[] | select(.mergedAt == null) | select(
+                    (.headRefName | startswith("continuum-child/task-")) or
+                    (.headRefName | startswith("runtime-worker/task-"))
+                  ) | [.number,.headRefName] | @tsv' 2>/dev/null || true
+            )
+
+            open_prs="$(
+              gh pr list --repo "$child_repo" --state open --limit 100 \
+                --json number,headRefName \
+                --jq 'sort_by(.number) | reverse | .[] | select(
+                    (.headRefName | startswith("continuum-child/task-")) or
+                    (.headRefName | startswith("runtime-worker/task-"))
+                  ) | [.number,.headRefName] | @tsv' 2>/dev/null || true
+            )"
+            open_pr_tasks="$(
+              cut -f2 <<<"$open_prs" \
+                | sed -nE 's#^(continuum-child|runtime-worker)/task-([0-9]+)-.*#\2#p'
+            )"
+
+            if [[ "${COUNT_OPEN_PRS_AS_WIP:-true}" != "false" ]]; then
+              while IFS= read -r open_task; do
+                [[ -n "$open_task" ]] || continue
+                active_wip_keys["$child_id#$open_task"]=1
+              done <<<"$open_pr_tasks"
+            fi
+
+            local_opencode_pr_tasks="$(
+              gh pr list --repo "$child_repo" --state open --limit 100 \
+                --json headRefName \
+                --jq '.[] | .headRefName | select(startswith("opencode/issue"))' \
+                | sed -nE 's#^opencode/issue([0-9]+)-.*#\1#p'
+            )"
+            local_opencode_run_tasks="$(
+              gh api --paginate "repos/$child_repo/actions/runs?per_page=100" \
+                --jq '.workflow_runs[]
+                  | select(.status != "completed")
+                  | .display_title
+                  | select(test("^OpenCode issue #[0-9]+$"))
+                  | capture("^OpenCode issue #(?<task>[0-9]+)$").task' \
+                2>/dev/null || true
+            )"
+            child_owner="$(gh api "repos/$child_repo" --jq '.owner.login' 2>/dev/null || true)"
+            command_grace_seconds=$(( COMMAND_GRACE_MINUTES * 60 ))
+
+            local_override_active() {
+              local task_number="$1"
+              local recent_command command_epoch now_epoch
+
+              if grep -Fxq "$task_number" <<<"$local_opencode_pr_tasks" ||
+                 grep -Fxq "$task_number" <<<"$local_opencode_run_tasks"; then
+                return 0
+              fi
+
+              [[ -n "$child_owner" ]] || return 1
+              recent_command="$(
+                gh api --paginate "repos/$child_repo/issues/$task_number/comments?per_page=100" \
+                  --jq '.[] | select(.user.login == "'"$child_owner"'") | select((.body // "") | test("(^|[[:space:]])/(oc|opencode)([[:space:]]|$)")) | .created_at' \
+                  2>/dev/null | tail -1 || true
+              )"
+              [[ -n "$recent_command" ]] || return 1
+
+              command_epoch="$(date -d "$recent_command" +%s 2>/dev/null || echo 0)"
+              now_epoch="$(date +%s)"
+              (( command_epoch > 0 && now_epoch - command_epoch < command_grace_seconds ))
+            }
+
+            if [[ -n "$open_prs" ]]; then
+              selected_review_tasks=""
+              while IFS=
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          # TAP_PAT is required because the existing OpenCode workflow accepts
+          # /oc only from the repository owner. It also makes issue-state
+          # mutations and comments created here visible as normal owner actions.
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const repoFullName = owner + '/' + repo;
+
+            function positiveInt(name, fallback) {
+              const value = Number.parseInt(process.env[name] || String(fallback), 10);
+              if (!Number.isInteger(value) || value < 1) {
+                throw new Error('Invalid ' + name + ': ' + process.env[name]);
+              }
+              return value;
+            }
+
+            const wipLimit = positiveInt('WIP_LIMIT', 2);
+            const leaseMinutes = positiveInt('LEASE_MINUTES', 45);
+            const maxDispatchAttempts = positiveInt('MAX_DISPATCH_ATTEMPTS', 2);
+            const leaseMs = leaseMinutes * 60 * 1000;
+            // A recent owner /oc is only a race guard while GitHub starts the
+            // corresponding workflow. It must not inherit the full work lease:
+            // cancelled/premature runs may legitimately become eligible again
+            // as soon as their native blockers close.
+            const commandGraceMinutes = positiveInt('COMMAND_GRACE_MINUTES', 5);
+            const commandGraceMs = commandGraceMinutes * 60 * 1000;
+
+            const priorityOrder = [
+              'priority:p0',
+              'priority:p1',
+              'priority:p2',
+            ];
+            const priorityRank = new Map(
+              priorityOrder.map((name, index) => [name, index])
+            );
+            const inProgressLabel = process.env.IN_PROGRESS_LABEL || 'automation:in-progress';
+            const pausedLabel = process.env.PAUSE_LABEL || 'automation:paused';
+            const dispatchMarker = process.env.DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->';
+            const postPauseComment =
+              (process.env.POST_PAUSE_COMMENT || 'true') !== 'false';
+            const resetMarkers =
+              (process.env.RESET_MARKERS || 'false') === 'true';
+            const requirePriorityLabel =
+              (process.env.REQUIRE_PRIORITY_LABEL || 'false') === 'true';
+            const opencodeWorkflowName =
+              process.env.OPENCODE_WORKFLOW_NAME || 'OpenCode agent';
+            const opencodeWorkflowPath =
+              process.env.OPENCODE_WORKFLOW_PATH ||
+              '.github/workflows/continuum-opencode.yml';
+            const dispatchRef = process.env.DISPATCH_REF || 'main';
+
+            // A ready issue normally reaches OpenCode as an owner comment, the
+            // only path that needs no extra permission. A consumer whose
+            // OpenCode caller has no `issue_comment` trigger needs the
+            // workflow_dispatch form instead.
+            const opencodeDispatch = (
+              process.env.OPENCODE_DISPATCH || 'comment'
+            ).trim();
+            if (!['comment', 'workflow'].includes(opencodeDispatch)) {
+              throw new Error(
+                "Unsupported opencode_dispatch '" + opencodeDispatch +
+                  "'; expected 'comment' or 'workflow'."
+              );
+            }
+
+            // Label-driven execution routes are configuration, never a table
+            // inside core: the render and Docker qualification controllers are
+            // separate reusable workflows that a consumer may or may not
+            // install, and a consumer may route to workflows core has never
+            // heard of. Empty means "route nothing".
+            //
+            // A malformed entry fails the run instead of being dropped,
+            // because a silently ignored route looks reserved but is never
+            // executed.
+            const executionRoutes = (process.env.EXECUTION_LABEL_ROUTES || '')
+              .split('\n')
+              .map(line => line.trim())
+              .filter(line => line && !line.startsWith('#'))
+              .map(line => {
+                const parts = line.split('|').map(part => part.trim());
+                if (parts.length < 2 || parts.length > 3 || !parts[0] || !parts[1]) {
+                  throw new Error(
+                    "Invalid execution_label_routes line: '" +
+                      line +
+                      "'; expected '<issue label>|<workflow file name>|<input>=<value>,...'."
+                  );
+                }
+                const inputs = {};
+                for (const assignment of (parts[2] || '').split(',')) {
+                  const trimmed = assignment.trim();
+                  if (!trimmed) continue;
+                  const separator = trimmed.indexOf('=');
+                  if (separator <= 0) {
+                    throw new Error(
+                      "Invalid execution_label_routes input '" +
+                        trimmed +
+                        "' on line '" +
+                        line +
+                        "'; expected '<name>=<value>'."
+                    );
+                  }
+                  inputs[trimmed.slice(0, separator).trim()] = trimmed
+                    .slice(separator + 1)
+                    .trim();
+                }
+                return { label: parts[0], workflow: parts[1], inputs };
+              });
+            const executionRouteLabels = new Set(
+              executionRoutes.map(route => route.label)
+            );
+
+            const childDispatchWorkflow = (
+              process.env.CHILD_DISPATCH_WORKFLOW || ''
+            ).trim();
+            const countOpenPrsAsWip =
+              (process.env.COUNT_OPEN_PRS_AS_WIP || 'true') !== 'false';
+            const pauseOnFailure =
+              (process.env.PAUSE_ON_FAILURE || 'true') !== 'false';
+
+            // Byte-for-byte the marker the watchdog parses. A doubled backslash
+            // here would silently disable declared-dependency blocking.
+            function declaredDependencyNumbers(issue) {
+              const match = (issue.body || '').match(
+                /<!--\s*automation-blocked-by:\s*([0-9#\s,]+?)\s*-->/i
+              );
+              if (!match) return [];
+              return [...new Set(
+                [...match[1].matchAll(/\d+/g)]
+                  .map(item => Number.parseInt(item[0], 10))
+                  .filter(Number.isInteger)
+              )];
+            }
+
+            async function openDeclaredBlockers(issue) {
+              const open = [];
+              for (const blockerNumber of declaredDependencyNumbers(issue)) {
+                if (blockerNumber === issue.number) continue;
+                const response = await github.rest.issues.get({
+                  owner,
+                  repo,
+                  issue_number: blockerNumber,
+                });
+                if (response.data.state === 'open') open.push(response.data);
+              }
+              return open;
+            }
+
+            // Every dispatch in this job goes through the PAT, so no
+            // `actions: write` grant is needed on the caller's token.
+            async function dispatchWorkflow(workflow, inputs) {
+              await github.request(
+                'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
+                { owner, repo, workflow_id: workflow, ref: dispatchRef, inputs }
+              );
+            }
+
+            const labelSpecs = [
+              {
+                name: 'priority:p0',
+                color: 'B60205',
+                description: 'P0 — critical work that should be handled immediately.',
+              },
+              {
+                name: 'priority:p1',
+                color: 'D93F0B',
+                description: 'P1 — high-priority planned work.',
+              },
+              {
+                name: 'priority:p2',
+                color: 'FBCA04',
+                description: 'P2 — normal planned work.',
+              },
+              {
+                name: inProgressLabel,
+                color: '5319E7',
+                description: 'Actively reserved or implemented by the automatic issue scheduler.',
+              },
+              {
+                name: pausedLabel,
+                color: 'BFDADC',
+                description: 'Automation is paused after a failed/stopped implementation; remove to retry.',
+              },
+              // A configured route label is reserved before this run can see
+              // it, so create it here rather than letting a consumer's
+              // selection silently no-op on a missing label.
+              ...[...executionRouteLabels].map(name => ({
+                name,
+                color: '0E8A16',
+                description:
+                  'Routes this issue to a configured execution workflow instead of the OpenCode agent.',
+              })),
+            ];
+
+            for (const spec of labelSpecs) {
+              try {
+                await github.rest.issues.createLabel({ owner, repo, ...spec });
+              } catch (err) {
+                if (err.status !== 422) throw err; // already exists
+              }
+            }
+
+            const labelsByIssue = new Map();
+
+            function rememberIssue(issue) {
+              labelsByIssue.set(
+                issue.number,
+                new Set(
+                  (issue.labels || []).map(label =>
+                    typeof label === 'string' ? label : label.name
+                  )
+                )
+              );
+            }
+
+            async function addLabel(issueNumber, name) {
+              const labels = labelsByIssue.get(issueNumber);
+              if (labels?.has(name)) return;
+              await github.rest.issues.addLabels({
+                owner,
+                repo,
+                issue_number: issueNumber,
+                labels: [name],
+              });
+              if (labels) labels.add(name);
+            }
+
+            async function removeLabel(issueNumber, name) {
+              const labels = labelsByIssue.get(issueNumber);
+              if (labels && !labels.has(name)) return;
+              try {
+                await github.rest.issues.removeLabel({
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                  name,
+                });
+              } catch (err) {
+                if (err.status !== 404) throw err;
+              }
+              if (labels) labels.delete(name);
+            }
+
+            async function pauseIssue(issueNumber, reason) {
+              await removeLabel(issueNumber, inProgressLabel);
+              if (!pauseOnFailure) {
+                await removeLabel(issueNumber, pausedLabel);
+                core.warning(
+                  'Released issue #' + issueNumber +
+                  ' for automatic retry instead of pausing: ' + reason
+                );
+                return;
+              }
+              await addLabel(issueNumber, pausedLabel);
+              core.warning('Paused issue #' + issueNumber + ': ' + reason);
+              if (postPauseComment) {
+                try {
+                  await github.rest.issues.createComment({
+                    owner,
+                    repo,
+                    issue_number: issueNumber,
+                    body: [
+                      'Automation paused: ' + reason + '.',
+                      '',
+                      'Remove the `' + pausedLabel + '` label to retry.',
+                    ].join('\n'),
+                  });
+                } catch (err) {
+                  core.warning(
+                    'Could not post the pause comment for #' +
+                      issueNumber +
+                      ': ' +
+                      err.message
+                  );
+                }
+              }
+            }
+
+            // A closed OpenCode PR is authoritative:
+            // - merged means the implementation is done -> close the issue;
+            // - closed without merge means the attempt was rejected/stopped ->
+            //   pause automation instead of looping and reopening PRs forever.
+            if (context.eventName === 'pull_request_target') {
+              const pr = context.payload.pull_request;
+              if (pr?.head?.repo?.full_name === repoFullName) {
+                const match = (pr.head.ref || '').match(/^opencode\/issue(\d+)-/);
+                if (match) {
+                  const issueNumber = Number(match[1]);
+                  try {
+                    const response = await github.rest.issues.get({
+                      owner,
+                      repo,
+                      issue_number: issueNumber,
+                    });
+                    rememberIssue(response.data);
+
+                    if (pr.merged) {
+                      await removeLabel(issueNumber, inProgressLabel);
+                      await removeLabel(issueNumber, pausedLabel);
+                      if (response.data.state !== 'closed') {
+                        await github.rest.issues.update({
+                          owner,
+                          repo,
+                          issue_number: issueNumber,
+                          state: 'closed',
+                          state_reason: 'completed',
+                        });
+                      }
+                      core.notice(
+                        'Merged OpenCode PR #' + pr.number +
+                        ' completed issue #' + issueNumber + '.'
+                      );
+                    } else {
+                      const blockers = await github.paginate(
+                        'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
+                        {
+                          owner,
+                          repo,
+                          issue_number: issueNumber,
+                          per_page: 100,
+                          headers: {
+                            'X-GitHub-Api-Version': '2022-11-28',
+                          },
+                        }
+                      );
+                      const openBlockers = blockers.filter(
+                        blocker => blocker.state === 'open'
+                      );
+
+                      // A rejected run against a blocked issue is not a
+                      // failure of the implementation; it is work that was not
+                      // eligible yet. Release the reservation and let the
+                      // dependency, not the pause label, decide readiness.
+                      if (openBlockers.length > 0) {
+                        await removeLabel(issueNumber, inProgressLabel);
+                        await removeLabel(issueNumber, pausedLabel);
+                        core.notice(
+                          'OpenCode PR #' + pr.number +
+                          ' closed without merge for blocked issue #' +
+                          issueNumber + '; reservation released, issue remains ' +
+                          'eligible after blockers complete.'
+                        );
+                      } else {
+                        await pauseIssue(
+                          issueNumber,
+                          'OpenCode PR #' + pr.number +
+                          ' was closed without merge.'
+                        );
+                      }
+                    }
+                  } catch (err) {
+                    if (err.status !== 404) throw err;
+                  }
+                }
+              }
+            }
+
+            // A closed issue is terminal for scheduler admission and must not
+            // retain an implementation reservation. Reconcile this in the
+            // shared engine rather than in a consumer caller so every consumer
+            // releases stale WIP immediately after an issue is closed.
+            const closedLeasedIssues = await github.paginate(
+              github.rest.issues.listForRepo,
+              {
+                owner,
+                repo,
+                state: 'closed',
+                labels: inProgressLabel,
+                per_page: 100,
+              }
+            );
+            for (const issue of closedLeasedIssues) {
+              if (issue.pull_request) continue;
+              await removeLabel(issue.number, inProgressLabel);
+              core.notice(
+                'Released stale reservation on closed issue #' +
+                  issue.number +
+                  '.'
+              );
+            }
+
+            let issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner,
+              repo,
+              state: 'open',
+              per_page: 100,
+            });
+            issues = issues.filter(issue => !issue.pull_request);
+            for (const issue of issues) rememberIssue(issue);
+
+            if (!pauseOnFailure) {
+              for (const issue of issues) {
+                if (labelsByIssue.get(issue.number).has(pausedLabel)) {
+                  await removeLabel(issue.number, pausedLabel);
+                  core.notice(
+                    'Cleared legacy automation pause on issue #' +
+                    issue.number +
+                    ' because pause_on_failure=false.'
+                  );
+                }
+              }
+            }
+
+            // Manual owner-triggered /oc runs are real in-flight work too.
+            // Reserve the issue immediately so the scheduler cannot enqueue a
+            // second OpenCode run before the first one creates its PR.
+            if (context.eventName === 'issue_comment') {
+              const eventIssue = context.payload.issue;
+              const comment = context.payload.comment;
+              const body = comment?.body || '';
+              const isOwnerCommand =
+                comment?.user?.login === owner &&
+                (body.includes('/oc') || body.includes('/opencode'));
+
+              if (
+                eventIssue &&
+                !eventIssue.pull_request &&
+                eventIssue.state === 'open' &&
+                isOwnerCommand
+              ) {
+                if (!labelsByIssue.has(eventIssue.number)) {
+                  rememberIssue(eventIssue);
+                }
+                await addLabel(eventIssue.number, inProgressLabel);
+                core.notice(
+                  'Reserved issue #' + eventIssue.number +
+                  ' for manually triggered OpenCode work.'
+                );
+              }
+            }
+
+            // One-time migration for the current backlog only. After this,
+            // priority labels are the source of truth. No default priority is
+            // assigned: an unprioritized issue is valid and sorts after P2.
+            for (const issue of issues) {
+              const labels = labelsByIssue.get(issue.number);
+              const currentPriorities = [...labels].filter(name =>
+                priorityRank.has(name)
+              );
+              if (currentPriorities.length !== 0) continue;
+
+              const match = issue.title.match(/^P([0-2]):\s+/i);
+              if (!match) continue;
+
+              const priority = ('priority:p' + match[1]).toLowerCase();
+              const cleanTitle = issue.title.replace(/^P[0-2]:\s+/i, '');
+
+              await addLabel(issue.number, priority);
+              if (cleanTitle !== issue.title) {
+                await github.rest.issues.update({
+                  owner,
+                  repo,
+                  issue_number: issue.number,
+                  title: cleanTitle,
+                });
+                issue.title = cleanTitle;
+              }
+
+              core.notice(
+                'Migrated issue #' + issue.number + ' to ' + priority + '.'
+              );
+            }
+
+            // Read every OpenCode issue PR, not just open ones. This lets the
+            // cron run reconcile missed PR-close events from current repository
+            // state rather than depending on a permanent dispatch marker.
+            const pulls = await github.paginate(github.rest.pulls.list, {
+              owner,
+              repo,
+              state: 'all',
+              per_page: 100,
+            });
+
+            const openPrIssues = new Set();
+            const latestPrByIssue = new Map();
+
+            for (const pr of pulls) {
+              if (pr.head?.repo?.full_name !== repoFullName) continue;
+              const match = (pr.head.ref || '').match(/^opencode\/issue(\d+)-/);
+              if (!match) continue;
+
+              const issueNumber = Number(match[1]);
+              const previous = latestPrByIssue.get(issueNumber);
+              if (!previous || pr.number > previous.number) {
+                latestPrByIssue.set(issueNumber, pr);
+              }
+              if (pr.state === 'open') openPrIssues.add(issueNumber);
+            }
+
+            const issueByNumber = new Map(issues.map(issue => [issue.number, issue]));
+            const issueNumbersByTitle = new Map();
+            for (const issue of issues) {
+              if (!issueNumbersByTitle.has(issue.title)) {
+                issueNumbersByTitle.set(issue.title, []);
+              }
+              issueNumbersByTitle.get(issue.title).push(issue.number);
+            }
+
+            const activeIssueNumbers = new Set();
+
+            // Active/pending OpenCode Actions are authoritative in-flight work.
+            // Without this, lease expiry releases an issue while GitHub is still
+            // running or queueing its implementation.
+            const workflowRuns = await github.paginate(
+              github.rest.actions.listWorkflowRunsForRepo,
+              {
+                owner,
+                repo,
+                per_page: 100,
+              }
+            );
+
+            const activeRunIssues = new Set();
+            for (const run of workflowRuns) {
+              const isOpenCodeWorkflow =
+                run.path === opencodeWorkflowPath ||
+                run.name === opencodeWorkflowName;
+              if (
+                !isOpenCodeWorkflow ||
+                run.status === 'completed' ||
+                run.event !== 'issue_comment'
+              ) {
+                continue;
+              }
+
+              const numbered = (run.display_title || '').match(
+                /^OpenCode issue #(\d+)$/
+              );
+              if (numbered) {
+                activeRunIssues.add(Number(numbered[1]));
+                continue;
+              }
+
+              // A caller without `run-name:` reports the issue title instead,
+              // which is only unambiguous while exactly one issue carries it.
+              const matches = issueNumbersByTitle.get(run.display_title || '') || [];
+              if (matches.length === 1) {
+                activeRunIssues.add(matches[0]);
+              }
+            }
+
+            for (const issueNumber of activeRunIssues) {
+              if (!issueByNumber.has(issueNumber)) continue;
+              activeIssueNumbers.add(issueNumber);
+              await addLabel(issueNumber, inProgressLabel);
+              await removeLabel(issueNumber, pausedLabel);
+            }
+
+            // An open OpenCode PR is still visible work, but consumers may
+            // choose not to spend an implementation WIP slot while that PR is
+            // merely waiting for CI, review, hardware, or merge.
+            for (const issueNumber of openPrIssues) {
+              if (countOpenPrsAsWip) {
+                activeIssueNumbers.add(issueNumber);
+              }
+              if (issueByNumber.has(issueNumber)) {
+                await addLabel(issueNumber, inProgressLabel);
+                await removeLabel(issueNumber, pausedLabel);
+              }
+            }
+
+            // Reconcile reservations for the gap between posting /oc and the PR
+            // appearing. The dispatch comment is audit/timing metadata only; it
+            // never blocks an issue forever.
+            for (const issue of issues) {
+              const issueNumber = issue.number;
+              if (
+                openPrIssues.has(issueNumber) ||
+                activeRunIssues.has(issueNumber)
+              ) continue;
+
+              const labels = labelsByIssue.get(issueNumber);
+              if (!labels.has(inProgressLabel)) continue;
+
+              // A native open dependency is authoritative even when an older
+              // dispatch lease still exists. Once the actual OpenCode run is
+              // gone, release the reservation immediately so blocked work does
+              // not consume WIP capacity or get resurrected from old comments.
+              const reservationBlockers = await github.paginate(
+                'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
+                {
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                  per_page: 100,
+                  headers: {
+                    'X-GitHub-Api-Version': '2022-11-28',
+                  },
+                }
+              );
+              const openReservationBlockers = reservationBlockers.filter(
+                blocker => blocker.state === 'open'
+              );
+              if (openReservationBlockers.length > 0) {
+                await removeLabel(issueNumber, inProgressLabel);
+                core.notice(
+                  'Released reservation on issue #' + issueNumber +
+                  ': blocked by ' +
+                  openReservationBlockers
+                    .map(blocker => '#' + blocker.number)
+                    .join(', ') + '.'
+                );
+                continue;
+              }
+
+              const comments = await github.paginate(
+                github.rest.issues.listComments,
+                {
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                  per_page: 100,
+                }
+              );
+              const dispatches = comments
+                .filter(comment => {
+                  const body = comment.body || '';
+                  const ownerOpenCodeCommand =
+                    comment.user?.login === owner &&
+                    (body.includes('/oc') || body.includes('/opencode'));
+                  return body.includes(dispatchMarker) || ownerOpenCodeCommand;
+                })
+                .sort(
+                  (a, b) =>
+                    new Date(a.created_at).getTime() -
+                    new Date(b.created_at).getTime()
+                );
+              // Only the scheduler's own dispatches consume the attempt budget;
+              // a manual owner /oc must never burn one.
+              const schedulerDispatches = comments.filter(comment =>
+                (comment.body || '').includes(dispatchMarker)
+              );
+              const latestDispatch = dispatches.at(-1);
+              const latestPr = latestPrByIssue.get(issueNumber);
+
+              // If a PR from the current/latest dispatch already completed but
+              // its event was missed, reconcile it here.
+              if (latestDispatch && latestPr) {
+                const dispatchAt = new Date(latestDispatch.created_at).getTime();
+                const prAt = new Date(latestPr.created_at).getTime();
+                if (prAt >= dispatchAt && latestPr.state === 'closed') {
+                  if (latestPr.merged_at) {
+                    await removeLabel(issueNumber, inProgressLabel);
+                    await removeLabel(issueNumber, pausedLabel);
+                    await github.rest.issues.update({
+                      owner,
+                      repo,
+                      issue_number: issueNumber,
+                      state: 'closed',
+                      state_reason: 'completed',
+                    });
+                    core.notice(
+                      'Reconciled merged PR #' + latestPr.number +
+                      ' -> completed issue #' + issueNumber + '.'
+                    );
+                  } else {
+                    await pauseIssue(
+                      issueNumber,
+                      'PR #' + latestPr.number + ' closed without merge.'
+                    );
+                  }
+                  continue;
+                }
+              }
+
+              if (!latestDispatch) {
+                // A stale/manual reservation with no evidence of a dispatch is
+                // safe to release immediately.
+                await removeLabel(issueNumber, inProgressLabel);
+                core.warning(
+                  'Released stale reservation on issue #' + issueNumber +
+                  ': no scheduler dispatch record exists.'
+                );
+                continue;
+              }
+
+              const ageMs =
+                Date.now() - new Date(latestDispatch.created_at).getTime();
+
+              if (ageMs < leaseMs) {
+                activeIssueNumbers.add(issueNumber);
+                continue;
+              }
+
+              await removeLabel(issueNumber, inProgressLabel);
+
+              if (
+                schedulerDispatches.length >= maxDispatchAttempts &&
+                pauseOnFailure
+              ) {
+                await addLabel(issueNumber, pausedLabel);
+                core.warning(
+                  'Issue #' + issueNumber + ' produced no OpenCode PR after ' +
+                  schedulerDispatches.length +
+                  ' scheduler dispatch attempt(s); automation paused.'
+                );
+              } else {
+                await removeLabel(issueNumber, pausedLabel);
+                core.warning(
+                  'Lease expired for issue #' + issueNumber +
+                  '; it is eligible for an automatic retry' +
+                  (schedulerDispatches.length >= maxDispatchAttempts
+                    ? ' because pause_on_failure=false.'
+                    : '.')
+                );
+              }
+            }
+
+            const freeSlots = Math.max(0, wipLimit - activeIssueNumbers.size);
+            core.notice(
+              'WIP: ' + activeIssueNumbers.size + '/' + wipLimit +
+              '; free slots: ' + freeSlots +
+              '; active issues: ' +
+              ([...activeIssueNumbers]
+                .sort((a, b) => a - b)
+                .map(n => '#' + n)
+                .join(', ') || 'none') + '.'
+            );
+
+            if (freeSlots === 0) {
+              core.info('No free WIP slots; nothing will be dispatched.');
+              return;
+            }
+
+            const candidates = [];
+            for (const issue of issues) {
+              if (activeIssueNumbers.has(issue.number)) continue;
+              // An existing implementation PR must never be duplicated even
+              // when it is configured not to consume a WIP slot.
+              if (openPrIssues.has(issue.number)) continue;
+
+              const labels = labelsByIssue.get(issue.number);
+              if (pauseOnFailure && labels.has(pausedLabel)) {
+                core.info('Skipping #' + issue.number + ': automation is paused.');
+                continue;
+              }
+
+              const priorities = [...labels]
+                .filter(name => priorityRank.has(name))
+                .sort(
+                  (a, b) => priorityRank.get(a) - priorityRank.get(b)
+                );
+
+              // Multiple priority labels are not a reason to deadlock an issue.
+              // Highest priority wins deterministically; the anomaly is logged.
+              const priority = priorities[0] || null;
+              if (requirePriorityLabel && priority === null) {
+                core.info(
+                  'Skipping #' + issue.number + ': no priority label and ' +
+                    'require_priority_label is enabled.'
+                );
+                continue;
+              }
+              const rank = priority === null ? priorityOrder.length : priorityRank.get(priority);
+              if (priorities.length > 1) {
+                core.warning(
+                  'Issue #' + issue.number + ' has multiple priority labels (' +
+                  priorities.join(', ') + '); using ' + priority + '.'
+                );
+              }
+
+              candidates.push({ issue, priority, rank });
+            }
+
+            candidates.sort(
+              (a, b) =>
+                a.rank - b.rank ||
+                a.issue.number - b.issue.number
+            );
+
+            const selected = [];
+            for (const candidate of candidates) {
+              if (selected.length >= freeSlots) break;
+
+              const issue = candidate.issue;
+              const declaredOpenBlockers = await openDeclaredBlockers(issue);
+              if (declaredOpenBlockers.length > 0) {
+                core.info(
+                  'Skipping #' + issue.number + ': declared blocked by ' +
+                  declaredOpenBlockers.map(blocker => '#' + blocker.number).join(', ') + '.'
+                );
+                continue;
+              }
+
+              const blockers = await github.paginate(
+                'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
+                {
+                  owner,
+                  repo,
+                  issue_number: issue.number,
+                  per_page: 100,
+                  headers: {
+                    'X-GitHub-Api-Version': '2022-11-28',
+                  },
+                }
+              );
+              const openBlockers = blockers.filter(
+                blocker => blocker.state === 'open'
+              );
+              if (openBlockers.length > 0) {
+                core.info(
+                  'Skipping #' + issue.number + ': blocked by ' +
+                  openBlockers.map(blocker => '#' + blocker.number).join(', ') + '.'
+                );
+                continue;
+              }
+
+              selected.push(candidate);
+            }
+
+            if (selected.length === 0) {
+              core.notice('No eligible unblocked issues are ready.');
+              return;
+            }
+
+            core.notice(
+              'Selected: ' +
+              selected
+                .map(item =>
+                  '#' + item.issue.number + ' (' +
+                  (item.priority || 'no priority') + ')'
+                )
+                .join(', ') + '.'
+            );
+
+            for (const { issue, priority } of selected) {
+              // Re-check mutable state immediately before dispatch. Another
+              // owner /oc, dependency update, pause, or reservation may have
+              // landed while this scheduler run was already evaluating the
+              // backlog. Without this JIT guard an older scheduler run can
+              // enqueue a duplicate OpenCode run after a manual /oc.
+              const freshIssueResponse = await github.rest.issues.get({
+                owner,
+                repo,
+                issue_number: issue.number,
+              });
+              const freshIssue = freshIssueResponse.data;
+              const freshLabels = new Set(
+                (freshIssue.labels || []).map(label =>
+                  typeof label === 'string' ? label : label.name
+                )
+              );
+
+              if (
+                freshIssue.state !== 'open' ||
+                (pauseOnFailure && freshLabels.has(pausedLabel)) ||
+                freshLabels.has(inProgressLabel)
+              ) {
+                core.info(
+                  'Skipping #' + issue.number +
+                  ': state changed before dispatch.'
+                );
+                continue;
+              }
+
+              const freshDeclaredBlockers = await openDeclaredBlockers(freshIssue);
+              if (freshDeclaredBlockers.length > 0) {
+                core.info(
+                  'Skipping #' + issue.number + ': declared blocker appeared before dispatch: ' +
+                  freshDeclaredBlockers.map(blocker => '#' + blocker.number).join(', ') + '.'
+                );
+                continue;
+              }
+
+              const freshBlockers = await github.paginate(
+                'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
+                {
+                  owner,
+                  repo,
+                  issue_number: issue.number,
+                  per_page: 100,
+                  headers: {
+                    'X-GitHub-Api-Version': '2022-11-28',
+                  },
+                }
+              );
+              const freshOpenBlockers = freshBlockers.filter(
+                blocker => blocker.state === 'open'
+              );
+              if (freshOpenBlockers.length > 0) {
+                core.info(
+                  'Skipping #' + issue.number +
+                  ': blocker appeared before dispatch: ' +
+                  freshOpenBlockers
+                    .map(blocker => '#' + blocker.number)
+                    .join(', ') + '.'
+                );
+                continue;
+              }
+
+              const freshComments = await github.paginate(
+                github.rest.issues.listComments,
+                {
+                  owner,
+                  repo,
+                  issue_number: issue.number,
+                  per_page: 100,
+                }
+              );
+              const latestOpenCodeCommand = freshComments
+                .filter(comment => {
+                  const body = comment.body || '';
+                  return comment.user?.login === owner &&
+                    (body.includes('/oc') || body.includes('/opencode'));
+                })
+                .sort(
+                  (a, b) =>
+                    new Date(a.created_at).getTime() -
+                    new Date(b.created_at).getTime()
+                )
+                .at(-1);
+
+              if (latestOpenCodeCommand) {
+                const commandAgeMs =
+                  Date.now() -
+                  new Date(latestOpenCodeCommand.created_at).getTime();
+                if (commandAgeMs < commandGraceMs) {
+                  core.info(
+                    'Skipping #' + issue.number +
+                    ': an owner OpenCode command was posted within the ' +
+                    'short dispatch race window.'
+                  );
+                  continue;
+                }
+              }
+
+              // A label acts as a short lease/reservation while OpenCode starts.
+              // It is rolled back immediately if posting /oc fails, expires
+              // automatically if no PR appears, and is reconciled from PR state.
+              await addLabel(issue.number, inProgressLabel);
+
+              try {
+                if (resetMarkers) {
+                  // Opt-in: drop previously recorded dispatch markers so the
+                  // issue starts from a fresh attempt budget. Consumers that
+                  // rely on markers as an audit trail leave this off.
+                  const previous = await github.paginate(
+                    'GET /repos/{owner}/{repo}/issues/{issue_number}/comments',
+                    {
+                      owner,
+                      repo,
+                      issue_number: issue.number,
+                      per_page: 100,
+                    }
+                  );
+                  for (const comment of previous) {
+                    if ((comment.body || '').includes(dispatchMarker)) {
+                      await github.rest.issues.deleteComment({
+                        owner,
+                        repo,
+                        comment_id: comment.id,
+                      });
+                    }
+                  }
+                }
+
+                const markerComment = [
+                  dispatchMarker,
+                  'Automatically dispatched by the issue scheduler (' +
+                    (priority || 'no explicit priority') + ').',
+                ].join('\n');
+
+                const route = executionRoutes.find(
+                  candidate => issue.labels.some(l => l.name === candidate.label)
+                );
+
+                if (route) {
+                  // The marker still lands on the issue so a consumer can see
+                  // the attempt in the audit trail, but the workflow is
+                  // dispatched directly: an execution workflow does not read
+                  // owner comments.
+                  await github.rest.issues.createComment({
+                    owner,
+                    repo,
+                    issue_number: issue.number,
+                    body: markerComment,
+                  });
+                  await dispatchWorkflow(route.workflow, {
+                    ...route.inputs,
+                    issue_number: String(issue.number),
+                  });
+                } else if (opencodeDispatch === 'workflow') {
+                  await github.rest.issues.createComment({
+                    owner,
+                    repo,
+                    issue_number: issue.number,
+                    body: markerComment,
+                  });
+                  // Inlined rather than routed through dispatchWorkflow so
+                  // the dispatched mode stays visible at the call site.
+                  await github.request(
+                    'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
+                    {
+                      owner,
+                      repo,
+                      workflow_id: opencodeWorkflowPath.replace(
+                        /^\.github\/workflows\//,
+                        ''
+                      ),
+                      ref: dispatchRef,
+                      inputs: { mode: 'issue', issue_number: String(issue.number) },
+                    }
+                  );
+                } else {
+                  await github.rest.issues.createComment({
+                    owner,
+                    repo,
+                    issue_number: issue.number,
+                    body: ['/oc', '', markerComment].join('\n'),
+                  });
+                }
+              } catch (err) {
+                await removeLabel(issue.number, inProgressLabel);
+                throw err;
+              }
+
+              core.notice(
+                'Dispatched issue #' + issue.number + ' (' +
+                (priority || 'no priority') + ').'
+              );
+            }
+
+      - name: Wake the configured downstream dispatcher
+        if: env.CHILD_DISPATCH_WORKFLOW != ''
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          CHILD_DISPATCH_WORKFLOW: ${{ env.CHILD_DISPATCH_WORKFLOW }}
+          DISPATCH_REF: ${{ env.DISPATCH_REF }}
+        run: |
+          set -euo pipefail
+          if ! gh api --method POST \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/$CHILD_DISPATCH_WORKFLOW/dispatches" \
+            -f ref="$DISPATCH_REF" >/dev/null; then
+            echo "::warning::Could not dispatch $CHILD_DISPATCH_WORKFLOW at $DISPATCH_REF."
+          else
+            echo "Dispatched $CHILD_DISPATCH_WORKFLOW at $DISPATCH_REF."
+          fi
+\t' read -r pr_number head_ref; do
+                [[ -n "$pr_number" ]] || continue
+                task_number="$(
+                  sed -nE 's#^(continuum-child|runtime-worker)/task-([0-9]+)-.*#\2#p' <<<"$head_ref"
+                )"
+                [[ -n "$task_number" ]] || continue
+
+                task_state="$(
+                  gh api "repos/$child_repo/issues/$task_number" --jq '.state' 2>/dev/null || echo closed
+                )"
+                if [[ "$task_state" != "open" ]]; then
+                  gh pr comment "$pr_number" --repo "$child_repo" \
+                    --body "Closed automatically: delegated task #$task_number is already completed." \
+                    >/dev/null 2>&1 || true
+                  gh pr close "$pr_number" --repo "$child_repo" >/dev/null 2>&1 || true
+                  echo "Closed stale delegated PR #$pr_number for completed task #$task_number."
+                  continue
+                fi
+
+                if grep -Fxq "$task_number" <<<"$selected_review_tasks"; then
+                  echo "Skipping duplicate delegated PR #$pr_number for task #$task_number in this cycle."
+                  continue
+                fi
+                selected_review_tasks+="$task_number"
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          # TAP_PAT is required because the existing OpenCode workflow accepts
+          # /oc only from the repository owner. It also makes issue-state
+          # mutations and comments created here visible as normal owner actions.
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const repoFullName = owner + '/' + repo;
+
+            function positiveInt(name, fallback) {
+              const value = Number.parseInt(process.env[name] || String(fallback), 10);
+              if (!Number.isInteger(value) || value < 1) {
+                throw new Error('Invalid ' + name + ': ' + process.env[name]);
+              }
+              return value;
+            }
+
+            const wipLimit = positiveInt('WIP_LIMIT', 2);
+            const leaseMinutes = positiveInt('LEASE_MINUTES', 45);
+            const maxDispatchAttempts = positiveInt('MAX_DISPATCH_ATTEMPTS', 2);
+            const leaseMs = leaseMinutes * 60 * 1000;
+            // A recent owner /oc is only a race guard while GitHub starts the
+            // corresponding workflow. It must not inherit the full work lease:
+            // cancelled/premature runs may legitimately become eligible again
+            // as soon as their native blockers close.
+            const commandGraceMinutes = positiveInt('COMMAND_GRACE_MINUTES', 5);
+            const commandGraceMs = commandGraceMinutes * 60 * 1000;
+
+            const priorityOrder = [
+              'priority:p0',
+              'priority:p1',
+              'priority:p2',
+            ];
+            const priorityRank = new Map(
+              priorityOrder.map((name, index) => [name, index])
+            );
+            const inProgressLabel = process.env.IN_PROGRESS_LABEL || 'automation:in-progress';
+            const pausedLabel = process.env.PAUSE_LABEL || 'automation:paused';
+            const dispatchMarker = process.env.DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->';
+            const postPauseComment =
+              (process.env.POST_PAUSE_COMMENT || 'true') !== 'false';
+            const resetMarkers =
+              (process.env.RESET_MARKERS || 'false') === 'true';
+            const requirePriorityLabel =
+              (process.env.REQUIRE_PRIORITY_LABEL || 'false') === 'true';
+            const opencodeWorkflowName =
+              process.env.OPENCODE_WORKFLOW_NAME || 'OpenCode agent';
+            const opencodeWorkflowPath =
+              process.env.OPENCODE_WORKFLOW_PATH ||
+              '.github/workflows/continuum-opencode.yml';
+            const dispatchRef = process.env.DISPATCH_REF || 'main';
+
+            // A ready issue normally reaches OpenCode as an owner comment, the
+            // only path that needs no extra permission. A consumer whose
+            // OpenCode caller has no `issue_comment` trigger needs the
+            // workflow_dispatch form instead.
+            const opencodeDispatch = (
+              process.env.OPENCODE_DISPATCH || 'comment'
+            ).trim();
+            if (!['comment', 'workflow'].includes(opencodeDispatch)) {
+              throw new Error(
+                "Unsupported opencode_dispatch '" + opencodeDispatch +
+                  "'; expected 'comment' or 'workflow'."
+              );
+            }
+
+            // Label-driven execution routes are configuration, never a table
+            // inside core: the render and Docker qualification controllers are
+            // separate reusable workflows that a consumer may or may not
+            // install, and a consumer may route to workflows core has never
+            // heard of. Empty means "route nothing".
+            //
+            // A malformed entry fails the run instead of being dropped,
+            // because a silently ignored route looks reserved but is never
+            // executed.
+            const executionRoutes = (process.env.EXECUTION_LABEL_ROUTES || '')
+              .split('\n')
+              .map(line => line.trim())
+              .filter(line => line && !line.startsWith('#'))
+              .map(line => {
+                const parts = line.split('|').map(part => part.trim());
+                if (parts.length < 2 || parts.length > 3 || !parts[0] || !parts[1]) {
+                  throw new Error(
+                    "Invalid execution_label_routes line: '" +
+                      line +
+                      "'; expected '<issue label>|<workflow file name>|<input>=<value>,...'."
+                  );
+                }
+                const inputs = {};
+                for (const assignment of (parts[2] || '').split(',')) {
+                  const trimmed = assignment.trim();
+                  if (!trimmed) continue;
+                  const separator = trimmed.indexOf('=');
+                  if (separator <= 0) {
+                    throw new Error(
+                      "Invalid execution_label_routes input '" +
+                        trimmed +
+                        "' on line '" +
+                        line +
+                        "'; expected '<name>=<value>'."
+                    );
+                  }
+                  inputs[trimmed.slice(0, separator).trim()] = trimmed
+                    .slice(separator + 1)
+                    .trim();
+                }
+                return { label: parts[0], workflow: parts[1], inputs };
+              });
+            const executionRouteLabels = new Set(
+              executionRoutes.map(route => route.label)
+            );
+
+            const childDispatchWorkflow = (
+              process.env.CHILD_DISPATCH_WORKFLOW || ''
+            ).trim();
+            const countOpenPrsAsWip =
+              (process.env.COUNT_OPEN_PRS_AS_WIP || 'true') !== 'false';
+            const pauseOnFailure =
+              (process.env.PAUSE_ON_FAILURE || 'true') !== 'false';
+
+            // Byte-for-byte the marker the watchdog parses. A doubled backslash
+            // here would silently disable declared-dependency blocking.
+            function declaredDependencyNumbers(issue) {
+              const match = (issue.body || '').match(
+                /<!--\s*automation-blocked-by:\s*([0-9#\s,]+?)\s*-->/i
+              );
+              if (!match) return [];
+              return [...new Set(
+                [...match[1].matchAll(/\d+/g)]
+                  .map(item => Number.parseInt(item[0], 10))
+                  .filter(Number.isInteger)
+              )];
+            }
+
+            async function openDeclaredBlockers(issue) {
+              const open = [];
+              for (const blockerNumber of declaredDependencyNumbers(issue)) {
+                if (blockerNumber === issue.number) continue;
+                const response = await github.rest.issues.get({
+                  owner,
+                  repo,
+                  issue_number: blockerNumber,
+                });
+                if (response.data.state === 'open') open.push(response.data);
+              }
+              return open;
+            }
+
+            // Every dispatch in this job goes through the PAT, so no
+            // `actions: write` grant is needed on the caller's token.
+            async function dispatchWorkflow(workflow, inputs) {
+              await github.request(
+                'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
+                { owner, repo, workflow_id: workflow, ref: dispatchRef, inputs }
+              );
+            }
+
+            const labelSpecs = [
+              {
+                name: 'priority:p0',
+                color: 'B60205',
+                description: 'P0 — critical work that should be handled immediately.',
+              },
+              {
+                name: 'priority:p1',
+                color: 'D93F0B',
+                description: 'P1 — high-priority planned work.',
+              },
+              {
+                name: 'priority:p2',
+                color: 'FBCA04',
+                description: 'P2 — normal planned work.',
+              },
+              {
+                name: inProgressLabel,
+                color: '5319E7',
+                description: 'Actively reserved or implemented by the automatic issue scheduler.',
+              },
+              {
+                name: pausedLabel,
+                color: 'BFDADC',
+                description: 'Automation is paused after a failed/stopped implementation; remove to retry.',
+              },
+              // A configured route label is reserved before this run can see
+              // it, so create it here rather than letting a consumer's
+              // selection silently no-op on a missing label.
+              ...[...executionRouteLabels].map(name => ({
+                name,
+                color: '0E8A16',
+                description:
+                  'Routes this issue to a configured execution workflow instead of the OpenCode agent.',
+              })),
+            ];
+
+            for (const spec of labelSpecs) {
+              try {
+                await github.rest.issues.createLabel({ owner, repo, ...spec });
+              } catch (err) {
+                if (err.status !== 422) throw err; // already exists
+              }
+            }
+
+            const labelsByIssue = new Map();
+
+            function rememberIssue(issue) {
+              labelsByIssue.set(
+                issue.number,
+                new Set(
+                  (issue.labels || []).map(label =>
+                    typeof label === 'string' ? label : label.name
+                  )
+                )
+              );
+            }
+
+            async function addLabel(issueNumber, name) {
+              const labels = labelsByIssue.get(issueNumber);
+              if (labels?.has(name)) return;
+              await github.rest.issues.addLabels({
+                owner,
+                repo,
+                issue_number: issueNumber,
+                labels: [name],
+              });
+              if (labels) labels.add(name);
+            }
+
+            async function removeLabel(issueNumber, name) {
+              const labels = labelsByIssue.get(issueNumber);
+              if (labels && !labels.has(name)) return;
+              try {
+                await github.rest.issues.removeLabel({
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                  name,
+                });
+              } catch (err) {
+                if (err.status !== 404) throw err;
+              }
+              if (labels) labels.delete(name);
+            }
+
+            async function pauseIssue(issueNumber, reason) {
+              await removeLabel(issueNumber, inProgressLabel);
+              if (!pauseOnFailure) {
+                await removeLabel(issueNumber, pausedLabel);
+                core.warning(
+                  'Released issue #' + issueNumber +
+                  ' for automatic retry instead of pausing: ' + reason
+                );
+                return;
+              }
+              await addLabel(issueNumber, pausedLabel);
+              core.warning('Paused issue #' + issueNumber + ': ' + reason);
+              if (postPauseComment) {
+                try {
+                  await github.rest.issues.createComment({
+                    owner,
+                    repo,
+                    issue_number: issueNumber,
+                    body: [
+                      'Automation paused: ' + reason + '.',
+                      '',
+                      'Remove the `' + pausedLabel + '` label to retry.',
+                    ].join('\n'),
+                  });
+                } catch (err) {
+                  core.warning(
+                    'Could not post the pause comment for #' +
+                      issueNumber +
+                      ': ' +
+                      err.message
+                  );
+                }
+              }
+            }
+
+            // A closed OpenCode PR is authoritative:
+            // - merged means the implementation is done -> close the issue;
+            // - closed without merge means the attempt was rejected/stopped ->
+            //   pause automation instead of looping and reopening PRs forever.
+            if (context.eventName === 'pull_request_target') {
+              const pr = context.payload.pull_request;
+              if (pr?.head?.repo?.full_name === repoFullName) {
+                const match = (pr.head.ref || '').match(/^opencode\/issue(\d+)-/);
+                if (match) {
+                  const issueNumber = Number(match[1]);
+                  try {
+                    const response = await github.rest.issues.get({
+                      owner,
+                      repo,
+                      issue_number: issueNumber,
+                    });
+                    rememberIssue(response.data);
+
+                    if (pr.merged) {
+                      await removeLabel(issueNumber, inProgressLabel);
+                      await removeLabel(issueNumber, pausedLabel);
+                      if (response.data.state !== 'closed') {
+                        await github.rest.issues.update({
+                          owner,
+                          repo,
+                          issue_number: issueNumber,
+                          state: 'closed',
+                          state_reason: 'completed',
+                        });
+                      }
+                      core.notice(
+                        'Merged OpenCode PR #' + pr.number +
+                        ' completed issue #' + issueNumber + '.'
+                      );
+                    } else {
+                      const blockers = await github.paginate(
+                        'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
+                        {
+                          owner,
+                          repo,
+                          issue_number: issueNumber,
+                          per_page: 100,
+                          headers: {
+                            'X-GitHub-Api-Version': '2022-11-28',
+                          },
+                        }
+                      );
+                      const openBlockers = blockers.filter(
+                        blocker => blocker.state === 'open'
+                      );
+
+                      // A rejected run against a blocked issue is not a
+                      // failure of the implementation; it is work that was not
+                      // eligible yet. Release the reservation and let the
+                      // dependency, not the pause label, decide readiness.
+                      if (openBlockers.length > 0) {
+                        await removeLabel(issueNumber, inProgressLabel);
+                        await removeLabel(issueNumber, pausedLabel);
+                        core.notice(
+                          'OpenCode PR #' + pr.number +
+                          ' closed without merge for blocked issue #' +
+                          issueNumber + '; reservation released, issue remains ' +
+                          'eligible after blockers complete.'
+                        );
+                      } else {
+                        await pauseIssue(
+                          issueNumber,
+                          'OpenCode PR #' + pr.number +
+                          ' was closed without merge.'
+                        );
+                      }
+                    }
+                  } catch (err) {
+                    if (err.status !== 404) throw err;
+                  }
+                }
+              }
+            }
+
+            // A closed issue is terminal for scheduler admission and must not
+            // retain an implementation reservation. Reconcile this in the
+            // shared engine rather than in a consumer caller so every consumer
+            // releases stale WIP immediately after an issue is closed.
+            const closedLeasedIssues = await github.paginate(
+              github.rest.issues.listForRepo,
+              {
+                owner,
+                repo,
+                state: 'closed',
+                labels: inProgressLabel,
+                per_page: 100,
+              }
+            );
+            for (const issue of closedLeasedIssues) {
+              if (issue.pull_request) continue;
+              await removeLabel(issue.number, inProgressLabel);
+              core.notice(
+                'Released stale reservation on closed issue #' +
+                  issue.number +
+                  '.'
+              );
+            }
+
+            let issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner,
+              repo,
+              state: 'open',
+              per_page: 100,
+            });
+            issues = issues.filter(issue => !issue.pull_request);
+            for (const issue of issues) rememberIssue(issue);
+
+            if (!pauseOnFailure) {
+              for (const issue of issues) {
+                if (labelsByIssue.get(issue.number).has(pausedLabel)) {
+                  await removeLabel(issue.number, pausedLabel);
+                  core.notice(
+                    'Cleared legacy automation pause on issue #' +
+                    issue.number +
+                    ' because pause_on_failure=false.'
+                  );
+                }
+              }
+            }
+
+            // Manual owner-triggered /oc runs are real in-flight work too.
+            // Reserve the issue immediately so the scheduler cannot enqueue a
+            // second OpenCode run before the first one creates its PR.
+            if (context.eventName === 'issue_comment') {
+              const eventIssue = context.payload.issue;
+              const comment = context.payload.comment;
+              const body = comment?.body || '';
+              const isOwnerCommand =
+                comment?.user?.login === owner &&
+                (body.includes('/oc') || body.includes('/opencode'));
+
+              if (
+                eventIssue &&
+                !eventIssue.pull_request &&
+                eventIssue.state === 'open' &&
+                isOwnerCommand
+              ) {
+                if (!labelsByIssue.has(eventIssue.number)) {
+                  rememberIssue(eventIssue);
+                }
+                await addLabel(eventIssue.number, inProgressLabel);
+                core.notice(
+                  'Reserved issue #' + eventIssue.number +
+                  ' for manually triggered OpenCode work.'
+                );
+              }
+            }
+
+            // One-time migration for the current backlog only. After this,
+            // priority labels are the source of truth. No default priority is
+            // assigned: an unprioritized issue is valid and sorts after P2.
+            for (const issue of issues) {
+              const labels = labelsByIssue.get(issue.number);
+              const currentPriorities = [...labels].filter(name =>
+                priorityRank.has(name)
+              );
+              if (currentPriorities.length !== 0) continue;
+
+              const match = issue.title.match(/^P([0-2]):\s+/i);
+              if (!match) continue;
+
+              const priority = ('priority:p' + match[1]).toLowerCase();
+              const cleanTitle = issue.title.replace(/^P[0-2]:\s+/i, '');
+
+              await addLabel(issue.number, priority);
+              if (cleanTitle !== issue.title) {
+                await github.rest.issues.update({
+                  owner,
+                  repo,
+                  issue_number: issue.number,
+                  title: cleanTitle,
+                });
+                issue.title = cleanTitle;
+              }
+
+              core.notice(
+                'Migrated issue #' + issue.number + ' to ' + priority + '.'
+              );
+            }
+
+            // Read every OpenCode issue PR, not just open ones. This lets the
+            // cron run reconcile missed PR-close events from current repository
+            // state rather than depending on a permanent dispatch marker.
+            const pulls = await github.paginate(github.rest.pulls.list, {
+              owner,
+              repo,
+              state: 'all',
+              per_page: 100,
+            });
+
+            const openPrIssues = new Set();
+            const latestPrByIssue = new Map();
+
+            for (const pr of pulls) {
+              if (pr.head?.repo?.full_name !== repoFullName) continue;
+              const match = (pr.head.ref || '').match(/^opencode\/issue(\d+)-/);
+              if (!match) continue;
+
+              const issueNumber = Number(match[1]);
+              const previous = latestPrByIssue.get(issueNumber);
+              if (!previous || pr.number > previous.number) {
+                latestPrByIssue.set(issueNumber, pr);
+              }
+              if (pr.state === 'open') openPrIssues.add(issueNumber);
+            }
+
+            const issueByNumber = new Map(issues.map(issue => [issue.number, issue]));
+            const issueNumbersByTitle = new Map();
+            for (const issue of issues) {
+              if (!issueNumbersByTitle.has(issue.title)) {
+                issueNumbersByTitle.set(issue.title, []);
+              }
+              issueNumbersByTitle.get(issue.title).push(issue.number);
+            }
+
+            const activeIssueNumbers = new Set();
+
+            // Active/pending OpenCode Actions are authoritative in-flight work.
+            // Without this, lease expiry releases an issue while GitHub is still
+            // running or queueing its implementation.
+            const workflowRuns = await github.paginate(
+              github.rest.actions.listWorkflowRunsForRepo,
+              {
+                owner,
+                repo,
+                per_page: 100,
+              }
+            );
+
+            const activeRunIssues = new Set();
+            for (const run of workflowRuns) {
+              const isOpenCodeWorkflow =
+                run.path === opencodeWorkflowPath ||
+                run.name === opencodeWorkflowName;
+              if (
+                !isOpenCodeWorkflow ||
+                run.status === 'completed' ||
+                run.event !== 'issue_comment'
+              ) {
+                continue;
+              }
+
+              const numbered = (run.display_title || '').match(
+                /^OpenCode issue #(\d+)$/
+              );
+              if (numbered) {
+                activeRunIssues.add(Number(numbered[1]));
+                continue;
+              }
+
+              // A caller without `run-name:` reports the issue title instead,
+              // which is only unambiguous while exactly one issue carries it.
+              const matches = issueNumbersByTitle.get(run.display_title || '') || [];
+              if (matches.length === 1) {
+                activeRunIssues.add(matches[0]);
+              }
+            }
+
+            for (const issueNumber of activeRunIssues) {
+              if (!issueByNumber.has(issueNumber)) continue;
+              activeIssueNumbers.add(issueNumber);
+              await addLabel(issueNumber, inProgressLabel);
+              await removeLabel(issueNumber, pausedLabel);
+            }
+
+            // An open OpenCode PR is still visible work, but consumers may
+            // choose not to spend an implementation WIP slot while that PR is
+            // merely waiting for CI, review, hardware, or merge.
+            for (const issueNumber of openPrIssues) {
+              if (countOpenPrsAsWip) {
+                activeIssueNumbers.add(issueNumber);
+              }
+              if (issueByNumber.has(issueNumber)) {
+                await addLabel(issueNumber, inProgressLabel);
+                await removeLabel(issueNumber, pausedLabel);
+              }
+            }
+
+            // Reconcile reservations for the gap between posting /oc and the PR
+            // appearing. The dispatch comment is audit/timing metadata only; it
+            // never blocks an issue forever.
+            for (const issue of issues) {
+              const issueNumber = issue.number;
+              if (
+                openPrIssues.has(issueNumber) ||
+                activeRunIssues.has(issueNumber)
+              ) continue;
+
+              const labels = labelsByIssue.get(issueNumber);
+              if (!labels.has(inProgressLabel)) continue;
+
+              // A native open dependency is authoritative even when an older
+              // dispatch lease still exists. Once the actual OpenCode run is
+              // gone, release the reservation immediately so blocked work does
+              // not consume WIP capacity or get resurrected from old comments.
+              const reservationBlockers = await github.paginate(
+                'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
+                {
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                  per_page: 100,
+                  headers: {
+                    'X-GitHub-Api-Version': '2022-11-28',
+                  },
+                }
+              );
+              const openReservationBlockers = reservationBlockers.filter(
+                blocker => blocker.state === 'open'
+              );
+              if (openReservationBlockers.length > 0) {
+                await removeLabel(issueNumber, inProgressLabel);
+                core.notice(
+                  'Released reservation on issue #' + issueNumber +
+                  ': blocked by ' +
+                  openReservationBlockers
+                    .map(blocker => '#' + blocker.number)
+                    .join(', ') + '.'
+                );
+                continue;
+              }
+
+              const comments = await github.paginate(
+                github.rest.issues.listComments,
+                {
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                  per_page: 100,
+                }
+              );
+              const dispatches = comments
+                .filter(comment => {
+                  const body = comment.body || '';
+                  const ownerOpenCodeCommand =
+                    comment.user?.login === owner &&
+                    (body.includes('/oc') || body.includes('/opencode'));
+                  return body.includes(dispatchMarker) || ownerOpenCodeCommand;
+                })
+                .sort(
+                  (a, b) =>
+                    new Date(a.created_at).getTime() -
+                    new Date(b.created_at).getTime()
+                );
+              // Only the scheduler's own dispatches consume the attempt budget;
+              // a manual owner /oc must never burn one.
+              const schedulerDispatches = comments.filter(comment =>
+                (comment.body || '').includes(dispatchMarker)
+              );
+              const latestDispatch = dispatches.at(-1);
+              const latestPr = latestPrByIssue.get(issueNumber);
+
+              // If a PR from the current/latest dispatch already completed but
+              // its event was missed, reconcile it here.
+              if (latestDispatch && latestPr) {
+                const dispatchAt = new Date(latestDispatch.created_at).getTime();
+                const prAt = new Date(latestPr.created_at).getTime();
+                if (prAt >= dispatchAt && latestPr.state === 'closed') {
+                  if (latestPr.merged_at) {
+                    await removeLabel(issueNumber, inProgressLabel);
+                    await removeLabel(issueNumber, pausedLabel);
+                    await github.rest.issues.update({
+                      owner,
+                      repo,
+                      issue_number: issueNumber,
+                      state: 'closed',
+                      state_reason: 'completed',
+                    });
+                    core.notice(
+                      'Reconciled merged PR #' + latestPr.number +
+                      ' -> completed issue #' + issueNumber + '.'
+                    );
+                  } else {
+                    await pauseIssue(
+                      issueNumber,
+                      'PR #' + latestPr.number + ' closed without merge.'
+                    );
+                  }
+                  continue;
+                }
+              }
+
+              if (!latestDispatch) {
+                // A stale/manual reservation with no evidence of a dispatch is
+                // safe to release immediately.
+                await removeLabel(issueNumber, inProgressLabel);
+                core.warning(
+                  'Released stale reservation on issue #' + issueNumber +
+                  ': no scheduler dispatch record exists.'
+                );
+                continue;
+              }
+
+              const ageMs =
+                Date.now() - new Date(latestDispatch.created_at).getTime();
+
+              if (ageMs < leaseMs) {
+                activeIssueNumbers.add(issueNumber);
+                continue;
+              }
+
+              await removeLabel(issueNumber, inProgressLabel);
+
+              if (
+                schedulerDispatches.length >= maxDispatchAttempts &&
+                pauseOnFailure
+              ) {
+                await addLabel(issueNumber, pausedLabel);
+                core.warning(
+                  'Issue #' + issueNumber + ' produced no OpenCode PR after ' +
+                  schedulerDispatches.length +
+                  ' scheduler dispatch attempt(s); automation paused.'
+                );
+              } else {
+                await removeLabel(issueNumber, pausedLabel);
+                core.warning(
+                  'Lease expired for issue #' + issueNumber +
+                  '; it is eligible for an automatic retry' +
+                  (schedulerDispatches.length >= maxDispatchAttempts
+                    ? ' because pause_on_failure=false.'
+                    : '.')
+                );
+              }
+            }
+
+            const freeSlots = Math.max(0, wipLimit - activeIssueNumbers.size);
+            core.notice(
+              'WIP: ' + activeIssueNumbers.size + '/' + wipLimit +
+              '; free slots: ' + freeSlots +
+              '; active issues: ' +
+              ([...activeIssueNumbers]
+                .sort((a, b) => a - b)
+                .map(n => '#' + n)
+                .join(', ') || 'none') + '.'
+            );
+
+            if (freeSlots === 0) {
+              core.info('No free WIP slots; nothing will be dispatched.');
+              return;
+            }
+
+            const candidates = [];
+            for (const issue of issues) {
+              if (activeIssueNumbers.has(issue.number)) continue;
+              // An existing implementation PR must never be duplicated even
+              // when it is configured not to consume a WIP slot.
+              if (openPrIssues.has(issue.number)) continue;
+
+              const labels = labelsByIssue.get(issue.number);
+              if (pauseOnFailure && labels.has(pausedLabel)) {
+                core.info('Skipping #' + issue.number + ': automation is paused.');
+                continue;
+              }
+
+              const priorities = [...labels]
+                .filter(name => priorityRank.has(name))
+                .sort(
+                  (a, b) => priorityRank.get(a) - priorityRank.get(b)
+                );
+
+              // Multiple priority labels are not a reason to deadlock an issue.
+              // Highest priority wins deterministically; the anomaly is logged.
+              const priority = priorities[0] || null;
+              if (requirePriorityLabel && priority === null) {
+                core.info(
+                  'Skipping #' + issue.number + ': no priority label and ' +
+                    'require_priority_label is enabled.'
+                );
+                continue;
+              }
+              const rank = priority === null ? priorityOrder.length : priorityRank.get(priority);
+              if (priorities.length > 1) {
+                core.warning(
+                  'Issue #' + issue.number + ' has multiple priority labels (' +
+                  priorities.join(', ') + '); using ' + priority + '.'
+                );
+              }
+
+              candidates.push({ issue, priority, rank });
+            }
+
+            candidates.sort(
+              (a, b) =>
+                a.rank - b.rank ||
+                a.issue.number - b.issue.number
+            );
+
+            const selected = [];
+            for (const candidate of candidates) {
+              if (selected.length >= freeSlots) break;
+
+              const issue = candidate.issue;
+              const declaredOpenBlockers = await openDeclaredBlockers(issue);
+              if (declaredOpenBlockers.length > 0) {
+                core.info(
+                  'Skipping #' + issue.number + ': declared blocked by ' +
+                  declaredOpenBlockers.map(blocker => '#' + blocker.number).join(', ') + '.'
+                );
+                continue;
+              }
+
+              const blockers = await github.paginate(
+                'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
+                {
+                  owner,
+                  repo,
+                  issue_number: issue.number,
+                  per_page: 100,
+                  headers: {
+                    'X-GitHub-Api-Version': '2022-11-28',
+                  },
+                }
+              );
+              const openBlockers = blockers.filter(
+                blocker => blocker.state === 'open'
+              );
+              if (openBlockers.length > 0) {
+                core.info(
+                  'Skipping #' + issue.number + ': blocked by ' +
+                  openBlockers.map(blocker => '#' + blocker.number).join(', ') + '.'
+                );
+                continue;
+              }
+
+              selected.push(candidate);
+            }
+
+            if (selected.length === 0) {
+              core.notice('No eligible unblocked issues are ready.');
+              return;
+            }
+
+            core.notice(
+              'Selected: ' +
+              selected
+                .map(item =>
+                  '#' + item.issue.number + ' (' +
+                  (item.priority || 'no priority') + ')'
+                )
+                .join(', ') + '.'
+            );
+
+            for (const { issue, priority } of selected) {
+              // Re-check mutable state immediately before dispatch. Another
+              // owner /oc, dependency update, pause, or reservation may have
+              // landed while this scheduler run was already evaluating the
+              // backlog. Without this JIT guard an older scheduler run can
+              // enqueue a duplicate OpenCode run after a manual /oc.
+              const freshIssueResponse = await github.rest.issues.get({
+                owner,
+                repo,
+                issue_number: issue.number,
+              });
+              const freshIssue = freshIssueResponse.data;
+              const freshLabels = new Set(
+                (freshIssue.labels || []).map(label =>
+                  typeof label === 'string' ? label : label.name
+                )
+              );
+
+              if (
+                freshIssue.state !== 'open' ||
+                (pauseOnFailure && freshLabels.has(pausedLabel)) ||
+                freshLabels.has(inProgressLabel)
+              ) {
+                core.info(
+                  'Skipping #' + issue.number +
+                  ': state changed before dispatch.'
+                );
+                continue;
+              }
+
+              const freshDeclaredBlockers = await openDeclaredBlockers(freshIssue);
+              if (freshDeclaredBlockers.length > 0) {
+                core.info(
+                  'Skipping #' + issue.number + ': declared blocker appeared before dispatch: ' +
+                  freshDeclaredBlockers.map(blocker => '#' + blocker.number).join(', ') + '.'
+                );
+                continue;
+              }
+
+              const freshBlockers = await github.paginate(
+                'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
+                {
+                  owner,
+                  repo,
+                  issue_number: issue.number,
+                  per_page: 100,
+                  headers: {
+                    'X-GitHub-Api-Version': '2022-11-28',
+                  },
+                }
+              );
+              const freshOpenBlockers = freshBlockers.filter(
+                blocker => blocker.state === 'open'
+              );
+              if (freshOpenBlockers.length > 0) {
+                core.info(
+                  'Skipping #' + issue.number +
+                  ': blocker appeared before dispatch: ' +
+                  freshOpenBlockers
+                    .map(blocker => '#' + blocker.number)
+                    .join(', ') + '.'
+                );
+                continue;
+              }
+
+              const freshComments = await github.paginate(
+                github.rest.issues.listComments,
+                {
+                  owner,
+                  repo,
+                  issue_number: issue.number,
+                  per_page: 100,
+                }
+              );
+              const latestOpenCodeCommand = freshComments
+                .filter(comment => {
+                  const body = comment.body || '';
+                  return comment.user?.login === owner &&
+                    (body.includes('/oc') || body.includes('/opencode'));
+                })
+                .sort(
+                  (a, b) =>
+                    new Date(a.created_at).getTime() -
+                    new Date(b.created_at).getTime()
+                )
+                .at(-1);
+
+              if (latestOpenCodeCommand) {
+                const commandAgeMs =
+                  Date.now() -
+                  new Date(latestOpenCodeCommand.created_at).getTime();
+                if (commandAgeMs < commandGraceMs) {
+                  core.info(
+                    'Skipping #' + issue.number +
+                    ': an owner OpenCode command was posted within the ' +
+                    'short dispatch race window.'
+                  );
+                  continue;
+                }
+              }
+
+              // A label acts as a short lease/reservation while OpenCode starts.
+              // It is rolled back immediately if posting /oc fails, expires
+              // automatically if no PR appears, and is reconciled from PR state.
+              await addLabel(issue.number, inProgressLabel);
+
+              try {
+                if (resetMarkers) {
+                  // Opt-in: drop previously recorded dispatch markers so the
+                  // issue starts from a fresh attempt budget. Consumers that
+                  // rely on markers as an audit trail leave this off.
+                  const previous = await github.paginate(
+                    'GET /repos/{owner}/{repo}/issues/{issue_number}/comments',
+                    {
+                      owner,
+                      repo,
+                      issue_number: issue.number,
+                      per_page: 100,
+                    }
+                  );
+                  for (const comment of previous) {
+                    if ((comment.body || '').includes(dispatchMarker)) {
+                      await github.rest.issues.deleteComment({
+                        owner,
+                        repo,
+                        comment_id: comment.id,
+                      });
+                    }
+                  }
+                }
+
+                const markerComment = [
+                  dispatchMarker,
+                  'Automatically dispatched by the issue scheduler (' +
+                    (priority || 'no explicit priority') + ').',
+                ].join('\n');
+
+                const route = executionRoutes.find(
+                  candidate => issue.labels.some(l => l.name === candidate.label)
+                );
+
+                if (route) {
+                  // The marker still lands on the issue so a consumer can see
+                  // the attempt in the audit trail, but the workflow is
+                  // dispatched directly: an execution workflow does not read
+                  // owner comments.
+                  await github.rest.issues.createComment({
+                    owner,
+                    repo,
+                    issue_number: issue.number,
+                    body: markerComment,
+                  });
+                  await dispatchWorkflow(route.workflow, {
+                    ...route.inputs,
+                    issue_number: String(issue.number),
+                  });
+                } else if (opencodeDispatch === 'workflow') {
+                  await github.rest.issues.createComment({
+                    owner,
+                    repo,
+                    issue_number: issue.number,
+                    body: markerComment,
+                  });
+                  // Inlined rather than routed through dispatchWorkflow so
+                  // the dispatched mode stays visible at the call site.
+                  await github.request(
+                    'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
+                    {
+                      owner,
+                      repo,
+                      workflow_id: opencodeWorkflowPath.replace(
+                        /^\.github\/workflows\//,
+                        ''
+                      ),
+                      ref: dispatchRef,
+                      inputs: { mode: 'issue', issue_number: String(issue.number) },
+                    }
+                  );
+                } else {
+                  await github.rest.issues.createComment({
+                    owner,
+                    repo,
+                    issue_number: issue.number,
+                    body: ['/oc', '', markerComment].join('\n'),
+                  });
+                }
+              } catch (err) {
+                await removeLabel(issue.number, inProgressLabel);
+                throw err;
+              }
+
+              core.notice(
+                'Dispatched issue #' + issue.number + ' (' +
+                (priority || 'no priority') + ').'
+              );
+            }
+
+      - name: Wake the configured downstream dispatcher
+        if: env.CHILD_DISPATCH_WORKFLOW != ''
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          CHILD_DISPATCH_WORKFLOW: ${{ env.CHILD_DISPATCH_WORKFLOW }}
+          DISPATCH_REF: ${{ env.DISPATCH_REF }}
+        run: |
+          set -euo pipefail
+          if ! gh api --method POST \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/$CHILD_DISPATCH_WORKFLOW/dispatches" \
+            -f ref="$DISPATCH_REF" >/dev/null; then
+            echo "::warning::Could not dispatch $CHILD_DISPATCH_WORKFLOW at $DISPATCH_REF."
+          else
+            echo "Dispatched $CHILD_DISPATCH_WORKFLOW at $DISPATCH_REF."
+          fi
+\n'
+
+                if task_active "$child_id" task "$task_number" ||
+                   task_active "$child_id" review "$task_number"; then
+                  continue
+                fi
+                gh workflow run "$CHILD_REVIEW_WORKFLOW" --repo "$GITHUB_REPOSITORY" \
+                  -f child_id="$child_id" \
+                  -f task_number="$task_number" \
+                  -f pr_number="$pr_number" >/dev/null
+                review_dispatches=$((review_dispatches + 1))
+              done <<<"$open_prs"
+            fi
+
+            manual_prs="$(
+              gh api --paginate "repos/$child_repo/pulls?state=open&per_page=100" \
+                --jq '.[] |
+                  select(.draft == false) |
+                  select(.head.repo.full_name == .base.repo.full_name) |
+                  select(.user.login == .base.repo.owner.login) |
+                  select(
+                    ((.head.ref | startswith("continuum-child/task-")) or
+                     (.head.ref | startswith("runtime-worker/task-"))) | not
+                  ) |
+                  select(([.labels[]?.name] | index("no-auto-merge")) | not) |
+                  .number' 2>/dev/null || true
+            )"
+
+            if [[ -n "$manual_prs" ]]; then
+              while IFS= read -r manual_pr; do
+                [[ -n "$manual_pr" ]] || continue
+                manual_pr_active "$child_id" "$manual_pr" && continue
+                gh workflow run "$CHILD_PR_REVIEW_WORKFLOW" --repo "$GITHUB_REPOSITORY" \
+                  -f child_id="$child_id" \
+                  -f pr_number="$manual_pr" >/dev/null
+                review_dispatches=$((review_dispatches + 1))
+                echo "Dispatched owner-created child PR #$manual_pr for independent review."
+              done <<<"$manual_prs"
+            fi
+
+            issues_json="$(
+              gh api --paginate "repos/$child_repo/issues?state=open&per_page=100" 2>/dev/null
+            )"
+
+            while IFS= read -r paused_task; do
+              [[ -n "$paused_task" ]] || continue
+              gh api --method DELETE \
+                "repos/$child_repo/issues/$paused_task/labels/${PAUSE_LABEL//:/%3A}" \
+                >/dev/null 2>&1 || true
+              echo "Cleared stale $PAUSE_LABEL on child task #$paused_task."
+            done < <(
+              jq -r --arg pause "$PAUSE_LABEL" '
+                .[]
+                | select(.pull_request == null)
+                | select(any(.labels[]?.name; . == $pause))
+                | .number
+              ' <<<"$issues_json"
+            )
+            issues_json="$(
+              jq --arg pause "$PAUSE_LABEL" '
+                map(
+                  if .pull_request == null
+                  then .labels = [(.labels[]? | select(.name != $pause))]
+                  else .
+                  end
+                )
+              ' <<<"$issues_json"
+            )"
+
+            while IFS= read -r encoded; do
+              [[ -n "$encoded" ]] || continue
+              decoded="$(base64 -d <<<"$encoded")"
+              task_number="$(jq -r '.number' <<<"$decoded")"
+              body="$(jq -r '.body' <<<"$decoded")"
+              title="$(jq -r '.title' <<<"$decoded")"
+              rank="$(jq -r '.rank' <<<"$decoded")"
+              priority="$(jq -r '.priority' <<<"$decoded")"
+
+              task_active "$child_id" task "$task_number" && continue
+              task_active "$child_id" review "$task_number" && continue
+              grep -Fxq "$task_number" <<<"$open_pr_tasks" && continue
+
+              if local_override_active "$task_number"; then
+                echo "Skipping child task #$task_number: local manual OpenCode work is active."
+                continue
+              fi
+
+              ready=true
+              deps="$(
+                sed -nE 's/.*<!-- *automation-blocked-by: *([^>]*) *-->.*/\1/p' \
+                  <<<"$body" | head -1 | tr ',' ' '
+              )"
+              for dep in $deps; do
+                dep="${dep//#/}"
+                dep="${dep//[[:space:]]/}"
+                [[ "$dep" =~ ^[0-9]+$ ]] || continue
+                state="$(
+                  gh api "repos/$child_repo/issues/$dep" --jq '.state' 2>/dev/null || echo open
+                )"
+                if [[ "$state" != "closed" ]]; then
+                  ready=false
+                  break
+                fi
+              done
+              [[ "$ready" == true ]] || continue
+
+              native_blockers="$(
+                gh api --paginate \
+                  -H 'X-GitHub-Api-Version: 2022-11-28' \
+                  "repos/$child_repo/issues/$task_number/dependencies/blocked_by?per_page=100" \
+                  --jq '.[] | select(.state == "open") | .number' 2>/dev/null || true
+              )"
+              [[ -z "$native_blockers" ]] || continue
+
+              jq -cn \
+                --arg child_id "$child_id" \
+                --arg repository "$child_repo" \
+                --argjson task_number "$task_number" \
+                --arg title "$title" \
+                --arg priority "$priority" \
+                --argjson rank "$rank" \
+                '{
+                  child_id: $child_id,
+                  repository: $repository,
+                  task_number: $task_number,
+                  title: $title,
+                  priority: (if $priority == "" then null else $priority end),
+                  rank: $rank
+                }' >> "$candidate_lines"
+            done < <(
+              jq -r '
+                map(
+                  select(.pull_request == null)
+                  | . + {
+                      _continuum_priority_rank:
+                        (if any(.labels[]?.name; . == "priority:p0") then 0
+                         elif any(.labels[]?.name; . == "priority:p1") then 1
+                         elif any(.labels[]?.name; . == "priority:p2") then 2
+                         else 3
+                         end),
+                      _continuum_priority:
+                        (if any(.labels[]?.name; . == "priority:p0") then "priority:p0"
+                         elif any(.labels[]?.name; . == "priority:p1") then "priority:p1"
+                         elif any(.labels[]?.name; . == "priority:p2") then "priority:p2"
+                         else ""
+                         end)
+                    }
+                )
+                | sort_by(._continuum_priority_rank, .number)
+                | .[]
+                | {
+                    number: .number,
+                    body: (.body // ""),
+                    title: (.title // ""),
+                    rank: ._continuum_priority_rank,
+                    priority: ._continuum_priority
+                  }
+                | @base64
+              ' <<<"$issues_json"
+            )
+          done < <(jq -c '.[]' <<<"$plan")
+
+          jq -s '.' "$candidate_lines" > "$CHILD_CANDIDATES_FILE"
+          active_wip="${#active_wip_keys[@]}"
+          candidate_count="$(wc -l < "$candidate_lines" | tr -d ' ')"
+          echo "active_wip=$active_wip" >> "$GITHUB_OUTPUT"
+          echo "candidate_count=$candidate_count" >> "$GITHUB_OUTPUT"
+          echo "Delegated queue: $active_wip active WIP item(s), $candidate_count eligible candidate(s), $review_dispatches review run(s) dispatched."
+
+          if [[ "$invalid" -gt 0 ]]; then
+            echo "::error::$invalid configured child relationship(s) failed bidirectional verification."
+            exit 2
+          fi
+
       - name: Reconcile state and dispatch ready issues
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          CHILD_ACTIVE_WIP: ${{ steps.child_queue.outputs.active_wip || '0' }}
+          CHILD_CANDIDATES_FILE: ${{ runner.temp }}/continuum-child-candidates.json
         with:
           # TAP_PAT is required because the existing OpenCode workflow accepts
           # /oc only from the repository owner. It also makes issue-state
