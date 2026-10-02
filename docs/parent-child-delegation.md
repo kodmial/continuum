@@ -58,15 +58,20 @@ variables.
 
 ## Parent workflows
 
-Use the four thin entry workflows in
-`.github/caller-stubs/parent/`. They call:
+Install the ordinary core `continuum-issue-scheduler.yml` caller plus the three
+thin entry workflows in `.github/caller-stubs/parent/`. The parent callers
+invoke:
 
-- `continuum-consumer-child-dispatcher.yml`
 - `continuum-consumer-child-worker.yml`
 - `continuum-consumer-child-review.yml`
 - `continuum-consumer-child-pr-review.yml`
 
-The wrapper passes no parent/child relationship values. Continuum reads
+There is no separate parent/child dispatcher caller. The core Issue scheduler
+resolves the verified child relationships, reconciles child reviews, and merges
+the parent's own issue candidates with child issue candidates before applying
+the normal priority ordering and WIP limit.
+
+The wrappers pass no parent/child relationship values. Continuum reads
 `CONTINUUM_ROLE` and `CONTINUUM_CHILDREN` directly from the parent repository
 through the GitHub API after the runner starts. This avoids exposing the child
 list in reusable-workflow inputs or job environment metadata. The child
@@ -105,7 +110,7 @@ installed caller and the reusable scheduler fail safe: when
 are never added or removed when repository role variables change.
 
 A repository-owner `/oc` or `/opencode` comment is deliberately still allowed
-to start the existing local OpenCode workflow in the child. The parent dispatcher
+to start the existing local OpenCode workflow in the child. The parent Issue scheduler
 does not start a delegated worker for the same issue while it observes an active
 local OpenCode run, an open `opencode/issue<NUMBER>-...` pull request, or a
 recent owner command inside the configured command-grace window.
@@ -146,15 +151,16 @@ bash install.sh /path/to/myapp main core
 # Opt-in technology library: CI, release, release PR, packaging smoke.
 bash install.sh /path/to/myapp main tech
 
-# Add parent execution to any repository without replacing its own workflows.
+# Parent scheduling is the ordinary core scheduler; parent adds worker/review entry points.
+bash install.sh /path/to/parent main core
 bash install.sh /path/to/parent main parent
 ```
 
 For production, replace `main` with a tested full Continuum commit SHA. Both
-`uses:` and `engine_ref` are set to that revision. The parent set installs
-only `continuum-child-dispatcher.yml`, `continuum-child-worker.yml`,
-`continuum-child-review.yml`, and `continuum-child-pr-review.yml`. It preserves
-existing CI, issue scheduling, OpenCode,
+`uses:` and `engine_ref` are set to that revision. The parent set installs only `continuum-child-worker.yml`,
+`continuum-child-review.yml`, and `continuum-child-pr-review.yml`. The
+ordinary scheduler comes from the core set. The parent set preserves existing
+CI, issue scheduling, OpenCode,
 release, Render, and artifact workflows. The token is supplied through the
 parent's existing `TAP_PAT` secret; it must be able to read the relevant Actions
 repository variables and operate on the selected child repositories.
@@ -165,9 +171,9 @@ deleting, restoring, or reinstalling workflow files. The local scheduler's
 child-role guard prevents automatic local issue execution while preserving the
 manual OpenCode entry point.
 
-The parent dispatcher wakes on main pushes, every ten minutes, manual dispatch,
-and completion of child task/review workflows. Task execution and independent
-review remain separate; completed tasks are not resurrected, dependency-blocked
+The parent Issue scheduler uses the same triggers as the ordinary core
+scheduler and is additionally woken when child task/review workflows complete.
+Task execution and independent review remain separate; completed tasks are not resurrected, dependency-blocked
 tasks stay blocked, and owner-created PRs use the independent PR review workflow.
 
 ## Migration baseline
