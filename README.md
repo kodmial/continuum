@@ -80,10 +80,10 @@ bash install.sh /path/to/consumer <ref> parent
 bash install.sh /path/to/consumer <ref> core --yes
 ```
 
-Use a **full commit SHA** as `<ref>` in production. The installer fetches the
-templates at that revision so the caller and its fallback scripts match, and it
-copies fallback scripts into the consumer's `scripts/` without overwriting
-existing files.
+The installer fetches caller templates from the requested `<ref>` and rewrites
+their Continuum references consistently. Use `main` when consumers should track
+the live shared implementation, or an explicit ref when a deployment requires
+pinning.
 
 | Set | Installs |
 | --- | --- |
