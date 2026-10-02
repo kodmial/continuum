@@ -459,6 +459,21 @@ class ContinuumTest < Minitest::Test
 
     watchdog_inputs = automation.fetch('jobs').fetch('watchdog').fetch('with')
     assert_equal 'OpenCode agent', watchdog_inputs.fetch('watched_workflow')
+
+    # A custom run-name changes workflow_run.name in the delivered payload on
+    # current GitHub Actions, even though workflow_run.workflows is matched by
+    # the workflow identity. Route completed self-entry runs by their stable
+    # repository-local path so OpenCode watchdog/scheduler recovery cannot be
+    # skipped merely because opencode.yml reports "OpenCode issue #<n>".
+    automation_body = File.read(File.join(ROOT, '.github/workflows/automation.yml'))
+    assert_includes automation_body,
+                    "github.event.workflow_run.path == '.github/workflows/opencode.yml'"
+    assert_includes automation_body,
+                    "github.event.workflow_run.path == '.github/workflows/ci.yml'"
+    refute_includes automation_body,
+                    "github.event.workflow_run.name == 'OpenCode agent'"
+    refute_includes automation_body,
+                    "github.event.workflow_run.name == 'CI'"
   end
 
   # install.sh installs the stored stub name verbatim. A prefix computed at
