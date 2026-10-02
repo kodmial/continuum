@@ -84,7 +84,7 @@ jobs:
         # ephemeral GITHUB_TOKEN does not reliably fan out into the downstream
         # push/merge workflows (version bump, release, PR reconciliation).
         env:
-          CONTINUUM_VERSION_FILE: ${{ vars.CONTINUUM_VERSION_FILE || 'Sources/NanoDictateCore/Version.swift' }}
+          CONTINUUM_VERSION_FILE: ${{ vars.CONTINUUM_VERSION_FILE || '' }}
           REQUIRE_CODERABBIT: ${{ inputs.require_coderabbit || vars.CONTINUUM_REQUIRE_CODERABBIT || 'false' }}
           POST_MERGE_WAKEUPS: ${{ inputs.post_merge_wakeups || vars.CONTINUUM_POST_MERGE_WAKEUPS }}
           POST_MERGE_WAKEUP_REF: ${{ inputs.post_merge_wakeup_ref || vars.CONTINUUM_POST_MERGE_WAKEUP_REF || github.event.repository.default_branch || 'main' }}
@@ -949,6 +949,7 @@ jobs:
                 // run that may itself be publishing a new release.
                 if (
                   run.name === 'Release' &&
+                  process.env.CONTINUUM_VERSION_FILE &&
                   run.event === 'push' &&
                   run.head_branch === 'main' &&
                   run.head_sha !== mainSha
