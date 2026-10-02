@@ -242,8 +242,9 @@ jobs:
           CHILD_CANDIDATES_FILE: ${{ runner.temp }}/continuum-child-candidates.json
         run: |
           set -euo pipefail
-          export PYTHONPATH="$GITHUB_WORKSPACE/.continuum-engine/src"
-          resolver="$GITHUB_WORKSPACE/.continuum-engine/.github/scripts/delegation_repository.sh"
+          export CONTINUUM_ENGINE_ROOT="$GITHUB_WORKSPACE/.continuum-engine"
+          export PYTHONPATH="$CONTINUUM_ENGINE_ROOT/src"
+          resolver="$CONTINUUM_ENGINE_ROOT/.github/scripts/delegation_repository.sh"
           plan="$(PARENT_CONFIG=.continuum.yml CHILD_REPOSITORIES="" bash "$resolver" plan)"
 
           gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs?per_page=100" \
