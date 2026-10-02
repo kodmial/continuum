@@ -568,9 +568,30 @@ jobs:
           # mutations and comments created here visible as normal owner actions.
           github-token: ${{ secrets.TAP_PAT }}
           script: |
+            const fs = require('fs');
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const repoFullName = owner + '/' + repo;
+            const childWorkerWorkflow =
+              process.env.CHILD_WORKER_WORKFLOW || 'continuum-child-worker.yml';
+            const childActiveWipParsed = Number.parseInt(
+              process.env.CHILD_ACTIVE_WIP || '0',
+              10
+            );
+            if (!Number.isInteger(childActiveWipParsed) || childActiveWipParsed < 0) {
+              throw new Error(
+                'Invalid CHILD_ACTIVE_WIP: ' + process.env.CHILD_ACTIVE_WIP
+              );
+            }
+            const childActiveWip = childActiveWipParsed;
+            const childCandidatesFile = process.env.CHILD_CANDIDATES_FILE || '';
+            const childCandidates =
+              childCandidatesFile && fs.existsSync(childCandidatesFile)
+                ? JSON.parse(fs.readFileSync(childCandidatesFile, 'utf8'))
+                : [];
+            if (!Array.isArray(childCandidates)) {
+              throw new Error('Delegated child candidate payload is not an array.');
+            }
 
             function positiveInt(name, fallback) {
               const value = Number.parseInt(process.env[name] || String(fallback), 10);
@@ -697,13 +718,17 @@ jobs:
               )];
             }
 
-            async function openDeclaredBlockers(issue) {
+            async function openDeclaredBlockers(
+              issue,
+              targetOwner = owner,
+              targetRepo = repo
+            ) {
               const open = [];
               for (const blockerNumber of declaredDependencyNumbers(issue)) {
                 if (blockerNumber === issue.number) continue;
                 const response = await github.rest.issues.get({
-                  owner,
-                  repo,
+                  owner: targetOwner,
+                  repo: targetRepo,
                   issue_number: blockerNumber,
                 });
                 if (response.data.state === 'open') open.push(response.data);
@@ -1271,11 +1296,14 @@ jobs:
               }
             }
 
-            const freeSlots = Math.max(0, wipLimit - activeIssueNumbers.size);
+            const totalActiveWip = activeIssueNumbers.size + childActiveWip;
+            const freeSlots = Math.max(0, wipLimit - totalActiveWip);
             core.notice(
-              'WIP: ' + activeIssueNumbers.size + '/' + wipLimit +
+              'WIP: ' + totalActiveWip + '/' + wipLimit +
+              ' (local ' + activeIssueNumbers.size +
+              ', delegated ' + childActiveWip + ')' +
               '; free slots: ' + freeSlots +
-              '; active issues: ' +
+              '; active local issues: ' +
               ([...activeIssueNumbers]
                 .sort((a, b) => a - b)
                 .map(n => '#' + n)
@@ -1324,13 +1352,49 @@ jobs:
                 );
               }
 
-              candidates.push({ issue, priority, rank });
+              candidates.push({ source: 'local', issue, priority, rank });
+            }
+
+            for (const child of childCandidates) {
+              const taskNumber = Number.parseInt(String(child.task_number), 10);
+              const rank = Number.parseInt(String(child.rank), 10);
+              if (
+                !child.child_id ||
+                !child.repository ||
+                !Number.isInteger(taskNumber) ||
+                taskNumber < 1 ||
+                !Number.isInteger(rank) ||
+                rank < 0
+              ) {
+                throw new Error(
+                  'Invalid delegated child candidate: ' + JSON.stringify(child)
+                );
+              }
+              candidates.push({
+                source: 'child',
+                issue: {
+                  number: taskNumber,
+                  title: child.title || '',
+                  body: '',
+                },
+                priority: child.priority || null,
+                rank,
+                child: {
+                  child_id: String(child.child_id),
+                  repository: String(child.repository),
+                  task_number: taskNumber,
+                },
+              });
             }
 
             candidates.sort(
               (a, b) =>
                 a.rank - b.rank ||
-                a.issue.number - b.issue.number
+                a.issue.number - b.issue.number ||
+                a.source.localeCompare(b.source) ||
+                String(a.child?.repository || '').localeCompare(
+                  String(b.child?.repository || '')
+                )
             );
 
             const selected = [];
@@ -1338,6 +1402,11 @@ jobs:
               if (selected.length >= freeSlots) break;
 
               const issue = candidate.issue;
+              if (candidate.source === 'child') {
+                selected.push(candidate);
+                continue;
+              }
+
               const declaredOpenBlockers = await openDeclaredBlockers(issue);
               if (declaredOpenBlockers.length > 0) {
                 core.info(
@@ -1382,13 +1451,91 @@ jobs:
               'Selected: ' +
               selected
                 .map(item =>
-                  '#' + item.issue.number + ' (' +
-                  (item.priority || 'no priority') + ')'
+                  (item.source === 'child'
+                    ? '[' + item.child.child_id + ']#' + item.issue.number
+                    : '#' + item.issue.number) +
+                  ' (' + (item.priority || 'no priority') + ')'
                 )
                 .join(', ') + '.'
             );
 
-            for (const { issue, priority } of selected) {
+            for (const candidate of selected) {
+              const { issue, priority } = candidate;
+
+              if (candidate.source === 'child') {
+                const child = candidate.child;
+                const parts = child.repository.split('/');
+                if (parts.length !== 2 || !parts[0] || !parts[1]) {
+                  throw new Error(
+                    'Invalid delegated child repository: ' + child.repository
+                  );
+                }
+                const [childOwner, childRepo] = parts;
+                const freshResponse = await github.rest.issues.get({
+                  owner: childOwner,
+                  repo: childRepo,
+                  issue_number: child.task_number,
+                });
+                const freshChildIssue = freshResponse.data;
+                if (
+                  freshChildIssue.state !== 'open' ||
+                  freshChildIssue.pull_request
+                ) {
+                  core.info(
+                    'Skipping delegated [' + child.child_id + ']#' +
+                    child.task_number + ': state changed before dispatch.'
+                  );
+                  continue;
+                }
+
+                const childDeclaredBlockers = await openDeclaredBlockers(
+                  freshChildIssue,
+                  childOwner,
+                  childRepo
+                );
+                if (childDeclaredBlockers.length > 0) {
+                  core.info(
+                    'Skipping delegated [' + child.child_id + ']#' +
+                    child.task_number +
+                    ': declared blocker appeared before dispatch.'
+                  );
+                  continue;
+                }
+
+                const childNativeBlockers = await github.paginate(
+                  'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
+                  {
+                    owner: childOwner,
+                    repo: childRepo,
+                    issue_number: child.task_number,
+                    per_page: 100,
+                    headers: {
+                      'X-GitHub-Api-Version': '2022-11-28',
+                    },
+                  }
+                );
+                if (
+                  childNativeBlockers.some(blocker => blocker.state === 'open')
+                ) {
+                  core.info(
+                    'Skipping delegated [' + child.child_id + ']#' +
+                    child.task_number +
+                    ': native blocker appeared before dispatch.'
+                  );
+                  continue;
+                }
+
+                await dispatchWorkflow(childWorkerWorkflow, {
+                  child_id: child.child_id,
+                  task_number: String(child.task_number),
+                });
+                core.notice(
+                  'Dispatched delegated [' + child.child_id + ']#' +
+                  child.task_number + ' (' +
+                  (priority || 'no priority') + ').'
+                );
+                continue;
+              }
               // Re-check mutable state immediately before dispatch. Another
               // owner /oc, dependency update, pause, or reservation may have
               // landed while this scheduler run was already evaluating the
@@ -1586,7 +1733,7 @@ jobs:
             }
 
       - name: Wake the configured downstream dispatcher
-        if: env.CHILD_DISPATCH_WORKFLOW != ''
+        if: env.CHILD_DISPATCH_WORKFLOW != '' && vars.CONTINUUM_ROLE != 'parent'
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           CHILD_DISPATCH_WORKFLOW: ${{ env.CHILD_DISPATCH_WORKFLOW }}
