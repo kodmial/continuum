@@ -200,7 +200,7 @@ def build_opencode_request(
     # immutable read-only policy instead of trusting the caller to contain
     # particular safety words.
     system = REVIEWER_SYSTEM_PROMPT
-    if upstream_system && upstream_system !== REVIEWER_SYSTEM_PROMPT:
+    if upstream_system and upstream_system != REVIEWER_SYSTEM_PROMPT:
         system = f"{REVIEWER_SYSTEM_PROMPT}\n\nUpstream review instructions:\n{upstream_system}"
     provider_id, _, model_id = model.partition("/")
     provider_id = provider_id.strip() or "opencode"
