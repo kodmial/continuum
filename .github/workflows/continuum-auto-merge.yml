@@ -320,6 +320,22 @@ jobs:
                 )[0] || null;
             }
 
+            async function latestReviewConvergenceStatus(headSha) {
+              const { data } = await github.rest.repos.getCombinedStatusForRef({
+                owner, repo, ref: headSha,
+              });
+
+              return (data.statuses || [])
+                .filter(
+                  status => status.context === 'continuum/review-convergence'
+                )
+                .sort(
+                  (a, b) =>
+                    new Date(b.updated_at || b.created_at).getTime() -
+                    new Date(a.updated_at || a.created_at).getTime()
+                )[0] || null;
+            }
+
             function retryWindowText(body = '') {
               const patterns = [
                 /next\s+(?:included\s+)?review\b[^\n<.]{0,120}?\bavailable\b[^\n<.]{0,40}?\b(?:in|after)\s+([^\n<.]+)/i,
@@ -1284,6 +1300,25 @@ jobs:
               const rabbitStatus = requireCodeRabbit
                 ? await latestCodeRabbitStatus(pr.head.sha)
                 : null;
+              const reviewConvergenceStatus = requireCodeRabbit
+                ? await latestReviewConvergenceStatus(pr.head.sha)
+                : null;
+
+              // A policy/task-contract verdict with no actionable code finding
+              // is terminal for this exact HEAD. Re-dispatching CodeRabbit or a
+              // coding agent cannot make progress and would only burn quota.
+              // A new HEAD gets a fresh status namespace automatically; a later
+              // explicit CodeRabbit approval on the same HEAD clears this status.
+              if (
+                requireCodeRabbit &&
+                !reviewBasis &&
+                reviewConvergenceStatus?.state === 'error'
+              ) {
+                core.warning(
+                  `PR #${pr.number}: exact HEAD ${pr.head.sha} is blocked by a non-code CodeRabbit verdict; automatic review/fix retries are suppressed.`
+                );
+                continue;
+              }
 
               // Any green current HEAD that still lacks a valid CodeRabbit
               // approval belongs to the global serialized review queue. Wake
