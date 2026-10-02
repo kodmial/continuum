@@ -94,7 +94,7 @@ pinning.
 | --- | --- |
 | `core` (default) | 14 callers covering OpenCode, issue scheduling, qualification, CodeRabbit, PR Agent, and auto-merge. Validation is a shared engine called by the project-owned `ci.yml`, not a second installed CI caller. |
 | `tech` | 1 caller: the optional consumer-neutral Swift CI profile. |
-| `parent` | 3 callers: `continuum-child-worker.yml`, `continuum-child-review.yml`, `continuum-child-pr-review.yml`. The ordinary core `Issue scheduler` owns parent/child dispatch. |
+| `parent` | 4 callers: `continuum-child-worker.yml`, `continuum-child-review.yml`, `continuum-child-pr-review.yml`, and `continuum-child-run-cleanup.yml`. The ordinary core `Issue scheduler` owns parent/child dispatch; the cleanup caller removes completed delegated public runs. |
 
 The `parent` and `tech` sets add **only** their own callers; each preserves
 the consumer's own CI, release, and scheduling workflows. The `core` set also
