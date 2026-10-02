@@ -2616,8 +2616,7 @@ class ContinuumTest < Minitest::Test
     ],
     'continuum-opencode-unresolved.yml' => %w[continuum_ref],
     'continuum-pr-agent.yml' => %w[continuum_ref],
-    'continuum-remove-review-label.yml' => %w[continuum_ref],
-    'continuum-validation.yml' => %w[continuum_ref pr_number]
+    'continuum-remove-review-label.yml' => %w[continuum_ref]
   }.freeze
 
   # A stub that pins an input to a literal overrides the consumer's own
@@ -3654,18 +3653,19 @@ class ContinuumTest < Minitest::Test
     assert_equal '', inputs.fetch('repair_workflow').fetch('default')
 
     raw = workflow_body('continuum-validation.yml')
-    %w[Python Node Java Go Rust Docker].each { |stack| assert_includes raw, stack }
+    %w[Python Node PHP Java Go Rust Docker Bun].each { |stack| assert_includes raw, stack }
     assert_includes raw, 'createCommitStatus'
     assert_includes raw, 'createWorkflowDispatch'
     assert_includes raw, 'actions/upload-artifact@'
     assert_includes raw, 'eval "$command"'
     refute_match(/nanodictate|kodmai|runtime-lab/i, raw)
 
-    stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-validation.yml'))
-    call = stub.fetch('jobs').fetch('call')
-    assert_equal 'kodmial/continuum/.github/workflows/continuum-validation.yml@main', call.fetch('uses')
-    assert_equal '${{ inputs.pr_number }}', call.fetch('with').fetch('pr_number')
+    refute File.exist?(File.join(ROOT, '.github/caller-stubs/continuum-validation.yml')),
+           'validation is a shared engine; primary CI stays project-owned'
     assert_includes raw, "vars.CONTINUUM_RUNNER || 'ubuntu-latest'"
+    assert_includes raw, 'inputs.node_version || vars.CONTINUUM_NODE_VERSION'
+    assert_includes raw, 'inputs.php_version || vars.CONTINUUM_PHP_VERSION'
+    assert_includes raw, 'inputs.bun_version || vars.CONTINUUM_BUN_VERSION'
   end
 
 
