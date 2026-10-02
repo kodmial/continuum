@@ -10,12 +10,21 @@ on:
         required: false
       require_coderabbit:
         description: >-
-          Require a CodeRabbit approval before merging and delegate rate-limited
-          reviews to the CodeRabbit retry controller. Empty falls back to
-          vars.CONTINUUM_REQUIRE_CODERABBIT. CodeRabbit is an optional
-          integration, so the default is OFF: a project that did not ask for
-          CodeRabbit must not be made to wait for an approval nobody will ever
-          give, and must not have a workflow dispatched it does not own.
+          Legacy CodeRabbit switch. Empty falls back to
+          vars.CONTINUUM_REQUIRE_CODERABBIT. Prefer the canonical
+          review_provider input / vars.CONTINUUM_REVIEW_PROVIDER: when both
+          are set they must agree, and contradictory values fail closed.
+          CodeRabbit is an optional integration, so the default is OFF.
+        type: string
+        default: ''
+        required: false
+      review_provider:
+        description: >-
+          Canonical review provider (none|coderabbit|pr-agent). Empty falls
+          back to vars.CONTINUUM_REVIEW_PROVIDER, then to legacy
+          require_coderabbit / vars.CONTINUUM_REQUIRE_CODERABBIT and
+          vars.CONTINUUM_PR_AGENT_ENABLED migration compatibility. This is
+          the single source of truth for runtime review-provider selection.
         type: string
         default: ''
         required: false
@@ -86,6 +95,8 @@ jobs:
         env:
           CONTINUUM_VERSION_FILE: ${{ vars.CONTINUUM_VERSION_FILE || '' }}
           REQUIRE_CODERABBIT: ${{ inputs.require_coderabbit || vars.CONTINUUM_REQUIRE_CODERABBIT || 'false' }}
+          REVIEW_PROVIDER: ${{ inputs.review_provider || vars.CONTINUUM_REVIEW_PROVIDER || '' }}
+          LEGACY_PR_AGENT_ENABLED: ${{ vars.CONTINUUM_PR_AGENT_ENABLED || 'false' }}
           POST_MERGE_WAKEUPS: ${{ inputs.post_merge_wakeups || vars.CONTINUUM_POST_MERGE_WAKEUPS }}
           POST_MERGE_WAKEUP_REF: ${{ inputs.post_merge_wakeup_ref || vars.CONTINUUM_POST_MERGE_WAKEUP_REF || github.event.repository.default_branch || 'main' }}
           REQUIRED_WORKFLOW_GATE_LABEL: ${{ inputs.required_workflow_gate_label || vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_LABEL || '' }}
@@ -105,8 +116,39 @@ jobs:
             // workflow the repository does not have is a 404.
             const REQUIRE_CODERABBIT =
               String(process.env.REQUIRE_CODERABBIT || '').trim().toLowerCase();
-            const requireCodeRabbit =
+            const legacyRequireCodeRabbit =
               REQUIRE_CODERABBIT === 'true' || REQUIRE_CODERABBIT === '1';
+            const LEGACY_PR_AGENT =
+              String(process.env.LEGACY_PR_AGENT_ENABLED || '').trim().toLowerCase();
+            const legacyRequirePrAgent =
+              LEGACY_PR_AGENT === 'true' || LEGACY_PR_AGENT === '1';
+            if (legacyRequireCodeRabbit && legacyRequirePrAgent) {
+              throw new Error(
+                'Contradictory review configuration: CONTINUUM_REQUIRE_CODERABBIT and CONTINUUM_PR_AGENT_ENABLED are both enabled; select exactly one review provider.'
+              );
+            }
+            const legacyProvider = legacyRequireCodeRabbit
+              ? 'coderabbit'
+              : (legacyRequirePrAgent ? 'pr-agent' : '');
+            // Single canonical selector: review.provider (transport
+            // CONTINUUM_REVIEW_PROVIDER) is the source of truth. Legacy
+            // booleans are migration compatibility only and must agree.
+            const REVIEW_PROVIDER_RAW =
+              String(process.env.REVIEW_PROVIDER || '').trim().toLowerCase();
+            if (REVIEW_PROVIDER_RAW && !['none', 'coderabbit', 'pr-agent'].includes(REVIEW_PROVIDER_RAW)) {
+              throw new Error(`Unknown review provider: ${REVIEW_PROVIDER_RAW}`);
+            }
+            if (REVIEW_PROVIDER_RAW && legacyProvider && REVIEW_PROVIDER_RAW !== legacyProvider) {
+              throw new Error(
+                `Contradictory review configuration: CONTINUUM_REVIEW_PROVIDER=${REVIEW_PROVIDER_RAW} disagrees with legacy selection ${legacyProvider}.`
+              );
+            }
+            const reviewProvider = REVIEW_PROVIDER_RAW || legacyProvider || 'none';
+            // Normalized selected-provider gate: auto-merge consumes this, not
+            // provider-specific state directly. CodeRabbit behavior below is
+            // preserved exactly when the selected provider is coderabbit.
+            const requireCodeRabbit = reviewProvider === 'coderabbit';
+            const requirePrAgent = reviewProvider === 'pr-agent';
             const requiredWorkflowGateLabel =
               String(process.env.REQUIRED_WORKFLOW_GATE_LABEL || '').trim();
             const requiredWorkflowGateName =
@@ -920,6 +962,68 @@ jobs:
               return requested;
             }
 
+            // Normalized selected-provider review gate. Provider-specific
+            // parsing stays inside each adapter branch; auto-merge consumes
+            // only the normalized outcome (exact HEAD evidence, no
+            // unresolved findings, complete coverage). CodeRabbit branches
+            // above are unchanged; PR-Agent branches below provide lifecycle
+            // parity through PR-Agent-native markers.
+            async function prAgentReviewEvidence(pr, headSha) {
+              const comments = await github.paginate(
+                github.rest.issues.listComments,
+                { owner, repo, issue_number: pr.number, per_page: 100 }
+              );
+              const markerRe =
+                /<!-- continuum-pr-agent-review head=([0-9a-f]{40}) verdict=(APPROVED|CHANGES_REQUESTED) -->/i;
+              const matches = comments
+                .map((comment) => {
+                  const match = (comment.body || '').match(markerRe);
+                  if (!match) return null;
+                  return {
+                    head: match[1].toLowerCase(),
+                    verdict: match[2].toUpperCase(),
+                    createdAt: new Date(comment.created_at || 0).getTime(),
+                  };
+                })
+                .filter(Boolean)
+                .filter((item) => item.head === headSha.toLowerCase())
+                .sort((a, b) => b.createdAt - a.createdAt);
+              return matches[0] || null;
+            }
+
+            async function unresolvedPrAgentThreads(pr) {
+              const comments = await github.paginate(
+                github.rest.pulls.listReviewComments,
+                { owner, repo, pull_number: pr.number, per_page: 100 }
+              );
+              const unresolved = [];
+              for (const comment of comments) {
+                if (!/\bUNRESOLVED\b/i.test(comment.body || '')) continue;
+                if (/\bRESOLVED\b/i.test(comment.body || '') &&
+                    !/\bUNRESOLVED\b/i.test(comment.body || '')) continue;
+                unresolved.push({ id: comment.id, path: comment.path });
+              }
+              // UNRESOLVED always wins: a later explicit RESOLVED reply for
+              // the same thread clears it.
+              const resolvedIds = new Set(
+                comments
+                  .filter((comment) =>
+                    /\*\*RESOLVED(?:\.|\*\*)/i.test(comment.body || '') &&
+                    !/\bUNRESOLVED\b/i.test(comment.body || '') &&
+                    comment.in_reply_to_id)
+                  .map((comment) => comment.in_reply_to_id)
+              );
+              return unresolved.filter((item) => !resolvedIds.has(item.id));
+            }
+
+            async function prAgentReviewBasis(pr, headSha = pr.head.sha) {
+              const evidence = await prAgentReviewEvidence(pr, headSha);
+              if (!evidence || evidence.verdict !== 'APPROVED') return null;
+              const unresolved = await unresolvedPrAgentThreads(pr);
+              if (unresolved.length !== 0) return null;
+              return { sourceSha: headSha, carried: false, evidence };
+            }
+
             async function cancelObsoleteRuns(openPulls) {
               const { data: mainBranch } = await github.rest.repos.getBranch({
                 owner,
@@ -1450,6 +1554,21 @@ jobs:
                 continue;
               }
 
+              // Normalized PR-Agent gate: valid exact-HEAD APPROVED evidence,
+              // no unresolved findings, complete coverage is implied by the
+              // evidence marker (the reviewer fails closed otherwise).
+              const prAgentBasis = requirePrAgent
+                ? await prAgentReviewBasis(pr, pr.head.sha)
+                : null;
+              if (requirePrAgent && !prAgentBasis) {
+                const evidence = await prAgentReviewEvidence(pr, pr.head.sha);
+                const unresolved = await unresolvedPrAgentThreads(pr);
+                core.info(
+                  `PR #${pr.number}: waiting for PR-Agent approval on current head (evidence=${evidence?.verdict || 'missing'}, unresolved=${unresolved.length}).`
+                );
+                continue;
+              }
+
               if (reviewBasis && reviewBasis.carried) {
                 core.info(
                   `PR #${pr.number}: using CodeRabbit approval from ${reviewBasis.sourceSha} for clean main-sync head ${pr.head.sha}; current-head CI remains mandatory.`
@@ -1492,14 +1611,17 @@ jobs:
               const finalCurrentHeadNitpicks = requireCodeRabbit
                 ? await codeRabbitNitpickReviews(pr)
                 : [];
+              const finalPrAgentBasis = requirePrAgent
+                ? await prAgentReviewBasis(pr, pr.head.sha)
+                : null;
 
               if (
                 !finalCi ||
                 finalCi.status !== 'completed' ||
                 finalCi.conclusion !== 'success' ||
                 (finalPackagingSmoke &&
-                 (finalPackagingSmoke.status !== 'completed' ||
-                  finalPackagingSmoke.conclusion !== 'success')) ||
+                  (finalPackagingSmoke.status !== 'completed' ||
+                   finalPackagingSmoke.conclusion !== 'success')) ||
                 (requiredWorkflowGateLabel &&
                  requiredWorkflowGateName &&
                  hasLabel(pr, requiredWorkflowGateLabel) &&
@@ -1513,7 +1635,11 @@ jobs:
                 (requireCodeRabbit &&
                   (!finalReviewBasis ||
                    finalUnresolvedThreads.length !== 0 ||
-                   finalCurrentHeadNitpicks.length !== 0))
+                   finalCurrentHeadNitpicks.length !== 0)) ||
+                // The normalized PR-Agent half: exact-HEAD APPROVED evidence
+                // with no unresolved findings is required when pr-agent is
+                // the selected provider.
+                (requirePrAgent && !finalPrAgentBasis)
               ) {
                 core.info(
                   `PR #${pr.number}: gate changed during final revalidation; merge cancelled.`
@@ -1559,12 +1685,13 @@ jobs:
                 continue;
               }
 
+              const mergeBasisText = requireCodeRabbit
+                ? `CodeRabbit approval from ${finalReviewBasis.sourceSha}`
+                : (requirePrAgent
+                  ? `PR-Agent approval for exact HEAD ${pr.head.sha}`
+                  : 'CI only; CodeRabbit is disabled for this repository');
               core.notice(
-                `PR #${pr.number}: auto-merged head ${pr.head.sha} using ${
-                  requireCodeRabbit
-                    ? `CodeRabbit approval from ${finalReviewBasis.sourceSha}`
-                    : 'CI only; CodeRabbit is disabled for this repository'
-                }; merge commit ${result.sha}.`
+                `PR #${pr.number}: auto-merged head ${pr.head.sha} using ${mergeBasisText}; merge commit ${result.sha}.`
               );
 
               // Waking downstream workflows is best-effort and never changes the

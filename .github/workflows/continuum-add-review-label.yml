@@ -10,13 +10,18 @@ on:
         required: false
       require_coderabbit:
         description: >-
-          Queue green PR heads for a CodeRabbit review. Empty falls back to
-          vars.CONTINUUM_REQUIRE_CODERABBIT. CodeRabbit is an optional
-          integration, so the default is OFF: this workflow still wakes the
-          auto-merge reconciler for every green head, but a project that did
-          not ask for CodeRabbit must not get its `review-ready` and
-          `coderabbit-review-requested` labels, and must not have a workflow
-          dispatched that it does not own.
+          Legacy CodeRabbit switch. Empty falls back to
+          vars.CONTINUUM_REQUIRE_CODERABBIT. Prefer review_provider /
+          vars.CONTINUUM_REVIEW_PROVIDER: contradictory values fail closed.
+        type: string
+        default: ''
+        required: false
+      review_provider:
+        description: >-
+          Canonical review provider (none|coderabbit|pr-agent). Empty falls
+          back to vars.CONTINUUM_REVIEW_PROVIDER, then to legacy
+          require_coderabbit / vars.CONTINUUM_REQUIRE_CODERABBIT and
+          vars.CONTINUUM_PR_AGENT_ENABLED compatibility.
         type: string
         default: ''
         required: false
@@ -37,6 +42,8 @@ jobs:
           CONTINUUM_VERSION_FILE: ${{ vars.CONTINUUM_VERSION_FILE || '' }}
           CONTINUUM_RELEASE_MANIFEST_FILES: ${{ vars.CONTINUUM_RELEASE_MANIFEST_FILES || '[]' }}
           REQUIRE_CODERABBIT: ${{ inputs.require_coderabbit || vars.CONTINUUM_REQUIRE_CODERABBIT || 'false' }}
+          REVIEW_PROVIDER: ${{ inputs.review_provider || vars.CONTINUUM_REVIEW_PROVIDER || '' }}
+          LEGACY_PR_AGENT_ENABLED: ${{ vars.CONTINUUM_PR_AGENT_ENABLED || 'false' }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
@@ -51,8 +58,32 @@ jobs:
             // and no dispatch of a controller the repository may not own.
             const REQUIRE_CODERABBIT =
               String(process.env.REQUIRE_CODERABBIT || '').trim().toLowerCase();
-            const requireCodeRabbit =
+            const legacyRequireCodeRabbit =
               REQUIRE_CODERABBIT === 'true' || REQUIRE_CODERABBIT === '1';
+            const LEGACY_PR_AGENT =
+              String(process.env.LEGACY_PR_AGENT_ENABLED || '').trim().toLowerCase();
+            const legacyRequirePrAgent =
+              LEGACY_PR_AGENT === 'true' || LEGACY_PR_AGENT === '1';
+            if (legacyRequireCodeRabbit && legacyRequirePrAgent) {
+              throw new Error(
+                'Contradictory review configuration: both legacy provider flags are enabled.'
+              );
+            }
+            const legacyProvider = legacyRequireCodeRabbit
+              ? 'coderabbit'
+              : (legacyRequirePrAgent ? 'pr-agent' : '');
+            const REVIEW_PROVIDER_RAW =
+              String(process.env.REVIEW_PROVIDER || '').trim().toLowerCase();
+            if (REVIEW_PROVIDER_RAW && !['none', 'coderabbit', 'pr-agent'].includes(REVIEW_PROVIDER_RAW)) {
+              throw new Error(`Unknown review provider: ${REVIEW_PROVIDER_RAW}`);
+            }
+            if (REVIEW_PROVIDER_RAW && legacyProvider && REVIEW_PROVIDER_RAW !== legacyProvider) {
+              throw new Error(
+                `Contradictory review configuration: ${REVIEW_PROVIDER_RAW} disagrees with legacy selection ${legacyProvider}.`
+              );
+            }
+            const reviewProvider = REVIEW_PROVIDER_RAW || legacyProvider || 'none';
+            const requireCodeRabbit = reviewProvider === 'coderabbit';
             const RELEASE_FILES = new Set([
               '.release-please-manifest.json',
               'CHANGELOG.md',

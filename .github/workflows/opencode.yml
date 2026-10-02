@@ -31,6 +31,7 @@ on:
         type: choice
         options:
           - coderabbit-fix
+          - review-fix
           - resolve-conflict
           - ci-fix
           - issue
@@ -47,7 +48,23 @@ on:
         required: false
         type: string
       review_id:
-        description: "Source CodeRabbit review id"
+        description: "Source review id / normalized review instance id"
+        required: false
+        type: string
+      review_provider:
+        description: "Selected review provider for generic review-fix mode"
+        required: false
+        type: string
+      reviewed_sha:
+        description: "PR head SHA the source review evaluated"
+        required: false
+        type: string
+      head_sha:
+        description: "Exact current PR head SHA at dispatch time"
+        required: false
+        type: string
+      findings_json:
+        description: "Normalized actionable finding set as JSON"
         required: false
         type: string
       run_id:
@@ -132,6 +149,10 @@ jobs:
       pr_number: "${{ inputs.pr_number }}"
       head_ref: "${{ inputs.head_ref }}"
       review_id: "${{ inputs.review_id }}"
+      review_provider: "${{ inputs.review_provider }}"
+      reviewed_sha: "${{ inputs.reviewed_sha }}"
+      head_sha: "${{ inputs.head_sha }}"
+      findings_json: "${{ inputs.findings_json }}"
       run_id: "${{ inputs.run_id }}"
       ci_workflow_id: "${{ inputs.ci_workflow_id }}"
       base_ref: "${{ inputs.base_ref }}"
