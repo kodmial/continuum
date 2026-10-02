@@ -66,10 +66,6 @@ CORE_STUBS=(
 )
 TECH_STUBS=(
   continuum-tech-swift-ci.yml
-  continuum-tech-swift-packaging-smoke.yml
-  continuum-tech-swift-release-automation-merge.yml
-  continuum-tech-swift-release-pr.yml
-  continuum-tech-swift-release.yml
 )
 PARENT_STUBS=(
   continuum-child-dispatcher.yml
