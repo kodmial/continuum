@@ -10,7 +10,7 @@ set -euo pipefail
 # empty, `0` and `false`, leaves the confirmation in place.
 # Installing into Continuum's own checkout is refused outright.
 # ref defaults to main. `core` is the task-domain layer every project needs;
-# `tech` is the opt-in technology library (the `continuum-tech-<tech>-` prefix marks the library);
+# `tech` is the opt-in consumer-neutral technology library (`continuum-tech-<tech>-`);
 # `parent` adds only child-execution callers.
 # Continuum never triggers its own technology library: consumers opt into it.
 DEST="${1:-.}"
@@ -66,10 +66,6 @@ CORE_STUBS=(
 )
 TECH_STUBS=(
   continuum-tech-swift-ci.yml
-  continuum-tech-swift-packaging-smoke.yml
-  continuum-tech-swift-release-automation-merge.yml
-  continuum-tech-swift-release-pr.yml
-  continuum-tech-swift-release.yml
 )
 PARENT_STUBS=(
   continuum-child-pr-review.yml
