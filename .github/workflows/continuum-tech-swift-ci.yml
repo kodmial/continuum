@@ -96,7 +96,7 @@ jobs:
       build_command: ${{ inputs.build_command || vars.CONTINUUM_SWIFT_BUILD_COMMAND || 'swift build' }}
       test_command: ${{ inputs.test_command || vars.CONTINUUM_SWIFT_TEST_COMMAND || 'swift test' }}
       validation_command: ${{ inputs.validation_command || vars.CONTINUUM_VALIDATION_COMMAND || '' }}
-      auto_detect: 'false'
+      auto_detect: ${{ 'false' }}
       artifact_paths: ${{ inputs.artifact_paths || vars.CONTINUUM_ARTIFACT_PATHS || '' }}
       artifact_name: ${{ inputs.artifact_name || vars.CONTINUUM_ARTIFACT_NAME || '' }}
       status_context: ${{ inputs.status_context || vars.CONTINUUM_STATUS_CONTEXT || '' }}
