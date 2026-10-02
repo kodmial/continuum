@@ -98,7 +98,7 @@ on:
           migrates. Empty falls back to CONTINUUM_LEGACY_CHILD_OWNED_MARKER.
         type: string
         required: false
-        default: '<!-- runtime-worker-owned -->'
+        default: ''
       opencode_workflow_name:
         description: >-
           `name:` of the consumer's OpenCode caller whose in-flight runs count as
@@ -200,7 +200,7 @@ jobs:
       REQUIRE_PRIORITY_LABEL: ${{ inputs.require_priority_label || vars.AUTOMATION_REQUIRE_PRIORITY_LABEL || 'false' }}
       COMMAND_GRACE_MINUTES: ${{ inputs.command_grace_minutes || vars.AUTOMATION_COMMAND_GRACE_MINUTES || '5' }}
       CHILD_OWNED_MARKER: ${{ inputs.child_owned_marker || vars.CONTINUUM_CHILD_OWNED_MARKER || '<!-- continuum-child-owned -->' }}
-      LEGACY_CHILD_OWNED_MARKER: ${{ inputs.legacy_child_owned_marker || vars.CONTINUUM_LEGACY_CHILD_OWNED_MARKER || '<!-- runtime-worker-owned -->' }}
+      LEGACY_CHILD_OWNED_MARKER: ${{ inputs.legacy_child_owned_marker || vars.CONTINUUM_LEGACY_CHILD_OWNED_MARKER || '' }}
       OPENCODE_WORKFLOW_NAME: ${{ inputs.opencode_workflow_name || vars.CONTINUUM_OPENCODE_WORKFLOW_NAME || 'OpenCode agent' }}
       OPENCODE_WORKFLOW_PATH: ${{ inputs.opencode_workflow_path || vars.CONTINUUM_OPENCODE_WORKFLOW_PATH || '.github/workflows/continuum-opencode.yml' }}
       DISPATCH_REF: ${{ inputs.dispatch_ref || vars.CONTINUUM_DISPATCH_REF || 'main' }}
@@ -262,7 +262,7 @@ jobs:
             const childOwnedMarker =
               process.env.CHILD_OWNED_MARKER || '<!-- continuum-child-owned -->';
             const legacyChildOwnedMarker =
-              process.env.LEGACY_CHILD_OWNED_MARKER || '<!-- runtime-worker-owned -->';
+              process.env.LEGACY_CHILD_OWNED_MARKER || '';
             const opencodeWorkflowName =
               process.env.OPENCODE_WORKFLOW_NAME || 'OpenCode agent';
             const opencodeWorkflowPath =
