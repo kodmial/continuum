@@ -38,7 +38,13 @@ jobs:
               return;
             }
             const allowed = new Set(['SubTask', 'SubTask review', 'SubTask PR review']);
-            if (!allowed.has(run.name)) {
+            const canonicalName = String(run.name || '').replace(/ #[1-9][0-9]*$/, '');
+            const allowedPaths = new Set([
+              '.github/workflows/continuum-child-worker.yml',
+              '.github/workflows/continuum-child-review.yml',
+              '.github/workflows/continuum-child-pr-review.yml',
+            ]);
+            if (!allowed.has(canonicalName) || !allowedPaths.has(run.path)) {
               core.setFailed('refusing to delete a non-delegated workflow run');
               return;
             }
