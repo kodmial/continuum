@@ -1,29 +1,24 @@
-name: CI
+name: Swift validation
 
 on:
+  pull_request:
   push:
     branches: [main]
-    # A documentation-only merge does not need a macOS build on main.
-    paths-ignore:
-      - '*.md'
-      - '**/*.md'
-      - 'docs/**'
-      - 'LICENSE'
-  pull_request:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number to validate
+        required: false
+        type: string
 
 permissions:
+  actions: write
   contents: read
   pull-requests: read
+  statuses: write
 
-# A superseded PR head cannot satisfy required checks, so cancel its CI run
-# immediately instead of letting stale macOS jobs occupy the shared queue. This
-# lives in the caller, not the callee: the caller gates the consumer's whole
-# run, so cancellation drops the macOS jobs themselves. The group name stays
-# Continuum's own — a shipped stub must not carry a consumer's product name —
-# and carries the repository so the group reads unambiguously in the Actions
-# UI.
 concurrency:
-  group: continuum-swift-ci-${{ github.repository }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref || github.run_id }}
+  group: continuum-swift-validation-${{ github.repository }}-${{ inputs.pr_number || github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -32,5 +27,4 @@ jobs:
     secrets: inherit
     with:
       continuum_ref: main
-      native_prepare_command: "${{ vars.CONTINUUM_NATIVE_PREPARE_COMMAND || '' }}"
-      static_archive_path: "${{ vars.CONTINUUM_STATIC_ARCHIVE_PATH || '' }}"
+      pr_number: "${{ inputs.pr_number }}"
