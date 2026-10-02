@@ -807,11 +807,11 @@ class ContinuumTest < Minitest::Test
           PARENT_STUBS.each { |stub| assert_includes installed, File.basename(stub) }
         end
       end
-      # Each set adds exactly its own files: 15 core, +5 tech, +3 parent.
+      # Each set adds exactly its own files: 15 core, +1 tech, +3 parent.
       assert_equal CORE_STUBS.size, counts['core']
       assert_equal CORE_STUBS.size + TECH_STUBS.size, counts['tech']
       assert_equal ALL_STUBS.size, counts['parent']
-      assert_equal 23, ALL_STUBS.size,
+      assert_equal 19, ALL_STUBS.size,
                    'every caller Continuum ships, across all three layers'
     end
   end
@@ -1737,10 +1737,14 @@ class ContinuumTest < Minitest::Test
 
   # The macOS-only toolchain steps must stay guarded twice, so a non-macOS
   # AUTOMATION_OPENCODE_RUNNER never tries to install Swift or probe sw_vers.
-  def test_opencode_macos_steps_are_guarded
+  def test_opencode_environment_is_consumer_owned
     body = File.read(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
-    assert_equal 2,
-                 body.scan(/if: startsWith\(vars\.AUTOMATION_OPENCODE_RUNNER/).size
+    assert_includes body, "runs-on: ${{ vars.AUTOMATION_OPENCODE_RUNNER || 'ubuntu-latest' }}"
+    assert_includes body, 'CONTINUUM_AGENT_PREPARE_COMMAND'
+    assert_includes body, 'eval "$PREPARE_COMMAND"'
+    refute_includes body, 'swift-actions/setup-swift'
+    refute_includes body, 'sw_vers'
+    refute_includes body, "'macos-15'"
   end
 
   # A `vars.X || '0'`-style default that resolved to zero would make a job or a
