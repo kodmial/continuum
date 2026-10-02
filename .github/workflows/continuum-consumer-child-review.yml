@@ -166,7 +166,7 @@ jobs:
           trusted_validation=""
           run_validation() {
             [[ -n "$trusted_validation" ]] || return 0
-            env -i               PATH="$PATH"               HOME="$HOME"               TMPDIR="${TMPDIR:-/tmp}"               LANG="${LANG:-C.UTF-8}"               CI=true               bash "$trusted_validation" >"$validation_log" 2>&1
+            env -i               PATH="$PATH"               HOME="$HOME"               TMPDIR="${TMPDIR:-/tmp}"               LANG="${LANG:-C.UTF-8}"               CI=true               CONTINUUM_ROLE=child               bash "$trusted_validation" >"$validation_log" 2>&1
           }
 
           initial_validation="not configured"
