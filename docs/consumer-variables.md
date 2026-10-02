@@ -19,7 +19,12 @@ repository variable shown below.
 | `CONTINUUM_VALIDATION_COMMAND` | empty | Additional validation hook. |
 | `CONTINUUM_PACKAGE_COMMAND` | empty | Consumer packaging hook. |
 | `CONTINUUM_RELEASE_COMMAND` | empty | Consumer release hook. |
-| `CONTINUUM_AUTO_DETECT` | `true` | Detect and validate Python/Node/Java/Go/Rust, Docker and shell. |
+| `CONTINUUM_AUTO_DETECT` | `true` | Detect and validate Python/Node/PHP/Java/Go/Rust, Docker and shell. |
+| `CONTINUUM_NODE_VERSION` | empty | Optional Node.js version setup for explicit consumer hooks. |
+| `CONTINUUM_PHP_VERSION` | empty | Optional PHP version setup for explicit consumer hooks. |
+| `CONTINUUM_PHP_EXTENSIONS` | empty | Comma-separated PHP extensions when PHP setup is requested. |
+| `CONTINUUM_PHP_COVERAGE` | `none` | PHP coverage driver when PHP setup is requested. |
+| `CONTINUUM_BUN_VERSION` | empty | Optional Bun version setup for explicit consumer hooks. |
 | `CONTINUUM_ARTIFACT_PATHS` | empty | Newline-separated artifact paths to upload. |
 | `CONTINUUM_ARTIFACT_NAME` | `continuum-validation` | Uploaded artifact name. |
 | `CONTINUUM_STATUS_CONTEXT` | `continuum/validation` | Commit-status context. |
@@ -28,8 +33,13 @@ repository variable shown below.
 | `CONTINUUM_REPAIR_WORKFLOW` | `continuum-opencode-repair.yml` | Repair caller file. |
 | `CONTINUUM_SKIP_OPENCODE_PR` | `false` | Suppress duplicate pull_request validation for `opencode/*` branches. |
 
-The installed core caller is named **CI**. This is the generic required-check
-name used by the lifecycle. Additional product checks remain consumer-owned.
+The reusable engine is **not** installed as a `continuum-validation.yml`
+caller. Each consumer owns one primary `.github/workflows/ci.yml` whose
+workflow `name:` is **CI** and calls
+`kodmial/continuum/.github/workflows/continuum-validation.yml@main`.
+That keeps trigger/toolchain differences project-owned without creating a second
+generic CI state machine. Core repair/watchdog logic treats the stable `CI`
+workflow name as the interface.
 
 ## Agent execution
 
@@ -113,12 +123,17 @@ Every installed parent stub fills `CHILD_RUNTIME_TOKEN` from the parent's own `T
 ## New repository example
 
 1. Install `core` from Continuum `main`.
-2. Configure `TAP_PAT` if the lifecycle needs authenticated writes.
-3. Run the default CI contract unchanged, or set hook variables for nonstandard
-   build/test commands.
-4. Set `CONTINUUM_RUNNER` only when `ubuntu-latest` is not suitable.
-5. Install `tech` only for an optional technology profile and `parent` only
+2. Add one project-owned `.github/workflows/ci.yml` named `CI` that calls
+   `kodmial/continuum/.github/workflows/continuum-validation.yml@main`.
+3. Supply project-specific build/test/toolchain semantics through validation
+   inputs or `CONTINUUM_*` variables; do not edit an installed
+   `continuum-*.yml` caller.
+4. Configure `TAP_PAT` if the lifecycle needs authenticated writes.
+5. Set `CONTINUUM_RUNNER` only when `ubuntu-latest` is not suitable.
+6. Install `tech` only for an optional technology profile and `parent` only
    for delegated execution.
+7. Re-running the same install is expected to be idempotent: project-owned
+   workflows are preserved and the install-managed caller topology is unchanged.
 
 No consumer source path, product name, release repository or signing secret is
 added to Continuum.
