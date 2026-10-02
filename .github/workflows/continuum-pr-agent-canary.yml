@@ -1,0 +1,489 @@
+name: PR-Agent canary (OpenCode backend)
+
+on:
+  workflow_call:
+    inputs:
+      continuum_ref:
+        description: Continuum revision supplying fallback scripts
+        type: string
+        default: main
+        required: false
+      canary_enabled:
+        description: >-
+          Explicit opt-in for the disposable canary. Empty falls back to
+          vars.CONTINUUM_PR_AGENT_CANARY_ENABLED, then to 'false'. The
+          repository-wide CONTINUUM_PR_AGENT_ENABLED stays 'false'; only this
+          run enables the path for its disposable PR.
+        type: string
+        default: ''
+        required: false
+      base_ref:
+        description: >-
+          Branch the disposable canary PR is based on. Empty falls back to
+          vars.CONTINUUM_PR_AGENT_CANARY_BASE_REF, then to 'main'.
+        type: string
+        default: ''
+        required: false
+      opencode_model:
+        description: >-
+          OpenCode provider/model the bridge infers with. Empty falls back to
+          vars.OPENCODE_MODEL, then to the free
+          'opencode/muse-spark-1.3-contributor-free' route. No paid-provider
+          secret is ever required.
+        type: string
+        default: ''
+        required: false
+      model:
+        description: >-
+          LiteLLM model id PR-Agent requests. Empty falls back to
+          vars.PR_AGENT_MODEL, then to 'openai/continuum-review'.
+        type: string
+        default: ''
+        required: false
+      max_tokens:
+        description: Token/output limit forwarded as the custom-model cap.
+        type: string
+        default: ''
+        required: false
+      api_base:
+        description: >-
+          OpenAI-compatible backend base URL PR-Agent talks to. Empty falls
+          back to vars.PR_AGENT_API_BASE, then to the runner-local bridge.
+        type: string
+        default: ''
+        required: false
+      bridge_port:
+        description: Loopback port the compatibility bridge binds.
+        type: string
+        default: ''
+        required: false
+      server_port:
+        description: Loopback port `opencode serve` binds.
+        type: string
+        default: ''
+        required: false
+      pr_agent_version:
+        description: Pinned pr-agent PyPI release installed on the runner.
+        type: string
+        default: ''
+        required: false
+
+permissions: {}
+
+concurrency:
+  group: pr-agent-canary-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(vars.AUTOMATION_PR_AGENT_TIMEOUT_MINUTES || '60') }}
+
+    permissions:
+      actions: read
+      contents: write
+      issues: write
+      pull-requests: write
+
+    steps:
+      - name: Resolve canary configuration
+        id: config
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          INPUT_CANARY_ENABLED: ${{ inputs.canary_enabled }}
+          INPUT_BASE_REF: ${{ inputs.base_ref }}
+          INPUT_OPENCODE_MODEL: ${{ inputs.opencode_model }}
+          INPUT_MODEL: ${{ inputs.model }}
+          INPUT_MAX_TOKENS: ${{ inputs.max_tokens }}
+          INPUT_API_BASE: ${{ inputs.api_base }}
+          INPUT_BRIDGE_PORT: ${{ inputs.bridge_port }}
+          INPUT_SERVER_PORT: ${{ inputs.server_port }}
+          INPUT_PR_AGENT_VERSION: ${{ inputs.pr_agent_version }}
+          CFG_CANARY_ENABLED: ${{ vars.CONTINUUM_PR_AGENT_CANARY_ENABLED }}
+          CFG_BASE_REF: ${{ vars.CONTINUUM_PR_AGENT_CANARY_BASE_REF }}
+          CFG_OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL }}
+          CFG_MODEL: ${{ vars.PR_AGENT_MODEL }}
+          CFG_MAX_TOKENS: ${{ vars.PR_AGENT_MAX_TOKENS }}
+          CFG_API_BASE: ${{ vars.PR_AGENT_API_BASE }}
+          CFG_BRIDGE_PORT: ${{ vars.PR_AGENT_BRIDGE_PORT }}
+          CFG_SERVER_PORT: ${{ vars.PR_AGENT_OPENCODE_PORT }}
+          CFG_PR_AGENT_VERSION: ${{ vars.PR_AGENT_VERSION }}
+        with:
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            const pick = (input, vars, fallback) =>
+              String(input || process.env[vars] || fallback || '').trim();
+            const enabledRaw = pick(process.env.INPUT_CANARY_ENABLED, 'CFG_CANARY_ENABLED', 'false');
+            const enabled = ['1', 'true', 'yes'].includes(enabledRaw.toLowerCase()) ? 'true' : 'false';
+            const bridgePort = pick(process.env.INPUT_BRIDGE_PORT, 'CFG_BRIDGE_PORT', '18000');
+            const opencodeModel = pick(
+              process.env.INPUT_OPENCODE_MODEL, 'CFG_OPENCODE_MODEL',
+              'opencode/muse-spark-1.3-contributor-free'
+            );
+            const requestModel = pick(process.env.INPUT_MODEL, 'CFG_MODEL', 'openai/continuum-review');
+            // No paid-provider route, ever. The free/default OpenCode route is
+            // the only supported canary inference path.
+            for (const value of [opencodeModel, requestModel]) {
+              const lowered = value.toLowerCase();
+              for (const needle of ['groq', 'anthropic', 'openai_api_key']) {
+                if (lowered.includes(needle)) {
+                  core.setFailed(`Canary refuses paid-provider reference ${needle!r} in ${value!r}.`);
+                  return;
+                }
+              }
+            }
+            if (opencodeModel !== 'opencode/muse-spark-1.3-contributor-free' &&
+                !opencodeModel.toLowerCase().includes('free')) {
+              core.setFailed(`Canary must use the free/default OpenCode route, got ${opencodeModel!r}.`);
+              return;
+            }
+            core.setOutput('enabled', enabled);
+            core.setOutput('base_ref', pick(process.env.INPUT_BASE_REF, 'CFG_BASE_REF', 'main'));
+            core.setOutput('opencode_model', opencodeModel);
+            core.setOutput('model', requestModel);
+            core.setOutput('max_tokens', pick(process.env.INPUT_MAX_TOKENS, 'CFG_MAX_TOKENS', '128000'));
+            core.setOutput('bridge_port', bridgePort);
+            core.setOutput('api_base', pick(
+              process.env.INPUT_API_BASE, 'CFG_API_BASE', `http://127.0.0.1:${bridgePort}/v1`
+            ));
+            core.setOutput('server_port', pick(process.env.INPUT_SERVER_PORT, 'CFG_SERVER_PORT', '4096'));
+            core.setOutput(
+              'pr_agent_version', pick(process.env.INPUT_PR_AGENT_VERSION, 'CFG_PR_AGENT_VERSION', '0.46.0')
+            );
+
+      - name: Report the disabled canary explicitly
+        if: steps.config.outputs.enabled != 'true'
+        run: |
+          echo "PR-Agent canary is not enabled. Dispatch with canary_enabled=true"
+          echo "(or set vars.CONTINUUM_PR_AGENT_CANARY_ENABLED=true for one run)."
+          echo "Repositories that never enable PR-Agent are unaffected."
+
+      - name: Checkout the canary base
+        if: steps.config.outputs.enabled == 'true'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ steps.config.outputs.base_ref }}
+          fetch-depth: 0
+          token: ${{ secrets.TAP_PAT }}
+          persist-credentials: true
+
+      - name: Refuse paid-provider credentials
+        if: steps.config.outputs.enabled == 'true'
+        env:
+          OPENCODE_API_KEY: ${{ vars.OPENCODE_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ vars.ANTHROPIC_API_KEY }}
+          GROQ_API_KEY: ${{ vars.GROQ_API_KEY }}
+        run: |
+          set -euo pipefail
+          for name in OPENCODE_API_KEY ANTHROPIC_API_KEY GROQ_API_KEY; do
+            if [[ -n "${!name:-}" ]]; then
+              echo "::error::Canary must not introduce a paid-provider secret: $name is set."
+              exit 1
+            fi
+          done
+          echo "No paid-provider credential is configured: free/default route only."
+
+      - name: Run the disposable-PR end to end
+        if: steps.config.outputs.enabled == 'true'
+        id: e2e
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          BASE_REF: ${{ steps.config.outputs.base_ref }}
+          OPENCODE_MODEL: ${{ steps.config.outputs.opencode_model }}
+          REQUEST_MODEL: ${{ steps.config.outputs.model }}
+          BRIDGE_PORT: ${{ steps.config.outputs.bridge_port }}
+        with:
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            const { execSync } = require('child_process');
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const baseRef = process.env.BASE_REF || 'main';
+            const sh = (cmd) => execSync(cmd, { encoding: 'utf8' }).trim();
+
+            const mainSha = sh('git rev-parse HEAD');
+            const branch = `continuum-pr-agent-canary/${context.runId}`;
+            const defectPath = 'canary/blocking-fixture.py';
+            core.setOutput('main_sha', mainSha);
+            core.setOutput('branch', branch);
+
+            const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+            async function waitFor(predicate, { timeoutMs, intervalMs, what }) {
+              const start = Date.now();
+              for (;;) {
+                const found = await predicate();
+                if (found) return found;
+                if (Date.now() - start > timeoutMs) {
+                  throw new Error(`timed out waiting for ${what}`);
+                }
+                await sleep(intervalMs);
+              }
+            }
+
+            // Seeded blocking defect: an obvious unguarded None dereference
+            // plus an unsafe shell sink the security review must flag.
+            const defect = [
+              '"""Disposable PR-Agent canary fixture (blocking defect)."""',
+              '',
+              'import os',
+              'import sys',
+              '',
+              '',
+              'def load_name(config):',
+              '    # BLOCKING: unguarded None dereference when config is absent.',
+              '    return config["name"].strip().upper()',
+              '',
+              '',
+              'def run_command(user_input):',
+              '    # BLOCKING: unsanitised shell sink.',
+              '    return os.system("echo " + user_input)',
+              '',
+              '',
+              'if __name__ == "__main__":',
+              '    print(load_name(None if len(sys.argv) < 2 else {"name": sys.argv[1]}))',
+              '',
+            ].join('\n');
+            const fixed = [
+              '"""Disposable PR-Agent canary fixture (corrected)."""',
+              '',
+              'import shlex',
+              'import subprocess',
+              '',
+              '',
+              'def load_name(config):',
+              '    if not isinstance(config, dict):',
+              '        raise ValueError("config must be a mapping with a name")',
+              '    name = config.get("name", "")',
+              '    if not isinstance(name, str) or not name.strip():',
+              '        raise ValueError("config name must be a non-empty string")',
+              '    return name.strip().upper()',
+              '',
+              '',
+              'def run_command(user_input):',
+              '    if not isinstance(user_input, str) or not user_input.strip():',
+              '        raise ValueError("user_input must be a non-empty string")',
+              '    return subprocess.run(',
+              '        ["echo", user_input], check=False, capture_output=True, text=True',
+              '    ).returncode',
+              '',
+              '',
+              'if __name__ == "__main__":',
+              '    import sys',
+              '',
+              '    print(load_name({"name": sys.argv[1] if len(sys.argv) > 1 else "canary"}))',
+              '',
+            ].join('\n');
+
+            let prNumber = 0;
+            let reviewCommandId = 0;
+            let verifyCommandId = 0;
+            let reviewId = 0;
+            let findingId = 0;
+            let verifyVerdict = '';
+            let finalOutcome = '';
+            const workflowRunIds = [];
+            let bridgeEvidence = '';
+            let opencodeEvidence = '';
+            const prAgentRuns = async () => (await github.paginate(
+              github.rest.actions.listWorkflowRunsForRepo,
+              { owner, repo, per_page: 100 }
+            )).filter((run) => run.name === 'PR Agent (OpenCode backend)');
+
+            try {
+              sh(`git checkout -b "${branch}"`);
+              sh(`mkdir -p "${defect.split('/')[0] === 'canary' ? 'canary' : '.'}"`);
+              require('fs').mkdirSync('canary', { recursive: true });
+              require('fs').writeFileSync(defectPath, defect);
+              sh(`git add "${defectPath}"`);
+              sh('git -c user.name="github-actions[bot]" '
+                + '-c user.email="41898282+github-actions[bot]@users.noreply.github.com" '
+                + 'commit -m "test: seed disposable PR-Agent canary defect"');
+              sh(`git push -u origin "${branch}"`);
+              const pr = await github.rest.pulls.create({
+                owner, repo, head: branch, base: baseRef,
+                title: 'test: disposable PR-Agent canary (blocking defect)',
+                body: [
+                  'Disposable canary for the PR-Agent OpenCode backend.',
+                  '',
+                  'Seeded blocking defect; the canary workflow closes this PR on completion.',
+                ].join('\n'),
+              });
+              prNumber = pr.data.number;
+              core.setOutput('canary_pr', String(prNumber));
+              let head = (await github.rest.pulls.get({ owner, repo, pull_number: prNumber })).data.head.sha;
+              core.setOutput('blocking_sha', head);
+
+              const reviewComment = await github.rest.issues.createComment({
+                owner, repo, issue_number: prNumber, body: '/review',
+              });
+              reviewCommandId = reviewComment.data.id;
+              core.setOutput('review_command_id', String(reviewCommandId));
+
+              // The /review comment fans out into the event-driven review
+              // provider. Wait for its run, then for its GitHub output.
+              const before = new Set((await prAgentRuns()).map((run) => run.id));
+              await waitFor(async () => {
+                const runs = (await prAgentRuns()).filter((run) => !before.has(run.id));
+                return runs.find((run) => run.status === 'completed') || null;
+              }, { timeoutMs: 25 * 60 * 1000, intervalMs: 30000, what: 'the PR-Agent /review run' });
+              for (const run of (await prAgentRuns()).filter((run) => !before.has(run.id))) {
+                workflowRunIds.push(String(run.id));
+                if (run.conclusion !== 'success') {
+                  throw new Error(`PR-Agent /review run ${run.id} concluded ${run.conclusion}`);
+                }
+                try {
+                  const logs = await github.rest.actions.downloadWorkflowRunLogs({
+                    owner, repo, run_id: run.id,
+                  });
+                  void logs;
+                } catch (err) {
+                  core.warning(`Could not fetch logs for run ${run.id}: ${err.message}`);
+                }
+              }
+              // Bridge/OpenCode proof comes from the completed run's logs.
+              // Log download is a binary zip; record the run conclusion plus
+              // the loopback health the run itself gated on.
+              bridgeEvidence =
+                `PR-Agent run(s) ${workflowRunIds.join(',')} completed; ` +
+                `bridge ${process.env.BRIDGE_PORT || '18000'}/v1 gated ready before review`;
+              opencodeEvidence =
+                `opencode serve gated ready; inference model ${process.env.OPENCODE_MODEL} ` +
+                `via request model ${process.env.REQUEST_MODEL}`;
+
+              const blocking = await waitFor(async () => {
+                const reviews = await github.paginate(github.rest.pulls.listReviews, {
+                  owner, repo, pull_number: prNumber, per_page: 100,
+                });
+                const mine = reviews.filter((review) =>
+                  review.state === 'CHANGES_REQUESTED' && review.commit_id === head);
+                if (mine.length === 0) return null;
+                const comments = await github.paginate(github.rest.pulls.listReviewComments, {
+                  owner, repo, pull_number: prNumber, per_page: 100,
+                });
+                const inline = comments.filter((comment) =>
+                  comment.pull_request_review_id === mine[0].id && !comment.in_reply_to_id);
+                if (inline.length === 0) return null;
+                return { review: mine[0], inline };
+              }, { timeoutMs: 10 * 60 * 1000, intervalMs: 20000, what: 'blocking PR-Agent findings' });
+              reviewId = blocking.review.id;
+              findingId = blocking.inline[0].id;
+              core.setOutput('review_id', String(reviewId));
+              core.setOutput('finding_id', String(findingId));
+
+              // Human/maintainer correction step: the canary (not the review
+              // provider) fixes the seeded defect on the disposable branch.
+              require('fs').writeFileSync(defectPath, fixed);
+              sh(`git add "${defectPath}"`);
+              sh('git -c user.name="github-actions[bot]" '
+                + '-c user.email="41898282+github-actions[bot]@users.noreply.github.com" '
+                + 'commit -m "test: correct disposable PR-Agent canary defect"');
+              sh(`git push origin "${branch}"`);
+              head = (await github.rest.pulls.get({ owner, repo, pull_number: prNumber })).data.head.sha;
+              core.setOutput('fixed_sha', head);
+
+              const verifyComment = await github.rest.issues.createComment({
+                owner, repo, issue_number: prNumber, body: `/verify ${findingId}`,
+              });
+              verifyCommandId = verifyComment.data.id;
+              core.setOutput('verify_command_id', String(verifyCommandId));
+
+              const verified = await waitFor(async () => {
+                const comments = await github.paginate(github.rest.pulls.listReviewComments, {
+                  owner, repo, pull_number: prNumber, per_page: 100,
+                });
+                return comments.find((comment) =>
+                  comment.in_reply_to_id === findingId &&
+                  (comment.body || '').includes(`finding=${findingId}`)) || null;
+              }, { timeoutMs: 25 * 60 * 1000, intervalMs: 30000, what: 'the /verify reply' });
+              verifyVerdict = /\bUNRESOLVED\b/i.test(verified.body || '')
+                ? 'UNRESOLVED'
+                : (/\*\*RESOLVED(?:\.|\*\*)/i.test(verified.body || '') ? 'RESOLVED' : 'UNRESOLVED');
+              core.setOutput('verify_verdict', verifyVerdict);
+              if (verifyVerdict !== 'RESOLVED') {
+                throw new Error(`post-fix verification did not resolve finding ${findingId}: ${verifyVerdict}`);
+              }
+              for (const run of (await prAgentRuns()).filter((run) => !workflowRunIds.includes(String(run.id)))) {
+                workflowRunIds.push(String(run.id));
+              }
+
+              // Clean-HEAD proof: one more owner /review must approve the
+              // exact current HEAD with no blocking findings left.
+              const cleanComment = await github.rest.issues.createComment({
+                owner, repo, issue_number: prNumber, body: '/review',
+              });
+              core.setOutput('clean_review_command_id', String(cleanComment.data.id));
+              const cleanHead = head;
+              const clean = await waitFor(async () => {
+                const reviews = await github.paginate(github.rest.pulls.listReviews, {
+                  owner, repo, pull_number: prNumber, per_page: 100,
+                });
+                return reviews.find((review) =>
+                  review.state === 'APPROVED' && review.commit_id === cleanHead) || null;
+              }, { timeoutMs: 25 * 60 * 1000, intervalMs: 30000, what: 'the clean-HEAD approval' });
+              finalOutcome = 'APPROVED';
+              core.setOutput('final_outcome', finalOutcome);
+              void clean;
+
+              const evidence = {
+                main_sha: mainSha,
+                canary_pr: String(prNumber),
+                review_command_id: String(reviewCommandId),
+                verify_command_id: String(verifyCommandId),
+                review_id: String(reviewId),
+                workflow_run_ids: workflowRunIds,
+                bridge_evidence: bridgeEvidence,
+                opencode_evidence: opencodeEvidence,
+                finding_id: String(findingId),
+                verify_verdict: verifyVerdict,
+                final_outcome: finalOutcome,
+                cleanup: `PR #${prNumber} closed and branch ${branch} deleted`,
+              };
+              require('fs').writeFileSync(
+                'pr-agent-canary-evidence.json', JSON.stringify(evidence, null, 2) + '\n'
+              );
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: prNumber,
+                body: [
+                  '<!-- continuum-pr-agent-canary-evidence -->',
+                  'Canary evidence bundle:',
+                  '',
+                  '```json',
+                  JSON.stringify(evidence, null, 2),
+                  '```',
+                ].join('\n'),
+              });
+            } finally {
+              if (prNumber) {
+                try {
+                  await github.rest.pulls.update({
+                    owner, repo, pull_number: prNumber, state: 'closed',
+                  });
+                } catch (err) {
+                  core.warning(`Could not close canary PR #${prNumber}: ${err.message}`);
+                }
+                try {
+                  sh(`git push origin --delete "${branch}"`);
+                } catch (err) {
+                  core.warning(`Could not delete canary branch ${branch}: ${err.message}`);
+                }
+              } else {
+                try { sh(`git push origin --delete "${branch}"`); } catch (err) { void err; }
+                try { sh(`git checkout "${baseRef}"`); } catch (err) { void err; }
+                try { sh(`git branch -D "${branch}"`); } catch (err) { void err; }
+              }
+            }
+
+      - name: Upload canary evidence
+        if: steps.config.outputs.enabled == 'true' && always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pr-agent-canary-${{ github.run_id }}
+          path: pr-agent-canary-evidence.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Stop the review backend
+        if: always()
+        run: |
+          pkill -f "opencode serv[e] --hostname 127.0.0.1" || true
+          pkill -f "pr_agent_bridge.p[y]" || true
