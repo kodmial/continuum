@@ -1,20 +1,20 @@
-name: Consumer validation
+name: CI
 
 on:
   workflow_call:
     inputs:
       runner:
-        description: GitHub runner label selected by the consumer
+        description: Optional runner override; empty uses CONTINUUM_RUNNER then ubuntu-latest
         required: false
         type: string
-        default: ubuntu-latest
+        default: ''
       timeout_minutes:
-        description: Validation job timeout in minutes
+        description: Optional timeout override; empty uses CONTINUUM_VALIDATION_TIMEOUT_MINUTES then 25
         required: false
         type: string
-        default: '25'
+        default: ''
       prepare_command:
-        description: Optional preparation hook executed before build/test validation
+        description: Optional preparation hook executed before validation
         required: false
         type: string
         default: ''
@@ -44,50 +44,50 @@ on:
         type: string
         default: ''
       auto_detect:
-        description: Run standard checks for detected Python, Node, Java, Go and Rust stacks
+        description: Empty uses CONTINUUM_AUTO_DETECT then true
         required: false
-        type: boolean
-        default: true
+        type: string
+        default: ''
       artifact_paths:
         description: Newline-separated paths uploaded after validation
         required: false
         type: string
         default: ''
       artifact_name:
-        description: Artifact bundle name when artifact_paths is non-empty
+        description: Artifact bundle name; empty uses CONTINUUM_ARTIFACT_NAME
         required: false
         type: string
-        default: continuum-validation
+        default: ''
       status_context:
-        description: Commit-status context published by this validation
+        description: Commit-status context; empty uses CONTINUUM_STATUS_CONTEXT
         required: false
         type: string
-        default: continuum/validation
+        default: ''
       publish_status:
-        description: Publish pending/final commit status for the selected target
-        required: false
-        type: boolean
-        default: true
-      dispatch_repair:
-        description: Dispatch the configured repair workflow for pull-request results
-        required: false
-        type: boolean
-        default: true
-      repair_workflow:
-        description: Consumer workflow file that owns repair decisions
+        description: Empty uses CONTINUUM_PUBLISH_STATUS then true
         required: false
         type: string
-        default: continuum-opencode-repair.yml
+        default: ''
+      dispatch_repair:
+        description: Empty uses CONTINUUM_DISPATCH_REPAIR then true
+        required: false
+        type: string
+        default: ''
+      repair_workflow:
+        description: Repair workflow file; empty uses CONTINUUM_REPAIR_WORKFLOW
+        required: false
+        type: string
+        default: ''
       pr_number:
         description: Optional pull request number for manual validation
         required: false
         type: string
         default: ''
       skip_opencode_pull_request:
-        description: Skip duplicate pull_request runs for opencode/* branches
+        description: Empty uses CONTINUUM_SKIP_OPENCODE_PR then false
         required: false
-        type: boolean
-        default: false
+        type: string
+        default: ''
       continuum_ref:
         description: Continuum revision supplying this contract
         required: false
@@ -100,11 +100,11 @@ jobs:
   validate:
     name: Validate
     if: >-
-      !inputs.skip_opencode_pull_request ||
+      !fromJSON(inputs.skip_opencode_pull_request || vars.CONTINUUM_SKIP_OPENCODE_PR || 'false') ||
       github.event_name != 'pull_request' ||
       !startsWith(github.head_ref, 'opencode/')
-    runs-on: ${{ inputs.runner }}
-    timeout-minutes: ${{ fromJSON(inputs.timeout_minutes) }}
+    runs-on: ${{ inputs.runner || vars.CONTINUUM_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || vars.CONTINUUM_VALIDATION_TIMEOUT_MINUTES || '25') }}
 
     permissions:
       actions: write
@@ -144,11 +144,11 @@ jobs:
             core.setOutput('pr_number', prNumber);
 
       - name: Mark validation pending
-        if: inputs.publish_status
+        if: fromJSON(inputs.publish_status || vars.CONTINUUM_PUBLISH_STATUS || 'true')
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           TARGET_SHA: ${{ steps.target.outputs.sha }}
-          STATUS_CONTEXT: ${{ inputs.status_context }}
+          STATUS_CONTEXT: ${{ inputs.status_context || vars.CONTINUUM_STATUS_CONTEXT || 'continuum/validation' }}
         with:
           script: |
             await github.rest.repos.createCommitStatus({
@@ -168,7 +168,7 @@ jobs:
           persist-credentials: false
 
       - name: Detect project stack
-        if: inputs.auto_detect
+        if: fromJSON(inputs.auto_detect || vars.CONTINUUM_AUTO_DETECT || 'true')
         id: stack
         shell: bash
         run: |
@@ -201,7 +201,7 @@ jobs:
           echo "Detected: python=$python node=$node java=$java go=$go rust=$rust"
 
       - name: Set up Python
-        if: inputs.auto_detect && steps.stack.outputs.python == 'true'
+        if: fromJSON(inputs.auto_detect || vars.CONTINUUM_AUTO_DETECT || 'true') && steps.stack.outputs.python == 'true'
         uses: actions/setup-python@82c7e631bb3cdc910f68e0081d67478d79c6982d # v5
         with:
           python-version: '3.12'
@@ -210,18 +210,18 @@ jobs:
         id: checks
         shell: bash
         env:
-          AUTO_DETECT: ${{ inputs.auto_detect }}
+          AUTO_DETECT: ${{ inputs.auto_detect || vars.CONTINUUM_AUTO_DETECT || 'true' }}
           STACK_PYTHON: ${{ steps.stack.outputs.python }}
           STACK_NODE: ${{ steps.stack.outputs.node }}
           STACK_JAVA: ${{ steps.stack.outputs.java }}
           STACK_GO: ${{ steps.stack.outputs.go }}
           STACK_RUST: ${{ steps.stack.outputs.rust }}
-          PREPARE_COMMAND: ${{ inputs.prepare_command }}
-          BUILD_COMMAND: ${{ inputs.build_command }}
-          TEST_COMMAND: ${{ inputs.test_command }}
-          VALIDATION_COMMAND: ${{ inputs.validation_command }}
-          PACKAGE_COMMAND: ${{ inputs.package_command }}
-          RELEASE_COMMAND: ${{ inputs.release_command }}
+          PREPARE_COMMAND: ${{ inputs.prepare_command || vars.CONTINUUM_PREPARE_COMMAND || '' }}
+          BUILD_COMMAND: ${{ inputs.build_command || vars.CONTINUUM_BUILD_COMMAND || '' }}
+          TEST_COMMAND: ${{ inputs.test_command || vars.CONTINUUM_TEST_COMMAND || '' }}
+          VALIDATION_COMMAND: ${{ inputs.validation_command || vars.CONTINUUM_VALIDATION_COMMAND || '' }}
+          PACKAGE_COMMAND: ${{ inputs.package_command || vars.CONTINUUM_PACKAGE_COMMAND || '' }}
+          RELEASE_COMMAND: ${{ inputs.release_command || vars.CONTINUUM_RELEASE_COMMAND || '' }}
         run: |
           set -euo pipefail
 
@@ -328,11 +328,11 @@ jobs:
           fi
 
       - name: Upload declared artifacts
-        if: always() && inputs.artifact_paths != ''
+        if: always() && (inputs.artifact_paths != '' || vars.CONTINUUM_ARTIFACT_PATHS != '')
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: ${{ inputs.artifact_name }}
-          path: ${{ inputs.artifact_paths }}
+          name: ${{ inputs.artifact_name || vars.CONTINUUM_ARTIFACT_NAME || 'continuum-validation' }}
+          path: ${{ inputs.artifact_paths || vars.CONTINUUM_ARTIFACT_PATHS }}
           if-no-files-found: error
 
       - name: Publish validation result and continue repair lifecycle
@@ -342,10 +342,10 @@ jobs:
           TARGET_SHA: ${{ steps.target.outputs.sha }}
           PR_NUMBER: ${{ steps.target.outputs.pr_number }}
           CHECK_OUTCOME: ${{ steps.checks.outcome }}
-          STATUS_CONTEXT: ${{ inputs.status_context }}
-          PUBLISH_STATUS: ${{ inputs.publish_status }}
-          DISPATCH_REPAIR: ${{ inputs.dispatch_repair }}
-          REPAIR_WORKFLOW: ${{ inputs.repair_workflow }}
+          STATUS_CONTEXT: ${{ inputs.status_context || vars.CONTINUUM_STATUS_CONTEXT || 'continuum/validation' }}
+          PUBLISH_STATUS: ${{ inputs.publish_status || vars.CONTINUUM_PUBLISH_STATUS || 'true' }}
+          DISPATCH_REPAIR: ${{ inputs.dispatch_repair || vars.CONTINUUM_DISPATCH_REPAIR || 'true' }}
+          REPAIR_WORKFLOW: ${{ inputs.repair_workflow || vars.CONTINUUM_REPAIR_WORKFLOW || 'continuum-opencode-repair.yml' }}
         with:
           script: |
             const passed = process.env.CHECK_OUTCOME === 'success';
