@@ -160,7 +160,6 @@ jobs:
       contents: read
       issues: write
       pull-requests: read
-      statuses: write
 
     steps:
       - name: Classify CodeRabbit feedback and dispatch only actionable code repair
@@ -174,7 +173,7 @@ jobs:
           REVIEW_BODY: ${{ github.event.review.body }}
           REVIEWED_SHA: ${{ github.event.review.commit_id }}
         with:
-          github-token: ${{ secrets.TAP_PAT }}
+          github-token: ${{ github.token }}
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
@@ -184,7 +183,6 @@ jobs:
             const reviewedSha = process.env.REVIEWED_SHA || '';
             const reviewState = (process.env.REVIEW_STATE || '').toLowerCase();
             const reviewBody = process.env.REVIEW_BODY || '';
-            const convergenceContext = 'continuum/review-convergence';
 
             const { data: pr } = await github.rest.pulls.get({
               owner,
@@ -204,17 +202,8 @@ jobs:
             }
 
             if (reviewState === 'approved') {
-              await github.rest.repos.createCommitStatus({
-                owner,
-                repo,
-                sha: expectedHead,
-                state: 'success',
-                context: convergenceContext,
-                description: 'CodeRabbit review converged for this exact HEAD',
-                target_url: `${context.serverUrl}/${owner}/${repo}/pull/${pullNumber}`,
-              });
               core.notice(
-                `PR #${pullNumber}: CodeRabbit approved ${expectedHead}; cleared any no-progress blocker for this HEAD.`
+                `PR #${pullNumber}: CodeRabbit approved exact HEAD ${expectedHead}; any older no-progress marker is superseded.`
               );
               return;
             }
@@ -273,17 +262,8 @@ jobs:
                   ].join('\n'),
                 });
               }
-              await github.rest.repos.createCommitStatus({
-                owner,
-                repo,
-                sha: expectedHead,
-                state: 'error',
-                context: convergenceContext,
-                description: 'Non-code CodeRabbit blocker; automatic repair suppressed',
-                target_url: `${context.serverUrl}/${owner}/${repo}/pull/${pullNumber}`,
-              });
               core.warning(
-                `PR #${pullNumber}: CodeRabbit review ${reviewId} has no inline code findings; recorded an exact-HEAD no-progress blocker instead of dispatching OpenCode.`
+                `PR #${pullNumber}: CodeRabbit review ${reviewId} has no inline code findings; recorded an exact-HEAD no-progress marker instead of dispatching OpenCode.`
               );
               return;
             }
