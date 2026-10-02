@@ -813,11 +813,11 @@ class ContinuumTest < Minitest::Test
           PARENT_STUBS.each { |stub| assert_includes installed, File.basename(stub) }
         end
       end
-      # Each set adds exactly its own files: 14 core, +1 tech, +3 parent.
+      # Each set adds exactly its own files: 14 core, +1 tech, +4 parent.
       assert_equal CORE_STUBS.size, counts['core']
       assert_equal CORE_STUBS.size + TECH_STUBS.size, counts['tech']
       assert_equal ALL_STUBS.size, counts['parent']
-      assert_equal 18, ALL_STUBS.size,
+      assert_equal 19, ALL_STUBS.size,
                    'every caller Continuum ships, across all three layers'
     end
   end
@@ -1398,10 +1398,16 @@ class ContinuumTest < Minitest::Test
         callee = yaml(File.join(ROOT, '.github/workflows', name))
         assert_equal ['workflow_call'], events(callee).keys
         contract = events(callee).fetch('workflow_call')
-        job.fetch('with').each_key { |key| assert contract.fetch('inputs').key?(key), key }
-        contract.fetch('inputs').each do |key, spec|
-          assert job.fetch('with').key?(key), key if spec['required']
+        job.fetch('with', {}).each_key { |key| assert contract.fetch('inputs').key?(key), key }
+        contract.fetch('inputs', {}).each do |key, spec|
+          assert job.fetch('with', {}).key?(key), key if spec['required']
         end
+
+        if File.basename(file) == 'continuum-child-run-cleanup.yml'
+          refute job.key?('secrets'), 'run cleanup needs only the caller GITHUB_TOKEN, never child credentials'
+          next
+        end
+
         assert job.fetch('secrets').key?('CHILD_RUNTIME_TOKEN')
         assert_equal 'main', job.fetch('with').fetch('engine_ref')
         callee.fetch('jobs').each_value do |inner|
@@ -1449,6 +1455,7 @@ class ContinuumTest < Minitest::Test
         yaml(file).fetch('jobs').each_value do |job|
           next unless job['uses']
           assert job['uses'].end_with?("@#{ref}")
+          next if File.basename(file) == 'continuum-child-run-cleanup.yml'
           assert_equal ref, job.fetch('with').fetch('engine_ref')
         end
       end
@@ -2359,12 +2366,17 @@ class ContinuumTest < Minitest::Test
       forwarded = yaml(path).fetch('jobs').each_value
                                     .map { |job| job.is_a?(Hash) ? job['secrets'] : nil }
                                     .compact
-      assert_equal [{ 'CHILD_RUNTIME_TOKEN' => '${{ secrets.TAP_PAT }}' }], forwarded,
-                   "#{File.basename(path)} must forward the parent's TAP_PAT as CHILD_RUNTIME_TOKEN"
+      if File.basename(path) == 'continuum-child-run-cleanup.yml'
+        assert_empty forwarded,
+                     'run cleanup must not receive the private child runtime credential'
+      else
+        assert_equal [{ 'CHILD_RUNTIME_TOKEN' => '${{ secrets.TAP_PAT }}' }], forwarded,
+                     "#{File.basename(path)} must forward the parent's TAP_PAT as CHILD_RUNTIME_TOKEN"
+      end
     end
 
-    assert_match(%r{Every installed parent stub fills `CHILD_RUNTIME_TOKEN` from the parent's own `TAP_PAT`}, doc,
-                 'the doc must say the installed parent stubs fill CHILD_RUNTIME_TOKEN from TAP_PAT')
+    assert_match(%r{Every installed parent execution stub fills `CHILD_RUNTIME_TOKEN` from the parent's own `TAP_PAT`}, doc,
+                 'the doc must distinguish child execution callers from metadata-only cleanup')
   end
 
   # README.md is the first document a consumer reads, and its secrets table had
