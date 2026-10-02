@@ -2311,9 +2311,9 @@ class ContinuumTest < Minitest::Test
       'QUALIFICATION_MARKER' => ['qualification_marker', 'RENDER_QUALIFICATION_MARKER', '<!-- continuum-render-qualification-result -->'],
       'ARTIFACT_PREFIX' => ['artifact_prefix', 'RENDER_ARTIFACT_PREFIX', 'render-qualification'],
       'DISPATCH_REF' => ['dispatch_ref', 'RENDER_DISPATCH_REF', 'main'],
-      'JOB_SCRIPT' => ['job_script', 'RENDER_JOB_SCRIPT', 'automation/render-job.sh'],
-      'CLEANUP_SCRIPT' => ['cleanup_script', 'RENDER_CLEANUP_SCRIPT', 'automation/render-cleanup.sh'],
-      'QUALIFICATION_SCRIPT' => ['qualification_script', 'RENDER_QUALIFICATION_SCRIPT', 'automation/record_render_qualification.py'],
+      'JOB_SCRIPT' => ['job_script', 'RENDER_JOB_SCRIPT', nil],
+      'CLEANUP_SCRIPT' => ['cleanup_script', 'RENDER_CLEANUP_SCRIPT', nil],
+      'QUALIFICATION_SCRIPT' => ['qualification_script', 'RENDER_QUALIFICATION_SCRIPT', nil],
       'IN_PROGRESS_LABEL' => ['in_progress_label', 'AUTOMATION_IN_PROGRESS_LABEL', 'automation:in-progress'],
       'PAUSE_LABEL' => ['pause_label', 'AUTOMATION_PAUSE_LABEL', 'automation:paused'],
       'REPAIR_LABEL' => ['repair_label', 'AUTOMATION_REPAIR_LABEL', 'priority:p0'],
@@ -2325,12 +2325,12 @@ class ContinuumTest < Minitest::Test
       assert_equal '', definition.fetch('default'), "#{input} must default to empty so vars can supply it"
       assert_equal false, definition.fetch('required'), input
       assert_equal 'string', definition.fetch('type'), input
-      # The chain is `inputs.x || vars.VAR`, and only the model has no literal.
+      # The chain is `inputs.x || vars.VAR`; consumer-owned script hooks and the model have no literal.
       expected = literal ? "inputs.#{input} || vars.#{variable} || '#{literal}'" : "inputs.#{input} || vars.#{variable}"
       assert_includes body, "#{env_key}: \${{ #{expected} }}", "#{env_key}: env mapping missing"
     end
 
-    # The model is the one knob with no default anywhere in the chain, so the
+    # The model is one required knob with no default anywhere in the chain, so the
     # run must fail explicitly rather than start a worker that executes nothing.
     refute_includes body, "vars.OPENCODE_MODEL || '",
                     'OPENCODE_MODEL must have no literal default'
