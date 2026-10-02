@@ -102,15 +102,15 @@ jobs:
           set -euo pipefail
 
           # Repair locks are one-attempt-per-HEAD, not one-attempt-per-PR.
-          # A synchronize event means the PR has a new head commit, so any
-          # CI/packaging-smoke lock belongs to the previous head and must not
-          # suppress repair of a fresh failure on this head. Reopened PRs also
-          # get a clean repair budget.
+          # A synchronize event means the PR has a new head commit, so the CI
+          # repair lock belongs to the previous head and must not suppress
+          # repair of a fresh failure on this head. Reopened PRs also get a
+          # clean repair budget.
           if [[ "$PR_ACTION" == "synchronize" || "$PR_ACTION" == "reopened" ]]; then
-            for label in "$CI_REPAIR_LABEL" opencode-packaging-smoke-repair; do
-              gh api --method DELETE                 "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/$label"                 >/dev/null 2>&1 || true
-            done
-            echo "Reset per-head workflow-repair locks for PR #$PR_NUMBER ($PR_ACTION)."
+            gh api --method DELETE \
+              "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/$CI_REPAIR_LABEL" \
+              >/dev/null 2>&1 || true
+            echo "Reset per-head CI-repair lock for PR #$PR_NUMBER ($PR_ACTION)."
           fi
 
           gh label create opencode-conflict-repair --repo "$GITHUB_REPOSITORY" --color B60205 \
@@ -296,20 +296,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          case "$RUN_NAME" in
-            CI)
-              lock_label="$CI_REPAIR_LABEL"
-              lock_description="One automatic OpenCode CI repair attempt per failing PR head."
-              ;;
-            "Packaging smoke")
-              lock_label="opencode-packaging-smoke-repair"
-              lock_description="One automatic OpenCode packaging-smoke repair attempt per failing PR head."
-              ;;
-            *)
-              echo "Unsupported workflow '$RUN_NAME'; nothing to repair."
-              exit 0
-              ;;
-          esac
+          if [[ "$RUN_NAME" != "CI" ]]; then
+            echo "Unsupported workflow '$RUN_NAME'; nothing to repair."
+            exit 0
+          fi
+          lock_label="$CI_REPAIR_LABEL"
+          lock_description="One automatic OpenCode CI repair attempt per failing PR head."
 
           pr=$(gh api "repos/$GITHUB_REPOSITORY/commits/$RUN_HEAD_SHA/pulls" \
             -H "Accept: application/vnd.github+json" \
