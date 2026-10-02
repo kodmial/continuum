@@ -31,6 +31,10 @@ permissions:
 
 jobs:
   dispatch:
+    # Compatibility shim for already-installed Child dispatcher callers. Parent
+    # repositories are now scheduled by the ordinary Issue scheduler, so an
+    # old caller must not start a second independent child queue.
+    if: vars.CONTINUUM_ROLE != 'parent'
     runs-on: ubuntu-latest
     timeout-minutes: ${{ fromJSON(vars.AUTOMATION_CHILD_DISPATCH_TIMEOUT_MINUTES || '8') }}
     env:
