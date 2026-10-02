@@ -12,6 +12,10 @@ class ContinuumTest < Minitest::Test
   TECH_STUBS = Dir[File.join(ROOT, '.github/caller-stubs/tech/*.yml')].sort
   PARENT_STUBS = Dir[File.join(ROOT, '.github/caller-stubs/parent/*.yml')].sort
   WORKFLOWS = Dir[File.join(ROOT, '.github/workflows/*.yml')].sort
+  # Project-owned entry workflows used only by the Continuum repository itself.
+  # They deliberately stay outside the `continuum-` namespace so installer
+  # ownership and reusable-engine ownership remain unambiguous.
+  PROJECT_ENTRY_WORKFLOWS = %w[automation.yml ci.yml opencode.yml].freeze
   # Every caller stub in every layer, for the checks that must not care which
   # layer a file belongs to.
   ALL_STUBS = (CORE_STUBS + TECH_STUBS + PARENT_STUBS).sort
@@ -280,20 +284,22 @@ class ContinuumTest < Minitest::Test
     end
   end
 
-  # `workflow_run.workflows` matches a workflow's `name:` VALUE, so two
-  # workflows sharing a `name:` are indistinguishable to the filter. The
-  # watchdog is the dangerous case: give the core watchdog and its stub the
-  # OpenCode caller's `name:` and it listens for its own completed runs, which
-  # dispatches another recovery, which completes, which triggers the watchdog
-  # again — an infinite self-trigger loop that no other assertion catches.
-  #
-  # The two sets are disjoint: a core workflow's `name:` is the name of the
-  # INSTALLED stub that calls it, and Continuum's own repository runs the core
-  # files directly, so `OpenCode agent` legitimately appears in both sets.
-  # Uniqueness is therefore required *within* each set, not across them.
+  # `workflow_run.workflows` matches a workflow's `name:` VALUE. Reusable
+  # engines and repository entry workflows are separate identity layers:
+  # `ci.yml` deliberately has the same public name as its CI engine, and
+  # `opencode.yml` deliberately has the same public name as its OpenCode
+  # engine. Within either layer a duplicate is still ambiguous and forbidden.
   def test_workflow_names_are_unique_within_each_layer
+    engine_workflows = WORKFLOWS.reject do |path|
+      PROJECT_ENTRY_WORKFLOWS.include?(File.basename(path))
+    end
+    project_entries = WORKFLOWS.select do |path|
+      PROJECT_ENTRY_WORKFLOWS.include?(File.basename(path))
+    end
+
     {
-      'core workflows' => WORKFLOWS,
+      'engine workflows' => engine_workflows,
+      'project entry workflows' => project_entries,
       'core stubs' => CORE_STUBS,
       'tech stubs' => TECH_STUBS,
       'parent stubs' => PARENT_STUBS
@@ -303,6 +309,22 @@ class ContinuumTest < Minitest::Test
                    "#{layer}: two workflows share a `name:`, which makes a " \
                    'workflow_run.workflows filter ambiguous'
     end
+
+    expected_identity_pairs = {
+      'ci.yml' => 'continuum-validation.yml',
+      'opencode.yml' => 'continuum-opencode.yml'
+    }
+    expected_identity_pairs.each do |entry, engine|
+      assert_equal yaml(File.join(ROOT, '.github/workflows', engine)).fetch('name'),
+                   yaml(File.join(ROOT, '.github/workflows', entry)).fetch('name'),
+                   "#{entry}: self entry must retain the public workflow identity of #{engine}"
+    end
+
+    engine_names = engine_workflows.map { |path| yaml(path).fetch('name') }
+    entry_names = project_entries.map { |path| yaml(path).fetch('name') }
+    assert_equal %w[CI OpenCode\ agent].sort,
+                 (engine_names & entry_names).sort,
+                 'only CI and OpenCode may deliberately share engine/entry workflow identities'
   end
 
   # A workflow must never watch its own `name:`. Within a layer the names are
@@ -351,62 +373,92 @@ class ContinuumTest < Minitest::Test
     end
   end
 
-  # Continuum ships two layers and the split is machine-checkable through the
-  # file name:
-  #
-  #   1. core   — `continuum-<name>.yml`, at least two dash-separated segments
-  #               and never a `continuum-tech-…` name, e.g.
-  #               `continuum-auto-merge.yml` or `continuum-opencode-watchdog.yml`.
-  #               Installed by the default `core` set; every project needs these.
-  #   2. tech   — `continuum-tech-<tech>-<name>.yml`, marked by the
-  #               `continuum-tech-<tech>-` prefix, e.g.
-  #               `continuum-tech-swift-release.yml`. Installed only by the
-  #               opt-in `tech` set; Continuum never triggers these itself.
-  #
-  # There is no exception list. A core file that is not `continuum-` prefixed
-  # is a defect: the prefix is what tells a consumer which workflows are
-  # Continuum-owned, so a bare name both loses that ownership signal and
-  # installs under a name Continuum's own dispatchers never look for.
-  def test_workflow_files_obey_the_two_layer_naming_rule
-    WORKFLOWS.each do |path|
+  # Continuum-owned reusable workflows have a machine-readable namespace:
+  # core is `continuum-<name>.yml` and technology-library workflows are
+  # `continuum-tech-<tech>-<name>.yml`. The Continuum repository may also own
+  # a very small set of project entry workflows used only to dogfood the engine;
+  # those are explicitly listed in PROJECT_ENTRY_WORKFLOWS and MUST NOT use the
+  # `continuum-` prefix because they are not install-managed consumer files.
+  def test_workflow_files_obey_the_ownership_naming_rule
+    engine_workflows = WORKFLOWS.reject do |path|
+      PROJECT_ENTRY_WORKFLOWS.include?(File.basename(path))
+    end
+
+    engine_workflows.each do |path|
       base = File.basename(path)
       segments = base.delete_suffix('.yml').split('-')
       category =
         if tech_name?(base)
           :tech
-        # A core name may itself be multi-word (`continuum-opencode-watchdog`),
-        # so the split counts on the `continuum-tech-<tech>-` marker rather
-        # than on a segment count.
         elsif base.start_with?('continuum-') && segments.size >= 2
           :core
         else
-          flunk "#{base}: neither a core file (continuum-<name>.yml, `continuum-` prefixed) " \
-                'nor a tech file (continuum-tech-<tech>-<name>.yml, continuum-tech-<tech>- prefix)'
+          flunk "#{base}: Continuum-owned reusable workflows must be continuum-<name>.yml " \
+                'or continuum-tech-<tech>-<name>.yml'
         end
       assert_includes %i[core tech], category
+    end
+
+    actual_entries = WORKFLOWS.map { |path| File.basename(path) } & PROJECT_ENTRY_WORKFLOWS
+    assert_equal PROJECT_ENTRY_WORKFLOWS.sort, actual_entries.sort
+    PROJECT_ENTRY_WORKFLOWS.each do |base|
+      refute base.start_with?('continuum-'), "#{base}: project-owned self entry must not use the continuum- prefix"
+      refute_includes ALL_STUBS.map { |path| File.basename(path) }, base,
+                      "#{base}: project-owned self entry must never be install-managed"
     end
     assert_tech_layers_agree
   end
 
-  # The prefix is one rule applied to every layer, not a convention that the
-  # core happens to satisfy. Every workflow and every caller stub in every
-  # layer must carry it; a file added without the prefix fails here the moment
-  # it lands, before any consumer installs it.
-  def test_every_workflow_and_stub_is_continuum_prefixed
-    # An empty tree would make every loop below and every assertion after it
-    # pass vacuously, so the population is asserted before it is inspected.
+  def test_continuum_owned_workflows_and_all_stubs_are_continuum_prefixed
     refute_empty WORKFLOWS, 'no workflows found: the tree is empty or the path is wrong'
     refute_empty ALL_STUBS, 'no caller stubs found: the tree is empty or the path is wrong'
-    unprefixed = (WORKFLOWS + ALL_STUBS).reject do |path|
+    owned_workflows = WORKFLOWS.reject do |path|
+      PROJECT_ENTRY_WORKFLOWS.include?(File.basename(path))
+    end
+    unprefixed = (owned_workflows + ALL_STUBS).reject do |path|
       File.basename(path).start_with?('continuum-')
     end.map { |path| File.basename(path) }
     assert_empty unprefixed,
-                 "these files are not `continuum-` prefixed and must be renamed: #{unprefixed.sort.join(', ')}"
-    (WORKFLOWS + ALL_STUBS).each do |path|
-      base = File.basename(path)
-      segments = base.delete_suffix('.yml').split('-')
-      assert_operator segments.size, :>=, 2, "#{base}: a continuum- name must name something after the prefix"
-    end
+                 "Continuum-owned files without the continuum- prefix: #{unprefixed.sort.join(', ')}"
+  end
+
+  def test_self_dogfood_entries_are_thin_local_callers
+    ci = yaml(File.join(ROOT, '.github/workflows/ci.yml'))
+    opencode = yaml(File.join(ROOT, '.github/workflows/opencode.yml'))
+    automation = yaml(File.join(ROOT, '.github/workflows/automation.yml'))
+
+    assert_equal 'CI', ci.fetch('name')
+    assert_equal 'OpenCode agent', opencode.fetch('name')
+    assert_equal 'Continuum automation', automation.fetch('name')
+
+    assert_equal './.github/workflows/continuum-validation.yml',
+                 ci.fetch('jobs').fetch('validate').fetch('uses')
+    assert_equal './.github/workflows/continuum-opencode.yml',
+                 opencode.fetch('jobs').fetch('call').fetch('uses')
+
+    expected_automation_callees = %w[
+      continuum-auto-merge.yml
+      continuum-issue-scheduler.yml
+      continuum-opencode-repair.yml
+      continuum-opencode-watchdog.yml
+    ].sort
+    actual_automation_callees = automation.fetch('jobs').values
+      .map { |job| job['uses'] }
+      .compact
+      .map { |uses| File.basename(uses) }
+      .sort
+    assert_equal expected_automation_callees, actual_automation_callees
+
+    scheduler_inputs = automation.fetch('jobs').fetch('scheduler').fetch('with')
+    assert_equal 'OpenCode agent', scheduler_inputs.fetch('opencode_workflow_name')
+    assert_equal '.github/workflows/opencode.yml', scheduler_inputs.fetch('opencode_workflow_path')
+
+    repair_inputs = automation.fetch('jobs').fetch('repair').fetch('with')
+    assert_equal 'opencode.yml', repair_inputs.fetch('opencode_workflow')
+    assert_equal 'automation.yml', repair_inputs.fetch('auto_merge_workflow')
+
+    watchdog_inputs = automation.fetch('jobs').fetch('watchdog').fetch('with')
+    assert_equal 'OpenCode agent', watchdog_inputs.fetch('watched_workflow')
   end
 
   # install.sh installs the stored stub name verbatim. A prefix computed at
@@ -1197,8 +1249,8 @@ class ContinuumTest < Minitest::Test
   #
   # A core workflow with no stub is legitimate only when it is named below:
   # the three child-execution callees installed by the `parent` set, the
-  # legacy child-dispatcher compatibility callee kept for stale callers, and
-  # Continuum's own CI, which is not a caller at all.
+  # legacy child-dispatcher compatibility callee kept for stale callers,
+  # shared validation, and Continuum's project-owned self-entry workflows.
   CORE_CALLEE_WORKFLOWS = %w[
     continuum-consumer-child-pr-review.yml
     continuum-consumer-child-review.yml
@@ -1206,9 +1258,11 @@ class ContinuumTest < Minitest::Test
     continuum-consumer-child-worker.yml
   ].freeze
   REPO_OWNED_WORKFLOWS = %w[
+    automation.yml
+    ci.yml
+    opencode.yml
     continuum-consumer-child-dispatcher.yml
     continuum-validation.yml
-    continuum-validate-continuum.yml
   ].freeze
 
   # The number of callers Continuum ships in the `tech` and `parent` layers,

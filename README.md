@@ -10,7 +10,8 @@ engine.
 
 | Path | Purpose |
 | --- | --- |
-| `.github/workflows/*.yml` | Reusable (`on: workflow_call`) workflows — the engine. |
+| `.github/workflows/continuum-*.yml` | Continuum-owned reusable (`on: workflow_call`) engine workflows. |
+| `.github/workflows/{ci,opencode,automation}.yml` | Project-owned entry workflows used only to dogfood Continuum on this repository. |
 | `.github/caller-stubs/*.yml` | Thin core callers installed by the default `core` set (task-domain). |
 | `.github/caller-stubs/tech/*.yml` | Thin callers for the opt-in technology library (`tech` set). |
 | `.github/caller-stubs/parent/*.yml` | Thin callers installed by the `parent` set. |
@@ -47,8 +48,8 @@ These names are the interface and never change per consumer:
 
 - the `TAP_PAT` repository secret (classic PAT, `repo` + `workflow` scopes) —
   every set expects a secret with exactly this name;
-- the `continuum-` prefix on every workflow file and caller stub, and the
-  `continuum-tech-<tech>-` prefix for opt-in library callers;
+- the `continuum-` prefix on every **Continuum-owned reusable workflow and installed caller stub**, and the
+  `continuum-tech-<tech>-` prefix for opt-in library callers; project-owned entry workflows are deliberately outside this namespace;
 - the installer sets (`core`, `tech`, and `parent`);
 - the `CONTINUUM_*` repository-variable names.
 
@@ -59,12 +60,14 @@ library of technology-specific workflows — the `continuum-tech-<tech>-` prefix
 (`continuum-tech-<tech>-<name>.yml`) marks them as a library that Continuum
 itself never triggers; `parent` drives delegated execution for any technology.
 
-Every workflow file and every caller stub is named `continuum-<name>.yml`, and
+Every **Continuum-owned reusable workflow** and every installed caller stub is named `continuum-<name>.yml`, and
 the installer writes each stub's stored name verbatim — it adds no prefix of
 its own. The technology library uses the longer
 `continuum-tech-<tech>-<name>.yml` name, where the `continuum-tech-<tech>-`
-prefix marks the opt-in layer. There is no unprefixed file and no exception
-list.
+prefix marks the opt-in layer. Project-owned workflow entry points are outside that ownership namespace.
+In this repository, `ci.yml`, `opencode.yml`, and `automation.yml` are the minimal
+self-dogfood ingress and intentionally have no `continuum-` prefix; they call
+the same reusable engines consumers use.
 
 ## Install
 
