@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number to validate
+        required: false
+        type: string
+
+permissions:
+  actions: write
+  contents: read
+  pull-requests: read
+  statuses: write
+
+concurrency:
+  group: continuum-validation-${{ github.repository }}-${{ inputs.pr_number || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  call:
+    uses: kodmial/continuum/.github/workflows/continuum-validation.yml@main
+    secrets: inherit
+    with:
+      continuum_ref: main
+      runner: "${{ vars.CONTINUUM_RUNNER || 'ubuntu-latest' }}"
+      timeout_minutes: "${{ vars.CONTINUUM_VALIDATION_TIMEOUT_MINUTES || '25' }}"
+      prepare_command: "${{ vars.CONTINUUM_PREPARE_COMMAND || '' }}"
+      build_command: "${{ vars.CONTINUUM_BUILD_COMMAND || '' }}"
+      test_command: "${{ vars.CONTINUUM_TEST_COMMAND || '' }}"
+      validation_command: "${{ vars.CONTINUUM_VALIDATION_COMMAND || '' }}"
+      package_command: "${{ vars.CONTINUUM_PACKAGE_COMMAND || '' }}"
+      release_command: "${{ vars.CONTINUUM_RELEASE_COMMAND || '' }}"
+      auto_detect: ${{ fromJSON(vars.CONTINUUM_AUTO_DETECT || 'true') }}
+      artifact_paths: "${{ vars.CONTINUUM_ARTIFACT_PATHS || '' }}"
+      artifact_name: "${{ vars.CONTINUUM_ARTIFACT_NAME || 'continuum-validation' }}"
+      status_context: "${{ vars.CONTINUUM_STATUS_CONTEXT || 'continuum/validation' }}"
+      publish_status: ${{ fromJSON(vars.CONTINUUM_PUBLISH_STATUS || 'true') }}
+      dispatch_repair: ${{ fromJSON(vars.CONTINUUM_DISPATCH_REPAIR || 'true') }}
+      repair_workflow: "${{ vars.CONTINUUM_REPAIR_WORKFLOW || 'continuum-opencode-repair.yml' }}"
+      pr_number: "${{ inputs.pr_number }}"
+      skip_opencode_pull_request: ${{ fromJSON(vars.CONTINUUM_SKIP_OPENCODE_PR || 'false') }}
