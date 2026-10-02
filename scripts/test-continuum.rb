@@ -2924,6 +2924,9 @@ class ContinuumTest < Minitest::Test
     scheduler = workflow_body('continuum-issue-scheduler.yml')
 
     assert_includes scheduler, 'Build delegated child queue'
+    assert_includes scheduler, 'export CONTINUUM_ENGINE_ROOT="$GITHUB_WORKSPACE/.continuum-engine"'
+    assert_includes scheduler, 'export PYTHONPATH="$CONTINUUM_ENGINE_ROOT/src"'
+    assert_includes scheduler, 'resolver="$CONTINUUM_ENGINE_ROOT/.github/scripts/delegation_repository.sh"'
     assert_includes scheduler, 'for (const child of childCandidates) {'
     assert_includes scheduler, "candidates.push({ source: 'local', issue, priority, rank });"
     assert_includes scheduler, "source: 'child'"
