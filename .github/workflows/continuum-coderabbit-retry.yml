@@ -254,6 +254,25 @@ jobs:
                 )[0] || null;
             }
 
+            async function latestReviewConvergenceStatus(pr) {
+              const { data: combined } =
+                await github.rest.repos.getCombinedStatusForRef({
+                  owner,
+                  repo,
+                  ref: pr.head.sha,
+                });
+
+              return (combined.statuses || [])
+                .filter(
+                  status => status.context === 'continuum/review-convergence'
+                )
+                .sort(
+                  (a, b) =>
+                    new Date(b.updated_at || b.created_at).getTime() -
+                    new Date(a.updated_at || a.created_at).getTime()
+                )[0] || null;
+            }
+
             async function collectState() {
               const pulls = await github.paginate(github.rest.pulls.list, {
                 owner,
@@ -397,6 +416,15 @@ jobs:
                     latestCompletedReviewAt,
                     new Date(review.submitted_at).getTime()
                   );
+                }
+
+                const convergenceStatus =
+                  await latestReviewConvergenceStatus(pr);
+                if (convergenceStatus?.state === 'error') {
+                  core.notice(
+                    `PR #${pr.number}: exact HEAD ${pr.head.sha} has a non-code CodeRabbit no-progress blocker; it is not eligible for automatic re-review until state changes.`
+                  );
+                  continue;
                 }
 
                 const labels = new Set(
