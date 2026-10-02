@@ -81,9 +81,20 @@ Render and Docker qualification remain generic execution envelopes. Their
 consumer-owned commands/files are already hooks/inputs; no product repository
 is assumed.
 
-Render consumers provide `RENDER_API_KEY` and their configured job/cleanup/
-qualification scripts. Docker qualification consumers configure their artifact
-repository, binary name, image, memory/trial limits and result paths.
+Render consumers provide `RENDER_API_KEY` and explicitly configure their
+consumer-owned hooks. Continuum deliberately supplies no repository-path defaults:
+
+| Repository variable | Default | Meaning |
+| --- | --- | --- |
+| `RENDER_JOB_SCRIPT` | empty | Consumer-owned script that drives the Render lifecycle. Required for Render execution. |
+| `RENDER_CLEANUP_SCRIPT` | empty | Consumer-owned script that deletes the ephemeral Render service. Required for Render execution. |
+| `RENDER_QUALIFICATION_SCRIPT` | empty | Consumer-owned qualification/classification script. Required only for qualification-labelled runs. |
+
+The same values may be passed as the reusable-workflow inputs `job_script`,
+`cleanup_script`, and `qualification_script`. A missing required hook fails
+explicitly; core never guesses a consumer repository layout. Docker qualification
+consumers configure their artifact repository, binary name, image, memory/trial
+limits and result paths.
 
 ## Secrets
 
