@@ -587,6 +587,30 @@ jobs:
               }
             }
 
+            // A closed issue is terminal for scheduler admission and must not
+            // retain an implementation reservation. Reconcile this in the
+            // shared engine rather than in a consumer caller so every consumer
+            // releases stale WIP immediately after an issue is closed.
+            const closedLeasedIssues = await github.paginate(
+              github.rest.issues.listForRepo,
+              {
+                owner,
+                repo,
+                state: 'closed',
+                labels: inProgressLabel,
+                per_page: 100,
+              }
+            );
+            for (const issue of closedLeasedIssues) {
+              if (issue.pull_request) continue;
+              await removeLabel(issue.number, inProgressLabel);
+              core.notice(
+                'Released stale reservation on closed issue #' +
+                  issue.number +
+                  '.'
+              );
+            }
+
             let issues = await github.paginate(github.rest.issues.listForRepo, {
               owner,
               repo,
