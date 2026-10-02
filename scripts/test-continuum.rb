@@ -1166,6 +1166,7 @@ class ContinuumTest < Minitest::Test
   CORE_CALLEE_WORKFLOWS = %w[
     continuum-consumer-child-pr-review.yml
     continuum-consumer-child-review.yml
+    continuum-consumer-child-run-cleanup.yml
     continuum-consumer-child-worker.yml
   ].freeze
   REPO_OWNED_WORKFLOWS = %w[
@@ -1187,7 +1188,7 @@ class ContinuumTest < Minitest::Test
   # it compares the two trees against each other by name, so adding a
   # technology still needs no edit — only changing the *size* of a layer does.
   TECH_COUNT = 1
-  PARENT_COUNT = 3
+  PARENT_COUNT = 4
 
   # The same `tech_name?` rule as the instance helper, hoisted so the constant
   # table above can use it. A tech name has a `tech` segment plus at least two
@@ -1272,6 +1273,18 @@ class ContinuumTest < Minitest::Test
     overlap = CORE_STUBS.map { |path| stub_callee_name(path) }.compact & CORE_CALLEE_WORKFLOWS
     assert_empty overlap,
                  "a core caller must not reach a child-execution callee; that is the parent layer's: #{overlap.join(', ')}"
+  end
+
+  def test_child_run_cleanup_is_scoped_to_completed_delegated_runs
+    caller = yaml(File.join(ROOT, '.github/caller-stubs/parent/continuum-child-run-cleanup.yml'))
+    watched = events(caller).fetch('workflow_run').fetch('workflows')
+    assert_equal ['SubTask', 'SubTask review', 'SubTask PR review'], watched
+    assert_equal ['completed'], events(caller).fetch('workflow_run').fetch('types')
+
+    body = workflow_body('continuum-consumer-child-run-cleanup.yml')
+    assert_includes body, "run.status !== 'completed'"
+    assert_includes body, "new Set(['SubTask', 'SubTask review', 'SubTask PR review'])"
+    assert_includes body, 'deleteWorkflowRun'
   end
 
   def test_installer_local_and_explicit_ref
