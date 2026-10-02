@@ -69,6 +69,7 @@ TECH_STUBS=(
 PARENT_STUBS=(
   continuum-child-pr-review.yml
   continuum-child-review.yml
+  continuum-child-run-cleanup.yml
   continuum-child-worker.yml
 )
 case "$SET" in
