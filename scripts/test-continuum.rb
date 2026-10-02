@@ -1333,6 +1333,49 @@ class ContinuumTest < Minitest::Test
       refute Dir.exist?(File.join(dir, 'legacy'))
     end
   end
+  def test_installing_main_preserves_canonical_core_stub_bytes
+    fixture do |dir|
+      destination = File.join(dir, 'consumer')
+      workflows = File.join(destination, '.github/workflows')
+      FileUtils.mkdir_p(workflows)
+
+      CORE_STUBS.each do |stub|
+        FileUtils.cp(stub, File.join(workflows, File.basename(stub)))
+      end
+      before = CORE_STUBS.to_h do |stub|
+        base = File.basename(stub)
+        [base, File.binread(File.join(workflows, base))]
+      end
+
+      bin = File.join(dir, 'bin')
+      FileUtils.mkdir_p(bin)
+      File.write(File.join(bin, 'curl'), <<~SH)
+        #!/usr/bin/env bash
+        set -eu
+        url="${@: -1}"
+        cat "$TEMPLATES/${url##*/}"
+      SH
+      FileUtils.chmod(0755, File.join(bin, 'curl'))
+      env = {
+        'PATH' => "#{bin}:#{ENV['PATH']}",
+        'TEMPLATES' => File.join(ROOT, '.github/caller-stubs'),
+        'CONTINUUM_INSTALL_ASSUME_YES' => '1'
+      }
+
+      output, status = Open3.capture2e(
+        env, 'bash', File.join(ROOT, 'install.sh'), destination, 'main', 'core', '--yes'
+      )
+      assert status.success?, output
+
+      after = CORE_STUBS.to_h do |stub|
+        base = File.basename(stub)
+        [base, File.binread(File.join(workflows, base))]
+      end
+      assert_equal before, after,
+                   'installing canonical main over canonical callers must be byte-stable'
+    end
+  end
+
   def test_parent_templates_match_reusable_contracts
     Dir[File.join(ROOT, '.github/caller-stubs/parent/*.yml')].each do |file|
       caller = yaml(file)
