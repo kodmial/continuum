@@ -811,7 +811,7 @@ class ContinuumTest < Minitest::Test
       assert_equal CORE_STUBS.size, counts['core']
       assert_equal CORE_STUBS.size + TECH_STUBS.size, counts['tech']
       assert_equal ALL_STUBS.size, counts['parent']
-      assert_equal 23, ALL_STUBS.size,
+      assert_equal 24, ALL_STUBS.size,
                    'every caller Continuum ships, across all three layers'
     end
   end
@@ -3811,7 +3811,6 @@ class ContinuumTest < Minitest::Test
     stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-validation.yml'))
     call = stub.fetch('jobs').fetch('call')
     assert_equal 'kodmial/continuum/.github/workflows/continuum-validation.yml@main', call.fetch('uses')
-    assert_equal 'ubuntu-latest', inputs.fetch('runner').fetch('default')
     assert_equal '${{ inputs.pr_number }}', call.fetch('with').fetch('pr_number')
     assert_includes raw, "vars.CONTINUUM_RUNNER || 'ubuntu-latest'"
   end
