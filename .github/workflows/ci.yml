@@ -16,8 +16,8 @@ jobs:
     uses: ./.github/workflows/continuum-validation.yml
     secrets: inherit
     with:
-      auto_detect: 'false'
-      dispatch_repair: 'false'
+      auto_detect: ${{ 'false' }}
+      dispatch_repair: ${{ 'false' }}
       validation_command: |
         ruby -E UTF-8 scripts/test-continuum.rb
         mkdir -p .opencode-tmp
