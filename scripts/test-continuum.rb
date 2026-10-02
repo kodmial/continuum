@@ -2780,7 +2780,8 @@ class ContinuumTest < Minitest::Test
     ],
     'continuum-opencode-unresolved.yml' => %w[continuum_ref],
     'continuum-pr-agent.yml' => %w[continuum_ref],
-    'continuum-remove-review-label.yml' => %w[continuum_ref]
+    'continuum-remove-review-label.yml' => %w[continuum_ref],
+    'continuum-validation.yml' => %w[continuum_ref pr_number]
   }.freeze
 
   # A stub that pins an input to a literal overrides the consumer's own
@@ -3791,13 +3792,13 @@ class ContinuumTest < Minitest::Test
     workflow = yaml(File.join(ROOT, '.github/workflows/continuum-validation.yml'))
     inputs = events(workflow).fetch('workflow_call').fetch('inputs')
 
-    assert_equal 'ubuntu-latest', inputs.fetch('runner').fetch('default')
+    assert_equal '', inputs.fetch('runner').fetch('default')
     %w[prepare_command build_command test_command validation_command package_command release_command].each do |name|
       assert_equal '', inputs.fetch(name).fetch('default'), name
     end
     assert_equal '', inputs.fetch('artifact_paths').fetch('default')
-    assert_equal 'continuum-validation', inputs.fetch('artifact_name').fetch('default')
-    assert_equal 'continuum-opencode-repair.yml', inputs.fetch('repair_workflow').fetch('default')
+    assert_equal '', inputs.fetch('artifact_name').fetch('default')
+    assert_equal '', inputs.fetch('repair_workflow').fetch('default')
 
     raw = workflow_body('continuum-validation.yml')
     %w[Python Node Java Go Rust Docker].each { |stack| assert_includes raw, stack }
@@ -3811,7 +3812,8 @@ class ContinuumTest < Minitest::Test
     call = stub.fetch('jobs').fetch('call')
     assert_equal 'kodmial/continuum/.github/workflows/continuum-validation.yml@main', call.fetch('uses')
     assert_equal 'ubuntu-latest', inputs.fetch('runner').fetch('default')
-    assert_includes call.fetch('with').fetch('runner'), 'CONTINUUM_RUNNER'
+    assert_equal '${{ inputs.pr_number }}', call.fetch('with').fetch('pr_number')
+    assert_includes raw, "vars.CONTINUUM_RUNNER || 'ubuntu-latest'"
   end
 
   end
