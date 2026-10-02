@@ -128,7 +128,7 @@ jobs:
 
           workdir="$RUNNER_TEMP/continuum-child-review"
           transcript="$RUNNER_TEMP/continuum-child-review.log"
-          review_file="automation/runtime-results/task-${TASK_NUMBER}-review.md"
+          review_file="$RUNNER_TEMP/continuum-child-review-${TASK_NUMBER}.md"
 
           review_started="<!-- continuum-child-review-started --> Independent delegated review/repair for child task #$TASK_NUMBER started on PR #$PR_NUMBER."
           gh issue comment "$TASK_NUMBER" --repo "$child_repo" --body "$review_started" >/dev/null 2>&1 || true

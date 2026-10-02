@@ -217,9 +217,9 @@ jobs:
       QUALIFICATION_MARKER: ${{ inputs.qualification_marker || vars.RENDER_QUALIFICATION_MARKER || '<!-- continuum-render-qualification-result -->' }}
       ARTIFACT_PREFIX: ${{ inputs.artifact_prefix || vars.RENDER_ARTIFACT_PREFIX || 'render-qualification' }}
       DISPATCH_REF: ${{ inputs.dispatch_ref || vars.RENDER_DISPATCH_REF || 'main' }}
-      JOB_SCRIPT: ${{ inputs.job_script || vars.RENDER_JOB_SCRIPT || 'automation/render-job.sh' }}
-      CLEANUP_SCRIPT: ${{ inputs.cleanup_script || vars.RENDER_CLEANUP_SCRIPT || 'automation/render-cleanup.sh' }}
-      QUALIFICATION_SCRIPT: ${{ inputs.qualification_script || vars.RENDER_QUALIFICATION_SCRIPT || 'automation/record_render_qualification.py' }}
+      JOB_SCRIPT: ${{ inputs.job_script || vars.RENDER_JOB_SCRIPT }}
+      CLEANUP_SCRIPT: ${{ inputs.cleanup_script || vars.RENDER_CLEANUP_SCRIPT }}
+      QUALIFICATION_SCRIPT: ${{ inputs.qualification_script || vars.RENDER_QUALIFICATION_SCRIPT }}
       IN_PROGRESS_LABEL: ${{ inputs.in_progress_label || vars.AUTOMATION_IN_PROGRESS_LABEL || 'automation:in-progress' }}
       PAUSE_LABEL: ${{ inputs.pause_label || vars.AUTOMATION_PAUSE_LABEL || 'automation:paused' }}
       REPAIR_LABEL: ${{ inputs.repair_label || vars.AUTOMATION_REPAIR_LABEL || 'priority:p0' }}
@@ -277,8 +277,20 @@ jobs:
             echo "::error::A Render worker started without a model executes nothing, so this run fails instead of reporting a green no-op."
             exit 2
           }
+          [[ -n "$JOB_SCRIPT" ]] || {
+            echo "::error::No Render job hook configured: pass job_script or set vars.RENDER_JOB_SCRIPT."
+            exit 2
+          }
+          [[ -n "$CLEANUP_SCRIPT" ]] || {
+            echo "::error::No Render cleanup hook configured: pass cleanup_script or set vars.RENDER_CLEANUP_SCRIPT."
+            exit 2
+          }
           [[ -f "$JOB_SCRIPT" ]] || {
-            echo "::error::Missing $JOB_SCRIPT"
+            echo "::error::Configured Render job hook does not exist: $JOB_SCRIPT"
+            exit 2
+          }
+          [[ -f "$CLEANUP_SCRIPT" ]] || {
+            echo "::error::Configured Render cleanup hook does not exist: $CLEANUP_SCRIPT"
             exit 2
           }
           bash "$JOB_SCRIPT"
@@ -294,6 +306,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
+          [[ -n "$CLEANUP_SCRIPT" ]] || {
+            echo "::error::No Render cleanup hook configured: pass cleanup_script or set vars.RENDER_CLEANUP_SCRIPT."
+            exit 2
+          }
 
           if [[ -f "$CLEANUP_SCRIPT" ]]; then
             # Deleting the ephemeral worker is a real Render API call, so a
@@ -334,8 +351,12 @@ jobs:
             [[ "$ARTIFACT_ID" =~ ^[0-9]+$ ]] || ARTIFACT_ID=0
             [[ "$BINARY_SHA" =~ ^[0-9a-f]{64}$ ]] || BINARY_SHA="unknown"
 
+            [[ -n "$QUALIFICATION_SCRIPT" ]] || {
+              echo "::error::No Render qualification hook configured: pass qualification_script or set vars.RENDER_QUALIFICATION_SCRIPT."
+              exit 2
+            }
             [[ -f "$QUALIFICATION_SCRIPT" ]] || {
-              echo "::error::Missing $QUALIFICATION_SCRIPT"
+              echo "::error::Configured Render qualification hook does not exist: $QUALIFICATION_SCRIPT"
               exit 1
             }
             python3 "$QUALIFICATION_SCRIPT" \

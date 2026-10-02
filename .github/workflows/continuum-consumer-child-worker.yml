@@ -97,7 +97,7 @@ jobs:
 
           workdir="$RUNNER_TEMP/continuum-child-target"
           transcript="$RUNNER_TEMP/continuum-child-agent.log"
-          result_file="automation/runtime-results/task-${TASK_NUMBER}.md"
+          result_file="$RUNNER_TEMP/continuum-child-task-${TASK_NUMBER}.md"
 
           gh auth setup-git >/dev/null 2>&1
           rm -rf "$workdir"
