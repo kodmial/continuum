@@ -34,8 +34,8 @@ jobs:
     steps:
       - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
-          CONTINUUM_VERSION_FILE: ${{ vars.CONTINUUM_VERSION_FILE || 'Sources/NanoDictateCore/Version.swift' }}
-          CONTINUUM_RELEASE_MANIFEST_FILES: ${{ vars.CONTINUUM_RELEASE_MANIFEST_FILES || '["nanodictate.rb","packaging/homebrew/nanodictate.rb","packaging/homebrew/Casks/nanodictate.rb","packaging/macports/Portfile","scripts/install-macports.sh"]' }}
+          CONTINUUM_VERSION_FILE: ${{ vars.CONTINUUM_VERSION_FILE || '' }}
+          CONTINUUM_RELEASE_MANIFEST_FILES: ${{ vars.CONTINUUM_RELEASE_MANIFEST_FILES || '[]' }}
           REQUIRE_CODERABBIT: ${{ inputs.require_coderabbit || vars.CONTINUUM_REQUIRE_CODERABBIT || 'false' }}
         with:
           github-token: ${{ secrets.TAP_PAT }}

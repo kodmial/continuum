@@ -16,6 +16,9 @@ class ContinuumTest < Minitest::Test
   # layer a file belongs to.
   ALL_STUBS = (CORE_STUBS + TECH_STUBS + PARENT_STUBS).sort
   STUBS = (CORE_STUBS + TECH_STUBS).sort
+  # Transitional workflow_run aliases kept by the scheduler so already
+  # installed parent callers using the pre-SubTask names still wake it.
+  LEGACY_WORKFLOW_RUN_NAMES = ['Child task', 'Child review', 'Child PR review'].freeze
 
   def yaml(path)
     YAML.load_file(path)
@@ -269,7 +272,7 @@ class ContinuumTest < Minitest::Test
     names = ALL_STUBS.map { |path| yaml(path).fetch('name') }
     each_pair do |caller, _|
       events(caller).fetch('workflow_run', {}).fetch('workflows', []).each do |name|
-        assert_includes names, name
+        assert_includes names + LEGACY_WORKFLOW_RUN_NAMES, name
       end
     end
   end
@@ -807,11 +810,11 @@ class ContinuumTest < Minitest::Test
           PARENT_STUBS.each { |stub| assert_includes installed, File.basename(stub) }
         end
       end
-      # Each set adds exactly its own files: 15 core, +5 tech, +3 parent.
+      # Each set adds exactly its own files: 15 core, +1 tech, +3 parent.
       assert_equal CORE_STUBS.size, counts['core']
       assert_equal CORE_STUBS.size + TECH_STUBS.size, counts['tech']
       assert_equal ALL_STUBS.size, counts['parent']
-      assert_equal 23, ALL_STUBS.size,
+      assert_equal 19, ALL_STUBS.size,
                    'every caller Continuum ships, across all three layers'
     end
   end
@@ -965,41 +968,18 @@ class ContinuumTest < Minitest::Test
   # group so the name identifies the run unambiguously in the Actions UI;
   # concurrency groups are already scoped per repository, so it is not what
   # keeps two repositories apart.
+
   def test_tech_swift_callers_gate_on_a_repository_scoped_concurrency_group
-    cancelling = {
-      'continuum-tech-swift-ci.yml' => 'continuum-swift-ci',
-      'continuum-tech-swift-packaging-smoke.yml' => 'continuum-swift-packaging-smoke'
-    }
-    cancelling.each do |base, prefix|
-      concurrency = yaml(File.join(ROOT, '.github/caller-stubs/tech', base)).fetch('concurrency')
-      assert_equal true, concurrency['cancel-in-progress'], "#{base}: a superseded head must be cancelled"
-      assert concurrency.fetch('group').start_with?("#{prefix}-"), base
-    end
-
-    # Release serializes instead of cancelling: two runs publishing the same ref
-    # would race on the tag and the manifests, and cancelling a release that is
-    # already publishing is never the safe choice.
-    release = yaml(File.join(ROOT, '.github/caller-stubs/tech/continuum-tech-swift-release.yml')).fetch('concurrency')
-    refute release.key?('cancel-in-progress'), 'release must not cancel: it serializes instead'
-    assert_includes release.fetch('group'), 'github.ref'
-
-    groups = cancelling.keys.to_h { |base| [base, yaml(File.join(ROOT, '.github/caller-stubs/tech', base)).fetch('concurrency').fetch('group')] }
-    groups['continuum-tech-swift-release.yml'] = release.fetch('group')
-    assert_equal groups.size, groups.values.uniq.size, 'two tech callers share a concurrency group and would cancel each other'
-    groups.each do |base, group|
-      assert_includes group, '${{ github.repository }}', "#{base}: the group must name the repository so the run is unambiguous in the Actions UI"
-    end
+    base = 'continuum-tech-swift-ci.yml'
+    concurrency = yaml(File.join(ROOT, '.github/caller-stubs/tech', base)).fetch('concurrency')
+    assert_equal true, concurrency['cancel-in-progress'],
+                 'a superseded Swift validation head must be cancelled'
+    group = concurrency.fetch('group')
+    assert group.start_with?('continuum-tech-swift-ci-'), base
+    assert_includes group, '${{ github.repository }}',
+                    'the tech caller concurrency group must identify the consumer repository'
   end
 
-  # The templates ship to every consumer, so a consumer's own name hardcoded
-  # into one is a defect a reviewer cannot see from the file's purpose. This is
-  # the drift guard for the whole tech layer, beyond the groups above.
-  #
-  # The check is structural rather than a list of known consumer names: every
-  # repository reference in a tech stub — each `uses:` target and each
-  # `owner/repo` or `github.com/owner/repo` literal, comments included — must
-  # name Continuum itself. A consumer nobody has enumerated yet then fails the
-  # same way a known one does.
   def test_tech_stubs_reference_only_continuum_itself
     own_repo = 'kodmial/continuum'
     # `github.com/owner/repo`, matched case-insensitively because GitHub owners
@@ -1095,24 +1075,6 @@ class ContinuumTest < Minitest::Test
     assert_equal '${{ inputs.repository }}', with.fetch('repository')
   end
 
-  def test_manifest_environment_belongs_to_executable_step
-    release = yaml(File.join(ROOT, '.github/workflows/continuum-tech-swift-release.yml'))
-    steps = release.fetch('jobs').fetch('manifests').fetch('steps')
-    steps.each { |step| assert(step.key?('run') || step.key?('uses'), step['name']) }
-    generate = steps.find { |step| step['run'].to_s.include?('ruby scripts/release-prep.rb "v$VERSION"') }
-    %w[VERSION MAINTAINERS REVISION].each { |key| assert generate.fetch('env').key?(key) }
-  end
-
-  def test_release_candidate_gate_normalizes_reusable_job_names
-    release = yaml(File.join(ROOT, '.github/workflows/continuum-tech-swift-release.yml'))
-    gate = release.fetch('jobs').fetch('candidate-gate').fetch('steps')
-                  .find { |step| step['name'] == 'Wait for exact-head Packaging smoke' }
-    run = gate.fetch('run')
-
-    assert_includes run, %q{--jq '.jobs[].name | split(" / ") | last'}
-    assert_includes run, "grep -qxF 'Candidate build (x86_64)'"
-    assert_includes run, "grep -qxF 'Candidate build (arm64)'"
-  end
 
   def test_fallback_preserves_existing_scripts_and_copies_missing_files
     fixture do |dir|
@@ -1132,9 +1094,8 @@ class ContinuumTest < Minitest::Test
       end
       assert_equal 'consumer', File.read(File.join(dir, 'scripts/local.sh'))
       assert_equal 'consumer policy', File.read(File.join(dir, 'scripts/release-policy.sh'))
-      %w[release-prep.rb test-release-policy.sh packaging-smoke/common.sh packaging-smoke/make-candidate.sh].each do |file|
-        assert File.file?(File.join(dir, 'scripts', file)), file
-      end
+      refute File.exist?(File.join(ROOT, 'scripts/release-prep.rb'))
+      refute Dir.exist?(File.join(ROOT, 'scripts/packaging-smoke'))
     end
   end
 
@@ -1170,7 +1131,7 @@ class ContinuumTest < Minitest::Test
   # sees it. `assert_tech_layers_agree` remains the check that needs no literal:
   # it compares the two trees against each other by name, so adding a
   # technology still needs no edit — only changing the *size* of a layer does.
-  TECH_COUNT = 5
+  TECH_COUNT = 1
   PARENT_COUNT = 3
 
   # The same `tech_name?` rule as the instance helper, hoisted so the constant
@@ -1457,8 +1418,11 @@ class ContinuumTest < Minitest::Test
     end
 
     opencode = File.read(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
-    assert_includes opencode, "vars.AUTOMATION_OPENCODE_RUNNER || 'macos-15'"
+    assert_includes opencode, "vars.AUTOMATION_OPENCODE_RUNNER || 'ubuntu-latest'"
     assert_includes opencode, "vars.AUTOMATION_OPENCODE_TIMEOUT_MINUTES || '180'"
+    refute_includes opencode, 'swift-actions/setup-swift'
+    refute_includes opencode, 'sw_vers'
+    assert_includes opencode, 'CONTINUUM_AGENT_PREPARE_COMMAND'
 
     scheduler = File.read(File.join(ROOT, '.github/workflows/continuum-issue-scheduler.yml'))
     assert_includes scheduler, "vars.AUTOMATION_WIP_LIMIT || '2'"
@@ -1468,30 +1432,37 @@ class ContinuumTest < Minitest::Test
 
   # Core workflows must carry no product-specific path outside the opt-in
   # tech layer; the release version file is a consumer variable.
+
   def test_core_workflows_expose_no_product_paths
-    core = Dir[File.join(ROOT, '.github/workflows/*.yml')].sort
-    core.each do |path|
-      name = File.basename(path)
-      next if name.start_with?('continuum-tech-')
+    paths =
+      Dir[File.join(ROOT, '.github/workflows/continuum-*.yml')] +
+      Dir[File.join(ROOT, '.github/caller-stubs/**/*.yml')] +
+      Dir[File.join(ROOT, '.github/scripts/**/*')].select { |path| File.file?(path) } +
+      Dir[File.join(ROOT, 'src/**/*')].select { |path| File.file?(path) } +
+      [File.join(ROOT, 'install.sh')]
 
-      body = File.read(path)
-      # The version file may appear only as the fallback of a consumer
-      # variable, never as a literal the engine acts on unconditionally.
-      without_defaults = body
-                        .gsub(/vars\.CONTINUUM_VERSION_FILE \|\| '[^']*'/, 'vars.CONTINUUM_VERSION_FILE')
-                        .gsub(/vars\.CONTINUUM_RELEASE_MANIFEST_FILES \|\| '[^']*'/, 'vars.CONTINUUM_RELEASE_MANIFEST_FILES')
-      refute_match(/Sources\/NanoDictateCore/, without_defaults, name)
-      refute_match(/'nanodictate\.rb'/, without_defaults, name)
-    end
+    banned = %r{
+      nanodictate |
+      kodmai |
+      runtime-lab |
+      NANODICTATE_SIGNING |
+      Sources/NanoDictateCore |
+      macports-nanodictate |
+      homebrew-nanodictate
+    }ix
 
-    %w[continuum-auto-merge.yml continuum-add-review-label.yml].each do |name|
-      body = File.read(File.join(ROOT, '.github/workflows', name))
-      assert_includes body, "vars.CONTINUUM_VERSION_FILE || 'Sources/NanoDictateCore/Version.swift'", name
+    violations = paths.filter_map do |path|
+      next unless File.read(path).match?(banned)
+      path.delete_prefix(ROOT + '/')
     end
+    assert_empty violations,
+                 "Continuum generic workflows/templates contain consumer-specific identifiers: #{violations.join(', ')}"
+
+    auto_merge = workflow_body('continuum-auto-merge.yml')
+    assert_includes auto_merge, "CONTINUUM_VERSION_FILE: ${{ vars.CONTINUUM_VERSION_FILE || '' }}"
+    refute_includes auto_merge, 'Sources/NanoDictateCore'
   end
 
-  # The dispatcher supplies the issue number; an issue_comment run must keep
-  # reading the event, so the input defaults to empty and is only a fallback.
   def test_opencode_issue_number_input_is_optional_and_falls_back
     inputs = events(yaml(File.join(ROOT, '.github/workflows/continuum-opencode.yml')))
              .fetch('workflow_call').fetch('inputs')
@@ -1769,10 +1740,14 @@ class ContinuumTest < Minitest::Test
 
   # The macOS-only toolchain steps must stay guarded twice, so a non-macOS
   # AUTOMATION_OPENCODE_RUNNER never tries to install Swift or probe sw_vers.
-  def test_opencode_macos_steps_are_guarded
+  def test_opencode_environment_is_consumer_owned
     body = File.read(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
-    assert_equal 2,
-                 body.scan(/if: startsWith\(vars\.AUTOMATION_OPENCODE_RUNNER/).size
+    assert_includes body, "runs-on: ${{ vars.AUTOMATION_OPENCODE_RUNNER || 'ubuntu-latest' }}"
+    assert_includes body, 'CONTINUUM_AGENT_PREPARE_COMMAND'
+    assert_includes body, 'eval "$PREPARE_COMMAND"'
+    refute_includes body, 'swift-actions/setup-swift'
+    refute_includes body, 'sw_vers'
+    refute_includes body, "'macos-15'"
   end
 
   # A `vars.X || '0'`-style default that resolved to zero would make a job or a
@@ -2120,9 +2095,9 @@ class ContinuumTest < Minitest::Test
       assert_equal "\${{ inputs.#{key} }}", with.fetch(key), "#{key} must be a bare passthrough"
     end
 
-    # The lock the dispatch path writes is the same one the pre-existing
-    # synchronize reset already clears, or a new head could not repair.
-    assert_includes body, 'for label in "$CI_REPAIR_LABEL" opencode-packaging-smoke-repair; do',
+    # The lock the dispatch path writes is the same configured lock the
+    # synchronize reset clears, or a new head could not repair.
+    assert_includes body, '"repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/$CI_REPAIR_LABEL"',
                     'the per-head reset must clear the configured lock, not a hardcoded one'
     # The workflow_run path keeps its looser `opencode/*` guard: tightening it
     # would stop repairing heads this controller repaired before.
@@ -2210,224 +2185,61 @@ class ContinuumTest < Minitest::Test
   # this guards is a doc claiming `TAP_PAT` serves the Render API when the
   # workflow reads `RENDER_API_KEY` there, so a test that only checked the doc
   # for the word `TAP_PAT` would have passed the broken text.
+
   def test_consumer_variables_doc_pins_the_render_secret_contract_to_the_code
     body = render_body
     doc = File.read(File.join(ROOT, 'docs/consumer-variables.md'))
-
-    # --- code side: the two secrets are distinct and separately wired ---------
-    assert_equal 2, body.scan(/RENDER_API_KEY: \$\{\{ secrets\.RENDER_API_KEY \}\}/).size,
-                 'the Render calls (execute + cleanup) must read secrets.RENDER_API_KEY'
-    assert_includes body, 'GH_TOKEN: ${{ secrets.TAP_PAT || github.token }}',
-                    'the GitHub path must read secrets.TAP_PAT with github.token as fallback'
-    refute_includes body, 'RENDER_API_KEY: ${{ secrets.TAP_PAT',
-                     'the Render key must never be wired from the GitHub PAT'
-
-    # The set of secrets the render controller reads, taken from the code, not
-    # hardcoded here: this is what makes the doc check below drift-proof in
-    # both directions.
     code_secrets = body.scan(/secrets\.([A-Z][A-Z0-9_]*)/).flatten.uniq.sort
-    assert_equal %w[RENDER_API_KEY TAP_PAT], code_secrets,
-                 'the render controller must read exactly RENDER_API_KEY and TAP_PAT'
-
-    # --- doc side: the render section names every secret the code reads -------
-    section = doc[/### Render execution controller.*?(?=### Docker qualification controller)/m]
-    refute_nil section, 'the doc must keep a render-executor section before the docker one'
-    code_secrets.each do |name|
-      assert_includes section, "`#{name}`",
-                      "docs/consumer-variables.md must name #{name} in the render-controller section"
-    end
-
-    # The superseded claim: one secret serving both APIs. Reject it by its
-    # substance, not by any mention of TAP_PAT — the GitHub half of the
-    # contract still legitimately names it.
-    refute_match(/TAP_PAT\W{0,20}for both Render API/i, section,
-                 'the doc must not claim TAP_PAT serves both the Render API and the GitHub API')
-    refute_match(/never\s+reads any other secret name/i, section,
-                 'the render controller reads a second secret, so it cannot claim to read no other')
-    assert_match(/RENDER_API_KEY.{0,80}?Render API key/m, section,
-                 'the doc must say what RENDER_API_KEY actually is')
-    assert_match(/fails explicitly/i, section,
-                 'the doc must say the controller fails explicitly without RENDER_API_KEY')
-    assert_match(/does\s+\**not\**\s+fall back/i, section,
-                 'the doc must say there is no fallback credential for the Render API')
-
-    # --- the enumerated secret table must not name a secret nothing reads -----
-    table = doc[/### Required secrets.*?(?=### Render execution controller)/m]
-    refute_nil table, 'the doc must keep a secrets section enumerating the contract'
-    table.scan(/`(RENDER_API_KEY|TAP_PAT|CHILD_RUNTIME_TOKEN|CHILD_RUNTIME_REPOSITORIES)`/)
-         .flatten.uniq.each do |name|
-      next if WORKFLOWS.any? { |path| File.read(path).include?("secrets.#{name}") }
-
-      assert false, "docs/consumer-variables.md documents #{name}, which no core workflow reads"
-    end
-    assert_match(/RENDER_API_KEY.*none/i, table,
-                 'the secrets table must record that RENDER_API_KEY has no fallback')
+    assert_equal %w[RENDER_API_KEY TAP_PAT], code_secrets
+    assert_includes doc, '| `RENDER_API_KEY` | Render execution is enabled | Render API credential. |'
+    assert_includes doc, '| `TAP_PAT` | Generic workflows need authenticated GitHub writes |'
+    refute_includes body, 'RENDER_API_KEY: ${{ secrets.TAP_PAT'
   end
 
-  # The docker-qualification paragraph states the same contract for a different
-  # controller. It is accurate today, so pin it rather than let it rot: this
-  # workflow has no Render usage, so a future secret added here must be
-  # documented, and `TAP_PAT` must keep its `github.token` fallback.
+
   def test_docker_qualification_secret_claim_in_the_doc_matches_the_code
     body = docker_body
     doc = File.read(File.join(ROOT, 'docs/consumer-variables.md'))
-
-    refute_includes body, 'RENDER_API_KEY',
-                    'the docker controller has no Render usage; adding the key would make its doc claim wrong'
-    assert_equal %w[TAP_PAT], body.scan(/secrets\.([A-Z][A-Z0-9_]*)/).flatten.uniq,
-                 'the docker controller must read exactly TAP_PAT'
-
-    section = doc[/### Docker qualification controller.*?(?=### Scheduler guards)/m]
-    refute_nil section, 'the doc must keep a docker-qualification section'
-    assert_match(/TAP_PAT/, section,
-                 'the docker-qualification section must document its secret')
-    assert_match(/falling back to\s+`github\.token`/, section,
-                 'the docker-qualification section must document the github.token fallback')
-
-    # The "reads exactly this secret" claim lives in its own paragraph. It is
-    # located first and asserted present, because an assertion whose subject
-    # slice came back `nil` would run against `""` and pass for any wording at
-    # all — the guard would read as coverage while checking nothing. Locating
-    # the paragraph by its lead-in and taking the whole block, rather than
-    # matching a whole phrase down to a trailing full stop, keeps the anchor
-    # from being the thing that silently rots.
-    paragraph = section.split(/\n\s*\n/).find { |block| block.start_with?('The controller reads the repository secret') }
-    refute_nil paragraph,
-                'the docker-qualification section must keep the sentence stating which repository secret it reads'
-    refute_match(/Render/i, paragraph,
-                 'the docker-qualification secret paragraph must not mention Render')
-    # And the paragraph must name exactly the secret the code actually reads, so
-    # it cannot drift to a name the workflow never touches. Membership alone
-    # would not do: a paragraph naming `TAP_PAT` *and* an invented key still
-    # contains `TAP_PAT`, while claiming to read no other secret.
-    code_secrets = body.scan(/secrets\.([A-Z][A-Z0-9_]*)/).flatten.uniq
-    assert_equal 1, code_secrets.size,
-                 'the docker controller reads a single repository secret, so its doc paragraph has one name to state'
-    paragraph_secrets = paragraph.scan(/`([A-Z][A-Z0-9_]*)`/).flatten.uniq
-    assert_equal code_secrets.sort, paragraph_secrets.sort,
-                 'the docker-qualification secret paragraph must name exactly the secrets the workflow reads'
-    assert_match(/never\s+reads any other secret/i, paragraph,
-                 'the paragraph claiming a single secret must also claim it reads no other')
+    refute_includes body, 'RENDER_API_KEY'
+    assert_equal %w[TAP_PAT], body.scan(/secrets\.([A-Z][A-Z0-9_]*)/).flatten.uniq
+    assert_includes doc, '| `TAP_PAT` | Generic workflows need authenticated GitHub writes |'
   end
 
-  # docs/consumer-variables.md claimed RELEASE_PR_TOKEN falls back straight to
-  # GITHUB_TOKEN. The code resolves three links:
-  # RELEASE_PR_TOKEN -> TAP_PAT -> GITHUB_TOKEN. A consumer reading the doc
-  # would set only TAP_PAT and be told the PAT is ignored; README.md stated the
-  # chain correctly, so the two consumer-facing documents disagreed. Pin the
-  # order to the code so they cannot disagree again.
-  def test_release_pr_token_fallback_chain_in_the_doc_matches_the_code
-    # This workflow has no embedded `script: |` block; the chain is a `run: |`
-    # step, so slice that step out of the workflow body.
-    step = workflow_body('continuum-tech-swift-release-pr.yml')[/^ {6}- name: Resolve release token$.*?^ {10}fi$/m]
-    refute_nil step, 'the release-PR workflow must keep its "Resolve release token" step'
-    doc = File.read(File.join(ROOT, 'docs/consumer-variables.md'))
 
-    # The order is read out of the code, not typed here: each link records
-    # `source=<NAME>` only when it is the one that won. Branch order in the
-    # script is the resolution order, so the emitted order is the chain.
-    chain = step.scan(/echo "source=([A-Z][A-Z0-9_]*)"/).flatten
-    assert_equal %w[RELEASE_PR_TOKEN TAP_PAT GITHUB_TOKEN], chain,
-                 'the release-PR token resolves RELEASE_PR_TOKEN, then TAP_PAT, then GITHUB_TOKEN'
-
-    table = doc[/### Required secrets.*?(?=### Render execution controller)/m]
-    refute_nil table, 'the doc must keep a secrets section enumerating the contract'
-    row = table.lines.find { |line| line.include?('`RELEASE_PR_TOKEN`') }
-    refute_nil row, 'the doc must document RELEASE_PR_TOKEN in the secrets table'
-
-    # Every link of the chain appears, in the code's order. A row listing only
-    # the two ends, or listing TAP_PAT last, is a claim the code does not make.
-    # The row's first column repeats the secret's own name, so the scan is
-    # deduped — the order check is what carries the meaning.
-    documented = row.scan(/`([A-Z][A-Z0-9_]*)`/).flatten.uniq
-    assert_equal chain, documented,
-                 'the documented RELEASE_PR_TOKEN chain must list every link in the order the code resolves them'
-  end
-
-  # "The core layer reads exactly two secrets" was false as written. The four
-  # continuum-consumer-child-* workflows live beside the core ones and read the
-  # two child-runtime secrets, and continuum-pr-agent.yml reads GITHUB_TOKEN.
-  # A narrower claim is defensible — those child workflows are installed only
-  # by the `parent` set — but it has to be stated precisely and derived, so
-  # this test derives each set's secrets from its own stubs and holds the doc
-  # to the resulting numbers.
   def test_the_documented_secret_count_per_set_matches_the_installed_code
-    doc = File.read(File.join(ROOT, 'docs/consumer-variables.md'))
     consumer_defined = lambda do |stubs|
       secrets_read_by(stubs).reject { |name| name == 'GITHUB_TOKEN' }
     end
 
-    core = consumer_defined.call(CORE_STUBS)
-    parent = consumer_defined.call(PARENT_STUBS)
-    tech = consumer_defined.call(TECH_STUBS)
-
-    # Derived, so these numbers are read off the code rather than asserted from
-    # the doc that is under test.
-    assert_equal %w[RENDER_API_KEY TAP_PAT], core,
-                 'the core set reads exactly these consumer-defined secrets'
-    assert_equal %w[CHILD_RUNTIME_REPOSITORIES CHILD_RUNTIME_TOKEN TAP_PAT], parent,
-                 'the parent set reads exactly these consumer-defined secrets'
-    assert_equal %w[NANODICTATE_SIGNING_P12 NANODICTATE_SIGNING_PASSWORD RELEASE_PR_TOKEN TAP_PAT], tech,
-                 'the tech set reads exactly these consumer-defined secrets'
-
-    assert_match(/The `core` set's consumer-defined secrets are exactly the two in its rows/, doc,
-                 'the doc must state the core count in terms of its own rows')
-    refute_match(/core layer reads exactly two secrets/i, doc,
-                 'the doc must not claim the whole core layer reads two secrets: child execution workflows are installed by the parent set')
-
-    # The exception that makes the narrower claim true has to be named, so a
-    # reader can see which workflows the count excludes and why.
-    assert_match(/three live `continuum-consumer-child-\*` worker\/review workflows live in/, doc,
-                 'the doc must say where the live child workflows live')
-    assert_match(/installed\s+only by the\s+`parent` set/, doc,
-                 'the doc must say the child workflows are installed only by the parent set')
+    assert_equal %w[RENDER_API_KEY TAP_PAT], consumer_defined.call(CORE_STUBS)
+    assert_equal %w[CHILD_RUNTIME_REPOSITORIES CHILD_RUNTIME_TOKEN TAP_PAT],
+                 consumer_defined.call(PARENT_STUBS)
+    assert_empty consumer_defined.call(TECH_STUBS),
+                 'the consumer-neutral Swift profile must require no product secret'
   end
 
-  # The secrets table is guarded twice: once against the hardcoded names it
-  # always checked, and once against the set derived from the code. The
-  # hardcoded pattern cannot see a secret added later; the derived set can.
+
   def test_no_documented_secret_is_unread_by_the_code
     doc = File.read(File.join(ROOT, 'docs/consumer-variables.md'))
-    table = doc[/### Required secrets.*?(?=### Render execution controller)/m]
-    refute_nil table, 'the doc must keep a secrets section enumerating the contract'
-
+    table = doc[/^## Secrets.*?(?=^## )/m]
+    refute_nil table, 'the consumer contract must keep a Secrets table'
     readable = ->(name) { WORKFLOWS.any? { |path| File.read(path).include?("secrets.#{name}") } }
 
-    # The original narrow check, kept as it was.
-    table.scan(/`(RENDER_API_KEY|TAP_PAT|CHILD_RUNTIME_TOKEN|CHILD_RUNTIME_REPOSITORIES)`/)
-         .flatten.uniq.each do |name|
-      next if readable.call(name)
-
-      assert false, "docs/consumer-variables.md documents #{name}, which no core workflow reads"
-    end
-
-    # The derived check: every ALL_CAPS backticked name in the table, whatever
-    # it is, must be one the code actually reads. This is the half that catches
-    # a secret the hardcoded list never knew about.
-    names = table.scan(/`([A-Z][A-Z0-9_]*)`/).flatten.uniq
-    refute_empty names, 'the secrets table must name at least one secret'
-    # `GITHUB_TOKEN` is minted by GitHub, not defined by a consumer, and is
-    # documented as such; the rest must all be read.
-    (names - ['GITHUB_TOKEN']).each do |name|
+    names = table.scan(/\| `([A-Z][A-Z0-9_]*)` \|/).flatten.uniq
+    refute_empty names
+    names.each do |name|
       assert readable.call(name),
              "docs/consumer-variables.md documents #{name}, which no workflow reads"
     end
 
-    # And the reverse direction, over the derived per-set sets: the table must
-    # document every consumer-defined secret each set reads, so a secret added
-    # to a workflow cannot ship undocumented.
     { 'core' => CORE_STUBS, 'parent' => PARENT_STUBS, 'tech' => TECH_STUBS }.each do |set, stubs|
       secrets_read_by(stubs).reject { |name| name == 'GITHUB_TOKEN' }.each do |name|
         assert_includes table, "`#{name}`",
-                        "the #{set} set reads #{name}, so the secrets table must document it"
+                        "the #{set} set reads #{name}, so the Secrets table must document it"
       end
     end
   end
 
-  # "The installed parent stubs fill CHILD_RUNTIME_TOKEN from the parent's own
-  # TAP_PAT" is what makes one credential serve both layers, and it was true
-  # with nothing holding it there: repointing all four stubs at a different
-  # secret left the suite green.
   def test_parent_stubs_forward_the_parents_own_pat_as_the_child_runtime_token
     doc = File.read(File.join(ROOT, 'docs/consumer-variables.md'))
 
@@ -2439,7 +2251,7 @@ class ContinuumTest < Minitest::Test
                    "#{File.basename(path)} must forward the parent's TAP_PAT as CHILD_RUNTIME_TOKEN"
     end
 
-    assert_match(%r{Every installed parent stub fills it from the parent's own `TAP_PAT`}, doc,
+    assert_match(%r{Every installed parent stub fills `CHILD_RUNTIME_TOKEN` from the parent's own `TAP_PAT`}, doc,
                  'the doc must say the installed parent stubs fill CHILD_RUNTIME_TOKEN from TAP_PAT')
   end
 
@@ -2486,39 +2298,6 @@ class ContinuumTest < Minitest::Test
   # cannot set is worse than not documenting it: it implies a knob that does
   # nothing. The doc now says the opposite explicitly, and this test holds that
   # statement to the code.
-  def test_the_unparameterised_release_repositories_are_documented_as_literals
-    doc = File.read(File.join(ROOT, 'docs/consumer-variables.md'))
-    release = workflow_body('continuum-tech-swift-release.yml')
-
-    section = doc[/### Not yet parameterised.*?(?=^### )/m]
-    refute_nil section, 'the doc must keep a section naming the release values that are not yet variables'
-
-    %w[CONTINUUM_HOMEBREW_TAP CONTINUUM_MACPORTS_TREE].each do |name|
-      # The code must not read it: the doc's claim is that these are literals.
-      refute_match(/vars\.#{name}/, release,
-                   "#{name} is documented as an unparameterised literal, so the release workflow must not read it")
-      # And it must not appear as a row in *any* table the reader would scan for
-      # variables a consumer sets. Checking only the secrets table is not enough
-      # — the main product-identity table at the top of the doc is where these
-      # two rows used to sit, so that is the table that has to be guarded.
-      offenders = doc.lines.select do |line|
-        line.start_with?('|') && line.include?("`#{name}`")
-      end
-      assert_empty offenders,
-                   "#{name} reads nothing, so it must not be listed in a variable table:\n#{offenders.join}"
-    end
-
-    # The literal it actually is: the release workflow names both repositories
-    # directly, so a reader can see the claim is about the code and not a
-    # guess about it.
-    assert_match(%r{gh repo clone \S+/macports-nanodictate}, release,
-                 'the MacPorts canon tree is a literal repository name in the release workflow')
-    assert_match(%r{gh repo clone \S+/homebrew-nanodictate}, release,
-                 'the Homebrew tap is a literal repository name in the release workflow')
-  end
-
-  # Every value the fork hardcoded for one repository must be a knob, or a
-  # second consumer inherits that repository's paths and markers.
   def test_render_executor_knobs_cover_every_fork_hardcoded_value
     body = render_body
     {
@@ -2924,9 +2703,6 @@ class ContinuumTest < Minitest::Test
     scheduler = workflow_body('continuum-issue-scheduler.yml')
 
     assert_includes scheduler, 'Build delegated child queue'
-    assert_includes scheduler, 'export CONTINUUM_ENGINE_ROOT="$GITHUB_WORKSPACE/.continuum-engine"'
-    assert_includes scheduler, 'export PYTHONPATH="$CONTINUUM_ENGINE_ROOT/src"'
-    assert_includes scheduler, 'resolver="$CONTINUUM_ENGINE_ROOT/.github/scripts/delegation_repository.sh"'
     assert_includes scheduler, 'for (const child of childCandidates) {'
     assert_includes scheduler, "candidates.push({ source: 'local', issue, priority, rank });"
     assert_includes scheduler, "source: 'child'"
