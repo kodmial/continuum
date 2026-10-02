@@ -16,6 +16,9 @@ class ContinuumTest < Minitest::Test
   # layer a file belongs to.
   ALL_STUBS = (CORE_STUBS + TECH_STUBS + PARENT_STUBS).sort
   STUBS = (CORE_STUBS + TECH_STUBS).sort
+  # Transitional workflow_run aliases kept by the scheduler so already
+  # installed parent callers using the pre-SubTask names still wake it.
+  LEGACY_WORKFLOW_RUN_NAMES = ['Child task', 'Child review', 'Child PR review'].freeze
 
   def yaml(path)
     YAML.load_file(path)
@@ -269,7 +272,7 @@ class ContinuumTest < Minitest::Test
     names = ALL_STUBS.map { |path| yaml(path).fetch('name') }
     each_pair do |caller, _|
       events(caller).fetch('workflow_run', {}).fetch('workflows', []).each do |name|
-        assert_includes names, name
+        assert_includes names + LEGACY_WORKFLOW_RUN_NAMES, name
       end
     end
   end
