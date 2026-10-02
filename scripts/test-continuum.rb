@@ -3964,8 +3964,8 @@ class ContinuumTest < Minitest::Test
   end
 
   # (d) `issue` mode must own the whole issue -> branch -> commit -> PR
-  # lifecycle, and it must refuse to publish anything under .github/workflows,
-  # which this token cannot push.
+  # lifecycle. Workflow files are valid task output; TAP_PAT carries the
+  # workflow scope needed to publish them on the generated task branch.
   def test_opencode_issue_mode_owns_the_full_issue_to_pr_lifecycle
     body = File.read(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
     step = step_body(body, 'Implement issue')
@@ -3976,7 +3976,10 @@ class ContinuumTest < Minitest::Test
     assert_includes step, 'BRANCH="opencode/issue${ISSUE_NUMBER}-${GITHUB_RUN_ID}"'
     assert_includes step, 'opencode run --auto --model "$OPENCODE_MODEL"'
     assert_includes step, "if [[ \"\$CURRENT_BRANCH\" != \"\$BRANCH\" ]]; then"
-    assert_includes step, 'git status --porcelain -- .github/workflows'
+    assert_includes step, 'You may modify .github/workflows/** when the issue requires it.'
+    refute_includes step, 'Do not modify .github/workflows/**'
+    refute_includes step, 'OpenCode modified .github/workflows/**'
+    refute_includes step, 'Task commit contains .github/workflows/** changes.'
     assert_includes step, 'git commit -m "${COMMIT_PREFIX}: implement issue #${ISSUE_NUMBER}"'
     assert_includes step, 'gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs"'
     assert_includes step, 'git push --force-with-lease="refs/heads/$BRANCH:$BASE_SHA"'

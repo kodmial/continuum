@@ -667,7 +667,7 @@ jobs:
           - Run the relevant local checks when practical.
           - Keep all comments and commit-facing text in English.
           - Do not add unrelated automation outside the issue scope.
-          - Do not modify .github/workflows/**. Stable workflow envelopes are provisioned separately because the Actions token cannot push workflow-file changes; put mutable automation logic under normal source files.
+          - You may modify .github/workflows/** when the issue requires it. Workflow changes must be published only on the task branch and reviewed through a pull request; never update main directly.
           - Do not perform git commits, pushes, branch switches, rebases, resets, merges, or PR creation; the workflow owns Git state.
           EOF
           )"
@@ -702,12 +702,6 @@ jobs:
             exit 1
           fi
 
-          if [[ -n "$(git status --porcelain -- .github/workflows)" ]]; then
-            echo "::error::OpenCode modified .github/workflows/**, which this token cannot safely push."
-            git status --short -- .github/workflows
-            exit 1
-          fi
-
           if [[ -z "$(git status --porcelain)" ]]; then
             echo "OpenCode produced no repository changes."
             gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
@@ -727,15 +721,10 @@ jobs:
           git commit -m "${COMMIT_PREFIX}: implement issue #${ISSUE_NUMBER}"
           TASK_COMMIT="$(git rev-parse HEAD)"
 
-          # The Actions token is a GitHub App installation token, which needs a
-          # separate Workflows permission to write .github/workflows/**. Keep
-          # the task commit outside that path, then create the remote branch
-          # from the base the agent used via the Git refs API.
-          if [[ -n "$(git diff-tree --no-commit-id --name-only -r "$TASK_COMMIT" -- .github/workflows)" ]]; then
-            echo "::error::Task commit contains .github/workflows/** changes."
-            git diff-tree --no-commit-id --name-status -r "$TASK_COMMIT" -- .github/workflows
-            exit 1
-          fi
+          # The checkout credential is TAP_PAT, which must carry repo + workflow
+          # scopes so issue implementations can include Actions workflow files.
+          # Publication still targets only the generated task branch; main is
+          # changed exclusively through the normal pull-request lifecycle.
 
           # Publish the task commit from the exact base the agent used. Do not
           # replay it onto a moving base here: merge/conflict reconciliation
@@ -743,11 +732,6 @@ jobs:
           # ordinary conflict into a failed task.
           BASE_SHA="$(git rev-parse "$TASK_COMMIT^")"
           [[ -n "$BASE_SHA" ]] || { echo "::error::Could not resolve task base SHA"; exit 1; }
-
-          if [[ -n "$(git diff --name-only "$BASE_SHA"...HEAD -- .github/workflows)" ]]; then
-            echo "::error::Task differs from its branch base under .github/workflows/**."
-            exit 1
-          fi
 
           gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
             -f ref="refs/heads/$BRANCH" \
