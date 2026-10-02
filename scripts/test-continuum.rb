@@ -2972,6 +2972,28 @@ class ContinuumTest < Minitest::Test
                  'every just-in-time guard must be a skip, not a fall-through'
   end
 
+  # Closed issues are terminal scheduler state. A stale in-progress label on a
+  # closed issue must be released by the shared engine itself, otherwise a
+  # consumer has to fork the scheduler merely to keep WIP accounting correct.
+  def test_scheduler_releases_stale_leases_from_closed_issues
+    scheduler = workflow_body('continuum-issue-scheduler.yml')
+
+    reconciliation = scheduler[/const closedLeasedIssues = await github\.paginate\(.*?\n\s*let issues = await github\.paginate/m]
+    refute_nil reconciliation, 'closed-issue lease reconciliation is missing from the shared scheduler'
+    assert_includes reconciliation, 'github.rest.issues.listForRepo'
+    assert_includes reconciliation, "state: 'closed'"
+    assert_includes reconciliation, 'labels: inProgressLabel'
+    assert_includes reconciliation, 'if (issue.pull_request) continue;'
+    assert_includes reconciliation, 'await removeLabel(issue.number, inProgressLabel);'
+    assert_includes reconciliation, 'Released stale reservation on closed issue #'
+
+    # The cleanup must happen before open-backlog admission so a closed issue
+    # cannot retain WIP while the same reconciliation pass selects new work.
+    assert_operator scheduler.index('const closedLeasedIssues = await github.paginate'),
+                    :<,
+                    scheduler.index("state: 'open'")
+  end
+
   # A blocked issue whose OpenCode PR was closed unmerged is not a failed
   # implementation, and a native blocker is authoritative over an old
   # reservation lease. Both must release, not pause.
