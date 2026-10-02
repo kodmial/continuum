@@ -1,4 +1,4 @@
-name: PR Agent (manual, Groq)
+name: PR Agent (OpenCode backend)
 
 on:
   workflow_call:
@@ -8,11 +8,70 @@ on:
         type: string
         default: main
         required: false
+      enabled:
+        description: >-
+          Enable the optional PR-Agent review provider. Empty falls back to
+          vars.CONTINUUM_PR_AGENT_ENABLED, then to 'false'. Consumers that do
+          not enable PR-Agent are unaffected: the run posts one explicit
+          disabled notice instead of reviewing.
+        type: string
+        default: ''
+        required: false
+      api_base:
+        description: >-
+          OpenAI-compatible backend base URL PR-Agent talks to. Empty falls
+          back to vars.PR_AGENT_API_BASE, then to the runner-local bridge
+          (http://127.0.0.1:<bridge_port>/v1).
+        type: string
+        default: ''
+        required: false
+      model:
+        description: >-
+          LiteLLM model id PR-Agent requests (openai/ prefix routes through
+          the bridge). Empty falls back to vars.PR_AGENT_MODEL, then to
+          'openai/continuum-review'.
+        type: string
+        default: ''
+        required: false
+      max_tokens:
+        description: >-
+          Token/output limit forwarded as the custom-model cap. Empty falls
+          back to vars.PR_AGENT_MAX_TOKENS, then to '4096'.
+        type: string
+        default: ''
+        required: false
+      opencode_model:
+        description: >-
+          OpenCode provider/model the bridge infers with. Empty falls back to
+          vars.OPENCODE_MODEL, then to the free
+          'opencode/muse-spark-1.3-contributor-free' route. No paid-provider
+          secret is ever required.
+        type: string
+        default: ''
+        required: false
+      bridge_port:
+        description: >-
+          Loopback port the compatibility bridge binds. Empty falls back to
+          vars.PR_AGENT_BRIDGE_PORT, then to '18000'.
+        type: string
+        default: ''
+        required: false
+      server_port:
+        description: >-
+          Loopback port `opencode serve` binds. Empty falls back to
+          vars.PR_AGENT_OPENCODE_PORT, then to '4096'.
+        type: string
+        default: ''
+        required: false
+      pr_agent_version:
+        description: >-
+          Pinned pr-agent PyPI release installed on the runner. Empty falls
+          back to vars.PR_AGENT_VERSION, then to '0.46.0'.
+        type: string
+        default: ''
+        required: false
 
-permissions:
-  contents: read
-  issues: write
-  pull-requests: write
+permissions: {}
 
 concurrency:
   group: pr-agent-${{ github.event.issue.number }}
@@ -25,39 +84,394 @@ jobs:
       github.actor == github.repository_owner &&
       (
         startsWith(github.event.comment.body, '/review') ||
-        startsWith(github.event.comment.body, '/improve') ||
         startsWith(github.event.comment.body, '/describe') ||
-        startsWith(github.event.comment.body, '/ask')
+        startsWith(github.event.comment.body, '/ask') ||
+        startsWith(github.event.comment.body, '/verify')
       )
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: ${{ fromJSON(vars.AUTOMATION_PR_AGENT_TIMEOUT_MINUTES || '60') }}
+
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
 
     steps:
-      # Continuum core automation runs on free anonymous OpenCode models and
-      # forbids paid providers. PR-Agent is wired to the paid Groq provider
-      # upstream and cannot fall back to a free model on its own, so it is not
-      # supported: this workflow reports an explicit failure instead of a quiet
-      # green run that did nothing. A consumer that wants PR-Agent must remove
-      # this caller or wire the action to a free provider itself.
-      - name: Report the unsupported paid provider
-        id: provider
+      - name: Resolve PR-Agent configuration
+        id: config
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          INPUT_ENABLED: ${{ inputs.enabled }}
+          INPUT_API_BASE: ${{ inputs.api_base }}
+          INPUT_MODEL: ${{ inputs.model }}
+          INPUT_MAX_TOKENS: ${{ inputs.max_tokens }}
+          INPUT_OPENCODE_MODEL: ${{ inputs.opencode_model }}
+          INPUT_BRIDGE_PORT: ${{ inputs.bridge_port }}
+          INPUT_SERVER_PORT: ${{ inputs.server_port }}
+          INPUT_PR_AGENT_VERSION: ${{ inputs.pr_agent_version }}
+          CFG_ENABLED: ${{ vars.CONTINUUM_PR_AGENT_ENABLED }}
+          CFG_API_BASE: ${{ vars.PR_AGENT_API_BASE }}
+          CFG_MODEL: ${{ vars.PR_AGENT_MODEL }}
+          CFG_MAX_TOKENS: ${{ vars.PR_AGENT_MAX_TOKENS }}
+          CFG_OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL }}
+          CFG_BRIDGE_PORT: ${{ vars.PR_AGENT_BRIDGE_PORT }}
+          CFG_SERVER_PORT: ${{ vars.PR_AGENT_OPENCODE_PORT }}
+          CFG_PR_AGENT_VERSION: ${{ vars.PR_AGENT_VERSION }}
         with:
+          github-token: ${{ secrets.TAP_PAT }}
           script: |
-            core.setOutput('supported', 'false');
-            core.setFailed(
-              'The optional PR-Agent helper is disabled: its upstream action requires the ' +
-              'paid Groq provider (GROQ_API_KEY), and Continuum core supports only free ' +
-              'anonymous models — no paid provider key. Continuum therefore neither reads ' +
-              'nor forwards that secret. Remove the pr-agent caller from this repository, or ' +
-              'wire PR-Agent to a free provider, to use it.'
+            const body = String(context.payload.comment?.body || '');
+            const prNumber = context.payload.issue?.number;
+            if (!prNumber) {
+              core.setFailed('PR-Agent runs only on pull request comments.');
+              return;
+            }
+
+            let command = null;
+            let argument = '';
+            for (const name of ['/verify', '/review', '/describe', '/ask']) {
+              if (body.startsWith(name) && (body.length === name.length || /\s/.test(body[name.length]))) {
+                command = name.slice(1);
+                argument = body.slice(name.length).trim();
+                break;
+              }
+            }
+            if (!command) {
+              core.setFailed(`Unsupported PR-Agent command in: ${body.split('\n')[0]}`);
+              return;
+            }
+
+            const pick = (input, vars, fallback) =>
+              String(input || process.env[vars] || fallback || '').trim();
+            // vars.* are read via the env snapshot below, because
+            // github-script expressions cannot expand them dynamically.
+            const enabled = pick(process.env.INPUT_ENABLED, 'CFG_ENABLED', 'false').toLowerCase();
+            const bridgePort = pick(process.env.INPUT_BRIDGE_PORT, 'CFG_BRIDGE_PORT', '18000');
+            const apiBase = pick(
+              process.env.INPUT_API_BASE, 'CFG_API_BASE', `http://127.0.0.1:${bridgePort}/v1`
             );
 
-      # Kept only so the failure above stays the single, explicit reason this
-      # helper cannot run. It is unreachable: the gate above fails the job and
-      # the paid key is deliberately not passed in.
-      - name: Run PR-Agent
-        if: steps.provider.outputs.supported == 'true'
-        uses: docker://pragent/pr-agent:github_action@sha256:65e5b196e38cecd7df8a71fe29942052e081a0c6645132c2ac874df60b1760c7 # 0.46.0
+            core.setOutput('enabled', enabled === 'true' || enabled === '1' ? 'true' : 'false');
+            core.setOutput('api_base', apiBase);
+            core.setOutput('model', pick(process.env.INPUT_MODEL, 'CFG_MODEL', 'openai/continuum-review'));
+            core.setOutput('max_tokens', pick(process.env.INPUT_MAX_TOKENS, 'CFG_MAX_TOKENS', '4096'));
+            core.setOutput(
+              'opencode_model',
+              pick(process.env.INPUT_OPENCODE_MODEL, 'CFG_OPENCODE_MODEL', 'opencode/muse-spark-1.3-contributor-free')
+            );
+            core.setOutput('bridge_port', bridgePort);
+            core.setOutput('server_port', pick(process.env.INPUT_SERVER_PORT, 'CFG_SERVER_PORT', '4096'));
+            core.setOutput(
+              'pr_agent_version', pick(process.env.INPUT_PR_AGENT_VERSION, 'CFG_PR_AGENT_VERSION', '0.46.0')
+            );
+            core.setOutput('command', command);
+            core.setOutput('argument', argument);
+            core.setOutput('pr_number', String(prNumber));
+
+            if (command === 'verify' && !argument) {
+              core.setFailed('Usage: /verify <finding-id> (the inline review comment id).');
+            }
+
+      - name: Report the disabled provider explicitly
+        if: steps.config.outputs.enabled != 'true'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: Number('${{ steps.config.outputs.pr_number }}'),
+              body: [
+                'PR-Agent is not enabled in this repository.',
+                '',
+                'Set the `CONTINUUM_PR_AGENT_ENABLED` repository variable to `true` ' +
+                'to enable the optional OpenCode-backed review provider. ' +
+                'No paid-provider secret is required.',
+              ].join('\n'),
+            });
+
+      - name: Checkout the pull request head
+        if: steps.config.outputs.enabled == 'true'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: refs/pull/${{ steps.config.outputs.pr_number }}/head
+
+      - name: Checkout Continuum engine for bridge fallback
+        if: steps.config.outputs.enabled == 'true'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: kodmial/continuum
+          ref: ${{ inputs.continuum_ref }}
+          path: .continuum-engine
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Record the reviewed head
+        if: steps.config.outputs.enabled == 'true'
+        id: head
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          PR_NUMBER: ${{ steps.config.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+          HEAD_SHA="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)"
+          [[ -n "$HEAD_SHA" ]] || { echo "::error::Could not resolve PR #$PR_NUMBER head."; exit 1; }
+          echo "sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "LOCAL_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          # The bridge script ships in Continuum; a consumer checkout never has
+          # it, so fall back to the pinned engine revision.
+          if [[ -f .github/scripts/pr_agent_bridge.py ]]; then
+            echo "BRIDGE_SCRIPT=.github/scripts/pr_agent_bridge.py" >> "$GITHUB_ENV"
+          else
+            echo "BRIDGE_SCRIPT=.continuum-engine/.github/scripts/pr_agent_bridge.py" >> "$GITHUB_ENV"
+          fi
+
+      # The upstream composite action resolves releases/latest before doing any
+      # useful work. Pin the CLI instead so API availability or rate limiting
+      # cannot prevent the review backend from starting.
+      - name: Install OpenCode CLI
+        if: steps.config.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if curl -fsSL --retry 3 --retry-delay 2 https://opencode.ai/install | bash -s -- --version 1.18.34; then
+              echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+              exit 0
+            fi
+            if [[ "$attempt" -eq 3 ]]; then
+              echo "::error::OpenCode installer failed after 3 attempts."
+              exit 1
+            fi
+            sleep $((attempt * 15))
+          done
+
+      - name: Install the pinned PR-Agent release on the runner
+        if: steps.config.outputs.enabled == 'true'
+        env:
+          PR_AGENT_VERSION: ${{ steps.config.outputs.pr_agent_version }}
+        run: |
+          set -euo pipefail
+          # A Docker action cannot reach the runner-local 127.0.0.1 bridge, so
+          # the pinned release runs directly on the runner instead of in a
+          # container. Never use host.docker.internal here: it is undocumented
+          # on GitHub-hosted runners.
+          python3 -m pip install --quiet "pr-agent==${PR_AGENT_VERSION}"
+          pr-agent --version
+
+      - name: Start opencode serve on loopback
+        if: steps.config.outputs.enabled == 'true'
+        env:
+          OPENCODE_MODEL: ${{ steps.config.outputs.opencode_model }}
+          SERVER_PORT: ${{ steps.config.outputs.server_port }}
+        run: |
+          set -euo pipefail
+          # Bind the minimum network surface: loopback only. Do NOT inject a
+          # restrictive OPENCODE_CONFIG_CONTENT here: the free tier rejects
+          # server-side permission overrides, so inference hardening lives in
+          # the bridge (read-only plan agent + reviewer-only system prompt)
+          # and in the post-run git-clean guard below.
+          (setsid nohup opencode serve --hostname 127.0.0.1 --port "$SERVER_PORT" \
+            > "$RUNNER_TEMP/opencode-serve.log" 2>&1 &)
+          for attempt in $(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:${SERVER_PORT}/global/health" >/dev/null 2>&1; then
+              echo "opencode serve is up on 127.0.0.1:${SERVER_PORT}."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::opencode serve did not become ready."
+          cat "$RUNNER_TEMP/opencode-serve.log" || true
+          exit 1
+
+      - name: Start the OpenAI-compatibility bridge on loopback
+        if: steps.config.outputs.enabled == 'true'
+        env:
+          OPENCODE_SERVER_URL: http://127.0.0.1:${{ steps.config.outputs.server_port }}
+          OPENCODE_MODEL: ${{ steps.config.outputs.opencode_model }}
+          PR_AGENT_BRIDGE_PORT: ${{ steps.config.outputs.bridge_port }}
+          PR_AGENT_TIMEOUT_SECONDS: '170'
+        run: |
+          set -euo pipefail
+          # The bridge exposes only the OpenAI-compatible surface PR-Agent
+          # needs (/v1/chat/completions, /v1/models, health). The full
+          # OpenCode control API is never exposed.
+          (setsid nohup python3 "$BRIDGE_SCRIPT" \
+            > "$RUNNER_TEMP/pr-agent-bridge.log" 2>&1 &)
+          for attempt in $(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:${PR_AGENT_BRIDGE_PORT}/v1/models" >/dev/null 2>&1; then
+              echo "bridge is up on 127.0.0.1:${PR_AGENT_BRIDGE_PORT}."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::compatibility bridge did not become ready."
+          cat "$RUNNER_TEMP/pr-agent-bridge.log" || true
+          exit 1
+
+      - name: Run PR-Agent review over the bridge
+        if: steps.config.outputs.enabled == 'true' && (steps.config.outputs.command == 'review' || steps.config.outputs.command == 'describe' || steps.config.outputs.command == 'ask')
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          GITHUB__USER_TOKEN: ${{ secrets.TAP_PAT }}
+          CONFIG__GIT_PROVIDER: github
+          CONFIG__MODEL: ${{ steps.config.outputs.model }}
+          CONFIG__CUSTOM_MODEL_MAX_TOKENS: ${{ steps.config.outputs.max_tokens }}
+          OPENAI__API_BASE: ${{ steps.config.outputs.api_base }}
+          # LiteLLM requires a key string on the OpenAI route; this loopback
+          # placeholder is not a credential and the bridge ignores it.
+          OPENAI__KEY: continuum-loopback
+          PR_URL: https://github.com/${{ github.repository }}/pull/${{ steps.config.outputs.pr_number }}
+          PR_COMMAND: ${{ steps.config.outputs.command }}
+          PR_ARGUMENT: ${{ steps.config.outputs.argument }}
+        run: |
+          set -euo pipefail
+          case "$PR_COMMAND" in
+            review)
+              # Reviews the exact current PR head: PR-Agent fetches the diff
+              # for the head resolved above. Large-PR chunking and the review
+              # coverage footer come from the shipped .pr_agent.toml.
+              pr-agent --pr_url "$PR_URL" review
+              ;;
+            describe)
+              pr-agent --pr_url "$PR_URL" describe
+              ;;
+            ask)
+              [[ -n "$PR_ARGUMENT" ]] || { echo "::error::Usage: /ask <question>."; exit 1; }
+              pr-agent --pr_url "$PR_URL" ask "$PR_ARGUMENT"
+              ;;
+          esac
+
+      - name: Verify one finding against the current head
+        if: steps.config.outputs.enabled == 'true' && steps.config.outputs.command == 'verify'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          HEAD_SHA: ${{ steps.head.outputs.sha }}
+          FINDING_ID: ${{ steps.config.outputs.argument }}
+          BRIDGE_URL: ${{ steps.config.outputs.api_base }}
+          BRIDGE_MODEL: ${{ steps.config.outputs.model }}
+        with:
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            const headSha = process.env.HEAD_SHA;
+            const findingId = Number(process.env.FINDING_ID);
+            if (!Number.isInteger(findingId)) {
+              core.setFailed('Usage: /verify <finding-id> (the inline review comment id).');
+              return;
+            }
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pullNumber = Number('${{ steps.config.outputs.pr_number }}');
+
+            const { data: comment } = await github.rest.pulls.getReviewComment({
+              owner, repo, comment_id: findingId,
+            });
+            const marker =
+              `<!-- continuum-pr-agent-verify finding=${findingId} head=${headSha} -->`;
+            const existing = await github.paginate(github.rest.pulls.listReviewComments, {
+              owner, repo, pull_number: pullNumber, per_page: 100,
+            });
+            if (existing.some(c => c.in_reply_to_id === findingId && c.body?.includes(marker))) {
+              core.notice(`Finding ${findingId} was already verified at ${headSha}.`);
+              return;
+            }
+
+            let current = '';
+            try {
+              const { data: file } = await github.rest.repos.getContent({
+                owner, repo, path: comment.path, ref: headSha,
+              });
+              if (!Array.isArray(file) && file.content) {
+                current = Buffer.from(file.content, 'base64').toString('utf8');
+              }
+            } catch (err) {
+              if (err.status !== 404) throw err;
+            }
+            const prompt = [
+              'You are a read-only code reviewer. Decide whether the review finding below',
+              `still applies to the CURRENT file content at PR HEAD ${headSha}.`,
+              '',
+              `Finding (${comment.path}, line ${comment.original_line || comment.line}):`,
+              comment.body || '',
+              '',
+              'Current file content:',
+              current ? current.slice(0, 20000) : '(file no longer exists at this HEAD)',
+              '',
+              'Reply with exactly **RESOLVED** if the underlying issue is fully fixed,',
+              'otherwise reply with exactly **UNRESOLVED** and state what remains.',
+            ].join('\n');
+
+            const res = await fetch(`${process.env.BRIDGE_URL}/chat/completions`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                model: process.env.BRIDGE_MODEL,
+                messages: [{ role: 'user', content: prompt }],
+              }),
+            });
+            if (!res.ok) {
+              core.setFailed(`Verify inference failed: bridge answered ${res.status}.`);
+              return;
+            }
+            const completion = await res.json();
+            const text = completion.choices?.[0]?.message?.content || '';
+            // UNRESOLVED always wins: only an explicit **RESOLVED** without any
+            // UNRESOLVED mention counts as resolved.
+            const verdict = /\bUNRESOLVED\b/i.test(text)
+              ? 'UNRESOLVED'
+              : (/\*\*RESOLVED(?:\.|\*\*)/i.test(text) ? 'RESOLVED' : 'UNRESOLVED');
+            await github.request(
+              'POST /repos/{owner}/{repo}/pulls/{pull_number}/comments/{comment_id}/replies',
+              {
+                owner, repo, pull_number: pullNumber, comment_id: findingId,
+                body: [
+                  marker,
+                  `Verification at HEAD \`${headSha}\`: **${verdict}**`,
+                  '',
+                  text.slice(0, 3000),
+                ].join('\n'),
+              }
+            );
+            core.notice(`Finding ${findingId} verified at ${headSha}: ${verdict}.`);
+
+      - name: Fail closed on a moved head
+        if: steps.config.outputs.enabled == 'true' && always()
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          PR_NUMBER: ${{ steps.config.outputs.pr_number }}
+          REVIEWED_SHA: ${{ steps.head.outputs.sha }}
+        run: |
+          set -euo pipefail
+          CURRENT_SHA="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)"
+          if [[ "$CURRENT_SHA" != "$REVIEWED_SHA" ]]; then
+            echo "::error::PR head moved during review ($REVIEWED_SHA -> $CURRENT_SHA); the review is stale."
+            exit 1
+          fi
+          echo "Reviewed head $REVIEWED_SHA is still current."
+
+      # PR-Agent is reviewer-only: it must never modify the checkout. The
+      # read-only plan agent and the reviewer-only system prompt already
+      # constrain inference; this guard proves the run kept that promise.
+      - name: Prove the checkout is unmodified
+        if: steps.config.outputs.enabled == 'true' && always()
+        run: |
+          set -euo pipefail
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "::error::PR-Agent modified the checkout; reviewer-only runs must not."
+            git status --short
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$LOCAL_SHA" ]]; then
+            echo "::error::PR-Agent created commits; reviewer-only runs must not."
+            exit 1
+          fi
+          echo "Checkout is unmodified: reviewer-only holds."
+
+      - name: Stop the review backend
+        if: always()
+        run: |
+          # Bracketed tails keep pkill from matching its own command line.
+          pkill -f "opencode serv[e] --hostname 127.0.0.1" || true
+          pkill -f "pr_agent_bridge.p[y]" || true
