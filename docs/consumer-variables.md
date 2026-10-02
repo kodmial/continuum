@@ -97,6 +97,8 @@ repository, binary name, image, memory/trial limits and result paths.
 The optional Swift profile defines **no signing or release secrets**. Product
 signing/release credentials belong to the consumer.
 
+Every installed parent stub fills `CHILD_RUNTIME_TOKEN` from the parent's own `TAP_PAT`; direct reusable-workflow callers may supply `CHILD_RUNTIME_TOKEN` themselves.
+
 ## New repository example
 
 1. Install `core` from Continuum `main`.
