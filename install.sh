@@ -166,11 +166,14 @@ for f in "${STUBS[@]}"; do
   # third-party action, an `@branch-main` tag, a `run:` body — never matches.
   # `@main` with no space before a `#` is deliberately NOT rewritten: YAML
   # requires whitespace to open a comment, so `#` there is part of the ref.
-  # The ref is written as a double-quoted YAML scalar rather than a bare or
-  # single-quoted one.
+  # Explicit non-main refs are quoted so values such as numeric tags stay YAML
+  # strings. The default `main` ref is already canonical in every shipped stub;
+  # leave it byte-stable instead of manufacturing a `main` -> `"main"` diff.
+  REF_YAML="$REF"
+  [[ "$REF" == "main" ]] || REF_YAML="\\\"$REF\\\""
   printf '%s\n' "$template" | sed -E \
     -e "s|^([[:space:]]*-?[[:space:]]*uses:[[:space:]]*[\"']?kodmial/continuum/\.github/workflows/[^@[:space:]\"']*)@main([\"']?)([[:space:]]+#.*)?([[:space:]]*)$|\1@$REF\2\3\4|" \
-    -e "s|^([[:space:]]*-?[[:space:]]*(continuum_ref\|engine_ref):[[:space:]]*)main([[:space:]]+#.*)?([[:space:]]*)$|\1\"$REF\"\3\4|" \
+    -e "s|^([[:space:]]*-?[[:space:]]*(continuum_ref\|engine_ref):[[:space:]]*)main([[:space:]]+#.*)?([[:space:]]*)$|\1$REF_YAML\3\4|" \
     > "$DEST/.github/workflows/$f"
 done
 # Supersession: a renamed or dropped stub must not leave a stale caller behind
