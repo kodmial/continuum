@@ -70,7 +70,7 @@ Provider, model, and limit details are configuration, not product policy:
 | `CONTINUUM_PR_AGENT_ENABLED` | `false` | Enable the optional PR-Agent provider. |
 | `PR_AGENT_API_BASE` | `http://127.0.0.1:<bridge_port>/v1` | OpenAI-compatible backend base. |
 | `PR_AGENT_MODEL` | `openai/continuum-review` | LiteLLM routing id (`openai/` prefix selects the bridge path). |
-| `PR_AGENT_MAX_TOKENS` | `4096` | Custom-model token/output cap. |
+| `PR_AGENT_MAX_TOKENS` | `128000` | Custom-model context cap used by PR-Agent prompt budgeting. |
 | `OPENCODE_MODEL` | `opencode/muse-spark-1.3-contributor-free` | Model the bridge infers with. |
 | `PR_AGENT_BRIDGE_PORT` | `18000` | Loopback port of the bridge. |
 | `PR_AGENT_OPENCODE_PORT` | `4096` | Loopback port of `opencode serve`. |
