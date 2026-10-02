@@ -2890,37 +2890,46 @@ class ContinuumTest < Minitest::Test
     assert_includes scheduler, "': declared blocked by '"
   end
 
-  # An issue carrying a child-owned marker belongs to a delegated worker. Both
-  # the candidate filter and the just-in-time re-check must skip it, and the
-  # marker must come from a knob rather than a literal.
-  def test_scheduler_skips_child_owned_issues_everywhere
+  # Child routing is repository-level. The installed caller and reusable
+  # scheduler both fail safe when CONTINUUM_ROLE=child, while legacy marker
+  # inputs stay accepted only for caller compatibility and have no routing role.
+  def test_scheduler_is_fail_safe_noop_for_child_role
     scheduler = workflow_body('continuum-issue-scheduler.yml')
-    assert_match(/function isChildOwned\(issue\) \{\s*\n\s*const body = issue\.body \|\| '';\s*\n\s*return \(\s*\n\s*body\.includes\(childOwnedMarker\) \|\|\s*\n\s*body\.includes\(legacyChildOwnedMarker\)/, scheduler,
-                 'isChildOwned must honour both the current and the legacy marker')
+    workflow = yaml(File.join(ROOT, '.github/workflows/continuum-issue-scheduler.yml'))
+    assert_equal "vars.CONTINUUM_ROLE != 'child'",
+                 workflow.fetch('jobs').fetch('schedule').fetch('if')
 
-    assert_includes scheduler, "CHILD_OWNED_MARKER: ${{ inputs.child_owned_marker || vars.CONTINUUM_CHILD_OWNED_MARKER || '<!-- continuum-child-owned -->' }}"
-    assert_includes scheduler, "LEGACY_CHILD_OWNED_MARKER: ${{ inputs.legacy_child_owned_marker || vars.CONTINUUM_LEGACY_CHILD_OWNED_MARKER || '<!-- runtime-worker-owned -->' }}"
+    stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-issue-scheduler.yml'))
+    caller_gate = stub.fetch('jobs').fetch('call').fetch('if')
+    assert_includes caller_gate, "vars.CONTINUUM_ROLE != 'child'"
 
-    # Call sites only — the `function isChildOwned(issue)` definition line is not
-    # a filter, it is the helper itself.
-    calls = scheduler.scan(/(?<!function )isChildOwned\((issue|freshIssue)\)/).flatten
-    assert_equal %w[freshIssue issue], calls.sort,
-                 'the child-owned filter must run both at selection time and just before dispatch'
+    refute_includes scheduler, 'function isChildOwned(issue)'
+    refute_includes scheduler, 'body.includes(childOwnedMarker)'
+    refute_includes scheduler, 'body.includes(legacyChildOwnedMarker)'
+    refute_includes scheduler, 'CHILD_OWNED_MARKER:'
+    refute_includes scheduler, 'LEGACY_CHILD_OWNED_MARKER:'
 
-    # The marker literals must live only in the fallback chain, not inline in
-    # the skip logic, or a consumer renaming its marker would be ignored. The
-    # assertion runs over the embedded script only — the `workflow_call`
-    # defaults are supposed to name these values.
-    engine = script_body('continuum-issue-scheduler.yml')
-    engine.lines.grep(/<!-- (continuum|runtime-worker)-(child-owned|owned) -->/).each do |line|
-      # A marker may appear in the engine only as the tail of a fallback chain
-      # (env, then `||` literal). Anywhere else — in isChildOwned, in the
-      # candidate filter, in the dispatch re-check — it would silently ignore a
-      # consumer that renamed its marker.
-      assert_match(/\|\|\s*'<!--\s/, line,
-                   "marker literal used outside a fallback chain: #{line.strip}")
-    end
-    assert_includes engine, 'function isChildOwned(issue) {'
+    inputs = events(workflow).fetch('workflow_call').fetch('inputs')
+    assert_includes inputs.fetch('child_owned_marker').fetch('description'), 'Deprecated'
+    assert_includes inputs.fetch('legacy_child_owned_marker').fetch('description'), 'Deprecated'
+  end
+
+  # The parent owns every open issue in a verified child. Priority labels only
+  # sort the queue; neither priorities nor historical body markers gate
+  # admission. Manual local OpenCode remains an explicit override.
+  def test_child_dispatcher_routes_all_open_issues_and_respects_local_override
+    dispatcher = workflow_body('continuum-consumer-child-dispatcher.yml')
+
+    refute_includes dispatcher, 'for priority in priority:p0 priority:p1 priority:p2'
+    refute_includes dispatcher, 'contains("<!-- continuum-child-owned -->")'
+    refute_includes dispatcher, 'contains("<!-- runtime-worker-owned -->")'
+    assert_includes dispatcher, 'sort_by(._continuum_priority_rank, .number)'
+    assert_includes dispatcher, 'else 3'
+    assert_includes dispatcher, 'local_opencode_pr_tasks'
+    assert_includes dispatcher, 'local_opencode_run_tasks'
+    assert_includes dispatcher, 'local_override_active "$task_number"'
+    assert_includes dispatcher, 'COMMAND_GRACE_MINUTES: ${{ vars.AUTOMATION_COMMAND_GRACE_MINUTES || \'5\' }}'
+    assert_includes dispatcher, 'select(.pull_request == null)'
   end
 
   # A manual owner `/oc` is real in-flight work: reserve it at once, and keep a
@@ -3067,8 +3076,6 @@ class ContinuumTest < Minitest::Test
       'MAX_DISPATCH_ATTEMPTS' => ['max_dispatch_attempts', '2', 'AUTOMATION_MAX_DISPATCH_ATTEMPTS'],
       'REQUIRE_PRIORITY_LABEL' => ['require_priority_label', 'false', 'AUTOMATION_REQUIRE_PRIORITY_LABEL'],
       'COMMAND_GRACE_MINUTES' => ['command_grace_minutes', '5', 'AUTOMATION_COMMAND_GRACE_MINUTES'],
-      'CHILD_OWNED_MARKER' => ['child_owned_marker', '<!-- continuum-child-owned -->', 'CONTINUUM_CHILD_OWNED_MARKER'],
-      'LEGACY_CHILD_OWNED_MARKER' => ['legacy_child_owned_marker', '<!-- runtime-worker-owned -->', 'CONTINUUM_LEGACY_CHILD_OWNED_MARKER'],
       'OPENCODE_WORKFLOW_NAME' => ['opencode_workflow_name', 'OpenCode agent', 'CONTINUUM_OPENCODE_WORKFLOW_NAME'],
       'OPENCODE_WORKFLOW_PATH' => ['opencode_workflow_path', '.github/workflows/continuum-opencode.yml', 'CONTINUUM_OPENCODE_WORKFLOW_PATH']
     }.each do |key, (input, expected, variable)|

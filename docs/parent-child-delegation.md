@@ -88,17 +88,31 @@ the project validation process. Validation output remains runner-local. Merge
 requires both independent review acceptance and successful deterministic
 validation.
 
-## Task opt-in
+## Repository-level task routing
 
-A child task is opt-in per issue. Add:
+A verified child relationship is the routing decision. When a repository has
+`CONTINUUM_ROLE=child` and its parent/child binding passes bidirectional
+verification, every open issue in that child is eligible for delegated execution
+by the parent. No issue-body ownership marker and no priority label is required.
 
-```html
-<!-- continuum-child-owned -->
-```
+Priority labels remain optional scheduling metadata only: when present,
+`priority:p0`, `priority:p1`, and `priority:p2` order work ahead of
+unprioritized issues. They never decide whether an issue belongs to the parent.
 
-The legacy `<!-- runtime-worker-owned -->` marker remains accepted during
-migration. The local scheduler skips both markers so local private Actions do
-not race the parent execution path.
+The local issue scheduler remains installed in the child repository, but both the
+installed caller and the reusable scheduler fail safe: when
+`CONTINUUM_ROLE=child`, local automatic scheduling is skipped. Workflow files
+are never added or removed when repository role variables change.
+
+A repository-owner `/oc` or `/opencode` comment is deliberately still allowed
+to start the existing local OpenCode workflow in the child. The parent dispatcher
+does not start a delegated worker for the same issue while it observes an active
+local OpenCode run, an open `opencode/issue<NUMBER>-...` pull request, or a
+recent owner command inside the configured command-grace window.
+
+The historical `<!-- continuum-child-owned -->` and
+`<!-- runtime-worker-owned -->` strings may remain in old issue bodies, but
+they are no longer routing inputs.
 
 ## Visibility is not routing
 
@@ -145,18 +159,16 @@ release, Render, and artifact workflows. The token is supplied through the
 parent's existing `TAP_PAT` secret; it must be able to read the relevant Actions
 repository variables and operate on the selected child repositories.
 
-Do not install the core set in a child repository as a migration
-shortcut. Its local scheduler and merge controller could compete with the
-parent. Existing children keep their opt-in ownership markers, neutral config,
-repository variables, and trusted base-branch validation script. Installing a
-parent set does not set variables or enroll repositories automatically.
+Core workflow files may remain installed in a child repository. Role changes are
+configuration-only: setting or clearing `CONTINUUM_ROLE=child` never requires
+deleting, restoring, or reinstalling workflow files. The local scheduler's
+child-role guard prevents automatic local issue execution while preserving the
+manual OpenCode entry point.
 
 The parent dispatcher wakes on main pushes, every ten minutes, manual dispatch,
-and completion of child task/review workflows. A repository's own scheduler can
-also dispatch `continuum-child-dispatcher.yml`; Runtime Lab already does this. Task
-execution and independent review remain separate; completed tasks are not
-resurrected, dependency-blocked tasks stay blocked, and owner-created PRs use
-the independent PR review workflow.
+and completion of child task/review workflows. Task execution and independent
+review remain separate; completed tasks are not resurrected, dependency-blocked
+tasks stay blocked, and owner-created PRs use the independent PR review workflow.
 
 ## Migration baseline
 

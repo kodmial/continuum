@@ -37,8 +37,8 @@ Fallback scripts are copied into the consumer's `scripts/` directory without ove
 ## Parent and child delegation
 
 See [Parent/child delegated execution](docs/parent-child-delegation.md) for the
-repository variables, opt-in task markers, validation gate, and `parent`
-installer set. Parent installation adds only child execution workflows;
+repository variables, repository-level task routing, validation gate, and
+`parent` installer set. Parent installation adds only child execution workflows;
 project CI and release workflows remain owned by the consumer.
 
 Run the Python suites with temporary files inside the worktree:

@@ -86,16 +86,16 @@ on:
         default: '5'
       child_owned_marker:
         description: >-
-          Hidden body marker reserving an issue for a delegated child worker, so
-          the local scheduler never dispatches it. Empty falls back to
-          CONTINUUM_CHILD_OWNED_MARKER.
+          Deprecated compatibility input. Repository-level child routing is
+          controlled by CONTINUUM_ROLE; issue body markers no longer affect
+          scheduler admission.
         type: string
         required: false
         default: '<!-- continuum-child-owned -->'
       legacy_child_owned_marker:
         description: >-
-          Legacy spelling of child_owned_marker, still accepted while a consumer
-          migrates. Empty falls back to CONTINUUM_LEGACY_CHILD_OWNED_MARKER.
+          Deprecated compatibility input retained so older callers keep working.
+          Legacy issue body markers no longer affect scheduler admission.
         type: string
         required: false
         default: '<!-- runtime-worker-owned -->'
@@ -186,6 +186,9 @@ concurrency:
 
 jobs:
   schedule:
+    # Repository role is the routing authority. A child keeps this workflow
+    # installed, but local automatic scheduling is fail-safe disabled.
+    if: vars.CONTINUUM_ROLE != 'child'
     runs-on: ubuntu-latest
     timeout-minutes: ${{ fromJSON(vars.AUTOMATION_SCHEDULER_TIMEOUT_MINUTES || '5') }}
     env:
@@ -199,8 +202,6 @@ jobs:
       RESET_MARKERS: ${{ inputs.reset_markers || 'false' }}
       REQUIRE_PRIORITY_LABEL: ${{ inputs.require_priority_label || vars.AUTOMATION_REQUIRE_PRIORITY_LABEL || 'false' }}
       COMMAND_GRACE_MINUTES: ${{ inputs.command_grace_minutes || vars.AUTOMATION_COMMAND_GRACE_MINUTES || '5' }}
-      CHILD_OWNED_MARKER: ${{ inputs.child_owned_marker || vars.CONTINUUM_CHILD_OWNED_MARKER || '<!-- continuum-child-owned -->' }}
-      LEGACY_CHILD_OWNED_MARKER: ${{ inputs.legacy_child_owned_marker || vars.CONTINUUM_LEGACY_CHILD_OWNED_MARKER || '<!-- runtime-worker-owned -->' }}
       OPENCODE_WORKFLOW_NAME: ${{ inputs.opencode_workflow_name || vars.CONTINUUM_OPENCODE_WORKFLOW_NAME || 'OpenCode agent' }}
       OPENCODE_WORKFLOW_PATH: ${{ inputs.opencode_workflow_path || vars.CONTINUUM_OPENCODE_WORKFLOW_PATH || '.github/workflows/continuum-opencode.yml' }}
       DISPATCH_REF: ${{ inputs.dispatch_ref || vars.CONTINUUM_DISPATCH_REF || 'main' }}
@@ -259,10 +260,6 @@ jobs:
               (process.env.RESET_MARKERS || 'false') === 'true';
             const requirePriorityLabel =
               (process.env.REQUIRE_PRIORITY_LABEL || 'false') === 'true';
-            const childOwnedMarker =
-              process.env.CHILD_OWNED_MARKER || '<!-- continuum-child-owned -->';
-            const legacyChildOwnedMarker =
-              process.env.LEGACY_CHILD_OWNED_MARKER || '<!-- runtime-worker-owned -->';
             const opencodeWorkflowName =
               process.env.OPENCODE_WORKFLOW_NAME || 'OpenCode agent';
             const opencodeWorkflowPath =
@@ -337,18 +334,6 @@ jobs:
               (process.env.COUNT_OPEN_PRS_AS_WIP || 'true') !== 'false';
             const pauseOnFailure =
               (process.env.PAUSE_ON_FAILURE || 'true') !== 'false';
-
-            // Issues explicitly owned by a delegated child worker must never be
-            // dispatched through this repository's OpenCode Actions path. The
-            // control plane intentionally knows only the markers; which child
-            // owns them is the consumer's repository-variable business.
-            function isChildOwned(issue) {
-              const body = issue.body || '';
-              return (
-                body.includes(childOwnedMarker) ||
-                body.includes(legacyChildOwnedMarker)
-              );
-            }
 
             // Byte-for-byte the marker the watchdog parses. A doubled backslash
             // here would silently disable declared-dependency blocking.
@@ -961,14 +946,6 @@ jobs:
               // when it is configured not to consume a WIP slot.
               if (openPrIssues.has(issue.number)) continue;
 
-              if (isChildOwned(issue)) {
-                core.info(
-                  'Skipping #' + issue.number +
-                  ': reserved for a delegated child worker.'
-                );
-                continue;
-              }
-
               const labels = labelsByIssue.get(issue.number);
               if (pauseOnFailure && labels.has(pausedLabel)) {
                 core.info('Skipping #' + issue.number + ': automation is paused.');
@@ -1080,14 +1057,6 @@ jobs:
                   typeof label === 'string' ? label : label.name
                 )
               );
-
-              if (isChildOwned(freshIssue)) {
-                core.info(
-                  'Skipping #' + issue.number +
-                  ': child-worker ownership appeared before dispatch.'
-                );
-                continue;
-              }
 
               if (
                 freshIssue.state !== 'open' ||

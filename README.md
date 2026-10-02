@@ -267,6 +267,12 @@ bash install.sh /path/to/parent-plane <sha> parent
   match an id in the parent's `CONTINUUM_CHILDREN`), `CONTINUUM_PARENT=<owner>/<repo>`
   (must equal the calling parent exactly), and optionally
   `CONTINUUM_VALIDATION_SCRIPT=<repo-relative .sh path>`.
+- Every open issue is parent-routed automatically; priority labels are optional
+  ordering hints, not admission requirements, and issue-body ownership markers
+  are not required.
+- The local issue scheduler remains installed but is fail-safe skipped while
+  `CONTINUUM_ROLE=child`. Manual owner `/oc` and `/opencode` commands still
+  use the existing local OpenCode workflow.
 - A trusted validation script on the **base** branch is executed against the
   candidate worktree with a minimal `env -i` environment.
 - Discovery is fail-closed: zero or multiple repositories matching the
