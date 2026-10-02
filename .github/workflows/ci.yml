@@ -12,72 +12,7 @@ permissions:
   statuses: write
 
 jobs:
-  # Temporary Work Lock #19 verification gate. It is inert for every PR except
-  # the explicitly labeled disposable canary and is removed after evidence is
-  # recorded. The production review/merge engine remains unchanged.
-  review-proof:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Require a real non-author approval on the labeled canary
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
-        with:
-          script: |
-            if (context.eventName !== 'pull_request') {
-              core.info('Not a pull_request event; review canary gate is inactive.');
-              return;
-            }
-
-            const pr = context.payload.pull_request;
-            const requiredLabel = 'work-lock-19-review-required';
-            const labels = new Set((pr.labels || []).map(label => label.name));
-            if (!labels.has(requiredLabel)) {
-              core.info('Review canary label absent; gate is inactive.');
-              return;
-            }
-
-            const reviews = await github.paginate(github.rest.pulls.listReviews, {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: pr.number,
-              per_page: 100,
-            });
-
-            const latestByReviewer = new Map();
-            for (const review of reviews) {
-              const login = review.user?.login;
-              if (!login) continue;
-              const previous = latestByReviewer.get(login);
-              const currentAt = new Date(review.submitted_at || 0).getTime();
-              const previousAt = previous
-                ? new Date(previous.submitted_at || 0).getTime()
-                : -1;
-              if (
-                !previous ||
-                currentAt > previousAt ||
-                (currentAt === previousAt && Number(review.id) > Number(previous.id))
-              ) {
-                latestByReviewer.set(login, review);
-              }
-            }
-
-            const approval = [...latestByReviewer.values()].find(review =>
-              review.user?.login !== pr.user?.login &&
-              review.state === 'APPROVED'
-            );
-
-            if (!approval) {
-              core.setFailed(
-                'Work Lock #19 review canary requires a real APPROVED review from a non-author.'
-              );
-              return;
-            }
-
-            core.notice(
-              `Work Lock #19 review canary approved by ${approval.user.login} at head ${pr.head.sha}.`
-            );
-
   validate:
-    needs: review-proof
     uses: ./.github/workflows/continuum-validation.yml
     secrets: inherit
     with:
