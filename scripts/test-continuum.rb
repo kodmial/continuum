@@ -2885,7 +2885,9 @@ class ContinuumTest < Minitest::Test
     scheduler = workflow_body('continuum-issue-scheduler.yml')
     # It must be a live parser, not a literal: numbers are extracted and read.
     assert_includes scheduler, '[...match[1].matchAll(/\d+/g)]'
-    assert_includes scheduler, 'async function openDeclaredBlockers(issue) {'
+    assert_includes scheduler, 'async function openDeclaredBlockers('
+    assert_includes scheduler, 'targetOwner = owner'
+    assert_includes scheduler, 'targetRepo = repo'
     # …and it must actually gate candidate selection.
     assert_includes scheduler, 'const declaredOpenBlockers = await openDeclaredBlockers(issue);'
     assert_includes scheduler, "': declared blocked by '"
@@ -2973,7 +2975,7 @@ class ContinuumTest < Minitest::Test
   # condition has to be a skip.
   def test_scheduler_rechecks_state_just_before_dispatch
     scheduler = workflow_body('continuum-issue-scheduler.yml')
-    dispatch = scheduler[/for \(const \{ issue, priority \} of selected\) \{\n(.*?)\n              await addLabel\(issue\.number, inProgressLabel\);/m, 1]
+    dispatch = scheduler[/for \(const candidate of selected\) \{\n(.*?)\n              await addLabel\(issue\.number, inProgressLabel\);/m, 1]
     refute_nil dispatch, 'the just-in-time re-check block is gone'
 
     [
@@ -2985,8 +2987,10 @@ class ContinuumTest < Minitest::Test
       'freshOpenBlockers.length > 0',
       'if (commandAgeMs < commandGraceMs) {'
     ].each { |guard| assert_includes dispatch, guard, "missing just-in-time guard: #{guard}" }
-    assert_equal 4, dispatch.scan(/^\s+continue;\s*$/).size,
-                 'every just-in-time guard must be a skip, not a fall-through'
+    local_dispatch = dispatch[/\/\/ Re-check mutable state immediately before dispatch\..*\z/m]
+    refute_nil local_dispatch, 'the local just-in-time re-check block is gone'
+    assert_equal 4, local_dispatch.scan(/^\s+continue;\s*$/).size,
+                 'every local just-in-time guard must be a skip, not a fall-through'
   end
 
   # Closed issues are terminal scheduler state. A stale in-progress label on a
