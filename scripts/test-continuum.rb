@@ -3281,6 +3281,74 @@ class ContinuumTest < Minitest::Test
     end
   end
 
+  # A task implementation command must obey the same dependency/DoR gate as
+  # the scheduler. Manual /oc is not an escape hatch that may turn a blocked
+  # tracking issue into a partial PR.
+  def test_issue_mode_checks_definition_of_ready_before_starting_the_agent
+    body = workflow_body('continuum-opencode.yml')
+
+    assert_includes body, '- name: Check issue Definition of Ready'
+    assert_includes body, '/<!--\s*automation-blocked-by:\s*([0-9#\s,]+?)\s*-->/i'
+    assert_includes body, "'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by'"
+    assert_includes body, "core.setOutput('ready', 'false');"
+    assert_includes body, 'Continuum will not create a partial PR for a blocked/umbrella task.'
+
+    assert_match(/- name: Implement issue\n\s+if: >-\n\s+steps\.issue_readiness\.outputs\.ready != 'false'/, body)
+    assert_match(/- name: Install OpenCode CLI for automated repair\n\s+if: github\.event_name == 'workflow_dispatch' && steps\.issue_readiness\.outputs\.ready != 'false'/, body)
+    assert_match(/- name: Install OpenCode CLI for interactive agent\n\s+if: github\.event_name != 'workflow_dispatch' && steps\.issue_readiness\.outputs\.ready != 'false'/, body)
+    assert_includes body, 'Do not turn a tracking/umbrella issue or a task with unmet prerequisites into a partial PR.'
+  end
+
+  # CodeRabbit can submit CHANGES_REQUESTED for a policy/pre-merge failure with
+  # no code finding at all. That state is not a coding-agent repair request.
+  def test_coderabbit_policy_blocker_is_classified_before_opencode_dispatch
+    body = workflow_body('continuum-opencode.yml')
+    job = body[/^  dispatch-coderabbit-fix:\n(.*?)(?=^  opencode:)/m, 1]
+    refute_nil job, 'dispatch-coderabbit-fix job is missing'
+
+    classifier = job.index("if (reviewState === 'changes_requested' && findings.length === 0)")
+    dispatch = job.index('github.rest.actions.createWorkflowDispatch')
+    refute_nil classifier, 'CHANGES_REQUESTED without inline findings is not classified'
+    refute_nil dispatch, 'actionable CodeRabbit repair dispatch is missing'
+    assert_operator classifier, :<, dispatch,
+                    'non-code review verdict must be classified before any OpenCode dispatch'
+
+    assert_includes job, "context: convergenceContext"
+    assert_includes job, "state: 'error'"
+    assert_includes job, "const convergenceContext = 'continuum/review-convergence';"
+    assert_includes job, 'No OpenCode repair was dispatched for this unchanged HEAD.'
+    assert_includes job, "if (reviewState === 'approved')"
+    assert_includes job, "state: 'success'",
+                    'a later same-head approval must clear the convergence blocker'
+  end
+
+  # One exact HEAD plus one non-code blocker is a terminal no-progress state.
+  # Both the global review queue and auto-merge reconciler must honour it rather
+  # than repeatedly buying another CodeRabbit review of identical code.
+  def test_coderabbit_no_progress_status_stops_same_head_requeue
+    retry_body = workflow_body('continuum-coderabbit-retry.yml')
+    merge_body = auto_merge_body
+
+    assert_includes retry_body, "status.context === 'continuum/review-convergence'"
+    assert_includes retry_body, "if (convergenceStatus?.state === 'error')"
+    assert_includes retry_body, 'it is not eligible for automatic re-review until state changes.'
+
+    assert_includes merge_body, "status.context === 'continuum/review-convergence'"
+    assert_includes merge_body, "reviewConvergenceStatus?.state === 'error'"
+    assert_includes merge_body, 'automatic review/fix retries are suppressed.'
+  end
+
+  # Inline findings already have an independent thread-verification protocol.
+  # If OpenCode decides no code change is needed, do not start another full
+  # review loop for the same inline findings. Body-only nitpicks retain one
+  # bounded full re-review because they have no thread of their own.
+  def test_unchanged_inline_coderabbit_fix_does_not_force_full_rereview
+    body = workflow_body('continuum-opencode.yml')
+    assert_includes body,
+                    'if (findings.length === 0 && reviewedSha && headSha === reviewedSha) {'
+    refute_match(/\n\s*if \(reviewedSha && headSha === reviewedSha\) \{/, body)
+  end
+
   # ------------------------------------------------- auto-merge / CodeRabbit
 
   def auto_merge_body
