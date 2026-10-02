@@ -247,22 +247,25 @@ jobs:
           resolver="$CONTINUUM_ENGINE_ROOT/.github/scripts/delegation_repository.sh"
           plan="$(PARENT_CONFIG=.continuum.yml CHILD_REPOSITORIES="" bash "$resolver" plan)"
 
-          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs?per_page=100" \
-            --jq '.workflow_runs[]
-              | select(.status == "completed")
-              | select(
-                  .name == "SubTask" or
-                  .name == "SubTask review" or
-                  .name == "SubTask PR review" or
-                  .name == "Child task" or
-                  .name == "Child review" or
-                  .name == "Child PR review" or
-                  .name == "Child dispatcher" or
-                  .name == "Worker task" or
-                  .name == "Worker review" or
-                  .name == "Worker dispatcher"
-                )
-              | .id' 2>/dev/null |
+          # Keep Actions-history inspection bounded. Three pages cover the latest
+          # 300 completed runs without walking the repository's entire run history.
+          for page in 1 2 3; do
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs?status=completed&per_page=100&page=$page" \
+              --jq '.workflow_runs[]
+                | select(
+                    .name == "SubTask" or
+                    .name == "SubTask review" or
+                    .name == "SubTask PR review" or
+                    .name == "Child task" or
+                    .name == "Child review" or
+                    .name == "Child PR review" or
+                    .name == "Child dispatcher" or
+                    .name == "Worker task" or
+                    .name == "Worker review" or
+                    .name == "Worker dispatcher"
+                  )
+                | .id' 2>/dev/null || break
+          done |
           while IFS= read -r run_id; do
             [[ -n "$run_id" ]] || continue
             [[ "$run_id" == "$GITHUB_RUN_ID" ]] && continue
@@ -389,13 +392,17 @@ jobs:
                 | sed -nE 's#^opencode/issue([0-9]+)-.*#\1#p'
             )"
             local_opencode_run_tasks="$(
-              gh api --paginate "repos/$child_repo/actions/runs?per_page=100" \
-                --jq '.workflow_runs[]
-                  | select(.status != "completed")
-                  | .display_title
-                  | select(test("^OpenCode issue #[0-9]+$"))
-                  | capture("^OpenCode issue #(?<task>[0-9]+)$").task' \
-                2>/dev/null || true
+              # The scheduler only needs recent active work. Bound this lookup to
+              # the latest 300 runs instead of paginating the full Actions history.
+              for page in 1 2 3; do
+                gh api "repos/$child_repo/actions/runs?per_page=100&page=$page" \
+                  --jq '.workflow_runs[]
+                    | select(.status != "completed")
+                    | .display_title
+                    | select(test("^OpenCode issue #[0-9]+$"))
+                    | capture("^OpenCode issue #(?<task>[0-9]+)$").task' \
+                  2>/dev/null || break
+              done
             )"
             child_owner="$(gh api "repos/$child_repo" --jq '.owner.login' 2>/dev/null || true)"
             command_grace_seconds=$(( COMMAND_GRACE_MINUTES * 60 ))
@@ -1104,14 +1111,21 @@ jobs:
             // Active/pending OpenCode Actions are authoritative in-flight work.
             // Without this, lease expiry releases an issue while GitHub is still
             // running or queueing its implementation.
-            const workflowRuns = await github.paginate(
-              github.rest.actions.listWorkflowRunsForRepo,
-              {
-                owner,
-                repo,
-                per_page: 100,
-              }
-            );
+            // The scheduler only needs recent active work. Never paginate the
+            // complete Actions history: large repositories can exhaust the
+            // GitHub API quota during a single reconciliation pass.
+            const workflowRuns = [];
+            for (let page = 1; page <= 3; page += 1) {
+              const { data } =
+                await github.rest.actions.listWorkflowRunsForRepo({
+                  owner,
+                  repo,
+                  per_page: 100,
+                  page,
+                });
+              workflowRuns.push(...data.workflow_runs);
+              if (data.workflow_runs.length < 100) break;
+            }
 
             const activeRunIssues = new Set();
             for (const run of workflowRuns) {
