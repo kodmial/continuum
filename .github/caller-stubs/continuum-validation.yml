@@ -1,0 +1,30 @@
+name: Consumer validation
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number to validate
+        required: false
+        type: string
+
+permissions:
+  actions: write
+  contents: read
+  pull-requests: read
+  statuses: write
+
+concurrency:
+  group: continuum-validation-${{ github.repository }}-${{ inputs.pr_number || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  call:
+    uses: kodmial/continuum/.github/workflows/continuum-validation.yml@main
+    secrets: inherit
+    with:
+      continuum_ref: main
+      pr_number: "${{ inputs.pr_number }}"

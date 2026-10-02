@@ -811,7 +811,7 @@ class ContinuumTest < Minitest::Test
       assert_equal CORE_STUBS.size, counts['core']
       assert_equal CORE_STUBS.size + TECH_STUBS.size, counts['tech']
       assert_equal ALL_STUBS.size, counts['parent']
-      assert_equal 23, ALL_STUBS.size,
+      assert_equal 24, ALL_STUBS.size,
                    'every caller Continuum ships, across all three layers'
     end
   end
@@ -1189,7 +1189,7 @@ class ContinuumTest < Minitest::Test
   # feature does — moved both sides and passed. A literal is the third,
   # independent source: to ship a fifteenth core caller someone has to say so
   # here, which is where a reviewer sees it.
-  CORE_COUNT = 14
+  CORE_COUNT = 15
 
   # Every core workflow is either called by a stub in one of the three layers
   # or is Continuum's own CI. A workflow nobody calls is a dead file that
@@ -2780,7 +2780,8 @@ class ContinuumTest < Minitest::Test
     ],
     'continuum-opencode-unresolved.yml' => %w[continuum_ref],
     'continuum-pr-agent.yml' => %w[continuum_ref],
-    'continuum-remove-review-label.yml' => %w[continuum_ref]
+    'continuum-remove-review-label.yml' => %w[continuum_ref],
+    'continuum-validation.yml' => %w[continuum_ref pr_number]
   }.freeze
 
   # A stub that pins an input to a literal overrides the consumer's own
@@ -3784,6 +3785,34 @@ class ContinuumTest < Minitest::Test
     assert_equal '', prefix.fetch('default'),
                  'the fallback chain supplies `fix`, so the input itself must default to empty'
     assert_includes prefix.fetch('description'), 'vars.CONTINUUM_ISSUE_COMMIT_PREFIX'
+  end
+
+
+  def test_generic_validation_contract_is_consumer_neutral_and_executable
+    workflow = yaml(File.join(ROOT, '.github/workflows/continuum-validation.yml'))
+    inputs = events(workflow).fetch('workflow_call').fetch('inputs')
+
+    assert_equal '', inputs.fetch('runner').fetch('default')
+    %w[prepare_command build_command test_command validation_command package_command release_command].each do |name|
+      assert_equal '', inputs.fetch(name).fetch('default'), name
+    end
+    assert_equal '', inputs.fetch('artifact_paths').fetch('default')
+    assert_equal '', inputs.fetch('artifact_name').fetch('default')
+    assert_equal '', inputs.fetch('repair_workflow').fetch('default')
+
+    raw = workflow_body('continuum-validation.yml')
+    %w[Python Node Java Go Rust Docker].each { |stack| assert_includes raw, stack }
+    assert_includes raw, 'createCommitStatus'
+    assert_includes raw, 'createWorkflowDispatch'
+    assert_includes raw, 'actions/upload-artifact@'
+    assert_includes raw, 'eval "$command"'
+    refute_match(/nanodictate|kodmai|runtime-lab/i, raw)
+
+    stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-validation.yml'))
+    call = stub.fetch('jobs').fetch('call')
+    assert_equal 'kodmial/continuum/.github/workflows/continuum-validation.yml@main', call.fetch('uses')
+    assert_equal '${{ inputs.pr_number }}', call.fetch('with').fetch('pr_number')
+    assert_includes raw, "vars.CONTINUUM_RUNNER || 'ubuntu-latest'"
   end
 
   end
