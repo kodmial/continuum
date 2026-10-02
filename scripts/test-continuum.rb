@@ -2379,7 +2379,7 @@ class ContinuumTest < Minitest::Test
     # reader can see which workflows the count excludes and why.
     assert_match(/three live `continuum-consumer-child-\*` worker\/review workflows live in/, doc,
                  'the doc must say where the live child workflows live')
-    assert_match(/installed\s+only by the `parent` set/, doc,
+    assert_match(/installed\s+only by the\s+`parent` set/, doc,
                  'the doc must say the child workflows are installed only by the parent set')
   end
 
