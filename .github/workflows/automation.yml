@@ -76,9 +76,22 @@ jobs:
       github.event_name == 'pull_request_review' ||
       github.event_name == 'status' ||
       github.event_name == 'push' ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request != null &&
+       github.actor == github.repository_owner &&
+       github.event.comment.body == '/work-lock-19-review-gate') ||
       (github.event_name == 'schedule' && github.event.schedule == '17,47 * * * *') ||
       (github.event_name == 'workflow_run' && github.event.workflow_run.name == 'CI')
     uses: ./.github/workflows/continuum-auto-merge.yml
     secrets: inherit
     with:
       continuum_ref: main
+      # Temporary Work Lock #19 live-verification ingress. Only the exact
+      # owner command on a PR turns on the existing shared CodeRabbit gate;
+      # normal self-dogfood events keep the repository's configured default.
+      require_coderabbit: >-
+        ${{ github.event_name == 'issue_comment' &&
+            github.event.issue.pull_request != null &&
+            github.actor == github.repository_owner &&
+            github.event.comment.body == '/work-lock-19-review-gate' &&
+            'true' || '' }}
