@@ -1,382 +1,107 @@
-# This is a technology-layer workflow (opt-in, library). It is NOT triggered by Continuum itself.
-# Naming: continuum-tech-<tech>-<name>.yml (the `continuum-tech-<tech>-` prefix marks the library).
+# Optional consumer-neutral Swift profile over the generic validation contract.
+# Product packaging, signing and release policy belong to the consumer.
 
-name: CI
+name: Swift CI profile
 
 on:
   workflow_call:
     inputs:
+      runner:
+        description: Optional Swift runner override
+        required: false
+        type: string
+        default: ''
+      timeout_minutes:
+        description: Optional validation timeout
+        required: false
+        type: string
+        default: ''
+      prepare_command:
+        description: Optional consumer preparation hook
+        required: false
+        type: string
+        default: ''
+      build_command:
+        description: Optional Swift build command
+        required: false
+        type: string
+        default: ''
+      test_command:
+        description: Optional Swift test command
+        required: false
+        type: string
+        default: ''
+      validation_command:
+        description: Optional additional validation hook
+        required: false
+        type: string
+        default: ''
+      artifact_paths:
+        description: Optional newline-separated artifacts
+        required: false
+        type: string
+        default: ''
+      artifact_name:
+        description: Optional artifact bundle name
+        required: false
+        type: string
+        default: ''
+      status_context:
+        description: Optional commit-status context
+        required: false
+        type: string
+        default: ''
+      publish_status:
+        description: Optional status publication override
+        required: false
+        type: string
+        default: ''
+      dispatch_repair:
+        description: Optional repair dispatch override
+        required: false
+        type: string
+        default: ''
+      repair_workflow:
+        description: Optional repair workflow file
+        required: false
+        type: string
+        default: ''
+      pr_number:
+        description: Optional pull request number for manual validation
+        required: false
+        type: string
+        default: ''
+      skip_opencode_pull_request:
+        description: Optional duplicate OpenCode PR suppression
+        required: false
+        type: string
+        default: ''
       continuum_ref:
-        description: Continuum revision supplying fallback scripts
+        description: Continuum revision supplying the generic validation engine
+        required: false
         type: string
         default: main
-        required: false
-      native_prepare_command:
-        description: >-
-          Optional consumer command that prepares a native/static dependency
-          before Swift builds (for example a Rust static library build).
-        type: string
-        default: ''
-        required: false
-      static_archive_path:
-        description: >-
-          Optional repository-relative static archive passed to SwiftPM via
-          -Xlinker for build and coverage-test linking.
-        type: string
-        default: ''
-        required: false
 
-permissions:
-  contents: read
-  pull-requests: read
-
-# Keep only the newest CI for each PR/branch. Automatic main synchronization can
-# create several short-lived heads in quick succession; stale macOS jobs must
-# not consume runner capacity ahead of the current head.
-concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+permissions: {}
 
 jobs:
-  classify-changes:
-    name: Classify changes
-    runs-on: ubuntu-latest
-    outputs:
-      build_required: ${{ steps.classify.outputs.build_required }}
-    steps:
-      - name: Decide whether macOS build is required
-        id: classify
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
-        with:
-          script: |
-            // Pushes that reach this workflow already passed paths-ignore above.
-            if (context.eventName !== 'pull_request') {
-              core.setOutput('build_required', 'true');
-              return;
-            }
-
-            const files = await github.paginate(github.rest.pulls.listFiles, {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: context.issue.number,
-              per_page: 100,
-            });
-
-            const pr = context.payload.pull_request;
-            const repoFullName = `${context.repo.owner}/${context.repo.repo}`;
-            const filenames = files.map(({ filename }) => filename);
-            const sameRepo = pr.head.repo?.full_name === repoFullName;
-            const labelNames = new Set((pr.labels || []).map(label => label.name));
-
-            // Generated release PRs are data-only changes. Do not spend a macOS
-            // runner rebuilding application code that did not change. The fast
-            // path is deliberately strict: same-repository automation branch,
-            // expected lifecycle marker (for release-please), and no file
-            // outside the generator-owned allow-list. Anything unexpected falls
-            // back to the normal full build instead of being trusted.
-            const releaseFiles = new Set([
-              '.release-please-manifest.json',
-              'CHANGELOG.md',
-              'Sources/NanoDictateCore/Version.swift',
-            ]);
-            const manifestFiles = new Set([
-              'nanodictate.rb',
-              'packaging/homebrew/nanodictate.rb',
-              'packaging/homebrew/Casks/nanodictate.rb',
-              'packaging/macports/Portfile',
-              'scripts/install-macports.sh',
-            ]);
-            const onlyAllowed = (allowed) =>
-              filenames.length > 0 && filenames.every(path => allowed.has(path));
-
-            const trustedReleasePr =
-              sameRepo &&
-              pr.head.ref === 'release-please--branches--main' &&
-              labelNames.has('autorelease: pending') &&
-              onlyAllowed(releaseFiles);
-            const trustedManifestPr =
-              sameRepo &&
-              pr.head.ref.startsWith('chore/release-manifests-v') &&
-              onlyAllowed(manifestFiles);
-
-            if (trustedReleasePr || trustedManifestPr) {
-              core.notice(
-                `Trusted generated ${trustedReleasePr ? 'Release' : 'manifest'} PR: skipping macOS build/tests; lightweight policy jobs remain required.`
-              );
-              core.info(`Changed files: ${filenames.join(', ')}`);
-              core.setOutput('build_required', 'false');
-              return;
-            }
-
-            // Keep this intentionally conservative: only documentation-only PRs
-            // skip the expensive macOS runner. Any non-documentation file means
-            // the normal build, lint, and test job still runs.
-            const isDocumentationOnlyPath = (path) =>
-              path.startsWith('docs/') ||
-              path.endsWith('.md') ||
-              path === 'LICENSE';
-
-            const docsOnly = files.length > 0 && files.every(({ filename }) =>
-              isDocumentationOnlyPath(filename)
-            );
-
-            core.info(`Changed files: ${filenames.join(', ')}`);
-            core.info(docsOnly
-              ? 'Documentation-only PR: skipping macOS build and tests.'
-              : 'Code or non-documentation change detected: macOS build and tests are required.');
-            core.setOutput('build_required', docsOnly ? 'false' : 'true');
-
-  # The release policy that decides whether a merge into main needs a Release
-  # PR update lives in scripts/release-policy.sh (used by release-pr.yml). It is
-  # plain bash, so it is tested on Linux against real git diff output.
-  release-policy:
-    name: Release policy
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          # This job runs scripts/test-release-policy.sh from the checked-out PR on
-          # pull_request events, so the token must not stay in .git/config where
-          # that code could reuse it (CWE-522).
-          persist-credentials: false
-
-      - name: Ensure Continuum scripts available
-        if: hashFiles('scripts/release-policy.sh') == ''
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          repository: kodmial/continuum
-          ref: ${{ inputs.continuum_ref || 'main' }}
-          path: .continuum
-          persist-credentials: false
-
-      - name: Copy missing Continuum scripts
-        if: hashFiles('scripts/release-policy.sh') == ''
-        run: |
-          mkdir -p scripts
-          rsync -a --ignore-existing .continuum/scripts/ scripts/
-
-      - name: Test the release policy
-        run: bash scripts/test-release-policy.sh
-
-  # Version ownership: only the automated Release PR branch may touch
-  # Sources/NanoDictateCore/Version.swift or .release-please-manifest.json.
-  # Ordinary PRs never reserve the next version, so concurrent merges cannot
-  # race or pick duplicate versions — version selection is serialized in the
-  # Release PR at release time (issue #10). Runs on pull_request only: pushes
-  # to main are merges that already passed this gate as PRs.
-  version-ownership:
-    name: Version ownership
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          fetch-depth: 0
-          # The checked-out PR code is only diffed here, so the token must not
-          # stay in .git/config where that code could reuse it (CWE-522).
-          persist-credentials: false
-
-      - name: Ensure Continuum scripts available
-        if: hashFiles('scripts/release-policy.sh') == ''
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          repository: kodmial/continuum
-          ref: ${{ inputs.continuum_ref || 'main' }}
-          path: .continuum
-          persist-credentials: false
-
-      - name: Copy missing Continuum scripts
-        if: hashFiles('scripts/release-policy.sh') == ''
-        run: |
-          mkdir -p scripts
-          rsync -a --ignore-existing .continuum/scripts/ scripts/
-
-      - name: Require consumer identity variables
-        env:
-          VERSION_FILE: ${{ vars.CONTINUUM_VERSION_FILE }}
-          CORE_TEST_TARGET: ${{ vars.CONTINUUM_CORE_TEST_TARGET }}
-        run: |
-          set -euo pipefail
-          missing=()
-          [[ -n "${VERSION_FILE:-}" ]] || missing+=('CONTINUUM_VERSION_FILE')
-          [[ -n "${CORE_TEST_TARGET:-}" ]] || missing+=('CONTINUUM_CORE_TEST_TARGET')
-          if (( ${#missing[@]} > 0 )); then
-            echo "::error::Missing repository variables: ${missing[*]}" >&2
-            exit 1
-          fi
-
-      - name: Reject hand-written version bumps
-        env:
-          HEAD_REF: ${{ github.head_ref }}
-          SAME_REPO: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          # Version-file ownership moves with the version source itself: the
-          # automated Release PR owns this file, ordinary PRs never bump it.
-          VERSION_FILE: ${{ vars.CONTINUUM_VERSION_FILE }}
-        run: |
-          set -euo pipefail
-          # shellcheck source=scripts/release-policy.sh
-          source scripts/release-policy.sh
-          CHANGED=$(git diff --name-only "$BASE_SHA...$HEAD_SHA")
-          echo "Changed files:"
-          printf '%s\n' "$CHANGED" | sed 's/^/  /'
-          # A fork can name its branch like the Release PR branch, so the
-          # branch name alone must not confer trust — only a same-repo head
-          # counts as the Release PR.
-          if [[ "$SAME_REPO" != "true" ]]; then HEAD_REF="fork:${HEAD_REF}"; fi
-          if policy_check_version_ownership "$HEAD_REF" "$CHANGED"; then
-            echo "Version ownership ok — no hand-written version bump."
-          elif policy_is_version_seeding \
-            "$(git show "$BASE_SHA:$VERSION_FILE" 2>/dev/null || true)" \
-            "$(git show "$HEAD_SHA:$VERSION_FILE" 2>/dev/null || true)" \
-            "$(git show "$BASE_SHA:.release-please-manifest.json" 2>/dev/null || true)" \
-            "$(git show "$HEAD_SHA:.release-please-manifest.json" 2>/dev/null || true)"; then
-            echo "Version ownership ok — one-time release-please bootstrap (manifest seeded at the current version, version-file version unchanged)."
-          else
-            echo "::error::PR '$HEAD_REF' touches Version.swift or .release-please-manifest.json. The next version is owned by the automated Release PR (release-pr.yml): remove the version bump from this PR and merge normally — the changes will ride along with the next Release PR."
-            exit 1
-          fi
-
-  build-and-test:
-    name: Build & Test (macOS)
-    needs: classify-changes
-    if: needs.classify-changes.outputs.build_required == 'true'
-    # macos-latest tracks macOS 26 (Xcode 26, SDK 26.5), too new for any
-    # current swift.org toolchain. macos-15 pins the macOS 15.5 SDK, which
-    # the Swift 6.1 toolchain parses cleanly.
-    runs-on: macos-15
-    timeout-minutes: 30
-    steps:
-      - name: Checkout
-        # Pin actions/checkout@v4 to a full commit SHA (CWE-829: mutable tag
-        # could be swapped upstream; the job runs with a 'contents: read' token).
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-
-      - name: Select preinstalled Swift 6.1
-        shell: bash
-        run: |
-          set -euo pipefail
-          selected=""
-          for xcode in /Applications/Xcode_16.4.app /Applications/Xcode_16.3.app; do
-            developer_dir="$xcode/Contents/Developer"
-            [[ -d "$developer_dir" ]] || continue
-            version="$(DEVELOPER_DIR="$developer_dir" xcrun swift --version 2>&1)"
-            echo "$xcode: $version"
-            if [[ "$version" == *"Swift version 6.1"* ]]; then
-              selected="$developer_dir"
-              break
-            fi
-          done
-          if [[ -z "$selected" ]]; then
-            echo "::error::No preinstalled Xcode with Swift 6.1 found on $(sw_vers -productVersion). Available Xcodes:"
-            ls -1d /Applications/Xcode*.app 2>/dev/null || true
-            exit 1
-          fi
-          echo "DEVELOPER_DIR=$selected" >> "$GITHUB_ENV"
-          echo "::notice::Using preinstalled Swift toolchain from $selected (no network install)."
-          DEVELOPER_DIR="$selected" xcrun swift --version
-
-      - name: Prepare consumer native dependency
-        if: inputs.native_prepare_command != ''
-        env:
-          NATIVE_PREPARE_COMMAND: ${{ inputs.native_prepare_command }}
-        run: |
-          set -euo pipefail
-          eval "$NATIVE_PREPARE_COMMAND"
-
-      # swift-format (Apple) is installed from its standard Homebrew location,
-      # matching the local development setup. No source build or /tmp files.
-      - name: Install swift-format
-        run: brew install swift-format
-
-      - name: Run swift-format lint
-        run: swift-format lint --recursive --configuration .swift-format Sources
-
-      - name: Run SwiftLint
-        run: |
-          brew install swiftlint
-          swiftlint lint Sources
-
-      - name: Build
-        env:
-          STATIC_ARCHIVE_PATH: ${{ inputs.static_archive_path }}
-        run: |
-          set -euo pipefail
-          if [[ -n "$STATIC_ARCHIVE_PATH" ]]; then
-            archive="$GITHUB_WORKSPACE/$STATIC_ARCHIVE_PATH"
-            [[ -f "$archive" ]] || {
-              echo "::error::Configured static archive does not exist: $archive"
-              exit 1
-            }
-            swift build -Xlinker "$archive"
-          else
-            swift build
-          fi
-
-      # The tests are a plain executable product (no .xctest bundle): without
-      # Xcode, `swift test` is unavailable. Build the custom runner with LLVM
-      # coverage instrumentation, execute it directly, then enforce line
-      # coverage for the consumer's production module sources.
-      - name: Build tests with coverage
-        env:
-          # The test target and the coverage profile carry the consumer's
-          # module name through env so the same job builds any Swift project.
-          CORE_TEST_TARGET: ${{ vars.CONTINUUM_CORE_TEST_TARGET }}
-          CLI_NAME: ${{ vars.CONTINUUM_CLI_NAME }}
-          STATIC_ARCHIVE_PATH: ${{ inputs.static_archive_path }}
-        run: |
-          set -euo pipefail
-          if [[ -n "$STATIC_ARCHIVE_PATH" ]]; then
-            archive="$GITHUB_WORKSPACE/$STATIC_ARCHIVE_PATH"
-            [[ -f "$archive" ]] || {
-              echo "::error::Configured static archive does not exist: $archive"
-              exit 1
-            }
-            swift build \
-              -Xswiftc -profile-generate \
-              -Xswiftc -profile-coverage-mapping \
-              --product "$CORE_TEST_TARGET" \
-              -Xlinker "$archive"
-          else
-            swift build \
-              -Xswiftc -profile-generate \
-              -Xswiftc -profile-coverage-mapping \
-              --product "$CORE_TEST_TARGET"
-          fi
-
-      - name: Run tests
-        env:
-          LLVM_PROFILE_FILE: .build/${{ vars.CONTINUUM_CLI_NAME }}-%p.profraw
-        run: .build/debug/${{ vars.CONTINUUM_CORE_TEST_TARGET }}
-
-      - name: Enforce core module coverage
-        env:
-          CORE_TEST_TARGET: ${{ vars.CONTINUUM_CORE_TEST_TARGET }}
-          CLI_NAME: ${{ vars.CONTINUUM_CLI_NAME }}
-          AGENT_NAME: ${{ vars.CONTINUUM_AGENT_NAME }}
-          # Directories excluded from the coverage denominator (tests plus the
-          # consumer's non-core production modules, pipe-separated).
-          CORE_IGNORE_SOURCES: ${{ vars.CONTINUUM_CORE_IGNORE_SOURCES }}
-        run: |
-          set -euo pipefail
-          xcrun llvm-profdata merge -sparse ".build/$CLI_NAME-"*.profraw -o ".build/$CLI_NAME.profdata"
-          REPORT=$(xcrun llvm-cov report \
-            ".build/debug/$CORE_TEST_TARGET" \
-            -instr-profile=".build/$CLI_NAME.profdata" \
-            -ignore-filename-regex="(Tests/|Sources/${AGENT_NAME}/|Sources/${CLI_NAME}/|${CORE_IGNORE_SOURCES:-UNUSED})")
-          printf '%s\n' "$REPORT"
-          COVERAGE=$(printf '%s\n' "$REPORT" | awk '/^TOTAL/ {gsub("%", "", $10); print $10}')
-          if [[ -z "$COVERAGE" ]]; then
-            echo "::error::Could not determine $CORE_TEST_TARGET line coverage."
-            exit 1
-          fi
-          echo "$CORE_TEST_TARGET line coverage: ${COVERAGE}%"
-          awk -v coverage="$COVERAGE" 'BEGIN { exit !(coverage >= 80.0) }' || {
-            echo "::error::$CORE_TEST_TARGET line coverage ${COVERAGE}% is below the required 80%."
-            exit 1
-          }
+  call:
+    uses: ./.github/workflows/continuum-validation.yml
+    secrets: inherit
+    with:
+      continuum_ref: ${{ inputs.continuum_ref }}
+      runner: ${{ inputs.runner || vars.CONTINUUM_SWIFT_RUNNER || 'macos-latest' }}
+      timeout_minutes: ${{ inputs.timeout_minutes }}
+      prepare_command: ${{ inputs.prepare_command || vars.CONTINUUM_PREPARE_COMMAND || '' }}
+      build_command: ${{ inputs.build_command || vars.CONTINUUM_SWIFT_BUILD_COMMAND || 'swift build' }}
+      test_command: ${{ inputs.test_command || vars.CONTINUUM_SWIFT_TEST_COMMAND || 'swift test' }}
+      validation_command: ${{ inputs.validation_command || vars.CONTINUUM_VALIDATION_COMMAND || '' }}
+      auto_detect: 'false'
+      artifact_paths: ${{ inputs.artifact_paths || vars.CONTINUUM_ARTIFACT_PATHS || '' }}
+      artifact_name: ${{ inputs.artifact_name || vars.CONTINUUM_ARTIFACT_NAME || '' }}
+      status_context: ${{ inputs.status_context || vars.CONTINUUM_STATUS_CONTEXT || '' }}
+      publish_status: ${{ inputs.publish_status || vars.CONTINUUM_PUBLISH_STATUS || '' }}
+      dispatch_repair: ${{ inputs.dispatch_repair || vars.CONTINUUM_DISPATCH_REPAIR || '' }}
+      repair_workflow: ${{ inputs.repair_workflow || vars.CONTINUUM_REPAIR_WORKFLOW || '' }}
+      pr_number: ${{ inputs.pr_number }}
+      skip_opencode_pull_request: ${{ inputs.skip_opencode_pull_request || vars.CONTINUUM_SKIP_OPENCODE_PR || '' }}
