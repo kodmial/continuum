@@ -3612,4 +3612,44 @@ class ContinuumTest < Minitest::Test
     assert_includes raw, "vars.CONTINUUM_RUNNER || 'ubuntu-latest'"
   end
 
+
+  # Consumer-owned repository paths are configuration, never core defaults.
+  # A quoted automation/... path in a reusable workflow writes into or executes
+  # from the consumer checkout and therefore couples core to one repository layout.
+  def test_core_workflows_embed_no_consumer_automation_paths
+    offenders = WORKFLOWS.filter_map do |path|
+      hits = File.readlines(path, chomp: true).each_with_index.filter_map do |line, index|
+        next unless line.match?(/["']automation\//)
+
+        "#{File.basename(path)}:#{index + 1}: #{line.strip}"
+      end
+      hits unless hits.empty?
+    end.flatten
+
+    assert_empty offenders,
+                 "consumer-owned automation/ paths must arrive through configuration/hooks:\n#{offenders.join("\n")}"
+  end
+
+  def test_render_script_hooks_are_configuration_only
+    body = workflow_body('continuum-render-executor.yml')
+
+    assert_includes body, 'JOB_SCRIPT: ${{ inputs.job_script || vars.RENDER_JOB_SCRIPT }}'
+    assert_includes body, 'CLEANUP_SCRIPT: ${{ inputs.cleanup_script || vars.RENDER_CLEANUP_SCRIPT }}'
+    assert_includes body, 'QUALIFICATION_SCRIPT: ${{ inputs.qualification_script || vars.RENDER_QUALIFICATION_SCRIPT }}'
+    refute_match(/RENDER_(?:JOB|CLEANUP|QUALIFICATION)_SCRIPT \|\| ['"][^'"]+['"]/, body)
+    assert_includes body, 'No Render job hook configured'
+    assert_includes body, 'No Render cleanup hook configured'
+    assert_includes body, 'No Render qualification hook configured'
+  end
+
+  def test_child_acceptance_sentinels_live_outside_consumer_checkout
+    worker = workflow_body('continuum-consumer-child-worker.yml')
+    review = workflow_body('continuum-consumer-child-review.yml')
+
+    assert_includes worker, 'result_file="$RUNNER_TEMP/continuum-child-task-${TASK_NUMBER}.md"'
+    assert_includes review, 'review_file="$RUNNER_TEMP/continuum-child-review-${TASK_NUMBER}.md"'
+    refute_includes worker, 'automation/runtime-results'
+    refute_includes review, 'automation/runtime-results'
+  end
+
   end
