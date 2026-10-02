@@ -1563,9 +1563,12 @@ class ContinuumTest < Minitest::Test
   end
 
   # Continuum automation runs on free anonymous OpenCode models, so no core
-  # workflow may read, require, or forward a paid provider token. There is no
-  # exception: `pr-agent` cannot run without the paid Groq provider, so it must
-  # report an explicit failure instead of a silent green no-op.
+  # workflow may read, require, or forward a paid provider token. PR-Agent is
+  # the optional review provider: it stays provider-neutral and reaches its
+  # model through the runner-local OpenCode bridge, so it needs no paid key
+  # either. A run that cannot review (disabled provider, unreachable backend,
+  # moved head, mutated checkout) fails explicitly instead of a silent green
+  # no-op.
   def test_core_automation_requires_no_paid_provider_key
     core = Dir[File.join(ROOT, '.github/workflows/*.yml')].sort
     refute_empty core
@@ -1587,9 +1590,52 @@ class ContinuumTest < Minitest::Test
     pr_agent = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent.yml'))
     assert_includes pr_agent, 'core.setFailed',
                     'pr-agent must fail explicitly, not skip green'
-    assert_includes pr_agent, 'paid Groq provider',
-                    'pr-agent must explain why it is disabled'
     refute_includes pr_agent, "if: steps.groq.outputs.available == 'true'"
+  end
+
+  # The reusable PR-Agent provider replaced the paid-Groq refusal stub: it
+  # must stay provider-neutral (no Groq/model hard-code), reach OpenCode
+  # through the minimal loopback bridge, and keep the review reviewer-only.
+  def test_pr_agent_uses_the_opencode_backend_without_a_paid_provider
+    pr_agent = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent.yml'))
+    stub = File.read(File.join(ROOT, '.github/caller-stubs/continuum-pr-agent.yml'))
+    toml = File.read(File.join(ROOT, '.pr_agent.toml'))
+
+    %w[groq GROQ].each do |needle|
+      refute_includes pr_agent, needle, 'pr-agent workflow must not name Groq'
+      refute_includes toml, needle, '.pr_agent.toml must not name Groq'
+    end
+
+    # The pinned release runs on the runner (a Docker action cannot reach
+    # runner loopback), against the loopback bridge only.
+    assert_includes pr_agent, 'python3 -m pip install',
+                    'pr-agent must install the pinned release on the runner'
+    assert_includes pr_agent, '"pr-agent==${PR_AGENT_VERSION}"',
+                    'pr-agent must install the pinned release on the runner'
+    assert_includes pr_agent, 'opencode serve --hostname 127.0.0.1',
+                    'the OpenCode server must bind loopback only'
+    assert_includes pr_agent, 'pr_agent_bridge.py',
+                    'PR-Agent must infer through the compatibility bridge'
+    refute_includes pr_agent, 'docker://',
+                    'a container cannot reach the runner-local bridge'
+    # The hostname may be named only to forbid it; it must never be used as
+    # a backend address.
+    refute_match(/https?:\/\/host\.docker\.internal/, pr_agent,
+                 'container networking must not rely on undocumented hostnames')
+    refute_match(/host\.docker\.internal:\d/, pr_agent,
+                 'container networking must not rely on undocumented hostnames')
+
+    # Reviewer-only: the run proves the checkout is untouched, and the
+    # provider stays opt-in so consumers that never enable it are unaffected.
+    assert_includes pr_agent, 'Prove the checkout is unmodified'
+    assert_includes pr_agent, 'CONTINUUM_PR_AGENT_ENABLED',
+                    'PR-Agent must stay disabled unless the consumer enables it'
+    assert_includes stub, 'continuum-pr-agent.yml@main'
+
+    # The generic contract is configuration, not hard-coded product policy.
+    %w[api_base model max_tokens enabled].each do |knob|
+      assert_includes pr_agent, knob, "pr-agent workflow must expose the #{knob} knob"
+    end
   end
 
   # The free default model must be the single documented fallback everywhere an

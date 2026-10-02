@@ -1,12 +1,24 @@
+# Provider-neutral PR-Agent defaults for Continuum.
+#
+# The model below is a routing id, not a vendor pin: the `openai/` prefix
+# sends the request through LiteLLM's OpenAI-compatible path to the backend
+# configured in `[openai] api_base` (environment `OPENAI__API_BASE`), which
+# the Continuum workflow points at the runner-local OpenCode bridge. The
+# actual inference model is the configured OpenCode provider/model
+# (vars.OPENCODE_MODEL), so no paid-provider key is ever required.
 [config]
-model = "groq/openai/gpt-oss-120b"
-fallback_models = ["groq/openai/gpt-oss-20b"]
+model = "openai/continuum-review"
+fallback_models = ["openai/continuum-review"]
+custom_model_max_tokens = 128000
 reasoning_effort = "medium"
 response_language = "en-US"
 ai_timeout = 180
 retry_same_model_on_timeout = false
 propagate_tool_errors = true
 repo_context_files = ["AGENTS.md"]
+
+[openai]
+api_base = "http://127.0.0.1:18000/v1"
 
 [pr_reviewer]
 require_score_review = false

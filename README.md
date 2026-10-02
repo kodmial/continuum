@@ -200,7 +200,7 @@ Workflow names are identical to the reusable file names unless noted.
 | `continuum-opencode-watchdog.yml` | Recover a failed issue implementation run (`name: OpenCode watchdog`). | `watched_workflow`, `max_recovery_retries`, `retry_marker`, `in_progress_label`, `pause_marker`, `dispatch_marker`, `timeout_minutes` |
 | `continuum-issue-scheduler.yml` | Scheduled issue dispatch. | — |
 | `continuum-auto-merge.yml` | Auto-merge reviewed pull requests. | `require_coderabbit` |
-| `continuum-pr-agent.yml` | Manual PR Agent (Groq). | — |
+| `continuum-pr-agent.yml` | Optional PR Agent review over the runner-local OpenCode backend. | `enabled`, `api_base`, `model`, `max_tokens`, `opencode_model` |
 | `continuum-add-review-label.yml` | Mark a PR ready for CodeRabbit. | — |
 | `continuum-remove-review-label.yml` | Remove the ready label on sync. | — |
 | `continuum-coderabbit-retry.yml` | Retry CodeRabbit after a rate limit. | — |
@@ -228,8 +228,10 @@ part of the contract and never change per consumer):
 
 No paid provider key is part of this contract: **no workflow reads
 `OPENCODE_API_KEY` or `GROQ_API_KEY`.** The core runs on free anonymous models
-and requires no API key; `continuum-pr-agent.yml` refuses to run rather than
-read a paid provider secret. `secrets.GITHUB_TOKEN` is minted by GitHub
+and requires no API key; `continuum-pr-agent.yml` is an opt-in review provider
+backed by the same free OpenCode route through a runner-local compatibility
+bridge, and it stays disabled unless `CONTINUUM_PR_AGENT_ENABLED` is `true`.
+`secrets.GITHUB_TOKEN` is minted by GitHub
 automatically, so it is not a credential a consumer defines.
 
 Repository variables:

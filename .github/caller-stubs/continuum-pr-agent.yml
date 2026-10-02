@@ -1,4 +1,4 @@
-name: PR Agent (manual, Groq)
+name: PR Agent (OpenCode backend)
 
 on:
   issue_comment:
