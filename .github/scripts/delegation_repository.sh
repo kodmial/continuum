@@ -10,6 +10,16 @@ repository_map_json="${CHILD_REPOSITORIES:-}"
 parent_role="${PARENT_ROLE:-}"
 parent_children="${PARENT_CHILDREN:-}"
 
+# Discovery can fail in two different ways and the caller must tell them
+# apart. Exit status 4 means delegated discovery itself is unavailable: the
+# GitHub API could not be reached or refused the request (for example when
+# the token's rate budget is exhausted by a post-completion wake storm). It
+# is returned instead of a verification verdict so an infrastructure failure
+# is never mistaken for "no repository declares this relationship".
+# Raw API errors stay hidden on purpose: they embed request URLs that would
+# disclose the private child repository name in public parent logs.
+UNAVAILABLE=4
+
 parent_child_ids() {
   if [[ -n "$parent_role" || -n "$parent_children" ]]; then
     python3 "$relation" parent-variable-ids       --role "$parent_role"       --children-json "$parent_children"
@@ -17,7 +27,11 @@ parent_child_ids() {
   fi
 
   local variables_json role children
-  variables_json="$(repository_variables "$GITHUB_REPOSITORY")"
+  if ! variables_json="$(repository_variables "$GITHUB_REPOSITORY")"; then
+    # The API read already reported the outage. Falling back to the tracked
+    # file here would resolve a possibly stale child set, so refuse instead.
+    return "$UNAVAILABLE"
+  fi
   role="$(variable_value "$variables_json" CONTINUUM_ROLE)"
   children="$(variable_value "$variables_json" CONTINUUM_CHILDREN)"
   if [[ -n "$role" || -n "$children" ]]; then
@@ -30,7 +44,12 @@ parent_child_ids() {
 
 assert_parent_allows_child() {
   local child_id="$1"
-  if parent_child_ids | grep -Fxq "$child_id"; then
+  local child_ids lookup_rc=0
+  if ! child_ids="$(parent_child_ids)"; then
+    lookup_rc=$?
+    return "$lookup_rc"
+  fi
+  if grep -Fxq "$child_id" <<<"$child_ids"; then
     return 0
   fi
   echo "::error::Child id is not allowed by CONTINUUM_CHILDREN." >&2
@@ -39,7 +58,12 @@ assert_parent_allows_child() {
 
 repository_variables() {
   local repository="$1"
-  gh api "repos/$repository/actions/variables?per_page=100" 2>/dev/null || true
+  local payload
+  if ! payload="$(gh api "repos/$repository/actions/variables?per_page=100" 2>/dev/null)"; then
+    echo "::error::Delegated child discovery is unavailable; refusing to guess." >&2
+    return "$UNAVAILABLE"
+  fi
+  printf '%s' "$payload"
 }
 
 variable_value() {
@@ -75,7 +99,9 @@ verify_child_legacy_config() {
 verify_child_repository() {
   local repository="$1" child_id="$2"
   local variables_json
-  variables_json="$(repository_variables "$repository")"
+  if ! variables_json="$(repository_variables "$repository")"; then
+    return "$UNAVAILABLE"
+  fi
   if [[ -n "$(variable_value "$variables_json" CONTINUUM_ROLE)" ||
         -n "$(variable_value "$variables_json" CONTINUUM_CHILD_ID)" ||
         -n "$(variable_value "$variables_json" CONTINUUM_PARENT)" ]]; then
@@ -86,7 +112,9 @@ verify_child_repository() {
 
   # Backward-compatible migration path. Once repository variables are present
   # this branch is not used; it exists so consumers can migrate without a
-  # flag-day update across parent and child repositories.
+  # flag-day update across parent and child repositories. This branch runs
+  # only after a successful variables read, so a failed file fetch means the
+  # candidate declares no usable legacy relationship and stays a non-match.
   verify_child_legacy_config "$repository" "$child_id" >/dev/null 2>&1
 }
 
@@ -97,21 +125,33 @@ resolve_by_roles() {
 
   assert_parent_allows_child "$child_id"
 
+  local listing
+  if ! listing="$(gh api --paginate '/user/repos?affiliation=owner&per_page=100' --jq '.[].full_name' 2>/dev/null)"; then
+    echo "::error::Delegated child discovery is unavailable; refusing to guess." >&2
+    return "$UNAVAILABLE"
+  fi
+
   while IFS= read -r candidate; do
     [[ -n "$candidate" ]] || continue
     [[ "$candidate" == "$GITHUB_REPOSITORY" ]] && continue
 
-    if verify_child_repository "$candidate" "$child_id"; then
+    local candidate_rc=0
+    verify_child_repository "$candidate" "$child_id" || candidate_rc=$?
+    if [[ "$candidate_rc" -eq 0 ]]; then
       matched="$candidate"
       count=$((count + 1))
       if [[ "$count" -gt 1 ]]; then
         echo "::error::More than one repository declares the same child relationship." >&2
         return 2
       fi
+    elif [[ "$candidate_rc" -eq "$UNAVAILABLE" ]]; then
+      # Verification never ran for this candidate. Counting it as a
+      # non-match would turn an API outage into a misleading zero-match
+      # verdict, so abort the whole discovery instead.
+      echo "::error::Delegated child discovery is unavailable; refusing to guess." >&2
+      return "$UNAVAILABLE"
     fi
-  done < <(
-    gh api --paginate '/user/repos?affiliation=owner&per_page=100'       --jq '.[].full_name' 2>/dev/null
-  )
+  done <<<"$listing"
 
   if [[ "$count" -ne 1 ]]; then
     echo "::error::No unique repository declares the requested child relationship." >&2
@@ -133,7 +173,9 @@ resolve_child() {
 validation_script() {
   local repository="$1"
   local variables_json value
-  variables_json="$(repository_variables "$repository")"
+  if ! variables_json="$(repository_variables "$repository")"; then
+    return "$UNAVAILABLE"
+  fi
   value="$(variable_value "$variables_json" CONTINUUM_VALIDATION_SCRIPT)"
   if [[ -n "$value" ]]; then
     python3 "$relation" validation-script-value --value "$value"

@@ -1394,6 +1394,36 @@ class ContinuumTest < Minitest::Test
     assert_includes body, 'deleteWorkflowRun'
   end
 
+  # kodmial/continuum#171: a post-completion wake storm exhausted the token's
+  # API budget and the resolver reported those failures as "no repository
+  # declares". A discovery outage must fail with a distinct unavailable
+  # verdict so a retryable storm is never mistaken for a misconfigured
+  # relationship, while genuine zero/ambiguous matches stay fail-closed.
+  def test_delegation_resolver_distinguishes_outage_from_misconfiguration
+    body = File.read(File.join(ROOT, '.github/scripts/delegation_repository.sh'))
+    unavailable = 'Delegated child discovery is unavailable; refusing to guess.'
+    assert_includes body, unavailable
+    # The outage verdict leaves through a dedicated status, never the
+    # verification status, so callers and humans can tell them apart.
+    assert_match(/return "\$UNAVAILABLE"/, body)
+    # Genuine fail-closed verdicts are unchanged.
+    assert_includes body, 'No unique repository declares the requested child relationship.'
+    assert_includes body, 'More than one repository declares the same child relationship.'
+    assert_includes body, 'Child id is not allowed by CONTINUUM_CHILDREN.'
+    # The opaque architecture: raw API errors embed request URLs naming the
+    # private child, so every resolver API call must hide stderr and the
+    # unavailable verdict must not interpolate a repository name.
+    body.each_line do |line|
+      refute_match(/gh api .*2>&1/, line, 'raw API output must stay out of parent logs')
+    end
+    unavailable_lines = body.each_line.select { |line| line.include?(unavailable) }
+    assert_operator unavailable_lines.size, :>=, 2
+    unavailable_lines.each do |line|
+      refute_includes line, '$repository'
+      refute_includes line, '$candidate'
+    end
+  end
+
   def test_installer_local_and_explicit_ref
     fixture do |dir|
       assert_equal CORE_COUNT, CORE_STUBS.size, 'core stub set drifted'

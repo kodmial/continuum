@@ -51,6 +51,20 @@ when all of these conditions hold:
 Zero matches or multiple matches fail closed. Repository visibility is never a
 routing signal.
 
+## Failure semantics
+
+Discovery distinguishes an unavailable GitHub API from a misconfigured
+relationship. When the API cannot be reached or refuses the request (for
+example when a post-completion wake storm exhausts the token's rate budget),
+resolution fails with `Delegated child discovery is unavailable; refusing to
+guess` instead of reporting a verification verdict. A genuine zero-match or
+ambiguous match keeps its own fail-closed error. Raw API errors are never
+surfaced: they embed request URLs that would disclose the private child
+repository name in public parent logs. The scheduler re-wakes on its normal
+triggers, so a run that fails unavailable retries deterministically once the
+budget resets, resolving the same configured child before and after
+delegated completion.
+
 The old `.continuum.yml` relationship declaration and optional
 `CONTINUUM_CHILD_REPOSITORIES` secret remain readable only as a compatibility
 path while existing consumers migrate. New integrations should use repository
