@@ -399,6 +399,37 @@ jobs:
                   );
                 }
 
+                const noProgressMarkerPrefix =
+                  `<!-- continuum-coderabbit-no-progress head=${pr.head.sha} `;
+                const latestNoProgress = comments
+                  .filter(comment => {
+                    const login = comment.user?.login || '';
+                    const trusted =
+                      login === 'github-actions[bot]' || login === owner;
+                    return trusted &&
+                      (comment.body || '').includes(noProgressMarkerPrefix);
+                  })
+                  .sort(
+                    (a, b) =>
+                      new Date(b.created_at || 0).getTime() -
+                      new Date(a.created_at || 0).getTime()
+                  )[0] || null;
+                const noProgressAt = latestNoProgress
+                  ? new Date(latestNoProgress.created_at || 0).getTime()
+                  : 0;
+                const laterApproval = latestNoProgress && reviews.some(review =>
+                  review.user?.login?.startsWith('coderabbitai') &&
+                  review.commit_id === pr.head.sha &&
+                  review.state === 'APPROVED' &&
+                  new Date(review.submitted_at || 0).getTime() > noProgressAt
+                );
+                if (latestNoProgress && !laterApproval) {
+                  core.notice(
+                    `PR #${pr.number}: exact HEAD ${pr.head.sha} has a non-code CodeRabbit no-progress marker; it is not eligible for automatic re-review until the head changes or a later explicit approval supersedes the marker.`
+                  );
+                  continue;
+                }
+
                 const labels = new Set(
                   (pr.labels || []).map(label =>
                     typeof label === 'string' ? label : label.name

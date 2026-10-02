@@ -97,8 +97,10 @@ class ContinuumTest < Minitest::Test
 
   def dispatch_calls(name)
     lines = workflow_body(name).lines
-    lines.each_index.select { |index| lines[index].include?('/dispatches') }
-         .map { |index| lines[[index - 2, 0].max, 12].join }
+    lines.each_index.select do |index|
+      lines[index].include?('/dispatches') ||
+        lines[index].include?('createWorkflowDispatch')
+    end.map { |index| lines[[index - 2, 0].max, 16].join }
   end
 
   def all_dispatch_calls
@@ -1803,7 +1805,7 @@ class ContinuumTest < Minitest::Test
       calls = dispatch_calls(name)
       refute_empty calls, "#{name} no longer performs a /dispatches call — the dispatch is a green no-op"
       calls.each do |call|
-        assert_match(/--method POST|['"]POST \/repos|method:\s*'POST'/, call, "#{name}: dispatch call is not a POST")
+        assert_match(/--method POST|['"]POST \/repos|method:\s*'POST'|createWorkflowDispatch/, call, "#{name}: dispatch call is not a POST/action dispatch")
       end
     end
   end
@@ -3281,6 +3283,75 @@ class ContinuumTest < Minitest::Test
     end
   end
 
+  # A task implementation command must obey the same dependency/DoR gate as
+  # the scheduler. Manual /oc is not an escape hatch that may turn a blocked
+  # tracking issue into a partial PR.
+  def test_issue_mode_checks_definition_of_ready_before_starting_the_agent
+    body = workflow_body('continuum-opencode.yml')
+
+    assert_includes body, '- name: Check issue Definition of Ready'
+    assert_includes body, '/<!--\s*automation-blocked-by:\s*([0-9#\s,]+?)\s*-->/i'
+    assert_includes body, "'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by'"
+    assert_includes body, "core.setOutput('ready', 'false');"
+    assert_includes body, 'Continuum will not create a partial PR for a blocked/umbrella task.'
+
+    assert_match(/- name: Implement issue\n\s+if: >-\n\s+steps\.issue_readiness\.outputs\.ready != 'false'/, body)
+    assert_match(/- name: Install OpenCode CLI for automated repair\n\s+if: github\.event_name == 'workflow_dispatch' && steps\.issue_readiness\.outputs\.ready != 'false'/, body)
+    assert_match(/- name: Install OpenCode CLI for interactive agent\n\s+if: github\.event_name != 'workflow_dispatch' && steps\.issue_readiness\.outputs\.ready != 'false'/, body)
+    assert_includes body, 'Do not turn a tracking/umbrella issue or a task with unmet prerequisites into a partial PR.'
+  end
+
+  # CodeRabbit can submit CHANGES_REQUESTED for a policy/pre-merge failure with
+  # no code finding at all. That state is not a coding-agent repair request.
+  def test_coderabbit_policy_blocker_is_classified_before_opencode_dispatch
+    body = workflow_body('continuum-opencode.yml')
+    job = body[/^  dispatch-coderabbit-fix:\n(.*?)(?=^  opencode:)/m, 1]
+    refute_nil job, 'dispatch-coderabbit-fix job is missing'
+
+    classifier = job.index("if (reviewState === 'changes_requested' && findings.length === 0)")
+    dispatch = job.index('github.rest.actions.createWorkflowDispatch')
+    refute_nil classifier, 'CHANGES_REQUESTED without inline findings is not classified'
+    refute_nil dispatch, 'actionable CodeRabbit repair dispatch is missing'
+    assert_operator classifier, :<, dispatch,
+                    'non-code review verdict must be classified before any OpenCode dispatch'
+
+    assert_includes job, 'continuum-coderabbit-no-progress head='
+    assert_includes job, 'No OpenCode repair was dispatched for this unchanged HEAD.'
+    assert_includes job, "if (reviewState === 'approved')"
+    assert_includes job, 'any older no-progress marker is superseded.'
+    assert_includes job, 'github-token: ${{ github.token }}',
+                    'the classifier must stay within the existing caller permission contract'
+  end
+
+  # One exact HEAD plus one non-code blocker is a terminal no-progress state.
+  # Both the global review queue and auto-merge reconciler must honour it rather
+  # than repeatedly buying another CodeRabbit review of identical code.
+  def test_coderabbit_no_progress_marker_stops_same_head_requeue
+    retry_body = workflow_body('continuum-coderabbit-retry.yml')
+    merge_body = auto_merge_body
+
+    assert_includes retry_body, 'continuum-coderabbit-no-progress head='
+    assert_includes retry_body, "login === 'github-actions[bot]' || login === owner"
+    assert_includes retry_body, 'laterApproval'
+    assert_includes retry_body, 'it is not eligible for automatic re-review until the head changes or a later explicit approval supersedes the marker.'
+
+    assert_includes merge_body, 'continuum-coderabbit-no-progress head='
+    assert_includes merge_body, 'codeRabbitNoProgressBlocked'
+    assert_includes merge_body, 'reviewNoProgressBlocked'
+    assert_includes merge_body, 'automatic review/fix retries are suppressed.'
+  end
+
+  # Inline findings already have an independent thread-verification protocol.
+  # If OpenCode decides no code change is needed, do not start another full
+  # review loop for the same inline findings. Body-only nitpicks retain one
+  # bounded full re-review because they have no thread of their own.
+  def test_unchanged_inline_coderabbit_fix_does_not_force_full_rereview
+    body = workflow_body('continuum-opencode.yml')
+    assert_includes body,
+                    'if (findings.length === 0 && reviewedSha && headSha === reviewedSha) {'
+    refute_match(/\n\s*if \(reviewedSha && headSha === reviewedSha\) \{/, body)
+  end
+
   # ------------------------------------------------- auto-merge / CodeRabbit
 
   def auto_merge_body
@@ -3741,7 +3812,9 @@ class ContinuumTest < Minitest::Test
 
     # Both launch sites must consult it.
     assert_includes body[run_at, issue_at], "steps.duplicate_guard.outputs.skip != 'true'"
-    assert_includes body[issue_at, 400], "steps.duplicate_guard.outputs.skip != 'true'"
+    issue_step = step_body(body, 'Implement issue')
+    refute_nil issue_step
+    assert_includes issue_step, "steps.duplicate_guard.outputs.skip != 'true'"
   end
 
   # Coordinator item 3: run-name. The watchdog and the scheduler both find a
