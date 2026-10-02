@@ -2248,7 +2248,7 @@ class ContinuumTest < Minitest::Test
                    "#{File.basename(path)} must forward the parent's TAP_PAT as CHILD_RUNTIME_TOKEN"
     end
 
-    assert_match(%r{Every installed parent stub fills it from the parent's own `TAP_PAT`}, doc,
+    assert_match(%r{Every installed parent stub fills `CHILD_RUNTIME_TOKEN` from the parent's own `TAP_PAT`}, doc,
                  'the doc must say the installed parent stubs fill CHILD_RUNTIME_TOKEN from TAP_PAT')
   end
 
