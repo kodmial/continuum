@@ -200,3 +200,8 @@ Worker and review workflows now select Python explicitly through the optional
 `python_version` input (default `3.12`). Callers can override it without changing
 the shared engine. This keeps child validation independent of runner-image
 Python defaults.
+
+
+## Public delegated run cleanup
+
+The parent layer installs `continuum-child-run-cleanup.yml`. It listens only for completed `SubTask`, `SubTask review`, and `SubTask PR review` runs and deletes that completed run through the GitHub Actions API. The cleanup workflow itself contains no child repository binding; repository identity remains in the configured private mapping rather than durable public run logs.
