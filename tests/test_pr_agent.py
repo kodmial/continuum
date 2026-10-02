@@ -96,6 +96,19 @@ class BridgeConversionTests(unittest.TestCase):
         self.assertIn("read-only", system.lower())
         self.assertEqual(prompt, "Review this diff.")
 
+    def test_external_system_prompt_is_wrapped_by_reviewer_policy(self):
+        body = pr_agent.build_opencode_request(
+            [
+                {"role": "system", "content": "You are PR-Reviewer. Focus on correctness."},
+                {"role": "user", "content": "Review this diff."},
+            ],
+            "openai/continuum-review",
+            4096,
+        )
+        self.assertIn(pr_agent.REVIEWER_SYSTEM_PROMPT, body["system"])
+        self.assertIn("You are PR-Reviewer", body["system"])
+        pr_agent.require_inference_hardening(body)
+
     def test_empty_messages_fail_closed(self):
         with self.assertRaises(PrAgentError):
             pr_agent.openai_messages_to_prompt([])
