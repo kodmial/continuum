@@ -807,11 +807,11 @@ class ContinuumTest < Minitest::Test
           PARENT_STUBS.each { |stub| assert_includes installed, File.basename(stub) }
         end
       end
-      # Each set adds exactly its own files: 14 core, +5 tech, +4 parent.
+      # Each set adds exactly its own files: 15 core, +1 tech, +4 parent.
       assert_equal CORE_STUBS.size, counts['core']
       assert_equal CORE_STUBS.size + TECH_STUBS.size, counts['tech']
       assert_equal ALL_STUBS.size, counts['parent']
-      assert_equal 24, ALL_STUBS.size,
+      assert_equal 20, ALL_STUBS.size,
                    'every caller Continuum ships, across all three layers'
     end
   end
@@ -965,41 +965,21 @@ class ContinuumTest < Minitest::Test
   # group so the name identifies the run unambiguously in the Actions UI;
   # concurrency groups are already scoped per repository, so it is not what
   # keeps two repositories apart.
-  def test_tech_swift_callers_gate_on_a_repository_scoped_concurrency_group
-    cancelling = {
-      'continuum-tech-swift-ci.yml' => 'continuum-swift-ci',
-      'continuum-tech-swift-packaging-smoke.yml' => 'continuum-swift-packaging-smoke'
-    }
-    cancelling.each do |base, prefix|
-      concurrency = yaml(File.join(ROOT, '.github/caller-stubs/tech', base)).fetch('concurrency')
-      assert_equal true, concurrency['cancel-in-progress'], "#{base}: a superseded head must be cancelled"
-      assert concurrency.fetch('group').start_with?("#{prefix}-"), base
-    end
 
-    # Release serializes instead of cancelling: two runs publishing the same ref
-    # would race on the tag and the manifests, and cancelling a release that is
-    # already publishing is never the safe choice.
-    release = yaml(File.join(ROOT, '.github/caller-stubs/tech/continuum-tech-swift-release.yml')).fetch('concurrency')
-    refute release.key?('cancel-in-progress'), 'release must not cancel: it serializes instead'
-    assert_includes release.fetch('group'), 'github.ref'
+  def test_tech_swift_caller_is_generic_and_repository_scoped
+    path = File.join(ROOT, '.github/caller-stubs/tech/continuum-tech-swift-ci.yml')
+    caller = yaml(path)
+    concurrency = caller.fetch('concurrency')
+    assert_equal true, concurrency['cancel-in-progress']
+    assert concurrency.fetch('group').start_with?('continuum-swift-validation-')
+    assert_includes concurrency.fetch('group'), '${{ github.repository }}'
 
-    groups = cancelling.keys.to_h { |base| [base, yaml(File.join(ROOT, '.github/caller-stubs/tech', base)).fetch('concurrency').fetch('group')] }
-    groups['continuum-tech-swift-release.yml'] = release.fetch('group')
-    assert_equal groups.size, groups.values.uniq.size, 'two tech callers share a concurrency group and would cancel each other'
-    groups.each do |base, group|
-      assert_includes group, '${{ github.repository }}', "#{base}: the group must name the repository so the run is unambiguous in the Actions UI"
-    end
+    callee = File.read(File.join(ROOT, '.github/workflows/continuum-tech-swift-ci.yml'))
+    assert_includes callee, "vars.CONTINUUM_SWIFT_RUNNER || 'macos-latest'"
+    assert_includes callee, "vars.CONTINUUM_SWIFT_BUILD_COMMAND || 'swift build'"
+    assert_includes callee, "vars.CONTINUUM_SWIFT_TEST_COMMAND || 'swift test'"
+    refute_match(/NanoDictate|nanodictate|NANODICTATE_SIGNING|macos-15/, callee)
   end
-
-  # The templates ship to every consumer, so a consumer's own name hardcoded
-  # into one is a defect a reviewer cannot see from the file's purpose. This is
-  # the drift guard for the whole tech layer, beyond the groups above.
-  #
-  # The check is structural rather than a list of known consumer names: every
-  # repository reference in a tech stub — each `uses:` target and each
-  # `owner/repo` or `github.com/owner/repo` literal, comments included — must
-  # name Continuum itself. A consumer nobody has enumerated yet then fails the
-  # same way a known one does.
   def test_tech_stubs_reference_only_continuum_itself
     own_repo = 'kodmial/continuum'
     # `github.com/owner/repo`, matched case-insensitively because GitHub owners
@@ -1095,86 +1075,39 @@ class ContinuumTest < Minitest::Test
     assert_equal '${{ inputs.repository }}', with.fetch('repository')
   end
 
-  def test_manifest_environment_belongs_to_executable_step
-    release = yaml(File.join(ROOT, '.github/workflows/continuum-tech-swift-release.yml'))
-    steps = release.fetch('jobs').fetch('manifests').fetch('steps')
-    steps.each { |step| assert(step.key?('run') || step.key?('uses'), step['name']) }
-    generate = steps.find { |step| step['run'].to_s.include?('ruby scripts/release-prep.rb "v$VERSION"') }
-    %w[VERSION MAINTAINERS REVISION].each { |key| assert generate.fetch('env').key?(key) }
+
+  def test_continuum_does_not_ship_consumer_release_scripts
+    removed = %w[
+      scripts/install-macports.sh
+      scripts/release-policy.sh
+      scripts/release-prep.rb
+      scripts/test-release-policy.sh
+      scripts/packaging-smoke/common.sh
+      scripts/packaging-smoke/ensure-macports.sh
+      scripts/packaging-smoke/homebrew-lifecycle.sh
+      scripts/packaging-smoke/macports-lifecycle.sh
+      scripts/packaging-smoke/make-candidate.sh
+    ]
+    removed.each { |path| refute File.exist?(File.join(ROOT, path)), path }
   end
 
-  def test_release_candidate_gate_normalizes_reusable_job_names
-    release = yaml(File.join(ROOT, '.github/workflows/continuum-tech-swift-release.yml'))
-    gate = release.fetch('jobs').fetch('candidate-gate').fetch('steps')
-                  .find { |step| step['name'] == 'Wait for exact-head Packaging smoke' }
-    run = gate.fetch('run')
-
-    assert_includes run, %q{--jq '.jobs[].name | split(" / ") | last'}
-    assert_includes run, "grep -qxF 'Candidate build (x86_64)'"
-    assert_includes run, "grep -qxF 'Candidate build (arm64)'"
-  end
-
-  def test_fallback_preserves_existing_scripts_and_copies_missing_files
-    fixture do |dir|
-      FileUtils.mkdir_p(File.join(dir, 'scripts'))
-      File.write(File.join(dir, 'scripts/local.sh'), 'consumer')
-      File.write(File.join(dir, 'scripts/release-policy.sh'), 'consumer policy')
-      FileUtils.mkdir_p(File.join(dir, '.continuum'))
-      FileUtils.cp_r(File.join(ROOT, 'scripts'), File.join(dir, '.continuum/scripts'))
-      each_pair do |_, callee|
-        callee['jobs'].each_value do |job|
-          job.fetch('steps', []).each do |step|
-            next unless step['name'] == 'Copy missing Continuum scripts'
-            output, status = Open3.capture2e('bash', '-e', '-c', step.fetch('run'), chdir: dir)
-            assert status.success?, output
-          end
-        end
-      end
-      assert_equal 'consumer', File.read(File.join(dir, 'scripts/local.sh'))
-      assert_equal 'consumer policy', File.read(File.join(dir, 'scripts/release-policy.sh'))
-      %w[release-prep.rb test-release-policy.sh packaging-smoke/common.sh packaging-smoke/make-candidate.sh].each do |file|
-        assert File.file?(File.join(dir, 'scripts', file)), file
-      end
+  def test_tech_layer_contains_only_consumer_neutral_profiles
+    names = TECH_STUBS.map { |path| File.basename(path) }
+    assert_equal ['continuum-tech-swift-ci.yml'], names
+    TECH_STUBS.each do |path|
+      refute_match(/release|packaging-smoke/, File.basename(path))
     end
   end
 
-  # Measured from the tree, never from a literal, so a stub added or dropped
-  # needs no test edit and cannot drift. The `core` set installs every stub
-  # directly under `.github/caller-stubs/` (task-domain layer); `tech` the
-  # `continuum-tech-<tech>-*` stubs in `.github/caller-stubs/tech/`; `parent`
-  # the child-execution stubs in `.github/caller-stubs/parent/`.
-  #
-  # A core workflow with no stub is legitimate in exactly two cases, both
-  # named here so a third one fails instead of passing unnoticed: the four
-  # child-execution callees, which the `parent` set installs, and
-  # Continuum's own CI, which is not a caller at all.
-  CORE_CALLEE_WORKFLOWS = %w[
-    continuum-consumer-child-dispatcher.yml
-    continuum-consumer-child-pr-review.yml
-    continuum-consumer-child-review.yml
-    continuum-consumer-child-worker.yml
-  ].freeze
-  REPO_OWNED_WORKFLOWS = %w[continuum-validate-continuum.yml].freeze
-
-  # The number of callers Continuum ships in the `tech` and `parent` layers,
-  # stated as literals for the same reason as `CORE_COUNT` below.
-  #
-  # These were once `TECH_STUBS.size` and `PARENT_STUBS.size`, which made every
-  # check that used them compare a value against itself: `assert_equal
-  # TECH_COUNT, <installed file count>` reduced to `<installed> == <installed>`
-  # and could not fail. A literal is the third, independent source, so shipping
-  # a sixth tech caller or a fifth parent caller has to be said out loud here,
-  # in the same file and in the same commit as the new stub, where a reviewer
-  # sees it. `assert_tech_layers_agree` remains the check that needs no literal:
-  # it compares the two trees against each other by name, so adding a
-  # technology still needs no edit — only changing the *size* of a layer does.
-  TECH_COUNT = 5
-  PARENT_COUNT = 4
-
-  # The same `tech_name?` rule as the instance helper, hoisted so the constant
-  # table above can use it. A tech name has a `tech` segment plus at least two
-  # further segments, so `continuum-tech-swift-release` counts and a bare
-  # `continuum-tech` does not.
+  def test_generic_workflows_do_not_copy_consumer_release_scripts
+    generic = WORKFLOWS.reject { |path| File.basename(path).start_with?('continuum-tech-') }
+    generic.each do |path|
+      text = File.read(path)
+      refute_includes text, 'Copy missing Continuum scripts', File.basename(path)
+      refute_includes text, 'scripts/release-policy.sh', File.basename(path)
+      refute_includes text, 'scripts/release-prep.rb', File.basename(path)
+    end
+  end
   def self.tech_name?(base)
     segments = base.delete_suffix('.yml').split('-')
     base.start_with?('continuum-') && segments[1] == 'tech' && segments.size >= 4
@@ -1455,7 +1388,7 @@ class ContinuumTest < Minitest::Test
     end
 
     opencode = File.read(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
-    assert_includes opencode, "vars.AUTOMATION_OPENCODE_RUNNER || 'macos-15'"
+    assert_includes opencode, "vars.AUTOMATION_OPENCODE_RUNNER || 'ubuntu-latest'"
     assert_includes opencode, "vars.AUTOMATION_OPENCODE_TIMEOUT_MINUTES || '180'"
 
     scheduler = File.read(File.join(ROOT, '.github/workflows/continuum-issue-scheduler.yml'))
@@ -1466,30 +1399,22 @@ class ContinuumTest < Minitest::Test
 
   # Core workflows must carry no product-specific path outside the opt-in
   # tech layer; the release version file is a consumer variable.
+
   def test_core_workflows_expose_no_product_paths
     core = Dir[File.join(ROOT, '.github/workflows/*.yml')].sort
     core.each do |path|
       name = File.basename(path)
       next if name.start_with?('continuum-tech-')
-
-      body = File.read(path)
-      # The version file may appear only as the fallback of a consumer
-      # variable, never as a literal the engine acts on unconditionally.
-      without_defaults = body
-                        .gsub(/vars\.CONTINUUM_VERSION_FILE \|\| '[^']*'/, 'vars.CONTINUUM_VERSION_FILE')
-                        .gsub(/vars\.CONTINUUM_RELEASE_MANIFEST_FILES \|\| '[^']*'/, 'vars.CONTINUUM_RELEASE_MANIFEST_FILES')
-      refute_match(/Sources\/NanoDictateCore/, without_defaults, name)
-      refute_match(/'nanodictate\.rb'/, without_defaults, name)
+      text = File.read(path)
+      refute_match(/NanoDictate|nanodictate|Sources\/NanoDictateCore|homebrew-nanodictate|macports-nanodictate|NANODICTATE_SIGNING/i, text, name)
+      refute_match(/runtime-lab|kodmai/i, text, name)
+      refute_includes text, 'macos-15', name
     end
 
-    %w[continuum-auto-merge.yml continuum-add-review-label.yml].each do |name|
-      body = File.read(File.join(ROOT, '.github/workflows', name))
-      assert_includes body, "vars.CONTINUUM_VERSION_FILE || 'Sources/NanoDictateCore/Version.swift'", name
-    end
+    auto_merge = File.read(File.join(ROOT, '.github/workflows/continuum-auto-merge.yml'))
+    assert_includes auto_merge, "vars.CONTINUUM_VERSION_FILE || ''"
+    refute_includes auto_merge, 'Sources/NanoDictateCore/Version.swift'
   end
-
-  # The dispatcher supplies the issue number; an issue_comment run must keep
-  # reading the event, so the input defaults to empty and is only a fallback.
   def test_opencode_issue_number_input_is_optional_and_falls_back
     inputs = events(yaml(File.join(ROOT, '.github/workflows/continuum-opencode.yml')))
              .fetch('workflow_call').fetch('inputs')
@@ -2315,41 +2240,11 @@ class ContinuumTest < Minitest::Test
   # would set only TAP_PAT and be told the PAT is ignored; README.md stated the
   # chain correctly, so the two consumer-facing documents disagreed. Pin the
   # order to the code so they cannot disagree again.
-  def test_release_pr_token_fallback_chain_in_the_doc_matches_the_code
-    # This workflow has no embedded `script: |` block; the chain is a `run: |`
-    # step, so slice that step out of the workflow body.
-    step = workflow_body('continuum-tech-swift-release-pr.yml')[/^ {6}- name: Resolve release token$.*?^ {10}fi$/m]
-    refute_nil step, 'the release-PR workflow must keep its "Resolve release token" step'
+
+  def test_removed_product_release_contract_is_not_documented_as_shared
     doc = File.read(File.join(ROOT, 'docs/consumer-variables.md'))
-
-    # The order is read out of the code, not typed here: each link records
-    # `source=<NAME>` only when it is the one that won. Branch order in the
-    # script is the resolution order, so the emitted order is the chain.
-    chain = step.scan(/echo "source=([A-Z][A-Z0-9_]*)"/).flatten
-    assert_equal %w[RELEASE_PR_TOKEN TAP_PAT GITHUB_TOKEN], chain,
-                 'the release-PR token resolves RELEASE_PR_TOKEN, then TAP_PAT, then GITHUB_TOKEN'
-
-    table = doc[/### Required secrets.*?(?=### Render execution controller)/m]
-    refute_nil table, 'the doc must keep a secrets section enumerating the contract'
-    row = table.lines.find { |line| line.include?('`RELEASE_PR_TOKEN`') }
-    refute_nil row, 'the doc must document RELEASE_PR_TOKEN in the secrets table'
-
-    # Every link of the chain appears, in the code's order. A row listing only
-    # the two ends, or listing TAP_PAT last, is a claim the code does not make.
-    # The row's first column repeats the secret's own name, so the scan is
-    # deduped — the order check is what carries the meaning.
-    documented = row.scan(/`([A-Z][A-Z0-9_]*)`/).flatten.uniq
-    assert_equal chain, documented,
-                 'the documented RELEASE_PR_TOKEN chain must list every link in the order the code resolves them'
+    refute_match(/RELEASE_PR_TOKEN|NANODICTATE_SIGNING|homebrew-nanodictate|macports-nanodictate/i, doc)
   end
-
-  # "The core layer reads exactly two secrets" was false as written. The four
-  # continuum-consumer-child-* workflows live beside the core ones and read the
-  # two child-runtime secrets, and continuum-pr-agent.yml reads GITHUB_TOKEN.
-  # A narrower claim is defensible — those child workflows are installed only
-  # by the `parent` set — but it has to be stated precisely and derived, so
-  # this test derives each set's secrets from its own stubs and holds the doc
-  # to the resulting numbers.
   def test_the_documented_secret_count_per_set_matches_the_installed_code
     doc = File.read(File.join(ROOT, 'docs/consumer-variables.md'))
     consumer_defined = lambda do |stubs|
@@ -2366,7 +2261,7 @@ class ContinuumTest < Minitest::Test
                  'the core set reads exactly these consumer-defined secrets'
     assert_equal %w[CHILD_RUNTIME_REPOSITORIES CHILD_RUNTIME_TOKEN TAP_PAT], parent,
                  'the parent set reads exactly these consumer-defined secrets'
-    assert_equal %w[NANODICTATE_SIGNING_P12 NANODICTATE_SIGNING_PASSWORD RELEASE_PR_TOKEN TAP_PAT], tech,
+    assert_equal [], tech,
                  'the tech set reads exactly these consumer-defined secrets'
 
     assert_match(/The `core` set's consumer-defined secrets are exactly the two in its rows/, doc,
@@ -2485,39 +2380,12 @@ class ContinuumTest < Minitest::Test
   # cannot set is worse than not documenting it: it implies a knob that does
   # nothing. The doc now says the opposite explicitly, and this test holds that
   # statement to the code.
-  def test_the_unparameterised_release_repositories_are_documented_as_literals
-    doc = File.read(File.join(ROOT, 'docs/consumer-variables.md'))
-    release = workflow_body('continuum-tech-swift-release.yml')
 
-    section = doc[/### Not yet parameterised.*?(?=^### )/m]
-    refute_nil section, 'the doc must keep a section naming the release values that are not yet variables'
-
-    %w[CONTINUUM_HOMEBREW_TAP CONTINUUM_MACPORTS_TREE].each do |name|
-      # The code must not read it: the doc's claim is that these are literals.
-      refute_match(/vars\.#{name}/, release,
-                   "#{name} is documented as an unparameterised literal, so the release workflow must not read it")
-      # And it must not appear as a row in *any* table the reader would scan for
-      # variables a consumer sets. Checking only the secrets table is not enough
-      # — the main product-identity table at the top of the doc is where these
-      # two rows used to sit, so that is the table that has to be guarded.
-      offenders = doc.lines.select do |line|
-        line.start_with?('|') && line.include?("`#{name}`")
-      end
-      assert_empty offenders,
-                   "#{name} reads nothing, so it must not be listed in a variable table:\n#{offenders.join}"
-    end
-
-    # The literal it actually is: the release workflow names both repositories
-    # directly, so a reader can see the claim is about the code and not a
-    # guess about it.
-    assert_match(%r{gh repo clone \S+/macports-nanodictate}, release,
-                 'the MacPorts canon tree is a literal repository name in the release workflow')
-    assert_match(%r{gh repo clone \S+/homebrew-nanodictate}, release,
-                 'the Homebrew tap is a literal repository name in the release workflow')
+  def test_tech_profiles_do_not_reference_consumer_release_repositories
+    tech = (Dir[File.join(ROOT, '.github/workflows/continuum-tech-*.yml')] +
+            Dir[File.join(ROOT, '.github/caller-stubs/tech/*.yml')]).map { |path| File.read(path) }.join("\n")
+    refute_match(/homebrew-nanodictate|macports-nanodictate|kodmial\/nanodictate/i, tech)
   end
-
-  # Every value the fork hardcoded for one repository must be a knob, or a
-  # second consumer inherits that repository's paths and markers.
   def test_render_executor_knobs_cover_every_fork_hardcoded_value
     body = render_body
     {
