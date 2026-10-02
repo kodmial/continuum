@@ -251,6 +251,9 @@ jobs:
             --jq '.workflow_runs[]
               | select(.status == "completed")
               | select(
+                  .name == "SubTask" or
+                  .name == "SubTask review" or
+                  .name == "SubTask PR review" or
                   .name == "Child task" or
                   .name == "Child review" or
                   .name == "Child PR review" or
@@ -277,12 +280,20 @@ jobs:
 
           task_active() {
             local child_id="$1" kind="$2" task="$3"
-            grep -Fxq "Child $kind [$child_id] #$task" <<<"$active_titles"
+            local neutral_title
+            if [[ "$kind" == "task" ]]; then
+              neutral_title="SubTask #$task"
+            else
+              neutral_title="SubTask review #$task"
+            fi
+            grep -Fxq "$neutral_title" <<<"$active_titles" ||
+              grep -Fxq "Child $kind [$child_id] #$task" <<<"$active_titles"
           }
 
           manual_pr_active() {
             local child_id="$1" pr="$2"
-            grep -Fxq "Child PR review [$child_id] #$pr" <<<"$active_titles"
+            grep -Fxq "SubTask PR review #$pr" <<<"$active_titles" ||
+              grep -Fxq "Child PR review [$child_id] #$pr" <<<"$active_titles"
           }
 
           candidate_lines="$RUNNER_TEMP/continuum-child-candidates.jsonl"
@@ -290,7 +301,9 @@ jobs:
           declare -A active_wip_keys=()
 
           while IFS= read -r title; do
-            if [[ "$title" =~ ^Child[[:space:]]task[[:space:]]\[([^]]+)\][[:space:]]#([0-9]+)$ ]]; then
+            if [[ "$title" =~ ^SubTask[[:space:]]#([0-9]+)$ ]]; then
+              active_wip_keys["subtask#${BASH_REMATCH[1]}"]=1
+            elif [[ "$title" =~ ^Child[[:space:]]task[[:space:]]\[([^]]+)\][[:space:]]#([0-9]+)$ ]]; then
               active_wip_keys["${BASH_REMATCH[1]}#${BASH_REMATCH[2]}"]=1
             fi
           done <<<"$active_titles"
@@ -305,7 +318,7 @@ jobs:
 
             if ! PARENT_CONFIG=.continuum.yml CHILD_REPOSITORIES="" \
               bash "$resolver" verify "$child_id" "$child_repo" >/dev/null 2>&1; then
-              echo "::error::Child '$child_id' relationship verification failed."
+              echo "::error::Delegated relationship verification failed."
               invalid=$((invalid + 1))
               continue
             fi
@@ -1367,7 +1380,7 @@ jobs:
                 rank < 0
               ) {
                 throw new Error(
-                  'Invalid delegated child candidate: ' + JSON.stringify(child)
+                  'Invalid delegated task candidate.'
                 );
               }
               candidates.push({
@@ -1452,7 +1465,7 @@ jobs:
               selected
                 .map(item =>
                   (item.source === 'child'
-                    ? '[' + item.child.child_id + ']#' + item.issue.number
+                    ? 'SubTask #' + item.issue.number
                     : '#' + item.issue.number) +
                   ' (' + (item.priority || 'no priority') + ')'
                 )
@@ -1467,7 +1480,7 @@ jobs:
                 const parts = child.repository.split('/');
                 if (parts.length !== 2 || !parts[0] || !parts[1]) {
                   throw new Error(
-                    'Invalid delegated child repository: ' + child.repository
+                    'Invalid delegated repository binding.'
                   );
                 }
                 const [childOwner, childRepo] = parts;
@@ -1482,8 +1495,8 @@ jobs:
                   freshChildIssue.pull_request
                 ) {
                   core.info(
-                    'Skipping delegated [' + child.child_id + ']#' +
-                    child.task_number + ': state changed before dispatch.'
+                    'Skipping SubTask #' + child.task_number +
+                    ': state changed before dispatch.'
                   );
                   continue;
                 }
@@ -1495,8 +1508,7 @@ jobs:
                 );
                 if (childDeclaredBlockers.length > 0) {
                   core.info(
-                    'Skipping delegated [' + child.child_id + ']#' +
-                    child.task_number +
+                    'Skipping SubTask #' + child.task_number +
                     ': declared blocker appeared before dispatch.'
                   );
                   continue;
@@ -1518,8 +1530,7 @@ jobs:
                   childNativeBlockers.some(blocker => blocker.state === 'open')
                 ) {
                   core.info(
-                    'Skipping delegated [' + child.child_id + ']#' +
-                    child.task_number +
+                    'Skipping SubTask #' + child.task_number +
                     ': native blocker appeared before dispatch.'
                   );
                   continue;
@@ -1530,8 +1541,7 @@ jobs:
                   task_number: String(child.task_number),
                 });
                 core.notice(
-                  'Dispatched delegated [' + child.child_id + ']#' +
-                  child.task_number + ' (' +
+                  'Dispatched SubTask #' + child.task_number + ' (' +
                   (priority || 'no priority') + ').'
                 );
                 continue;
