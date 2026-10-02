@@ -59,6 +59,7 @@ CORE_STUBS=(
   continuum-opencode-unresolved.yml
   continuum-opencode-watchdog.yml
   continuum-opencode.yml
+  continuum-pr-agent-canary.yml
   continuum-pr-agent.yml
   continuum-remove-review-label.yml
   continuum-render-executor.yml

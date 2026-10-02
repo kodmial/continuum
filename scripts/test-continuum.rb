@@ -857,7 +857,7 @@ class ContinuumTest < Minitest::Test
   # three sets are independent files in one directory, so a one-line edit to the
   # prune candidate list — or a future edit to `"${STUBS[@]}"` — could delete a
   # consumer's whole tech or parent layer with no warning. The growth
-  # 14 -> 15 -> 18 is the observable form of that guarantee.
+  # 15 -> 16 -> 20 is the observable form of that guarantee.
   def test_installing_one_set_does_not_delete_another_sets_callers
     fixture do |dir|
       target = File.join(dir, 'consumer')
@@ -882,11 +882,11 @@ class ContinuumTest < Minitest::Test
           PARENT_STUBS.each { |stub| assert_includes installed, File.basename(stub) }
         end
       end
-      # Each set adds exactly its own files: 14 core, +1 tech, +4 parent.
+      # Each set adds exactly its own files: 15 core, +1 tech, +4 parent.
       assert_equal CORE_STUBS.size, counts['core']
       assert_equal CORE_STUBS.size + TECH_STUBS.size, counts['tech']
       assert_equal ALL_STUBS.size, counts['parent']
-      assert_equal 19, ALL_STUBS.size,
+      assert_equal 20, ALL_STUBS.size,
                    'every caller Continuum ships, across all three layers'
     end
   end
@@ -1313,9 +1313,9 @@ class ContinuumTest < Minitest::Test
   # count was taken from the workflow tree and then compared against the stub
   # tree, so adding a workflow and its stub together — exactly what a new
   # feature does — moved both sides and passed. A literal is the third,
-  # independent source: to change the fourteen core callers someone has to say so
+  # independent source: to change the fifteen core callers someone has to say so
   # here, which is where a reviewer sees it.
-  CORE_COUNT = 14
+  CORE_COUNT = 15
 
   # Every core workflow is either called by a stub in one of the three layers
   # or is a repository-owned/shared engine intentionally invoked from a
@@ -2866,6 +2866,10 @@ class ContinuumTest < Minitest::Test
       head_ref_pattern auto_merge_workflow opencode_workflow
     ],
     'continuum-opencode-unresolved.yml' => %w[continuum_ref],
+    'continuum-pr-agent-canary.yml' => %w[
+      continuum_ref canary_enabled base_ref opencode_model model max_tokens
+      api_base bridge_port server_port pr_agent_version
+    ],
     'continuum-pr-agent.yml' => %w[continuum_ref],
     'continuum-remove-review-label.yml' => %w[continuum_ref]
   }.freeze

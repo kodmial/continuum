@@ -29,11 +29,33 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest tests.test_pr_agent
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -c "from continuum.pr_agent_canary import self_check; print(self_check().describe())"
 ```
 
+## Executable canary (opt-in, disposable only)
+
+The durable executable path is the `continuum-pr-agent-canary.yml`
+reusable workflow plus its caller stub of the same name. It is disabled
+by default and never enables PR-Agent globally: `CONTINUUM_PR_AGENT_ENABLED`
+stays `false`, and only a manual `workflow_dispatch` run with
+`canary_enabled=true` (or a one-run
+`CONTINUUM_PR_AGENT_CANARY_ENABLED=true` variable) creates the disposable
+PR, posts the real `/review` and `/verify <finding-id>` commands as the
+owner, waits for the real event-driven `continuum-pr-agent.yml` runs,
+proves blocking finding -> correction -> `RESOLVED` -> clean-HEAD
+`APPROVED`, uploads the `pr-agent-canary-evidence.json` bundle, then
+closes the PR and deletes the branch in a `finally` block even when a
+gate fails. CodeRabbit is never referenced or changed, and any
+paid-provider credential or non-free route fails the run closed.
+
+```sh
+gh workflow run continuum-pr-agent-canary.yml \
+  --repo kodmial/continuum --ref main -f canary_enabled=true
+```
+
 ## Live rerun (maintainer, disposable only)
 
 1. Record the exact current-main SHA:
    `git rev-parse HEAD`.
-2. Create a disposable branch/PR from that SHA containing only the known
+2. Dispatch the executable canary above (preferred), or manually:
+   create a disposable branch/PR from that SHA containing only the known
    blocking defect (for example `canary/blocking-fixture.txt` with a
    `missing-null-check` at line 10).
 3. Dispatch the existing `continuum-pr-agent.yml` path for that PR with
