@@ -375,8 +375,13 @@ jobs:
           PY
           )"
           START_HEAD="$(git rev-parse HEAD)"
-          opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
+          if ! opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"; then
+            echo "classification=transient" >> "$GITHUB_OUTPUT"
+            echo "::error::OpenCode repair runtime failed; recovery may retry this exact operation."
+            exit 1
+          fi
           if [[ "$(git rev-parse HEAD)" != "$START_HEAD" ]]; then
+            echo "classification=deterministic" >> "$GITHUB_OUTPUT"
             echo "::error::OpenCode created a commit; PR-Agent repair requires the workflow to own commit/push."
             exit 1
           fi
@@ -400,10 +405,12 @@ jobs:
           CURRENT_SHA="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid || true)"
           REMOTE_SHA="$(git ls-remote origin "refs/heads/$HEAD_REF" | awk '{print $1}' || true)"
           if [[ -z "$HEAD_SHA" || -z "$CURRENT_SHA" || -z "$REMOTE_SHA" ]]; then
+            echo "classification=deterministic" >> "$GITHUB_OUTPUT"
             echo "::error::Unable to revalidate PR branch before publish (reviewed=$HEAD_SHA current=$CURRENT_SHA remote=$REMOTE_SHA); discarding repair."
             exit 1
           fi
           if [[ "$CURRENT_SHA" != "$HEAD_SHA" || "$REMOTE_SHA" != "$HEAD_SHA" ]]; then
+            echo "classification=deterministic" >> "$GITHUB_OUTPUT"
             echo "::error::PR branch moved before publish (reviewed=$HEAD_SHA current=$CURRENT_SHA remote=$REMOTE_SHA); discarding repair."
             exit 1
           fi
@@ -411,10 +418,23 @@ jobs:
             -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
             commit -m "fix: apply PR-Agent review findings for HEAD $HEAD_SHA"
           if ! git merge-base --is-ancestor "$HEAD_SHA" HEAD; then
+            echo "classification=deterministic" >> "$GITHUB_OUTPUT"
             echo "::error::Local repair is not based on reviewed HEAD $HEAD_SHA; discarding repair."
             exit 1
           fi
-          git push --force-with-lease="refs/heads/$HEAD_REF:$HEAD_SHA" origin "HEAD:refs/heads/$HEAD_REF"
+          if ! git push --force-with-lease="refs/heads/$HEAD_REF:$HEAD_SHA" origin "HEAD:refs/heads/$HEAD_REF"; then
+            CURRENT_AFTER="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid || true)"
+            REMOTE_AFTER="$(git ls-remote origin "refs/heads/$HEAD_REF" | awk '{print $1}' || true)"
+            if [[ "$CURRENT_AFTER" != "$HEAD_SHA" || "$REMOTE_AFTER" != "$HEAD_SHA" ]]; then
+              echo "classification=deterministic" >> "$GITHUB_OUTPUT"
+              echo "::error::PR branch moved during publish; stale repair will not be retried."
+            else
+              echo "classification=transient" >> "$GITHUB_OUTPUT"
+              echo "::error::Repair push failed without a branch move; recovery may retry."
+            fi
+            exit 1
+          fi
+          echo "classification=settled" >> "$GITHUB_OUTPUT"
           echo "Pushed one bounded repair to refs/heads/$HEAD_REF for PR #$PR_NUMBER."
 
       - name: Publish durable PR-Agent repair state
@@ -442,6 +462,7 @@ jobs:
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           HEAD_SHA: ${{ inputs.head_sha }}
+          RETRYABLE_FAILURE: ${{ (steps.install_opencode.outcome == 'failure' || (steps.repair_pass.outcome == 'failure' && steps.repair_pass.outputs.classification == 'transient')) && 'true' || 'false' }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
@@ -451,7 +472,10 @@ jobs:
               sha: process.env.HEAD_SHA,
               state: 'failure',
               context: 'continuum/pr-agent-repair',
-              description: 'PR-Agent repair failed; recovery eligible',
+              description:
+                process.env.RETRYABLE_FAILURE === 'true'
+                  ? 'PR-Agent repair failed: transient; recovery eligible'
+                  : 'PR-Agent repair failed: deterministic; recovery held',
               target_url:
                 context.serverUrl + '/' + context.repo.owner + '/' +
                 context.repo.repo + '/actions/runs/' + context.runId,
@@ -464,13 +488,15 @@ jobs:
           steps.convergence.outputs.held != 'true' &&
           failure() &&
           (steps.install_opencode.outcome == 'failure' ||
-           steps.repair_pass.outcome == 'failure')
+           (steps.repair_pass.outcome == 'failure' &&
+            steps.repair_pass.outputs.classification == 'transient'))
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ inputs.pr_number }}
           HEAD_SHA: ${{ inputs.head_sha }}
           RETRY_ATTEMPT: ${{ inputs.retry_attempt || '0' }}
           RETRY_WORKFLOW: ${{ inputs.retry_workflow || 'continuum-pr-agent.yml' }}
+          CI_WORKFLOW_NAME: ${{ vars.CONTINUUM_CI_WORKFLOW_NAME || 'CI' }}
         run: |
           set -euo pipefail
           attempt="${RETRY_ATTEMPT:-0}"
@@ -515,11 +541,27 @@ jobs:
             echo "PR state changed during repair retry backoff; stale retry cancelled."
             exit 0
           fi
-          if ! combined="$(gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/status" --jq .state)"; then
+          CI_JSON="$RUNNER_TEMP/pr-agent-repair-ci-runs.json"
+          if ! gh api "repos/$GITHUB_REPOSITORY/actions/runs?event=pull_request&head_sha=$HEAD_SHA&per_page=100" > "$CI_JSON"; then
             echo "Could not revalidate exact-HEAD CI after backoff; stale retry cancelled."
             exit 0
           fi
-          if [[ "$combined" != "success" ]]; then
+          if ! python3 - "$CI_JSON" "$CI_WORKFLOW_NAME" "$HEAD_SHA" <<'PY'
+          import json, sys
+          path, workflow, head = sys.argv[1:4]
+          with open(path, "r", encoding="utf-8") as handle:
+              runs = json.load(handle).get("workflow_runs", [])
+          current = sorted(
+              (run for run in runs if run.get("name") == workflow and run.get("head_sha") == head),
+              key=lambda run: run.get("created_at") or "",
+              reverse=True,
+          )
+          raise SystemExit(
+              0 if current and current[0].get("status") == "completed"
+              and current[0].get("conclusion") == "success" else 1
+          )
+          PY
+          then
             echo "Exact HEAD no longer has green CI; retry cancelled until a fresh CI event."
             exit 0
           fi
@@ -531,5 +573,5 @@ jobs:
           esac
           if ! [[ "$DEFAULT_BRANCH" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]]; then DEFAULT_BRANCH="main"; fi
           if [[ "$DEFAULT_BRANCH" == */.*/* || "$DEFAULT_BRANCH" == .*/ || "$DEFAULT_BRANCH" == */. ]] || [[ "$DEFAULT_BRANCH" =~ (^|/)\. ]] || [[ "$DEFAULT_BRANCH" =~ \.lock($|/) ]]; then DEFAULT_BRANCH="main"; fi
-          gh workflow run "$RETRY_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH"             -f pr_number="$PR_NUMBER"             -f expected_head_sha="$HEAD_SHA"             -f retry_attempt="$next"             -f retry_workflow="$RETRY_WORKFLOW"
+          gh workflow run "$RETRY_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH"             -f pr_number="$PR_NUMBER"             -f expected_head_sha="$HEAD_SHA"             -f retry_attempt="$next"             -f retry_workflow="$RETRY_WORKFLOW"             -f recovery_kind="repair"
           echo "Dispatched isolated PR-Agent repair retry via fresh review attempt $next/3."
