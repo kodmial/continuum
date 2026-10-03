@@ -16,32 +16,7 @@ on:
         required: false
         type: string
       review_id:
-        description: >-
-          Source review id / normalized review instance id (CodeRabbit review
-          id or PR-Agent review instance id, depending on review_provider).
-          Transitional: coderabbit-fix keeps using the CodeRabbit review id.
-        required: false
-        type: string
-      review_provider:
-        description: >-
-          Selected review provider for generic review-fix mode
-          (none|coderabbit|pr-agent). Empty falls back to
-          vars.CONTINUUM_REVIEW_PROVIDER, then to legacy
-          vars.CONTINUUM_REQUIRE_CODERABBIT / vars.CONTINUUM_PR_AGENT_ENABLED
-          migration compatibility. coderabbit-fix keeps its CodeRabbit-only
-          semantics for migration.
-        required: false
-        type: string
-      reviewed_sha:
-        description: PR head SHA the source review evaluated (generic mode)
-        required: false
-        type: string
-      head_sha:
-        description: Exact current PR head SHA at dispatch time (generic mode)
-        required: false
-        type: string
-      findings_json:
-        description: Normalized actionable finding set as JSON (generic mode)
+        description: Source CodeRabbit review id
         required: false
         type: string
       run_id:
@@ -321,7 +296,7 @@ jobs:
     # internal workflow_dispatch events from trusted workflows on main.
     if: >-
       (github.event_name == 'workflow_dispatch' &&
-       contains(fromJSON('["coderabbit-fix","review-fix","resolve-conflict","ci-fix","issue"]'), inputs.mode)) ||
+       contains(fromJSON('["coderabbit-fix","resolve-conflict","ci-fix","issue"]'), inputs.mode)) ||
       ((github.event_name == 'issue_comment' ||
         github.event_name == 'pull_request_review_comment') &&
        github.actor == github.repository_owner &&
@@ -983,158 +958,6 @@ jobs:
                 );
               }
             }
-
-      - name: Fix review findings (generic provider-neutral repair)
-        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'review-fix'
-        env:
-          OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
-          GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
-          GH_TOKEN: ${{ secrets.TAP_PAT }}
-          PR_NUMBER: ${{ inputs.pr_number }}
-          REVIEW_PROVIDER: ${{ inputs.review_provider || vars.CONTINUUM_REVIEW_PROVIDER || '' }}
-          REVIEW_ID: ${{ inputs.review_id }}
-          REVIEWED_SHA: ${{ inputs.reviewed_sha }}
-          HEAD_REF: ${{ inputs.head_ref }}
-          HEAD_SHA: ${{ inputs.head_sha }}
-          FINDINGS_JSON: ${{ inputs.findings_json }}
-        run: |
-          set -euo pipefail
-          PROMPT=$(cat <<EOF
-          Fix every review finding on pull request #${PR_NUMBER}.
-
-          Context:
-          - The selected review provider is ${REVIEW_PROVIDER:-unknown}.
-          - The normalized review instance is ${REVIEW_ID}.
-          - The reviewed commit is ${REVIEWED_SHA}.
-          - The exact current HEAD is ${HEAD_SHA}.
-          - The current checkout is the existing PR head branch: ${HEAD_REF}.
-          - Normalized finding set (JSON):
-          ${FINDINGS_JSON}
-          - Inspect the listed findings, their review threads, the PR
-            conversation, and the current diff using GitHub CLI/API as needed.
-
-          Requirements:
-          - Address every finding in this batch in one repair pass, including
-            non-blocking feedback that the provider submitted as advisory.
-          - Keep fixes scoped to the listed feedback; do not make unrelated refactors.
-          - Run the relevant tests, linters, or validation for the files you change.
-          - Work only in the current checked-out PR branch. Do not create or switch to
-            another branch and do not create a new pull request.
-          - Commit and push fixes to the current PR branch so the existing PR is updated.
-          - If a finding is incorrect or no longer applicable, do not make a speculative
-            code change; explain the reason in the existing PR conversation.
-          - Do not resolve or dismiss review threads yourself. The selected provider
-            will independently verify every original finding after this repair step completes.
-          - If no actionable findings remain, leave the code unchanged.
-          - Keep all comments and commit messages in English.
-          EOF
-          )
-          opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
-
-      - name: Ask selected provider to verify every original finding
-        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'review-fix'
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
-        env:
-          PR_NUMBER: ${{ inputs.pr_number }}
-          REVIEW_PROVIDER: ${{ inputs.review_provider || vars.CONTINUUM_REVIEW_PROVIDER || '' }}
-          REVIEW_ID: ${{ inputs.review_id }}
-          LEGACY_REQUIRE_CODERABBIT: ${{ vars.CONTINUUM_REQUIRE_CODERABBIT || 'false' }}
-          LEGACY_PR_AGENT_ENABLED: ${{ vars.CONTINUUM_PR_AGENT_ENABLED || 'false' }}
-        with:
-          github-token: ${{ secrets.TAP_PAT }}
-          script: |
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const pullNumber = Number(process.env.PR_NUMBER);
-            const reviewId = String(process.env.REVIEW_ID || '');
-            const canonical = String(process.env.REVIEW_PROVIDER || '').trim().toLowerCase();
-            const legacyRabbit = String(process.env.LEGACY_REQUIRE_CODERABBIT || '').trim().toLowerCase();
-            const legacyAgent = String(process.env.LEGACY_PR_AGENT_ENABLED || '').trim().toLowerCase();
-            const legacyProvider = (legacyRabbit === 'true' || legacyRabbit === '1')
-              ? 'coderabbit'
-              : ((legacyAgent === 'true' || legacyAgent === '1') ? 'pr-agent' : '');
-            if ((legacyRabbit === 'true' || legacyRabbit === '1') && (legacyAgent === 'true' || legacyAgent === '1')) {
-              core.setFailed('Contradictory review configuration: both legacy provider flags are enabled.');
-              return;
-            }
-            let provider = canonical || legacyProvider || 'none';
-            if (!['none', 'coderabbit', 'pr-agent'].includes(provider)) {
-              core.setFailed(`Unknown review provider: ${provider}`);
-              return;
-            }
-            if (canonical && legacyProvider && canonical !== legacyProvider) {
-              core.setFailed(`Contradictory review configuration: ${canonical} disagrees with legacy selection ${legacyProvider}.`);
-              return;
-            }
-            if (!Number.isInteger(pullNumber) || !reviewId) {
-              core.setFailed('Invalid pull request number or review instance id.');
-              return;
-            }
-            const pr = await github.rest.pulls.get({ owner, repo, pull_number: pullNumber });
-            const headSha = pr.data.head.sha;
-            const comments = await github.paginate(
-              github.rest.pulls.listReviewComments,
-              { owner, repo, pull_number: pullNumber, per_page: 100 }
-            );
-            // Provider-owned verification: CodeRabbit uses thread replies to
-            // coderabbitai[bot] findings; PR-Agent uses /verify replies to its
-            // own inline findings. The generic controller only routes; the
-            // native comment semantics stay inside each adapter branch.
-            const isCodeRabbit = provider === 'coderabbit';
-            const botLogin = isCodeRabbit ? 'coderabbitai[bot]' : context.repo.owner;
-            const findings = comments.filter((comment) => {
-              if (isCodeRabbit) {
-                return String(comment.pull_request_review_id) === reviewId &&
-                  comment.user?.login === 'coderabbitai[bot]' &&
-                  !comment.in_reply_to_id;
-              }
-              return String(comment.pull_request_review_id || comment.id) === reviewId ||
-                (comment.body || '').includes(`finding=${reviewId}`) ||
-                (comment.body || '').includes(reviewId);
-            });
-            let requested = 0;
-            if (findings.length === 0) {
-              core.notice(
-                `Review ${reviewId} (provider=${provider}) has no inline threads; no thread replies are needed.`
-              );
-              return;
-            }
-            for (const finding of findings) {
-              const marker = isCodeRabbit
-                ? `<!-- opencode-coderabbit-verification review=${reviewId} finding=${finding.id} head=${headSha} -->`
-                : `<!-- opencode-review-verification provider=pr-agent review=${reviewId} finding=${finding.id} head=${headSha} -->`;
-              const duplicate = comments.some(
-                (comment) =>
-                  comment.in_reply_to_id === finding.id &&
-                  comment.body?.includes(marker)
-              );
-              if (duplicate) {
-                core.info(`Verification already requested for finding ${finding.id} at ${headSha}.`);
-                continue;
-              }
-              const mention = isCodeRabbit ? '@coderabbitai' : '';
-              const body = [
-                marker,
-                `${mention} Re-check this exact original finding after the OpenCode fixes.`.trim(),
-                '',
-                `Provider: \`${provider}\``,
-                `Current PR HEAD: \`${headSha}\``,
-                '',
-                'Compare the original finding in this thread with the current code itself,',
-                'not merely with the latest incremental diff or the OpenCode report.',
-                '',
-                'Reply with **RESOLVED** only if the underlying issue is fully fixed.',
-                'Otherwise reply with **UNRESOLVED** and state exactly what remains.',
-              ].join('\n');
-              await github.request(
-                'POST /repos/{owner}/{repo}/pulls/{pull_number}/comments/{comment_id}/replies',
-                { owner, repo, pull_number: pullNumber, comment_id: finding.id, body }
-              );
-              requested += 1;
-            }
-            core.notice(
-              `Requested ${provider} verification for ${requested}/${findings.length} findings from review ${reviewId} at HEAD ${headSha}.`
-            );
 
       - name: Resolve merge conflict with main
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'resolve-conflict'
