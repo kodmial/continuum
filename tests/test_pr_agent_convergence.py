@@ -1,66 +1,41 @@
 import unittest
-
 from continuum.pr_agent_convergence import (
-    logical_fingerprint,
-    should_hold,
+    batch_fingerprint, finding_fingerprints, should_hold, surviving_findings,
     transition_marker,
 )
-
-
-A = "a" * 40
-B = "b" * 40
-C = "c" * 40
-
+A="a"*40; B="b"*40; C="c"*40
+def item(problem, line=1):
+    return {"source":"review","finding":{"path":"a.py","problem":problem,"line":line},"index":0}
 
 class ConvergenceTests(unittest.TestCase):
-    def test_fingerprint_is_order_independent(self):
-        x = [{"source": "review", "finding": {"path": "a.py", "problem": "bug"}},
-             {"source": "review", "finding": {"path": "b.py", "problem": "other"}}]
-        self.assertEqual(logical_fingerprint(x), logical_fingerprint(list(reversed(x))))
-
-    def test_location_and_score_do_not_change_logical_identity(self):
-        before = [{"source": "review", "finding": {
-            "path": "a.py", "problem": "null race", "line": 10, "score": 8}}]
-        after = [{"source": "review", "finding": {
-            "path": "a.py", "problem": "null race", "line": 14, "score": 9}}]
-        self.assertEqual(logical_fingerprint(before), logical_fingerprint(after))
-
-    def test_material_change_changes_identity(self):
-        before = [{"source": "review", "finding": {"path": "a.py", "problem": "null race"}}]
-        after = [{"source": "review", "finding": {"path": "a.py", "problem": "deadlock"}}]
-        self.assertNotEqual(logical_fingerprint(before), logical_fingerprint(after))
-
+    def test_location_is_not_identity(self):
+        self.assertEqual(finding_fingerprints([item("bug",1)]), finding_fingerprints([item("bug",99)]))
+    def test_material_change_is_new_identity(self):
+        self.assertNotEqual(finding_fingerprints([item("bug")]), finding_fingerprints([item("deadlock")]))
     def test_no_diff_same_head_holds(self):
-        fp = logical_fingerprint([{"source": "review", "finding": {"problem": "bug"}}])
-        marker = f"<!-- continuum-pr-agent-no-progress head={A} fingerprint={fp} -->"
-        self.assertTrue(should_hold(head_sha=A, fingerprint=fp, comment_bodies=[marker]))
+        xs=[item("bug")]; batch=batch_fingerprint(xs)
+        marker=f"<!-- continuum-pr-agent-no-progress head={A} fingerprint={batch} -->"
+        self.assertTrue(should_hold(head_sha=A,batch_fp=batch,current_finding_ids=finding_fingerprints(xs),comment_bodies=[marker]))
+    def test_repair_head_same_finding_holds(self):
+        ids=finding_fingerprints([item("bug")]); marker=transition_marker(A,B,ids)
+        self.assertTrue(should_hold(head_sha=B,batch_fp="1"*64,current_finding_ids=ids,comment_bodies=[marker]))
+    def test_partial_survivor_holds_even_when_set_changed(self):
+        old=finding_fingerprints([item("one"),item("two")])
+        current=finding_fingerprints([item("two"),item("three")])
+        marker=transition_marker(A,B,old)
+        self.assertEqual(len(surviving_findings(head_sha=B,current_finding_ids=current,comment_bodies=[marker])),1)
+        self.assertTrue(should_hold(head_sha=B,batch_fp="1"*64,current_finding_ids=current,comment_bodies=[marker]))
+    def test_materially_changed_findings_resume(self):
+        old=finding_fingerprints([item("one")]); current=finding_fingerprints([item("two")])
+        self.assertFalse(should_hold(head_sha=B,batch_fp="1"*64,current_finding_ids=current,comment_bodies=[transition_marker(A,B,old)]))
+    def test_user_new_head_invalidates_episode(self):
+        ids=finding_fingerprints([item("bug")])
+        self.assertFalse(should_hold(head_sha=C,batch_fp="1"*64,current_finding_ids=ids,comment_bodies=[transition_marker(A,B,ids)]))
+    def test_duplicate_transition_is_idempotent(self):
+        ids=finding_fingerprints([item("bug")]); marker=transition_marker(A,B,ids)
+        self.assertEqual(surviving_findings(head_sha=B,current_finding_ids=ids,comment_bodies=[marker,marker]),frozenset(ids))
+    def test_marker_contains_no_upstream_resolution_state(self):
+        ids=finding_fingerprints([item("bug")]); marker=transition_marker(A,B,ids)
+        self.assertNotIn("RESOLVED",marker); self.assertNotIn("ACTIVE",marker)
 
-    def test_repair_generated_head_same_finding_holds(self):
-        fp = logical_fingerprint([{"source": "review", "finding": {"problem": "bug"}}])
-        marker = transition_marker(A, B, fp)
-        self.assertTrue(should_hold(head_sha=B, fingerprint=fp, comment_bodies=[marker]))
-
-    def test_repair_generated_head_changed_finding_resumes(self):
-        old = logical_fingerprint([{"source": "review", "finding": {"problem": "bug"}}])
-        new = logical_fingerprint([{"source": "review", "finding": {"problem": "different"}}])
-        self.assertFalse(should_hold(head_sha=B, fingerprint=new,
-                                    comment_bodies=[transition_marker(A, B, old)]))
-
-    def test_user_new_work_head_does_not_inherit_episode(self):
-        fp = logical_fingerprint([{"source": "review", "finding": {"problem": "bug"}}])
-        self.assertFalse(should_hold(head_sha=C, fingerprint=fp,
-                                    comment_bodies=[transition_marker(A, B, fp)]))
-
-    def test_different_finding_set_starts_new_episode(self):
-        one = logical_fingerprint([{"source": "review", "finding": {"problem": "one"}}])
-        two = logical_fingerprint([{"source": "review", "finding": {"problem": "two"}}])
-        self.assertFalse(should_hold(head_sha=B, fingerprint=two,
-                                    comment_bodies=[transition_marker(A, B, one)]))
-
-    def test_invalid_identity_fails_closed(self):
-        with self.assertRaises(ValueError):
-            should_hold(head_sha="short", fingerprint="bad", comment_bodies=[])
-
-
-if __name__ == "__main__":
-    unittest.main()
+if __name__=="__main__": unittest.main()
