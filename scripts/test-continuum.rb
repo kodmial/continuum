@@ -15,7 +15,7 @@ class ContinuumTest < Minitest::Test
   # Project-owned entry workflows used only by the Continuum repository itself.
   # They deliberately stay outside the `continuum-` namespace so installer
   # ownership and reusable-engine ownership remain unambiguous.
-  PROJECT_ENTRY_WORKFLOWS = %w[automation.yml ci.yml opencode.yml pr-agent.yml].freeze
+  PROJECT_ENTRY_WORKFLOWS = %w[automation.yml ci.yml opencode.yml pr-agent.yml pr-agent-recovery.yml].freeze
   # Every caller stub in every layer, for the checks that must not care which
   # layer a file belongs to.
   ALL_STUBS = (CORE_STUBS + TECH_STUBS + PARENT_STUBS).sort
@@ -1279,6 +1279,7 @@ class ContinuumTest < Minitest::Test
     ci.yml
     opencode.yml
     pr-agent.yml
+    pr-agent-recovery.yml
     continuum-consumer-child-dispatcher.yml
     continuum-validation.yml
   ].freeze
@@ -1314,9 +1315,9 @@ class ContinuumTest < Minitest::Test
   # count was taken from the workflow tree and then compared against the stub
   # tree, so adding a workflow and its stub together — exactly what a new
   # feature does — moved both sides and passed. A literal is the third,
-  # independent source: to change the seventeen core callers someone has to say so
+  # independent source: to change the eighteen core callers someone has to say so
   # here, which is where a reviewer sees it.
-  CORE_COUNT = 17
+  CORE_COUNT = 18
 
   # Every core workflow is either called by a stub in one of the three layers
   # or is a repository-owned/shared engine intentionally invoked from a
@@ -2870,12 +2871,13 @@ class ContinuumTest < Minitest::Test
       head_ref_pattern auto_merge_workflow opencode_workflow
     ],
     'continuum-opencode-unresolved.yml' => %w[continuum_ref],
+    'continuum-pr-agent-recovery.yml' => %w[continuum_ref],
     'continuum-pr-agent-canary.yml' => %w[
       continuum_ref canary_enabled base_ref opencode_model model max_tokens
       api_base bridge_port server_port pr_agent_version
     ],
     'continuum-pr-agent.yml' => %w[
-      continuum_ref pr_number expected_head_sha retry_attempt retry_workflow
+      continuum_ref pr_number expected_head_sha retry_attempt retry_workflow recovery_kind
     ],
     'continuum-pr-agent-repair.yml' => %w[
       continuum_ref pr_number head_sha review_json improve_jsonl
