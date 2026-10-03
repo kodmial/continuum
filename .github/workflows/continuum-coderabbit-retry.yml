@@ -22,7 +22,10 @@ permissions: {}
 # CodeRabbit's included full-review quota is shared across PRs. There must be
 # exactly one controller deciding which PR gets the next review slot.
 concurrency:
-  group: ${{ github.workflow }}-coderabbit-rate-limit-controller
+  # Repository-wide fixed key: every caller/event shares one quota controller.
+  # Do not derive this from github.workflow; a second caller name must not create
+  # an independent CodeRabbit slot.
+  group: coderabbit-rate-limit-controller-${{ github.repository }}
   # This controller deliberately sleeps until the next shared quota slot.
   # Cancelling it on every wake-up resets that timer and can starve the queue
   # forever when status/review events keep arriving. Keep one runner alive;
@@ -41,12 +44,15 @@ jobs:
         contains(github.event.comment.body, 'Review limit reached'))) ||
       (github.event_name == 'pull_request_review' &&
        github.event.review.user.login == 'coderabbitai[bot]' &&
+       github.event.pull_request.state == 'open') ||
+      (github.event_name == 'pull_request_review_comment' &&
+       startsWith(github.event.comment.user.login, 'coderabbitai') &&
        github.event.pull_request.state == 'open'))
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
     permissions:
-      actions: read
+      actions: write
       contents: read
       issues: write
       pull-requests: read
@@ -55,6 +61,9 @@ jobs:
     steps:
       - name: Reconcile global CodeRabbit review queue
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          REQUIRED_WORKFLOW_GATE_LABEL: ${{ vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_LABEL || '' }}
+          REQUIRED_WORKFLOW_GATE_NAME: ${{ vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_NAME || '' }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
@@ -72,6 +81,10 @@ jobs:
               ['priority:p1', 1],
               ['priority:p2', 2],
             ]);
+            const requiredWorkflowGateLabel =
+              String(process.env.REQUIRED_WORKFLOW_GATE_LABEL || '').trim();
+            const requiredWorkflowGateName =
+              String(process.env.REQUIRED_WORKFLOW_GATE_NAME || '').trim();
 
             // CodeRabbit currently provides one included full review per hour.
             // A completed full review therefore moves the shared controller
@@ -164,7 +177,16 @@ jobs:
               }
             }
 
-            async function currentHeadHasGreenCi(pr) {
+            function hasLabel(pr, name) {
+              return Boolean(
+                name &&
+                (pr.labels || []).some(label =>
+                  (typeof label === 'string' ? label : label.name) === name
+                )
+              );
+            }
+
+            async function latestWorkflowForHead(pr, workflowName) {
               const runs = await github.paginate(
                 github.rest.actions.listWorkflowRunsForRepo,
                 {
@@ -176,22 +198,97 @@ jobs:
                 }
               );
 
-              const current = runs
+              return runs
                 .filter(run =>
-                  run.name === 'CI' &&
+                  run.name === workflowName &&
                   run.head_sha === pr.head.sha
                 )
                 .sort(
                   (a, b) =>
-                    new Date(b.created_at).getTime() -
-                    new Date(a.created_at).getTime()
-                )[0];
+                    (new Date(b.updated_at || b.created_at).getTime() -
+                     new Date(a.updated_at || a.created_at).getTime()) ||
+                    (Number(b.run_attempt || 0) -
+                     Number(a.run_attempt || 0))
+                )[0] || null;
+            }
 
-              return Boolean(
-                current &&
-                current.status === 'completed' &&
-                current.conclusion === 'success'
-              );
+            async function currentHeadReviewGate(pr) {
+              try {
+                const labelConfigured = Boolean(requiredWorkflowGateLabel);
+                const nameConfigured = Boolean(requiredWorkflowGateName);
+                if (labelConfigured !== nameConfigured) {
+                  core.warning(
+                    'Required workflow gate configuration is incomplete: both CONTINUUM_REQUIRED_WORKFLOW_GATE_LABEL and CONTINUUM_REQUIRED_WORKFLOW_GATE_NAME must be set together.'
+                  );
+                  return {
+                    ready: false,
+                    reason: 'required workflow gate configuration is incomplete',
+                  };
+                }
+
+                const ci = await latestWorkflowForHead(pr, 'CI');
+                if (
+                  !ci ||
+                  ci.status !== 'completed' ||
+                  ci.conclusion !== 'success'
+                ) {
+                  return {
+                    ready: false,
+                    reason: `CI is ${ci ? `${ci.status}/${ci.conclusion || 'pending'}` : 'missing'}`,
+                  };
+                }
+
+                // Match auto-merge: Packaging smoke is conditional/path-filtered.
+                // Absence is allowed; an API inspection failure is not. The
+                // surrounding try/catch fails this PR closed on unknown state.
+                const packagingSmoke =
+                  await latestWorkflowForHead(pr, 'Packaging smoke');
+                if (
+                  packagingSmoke &&
+                  (
+                    packagingSmoke.status !== 'completed' ||
+                    packagingSmoke.conclusion !== 'success'
+                  )
+                ) {
+                  return {
+                    ready: false,
+                    reason:
+                      `Packaging smoke is ${packagingSmoke.status}/${packagingSmoke.conclusion || 'pending'}`,
+                  };
+                }
+
+                if (
+                  labelConfigured &&
+                  hasLabel(pr, requiredWorkflowGateLabel)
+                ) {
+                  const required =
+                    await latestWorkflowForHead(pr, requiredWorkflowGateName);
+                  if (
+                    !required ||
+                    required.status !== 'completed' ||
+                    required.conclusion !== 'success'
+                  ) {
+                    return {
+                      ready: false,
+                      reason:
+                        `required workflow '${requiredWorkflowGateName}' is ${required ? `${required.status}/${required.conclusion || 'pending'}` : 'missing'}`,
+                    };
+                  }
+                }
+
+                return {
+                  ready: true,
+                  reason: 'all pre-review merge gates are green',
+                };
+              } catch (err) {
+                core.warning(
+                  `PR #${pr.number}: could not inspect pre-review workflow gates; skipping this PR for this pass: ${err.message}`
+                );
+                return {
+                  ready: false,
+                  reason: 'workflow gate state is unknown',
+                };
+              }
             }
 
             function sourceIssueNumber(pr) {
@@ -207,10 +304,14 @@ jobs:
             async function sourcePriority(pr) {
               const issueNumber = sourceIssueNumber(pr);
               if (!issueNumber) {
+                // A PR without a source issue must not starve forever behind an
+                // unbounded prioritized queue. Treat it as a deterministic P2
+                // fallback for review scheduling while keeping the diagnostic
+                // label explicit.
                 return {
                   issueNumber: Number.MAX_SAFE_INTEGER,
-                  priority: 'unprioritized',
-                  rank: Number.MAX_SAFE_INTEGER,
+                  priority: 'unprioritized:p2-fallback',
+                  rank: priorityRank.get('priority:p2'),
                 };
               }
 
@@ -262,6 +363,122 @@ jobs:
                 )[0] || null;
             }
 
+            function codeRabbitExplicitlyResolved(body = '') {
+              // UNRESOLVED contains RESOLVED as a substring, so reject it first.
+              // Then accept the same semantic token used by the wake trigger,
+              // regardless of markdown decoration.
+              if (/\bUNRESOLVED\b/i.test(body)) return false;
+              return (
+                /\bRESOLVED\b/i.test(body) ||
+                /✅\s*Review thread resolved\.?/i.test(body)
+              );
+            }
+
+            async function unresolvedCodeRabbitThreads(pr) {
+              const unresolved = [];
+              let cursor = null;
+
+              try {
+                do {
+                  const data = await github.graphql(
+                    `query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+                      repository(owner: $owner, name: $repo) {
+                        pullRequest(number: $number) {
+                          reviewThreads(first: 100, after: $cursor) {
+                            nodes {
+                              id
+                              isResolved
+                              comments(first: 100) {
+                                nodes {
+                                  databaseId
+                                  body
+                                  author { login }
+                                }
+                              }
+                            }
+                            pageInfo { hasNextPage endCursor }
+                          }
+                        }
+                      }
+                    }`,
+                    {
+                      owner,
+                      repo,
+                      number: pr.number,
+                      cursor,
+                    }
+                  );
+
+                  const connection =
+                    data.repository?.pullRequest?.reviewThreads;
+                  if (!connection) {
+                    core.warning(
+                      `PR #${pr.number}: review-thread query returned no pull request; skipping this PR for the current reconciliation.`
+                    );
+                    return null;
+                  }
+
+                  for (const thread of connection.nodes || []) {
+                    const comments = thread.comments?.nodes || [];
+                    const root = comments[0];
+                    if (!root?.author?.login?.startsWith('coderabbitai')) {
+                      continue;
+                    }
+                    if (thread.isResolved) continue;
+
+                    // CodeRabbit's semantic RESOLVED reply is authoritative even
+                    // when GitHub has not flipped the thread bit yet. The
+                    // auto-merger later normalizes that bit with its write token.
+                    const latestComment = comments.at(-1);
+                    if (
+                      latestComment &&
+                      latestComment.author?.login?.startsWith('coderabbitai') &&
+                      codeRabbitExplicitlyResolved(latestComment.body || '')
+                    ) {
+                      continue;
+                    }
+
+                    unresolved.push({
+                      id: thread.id,
+                      commentId: root.databaseId,
+                    });
+                  }
+
+                  cursor = connection.pageInfo.hasNextPage
+                    ? connection.pageInfo.endCursor
+                    : null;
+                } while (cursor);
+
+                return unresolved;
+              } catch (err) {
+                // A transient query/permission/deletion race on one PR must not
+                // abort reconciliation for every other PR. Fail closed for this
+                // PR and let the next event or safety-net pass retry it.
+                core.warning(
+                  `PR #${pr.number}: could not inspect CodeRabbit review threads; skipping this PR for this pass: ${err.message}`
+                );
+                return null;
+              }
+            }
+
+            function latestCurrentHeadDecision(reviews, headSha) {
+              return (reviews || [])
+                .filter(review =>
+                  review.user?.login?.startsWith('coderabbitai') &&
+                  review.commit_id === headSha &&
+                  (review.state === 'APPROVED' ||
+                   review.state === 'CHANGES_REQUESTED')
+                )
+                .sort((a, b) => {
+                  const time =
+                    new Date(a.submitted_at || 0).getTime() -
+                    new Date(b.submitted_at || 0).getTime();
+                  return time || Number(a.id) - Number(b.id);
+                })
+                .at(-1) || null;
+            }
+
+
             async function collectState() {
               const pulls = await github.paginate(github.rest.pulls.list, {
                 owner,
@@ -273,10 +490,12 @@ jobs:
 
               let latestCompletedReviewAt = 0;
               let latestInFlightCommand = null;
+              let autoMergeReconcilerDispatched = false;
               const candidates = [];
 
               for (const listed of pulls) {
-                const { data: pr } = await github.rest.pulls.get({
+                try {
+                  const { data: pr } = await github.rest.pulls.get({
                   owner,
                   repo,
                   pull_number: listed.number,
@@ -444,13 +663,73 @@ jobs:
                   )
                 );
                 if (!labels.has('review-ready')) continue;
-                if (!(await currentHeadHasGreenCi(pr))) continue;
+
+                const reviewGate = await currentHeadReviewGate(pr);
+                if (!reviewGate.ready) {
+                  core.info(
+                    `PR #${pr.number}: not eligible for a CodeRabbit full-review slot yet: ${reviewGate.reason}.`
+                  );
+                  continue;
+                }
+
+                // Full review is a finalization step, not a substitute for
+                // finding verification. Wait until every CodeRabbit-authored
+                // thread is resolved (including semantic RESOLVED replies)
+                // before spending another included review.
+                const unresolvedThreads =
+                  await unresolvedCodeRabbitThreads(pr);
+                if (unresolvedThreads === null) {
+                  continue;
+                }
+                if (unresolvedThreads.length > 0) {
+                  // Preserve the mature consumer auto-merge safety rule:
+                  // outdated findings are not discarded merely because HEAD
+                  // changed. Wake the single reconciler that already owns
+                  // idempotent exact-finding verification; one dispatch covers
+                  // every open PR and its marker prevents duplicate requests.
+                  if (!autoMergeReconcilerDispatched) {
+                    await github.rest.actions.createWorkflowDispatch({
+                      owner,
+                      repo,
+                      workflow_id: 'continuum-auto-merge.yml',
+                      ref: 'main',
+                    });
+                    autoMergeReconcilerDispatched = true;
+                    core.notice(
+                      'Unresolved CodeRabbit findings remain; dispatched auto-merge reconciliation for exact-finding verification.'
+                    );
+                  }
+                  core.info(
+                    `PR #${pr.number}: waiting for ${unresolvedThreads.length} unresolved CodeRabbit thread(s) before final full review.`
+                  );
+                  continue;
+                }
+
+                const currentDecision =
+                  latestCurrentHeadDecision(reviews, pr.head.sha);
+                if (currentDecision?.state === 'APPROVED') {
+                  continue;
+                }
+
+                // Non-code/task-contract blockers are represented by the
+                // durable exact-HEAD no-progress marker handled above. Do not
+                // re-classify a summary-only review here: an older sibling
+                // review on the same HEAD may still own actionable findings.
+                // Keeping one authoritative marker avoids contradictory queue
+                // decisions and preserves the convergence contract.
+
 
                 const requested = labels.has(REQUESTED_LABEL);
                 const rabbitStatus = await latestCodeRabbitStatus(pr);
+                const finalReview =
+                  fullReviewCount > 0 ||
+                  reviews.some(review =>
+                    review.user?.login?.startsWith('coderabbitai') &&
+                    review.state === 'CHANGES_REQUESTED'
+                  );
 
                 let dueAt = 0;
-                let kind = 'initial';
+                let kind = finalReview ? 'final-review' : 'initial';
 
                 if (
                   rabbitStatus &&
@@ -525,9 +804,18 @@ jobs:
                   headSha: pr.head.sha,
                   dueAt,
                   kind,
+                  stage: finalReview ? 'final-review' : 'initial-review',
+                  stageRank: finalReview ? 0 : 1,
+                  createdAt: new Date(pr.created_at || 0).getTime(),
                   fullReviewCount,
                   ...priority,
                 });
+                } catch (err) {
+                  core.warning(
+                    `PR #${listed.number}: queue reconciliation failed for this PR; skipping it for this pass: ${err.message}`
+                  );
+                  continue;
+                }
               }
 
               const globalNotBefore = latestCompletedReviewAt
@@ -553,12 +841,18 @@ jobs:
 
             function candidateOrder(a, b) {
               // Priority is the hard primary key and must never be bypassed:
-              // P0 > P1 > P2 > unprioritized. Fairness is allowed only
-              // *within the same priority class* so it cannot move a lower
-              // priority PR ahead of a higher-priority re-review.
+              // P0 > P1 > P2. PRs without a source issue use the explicit P2
+              // fallback above so they cannot silently starve forever.
+              //
+              // Within one priority class, a merge-ready final review beats a
+              // first review. Oldest PR then wins among otherwise equivalent
+              // candidates, which prevents a constant stream of new work from
+              // starving an older candidate.
               return (
                 a.rank - b.rank ||
+                a.stageRank - b.stageRank ||
                 a.fullReviewCount - b.fullReviewCount ||
+                a.createdAt - b.createdAt ||
                 a.issueNumber - b.issueNumber ||
                 a.prNumber - b.prNumber
               );
@@ -592,7 +886,7 @@ jobs:
               const queue = [...state.candidates]
                 .sort(candidateOrder)
                 .map(candidate =>
-                  `#${candidate.prNumber}/issue#${candidate.issueNumber === Number.MAX_SAFE_INTEGER ? '?' : candidate.issueNumber} ${candidate.priority} reviews=${candidate.fullReviewCount} due=${new Date(candidate.effectiveDueAt).toISOString()}`
+                  `#${candidate.prNumber}/issue#${candidate.issueNumber === Number.MAX_SAFE_INTEGER ? '?' : candidate.issueNumber} ${candidate.priority} stage=${candidate.stage} reviews=${candidate.fullReviewCount} due=${new Date(candidate.effectiveDueAt).toISOString()}`
                 )
                 .join(', ');
 
@@ -684,5 +978,5 @@ jobs:
             }
 
             core.notice(
-              `Selected PR #${selected.prNumber} from issue #${selected.issueNumber === Number.MAX_SAFE_INTEGER ? '?' : selected.issueNumber} (${selected.priority}, ${selected.kind}) for the next CodeRabbit slot at head ${selected.headSha}.`
+              `Selected PR #${selected.prNumber} from issue #${selected.issueNumber === Number.MAX_SAFE_INTEGER ? '?' : selected.issueNumber} (${selected.priority}, ${selected.stage}, ${selected.kind}) for the next CodeRabbit slot at head ${selected.headSha}.`
             );

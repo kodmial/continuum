@@ -11,11 +11,19 @@ on:
   pull_request_review:
     types: [submitted]
 
+  # A CodeRabbit finding verdict is a lifecycle transition too. Wake the
+  # serialized queue immediately after RESOLVED/UNRESOLVED instead of waiting
+  # for cron or an unrelated status/review event.
+  pull_request_review_comment:
+    types: [created, edited]
+
   # Manual/safety-net reconciliation.
   workflow_dispatch:
 
 permissions:
-  actions: read
+  # The queue may wake the trusted auto-merge reconciler to re-verify stale
+  # CodeRabbit findings before spending another full-review slot.
+  actions: write
   contents: read
   issues: write
   pull-requests: read

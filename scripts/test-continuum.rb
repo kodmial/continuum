@@ -3530,6 +3530,68 @@ class ContinuumTest < Minitest::Test
     refute_match(/\n\s*if \(reviewedSha && headSha === reviewedSha\) \{/, body)
   end
 
+  # The global CodeRabbit queue spends a repository-wide scarce review slot.
+  # Admission must therefore match every pre-review gate the auto-merger can
+  # already prove before review, and a re-review must wait for finding-level
+  # verification to converge.
+  def test_coderabbit_review_queue_is_merge_aware_and_has_final_review_stage
+    body = workflow_body('continuum-coderabbit-retry.yml')
+
+    assert_includes body, "REQUIRED_WORKFLOW_GATE_LABEL: ${{ vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_LABEL || '' }}"
+    assert_includes body, "REQUIRED_WORKFLOW_GATE_NAME: ${{ vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_NAME || '' }}"
+    assert_includes body, "await latestWorkflowForHead(pr, 'Packaging smoke')"
+    assert_includes body, 'new Date(b.updated_at || b.created_at).getTime()'
+    assert_includes body, 'Number(b.run_attempt || 0)'
+    assert_includes body, 'requiredWorkflowGateLabel'
+    assert_includes body, 'requiredWorkflowGateName'
+    assert_includes body, 'not eligible for a CodeRabbit full-review slot yet'
+
+    assert_includes body, 'await unresolvedCodeRabbitThreads(pr)'
+    assert_includes body, 'waiting for ${unresolvedThreads.length} unresolved CodeRabbit thread(s) before final full review'
+    assert_includes body, 'codeRabbitExplicitlyResolved'
+    assert_includes body, '/\\bRESOLVED\\b/i.test(body)'
+    assert_includes body, 'data.repository?.pullRequest?.reviewThreads'
+    assert_includes body, 'const latestComment = comments.at(-1)'
+    assert_includes body, "latestComment.author?.login?.startsWith('coderabbitai')"
+    assert_includes body, 'if (unresolvedThreads === null)'
+    assert_includes body, 'could not inspect CodeRabbit review threads; skipping this PR for this pass'
+    assert_includes body, 'queue reconciliation failed for this PR; skipping it for this pass'
+    assert_includes body, "return (reviews || [])"
+    assert_includes body, "currentDecision?.state === 'APPROVED'"
+    assert_includes body, 'durable exact-HEAD no-progress marker handled above'
+    assert_includes body, 'continuum-coderabbit-no-progress head='
+    assert_includes body, 'could not inspect pre-review workflow gates; skipping this PR for this pass'
+    assert_includes body, 'required workflow gate configuration is incomplete'
+    assert_includes body, 'labelConfigured !== nameConfigured'
+    assert_includes body, "stage: finalReview ? 'final-review' : 'initial-review'"
+    assert_includes body, 'stageRank: finalReview ? 0 : 1'
+    assert_match(/a\.rank - b\.rank \|\|\s*a\.stageRank - b\.stageRank/m, body)
+
+    # The requested label remains the exact-head/idempotency lock and there is
+    # still one authoritative command emission site in the serialized queue.
+    assert_includes body, 'const requested = labels.has(REQUESTED_LABEL);'
+    assert_equal 1, body.scan("body: '@coderabbitai full review'").size
+  end
+
+  # RESOLVED/UNRESOLVED replies are lifecycle events. They must wake the queue
+  # without relying on cron. A PR lacking a source issue gets an explicit P2
+  # fallback instead of an infinite rank that can starve forever.
+  def test_coderabbit_review_queue_wakes_on_finding_verdict_and_has_nonstarving_fallback
+    body = workflow_body('continuum-coderabbit-retry.yml')
+    stub = File.read(
+      File.join(ROOT, '.github/caller-stubs/continuum-coderabbit-retry.yml')
+    )
+
+    assert_includes stub, 'pull_request_review_comment:'
+    assert_includes stub, 'types: [created, edited]'
+    assert_includes body, "github.event_name == 'pull_request_review_comment'"
+    assert_includes body, "startsWith(github.event.comment.user.login, 'coderabbitai')"
+
+    assert_includes body, "priority: 'unprioritized:p2-fallback'"
+    assert_includes body, "rank: priorityRank.get('priority:p2')"
+    assert_includes body, 'a.createdAt - b.createdAt'
+  end
+
   # ------------------------------------------------- auto-merge / CodeRabbit
 
   def auto_merge_body
