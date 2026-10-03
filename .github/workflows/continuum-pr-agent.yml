@@ -739,8 +739,8 @@ jobs:
           set -euo pipefail
           attempt="${RETRY_ATTEMPT:-0}"
           [[ "$attempt" =~ ^[0-9]+$ ]] || attempt=0
-          if (( attempt >= 3 )); then
-            MARKER="<!-- continuum-pr-agent-retry-exhausted head=${HEAD_SHA,,} kind=review attempts=$attempt -->"
+          if (( attempt >= 2 )); then
+            MARKER="<!-- continuum-pr-agent-retry-exhausted head=${HEAD_SHA,,} kind=review attempts=$((attempt + 1)) -->"
             printf -v BODY '%s\n%s' "$MARKER" "PR-Agent review exhausted the bounded retry budget for this exact HEAD. A new HEAD or an explicit owner /review starts a fresh evaluation."
             gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$BODY"
             echo "Retry budget exhausted for PR #$PR_NUMBER HEAD $HEAD_SHA."
