@@ -354,74 +354,91 @@ jobs:
               const unresolved = [];
               let cursor = null;
 
-              do {
-                const data = await github.graphql(
-                  `query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
-                    repository(owner: $owner, name: $repo) {
-                      pullRequest(number: $number) {
-                        reviewThreads(first: 100, after: $cursor) {
-                          nodes {
-                            id
-                            isResolved
-                            comments(first: 100) {
-                              nodes {
-                                databaseId
-                                body
-                                author { login }
+              try {
+                do {
+                  const data = await github.graphql(
+                    `query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+                      repository(owner: $owner, name: $repo) {
+                        pullRequest(number: $number) {
+                          reviewThreads(first: 100, after: $cursor) {
+                            nodes {
+                              id
+                              isResolved
+                              comments(first: 100) {
+                                nodes {
+                                  databaseId
+                                  body
+                                  author { login }
+                                }
                               }
                             }
+                            pageInfo { hasNextPage endCursor }
                           }
-                          pageInfo { hasNextPage endCursor }
                         }
                       }
+                    }`,
+                    {
+                      owner,
+                      repo,
+                      number: pr.number,
+                      cursor,
                     }
-                  }`,
-                  {
-                    owner,
-                    repo,
-                    number: pr.number,
-                    cursor,
+                  );
+
+                  const connection =
+                    data.repository?.pullRequest?.reviewThreads;
+                  if (!connection) {
+                    core.warning(
+                      `PR #${pr.number}: review-thread query returned no pull request; skipping this PR for the current reconciliation.`
+                    );
+                    return null;
                   }
+
+                  for (const thread of connection.nodes || []) {
+                    const comments = thread.comments?.nodes || [];
+                    const root = comments[0];
+                    if (!root?.author?.login?.startsWith('coderabbitai')) {
+                      continue;
+                    }
+                    if (thread.isResolved) continue;
+
+                    // CodeRabbit's semantic RESOLVED reply is authoritative even
+                    // when GitHub has not flipped the thread bit yet. The
+                    // auto-merger later normalizes that bit with its write token.
+                    const latestRabbitReply = comments
+                      .slice(1)
+                      .filter(comment =>
+                        comment.author?.login?.startsWith('coderabbitai')
+                      )
+                      .at(-1);
+                    if (
+                      latestRabbitReply &&
+                      codeRabbitExplicitlyResolved(latestRabbitReply.body || '')
+                    ) {
+                      continue;
+                    }
+
+                    unresolved.push({
+                      id: thread.id,
+                      commentId: root.databaseId,
+                    });
+                  }
+
+                  cursor = connection.pageInfo.hasNextPage
+                    ? connection.pageInfo.endCursor
+                    : null;
+                } while (cursor);
+
+                return unresolved;
+              } catch (err) {
+                // A transient query/permission/deletion race on one PR must not
+                // abort reconciliation for every other PR. Fail closed for this
+                // PR and let the next event or safety-net pass retry it.
+                core.warning(
+                  `PR #${pr.number}: could not inspect CodeRabbit review threads; skipping this PR for this pass: ${err.message}`
                 );
-
-                const connection =
-                  data.repository.pullRequest.reviewThreads;
-                for (const thread of connection.nodes || []) {
-                  const comments = thread.comments?.nodes || [];
-                  const root = comments[0];
-                  if (!root?.author?.login?.startsWith('coderabbitai')) {
-                    continue;
-                  }
-                  if (thread.isResolved) continue;
-
-                  // CodeRabbit's semantic RESOLVED reply is authoritative even
-                  // when GitHub has not flipped the thread bit yet. The
-                  // auto-merger later normalizes that bit with its write token.
-                  const latestRabbitReply = comments
-                    .slice(1)
-                    .filter(comment =>
-                      comment.author?.login?.startsWith('coderabbitai')
-                    )
-                    .at(-1);
-                  if (
-                    latestRabbitReply &&
-                    codeRabbitExplicitlyResolved(latestRabbitReply.body || '')
-                  ) {
-                    continue;
-                  }
-
-                  unresolved.push({
-                    id: thread.id,
-                    commentId: root.databaseId,
-                  });
-                }
-
-                cursor = connection.pageInfo.hasNextPage
-                  ? connection.pageInfo.endCursor
-                  : null;
-              } while (cursor);
-
-              return unresolved;
+                return null;
+              }
             }
 
             function latestCurrentHeadDecision(reviews, headSha) {
@@ -656,6 +673,9 @@ jobs:
                 // before spending another included review.
                 const unresolvedThreads =
                   await unresolvedCodeRabbitThreads(pr);
+                if (unresolvedThreads === null) {
+                  continue;
+                }
                 if (unresolvedThreads.length > 0) {
                   core.info(
                     `PR #${pr.number}: waiting for ${unresolvedThreads.length} unresolved CodeRabbit thread(s) before final full review.`
