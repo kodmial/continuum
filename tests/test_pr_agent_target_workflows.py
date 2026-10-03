@@ -49,8 +49,12 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
 
     def test_repair_targets_child_branch_without_actions_checkout_metadata(self):
         body = read(".github/workflows/continuum-pr-agent-repair.yml")
-        self.assertIn('gh repo clone "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY"', body)
-        self.assertIn("-- --quiet >/dev/null 2>&1", body)
+        self.assertIn('git remote add origin "https://github.com/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY.git"', body)
+        self.assertIn('git check-ref-format "refs/heads/$HEAD_REF"', body)
+        self.assertIn('"+refs/heads/$HEAD_REF:refs/remotes/origin/continuum-pr-agent-target"', body)
+        self.assertIn("git checkout --detach refs/remotes/origin/continuum-pr-agent-target", body)
+        self.assertNotIn('git fetch origin "$HEAD_REF"', body)
+        self.assertNotIn('git checkout -B "$HEAD_REF"', body)
         self.assertIn('git push --force-with-lease=', body)
         self.assertIn('gh workflow run "$RETRY_WORKFLOW" --repo "$GITHUB_REPOSITORY"', body)
         self.assertNotIn("repository: " + "${" + "{", body)
@@ -86,8 +90,10 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
         review = read(".github/workflows/continuum-pr-agent.yml")
         repair = read(".github/workflows/continuum-pr-agent-repair.yml")
         for body in (review, repair):
-            self.assertIn('gh repo clone "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY"', body)
-            self.assertIn("-- --quiet >/dev/null 2>&1", body)
+            self.assertIn('git remote add origin "https://github.com/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY.git"', body)
+            self.assertIn(">/dev/null 2>&1", body)
+        self.assertIn("git fetch --depth=1 --no-tags origin", review)
+        self.assertIn("git checkout --detach FETCH_HEAD", review)
         self.assertIn("detailed output remains runner-local", review)
 
     def test_coderabbit_workflows_remain_outside_target_context(self):
