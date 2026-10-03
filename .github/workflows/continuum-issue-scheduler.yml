@@ -241,8 +241,11 @@ jobs:
             local repository="$1" name="$2"
             local err_file value rc
             err_file="$(mktemp)"
-            value="$(gh api "repos/$repository/actions/variables/$name" --jq '.value // ""' 2>"$err_file")"
-            rc=$?
+            if value="$(gh api "repos/$repository/actions/variables/$name" --jq '.value // ""' 2>"$err_file")"; then
+              rc=0
+            else
+              rc=$?
+            fi
             if [ "$rc" -eq 0 ]; then
               rm -f "$err_file"
               printf '%s' "$value"
