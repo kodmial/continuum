@@ -702,6 +702,8 @@ jobs:
           - Keep all comments and commit-facing text in English.
           - Do not add unrelated automation outside the issue scope.
           - You may modify .github/workflows/** when the issue requires it. Workflow changes must be published only on the task branch and reviewed through a pull request; never update main directly.
+          - You may use GitHub CLI/API and dispatch existing repository workflows when required by the issue. Treat specialized workflows as tools: inspect their outputs, wait for completion, and use their evidence to satisfy the Definition of Done; the scheduler will not reroute the issue for you.
+          - If the Definition of Done is fully satisfied without repository changes, post the required evidence on the issue and close the issue yourself only after every Definition of Done item is verified. Never close an implementation task that still requires code changes.
           - Do not perform git commits, pushes, branch switches, rebases, resets, merges, or PR creation; the workflow owns Git state.
           EOF
           )"
@@ -737,6 +739,13 @@ jobs:
           fi
 
           if [[ -z "$(git status --porcelain)" ]]; then
+            ISSUE_STATE="$(gh issue view "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --json state --jq .state)"
+            if [[ "$ISSUE_STATE" == "CLOSED" ]]; then
+              gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                --remove-label "$IN_PROGRESS_LABEL" >/dev/null 2>&1 || true
+              echo "Issue #$ISSUE_NUMBER completed without repository changes and was closed with evidence."
+              exit 0
+            fi
             echo "OpenCode produced no repository changes."
             gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
               --body "Automation produced no code changes; pausing this issue for manual inspection."
