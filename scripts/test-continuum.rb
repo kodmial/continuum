@@ -3540,6 +3540,8 @@ class ContinuumTest < Minitest::Test
     assert_includes body, "REQUIRED_WORKFLOW_GATE_LABEL: ${{ vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_LABEL || '' }}"
     assert_includes body, "REQUIRED_WORKFLOW_GATE_NAME: ${{ vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_NAME || '' }}"
     assert_includes body, "await latestWorkflowForHead(pr, 'Packaging smoke')"
+    assert_includes body, 'new Date(b.updated_at || b.created_at).getTime()'
+    assert_includes body, 'Number(b.run_attempt || 0)'
     assert_includes body, 'requiredWorkflowGateLabel'
     assert_includes body, 'requiredWorkflowGateName'
     assert_includes body, 'not eligible for a CodeRabbit full-review slot yet'
