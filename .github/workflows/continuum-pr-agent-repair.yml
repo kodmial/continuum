@@ -385,6 +385,12 @@ jobs:
             echo "::error::OpenCode created a commit; PR-Agent repair requires the workflow to own commit/push."
             exit 1
           fi
+
+          # Remove only repository-ignored build/cache artifacts left by tools
+          # the repair agent ran. This cannot delete source changes because
+          # git clean -X is restricted to ignored paths.
+          git clean -fdX
+
           if [[ -z "$(git status --porcelain)" ]]; then
             MARKER="<!-- continuum-pr-agent-no-progress head=${HEAD_SHA,,} fingerprint=${BATCH_FINGERPRINT,,} -->"
             printf -v BODY '%s\n%s' "$MARKER" "PR-Agent reported actionable structured findings, but the bounded OpenCode repair produced no code change for this exact HEAD/finding state. Automatic same-state repair is held until the HEAD or structured finding state changes."
