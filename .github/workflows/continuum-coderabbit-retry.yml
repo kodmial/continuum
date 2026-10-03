@@ -43,10 +43,8 @@ jobs:
        github.event.review.user.login == 'coderabbitai[bot]' &&
        github.event.pull_request.state == 'open') ||
       (github.event_name == 'pull_request_review_comment' &&
-       github.event.comment.user.login == 'coderabbitai[bot]' &&
-       github.event.pull_request.state == 'open' &&
-       (contains(github.event.comment.body, 'RESOLVED') ||
-        contains(github.event.comment.body, 'UNRESOLVED'))))
+       startsWith(github.event.comment.user.login, 'coderabbitai') &&
+       github.event.pull_request.state == 'open'))
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
