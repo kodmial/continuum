@@ -186,27 +186,34 @@ jobs:
             }
 
             async function latestWorkflowForHead(pr, workflowName) {
-              const runs = await github.paginate(
-                github.rest.actions.listWorkflowRunsForRepo,
-                {
-                  owner,
-                  repo,
-                  branch: pr.head.ref,
-                  event: 'pull_request',
-                  per_page: 100,
-                }
-              );
+              try {
+                const runs = await github.paginate(
+                  github.rest.actions.listWorkflowRunsForRepo,
+                  {
+                    owner,
+                    repo,
+                    branch: pr.head.ref,
+                    event: 'pull_request',
+                    per_page: 100,
+                  }
+                );
 
-              return runs
-                .filter(run =>
-                  run.name === workflowName &&
-                  run.head_sha === pr.head.sha
-                )
-                .sort(
-                  (a, b) =>
-                    new Date(b.created_at).getTime() -
-                    new Date(a.created_at).getTime()
-                )[0] || null;
+                return runs
+                  .filter(run =>
+                    run.name === workflowName &&
+                    run.head_sha === pr.head.sha
+                  )
+                  .sort(
+                    (a, b) =>
+                      new Date(b.created_at).getTime() -
+                      new Date(a.created_at).getTime()
+                  )[0] || null;
+              } catch (err) {
+                core.warning(
+                  `PR #${pr.number}: could not inspect workflow '${workflowName}'; treating the gate as unavailable for this pass: ${err.message}`
+                );
+                return null;
+              }
             }
 
             async function currentHeadReviewGate(pr) {
@@ -458,23 +465,6 @@ jobs:
                 .at(-1) || null;
             }
 
-            async function reviewHasInlineFindings(pr, reviewId) {
-              if (!reviewId) return false;
-              const comments = await github.paginate(
-                github.rest.pulls.listReviewComments,
-                {
-                  owner,
-                  repo,
-                  pull_number: pr.number,
-                  per_page: 100,
-                }
-              );
-              return comments.some(comment =>
-                comment.pull_request_review_id === reviewId &&
-                comment.user?.login?.startsWith('coderabbitai') &&
-                !comment.in_reply_to_id
-              );
-            }
 
             async function collectState() {
               const pulls = await github.paginate(github.rest.pulls.list, {
@@ -689,20 +679,13 @@ jobs:
                   continue;
                 }
 
-                // CHANGES_REQUESTED with no inline finding is a policy/task
-                // contract blocker (for example Linked Issues), not a coding
-                // repair state. The OpenCode classifier normally writes a
-                // durable no-progress marker; this direct guard makes the quota
-                // controller fail closed even if that wake-up was lost.
-                if (
-                  currentDecision?.state === 'CHANGES_REQUESTED' &&
-                  !(await reviewHasInlineFindings(pr, currentDecision.id))
-                ) {
-                  core.notice(
-                    `PR #${pr.number}: current-head CHANGES_REQUESTED review ${currentDecision.id} has no inline findings; suppressing full re-review until the HEAD or policy state changes.`
-                  );
-                  continue;
-                }
+                // Non-code/task-contract blockers are represented by the
+                // durable exact-HEAD no-progress marker handled above. Do not
+                // re-classify a summary-only review here: an older sibling
+                // review on the same HEAD may still own actionable findings.
+                // Keeping one authoritative marker avoids contradictory queue
+                // decisions and preserves the convergence contract.
+
 
                 const requested = labels.has(REQUESTED_LABEL);
                 const rabbitStatus = await latestCodeRabbitStatus(pr);
