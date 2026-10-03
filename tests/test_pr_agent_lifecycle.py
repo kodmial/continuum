@@ -1019,10 +1019,11 @@ class RepairWiringRegressionTests(unittest.TestCase):
         # Bounded merge-scope repair: explicit strategy plus a timeout.
         self.assertIn("conflict_strategy: 'merge'", merge)
         self.assertIn("timeout_minutes: '60'", merge)
-        # Stranded-lock watchdog: liveness probe plus lock release.
-        self.assertIn("conflictRepairRunsActive", merge)
+        # Isolation is per PR/per HEAD: a repository-global active-run probe
+        # would let an unrelated PR block this PR.
+        self.assertNotIn("conflictRepairRunsActive", merge)
         self.assertIn("releaseConflictLock", merge)
-        self.assertIn("released a stranded opencode-conflict-repair lock", merge)
+        self.assertIn("exact-HEAD marker decides whether this PR may dispatch", merge)
         # Bounded retry: one attempt marker per HEAD, then hold.
         self.assertIn("opencode-conflict-repair-attempt head=", merge)
         self.assertIn("already ran for this HEAD", merge)
@@ -1063,6 +1064,32 @@ class RepairWiringRegressionTests(unittest.TestCase):
                     "Could not revalidate exact-HEAD CI after backoff", body
                 )
                 self.assertNotIn('--ref main', body)
+
+    def test_retry_workflow_target_is_allow_listed(self):
+        review = read_repo(".github/workflows/continuum-pr-agent.yml")
+        repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
+        self.assertIn(
+            "['continuum-pr-agent.yml', 'pr-agent.yml'].includes(retryWorkflow)",
+            review,
+        )
+        self.assertIn("continuum-pr-agent.yml|pr-agent.yml", repair)
+
+    def test_conflict_dispatch_failure_does_not_consume_head_attempt(self):
+        merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
+        self.assertIn("attemptComment.data.id", merge)
+        self.assertIn("deleteComment", merge)
+        self.assertLess(
+            merge.index("createComment"),
+            merge.index("actions/workflows/{workflow_id}/dispatches"),
+        )
+
+    def test_final_merge_refreshes_pr_and_handles_late_conflict(self):
+        merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
+        self.assertIn("Re-read after all asynchronous gate queries", merge)
+        self.assertIn("preMergeSync", merge)
+        self.assertIn("preMergeGates", merge)
+        self.assertIn("err.status === 409", merge)
+        self.assertIn("await dispatchConflictRepair(fresh, message)", merge)
 
     def test_pr_agent_caller_forwards_exact_head_retry_inputs(self):
         caller = read_repo(".github/workflows/pr-agent.yml")
