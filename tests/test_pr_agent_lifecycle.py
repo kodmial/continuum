@@ -72,10 +72,30 @@ def issue_entry(relevant_file="src/app.py", header="Possible Bug", n: int = 0) -
 
 class ProtectedBaselineTests(unittest.TestCase):
     def test_every_protected_coderabbit_file_has_zero_diff_from_baseline(self):
+        # The validation workflow checks out with fetch-depth 1, so the
+        # baseline object may be absent ("fatal: bad object"). Fetch it on
+        # demand; the baseline commit is an ancestor on origin so a shallow
+        # fetch of that single object is sufficient for the diff below.
+        present = subprocess.run(
+            ["git", "cat-file", "-e", BASELINE_SHA],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if present.returncode != 0:
+            fetched = subprocess.run(
+                ["git", "fetch", "--depth", "1", "origin", BASELINE_SHA],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            self.assertEqual(fetched.returncode, 0, fetched.stderr)
         for path in PROTECTED_FILES:
             with self.subTest(path=path):
                 out = subprocess.run(
-                    ["git", "diff", BASELINE_SHA, "--", path],
+                    ["git", "diff", BASELINE_SHA, "HEAD", "--", path],
                     cwd=ROOT,
                     capture_output=True,
                     text=True,
