@@ -38,7 +38,7 @@ permissions:
   statuses: read
 
 concurrency:
-  group: pr-agent-caller-${{ github.event.issue.number || github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || inputs.pr_number || github.run_id }}
+  group: pr-agent-caller-${{ github.event_name == 'schedule' && 'schedule' || github.event.issue.number || github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || inputs.pr_number || github.run_id }}
   cancel-in-progress: false
 
 jobs:
@@ -156,6 +156,25 @@ jobs:
                 continue;
               }
 
+              // Bounded stale-recovery budget: every recovery dispatch writes
+              // a `continuum-pr-agent-retry head=<head> ... attempt=N` marker,
+              // so resume the attempt count instead of resetting to 0. A HEAD
+              // that already consumed 3 attempts holds terminal even when the
+              // exhausted-marker write was lost or deleted.
+              const retryPrefix =
+                '<!-- continuum-pr-agent-retry head=' + head.toLowerCase() + ' ';
+              let maxRetryAttempt = -1;
+              for (const comment of comments) {
+                const body = String(comment.body || '');
+                if (!body.includes(retryPrefix)) continue;
+                const match = body.match(/attempt=(\d+)/);
+                if (match) maxRetryAttempt = Math.max(maxRetryAttempt, Number(match[1]));
+              }
+              const nextAttempt = maxRetryAttempt + 1;
+              if (nextAttempt >= 3) {
+                continue;
+              }
+
               const statuses = combined.data.statuses || [];
               const review = latestStatus(statuses, REVIEW_CONTEXT);
               const repair = latestStatus(statuses, REPAIR_CONTEXT);
@@ -211,7 +230,7 @@ jobs:
                 inputs: {
                   pr_number: String(pr.number),
                   expected_head_sha: head,
-                  retry_attempt: '0',
+                  retry_attempt: String(nextAttempt),
                   retry_workflow: callerWorkflow,
                 },
               });

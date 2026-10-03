@@ -42,6 +42,7 @@ this file contains no marker format knowledge.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Sequence
 
@@ -519,7 +520,7 @@ def conflict_repair_action(
         raise LifecycleError("conflict-repair attempt count cannot be negative")
     if active_repair_runs < 0:
         raise LifecycleError("active repair run count cannot be negative")
-    if label_present and active_repair_runs > 0:
+    if active_repair_runs > 0:
         return {
             "action": "wait",
             "release_lock": False,
@@ -583,7 +584,9 @@ def resolve_dispatch_ref(default_branch: object, fallback: object = "main") -> s
     name = str(default_branch or "").strip()
     if not name:
         name = str(fallback or "").strip()
-    return name or "main"
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", name or ""):
+        return "main"
+    return name
 
 
 def needs_fresh_review(old_head_sha: str, new_head_sha: str) -> bool:
