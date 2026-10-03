@@ -84,23 +84,24 @@ publication are not part of the Swift profile.
 | `AUTOMATION_BLOCKED_LABEL` | `automation:blocked` | Capabilities whose mandatory qualification failed and need repair. |
 | `CONTINUUM_CHILD_OWNED_MARKER` | `<!-- continuum-child-owned -->` | Current delegated-child ownership marker. |
 | `CONTINUUM_LEGACY_CHILD_OWNED_MARKER` | empty | Optional legacy marker supplied by a migrating consumer. |
-| `CONTINUUM_REQUIRE_CODERABBIT` | `false` | Require CodeRabbit before merge. |
+| `CONTINUUM_REVIEW_PROVIDER` | `none` | Authoritative review selector: `none`, `coderabbit`, or `pr-agent`. |
 | `CONTINUUM_VERSION_FILE` | empty | Optional version file used only by the generic stale-release-run optimization. |
 
 ## Optional PR-Agent review provider
 
-PR-Agent is an independently configurable optional review provider backed by
-the runner-local OpenCode bridge. It stays disabled unless enabled here;
-consumers that never enable it are unaffected, and no paid-provider secret
-is ever required. See `docs/pr-agent-opencode.md` for the architecture,
-commands, and failure modes.
+PR-Agent is the optional review stack selected with
+`CONTINUUM_REVIEW_PROVIDER=pr-agent` and backed by the runner-local OpenCode
+bridge. Provider selection does not use legacy true/false switches. Consumers
+selecting `coderabbit` keep the CodeRabbit stack; no paid-provider secret is
+required for PR-Agent. See `docs/pr-agent-opencode.md` for the architecture
+and failure modes.
 
 | Repository variable | Default | Meaning |
 | --- | --- | --- |
-| `CONTINUUM_PR_AGENT_ENABLED` | `false` | Enable the optional PR-Agent review provider. |
 | `PR_AGENT_API_BASE` | `http://127.0.0.1:<bridge_port>/v1` | OpenAI-compatible backend base PR-Agent talks to. |
 | `PR_AGENT_MODEL` | `openai/continuum-review` | LiteLLM routing id (`openai/` prefix selects the bridge path). |
-| `PR_AGENT_MAX_TOKENS` | `4096` | Custom-model token/output cap. |
+| `PR_AGENT_MAX_TOKENS` | `128000` | Custom-model context cap used by PR-Agent prompt budgeting. |
+| `OPENCODE_MODEL` | `opencode/muse-spark-1.3-contributor-free` | OpenCode model used by the PR-Agent bridge. |
 | `PR_AGENT_BRIDGE_PORT` | `18000` | Loopback port of the compatibility bridge. |
 | `PR_AGENT_OPENCODE_PORT` | `4096` | Loopback port of `opencode serve`. |
 | `PR_AGENT_VERSION` | `0.46.0` | Pinned `pr-agent` release installed on the runner. |

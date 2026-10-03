@@ -547,8 +547,9 @@ class GateTests(unittest.TestCase):
 
     def test_head_capture_before_and_revalidation_after(self):
         body = read_repo(".github/workflows/continuum-pr-agent.yml")
-        self.assertIn("Capture the PR head before review", body)
-        self.assertIn("Revalidate the PR head after review", body)
+        self.assertIn("Revalidate the admitted exact HEAD immediately before review", body)
+        self.assertIn("steps.admit.outputs.head_sha", body)
+        self.assertIn("Revalidate the PR head and native review output after review", body)
         self.assertIn("moved during review", body)
         self.assertIn("discarding", body)
 
@@ -640,8 +641,9 @@ class IsolationTests(unittest.TestCase):
         with self.assertRaises(life.LifecycleError):
             life.resolve_consumer_mode({"CONTINUUM_REVIEW_PROVIDER": "both"})
 
-    def test_repair_and_merge_use_unified_review_provider_selector(self):
+    def test_pr_agent_workflows_use_unified_review_provider_selector(self):
         for path in (
+            ".github/workflows/continuum-pr-agent.yml",
             ".github/workflows/continuum-pr-agent-repair.yml",
             ".github/workflows/continuum-pr-agent-auto-merge.yml",
         ):
@@ -650,6 +652,20 @@ class IsolationTests(unittest.TestCase):
                 self.assertIn("CONTINUUM_REVIEW_PROVIDER", body)
                 self.assertNotIn("CONTINUUM_PR_AGENT_ENABLED", body)
                 self.assertNotIn("CONTINUUM_REQUIRE_CODERABBIT", body)
+
+    def test_review_caller_wakes_on_successful_ci_and_exports_native_outputs(self):
+        caller = read_repo(".github/caller-stubs/continuum-pr-agent.yml")
+        self.assertIn("workflow_run:", caller)
+        self.assertIn('workflows: ["CI"]', caller)
+        self.assertIn("github.event.workflow_run.conclusion == 'success'", caller)
+        body = read_repo(".github/workflows/continuum-pr-agent.yml")
+        self.assertIn("review_json:", body)
+        self.assertIn("improve_jsonl:", body)
+        self.assertIn("steps.pragent.outputs.review", body)
+        self.assertNotIn("CONTINUUM_PR_AGENT_ENABLED", body)
+        self.assertNotIn("CONTINUUM_REQUIRE_CODERABBIT", body)
+        self.assertIn("Install pinned OpenCode CLI for the PR-Agent backend", body)
+        self.assertIn("Resolve the Continuum-owned PR-Agent bridge", body)
 
     def test_pr_agent_stack_invokes_only_pr_agent_workflows(self):
         import sys

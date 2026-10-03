@@ -1,10 +1,11 @@
 # PR-Agent over the OpenCode backend
 
-PR-Agent is Continuum's optional, independently configurable review
-provider. It does not replace CodeRabbit: a repository enables either,
-both, or neither. Consumers that never enable PR-Agent are unaffected —
-the provider stays disabled unless `CONTINUUM_PR_AGENT_ENABLED` is `true`,
-and the disabled run posts one explicit notice instead of reviewing.
+PR-Agent is Continuum's optional review provider. Review-provider selection
+has exactly one repository-level source of truth:
+`CONTINUUM_REVIEW_PROVIDER=none|coderabbit|pr-agent`. Selecting
+`pr-agent` activates the PR-Agent stack; selecting `coderabbit` leaves the
+existing CodeRabbit stack authoritative. Legacy true/false provider switches
+are not part of the PR-Agent contract.
 
 ## Architecture
 
@@ -67,7 +68,7 @@ Provider, model, and limit details are configuration, not product policy:
 
 | Repository variable | Default | Meaning |
 | --- | --- | --- |
-| `CONTINUUM_PR_AGENT_ENABLED` | `false` | Enable the optional PR-Agent provider. |
+| `CONTINUUM_REVIEW_PROVIDER` | `none` | Select the review stack: `none`, `coderabbit`, or `pr-agent`. |
 | `PR_AGENT_API_BASE` | `http://127.0.0.1:<bridge_port>/v1` | OpenAI-compatible backend base. |
 | `PR_AGENT_MODEL` | `openai/continuum-review` | LiteLLM routing id (`openai/` prefix selects the bridge path). |
 | `PR_AGENT_MAX_TOKENS` | `128000` | Custom-model context cap used by PR-Agent prompt budgeting. |
@@ -77,10 +78,12 @@ Provider, model, and limit details are configuration, not product policy:
 | `PR_AGENT_VERSION` | `0.46.0` | Pinned `pr-agent` release. |
 | `AUTOMATION_PR_AGENT_TIMEOUT_MINUTES` | `60` | Job timeout. |
 
-The same knobs exist as reusable-workflow inputs (`enabled`, `api_base`,
-`model`, `max_tokens`, `opencode_model`, `bridge_port`, `server_port`,
-`pr_agent_version`); an empty input falls back to the variable, then to the
-default. Authentication is loopback-only by default and needs nothing;
+The same knobs exist as reusable-workflow inputs (`review_provider`,
+`api_base`, `model`, `max_tokens`, `opencode_model`, `bridge_port`,
+`server_port`, `pr_agent_version`); an empty input falls back to the
+repository variable, then to the default. `review_provider` is an explicit
+override for controlled calls; ordinary consumers set only
+`CONTINUUM_REVIEW_PROVIDER`. Authentication is loopback-only by default and needs nothing;
 LiteLLM still requires a key *string* on the OpenAI route, so the workflow
 sends the documented `continuum-loopback` placeholder, which the bridge
 ignores. No paid-provider secret is ever required, read, or forwarded.
@@ -90,23 +93,15 @@ coverage footer, reviewer behavior). A repository-local `.pr_agent.toml`
 may tune review *behavior*, but provider routing is forced through the
 `OPENAI__API_BASE` / `CONFIG__MODEL` environment, which override files.
 
-## Commands
+## Review lifecycle
 
-Comment on a pull request (owner only):
-
-- `/review` — full review of the exact current HEAD: actionable
-  correctness/regression/reliability/race/security/performance/
-  maintainability/test findings, inline comments where supported, and a
-  real upstream `APPROVED` / `CHANGES_REQUESTED` review.
-- `/verify <finding-id>` — re-checks one inline finding (its review-comment
-  id) against the current file content at the current HEAD through the
-  bridge, and replies with machine-detectable `**RESOLVED**` or
-  `**UNRESOLVED**` (`UNRESOLVED` always wins ties). A finding already
-  verified at the same HEAD is not re-verified.
-- `/describe` — PR title/summary/walkthrough.
-- `/ask <question>` — question about the PR.
-
-`/improve` is intentionally unsupported: the provider is reviewer-only.
+The installed PR-Agent caller wakes on PR events and again when the repository's
+`CI` workflow completes successfully for a pull request. The reusable workflow
+admits one exact CI-qualified HEAD, runs upstream PR-Agent v0.46.0 full
+`review` and full `improve`, and exposes the native structured review JSON,
+the reviewed HEAD SHA, and the native improve JSONL as reusable-workflow
+outputs. The bridge is resolved from the selected Continuum revision; consumers
+do not copy Continuum-internal bridge code into their repositories.
 
 ## Failure modes (all explicit, never silent green)
 

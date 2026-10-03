@@ -5,6 +5,9 @@ on:
     types: [created]
   pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review]
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
 
 permissions:
   contents: read
@@ -13,9 +16,14 @@ permissions:
 
 jobs:
   call:
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'pull_request' &&
+       github.event.workflow_run.pull_requests[0].number)
     uses: kodmial/continuum/.github/workflows/continuum-pr-agent.yml@main
     secrets: inherit
     with:
       continuum_ref: main
-      # Continuum dogfoods the PR-Agent review stack.
-      review_provider: 'pr-agent'
+      pr_number: "${{ github.event_name == 'workflow_run' && github.event.workflow_run.pull_requests[0].number || '' }}"
+      expected_head_sha: "${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || '' }}"

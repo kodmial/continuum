@@ -2,6 +2,19 @@ name: PR Agent (OpenCode backend)
 
 on:
   workflow_call:
+    outputs:
+      admitted:
+        description: Whether the exact PR HEAD was admitted for review.
+        value: ${{ jobs.pr_agent.outputs.admitted }}
+      head_sha:
+        description: Exact PR HEAD reviewed by upstream PR-Agent.
+        value: ${{ jobs.pr_agent.outputs.head_sha }}
+      review_json:
+        description: Native upstream PR-Agent structured review JSON for head_sha.
+        value: ${{ jobs.pr_agent.outputs.review_json }}
+      improve_jsonl:
+        description: Native upstream /improve push_outputs JSONL for head_sha.
+        value: ${{ jobs.pr_agent.outputs.improve_jsonl }}
     inputs:
       continuum_ref:
         description: Continuum revision supplying fallback scripts
@@ -12,20 +25,6 @@ on:
         description: >-
           Review provider: none, coderabbit, or pr-agent. Empty falls back to
           vars.CONTINUUM_REVIEW_PROVIDER, then to none.
-        type: string
-        default: ''
-        required: false
-      enabled:
-        description: Deprecated compatibility input; review_provider is authoritative.
-        type: string
-        default: ''
-        required: false
-      require_coderabbit:
-        description: >-
-          CodeRabbit gate expectation. Empty falls back to
-          vars.CONTINUUM_REQUIRE_CODERABBIT, then to 'false'. Isolated
-          PR-Agent mode requires 'false'; contradictory configuration fails
-          closed.
         type: string
         default: ''
         required: false
@@ -100,9 +99,14 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  pr-agent:
+  pr_agent:
     runs-on: ubuntu-latest
     timeout-minutes: ${{ fromJSON(vars.AUTOMATION_PR_AGENT_TIMEOUT_MINUTES || '60') }}
+    outputs:
+      admitted: ${{ steps.admit.outputs.admitted }}
+      head_sha: ${{ steps.result.outputs.head_sha }}
+      review_json: ${{ steps.pragent.outputs.review }}
+      improve_jsonl: ${{ steps.improve_output.outputs.improve_jsonl }}
 
     permissions:
       contents: read
@@ -125,6 +129,13 @@ jobs:
           INPUT_BRIDGE_PORT: ${{ inputs.bridge_port }}
           INPUT_SERVER_PORT: ${{ inputs.server_port }}
           INPUT_PR_AGENT_VERSION: ${{ inputs.pr_agent_version }}
+          CFG_API_BASE: ${{ vars.PR_AGENT_API_BASE }}
+          CFG_MODEL: ${{ vars.PR_AGENT_MODEL }}
+          CFG_MAX_TOKENS: ${{ vars.PR_AGENT_MAX_TOKENS }}
+          CFG_OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL }}
+          CFG_BRIDGE_PORT: ${{ vars.PR_AGENT_BRIDGE_PORT }}
+          CFG_SERVER_PORT: ${{ vars.PR_AGENT_OPENCODE_PORT }}
+          CFG_PR_AGENT_VERSION: ${{ vars.PR_AGENT_VERSION }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
@@ -232,26 +243,13 @@ jobs:
             core.setOutput('head_sha', headSha);
             core.notice(`PR #${prNumber} admitted at HEAD ${headSha} with green CI.`);
 
-      - name: Capture the PR head before review
-        if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
-        id: before
-        env:
-          GH_TOKEN: ${{ secrets.TAP_PAT }}
-          PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
-        run: |
-          set -euo pipefail
-          HEAD_SHA="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)"
-          [[ -n "$HEAD_SHA" ]] || { echo "::error::Could not resolve PR #$PR_NUMBER head."; exit 1; }
-          echo "sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
-          echo "Expected head for this review: $HEAD_SHA"
-
       - name: Checkout the pull request head
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           fetch-depth: 1
           persist-credentials: false
-          ref: ${{ steps.before.outputs.sha }}
+          ref: ${{ steps.admit.outputs.head_sha }}
 
       - name: Install the pinned upstream PR-Agent release on the runner
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
@@ -268,6 +266,22 @@ jobs:
           fi
           python3 -m pip install --quiet "pr-agent==${PR_AGENT_VERSION}"
           pr-agent --version
+
+      - name: Install pinned OpenCode CLI for the PR-Agent backend
+        if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if curl -fsSL --retry 3 --retry-delay 2 https://opencode.ai/install | bash -s -- --version 1.18.34; then
+              echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+              exit 0
+            fi
+            if [[ "$attempt" -eq 3 ]]; then
+              echo "::error::OpenCode installer failed after 3 attempts."
+              exit 1
+            fi
+            sleep $((attempt * 15))
+          done
 
       - name: Start opencode serve on loopback
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
@@ -289,6 +303,22 @@ jobs:
           cat "$RUNNER_TEMP/opencode-serve.log" || true
           exit 1
 
+      - name: Resolve the Continuum-owned PR-Agent bridge
+        if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
+        id: runtime
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          CONTINUUM_REF: ${{ inputs.continuum_ref }}
+        run: |
+          set -euo pipefail
+          BRIDGE_SCRIPT="$RUNNER_TEMP/continuum-pr-agent-bridge.py"
+          gh api --method GET \
+            "repos/kodmial/continuum/contents/.github/scripts/pr_agent_bridge.py" \
+            -f ref="$CONTINUUM_REF" --jq .content \
+            | tr -d '\n' | base64 --decode > "$BRIDGE_SCRIPT"
+          python3 -m py_compile "$BRIDGE_SCRIPT"
+          echo "bridge_script=$BRIDGE_SCRIPT" >> "$GITHUB_OUTPUT"
+
       - name: Start the OpenAI-compatibility bridge on loopback
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
         env:
@@ -296,15 +326,10 @@ jobs:
           OPENCODE_MODEL: ${{ steps.stack.outputs.opencode_model }}
           PR_AGENT_BRIDGE_PORT: ${{ steps.stack.outputs.bridge_port }}
           PR_AGENT_TIMEOUT_SECONDS: '170'
+          BRIDGE_SCRIPT: ${{ steps.runtime.outputs.bridge_script }}
         run: |
           set -euo pipefail
-          if [[ -f .github/scripts/pr_agent_bridge.py ]]; then
-            BRIDGE_SCRIPT=".github/scripts/pr_agent_bridge.py"
-          else
-            echo "::error::Bridge script not found in the checkout."
-            exit 1
-          fi
-          echo "BRIDGE_SCRIPT=$BRIDGE_SCRIPT" >> "$GITHUB_ENV"
+          [[ -s "$BRIDGE_SCRIPT" ]] || { echo "::error::Continuum PR-Agent bridge was not resolved."; exit 1; }
           (setsid nohup python3 "$BRIDGE_SCRIPT" \
             > "$RUNNER_TEMP/pr-agent-bridge.log" 2>&1 &)
           for attempt in $(seq 1 30); do
@@ -317,6 +342,28 @@ jobs:
           echo "::error::compatibility bridge did not become ready."
           cat "$RUNNER_TEMP/pr-agent-bridge.log" || true
           exit 1
+
+      - name: Revalidate the admitted exact HEAD immediately before review
+        if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
+        id: before
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
+          ADMITTED_SHA: ${{ steps.admit.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          CURRENT_SHA="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)"
+          if [[ "${CURRENT_SHA,,}" != "${ADMITTED_SHA,,}" ]]; then
+            echo "::error::PR head moved after CI admission ($ADMITTED_SHA -> $CURRENT_SHA); refusing to review an unqualified HEAD."
+            exit 1
+          fi
+          COMBINED="$(gh api "repos/$GITHUB_REPOSITORY/commits/$ADMITTED_SHA/status" --jq .state)"
+          if [[ "$COMBINED" != "success" ]]; then
+            echo "::error::CI for admitted HEAD $ADMITTED_SHA is now $COMBINED, not success."
+            exit 1
+          fi
+          echo "sha=$ADMITTED_SHA" >> "$GITHUB_OUTPUT"
+          echo "Exact CI-qualified HEAD $ADMITTED_SHA is still current."
 
       - name: Run upstream full review and full improve on the exact HEAD
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
@@ -412,19 +459,33 @@ jobs:
           echo "improve_file=pr-agent-outputs/continuum.jsonl" >> "$GITHUB_OUTPUT"
           echo "Upstream review and improve completed for $REVIEWED_SHA."
 
-      - name: Revalidate the PR head after review and export the review JSON
+      - name: Export native improve output
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
-        id: review
+        id: improve_output
+        run: |
+          set -euo pipefail
+          [[ -s pr-agent-outputs/continuum.jsonl ]] || {
+            echo "::error::Native PR-Agent improve output file is missing."
+            exit 1
+          }
+          DELIMITER="__CONTINUUM_PR_AGENT_IMPROVE_EOF__"
+          {
+            echo "improve_jsonl<<$DELIMITER"
+            cat pr-agent-outputs/continuum.jsonl
+            echo "$DELIMITER"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Revalidate the PR head and native review output after review
+        if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
+        id: result
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           REVIEWED_SHA: ${{ steps.before.outputs.sha }}
+          REVIEW_JSON: ${{ steps.pragent.outputs.review }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
-            // The wrapper captures the head before review and re-fetches it
-            // after review returns. An in-flight head change invalidates the
-            // output: results for SHA A never make SHA B mergeable.
             const prNumber = Number(process.env.PR_NUMBER);
             const reviewedSha = String(process.env.REVIEWED_SHA || '').toLowerCase();
             const { data: pr } = await github.rest.pulls.get({
@@ -434,20 +495,28 @@ jobs:
             if (currentSha !== reviewedSha) {
               core.setFailed(
                 `PR head moved during review (${reviewedSha} -> ${currentSha}); ` +
-                'discarding both results and scheduling a fresh post-CI review.'
+                'discarding both results and waiting for fresh CI on the new HEAD.'
               );
               return;
             }
-            // The structured review JSON for this exact HEAD is the canonical
-            // machine source (steps.review.outputs.review). It is produced by
-            // upstream PR-Agent v0.46.0 with enable_output=true and matches
-            // the PRReview schema (review.key_issues_to_review,
-            // merge_recommendation, security/risk/ticket fields, coverage).
-            // This step re-exports the reviewed HEAD alongside it so every
-            // consumer can enforce exact-head validity.
-            core.setOutput('review', JSON.stringify({ note: 'upstream review JSON is consumed via the PR-Agent outputs file and API; see repair workflow' }));
+            const raw = String(process.env.REVIEW_JSON || '').trim();
+            if (!raw) {
+              core.setFailed('Upstream PR-Agent produced no structured review output.');
+              return;
+            }
+            let review;
+            try {
+              review = JSON.parse(raw);
+            } catch (err) {
+              core.setFailed(`Upstream PR-Agent review output is invalid JSON: ${err.message}`);
+              return;
+            }
+            if (!review || typeof review !== 'object' || !Array.isArray(review.key_issues_to_review)) {
+              core.setFailed('Upstream PR-Agent review output does not match the expected PRReview schema.');
+              return;
+            }
             core.setOutput('head_sha', currentSha);
-            core.notice(`Review output for ${reviewedSha} is still current.`);
+            core.notice(`Native PR-Agent review output for ${reviewedSha} is current and machine-readable.`);
 
       - name: Fail closed on a moved head
         if: steps.stack.outputs.enabled == 'true' && always()
@@ -484,4 +553,5 @@ jobs:
         if: always()
         run: |
           pkill -f "opencode serv[e] --hostname 127.0.0.1" || true
+          pkill -f "continuum-pr-agent-bridge.p[y]" || true
           pkill -f "pr_agent_bridge.p[y]" || true
