@@ -34,6 +34,12 @@ class PrAgentTargetContextTests(unittest.TestCase):
                     "CONTINUUM_ENGINE_ROOT": str(root),
                     "GITHUB_ENV": str(env_file),
                     "RUNNER_TEMP": td,
+                    # Unit subprocess output is captured before the GitHub
+                    # runner command processor can apply ::add-mask::. Keep
+                    # this test in plain-shell mode; the workflow contract
+                    # separately asserts that delegated Actions runs install
+                    # the required masks.
+                    "GITHUB_ACTIONS": "false",
                 }
             )
             proc = subprocess.run(
