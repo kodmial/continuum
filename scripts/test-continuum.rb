@@ -1676,12 +1676,12 @@ class ContinuumTest < Minitest::Test
     # Reviewer-only: the run proves the checkout is untouched, and the
     # provider stays opt-in so consumers that never enable it are unaffected.
     assert_includes pr_agent, 'Prove the checkout is unmodified'
-    assert_includes pr_agent, 'CONTINUUM_PR_AGENT_ENABLED',
-                    'PR-Agent must stay disabled unless the consumer enables it'
+    assert_includes pr_agent, 'CONTINUUM_REVIEW_PROVIDER',
+                    'PR-Agent must stay disabled unless the consumer selects pr-agent'
     assert_includes stub, 'continuum-pr-agent.yml@main'
 
     # The generic contract is configuration, not hard-coded product policy.
-    %w[api_base model max_tokens enabled].each do |knob|
+    %w[api_base model max_tokens review_provider].each do |knob|
       assert_includes pr_agent, knob, "pr-agent workflow must expose the #{knob} knob"
     end
   end
@@ -2949,7 +2949,7 @@ class ContinuumTest < Minitest::Test
     end
 
     assert_includes auto_merge_body,
-                    "REQUIRE_CODERABBIT: ${{ inputs.require_coderabbit || vars.CONTINUUM_REQUIRE_CODERABBIT || 'false' }}"
+                    "REVIEW_PROVIDER: ${{ inputs.review_provider || vars.CONTINUUM_REVIEW_PROVIDER || 'none' }}"
     assert_includes watchdog_body,
                     "MAX_RECOVERY_RETRIES: ${{ inputs.max_recovery_retries || vars.AUTOMATION_WATCHDOG_MAX_RETRIES || '1' }}"
   end
@@ -3352,21 +3352,19 @@ class ContinuumTest < Minitest::Test
   # never asked for CodeRabbit would get `review-ready` and
   # `coderabbit-review-requested` on every green PR, and a 404 from a
   # `continuum-coderabbit-retry.yml` it does not have.
-  def test_add_review_label_gates_the_coderabbit_path_behind_the_flag
+  def test_add_review_label_gates_the_coderabbit_path_behind_the_provider
     inputs = events(yaml(File.join(ROOT, '.github/workflows/continuum-add-review-label.yml')))
              .fetch('workflow_call').fetch('inputs')
-    knob = inputs.fetch('require_coderabbit')
+    knob = inputs.fetch('review_provider')
     assert_equal '', knob.fetch('default'),
-                 'require_coderabbit must default to empty so vars.CONTINUUM_REQUIRE_CODERABBIT decides'
+                 'review_provider must default to empty so vars.CONTINUUM_REVIEW_PROVIDER decides'
     assert_equal 'string', knob.fetch('type')
     assert_equal false, knob.fetch('required')
 
     body = add_review_label_body
-    assert_includes body, "REQUIRE_CODERABBIT: ${{ inputs.require_coderabbit || vars.CONTINUUM_REQUIRE_CODERABBIT || 'false' }}"
-    refute_includes body, "vars.CONTINUUM_REQUIRE_CODERABBIT || 'true'",
-                    'CodeRabbit must not default to on'
-    assert_match(/const REQUIRE_CODERABBIT =\s*String\(process\.env\.REQUIRE_CODERABBIT \|\| ''\)\.trim\(\)\.toLowerCase\(\);/, body)
-    assert_match(/REQUIRE_CODERABBIT === 'true' \|\| REQUIRE_CODERABBIT === '1'/, body)
+    assert_includes body, "REVIEW_PROVIDER: ${{ inputs.review_provider || vars.CONTINUUM_REVIEW_PROVIDER || 'none' }}"
+    assert_match(/const reviewProvider =\s*String\(process\.env\.REVIEW_PROVIDER \|\| 'none'\)\.trim\(\)\.toLowerCase\(\);/, body)
+    assert_includes body, "const requireCodeRabbit = reviewProvider === 'coderabbit';"
   end
 
   # Both CodeRabbit label writes and the retry-controller dispatch must sit
@@ -3543,19 +3541,19 @@ class ContinuumTest < Minitest::Test
   # project without CodeRabbit wait forever for an approval nobody will give,
   # and would dispatch a workflow it does not have. The enabling value belongs
   # in the one repository that asked for CodeRabbit.
-  def test_coderabbit_gate_is_off_by_default_and_variable_driven
+  def test_review_provider_defaults_to_none_and_is_variable_driven
     inputs = events(yaml(File.join(ROOT, '.github/workflows/continuum-auto-merge.yml')))
              .fetch('workflow_call').fetch('inputs')
-    knob = inputs.fetch('require_coderabbit')
+    knob = inputs.fetch('review_provider')
     assert_equal '', knob.fetch('default'),
-                 'require_coderabbit must default to empty so vars.CONTINUUM_REQUIRE_CODERABBIT decides'
+                 'review_provider must default to empty so vars.CONTINUUM_REVIEW_PROVIDER decides'
     assert_equal 'string', knob.fetch('type')
     assert_equal false, knob.fetch('required')
 
     body = auto_merge_body
-    assert_includes body, "REQUIRE_CODERABBIT: ${{ inputs.require_coderabbit || vars.CONTINUUM_REQUIRE_CODERABBIT || 'false' }}"
-    refute_includes body, "vars.CONTINUUM_REQUIRE_CODERABBIT || 'true'",
-                    'CodeRabbit must not default to on'
+    assert_includes body, "REVIEW_PROVIDER: ${{ inputs.review_provider || vars.CONTINUUM_REVIEW_PROVIDER || 'none' }}"
+    assert_includes body, "const requireCodeRabbit = reviewProvider === 'coderabbit';"
+    assert_includes body, "if (reviewProvider === 'pr-agent') {"
   end
 
   # Both branches of the flag, checked in the body that acts on them. Asserting
@@ -3564,9 +3562,10 @@ class ContinuumTest < Minitest::Test
   def test_auto_merge_skips_every_coderabbit_gate_when_disabled
     body = auto_merge_body
 
-    # The flag is parsed once, and the only truthy spellings are explicit.
-    assert_match(/const REQUIRE_CODERABBIT =\s*String\(process\.env\.REQUIRE_CODERABBIT \|\| ''\)\.trim\(\)\.toLowerCase\(\);/, body)
-    assert_match(/REQUIRE_CODERABBIT === 'true' \|\| REQUIRE_CODERABBIT === '1'/, body)
+    # The provider is parsed once and CodeRabbit gates are active only for
+    # the exact coderabbit mode.
+    assert_match(/const reviewProvider =\s*String\(process\.env\.REVIEW_PROVIDER \|\| 'none'\)\.trim\(\)\.toLowerCase\(\);/, body)
+    assert_includes body, "const requireCodeRabbit = reviewProvider === 'coderabbit';"
 
     # Every CodeRabbit query that decides whether a PR merges is conditional,
     # so a repository without CodeRabbit never waits on one. Each call site is
@@ -3643,8 +3642,8 @@ class ContinuumTest < Minitest::Test
     assert_includes body, 'const unresolvedThreads = requireCodeRabbit'
     assert_includes body, 'const currentHeadNitpicks = requireCodeRabbit'
 
-    # The `true` spelling must switch every gate on.
-    assert_match(/REQUIRE_CODERABBIT === 'true' \|\| REQUIRE_CODERABBIT === '1'/, body)
+    # The coderabbit provider must switch every CodeRabbit gate on.
+    assert_includes body, "const requireCodeRabbit = reviewProvider === 'coderabbit';"
 
     # The CI gate stays unconditional: CodeRabbit never replaced it.
     refute_match(/requireCodeRabbit[^;]*!finalCi/, body)
