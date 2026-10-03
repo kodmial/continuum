@@ -3551,8 +3551,12 @@ class ContinuumTest < Minitest::Test
     assert_includes body, 'codeRabbitExplicitlyResolved'
     assert_includes body, '/\\bRESOLVED\\b/i.test(body)'
     assert_includes body, 'data.repository?.pullRequest?.reviewThreads'
+    assert_includes body, 'const latestComment = comments.at(-1)'
+    assert_includes body, "latestComment.author?.login?.startsWith('coderabbitai')"
     assert_includes body, 'if (unresolvedThreads === null)'
     assert_includes body, 'could not inspect CodeRabbit review threads; skipping this PR for this pass'
+    assert_includes body, 'queue reconciliation failed for this PR; skipping it for this pass'
+    assert_includes body, "return (reviews || [])"
     assert_includes body, "currentDecision?.state === 'APPROVED'"
     assert_includes body, 'durable exact-HEAD no-progress marker handled above'
     assert_includes body, 'continuum-coderabbit-no-progress head='
