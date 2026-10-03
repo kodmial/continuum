@@ -52,7 +52,7 @@ jobs:
     timeout-minutes: 360
 
     permissions:
-      actions: write
+      actions: read
       contents: read
       issues: write
       pull-requests: read
@@ -341,8 +341,8 @@ jobs:
 
               return {
                 issueNumber,
-                priority: 'unprioritized',
-                rank: Number.MAX_SAFE_INTEGER,
+                priority: 'unprioritized:p2-fallback',
+                rank: priorityRank.get('priority:p2'),
               };
             }
 
@@ -490,7 +490,6 @@ jobs:
 
               let latestCompletedReviewAt = 0;
               let latestInFlightCommand = null;
-              let autoMergeReconcilerDispatched = false;
               const candidates = [];
 
               for (const listed of pulls) {
@@ -682,23 +681,11 @@ jobs:
                   continue;
                 }
                 if (unresolvedThreads.length > 0) {
-                  // Preserve the mature consumer auto-merge safety rule:
-                  // outdated findings are not discarded merely because HEAD
-                  // changed. Wake the single reconciler that already owns
-                  // idempotent exact-finding verification; one dispatch covers
-                  // every open PR and its marker prevents duplicate requests.
-                  if (!autoMergeReconcilerDispatched) {
-                    await github.rest.actions.createWorkflowDispatch({
-                      owner,
-                      repo,
-                      workflow_id: 'continuum-auto-merge.yml',
-                      ref: 'main',
-                    });
-                    autoMergeReconcilerDispatched = true;
-                    core.notice(
-                      'Unresolved CodeRabbit findings remain; dispatched auto-merge reconciliation for exact-finding verification.'
-                    );
-                  }
+                  // Finding verification is owned by the existing auto-merge
+                  // reconciler. Keep this quota controller read-only for
+                  // Actions so older open PR callers with actions:read remain
+                  // compatible; their review/review-comment wakeups will
+                  // re-enter the queue as verification converges.
                   core.info(
                     `PR #${pr.number}: waiting for ${unresolvedThreads.length} unresolved CodeRabbit thread(s) before final full review.`
                   );
