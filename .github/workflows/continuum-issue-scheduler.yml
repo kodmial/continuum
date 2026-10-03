@@ -318,13 +318,16 @@ jobs:
             exit 2
           fi
           rm -f "$parent_ids_err"
+          if ! printf '%s' "$parent_children" | grep -Fq -- "$GITHUB_REPOSITORY"; then
+            echo "::error::Bidirectional parent/child verification failed; parent wake-up refused."
+            exit 2
+          fi
           if ! parent_err="$(mktemp -p "${RUNNER_TEMP:-$GITHUB_WORKSPACE}" continuum-parent-err.XXXXXX)"; then
             echo "::error::Parent default branch lookup is unavailable; parent wake-up refused."
             exit 4
           fi
           if ! parent_ref="$(gh api "repos/$parent" --jq '.default_branch // ""' 2>"$parent_err")" || \
-             [[ ! "$parent_ref" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ ]] || \
-             [[ "$parent_ref" == *..* ]] || [[ "$parent_ref" == */ ]] || [[ "$parent_ref" == */.git* ]]; then
+             [ -z "$parent_ref" ] || ! git check-ref-format --branch "$parent_ref" >/dev/null 2>&1; then
             cat "$parent_err" >&2 || true
             rm -f "$parent_err"
             echo "::error::Parent default branch lookup is unavailable; parent wake-up refused."
