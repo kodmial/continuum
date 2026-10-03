@@ -1160,6 +1160,11 @@ class RepairWiringRegressionTests(unittest.TestCase):
         self.assertIn("preMergeSync", merge)
         self.assertIn("preMergeGates", merge)
         self.assertIn("err.status === 409", merge)
+        self.assertIn("const isConflictMessage", merge)
+        self.assertIn(
+            "Atomic merge rejected with HTTP 422 without conflict evidence",
+            merge,
+        )
         self.assertIn("await dispatchConflictRepair(fresh, message)", merge)
 
     def test_pr_agent_caller_forwards_exact_head_retry_inputs(self):
