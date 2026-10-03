@@ -226,5 +226,75 @@ class RecoveryDecisionTests(unittest.TestCase):
         self.assertEqual(recovery.backoff_seconds(2), 30)
 
 
+class RecoveryWiringTests(unittest.TestCase):
+    def read(self, path: str) -> str:
+        with open(os.path.join(ROOT, path), "r", encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_recovery_has_event_driven_wakeups_and_schedule_safety_net(self):
+        stub = self.read(".github/caller-stubs/continuum-pr-agent-recovery.yml")
+        self.assertIn("workflow_run:", stub)
+        self.assertIn("- CI", stub)
+        self.assertIn("- PR Agent (OpenCode backend)", stub)
+        self.assertIn("pull_request_target:", stub)
+        self.assertIn('cron: "*/10 * * * *"', stub)
+
+    def test_review_caller_no_longer_competes_for_ci_wakeup(self):
+        for path in (
+            ".github/workflows/pr-agent.yml",
+            ".github/caller-stubs/continuum-pr-agent.yml",
+        ):
+            body = self.read(path)
+            with self.subTest(path=path):
+                self.assertNotIn("workflow_run:", body)
+                self.assertNotIn("pull_request_target:", body)
+                self.assertIn("recovery_kind:", body)
+                self.assertIn("run-name: >-", body)
+                self.assertIn("head=${{ inputs.expected_head_sha || 'event' }}", body)
+
+    def test_recovery_engine_is_provider_isolated_and_exact_head_driven(self):
+        body = self.read(".github/workflows/continuum-pr-agent-recovery.yml")
+        for needle in (
+            "head_sha: head",
+            "exactActiveRun",
+            "author_association",
+            "continuum/pr-agent-review",
+            "continuum/pr-agent-repair",
+            "retryableConclusions",
+            "createWorkflowDispatch",
+            "expected_head_sha: head",
+            "recovery_kind: kind",
+        ):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, body)
+        self.assertNotIn("continuum-coderabbit-retry.yml", body)
+        self.assertNotIn("continuum-coderabbit-unresolved.yml", body)
+
+    def test_recovered_review_uses_ci_workflow_not_combined_status(self):
+        review = self.read(".github/workflows/continuum-pr-agent.yml")
+        self.assertIn("listWorkflowRunsForRepo", review)
+        self.assertIn("CI_WORKFLOW_NAME", review)
+        self.assertNotIn(
+            "const { data: combined } = await github.rest.repos.getCombinedStatusForRef",
+            review,
+        )
+
+    def test_failure_classification_is_explicit(self):
+        review = self.read(".github/workflows/continuum-pr-agent.yml")
+        repair = self.read(".github/workflows/continuum-pr-agent-repair.yml")
+        self.assertIn("PR-Agent review failed: transient; recovery eligible", review)
+        self.assertIn("PR-Agent review failed: deterministic; recovery held", review)
+        self.assertIn('echo "classification=transient"', repair)
+        self.assertIn('echo "classification=deterministic"', repair)
+        self.assertIn("PR-Agent repair failed: transient; recovery eligible", repair)
+        self.assertIn("PR-Agent repair failed: deterministic; recovery held", repair)
+
+    def test_inline_retries_preserve_operation_kind(self):
+        review = self.read(".github/workflows/continuum-pr-agent.yml")
+        repair = self.read(".github/workflows/continuum-pr-agent-repair.yml")
+        self.assertIn('-f recovery_kind="review"', review)
+        self.assertIn('-f recovery_kind="repair"', repair)
+
+
 if __name__ == "__main__":
     unittest.main()
