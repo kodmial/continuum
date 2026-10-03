@@ -132,6 +132,8 @@ jobs:
       improve_jsonl: ${{ steps.improve_output.outputs.improve_jsonl }}
       persistent_state_json: ${{ steps.persistent.outputs.persistent_state_json }}
       needs_repair: ${{ steps.route.outputs.needs_repair }}
+      retry_attempt: ${{ steps.stack.outputs.retry_attempt }}
+      retry_workflow: ${{ steps.stack.outputs.retry_workflow }}
 
     permissions:
       actions: write
@@ -147,8 +149,10 @@ jobs:
         env:
           INPUT_REVIEW_PROVIDER: ${{ inputs.review_provider }}
           CFG_REVIEW_PROVIDER: ${{ vars.CONTINUUM_REVIEW_PROVIDER }}
-          INPUT_PR_NUMBER: ${{ inputs.pr_number }}
-          INPUT_EXPECTED_HEAD: ${{ inputs.expected_head_sha }}
+          INPUT_PR_NUMBER: ${{ inputs.pr_number || github.event.inputs.pr_number || '' }}
+          INPUT_EXPECTED_HEAD: ${{ inputs.expected_head_sha || github.event.inputs.expected_head_sha || '' }}
+          INPUT_RETRY_ATTEMPT: ${{ inputs.retry_attempt || github.event.inputs.retry_attempt || '0' }}
+          INPUT_RETRY_WORKFLOW: ${{ inputs.retry_workflow || '' }}
           INPUT_API_BASE: ${{ inputs.api_base }}
           INPUT_MODEL: ${{ inputs.model }}
           INPUT_MAX_TOKENS: ${{ inputs.max_tokens }}
@@ -198,6 +202,16 @@ jobs:
             core.setOutput('enabled', enabled ? 'true' : 'false');
             core.setOutput('stack', enabled ? 'pr-agent' : reviewProvider);
             core.setOutput('pr_number', prNumber);
+            const retryAttempt = String(process.env.INPUT_RETRY_ATTEMPT || '0').trim();
+            if (!/^\d+$/.test(retryAttempt)) {
+              core.setFailed('PR-Agent retry_attempt must be a non-negative integer.');
+              return;
+            }
+            core.setOutput('retry_attempt', retryAttempt);
+            core.setOutput(
+              'retry_workflow',
+              String(process.env.INPUT_RETRY_WORKFLOW || 'continuum-pr-agent.yml').trim()
+            );
             const eventExpectedHead = context.payload.workflow_run?.head_sha || '';
             core.setOutput(
               'expected_head',
@@ -714,8 +728,8 @@ jobs:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           HEAD_SHA: ${{ steps.admit.outputs.head_sha }}
-          RETRY_ATTEMPT: ${{ inputs.retry_attempt || '0' }}
-          RETRY_WORKFLOW: ${{ inputs.retry_workflow || 'continuum-pr-agent.yml' }}
+          RETRY_ATTEMPT: ${{ steps.stack.outputs.retry_attempt }}
+          RETRY_WORKFLOW: ${{ steps.stack.outputs.retry_workflow }}
         run: |
           set -euo pipefail
           attempt="${RETRY_ATTEMPT:-0}"
@@ -766,8 +780,8 @@ jobs:
       head_sha: ${{ needs.pr_agent.outputs.head_sha }}
       review_json: ${{ needs.pr_agent.outputs.review_json }}
       improve_jsonl: ${{ needs.pr_agent.outputs.improve_jsonl }}
-      retry_attempt: ${{ inputs.retry_attempt }}
-      retry_workflow: ${{ inputs.retry_workflow }}
+      retry_attempt: ${{ needs.pr_agent.outputs.retry_attempt }}
+      retry_workflow: ${{ needs.pr_agent.outputs.retry_workflow }}
 
   merge:
     needs: pr_agent
