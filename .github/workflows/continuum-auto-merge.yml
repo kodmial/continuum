@@ -113,7 +113,7 @@ jobs:
               );
             }
             // PR-Agent owns a separate exact-head merge gate. Keep this
-            // mature NanoDictate-derived reconciler alive in sync-only mode so
+            // mature legacy reconciler alive in sync-only mode so
             // push-to-main still refreshes open PR branches, but never let the
             // generic path merge a PR-Agent-managed PR.
             const prAgentSyncOnly = reviewProvider === 'pr-agent';
