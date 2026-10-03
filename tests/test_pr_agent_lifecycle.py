@@ -672,6 +672,15 @@ class IsolationTests(unittest.TestCase):
                 self.assertNotIn("CONTINUUM_PR_AGENT_ENABLED", body)
                 self.assertNotIn("CONTINUUM_REQUIRE_CODERABBIT", body)
 
+    def test_pr_agent_permission_ceiling_allows_nested_repair_and_merge(self):
+        engine = read_repo(".github/workflows/continuum-pr-agent.yml")
+        caller = read_repo(".github/caller-stubs/continuum-pr-agent.yml")
+        self_caller = read_repo(".github/workflows/pr-agent.yml")
+        for body in (engine, caller, self_caller):
+            self.assertIn("contents: write", body)
+            self.assertIn("pull-requests: write", body)
+        self.assertIn("statuses: read", engine)
+
     def test_review_caller_wakes_on_successful_ci_and_exports_native_outputs(self):
         caller = read_repo(".github/caller-stubs/continuum-pr-agent.yml")
         self.assertIn("workflow_run:", caller)
