@@ -241,13 +241,14 @@ jobs:
             local repository="$1" name="$2"
             local err_file value rc
             err_file="$(mktemp)"
-            if value="$(gh api "repos/$repository/actions/variables/$name" --jq '.value // ""' 2>"$err_file")"; then
+            value="$(gh api "repos/$repository/actions/variables/$name" --jq '.value // ""' 2>"$err_file")"
+            rc=$?
+            if [ "$rc" -eq 0 ]; then
               rm -f "$err_file"
               printf '%s' "$value"
               return 0
             fi
-            rc=$?
-            if grep -q '404' "$err_file" 2>/dev/null; then
+            if grep -q '(HTTP 404)' "$err_file" 2>/dev/null; then
               rm -f "$err_file"
               printf ''
               return 0
@@ -300,8 +301,8 @@ jobs:
             exit 2
           fi
 
-          if ! parent_ref="$(gh api "repos/$parent" --jq '.default_branch' 2>/dev/null)" || \
-             [[ -z "$parent_ref" ]]; then
+          if ! parent_ref="$(gh api "repos/$parent" --jq -r '.default_branch // ""' 2>/dev/null)" || \
+             [[ ! "$parent_ref" =~ ^[A-Za-z0-9._/-]+$ ]]; then
             echo "::error::Parent default branch lookup is unavailable; parent wake-up refused."
             exit 4
           fi
