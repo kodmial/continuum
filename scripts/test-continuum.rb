@@ -3062,6 +3062,24 @@ class ContinuumTest < Minitest::Test
                  legacy.fetch('jobs').fetch('dispatch').fetch('if')
   end
 
+  # The unified scheduler replaced the standalone parent child dispatcher, so
+  # it must retain that dispatcher's autonomous wake-up surface. Child issue
+  # creation cannot emit an event in the parent repository; polling therefore
+  # remains the zero-private-minutes path that discovers new delegated work.
+  def test_unified_parent_scheduler_keeps_delegated_polling_wakeups
+    stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-issue-scheduler.yml'))
+    on = events(stub)
+
+    assert_equal ['7,17,27,37,47,57 * * * *'],
+                 on.fetch('schedule').map { |entry| entry.fetch('cron') }
+    assert_equal ['main'], on.fetch('push').fetch('branches')
+
+    workflow_names = on.fetch('workflow_run').fetch('workflows')
+    %w[SubTask].each { |name| assert_includes workflow_names, name }
+    assert_includes workflow_names, 'SubTask review'
+    assert_includes workflow_names, 'SubTask PR review'
+  end
+
   # A manual owner `/oc` is real in-flight work: reserve it at once, and keep a
   # short grace window so this run cannot enqueue a duplicate right behind it.
   def test_scheduler_reserves_owner_commands_and_honours_the_grace_window
@@ -3639,7 +3657,28 @@ class ContinuumTest < Minitest::Test
     body = auto_merge_body
     assert_includes body, "REVIEW_PROVIDER: ${{ inputs.review_provider || vars.CONTINUUM_REVIEW_PROVIDER || 'none' }}"
     assert_includes body, "const requireCodeRabbit = reviewProvider === 'coderabbit';"
-    assert_includes body, "if (reviewProvider === 'pr-agent') {"
+    assert_includes body, "const prAgentSyncOnly = reviewProvider === 'pr-agent';"
+    assert_includes body, 'generic reconciler is sync-only'
+  end
+
+  def test_pr_agent_mode_keeps_nano_main_sync_but_never_uses_generic_merge
+    body = auto_merge_body
+    automation = File.read(File.join(ROOT, '.github/workflows/automation.yml'))
+
+    assert_includes automation, 'push:'
+    assert_includes automation, 'branches: [main]'
+    assert_includes automation, "github.event_name == 'push'"
+    assert_includes body, "const prAgentSyncOnly = reviewProvider === 'pr-agent';"
+    assert_includes body, "await updateFromMain(pr);"
+    assert_includes body, "if (prAgentSyncOnly) {"
+    assert_includes body, 'generic reconciler stops after main-sync evaluation'
+
+    sync_guard = body.index("if (prAgentSyncOnly) {", body.index("await updateFromMain(pr);"))
+    generic_ci = body.index("const ci = await latestCurrentHeadCi(pr);")
+    refute_nil sync_guard
+    refute_nil generic_ci
+    assert_operator sync_guard, :<, generic_ci,
+                    'PR-Agent sync-only mode must exit before generic review/merge gates'
   end
 
   # Both branches of the flag, checked in the body that acts on them. Asserting
