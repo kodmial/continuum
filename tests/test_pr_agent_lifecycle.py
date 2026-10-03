@@ -681,6 +681,15 @@ class IsolationTests(unittest.TestCase):
             self.assertIn("pull-requests: write", body)
         self.assertIn("statuses: read", engine)
 
+    def test_improve_uses_env_for_push_outputs_not_forbidden_cli_args(self):
+        body = read_repo(".github/workflows/continuum-pr-agent.yml")
+        self.assertIn("PUSH_OUTPUTS__ENABLE: 'true'", body)
+        self.assertIn("PUSH_OUTPUTS__CHANNELS:", body)
+        self.assertIn("PUSH_OUTPUTS__FILE_PATH:", body)
+        self.assertNotIn("--push_outputs.enable", body)
+        self.assertNotIn("--push_outputs.channels", body)
+        self.assertNotIn("--push_outputs.file_path", body)
+
     def test_pr_agent_bridge_runtime_bundle_includes_python_dependency(self):
         body = read_repo(".github/workflows/continuum-pr-agent.yml")
         self.assertIn("Resolve the Continuum-owned PR-Agent runtime bundle", body)
