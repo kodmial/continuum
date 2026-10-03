@@ -339,7 +339,6 @@ jobs:
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           HEAD_SHA: ${{ steps.admit.outputs.head_sha }}
-          RETRYABLE_FAILURE: ${{ (steps.install_pragent.outcome == 'failure' || steps.install_opencode.outcome == 'failure' || steps.start_opencode.outcome == 'failure' || steps.runtime.outcome == 'failure' || steps.start_bridge.outcome == 'failure' || steps.pragent.outcome == 'failure') && 'true' || 'false' }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
@@ -770,6 +769,7 @@ jobs:
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           HEAD_SHA: ${{ steps.admit.outputs.head_sha }}
+          RETRYABLE_FAILURE: ${{ (steps.install_pragent.outcome == 'failure' || steps.install_opencode.outcome == 'failure' || steps.start_opencode.outcome == 'failure' || steps.runtime.outcome == 'failure' || steps.start_bridge.outcome == 'failure' || steps.pragent.outcome == 'failure') && 'true' || 'false' }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
