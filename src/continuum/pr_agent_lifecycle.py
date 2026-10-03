@@ -583,7 +583,7 @@ def retry_backoff_seconds(
         raise LifecycleError("retry base must be a non-negative integer")
     if base_number < 0:
         raise LifecycleError("retry base must be a non-negative integer")
-    if attempt_number > 10:
+    if attempt_number >= RETRY_MAX_ATTEMPTS:
         raise LifecycleError("retry attempt out of bounded retry range")
     return base_number * (1 << attempt_number)
 

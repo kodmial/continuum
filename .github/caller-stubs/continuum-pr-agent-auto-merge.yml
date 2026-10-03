@@ -23,6 +23,22 @@ on:
         description: "Upstream native persistent finding state for the latest full review"
         required: false
         type: string
+      post_merge_wakeups:
+        description: "Workflows to wake after a successful merge, comma-separated."
+        required: false
+        type: string
+      post_merge_wakeup_ref:
+        description: "Git ref used for post-merge wakeups."
+        required: false
+        type: string
+      required_workflow_gate_label:
+        description: "Label enabling an additional required workflow gate."
+        required: false
+        type: string
+      required_workflow_gate_name:
+        description: "Required workflow name when the gate label is present."
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -41,3 +57,7 @@ jobs:
       review_json: "${{ inputs.review_json }}"
       improve_jsonl: "${{ inputs.improve_jsonl }}"
       persistent_state_json: "${{ inputs.persistent_state_json }}"
+      post_merge_wakeups: "${{ inputs.post_merge_wakeups }}"
+      post_merge_wakeup_ref: "${{ inputs.post_merge_wakeup_ref }}"
+      required_workflow_gate_label: "${{ inputs.required_workflow_gate_label }}"
+      required_workflow_gate_name: "${{ inputs.required_workflow_gate_name }}"

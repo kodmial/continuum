@@ -298,8 +298,12 @@ jobs:
               .split(',')
               .map(name => name.trim())
               .filter(Boolean);
-            const postMergeWakeupRef =
+            let postMergeWakeupRef =
               String(process.env.POST_MERGE_WAKEUP_REF || 'main').trim();
+            if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(postMergeWakeupRef) || postMergeWakeupRef.includes('..') || postMergeWakeupRef.includes('//') || postMergeWakeupRef.includes('@{') || postMergeWakeupRef.endsWith('/') || postMergeWakeupRef.endsWith('.') || postMergeWakeupRef.endsWith('.lock') || postMergeWakeupRef === 'HEAD' || postMergeWakeupRef === '@' || postMergeWakeupRef.startsWith('refs/') || postMergeWakeupRef.startsWith('-') || postMergeWakeupRef.startsWith('.')) {
+              core.warning('Invalid post-merge wakeup ref; falling back to main: ' + postMergeWakeupRef);
+              postMergeWakeupRef = 'main';
+            }
 
             if (!prNumber || !reviewedHead) {
               core.setFailed('PR-Agent reconciliation requires pr_number and reviewed HEAD.');
@@ -524,6 +528,10 @@ jobs:
               // re-dispatching the same full run would replay the whole task
               // duration with no new information. A new HEAD starts a new
               // episode.
+              if (fresh.head.sha.toLowerCase() !== reviewedHead) {
+                core.warning('PR #' + prNumber + ': head moved during conflict handling; stale repair cancelled.');
+                return;
+              }
               const attemptMarker = conflictAttemptMarker(fresh.head.sha);
               const priorComments = await github.paginate(
                 github.rest.issues.listComments,
