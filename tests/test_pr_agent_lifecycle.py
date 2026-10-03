@@ -770,10 +770,14 @@ class IsolationTests(unittest.TestCase):
         self.assertIn("lastRun.head_sha", merge)
         self.assertNotIn("entry.status", merge)
 
-    def test_generic_auto_merge_still_refuses_pr_agent_mode(self):
+    def test_generic_auto_merge_is_sync_only_in_pr_agent_mode(self):
         generic = read_repo(".github/workflows/continuum-auto-merge.yml")
-        self.assertIn("if (reviewProvider === 'pr-agent')", generic)
-        self.assertIn("Only the PR-Agent-specific merge gate may merge.", generic)
+        self.assertIn("const prAgentSyncOnly = reviewProvider === 'pr-agent';", generic)
+        self.assertIn("Main synchronization remains active; merge stays PR-Agent-owned.", generic)
+        self.assertIn("await updateFromMain(pr);", generic)
+        sync_guard = generic.index("if (prAgentSyncOnly) {", generic.index("await updateFromMain(pr);"))
+        generic_ci = generic.index("const ci = await latestCurrentHeadCi(pr);")
+        self.assertLess(sync_guard, generic_ci)
 
     def test_pr_agent_stack_invokes_only_pr_agent_workflows(self):
         import sys

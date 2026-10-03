@@ -112,14 +112,16 @@ jobs:
                 `Invalid CONTINUUM_REVIEW_PROVIDER="${reviewProvider}". Expected none, coderabbit, or pr-agent.`
               );
             }
-            // PR-Agent owns a separate exact-head merge gate. The generic
-            // auto-merger must never bypass it.
-            if (reviewProvider === 'pr-agent') {
+            // PR-Agent owns a separate exact-head merge gate. Keep this
+            // mature legacy reconciler alive in sync-only mode so
+            // push-to-main still refreshes open PR branches, but never let the
+            // generic path merge a PR-Agent-managed PR.
+            const prAgentSyncOnly = reviewProvider === 'pr-agent';
+            if (prAgentSyncOnly) {
               core.notice(
-                'PR-Agent review provider selected; generic auto-merge is disabled. ' +
-                'Only the PR-Agent-specific merge gate may merge.'
+                'PR-Agent review provider selected; generic reconciler is sync-only. ' +
+                'Main synchronization remains active; merge stays PR-Agent-owned.'
               );
-              return;
             }
             const requireCodeRabbit = reviewProvider === 'coderabbit';
             const requiredWorkflowGateLabel =
@@ -1279,6 +1281,13 @@ jobs:
                 core.notice(
                   `PR #${pr.number}: main advanced only in non-merge-critical files; preserving PR HEAD and existing review/CI state: ${mainSync.files.join(', ')}.`
                 );
+              }
+
+              if (prAgentSyncOnly) {
+                core.info(
+                  `PR #${pr.number}: PR-Agent owns review/merge; generic reconciler stops after main-sync evaluation.`
+                );
+                continue;
               }
 
               const ci = await latestCurrentHeadCi(pr);
