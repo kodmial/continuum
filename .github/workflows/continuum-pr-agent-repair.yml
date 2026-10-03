@@ -414,6 +414,13 @@ jobs:
           set -euo pipefail
           attempt="${RETRY_ATTEMPT:-0}"
           [[ "$attempt" =~ ^[0-9]+$ ]] || attempt=0
+          case "$RETRY_WORKFLOW" in
+            continuum-pr-agent.yml|pr-agent.yml) ;;
+            *)
+              echo "::error::Invalid isolated PR-Agent retry workflow: $RETRY_WORKFLOW"
+              exit 1
+              ;;
+          esac
 
           current_sha="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid || true)"
           if [[ -z "$current_sha" || "$current_sha" != "$HEAD_SHA" ]]; then
