@@ -3592,9 +3592,13 @@ class ContinuumTest < Minitest::Test
     assert_includes body, "github.event_name == 'pull_request_review_comment'"
     assert_includes body, "startsWith(github.event.comment.user.login, 'coderabbitai')"
 
-    assert_includes body, "priority: 'unprioritized:p2-fallback'"
-    assert_includes body, "rank: priorityRank.get('priority:p2')"
+    assert_operator body.scan("priority: 'unprioritized:p2-fallback'").size, :>=, 2,
+                    'both source-less and issue-backed unprioritized PRs must use the P2 fallback'
+    assert_operator body.scan("rank: priorityRank.get('priority:p2')").size, :>=, 2
     assert_includes body, 'a.createdAt - b.createdAt'
+    assert_includes stub, 'actions: read'
+    refute_includes stub, 'actions: write'
+    refute_includes body, "workflow_id: 'continuum-auto-merge.yml'"
   end
 
   # ------------------------------------------------- auto-merge / CodeRabbit
