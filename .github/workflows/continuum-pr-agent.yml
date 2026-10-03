@@ -295,6 +295,26 @@ jobs:
             core.setOutput('head_sha', headSha);
             core.notice(`PR #${prNumber} admitted at HEAD ${headSha} with green CI.`);
 
+      - name: Mark PR-Agent review in flight
+        if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          HEAD_SHA: ${{ steps.admit.outputs.head_sha }}
+        with:
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: process.env.HEAD_SHA,
+              state: 'pending',
+              context: 'continuum/pr-agent-review',
+              description: 'PR-Agent review is running',
+              target_url:
+                context.serverUrl + '/' + context.repo.owner + '/' +
+                context.repo.repo + '/actions/runs/' + context.runId,
+            });
+
       - name: Checkout the pull request head
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -676,6 +696,54 @@ jobs:
                 ? `Routing ${keyIssues.length} review finding(s) and ${suggestions.length} improve suggestion(s) to PR-Agent repair.`
                 : 'No current actionable review/improve items; routing this exact HEAD to the PR-Agent merge gate.'
             );
+
+      - name: Publish durable PR-Agent review state
+        if: steps.route.outcome == 'success' && steps.result.outputs.head_sha
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          HEAD_SHA: ${{ steps.result.outputs.head_sha }}
+          NEEDS_REPAIR: ${{ steps.route.outputs.needs_repair }}
+        with:
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            const actionable = process.env.NEEDS_REPAIR === 'true';
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: process.env.HEAD_SHA,
+              state: 'success',
+              context: 'continuum/pr-agent-review',
+              description: actionable
+                ? 'PR-Agent review complete: actionable'
+                : 'PR-Agent review complete: clean',
+              target_url:
+                context.serverUrl + '/' + context.repo.owner + '/' +
+                context.repo.repo + '/actions/runs/' + context.runId,
+            });
+
+      - name: Publish failed PR-Agent review state
+        if: >-
+          failure() &&
+          steps.stack.outputs.enabled == 'true' &&
+          steps.admit.outputs.admitted == 'true' &&
+          steps.admit.outputs.head_sha
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          HEAD_SHA: ${{ steps.admit.outputs.head_sha }}
+        with:
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: process.env.HEAD_SHA,
+              state: 'failure',
+              context: 'continuum/pr-agent-review',
+              description: 'PR-Agent review failed; recovery eligible',
+              target_url:
+                context.serverUrl + '/' + context.repo.owner + '/' +
+                context.repo.repo + '/actions/runs/' + context.runId,
+            });
 
       - name: Fail closed on a moved head
         if: steps.stack.outputs.enabled == 'true' && always()
