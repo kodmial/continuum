@@ -107,12 +107,36 @@ jobs:
           CONTINUUM_REF: ${{ inputs.continuum_ref }}
         run: |
           set -euo pipefail
+          : "${CONTINUUM_REF:?CONTINUUM_REF is required for pinned target resolution}"
+          CONTINUUM_SOURCE_REPO="${GITHUB_WORKFLOW_REF:-}"
+          CONTINUUM_SOURCE_REPO="${CONTINUUM_SOURCE_REPO%%/.github/workflows/*}"
+          if ! [[ "$CONTINUUM_SOURCE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            CONTINUUM_SOURCE_REPO="kodmial/continuum"
+          fi
+          if [[ -z "${TARGET_CHILD_ID:-}" ]]; then
+            if ! [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+              echo "::error::PR-Agent target repository identity is invalid."
+              exit 2
+            fi
+            {
+              printf 'CONTINUUM_PR_AGENT_TARGET_REPOSITORY=%s\n' "$GITHUB_REPOSITORY"
+              printf 'CONTINUUM_PR_AGENT_TARGET_OWNER=%s\n' "${GITHUB_REPOSITORY%%/*}"
+              printf 'CONTINUUM_PR_AGENT_TARGET_REPO=%s\n' "${GITHUB_REPOSITORY#*/}"
+              printf 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED=%s\n' "false"
+            } >> "$GITHUB_ENV"
+            echo "PR-Agent target context resolved locally."
+            exit 0
+          fi
           RUNTIME_ROOT="$RUNNER_TEMP/continuum-pr-agent-target-runtime"
           mkdir -p "$RUNTIME_ROOT/.github/scripts"
           fetch_runtime_file() {
             local path="$1" dest="$2"
-            if ! gh api --method GET "repos/kodmial/continuum/contents/$path" -f ref="$CONTINUUM_REF" --jq .content 2>/dev/null \
+            if ! gh api --method GET "repos/$CONTINUUM_SOURCE_REPO/contents/$path" -f ref="$CONTINUUM_REF" --jq .content 2>/dev/null \
               | tr -d '\n' | base64 --decode > "$dest" 2>/dev/null; then
+              echo "::error::Unable to load the Continuum PR-Agent target resolver."
+              exit 1
+            fi
+            if [[ ! -s "$dest" ]]; then
               echo "::error::Unable to load the Continuum PR-Agent target resolver."
               exit 1
             fi
@@ -343,7 +367,10 @@ jobs:
           mkdir -p "$worktree"
           cd "$worktree"
           git init --quiet
-          gh auth setup-git >/dev/null 2>&1
+          TOKEN_B64="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          git config --local http.https://github.com/.extraheader "AUTHORIZATION: basic $TOKEN_B64"
+          unset TOKEN_B64
+          trap 'git config --local --unset http.https://github.com/.extraheader || true; unset TOKEN_B64 || true' EXIT
           git remote add origin "https://github.com/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY.git"
           if ! git check-ref-format "refs/heads/$HEAD_REF" >/dev/null 2>&1; then
             echo "::error::PR-Agent target branch is not a valid heads ref."
@@ -351,7 +378,7 @@ jobs:
           fi
           if ! git fetch --no-tags --depth=1 origin                "+refs/heads/$HEAD_REF:refs/remotes/origin/continuum-pr-agent-target"                --quiet >/dev/null 2>&1 ||
              ! git checkout --detach refs/remotes/origin/continuum-pr-agent-target --quiet >/dev/null 2>&1 ||
-             [[ "$(git rev-parse HEAD)" != "$HEAD_SHA" ]]; then
+             [[ "$(git rev-parse HEAD)" != "${HEAD_SHA,,}" ]]; then
             echo "::error::Writable PR-Agent target branch does not match the reviewed HEAD."
             exit 1
           fi
@@ -365,7 +392,7 @@ jobs:
         run: |
           set -euo pipefail
           cd "$CONTINUUM_PR_AGENT_WORKTREE"
-          if [[ "$(git rev-parse HEAD)" != "$HEAD_SHA" ]]; then
+          if [[ "$(git rev-parse HEAD)" != "${HEAD_SHA,,}" ]]; then
             echo "::error::Checked-out branch $HEAD_REF does not match reviewed HEAD $HEAD_SHA."
             exit 1
           fi
