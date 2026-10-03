@@ -1,4 +1,4 @@
-name: PR-Agent recovery
+name: PR-Agent recovery dogfood
 
 on:
   workflow_dispatch:
