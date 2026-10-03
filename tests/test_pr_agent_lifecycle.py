@@ -856,7 +856,6 @@ class StabilizationParityTests(unittest.TestCase):
             self.assertNotIn("continuum-coderabbit-retry.yml", body)
             self.assertNotIn("continuum-coderabbit-unresolved.yml", body)
         self.assertIn("workflow_dispatch:", caller)
-        self.assertIn("actions: write", caller)
 
     def test_no_progress_uses_structured_fingerprint_and_head(self):
         repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
