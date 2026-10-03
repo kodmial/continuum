@@ -1,0 +1,623 @@
+name: PR-Agent recovery
+
+on:
+  workflow_call:
+    inputs:
+      continuum_ref:
+        description: Continuum revision supplying the recovery engine.
+        type: string
+        default: main
+        required: false
+      review_provider:
+        description: Review provider selector; empty falls back to CONTINUUM_REVIEW_PROVIDER.
+        type: string
+        default: ''
+        required: false
+      review_workflow:
+        description: PR-Agent caller workflow file to dispatch.
+        type: string
+        default: continuum-pr-agent.yml
+        required: false
+      ci_workflow_name:
+        description: Exact workflow name that proves current-head CI.
+        type: string
+        default: CI
+        required: false
+      stale_minutes:
+        description: Pending operation age after which missing liveness becomes recoverable.
+        type: string
+        default: ''
+        required: false
+      dispatch_grace_seconds:
+        description: Grace after a durable dispatch marker before a missing run may be replayed.
+        type: string
+        default: ''
+        required: false
+
+permissions: {}
+
+concurrency:
+  group: pr-agent-recovery-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    if: >-
+      (inputs.review_provider || vars.CONTINUUM_REVIEW_PROVIDER || 'none') == 'pr-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+      pull-requests: read
+      statuses: read
+
+    steps:
+      - name: Reconcile PR-Agent latest state
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          REVIEW_WORKFLOW: ${{ inputs.review_workflow }}
+          CI_WORKFLOW_NAME: ${{ inputs.ci_workflow_name || 'CI' }}
+          STALE_MINUTES: ${{ inputs.stale_minutes || vars.PR_AGENT_RECOVERY_STALE_MINUTES || '70' }}
+          DISPATCH_GRACE_SECONDS: ${{ inputs.dispatch_grace_seconds || vars.PR_AGENT_RECOVERY_DISPATCH_GRACE_SECONDS || '90' }}
+        with:
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const repoFullName = owner + '/' + repo;
+            const reviewWorkflow = String(process.env.REVIEW_WORKFLOW || 'continuum-pr-agent.yml').trim();
+            const ciWorkflowName = String(process.env.CI_WORKFLOW_NAME || 'CI').trim();
+            const maxExecutions = 3;
+            const staleMs = Number.parseInt(process.env.STALE_MINUTES || '70', 10) * 60_000;
+            const dispatchGraceMs =
+              Number.parseInt(process.env.DISPATCH_GRACE_SECONDS || '90', 10) * 1_000;
+            const trustedAssociations = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
+            const retryableConclusions = new Set([
+              'cancelled',
+              'timed_out',
+              'stale',
+              'startup_failure',
+            ]);
+            const activeStatuses = new Set([
+              'queued',
+              'in_progress',
+              'waiting',
+              'requested',
+              'pending',
+            ]);
+            const REVIEW_CONTEXT = 'continuum/pr-agent-review';
+            const REPAIR_CONTEXT = 'continuum/pr-agent-repair';
+
+            if (!['continuum-pr-agent.yml', 'pr-agent.yml'].includes(reviewWorkflow)) {
+              core.setFailed(
+                'Invalid PR-Agent review workflow: ' + reviewWorkflow +
+                '. Expected continuum-pr-agent.yml or pr-agent.yml.'
+              );
+              return;
+            }
+            if (!Number.isFinite(staleMs) || staleMs < 60_000) {
+              core.setFailed('PR_AGENT_RECOVERY_STALE_MINUTES must be at least 1.');
+              return;
+            }
+            if (!Number.isFinite(dispatchGraceMs) || dispatchGraceMs < 0) {
+              core.setFailed('PR_AGENT_RECOVERY_DISPATCH_GRACE_SECONDS must be non-negative.');
+              return;
+            }
+
+            function nowMs() {
+              return Date.now();
+            }
+
+            function ageMs(value) {
+              const parsed = Date.parse(String(value || ''));
+              return Number.isFinite(parsed) ? Math.max(0, nowMs() - parsed) : Number.MAX_SAFE_INTEGER;
+            }
+
+            function retryMarker(head, kind, attempt) {
+              return '<!-- continuum-pr-agent-retry head=' +
+                String(head).toLowerCase() + ' kind=' + kind +
+                ' attempt=' + String(attempt) + ' -->';
+            }
+
+            function exhaustedMarker(head, kind) {
+              return '<!-- continuum-pr-agent-retry-exhausted head=' +
+                String(head).toLowerCase() + ' kind=' + kind +
+                ' attempts=' + String(maxExecutions) + ' -->';
+            }
+
+            function parseEvidence(comments, head, kind) {
+              const exactHead = String(head).toLowerCase();
+              const retryRe =
+                /<!--\s*continuum-pr-agent-retry\s+head=([0-9a-f]{7,64})\s+kind=(review|repair)\s+attempt=(\d+)\s*-->/ig;
+              const exhaustedRe =
+                /<!--\s*continuum-pr-agent-retry-exhausted\s+head=([0-9a-f]{7,64})\s+kind=(review|repair)\s+attempts=(\d+)\s*-->/ig;
+              let latestAttempt = null;
+              let latestMarkerAt = null;
+              let exhausted = false;
+              for (const comment of comments) {
+                if (!trustedAssociations.has(String(comment.author_association || '').toUpperCase())) {
+                  continue;
+                }
+                const body = String(comment.body || '');
+                const createdAt = Date.parse(String(comment.created_at || comment.updated_at || ''));
+                retryRe.lastIndex = 0;
+                exhaustedRe.lastIndex = 0;
+                for (const match of body.matchAll(retryRe)) {
+                  if (match[1].toLowerCase() !== exactHead || match[2] !== kind) continue;
+                  const attempt = Number.parseInt(match[3], 10);
+                  if (
+                    latestAttempt === null ||
+                    attempt > latestAttempt ||
+                    (attempt === latestAttempt &&
+                     Number.isFinite(createdAt) &&
+                     (latestMarkerAt === null || createdAt > latestMarkerAt))
+                  ) {
+                    latestAttempt = attempt;
+                    latestMarkerAt = Number.isFinite(createdAt) ? createdAt : null;
+                  }
+                }
+                for (const match of body.matchAll(exhaustedRe)) {
+                  if (
+                    match[1].toLowerCase() === exactHead &&
+                    match[2] === kind &&
+                    Number.parseInt(match[3], 10) >= maxExecutions
+                  ) {
+                    exhausted = true;
+                  }
+                }
+              }
+              return { latestAttempt, latestMarkerAt, exhausted };
+            }
+
+            function latestContext(statuses, name) {
+              return statuses
+                .filter(status => status.context === name)
+                .sort((a, b) =>
+                  Date.parse(b.updated_at || b.created_at || 0) -
+                  Date.parse(a.updated_at || a.created_at || 0)
+                )[0] || null;
+            }
+
+            async function listReviewRuns() {
+              try {
+                return await github.paginate(
+                  github.rest.actions.listWorkflowRuns,
+                  {
+                    owner,
+                    repo,
+                    workflow_id: reviewWorkflow,
+                    per_page: 100,
+                  }
+                );
+              } catch (err) {
+                core.setFailed(
+                  'Could not inspect PR-Agent caller runs for ' + reviewWorkflow +
+                  ': ' + (err.message || err)
+                );
+                throw err;
+              }
+            }
+
+            function exactActiveRun(runs, prNumber, kind, head) {
+              const prefix = 'PR-Agent PR #' + prNumber + ' [' + kind + ':';
+              const suffix = '] head=' + String(head).toLowerCase();
+              return runs.find(run =>
+                String(run.display_title || '').startsWith(prefix) &&
+                String(run.display_title || '').endsWith(suffix) &&
+                activeStatuses.has(String(run.status || '').toLowerCase())
+              ) || null;
+            }
+
+            async function statusRunMetadata(status) {
+              const target = String(status?.target_url || '');
+              const match = target.match(/\/actions\/runs\/(\d+)(?:$|[/?#])/);
+              if (!match) return { conclusion: null, recoveryKind: null };
+              try {
+                const { data: run } = await github.rest.actions.getWorkflowRun({
+                  owner,
+                  repo,
+                  run_id: Number(match[1]),
+                });
+                const title = String(run.display_title || '');
+                const identity = title.match(/\[(review|repair):\d+\]/);
+                const recoveryKind = identity ? identity[1] : null;
+                if (activeStatuses.has(String(run.status || '').toLowerCase())) {
+                  return {
+                    conclusion: String(run.status || '').toLowerCase(),
+                    recoveryKind,
+                  };
+                }
+                return {
+                  conclusion:
+                    String(run.conclusion || run.status || '').toLowerCase() || null,
+                  recoveryKind,
+                };
+              } catch (err) {
+                if (err.status === 404) {
+                  return { conclusion: null, recoveryKind: null };
+                }
+                throw err;
+              }
+            }
+
+            async function exactHeadCiGreen(head) {
+              const runs = await github.paginate(
+                github.rest.actions.listWorkflowRunsForRepo,
+                {
+                  owner,
+                  repo,
+                  event: 'pull_request',
+                  head_sha: head,
+                  per_page: 100,
+                }
+              );
+              const latest = runs
+                .filter(run => run.name === ciWorkflowName && run.head_sha === head)
+                .sort((a, b) =>
+                  Date.parse(b.created_at || 0) - Date.parse(a.created_at || 0)
+                )[0];
+              return Boolean(
+                latest &&
+                latest.status === 'completed' &&
+                latest.conclusion === 'success'
+              );
+            }
+
+            function backoffSeconds(attempt) {
+              if (attempt <= 0) return 0;
+              return 15 * (1 << (attempt - 1));
+            }
+
+            function decide({
+              ciGreen,
+              operationStatus,
+              activeRun,
+              runConclusion,
+              evidence,
+            }) {
+              if (!ciGreen) return { action: 'wait', reason: 'exact HEAD CI is not green' };
+              if (evidence.exhausted) {
+                return { action: 'hold', reason: 'durable retry exhaustion marker exists' };
+              }
+              if (activeRun) {
+                return { action: 'wait', reason: 'exact PR/HEAD/operation already active' };
+              }
+
+              const state = String(operationStatus?.state || '').toLowerCase() || null;
+              const description = String(operationStatus?.description || '');
+              const statusAt = operationStatus
+                ? Date.parse(String(operationStatus.updated_at || operationStatus.created_at || ''))
+                : null;
+              const markerNewer =
+                evidence.latestMarkerAt !== null &&
+                (!Number.isFinite(statusAt) || evidence.latestMarkerAt > statusAt);
+              const markerAge =
+                evidence.latestMarkerAt === null ? null : Math.max(0, nowMs() - evidence.latestMarkerAt);
+
+              if (
+                markerNewer &&
+                evidence.latestAttempt !== null &&
+                markerAge !== null &&
+                markerAge < dispatchGraceMs
+              ) {
+                return {
+                  action: 'wait',
+                  reason: 'newer durable dispatch marker is inside grace window',
+                };
+              }
+
+              let recoverable = false;
+              const operationSeen = state !== null;
+              if (state === null) {
+                recoverable = true;
+              } else if (state === 'success') {
+                return { action: 'settled', reason: 'operation already settled' };
+              } else if (state === 'failure') {
+                if (/recovery eligible|transient/i.test(description)) {
+                  recoverable = true;
+                } else {
+                  return {
+                    action: 'hold',
+                    reason: 'deterministic failure is not automatically retried',
+                  };
+                }
+              } else if (state === 'pending') {
+                if (retryableConclusions.has(String(runConclusion || '').toLowerCase())) {
+                  recoverable = true;
+                } else if (
+                  ageMs(operationStatus.updated_at || operationStatus.created_at) >= staleMs &&
+                  !activeStatuses.has(String(runConclusion || '').toLowerCase())
+                ) {
+                  recoverable = true;
+                } else {
+                  return { action: 'wait', reason: 'pending operation is not stale' };
+                }
+              } else {
+                return { action: 'hold', reason: 'unknown operation state ' + state };
+              }
+
+              if (!recoverable) {
+                return { action: 'hold', reason: 'operation is not recoverable' };
+              }
+
+              let attempt;
+              if (evidence.latestAttempt === null) {
+                attempt = operationSeen ? 1 : 0;
+              } else if (markerNewer) {
+                attempt = evidence.latestAttempt;
+              } else {
+                attempt = evidence.latestAttempt + 1;
+              }
+
+              if (attempt >= maxExecutions) {
+                return { action: 'exhaust', reason: 'automatic execution budget exhausted' };
+              }
+              return {
+                action: 'dispatch',
+                attempt,
+                reason: state === null ? 'lost/missing operation' : 'transient/stale operation',
+              };
+            }
+
+            async function defaultBranch() {
+              const { data } = await github.rest.repos.get({ owner, repo });
+              return String(data.default_branch || 'main');
+            }
+
+            async function dispatch(pr, kind, head, attempt, status) {
+              const delaySeconds = backoffSeconds(attempt);
+              const statusTime = status
+                ? Date.parse(String(status.updated_at || status.created_at || ''))
+                : null;
+              const elapsedSeconds = Number.isFinite(statusTime)
+                ? Math.floor(Math.max(0, nowMs() - statusTime) / 1000)
+                : delaySeconds;
+              const remaining = Math.max(0, delaySeconds - elapsedSeconds);
+              if (remaining > 0) {
+                core.info(
+                  'PR #' + pr.number + ' ' + kind +
+                  ': bounded backoff ' + remaining + 's before execution index ' + attempt + '.'
+                );
+                await new Promise(resolve => setTimeout(resolve, remaining * 1000));
+              }
+
+              const { data: fresh } = await github.rest.pulls.get({
+                owner,
+                repo,
+                pull_number: pr.number,
+              });
+              if (
+                fresh.state !== 'open' ||
+                fresh.draft ||
+                !fresh.head.repo ||
+                fresh.head.repo.full_name !== repoFullName ||
+                fresh.head.sha !== head
+              ) {
+                core.info(
+                  'PR #' + pr.number + ' moved/closed during recovery backoff; stale dispatch cancelled.'
+                );
+                return false;
+              }
+              if (!(await exactHeadCiGreen(head))) {
+                core.info(
+                  'PR #' + pr.number + ' HEAD ' + head +
+                  ': CI is no longer green; recovery dispatch cancelled.'
+                );
+                return false;
+              }
+
+              const refreshedRuns = await listReviewRuns();
+              if (exactActiveRun(refreshedRuns, pr.number, kind, head)) {
+                core.info(
+                  'PR #' + pr.number + ' ' + kind +
+                  ': another exact operation became active; duplicate wakeup coalesced.'
+                );
+                return false;
+              }
+
+              const refreshedComments = await github.paginate(
+                github.rest.issues.listComments,
+                { owner, repo, issue_number: pr.number, per_page: 100 }
+              );
+              const refreshedEvidence = parseEvidence(refreshedComments, head, kind);
+              if (refreshedEvidence.exhausted) {
+                core.info('PR #' + pr.number + ' ' + kind + ': retry budget is already exhausted.');
+                return false;
+              }
+              if (
+                refreshedEvidence.latestAttempt !== null &&
+                refreshedEvidence.latestAttempt > attempt
+              ) {
+                core.info(
+                  'PR #' + pr.number + ' ' + kind +
+                  ': a newer retry attempt already exists; stale dispatch cancelled.'
+                );
+                return false;
+              }
+              if (
+                refreshedEvidence.latestAttempt === attempt &&
+                refreshedEvidence.latestMarkerAt !== null &&
+                nowMs() - refreshedEvidence.latestMarkerAt < dispatchGraceMs
+              ) {
+                core.info(
+                  'PR #' + pr.number + ' ' + kind +
+                  ': matching retry marker is inside dispatch grace; duplicate wakeup coalesced.'
+                );
+                return false;
+              }
+
+              const marker = retryMarker(head, kind, attempt);
+              const { data: markerComment } = await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: pr.number,
+                body: [
+                  marker,
+                  'Automatic PR-Agent ' + kind + ' recovery for exact HEAD ' + head +
+                    ' (execution ' + (attempt + 1) + '/' + maxExecutions + ').',
+                ].join('\n'),
+              });
+
+              try {
+                const ref = await defaultBranch();
+                await github.rest.actions.createWorkflowDispatch({
+                  owner,
+                  repo,
+                  workflow_id: reviewWorkflow,
+                  ref,
+                  inputs: {
+                    pr_number: String(pr.number),
+                    expected_head_sha: head,
+                    retry_attempt: String(attempt),
+                    retry_workflow: reviewWorkflow,
+                    recovery_kind: kind,
+                  },
+                });
+                core.notice(
+                  'PR #' + pr.number + ' HEAD ' + head + ': dispatched ' +
+                  kind + ' recovery execution ' + (attempt + 1) + '/' + maxExecutions + '.'
+                );
+                return true;
+              } catch (err) {
+                try {
+                  await github.rest.issues.deleteComment({
+                    owner,
+                    repo,
+                    comment_id: markerComment.id,
+                  });
+                } catch (cleanupErr) {
+                  core.warning(
+                    'Could not remove uncommitted recovery marker: ' +
+                    (cleanupErr.message || cleanupErr)
+                  );
+                }
+                throw err;
+              }
+            }
+
+            async function exhaust(pr, head, kind, comments) {
+              const marker = exhaustedMarker(head, kind);
+              const already = comments.some(comment =>
+                trustedAssociations.has(String(comment.author_association || '').toUpperCase()) &&
+                String(comment.body || '').includes(marker)
+              );
+              if (already) return;
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: pr.number,
+                body: [
+                  marker,
+                  'PR-Agent ' + kind + ' recovery exhausted the bounded ' +
+                    maxExecutions + '-execution budget for exact HEAD ' + head +
+                    '. A changed HEAD starts a new recovery identity.',
+                ].join('\n'),
+              });
+            }
+
+            const openPrs = await github.paginate(
+              github.rest.pulls.list,
+              { owner, repo, state: 'open', per_page: 100 }
+            );
+            let reviewRuns = await listReviewRuns();
+
+            for (const pr of openPrs) {
+              if (
+                pr.draft ||
+                !pr.head.repo ||
+                pr.head.repo.full_name !== repoFullName
+              ) {
+                continue;
+              }
+              const head = String(pr.head.sha || '').toLowerCase();
+              if (!head) continue;
+
+              const ciGreen = await exactHeadCiGreen(head);
+              if (!ciGreen) {
+                core.info('PR #' + pr.number + ' HEAD ' + head + ': exact-head CI not green; skip.');
+                continue;
+              }
+
+              const [statuses, comments] = await Promise.all([
+                github.paginate(
+                  github.rest.repos.listCommitStatusesForRef,
+                  { owner, repo, ref: head, per_page: 100 }
+                ),
+                github.paginate(
+                  github.rest.issues.listComments,
+                  { owner, repo, issue_number: pr.number, per_page: 100 }
+                ),
+              ]);
+
+              const reviewStatus = latestContext(statuses, REVIEW_CONTEXT);
+              const reviewRun = reviewStatus
+                ? await statusRunMetadata(reviewStatus)
+                : { conclusion: null, recoveryKind: null };
+              let kind = 'review';
+              let operationStatus = reviewStatus;
+              let operationRun = reviewRun;
+
+              if (reviewStatus?.state === 'success') {
+                if (/actionable/i.test(String(reviewStatus.description || ''))) {
+                  kind = 'repair';
+                  operationStatus = latestContext(statuses, REPAIR_CONTEXT);
+                  operationRun = operationStatus
+                    ? await statusRunMetadata(operationStatus)
+                    : { conclusion: null, recoveryKind: null };
+                } else {
+                  core.info(
+                    'PR #' + pr.number + ' HEAD ' + head +
+                    ': review is settled clean; recovery has nothing to do.'
+                  );
+                  continue;
+                }
+              } else if (
+                reviewRun.recoveryKind === 'repair' &&
+                ['pending', 'failure'].includes(
+                  String(reviewStatus?.state || '').toLowerCase()
+                )
+              ) {
+                // A repair recovery must first reconstruct canonical review/
+                // improve payloads. If that prerequisite review is cancelled,
+                // stale, or fails, it still belongs to the durable repair
+                // operation and must consume/replay the repair budget.
+                kind = 'repair';
+              }
+
+              const evidence = parseEvidence(comments, head, kind);
+              const activeRun = exactActiveRun(reviewRuns, pr.number, kind, head);
+              const decision = decide({
+                ciGreen,
+                operationStatus,
+                activeRun,
+                runConclusion: operationRun.conclusion,
+                evidence,
+              });
+
+              core.info(
+                'PR #' + pr.number + ' HEAD ' + head + ' ' + kind +
+                ': recovery decision=' + decision.action +
+                ' reason=' + decision.reason +
+                (decision.attempt === undefined ? '' : ' attempt=' + decision.attempt)
+              );
+
+              if (decision.action === 'exhaust') {
+                await exhaust(pr, head, kind, comments);
+                continue;
+              }
+              if (decision.action !== 'dispatch') continue;
+
+              const dispatched = await dispatch(
+                pr,
+                kind,
+                head,
+                decision.attempt,
+                operationStatus
+              );
+              if (dispatched) {
+                reviewRuns = await listReviewRuns();
+              }
+            }

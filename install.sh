@@ -60,6 +60,7 @@ CORE_STUBS=(
   continuum-opencode-watchdog.yml
   continuum-opencode.yml
   continuum-pr-agent-canary.yml
+  continuum-pr-agent-recovery.yml
   continuum-pr-agent.yml
   continuum-pr-agent-repair.yml
   continuum-pr-agent-auto-merge.yml
