@@ -75,7 +75,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: pr-agent-merge-${{ inputs.target_child_id == '' && 'local' || format('child-{0}', inputs.target_child_id) }}-${{ inputs.pr_number || github.run_id }}
+  group: pr-agent-merge-${{ inputs.target_child_id && format('child-{0}', inputs.target_child_id) || 'local' }}-${{ inputs.pr_number || github.run_id }}
   cancel-in-progress: false
 
 jobs:
@@ -629,19 +629,31 @@ jobs:
               try {
                 if (delegated) {
                   // Delegated surface: a target-local OpenCode dispatch would
-                  // run in the wrong repository. The bounded lock plus the
-                  // exact-HEAD marker above already consumed this HEAD's
-                  // single attempt, so hold for the parent routing controller
-                  // instead of failing the run: the next pass observes the
-                  // marker, releases the lock, and holds without a storm.
-                  core.warning(
+                  // run in the wrong repository, and the parent routing
+                  // controller (future Work Lock #43) does not exist yet.
+                  // Do not consume this HEAD's single bounded attempt and do
+                  // not hold green: remove the lock plus the exact-HEAD
+                  // marker created above and fail explicitly so the conflict
+                  // stays visible and retryable instead of freezing green.
+                  try {
+                    await github.rest.issues.deleteComment({
+                      owner,
+                      repo,
+                      comment_id: attemptComment.data.id,
+                    });
+                  } catch (cleanupErr) {
+                    core.warning(
+                      'PR #' + prNumber +
+                      ': failed to remove uncommitted delegated conflict-attempt marker: ' +
+                      (cleanupErr.message || cleanupErr)
+                    );
+                  }
+                  await releaseConflictLock();
+                  core.setFailed(
                     'PR #' + prNumber +
                     ': Delegated PR conflict repair needs the parent routing controller; ' +
-                    'recorded bounded attempt 1/1 for HEAD ' + fresh.head.sha +
-                    ' without a target-local dispatch (' + reason + ').'
-                  );
-                  core.notice(
-                    'PR #' + prNumber + ': delegated conflict-repair attempt held for parent routing.'
+                    'no target-local dispatch was made for HEAD ' + fresh.head.sha +
+                    ' (' + reason + '). Push a new HEAD or rerun once parent routing lands.'
                   );
                   return;
                 }

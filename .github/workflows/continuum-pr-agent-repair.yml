@@ -58,7 +58,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: pr-agent-repair-${{ inputs.target_child_id || 'local' }}-${{ inputs.pr_number || github.run_id }}-${{ inputs.head_sha || github.sha }}
+  group: pr-agent-repair-${{ inputs.target_child_id && format('child-{0}', inputs.target_child_id) || 'local' }}-${{ inputs.pr_number || github.run_id }}-${{ inputs.head_sha || github.sha }}
   cancel-in-progress: false
 
 jobs:

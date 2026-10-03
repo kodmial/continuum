@@ -130,7 +130,7 @@ permissions:
   statuses: read
 
 concurrency:
-  group: pr-agent-${{ inputs.target_child_id == '' && 'local' || format('child-{0}', inputs.target_child_id) }}-${{ github.event.issue.number || github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || inputs.pr_number || github.run_id }}
+  group: pr-agent-${{ inputs.target_child_id && format('child-{0}', inputs.target_child_id) || 'local' }}-${{ github.event.issue.number || github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || inputs.pr_number || github.run_id }}
   cancel-in-progress: false
 
 jobs:

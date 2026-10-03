@@ -39,6 +39,10 @@ if [[ -n "$child_id" ]]; then
     exit "$resolve_rc"
   fi
 
+  if ! [[ "$target_repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    echo "::error::PR-Agent target repository identity is invalid." >&2
+    exit 2
+  fi
   if ! PARENT_CONFIG="${PARENT_CONFIG:-.continuum.yml}" \
        CHILD_REPOSITORIES="${CHILD_REPOSITORIES:-}" \
        bash "$resolver" verify "$child_id" "$target_repository" >/dev/null 2>&1; then

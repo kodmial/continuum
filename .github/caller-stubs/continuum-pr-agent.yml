@@ -47,7 +47,7 @@ permissions:
   statuses: read
 
 concurrency:
-  group: pr-agent-caller-${{ inputs.target_child_id || 'local' }}-${{ github.event.issue.number || inputs.pr_number || github.run_id }}
+  group: pr-agent-caller-${{ inputs.target_child_id && format('child-{0}', inputs.target_child_id) || 'local' }}-${{ github.event.issue.number || inputs.pr_number || github.run_id }}
   cancel-in-progress: false
 
 jobs:

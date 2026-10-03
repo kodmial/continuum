@@ -1187,7 +1187,7 @@ class RepairWiringRegressionTests(unittest.TestCase):
     def test_merge_reconciliation_is_serialized_per_pr(self):
         merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
         self.assertIn(
-            "group: pr-agent-merge-${{ inputs.target_child_id == '' && 'local' || format('child-{0}', inputs.target_child_id) }}-${{ inputs.pr_number || github.run_id }}",
+            "group: pr-agent-merge-${{ inputs.target_child_id && format('child-{0}', inputs.target_child_id) || 'local' }}-${{ inputs.pr_number || github.run_id }}",
             merge,
         )
         self.assertIn("cancel-in-progress: false", merge)
