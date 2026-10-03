@@ -22,7 +22,10 @@ permissions: {}
 # CodeRabbit's included full-review quota is shared across PRs. There must be
 # exactly one controller deciding which PR gets the next review slot.
 concurrency:
-  group: ${{ github.workflow }}-coderabbit-rate-limit-controller
+  # Repository-wide fixed key: every caller/event shares one quota controller.
+  # Do not derive this from github.workflow; a second caller name must not create
+  # an independent CodeRabbit slot.
+  group: coderabbit-rate-limit-controller-${{ github.repository }}
   # This controller deliberately sleeps until the next shared quota slot.
   # Cancelling it on every wake-up resets that timer and can starve the queue
   # forever when status/review events keep arriving. Keep one runner alive;
@@ -49,7 +52,7 @@ jobs:
     timeout-minutes: 360
 
     permissions:
-      actions: read
+      actions: write
       contents: read
       issues: write
       pull-requests: read
@@ -487,6 +490,7 @@ jobs:
 
               let latestCompletedReviewAt = 0;
               let latestInFlightCommand = null;
+              let autoMergeReconcilerDispatched = false;
               const candidates = [];
 
               for (const listed of pulls) {
@@ -678,6 +682,23 @@ jobs:
                   continue;
                 }
                 if (unresolvedThreads.length > 0) {
+                  // Preserve the mature NanoDictate/auto-merge safety rule:
+                  // outdated findings are not discarded merely because HEAD
+                  // changed. Wake the single reconciler that already owns
+                  // idempotent exact-finding verification; one dispatch covers
+                  // every open PR and its marker prevents duplicate requests.
+                  if (!autoMergeReconcilerDispatched) {
+                    await github.rest.actions.createWorkflowDispatch({
+                      owner,
+                      repo,
+                      workflow_id: 'continuum-auto-merge.yml',
+                      ref: 'main',
+                    });
+                    autoMergeReconcilerDispatched = true;
+                    core.notice(
+                      'Unresolved CodeRabbit findings remain; dispatched auto-merge reconciliation for exact-finding verification.'
+                    );
+                  }
                   core.info(
                     `PR #${pr.number}: waiting for ${unresolvedThreads.length} unresolved CodeRabbit thread(s) before final full review.`
                   );
