@@ -813,5 +813,78 @@ class IsolationTests(unittest.TestCase):
         self.assertIn("safe_to_merge", merge)
 
 
+class StabilizationParityTests(unittest.TestCase):
+    def test_pr_agent_merge_reuses_mature_common_safety_contract(self):
+        merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
+        for needle in (
+            "AUTO_MERGE_BLOCK_LABEL = 'no-auto-merge'",
+            "CONFLICT_LOCK_LABEL = 'opencode-conflict-repair'",
+            "Packaging smoke",
+            "REQUIRED_WORKFLOW_GATE_LABEL",
+            "requiredWorkflowGateName",
+            "expected_head_sha: oldHead",
+            "mode: 'resolve-conflict'",
+            "sha: reviewedHead",
+            "commit_title: conventionalTitle",
+            "POST_MERGE_WAKEUPS",
+        ):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, merge)
+
+    def test_pr_agent_main_sync_never_carries_old_review(self):
+        merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
+        self.assertIn("fresh CI and a fresh full PR-Agent review", merge)
+        self.assertNotIn("carrying PR-Agent approval", merge)
+        self.assertIn("main advanced in merge-critical files", merge)
+        self.assertIn("non-merge-critical-main-delta", merge)
+
+    def test_pr_agent_merge_is_atomic_against_reviewed_head(self):
+        merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
+        self.assertIn("pr.head.sha.toLowerCase() !== reviewedHead", merge)
+        self.assertIn("sha: reviewedHead", merge)
+        self.assertNotIn('gh pr merge "$PR_NUMBER"', merge)
+
+    def test_pr_agent_retry_is_bounded_exact_head_and_isolated(self):
+        review = read_repo(".github/workflows/continuum-pr-agent.yml")
+        repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
+        caller = read_repo(".github/caller-stubs/continuum-pr-agent.yml")
+        for body in (review, repair):
+            self.assertIn("retry_attempt", body)
+            self.assertIn("15 * (1 << attempt)", body)
+            self.assertIn("attempt >= 3", body)
+            self.assertIn("expected_head_sha", review)
+            self.assertNotIn("continuum-coderabbit-retry.yml", body)
+            self.assertNotIn("continuum-coderabbit-unresolved.yml", body)
+        self.assertIn("workflow_dispatch:", caller)
+        self.assertIn("actions: write", caller)
+
+    def test_no_progress_uses_structured_fingerprint_and_head(self):
+        repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
+        self.assertIn("createHash('sha256')", repair)
+        self.assertIn("continuum-pr-agent-no-progress head=", repair)
+        self.assertIn("fingerprint=", repair)
+        self.assertIn("identical structured PR-Agent finding state", repair)
+        self.assertIn("steps.convergence.outputs.held != 'true'", repair)
+
+    def test_pr_agent_consumer_permission_ceiling_supports_recovery_and_conflict_repair(self):
+        for path in (
+            ".github/caller-stubs/continuum-pr-agent.yml",
+            ".github/caller-stubs/continuum-pr-agent-repair.yml",
+            ".github/caller-stubs/continuum-pr-agent-auto-merge.yml",
+        ):
+            with self.subTest(path=path):
+                self.assertIn("actions: write", read_repo(path))
+
+    def test_code_rabbit_workflows_are_not_referenced_by_new_pr_agent_recovery(self):
+        for path in (
+            ".github/workflows/continuum-pr-agent.yml",
+            ".github/workflows/continuum-pr-agent-repair.yml",
+            ".github/workflows/continuum-pr-agent-auto-merge.yml",
+        ):
+            body = read_repo(path)
+            self.assertNotIn("continuum-coderabbit-retry.yml", body)
+            self.assertNotIn("continuum-coderabbit-unresolved.yml", body)
+
+
 if __name__ == "__main__":
     unittest.main()
