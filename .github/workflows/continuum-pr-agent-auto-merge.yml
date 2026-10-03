@@ -46,6 +46,26 @@ on:
         type: string
         default: ''
         required: false
+      post_merge_wakeups:
+        description: Workflows to wake after a successful merge, comma-separated.
+        type: string
+        default: ''
+        required: false
+      post_merge_wakeup_ref:
+        description: Git ref used for post-merge wakeups.
+        type: string
+        default: ''
+        required: false
+      required_workflow_gate_label:
+        description: Label enabling an additional required workflow gate.
+        type: string
+        default: ''
+        required: false
+      required_workflow_gate_name:
+        description: Required workflow name when the gate label is present.
+        type: string
+        default: ''
+        required: false
 
 permissions: {}
 
@@ -62,6 +82,7 @@ jobs:
       contents: write
       issues: write
       pull-requests: write
+      statuses: read
 
     steps:
       - name: Resolve the isolated PR-Agent stack
@@ -246,47 +267,609 @@ jobs:
             core.setOutput('head_sha', headSha);
             core.notice(`PR #${prNumber} review portion satisfied at ${headSha}.`);
 
-      - name: Revalidate exact HEAD, CI, draft, and conflicts before merge
-        if: steps.gate.outputs.green == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.TAP_PAT }}
-          PR_NUMBER: ${{ inputs.pr_number }}
-          HEAD_SHA: ${{ inputs.head_sha }}
-        run: |
-          set -euo pipefail
-          CURRENT_SHA="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)"
-          if [[ "${CURRENT_SHA,,}" != "${HEAD_SHA,,}" ]]; then
-            echo "::error::PR head moved ($HEAD_SHA -> $CURRENT_SHA); refusing to merge a stale result."
-            exit 1
-          fi
-          STATE="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json state --jq .state)"
-          IS_DRAFT="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)"
-          if [[ "$STATE" != "OPEN" ]]; then
-            echo "::error::PR #$PR_NUMBER is not open ($STATE)."
-            exit 1
-          fi
-          if [[ "$IS_DRAFT" == "true" ]]; then
-            echo "::error::PR #$PR_NUMBER is a draft."
-            exit 1
-          fi
-          MERGEABLE="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json mergeable --jq .mergeable)"
-          if [[ "$MERGEABLE" == "CONFLICTING" ]]; then
-            echo "::error::PR #$PR_NUMBER has merge conflicts."
-            exit 1
-          fi
-          COMBINED="$(gh api "repos/$GITHUB_REPOSITORY/commits/$CURRENT_SHA/status" --jq .state)"
-          if [[ "$COMBINED" != "success" ]]; then
-            echo "::error::Current-head CI for $CURRENT_SHA is $COMBINED, not success."
-            exit 1
-          fi
-          echo "Final revalidation passed for PR #$PR_NUMBER at $CURRENT_SHA."
 
-      - name: Merge on the PR-Agent green gate
+      - name: Reconcile current PR state and merge only the exact reviewed HEAD
         if: steps.gate.outputs.green == 'true'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
-          GH_TOKEN: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ inputs.pr_number }}
-        run: |
-          set -euo pipefail
-          gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --squash
-          echo "Merged PR #$PR_NUMBER on the isolated PR-Agent green gate."
+          REVIEWED_HEAD: ${{ inputs.head_sha }}
+          POST_MERGE_WAKEUPS: ${{ inputs.post_merge_wakeups || vars.CONTINUUM_POST_MERGE_WAKEUPS }}
+          POST_MERGE_WAKEUP_REF: ${{ inputs.post_merge_wakeup_ref || vars.CONTINUUM_POST_MERGE_WAKEUP_REF || github.event.repository.default_branch || 'main' }}
+          REQUIRED_WORKFLOW_GATE_LABEL: ${{ inputs.required_workflow_gate_label || vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_LABEL || '' }}
+          REQUIRED_WORKFLOW_GATE_NAME: ${{ inputs.required_workflow_gate_name || vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_NAME || '' }}
+        with:
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            // Work Lock #33 mirrors the mature provider-neutral mechanics from
+            // continuum-auto-merge.yml while keeping CodeRabbit untouched.
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const repoFullName = owner + '/' + repo;
+            const prNumber = Number(process.env.PR_NUMBER);
+            const reviewedHead = String(process.env.REVIEWED_HEAD || '').trim().toLowerCase();
+            const AUTO_MERGE_BLOCK_LABEL = 'no-auto-merge';
+            const CONFLICT_LOCK_LABEL = 'opencode-conflict-repair';
+            const requiredWorkflowGateLabel =
+              String(process.env.REQUIRED_WORKFLOW_GATE_LABEL || '').trim();
+            const requiredWorkflowGateName =
+              String(process.env.REQUIRED_WORKFLOW_GATE_NAME || '').trim();
+            const postMergeWakeups = String(process.env.POST_MERGE_WAKEUPS || '')
+              .split(',')
+              .map(name => name.trim())
+              .filter(Boolean);
+            let postMergeWakeupRef =
+              String(process.env.POST_MERGE_WAKEUP_REF || 'main').trim();
+            if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(postMergeWakeupRef) || postMergeWakeupRef.includes('..') || postMergeWakeupRef.includes('//') || postMergeWakeupRef.includes('@{') || postMergeWakeupRef.endsWith('/') || postMergeWakeupRef.endsWith('.') || postMergeWakeupRef.endsWith('.lock') || postMergeWakeupRef === 'HEAD' || postMergeWakeupRef === '@' || postMergeWakeupRef.startsWith('refs/') || postMergeWakeupRef.startsWith('-') || postMergeWakeupRef.startsWith('.')) {
+              core.warning('Invalid post-merge wakeup ref; falling back to main: ' + postMergeWakeupRef);
+              postMergeWakeupRef = 'main';
+            }
+
+            if (!prNumber || !reviewedHead) {
+              core.setFailed('PR-Agent reconciliation requires pr_number and reviewed HEAD.');
+              return;
+            }
+
+            async function getPull() {
+              const response = await github.rest.pulls.get({
+                owner, repo, pull_number: prNumber,
+              });
+              return response.data;
+            }
+
+            function hasLabel(pr, name) {
+              return (pr.labels || []).some(label =>
+                (typeof label === 'string' ? label : label.name) === name
+              );
+            }
+
+            async function ensureLabel(name, color, description) {
+              try {
+                await github.rest.issues.createLabel({
+                  owner, repo, name, color, description,
+                });
+              } catch (err) {
+                if (err.status !== 422) throw err;
+              }
+            }
+
+            async function latestWorkflowForHead(pr, headSha, workflowName) {
+              const runs = await github.paginate(
+                github.rest.actions.listWorkflowRunsForRepo,
+                {
+                  owner,
+                  repo,
+                  branch: pr.head.ref,
+                  event: 'pull_request',
+                  per_page: 100,
+                }
+              );
+              return runs
+                .filter(run => run.name === workflowName && run.head_sha === headSha)
+                .sort((a, b) =>
+                  new Date(b.created_at || 0).getTime() -
+                  new Date(a.created_at || 0).getTime()
+                )[0] || null;
+            }
+
+            async function currentHeadGates(pr) {
+              const ci = await latestWorkflowForHead(pr, pr.head.sha, 'CI');
+              if (!ci || ci.status !== 'completed' || ci.conclusion !== 'success') {
+                return { ok: false, reason: 'Current-head CI is not successful' };
+              }
+
+              const combinedResponse =
+                await github.rest.repos.getCombinedStatusForRef({
+                  owner, repo, ref: pr.head.sha,
+                });
+              if (combinedResponse.data.state !== 'success') {
+                return {
+                  ok: false,
+                  reason: 'combined status is ' + combinedResponse.data.state + ', not success',
+                };
+              }
+
+              const packaging =
+                await latestWorkflowForHead(pr, pr.head.sha, 'Packaging smoke');
+              if (
+                packaging &&
+                (packaging.status !== 'completed' || packaging.conclusion !== 'success')
+              ) {
+                return {
+                  ok: false,
+                  reason:
+                    'Packaging smoke is ' + packaging.status + '/' +
+                    (packaging.conclusion || 'pending'),
+                };
+              }
+
+              if (
+                requiredWorkflowGateLabel &&
+                requiredWorkflowGateName &&
+                hasLabel(pr, requiredWorkflowGateLabel)
+              ) {
+                const required =
+                  await latestWorkflowForHead(pr, pr.head.sha, requiredWorkflowGateName);
+                if (
+                  !required ||
+                  required.status !== 'completed' ||
+                  required.conclusion !== 'success'
+                ) {
+                  return {
+                    ok: false,
+                    reason:
+                      'required workflow ' + requiredWorkflowGateName + ' is not successful',
+                  };
+                }
+              }
+
+              return { ok: true };
+            }
+
+            function isNonMergeCriticalMainPath(path) {
+              if (path.startsWith('.github/workflows/continuum-')) return false;
+              return (
+                path === 'LICENSE' ||
+                path === '.gitignore' ||
+                path === '.release-please-manifest.json' ||
+                path === 'CHANGELOG.md' ||
+                path.endsWith('.md') ||
+                path.startsWith('docs/') ||
+                path.startsWith('.github/')
+              );
+            }
+
+            function sanitizeBranch(name, fallback = 'main') {
+              let value = String(name || '').trim() || String(fallback || '').trim() || 'main';
+              if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(value)) return 'main';
+              if (value.includes('..') || value.includes('//') || value.includes('@{')) return 'main';
+              if (value.endsWith('/') || value.endsWith('.') || value.endsWith('.lock')) return 'main';
+              if (value === 'HEAD' || value === '@') return 'main';
+              if (value.startsWith('refs/') || value.startsWith('-') || value.startsWith('.')) return 'main';
+              if (value.split('/').some(part => part.startsWith('.') || part.endsWith('.lock'))) return 'main';
+              return value;
+            }
+            let cachedDefaultBranch = null;
+            async function getDefaultBranch() {
+              if (cachedDefaultBranch) return cachedDefaultBranch;
+              try {
+                const { data: repoInfo } = await github.rest.repos.get({
+                  owner, repo,
+                });
+                const name = String(repoInfo.default_branch || '').trim();
+                cachedDefaultBranch = sanitizeBranch(name, 'main');
+              } catch (err) {
+                core.warning(
+                  'Could not resolve the repository default branch; falling back to main: ' +
+                  (err.message || err)
+                );
+                cachedDefaultBranch = 'main';
+              }
+              return cachedDefaultBranch;
+            }
+
+            async function mainSyncDecision(pr) {
+              const defaultBranch = await getDefaultBranch();
+              const comparison = await github.request(
+                'GET /repos/{owner}/{repo}/compare/{basehead}',
+                {
+                  owner,
+                  repo,
+                  basehead: defaultBranch + '...' + pr.head.sha,
+                }
+              );
+              if ((comparison.data.behind_by || 0) <= 0) {
+                return {
+                  required: false,
+                  reason: 'up-to-date',
+                  files: [],
+                  criticalFiles: [],
+                };
+              }
+
+              const reverse = await github.request(
+                'GET /repos/{owner}/{repo}/compare/{basehead}',
+                {
+                  owner,
+                  repo,
+                  basehead: pr.head.sha + '...' + defaultBranch,
+                }
+              );
+              const files = (reverse.data.files || []).map(file => file.filename);
+              const criticalFiles =
+                files.filter(path => !isNonMergeCriticalMainPath(path));
+              const onlyNonCritical =
+                files.length > 0 && criticalFiles.length === 0;
+              return {
+                required: !onlyNonCritical,
+                reason:
+                  files.length === 0
+                    ? 'unknown-main-delta'
+                    : onlyNonCritical
+                      ? 'non-merge-critical-main-delta'
+                      : 'merge-critical-main-delta',
+                files,
+                criticalFiles,
+              };
+            }
+
+            function conflictAttemptMarker(headSha) {
+              return '<!-- opencode-conflict-repair-attempt head=' +
+                String(headSha || '').toLowerCase() + ' -->';
+            }
+
+            async function releaseConflictLock() {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner,
+                  repo,
+                  issue_number: prNumber,
+                  name: CONFLICT_LOCK_LABEL,
+                });
+              } catch (err) {
+                if (err.status !== 404) throw err;
+              }
+            }
+
+            async function dispatchConflictRepair(pr, reason) {
+              await ensureLabel(
+                CONFLICT_LOCK_LABEL,
+                'B60205',
+                'One automatic OpenCode conflict-repair attempt per conflict episode.'
+              );
+              const defaultBranch = await getDefaultBranch();
+              let fresh = await getPull();
+              if (hasLabel(fresh, CONFLICT_LOCK_LABEL)) {
+                // This merge workflow is serialized per PR. A bare label is
+                // therefore never treated as a repository-global liveness
+                // signal: the exact-HEAD attempt marker below is authoritative.
+                // Release stale/inherited lock state before deciding this HEAD.
+                await releaseConflictLock();
+                core.warning(
+                  'PR #' + prNumber +
+                  ': released pre-existing conflict-repair lock; exact-HEAD marker decides whether this PR may dispatch.'
+                );
+                fresh = await getPull();
+              }
+
+              // Bounded retry: exactly one automatic conflict-repair attempt
+              // per PR HEAD. A repeat conflict on the same HEAD after an
+              // attempt already ran means OpenCode could not resolve it;
+              // re-dispatching the same full run would replay the whole task
+              // duration with no new information. A new HEAD starts a new
+              // episode.
+              if (fresh.head.sha.toLowerCase() !== reviewedHead) {
+                core.warning('PR #' + prNumber + ': head moved during conflict handling; stale repair cancelled.');
+                return;
+              }
+              const attemptMarker = conflictAttemptMarker(fresh.head.sha);
+              const priorComments = await github.paginate(
+                github.rest.issues.listComments,
+                { owner, repo, issue_number: prNumber, per_page: 100 }
+              );
+              if (priorComments.some(comment =>
+                String(comment.body || '').includes(attemptMarker)
+              )) {
+                await releaseConflictLock();
+                core.warning(
+                  'PR #' + prNumber + ' HEAD ' + fresh.head.sha +
+                  ': a conflict-repair attempt already ran for this HEAD; ' +
+                  'not re-dispatching. Push a new HEAD to start a new episode.'
+                );
+                return;
+              }
+
+              await github.rest.issues.addLabels({
+                owner,
+                repo,
+                issue_number: prNumber,
+                labels: [CONFLICT_LOCK_LABEL],
+              });
+              // Task-replay record: the repair run merges the default branch
+              // into this exact HEAD and preserves intent from both sides; it
+              // never redoes the original task. The marker bounds retries and
+              // carries the replay coordinates (HEAD, base, reason) so a timed
+              // out episode can be replaced from evidence instead of rerun.
+              const attemptComment = await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: prNumber,
+                body: [
+                  attemptMarker,
+                  'Automatic OpenCode conflict repair, attempt 1/1 for HEAD `' +
+                    fresh.head.sha + '` (base `' + defaultBranch + '`, reason: ' +
+                    reason + '). Scope is merge-conflict resolution only; ' +
+                    'the repair merges the base into the PR branch and preserves ' +
+                    'intent from both sides without redoing the original task.',
+                ].join('\n'),
+              });
+              try {
+                await github.request(
+                  'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
+                  {
+                    owner,
+                    repo,
+                    workflow_id: 'continuum-opencode.yml',
+                    ref: defaultBranch,
+                    inputs: {
+                      mode: 'resolve-conflict',
+                      pr_number: String(prNumber),
+                      head_ref: fresh.head.ref,
+                      conflict_strategy: 'merge',
+                      timeout_minutes: '60',
+                    },
+                  }
+                );
+                core.notice(
+                  'PR #' + prNumber + ': dispatched OpenCode conflict repair (' + reason + ').'
+                );
+              } catch (err) {
+                try {
+                  await github.rest.issues.deleteComment({
+                    owner,
+                    repo,
+                    comment_id: attemptComment.data.id,
+                  });
+                } catch (cleanupErr) {
+                  core.warning(
+                    'PR #' + prNumber +
+                    ': failed to remove uncommitted conflict-attempt marker: ' +
+                    (cleanupErr.message || cleanupErr)
+                  );
+                }
+                await releaseConflictLock();
+                throw err;
+              }
+            }
+
+            async function syncFromMain(pr, reason) {
+              const oldHead = pr.head.sha;
+              try {
+                await github.request(
+                  'PUT /repos/{owner}/{repo}/pulls/{pull_number}/update-branch',
+                  {
+                    owner,
+                    repo,
+                    pull_number: prNumber,
+                    expected_head_sha: oldHead,
+                  }
+                );
+                core.notice(
+                  'PR #' + prNumber +
+                  ': synchronized merge-critical main delta (' + reason +
+                  '); the new HEAD must pass fresh CI and a fresh full PR-Agent review.'
+                );
+                return true;
+              } catch (err) {
+                const fresh = await getPull();
+                if (fresh.head.sha !== oldHead) {
+                  core.notice(
+                    'PR #' + prNumber +
+                    ': head advanced during main sync; stale review will not be merged.'
+                  );
+                  return true;
+                }
+                const message = String(err.message || err);
+                if (
+                  err.status === 409 ||
+                  /merge conflict|conflict|cannot be performed|not updateable/i.test(message)
+                ) {
+                  await dispatchConflictRepair(fresh, message);
+                  return true;
+                }
+                throw err;
+              }
+            }
+
+            let pr = await getPull();
+            if (
+              pr.state !== 'open' ||
+              pr.draft ||
+              !pr.head.repo ||
+              pr.head.repo.full_name !== repoFullName
+            ) {
+              core.setFailed(
+                'PR-Agent candidate is no longer an open non-draft same-repository PR.'
+              );
+              return;
+            }
+            if (pr.head.sha.toLowerCase() !== reviewedHead) {
+              core.setFailed(
+                'PR head moved (' + reviewedHead + ' -> ' + pr.head.sha +
+                '); refusing to merge a stale result.'
+              );
+              return;
+            }
+
+            if (hasLabel(pr, AUTO_MERGE_BLOCK_LABEL)) {
+              core.notice(
+                'PR #' + prNumber + ': ' + AUTO_MERGE_BLOCK_LABEL +
+                ' blocks automatic merge.'
+              );
+              return;
+            }
+
+            const initialGates = await currentHeadGates(pr);
+            if (!initialGates.ok) {
+              core.setFailed('PR #' + prNumber + ': ' + initialGates.reason + '.');
+              return;
+            }
+
+            const mainSync = await mainSyncDecision(pr);
+            if (mainSync.required) {
+              core.notice(
+                'PR #' + prNumber + ': main advanced in merge-critical files: ' +
+                (mainSync.criticalFiles.join(', ') || mainSync.reason) + '.'
+              );
+              await syncFromMain(pr, mainSync.reason);
+              return;
+            }
+            if (mainSync.reason === 'non-merge-critical-main-delta') {
+              core.notice(
+                'PR #' + prNumber +
+                ': main advanced only in non-merge-critical files; preserving the reviewed HEAD.'
+              );
+            }
+
+            pr = await getPull();
+            if (
+              pr.state !== 'open' ||
+              pr.draft ||
+              !pr.head.repo ||
+              pr.head.repo.full_name !== repoFullName ||
+              pr.head.sha.toLowerCase() !== reviewedHead ||
+              hasLabel(pr, AUTO_MERGE_BLOCK_LABEL)
+            ) {
+              core.setFailed(
+                'PR state changed during final PR-Agent revalidation; merge cancelled.'
+              );
+              return;
+            }
+
+            const finalSync = await mainSyncDecision(pr);
+            if (finalSync.required) {
+              core.notice(
+                'PR #' + prNumber +
+                ': merge-critical main delta appeared during final revalidation.'
+              );
+              await syncFromMain(pr, finalSync.reason);
+              return;
+            }
+
+            const finalGates = await currentHeadGates(pr);
+            if (!finalGates.ok) {
+              core.setFailed(
+                'PR #' + prNumber +
+                ': gate changed during final revalidation: ' + finalGates.reason + '.'
+              );
+              return;
+            }
+
+            // Re-read after all asynchronous gate queries. Mergeability and
+            // main delta from an older PR object are not authoritative here.
+            pr = await getPull();
+            if (
+              pr.state !== 'open' ||
+              pr.draft ||
+              !pr.head.repo ||
+              pr.head.repo.full_name !== repoFullName ||
+              pr.head.sha.toLowerCase() !== reviewedHead ||
+              hasLabel(pr, AUTO_MERGE_BLOCK_LABEL)
+            ) {
+              core.setFailed(
+                'PR state changed immediately before merge; merge cancelled.'
+              );
+              return;
+            }
+
+            const preMergeSync = await mainSyncDecision(pr);
+            if (preMergeSync.required) {
+              core.notice(
+                'PR #' + prNumber +
+                ': merge-critical main delta appeared immediately before merge.'
+              );
+              await syncFromMain(pr, preMergeSync.reason);
+              return;
+            }
+            const preMergeGates = await currentHeadGates(pr);
+            if (!preMergeGates.ok) {
+              core.setFailed(
+                'PR #' + prNumber +
+                ': gate changed immediately before merge: ' + preMergeGates.reason + '.'
+              );
+              return;
+            }
+
+            if (pr.mergeable === false || pr.mergeable_state === 'dirty') {
+              await dispatchConflictRepair(
+                pr,
+                'mergeable_state=' + pr.mergeable_state
+              );
+              return;
+            }
+            if (pr.mergeable === null) {
+              core.notice(
+                'PR #' + prNumber +
+                ': GitHub mergeability is still being computed; waiting.'
+              );
+              return;
+            }
+
+            const conventionalTitle =
+              /^(?:fix|feat|perf|refactor)(?:\([^)]*\))?!?:\s/i.test(pr.title)
+                ? pr.title
+                : 'fix: ' + pr.title;
+
+            let mergeResponse;
+            try {
+              mergeResponse = await github.rest.pulls.merge({
+                owner,
+                repo,
+                pull_number: prNumber,
+                merge_method: 'squash',
+                commit_title: conventionalTitle,
+                sha: reviewedHead,
+              });
+            } catch (err) {
+              const fresh = await getPull();
+              if (fresh.head.sha.toLowerCase() !== reviewedHead) {
+                core.setFailed(
+                  'PR HEAD moved during atomic merge; stale reviewed HEAD was not merged.'
+                );
+                return;
+              }
+              const message = String(err.message || err);
+              const isConflictMessage =
+                /merge conflict|conflict|not mergeable|cannot be merged/i.test(message);
+              if (err.status === 409 || isConflictMessage) {
+                await dispatchConflictRepair(fresh, message);
+                return;
+              }
+              if (err.status === 422) {
+                core.setFailed(
+                  'Atomic merge rejected with HTTP 422 without conflict evidence: ' +
+                  message
+                );
+                return;
+              }
+              throw err;
+            }
+            const result = mergeResponse.data;
+
+            if (!result.merged) {
+              core.setFailed(
+                'PR #' + prNumber +
+                ': GitHub refused exact-head merge: ' +
+                (result.message || 'unknown reason')
+              );
+              return;
+            }
+
+            core.notice(
+              'PR #' + prNumber + ': merged exact reviewed HEAD ' +
+              reviewedHead + '; merge commit ' + result.sha + '.'
+            );
+
+            for (const workflow of postMergeWakeups) {
+              if (!/^[\w][\w.\-]*\.yml$/.test(workflow)) {
+                core.warning('PR #' + prNumber + ': skipping invalid post-merge wakeup: ' + workflow);
+                continue;
+              }
+              try {
+                await github.request(
+                  'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
+                  {
+                    owner,
+                    repo,
+                    workflow_id: workflow,
+                    ref: postMergeWakeupRef,
+                  }
+                );
+                core.notice('Woke ' + workflow + ' at ' + postMergeWakeupRef + '.');
+              } catch (err) {
+                core.warning(
+                  'PR #' + prNumber +
+                  ': could not wake ' + workflow + ': ' + err.message
+                );
+              }
+            }

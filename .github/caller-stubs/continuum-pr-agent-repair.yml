@@ -19,6 +19,15 @@ on:
         description: "Runner-local push_outputs file payload for the exact HEAD"
         required: false
         type: string
+      retry_attempt:
+        description: "Bounded PR-Agent retry attempt number (0 = initial run)"
+        required: false
+        default: '0'
+        type: string
+      retry_workflow:
+        description: "Caller workflow filename used to restart the isolated PR-Agent stack"
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -35,3 +44,5 @@ jobs:
       head_sha: "${{ inputs.head_sha }}"
       review_json: "${{ inputs.review_json }}"
       improve_jsonl: "${{ inputs.improve_jsonl }}"
+      retry_attempt: "${{ inputs.retry_attempt }}"
+      retry_workflow: "${{ inputs.retry_workflow }}"

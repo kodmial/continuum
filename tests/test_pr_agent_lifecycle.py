@@ -813,5 +813,498 @@ class IsolationTests(unittest.TestCase):
         self.assertIn("safe_to_merge", merge)
 
 
+class StabilizationParityTests(unittest.TestCase):
+    def test_pr_agent_merge_reuses_mature_common_safety_contract(self):
+        merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
+        for needle in (
+            "AUTO_MERGE_BLOCK_LABEL = 'no-auto-merge'",
+            "CONFLICT_LOCK_LABEL = 'opencode-conflict-repair'",
+            "Packaging smoke",
+            "REQUIRED_WORKFLOW_GATE_LABEL",
+            "requiredWorkflowGateName",
+            "expected_head_sha: oldHead",
+            "mode: 'resolve-conflict'",
+            "sha: reviewedHead",
+            "commit_title: conventionalTitle",
+            "POST_MERGE_WAKEUPS",
+        ):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, merge)
+
+    def test_pr_agent_main_sync_never_carries_old_review(self):
+        merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
+        self.assertIn("fresh CI and a fresh full PR-Agent review", merge)
+        self.assertNotIn("carrying PR-Agent approval", merge)
+        self.assertIn("main advanced in merge-critical files", merge)
+        self.assertIn("non-merge-critical-main-delta", merge)
+
+    def test_pr_agent_merge_is_atomic_against_reviewed_head(self):
+        merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
+        self.assertIn("pr.head.sha.toLowerCase() !== reviewedHead", merge)
+        self.assertIn("sha: reviewedHead", merge)
+        self.assertNotIn('gh pr merge "$PR_NUMBER"', merge)
+
+    def test_pr_agent_retry_is_bounded_exact_head_and_isolated(self):
+        review = read_repo(".github/workflows/continuum-pr-agent.yml")
+        repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
+        caller = read_repo(".github/caller-stubs/continuum-pr-agent.yml")
+        for body in (review, repair):
+            self.assertIn("retry_attempt", body)
+            self.assertIn("15 * (1 << attempt)", body)
+            self.assertIn("attempt >= 2", body)
+            self.assertIn("expected_head_sha", review)
+            self.assertNotIn("continuum-coderabbit-retry.yml", body)
+            self.assertNotIn("continuum-coderabbit-unresolved.yml", body)
+        self.assertIn("workflow_dispatch:", caller)
+
+    def test_no_progress_uses_structured_fingerprint_and_head(self):
+        repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
+        self.assertIn("createHash('sha256')", repair)
+        self.assertIn("continuum-pr-agent-no-progress head=", repair)
+        self.assertIn("fingerprint=", repair)
+        self.assertIn("identical structured PR-Agent finding state", repair)
+        self.assertIn("steps.convergence.outputs.held != 'true'", repair)
+
+    def test_main_sync_classification_predicate_is_not_inverted(self):
+        merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
+        # The exact negation is the contract: only a fully non-critical
+        # delta may skip the sync. An inverted `required: onlyNonCritical`
+        # would sync the wrong set and merge the wrong HEAD.
+        self.assertIn("required: !onlyNonCritical", merge)
+        self.assertNotIn("required: onlyNonCritical", merge)
+        self.assertIn(
+            "files.length > 0 && criticalFiles.length === 0", merge
+        )
+        self.assertIn("unknown-main-delta", merge)
+        self.assertIn("non-merge-critical-main-delta", merge)
+        self.assertIn("merge-critical-main-delta", merge)
+        # Both compare directions are required; a single direction cannot
+        # distinguish behind-by from the file delta.
+        self.assertIn("defaultBranch + '...' + pr.head.sha", merge)
+        self.assertIn("pr.head.sha + '...' + defaultBranch", merge)
+
+    def test_final_and_premerge_revalidation_refresh_pr_before_merge(self):
+        merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
+        # A missing final getPull would merge on a stale PR object; the
+        # reconciliation must refresh before every gate window.
+        self.assertGreaterEqual(merge.count("await getPull()"), 5)
+        self.assertGreaterEqual(
+            merge.count("pr = await getPull()"), 2
+        )
+        ordered = (
+            "let pr = await getPull()",
+            "mainSync",
+            "pr = await getPull()",
+            "finalSync",
+            "finalGates",
+            "pr = await getPull()",
+            "preMergeSync",
+            "preMergeGates",
+            "pr.mergeable",
+            "pulls.merge",
+        )
+        index = -1
+        for needle in ordered:
+            nxt = merge.index(needle, index + 1)
+            self.assertGreater(
+                nxt, index, f"{needle} must follow the prior gate in order"
+            )
+            index = nxt
+        # Every revalidation window re-checks the exact reviewed HEAD.
+        self.assertGreaterEqual(
+            merge.count("pr.head.sha.toLowerCase() !== reviewedHead"), 3
+        )
+        self.assertIn("PR state changed during final PR-Agent revalidation", merge)
+        self.assertIn("PR state changed immediately before merge", merge)
+
+    def test_merge_conflict_error_routing_is_not_swapped(self):
+        merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
+        idx_409 = merge.index("err.status === 409")
+        idx_422 = merge.index("err.status === 422")
+        self.assertLess(
+            idx_409, idx_422, "conflict (409) handling must precede 422 handling"
+        )
+        window_409 = merge[idx_409:idx_422]
+        self.assertIn("isConflictMessage", window_409)
+        self.assertIn("await dispatchConflictRepair(fresh, message)", window_409)
+        window_422 = merge[idx_422 : idx_422 + 800]
+        self.assertIn(
+            "Atomic merge rejected with HTTP 422 without conflict evidence",
+            window_422,
+        )
+        self.assertNotIn("dispatchConflictRepair", window_422)
+        # Mergeability states: dirty dispatches repair, unknown waits.
+        self.assertIn(
+            "pr.mergeable === false || pr.mergeable_state === 'dirty'", merge
+        )
+        self.assertIn("pr.mergeable === null", merge)
+        self.assertIn("still being computed", merge)
+
+    def test_packaging_and_required_gates_block_merge(self):
+        merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
+        self.assertIn("Packaging smoke", merge)
+        self.assertIn(
+            "packaging.status !== 'completed' || packaging.conclusion !== 'success'",
+            merge,
+        )
+        self.assertIn("requiredWorkflowGateName", merge)
+        self.assertIn(
+            "required.status !== 'completed' ||",
+            merge,
+        )
+        self.assertIn("required workflow ", merge)
+        self.assertIn("combined status is ", merge)
+
+    def test_finding_fingerprint_is_order_independent(self):
+        repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
+        self.assertIn(
+            "stable(items).map(entry => JSON.stringify(entry)).sort()", repair
+        )
+        self.assertIn("JSON.stringify(canonical)", repair)
+
+    def test_default_branch_resolution_is_validated(self):
+        merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
+        self.assertIn("function sanitizeBranch", merge)
+        self.assertIn("cachedDefaultBranch = sanitizeBranch(name,", merge)
+        self.assertIn("part.startsWith('.')", merge)
+        self.assertIn("part.endsWith('.lock')", merge)
+
+    def test_retry_branch_sanitizer_covers_hidden_components(self):
+        for path in (
+            ".github/workflows/continuum-pr-agent.yml",
+            ".github/workflows/continuum-pr-agent-repair.yml",
+        ):
+            with self.subTest(path=path):
+                body = read_repo(path)
+                self.assertIn("|-*|.*)", body)
+                self.assertIn(r"\.lock($|/)", body)
+                self.assertIn("(^|/)", body)
+
+    def test_pr_agent_callers_do_not_expand_github_token_actions_permission(self):
+        for path in (
+            ".github/workflows/pr-agent.yml",
+            ".github/caller-stubs/continuum-pr-agent.yml",
+            ".github/caller-stubs/continuum-pr-agent-repair.yml",
+            ".github/caller-stubs/continuum-pr-agent-auto-merge.yml",
+            ".github/workflows/continuum-pr-agent.yml",
+            ".github/workflows/continuum-pr-agent-repair.yml",
+            ".github/workflows/continuum-pr-agent-auto-merge.yml",
+        ):
+            with self.subTest(path=path):
+                self.assertNotIn("actions: write", read_repo(path))
+
+    def test_code_rabbit_workflows_are_not_referenced_by_new_pr_agent_recovery(self):
+        for path in (
+            ".github/workflows/continuum-pr-agent.yml",
+            ".github/workflows/continuum-pr-agent-repair.yml",
+            ".github/workflows/continuum-pr-agent-auto-merge.yml",
+        ):
+            body = read_repo(path)
+            self.assertNotIn("continuum-coderabbit-retry.yml", body)
+            self.assertNotIn("continuum-coderabbit-unresolved.yml", body)
+
+
+class ConflictLockRegressionTests(unittest.TestCase):
+    """Behavioral regression for the conflict-repair lock freeze.
+
+    A stranded `opencode-conflict-repair` label with no live repair run
+    behind it must release, never wait forever. These tests exercise the
+    decision helper directly instead of asserting workflow substrings.
+    """
+
+    def _life(self):
+        import sys
+
+        sys.path.insert(0, SRC)
+        try:
+            from continuum import pr_agent_lifecycle as life
+        finally:
+            sys.path.remove(SRC)
+        return life
+
+    def test_stranded_lock_with_no_active_run_is_released_not_waited(self):
+        life = self._life()
+        # The freeze: label present, terminal run left nothing active.
+        self.assertTrue(
+            life.is_conflict_lock_stranded(
+                label_present=True, active_repair_runs=0
+            )
+        )
+        decision = life.conflict_repair_action(
+            label_present=True, active_repair_runs=0, attempts_for_head=0
+        )
+        self.assertEqual(decision["action"], "release-and-dispatch")
+        self.assertTrue(decision["release_lock"])
+
+    def test_active_repair_run_still_waits(self):
+        life = self._life()
+        self.assertFalse(
+            life.is_conflict_lock_stranded(
+                label_present=True, active_repair_runs=1
+            )
+        )
+        decision = life.conflict_repair_action(
+            label_present=True, active_repair_runs=1, attempts_for_head=0
+        )
+        self.assertEqual(decision["action"], "wait")
+        self.assertFalse(decision["release_lock"])
+
+    def test_no_label_without_prior_attempt_dispatches(self):
+        life = self._life()
+        decision = life.conflict_repair_action(
+            label_present=False, active_repair_runs=0, attempts_for_head=0
+        )
+        self.assertEqual(decision["action"], "dispatch")
+
+    def test_second_conflict_on_same_head_is_held_not_redispatched(self):
+        life = self._life()
+        # Replay-vs-redo: the same HEAD already consumed its single bounded
+        # merge-scope attempt, so no full repair run is re-dispatched.
+        for label in (False, True):
+            with self.subTest(label_present=label):
+                decision = life.conflict_repair_action(
+                    label_present=label,
+                    active_repair_runs=0,
+                    attempts_for_head=1,
+                )
+                self.assertEqual(decision["action"], "hold")
+                self.assertTrue(decision["release_lock"])
+
+    def test_new_head_starts_a_new_episode(self):
+        life = self._life()
+        self.assertTrue(life.needs_fresh_review("oldhead", "newhead"))
+        decision = life.conflict_repair_action(
+            label_present=False, active_repair_runs=0, attempts_for_head=0
+        )
+        self.assertEqual(decision["action"], "dispatch")
+
+    def test_invalid_lock_inputs_fail_closed(self):
+        life = self._life()
+        with self.assertRaises(life.LifecycleError):
+            life.is_conflict_lock_stranded(
+                label_present=True, active_repair_runs=-1
+            )
+        with self.assertRaises(life.LifecycleError):
+            life.conflict_repair_action(
+                label_present=False,
+                active_repair_runs=0,
+                attempts_for_head=-1,
+            )
+
+    def test_retry_budget_is_bounded_with_exponential_backoff(self):
+        life = self._life()
+        self.assertEqual(life.RETRY_MAX_ATTEMPTS, 3)
+        for attempt in (0, 1):
+            with self.subTest(attempt=attempt):
+                self.assertTrue(life.retry_allowed(attempt))
+        self.assertFalse(life.retry_allowed(2))
+        self.assertFalse(life.retry_allowed(3))
+        self.assertFalse(life.retry_allowed(9))
+        self.assertEqual(life.retry_backoff_seconds(0), 15)
+        self.assertEqual(life.retry_backoff_seconds(1), 30)
+        self.assertEqual(life.retry_backoff_seconds(2), 60)
+        with self.assertRaises(life.LifecycleError):
+            life.retry_allowed("nope")
+        with self.assertRaises(life.LifecycleError):
+            life.retry_backoff_seconds(-1)
+
+    def test_retry_backoff_threads_the_same_limit_as_allowed(self):
+        life = self._life()
+        # retry_allowed accepts a custom limit; backoff must bound with the
+        # same limit instead of the global so limit=10 does not diverge.
+        self.assertTrue(life.retry_allowed(8, limit=10))
+        self.assertEqual(life.retry_backoff_seconds(9, limit=10), 15 * (1 << 9))
+        self.assertFalse(life.retry_allowed(9, limit=10))
+        self.assertFalse(life.retry_allowed(9, limit=9))
+        with self.assertRaises(life.LifecycleError):
+            life.retry_backoff_seconds(10, limit=10)
+        with self.assertRaises(life.LifecycleError):
+            life.retry_backoff_seconds(9, limit=9)
+        with self.assertRaises(life.LifecycleError):
+            life.retry_backoff_seconds(0, limit="nope")
+
+    def test_dispatch_ref_never_hardcodes_a_branch(self):
+        life = self._life()
+        self.assertEqual(
+            life.resolve_dispatch_ref("my-default"), "my-default"
+        )
+        self.assertEqual(life.resolve_dispatch_ref("", "main"), "main")
+        self.assertEqual(life.resolve_dispatch_ref(None, ""), "main")
+        self.assertEqual(
+            life.CONFLICT_REPAIR_TIMEOUT_MINUTES, 60
+        )
+        self.assertEqual(
+            life.CONFLICT_REPAIR_ATTEMPTS_PER_HEAD, 1
+        )
+
+
+class RepairWiringRegressionTests(unittest.TestCase):
+    """The workflow wiring must implement the lock/timeout/retry contract."""
+
+    def test_conflict_dispatch_is_bounded_merge_scope_on_default_branch(self):
+        merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
+        # Default-branch sync in both compare directions, never a literal.
+        self.assertIn("getDefaultBranch", merge)
+        self.assertIn("defaultBranch + '...' + pr.head.sha", merge)
+        self.assertIn("pr.head.sha + '...' + defaultBranch", merge)
+        self.assertNotIn("basehead: 'main", merge)
+        self.assertNotIn("'...main'", merge)
+        self.assertNotIn('"...main"', merge)
+        # Bounded merge-scope repair: explicit strategy plus a timeout.
+        self.assertIn("conflict_strategy: 'merge'", merge)
+        self.assertIn("timeout_minutes: '60'", merge)
+        # Isolation is per PR/per HEAD: a repository-global active-run probe
+        # would let an unrelated PR block this PR.
+        self.assertNotIn("conflictRepairRunsActive", merge)
+        self.assertIn("releaseConflictLock", merge)
+        self.assertIn("exact-HEAD marker decides whether this PR may dispatch", merge)
+        # Bounded retry: one attempt marker per HEAD, then hold.
+        self.assertIn("opencode-conflict-repair-attempt head=", merge)
+        self.assertIn("already ran for this HEAD", merge)
+        # Dispatch still targets the resolved default branch.
+        self.assertIn("ref: defaultBranch", merge)
+        # Required parity needles survive the repair.
+        for needle in (
+            "AUTO_MERGE_BLOCK_LABEL = 'no-auto-merge'",
+            "CONFLICT_LOCK_LABEL = 'opencode-conflict-repair'",
+            "mode: 'resolve-conflict'",
+            "expected_head_sha: oldHead",
+        ):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, merge)
+
+    def test_merge_reconciliation_is_serialized_per_pr(self):
+        merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
+        self.assertIn(
+            "group: pr-agent-merge-${{ inputs.pr_number || github.run_id }}",
+            merge,
+        )
+        self.assertIn("cancel-in-progress: false", merge)
+        # Per-PR serialization plus the exact-HEAD marker is the isolation
+        # contract; repository-global active-run probing is forbidden.
+        self.assertNotIn("conflictRepairRunsActive", merge)
+
+    def test_active_conflict_repair_wins_over_exhausted_attempt_helper(self):
+        import sys
+
+        sys.path.insert(0, SRC)
+        try:
+            from continuum import pr_agent_lifecycle as life
+        finally:
+            sys.path.remove(SRC)
+        decision = life.conflict_repair_action(
+            label_present=True,
+            active_repair_runs=1,
+            attempts_for_head=1,
+        )
+        self.assertEqual(decision["action"], "wait")
+        self.assertFalse(decision["release_lock"])
+
+    def test_recovery_controller_is_deferred_out_of_33(self):
+        for path in (
+            ".github/workflows/pr-agent.yml",
+            ".github/caller-stubs/continuum-pr-agent.yml",
+        ):
+            with self.subTest(path=path):
+                caller = read_repo(path)
+                self.assertIn("workflow_run:", caller)
+                self.assertIn('workflows: ["CI"]', caller)
+                self.assertIn(
+                    "github.event.workflow_run.conclusion == 'success'", caller
+                )
+                self.assertNotIn("schedule:", caller)
+                self.assertNotIn("reconcile-stale-pr-agent:", caller)
+                self.assertNotIn("github.event_name == 'schedule'", caller)
+
+    def test_review_and_repair_publish_durable_exact_head_statuses(self):
+        review = read_repo(".github/workflows/continuum-pr-agent.yml")
+        repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
+        self.assertIn("Mark PR-Agent review in flight", review)
+        self.assertIn("Publish durable PR-Agent review state", review)
+        self.assertIn("Publish failed PR-Agent review state", review)
+        self.assertIn("continuum/pr-agent-review", review)
+        self.assertIn("PR-Agent review complete: actionable", review)
+        self.assertIn("PR-Agent review complete: clean", review)
+        self.assertIn("Mark PR-Agent repair in flight", repair)
+        self.assertIn("Publish durable PR-Agent repair state", repair)
+        self.assertIn("Publish failed PR-Agent repair state", repair)
+        self.assertIn("continuum/pr-agent-repair", repair)
+
+    def test_caller_level_concurrency_serializes_duplicate_wakeups(self):
+        for path in (
+            ".github/workflows/pr-agent.yml",
+            ".github/caller-stubs/continuum-pr-agent.yml",
+        ):
+            with self.subTest(path=path):
+                caller = read_repo(path)
+                self.assertIn("group: pr-agent-caller-", caller)
+                self.assertIn("cancel-in-progress: false", caller)
+
+    def test_no_progress_marker_trust_does_not_depend_on_login(self):
+        repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
+        # Stale-label regression: markers posted under the TAP_PAT machine
+        # user must hold; a login allow-list strands them into a storm.
+        self.assertIn("continuum-pr-agent-no-progress head=", repair)
+        self.assertNotIn("login === owner", repair)
+        self.assertNotIn("comment.user?.login", repair)
+
+    def test_retry_dispatch_preserves_branch_workflow_and_guards_api(self):
+        for path in (
+            ".github/workflows/continuum-pr-agent.yml",
+            ".github/workflows/continuum-pr-agent-repair.yml",
+        ):
+            with self.subTest(path=path):
+                body = read_repo(path)
+                self.assertIn("DEFAULT_BRANCH=", body)
+                self.assertIn('"${DEFAULT_BRANCH:-main}"', body)
+                self.assertIn('-f retry_workflow="$RETRY_WORKFLOW"', body)
+                self.assertIn(
+                    "Could not revalidate PR state after backoff", body
+                )
+                self.assertIn(
+                    "Could not revalidate exact-HEAD CI after backoff", body
+                )
+                self.assertNotIn('--ref main', body)
+
+    def test_retry_workflow_target_is_allow_listed(self):
+        review = read_repo(".github/workflows/continuum-pr-agent.yml")
+        repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
+        self.assertIn(
+            "['continuum-pr-agent.yml', 'pr-agent.yml'].includes(retryWorkflow)",
+            review,
+        )
+        self.assertIn("continuum-pr-agent.yml|pr-agent.yml", repair)
+
+    def test_conflict_dispatch_failure_does_not_consume_head_attempt(self):
+        merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
+        self.assertIn("attemptComment.data.id", merge)
+        self.assertIn("deleteComment", merge)
+        self.assertLess(
+            merge.index("createComment"),
+            merge.index("actions/workflows/{workflow_id}/dispatches"),
+        )
+
+    def test_final_merge_refreshes_pr_and_handles_late_conflict(self):
+        merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
+        self.assertIn("Re-read after all asynchronous gate queries", merge)
+        self.assertIn("preMergeSync", merge)
+        self.assertIn("preMergeGates", merge)
+        self.assertIn("err.status === 409", merge)
+        self.assertIn("const isConflictMessage", merge)
+        self.assertIn(
+            "Atomic merge rejected with HTTP 422 without conflict evidence",
+            merge,
+        )
+        self.assertIn("await dispatchConflictRepair(fresh, message)", merge)
+
+    def test_pr_agent_caller_forwards_exact_head_retry_inputs(self):
+        caller = read_repo(".github/workflows/pr-agent.yml")
+        self.assertIn('pr_number: "${{ inputs.pr_number }}"', caller)
+        self.assertIn(
+            'expected_head_sha: "${{ inputs.expected_head_sha }}"', caller
+        )
+        self.assertIn('retry_attempt: "${{ inputs.retry_attempt }}"', caller)
+
+
 if __name__ == "__main__":
     unittest.main()
