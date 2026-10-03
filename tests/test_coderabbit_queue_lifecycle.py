@@ -19,6 +19,7 @@ class QueueState:
     packaging_green: bool = True
     required_gate_active: bool = False
     required_gate_green: bool = True
+    required_gate_config_valid: bool = True
     unresolved_threads: int = 0
     current_head_decision: str | None = None
     no_progress_blocked: bool = False
@@ -45,6 +46,8 @@ def review_stage(state: QueueState) -> tuple[str, int]:
 
 
 def eligible_for_full_review(state: QueueState) -> bool:
+    if not state.required_gate_config_valid:
+        return False
     if not state.review_ready or not state.ci_green:
         return False
     if state.packaging_present and not state.packaging_green:
@@ -127,6 +130,10 @@ class CodeRabbitQueueLifecycleTests(unittest.TestCase):
         )
         self.assertFalse(may_emit_command(packaging_red))
         self.assertFalse(may_emit_command(required_gate_red))
+
+    def test_partial_required_gate_configuration_fails_closed(self):
+        misconfigured = QueueState(required_gate_config_valid=False)
+        self.assertFalse(may_emit_command(misconfigured))
 
     def test_durable_no_progress_marker_is_terminal_for_same_head(self):
         blocked = QueueState(
@@ -264,6 +271,8 @@ class WorkflowBindingTests(unittest.TestCase):
     def test_model_is_bound_to_review_queue_source(self):
         for contract in (
             "await latestWorkflowForHead(pr, 'Packaging smoke')",
+            "labelConfigured !== nameConfigured",
+            "workflow gate state is unknown",
             "await unresolvedCodeRabbitThreads(pr)",
             "continuum-coderabbit-no-progress head=",
             "stage: finalReview ? 'final-review' : 'initial-review'",
