@@ -23,11 +23,6 @@ on:
         type: string
         default: CI
         required: false
-      max_executions:
-        description: Total automatic executions per PR + HEAD + operation, including index 0.
-        type: string
-        default: ''
-        required: false
       stale_minutes:
         description: Pending operation age after which missing liveness becomes recoverable.
         type: string
@@ -65,7 +60,6 @@ jobs:
         env:
           REVIEW_WORKFLOW: ${{ inputs.review_workflow }}
           CI_WORKFLOW_NAME: ${{ inputs.ci_workflow_name || 'CI' }}
-          MAX_EXECUTIONS: ${{ inputs.max_executions || vars.PR_AGENT_RECOVERY_MAX_EXECUTIONS || '3' }}
           STALE_MINUTES: ${{ inputs.stale_minutes || vars.PR_AGENT_RECOVERY_STALE_MINUTES || '70' }}
           DISPATCH_GRACE_SECONDS: ${{ inputs.dispatch_grace_seconds || vars.PR_AGENT_RECOVERY_DISPATCH_GRACE_SECONDS || '90' }}
         with:
@@ -76,7 +70,7 @@ jobs:
             const repoFullName = owner + '/' + repo;
             const reviewWorkflow = String(process.env.REVIEW_WORKFLOW || 'continuum-pr-agent.yml').trim();
             const ciWorkflowName = String(process.env.CI_WORKFLOW_NAME || 'CI').trim();
-            const maxExecutions = Number.parseInt(process.env.MAX_EXECUTIONS || '3', 10);
+            const maxExecutions = 3;
             const staleMs = Number.parseInt(process.env.STALE_MINUTES || '70', 10) * 60_000;
             const dispatchGraceMs =
               Number.parseInt(process.env.DISPATCH_GRACE_SECONDS || '90', 10) * 1_000;
@@ -102,10 +96,6 @@ jobs:
                 'Invalid PR-Agent review workflow: ' + reviewWorkflow +
                 '. Expected continuum-pr-agent.yml or pr-agent.yml.'
               );
-              return;
-            }
-            if (!Number.isInteger(maxExecutions) || maxExecutions < 1 || maxExecutions > 9) {
-              core.setFailed('PR_AGENT_RECOVERY_MAX_EXECUTIONS must be an integer from 1 to 9.');
               return;
             }
             if (!Number.isFinite(staleMs) || staleMs < 60_000) {
