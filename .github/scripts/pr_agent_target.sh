@@ -44,6 +44,11 @@ fi
 target_owner="${target_repository%%/*}"
 target_repo="${target_repository#*/}"
 
+if [[ "$delegated" == true && "${GITHUB_ACTIONS:-}" == "true" ]]; then
+  echo "::add-mask::$target_repository"
+  echo "::add-mask::$target_repo"
+fi
+
 {
   printf 'CONTINUUM_PR_AGENT_TARGET_REPOSITORY=%s\n' "$target_repository"
   printf 'CONTINUUM_PR_AGENT_TARGET_OWNER=%s\n' "$target_owner"
