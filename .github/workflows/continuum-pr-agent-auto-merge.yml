@@ -480,36 +480,6 @@ jobs:
               };
             }
 
-            async function conflictRepairRunsActive() {
-              // Liveness probe for the stranded-lock (#66) freeze: the
-              // opencode-conflict-repair label is only evidence of an active
-              // repair while a continuum-opencode run is actually still
-              // queued or in progress. A timed-out or otherwise terminal run
-              // leaves no active run behind; treating the bare label as
-              // "already active; waiting" forever would strand the PR.
-              try {
-                const runs = await github.paginate(
-                  github.rest.actions.listWorkflowRunsForRepo,
-                  {
-                    owner,
-                    repo,
-                    event: 'workflow_dispatch',
-                    per_page: 100,
-                  }
-                );
-                return runs.some(run =>
-                  String(run.path || '').endsWith('continuum-opencode.yml') &&
-                  ['queued', 'in_progress', 'waiting', 'requested', 'pending'].includes(run.status)
-                );
-              } catch (err) {
-                core.warning(
-                  'Conflict-repair liveness probe failed; treating the lock as stranded: ' +
-                  (err.message || err)
-                );
-                return false;
-              }
-            }
-
             function conflictAttemptMarker(headSha) {
               return '<!-- opencode-conflict-repair-attempt head=' +
                 String(headSha || '').toLowerCase() + ' -->';
@@ -537,21 +507,14 @@ jobs:
               const defaultBranch = await getDefaultBranch();
               let fresh = await getPull();
               if (hasLabel(fresh, CONFLICT_LOCK_LABEL)) {
-                if (await conflictRepairRunsActive()) {
-                  core.notice(
-                    'PR #' + prNumber + ': conflict repair already active; waiting.'
-                  );
-                  return;
-                }
-                // Stranded lock: a previous episode dispatched repair, the run
-                // reached a terminal state (timeout, cancellation, or success
-                // path), and the label was never released. Release it so this
-                // run can make its single bounded attempt instead of waiting
-                // forever.
+                // This merge workflow is serialized per PR. A bare label is
+                // therefore never treated as a repository-global liveness
+                // signal: the exact-HEAD attempt marker below is authoritative.
+                // Release stale/inherited lock state before deciding this HEAD.
                 await releaseConflictLock();
                 core.warning(
                   'PR #' + prNumber +
-                  ': released a stranded opencode-conflict-repair lock with no active repair run.'
+                  ': released pre-existing conflict-repair lock; exact-HEAD marker decides whether this PR may dispatch.'
                 );
                 fresh = await getPull();
               }
@@ -590,7 +553,7 @@ jobs:
               // never redoes the original task. The marker bounds retries and
               // carries the replay coordinates (HEAD, base, reason) so a timed
               // out episode can be replaced from evidence instead of rerun.
-              await github.rest.issues.createComment({
+              const attemptComment = await github.rest.issues.createComment({
                 owner,
                 repo,
                 issue_number: prNumber,
@@ -624,6 +587,19 @@ jobs:
                   'PR #' + prNumber + ': dispatched OpenCode conflict repair (' + reason + ').'
                 );
               } catch (err) {
+                try {
+                  await github.rest.issues.deleteComment({
+                    owner,
+                    repo,
+                    comment_id: attemptComment.data.id,
+                  });
+                } catch (cleanupErr) {
+                  core.warning(
+                    'PR #' + prNumber +
+                    ': failed to remove uncommitted conflict-attempt marker: ' +
+                    (cleanupErr.message || cleanupErr)
+                  );
+                }
                 await releaseConflictLock();
                 throw err;
               }
@@ -752,6 +728,41 @@ jobs:
               return;
             }
 
+            // Re-read after all asynchronous gate queries. Mergeability and
+            // main delta from an older PR object are not authoritative here.
+            pr = await getPull();
+            if (
+              pr.state !== 'open' ||
+              pr.draft ||
+              !pr.head.repo ||
+              pr.head.repo.full_name !== repoFullName ||
+              pr.head.sha.toLowerCase() !== reviewedHead ||
+              hasLabel(pr, AUTO_MERGE_BLOCK_LABEL)
+            ) {
+              core.setFailed(
+                'PR state changed immediately before merge; merge cancelled.'
+              );
+              return;
+            }
+
+            const preMergeSync = await mainSyncDecision(pr);
+            if (preMergeSync.required) {
+              core.notice(
+                'PR #' + prNumber +
+                ': merge-critical main delta appeared immediately before merge.'
+              );
+              await syncFromMain(pr, preMergeSync.reason);
+              return;
+            }
+            const preMergeGates = await currentHeadGates(pr);
+            if (!preMergeGates.ok) {
+              core.setFailed(
+                'PR #' + prNumber +
+                ': gate changed immediately before merge: ' + preMergeGates.reason + '.'
+              );
+              return;
+            }
+
             if (pr.mergeable === false || pr.mergeable_state === 'dirty') {
               await dispatchConflictRepair(
                 pr,
@@ -772,14 +783,35 @@ jobs:
                 ? pr.title
                 : 'fix: ' + pr.title;
 
-            const mergeResponse = await github.rest.pulls.merge({
-              owner,
-              repo,
-              pull_number: prNumber,
-              merge_method: 'squash',
-              commit_title: conventionalTitle,
-              sha: reviewedHead,
-            });
+            let mergeResponse;
+            try {
+              mergeResponse = await github.rest.pulls.merge({
+                owner,
+                repo,
+                pull_number: prNumber,
+                merge_method: 'squash',
+                commit_title: conventionalTitle,
+                sha: reviewedHead,
+              });
+            } catch (err) {
+              const fresh = await getPull();
+              if (fresh.head.sha.toLowerCase() !== reviewedHead) {
+                core.setFailed(
+                  'PR HEAD moved during atomic merge; stale reviewed HEAD was not merged.'
+                );
+                return;
+              }
+              const message = String(err.message || err);
+              if (
+                err.status === 409 ||
+                err.status === 422 ||
+                /merge conflict|conflict|not mergeable|cannot be merged/i.test(message)
+              ) {
+                await dispatchConflictRepair(fresh, message);
+                return;
+              }
+              throw err;
+            }
             const result = mergeResponse.data;
 
             if (!result.merged) {
