@@ -204,6 +204,101 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  wake_parent:
+    # Child repositories never schedule work locally. Event-driven caller runs
+    # only verify the bidirectional relationship and wake the parent's public
+    # scheduler; the caller keeps child cron events skipped to avoid consuming
+    # private child runner minutes as a polling mechanism.
+    if: vars.CONTINUUM_ROLE == 'child'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    concurrency:
+      group: continuum-child-parent-wakeup
+      cancel-in-progress: true
+    steps:
+      - name: Checkout Continuum engine for parent wake-up verification
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: kodmial/continuum
+          ref: ${{ inputs.continuum_ref }}
+          path: .continuum-engine
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify relationship and wake parent scheduler
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
+        run: |
+          set -euo pipefail
+          runtime="$GITHUB_WORKSPACE/.continuum-engine/.github/scripts/delegation_runtime.py"
+
+          variable_value() {
+            local json="$1" name="$2"
+            jq -r --arg name "$name" \
+              '[.variables[]? | select(.name == $name) | .value][0] // ""' \
+              <<<"$json" 2>/dev/null || true
+          }
+
+          if ! child_variables="$(
+            gh api "repos/$GITHUB_REPOSITORY/actions/variables?per_page=100" 2>/dev/null
+          )"; then
+            echo "::error::Child relationship lookup is unavailable; parent wake-up refused."
+            exit 4
+          fi
+
+          child_role="$(variable_value "$child_variables" CONTINUUM_ROLE)"
+          child_id="$(variable_value "$child_variables" CONTINUUM_CHILD_ID)"
+          parent="$(variable_value "$child_variables" CONTINUUM_PARENT)"
+
+          # Validate the child declaration with the same authoritative parser
+          # used by parent-side delegated discovery. Values are never echoed.
+          if ! python3 "$runtime" verify-child-variables \
+            --role "$child_role" \
+            --declared-id "$child_id" \
+            --declared-parent "$parent" \
+            --child-id "$child_id" \
+            --parent-repository "$parent" >/dev/null 2>&1; then
+            echo "::error::Child relationship declaration is invalid; parent wake-up refused."
+            exit 2
+          fi
+
+          printf '::add-mask::%s\n' "$parent"
+          printf '::add-mask::%s\n' "$child_id"
+
+          if ! parent_variables="$(
+            gh api "repos/$parent/actions/variables?per_page=100" 2>/dev/null
+          )"; then
+            echo "::error::Parent relationship lookup is unavailable; parent wake-up refused."
+            exit 4
+          fi
+
+          parent_role="$(variable_value "$parent_variables" CONTINUUM_ROLE)"
+          parent_children="$(variable_value "$parent_variables" CONTINUUM_CHILDREN)"
+          if ! python3 "$runtime" parent-variable-ids \
+            --role "$parent_role" \
+            --children-json "$parent_children" 2>/dev/null \
+            | grep -Fxq "$child_id"; then
+            echo "::error::Bidirectional parent/child verification failed; parent wake-up refused."
+            exit 2
+          fi
+
+          if ! parent_ref="$(gh api "repos/$parent" --jq '.default_branch' 2>/dev/null)" || \
+             [[ -z "$parent_ref" ]]; then
+            echo "::error::Parent default branch lookup is unavailable; parent wake-up refused."
+            exit 4
+          fi
+
+          if ! gh api --method POST \
+            "repos/$parent/actions/workflows/continuum-issue-scheduler.yml/dispatches" \
+            -f ref="$parent_ref" >/dev/null 2>&1; then
+            echo "::error::Verified parent scheduler could not be dispatched."
+            exit 4
+          fi
+
+          echo "Woke verified parent scheduler."
+
   schedule:
     # Repository role is the routing authority. A child keeps this workflow
     # installed, but local automatic scheduling is fail-safe disabled.
