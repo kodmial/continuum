@@ -866,14 +866,18 @@ class StabilizationParityTests(unittest.TestCase):
         self.assertIn("identical structured PR-Agent finding state", repair)
         self.assertIn("steps.convergence.outputs.held != 'true'", repair)
 
-    def test_pr_agent_consumer_permission_ceiling_supports_recovery_and_conflict_repair(self):
+    def test_pr_agent_callers_do_not_expand_github_token_actions_permission(self):
         for path in (
+            ".github/workflows/pr-agent.yml",
             ".github/caller-stubs/continuum-pr-agent.yml",
             ".github/caller-stubs/continuum-pr-agent-repair.yml",
             ".github/caller-stubs/continuum-pr-agent-auto-merge.yml",
+            ".github/workflows/continuum-pr-agent.yml",
+            ".github/workflows/continuum-pr-agent-repair.yml",
+            ".github/workflows/continuum-pr-agent-auto-merge.yml",
         ):
             with self.subTest(path=path):
-                self.assertIn("actions: write", read_repo(path))
+                self.assertNotIn("actions: write", read_repo(path))
 
     def test_code_rabbit_workflows_are_not_referenced_by_new_pr_agent_recovery(self):
         for path in (
@@ -976,9 +980,10 @@ class ConflictLockRegressionTests(unittest.TestCase):
     def test_retry_budget_is_bounded_with_exponential_backoff(self):
         life = self._life()
         self.assertEqual(life.RETRY_MAX_ATTEMPTS, 3)
-        for attempt in (0, 1, 2):
+        for attempt in (0, 1):
             with self.subTest(attempt=attempt):
                 self.assertTrue(life.retry_allowed(attempt))
+        self.assertFalse(life.retry_allowed(2))
         self.assertFalse(life.retry_allowed(3))
         self.assertFalse(life.retry_allowed(9))
         self.assertEqual(life.retry_backoff_seconds(0), 15)
@@ -1038,6 +1043,27 @@ class RepairWiringRegressionTests(unittest.TestCase):
         ):
             with self.subTest(needle=needle):
                 self.assertIn(needle, merge)
+
+    def test_merge_reconciliation_is_serialized_per_pr(self):
+        merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
+        self.assertIn(
+            "group: pr-agent-merge-${{ inputs.pr_number || github.run_id }}",
+            merge,
+        )
+        self.assertIn("cancel-in-progress: false", merge)
+        # Per-PR serialization plus the exact-HEAD marker is the isolation
+        # contract; repository-global active-run probing is forbidden.
+        self.assertNotIn("conflictRepairRunsActive", merge)
+
+    def test_active_conflict_repair_wins_over_exhausted_attempt_helper(self):
+        life = self._life()
+        decision = life.conflict_repair_action(
+            label_present=True,
+            active_repair_runs=1,
+            attempts_for_head=1,
+        )
+        self.assertEqual(decision["action"], "wait")
+        self.assertFalse(decision["release_lock"])
 
     def test_no_progress_marker_trust_does_not_depend_on_login(self):
         repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
