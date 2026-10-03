@@ -261,6 +261,12 @@ jobs:
           CURRENT_SHA="$(jq -r '.head.sha' <<<"$PR_JSON")"
           HEAD_REF="$(jq -r '.head.ref' <<<"$PR_JSON")"
           HEAD_REPO="$(jq -r '.head.repo.full_name' <<<"$PR_JSON")"
+          PR_STATE="$(jq -r '.state' <<<"$PR_JSON")"
+          PR_DRAFT="$(jq -r '.draft' <<<"$PR_JSON")"
+          if [[ "$PR_STATE" != "open" || "$PR_DRAFT" == "true" ]]; then
+            echo "::notice::PR #$PR_NUMBER is closed or draft; automatic repair will not modify it."
+            exit 1
+          fi
           if [[ "$CURRENT_SHA" != "$HEAD_SHA" ]]; then
             echo "::error::PR head moved ($HEAD_SHA -> $CURRENT_SHA); discarding this repair batch."
             exit 1
@@ -414,8 +420,16 @@ jobs:
           fi
           # Revalidate immediately before publication so a long repair run can
           # never publish against a PR branch that moved after repair started.
-          CURRENT_SHA="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid || true)"
+          CURRENT_STATE="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid,state,isDraft --jq '[.headRefOid,.state,(.isDraft|tostring)]|@tsv' || true)"
+          CURRENT_SHA="$(cut -f1 <<<"$CURRENT_STATE")"
+          CURRENT_PR_STATE="$(cut -f2 <<<"$CURRENT_STATE")"
+          CURRENT_DRAFT="$(cut -f3 <<<"$CURRENT_STATE")"
           REMOTE_SHA="$(git ls-remote origin "refs/heads/$HEAD_REF" | awk '{print $1}' || true)"
+          if [[ "$CURRENT_PR_STATE" != "OPEN" || "$CURRENT_DRAFT" == "true" ]]; then
+            echo "classification=deterministic" >> "$GITHUB_OUTPUT"
+            echo "::notice::PR #$PR_NUMBER became closed or draft during repair; discarding local changes without publication."
+            exit 1
+          fi
           if [[ -z "$HEAD_SHA" || -z "$CURRENT_SHA" || -z "$REMOTE_SHA" ]]; then
             echo "classification=deterministic" >> "$GITHUB_OUTPUT"
             echo "::error::Unable to revalidate PR branch before publish (reviewed=$HEAD_SHA current=$CURRENT_SHA remote=$REMOTE_SHA); discarding repair."
