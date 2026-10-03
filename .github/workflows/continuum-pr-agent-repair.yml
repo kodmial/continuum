@@ -522,7 +522,15 @@ jobs:
             exit 1
           fi
           NEW_HEAD="$(git rev-parse HEAD)"
-          [[ "$FINDING_IDS" =~ ^[0-9a-f]{64}(,[0-9a-f]{64})*$ ]] || {
+          FINDING_IDS_LOWER="${FINDING_IDS,,}"
+          HEAD_SHA_LOWER="${HEAD_SHA,,}"
+          NEW_HEAD_LOWER="${NEW_HEAD,,}"
+          if [[ "$HEAD_SHA_LOWER" == "$NEW_HEAD_LOWER" ]]; then
+            echo "classification=deterministic" >> "$GITHUB_OUTPUT"
+            echo "::error::Repair produced no new HEAD; refusing self-transition marker."
+            exit 1
+          fi
+          [[ "$FINDING_IDS_LOWER" =~ ^[0-9a-f]{64}(,[0-9a-f]{64})*$ ]] || {
             echo "classification=deterministic" >> "$GITHUB_OUTPUT"
             echo "::error::Logical finding IDs are missing or invalid; refusing publication."
             exit 1

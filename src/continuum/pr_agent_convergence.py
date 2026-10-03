@@ -106,10 +106,14 @@ def transition_marker(
     from_head: str, to_head: str, finding_ids: Iterable[str]
 ) -> str:
     ids = sorted({str(fp).lower() for fp in finding_ids})
-    if not re.fullmatch(_SHA, (from_head or "").lower()):
+    source = (from_head or "").lower()
+    target = (to_head or "").lower()
+    if not re.fullmatch(_SHA, source):
         raise ValueError("from_head must be a full commit SHA")
-    if not re.fullmatch(_SHA, (to_head or "").lower()):
+    if not re.fullmatch(_SHA, target):
         raise ValueError("to_head must be a full commit SHA")
+    if source == target:
+        raise ValueError("transition requires distinct from_head and to_head")
     if not ids or any(not re.fullmatch(_FP, fp) for fp in ids):
         raise ValueError("transition requires valid logical finding fingerprints")
     return (
@@ -121,9 +125,12 @@ def transition_marker(
 def parse_transitions(bodies: Sequence[str]) -> list[Transition]:
     result: list[Transition] = []
     for body in bodies:
-        for match in TRANSITION_RE.finditer(body or ""):
+        for match in TRANSITION_RE.finditer((body or "").lower()):
             source, target, raw = match.groups()
-            result.append(Transition(source, target, frozenset(raw.split(","))))
+            if source == target:
+                continue
+            findings = frozenset(part for part in raw.split(",") if part)
+            result.append(Transition(source, target, findings))
     return result
 
 
@@ -156,7 +163,7 @@ def decide(
 
     prior: set[str] = set()
     for transition in parse_transitions(comment_bodies):
-        if transition.to_head == head:
+        if transition.to_head == head and transition.from_head != head:
             prior.update(transition.findings)
     surviving = frozenset(prior & current)
     eligible = frozenset() if same_head_hold else frozenset(current - surviving)
