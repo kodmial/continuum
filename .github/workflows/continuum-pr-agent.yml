@@ -471,10 +471,7 @@ jobs:
             --config.propagate_tool_errors=true \
             --pr_code_suggestions.focus_only_on_problems=true \
             --pr_code_suggestions.suggestions_score_threshold=1 \
-            --github.publish_as_check_run=false \
-            --push_outputs.enable=true \
-            --push_outputs.channels='["file"]' \
-            --push_outputs.file_path=pr-agent-outputs/continuum.jsonl
+            --github.publish_as_check_run=false
           # Canonical machine source: the structured review JSON is exported
           # as the step output `review` (steps.pragent.outputs.review) for
           # the repair and merge workflows. Prose comments are presentation
