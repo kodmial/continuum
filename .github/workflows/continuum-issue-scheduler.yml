@@ -324,12 +324,19 @@ jobs:
           fi
           rm -f "$parent_err"
 
+          if ! dispatch_err="$(mktemp -p "${RUNNER_TEMP:-$GITHUB_WORKSPACE}" continuum-dispatch-err.XXXXXX)"; then
+            echo "::error::Parent dispatch lookup is unavailable; parent wake-up refused." >&2
+            exit 4
+          fi
           if ! gh api --method POST \
             "repos/$parent/actions/workflows/continuum-issue-scheduler.yml/dispatches" \
-            -f ref="$parent_ref" >/dev/null 2>&1; then
+            -f ref="$parent_ref" >/dev/null 2>"$dispatch_err"; then
+            cat "$dispatch_err" >&2 || true
+            rm -f "$dispatch_err"
             echo "::error::Verified parent scheduler could not be dispatched."
             exit 4
           fi
+          rm -f "$dispatch_err"
 
           echo "Woke verified parent scheduler."
 
