@@ -8,15 +8,15 @@ on:
         type: string
         default: main
         required: false
-      require_coderabbit:
+      review_provider:
         description: >-
-          Queue green PR heads for a CodeRabbit review. Empty falls back to
-          vars.CONTINUUM_REQUIRE_CODERABBIT. CodeRabbit is an optional
-          integration, so the default is OFF: this workflow still wakes the
-          auto-merge reconciler for every green head, but a project that did
-          not ask for CodeRabbit must not get its `review-ready` and
-          `coderabbit-review-requested` labels, and must not have a workflow
-          dispatched that it does not own.
+          Review provider: none, coderabbit, or pr-agent. Empty falls back to
+          vars.CONTINUUM_REVIEW_PROVIDER, then to none.
+        type: string
+        default: ''
+        required: false
+      require_coderabbit:
+        description: Deprecated compatibility input; review_provider is authoritative.
         type: string
         default: ''
         required: false
@@ -36,7 +36,7 @@ jobs:
         env:
           CONTINUUM_VERSION_FILE: ${{ vars.CONTINUUM_VERSION_FILE || '' }}
           CONTINUUM_RELEASE_MANIFEST_FILES: ${{ vars.CONTINUUM_RELEASE_MANIFEST_FILES || '[]' }}
-          REQUIRE_CODERABBIT: ${{ inputs.require_coderabbit || vars.CONTINUUM_REQUIRE_CODERABBIT || 'false' }}
+          REVIEW_PROVIDER: ${{ inputs.review_provider || vars.CONTINUUM_REVIEW_PROVIDER || 'none' }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
@@ -49,10 +49,14 @@ jobs:
             // workflow must stay a pure CI wake-up for the auto-merge
             // reconciler: no CodeRabbit lock label, no `review-ready` label,
             // and no dispatch of a controller the repository may not own.
-            const REQUIRE_CODERABBIT =
-              String(process.env.REQUIRE_CODERABBIT || '').trim().toLowerCase();
-            const requireCodeRabbit =
-              REQUIRE_CODERABBIT === 'true' || REQUIRE_CODERABBIT === '1';
+            const reviewProvider =
+              String(process.env.REVIEW_PROVIDER || 'none').trim().toLowerCase();
+            if (!['none', 'coderabbit', 'pr-agent'].includes(reviewProvider)) {
+              throw new Error(
+                `Invalid CONTINUUM_REVIEW_PROVIDER="${reviewProvider}". Expected none, coderabbit, or pr-agent.`
+              );
+            }
+            const requireCodeRabbit = reviewProvider === 'coderabbit';
             const RELEASE_FILES = new Set([
               '.release-please-manifest.json',
               'CHANGELOG.md',
