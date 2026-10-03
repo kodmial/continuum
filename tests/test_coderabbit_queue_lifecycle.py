@@ -302,6 +302,12 @@ class WorkflowBindingTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
     def test_model_is_bound_to_review_queue_source(self):
+        self.assertGreaterEqual(
+            self.workflow.count("priority: 'unprioritized:p2-fallback'"),
+            2,
+        )
+        self.assertNotIn("workflow_id: 'continuum-auto-merge.yml'", self.workflow)
+
         for contract in (
             "await latestWorkflowForHead(pr, 'Packaging smoke')",
             "labelConfigured !== nameConfigured",
