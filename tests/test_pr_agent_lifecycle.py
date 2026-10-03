@@ -688,6 +688,13 @@ class IsolationTests(unittest.TestCase):
             body,
         )
 
+    def test_automatic_pr_agent_review_has_one_authoritative_wakeup(self):
+        caller = read_repo(".github/caller-stubs/continuum-pr-agent.yml")
+        self.assertIn('workflows: ["CI"]', caller)
+        self.assertIn("types: [ready_for_review]", caller)
+        self.assertNotIn("opened, synchronize, reopened", caller)
+        self.assertIn("contains(github.event.comment.body, '/review')", caller)
+
     def test_review_caller_wakes_on_successful_ci_and_exports_native_outputs(self):
         caller = read_repo(".github/caller-stubs/continuum-pr-agent.yml")
         self.assertIn("workflow_run:", caller)
