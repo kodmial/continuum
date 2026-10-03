@@ -865,6 +865,121 @@ class StabilizationParityTests(unittest.TestCase):
         self.assertIn("identical structured PR-Agent finding state", repair)
         self.assertIn("steps.convergence.outputs.held != 'true'", repair)
 
+    def test_main_sync_classification_predicate_is_not_inverted(self):
+        merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
+        # The exact negation is the contract: only a fully non-critical
+        # delta may skip the sync. An inverted `required: onlyNonCritical`
+        # would sync the wrong set and merge the wrong HEAD.
+        self.assertIn("required: !onlyNonCritical", merge)
+        self.assertNotIn("required: onlyNonCritical", merge)
+        self.assertIn(
+            "files.length > 0 && criticalFiles.length === 0", merge
+        )
+        self.assertIn("unknown-main-delta", merge)
+        self.assertIn("non-merge-critical-main-delta", merge)
+        self.assertIn("merge-critical-main-delta", merge)
+        # Both compare directions are required; a single direction cannot
+        # distinguish behind-by from the file delta.
+        self.assertIn("defaultBranch + '...' + pr.head.sha", merge)
+        self.assertIn("pr.head.sha + '...' + defaultBranch", merge)
+
+    def test_final_and_premerge_revalidation_refresh_pr_before_merge(self):
+        merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
+        # A missing final getPull would merge on a stale PR object; the
+        # reconciliation must refresh before every gate window.
+        self.assertGreaterEqual(merge.count("await getPull()"), 5)
+        self.assertGreaterEqual(
+            merge.count("pr = await getPull()"), 2
+        )
+        ordered = (
+            "let pr = await getPull()",
+            "mainSync",
+            "pr = await getPull()",
+            "finalSync",
+            "finalGates",
+            "pr = await getPull()",
+            "preMergeSync",
+            "preMergeGates",
+            "pr.mergeable",
+            "pulls.merge",
+        )
+        index = -1
+        for needle in ordered:
+            nxt = merge.index(needle, index + 1)
+            self.assertGreater(
+                nxt, index, f"{needle} must follow the prior gate in order"
+            )
+            index = nxt
+        # Every revalidation window re-checks the exact reviewed HEAD.
+        self.assertGreaterEqual(
+            merge.count("pr.head.sha.toLowerCase() !== reviewedHead"), 3
+        )
+        self.assertIn("PR state changed during final PR-Agent revalidation", merge)
+        self.assertIn("PR state changed immediately before merge", merge)
+
+    def test_merge_conflict_error_routing_is_not_swapped(self):
+        merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
+        idx_409 = merge.index("err.status === 409")
+        idx_422 = merge.index("err.status === 422")
+        self.assertLess(
+            idx_409, idx_422, "conflict (409) handling must precede 422 handling"
+        )
+        window_409 = merge[idx_409:idx_422]
+        self.assertIn("isConflictMessage", window_409)
+        self.assertIn("await dispatchConflictRepair(fresh, message)", window_409)
+        window_422 = merge[idx_422 : idx_422 + 800]
+        self.assertIn(
+            "Atomic merge rejected with HTTP 422 without conflict evidence",
+            window_422,
+        )
+        self.assertNotIn("dispatchConflictRepair", window_422)
+        # Mergeability states: dirty dispatches repair, unknown waits.
+        self.assertIn(
+            "pr.mergeable === false || pr.mergeable_state === 'dirty'", merge
+        )
+        self.assertIn("pr.mergeable === null", merge)
+        self.assertIn("still being computed", merge)
+
+    def test_packaging_and_required_gates_block_merge(self):
+        merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
+        self.assertIn("Packaging smoke", merge)
+        self.assertIn(
+            "packaging.status !== 'completed' || packaging.conclusion !== 'success'",
+            merge,
+        )
+        self.assertIn("requiredWorkflowGateName", merge)
+        self.assertIn(
+            "required.status !== 'completed' ||",
+            merge,
+        )
+        self.assertIn("required workflow ", merge)
+        self.assertIn("combined status is ", merge)
+
+    def test_finding_fingerprint_is_order_independent(self):
+        repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
+        self.assertIn(
+            "stable(items).map(entry => JSON.stringify(entry)).sort()", repair
+        )
+        self.assertIn("JSON.stringify(canonical)", repair)
+
+    def test_default_branch_resolution_is_validated(self):
+        merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
+        self.assertIn("function sanitizeBranch", merge)
+        self.assertIn("cachedDefaultBranch = sanitizeBranch(name,", merge)
+        self.assertIn("part.startsWith('.')", merge)
+        self.assertIn("part.endsWith('.lock')", merge)
+
+    def test_retry_branch_sanitizer_covers_hidden_components(self):
+        for path in (
+            ".github/workflows/continuum-pr-agent.yml",
+            ".github/workflows/continuum-pr-agent-repair.yml",
+        ):
+            with self.subTest(path=path):
+                body = read_repo(path)
+                self.assertIn("|-*|.*)", body)
+                self.assertIn(r"\.lock($|/)", body)
+                self.assertIn("(^|/)", body)
+
     def test_pr_agent_callers_do_not_expand_github_token_actions_permission(self):
         for path in (
             ".github/workflows/pr-agent.yml",
@@ -992,6 +1107,21 @@ class ConflictLockRegressionTests(unittest.TestCase):
             life.retry_allowed("nope")
         with self.assertRaises(life.LifecycleError):
             life.retry_backoff_seconds(-1)
+
+    def test_retry_backoff_threads_the_same_limit_as_allowed(self):
+        life = self._life()
+        # retry_allowed accepts a custom limit; backoff must bound with the
+        # same limit instead of the global so limit=10 does not diverge.
+        self.assertTrue(life.retry_allowed(8, limit=10))
+        self.assertEqual(life.retry_backoff_seconds(9, limit=10), 15 * (1 << 9))
+        self.assertFalse(life.retry_allowed(9, limit=10))
+        self.assertFalse(life.retry_allowed(9, limit=9))
+        with self.assertRaises(life.LifecycleError):
+            life.retry_backoff_seconds(10, limit=10)
+        with self.assertRaises(life.LifecycleError):
+            life.retry_backoff_seconds(9, limit=9)
+        with self.assertRaises(life.LifecycleError):
+            life.retry_backoff_seconds(0, limit="nope")
 
     def test_dispatch_ref_never_hardcodes_a_branch(self):
         life = self._life()

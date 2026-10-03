@@ -567,7 +567,9 @@ def retry_allowed(attempt: object, limit: int = RETRY_MAX_ATTEMPTS) -> bool:
 
 
 def retry_backoff_seconds(
-    attempt: object, base: int = RETRY_BASE_DELAY_SECONDS
+    attempt: object,
+    base: int = RETRY_BASE_DELAY_SECONDS,
+    limit: int = RETRY_MAX_ATTEMPTS,
 ) -> int:
     """Exponential backoff before a bounded retry (15s, 30s, 60s)."""
 
@@ -583,7 +585,13 @@ def retry_backoff_seconds(
         raise LifecycleError("retry base must be a non-negative integer")
     if base_number < 0:
         raise LifecycleError("retry base must be a non-negative integer")
-    if attempt_number >= RETRY_MAX_ATTEMPTS:
+    try:
+        limit_number = int(str(limit).strip())
+    except (TypeError, ValueError):
+        raise LifecycleError("retry limit must be a non-negative integer")
+    if limit_number < 0:
+        raise LifecycleError("retry limit must be a non-negative integer")
+    if attempt_number >= limit_number:
         raise LifecycleError("retry attempt out of bounded retry range")
     return base_number * (1 << attempt_number)
 

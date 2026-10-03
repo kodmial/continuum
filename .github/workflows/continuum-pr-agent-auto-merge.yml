@@ -419,6 +419,16 @@ jobs:
               );
             }
 
+            function sanitizeBranch(name, fallback = 'main') {
+              let value = String(name || '').trim() || String(fallback || '').trim() || 'main';
+              if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(value)) return 'main';
+              if (value.includes('..') || value.includes('//') || value.includes('@{')) return 'main';
+              if (value.endsWith('/') || value.endsWith('.') || value.endsWith('.lock')) return 'main';
+              if (value === 'HEAD' || value === '@') return 'main';
+              if (value.startsWith('refs/') || value.startsWith('-') || value.startsWith('.')) return 'main';
+              if (value.split('/').some(part => part.startsWith('.') || part.endsWith('.lock'))) return 'main';
+              return value;
+            }
             let cachedDefaultBranch = null;
             async function getDefaultBranch() {
               if (cachedDefaultBranch) return cachedDefaultBranch;
@@ -427,7 +437,7 @@ jobs:
                   owner, repo,
                 });
                 const name = String(repoInfo.default_branch || '').trim();
-                cachedDefaultBranch = name || 'main';
+                cachedDefaultBranch = sanitizeBranch(name, 'main');
               } catch (err) {
                 core.warning(
                   'Could not resolve the repository default branch; falling back to main: ' +

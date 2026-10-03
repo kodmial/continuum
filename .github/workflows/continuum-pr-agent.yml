@@ -850,9 +850,10 @@ jobs:
           DEFAULT_BRANCH="$(gh repo view "$GITHUB_REPOSITORY" --json defaultBranchRef --jq .defaultBranchRef.name 2>/dev/null || echo main)"
           DEFAULT_BRANCH="$(printf '%s' "${DEFAULT_BRANCH:-main}" | tr -d ' \t\r\n')"
           case "$DEFAULT_BRANCH" in
-            ""|*".."*|*"//"*|*"@{"*|*/|*.|*.lock|HEAD|"@"|refs/*) DEFAULT_BRANCH="main" ;;
+            ""|*".."*|*"//"*|*"@{"*|*/|*.|*.lock|HEAD|"@"|refs/*|-*|.*) DEFAULT_BRANCH="main" ;;
           esac
           if ! [[ "$DEFAULT_BRANCH" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]]; then DEFAULT_BRANCH="main"; fi
+          if [[ "$DEFAULT_BRANCH" == */.*/* || "$DEFAULT_BRANCH" == .*/ || "$DEFAULT_BRANCH" == */. ]] || [[ "$DEFAULT_BRANCH" =~ (^|/)\. ]] || [[ "$DEFAULT_BRANCH" =~ \.lock($|/) ]]; then DEFAULT_BRANCH="main"; fi
           gh workflow run "$RETRY_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH"             -f pr_number="$PR_NUMBER"             -f expected_head_sha="$HEAD_SHA"             -f retry_attempt="$next"             -f retry_workflow="$RETRY_WORKFLOW"
           echo "Dispatched isolated PR-Agent retry attempt $next/3 for PR #$PR_NUMBER HEAD $HEAD_SHA."
 
