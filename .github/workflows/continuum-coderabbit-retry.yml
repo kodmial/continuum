@@ -340,9 +340,12 @@ jobs:
             }
 
             function codeRabbitExplicitlyResolved(body = '') {
+              // UNRESOLVED contains RESOLVED as a substring, so reject it first.
+              // Then accept the same semantic token used by the wake trigger,
+              // regardless of markdown decoration.
               if (/\bUNRESOLVED\b/i.test(body)) return false;
               return (
-                /\*\*RESOLVED(?:\.|\*\*)/i.test(body) ||
+                /\bRESOLVED\b/i.test(body) ||
                 /✅\s*Review thread resolved\.?/i.test(body)
               );
             }
