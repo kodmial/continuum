@@ -315,7 +315,7 @@ jobs:
             if (held) {
               core.notice(
                 'PR #' + prNumber + ' HEAD ' + headSha +
-                ': PR-Agent convergence hold; no eligible logical findings remain (' +
+                ': identical structured PR-Agent finding state or no eligible logical findings remain (' +
                 surviving.length + ' survived a workflow-generated repair HEAD).'
               );
             }
