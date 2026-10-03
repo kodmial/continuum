@@ -1070,6 +1070,58 @@ class RepairWiringRegressionTests(unittest.TestCase):
         self.assertEqual(decision["action"], "wait")
         self.assertFalse(decision["release_lock"])
 
+    def test_cancelled_and_lost_runs_have_status_based_reconciliation(self):
+        for path in (
+            ".github/workflows/pr-agent.yml",
+            ".github/caller-stubs/continuum-pr-agent.yml",
+        ):
+            with self.subTest(path=path):
+                caller = read_repo(path)
+                self.assertIn("cron: '*/15 * * * *'", caller)
+                self.assertIn("reconcile-stale-pr-agent:", caller)
+                self.assertIn("continuum/pr-agent-review", caller)
+                self.assertIn("continuum/pr-agent-repair", caller)
+                self.assertIn("REVIEW_STALE_MS = 75 * 60_000", caller)
+                self.assertIn("REPAIR_STALE_MS = 45 * 60_000", caller)
+                self.assertIn("one state-changing", caller)
+                self.assertIn("createWorkflowDispatch", caller)
+                self.assertIn("fresh.data.head.sha !== head", caller)
+                self.assertIn("freshCombined.data.state !== 'success'", caller)
+                self.assertIn("continuum-pr-agent-retry-exhausted head=", caller)
+                self.assertIn("continuum-pr-agent-no-progress head=", caller)
+                self.assertNotIn("continuum-coderabbit", caller)
+
+    def test_event_driven_ci_wakeup_remains_primary_with_cron_as_safety_net(self):
+        caller = read_repo(".github/caller-stubs/continuum-pr-agent.yml")
+        self.assertIn("workflow_run:", caller)
+        self.assertIn('workflows: ["CI"]', caller)
+        self.assertIn("github.event.workflow_run.conclusion == 'success'", caller)
+        self.assertIn("github.event_name == 'schedule'", caller)
+
+    def test_review_and_repair_publish_durable_exact_head_statuses(self):
+        review = read_repo(".github/workflows/continuum-pr-agent.yml")
+        repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
+        self.assertIn("Mark PR-Agent review in flight", review)
+        self.assertIn("Publish durable PR-Agent review state", review)
+        self.assertIn("Publish failed PR-Agent review state", review)
+        self.assertIn("continuum/pr-agent-review", review)
+        self.assertIn("PR-Agent review complete: actionable", review)
+        self.assertIn("PR-Agent review complete: clean", review)
+        self.assertIn("Mark PR-Agent repair in flight", repair)
+        self.assertIn("Publish durable PR-Agent repair state", repair)
+        self.assertIn("Publish failed PR-Agent repair state", repair)
+        self.assertIn("continuum/pr-agent-repair", repair)
+
+    def test_caller_level_concurrency_serializes_duplicate_wakeups(self):
+        for path in (
+            ".github/workflows/pr-agent.yml",
+            ".github/caller-stubs/continuum-pr-agent.yml",
+        ):
+            with self.subTest(path=path):
+                caller = read_repo(path)
+                self.assertIn("group: pr-agent-caller-", caller)
+                self.assertIn("cancel-in-progress: false", caller)
+
     def test_no_progress_marker_trust_does_not_depend_on_login(self):
         repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
         # Stale-label regression: markers posted under the TAP_PAT machine
