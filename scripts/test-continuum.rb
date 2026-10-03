@@ -1703,6 +1703,10 @@ class ContinuumTest < Minitest::Test
     assert_includes pr_agent, '"complete": True'
     assert_includes pr_agent, '"kind": "full"'
     assert_includes pr_agent, 'Upstream review has key findings but published no persistent finding state.'
+
+    repair = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent-repair.yml'))
+    assert_includes repair, 'git clean -fdX',
+                    'repair must remove only ignored tool/build artifacts before staging'
   end
 
   # The free default model must be the single documented fallback everywhere an
