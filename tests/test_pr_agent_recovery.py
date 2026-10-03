@@ -278,6 +278,15 @@ class RecoveryWiringTests(unittest.TestCase):
             "const { data: combined } = await github.rest.repos.getCombinedStatusForRef",
             review,
         )
+        self.assertNotIn(
+            'commits/$ADMITTED_SHA/status',
+            review,
+            "pre-review revalidation must not fall back to combined commit status",
+        )
+        self.assertIn(
+            'actions/runs?event=pull_request&head_sha=$ADMITTED_SHA',
+            review,
+        )
 
     def test_failure_classification_is_explicit(self):
         review = self.read(".github/workflows/continuum-pr-agent.yml")
