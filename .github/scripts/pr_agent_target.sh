@@ -6,6 +6,10 @@ set -euo pipefail
 : "${GITHUB_ENV:?GITHUB_ENV is required}"
 
 child_id="${1:-}"
+if [[ -n "$child_id" ]] && ! [[ "$child_id" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$ ]]; then
+  echo "::error::PR-Agent delegated target identity is invalid." >&2
+  exit 2
+fi
 target_repository="$GITHUB_REPOSITORY"
 delegated=false
 

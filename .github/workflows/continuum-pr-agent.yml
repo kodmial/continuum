@@ -130,7 +130,7 @@ permissions:
   statuses: read
 
 concurrency:
-  group: pr-agent-${{ inputs.target_child_id || 'local' }}-${{ github.event.issue.number || github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || inputs.pr_number || github.run_id }}
+  group: pr-agent-${{ inputs.target_child_id == '' && 'local' || format('child-{0}', inputs.target_child_id) }}-${{ github.event.issue.number || github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || inputs.pr_number || github.run_id }}
   cancel-in-progress: false
 
 jobs:
@@ -404,7 +404,8 @@ jobs:
           gh auth setup-git >/dev/null 2>&1
           git remote add origin "https://github.com/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY.git"
           if ! git fetch --depth=1 --no-tags origin "$HEAD_SHA" --quiet >/dev/null 2>&1 ||
-             ! git checkout --detach FETCH_HEAD --quiet >/dev/null 2>&1; then
+             ! git checkout --detach FETCH_HEAD --quiet >/dev/null 2>&1 ||
+             [[ "$(git rev-parse HEAD)" != "$HEAD_SHA" ]]; then
             echo "::error::Unable to checkout the exact PR-Agent target HEAD."
             exit 1
           fi
