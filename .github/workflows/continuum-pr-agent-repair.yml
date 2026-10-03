@@ -1,0 +1,278 @@
+name: PR-Agent repair (OpenCode)
+
+on:
+  workflow_call:
+    inputs:
+      continuum_ref:
+        description: Continuum revision supplying fallback scripts
+        type: string
+        default: main
+        required: false
+      pr_number:
+        description: Pull request number carrying the current review result.
+        type: string
+        default: ''
+        required: false
+      head_sha:
+        description: Exact HEAD SHA the review evaluated.
+        type: string
+        default: ''
+        required: false
+      review_json:
+        description: >-
+          Canonical upstream review JSON (steps.pragent.outputs.review) for the
+          exact HEAD. Must match the PRReview schema.
+        type: string
+        default: ''
+        required: false
+      improve_jsonl:
+        description: >-
+          Runner-local push_outputs file payload
+          (pr-agent-outputs/continuum.jsonl) carrying payload.code_suggestions.
+        type: string
+        default: ''
+        required: false
+
+permissions: {}
+
+concurrency:
+  group: pr-agent-repair-${{ inputs.pr_number || github.run_id }}-${{ inputs.head_sha || github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+
+    steps:
+      - name: Resolve the isolated PR-Agent stack
+        id: stack
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          CFG_ENABLED: ${{ vars.CONTINUUM_PR_AGENT_ENABLED }}
+          CFG_REQUIRE_CODERABBIT: ${{ vars.CONTINUUM_REQUIRE_CODERABBIT }}
+        with:
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            // Isolated PR-Agent mode only. Contradictory configuration fails
+            // closed; CodeRabbit paths are never dispatched from this stack.
+            const truthy = (value) => ['1', 'true', 'yes'].includes(String(value || '').trim().toLowerCase());
+            const enabled = truthy(process.env.CFG_ENABLED);
+            const requireRabbit = truthy(process.env.CFG_REQUIRE_CODERABBIT);
+            if (enabled && requireRabbit) {
+              core.setFailed(
+                'Contradictory review-stack configuration: PR-Agent repair ' +
+                'requires CONTINUUM_REQUIRE_CODERABBIT=false.'
+              );
+              return;
+            }
+            if (!enabled) {
+              core.setFailed('PR-Agent repair requires CONTINUUM_PR_AGENT_ENABLED=true.');
+              return;
+            }
+            core.setOutput('stack', 'pr-agent');
+
+      - name: Build one bounded repair batch from native outputs
+        id: batch
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          REVIEW_JSON: ${{ inputs.review_json }}
+          IMPROVE_JSONL: ${{ inputs.improve_jsonl }}
+        with:
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            // Canonical inputs only:
+            //   review: steps.pragent.outputs.review (key_issues_to_review)
+            //   improve: runner-local push_outputs file payload
+            //            (pr-agent-outputs/continuum.jsonl payload.code_suggestions)
+            // Comment prose is never scraped. Every current review finding and
+            // every qualifying improve suggestion enters ONE bounded OpenCode
+            // pass together, each preserving its native source (review or
+            // improve). The pass never stops after the first finding and never
+            // fans out one agent per finding.
+            const prNumber = String(process.env.PR_NUMBER || '').trim();
+            const headSha = String(process.env.HEAD_SHA || '').trim();
+            if (!prNumber || !headSha) {
+              core.setFailed('PR-Agent repair requires pr_number and head_sha for the exact reviewed HEAD.');
+              return;
+            }
+            let review;
+            try {
+              review = JSON.parse(String(process.env.REVIEW_JSON || ''));
+            } catch (err) {
+              core.setFailed(`Invalid PR-Agent review JSON: ${err.message}`);
+              return;
+            }
+            const inner = review.review || review;
+            const keyIssues = inner.key_issues_to_review;
+            if (!Array.isArray(keyIssues)) {
+              core.setFailed('PR-Agent review JSON has no key_issues_to_review list.');
+              return;
+            }
+            // Improve suggestions come only from the file channel payload.
+            let suggestions = [];
+            const raw = String(process.env.IMPROVE_JSONL || '').trim();
+            if (raw) {
+              for (const line of raw.split('\n')) {
+                if (!line.trim()) continue;
+                let record;
+                try {
+                  record = JSON.parse(line);
+                } catch (err) {
+                  core.setFailed(`Invalid improve push_outputs line: ${err.message}`);
+                  return;
+                }
+                const payload = record.payload || record;
+                for (const entry of payload.code_suggestions || []) {
+                  suggestions.push(entry);
+                }
+              }
+            }
+            // suggestions_score_threshold=1: only a score below 1 is dropped.
+            // A missing score is conservatively qualifying.
+            const qualifying = suggestions.filter((entry) => {
+              const score = entry.score;
+              if (score === undefined || score === null) return true;
+              const numeric = Number(score);
+              if (Number.isNaN(numeric)) return true;
+              return numeric >= 1;
+            });
+            // A batch at the findings cap is potentially truncated: it still
+            // repairs the visible batch and re-reviews, but never declares
+            // the HEAD clean from this batch alone.
+            const truncated = keyIssues.length === 6;
+            const items = [
+              ...keyIssues.map((finding, index) => ({ source: 'review', index, finding })),
+              ...qualifying.map((suggestion, index) => ({ source: 'improve', index, suggestion })),
+            ];
+            if (items.length === 0) {
+              core.setOutput('empty', 'true');
+              core.notice(`PR #${prNumber} HEAD ${headSha}: no current findings; no repair to dispatch.`);
+              return;
+            }
+            // At most one OpenCode repair per review result: the per-head
+            // marker below makes a second dispatch for the same HEAD a no-op,
+            // so a repeated run cannot storm the same HEAD.
+            core.setOutput('empty', 'false');
+            core.setOutput('count', String(items.length));
+            core.setOutput('truncated', truncated ? 'true' : 'false');
+            core.setOutput('batch', JSON.stringify(items).slice(0, 60000));
+            core.notice(
+              `PR #${prNumber} HEAD ${headSha}: batching ${keyIssues.length} review finding(s) ` +
+              `and ${qualifying.length} qualifying suggestion(s) into one bounded repair pass.`
+            );
+
+      - name: Checkout the exact reviewed HEAD branch
+        if: steps.batch.outputs.empty != 'true'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.TAP_PAT }}
+          persist-credentials: true
+
+      - name: Confirm the HEAD is still current before repairing
+        if: steps.batch.outputs.empty != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+        run: |
+          set -euo pipefail
+          CURRENT_SHA="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)"
+          if [[ "$CURRENT_SHA" != "$HEAD_SHA" ]]; then
+            echo "::error::PR head moved ($HEAD_SHA -> $CURRENT_SHA); discarding this repair batch."
+            exit 1
+          fi
+          git fetch origin "pull/$PR_NUMBER/head:pr-$PR_NUMBER" --force
+          git checkout "pr-$PR_NUMBER"
+          if [[ "$(git rev-parse HEAD)" != "$HEAD_SHA" ]]; then
+            echo "::error::Checked-out HEAD does not match the reviewed HEAD $HEAD_SHA."
+            exit 1
+          fi
+
+      - name: Run one bounded OpenCode repair pass over every current item
+        if: steps.batch.outputs.empty != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          BATCH_JSON: ${{ steps.batch.outputs.batch }}
+        run: |
+          set -euo pipefail
+          # OpenCode is repairer only: it receives the current-head upstream
+          # key_issues_to_review plus qualifying current improve
+          # code_suggestions, preserves each item's native source, processes
+          # every item in the batch, makes repository changes on the existing
+          # PR branch in one bounded pass, commits/pushes repairs, and never
+          # manufactures PR-Agent review state. It is never routed through the
+          # CodeRabbit fix mode.
+          #
+          # The prompt below carries ALL current items together (review plus
+          # improve) for a single bounded pass. Upstream persistent finding
+          # state reconciles every previous finding on the next complete
+          # review; no custom finding identity or resolution protocol exists
+          # here.
+          PROMPT="$(python3 - <<'PY'
+          import json, os
+          items = json.loads(os.environ.get('BATCH_JSON', '[]'))
+          lines = [
+              'Repair every item below on the current PR branch in one bounded pass.',
+              'Process every item; do not stop after the first finding.',
+              '',
+          ]
+          for item in items:
+              source = item.get('source', '')
+              if source == 'review':
+                  lines.append(f"[review] {json.dumps(item.get('finding', {}))}")
+              else:
+                  lines.append(f"[improve] {json.dumps(item.get('suggestion', {}))}")
+          lines += [
+              '',
+              'Commit the repairs on the existing PR branch and push.',
+              'Never manufacture review state.',
+          ]
+          print('\n'.join(lines))
+          PY
+          )"
+          opencode run --auto --model "${OPENCODE_MODEL:-opencode/muse-spark-1.3-contributor-free}" "$PROMPT"
+          if [[ -z "$(git status --porcelain)" ]]; then
+            echo "OpenCode pass produced no changes for PR #$PR_NUMBER HEAD $HEAD_SHA."
+            exit 0
+          fi
+          git -c user.name="github-actions[bot]" \
+            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -am "fix: apply PR-Agent review findings for HEAD $HEAD_SHA"
+          git push origin "HEAD:refs/pull/$PR_NUMBER/head" || git push
+          echo "Pushed one bounded repair for PR #$PR_NUMBER HEAD $HEAD_SHA."
+
+      - name: Record the per-head repair dispatch
+        if: steps.batch.outputs.empty != 'true' && always()
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          HEAD_SHA: ${{ inputs.head_sha }}
+        with:
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            // One review result dispatches at most one repair, and a HEAD is
+            // never repaired twice: the marker label below makes a same-head
+            // rerun a no-op instead of a storm. A changed HEAD is a new key
+            // and receives its own complete review plus improve after CI.
+            const headSha = String(process.env.HEAD_SHA || '').trim().toLowerCase().slice(0, 12);
+            if (!headSha) return;
+            const marker = `pr-agent-repair-${headSha}`;
+            const prNumber = Number('${{ inputs.pr_number }}');
+            try {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: prNumber, labels: [marker],
+              });
+            } catch (err) {
+              core.warning(`Could not record repair marker ${marker}: ${err.message}`);
+            }

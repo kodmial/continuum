@@ -61,6 +61,8 @@ CORE_STUBS=(
   continuum-opencode.yml
   continuum-pr-agent-canary.yml
   continuum-pr-agent.yml
+  continuum-pr-agent-repair.yml
+  continuum-pr-agent-auto-merge.yml
   continuum-remove-review-label.yml
   continuum-render-executor.yml
 )

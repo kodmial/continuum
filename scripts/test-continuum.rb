@@ -857,7 +857,7 @@ class ContinuumTest < Minitest::Test
   # three sets are independent files in one directory, so a one-line edit to the
   # prune candidate list — or a future edit to `"${STUBS[@]}"` — could delete a
   # consumer's whole tech or parent layer with no warning. The growth
-  # 15 -> 16 -> 20 is the observable form of that guarantee.
+  # 17 -> 18 -> 22 is the observable form of that guarantee.
   def test_installing_one_set_does_not_delete_another_sets_callers
     fixture do |dir|
       target = File.join(dir, 'consumer')
@@ -882,11 +882,11 @@ class ContinuumTest < Minitest::Test
           PARENT_STUBS.each { |stub| assert_includes installed, File.basename(stub) }
         end
       end
-      # Each set adds exactly its own files: 15 core, +1 tech, +4 parent.
+      # Each set adds exactly its own files: 17 core, +1 tech, +4 parent.
       assert_equal CORE_STUBS.size, counts['core']
       assert_equal CORE_STUBS.size + TECH_STUBS.size, counts['tech']
       assert_equal ALL_STUBS.size, counts['parent']
-      assert_equal 20, ALL_STUBS.size,
+      assert_equal 22, ALL_STUBS.size,
                    'every caller Continuum ships, across all three layers'
     end
   end
@@ -1314,9 +1314,9 @@ class ContinuumTest < Minitest::Test
   # count was taken from the workflow tree and then compared against the stub
   # tree, so adding a workflow and its stub together — exactly what a new
   # feature does — moved both sides and passed. A literal is the third,
-  # independent source: to change the fifteen core callers someone has to say so
+  # independent source: to change the seventeen core callers someone has to say so
   # here, which is where a reviewer sees it.
-  CORE_COUNT = 15
+  CORE_COUNT = 17
 
   # Every core workflow is either called by a stub in one of the three layers
   # or is a repository-owned/shared engine intentionally invoked from a
@@ -2875,6 +2875,12 @@ class ContinuumTest < Minitest::Test
       api_base bridge_port server_port pr_agent_version
     ],
     'continuum-pr-agent.yml' => %w[continuum_ref],
+    'continuum-pr-agent-repair.yml' => %w[
+      continuum_ref pr_number head_sha review_json improve_jsonl
+    ],
+    'continuum-pr-agent-auto-merge.yml' => %w[
+      continuum_ref pr_number head_sha review_json improve_jsonl persistent_state_json
+    ],
     'continuum-remove-review-label.yml' => %w[continuum_ref]
   }.freeze
 

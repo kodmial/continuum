@@ -1,4 +1,16 @@
-# Provider-neutral PR-Agent defaults for Continuum.
+# Provider-neutral PR-Agent defaults for Continuum (isolated PR-Agent stack).
+#
+# Pinned upstream: PR-Agent v0.46.0.
+# Authoritative sources (v0.46.0):
+# - usage-guide/automations_and_usage.md (review/improve tools, enable_output,
+#   push triggers, publish_as_check_run)
+# - tools/review.md, tools/improve.md
+# - usage-guide/configuration_reference.md (native push outputs)
+# - pr_reviewer_prompts.toml (PRReview schema: review.key_issues_to_review,
+#   merge_recommendation, ticket compliance, security/risk fields)
+# - configuration.toml (persistent_finding_state, persistent_inline_comments,
+#   large-PR chunking, propagate_tool_errors)
+# - installation/github.md (GitHub Action integration)
 #
 # The model below is a routing id, not a vendor pin: the `openai/` prefix
 # sends the request through LiteLLM's OpenAI-compatible path to the backend
@@ -15,6 +27,7 @@ response_language = "en-US"
 ai_timeout = 180
 retry_same_model_on_timeout = false
 propagate_tool_errors = true
+persistent_inline_comments = true
 repo_context_files = ["AGENTS.md"]
 
 [openai]
@@ -26,9 +39,11 @@ require_tests_review = true
 require_security_review = true
 require_risk_assessment = true
 require_priority_files = true
-require_merge_recommendation = false
+require_merge_recommendation = true
+require_ticket_analysis_review = true
 publish_error_details = true
 persistent_comment = true
+persistent_finding_state = true
 inline_key_issues = true
 num_max_findings = 6
 enable_review_coverage_footer = true
@@ -46,12 +61,27 @@ max_number_of_calls = 3
 [pr_code_suggestions]
 focus_only_on_problems = true
 persistent_comment = true
-suggestions_score_threshold = 7
+publish_output_no_suggestions = true
+suggestions_score_threshold = 1
 num_code_suggestions_per_chunk = 4
+max_suggestions_per_file = 0
 max_number_of_calls = 3
+enable_suggestions_coverage_footer = true
 commitable_code_suggestions = false
 extra_instructions = """\
 Only suggest changes that fix a concrete bug, security issue, reliability problem,
 performance regression, or meaningful maintainability risk. Avoid formatting-only
 or subjective style suggestions.
 """
+
+[push_outputs]
+enable = true
+channels = ["file"]
+file_path = "pr-agent-outputs/continuum.jsonl"
+
+[github]
+publish_as_check_run = false
+
+[github_action_config]
+enable_output = true
+fail_on_tool_errors = true
