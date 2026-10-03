@@ -473,6 +473,7 @@ jobs:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           ADMITTED_SHA: ${{ steps.admit.outputs.head_sha }}
+          CI_WORKFLOW_NAME: ${{ inputs.ci_workflow_name || vars.CONTINUUM_CI_WORKFLOW_NAME || 'CI' }}
         run: |
           set -euo pipefail
           CURRENT_SHA="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)"
@@ -480,9 +481,25 @@ jobs:
             echo "::error::PR head moved after CI admission ($ADMITTED_SHA -> $CURRENT_SHA); refusing to review an unqualified HEAD."
             exit 1
           fi
-          COMBINED="$(gh api "repos/$GITHUB_REPOSITORY/commits/$ADMITTED_SHA/status" --jq .state)"
-          if [[ "$COMBINED" != "success" ]]; then
-            echo "::error::CI for admitted HEAD $ADMITTED_SHA is now $COMBINED, not success."
+          CI_JSON="$RUNNER_TEMP/pr-agent-before-review-ci-runs.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs?event=pull_request&head_sha=$ADMITTED_SHA&per_page=100" > "$CI_JSON"
+          if ! python3 - "$CI_JSON" "$CI_WORKFLOW_NAME" "$ADMITTED_SHA" <<'PY'
+          import json, sys
+          path, workflow, head = sys.argv[1:4]
+          with open(path, "r", encoding="utf-8") as handle:
+              runs = json.load(handle).get("workflow_runs", [])
+          current = sorted(
+              (run for run in runs if run.get("name") == workflow and run.get("head_sha") == head),
+              key=lambda run: run.get("created_at") or "",
+              reverse=True,
+          )
+          raise SystemExit(
+              0 if current and current[0].get("status") == "completed"
+              and current[0].get("conclusion") == "success" else 1
+          )
+          PY
+          then
+            echo "::error::CI for admitted HEAD $ADMITTED_SHA is no longer completed:success."
             exit 1
           fi
           echo "sha=$ADMITTED_SHA" >> "$GITHUB_OUTPUT"
