@@ -8,10 +8,15 @@ on:
         type: string
         default: main
         required: false
-      enabled:
+      review_provider:
         description: >-
-          Enable the isolated PR-Agent review stack. Empty falls back to
-          vars.CONTINUUM_PR_AGENT_ENABLED, then to 'false'.
+          Review provider: none, coderabbit, or pr-agent. Empty falls back to
+          vars.CONTINUUM_REVIEW_PROVIDER, then to none.
+        type: string
+        default: ''
+        required: false
+      enabled:
+        description: Deprecated compatibility input; review_provider is authoritative.
         type: string
         default: ''
         required: false
@@ -109,10 +114,8 @@ jobs:
         id: stack
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
-          INPUT_ENABLED: ${{ inputs.enabled }}
-          INPUT_REQUIRE_CODERABBIT: ${{ inputs.require_coderabbit }}
-          CFG_ENABLED: ${{ vars.CONTINUUM_PR_AGENT_ENABLED }}
-          CFG_REQUIRE_CODERABBIT: ${{ vars.CONTINUUM_REQUIRE_CODERABBIT }}
+          INPUT_REVIEW_PROVIDER: ${{ inputs.review_provider }}
+          CFG_REVIEW_PROVIDER: ${{ vars.CONTINUUM_REVIEW_PROVIDER }}
           INPUT_PR_NUMBER: ${{ inputs.pr_number }}
           INPUT_EXPECTED_HEAD: ${{ inputs.expected_head_sha }}
           INPUT_API_BASE: ${{ inputs.api_base }}
@@ -125,28 +128,21 @@ jobs:
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
-            // Isolated PR-Agent mode contract:
-            //   CONTINUUM_PR_AGENT_ENABLED=true
-            //   CONTINUUM_REQUIRE_CODERABBIT=false
-            // Contradictory configuration fails closed. In PR-Agent mode only
-            // the PR-Agent-owned admission/review/repair/merge workflows run:
-            // the CodeRabbit admission/retry/unresolved path, the generic
-            // continuum-add-review-label.yml admission path, and the generic
-            // continuum-auto-merge.yml path are never invoked here.
+            // A single selector owns the whole review stack.
             const pick = (input, vars, fallback) =>
               String(input || process.env[vars] || fallback || '').trim();
-            const truthy = (value) => ['1', 'true', 'yes'].includes(String(value || '').trim().toLowerCase());
-            const enabledRaw = pick(process.env.INPUT_ENABLED, 'CFG_ENABLED', 'false');
-            const requireRabbitRaw = pick(process.env.INPUT_REQUIRE_CODERABBIT, 'CFG_REQUIRE_CODERABBIT', 'false');
-            const enabled = truthy(enabledRaw);
-            const requireRabbit = truthy(requireRabbitRaw);
-            if (enabled && requireRabbit) {
+            const reviewProvider = pick(
+              process.env.INPUT_REVIEW_PROVIDER,
+              'CFG_REVIEW_PROVIDER',
+              'none'
+            ).toLowerCase();
+            if (!['none', 'coderabbit', 'pr-agent'].includes(reviewProvider)) {
               core.setFailed(
-                'Contradictory review-stack configuration: CONTINUUM_PR_AGENT_ENABLED=true ' +
-                'requires CONTINUUM_REQUIRE_CODERABBIT=false.'
+                `Invalid CONTINUUM_REVIEW_PROVIDER="${reviewProvider}". Expected none, coderabbit, or pr-agent.`
               );
               return;
             }
+            const enabled = reviewProvider === 'pr-agent';
             const eventPr = context.payload.pull_request?.number || context.payload.issue?.number || '';
             const prNumber = String(process.env.INPUT_PR_NUMBER || eventPr || '').trim();
             if (!prNumber) {
@@ -158,7 +154,7 @@ jobs:
               process.env.INPUT_API_BASE, 'CFG_API_BASE', `http://127.0.0.1:${bridgePort}/v1`
             );
             core.setOutput('enabled', enabled ? 'true' : 'false');
-            core.setOutput('stack', enabled && !requireRabbit ? 'pr-agent' : 'none');
+            core.setOutput('stack', enabled ? 'pr-agent' : reviewProvider);
             core.setOutput('pr_number', prNumber);
             core.setOutput('expected_head', String(process.env.INPUT_EXPECTED_HEAD || '').trim());
             core.setOutput('api_base', apiBase);
@@ -176,22 +172,7 @@ jobs:
 
       - name: Report the disabled provider explicitly
         if: steps.stack.outputs.enabled != 'true'
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
-        with:
-          github-token: ${{ secrets.TAP_PAT }}
-          script: |
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: Number('${{ steps.stack.outputs.pr_number }}'),
-              body: [
-                'PR-Agent is not enabled in this repository.',
-                '',
-                'Set the `CONTINUUM_PR_AGENT_ENABLED` repository variable to `true` ' +
-                'and `CONTINUUM_REQUIRE_CODERABBIT` to `false` for isolated PR-Agent mode. ' +
-                'No paid-provider secret is required.',
-              ].join('\n'),
-            });
+        run: echo "PR-Agent skipped because CONTINUUM_REVIEW_PROVIDER is not pr-agent."
 
       - name: Admit only a review-ready PR with green CI on the exact HEAD
         if: steps.stack.outputs.enabled == 'true'
