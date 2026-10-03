@@ -55,6 +55,9 @@ jobs:
     steps:
       - name: Reconcile global CodeRabbit review queue
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          REQUIRED_WORKFLOW_GATE_LABEL: ${{ vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_LABEL || '' }}
+          REQUIRED_WORKFLOW_GATE_NAME: ${{ vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_NAME || '' }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
@@ -72,6 +75,10 @@ jobs:
               ['priority:p1', 1],
               ['priority:p2', 2],
             ]);
+            const requiredWorkflowGateLabel =
+              String(process.env.REQUIRED_WORKFLOW_GATE_LABEL || '').trim();
+            const requiredWorkflowGateName =
+              String(process.env.REQUIRED_WORKFLOW_GATE_NAME || '').trim();
 
             // CodeRabbit currently provides one included full review per hour.
             // A completed full review therefore moves the shared controller
@@ -164,7 +171,16 @@ jobs:
               }
             }
 
-            async function currentHeadHasGreenCi(pr) {
+            function hasLabel(pr, name) {
+              return Boolean(
+                name &&
+                (pr.labels || []).some(label =>
+                  (typeof label === 'string' ? label : label.name) === name
+                )
+              );
+            }
+
+            async function latestWorkflowForHead(pr, workflowName) {
               const runs = await github.paginate(
                 github.rest.actions.listWorkflowRunsForRepo,
                 {
@@ -176,22 +192,74 @@ jobs:
                 }
               );
 
-              const current = runs
+              return runs
                 .filter(run =>
-                  run.name === 'CI' &&
+                  run.name === workflowName &&
                   run.head_sha === pr.head.sha
                 )
                 .sort(
                   (a, b) =>
                     new Date(b.created_at).getTime() -
                     new Date(a.created_at).getTime()
-                )[0];
+                )[0] || null;
+            }
 
-              return Boolean(
-                current &&
-                current.status === 'completed' &&
-                current.conclusion === 'success'
-              );
+            async function currentHeadReviewGate(pr) {
+              const ci = await latestWorkflowForHead(pr, 'CI');
+              if (
+                !ci ||
+                ci.status !== 'completed' ||
+                ci.conclusion !== 'success'
+              ) {
+                return {
+                  ready: false,
+                  reason: `CI is ${ci ? `${ci.status}/${ci.conclusion || 'pending'}` : 'missing'}`,
+                };
+              }
+
+              // Match auto-merge: Packaging smoke is conditional/path-filtered.
+              // If a run exists for this exact HEAD it must be green before a
+              // scarce full-review slot is spent.
+              const packagingSmoke =
+                await latestWorkflowForHead(pr, 'Packaging smoke');
+              if (
+                packagingSmoke &&
+                (
+                  packagingSmoke.status !== 'completed' ||
+                  packagingSmoke.conclusion !== 'success'
+                )
+              ) {
+                return {
+                  ready: false,
+                  reason:
+                    `Packaging smoke is ${packagingSmoke.status}/${packagingSmoke.conclusion || 'pending'}`,
+                };
+              }
+
+              // Match auto-merge's configurable consumer gate. A PR that cannot
+              // merge because this gate is red/missing must not consume the
+              // repository-wide included CodeRabbit review quota.
+              if (
+                requiredWorkflowGateLabel &&
+                requiredWorkflowGateName &&
+                hasLabel(pr, requiredWorkflowGateLabel)
+              ) {
+                const required =
+                  await latestWorkflowForHead(pr, requiredWorkflowGateName);
+                if (
+                  !required ||
+                  required.status !== 'completed' ||
+                  required.conclusion !== 'success'
+                ) {
+                  return {
+                    ready: false,
+                    reason:
+                      `required workflow '${requiredWorkflowGateName}' is ${required ? `${required.status}/${required.conclusion || 'pending'}` : 'missing'}`,
+                  };
+                }
+              }
+
+              return { ready: true, reason: 'all pre-review merge gates are green' };
             }
 
             function sourceIssueNumber(pr) {
@@ -207,10 +275,14 @@ jobs:
             async function sourcePriority(pr) {
               const issueNumber = sourceIssueNumber(pr);
               if (!issueNumber) {
+                // A PR without a source issue must not starve forever behind an
+                // unbounded prioritized queue. Treat it as a deterministic P2
+                // fallback for review scheduling while keeping the diagnostic
+                // label explicit.
                 return {
                   issueNumber: Number.MAX_SAFE_INTEGER,
-                  priority: 'unprioritized',
-                  rank: Number.MAX_SAFE_INTEGER,
+                  priority: 'unprioritized:p2-fallback',
+                  rank: priorityRank.get('priority:p2'),
                 };
               }
 
@@ -260,6 +332,123 @@ jobs:
                     new Date(b.updated_at || b.created_at).getTime() -
                     new Date(a.updated_at || a.created_at).getTime()
                 )[0] || null;
+            }
+
+            function codeRabbitExplicitlyResolved(body = '') {
+              if (/\bUNRESOLVED\b/i.test(body)) return false;
+              return (
+                /\*\*RESOLVED(?:\.|\*\*)/i.test(body) ||
+                /✅\s*Review thread resolved\.?/i.test(body)
+              );
+            }
+
+            async function unresolvedCodeRabbitThreads(pr) {
+              const unresolved = [];
+              let cursor = null;
+
+              do {
+                const data = await github.graphql(
+                  `query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+                    repository(owner: $owner, name: $repo) {
+                      pullRequest(number: $number) {
+                        reviewThreads(first: 100, after: $cursor) {
+                          nodes {
+                            id
+                            isResolved
+                            comments(first: 100) {
+                              nodes {
+                                databaseId
+                                body
+                                author { login }
+                              }
+                            }
+                          }
+                          pageInfo { hasNextPage endCursor }
+                        }
+                      }
+                    }
+                  }`,
+                  {
+                    owner,
+                    repo,
+                    number: pr.number,
+                    cursor,
+                  }
+                );
+
+                const connection =
+                  data.repository.pullRequest.reviewThreads;
+                for (const thread of connection.nodes || []) {
+                  const comments = thread.comments?.nodes || [];
+                  const root = comments[0];
+                  if (!root?.author?.login?.startsWith('coderabbitai')) {
+                    continue;
+                  }
+                  if (thread.isResolved) continue;
+
+                  // CodeRabbit's semantic RESOLVED reply is authoritative even
+                  // when GitHub has not flipped the thread bit yet. The
+                  // auto-merger later normalizes that bit with its write token.
+                  const latestRabbitReply = comments
+                    .slice(1)
+                    .filter(comment =>
+                      comment.author?.login?.startsWith('coderabbitai')
+                    )
+                    .at(-1);
+                  if (
+                    latestRabbitReply &&
+                    codeRabbitExplicitlyResolved(latestRabbitReply.body || '')
+                  ) {
+                    continue;
+                  }
+
+                  unresolved.push({
+                    id: thread.id,
+                    commentId: root.databaseId,
+                  });
+                }
+
+                cursor = connection.pageInfo.hasNextPage
+                  ? connection.pageInfo.endCursor
+                  : null;
+              } while (cursor);
+
+              return unresolved;
+            }
+
+            function latestCurrentHeadDecision(reviews, headSha) {
+              return reviews
+                .filter(review =>
+                  review.user?.login?.startsWith('coderabbitai') &&
+                  review.commit_id === headSha &&
+                  (review.state === 'APPROVED' ||
+                   review.state === 'CHANGES_REQUESTED')
+                )
+                .sort((a, b) => {
+                  const time =
+                    new Date(a.submitted_at || 0).getTime() -
+                    new Date(b.submitted_at || 0).getTime();
+                  return time || Number(a.id) - Number(b.id);
+                })
+                .at(-1) || null;
+            }
+
+            async function reviewHasInlineFindings(pr, reviewId) {
+              if (!reviewId) return false;
+              const comments = await github.paginate(
+                github.rest.pulls.listReviewComments,
+                {
+                  owner,
+                  repo,
+                  pull_number: pr.number,
+                  per_page: 100,
+                }
+              );
+              return comments.some(comment =>
+                comment.pull_request_review_id === reviewId &&
+                comment.user?.login === 'coderabbitai[bot]' &&
+                !comment.in_reply_to_id
+              );
             }
 
             async function collectState() {
@@ -444,13 +633,60 @@ jobs:
                   )
                 );
                 if (!labels.has('review-ready')) continue;
-                if (!(await currentHeadHasGreenCi(pr))) continue;
+
+                const reviewGate = await currentHeadReviewGate(pr);
+                if (!reviewGate.ready) {
+                  core.info(
+                    `PR #${pr.number}: not eligible for a CodeRabbit full-review slot yet: ${reviewGate.reason}.`
+                  );
+                  continue;
+                }
+
+                // Full review is a finalization step, not a substitute for
+                // finding verification. Wait until every CodeRabbit-authored
+                // thread is resolved (including semantic RESOLVED replies)
+                // before spending another included review.
+                const unresolvedThreads =
+                  await unresolvedCodeRabbitThreads(pr);
+                if (unresolvedThreads.length > 0) {
+                  core.info(
+                    `PR #${pr.number}: waiting for ${unresolvedThreads.length} unresolved CodeRabbit thread(s) before final full review.`
+                  );
+                  continue;
+                }
+
+                const currentDecision =
+                  latestCurrentHeadDecision(reviews, pr.head.sha);
+                if (currentDecision?.state === 'APPROVED') {
+                  continue;
+                }
+
+                // CHANGES_REQUESTED with no inline finding is a policy/task
+                // contract blocker (for example Linked Issues), not a coding
+                // repair state. The OpenCode classifier normally writes a
+                // durable no-progress marker; this direct guard makes the quota
+                // controller fail closed even if that wake-up was lost.
+                if (
+                  currentDecision?.state === 'CHANGES_REQUESTED' &&
+                  !(await reviewHasInlineFindings(pr, currentDecision.id))
+                ) {
+                  core.notice(
+                    `PR #${pr.number}: current-head CHANGES_REQUESTED review ${currentDecision.id} has no inline findings; suppressing full re-review until the HEAD or policy state changes.`
+                  );
+                  continue;
+                }
 
                 const requested = labels.has(REQUESTED_LABEL);
                 const rabbitStatus = await latestCodeRabbitStatus(pr);
+                const finalReview =
+                  fullReviewCount > 0 ||
+                  reviews.some(review =>
+                    review.user?.login?.startsWith('coderabbitai') &&
+                    review.state === 'CHANGES_REQUESTED'
+                  );
 
                 let dueAt = 0;
-                let kind = 'initial';
+                let kind = finalReview ? 'final-review' : 'initial';
 
                 if (
                   rabbitStatus &&
@@ -525,6 +761,9 @@ jobs:
                   headSha: pr.head.sha,
                   dueAt,
                   kind,
+                  stage: finalReview ? 'final-review' : 'initial-review',
+                  stageRank: finalReview ? 0 : 1,
+                  createdAt: new Date(pr.created_at || 0).getTime(),
                   fullReviewCount,
                   ...priority,
                 });
@@ -553,12 +792,18 @@ jobs:
 
             function candidateOrder(a, b) {
               // Priority is the hard primary key and must never be bypassed:
-              // P0 > P1 > P2 > unprioritized. Fairness is allowed only
-              // *within the same priority class* so it cannot move a lower
-              // priority PR ahead of a higher-priority re-review.
+              // P0 > P1 > P2. PRs without a source issue use the explicit P2
+              // fallback above so they cannot silently starve forever.
+              //
+              // Within one priority class, a merge-ready final review beats a
+              // first review. Oldest PR then wins among otherwise equivalent
+              // candidates, which prevents a constant stream of new work from
+              // starving an older candidate.
               return (
                 a.rank - b.rank ||
+                a.stageRank - b.stageRank ||
                 a.fullReviewCount - b.fullReviewCount ||
+                a.createdAt - b.createdAt ||
                 a.issueNumber - b.issueNumber ||
                 a.prNumber - b.prNumber
               );
@@ -592,7 +837,7 @@ jobs:
               const queue = [...state.candidates]
                 .sort(candidateOrder)
                 .map(candidate =>
-                  `#${candidate.prNumber}/issue#${candidate.issueNumber === Number.MAX_SAFE_INTEGER ? '?' : candidate.issueNumber} ${candidate.priority} reviews=${candidate.fullReviewCount} due=${new Date(candidate.effectiveDueAt).toISOString()}`
+                  `#${candidate.prNumber}/issue#${candidate.issueNumber === Number.MAX_SAFE_INTEGER ? '?' : candidate.issueNumber} ${candidate.priority} stage=${candidate.stage} reviews=${candidate.fullReviewCount} due=${new Date(candidate.effectiveDueAt).toISOString()}`
                 )
                 .join(', ');
 
@@ -684,5 +929,5 @@ jobs:
             }
 
             core.notice(
-              `Selected PR #${selected.prNumber} from issue #${selected.issueNumber === Number.MAX_SAFE_INTEGER ? '?' : selected.issueNumber} (${selected.priority}, ${selected.kind}) for the next CodeRabbit slot at head ${selected.headSha}.`
+              `Selected PR #${selected.prNumber} from issue #${selected.issueNumber === Number.MAX_SAFE_INTEGER ? '?' : selected.issueNumber} (${selected.priority}, ${selected.stage}, ${selected.kind}) for the next CodeRabbit slot at head ${selected.headSha}.`
             );
