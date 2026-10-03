@@ -241,11 +241,15 @@ jobs:
           fetch_variable() {
             local repository="$1" name="$2"
             local err_file value rc
-            err_file="$(mktemp -p "${RUNNER_TEMP:-$GITHUB_WORKSPACE}")"
-            if value="$(gh api "repos/$repository/actions/variables/$name" --jq '.value // ""' 2>"$err_file")"; then
+            if ! err_file="$(mktemp -p "${RUNNER_TEMP:-$GITHUB_WORKSPACE}" continuum-var-err.XXXXXX)"; then
+              echo "::error::Child relationship lookup is unavailable; parent wake-up refused." >&2
+              return 4
+            fi
+            if value="$(gh api "repos/$repository/actions/variables/$name" --jq -r '.value // ""' 2>"$err_file")"; then
               rc=0
             else
               rc=$?
+              cat "$err_file" >&2 || true
             fi
             rm -f "$err_file"
             if [ "$rc" -eq 0 ]; then
@@ -283,6 +287,10 @@ jobs:
           printf '::add-mask::%s\n' "$parent"
           printf '::add-mask::%s\n' "$child_id"
 
+          if [[ ! "$parent" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::Child relationship declaration is invalid; parent wake-up refused."
+            exit 2
+          fi
           if ! parent_role="$(fetch_variable "$parent" CONTINUUM_ROLE)"; then
             echo "::error::Parent relationship lookup is unavailable; parent wake-up refused."
             exit 4
@@ -300,11 +308,6 @@ jobs:
             --children-json "$parent_children" 2>/dev/null \
             | grep -Fxq -- "$child_id"; then
             echo "::error::Bidirectional parent/child verification failed; parent wake-up refused."
-            exit 2
-          fi
-
-          if [[ ! "$parent" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
-            echo "::error::Child relationship declaration is invalid; parent wake-up refused."
             exit 2
           fi
           if ! parent_err="$(mktemp -p "${RUNNER_TEMP:-$GITHUB_WORKSPACE}")"; then
