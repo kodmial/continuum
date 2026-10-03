@@ -3049,6 +3049,24 @@ class ContinuumTest < Minitest::Test
                  legacy.fetch('jobs').fetch('dispatch').fetch('if')
   end
 
+  # The unified scheduler replaced the standalone parent child dispatcher, so
+  # it must retain that dispatcher's autonomous wake-up surface. Child issue
+  # creation cannot emit an event in the parent repository; polling therefore
+  # remains the zero-private-minutes path that discovers new delegated work.
+  def test_unified_parent_scheduler_keeps_delegated_polling_wakeups
+    stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-issue-scheduler.yml'))
+    on = events(stub)
+
+    assert_equal ['7,17,27,37,47,57 * * * *'],
+                 on.fetch('schedule').map { |entry| entry.fetch('cron') }
+    assert_equal ['main'], on.fetch('push').fetch('branches')
+
+    workflow_names = on.fetch('workflow_run').fetch('workflows')
+    %w[SubTask].each { |name| assert_includes workflow_names, name }
+    assert_includes workflow_names, 'SubTask review'
+    assert_includes workflow_names, 'SubTask PR review'
+  end
+
   # A manual owner `/oc` is real in-flight work: reserve it at once, and keep a
   # short grace window so this run cannot enqueue a duplicate right behind it.
   def test_scheduler_reserves_owner_commands_and_honours_the_grace_window
