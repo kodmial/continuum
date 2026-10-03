@@ -156,9 +156,13 @@ on:
         default: 'comment'
       execution_label_routes:
         description: >-
-          Deprecated compatibility input. It is intentionally ignored: every
-          ready issue is dispatched to OpenCode. Specialized workflows remain
-          available as tools that task execution may invoke explicitly.
+          Label-driven execution routes, one per line, as
+          `<issue label>|<workflow file name>|<input>=<value>,...`. When a
+          selected issue carries one of these labels the scheduler dispatches
+          that workflow with those inputs plus `issue_number` instead of waking
+          OpenCode, and still records the dispatch marker. Empty (the default)
+          routes nothing, so no execution workflow is dispatched by label.
+          Empty falls back to vars.CONTINUUM_EXECUTION_LABEL_ROUTES.
         type: string
         required: false
         default: ''
@@ -223,6 +227,7 @@ jobs:
       OPENCODE_WORKFLOW_PATH: ${{ inputs.opencode_workflow_path || vars.CONTINUUM_OPENCODE_WORKFLOW_PATH || '.github/workflows/continuum-opencode.yml' }}
       DISPATCH_REF: ${{ inputs.dispatch_ref || vars.CONTINUUM_DISPATCH_REF || 'main' }}
       OPENCODE_DISPATCH: ${{ inputs.opencode_dispatch || vars.CONTINUUM_OPENCODE_DISPATCH || 'comment' }}
+      EXECUTION_LABEL_ROUTES: ${{ inputs.execution_label_routes || vars.CONTINUUM_EXECUTION_LABEL_ROUTES }}
       CHILD_DISPATCH_WORKFLOW: ${{ inputs.child_dispatch_workflow || vars.CONTINUUM_CHILD_DISPATCH_WORKFLOW }}
       CHILD_WORKER_WORKFLOW: ${{ vars.CONTINUUM_CHILD_WORKER_WORKFLOW || 'continuum-child-worker.yml' }}
       CHILD_REVIEW_WORKFLOW: ${{ vars.CONTINUUM_CHILD_REVIEW_WORKFLOW || 'continuum-child-review.yml' }}
@@ -687,6 +692,52 @@ jobs:
                   "'; expected 'comment' or 'workflow'."
               );
             }
+
+            // Label-driven execution routes are configuration, never a table
+            // inside core: the render and Docker qualification controllers are
+            // separate reusable workflows that a consumer may or may not
+            // install, and a consumer may route to workflows core has never
+            // heard of. Empty means "route nothing".
+            //
+            // A malformed entry fails the run instead of being dropped,
+            // because a silently ignored route looks reserved but is never
+            // executed.
+            const executionRoutes = (process.env.EXECUTION_LABEL_ROUTES || '')
+              .split('\n')
+              .map(line => line.trim())
+              .filter(line => line && !line.startsWith('#'))
+              .map(line => {
+                const parts = line.split('|').map(part => part.trim());
+                if (parts.length < 2 || parts.length > 3 || !parts[0] || !parts[1]) {
+                  throw new Error(
+                    "Invalid execution_label_routes line: '" +
+                      line +
+                      "'; expected '<issue label>|<workflow file name>|<input>=<value>,...'."
+                  );
+                }
+                const inputs = {};
+                for (const assignment of (parts[2] || '').split(',')) {
+                  const trimmed = assignment.trim();
+                  if (!trimmed) continue;
+                  const separator = trimmed.indexOf('=');
+                  if (separator <= 0) {
+                    throw new Error(
+                      "Invalid execution_label_routes input '" +
+                        trimmed +
+                        "' on line '" +
+                        line +
+                        "'; expected '<name>=<value>'."
+                    );
+                  }
+                  inputs[trimmed.slice(0, separator).trim()] = trimmed
+                    .slice(separator + 1)
+                    .trim();
+                }
+                return { label: parts[0], workflow: parts[1], inputs };
+              });
+            const executionRouteLabels = new Set(
+              executionRoutes.map(route => route.label)
+            );
 
             const childDispatchWorkflow = (
               process.env.CHILD_DISPATCH_WORKFLOW || ''
@@ -1292,6 +1343,15 @@ jobs:
                 color: 'B60205',
                 description: 'Mandatory live qualification failed; repair is required before completion.',
               },
+              // A configured route label is reserved before this run can see
+              // it, so create it here rather than letting a consumer's
+              // selection silently no-op on a missing label.
+              ...[...executionRouteLabels].map(name => ({
+                name,
+                color: '0E8A16',
+                description:
+                  'Routes this issue to a configured execution workflow instead of the OpenCode agent.',
+              })),
             ];
 
             for (const spec of labelSpecs) {
@@ -2316,7 +2376,26 @@ jobs:
                     (priority || 'no explicit priority') + ').',
                 ].join('\n');
 
-                if (opencodeDispatch === 'workflow') {
+                const route = executionRoutes.find(
+                  candidate => issue.labels.some(l => l.name === candidate.label)
+                );
+
+                if (route) {
+                  // The marker still lands on the issue so a consumer can see
+                  // the attempt in the audit trail, but the workflow is
+                  // dispatched directly: an execution workflow does not read
+                  // owner comments.
+                  await github.rest.issues.createComment({
+                    owner,
+                    repo,
+                    issue_number: issue.number,
+                    body: markerComment,
+                  });
+                  await dispatchWorkflow(route.workflow, {
+                    ...route.inputs,
+                    issue_number: String(issue.number),
+                  });
+                } else if (opencodeDispatch === 'workflow') {
                   await github.rest.issues.createComment({
                     owner,
                     repo,

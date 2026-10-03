@@ -76,7 +76,7 @@ on:
         required: false
         type: string
       execution_label_routes:
-        description: "Deprecated compatibility input; ignored because ready issues always go to OpenCode"
+        description: "Label-driven execution routes, one per line"
         required: false
         type: string
       child_dispatch_workflow:
