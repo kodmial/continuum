@@ -235,30 +235,23 @@ jobs:
           set -euo pipefail
           runtime="$GITHUB_WORKSPACE/.continuum-engine/.github/scripts/delegation_runtime.py"
 
-          # Fetch one named variable directly. A missing variable yields an
-          # empty value (later rejected as invalid); any other API failure is
+          # Fetch one named variable directly. Any API failure is
           # an outage and refuses the wake-up. Listing the whole collection
           # would truncate past 100 variables and over-expose values.
           fetch_variable() {
             local repository="$1" name="$2"
             local err_file value rc
-            err_file="$(mktemp)"
+            err_file="$(mktemp -p "${RUNNER_TEMP:-$GITHUB_WORKSPACE}")"
             if value="$(gh api "repos/$repository/actions/variables/$name" --jq '.value // ""' 2>"$err_file")"; then
               rc=0
             else
               rc=$?
             fi
+            rm -f "$err_file"
             if [ "$rc" -eq 0 ]; then
-              rm -f "$err_file"
               printf '%s' "$value"
               return 0
             fi
-            if grep -q '(HTTP 404)' "$err_file" 2>/dev/null; then
-              rm -f "$err_file"
-              printf ''
-              return 0
-            fi
-            rm -f "$err_file"
             return "$rc"
           }
 
@@ -298,6 +291,10 @@ jobs:
             echo "::error::Parent relationship lookup is unavailable; parent wake-up refused."
             exit 4
           fi
+          if [ -z "$child_id" ]; then
+            echo "::error::Bidirectional parent/child verification failed; parent wake-up refused."
+            exit 2
+          fi
           if ! python3 "$runtime" parent-variable-ids \
             --role "$parent_role" \
             --children-json "$parent_children" 2>/dev/null \
@@ -306,12 +303,23 @@ jobs:
             exit 2
           fi
 
-          if ! parent_ref="$(gh api "repos/$parent" --jq -r '.default_branch // ""' 2>/dev/null)" || \
-             [[ ! "$parent_ref" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ ]] || \
-             [[ "$parent_ref" == *..* ]] || [[ "$parent_ref" == */ ]] || [[ "$parent_ref" == */.git* ]]; then
+          if [[ ! "$parent" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::Child relationship declaration is invalid; parent wake-up refused."
+            exit 2
+          fi
+          if ! parent_err="$(mktemp -p "${RUNNER_TEMP:-$GITHUB_WORKSPACE}")"; then
             echo "::error::Parent default branch lookup is unavailable; parent wake-up refused."
             exit 4
           fi
+          if ! parent_ref="$(gh api "repos/$parent" --jq -r '.default_branch // ""' 2>"$parent_err")" || \
+             [[ ! "$parent_ref" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ ]] || \
+             [[ "$parent_ref" == *..* ]] || [[ "$parent_ref" == */ ]] || [[ "$parent_ref" == */.git* ]]; then
+            cat "$parent_err" >&2 || true
+            rm -f "$parent_err"
+            echo "::error::Parent default branch lookup is unavailable; parent wake-up refused."
+            exit 4
+          fi
+          rm -f "$parent_err"
 
           if ! gh api --method POST \
             "repos/$parent/actions/workflows/continuum-issue-scheduler.yml/dispatches" \
