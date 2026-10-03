@@ -3009,13 +3009,23 @@ class ContinuumTest < Minitest::Test
     workflow = yaml(File.join(ROOT, '.github/workflows/continuum-issue-scheduler.yml'))
     assert_equal "vars.CONTINUUM_ROLE != 'child'",
                  workflow.fetch('jobs').fetch('schedule').fetch('if')
-    assert_equal "vars.CONTINUUM_ROLE == 'child'",
+    assert_equal "vars.CONTINUUM_ROLE == 'child' && github.event_name != 'schedule'",
                  workflow.fetch('jobs').fetch('wake_parent').fetch('if')
 
     stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-issue-scheduler.yml'))
     caller_gate = stub.fetch('jobs').fetch('call').fetch('if')
     assert_includes caller_gate, "vars.CONTINUUM_ROLE != 'child' || github.event_name != 'schedule'"
     assert_includes caller_gate, "github.event_name != 'issue_comment'"
+    assert_includes caller_gate, 'github.actor == github.repository_owner',
+                    'the parent wake gate must stay owner-only or any comment wakes a TAP_PAT dispatch'
+    assert_includes caller_gate, "contains(github.event.comment.body, '/oc')",
+                    'the parent wake gate must still require an owner /oc command'
+    assert_includes caller_gate, "contains(github.event.comment.body, '/opencode')",
+                    'the parent wake gate must still require an owner /opencode command'
+
+    wake_parent = workflow.fetch('jobs').fetch('wake_parent')
+    assert_equal false, wake_parent.fetch('concurrency').fetch('cancel-in-progress'),
+                     'a wake-up signal must not be cancelled mid-dispatch'
 
     assert_includes scheduler, 'CONTINUUM_CHILD_ID'
     assert_includes scheduler, 'CONTINUUM_PARENT'
@@ -3026,6 +3036,14 @@ class ContinuumTest < Minitest::Test
     assert_includes scheduler, '2>/dev/null'
     refute_includes scheduler, 'echo "$parent"'
     refute_includes scheduler, 'echo "$child_id"'
+    assert_includes scheduler, 'actions/variables/$name',
+                    'relationship lookups must fetch the named variable directly instead of paginating the collection'
+    refute_includes scheduler, 'actions/variables?per_page=100',
+                    'paginated variable listings truncate past 100 entries and over-expose values'
+    assert_includes scheduler, 'grep -Fxq -- "$child_id"',
+                    'the child-id match must terminate option parsing before the attacker-influenced pattern'
+    refute_includes scheduler, 'GITHUB_TOKEN: ${{ secrets.TAP_PAT }}',
+                    'gh already uses GH_TOKEN; overriding GITHUB_TOKEN elevates every consumer to PAT privileges'
 
     refute_includes scheduler, 'function isChildOwned(issue)'
     refute_includes scheduler, 'body.includes(childOwnedMarker)'

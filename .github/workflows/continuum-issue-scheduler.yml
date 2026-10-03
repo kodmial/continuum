@@ -209,12 +209,12 @@ jobs:
     # only verify the bidirectional relationship and wake the parent's public
     # scheduler; the caller keeps child cron events skipped to avoid consuming
     # private child runner minutes as a polling mechanism.
-    if: vars.CONTINUUM_ROLE == 'child'
+    if: vars.CONTINUUM_ROLE == 'child' && github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: ${{ fromJSON(vars.AUTOMATION_SCHEDULER_TIMEOUT_MINUTES || '5') }}
     concurrency:
       group: continuum-child-parent-wakeup
-      cancel-in-progress: true
+      cancel-in-progress: false
     steps:
       - name: Checkout Continuum engine for parent wake-up verification
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -229,28 +229,45 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
-          GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
         run: |
           set -euo pipefail
           runtime="$GITHUB_WORKSPACE/.continuum-engine/.github/scripts/delegation_runtime.py"
 
-          variable_value() {
-            local json="$1" name="$2"
-            jq -r --arg name "$name" \
-              '[.variables[]? | select(.name == $name) | .value][0] // ""' \
-              <<<"$json" 2>/dev/null || true
+          # Fetch one named variable directly. A missing variable yields an
+          # empty value (later rejected as invalid); any other API failure is
+          # an outage and refuses the wake-up. Listing the whole collection
+          # would truncate past 100 variables and over-expose values.
+          fetch_variable() {
+            local repository="$1" name="$2"
+            local err_file value rc
+            err_file="$(mktemp)"
+            if value="$(gh api "repos/$repository/actions/variables/$name" --jq '.value // ""' 2>"$err_file")"; then
+              rm -f "$err_file"
+              printf '%s' "$value"
+              return 0
+            fi
+            rc=$?
+            if grep -q '404' "$err_file" 2>/dev/null; then
+              rm -f "$err_file"
+              printf ''
+              return 0
+            fi
+            rm -f "$err_file"
+            return "$rc"
           }
 
-          if ! child_variables="$(
-            gh api "repos/$GITHUB_REPOSITORY/actions/variables?per_page=100" 2>/dev/null
-          )"; then
+          if ! child_role="$(fetch_variable "$GITHUB_REPOSITORY" CONTINUUM_ROLE)"; then
             echo "::error::Child relationship lookup is unavailable; parent wake-up refused."
             exit 4
           fi
-
-          child_role="$(variable_value "$child_variables" CONTINUUM_ROLE)"
-          child_id="$(variable_value "$child_variables" CONTINUUM_CHILD_ID)"
-          parent="$(variable_value "$child_variables" CONTINUUM_PARENT)"
+          if ! child_id="$(fetch_variable "$GITHUB_REPOSITORY" CONTINUUM_CHILD_ID)"; then
+            echo "::error::Child relationship lookup is unavailable; parent wake-up refused."
+            exit 4
+          fi
+          if ! parent="$(fetch_variable "$GITHUB_REPOSITORY" CONTINUUM_PARENT)"; then
+            echo "::error::Child relationship lookup is unavailable; parent wake-up refused."
+            exit 4
+          fi
 
           # Validate the child declaration with the same authoritative parser
           # used by parent-side delegated discovery. Values are never echoed.
@@ -267,19 +284,18 @@ jobs:
           printf '::add-mask::%s\n' "$parent"
           printf '::add-mask::%s\n' "$child_id"
 
-          if ! parent_variables="$(
-            gh api "repos/$parent/actions/variables?per_page=100" 2>/dev/null
-          )"; then
+          if ! parent_role="$(fetch_variable "$parent" CONTINUUM_ROLE)"; then
             echo "::error::Parent relationship lookup is unavailable; parent wake-up refused."
             exit 4
           fi
-
-          parent_role="$(variable_value "$parent_variables" CONTINUUM_ROLE)"
-          parent_children="$(variable_value "$parent_variables" CONTINUUM_CHILDREN)"
+          if ! parent_children="$(fetch_variable "$parent" CONTINUUM_CHILDREN)"; then
+            echo "::error::Parent relationship lookup is unavailable; parent wake-up refused."
+            exit 4
+          fi
           if ! python3 "$runtime" parent-variable-ids \
             --role "$parent_role" \
             --children-json "$parent_children" 2>/dev/null \
-            | grep -Fxq "$child_id"; then
+            | grep -Fxq -- "$child_id"; then
             echo "::error::Bidirectional parent/child verification failed; parent wake-up refused."
             exit 2
           fi
@@ -354,7 +370,6 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
-          GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
           CHILD_CANDIDATES_FILE: ${{ runner.temp }}/continuum-child-candidates.json
         run: |
           set -euo pipefail
