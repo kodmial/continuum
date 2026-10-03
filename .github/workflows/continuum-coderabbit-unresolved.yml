@@ -8,12 +8,20 @@ on:
         type: string
         default: main
         required: false
+      review_provider:
+        description: >-
+          Review provider: none, coderabbit, or pr-agent. Empty falls back to
+          vars.CONTINUUM_REVIEW_PROVIDER, then to none.
+        type: string
+        default: ''
+        required: false
 
 permissions: {}
 
 jobs:
   retry-unresolved:
     if: >-
+      (inputs.review_provider || vars.CONTINUUM_REVIEW_PROVIDER || 'none') == 'coderabbit' &&
       github.event.action == 'created' &&
       github.event.comment.user.login == 'coderabbitai[bot]' &&
       github.event.pull_request.state == 'open' &&
