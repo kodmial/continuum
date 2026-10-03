@@ -75,7 +75,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: pr-agent-merge-${{ inputs.target_child_id || 'local' }}-${{ inputs.pr_number || github.run_id }}
+  group: pr-agent-merge-${{ inputs.target_child_id == '' && 'local' || format('child-{0}', inputs.target_child_id) }}-${{ inputs.pr_number || github.run_id }}
   cancel-in-progress: false
 
 jobs:
@@ -311,6 +311,7 @@ jobs:
           POST_MERGE_WAKEUP_REF: ${{ inputs.post_merge_wakeup_ref || vars.CONTINUUM_POST_MERGE_WAKEUP_REF || github.event.repository.default_branch || 'main' }}
           REQUIRED_WORKFLOW_GATE_LABEL: ${{ inputs.required_workflow_gate_label || vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_LABEL || '' }}
           REQUIRED_WORKFLOW_GATE_NAME: ${{ inputs.required_workflow_gate_name || vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_NAME || '' }}
+          TARGET_CHILD_ID: ${{ inputs.target_child_id }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
@@ -549,13 +550,11 @@ jobs:
             }
 
             async function dispatchConflictRepair(pr, reason) {
-              if (delegated) {
-                core.setFailed(
-                  'Delegated PR conflict repair needs the parent routing controller; ' +
-                  'refusing to dispatch a target-local OpenCode workflow.'
-                );
-                return;
-              }
+              // Bounded attempt accounting applies to every surface,
+              // including delegated PRs: the lock label plus the exact-HEAD
+              // marker below is what bounds retries and lets the next pass
+              // clear a stranded lock. Failing before they exist replays the
+              // same failure on every reconciliation with no evidence.
               await ensureLabel(
                 CONFLICT_LOCK_LABEL,
                 'B60205',
@@ -628,6 +627,24 @@ jobs:
                 ].join('\n'),
               });
               try {
+                if (delegated) {
+                  // Delegated surface: a target-local OpenCode dispatch would
+                  // run in the wrong repository. The bounded lock plus the
+                  // exact-HEAD marker above already consumed this HEAD's
+                  // single attempt, so hold for the parent routing controller
+                  // instead of failing the run: the next pass observes the
+                  // marker, releases the lock, and holds without a storm.
+                  core.warning(
+                    'PR #' + prNumber +
+                    ': Delegated PR conflict repair needs the parent routing controller; ' +
+                    'recorded bounded attempt 1/1 for HEAD ' + fresh.head.sha +
+                    ' without a target-local dispatch (' + reason + ').'
+                  );
+                  core.notice(
+                    'PR #' + prNumber + ': delegated conflict-repair attempt held for parent routing.'
+                  );
+                  return;
+                }
                 await github.request(
                   'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
                   {
