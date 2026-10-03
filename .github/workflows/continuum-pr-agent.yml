@@ -98,7 +98,11 @@ on:
         default: ''
         required: false
 
-permissions: {}
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  statuses: read
 
 concurrency:
   group: pr-agent-${{ github.event.issue.number || github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || inputs.pr_number || github.run_id }}
