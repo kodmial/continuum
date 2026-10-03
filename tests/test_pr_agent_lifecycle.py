@@ -681,6 +681,13 @@ class IsolationTests(unittest.TestCase):
             self.assertIn("pull-requests: write", body)
         self.assertIn("statuses: read", engine)
 
+    def test_pre_ci_skip_does_not_run_checkout_integrity_guard(self):
+        body = read_repo(".github/workflows/continuum-pr-agent.yml")
+        self.assertIn(
+            "if: always() && steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'",
+            body,
+        )
+
     def test_review_caller_wakes_on_successful_ci_and_exports_native_outputs(self):
         caller = read_repo(".github/caller-stubs/continuum-pr-agent.yml")
         self.assertIn("workflow_run:", caller)
