@@ -1,1 +1,3 @@
 version: 1
+review:
+  provider: pr-agent

@@ -20,3 +20,7 @@ jobs:
       # Explicit Continuum self-opt-in, matching the qualified Kodmai consumer.
       # The provider remains OpenCode-backed and requires no paid LLM secret.
       enabled: 'true'
+      # Canonical lifecycle source of truth for the PR-Agent qualification
+      # path (issue #186): review.provider=pr-agent from .continuum.yml.
+      # The legacy `enabled` flag alone is not sufficient.
+      review_provider: 'pr-agent'

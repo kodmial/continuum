@@ -991,34 +991,84 @@ jobs:
               return matches[0] || null;
             }
 
-            async function unresolvedPrAgentThreads(pr) {
+            // Provider-owned PR-Agent state for the exact HEAD. Arbitrary
+            // human/other-bot comments are never findings: only blocks
+            // authored by the repository owner identity (or
+            // github-actions[bot]) with the exact marker and a correlated
+            // head count.
+            async function prAgentStateForHead(pr, headSha) {
               const comments = await github.paginate(
-                github.rest.pulls.listReviewComments,
-                { owner, repo, pull_number: pr.number, per_page: 100 }
+                github.rest.issues.listComments,
+                { owner, repo, issue_number: pr.number, per_page: 100 }
               );
-              const unresolved = [];
+              const providerOwned = (login) =>
+                login === owner || login === 'github-actions[bot]' || login === 'github-actions';
+              const stateRe = /<!--\s*pr-agent-review-state:v1\s*\n([\s\S]*?)-->/g;
+              let selected = null;
               for (const comment of comments) {
-                if (!/\bUNRESOLVED\b/i.test(comment.body || '')) continue;
-                if (/\bRESOLVED\b/i.test(comment.body || '') &&
-                    !/\bUNRESOLVED\b/i.test(comment.body || '')) continue;
-                unresolved.push({ id: comment.id, path: comment.path });
+                if (!providerOwned(comment.user?.login)) continue;
+                stateRe.lastIndex = 0;
+                let match = null;
+                while ((match = stateRe.exec(comment.body || '')) !== null) {
+                  let parsed = null;
+                  try {
+                    parsed = JSON.parse(match[1]);
+                  } catch (err) {
+                    continue;
+                  }
+                  if (String(parsed.provider || 'pr-agent').toLowerCase() !== 'pr-agent') continue;
+                  const parsedHead = String(
+                    parsed.reviewed_sha || parsed.head_sha || parsed.head || parsed.sha || ''
+                  ).toLowerCase();
+                  if (parsedHead !== String(headSha).toLowerCase()) continue;
+                  selected = parsed;
+                }
               }
-              // UNRESOLVED always wins: a later explicit RESOLVED reply for
-              // the same thread clears it.
-              const resolvedIds = new Set(
-                comments
-                  .filter((comment) =>
-                    /\*\*RESOLVED(?:\.|\*\*)/i.test(comment.body || '') &&
-                    !/\bUNRESOLVED\b/i.test(comment.body || '') &&
-                    comment.in_reply_to_id)
-                  .map((comment) => comment.in_reply_to_id)
-              );
-              return unresolved.filter((item) => !resolvedIds.has(item.id));
+              return selected;
+            }
+
+            function prAgentActiveFindings(state) {
+              const ACTIVE = new Set(['ACTIVE', 'OPEN', 'UNRESOLVED']);
+              if (!state || !Array.isArray(state.findings)) return [];
+              return state.findings.filter((item) =>
+                ACTIVE.has(String(item?.status || 'ACTIVE').toUpperCase()));
+            }
+
+            function prAgentStateComplete(state) {
+              if (!state) return false;
+              const complete = state.complete ?? state.last_run?.complete;
+              if (complete !== true) return false;
+              const coverage = state.coverage;
+              if (coverage && Number(coverage.total) > 0 &&
+                  Number(coverage.reviewed) < Number(coverage.total)) return false;
+              if (coverage && Number(coverage.total) <= 0) return false;
+              return true;
+            }
+
+            async function unresolvedPrAgentThreads(pr) {
+              // Normalized unresolved set: ACTIVE findings in provider-owned
+              // exact-head state. Stale heads never block a newly clean
+              // current HEAD (the state lookup is head-correlated), while a
+              // current-head ACTIVE set always blocks.
+              const state = await prAgentStateForHead(pr, pr.head.sha);
+              if (!state || !prAgentStateComplete(state)) return [{ id: 'incomplete-state' }];
+              return prAgentActiveFindings(state).map((item) => ({ id: item.id, path: item.path }));
             }
 
             async function prAgentReviewBasis(pr, headSha = pr.head.sha) {
               const evidence = await prAgentReviewEvidence(pr, headSha);
               if (!evidence || evidence.verdict !== 'APPROVED') return null;
+              // Cross-check the normalized marker against provider-owned
+              // state: a stale or incomplete state, or any current-head
+              // ACTIVE finding, keeps the gate red even when a marker claims
+              // APPROVED (false-approval fail-closed).
+              const state = await prAgentStateForHead(pr, headSha);
+              if (!state || !prAgentStateComplete(state)) return null;
+              const headOf = String(
+                state.reviewed_sha || state.head_sha || state.head || state.sha || ''
+              ).toLowerCase();
+              if (headOf !== String(headSha).toLowerCase()) return null;
+              if (prAgentActiveFindings(state).length !== 0) return null;
               const unresolved = await unresolvedPrAgentThreads(pr);
               if (unresolved.length !== 0) return null;
               return { sourceSha: headSha, carried: false, evidence };

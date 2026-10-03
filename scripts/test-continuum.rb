@@ -15,7 +15,7 @@ class ContinuumTest < Minitest::Test
   # Project-owned entry workflows used only by the Continuum repository itself.
   # They deliberately stay outside the `continuum-` namespace so installer
   # ownership and reusable-engine ownership remain unambiguous.
-  PROJECT_ENTRY_WORKFLOWS = %w[automation.yml ci.yml opencode.yml].freeze
+  PROJECT_ENTRY_WORKFLOWS = %w[automation.yml ci.yml opencode.yml pr-agent.yml].freeze
   # Every caller stub in every layer, for the checks that must not care which
   # layer a file belongs to.
   ALL_STUBS = (CORE_STUBS + TECH_STUBS + PARENT_STUBS).sort
@@ -428,15 +428,24 @@ class ContinuumTest < Minitest::Test
     ci = yaml(File.join(ROOT, '.github/workflows/ci.yml'))
     opencode = yaml(File.join(ROOT, '.github/workflows/opencode.yml'))
     automation = yaml(File.join(ROOT, '.github/workflows/automation.yml'))
+    pr_agent = yaml(File.join(ROOT, '.github/workflows/pr-agent.yml'))
 
     assert_equal 'CI', ci.fetch('name')
     assert_equal 'OpenCode agent', opencode.fetch('name')
     assert_equal 'Continuum automation', automation.fetch('name')
+    assert_equal 'PR Agent (OpenCode-backed)', pr_agent.fetch('name')
 
     assert_equal './.github/workflows/continuum-validation.yml',
                  ci.fetch('jobs').fetch('validate').fetch('uses')
     assert_equal './.github/workflows/continuum-opencode.yml',
                  opencode.fetch('jobs').fetch('call').fetch('uses')
+    # The PR-Agent qualification path (#186) calls the reusable engine and
+    # selects the canonical provider explicitly: `enabled` alone is never
+    # the lifecycle source of truth.
+    assert_equal 'kodmial/continuum/.github/workflows/continuum-pr-agent.yml@main',
+                 pr_agent.fetch('jobs').fetch('call').fetch('uses')
+    assert_equal 'pr-agent',
+                 pr_agent.fetch('jobs').fetch('call').fetch('with').fetch('review_provider')
 
     expected_automation_callees = %w[
       continuum-auto-merge.yml
@@ -1278,6 +1287,7 @@ class ContinuumTest < Minitest::Test
     automation.yml
     ci.yml
     opencode.yml
+    pr-agent.yml
     continuum-consumer-child-dispatcher.yml
     continuum-validation.yml
   ].freeze
@@ -4234,6 +4244,145 @@ class ContinuumTest < Minitest::Test
     assert_includes body, 'unresolvedPrAgentThreads', 'auto-merge must block on unresolved PR-Agent findings'
     assert_includes body, 'requirePrAgent', 'auto-merge must gate on the selected provider'
     assert_includes body, 'finalPrAgentBasis', 'final revalidation must include the PR-Agent gate'
+  end
+
+  # ------------------------------------------------- #186 live lifecycle repairs
+  #
+  # PR #185 proved the post-#182 adapter crashed (`pr.data.head.sha` after
+  # destructuring) and false-approved real findings by counting inline
+  # review comments while the backend emits `pr-agent-review-state:v1`.
+  # These contract tests pin the repaired adapter/security/head semantics
+  # so a regression fails here instead of in a live run.
+
+  def pr_agent_body
+    File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent.yml'))
+  end
+
+  # The destructured `data` IS the pull request: `pr.data.head.sha` crashes
+  # with `Cannot read properties of undefined (reading 'head')`.
+  def test_pr_agent_adapter_reads_the_destructured_head
+    body = pr_agent_body
+    refute_includes body, 'pr.data.head.sha',
+                    'continuum-pr-agent.yml: destructured pr has no .data; this is the live crash'
+    assert_includes body, 'pr.head.sha',
+                    'continuum-pr-agent.yml: the reviewed head must come from the destructured payload'
+    assert_includes body, 'pr.head.ref',
+                    'continuum-pr-agent.yml: the repair dispatch must carry the branch ref'
+  end
+
+  # The native output is the provider-owned state block, never inline
+  # review comments (which are zero on the OpenCode-backed path).
+  def test_pr_agent_adapter_parses_provider_owned_state_not_inline_comments
+    body = pr_agent_body
+    assert_includes body, 'pr-agent-review-state:v1',
+                    'pr-agent must parse the provider-owned native state block'
+    assert_includes body, 'providerOwned',
+                    'pr-agent must accept only provider-owned state (owner/bot), never arbitrary comments'
+    assert_includes body, 'failing closed',
+                    'pr-agent must fail closed instead of approving without exact-head state'
+    refute_includes body, 'listReviewComments',
+                    'pr-agent must not count inline review comments as findings'
+  end
+
+  # Silent truncation (`slice(0, 20)`) loses findings; every actionable
+  # finding must reach repair through bounded complete batching.
+  def test_pr_agent_adapter_batches_completely_without_silent_loss
+    body = pr_agent_body
+    refute_includes body, 'slice(0, 20)',
+                    'pr-agent must not silently truncate the finding set'
+    assert_includes body, 'PER_BATCH',
+                    'pr-agent must batch findings with a bounded complete strategy'
+    assert_includes body, 'findings_json: findingsJson',
+                    'pr-agent repair dispatch must carry the batched normalized payload'
+    assert_includes body, 'Refusing empty findings_json',
+                    'pr-agent must never dispatch an empty repair payload'
+  end
+
+  # Stale blocks must not satisfy the current review, and incomplete or
+  # partial state must never read green.
+  def test_pr_agent_adapter_correlates_heads_and_fails_closed_on_partial
+    body = pr_agent_body
+    assert_includes body, 'last_run?.complete',
+                    'pr-agent must gate on review completeness'
+    assert_includes body, 'coverage',
+                    'pr-agent must gate on review coverage'
+    assert_includes body, 'is still current',
+                    'pr-agent must keep the moved-head stale rejection'
+  end
+
+  # Blocking findings keep the normalized gate red; a complete clean
+  # exact-head review makes it green via a real GitHub review when the
+  # identity allows it, with the limitation recorded explicitly.
+  def test_pr_agent_adapter_records_blocking_green_semantics
+    body = pr_agent_body
+    assert_includes body, 'createReview',
+                    'pr-agent must create a real GitHub review state when the identity allows it'
+    assert_includes body, 'continuum-pr-agent-github-review',
+                    'pr-agent must record the review-submission limitation explicitly'
+    assert_includes body, 'CHANGES_REQUESTED',
+                    'pr-agent must keep blocking findings red'
+  end
+
+  # Verification selects exact normalized finding ids from the
+  # provider-owned instance; inline comment ids and unrelated comments are
+  # excluded and provider/head correlation is enforced.
+  def test_pr_agent_verify_selects_normalized_findings_only
+    body = pr_agent_body
+    assert_includes body, 'continuum-pr-agent-verify finding=',
+                    'pr-agent verify must write a head-correlated verification marker'
+    assert_includes body, 'not an ACTIVE normalized finding',
+                    'pr-agent verify must reject ids outside the ACTIVE provider-owned set'
+    refute_includes body, 'getReviewComment',
+                    'pr-agent verify must not resolve findings through raw inline comment ids'
+  end
+
+  # The generic verification controller must apply the same strict
+  # selection: no substring match on an arbitrary review id.
+  def test_generic_verification_selects_correlated_findings_only
+    body = workflow_body('continuum-opencode.yml')
+    assert_includes body, 'pr-agent-review-state:v1',
+                    'generic verification must consult provider-owned PR-Agent state'
+    refute_includes body, "(comment.body || '').includes(reviewId)",
+                    'generic verification must not match arbitrary comments by review-id substring'
+  end
+
+  # Privileged repair is fenced: arbitrary UNRESOLVED replies never
+  # dispatch, and the PR-Agent retry carries the exact normalized set.
+  def test_unresolved_reentry_is_authorized_and_non_empty
+    body = workflow_body('continuum-opencode-unresolved.yml')
+    assert_includes body, 'UNRESOLVED_AUTHOR',
+                    'unresolved must observe the reply author'
+    assert_includes body, 'is not provider-owned',
+                    'unresolved must reject unprivileged UNRESOLVED replies'
+    assert_includes body, 'inputs[findings_json]',
+                    'unresolved PR-Agent re-entry must carry the exact finding payload'
+    assert_includes body, 'Refusing empty findings_json',
+                    'unresolved must never dispatch an empty repair payload'
+  end
+
+  # Auto-merge consumes provider-owned exact-head state (not arbitrary
+  # UNRESOLVED text), cross-checks the normalized marker against it, and
+  # never lets a stale head block a newly clean current HEAD.
+  def test_auto_merge_gate_consumes_provider_owned_exact_head_state
+    body = auto_merge_body
+    assert_includes body, 'prAgentStateForHead',
+                    'auto-merge must resolve provider-owned state for the exact HEAD'
+    assert_includes body, 'prAgentActiveFindings',
+                    'auto-merge must block on current-head ACTIVE findings'
+    assert_includes body, 'prAgentStateComplete',
+                    'auto-merge must fail closed on incomplete or partial state'
+  end
+
+  # The qualification path selects the canonical provider explicitly: the
+  # checked-in configuration owns `review.provider: pr-agent` and the thin
+  # caller passes it, so `enabled: true` alone is never the source of truth.
+  def test_pr_agent_qualification_selects_the_canonical_provider
+    config = File.read(File.join(ROOT, '.continuum.yml'))
+    assert_includes config, 'provider: pr-agent',
+                    '.continuum.yml must explicitly select review.provider: pr-agent'
+    caller = File.read(File.join(ROOT, '.github/workflows/pr-agent.yml'))
+    assert_includes caller, "review_provider: 'pr-agent'",
+                    'pr-agent.yml must pass the canonical provider explicitly'
   end
 
   end

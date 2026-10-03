@@ -413,24 +413,81 @@ jobs:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
             const headSha = process.env.HEAD_SHA;
-            const findingId = Number(process.env.FINDING_ID);
-            if (!Number.isInteger(findingId)) {
-              core.setFailed('Usage: /verify <finding-id> (the inline review comment id).');
+            // Normalized finding identity: the stable `pra-<digest>` id from
+            // the provider-owned `pr-agent-review-state:v1` block for this
+            // review instance. Raw inline review-comment ids are never
+            // accepted here: verification selects the exact normalized id,
+            // excludes replies/unrelated comments, and enforces
+            // provider/head correlation.
+            const findingId = String(process.env.FINDING_ID || '').trim().split(/\s+/)[0] || '';
+            if (!findingId || !/^[A-Za-z0-9_-]+$/.test(findingId)) {
+              core.setFailed('Usage: /verify <finding-id> (the normalized PR-Agent finding id, e.g. pra-<digest>).');
               return;
             }
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const pullNumber = Number('${{ steps.config.outputs.pr_number }}');
+            const providerOwned = (login) =>
+              login === owner || login === 'github-actions[bot]' || login === 'github-actions';
+            const stateRe = /<!--\s*pr-agent-review-state:v1\s*\n([\s\S]*?)-->/g;
 
-            const { data: comment } = await github.rest.pulls.getReviewComment({
-              owner, repo, comment_id: findingId,
-            });
+            const issueComments = await github.paginate(
+              github.rest.issues.listComments,
+              { owner, repo, issue_number: pullNumber, per_page: 100 }
+            );
+            // Provider-owned state only: arbitrary human/other-bot comments
+            // are never findings, even when they carry a similar marker.
+            const states = [];
+            for (const comment of issueComments) {
+              if (!providerOwned(comment.user?.login)) continue;
+              stateRe.lastIndex = 0;
+              let match = null;
+              while ((match = stateRe.exec(comment.body || '')) !== null) {
+                try {
+                  states.push({ state: JSON.parse(match[1]), createdAt: comment.created_at });
+                } catch (err) {
+                  core.setFailed(`PR-Agent review state is not valid JSON: ${err.message}`);
+                  return;
+                }
+              }
+            }
+            const headOf = (state) =>
+              state.reviewed_sha || state.head_sha || state.head || state.sha ||
+              state.last_run?.reviewed_sha || state.last_run?.head_sha || '';
+            const exact = states.filter((entry) =>
+              String(entry.state.provider || 'pr-agent').toLowerCase() === 'pr-agent' &&
+              String(headOf(entry.state) || '').toLowerCase() === String(headSha).toLowerCase()
+            );
+            if (exact.length === 0) {
+              core.setFailed(
+                `No provider-owned PR-Agent state for exact HEAD ${headSha}; stale verification is rejected.`
+              );
+              return;
+            }
+            const state = exact[exact.length - 1].state;
+            const complete = state.complete ?? state.last_run?.complete;
+            if (complete !== true) {
+              core.setFailed('PR-Agent review state is incomplete or partial: failing closed.');
+              return;
+            }
+            const coverage = state.coverage;
+            if (coverage && Number(coverage.total) > 0 && Number(coverage.reviewed) < Number(coverage.total)) {
+              core.setFailed('PR-Agent review coverage is partial: failing closed.');
+              return;
+            }
+            const ACTIVE = new Set(['ACTIVE', 'OPEN', 'UNRESOLVED']);
+            const entries = Array.isArray(state.findings) ? state.findings : [];
+            const entry = entries.find((item) => String(item?.id || '') === findingId);
+            if (!entry || !ACTIVE.has(String(entry.status || 'ACTIVE').toUpperCase())) {
+              core.setFailed(
+                `Finding ${findingId} is not an ACTIVE normalized finding of the provider-owned review instance at ${headSha}.`
+              );
+              return;
+            }
             const marker =
               `<!-- continuum-pr-agent-verify finding=${findingId} head=${headSha} -->`;
-            const existing = await github.paginate(github.rest.pulls.listReviewComments, {
-              owner, repo, pull_number: pullNumber, per_page: 100,
-            });
-            if (existing.some(c => c.in_reply_to_id === findingId && c.body?.includes(marker))) {
+            if (issueComments.some((c) =>
+              providerOwned(c.user?.login) && (c.body || '').includes(marker))) {
               core.notice(`Finding ${findingId} was already verified at ${headSha}.`);
               return;
             }
@@ -438,7 +495,7 @@ jobs:
             let current = '';
             try {
               const { data: file } = await github.rest.repos.getContent({
-                owner, repo, path: comment.path, ref: headSha,
+                owner, repo, path: entry.path, ref: headSha,
               });
               if (!Array.isArray(file) && file.content) {
                 current = Buffer.from(file.content, 'base64').toString('utf8');
@@ -450,8 +507,8 @@ jobs:
               'You are a read-only code reviewer. Decide whether the review finding below',
               `still applies to the CURRENT file content at PR HEAD ${headSha}.`,
               '',
-              `Finding (${comment.path}, line ${comment.original_line || comment.line}):`,
-              comment.body || '',
+              `Finding (${entry.path || ''}, line ${entry.line || 0}):`,
+              entry.summary || entry.title || findingId,
               '',
               'Current file content:',
               current ? current.slice(0, 20000) : '(file no longer exists at this HEAD)',
@@ -479,18 +536,17 @@ jobs:
             const verdict = /\bUNRESOLVED\b/i.test(text)
               ? 'UNRESOLVED'
               : (/\*\*RESOLVED(?:\.|\*\*)/i.test(text) ? 'RESOLVED' : 'UNRESOLVED');
-            await github.request(
-              'POST /repos/{owner}/{repo}/pulls/{pull_number}/comments/{comment_id}/replies',
-              {
-                owner, repo, pull_number: pullNumber, comment_id: findingId,
-                body: [
-                  marker,
-                  `Verification at HEAD \`${headSha}\`: **${verdict}**`,
-                  '',
-                  text.slice(0, 3000),
-                ].join('\n'),
-              }
-            );
+            await github.rest.issues.createComment({
+              owner, repo, issue_number: pullNumber,
+              body: [
+                marker,
+                `Verification at HEAD \`${headSha}\`: **${verdict}**`,
+                '',
+                `Finding: \`${findingId}\` (${entry.path || ''}:${entry.line || 0})`,
+                '',
+                text.slice(0, 3000),
+              ].join('\n'),
+            });
             core.notice(`Finding ${findingId} verified at ${headSha}: ${verdict}.`);
 
       - name: Fail closed on a moved head
@@ -541,69 +597,196 @@ jobs:
             const pullNumber = Number('${{ steps.config.outputs.pr_number }}');
             const reviewedSha = process.env.REVIEWED_SHA;
             const provider = process.env.REVIEW_PROVIDER || 'pr-agent';
+            // The destructured `data` IS the pull request object itself, so
+            // the head ships directly on it (re-qualifying through a nested
+            // data member crashes after destructuring).
             const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: pullNumber });
-            const headSha = pr.data.head.sha;
+            const headSha = pr.head.sha;
             if (headSha !== reviewedSha) {
               core.setFailed(`PR head moved during review (${reviewedSha} -> ${headSha}); the review is stale.`);
               return;
             }
-            // Adapter parses its own native output: PR-Agent inline findings
-            // are review comments authored by the review backend for this PR.
-            const comments = await github.paginate(
-              github.rest.pulls.listReviewComments,
-              { owner, repo, pull_number: pullNumber, per_page: 100 }
-            );
-            const findings = comments.filter((comment) =>
-              !comment.in_reply_to_id && (comment.body || '').trim().length > 0
-            );
-            const verdict = findings.length > 0 ? 'CHANGES_REQUESTED' : 'APPROVED';
-            const marker =
-              `<!-- continuum-pr-agent-review head=${headSha} verdict=${verdict} -->`;
+            // Adapter parses its own native output: the provider-owned
+            // `pr-agent-review-state:v1` block in the persistent PR Reviewer
+            // Guide comment. Inline review comments are NEVER findings on
+            // this path: the OpenCode-backed backend emits zero review
+            // submissions, so counting them false-approves real findings.
+            const providerOwned = (login) =>
+              login === owner || login === 'github-actions[bot]' || login === 'github-actions';
             const issueComments = await github.paginate(
               github.rest.issues.listComments,
               { owner, repo, issue_number: pullNumber, per_page: 100 }
             );
+            const stateRe = /<!--\s*pr-agent-review-state:v1\s*\n([\s\S]*?)-->/g;
+            const states = [];
+            for (const comment of issueComments) {
+              if (!providerOwned(comment.user?.login)) continue;
+              stateRe.lastIndex = 0;
+              let match = null;
+              while ((match = stateRe.exec(comment.body || '')) !== null) {
+                try {
+                  states.push({ state: JSON.parse(match[1]), createdAt: comment.created_at });
+                } catch (err) {
+                  core.setFailed(`PR-Agent review state is not valid JSON: ${err.message}`);
+                  return;
+                }
+              }
+            }
+            const headOf = (state) =>
+              state.reviewed_sha || state.head_sha || state.head || state.sha ||
+              state.last_run?.reviewed_sha || state.last_run?.head_sha || '';
+            // Correlate the state to the exact reviewed HEAD: stale blocks
+            // from an old HEAD never satisfy the current review, and a stale
+            // review/verification is rejected, not silently carried.
+            const exact = states.filter((entry) =>
+              String(entry.state.provider || 'pr-agent').toLowerCase() === 'pr-agent' &&
+              String(headOf(entry.state) || '').toLowerCase() === String(headSha).toLowerCase()
+            );
+            if (exact.length === 0) {
+              core.setFailed(
+                `No provider-owned pr-agent-review-state:v1 for exact HEAD ${headSha}; failing closed (never APPROVED).`
+              );
+              return;
+            }
+            const state = exact[exact.length - 1].state;
+            const reviewId = state.review_id || state.review_instance_id || state.instance_id || reviewedSha;
+            // Incomplete/partial review state fails closed and must never
+            // become APPROVED.
+            const complete = state.complete ?? state.last_run?.complete;
+            if (complete !== true) {
+              core.setFailed('PR-Agent review state is incomplete (last_run.complete !== true): failing closed.');
+              return;
+            }
+            const coverage = state.coverage;
+            if (coverage && Number(coverage.total) > 0 && Number(coverage.reviewed) < Number(coverage.total)) {
+              core.setFailed(
+                `PR-Agent review coverage is partial (${coverage.reviewed}/${coverage.total}): failing closed.`
+              );
+              return;
+            }
+            if (coverage && Number(coverage.total) <= 0) {
+              core.setFailed('PR-Agent review coverage is unknown: failing closed.');
+              return;
+            }
+            const ACTIVE = new Set(['ACTIVE', 'OPEN', 'UNRESOLVED']);
+            const RESOLVED = new Set(['RESOLVED', 'FIXED', 'DISMISSED', 'DONE']);
+            const rawFindings = Array.isArray(state.findings) ? state.findings : [];
+            for (const item of rawFindings) {
+              const status = String(item?.status || 'ACTIVE').toUpperCase();
+              if (!ACTIVE.has(status) && !RESOLVED.has(status)) {
+                core.setFailed(`PR-Agent review state has unknown finding status ${status}: failing closed.`);
+                return;
+              }
+            }
+            const findings = rawFindings
+              .filter((item) => ACTIVE.has(String(item?.status || 'ACTIVE').toUpperCase()))
+              .map((item) => ({
+                id: String(item.id || ''),
+                path: String(item.path || ''),
+                line: Number(item.line || 0),
+                severity: String(item.severity || 'high'),
+                summary: String(item.summary || item.title || item.rule || item.id || ''),
+              }))
+              .filter((item) => item.id);
+            const verdict = findings.length > 0 ? 'CHANGES_REQUESTED' : 'APPROVED';
+            const marker =
+              `<!-- continuum-pr-agent-review head=${headSha} verdict=${verdict} -->`;
             if (!issueComments.some((comment) => (comment.body || '').includes(marker))) {
               await github.rest.issues.createComment({
                 owner, repo, issue_number: pullNumber,
-                body: [marker, `PR-Agent ${verdict} for exact HEAD \`${headSha}\` (${findings.length} inline finding(s)).`].join('\n'),
+                body: [marker, `PR-Agent ${verdict} for exact HEAD \`${headSha}\` (${findings.length} normalized finding(s) from pr-agent-review-state:v1).`].join('\n'),
               });
+            }
+            // Blocking/green semantics: a real GitHub review is created when
+            // the execution identity allows it. GitHub forbids approving the
+            // actor's own PR, so that limitation is recorded explicitly and
+            // the exact-head normalized marker stays authoritative instead of
+            // faking APPROVED.
+            try {
+              await github.rest.pulls.createReview({
+                owner, repo, pull_number: pullNumber, commit_id: headSha,
+                event: findings.length > 0 ? 'REQUEST_CHANGES' : 'APPROVE',
+                body: `${marker}\nPR-Agent ${verdict} for exact HEAD \`${headSha}\`.`,
+              });
+            } catch (err) {
+              const limitation =
+                `<!-- continuum-pr-agent-github-review head=${headSha} verdict=${verdict} -->`;
+              if (!issueComments.some((comment) => (comment.body || '').includes(limitation))) {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: pullNumber,
+                  body: [
+                    limitation,
+                    `GitHub review submission returned ${err.status || 'an error'} (${(err.message || '').split('\n')[0]}); ` +
+                    'the exact-head normalized marker above remains authoritative.',
+                  ].join('\n'),
+                });
+              }
+              core.warning(`GitHub review submission unavailable: ${err.message}`);
             }
             if (findings.length === 0) {
               core.notice(`PR #${pullNumber}: PR-Agent approved exact HEAD ${headSha}; no repair dispatch needed.`);
               return;
             }
-            // Generic repair controller: exactly one batch dispatch per
-            // normalized review (provider/review/head/finding-set). Duplicate
-            // protection is the verification marker for the same head.
-            const batchMarker = `<!-- opencode-review-verification provider=pr-agent review=${reviewedSha} head=${headSha} -->`;
-            if (issueComments.some((comment) => (comment.body || '').includes(batchMarker))) {
-              core.info(`Repair already dispatched for PR-Agent review ${reviewedSha} at ${headSha}.`);
+            // Bounded complete batching: every actionable finding reaches
+            // repair. Findings are chunked into complete batches; if complete
+            // coverage cannot be represented, the run fails closed instead of
+            // silently truncating.
+            const PER_BATCH = 50;
+            const MAX_BATCHES = 10;
+            const batches = [];
+            for (let i = 0; i < findings.length; i += PER_BATCH) {
+              batches.push(findings.slice(i, i + PER_BATCH));
+            }
+            if (batches.length > MAX_BATCHES) {
+              core.setFailed(
+                `PR-Agent finding set needs ${batches.length} batches: failing closed rather than truncating.`
+              );
               return;
             }
-            await github.rest.issues.createComment({
-              owner, repo, issue_number: pullNumber, body: batchMarker,
-            });
-            const findingPayload = findings.slice(0, 20).map((comment) => ({
-              id: comment.id, path: comment.path, line: comment.line || comment.original_line || 0,
-            }));
-            await github.rest.actions.createWorkflowDispatch({
-              owner, repo,
-              workflow_id: 'continuum-opencode.yml',
-              ref: 'main',
-              inputs: {
-                mode: 'review-fix',
-                pr_number: String(pullNumber),
-                head_ref: pr.head.ref,
-                review_id: reviewedSha,
-                review_provider: provider,
-                reviewed_sha: reviewedSha,
-                head_sha: headSha,
-                findings_json: JSON.stringify(findingPayload),
-              },
-            });
+            let dispatched = 0;
+            for (let index = 0; index < batches.length; index += 1) {
+              const batch = batches[index];
+              // Generic repair controller: one dispatch per normalized batch
+              // (provider/review/head/batch/finding-set). Duplicate
+              // protection is the per-batch verification marker.
+              const batchMarker = `<!-- opencode-review-verification provider=pr-agent review=${reviewId} head=${headSha} batch=${index + 1}/${batches.length} findings=${batch.map((f) => f.id).join(',')} -->`;
+              if (issueComments.some((comment) => (comment.body || '').includes(
+                `<!-- opencode-review-verification provider=pr-agent review=${reviewId} head=${headSha} batch=${index + 1}/${batches.length}`
+              ))) {
+                core.info(`Repair already dispatched for PR-Agent review ${reviewId} batch ${index + 1}/${batches.length}.`);
+                continue;
+              }
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: pullNumber, body: batchMarker,
+              });
+              const findingPayload = batch.map((finding) => ({
+                id: finding.id, path: finding.path, line: finding.line,
+                severity: finding.severity, summary: finding.summary,
+              }));
+              const findingsJson = JSON.stringify(findingPayload);
+              if (!findingsJson || findingsJson === '[]') {
+                core.setFailed('Refusing empty findings_json repair dispatch.');
+                return;
+              }
+              await github.rest.actions.createWorkflowDispatch({
+                owner, repo,
+                workflow_id: 'continuum-opencode.yml',
+                ref: 'main',
+                inputs: {
+                  mode: 'review-fix',
+                  pr_number: String(pullNumber),
+                  head_ref: pr.head.ref,
+                  review_id: String(reviewId),
+                  review_provider: provider,
+                  reviewed_sha: reviewedSha,
+                  head_sha: headSha,
+                  findings_json: findingsJson,
+                },
+              });
+              dispatched += 1;
+            }
             core.notice(
-              `Dispatched generic OpenCode repair for PR-Agent review ${reviewedSha} on PR #${pullNumber} with ${findings.length} finding(s).`
+              `Dispatched generic OpenCode repair for PR-Agent review ${reviewId} on PR #${pullNumber} with ${findings.length} finding(s) in ${dispatched} batch(es).`
             );
 
       - name: Stop the review backend

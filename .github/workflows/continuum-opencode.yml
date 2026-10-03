@@ -1050,21 +1050,78 @@ jobs:
               { owner, repo, pull_number: pullNumber, per_page: 100 }
             );
             // Provider-owned verification: CodeRabbit uses thread replies to
-            // coderabbitai[bot] findings; PR-Agent uses /verify replies to its
-            // own inline findings. The generic controller only routes; the
-            // native comment semantics stay inside each adapter branch.
+            // coderabbitai[bot] findings; PR-Agent selects exact normalized
+            // finding ids from the provider-owned pr-agent-review-state:v1
+            // instance for this head. Replies and unrelated comments are
+            // always excluded and provider/head correlation is enforced, so
+            // an arbitrary comment can never be mistaken for a finding.
             const isCodeRabbit = provider === 'coderabbit';
-            const botLogin = isCodeRabbit ? 'coderabbitai[bot]' : context.repo.owner;
-            const findings = comments.filter((comment) => {
-              if (isCodeRabbit) {
-                return String(comment.pull_request_review_id) === reviewId &&
-                  comment.user?.login === 'coderabbitai[bot]' &&
-                  !comment.in_reply_to_id;
+            const providerOwned = (login) =>
+              login === owner || login === 'github-actions[bot]' || login === 'github-actions';
+            let findings = [];
+            if (isCodeRabbit) {
+              findings = comments.filter((comment) =>
+                String(comment.pull_request_review_id) === reviewId &&
+                comment.user?.login === 'coderabbitai[bot]' &&
+                !comment.in_reply_to_id
+              );
+            } else {
+              const issueComments = await github.paginate(
+                github.rest.issues.listComments,
+                { owner, repo, issue_number: pullNumber, per_page: 100 }
+              );
+              const stateRe = /<!--\s*pr-agent-review-state:v1\s*\n([\s\S]*?)-->/g;
+              let state = null;
+              for (const comment of issueComments) {
+                if (!providerOwned(comment.user?.login)) continue;
+                stateRe.lastIndex = 0;
+                let match = null;
+                while ((match = stateRe.exec(comment.body || '')) !== null) {
+                  try {
+                    const parsed = JSON.parse(match[1]);
+                    const parsedId = String(
+                      parsed.review_id || parsed.review_instance_id || parsed.instance_id ||
+                      parsed.reviewed_sha || parsed.head_sha || parsed.head || ''
+                    );
+                    const parsedHead = String(
+                      parsed.reviewed_sha || parsed.head_sha || parsed.head || parsed.sha || ''
+                    ).toLowerCase();
+                    if (String(parsed.provider || 'pr-agent').toLowerCase() !== 'pr-agent') continue;
+                    if (parsedHead !== String(headSha).toLowerCase()) continue;
+                    if (parsedId !== String(reviewId) &&
+                        String(parsed.reviewed_sha || '') !== String(reviewId)) continue;
+                    state = parsed;
+                  } catch (err) {
+                    core.setFailed(`PR-Agent review state is not valid JSON: ${err.message}`);
+                    return;
+                  }
+                }
               }
-              return String(comment.pull_request_review_id || comment.id) === reviewId ||
-                (comment.body || '').includes(`finding=${reviewId}`) ||
-                (comment.body || '').includes(reviewId);
-            });
+              if (!state) {
+                core.setFailed(
+                  `No provider-owned PR-Agent state for review ${reviewId} at exact HEAD ${headSha}; verification is rejected.`
+                );
+                return;
+              }
+              const ACTIVE = new Set(['ACTIVE', 'OPEN', 'UNRESOLVED']);
+              const activeIds = new Set(
+                (Array.isArray(state.findings) ? state.findings : [])
+                  .filter((item) => ACTIVE.has(String(item?.status || 'ACTIVE').toUpperCase()))
+                  .map((item) => String(item?.id || ''))
+                  .filter(Boolean)
+              );
+              // There are no PR-Agent inline threads on this path; the
+              // normalized ACTIVE ids are the verification set. Any matching
+              // provider-owned thread is verified, otherwise verification is
+              // recorded against the normalized ids without inventing threads.
+              const threads = comments.filter((comment) => {
+                if (comment.in_reply_to_id) return false;
+                if (!providerOwned(comment.user?.login)) return false;
+                const tokens = String(comment.body || '').match(/finding=([A-Za-z0-9_-]+)/g) || [];
+                return tokens.some((token) => activeIds.has(token.split('=')[1]));
+              });
+              findings = threads.length > 0 ? threads : [...activeIds].map((id) => ({ id, synthetic: true }));
+            }
             let requested = 0;
             if (findings.length === 0) {
               core.notice(
@@ -1099,10 +1156,27 @@ jobs:
                 'Reply with **RESOLVED** only if the underlying issue is fully fixed.',
                 'Otherwise reply with **UNRESOLVED** and state exactly what remains.',
               ].join('\n');
-              await github.request(
-                'POST /repos/{owner}/{repo}/pulls/{pull_number}/comments/{comment_id}/replies',
-                { owner, repo, pull_number: pullNumber, comment_id: finding.id, body }
-              );
+              if (!isCodeRabbit && finding.synthetic) {
+                // PR-Agent findings live in provider-owned state, not inline
+                // threads: record the verification request as a correlated
+                // issue comment instead of inventing a thread.
+                const issueComments = await github.paginate(
+                  github.rest.issues.listComments,
+                  { owner, repo, issue_number: pullNumber, per_page: 100 }
+                );
+                if (issueComments.some((comment) => (comment.body || '').includes(marker))) {
+                  core.info(`Verification already requested for finding ${finding.id} at ${headSha}.`);
+                  continue;
+                }
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: pullNumber, body,
+                });
+              } else {
+                await github.request(
+                  'POST /repos/{owner}/{repo}/pulls/{pull_number}/comments/{comment_id}/replies',
+                  { owner, repo, pull_number: pullNumber, comment_id: finding.id, body }
+                );
+              }
               requested += 1;
             }
             core.notice(

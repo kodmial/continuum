@@ -397,6 +397,377 @@ def pr_agent_findings_from_text(
     ]
 
 
+# -- Adapter: PR-Agent persistent state block -> normalized payload -------------
+#
+# Live defect oracle (#186): the OpenCode-backed PR-Agent backend does NOT
+# emit its findings as GitHub inline review comments. It emits them in the
+# persistent ``PR Reviewer Guide`` issue comment inside a machine-readable
+# block::
+#
+#     <!-- pr-agent-review-state:v1
+#     {...}
+#     -->
+#
+# PR #185 had zero review submissions and zero inline findings while the
+# state block carried six ACTIVE findings, so an adapter that counts inline
+# comments false-approves a review with real findings. The functions below
+# are the deterministic oracle the workflow adapters mirror: parse only
+# provider-owned state for the exact reviewed HEAD, fail closed on
+# incomplete/partial coverage, ignore arbitrary human/other-bot comments,
+# batch completely without silent loss, and validate privileged triggers.
+
+PR_AGENT_STATE_MARKER = "pr-agent-review-state:v1"
+PR_AGENT_STATE_RE = re.compile(
+    r"<!--\s*pr-agent-review-state:v1\s*\n(?P<json>.*?)-->",
+    re.DOTALL,
+)
+_HEX40_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
+ACTIVE_FINDING_STATUSES = ("ACTIVE", "OPEN", "UNRESOLVED")
+RESOLVED_FINDING_STATUSES = ("RESOLVED", "FIXED", "DISMISSED", "DONE")
+PR_AGENT_BLOCKING_SEVERITIES = ("blocker", "critical", "high")
+MAX_FINDINGS_PER_DISPATCH = 50
+MAX_DISPATCH_BATCHES = 10
+
+
+def extract_pr_agent_state_blocks(body: str) -> List[str]:
+    """Return every raw ``pr-agent-review-state:v1`` JSON payload in a body."""
+
+    if not body or PR_AGENT_STATE_MARKER not in body:
+        return []
+    return [
+        match.group("json").strip()
+        for match in PR_AGENT_STATE_RE.finditer(body)
+    ]
+
+
+def parse_pr_agent_state_block(raw: str) -> Dict[str, Any]:
+    """Parse one raw state payload, failing closed on malformed JSON."""
+
+    try:
+        parsed = __import__("json").loads(raw)
+    except Exception as exc:
+        raise ReviewRoutingError(
+            f"PR-Agent review state is not valid JSON: {exc}"
+        ) from None
+    if not isinstance(parsed, dict):
+        raise ReviewRoutingError("PR-Agent review state must be a JSON object")
+    return parsed
+
+
+def _state_head(state: Mapping[str, Any]) -> str:
+    for key in ("reviewed_sha", "head_sha", "head", "sha", "commit"):
+        value = state.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    last_run = state.get("last_run")
+    if isinstance(last_run, dict):
+        for key in ("reviewed_sha", "head_sha", "head", "sha"):
+            value = last_run.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
+def _state_review_id(state: Mapping[str, Any]) -> str:
+    for key in ("review_id", "review_instance_id", "instance_id", "id"):
+        value = state.get(key)
+        if isinstance(value, (str, int)) and str(value).strip():
+            return str(value).strip()
+    return _state_head(state)
+
+
+def _state_provider(state: Mapping[str, Any]) -> str:
+    provider = state.get("provider", "pr-agent")
+    return str(provider or "pr-agent").strip().lower()
+
+
+def is_pr_agent_state_complete(state: Mapping[str, Any]) -> bool:
+    """Whether a state block represents a complete review (fail-closed gate)."""
+
+    if not isinstance(state, dict):
+        return False
+    last_run = state.get("last_run")
+    if isinstance(last_run, dict) and "complete" in last_run:
+        if not last_run.get("complete") is True:
+            return False
+    elif "complete" in state:
+        if not state.get("complete") is True:
+            return False
+    coverage = state.get("coverage")
+    if isinstance(coverage, dict) and ("reviewed" in coverage or "total" in coverage):
+        try:
+            reviewed = int(coverage.get("reviewed", 0))
+            total = int(coverage.get("total", 0))
+        except (TypeError, ValueError):
+            return False
+        if total <= 0 or reviewed < total:
+            return False
+    return True
+
+
+def pr_agent_state_active_findings(
+    state: Mapping[str, Any],
+) -> List[NormalizedFinding]:
+    """ACTIVE findings from provider-owned state (resolved ones excluded)."""
+
+    raw_findings = state.get("findings", [])
+    if not isinstance(raw_findings, list):
+        raise ReviewRoutingError("PR-Agent review state findings must be a list")
+    active: List[NormalizedFinding] = []
+    for entry in raw_findings:
+        if not isinstance(entry, dict):
+            raise ReviewRoutingError("PR-Agent review state finding must be an object")
+        status = str(entry.get("status", "ACTIVE") or "ACTIVE").strip().upper()
+        if status in RESOLVED_FINDING_STATUSES:
+            continue
+        if status not in ACTIVE_FINDING_STATUSES:
+            raise ReviewRoutingError(
+                f"PR-Agent review state has unknown finding status {status!r}: failing closed"
+            )
+        path = str(entry.get("path", "") or "")
+        try:
+            line = int(entry.get("line", 0) or 0)
+        except (TypeError, ValueError):
+            line = 0
+        severity = str(entry.get("severity", "") or "high").strip().lower()
+        rule = str(entry.get("rule", "") or entry.get("id", "") or summary_fallback(entry))
+        finding_id = str(entry.get("id", "") or "").strip()
+        if not finding_id:
+            finding_id = stable_finding_id(PROVIDER_PR_AGENT, path, line, rule or path)
+        summary = str(entry.get("summary", "") or entry.get("title", "") or rule)
+        active.append(
+            NormalizedFinding(
+                id=finding_id,
+                path=path,
+                line=line,
+                severity=severity,
+                summary=summary[:500],
+                body=summary,
+            )
+        )
+    return active
+
+
+def summary_fallback(entry: Mapping[str, Any]) -> str:
+    return str(entry.get("summary", "") or entry.get("title", "") or entry.get("rule", "") or "")
+
+
+def select_pr_agent_state_for_head(
+    bodies: Sequence[str],
+    head_sha: str,
+) -> Optional[Dict[str, Any]]:
+    """Select the latest provider-owned state block for the exact HEAD.
+
+    ``bodies`` are comment bodies in chronological order (oldest first);
+    the last exact-head state wins. Blocks from other heads are stale and
+    never selected, so an old-head ACTIVE set cannot block a newly clean
+    current HEAD.
+    """
+
+    selected: Optional[Dict[str, Any]] = None
+    for body in bodies or []:
+        for raw in extract_pr_agent_state_blocks(body or ""):
+            try:
+                state = parse_pr_agent_state_block(raw)
+            except ReviewRoutingError:
+                raise
+            if _state_provider(state) != PROVIDER_PR_AGENT:
+                continue
+            if not is_current_head(_state_head(state), head_sha):
+                continue
+            selected = state
+    return selected
+
+
+def is_valid_head_sha(value: object) -> bool:
+    return isinstance(value, str) and bool(_HEX40_RE.match(value.strip()))
+
+
+def pr_agent_state_to_payload(
+    pr_number: int,
+    state: Mapping[str, Any],
+    current_head_sha: str,
+) -> Optional[NormalizedRepairPayload]:
+    """Normalize one provider-owned state block (fail-closed on partial).
+
+    Returns ``None`` for a complete clean exact-head review (APPROVED, no
+    dispatch) or a stale head (rejected, never dispatched). Raises
+    :class:`ReviewRoutingError` when coverage is incomplete/partial/unknown
+    so the caller can fail closed instead of approving.
+    """
+
+    if _state_provider(state) != PROVIDER_PR_AGENT:
+        raise ReviewRoutingError("PR-Agent state provider must be pr-agent")
+    reviewed_sha = _state_head(state)
+    if not reviewed_sha or not is_current_head(reviewed_sha, current_head_sha):
+        return None
+    if not is_pr_agent_state_complete(state):
+        raise ReviewRoutingError(
+            "PR-Agent review state is incomplete or partial: failing closed"
+        )
+    active = pr_agent_state_active_findings(state)
+    if not active:
+        return None
+    ordered = tuple(sorted(active, key=lambda item: item.id))
+    return NormalizedRepairPayload(
+        provider=PROVIDER_PR_AGENT,
+        pr_number=int(pr_number),
+        review_id=_state_review_id(state) or reviewed_sha,
+        reviewed_sha=reviewed_sha,
+        head_sha=current_head_sha,
+        findings=ordered,
+        verification="pr-agent-verify",
+    )
+
+
+def pr_agent_state_verdict(
+    state: Optional[Mapping[str, Any]],
+    current_head_sha: str,
+) -> str:
+    """Normalized review verdict from provider-owned state.
+
+    ``APPROVED`` only for a complete clean exact-head review; every other
+    shape (missing, stale, incomplete, ACTIVE findings) is
+    ``CHANGES_REQUESTED`` or ``STALE``/fail-closed and must never read green.
+    """
+
+    if state is None:
+        return "STALE"
+    reviewed_sha = _state_head(state)
+    if not is_current_head(reviewed_sha, current_head_sha):
+        return "STALE"
+    if not is_pr_agent_state_complete(state):
+        return "CHANGES_REQUESTED"
+    active = pr_agent_state_active_findings(state)
+    blocking = [
+        finding
+        for finding in active
+        if finding.severity.lower() in PR_AGENT_BLOCKING_SEVERITIES
+        or not finding.severity
+    ]
+    # Any ACTIVE finding blocks: unknown/empty severity fails closed too.
+    actionable = blocking if blocking else active
+    return "CHANGES_REQUESTED" if actionable else "APPROVED"
+
+
+def batch_normalized_findings(
+    findings: Sequence[NormalizedFinding],
+    per_batch: int = MAX_FINDINGS_PER_DISPATCH,
+) -> List[Tuple[NormalizedFinding, ...]]:
+    """Split findings into bounded complete batches (no silent loss)."""
+
+    items = list(findings or [])
+    if not items:
+        raise ReviewRoutingError("cannot batch an empty finding set")
+    if per_batch <= 0:
+        raise ReviewRoutingError("batch size must be positive")
+    batches = [
+        tuple(items[index : index + per_batch])
+        for index in range(0, len(items), per_batch)
+    ]
+    if len(batches) > MAX_DISPATCH_BATCHES:
+        raise ReviewRoutingError(
+            f"PR-Agent finding set needs {len(batches)} batches: failing closed"
+        )
+    # Completeness proof: every finding appears exactly once.
+    flattened = [finding.id for batch in batches for finding in batch]
+    if sorted(flattened) != sorted(finding.id for finding in items):
+        raise ReviewRoutingError("finding batch coverage is incomplete: failing closed")
+    return batches
+
+
+def is_provider_owned_login(login: object, repo_owner: str) -> bool:
+    """Whether a comment author is provider-owned (never an arbitrary user)."""
+
+    if not isinstance(login, str) or not login.strip():
+        return False
+    text = login.strip()
+    return text == repo_owner or text in (
+        "github-actions[bot]",
+        "github-actions",
+    )
+
+
+def validate_pr_agent_trigger(
+    unresolved_author: str,
+    verification_author: str,
+    repo_owner: str,
+    finding_id: str,
+    state: Optional[Mapping[str, Any]],
+    current_head_sha: str,
+) -> bool:
+    """Deterministic privileged-trigger gate for UNRESOLVED re-entry.
+
+    All of these must hold before a repair dispatch: the verification
+    request is provider-owned, the UNRESOLVED reply is provider-owned (an
+    arbitrary human reply can never trigger privileged repair), the
+    finding identity exists in the provider-owned ACTIVE set for the
+    exact current HEAD, and the state head correlates.
+    """
+
+    if not is_provider_owned_login(verification_author, repo_owner):
+        return False
+    if not is_provider_owned_login(unresolved_author, repo_owner):
+        return False
+    if state is None:
+        return False
+    if not is_current_head(_state_head(state), current_head_sha):
+        return False
+    if not is_pr_agent_state_complete(state):
+        return False
+    try:
+        active_ids = {finding.id for finding in pr_agent_state_active_findings(state)}
+    except ReviewRoutingError:
+        return False
+    return str(finding_id or "").strip() in active_ids
+
+
+def select_verification_findings(
+    state: Mapping[str, Any],
+    comments: Sequence[Mapping[str, Any]],
+    head_sha: str,
+    repo_owner: str,
+) -> List[Mapping[str, Any]]:
+    """Select exact normalized finding threads for verification.
+
+    Only provider-owned top-level comments whose normalized finding id is
+    in the provider-owned ACTIVE set for the exact HEAD are returned.
+    Replies and unrelated comments are always excluded.
+    """
+
+    try:
+        active_ids = {finding.id for finding in pr_agent_state_active_findings(state)}
+    except ReviewRoutingError:
+        return []
+    if not is_current_head(_state_head(state), head_sha):
+        return []
+    selected: List[Mapping[str, Any]] = []
+    for comment in comments or []:
+        if comment.get("in_reply_to_id"):
+            continue
+        if not is_provider_owned_login(comment.get("user", {}).get("login")
+                                        if isinstance(comment.get("user"), dict)
+                                        else comment.get("user_login", ""), repo_owner):
+            # Fall back to explicit login field used by tests.
+            login = ""
+            user = comment.get("user")
+            if isinstance(user, dict):
+                login = str(user.get("login", "") or "")
+            elif isinstance(comment.get("user_login"), str):
+                login = str(comment.get("user_login") or "")
+            else:
+                login = str(comment.get("author", "") or "")
+            if not is_provider_owned_login(login, repo_owner):
+                continue
+        candidate = str(comment.get("finding_id", "") or comment.get("id", "") or "")
+        # Tests and live threads identify findings by stable id; accept the
+        # explicit normalized id or a body-embedded `finding=<id>` token.
+        body_ids = re.findall(r"finding=([A-Za-z0-9_-]+)", str(comment.get("body", "") or ""))
+        if candidate in active_ids or any(token in active_ids for token in body_ids):
+            selected.append(comment)
+    return selected
+
+
 # -- Generic repair controller -------------------------------------------------
 
 
@@ -563,10 +934,17 @@ def describe_provider_transport(provider: str) -> Dict[str, str]:
 
 
 __all__ = [
+    "ACTIVE_FINDING_STATUSES",
     "LEGACY_CODERABBIT_FIX_MODE",
     "LEGACY_PR_AGENT_ENABLED_VAR",
     "LEGACY_REQUIRE_CODERABBIT_VAR",
+    "MAX_DISPATCH_BATCHES",
+    "MAX_FINDINGS_PER_DISPATCH",
     "MAX_REPAIR_ATTEMPTS",
+    "PR_AGENT_BLOCKING_SEVERITIES",
+    "PR_AGENT_STATE_MARKER",
+    "PR_AGENT_STATE_RE",
+    "RESOLVED_FINDING_STATUSES",
     "REVIEW_FIX_MODE",
     "REVIEW_PROVIDER_ENV_VAR",
     "MergeGate",
@@ -576,6 +954,7 @@ __all__ = [
     "CodeRabbitClassification",
     "ReviewRoutingError",
     "active_provider",
+    "batch_normalized_findings",
     "bounded_retry",
     "classify_coderabbit_review",
     "classify_retry",
@@ -583,17 +962,28 @@ __all__ = [
     "coderabbit_review_to_payload",
     "describe_provider_transport",
     "dispatch_key",
+    "extract_pr_agent_state_blocks",
     "is_current_head",
+    "is_pr_agent_state_complete",
+    "is_provider_owned_login",
+    "is_valid_head_sha",
     "normalized_merge_gate",
     "normalize_provider",
+    "parse_pr_agent_state_block",
     "pr_agent_findings_from_text",
     "pr_agent_review_to_payload",
+    "pr_agent_state_active_findings",
+    "pr_agent_state_to_payload",
+    "pr_agent_state_verdict",
     "require_single_provider",
     "resolve_review_provider",
     "resolve_review_provider_from_env",
     "review_fix_prompt",
     "same_head_no_progress",
+    "select_pr_agent_state_for_head",
+    "select_verification_findings",
     "should_dispatch_repair",
     "stable_finding_id",
+    "validate_pr_agent_trigger",
     "verification_verdict",
 ]

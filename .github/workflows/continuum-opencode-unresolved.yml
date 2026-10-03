@@ -38,6 +38,7 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           FINDING_ID: ${{ github.event.comment.in_reply_to_id }}
           UNRESOLVED_COMMENT_ID: ${{ github.event.comment.id }}
+          UNRESOLVED_AUTHOR: ${{ github.event.comment.user.login }}
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           REPO_OWNER: ${{ github.repository_owner }}
@@ -50,6 +51,11 @@ jobs:
           # harmless if the branch has already advanced. Both the legacy
           # CodeRabbit marker and the generic review-verification marker are
           # accepted; the provider is derived from whichever marker matched.
+          # Privilege gate: an arbitrary user replying UNRESOLVED must never
+          # trigger privileged repair. The verification request must be
+          # provider-owned, the UNRESOLVED reply must be provider-owned for
+          # the matched provider, and the finding identity plus head must
+          # correlate to provider-owned review state.
           COMMENTS=$(gh api --paginate --slurp \
             "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/comments?per_page=100")
 
@@ -94,6 +100,75 @@ jobs:
             exit 1
           fi
 
+          # Author allowlist per provider: CodeRabbit UNRESOLVED replies are
+          # authored by coderabbitai[bot]; PR-Agent UNRESOLVED verdicts are
+          # authored by the repository owner identity or github-actions[bot].
+          # Anything else is an unprivileged human/other-bot reply and never
+          # dispatches repair.
+          if [[ "$PROVIDER" == "coderabbit" ]]; then
+            if [[ "$UNRESOLVED_AUTHOR" != "coderabbitai[bot]" ]]; then
+              echo "UNRESOLVED reply $UNRESOLVED_COMMENT_ID authored by '$UNRESOLVED_AUTHOR' is not coderabbitai[bot]; ignoring."
+              echo "dispatch=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          else
+            if [[ "$UNRESOLVED_AUTHOR" != "$REPO_OWNER" && "$UNRESOLVED_AUTHOR" != "github-actions[bot]" && "$UNRESOLVED_AUTHOR" != "github-actions" ]]; then
+              echo "UNRESOLVED reply $UNRESOLVED_COMMENT_ID authored by '$UNRESOLVED_AUTHOR' is not provider-owned; ignoring."
+              echo "dispatch=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            # Finding-identity correlation: the finding must exist in the
+            # provider-owned pr-agent-review-state:v1 ACTIVE set for the
+            # exact current HEAD. Stale or unknown ids are rejected.
+            ISSUE_COMMENTS=$(gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100")
+            STATE_JSON=$(jq -r \
+              --arg head "$HEAD_SHA" \
+              --arg review "$REVIEW_ID" '
+                [.[] | select(.user.login == env.REPO_OWNER or .user.login == "github-actions[bot]")
+                 | .body | scan("<!--\\s*pr-agent-review-state:v1\\s*\\n([\\s\\S]*?)-->") | .[0]]
+                | last // empty
+              ' <<<"$ISSUE_COMMENTS")
+            if [[ -z "$STATE_JSON" ]]; then
+              echo "No provider-owned pr-agent-review-state:v1 for HEAD $HEAD_SHA; ignoring."
+              echo "dispatch=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if ! jq -e \
+              --arg finding "$FINDING_ID" \
+              --arg head "$HEAD_SHA" \
+              --arg review "$REVIEW_ID" '
+                (.provider // "pr-agent" == "pr-agent")
+                and (((.reviewed_sha // .head_sha // .head // "") | ascii_downcase) == ($head | ascii_downcase))
+                and (((.review_id // .review_instance_id // .instance_id // .reviewed_sha // "") == $review)
+                     or ((.reviewed_sha // "") == $review))
+                and ([.findings[]? | select((.status // "ACTIVE" | ascii_upcase) as $s
+                     | ["ACTIVE","OPEN","UNRESOLVED"] | index($s))
+                     | (.id | tostring)] | index($finding))
+              ' <<<"$STATE_JSON" >/dev/null; then
+              echo "Finding $FINDING_ID is not an ACTIVE provider-owned finding for review $REVIEW_ID at HEAD $HEAD_SHA; ignoring."
+              echo "dispatch=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            # Exact normalized unresolved finding set for this review/head:
+            # every ACTIVE finding in provider-owned state (bounded, complete).
+            FINDINGS_JSON=$(jq -c \
+              --arg head "$HEAD_SHA" '
+                [.findings[]?
+                 | select((.status // "ACTIVE" | ascii_upcase) as $s
+                   | ["ACTIVE","OPEN","UNRESOLVED"] | index($s))
+                 | {id: (.id | tostring), path: (.path // ""),
+                    line: (.line // 0),
+                    severity: (.severity // "high"),
+                    summary: (.summary // .title // .rule // (.id | tostring))}]
+              ' <<<"$STATE_JSON")
+            if [[ -z "$FINDINGS_JSON" || "$FINDINGS_JSON" == "[]" ]]; then
+              echo "::error::Refusing empty findings_json repair dispatch."
+              exit 1
+            fi
+            echo "findings_json=$FINDINGS_JSON" >> "$GITHUB_OUTPUT"
+          fi
+
           echo "dispatch=true" >> "$GITHUB_OUTPUT"
           echo "review_id=$REVIEW_ID" >> "$GITHUB_OUTPUT"
           echo "provider=$PROVIDER" >> "$GITHUB_OUTPUT"
@@ -109,6 +184,7 @@ jobs:
           REVIEW_ID: ${{ steps.context.outputs.review_id }}
           REVIEW_PROVIDER: ${{ steps.context.outputs.provider }}
           REVIEW_PROVIDER_VAR: ${{ vars.CONTINUUM_REVIEW_PROVIDER || '' }}
+          FINDINGS_JSON: ${{ steps.context.outputs.findings_json }}
         run: |
           set -euo pipefail
           # Bounded generic re-entry: the PR-Agent path uses the generic
@@ -119,6 +195,13 @@ jobs:
           # statically visible: every whitelisted mode must be dispatched by
           # a core workflow.
           if [[ "${REVIEW_PROVIDER:-}" == "pr-agent" ]]; then
+            # Empty retry is forbidden: the exact normalized unresolved
+            # finding set from provider-owned state travels with the
+            # dispatch; an empty findings_json never dispatches repair.
+            if [[ -z "${FINDINGS_JSON:-}" || "${FINDINGS_JSON:-}" == "[]" ]]; then
+              echo "::error::Refusing empty findings_json repair dispatch for PR-Agent review ${REVIEW_ID}."
+              exit 1
+            fi
             gh api --method POST \
               "repos/${GITHUB_REPOSITORY}/actions/workflows/continuum-opencode.yml/dispatches" \
               -f ref=main \
@@ -128,7 +211,8 @@ jobs:
               -f "inputs[review_id]=${REVIEW_ID}" \
               -f "inputs[review_provider]=${REVIEW_PROVIDER_VAR:-pr-agent}" \
               -f "inputs[reviewed_sha]=${HEAD_SHA}" \
-              -f "inputs[head_sha]=${HEAD_SHA}"
+              -f "inputs[head_sha]=${HEAD_SHA}" \
+              -f "inputs[findings_json]=${FINDINGS_JSON}"
           else
             gh api --method POST \
               "repos/${GITHUB_REPOSITORY}/actions/workflows/continuum-opencode.yml/dispatches" \

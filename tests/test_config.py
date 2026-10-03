@@ -283,8 +283,10 @@ class ConfigTests(unittest.TestCase):
             )
 
     def test_repository_configuration_is_valid(self):
+        # Issue #186: the checked-in qualification configuration selects
+        # the canonical PR-Agent provider explicitly.
         config = config_module.load_config(".continuum.yml")
-        self.assertEqual(config.review.provider, config_module.PROVIDER_NONE)
+        self.assertEqual(config.review.provider, config_module.PROVIDER_PR_AGENT)
         self.assertTrue(config.review.block_merge)
 
 
