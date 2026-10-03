@@ -833,6 +833,10 @@ jobs:
             );
 
             for (const workflow of postMergeWakeups) {
+              if (!/^[\w][\w.\-]*\.yml$/.test(workflow)) {
+                core.warning('PR #' + prNumber + ': skipping invalid post-merge wakeup: ' + workflow);
+                continue;
+              }
               try {
                 await github.request(
                   'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',

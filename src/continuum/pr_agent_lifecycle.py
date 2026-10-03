@@ -577,7 +577,15 @@ def retry_backoff_seconds(
         raise LifecycleError("retry attempt must be a non-negative integer")
     if attempt_number < 0:
         raise LifecycleError("retry attempt must be a non-negative integer")
-    return base * (1 << attempt_number)
+    try:
+        base_number = int(str(base).strip())
+    except (TypeError, ValueError):
+        raise LifecycleError("retry base must be a non-negative integer")
+    if base_number < 0:
+        raise LifecycleError("retry base must be a non-negative integer")
+    if attempt_number > 10:
+        raise LifecycleError("retry attempt out of bounded retry range")
+    return base_number * (1 << attempt_number)
 
 
 def resolve_dispatch_ref(default_branch: object, fallback: object = "main") -> str:
@@ -597,6 +605,10 @@ def resolve_dispatch_ref(default_branch: object, fallback: object = "main") -> s
     if name.endswith(("/", ".", ".lock")):
         return "main"
     if name in ("HEAD", "@"):
+        return "main"
+    if name.startswith(("refs/", "-", ".")):
+        return "main"
+    if any(part.startswith(".") or part.endswith(".lock") for part in name.split("/")):
         return "main"
     return name
 
