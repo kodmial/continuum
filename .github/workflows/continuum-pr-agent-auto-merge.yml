@@ -79,7 +79,7 @@ jobs:
     timeout-minutes: 10
 
     permissions:
-          contents: write
+      contents: write
       issues: write
       pull-requests: write
       statuses: read
