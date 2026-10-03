@@ -24,7 +24,10 @@ if [[ -n "$child_id" ]]; then
   )" || resolve_rc=$?
   if [[ "$resolve_rc" -ne 0 || -z "$target_repository" ]]; then
     echo "::error::PR-Agent delegated target resolution failed closed." >&2
-    exit "${resolve_rc:-2}"
+    if [[ "$resolve_rc" -eq 0 ]]; then
+      resolve_rc=2
+    fi
+    exit "$resolve_rc"
   fi
 
   if ! PARENT_CONFIG="${PARENT_CONFIG:-.continuum.yml}" \
