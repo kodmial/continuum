@@ -1306,5 +1306,118 @@ class RepairWiringRegressionTests(unittest.TestCase):
         self.assertIn('retry_attempt: "${{ inputs.retry_attempt }}"', caller)
 
 
+class RetryParityTests(unittest.TestCase):
+    """Deterministic parity baseline for the bounded retry/status contract.
+
+    Pins the shell/gh paths that otherwise risk silent retry storms, missed
+    exhaustion, or status drift: budget/exhaustion comment, backoff sleep,
+    exact-HEAD revalidation, retry_workflow allowlist, and durable
+    success/failure/cleared status transitions.
+    """
+
+    def test_retry_budget_and_exhaustion_comment_are_bounded(self):
+        for path in (
+            ".github/workflows/continuum-pr-agent.yml",
+            ".github/workflows/continuum-pr-agent-repair.yml",
+        ):
+            with self.subTest(path=path):
+                body = read_repo(path)
+                self.assertIn("attempt >= 2", body)
+                self.assertIn("continuum-pr-agent-retry-exhausted", body)
+                self.assertIn("exhausted the bounded retry budget", body)
+                self.assertIn("continuum-pr-agent-retry head=", body)
+
+    def test_retry_backoff_sleep_is_exponential(self):
+        for path in (
+            ".github/workflows/continuum-pr-agent.yml",
+            ".github/workflows/continuum-pr-agent-repair.yml",
+        ):
+            with self.subTest(path=path):
+                body = read_repo(path)
+                self.assertIn("15 * (1 << attempt)", body)
+                self.assertIn('sleep "$delay"', body)
+
+    def test_retry_revalidates_exact_head_before_dispatch(self):
+        for path in (
+            ".github/workflows/continuum-pr-agent.yml",
+            ".github/workflows/continuum-pr-agent-repair.yml",
+        ):
+            with self.subTest(path=path):
+                body = read_repo(path)
+                self.assertIn("expected_head_sha", body)
+                self.assertIn("headRefOid", body)
+                self.assertIn("PR state changed during", body)
+                self.assertIn("Could not revalidate exact-HEAD CI after backoff", body)
+                self.assertIn("Exact HEAD no longer has green CI", body)
+
+    def test_retry_ci_gate_uses_combined_status_plus_check_runs(self):
+        # Admission gates on the combined status; the retry must consult the
+        # same source and additionally accept an all-green check-run set so a
+        # Checks-green HEAD with no legacy statuses is not falsely cancelled.
+        for path in (
+            ".github/workflows/continuum-pr-agent.yml",
+            ".github/workflows/continuum-pr-agent-repair.yml",
+        ):
+            with self.subTest(path=path):
+                body = read_repo(path)
+                self.assertIn("commits/$HEAD_SHA/status", body)
+                self.assertIn("commits/$HEAD_SHA/check-runs", body)
+                self.assertIn("treating exact HEAD as CI-green", body)
+
+    def test_retry_workflow_target_is_allow_listed_in_shell_and_selector(self):
+        review = read_repo(".github/workflows/continuum-pr-agent.yml")
+        repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
+        self.assertIn("continuum-pr-agent.yml|pr-agent.yml", review)
+        self.assertIn("continuum-pr-agent.yml|pr-agent.yml", repair)
+        self.assertIn(
+            "['continuum-pr-agent.yml', 'pr-agent.yml'].includes(retryWorkflow)",
+            review,
+        )
+        self.assertIn('-f retry_workflow="$RETRY_WORKFLOW"', review)
+        self.assertIn('-f retry_workflow="$RETRY_WORKFLOW"', repair)
+
+    def test_durable_review_status_transitions_cover_pending_success_failure(self):
+        body = read_repo(".github/workflows/continuum-pr-agent.yml")
+        self.assertIn("Mark PR-Agent review in flight", body)
+        self.assertIn("continuum/pr-agent-review", body)
+        self.assertIn("PR-Agent review complete: actionable", body)
+        self.assertIn("PR-Agent review complete: clean", body)
+        self.assertIn("PR-Agent review failed; recovery eligible", body)
+
+    def test_stale_in_flight_status_is_cleared_on_cancel_or_early_exit(self):
+        review = read_repo(".github/workflows/continuum-pr-agent.yml")
+        self.assertIn("Clear stale in-flight PR-Agent review state", review)
+        self.assertIn("publish_success.outcome != 'success'", review)
+        self.assertIn("publish_failure.outcome != 'success'", review)
+        self.assertIn("PR-Agent review did not complete", review)
+        repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
+        self.assertIn("Clear stale in-flight PR-Agent repair state", repair)
+        self.assertIn("PR-Agent repair did not complete", repair)
+
+    def test_caller_concurrency_survives_empty_pull_requests_list(self):
+        for path in (
+            ".github/workflows/pr-agent.yml",
+            ".github/caller-stubs/continuum-pr-agent.yml",
+        ):
+            with self.subTest(path=path):
+                body = read_repo(path)
+                self.assertIn("workflow_run.head_branch", body)
+                self.assertIn("workflow_run.head_sha", body)
+                self.assertIn("cancel-in-progress: false", body)
+
+    def test_conflict_lock_acquisition_is_failure_safe(self):
+        merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
+        self.assertIn("let attemptComment = null", merge)
+        self.assertIn("if (attemptComment)", merge)
+        self.assertLess(
+            merge.index("addLabels"),
+            merge.index("actions/workflows/{workflow_id}/dispatches"),
+        )
+        self.assertLess(
+            merge.index("createComment"),
+            merge.index("actions/workflows/{workflow_id}/dispatches"),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

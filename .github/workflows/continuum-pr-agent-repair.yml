@@ -418,6 +418,7 @@ jobs:
           echo "Pushed one bounded repair to refs/heads/$HEAD_REF for PR #$PR_NUMBER."
 
       - name: Publish durable PR-Agent repair state
+        id: publish_repair_success
         if: steps.repair_status.outcome == 'success' && steps.repair_pass.outcome == 'success'
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
@@ -438,6 +439,7 @@ jobs:
             });
 
       - name: Publish failed PR-Agent repair state
+        id: publish_repair_failure
         if: failure() && steps.repair_status.outcome == 'success'
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
@@ -452,6 +454,33 @@ jobs:
               state: 'failure',
               context: 'continuum/pr-agent-repair',
               description: 'PR-Agent repair failed; recovery eligible',
+              target_url:
+                context.serverUrl + '/' + context.repo.owner + '/' +
+                context.repo.repo + '/actions/runs/' + context.runId,
+            });
+
+      - name: Clear stale in-flight PR-Agent repair state
+        id: publish_repair_cleared
+        if: >-
+          always() &&
+          steps.repair_status.outcome == 'success' &&
+          steps.publish_repair_success.outcome != 'success' &&
+          steps.publish_repair_failure.outcome != 'success'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          HEAD_SHA: ${{ inputs.head_sha }}
+        with:
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            // Same dangling-pending guard as the review workflow: a
+            // cancelled or early-exited repair must not leave pending behind.
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: process.env.HEAD_SHA,
+              state: 'failure',
+              context: 'continuum/pr-agent-repair',
+              description: 'PR-Agent repair did not complete; recovery eligible',
               target_url:
                 context.serverUrl + '/' + context.repo.owner + '/' +
                 context.repo.repo + '/actions/runs/' + context.runId,
@@ -515,13 +544,24 @@ jobs:
             echo "PR state changed during repair retry backoff; stale retry cancelled."
             exit 0
           fi
+          # Same dual-source exact-HEAD CI gate as the review retry:
+          # combined status (admission source) plus completed check-runs
+          # (merge-gate source), so a Checks-green HEAD with no legacy
+          # statuses is not falsely cancelled.
           if ! combined="$(gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/status" --jq .state)"; then
             echo "Could not revalidate exact-HEAD CI after backoff; stale retry cancelled."
             exit 0
           fi
           if [[ "$combined" != "success" ]]; then
-            echo "Exact HEAD no longer has green CI; retry cancelled until a fresh CI event."
-            exit 0
+            check_summary="$(gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/check-runs" --jq '[.check_runs[] | select(.status == "completed")] | "\([length]) \([map(select(.conclusion != "success" and .conclusion != "neutral" and .conclusion != "skipped")) | length])"' 2>/dev/null || echo "")"
+            check_total="$(awk '{print $1}' <<<"$check_summary")"
+            check_failed="$(awk '{print $2}' <<<"$check_summary")"
+            if [[ "$check_total" =~ ^[0-9]+$ && "$check_failed" == "0" && "$check_total" != "0" ]]; then
+              echo "Combined status is $combined but all $check_total completed check-runs are green; treating exact HEAD as CI-green (Checks parity)."
+            else
+              echo "Exact HEAD no longer has green CI; retry cancelled until a fresh CI event."
+              exit 0
+            fi
           fi
 
           DEFAULT_BRANCH="$(gh repo view "$GITHUB_REPOSITORY" --json defaultBranchRef --jq .defaultBranchRef.name 2>/dev/null || echo main)"

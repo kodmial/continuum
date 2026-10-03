@@ -559,31 +559,34 @@ jobs:
                 return;
               }
 
-              await github.rest.issues.addLabels({
-                owner,
-                repo,
-                issue_number: prNumber,
-                labels: [CONFLICT_LOCK_LABEL],
-              });
               // Task-replay record: the repair run merges the default branch
               // into this exact HEAD and preserves intent from both sides; it
               // never redoes the original task. The marker bounds retries and
               // carries the replay coordinates (HEAD, base, reason) so a timed
               // out episode can be replaced from evidence instead of rerun.
-              const attemptComment = await github.rest.issues.createComment({
-                owner,
-                repo,
-                issue_number: prNumber,
-                body: [
-                  attemptMarker,
-                  'Automatic OpenCode conflict repair, attempt 1/1 for HEAD `' +
-                    fresh.head.sha + '` (base `' + defaultBranch + '`, reason: ' +
-                    reason + '). Scope is merge-conflict resolution only; ' +
-                    'the repair merges the base into the PR branch and preserves ' +
-                    'intent from both sides without redoing the original task.',
-                ].join('\n'),
-              });
+              // Lock acquisition lives inside the dispatch try so a marker
+              // failure cannot strand the label without its attempt record.
+              let attemptComment = null;
               try {
+                await github.rest.issues.addLabels({
+                  owner,
+                  repo,
+                  issue_number: prNumber,
+                  labels: [CONFLICT_LOCK_LABEL],
+                });
+                attemptComment = await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: prNumber,
+                  body: [
+                    attemptMarker,
+                    'Automatic OpenCode conflict repair, attempt 1/1 for HEAD `' +
+                      fresh.head.sha + '` (base `' + defaultBranch + '`, reason: ' +
+                      reason + '). Scope is merge-conflict resolution only; ' +
+                      'the repair merges the base into the PR branch and preserves ' +
+                      'intent from both sides without redoing the original task.',
+                  ].join('\n'),
+                });
                 await github.request(
                   'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
                   {
@@ -604,18 +607,20 @@ jobs:
                   'PR #' + prNumber + ': dispatched OpenCode conflict repair (' + reason + ').'
                 );
               } catch (err) {
-                try {
-                  await github.rest.issues.deleteComment({
-                    owner,
-                    repo,
-                    comment_id: attemptComment.data.id,
-                  });
-                } catch (cleanupErr) {
-                  core.warning(
-                    'PR #' + prNumber +
-                    ': failed to remove uncommitted conflict-attempt marker: ' +
-                    (cleanupErr.message || cleanupErr)
-                  );
+                if (attemptComment) {
+                  try {
+                    await github.rest.issues.deleteComment({
+                      owner,
+                      repo,
+                      comment_id: attemptComment.data.id,
+                    });
+                  } catch (cleanupErr) {
+                    core.warning(
+                      'PR #' + prNumber +
+                      ': failed to remove uncommitted conflict-attempt marker: ' +
+                      (cleanupErr.message || cleanupErr)
+                    );
+                  }
                 }
                 await releaseConflictLock();
                 throw err;

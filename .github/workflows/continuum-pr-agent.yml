@@ -279,7 +279,10 @@ jobs:
             }
             // Exact-current-HEAD CI must be green before review. The combined
             // status for the exact HEAD is the gate; a non-green HEAD never
-            // reaches upstream review.
+            // reaches upstream review. The bounded retry revalidates this
+            // same combined-status source and additionally accepts an
+            // all-green completed check-run set, so a Checks-green HEAD with
+            // no legacy statuses is not cancelled as stale.
             const { data: combined } = await github.rest.repos.getCombinedStatusForRef({
               owner: context.repo.owner, repo: context.repo.repo, ref: headSha,
             });
@@ -698,6 +701,7 @@ jobs:
             );
 
       - name: Publish durable PR-Agent review state
+        id: publish_success
         if: steps.route.outcome == 'success' && steps.result.outputs.head_sha
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
@@ -722,6 +726,7 @@ jobs:
             });
 
       - name: Publish failed PR-Agent review state
+        id: publish_failure
         if: >-
           failure() &&
           steps.stack.outputs.enabled == 'true' &&
@@ -740,6 +745,38 @@ jobs:
               state: 'failure',
               context: 'continuum/pr-agent-review',
               description: 'PR-Agent review failed; recovery eligible',
+              target_url:
+                context.serverUrl + '/' + context.repo.owner + '/' +
+                context.repo.repo + '/actions/runs/' + context.runId,
+            });
+
+      - name: Clear stale in-flight PR-Agent review state
+        id: publish_cleared
+        if: >-
+          always() &&
+          steps.stack.outputs.enabled == 'true' &&
+          steps.admit.outputs.admitted == 'true' &&
+          steps.admit.outputs.head_sha &&
+          steps.publish_success.outcome != 'success' &&
+          steps.publish_failure.outcome != 'success'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          HEAD_SHA: ${{ steps.admit.outputs.head_sha }}
+        with:
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            // The in-flight pending status is posted at admission. Success
+            // clears it on the reviewed HEAD and failure clears it on the
+            // admitted HEAD, but neither runs on cancellation, skipped
+            // admission follow-ups, or early exits. Without this clearer the
+            // pending context dangles and can block the PR if ever required.
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: process.env.HEAD_SHA,
+              state: 'failure',
+              context: 'continuum/pr-agent-review',
+              description: 'PR-Agent review did not complete; recovery eligible',
               target_url:
                 context.serverUrl + '/' + context.repo.owner + '/' +
                 context.repo.repo + '/actions/runs/' + context.runId,
@@ -838,13 +875,27 @@ jobs:
             echo "PR state changed during retry backoff; stale retry cancelled."
             exit 0
           fi
+          # Exact-HEAD CI revalidation uses the same combined-status source
+          # as admission (getCombinedStatusForRef is GET
+          # repos/{owner}/{repo}/commits/{ref}/status) plus the check-run
+          # source used by the merge gate. A HEAD that is green via Checks
+          # but carries no legacy statuses reports pending on the combined
+          # endpoint; consulting check-runs keeps the retry from cancelling
+          # a HEAD the admission gate already qualified.
           if ! combined="$(gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/status" --jq .state)"; then
             echo "Could not revalidate exact-HEAD CI after backoff; stale retry cancelled."
             exit 0
           fi
           if [[ "$combined" != "success" ]]; then
-            echo "Exact HEAD no longer has green CI; retry cancelled until a fresh CI event."
-            exit 0
+            check_summary="$(gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/check-runs" --jq '[.check_runs[] | select(.status == "completed")] | "\([length]) \([map(select(.conclusion != "success" and .conclusion != "neutral" and .conclusion != "skipped")) | length])"' 2>/dev/null || echo "")"
+            check_total="$(awk '{print $1}' <<<"$check_summary")"
+            check_failed="$(awk '{print $2}' <<<"$check_summary")"
+            if [[ "$check_total" =~ ^[0-9]+$ && "$check_failed" == "0" && "$check_total" != "0" ]]; then
+              echo "Combined status is $combined but all $check_total completed check-runs are green; treating exact HEAD as CI-green (Checks parity)."
+            else
+              echo "Exact HEAD no longer has green CI; retry cancelled until a fresh CI event."
+              exit 0
+            fi
           fi
 
           DEFAULT_BRANCH="$(gh repo view "$GITHUB_REPOSITORY" --json defaultBranchRef --jq .defaultBranchRef.name 2>/dev/null || echo main)"
