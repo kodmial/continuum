@@ -554,10 +554,16 @@ def retry_allowed(attempt: object, limit: int = RETRY_MAX_ATTEMPTS) -> bool:
         raise LifecycleError("retry attempt must be a non-negative integer")
     if attempt_number < 0:
         raise LifecycleError("retry attempt must be a non-negative integer")
+    try:
+        limit_number = int(str(limit).strip())
+    except (TypeError, ValueError):
+        raise LifecycleError("retry limit must be a non-negative integer")
+    if limit_number < 0:
+        raise LifecycleError("retry limit must be a non-negative integer")
     # attempt_number is the zero-based index of the current execution.
     # With limit=3, only executions 0 and 1 may schedule a successor; 2 is
     # the third and final execution.
-    return (attempt_number + 1) < limit
+    return (attempt_number + 1) < limit_number
 
 
 def retry_backoff_seconds(
@@ -585,6 +591,12 @@ def resolve_dispatch_ref(default_branch: object, fallback: object = "main") -> s
     if not name:
         name = str(fallback or "").strip()
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", name or ""):
+        return "main"
+    if ".." in name or "//" in name or "@{" in name:
+        return "main"
+    if name.endswith(("/", ".", ".lock")):
+        return "main"
+    if name in ("HEAD", "@"):
         return "main"
     return name
 
