@@ -545,7 +545,9 @@ class GateTests(unittest.TestCase):
         gate = self._gate(ci_green_on_exact_head=False)
         self.assertFalse(gate["green"])
         body = read_repo(".github/workflows/continuum-pr-agent.yml")
-        self.assertIn("getCombinedStatusForRef", body)
+        self.assertIn("listWorkflowRunsForRepo", body)
+        self.assertIn("CI_WORKFLOW_NAME", body)
+        self.assertNotIn("getCombinedStatusForRef", body)
         merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
         self.assertIn("Current-head CI", merge)
 
@@ -705,16 +707,25 @@ class IsolationTests(unittest.TestCase):
 
     def test_automatic_pr_agent_review_has_one_authoritative_wakeup(self):
         caller = read_repo(".github/caller-stubs/continuum-pr-agent.yml")
-        self.assertIn('workflows: ["CI"]', caller)
-        self.assertIn("types: [ready_for_review]", caller)
-        self.assertNotIn("opened, synchronize, reopened", caller)
+        recovery = read_repo(
+            ".github/caller-stubs/continuum-pr-agent-recovery.yml"
+        )
+        self.assertNotIn("workflow_run:", caller)
+        self.assertNotIn("pull_request_target:", caller)
         self.assertIn("contains(github.event.comment.body, '/review')", caller)
+        self.assertIn("workflow_run:", recovery)
+        self.assertIn("- CI", recovery)
+        self.assertIn("pull_request_target:", recovery)
+        self.assertIn("ready_for_review", recovery)
+        self.assertIn("synchronize", recovery)
 
-    def test_review_caller_wakes_on_successful_ci_and_exports_native_outputs(self):
-        caller = read_repo(".github/caller-stubs/continuum-pr-agent.yml")
+    def test_recovery_caller_wakes_on_successful_ci_and_review_exports_native_outputs(self):
+        caller = read_repo(
+            ".github/caller-stubs/continuum-pr-agent-recovery.yml"
+        )
         self.assertIn("workflow_run:", caller)
-        self.assertIn('workflows: ["CI"]', caller)
-        self.assertIn("github.event.workflow_run.conclusion == 'success'", caller)
+        self.assertIn("- CI", caller)
+        self.assertIn("- PR Agent (OpenCode backend)", caller)
         body = read_repo(".github/workflows/continuum-pr-agent.yml")
         self.assertIn("review_json:", body)
         self.assertIn("improve_jsonl:", body)
@@ -1200,21 +1211,32 @@ class RepairWiringRegressionTests(unittest.TestCase):
         self.assertEqual(decision["action"], "wait")
         self.assertFalse(decision["release_lock"])
 
-    def test_recovery_controller_is_deferred_out_of_33(self):
+    def test_recovery_controller_is_owned_by_dedicated_38_workflows(self):
         for path in (
             ".github/workflows/pr-agent.yml",
             ".github/caller-stubs/continuum-pr-agent.yml",
         ):
             with self.subTest(path=path):
                 caller = read_repo(path)
-                self.assertIn("workflow_run:", caller)
-                self.assertIn('workflows: ["CI"]', caller)
-                self.assertIn(
-                    "github.event.workflow_run.conclusion == 'success'", caller
-                )
+                self.assertNotIn("workflow_run:", caller)
+                self.assertNotIn("pull_request_target:", caller)
                 self.assertNotIn("schedule:", caller)
-                self.assertNotIn("reconcile-stale-pr-agent:", caller)
-                self.assertNotIn("github.event_name == 'schedule'", caller)
+
+        for path in (
+            ".github/workflows/pr-agent-recovery.yml",
+            ".github/caller-stubs/continuum-pr-agent-recovery.yml",
+        ):
+            with self.subTest(path=path):
+                recovery = read_repo(path)
+                self.assertIn("workflow_run:", recovery)
+                self.assertIn("schedule:", recovery)
+                self.assertIn("- CI", recovery)
+
+        engine = read_repo(
+            ".github/workflows/continuum-pr-agent-recovery.yml"
+        )
+        self.assertIn("Reconcile PR-Agent latest state", engine)
+        self.assertIn("createWorkflowDispatch", engine)
 
     def test_review_and_repair_publish_durable_exact_head_statuses(self):
         review = read_repo(".github/workflows/continuum-pr-agent.yml")
