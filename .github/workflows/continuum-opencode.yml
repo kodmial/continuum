@@ -673,8 +673,7 @@ jobs:
           - Implement the complete task, not a partial sketch.
           - Do not turn a tracking/umbrella issue or a task with unmet prerequisites into a partial PR. If the complete Definition of Done cannot be satisfied now, leave the repository unchanged and explain the blocker instead of inventing a smaller scope.
           - Add or update automated tests when appropriate.
-          - Before finishing, read repository-local verification instructions (for example AGENTS.md or CONTRIBUTING.md) and run the complete project verification command/suite they define after the final edit.
-          - Do not substitute a narrower check set for the repository or CI contract. If a required check cannot run, report the exact limitation and do not claim it passed.
+          - Run the relevant local checks when practical.
           - Keep all comments and commit-facing text in English.
           - Do not add unrelated automation outside the issue scope.
           - You may modify .github/workflows/** when the issue requires it. Workflow changes must be published only on the task branch and reviewed through a pull request; never update main directly.
