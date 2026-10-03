@@ -416,16 +416,18 @@ jobs:
           fi
 
           if (( attempt >= 3 )); then
-            gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "<!-- continuum-pr-agent-retry-exhausted head=${HEAD_SHA,,} kind=repair attempts=$attempt -->
-PR-Agent repair exhausted the bounded retry budget for this exact HEAD. A changed HEAD/finding state or explicit owner /review starts a fresh evaluation."
+            MARKER="<!-- continuum-pr-agent-retry-exhausted head=${HEAD_SHA,,} kind=repair attempts=$attempt -->"
+            printf -v BODY '%s\n%s' "$MARKER" "PR-Agent repair exhausted the bounded retry budget for this exact HEAD. A changed HEAD/finding state or explicit owner /review starts a fresh evaluation."
+            gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$BODY"
             echo "Repair retry budget exhausted for PR #$PR_NUMBER HEAD $HEAD_SHA."
             exit 0
           fi
 
           next=$((attempt + 1))
           delay=$((15 * (1 << attempt)))
-          gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "<!-- continuum-pr-agent-retry head=${HEAD_SHA,,} kind=repair attempt=$next -->
-Retrying a transient PR-Agent repair/runtime failure through a fresh exact-HEAD review (attempt $next/3, backoff ${delay}s)."
+          MARKER="<!-- continuum-pr-agent-retry head=${HEAD_SHA,,} kind=repair attempt=$next -->"
+          printf -v BODY '%s\n%s' "$MARKER" "Retrying a transient PR-Agent repair/runtime failure through a fresh exact-HEAD review (attempt $next/3, backoff ${delay}s)."
+          gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$BODY"
           sleep "$delay"
 
           current="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid,state,isDraft --jq '[.headRefOid,.state,(.isDraft|tostring)]|@tsv')"
