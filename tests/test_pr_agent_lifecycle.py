@@ -1070,33 +1070,21 @@ class RepairWiringRegressionTests(unittest.TestCase):
         self.assertEqual(decision["action"], "wait")
         self.assertFalse(decision["release_lock"])
 
-    def test_cancelled_and_lost_runs_have_status_based_reconciliation(self):
+    def test_recovery_controller_is_deferred_out_of_33(self):
         for path in (
             ".github/workflows/pr-agent.yml",
             ".github/caller-stubs/continuum-pr-agent.yml",
         ):
             with self.subTest(path=path):
                 caller = read_repo(path)
-                self.assertIn("cron: '*/15 * * * *'", caller)
-                self.assertIn("reconcile-stale-pr-agent:", caller)
-                self.assertIn("continuum/pr-agent-review", caller)
-                self.assertIn("continuum/pr-agent-repair", caller)
-                self.assertIn("REVIEW_STALE_MS = 75 * 60_000", caller)
-                self.assertIn("REPAIR_STALE_MS = 45 * 60_000", caller)
-                self.assertIn("one state-changing", caller)
-                self.assertIn("createWorkflowDispatch", caller)
-                self.assertIn("fresh.data.head.sha !== head", caller)
-                self.assertIn("freshCombined.data.state !== 'success'", caller)
-                self.assertIn("continuum-pr-agent-retry-exhausted head=", caller)
-                self.assertIn("continuum-pr-agent-no-progress head=", caller)
-                self.assertNotIn("continuum-coderabbit", caller)
-
-    def test_event_driven_ci_wakeup_remains_primary_with_cron_as_safety_net(self):
-        caller = read_repo(".github/caller-stubs/continuum-pr-agent.yml")
-        self.assertIn("workflow_run:", caller)
-        self.assertIn('workflows: ["CI"]', caller)
-        self.assertIn("github.event.workflow_run.conclusion == 'success'", caller)
-        self.assertIn("github.event_name == 'schedule'", caller)
+                self.assertIn("workflow_run:", caller)
+                self.assertIn('workflows: ["CI"]', caller)
+                self.assertIn(
+                    "github.event.workflow_run.conclusion == 'success'", caller
+                )
+                self.assertNotIn("schedule:", caller)
+                self.assertNotIn("reconcile-stale-pr-agent:", caller)
+                self.assertNotIn("github.event_name == 'schedule'", caller)
 
     def test_review_and_repair_publish_durable_exact_head_statuses(self):
         review = read_repo(".github/workflows/continuum-pr-agent.yml")
