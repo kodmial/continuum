@@ -314,8 +314,7 @@ class ContinuumTest < Minitest::Test
 
     expected_identity_pairs = {
       'ci.yml' => 'continuum-validation.yml',
-      'opencode.yml' => 'continuum-opencode.yml',
-      'pr-agent-recovery.yml' => 'continuum-pr-agent-recovery.yml'
+      'opencode.yml' => 'continuum-opencode.yml'
     }
     expected_identity_pairs.each do |entry, engine|
       assert_equal yaml(File.join(ROOT, '.github/workflows', engine)).fetch('name'),
@@ -325,9 +324,9 @@ class ContinuumTest < Minitest::Test
 
     engine_names = engine_workflows.map { |path| yaml(path).fetch('name') }
     entry_names = project_entries.map { |path| yaml(path).fetch('name') }
-    assert_equal ['CI', 'OpenCode agent', 'PR-Agent recovery'].sort,
+    assert_equal %w[CI OpenCode\ agent].sort,
                  (engine_names & entry_names).sort,
-                 'only explicit project entry/engine pairs may share workflow identities'
+                 'only CI and OpenCode may deliberately share engine/entry workflow identities'
   end
 
   # A workflow must never watch its own `name:`. Within a layer the names are
