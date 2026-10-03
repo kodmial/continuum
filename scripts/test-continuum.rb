@@ -3552,10 +3552,9 @@ class ContinuumTest < Minitest::Test
     assert_includes body, 'if (unresolvedThreads === null)'
     assert_includes body, 'could not inspect CodeRabbit review threads; skipping this PR for this pass'
     assert_includes body, "currentDecision?.state === 'APPROVED'"
-
-    assert_includes body, 'current-head CHANGES_REQUESTED review'
-    assert_includes body, "comment.user?.login?.startsWith('coderabbitai')"
-    assert_includes body, 'has no inline findings; suppressing full re-review'
+    assert_includes body, 'durable exact-HEAD no-progress marker handled above'
+    assert_includes body, 'continuum-coderabbit-no-progress head='
+    assert_includes body, 'could not inspect workflow'
     assert_includes body, "stage: finalReview ? 'final-review' : 'initial-review'"
     assert_includes body, 'stageRank: finalReview ? 0 : 1'
     assert_match(/a\.rank - b\.rank \|\|\s*a\.stageRank - b\.stageRank/m, body)
@@ -3578,8 +3577,7 @@ class ContinuumTest < Minitest::Test
     assert_includes stub, 'pull_request_review_comment:'
     assert_includes stub, 'types: [created, edited]'
     assert_includes body, "github.event_name == 'pull_request_review_comment'"
-    assert_includes body, "contains(github.event.comment.body, 'RESOLVED')"
-    assert_includes body, "contains(github.event.comment.body, 'UNRESOLVED')"
+    assert_includes body, "startsWith(github.event.comment.user.login, 'coderabbitai')"
 
     assert_includes body, "priority: 'unprioritized:p2-fallback'"
     assert_includes body, "rank: priorityRank.get('priority:p2')"
