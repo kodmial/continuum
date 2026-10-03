@@ -428,8 +428,8 @@ jobs:
             exit 0
           fi
 
-          if (( attempt >= 3 )); then
-            MARKER="<!-- continuum-pr-agent-retry-exhausted head=${HEAD_SHA,,} kind=repair attempts=$attempt -->"
+          if (( attempt >= 2 )); then
+            MARKER="<!-- continuum-pr-agent-retry-exhausted head=${HEAD_SHA,,} kind=repair attempts=$((attempt + 1)) -->"
             printf -v BODY '%s\n%s' "$MARKER" "PR-Agent repair exhausted the bounded retry budget for this exact HEAD. A changed HEAD/finding state or explicit owner /review starts a fresh evaluation."
             gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$BODY"
             echo "Repair retry budget exhausted for PR #$PR_NUMBER HEAD $HEAD_SHA."
