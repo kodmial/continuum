@@ -1,4 +1,4 @@
-name: PR-Agent recovery engine
+name: PR-Agent recovery
 
 on:
   workflow_call:
