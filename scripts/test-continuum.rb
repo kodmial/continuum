@@ -3576,7 +3576,7 @@ class ContinuumTest < Minitest::Test
     )
 
     assert_includes stub, 'pull_request_review_comment:'
-    assert_includes stub, 'types: [created]'
+    assert_includes stub, 'types: [created, edited]'
     assert_includes body, "github.event_name == 'pull_request_review_comment'"
     assert_includes body, "contains(github.event.comment.body, 'RESOLVED')"
     assert_includes body, "contains(github.event.comment.body, 'UNRESOLVED')"
