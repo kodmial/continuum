@@ -297,6 +297,10 @@ jobs:
           # never publish against a PR branch that moved after repair started.
           CURRENT_SHA="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)"
           REMOTE_SHA="$(git ls-remote origin "refs/heads/$HEAD_REF" | awk '{print $1}')"
+          if [[ -z "$HEAD_SHA" || -z "$CURRENT_SHA" || -z "$REMOTE_SHA" ]]; then
+            echo "::error::Unable to revalidate PR branch before publish (reviewed=$HEAD_SHA current=$CURRENT_SHA remote=$REMOTE_SHA); discarding repair."
+            exit 1
+          fi
           if [[ "$CURRENT_SHA" != "$HEAD_SHA" || "$REMOTE_SHA" != "$HEAD_SHA" ]]; then
             echo "::error::PR branch moved before publish (reviewed=$HEAD_SHA current=$CURRENT_SHA remote=$REMOTE_SHA); discarding repair."
             exit 1
