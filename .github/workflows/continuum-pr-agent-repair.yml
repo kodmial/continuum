@@ -39,6 +39,16 @@ on:
         type: string
         default: ''
         required: false
+      retry_attempt:
+        description: Bounded PR-Agent retry attempt number (0 = initial run).
+        type: string
+        default: '0'
+        required: false
+      retry_workflow:
+        description: Caller workflow filename used to restart the isolated PR-Agent stack.
+        type: string
+        default: 'continuum-pr-agent.yml'
+        required: false
 
 permissions: {}
 
@@ -52,6 +62,7 @@ jobs:
     timeout-minutes: 30
 
     permissions:
+      actions: write
       contents: write
       issues: write
       pull-requests: write
@@ -281,6 +292,7 @@ jobs:
           fi
 
       - name: Install pinned OpenCode CLI for PR-Agent repair
+        id: install_opencode
         if: steps.batch.outputs.empty != 'true' && steps.convergence.outputs.held != 'true'
         run: |
           set -euo pipefail
@@ -297,6 +309,7 @@ jobs:
           done
 
       - name: Run one bounded OpenCode repair pass over every current item
+        id: repair_pass
         if: steps.batch.outputs.empty != 'true' && steps.convergence.outputs.held != 'true'
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
@@ -376,3 +389,58 @@ PR-Agent repair staged no effective change for this exact HEAD/finding state. Au
           fi
           git push --force-with-lease="refs/heads/$HEAD_REF:$HEAD_SHA" origin "HEAD:refs/heads/$HEAD_REF"
           echo "Pushed one bounded repair to refs/heads/$HEAD_REF for PR #$PR_NUMBER."
+
+      - name: Schedule bounded retry for retryable PR-Agent repair failure
+        if: >-
+          always() &&
+          steps.batch.outputs.empty != 'true' &&
+          steps.convergence.outputs.held != 'true' &&
+          failure() &&
+          (steps.install_opencode.outcome == 'failure' ||
+           steps.repair_pass.outcome == 'failure')
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          RETRY_ATTEMPT: ${{ inputs.retry_attempt || '0' }}
+          RETRY_WORKFLOW: ${{ inputs.retry_workflow || 'continuum-pr-agent.yml' }}
+        run: |
+          set -euo pipefail
+          attempt="${RETRY_ATTEMPT:-0}"
+          [[ "$attempt" =~ ^[0-9]+$ ]] || attempt=0
+
+          current_sha="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid || true)"
+          if [[ -z "$current_sha" || "$current_sha" != "$HEAD_SHA" ]]; then
+            echo "PR HEAD changed during failed repair; stale retry cancelled."
+            exit 0
+          fi
+
+          if (( attempt >= 3 )); then
+            gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "<!-- continuum-pr-agent-retry-exhausted head=${HEAD_SHA,,} kind=repair attempts=$attempt -->
+PR-Agent repair exhausted the bounded retry budget for this exact HEAD. A changed HEAD/finding state or explicit owner /review starts a fresh evaluation."
+            echo "Repair retry budget exhausted for PR #$PR_NUMBER HEAD $HEAD_SHA."
+            exit 0
+          fi
+
+          next=$((attempt + 1))
+          delay=$((15 * (1 << attempt)))
+          gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "<!-- continuum-pr-agent-retry head=${HEAD_SHA,,} kind=repair attempt=$next -->
+Retrying a transient PR-Agent repair/runtime failure through a fresh exact-HEAD review (attempt $next/3, backoff ${delay}s)."
+          sleep "$delay"
+
+          current="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid,state,isDraft --jq '[.headRefOid,.state,(.isDraft|tostring)]|@tsv')"
+          current_sha="$(cut -f1 <<<"$current")"
+          current_state="$(cut -f2 <<<"$current")"
+          current_draft="$(cut -f3 <<<"$current")"
+          if [[ "$current_sha" != "$HEAD_SHA" || "$current_state" != "OPEN" || "$current_draft" == "true" ]]; then
+            echo "PR state changed during repair retry backoff; stale retry cancelled."
+            exit 0
+          fi
+          combined="$(gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/status" --jq .state)"
+          if [[ "$combined" != "success" ]]; then
+            echo "Exact HEAD no longer has green CI; retry cancelled until a fresh CI event."
+            exit 0
+          fi
+
+          gh workflow run "$RETRY_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref main             -f pr_number="$PR_NUMBER"             -f expected_head_sha="$HEAD_SHA"             -f retry_attempt="$next"
+          echo "Dispatched isolated PR-Agent repair retry via fresh review attempt $next/3."
