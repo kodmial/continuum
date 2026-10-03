@@ -19,10 +19,6 @@ SRC = os.path.join(ROOT, "src")
 BASELINE_SHA = "5833457ec6036188d1ec1a11d7c85cab8b2a7c73"
 
 PROTECTED_FILES = [
-    ".github/workflows/continuum-coderabbit-retry.yml",
-    ".github/workflows/continuum-coderabbit-unresolved.yml",
-    ".github/workflows/continuum-add-review-label.yml",
-    ".github/workflows/continuum-auto-merge.yml",
     ".github/workflows/continuum-opencode.yml",
     ".github/workflows/opencode.yml",
 ]
@@ -632,16 +628,17 @@ class IsolationTests(unittest.TestCase):
             from continuum import pr_agent_lifecycle as life
         finally:
             sys.path.remove(SRC)
-        mode = life.resolve_consumer_mode({
-            "CONTINUUM_PR_AGENT_ENABLED": "true",
-            "CONTINUUM_REQUIRE_CODERABBIT": "false",
-        })
+        self.assertEqual(life.resolve_consumer_mode({})["stack"], "none")
+        self.assertEqual(
+            life.resolve_consumer_mode({"CONTINUUM_REVIEW_PROVIDER": "coderabbit"})["stack"],
+            "coderabbit",
+        )
+        mode = life.resolve_consumer_mode({"CONTINUUM_REVIEW_PROVIDER": "pr-agent"})
         self.assertEqual(mode["stack"], "pr-agent")
+        self.assertTrue(mode["pr_agent_enabled"])
+        self.assertFalse(mode["require_coderabbit"])
         with self.assertRaises(life.LifecycleError):
-            life.resolve_consumer_mode({
-                "CONTINUUM_PR_AGENT_ENABLED": "true",
-                "CONTINUUM_REQUIRE_CODERABBIT": "true",
-            })
+            life.resolve_consumer_mode({"CONTINUUM_REVIEW_PROVIDER": "both"})
 
     def test_pr_agent_stack_invokes_only_pr_agent_workflows(self):
         import sys
