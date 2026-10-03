@@ -65,7 +65,6 @@ jobs:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           TARGET_CHILD_ID: ${{ inputs.target_child_id }}
           CONTINUUM_REF: ${{ inputs.continuum_ref }}
-          CHILD_REPOSITORIES: ${{ secrets.CHILD_RUNTIME_REPOSITORIES }}
         run: |
           set -euo pipefail
           RUNTIME_ROOT="$RUNNER_TEMP/continuum-pr-agent-target-runtime"
