@@ -95,33 +95,27 @@ def _as_bool(value: object) -> bool:
 
 
 def resolve_consumer_mode(env: Mapping[str, object]) -> Dict[str, Any]:
-    """Resolve the isolated consumer stack from environment configuration.
+    """Resolve the single authoritative review provider.
 
-    Isolated PR-Agent mode contract:
-      CONTINUUM_PR_AGENT_ENABLED=true
-      CONTINUUM_REQUIRE_CODERABBIT=false
-    Fails closed on contradictory configuration (both stacks requested).
+    CONTINUUM_REVIEW_PROVIDER accepts exactly:
+      none | coderabbit | pr-agent
+
+    Missing/empty configuration defaults to none.
     """
 
-    pr_agent_enabled = _as_bool(env.get("CONTINUUM_PR_AGENT_ENABLED", ""))
-    require_coderabbit = _as_bool(env.get("CONTINUUM_REQUIRE_CODERABBIT", ""))
-    if pr_agent_enabled and require_coderabbit:
-        raise LifecycleError(
-            "contradictory review-stack configuration: PR-Agent mode requires "
-            "CONTINUUM_REQUIRE_CODERABBIT=false"
-        )
-    if pr_agent_enabled:
-        stack = "pr-agent"
-    elif require_coderabbit:
-        stack = "coderabbit"
-    else:
+    stack = str(env.get("CONTINUUM_REVIEW_PROVIDER", "") or "none").strip().lower()
+    if not stack:
         stack = "none"
+    if stack not in ("none", "coderabbit", "pr-agent"):
+        raise LifecycleError(
+            "invalid CONTINUUM_REVIEW_PROVIDER: expected none, coderabbit, or pr-agent"
+        )
     return {
-        "pr_agent_enabled": pr_agent_enabled,
-        "require_coderabbit": require_coderabbit,
+        "review_provider": stack,
+        "pr_agent_enabled": stack == "pr-agent",
+        "require_coderabbit": stack == "coderabbit",
         "stack": stack,
     }
-
 
 def workflows_for_stack(stack: str) -> List[str]:
     """Workflows invoked for one complete stack (no mixing of gates)."""
