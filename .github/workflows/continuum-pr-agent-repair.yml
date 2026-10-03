@@ -388,8 +388,14 @@ jobs:
 
           # Remove only repository-ignored build/cache artifacts left by tools
           # the repair agent ran. This cannot delete source changes because
-          # git clean -X is restricted to ignored paths.
+          # git clean -X is restricted to ignored paths. If an older branch
+          # already tracks an ignored generated file, restore it to the reviewed
+          # HEAD so repair cannot smuggle a cache/build mutation into the commit.
           git clean -fdX
+          mapfile -t TRACKED_IGNORED < <(git ls-files -ci --exclude-standard)
+          if (( ${#TRACKED_IGNORED[@]} > 0 )); then
+            git restore --source="$START_HEAD" --worktree --staged -- "${TRACKED_IGNORED[@]}"
+          fi
 
           if [[ -z "$(git status --porcelain)" ]]; then
             MARKER="<!-- continuum-pr-agent-no-progress head=${HEAD_SHA,,} fingerprint=${BATCH_FINGERPRINT,,} -->"
