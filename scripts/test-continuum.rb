@@ -2879,9 +2879,12 @@ class ContinuumTest < Minitest::Test
     ],
     'continuum-pr-agent-repair.yml' => %w[
       continuum_ref pr_number head_sha review_json improve_jsonl
+      retry_attempt retry_workflow
     ],
     'continuum-pr-agent-auto-merge.yml' => %w[
       continuum_ref pr_number head_sha review_json improve_jsonl persistent_state_json
+      post_merge_wakeups post_merge_wakeup_ref
+      required_workflow_gate_label required_workflow_gate_name
     ],
     'continuum-remove-review-label.yml' => %w[continuum_ref]
   }.freeze
