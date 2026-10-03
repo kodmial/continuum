@@ -54,6 +54,8 @@ class PrAgentTargetContextTests(unittest.TestCase):
             values = {}
             if env_file.exists():
                 for line in env_file.read_text(encoding="utf-8").splitlines():
+                    if "=" not in line:
+                        continue
                     key, value = line.split("=", 1)
                     values[key] = value
             return proc, values, calls.read_text(encoding="utf-8") if calls.exists() else ""

@@ -30,5 +30,9 @@ jobs:
     secrets: inherit
     with:
       continuum_ref: main
+      # Bare passthrough: schedule, pull_request_target, and workflow_run
+      # carry no dispatch inputs, so those runs pass empty here and the
+      # reusable falls through to vars.CONTINUUM_PR_AGENT_TARGET_CHILD_ID
+      # (then to the execution repository).
       target_child_id: "${{ inputs.target_child_id }}"
       review_workflow: pr-agent.yml

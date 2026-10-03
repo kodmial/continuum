@@ -19,7 +19,11 @@ on:
         default: continuum-pr-agent.yml
         required: false
       target_child_id:
-        description: Opaque verified child id for delegated execution. Empty targets the caller repository.
+        description: >-
+          Opaque verified child id for delegated execution. Empty targets the
+          caller repository, unless vars.CONTINUUM_PR_AGENT_TARGET_CHILD_ID
+          configures a default delegated target for schedule/event triggers
+          that carry no dispatch inputs.
         type: string
         default: ''
         required: false
@@ -63,7 +67,7 @@ jobs:
       - name: Resolve PR-Agent target context
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
-          TARGET_CHILD_ID: ${{ inputs.target_child_id }}
+          TARGET_CHILD_ID: ${{ inputs.target_child_id || vars.CONTINUUM_PR_AGENT_TARGET_CHILD_ID }}
           CONTINUUM_REF: ${{ inputs.continuum_ref }}
         run: |
           set -euo pipefail
@@ -125,7 +129,7 @@ jobs:
           CI_WORKFLOW_NAME: ${{ inputs.ci_workflow_name || 'CI' }}
           STALE_MINUTES: ${{ inputs.stale_minutes || vars.PR_AGENT_RECOVERY_STALE_MINUTES || '70' }}
           DISPATCH_GRACE_SECONDS: ${{ inputs.dispatch_grace_seconds || vars.PR_AGENT_RECOVERY_DISPATCH_GRACE_SECONDS || '90' }}
-          TARGET_CHILD_ID: ${{ inputs.target_child_id }}
+          TARGET_CHILD_ID: ${{ inputs.target_child_id || vars.CONTINUUM_PR_AGENT_TARGET_CHILD_ID }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |

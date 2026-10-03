@@ -370,7 +370,7 @@ jobs:
           TOKEN_B64="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
           git config --local http.https://github.com/.extraheader "AUTHORIZATION: basic $TOKEN_B64"
           unset TOKEN_B64
-          trap 'git config --local --unset http.https://github.com/.extraheader || true; unset TOKEN_B64 || true' EXIT
+          # Do not remove http.extraheader here: later publish steps in this job need it for ls-remote/push. Remove it in a final always-run cleanup step at job end.
           git remote add origin "https://github.com/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY.git"
           if ! git check-ref-format "refs/heads/$HEAD_REF" >/dev/null 2>&1; then
             echo "::error::PR-Agent target branch is not a valid heads ref."
@@ -662,3 +662,11 @@ jobs:
           if [[ "$DEFAULT_BRANCH" == */.*/* || "$DEFAULT_BRANCH" == .*/ || "$DEFAULT_BRANCH" == */. ]] || [[ "$DEFAULT_BRANCH" =~ (^|/)\. ]] || [[ "$DEFAULT_BRANCH" =~ \.lock($|/) ]]; then DEFAULT_BRANCH="main"; fi
           gh workflow run "$RETRY_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH"             -f pr_number="$PR_NUMBER"             -f expected_head_sha="$HEAD_SHA"             -f retry_attempt="$next"             -f retry_workflow="$RETRY_WORKFLOW"             -f recovery_kind="repair"             -f target_child_id="$TARGET_CHILD_ID"
           echo "Dispatched isolated PR-Agent repair retry via fresh review attempt $next/3."
+
+      - name: Remove PR-Agent repair git credentials
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ -n "${CONTINUUM_PR_AGENT_WORKTREE:-}" && -d "$CONTINUUM_PR_AGENT_WORKTREE/.git" ]]; then
+            git -C "$CONTINUUM_PR_AGENT_WORKTREE" config --local --unset http.https://github.com/.extraheader || true
+          fi
