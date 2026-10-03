@@ -682,7 +682,7 @@ jobs:
                   continue;
                 }
                 if (unresolvedThreads.length > 0) {
-                  // Preserve the mature NanoDictate/auto-merge safety rule:
+                  // Preserve the mature consumer auto-merge safety rule:
                   // outdated findings are not discarded merely because HEAD
                   // changed. Wake the single reconciler that already owns
                   // idempotent exact-finding verification; one dispatch covers
