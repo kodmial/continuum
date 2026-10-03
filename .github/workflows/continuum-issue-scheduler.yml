@@ -54,6 +54,25 @@ on:
         type: string
         required: false
         default: 'automation:paused'
+      qualifying_label:
+        description: >-
+          Label marking implementation-merged capabilities that are waiting
+          on mandatory live qualification. Empty falls back to
+          AUTOMATION_QUALIFYING_LABEL. The qualification gate adds it
+          instead of closing the issue when an implementation PR merges
+          while mandatory qualification is still pending.
+        type: string
+        required: false
+        default: 'automation:qualifying'
+      blocked_label:
+        description: >-
+          Label marking capabilities whose mandatory qualification failed
+          and that need repair. Empty falls back to
+          AUTOMATION_BLOCKED_LABEL. The qualification gate adds it on
+          qualification failure and clears it when a rerun is due.
+        type: string
+        required: false
+        default: 'automation:blocked'
       post_pause_comment:
         description: >-
           Post a comment on an issue when the scheduler pauses it. Only the
@@ -198,6 +217,8 @@ jobs:
       DISPATCH_MARKER: ${{ inputs.dispatch_marker || vars.AUTOMATION_DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->' }}
       IN_PROGRESS_LABEL: ${{ inputs.in_progress_label || vars.AUTOMATION_IN_PROGRESS_LABEL || 'automation:in-progress' }}
       PAUSE_LABEL: ${{ inputs.pause_marker || vars.AUTOMATION_PAUSE_LABEL || 'automation:paused' }}
+      QUALIFYING_LABEL: ${{ inputs.qualifying_label || vars.AUTOMATION_QUALIFYING_LABEL || 'automation:qualifying' }}
+      BLOCKED_LABEL: ${{ inputs.blocked_label || vars.AUTOMATION_BLOCKED_LABEL || 'automation:blocked' }}
       POST_PAUSE_COMMENT: ${{ inputs.post_pause_comment || 'true' }}
       RESET_MARKERS: ${{ inputs.reset_markers || 'false' }}
       REQUIRE_PRIORITY_LABEL: ${{ inputs.require_priority_label || vars.AUTOMATION_REQUIRE_PRIORITY_LABEL || 'false' }}
@@ -642,6 +663,8 @@ jobs:
             );
             const inProgressLabel = process.env.IN_PROGRESS_LABEL || 'automation:in-progress';
             const pausedLabel = process.env.PAUSE_LABEL || 'automation:paused';
+            const qualifyingLabel = process.env.QUALIFYING_LABEL || 'automation:qualifying';
+            const blockedLabel = process.env.BLOCKED_LABEL || 'automation:blocked';
             const dispatchMarker = process.env.DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->';
             const postPauseComment =
               (process.env.POST_PAUSE_COMMENT || 'true') !== 'false';
@@ -756,6 +779,525 @@ jobs:
               return open;
             }
 
+            // Mandatory live-qualification gate: implementation -> qualification
+            // -> capability completion. The deterministic rules live in
+            // src/continuum/qualification.py; this embedding mirrors them for
+            // the scheduler runtime. Byte-for-byte markers: a doubled
+            // backslash here would silently disable the whole gate.
+            function qualificationRefs(body, selfNumber) {
+              if (typeof body !== 'string' || !body) return [];
+              const found = new Set();
+              const pattern = /<!--\s*automation-qualification:\s*([0-9#\s,]+?)\s*-->/gi;
+              for (const match of body.matchAll(pattern)) {
+                for (const item of match[1].matchAll(/\d+/g)) {
+                  const number = Number.parseInt(item[0], 10);
+                  if (!Number.isInteger(number) || number <= 0) continue;
+                  if (number === selfNumber) continue;
+                  found.add(number);
+                }
+              }
+              return [...found].sort((a, b) => a - b);
+            }
+
+            function isValidSha(value) {
+              return typeof value === 'string' && /^[0-9a-f]{40}$/i.test(value.trim());
+            }
+
+            function normalizeSha(value) {
+              if (!isValidSha(value)) return null;
+              return value.trim().toLowerCase();
+            }
+
+            function latestRequiredSha(body, capabilityNumber) {
+              if (typeof body !== 'string' || !body) return null;
+              let latest = null;
+              const pattern = /<!--\s*continuum-qualification-required\s+capability\s*=\s*(\d+)\s+sha\s*=\s*([0-9a-f]{40})\s*-->/gi;
+              for (const match of body.matchAll(pattern)) {
+                if (capabilityNumber != null && Number(match[1]) !== capabilityNumber) continue;
+                latest = match[2].toLowerCase();
+              }
+              return latest;
+            }
+
+            function requiredShaMarker(capabilityNumber, sha) {
+              return '<!-- continuum-qualification-required capability=' +
+                capabilityNumber + ' sha=' + sha + ' -->';
+            }
+
+            function qualificationDispatchMarker(capabilityNumber, qualificationNumber, sha) {
+              return '<!-- continuum-qualification-dispatch capability=' +
+                capabilityNumber + ' qualification=' + qualificationNumber +
+                ' sha=' + sha + ' -->';
+            }
+
+            function hasQualificationDispatch(bodies, capabilityNumber, qualificationNumber, sha) {
+              const wanted = normalizeSha(sha);
+              if (!wanted) return false;
+              const pattern = /<!--\s*continuum-qualification-dispatch\s+capability\s*=\s*(\d+)\s+qualification\s*=\s*(\d+)\s+sha\s*=\s*([0-9a-f]{40})\s*-->/gi;
+              for (const body of bodies || []) {
+                if (typeof body !== 'string') continue;
+                for (const match of body.matchAll(pattern)) {
+                  if (
+                    Number(match[1]) === capabilityNumber &&
+                    Number(match[2]) === qualificationNumber &&
+                    match[3].toLowerCase() === wanted
+                  ) {
+                    return true;
+                  }
+                }
+              }
+              return false;
+            }
+
+            // Machine-readable evidence only: the canonical marker, or a
+            // Docker/Render controller payload whose head SHA matches. Prose
+            // verdicts never count, and entries for any other SHA are stale.
+            function parseQualificationEvidenceEntries(commentBody) {
+              if (typeof commentBody !== 'string' || !commentBody) return [];
+              const entries = [];
+              const canonical = /<!--\s*continuum-qualification-result\b([^>]*?)-->/gi;
+              for (const match of commentBody.matchAll(canonical)) {
+                const attrs = {};
+                for (const attr of (match[1] || '').matchAll(/([A-Za-z_]+)\s*=\s*([^\s>]+)/g)) {
+                  attrs[attr[1].toLowerCase()] = attr[2];
+                }
+                const sha = normalizeSha(attrs.sha || attrs.head);
+                let verdict = null;
+                for (const key of ['result', 'classification', 'verdict']) {
+                  if (attrs[key] == null) continue;
+                  const text = String(attrs[key]).toLowerCase();
+                  verdict = ['pass', 'passed', 'success', 'approved'].includes(text)
+                    ? 'pass'
+                    : 'fail';
+                  break;
+                }
+                if (!sha || !verdict) continue;
+                let issue = null;
+                if (attrs.issue != null) {
+                  issue = Number.parseInt(String(attrs.issue), 10);
+                  if (!Number.isInteger(issue)) continue;
+                }
+                entries.push({ issue, sha, result: verdict });
+              }
+              for (const marker of [
+                '<!-- continuum-docker-qualification-result -->',
+                '<!-- continuum-render-qualification-result -->',
+              ]) {
+                const at = commentBody.indexOf(marker);
+                if (at === -1) continue;
+                const tail = commentBody.slice(at + marker.length).split('-->')[0].trim();
+                let payload = null;
+                try {
+                  payload = JSON.parse(tail.startsWith('{') ? tail : tail);
+                } catch (err) {
+                  payload = null;
+                }
+                if (payload && typeof payload === 'object') {
+                  const sha = normalizeSha(
+                    payload.head_sha || payload.sha || payload.head
+                  );
+                  const classification = String(
+                    payload.classification || payload.result || payload.verdict || ''
+                  ).toLowerCase();
+                  if (sha && classification) {
+                    entries.push({
+                      issue: null,
+                      sha,
+                      result: ['pass', 'passed', 'success', 'approved'].includes(classification)
+                        ? 'pass'
+                        : 'fail',
+                    });
+                  }
+                }
+              }
+              return entries;
+            }
+
+            function qualificationEvidenceState(commentBodies, qualificationNumber, requiredSha) {
+              const sha = normalizeSha(requiredSha);
+              if (!sha) return 'unknown';
+              let latest = null;
+              for (const body of commentBodies || []) {
+                for (const entry of parseQualificationEvidenceEntries(body)) {
+                  if (entry.issue != null && entry.issue !== qualificationNumber) continue;
+                  if (entry.sha !== sha) continue;
+                  latest = entry.result;
+                }
+              }
+              if (latest === 'pass') return 'pass';
+              if (latest === 'fail') return 'fail';
+              return 'unknown';
+            }
+
+            let cachedMainSha = null;
+            async function currentMainSha() {
+              if (cachedMainSha) return cachedMainSha;
+              const { data } = await github.rest.repos.getBranch({
+                owner,
+                repo,
+                branch: 'main',
+              });
+              cachedMainSha = data.commit.sha;
+              return cachedMainSha;
+            }
+
+            async function issueCommentsBodies(issueNumber) {
+              const comments = await github.paginate(
+                github.rest.issues.listComments,
+                { owner, repo, issue_number: issueNumber, per_page: 100 }
+              );
+              return comments.map(comment => comment.body || '');
+            }
+
+            // Dispatch one mandatory qualification for an exact main SHA.
+            // Pause never strands the lifecycle: a paused qualification is
+            // unpaused here, not skipped. Idempotent per SHA so duplicate
+            // merge events cannot start qualification storms; a closed
+            // qualification is never dispatched (it must be reopened first).
+            async function dispatchQualificationIssue(
+              capabilityNumber,
+              qualificationNumber,
+              requiredSha
+            ) {
+              const sha = normalizeSha(requiredSha);
+              if (!sha) return 'no-required-sha';
+              let qual;
+              try {
+                qual = (await github.rest.issues.get({
+                  owner,
+                  repo,
+                  issue_number: qualificationNumber,
+                })).data;
+              } catch (err) {
+                if (err.status === 404) return 'qualification-missing';
+                throw err;
+              }
+              if (qual.pull_request) return 'qualification-missing';
+              if (qual.state !== 'open') return 'qualification-closed';
+              rememberIssue(qual);
+              const qualLabels = labelsByIssue.get(qualificationNumber) || new Set();
+              const wasPaused = qualLabels.has(pausedLabel);
+              await removeLabel(qualificationNumber, pausedLabel);
+              const bodies = await issueCommentsBodies(qualificationNumber);
+              if (
+                hasQualificationDispatch(
+                  bodies, capabilityNumber, qualificationNumber, sha
+                )
+              ) {
+                return wasPaused ? 'unpaused-already-dispatched' : 'already-dispatched';
+              }
+              const marker = qualificationDispatchMarker(
+                capabilityNumber, qualificationNumber, sha
+              );
+              const note =
+                'Mandatory live qualification for capability #' + capabilityNumber +
+                ' at main `' + sha +
+                '`: automatically dispatched after implementation merge. ' +
+                'Qualification must publish `<!-- continuum-qualification-result' +
+                ' issue=' + qualificationNumber + ' sha=' + sha + ' result=pass -->`' +
+                ' evidence for this exact SHA.';
+              if (opencodeDispatch === 'workflow') {
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: qualificationNumber,
+                  body: [marker, dispatchMarker, '', note].join('\n'),
+                });
+                await github.request(
+                  'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
+                  {
+                    owner,
+                    repo,
+                    workflow_id: opencodeWorkflowPath.replace(
+                      /^\.github\/workflows\//,
+                      ''
+                    ),
+                    ref: dispatchRef,
+                    inputs: {
+                      mode: 'issue',
+                      issue_number: String(qualificationNumber),
+                    },
+                  }
+                );
+              } else {
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: qualificationNumber,
+                  body: ['/oc', '', marker, dispatchMarker, '', note].join('\n'),
+                });
+              }
+              await addLabel(qualificationNumber, inProgressLabel);
+              return wasPaused ? 'unpause-and-dispatch' : 'dispatch';
+            }
+
+            // Reconcile one capability through the qualification phase.
+            // Returns the lifecycle state: 'complete', 'qualifying', or
+            // 'blocked'. A closed capability without exact-SHA pass evidence
+            // fails closed ('must-reopen'), so auto-close keywords can never
+            // bypass the gate.
+            async function reconcileQualificationCapability(capabilityIssue) {
+              const capabilityNumber = capabilityIssue.number;
+              rememberIssue(capabilityIssue);
+              const refs = qualificationRefs(
+                capabilityIssue.body || '', capabilityNumber
+              );
+              if (refs.length === 0) return 'no-qualification';
+              let requiredSha = latestRequiredSha(
+                capabilityIssue.body || '', capabilityNumber
+              );
+              if (!requiredSha) {
+                requiredSha = await currentMainSha();
+                await github.rest.issues.update({
+                  owner,
+                  repo,
+                  issue_number: capabilityNumber,
+                  body: (capabilityIssue.body || '') +
+                    '\n' + requiredShaMarker(capabilityNumber, requiredSha),
+                });
+                capabilityIssue.body =
+                  (capabilityIssue.body || '') +
+                  '\n' + requiredShaMarker(capabilityNumber, requiredSha);
+                core.notice(
+                  'Capability #' + capabilityNumber +
+                  ': recorded missing required SHA ' + requiredSha + '.'
+                );
+              }
+              const mainSha = await currentMainSha();
+              if (normalizeSha(mainSha) !== requiredSha) {
+                // A repair merge advanced main: stale evidence no longer
+                // matches, so record the new exact SHA and rerun.
+                requiredSha = normalizeSha(mainSha);
+                await github.rest.issues.update({
+                  owner,
+                  repo,
+                  issue_number: capabilityNumber,
+                  body: (capabilityIssue.body || '') +
+                    '\n' + requiredShaMarker(capabilityNumber, requiredSha),
+                });
+                capabilityIssue.body =
+                  (capabilityIssue.body || '') +
+                  '\n' + requiredShaMarker(capabilityNumber, requiredSha);
+                core.notice(
+                  'Capability #' + capabilityNumber +
+                  ': main advanced; qualification reruns for ' + requiredSha + '.'
+                );
+              }
+              const evidence = {};
+              for (const ref of refs) {
+                let bodies = [];
+                try {
+                  bodies = await issueCommentsBodies(ref);
+                } catch (err) {
+                  if (err.status !== 404) throw err;
+                }
+                evidence[ref] = qualificationEvidenceState(
+                  bodies, ref, requiredSha
+                );
+              }
+              const states = refs.map(ref => evidence[ref]);
+              const failures = refs.filter(ref => evidence[ref] === 'fail');
+              if (states.every(state => state === 'pass')) {
+                await removeLabel(capabilityNumber, inProgressLabel);
+                await removeLabel(capabilityNumber, pausedLabel);
+                await removeLabel(capabilityNumber, qualifyingLabel);
+                await removeLabel(capabilityNumber, blockedLabel);
+                if (capabilityIssue.state !== 'closed') {
+                  await github.rest.issues.createComment({
+                    owner,
+                    repo,
+                    issue_number: capabilityNumber,
+                    body: [
+                      'Capability complete: mandatory qualification passed for exact main `' +
+                        requiredSha + '` (' +
+                        refs.map(ref => '#' + ref).join(', ') + ').',
+                    ].join('\n'),
+                  });
+                  await github.rest.issues.update({
+                    owner,
+                    repo,
+                    issue_number: capabilityNumber,
+                    state: 'closed',
+                    state_reason: 'completed',
+                  });
+                }
+                core.notice(
+                  'Capability #' + capabilityNumber +
+                  ' completed with exact-SHA qualification evidence.'
+                );
+                return 'complete';
+              }
+              await addLabel(capabilityNumber, qualifyingLabel);
+              if (failures.length > 0) {
+                await addLabel(capabilityNumber, blockedLabel);
+                await ensureRepairIssue(capabilityNumber, failures, requiredSha);
+                for (const ref of refs) {
+                  await dispatchQualificationIssue(
+                    capabilityNumber, ref, requiredSha
+                  );
+                }
+                core.warning(
+                  'Capability #' + capabilityNumber +
+                  ' blocked: qualification failure in ' +
+                  failures.map(ref => '#' + ref).join(', ') + '.'
+                );
+                return 'blocked';
+              }
+              await removeLabel(capabilityNumber, blockedLabel);
+              for (const ref of refs) {
+                await dispatchQualificationIssue(
+                  capabilityNumber, ref, requiredSha
+                );
+              }
+              return 'qualifying';
+            }
+
+            // A failed qualification routes repair work back into the
+            // capability lifecycle as a tracked issue. At most one open
+            // repair issue exists per (capability, qualification) pair, so
+            // repeated failures cannot file repair storms.
+            const repairMarkerPattern =
+              /<!--\s*continuum-qualification-repair\s+source\s*=\s*(\d+)\s+capability\s*=\s*(\d+)\s*-->/i;
+
+            async function ensureRepairIssue(
+              capabilityNumber,
+              failures,
+              requiredSha
+            ) {
+              const openIssues = await github.paginate(
+                github.rest.issues.listForRepo,
+                { owner, repo, state: 'open', per_page: 100 }
+              );
+              for (const failure of failures) {
+                const existing = openIssues.find(
+                  item =>
+                    !item.pull_request &&
+                    (item.body || '').match(repairMarkerPattern) &&
+                    Number((item.body || '').match(repairMarkerPattern)[1]) === failure &&
+                    Number((item.body || '').match(repairMarkerPattern)[2]) === capabilityNumber
+                );
+                if (existing) {
+                  core.info(
+                    'Repair for qualification #' + failure +
+                    ' already tracked in #' + existing.number + '.'
+                  );
+                  continue;
+                }
+                const marker =
+                  '<!-- continuum-qualification-repair source=' + failure +
+                  ' capability=' + capabilityNumber + ' -->';
+                const created = await github.rest.issues.create({
+                  owner,
+                  repo,
+                  title: 'Repair qualification failure for #' + capabilityNumber +
+                    ' (qualification #' + failure + ')',
+                  body: [
+                    marker,
+                    '',
+                    'Mandatory qualification #' + failure + ' for capability #' +
+                      capabilityNumber + ' failed at main `' + requiredSha + '`.',
+                    '',
+                    'Repair the concrete defect, merge the fix, and the',
+                    'qualification gate automatically reruns qualification #' +
+                      failure + ' against the new exact main SHA.',
+                    'Do not close capability #' + capabilityNumber +
+                      ' manually: only exact-SHA pass evidence may complete it.',
+                  ].join('\n'),
+                  labels: ['priority:p0'],
+                });
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: capabilityNumber,
+                  body: 'Qualification #' + failure + ' failed at main `' +
+                    requiredSha + '`; repair tracked in #' + created.data.number + '.',
+                });
+                core.warning(
+                  'Created repair issue #' + created.data.number +
+                  ' for qualification #' + failure + '.'
+                );
+              }
+            }
+
+            // An implementation merge enters the qualifying state instead of
+            // completing the capability. Returns 'missing' when the issue is
+            // gone, otherwise the declared qualification refs (empty means
+            // the caller runs the normal completion path).
+            async function enterQualifyingState(
+              issueNumber,
+              mergedSha,
+              originText
+            ) {
+              let fresh;
+              try {
+                fresh = (await github.rest.issues.get({
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                })).data;
+              } catch (err) {
+                if (err.status === 404) return 'missing';
+                throw err;
+              }
+              if (fresh.pull_request) return 'missing';
+              rememberIssue(fresh);
+              const refs = qualificationRefs(fresh.body || '', issueNumber);
+              if (refs.length === 0) return refs;
+              const sha = normalizeSha(mergedSha) || (await currentMainSha());
+              const knownSha = latestRequiredSha(fresh.body || '', issueNumber);
+              if (knownSha !== sha) {
+                await github.rest.issues.update({
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                  body: (fresh.body || '') + '\n' + requiredShaMarker(issueNumber, sha),
+                });
+              }
+              if (fresh.state === 'closed') {
+                await github.rest.issues.update({
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                  state: 'open',
+                });
+                core.warning(
+                  'Capability #' + issueNumber +
+                  ' closed with pending mandatory qualification (' + originText +
+                  '); reopened instead of completing (fail closed).'
+                );
+              }
+              await removeLabel(issueNumber, inProgressLabel);
+              await removeLabel(issueNumber, pausedLabel);
+              await removeLabel(issueNumber, blockedLabel);
+              await addLabel(issueNumber, qualifyingLabel);
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: issueNumber,
+                body: [
+                  'Implementation merged (' + originText + ') at main `' + sha + '`.',
+                  '',
+                  'Capability #' + issueNumber + ' enters `' + qualifyingLabel +
+                    '`: mandatory qualification (' +
+                    refs.map(ref => '#' + ref).join(', ') +
+                    ') must publish exact-SHA pass evidence before completion.',
+                  'Implementation completion and capability completion are distinct states.',
+                ].join('\n'),
+              });
+              for (const ref of refs) {
+                const outcome = await dispatchQualificationIssue(
+                  issueNumber,
+                  ref,
+                  sha
+                );
+                core.notice(
+                  'Qualification #' + ref + ' for capability #' +
+                  issueNumber + ': ' + outcome + '.'
+                );
+              }
+              return refs;
+            }
+
             // Every dispatch in this job goes through the PAT, so no
             // `actions: write` grant is needed on the caller's token.
             async function dispatchWorkflow(workflow, inputs) {
@@ -790,6 +1332,16 @@ jobs:
                 name: pausedLabel,
                 color: 'BFDADC',
                 description: 'Automation is paused after a failed/stopped implementation; remove to retry.',
+              },
+              {
+                name: qualifyingLabel,
+                color: '0E8A16',
+                description: 'Implementation merged; mandatory live qualification is pending exact-SHA evidence.',
+              },
+              {
+                name: blockedLabel,
+                color: 'B60205',
+                description: 'Mandatory live qualification failed; repair is required before completion.',
               },
               // A configured route label is reserved before this run can see
               // it, so create it here rather than letting a consumer's
@@ -905,21 +1457,34 @@ jobs:
                     rememberIssue(response.data);
 
                     if (pr.merged) {
-                      await removeLabel(issueNumber, inProgressLabel);
-                      await removeLabel(issueNumber, pausedLabel);
-                      if (response.data.state !== 'closed') {
-                        await github.rest.issues.update({
-                          owner,
-                          repo,
-                          issue_number: issueNumber,
-                          state: 'closed',
-                          state_reason: 'completed',
-                        });
-                      }
-                      core.notice(
-                        'Merged OpenCode PR #' + pr.number +
-                        ' completed issue #' + issueNumber + '.'
+                      const entered = await enterQualifyingState(
+                        issueNumber,
+                        pr.merge_commit_sha,
+                        'merged PR #' + pr.number
                       );
+                      if (entered === 'missing' || entered.length === 0) {
+                        await removeLabel(issueNumber, inProgressLabel);
+                        await removeLabel(issueNumber, pausedLabel);
+                        if (response.data.state !== 'closed') {
+                          await github.rest.issues.update({
+                            owner,
+                            repo,
+                            issue_number: issueNumber,
+                            state: 'closed',
+                            state_reason: 'completed',
+                          });
+                        }
+                        core.notice(
+                          'Merged OpenCode PR #' + pr.number +
+                          ' completed issue #' + issueNumber + '.'
+                        );
+                      } else {
+                        core.notice(
+                          'Merged OpenCode PR #' + pr.number +
+                          ': capability #' + issueNumber +
+                          ' enters qualification instead of completing.'
+                        );
+                      }
                     } else {
                       const blockers = await github.paginate(
                         'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
@@ -1009,6 +1574,97 @@ jobs:
                   );
                 }
               }
+            }
+
+            // Fail-closed auto-close sweep. A PR body carrying `Fixes #N`
+            // auto-closes the capability at merge time, bypassing the merge
+            // handler above when the event is missed or the label was never
+            // applied. The latest closed issues are bounded (one page), so
+            // this sweep costs one API call plus follow-ups only for
+            // capabilities that declare mandatory qualification.
+            const { data: recentlyClosed } = await github.rest.issues.listForRepo({
+              owner,
+              repo,
+              state: 'closed',
+              sort: 'updated',
+              direction: 'desc',
+              per_page: 30,
+            });
+            for (const closed of recentlyClosed) {
+              if (closed.pull_request) continue;
+              const refs = qualificationRefs(closed.body || '', closed.number);
+              if (refs.length === 0) continue;
+              rememberIssue(closed);
+              const requiredSha = latestRequiredSha(
+                closed.body || '',
+                closed.number
+              );
+              const commentBodies = {};
+              for (const ref of refs) {
+                try {
+                  commentBodies[ref] = await issueCommentsBodies(ref);
+                } catch (err) {
+                  if (err.status === 404) commentBodies[ref] = [];
+                  else throw err;
+                }
+              }
+              const complete = requiredSha &&
+                refs.every(
+                  ref =>
+                    qualificationEvidenceState(
+                      commentBodies[ref],
+                      ref,
+                      requiredSha
+                    ) === 'pass'
+                );
+              if (complete) {
+                await removeLabel(closed.number, qualifyingLabel);
+                await removeLabel(closed.number, blockedLabel);
+                core.notice(
+                  'Closed capability #' + closed.number +
+                  ' holds exact-SHA qualification evidence; no reopen needed.'
+                );
+                continue;
+              }
+              await github.rest.issues.update({
+                owner,
+                repo,
+                issue_number: closed.number,
+                state: 'open',
+              });
+              await addLabel(closed.number, qualifyingLabel);
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: closed.number,
+                body: [
+                  'Reopened by the qualification gate: this capability declares mandatory qualification (' +
+                    refs.map(ref => '#' + ref).join(', ') +
+                    ') but holds no exact-SHA pass evidence' +
+                    (requiredSha ? ' for main `' + requiredSha + '`.' : '.') +
+                    ' Auto-close keywords cannot bypass qualification.',
+                ].join('\n'),
+              });
+              core.warning(
+                'Reopened auto-closed capability #' + closed.number +
+                ' with pending mandatory qualification.'
+              );
+              issues.push({ ...closed, state: 'open' });
+            }
+
+            // Open-capability reconcile: exact-SHA evidence may complete the
+            // capability, failure blocks it with a repair issue, and anything
+            // else keeps it qualifying with its qualifications dispatched.
+            // A main advance since the recorded SHA invalidates stale
+            // evidence and reruns qualification automatically.
+            for (const issue of issues) {
+              const refs = qualificationRefs(issue.body || '', issue.number);
+              if (refs.length === 0) continue;
+              const outcome = await reconcileQualificationCapability(issue);
+              core.notice(
+                'Capability #' + issue.number +
+                ' qualification reconcile: ' + outcome + '.'
+              );
             }
 
             // Manual owner-triggered /oc runs are real in-flight work too.
@@ -1257,19 +1913,43 @@ jobs:
                 const prAt = new Date(latestPr.created_at).getTime();
                 if (prAt >= dispatchAt && latestPr.state === 'closed') {
                   if (latestPr.merged_at) {
-                    await removeLabel(issueNumber, inProgressLabel);
-                    await removeLabel(issueNumber, pausedLabel);
-                    await github.rest.issues.update({
-                      owner,
-                      repo,
-                      issue_number: issueNumber,
-                      state: 'closed',
-                      state_reason: 'completed',
-                    });
-                    core.notice(
-                      'Reconciled merged PR #' + latestPr.number +
-                      ' -> completed issue #' + issueNumber + '.'
+                    let mergeSha = null;
+                    try {
+                      const fullPr = (await github.rest.pulls.get({
+                        owner,
+                        repo,
+                        pull_number: latestPr.number,
+                      })).data;
+                      mergeSha = normalizeSha(fullPr.merge_commit_sha);
+                    } catch (err) {
+                      if (err.status !== 404) throw err;
+                    }
+                    const entered = await enterQualifyingState(
+                      issueNumber,
+                      mergeSha,
+                      'reconciled PR #' + latestPr.number
                     );
+                    if (entered === 'missing' || entered.length === 0) {
+                      await removeLabel(issueNumber, inProgressLabel);
+                      await removeLabel(issueNumber, pausedLabel);
+                      await github.rest.issues.update({
+                        owner,
+                        repo,
+                        issue_number: issueNumber,
+                        state: 'closed',
+                        state_reason: 'completed',
+                      });
+                      core.notice(
+                        'Reconciled merged PR #' + latestPr.number +
+                        ' -> completed issue #' + issueNumber + '.'
+                      );
+                    } else {
+                      core.notice(
+                        'Reconciled merged PR #' + latestPr.number +
+                        ' -> capability #' + issueNumber +
+                        ' enters qualification instead of completing.'
+                      );
+                    }
                   } else {
                     await pauseIssue(
                       issueNumber,
