@@ -367,7 +367,7 @@ jobs:
           mkdir -p "$worktree"
           cd "$worktree"
           git init --quiet
-          TOKEN_B64="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          TOKEN_B64="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
           git config --local http.https://github.com/.extraheader "AUTHORIZATION: basic $TOKEN_B64"
           unset TOKEN_B64
           trap 'git config --local --unset http.https://github.com/.extraheader || true; unset TOKEN_B64 || true' EXIT
