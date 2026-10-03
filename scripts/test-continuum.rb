@@ -3547,9 +3547,14 @@ class ContinuumTest < Minitest::Test
     assert_includes body, 'await unresolvedCodeRabbitThreads(pr)'
     assert_includes body, 'waiting for ${unresolvedThreads.length} unresolved CodeRabbit thread(s) before final full review'
     assert_includes body, 'codeRabbitExplicitlyResolved'
+    assert_includes body, '/\\bRESOLVED\\b/i.test(body)'
+    assert_includes body, 'data.repository?.pullRequest?.reviewThreads'
+    assert_includes body, 'if (unresolvedThreads === null)'
+    assert_includes body, 'could not inspect CodeRabbit review threads; skipping this PR for this pass'
     assert_includes body, "currentDecision?.state === 'APPROVED'"
 
     assert_includes body, 'current-head CHANGES_REQUESTED review'
+    assert_includes body, "comment.user?.login?.startsWith('coderabbitai')"
     assert_includes body, 'has no inline findings; suppressing full re-review'
     assert_includes body, "stage: finalReview ? 'final-review' : 'initial-review'"
     assert_includes body, 'stageRank: finalReview ? 0 : 1'
