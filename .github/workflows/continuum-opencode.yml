@@ -635,7 +635,16 @@ jobs:
           git push -u origin "HEAD:$CURRENT_BRANCH"
 
           TITLE="$(git log -1 --format=%s)"
-          BODY="$(printf 'Recovered automatically after the OpenCode agent changed branches during issue #%s execution.\n\nCloses #%s' "$ISSUE_NUMBER" "$ISSUE_NUMBER")"
+          # A capability with mandatory live qualification must never be
+          # auto-closed by PR keywords: `Closes #N` would bypass the
+          # qualification gate, so a qualifying issue gets a non-closing
+          # body and the gate completes it only on exact-SHA evidence.
+          RECOVER_ISSUE_BODY="$(gh issue view "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --json body --jq '.body // ""')"
+          if grep -Eqi '<!--[[:space:]]*automation-qualification:' <<<"$RECOVER_ISSUE_BODY"; then
+            BODY="$(printf 'Recovered automatically after the OpenCode agent changed branches during issue #%s execution.\n\nRelates to #%s\n\nMandatory live qualification is declared on #%s; this PR must not auto-close it. The qualification gate completes it only on exact-SHA pass evidence.' "$ISSUE_NUMBER" "$ISSUE_NUMBER" "$ISSUE_NUMBER")"
+          else
+            BODY="$(printf 'Recovered automatically after the OpenCode agent changed branches during issue #%s execution.\n\nCloses #%s' "$ISSUE_NUMBER" "$ISSUE_NUMBER")"
+          fi
           gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$CURRENT_BRANCH" --title "$TITLE" --body "$BODY"
 
       - name: Implement issue
@@ -767,11 +776,20 @@ jobs:
           PR_NUMBER="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --state all \
             --json number --jq '.[0].number // empty')"
           if [[ -z "$PR_NUMBER" ]]; then
+            # A capability with mandatory live qualification must never be
+            # auto-closed by PR keywords: `Closes #N` would bypass the
+            # qualification gate, so a qualifying issue gets a non-closing
+            # body and the gate completes it only on exact-SHA evidence.
+            if grep -Eqi '<!--[[:space:]]*automation-qualification:' <<<"$ISSUE_BODY"; then
+              PR_BODY="$(printf 'Automated implementation for #%s.\n\nRelates to #%s\n\nMandatory live qualification is declared on #%s; this PR must not auto-close it. The qualification gate records the merged main SHA and dispatches qualification after merge.' "$ISSUE_NUMBER" "$ISSUE_NUMBER" "$ISSUE_NUMBER")"
+            else
+              PR_BODY="$(printf 'Automated implementation for #%s.\n\nCloses #%s' "$ISSUE_NUMBER" "$ISSUE_NUMBER")"
+            fi
             PR_URL="$(gh pr create --repo "$GITHUB_REPOSITORY" \
               --base "$BASE_REF" \
               --head "$BRANCH" \
               --title "$ISSUE_TITLE" \
-              --body "$(printf 'Automated implementation for #%s.\n\nCloses #%s' "$ISSUE_NUMBER" "$ISSUE_NUMBER")")"
+              --body "$PR_BODY")"
             PR_NUMBER="$(gh pr view "$PR_URL" --repo "$GITHUB_REPOSITORY" --json number --jq .number)"
           fi
 

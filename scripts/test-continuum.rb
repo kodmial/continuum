@@ -15,7 +15,7 @@ class ContinuumTest < Minitest::Test
   # Project-owned entry workflows used only by the Continuum repository itself.
   # They deliberately stay outside the `continuum-` namespace so installer
   # ownership and reusable-engine ownership remain unambiguous.
-  PROJECT_ENTRY_WORKFLOWS = %w[automation.yml ci.yml opencode.yml].freeze
+  PROJECT_ENTRY_WORKFLOWS = %w[automation.yml ci.yml opencode.yml pr-agent.yml].freeze
   # Every caller stub in every layer, for the checks that must not care which
   # layer a file belongs to.
   ALL_STUBS = (CORE_STUBS + TECH_STUBS + PARENT_STUBS).sort
@@ -1278,6 +1278,7 @@ class ContinuumTest < Minitest::Test
     automation.yml
     ci.yml
     opencode.yml
+    pr-agent.yml
     continuum-consumer-child-dispatcher.yml
     continuum-validation.yml
   ].freeze
@@ -1852,6 +1853,8 @@ class ContinuumTest < Minitest::Test
       'dispatch_marker' => '<!-- issue-scheduler-dispatch -->',
       'in_progress_label' => 'automation:in-progress',
       'pause_marker' => 'automation:paused',
+      'qualifying_label' => 'automation:qualifying',
+      'blocked_label' => 'automation:blocked',
       'post_pause_comment' => 'true',
       'reset_markers' => 'false',
       'require_priority_label' => 'false',
@@ -2846,7 +2849,8 @@ class ContinuumTest < Minitest::Test
     ],
     'continuum-issue-scheduler.yml' => %w[
       continuum_ref wip_limit lease_minutes max_dispatch_attempts dispatch_marker
-      in_progress_label pause_marker post_pause_comment reset_markers
+      in_progress_label pause_marker qualifying_label blocked_label
+      post_pause_comment reset_markers
       require_priority_label command_grace_minutes child_owned_marker
       legacy_child_owned_marker opencode_workflow_name opencode_workflow_path
       dispatch_ref opencode_dispatch execution_label_routes
@@ -2929,6 +2933,8 @@ class ContinuumTest < Minitest::Test
       'DISPATCH_MARKER' => ['dispatch_marker', 'AUTOMATION_DISPATCH_MARKER', '<!-- issue-scheduler-dispatch -->'],
       'IN_PROGRESS_LABEL' => ['in_progress_label', 'AUTOMATION_IN_PROGRESS_LABEL', 'automation:in-progress'],
       'PAUSE_LABEL' => ['pause_marker', 'AUTOMATION_PAUSE_LABEL', 'automation:paused'],
+      'QUALIFYING_LABEL' => ['qualifying_label', 'AUTOMATION_QUALIFYING_LABEL', 'automation:qualifying'],
+      'BLOCKED_LABEL' => ['blocked_label', 'AUTOMATION_BLOCKED_LABEL', 'automation:blocked'],
       'COUNT_OPEN_PRS_AS_WIP' => ['count_open_prs_as_wip', 'AUTOMATION_COUNT_OPEN_PRS_AS_WIP', 'true'],
       'PAUSE_ON_FAILURE' => ['pause_on_failure', 'AUTOMATION_PAUSE_ON_FAILURE', 'true']
     }.each do |env_key, (input, variable, literal)|
@@ -3100,9 +3106,16 @@ class ContinuumTest < Minitest::Test
 
     # The cleanup must happen before open-backlog admission so a closed issue
     # cannot retain WIP while the same reconciliation pass selects new work.
+    # The admission is located by its own statement, not by the first
+    # `state: 'open'` string in the file: helpers elsewhere in the script
+    # legitimately reopen issues and would otherwise move that match.
+    admission_at = scheduler.index('let issues = await github.paginate(')
+    refute_nil admission_at, 'the open-backlog admission is missing from the shared scheduler'
+    assert_includes scheduler[admission_at, 400], "state: 'open'",
+                    'the backlog admission must list open issues'
     assert_operator scheduler.index('const closedLeasedIssues = await github.paginate'),
                     :<,
-                    scheduler.index("state: 'open'")
+                    admission_at
   end
 
   # A blocked issue whose OpenCode PR was closed unmerged is not a failed
@@ -4234,6 +4247,104 @@ class ContinuumTest < Minitest::Test
     assert_includes body, 'unresolvedPrAgentThreads', 'auto-merge must block on unresolved PR-Agent findings'
     assert_includes body, 'requirePrAgent', 'auto-merge must gate on the selected provider'
     assert_includes body, 'finalPrAgentBasis', 'final revalidation must include the PR-Agent gate'
+  end
+
+  # ------------------------------------------------- mandatory qualification gate
+
+  # The implementation -> qualification -> capability-completion lifecycle is
+  # a first-class gate: an implementation merge enters `automation:qualifying`
+  # instead of closing the capability, qualification auto-starts against the
+  # exact merged main SHA, only exact-SHA pass evidence may complete the
+  # capability, failure blocks with repair routing, and auto-close keywords
+  # can never bypass the gate. Each behavior below is asserted on the code
+  # that acts on it, so deleting the behavior while leaving the marker in
+  # place fails here.
+  def test_mandatory_qualification_gate_is_a_first_class_lifecycle
+    scheduler = workflow_body('continuum-issue-scheduler.yml')
+
+    # The declaration marker is parsed deterministically, never inferred
+    # from prose. Single backslashes: a doubled backslash is a legal,
+    # silently non-matching regex.
+    assert_includes scheduler, '/<!--\s*automation-qualification:\s*([0-9#\s,]+?)\s*-->/',
+                    'the automation-qualification regex must use single backslashes'
+    doubled = 'automation-qualification:' + ('\\' * 2) + 's'
+    refute_includes scheduler, doubled,
+                    'doubled backslash in the automation-qualification regex matches nothing'
+    assert_includes scheduler, '[...match[1].matchAll(/\\d+/g)]'
+
+    # The gate helpers mirror src/continuum/qualification.py in the runtime.
+    %w[
+      qualificationRefs
+      latestRequiredSha
+      requiredShaMarker
+      qualificationDispatchMarker
+      hasQualificationDispatch
+      parseQualificationEvidenceEntries
+      qualificationEvidenceState
+      currentMainSha
+      dispatchQualificationIssue
+      reconcileQualificationCapability
+      ensureRepairIssue
+      enterQualifyingState
+    ].each do |name|
+      assert_includes scheduler, name,
+                      "the scheduler runtime is missing the qualification helper #{name}"
+    end
+
+    # An implementation merge enters qualifying instead of completing.
+    assert_includes scheduler, 'enters qualification instead of completing'
+    assert_includes scheduler, 'await addLabel(issueNumber, qualifyingLabel);'
+    assert_includes scheduler, 'continuum-qualification-required capability='
+    assert_includes scheduler, 'continuum-qualification-dispatch capability='
+
+    # Exact-SHA evidence is required: entries for another SHA are stale and
+    # prose verdicts never count.
+    assert_includes scheduler, 'continuum-qualification-result'
+    assert_includes scheduler, 'continuum-docker-qualification-result'
+    assert_includes scheduler, 'continuum-render-qualification-result'
+    assert_includes scheduler, 'if (entry.sha !== sha) continue;'
+
+    # Failure blocks and routes repair; a main advance reruns qualification.
+    assert_includes scheduler, 'await addLabel(capabilityNumber, blockedLabel);'
+    assert_includes scheduler, 'continuum-qualification-repair source='
+    assert_includes scheduler, 'qualification reruns for '
+
+    # Fail closed: a closed capability without exact-SHA pass evidence is
+    # reopened, so `Fixes #N` cannot bypass the gate.
+    assert_includes scheduler, 'Reopened auto-closed capability'
+    assert_includes scheduler, "state: 'open'"
+
+    # Pause never strands a mandatory qualification, and duplicate merge
+    # events never start dispatch storms.
+    assert_includes scheduler, 'unpause-and-dispatch'
+    assert_includes scheduler, 'already-dispatched'
+
+    # The lifecycle labels are created and bound to the consumer knobs.
+    assert_includes scheduler, 'name: qualifyingLabel,'
+    assert_includes scheduler, 'name: blockedLabel,'
+    assert_includes scheduler, "QUALIFYING_LABEL: ${{ inputs.qualifying_label || vars.AUTOMATION_QUALIFYING_LABEL || 'automation:qualifying' }}"
+    assert_includes scheduler, "BLOCKED_LABEL: ${{ inputs.blocked_label || vars.AUTOMATION_BLOCKED_LABEL || 'automation:blocked' }}"
+
+    # PR bodies for qualifying capabilities must not carry auto-close
+    # keywords: both PR creation sites choose a non-closing body when the
+    # issue declares mandatory qualification.
+    opencode = File.read(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
+    assert_equal 2, opencode.scan('automation-qualification:').size,
+                   'both PR creation sites must branch on the qualification marker'
+    assert_includes opencode, 'Relates to #'
+    assert_includes opencode, 'must not auto-close it'
+
+    # The deterministic engine and its CLI own the same rules.
+    engine = File.read(File.join(ROOT, 'src/continuum/qualification.py'))
+    assert_includes engine, 'automation-qualification'
+    assert_includes engine, 'continuum-qualification-result'
+    assert_includes engine, 'continuum-qualification-required'
+    assert_includes engine, 'continuum-qualification-dispatch'
+    assert_includes engine, 'def capability_status'
+    assert_includes engine, 'def should_dispatch_qualification'
+    cli = File.read(File.join(ROOT, '.github/scripts/qualification_gate.py'))
+    assert_includes cli, 'from continuum.qualification import',
+                    'the CLI must delegate to the canonical gate, not reimplement it'
   end
 
   end

@@ -80,6 +80,8 @@ publication are not part of the Swift profile.
 | `AUTOMATION_DISPATCH_MARKER` | `<!-- issue-scheduler-dispatch -->` | Scheduler dispatch marker. |
 | `AUTOMATION_IN_PROGRESS_LABEL` | `automation:in-progress` | Reservation label. |
 | `AUTOMATION_PAUSE_LABEL` | `automation:paused` | Pause label. |
+| `AUTOMATION_QUALIFYING_LABEL` | `automation:qualifying` | Implementation-merged capabilities waiting on mandatory live qualification. |
+| `AUTOMATION_BLOCKED_LABEL` | `automation:blocked` | Capabilities whose mandatory qualification failed and need repair. |
 | `CONTINUUM_CHILD_OWNED_MARKER` | `<!-- continuum-child-owned -->` | Current delegated-child ownership marker. |
 | `CONTINUUM_LEGACY_CHILD_OWNED_MARKER` | empty | Optional legacy marker supplied by a migrating consumer. |
 | `CONTINUUM_REQUIRE_CODERABBIT` | `false` | Require CodeRabbit before merge. |
