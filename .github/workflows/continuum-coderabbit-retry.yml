@@ -8,6 +8,13 @@ on:
         type: string
         default: main
         required: false
+      review_provider:
+        description: >-
+          Review provider: none, coderabbit, or pr-agent. Empty falls back to
+          vars.CONTINUUM_REVIEW_PROVIDER, then to none.
+        type: string
+        default: ''
+        required: false
   # Any new/edited CodeRabbit rate-limit response wakes the global controller.
 
 permissions: {}
@@ -25,7 +32,8 @@ concurrency:
 jobs:
   controller:
     if: >-
-      github.event_name == 'workflow_dispatch' ||
+      (inputs.review_provider || vars.CONTINUUM_REVIEW_PROVIDER || 'none') == 'coderabbit' &&
+      (github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'issue_comment' &&
        github.event.issue.pull_request != null &&
        github.event.comment.user.login == 'coderabbitai[bot]' &&
@@ -33,7 +41,7 @@ jobs:
         contains(github.event.comment.body, 'Review limit reached'))) ||
       (github.event_name == 'pull_request_review' &&
        github.event.review.user.login == 'coderabbitai[bot]' &&
-       github.event.pull_request.state == 'open')
+       github.event.pull_request.state == 'open'))
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
