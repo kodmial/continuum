@@ -275,6 +275,27 @@ jobs:
           echo "head_ref=$HEAD_REF" >> "$GITHUB_OUTPUT"
           echo "Resolved writable PR source branch refs/heads/$HEAD_REF at $CURRENT_SHA."
 
+      - name: Mark PR-Agent repair in flight
+        id: repair_status
+        if: steps.batch.outputs.empty != 'true' && steps.convergence.outputs.held != 'true' && steps.target.outcome == 'success'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          HEAD_SHA: ${{ inputs.head_sha }}
+        with:
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: process.env.HEAD_SHA,
+              state: 'pending',
+              context: 'continuum/pr-agent-repair',
+              description: 'PR-Agent repair is running',
+              target_url:
+                context.serverUrl + '/' + context.repo.owner + '/' +
+                context.repo.repo + '/actions/runs/' + context.runId,
+            });
+
       - name: Checkout the writable PR source branch
         if: steps.batch.outputs.empty != 'true' && steps.convergence.outputs.held != 'true'
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -394,6 +415,46 @@ jobs:
           fi
           git push --force-with-lease="refs/heads/$HEAD_REF:$HEAD_SHA" origin "HEAD:refs/heads/$HEAD_REF"
           echo "Pushed one bounded repair to refs/heads/$HEAD_REF for PR #$PR_NUMBER."
+
+      - name: Publish durable PR-Agent repair state
+        if: steps.repair_status.outcome == 'success' && steps.repair_pass.outcome == 'success'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          HEAD_SHA: ${{ inputs.head_sha }}
+        with:
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: process.env.HEAD_SHA,
+              state: 'success',
+              context: 'continuum/pr-agent-repair',
+              description: 'PR-Agent repair settled',
+              target_url:
+                context.serverUrl + '/' + context.repo.owner + '/' +
+                context.repo.repo + '/actions/runs/' + context.runId,
+            });
+
+      - name: Publish failed PR-Agent repair state
+        if: failure() && steps.repair_status.outcome == 'success'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          HEAD_SHA: ${{ inputs.head_sha }}
+        with:
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: process.env.HEAD_SHA,
+              state: 'failure',
+              context: 'continuum/pr-agent-repair',
+              description: 'PR-Agent repair failed; recovery eligible',
+              target_url:
+                context.serverUrl + '/' + context.repo.owner + '/' +
+                context.repo.repo + '/actions/runs/' + context.runId,
+            });
 
       - name: Schedule bounded retry for retryable PR-Agent repair failure
         if: >-
