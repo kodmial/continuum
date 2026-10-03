@@ -170,39 +170,76 @@ jobs:
             core.setOutput('empty', 'false');
             core.setOutput('count', String(items.length));
             core.setOutput('truncated', truncated ? 'true' : 'false');
-            core.setOutput('batch', JSON.stringify(items).slice(0, 60000));
+            core.setOutput('batch', JSON.stringify(items));
             core.notice(
               `PR #${prNumber} HEAD ${headSha}: batching ${keyIssues.length} review finding(s) ` +
               `and ${qualifying.length} qualifying suggestion(s) into one bounded repair pass.`
             );
 
-      - name: Checkout the exact reviewed HEAD branch
+      - name: Resolve the writable PR source branch
         if: steps.batch.outputs.empty != 'true'
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          fetch-depth: 0
-          token: ${{ secrets.TAP_PAT }}
-          persist-credentials: true
-
-      - name: Confirm the HEAD is still current before repairing
-        if: steps.batch.outputs.empty != 'true'
+        id: target
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ inputs.pr_number }}
           HEAD_SHA: ${{ inputs.head_sha }}
         run: |
           set -euo pipefail
-          CURRENT_SHA="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)"
+          PR_JSON="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")"
+          CURRENT_SHA="$(jq -r '.head.sha' <<<"$PR_JSON")"
+          HEAD_REF="$(jq -r '.head.ref' <<<"$PR_JSON")"
+          HEAD_REPO="$(jq -r '.head.repo.full_name' <<<"$PR_JSON")"
           if [[ "$CURRENT_SHA" != "$HEAD_SHA" ]]; then
             echo "::error::PR head moved ($HEAD_SHA -> $CURRENT_SHA); discarding this repair batch."
             exit 1
           fi
-          git fetch origin "pull/$PR_NUMBER/head:pr-$PR_NUMBER" --force
-          git checkout "pr-$PR_NUMBER"
-          if [[ "$(git rev-parse HEAD)" != "$HEAD_SHA" ]]; then
-            echo "::error::Checked-out HEAD does not match the reviewed HEAD $HEAD_SHA."
+          if [[ "$HEAD_REPO" != "$GITHUB_REPOSITORY" ]]; then
+            echo "::error::PR-Agent automatic repair supports same-repository PR branches only."
             exit 1
           fi
+          [[ -n "$HEAD_REF" && "$HEAD_REF" != "null" ]] || {
+            echo "::error::Could not resolve the writable PR source branch."
+            exit 1
+          }
+          echo "head_ref=$HEAD_REF" >> "$GITHUB_OUTPUT"
+          echo "Resolved writable PR source branch refs/heads/$HEAD_REF at $CURRENT_SHA."
+
+      - name: Checkout the writable PR source branch
+        if: steps.batch.outputs.empty != 'true'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.TAP_PAT }}
+          persist-credentials: true
+          ref: ${{ steps.target.outputs.head_ref }}
+
+      - name: Confirm the checked-out branch is the reviewed HEAD
+        if: steps.batch.outputs.empty != 'true'
+        env:
+          HEAD_SHA: ${{ inputs.head_sha }}
+          HEAD_REF: ${{ steps.target.outputs.head_ref }}
+        run: |
+          set -euo pipefail
+          if [[ "$(git rev-parse HEAD)" != "$HEAD_SHA" ]]; then
+            echo "::error::Checked-out branch $HEAD_REF does not match reviewed HEAD $HEAD_SHA."
+            exit 1
+          fi
+
+      - name: Install pinned OpenCode CLI for PR-Agent repair
+        if: steps.batch.outputs.empty != 'true'
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if curl -fsSL --retry 3 --retry-delay 2 https://opencode.ai/install | bash -s -- --version 1.18.34; then
+              echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+              exit 0
+            fi
+            if [[ "$attempt" -eq 3 ]]; then
+              echo "::error::OpenCode installer failed after 3 attempts."
+              exit 1
+            fi
+            sleep $((attempt * 15))
+          done
 
       - name: Run one bounded OpenCode repair pass over every current item
         if: steps.batch.outputs.empty != 'true'
@@ -210,22 +247,15 @@ jobs:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ inputs.pr_number }}
           HEAD_SHA: ${{ inputs.head_sha }}
+          HEAD_REF: ${{ steps.target.outputs.head_ref }}
           BATCH_JSON: ${{ steps.batch.outputs.batch }}
+          OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
         run: |
           set -euo pipefail
-          # OpenCode is repairer only: it receives the current-head upstream
-          # key_issues_to_review plus qualifying current improve
-          # code_suggestions, preserves each item's native source, processes
-          # every item in the batch, makes repository changes on the existing
-          # PR branch in one bounded pass, commits/pushes repairs, and never
-          # manufactures PR-Agent review state. It is never routed through the
-          # CodeRabbit fix mode.
-          #
-          # The prompt below carries ALL current items together (review plus
-          # improve) for a single bounded pass. Upstream persistent finding
-          # state reconciles every previous finding on the next complete
-          # review; no custom finding identity or resolution protocol exists
-          # here.
+          # OpenCode is repairer only: it receives every current native review
+          # finding and qualifying improve suggestion in one bounded pass.
+          # The workflow, not OpenCode, owns commit/push so publication always
+          # targets the real writable PR source branch.
           PROMPT="$(python3 - <<'PY'
           import json, os
           items = json.loads(os.environ.get('BATCH_JSON', '[]'))
@@ -242,44 +272,29 @@ jobs:
                   lines.append(f"[improve] {json.dumps(item.get('suggestion', {}))}")
           lines += [
               '',
-              'Commit the repairs on the existing PR branch and push.',
-              'Never manufacture review state.',
+              'Apply the required code changes only.',
+              'Do not commit, push, create a PR, or manufacture review state; the workflow owns publication.',
           ]
           print('\n'.join(lines))
           PY
           )"
-          opencode run --auto --model "${OPENCODE_MODEL:-opencode/muse-spark-1.3-contributor-free}" "$PROMPT"
+          START_HEAD="$(git rev-parse HEAD)"
+          opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
+          if [[ "$(git rev-parse HEAD)" != "$START_HEAD" ]]; then
+            echo "::error::OpenCode created a commit; PR-Agent repair requires the workflow to own commit/push."
+            exit 1
+          fi
           if [[ -z "$(git status --porcelain)" ]]; then
-            echo "OpenCode pass produced no changes for PR #$PR_NUMBER HEAD $HEAD_SHA."
-            exit 0
+            echo "::error::Actionable PR-Agent findings produced no repair changes for PR #$PR_NUMBER HEAD $HEAD_SHA."
+            exit 1
+          fi
+          git add -A
+          if git diff --cached --quiet; then
+            echo "::error::Repair produced no staged changes for PR #$PR_NUMBER HEAD $HEAD_SHA."
+            exit 1
           fi
           git -c user.name="github-actions[bot]" \
             -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-            commit -am "fix: apply PR-Agent review findings for HEAD $HEAD_SHA"
-          git push origin "HEAD:refs/pull/$PR_NUMBER/head" || git push
-          echo "Pushed one bounded repair for PR #$PR_NUMBER HEAD $HEAD_SHA."
-
-      - name: Record the per-head repair dispatch
-        if: steps.batch.outputs.empty != 'true' && always()
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
-        env:
-          HEAD_SHA: ${{ inputs.head_sha }}
-        with:
-          github-token: ${{ secrets.TAP_PAT }}
-          script: |
-            // One review result dispatches at most one repair, and a HEAD is
-            // never repaired twice: the marker label below makes a same-head
-            // rerun a no-op instead of a storm. A changed HEAD is a new key
-            // and receives its own complete review plus improve after CI.
-            const headSha = String(process.env.HEAD_SHA || '').trim().toLowerCase().slice(0, 12);
-            if (!headSha) return;
-            const marker = `pr-agent-repair-${headSha}`;
-            const prNumber = Number('${{ inputs.pr_number }}');
-            try {
-              await github.rest.issues.addLabels({
-                owner: context.repo.owner, repo: context.repo.repo,
-                issue_number: prNumber, labels: [marker],
-              });
-            } catch (err) {
-              core.warning(`Could not record repair marker ${marker}: ${err.message}`);
-            }
+            commit -m "fix: apply PR-Agent review findings for HEAD $HEAD_SHA"
+          git push origin "HEAD:refs/heads/$HEAD_REF"
+          echo "Pushed one bounded repair to refs/heads/$HEAD_REF for PR #$PR_NUMBER."

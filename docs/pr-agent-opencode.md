@@ -98,10 +98,20 @@ may tune review *behavior*, but provider routing is forced through the
 The installed PR-Agent caller wakes on PR events and again when the repository's
 `CI` workflow completes successfully for a pull request. The reusable workflow
 admits one exact CI-qualified HEAD, runs upstream PR-Agent v0.46.0 full
-`review` and full `improve`, and exposes the native structured review JSON,
-the reviewed HEAD SHA, and the native improve JSONL as reusable-workflow
-outputs. The bridge is resolved from the selected Continuum revision; consumers
-do not copy Continuum-internal bridge code into their repositories.
+`review` and full `improve`, reads the native v0.46.0 persistent finding
+state for that exact HEAD, and routes the result automatically:
+
+```text
+CI -> review + improve
+   -> actionable items -> PR-Agent repair -> writable PR branch -> CI -> fresh review
+   -> no actionable items -> PR-Agent exact-HEAD merge gate
+```
+
+The merge gate requires the native persistent state to be a complete full review
+for the same HEAD and accepts only `safe_to_merge` with no current findings or
+qualifying suggestions. Generic auto-merge is disabled in PR-Agent mode. The
+bridge is resolved from the selected Continuum revision; consumers do not copy
+Continuum-internal bridge code into their repositories.
 
 ## Failure modes (all explicit, never silent green)
 

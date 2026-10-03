@@ -15,6 +15,12 @@ on:
       improve_jsonl:
         description: Native upstream /improve push_outputs JSONL for head_sha.
         value: ${{ jobs.pr_agent.outputs.improve_jsonl }}
+      persistent_state_json:
+        description: Native upstream persistent finding state for head_sha.
+        value: ${{ jobs.pr_agent.outputs.persistent_state_json }}
+      needs_repair:
+        description: Whether current native review/improve output requires repair.
+        value: ${{ jobs.pr_agent.outputs.needs_repair }}
     inputs:
       continuum_ref:
         description: Continuum revision supplying fallback scripts
@@ -95,7 +101,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: pr-agent-${{ github.event.issue.number || github.event.pull_request.number || inputs.pr_number || github.run_id }}
+  group: pr-agent-${{ github.event.issue.number || github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || inputs.pr_number || github.run_id }}
   cancel-in-progress: false
 
 jobs:
@@ -104,9 +110,13 @@ jobs:
     timeout-minutes: ${{ fromJSON(vars.AUTOMATION_PR_AGENT_TIMEOUT_MINUTES || '60') }}
     outputs:
       admitted: ${{ steps.admit.outputs.admitted }}
+      pr_number: ${{ steps.stack.outputs.pr_number }}
+      review_provider: ${{ steps.stack.outputs.stack }}
       head_sha: ${{ steps.result.outputs.head_sha }}
       review_json: ${{ steps.pragent.outputs.review }}
       improve_jsonl: ${{ steps.improve_output.outputs.improve_jsonl }}
+      persistent_state_json: ${{ steps.persistent.outputs.persistent_state_json }}
+      needs_repair: ${{ steps.route.outputs.needs_repair }}
 
     permissions:
       contents: read
@@ -527,6 +537,104 @@ jobs:
             core.setOutput('head_sha', currentSha);
             core.notice(`Native PR-Agent review output for ${reviewedSha} is current and machine-readable.`);
 
+      - name: Export native persistent finding state for the reviewed HEAD
+        if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
+        id: persistent
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
+          REVIEWED_SHA: ${{ steps.result.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          COMMENTS_JSON="$RUNNER_TEMP/pr-agent-comments.json"
+          gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100" \
+            > "$COMMENTS_JSON"
+          python3 - "$COMMENTS_JSON" <<'PY'
+          import json
+          import os
+          import sys
+          from pr_agent.algo.review_finding_state import parse_review_state
+
+          path = sys.argv[1]
+          reviewed = os.environ["REVIEWED_SHA"].strip().lower()
+          with open(path, "r", encoding="utf-8") as handle:
+              pages = json.load(handle)
+          comments = []
+          for page in pages:
+              if isinstance(page, list):
+                  comments.extend(page)
+          candidates = [
+              c for c in comments
+              if "<!-- pr-agent-review-state:" in str(c.get("body") or "")
+          ]
+          if not candidates:
+              raise SystemExit("No upstream PR-Agent persistent finding state marker was published.")
+          latest = max(candidates, key=lambda c: str(c.get("updated_at") or c.get("created_at") or ""))
+          parsed = parse_review_state(str(latest.get("body") or ""))
+          if not parsed.present or not parsed.valid or not isinstance(parsed.state, dict):
+              raise SystemExit("Latest upstream PR-Agent persistent finding state is missing or invalid.")
+          state = parsed.state
+          last = state.get("last_run")
+          if not isinstance(last, dict):
+              raise SystemExit("Upstream PR-Agent persistent state has no last_run.")
+          state_head = str(last.get("head_sha") or "").strip().lower()
+          if state_head != reviewed:
+              raise SystemExit(
+                  f"Persistent state is stale: last_run.head_sha={state_head or '<empty>'}, reviewed={reviewed}."
+              )
+          if last.get("complete") is not True or str(last.get("kind") or "") != "full":
+              raise SystemExit("Persistent state does not represent a complete full review.")
+          findings = state.get("findings")
+          if not isinstance(findings, list):
+              raise SystemExit("Upstream PR-Agent persistent state findings is not a list.")
+          valid_states = {"ACTIVE", "RESOLVED"}
+          for finding in findings:
+              if not isinstance(finding, dict):
+                  raise SystemExit("Upstream PR-Agent persistent state contains a non-object finding.")
+              if str(finding.get("state") or "").upper() not in valid_states:
+                  raise SystemExit("Upstream PR-Agent persistent state contains an unknown finding state.")
+          compact = json.dumps(state, separators=(",", ":"), ensure_ascii=False)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"persistent_state_json={compact}\n")
+          PY
+
+      - name: Route the current PR-Agent result
+        if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
+        id: route
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          REVIEW_JSON: ${{ steps.pragent.outputs.review }}
+          IMPROVE_JSONL: ${{ steps.improve_output.outputs.improve_jsonl }}
+        with:
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            const review = JSON.parse(String(process.env.REVIEW_JSON || ''));
+            const keyIssues = Array.isArray(review.key_issues_to_review)
+              ? review.key_issues_to_review
+              : [];
+            const suggestions = [];
+            for (const line of String(process.env.IMPROVE_JSONL || '').split('\n')) {
+              if (!line.trim()) continue;
+              const record = JSON.parse(line);
+              const payload = record.payload || record;
+              for (const entry of payload.code_suggestions || []) {
+                const score = entry?.score;
+                if (score === undefined || score === null || Number.isNaN(Number(score)) || Number(score) >= 1) {
+                  suggestions.push(entry);
+                }
+              }
+            }
+            const needsRepair = keyIssues.length > 0 || suggestions.length > 0;
+            core.setOutput('needs_repair', needsRepair ? 'true' : 'false');
+            core.setOutput('review_findings', String(keyIssues.length));
+            core.setOutput('improve_suggestions', String(suggestions.length));
+            core.notice(
+              needsRepair
+                ? `Routing ${keyIssues.length} review finding(s) and ${suggestions.length} improve suggestion(s) to PR-Agent repair.`
+                : 'No current actionable review/improve items; routing this exact HEAD to the PR-Agent merge gate.'
+            );
+
       - name: Fail closed on a moved head
         if: steps.stack.outputs.enabled == 'true' && always()
         env:
@@ -564,3 +672,34 @@ jobs:
           pkill -f "opencode serv[e] --hostname 127.0.0.1" || true
           pkill -f "continuum-pr-agent-bridge.p[y]" || true
           pkill -f "pr_agent_bridge.p[y]" || true
+
+  repair:
+    needs: pr_agent
+    if: >-
+      needs.pr_agent.outputs.admitted == 'true' &&
+      needs.pr_agent.outputs.needs_repair == 'true'
+    uses: ./.github/workflows/continuum-pr-agent-repair.yml
+    secrets: inherit
+    with:
+      continuum_ref: ${{ inputs.continuum_ref }}
+      review_provider: ${{ needs.pr_agent.outputs.review_provider }}
+      pr_number: ${{ needs.pr_agent.outputs.pr_number }}
+      head_sha: ${{ needs.pr_agent.outputs.head_sha }}
+      review_json: ${{ needs.pr_agent.outputs.review_json }}
+      improve_jsonl: ${{ needs.pr_agent.outputs.improve_jsonl }}
+
+  merge:
+    needs: pr_agent
+    if: >-
+      needs.pr_agent.outputs.admitted == 'true' &&
+      needs.pr_agent.outputs.needs_repair == 'false'
+    uses: ./.github/workflows/continuum-pr-agent-auto-merge.yml
+    secrets: inherit
+    with:
+      continuum_ref: ${{ inputs.continuum_ref }}
+      review_provider: ${{ needs.pr_agent.outputs.review_provider }}
+      pr_number: ${{ needs.pr_agent.outputs.pr_number }}
+      head_sha: ${{ needs.pr_agent.outputs.head_sha }}
+      review_json: ${{ needs.pr_agent.outputs.review_json }}
+      improve_jsonl: ${{ needs.pr_agent.outputs.improve_jsonl }}
+      persistent_state_json: ${{ needs.pr_agent.outputs.persistent_state_json }}

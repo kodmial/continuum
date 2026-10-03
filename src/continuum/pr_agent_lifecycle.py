@@ -351,31 +351,24 @@ def build_repair_batch(
 def upstream_state_has_active(state: object) -> bool:
     """Whether native persistent state still contains an ACTIVE finding.
 
-    Reads only the upstream-structured state object (findings with a
-    status field). Marker parsing lives in the pinned upstream
-    implementation and is not reproduced here.
+    Reads the upstream v0.46.0 state object: top-level `findings` entries
+    use `state=ACTIVE|RESOLVED`. Marker parsing stays in pinned upstream
+    PR-Agent and is not reproduced here.
     """
 
-    findings: Sequence[Any]
-    if state is None:
-        return False
-    if isinstance(state, dict):
-        raw = state.get("findings", state.get("persistent_findings", []))
-        if isinstance(raw, dict):
-            findings = list(raw.values())
-        elif isinstance(raw, list):
-            findings = raw
-        else:
-            raise LifecycleError("upstream finding state findings must be a list")
-    elif isinstance(state, list):
-        findings = state
-    else:
-        raise LifecycleError("upstream finding state must be a list or mapping")
+    if not isinstance(state, dict):
+        raise LifecycleError("upstream finding state must be the v0.46.0 state object")
+    raw = state.get("findings")
+    if not isinstance(raw, list):
+        raise LifecycleError("upstream finding state findings must be a list")
+    findings: Sequence[Any] = raw
     for entry in findings:
         if not isinstance(entry, dict):
-            continue
-        status = str(entry.get("status", "") or "").strip().upper()
-        if status in (STATE_ACTIVE, "REOPENED", "OPEN"):
+            raise LifecycleError("upstream finding state contains a non-object finding")
+        finding_state = str(entry.get("state", "") or "").strip().upper()
+        if finding_state not in (STATE_ACTIVE, STATE_RESOLVED):
+            raise LifecycleError("upstream finding state contains an unknown state")
+        if finding_state == STATE_ACTIVE:
             return True
     return False
 

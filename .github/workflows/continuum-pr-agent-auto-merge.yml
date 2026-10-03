@@ -41,8 +41,8 @@ on:
         required: false
       persistent_state_json:
         description: >-
-          Upstream native persistent finding state for the latest successful
-          full review (structured findings with status fields).
+          Upstream PR-Agent v0.46.0 persistent finding state for the latest
+          successful full review (findings[].state plus last_run metadata).
         type: string
         default: ''
         required: false
@@ -164,16 +164,55 @@ jobs:
               const numeric = Number(entry.score);
               return Number.isNaN(numeric) ? true : numeric >= 1;
             });
-            let persistent = [];
             const stateRaw = String(process.env.PERSISTENT_STATE_JSON || '').trim();
-            if (stateRaw) {
-              const parsed = JSON.parse(stateRaw);
-              persistent = Array.isArray(parsed) ? parsed : (parsed.findings || []);
+            if (!stateRaw) {
+              core.setFailed('PR-Agent gate requires native persistent finding state for the exact reviewed HEAD.');
+              return;
             }
-            const hasActive = persistent.some((entry) => {
-              const status = String(entry.status || '').trim().toUpperCase();
-              return status === 'ACTIVE' || status === 'REOPENED' || status === 'OPEN';
-            });
+            let persistentState;
+            try {
+              persistentState = JSON.parse(stateRaw);
+            } catch (err) {
+              core.setFailed(`Invalid PR-Agent persistent state JSON: ${err.message}`);
+              return;
+            }
+            if (!persistentState || typeof persistentState !== 'object' || Array.isArray(persistentState)) {
+              core.setFailed('PR-Agent persistent state must be the upstream state object.');
+              return;
+            }
+            if (persistentState.schema_version !== 1 || !Array.isArray(persistentState.findings)) {
+              core.setFailed('PR-Agent persistent state does not match upstream v0.46.0 schema.');
+              return;
+            }
+            const lastRun = persistentState.last_run;
+            if (!lastRun || typeof lastRun !== 'object') {
+              core.setFailed('PR-Agent persistent state has no last_run metadata.');
+              return;
+            }
+            const stateHead = String(lastRun.head_sha || '').trim().toLowerCase();
+            if (stateHead !== headSha) {
+              core.setFailed(
+                `PR-Agent persistent state is stale: last_run.head_sha=${stateHead || '<empty>'}, expected=${headSha}.`
+              );
+              return;
+            }
+            if (lastRun.complete !== true || String(lastRun.kind || '') !== 'full') {
+              core.setFailed('PR-Agent persistent state is not from a complete full review.');
+              return;
+            }
+            let hasActive = false;
+            for (const entry of persistentState.findings) {
+              if (!entry || typeof entry !== 'object') {
+                core.setFailed('PR-Agent persistent state contains a non-object finding.');
+                return;
+              }
+              const state = String(entry.state || '').trim().toUpperCase();
+              if (!['ACTIVE', 'RESOLVED'].includes(state)) {
+                core.setFailed(`PR-Agent persistent finding has invalid state "${state || '<empty>'}".`);
+                return;
+              }
+              if (state === 'ACTIVE') hasActive = true;
+            }
             const fail = (reason) => {
               core.setOutput('green', 'false');
               core.setOutput('reason', reason);

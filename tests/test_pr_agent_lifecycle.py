@@ -56,6 +56,20 @@ def make_review(
     return review
 
 
+def make_persistent(findings=None, head_sha="head") -> dict:
+    return {
+        "schema_version": 1,
+        "findings": list(findings or []),
+        "last_run": {
+            "complete": True,
+            "excluded_files": [],
+            "head_sha": head_sha,
+            "kind": "full",
+            "run_id": "test",
+        },
+    }
+
+
 def issue_entry(relevant_file="src/app.py", header="Possible Bug", n: int = 0) -> dict:
     return {
         "relevant_file": relevant_file,
@@ -355,10 +369,15 @@ class NoCustomProtocolTests(unittest.TestCase):
         finally:
             sys.path.remove(SRC)
         self.assertEqual(life.UPSTREAM_FINDING_STATE_VERSION, "0.46.0")
-        # Structured upstream state is read via status fields only.
-        self.assertTrue(life.upstream_state_has_active([{"status": "ACTIVE"}]))
-        self.assertFalse(life.upstream_state_has_active([{"status": "RESOLVED"}]))
-        self.assertTrue(life.upstream_state_has_active([{"status": "reopened"}]))
+        # v0.46.0 persistent findings use the native `state` field.
+        self.assertTrue(
+            life.upstream_state_has_active(make_persistent([{"state": "ACTIVE"}]))
+        )
+        self.assertFalse(
+            life.upstream_state_has_active(make_persistent([{"state": "RESOLVED"}]))
+        )
+        with self.assertRaises(life.LifecycleError):
+            life.upstream_state_has_active({"findings": [{"status": "ACTIVE"}]})
 
     def test_large_pr_behavior_is_upstream_chunking_not_continuum(self):
         source = lifecycle_source()
@@ -473,7 +492,7 @@ class ConfigurationTests(unittest.TestCase):
         partial = make_review([issue_entry(n=i) for i in range(5)])
         self.assertFalse(life.is_potentially_truncated(partial))
         gate = life.evaluate_gate(life.GateInputs(
-            review=full, qualifying_improve=[], persistent_state=[],
+            review=full, qualifying_improve=[], persistent_state=make_persistent(),
             ci_green_on_exact_head=True, head_matches=True,
             review_coverage_complete=True, improve_coverage_complete=True,
         ))
@@ -492,7 +511,7 @@ class GateTests(unittest.TestCase):
         base = dict(
             review=make_review([]),
             qualifying_improve=[],
-            persistent_state=[],
+            persistent_state=make_persistent(),
             ci_green_on_exact_head=True,
             head_matches=True,
             review_coverage_complete=True,
@@ -513,9 +532,9 @@ class GateTests(unittest.TestCase):
                 self.assertFalse(gate["green"])
 
     def test_active_persistent_state_blocks(self):
-        gate = self._gate(persistent_state=[{"status": "ACTIVE"}])
+        gate = self._gate(persistent_state=make_persistent([{"state": "ACTIVE"}]))
         self.assertFalse(gate["green"])
-        gate = self._gate(persistent_state=[{"status": "RESOLVED"}])
+        gate = self._gate(persistent_state=make_persistent([{"state": "RESOLVED"}]))
         self.assertTrue(gate["green"])
 
     def test_stale_head_blocks(self):
@@ -666,6 +685,38 @@ class IsolationTests(unittest.TestCase):
         self.assertNotIn("CONTINUUM_REQUIRE_CODERABBIT", body)
         self.assertIn("Install pinned OpenCode CLI for the PR-Agent backend", body)
         self.assertIn("Resolve the Continuum-owned PR-Agent bridge", body)
+
+    def test_review_routes_only_to_pr_agent_repair_or_merge(self):
+        review = read_repo(".github/workflows/continuum-pr-agent.yml")
+        self.assertIn("uses: ./.github/workflows/continuum-pr-agent-repair.yml", review)
+        self.assertIn("uses: ./.github/workflows/continuum-pr-agent-auto-merge.yml", review)
+        self.assertIn("needs.pr_agent.outputs.needs_repair == 'true'", review)
+        self.assertIn("needs.pr_agent.outputs.needs_repair == 'false'", review)
+        self.assertIn("Export native persistent finding state for the reviewed HEAD", review)
+        self.assertIn("parse_review_state", review)
+
+    def test_repair_targets_real_branch_and_never_truncates_json(self):
+        repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
+        self.assertNotIn("refs/pull/$PR_NUMBER/head", repair)
+        self.assertNotIn(".slice(0, 60000)", repair)
+        self.assertIn('refs/heads/$HEAD_REF', repair)
+        self.assertIn("Resolve the writable PR source branch", repair)
+        self.assertIn("Install pinned OpenCode CLI for PR-Agent repair", repair)
+        self.assertIn("git add -A", repair)
+
+    def test_merge_gate_uses_native_v046_persistent_state_schema(self):
+        merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
+        self.assertIn("persistentState.findings", merge)
+        self.assertIn("entry.state", merge)
+        self.assertIn("last_run", merge)
+        self.assertIn("lastRun.complete", merge)
+        self.assertIn("lastRun.head_sha", merge)
+        self.assertNotIn("entry.status", merge)
+
+    def test_generic_auto_merge_still_refuses_pr_agent_mode(self):
+        generic = read_repo(".github/workflows/continuum-auto-merge.yml")
+        self.assertIn("if (reviewProvider === 'pr-agent')", generic)
+        self.assertIn("Only the PR-Agent-specific merge gate may merge.", generic)
 
     def test_pr_agent_stack_invokes_only_pr_agent_workflows(self):
         import sys
