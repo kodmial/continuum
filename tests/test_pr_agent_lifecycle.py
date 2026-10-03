@@ -851,7 +851,7 @@ class StabilizationParityTests(unittest.TestCase):
         for body in (review, repair):
             self.assertIn("retry_attempt", body)
             self.assertIn("15 * (1 << attempt)", body)
-            self.assertIn("attempt >= 3", body)
+            self.assertIn("attempt >= 2", body)
             self.assertIn("expected_head_sha", review)
             self.assertNotIn("continuum-coderabbit-retry.yml", body)
             self.assertNotIn("continuum-coderabbit-unresolved.yml", body)
@@ -1056,7 +1056,13 @@ class RepairWiringRegressionTests(unittest.TestCase):
         self.assertNotIn("conflictRepairRunsActive", merge)
 
     def test_active_conflict_repair_wins_over_exhausted_attempt_helper(self):
-        life = self._life()
+        import sys
+
+        sys.path.insert(0, SRC)
+        try:
+            from continuum import pr_agent_lifecycle as life
+        finally:
+            sys.path.remove(SRC)
         decision = life.conflict_repair_action(
             label_present=True,
             active_repair_runs=1,
