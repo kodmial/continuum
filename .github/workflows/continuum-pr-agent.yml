@@ -208,10 +208,15 @@ jobs:
               return;
             }
             core.setOutput('retry_attempt', retryAttempt);
-            core.setOutput(
-              'retry_workflow',
-              String(process.env.INPUT_RETRY_WORKFLOW || 'continuum-pr-agent.yml').trim()
-            );
+            const retryWorkflow =
+              String(process.env.INPUT_RETRY_WORKFLOW || 'continuum-pr-agent.yml').trim();
+            if (!['continuum-pr-agent.yml', 'pr-agent.yml'].includes(retryWorkflow)) {
+              core.setFailed(
+                'PR-Agent retry_workflow must be continuum-pr-agent.yml or pr-agent.yml.'
+              );
+              return;
+            }
+            core.setOutput('retry_workflow', retryWorkflow);
             const eventExpectedHead = context.payload.workflow_run?.head_sha || '';
             core.setOutput(
               'expected_head',
