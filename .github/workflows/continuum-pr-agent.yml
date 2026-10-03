@@ -398,13 +398,13 @@ jobs:
           set -euo pipefail
           worktree="$RUNNER_TEMP/continuum-pr-agent-review-worktree"
           rm -rf "$worktree"
-          if ! gh repo clone "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" "$worktree" -- --quiet >/dev/null 2>&1; then
-            echo "::error::Unable to checkout the verified PR-Agent target repository."
-            exit 1
-          fi
+          mkdir -p "$worktree"
           cd "$worktree"
-          if ! git fetch origin "$HEAD_SHA" --depth=1 --quiet >/dev/null 2>&1 ||
-             ! git checkout --detach "$HEAD_SHA" --quiet >/dev/null 2>&1; then
+          git init --quiet
+          gh auth setup-git >/dev/null 2>&1
+          git remote add origin "https://github.com/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY.git"
+          if ! git fetch --depth=1 --no-tags origin "$HEAD_SHA" --quiet >/dev/null 2>&1 ||
+             ! git checkout --detach FETCH_HEAD --quiet >/dev/null 2>&1; then
             echo "::error::Unable to checkout the exact PR-Agent target HEAD."
             exit 1
           fi
