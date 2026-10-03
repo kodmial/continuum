@@ -3001,18 +3001,31 @@ class ContinuumTest < Minitest::Test
     assert_includes scheduler, "': declared blocked by '"
   end
 
-  # Child routing is repository-level. The installed caller and reusable
-  # scheduler both fail safe when CONTINUUM_ROLE=child, while legacy marker
-  # inputs stay accepted only for caller compatibility and have no routing role.
-  def test_scheduler_is_fail_safe_noop_for_child_role
+  # Child routing is repository-level. A child never schedules locally, but
+  # event-driven caller runs wake only its verified parent. Child schedule events
+  # stay skipped so private child minutes are not used as a polling mechanism.
+  def test_scheduler_child_role_wakes_verified_parent_without_local_dispatch
     scheduler = workflow_body('continuum-issue-scheduler.yml')
     workflow = yaml(File.join(ROOT, '.github/workflows/continuum-issue-scheduler.yml'))
     assert_equal "vars.CONTINUUM_ROLE != 'child'",
                  workflow.fetch('jobs').fetch('schedule').fetch('if')
+    assert_equal "vars.CONTINUUM_ROLE == 'child'",
+                 workflow.fetch('jobs').fetch('wake_parent').fetch('if')
 
     stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-issue-scheduler.yml'))
     caller_gate = stub.fetch('jobs').fetch('call').fetch('if')
-    assert_includes caller_gate, "vars.CONTINUUM_ROLE != 'child'"
+    assert_includes caller_gate, "vars.CONTINUUM_ROLE != 'child' || github.event_name != 'schedule'"
+    assert_includes caller_gate, "github.event_name != 'issue_comment'"
+
+    assert_includes scheduler, 'CONTINUUM_CHILD_ID'
+    assert_includes scheduler, 'CONTINUUM_PARENT'
+    assert_includes scheduler, 'verify-child-variables'
+    assert_includes scheduler, 'parent-variable-ids'
+    assert_includes scheduler, 'actions/workflows/continuum-issue-scheduler.yml/dispatches'
+    assert_includes scheduler, 'Woke verified parent scheduler.'
+    assert_includes scheduler, '2>/dev/null'
+    refute_includes scheduler, 'echo "$parent"'
+    refute_includes scheduler, 'echo "$child_id"'
 
     refute_includes scheduler, 'function isChildOwned(issue)'
     refute_includes scheduler, 'body.includes(childOwnedMarker)'
