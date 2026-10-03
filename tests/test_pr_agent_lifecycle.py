@@ -681,6 +681,12 @@ class IsolationTests(unittest.TestCase):
             self.assertIn("pull-requests: write", body)
         self.assertIn("statuses: read", engine)
 
+    def test_pr_agent_bridge_runtime_bundle_includes_python_dependency(self):
+        body = read_repo(".github/workflows/continuum-pr-agent.yml")
+        self.assertIn("Resolve the Continuum-owned PR-Agent runtime bundle", body)
+        self.assertIn("contents/src/continuum/pr_agent.py", body)
+        self.assertIn("continuum-pr-agent-runtime", body)
+
     def test_pre_ci_skip_does_not_run_checkout_integrity_guard(self):
         body = read_repo(".github/workflows/continuum-pr-agent.yml")
         self.assertIn(
