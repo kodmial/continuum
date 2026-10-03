@@ -648,7 +648,15 @@ jobs:
                       (cleanupErr.message || cleanupErr)
                     );
                   }
-                  await releaseConflictLock();
+                  try {
+                    await releaseConflictLock();
+                  } catch (lockErr) {
+                    core.warning(
+                      'PR #' + prNumber +
+                      ': failed to release delegated conflict lock: ' +
+                      (lockErr.message || lockErr)
+                    );
+                  }
                   core.setFailed(
                     'PR #' + prNumber +
                     ': Delegated PR conflict repair needs the parent routing controller; ' +
