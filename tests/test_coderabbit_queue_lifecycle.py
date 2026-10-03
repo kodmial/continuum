@@ -1,5 +1,6 @@
 import unittest
 from dataclasses import dataclass
+from pathlib import Path
 
 
 PRIORITY_RANK = {
@@ -20,7 +21,7 @@ class QueueState:
     required_gate_green: bool = True
     unresolved_threads: int = 0
     current_head_decision: str | None = None
-    current_head_inline_findings: int = 0
+    no_progress_blocked: bool = False
     prior_full_reviews: int = 0
     prior_changes_requested: bool = False
     requested_lock: bool = False
@@ -54,10 +55,7 @@ def eligible_for_full_review(state: QueueState) -> bool:
         return False
     if state.current_head_decision == "APPROVED":
         return False
-    if (
-        state.current_head_decision == "CHANGES_REQUESTED"
-        and state.current_head_inline_findings == 0
-    ):
+    if state.no_progress_blocked:
         return False
     return True
 
@@ -66,6 +64,21 @@ def may_emit_command(state: QueueState, shared_slot_busy: bool = False) -> bool:
     if shared_slot_busy or state.requested_lock or state.rate_limited:
         return False
     return eligible_for_full_review(state)
+
+
+def can_merge(state: QueueState) -> bool:
+    """Model the exact-head CodeRabbit half of final auto-merge admission."""
+    if not state.ci_green:
+        return False
+    if state.packaging_present and not state.packaging_green:
+        return False
+    if state.required_gate_active and not state.required_gate_green:
+        return False
+    if state.unresolved_threads:
+        return False
+    if state.no_progress_blocked:
+        return False
+    return state.current_head_decision == "APPROVED"
 
 
 def order_key(state: QueueState):
@@ -115,20 +128,20 @@ class CodeRabbitQueueLifecycleTests(unittest.TestCase):
         self.assertFalse(may_emit_command(packaging_red))
         self.assertFalse(may_emit_command(required_gate_red))
 
-    def test_policy_changes_requested_without_inline_findings_is_terminal_for_head(self):
+    def test_durable_no_progress_marker_is_terminal_for_same_head(self):
         blocked = QueueState(
             current_head_decision="CHANGES_REQUESTED",
-            current_head_inline_findings=0,
+            no_progress_blocked=True,
             prior_full_reviews=1,
         )
         self.assertFalse(eligible_for_full_review(blocked))
 
-        actionable = QueueState(
+        changed_policy_state = QueueState(
             current_head_decision="CHANGES_REQUESTED",
-            current_head_inline_findings=2,
+            no_progress_blocked=False,
             prior_full_reviews=1,
         )
-        self.assertTrue(eligible_for_full_review(actionable))
+        self.assertTrue(eligible_for_full_review(changed_policy_state))
 
     def test_exact_head_approval_stops_queue_and_new_head_without_approval_reenters(self):
         approved = QueueState(
@@ -145,6 +158,36 @@ class CodeRabbitQueueLifecycleTests(unittest.TestCase):
             prior_full_reviews=1,
         )
         self.assertTrue(eligible_for_full_review(moved_head))
+
+    def test_auto_merge_requires_exact_head_approved_after_all_gates(self):
+        approved = QueueState(
+            current_head_decision="APPROVED",
+            prior_full_reviews=1,
+        )
+        self.assertTrue(can_merge(approved))
+
+        stale_or_missing_approval = QueueState(
+            current_head_decision=None,
+            prior_full_reviews=1,
+        )
+        self.assertFalse(can_merge(stale_or_missing_approval))
+        self.assertFalse(
+            can_merge(
+                QueueState(
+                    current_head_decision="APPROVED",
+                    unresolved_threads=1,
+                )
+            )
+        )
+        self.assertFalse(
+            can_merge(
+                QueueState(
+                    current_head_decision="APPROVED",
+                    required_gate_active=True,
+                    required_gate_green=False,
+                )
+            )
+        )
 
     def test_requested_lock_and_shared_slot_make_duplicate_wakeups_idempotent(self):
         candidate = QueueState()
@@ -202,6 +245,53 @@ class CodeRabbitQueueLifecycleTests(unittest.TestCase):
         rate_limited = QueueState(rate_limited=True)
         self.assertFalse(may_emit_command(rate_limited))
         self.assertTrue(may_emit_command(QueueState(rate_limited=False)))
+
+
+class WorkflowBindingTests(unittest.TestCase):
+    """Bind the executable model to the production workflow contract."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.workflow = (
+            Path(__file__).resolve().parents[1]
+            / ".github/workflows/continuum-coderabbit-retry.yml"
+        ).read_text(encoding="utf-8")
+        cls.auto_merge = (
+            Path(__file__).resolve().parents[1]
+            / ".github/workflows/continuum-auto-merge.yml"
+        ).read_text(encoding="utf-8")
+
+    def test_model_is_bound_to_review_queue_source(self):
+        for contract in (
+            "await latestWorkflowForHead(pr, 'Packaging smoke')",
+            "await unresolvedCodeRabbitThreads(pr)",
+            "reviewNoProgressBlocked",
+            "stage: finalReview ? 'final-review' : 'initial-review'",
+            "stageRank: finalReview ? 0 : 1",
+            "priority: 'unprioritized:p2-fallback'",
+            "rank: priorityRank.get('priority:p2')",
+            "a.stageRank - b.stageRank",
+            "a.createdAt - b.createdAt",
+        ):
+            self.assertIn(contract, self.workflow)
+
+    def test_exact_head_approval_contract_is_bound_to_auto_merge(self):
+        self.assertIn(
+            "review.commit_id === headSha",
+            self.auto_merge,
+        )
+        self.assertIn(
+            "decision.state !== 'APPROVED'",
+            self.auto_merge,
+        )
+        self.assertIn(
+            "finalReviewBasis",
+            self.auto_merge,
+        )
+        self.assertIn(
+            "sha: pr.head.sha",
+            self.auto_merge,
+        )
 
 
 if __name__ == "__main__":
