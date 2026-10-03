@@ -867,9 +867,6 @@ jobs:
           set -euo pipefail
           attempt="${RETRY_ATTEMPT:-0}"
           [[ "$attempt" =~ ^[0-9]+$ ]] || attempt=0
-          if [[ "${CURRENT_RECOVERY_KIND:-review}" != "review" ]]; then
-            attempt=0
-          fi
           case "$RETRY_WORKFLOW" in
             continuum-pr-agent.yml|pr-agent.yml) ;;
             *)
@@ -878,8 +875,8 @@ jobs:
               ;;
           esac
           if (( attempt >= 2 )); then
-            MARKER="<!-- continuum-pr-agent-retry-exhausted head=${HEAD_SHA,,} kind=review attempts=$((attempt + 1)) -->"
-            printf -v BODY '%s\n%s' "$MARKER" "PR-Agent review exhausted the bounded retry budget for this exact HEAD. A new HEAD or an explicit owner /review starts a fresh evaluation."
+            MARKER="<!-- continuum-pr-agent-retry-exhausted head=${HEAD_SHA,,} kind=${CURRENT_RECOVERY_KIND:-review} attempts=$((attempt + 1)) -->"
+            printf -v BODY '%s\n%s' "$MARKER" "PR-Agent ${CURRENT_RECOVERY_KIND:-review} recovery exhausted the bounded retry budget for this exact HEAD. A new HEAD or an explicit owner /review starts a fresh evaluation."
             gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$BODY"
             echo "Retry budget exhausted for PR #$PR_NUMBER HEAD $HEAD_SHA."
             exit 0
@@ -887,8 +884,8 @@ jobs:
 
           next=$((attempt + 1))
           delay=$((15 * (1 << attempt)))
-          MARKER="<!-- continuum-pr-agent-retry head=${HEAD_SHA,,} kind=review attempt=$next -->"
-          printf -v BODY '%s\n%s' "$MARKER" "Retrying a transient PR-Agent review/runtime failure for this exact HEAD (attempt $next/3, backoff ${delay}s)."
+          MARKER="<!-- continuum-pr-agent-retry head=${HEAD_SHA,,} kind=${CURRENT_RECOVERY_KIND:-review} attempt=$next -->"
+          printf -v BODY '%s\n%s' "$MARKER" "Retrying a transient PR-Agent ${CURRENT_RECOVERY_KIND:-review} recovery/runtime failure for this exact HEAD (attempt $next/3, backoff ${delay}s)."
           gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$BODY"
           sleep "$delay"
 
@@ -935,7 +932,7 @@ jobs:
           esac
           if ! [[ "$DEFAULT_BRANCH" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]]; then DEFAULT_BRANCH="main"; fi
           if [[ "$DEFAULT_BRANCH" == */.*/* || "$DEFAULT_BRANCH" == .*/ || "$DEFAULT_BRANCH" == */. ]] || [[ "$DEFAULT_BRANCH" =~ (^|/)\. ]] || [[ "$DEFAULT_BRANCH" =~ \.lock($|/) ]]; then DEFAULT_BRANCH="main"; fi
-          gh workflow run "$RETRY_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH"             -f pr_number="$PR_NUMBER"             -f expected_head_sha="$HEAD_SHA"             -f retry_attempt="$next"             -f retry_workflow="$RETRY_WORKFLOW"             -f recovery_kind="review"
+          gh workflow run "$RETRY_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH"             -f pr_number="$PR_NUMBER"             -f expected_head_sha="$HEAD_SHA"             -f retry_attempt="$next"             -f retry_workflow="$RETRY_WORKFLOW"             -f recovery_kind="${CURRENT_RECOVERY_KIND:-review}"
           echo "Dispatched isolated PR-Agent retry attempt $next/3 for PR #$PR_NUMBER HEAD $HEAD_SHA."
 
   repair:
