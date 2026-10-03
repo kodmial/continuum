@@ -21,9 +21,10 @@ on:
   workflow_dispatch:
 
 permissions:
-  # The queue may wake the trusted auto-merge reconciler to re-verify stale
-  # CodeRabbit findings before spending another full-review slot.
-  actions: write
+  # Keep the caller compatible with already-open PR branches. The review
+  # queue only reads Actions state; exact-finding verification remains owned by
+  # the existing auto-merge reconciler.
+  actions: read
   contents: read
   issues: write
   pull-requests: read
