@@ -1698,7 +1698,7 @@ class ContinuumTest < Minitest::Test
     assert_includes pr_agent, 'Stale admission ignored:'
     refute_includes pr_agent, 'Stale admission: caller observed'
 
-    assert_includes pr_agent, 'REVIEW_JSON: \${{ steps.pragent.outputs.review }}'
+    assert_includes pr_agent, 'REVIEW_JSON: ${{ steps.pragent.outputs.review }}'
     assert_includes pr_agent, '"findings": []'
     assert_includes pr_agent, '"complete": True'
     assert_includes pr_agent, '"kind": "full"'
