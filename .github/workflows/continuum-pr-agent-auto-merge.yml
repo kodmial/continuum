@@ -352,7 +352,7 @@ jobs:
             async function currentHeadGates(pr) {
               const ci = await latestWorkflowForHead(pr, pr.head.sha, 'CI');
               if (!ci || ci.status !== 'completed' || ci.conclusion !== 'success') {
-                return { ok: false, reason: 'current-head CI is not successful' };
+                return { ok: false, reason: 'Current-head CI is not successful' };
               }
 
               const combinedResponse =
@@ -565,7 +565,7 @@ jobs:
             if (pr.head.sha.toLowerCase() !== reviewedHead) {
               core.setFailed(
                 'PR head moved (' + reviewedHead + ' -> ' + pr.head.sha +
-                '); refusing stale PR-Agent merge.'
+                '); refusing to merge a stale result.'
               );
               return;
             }
