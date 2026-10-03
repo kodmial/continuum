@@ -640,6 +640,17 @@ class IsolationTests(unittest.TestCase):
         with self.assertRaises(life.LifecycleError):
             life.resolve_consumer_mode({"CONTINUUM_REVIEW_PROVIDER": "both"})
 
+    def test_repair_and_merge_use_unified_review_provider_selector(self):
+        for path in (
+            ".github/workflows/continuum-pr-agent-repair.yml",
+            ".github/workflows/continuum-pr-agent-auto-merge.yml",
+        ):
+            with self.subTest(path=path):
+                body = read_repo(path)
+                self.assertIn("CONTINUUM_REVIEW_PROVIDER", body)
+                self.assertNotIn("CONTINUUM_PR_AGENT_ENABLED", body)
+                self.assertNotIn("CONTINUUM_REQUIRE_CODERABBIT", body)
+
     def test_pr_agent_stack_invokes_only_pr_agent_workflows(self):
         import sys
 

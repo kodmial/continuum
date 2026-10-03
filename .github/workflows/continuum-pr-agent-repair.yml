@@ -8,6 +8,13 @@ on:
         type: string
         default: main
         required: false
+      review_provider:
+        description: >-
+          Review provider: none, coderabbit, or pr-agent. Empty falls back to
+          vars.CONTINUUM_REVIEW_PROVIDER, then to none.
+        type: string
+        default: ''
+        required: false
       pr_number:
         description: Pull request number carrying the current review result.
         type: string
@@ -54,25 +61,25 @@ jobs:
         id: stack
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
-          CFG_ENABLED: ${{ vars.CONTINUUM_PR_AGENT_ENABLED }}
-          CFG_REQUIRE_CODERABBIT: ${{ vars.CONTINUUM_REQUIRE_CODERABBIT }}
+          INPUT_REVIEW_PROVIDER: ${{ inputs.review_provider }}
+          CFG_REVIEW_PROVIDER: ${{ vars.CONTINUUM_REVIEW_PROVIDER }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
-            // Isolated PR-Agent mode only. Contradictory configuration fails
-            // closed; CodeRabbit paths are never dispatched from this stack.
-            const truthy = (value) => ['1', 'true', 'yes'].includes(String(value || '').trim().toLowerCase());
-            const enabled = truthy(process.env.CFG_ENABLED);
-            const requireRabbit = truthy(process.env.CFG_REQUIRE_CODERABBIT);
-            if (enabled && requireRabbit) {
+            // One selector owns the entire review stack.
+            const reviewProvider = String(
+              process.env.INPUT_REVIEW_PROVIDER || process.env.CFG_REVIEW_PROVIDER || 'none'
+            ).trim().toLowerCase();
+            if (!['none', 'coderabbit', 'pr-agent'].includes(reviewProvider)) {
               core.setFailed(
-                'Contradictory review-stack configuration: PR-Agent repair ' +
-                'requires CONTINUUM_REQUIRE_CODERABBIT=false.'
+                `Invalid CONTINUUM_REVIEW_PROVIDER="${reviewProvider}". Expected none, coderabbit, or pr-agent.`
               );
               return;
             }
-            if (!enabled) {
-              core.setFailed('PR-Agent repair requires CONTINUUM_PR_AGENT_ENABLED=true.');
+            if (reviewProvider !== 'pr-agent') {
+              core.setFailed(
+                `PR-Agent repair requires CONTINUUM_REVIEW_PROVIDER=pr-agent; got ${reviewProvider}.`
+              );
               return;
             }
             core.setOutput('stack', 'pr-agent');
