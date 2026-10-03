@@ -301,8 +301,27 @@ class RecoveryWiringTests(unittest.TestCase):
     def test_inline_retries_preserve_operation_kind(self):
         review = self.read(".github/workflows/continuum-pr-agent.yml")
         repair = self.read(".github/workflows/continuum-pr-agent-repair.yml")
-        self.assertIn('-f recovery_kind="review"', review)
+        self.assertIn('CURRENT_RECOVERY_KIND:', review)
+        self.assertIn(
+            '-f recovery_kind="${CURRENT_RECOVERY_KIND:-review}"',
+            review,
+        )
+        self.assertNotIn(
+            'if [[ "${CURRENT_RECOVERY_KIND:-review}" != "review" ]]; then',
+            review,
+        )
         self.assertIn('-f recovery_kind="repair"', repair)
+
+    def test_cancelled_recovery_review_keeps_repair_identity(self):
+        recovery_workflow = self.read(
+            ".github/workflows/continuum-pr-agent-recovery.yml"
+        )
+        self.assertIn("statusRunMetadata", recovery_workflow)
+        self.assertIn("reviewRun.recoveryKind === 'repair'", recovery_workflow)
+        self.assertIn(
+            "it still belongs to the durable repair",
+            recovery_workflow,
+        )
 
 
 if __name__ == "__main__":
