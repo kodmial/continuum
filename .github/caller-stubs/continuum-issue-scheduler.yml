@@ -118,11 +118,12 @@ permissions:
 
 jobs:
   call:
-    # A manual owner `/oc` is in-flight work the scheduler must reserve. Gate the
-    # event trigger the way the engine's own `issue_comment` branch expects, so an
-    # unrelated comment costs a skipped run and not a full reconciliation.
+    # A child keeps local scheduling disabled, but repository events must reach
+    # the reusable scheduler so it can wake the verified parent immediately.
+    # Child cron stays skipped: polling belongs to the parent and must not burn
+    # private child runner minutes. Unrelated issue comments remain cheap skips.
     if: >-
-      vars.CONTINUUM_ROLE != 'child' &&
+      (vars.CONTINUUM_ROLE != 'child' || github.event_name != 'schedule') &&
       (github.event_name != 'issue_comment' ||
        (github.actor == github.repository_owner &&
         (contains(github.event.comment.body, '/oc') ||

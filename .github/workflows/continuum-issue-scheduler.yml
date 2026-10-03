@@ -204,6 +204,215 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  wake_parent:
+    # Child repositories never schedule work locally. Event-driven caller runs
+    # only verify the bidirectional relationship and wake the parent's public
+    # scheduler; the caller keeps child cron events skipped to avoid consuming
+    # private child runner minutes as a polling mechanism.
+    if: vars.CONTINUUM_ROLE == 'child' && github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: ${{ fromJSON(vars.AUTOMATION_SCHEDULER_TIMEOUT_MINUTES || '5') }}
+    concurrency:
+      group: continuum-child-parent-wakeup
+      cancel-in-progress: false
+    steps:
+      - name: Checkout Continuum engine for parent wake-up verification
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: kodmial/continuum
+          ref: ${{ inputs.continuum_ref }}
+          path: .continuum-engine
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify relationship and wake parent scheduler
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+        run: |
+          set -euo pipefail
+          runtime="$GITHUB_WORKSPACE/.continuum-engine/.github/scripts/delegation_runtime.py"
+
+          # Fetch one named variable directly. A missing variable (404) is
+          # persistent misconfiguration and returns 2 so callers fail closed
+          # with a config error; any other API failure is an outage and
+          # refuses the wake-up. Listing the whole collection
+          # would truncate past 100 variables and over-expose values.
+          fetch_variable() {
+            local repository="$1" name="$2"
+            local err_file value rc
+            if [ -z "${RUNNER_TEMP:-}" ]; then
+              echo "::error::Child relationship lookup is unavailable; parent wake-up refused." >&2
+              return 4
+            fi
+            if ! err_file="$(mktemp -p "$RUNNER_TEMP" continuum-var-err.XXXXXX)"; then
+              echo "::error::Child relationship lookup is unavailable; parent wake-up refused." >&2
+              return 4
+            fi
+            if value="$(gh api "repos/$repository/actions/variables/$name" --jq '.value // ""' 2>"$err_file")"; then
+              rc=0
+            else
+              rc=$?
+              if grep -qiE '\b404\b|Not Found' "$err_file" 2>/dev/null; then
+                cat "$err_file" >&2 || true
+                rm -f "$err_file"
+                return 2
+              fi
+              cat "$err_file" >&2 || true
+            fi
+            rm -f "$err_file"
+            if [ "$rc" -eq 0 ]; then
+              printf '%s' "$value"
+              return 0
+            fi
+            return "$rc"
+          }
+
+          if ! child_role="$(fetch_variable "$GITHUB_REPOSITORY" CONTINUUM_ROLE)"; then
+            rc=$?
+            if [ "$rc" -eq 2 ]; then
+              echo "::error::Child relationship variable CONTINUUM_ROLE is missing; parent wake-up refused."
+              exit 2
+            fi
+            echo "::error::Child relationship lookup is unavailable; parent wake-up refused."
+            exit 4
+          fi
+          if ! child_id="$(fetch_variable "$GITHUB_REPOSITORY" CONTINUUM_CHILD_ID)"; then
+            rc=$?
+            if [ "$rc" -eq 2 ]; then
+              echo "::error::Child relationship variable CONTINUUM_CHILD_ID is missing; parent wake-up refused."
+              exit 2
+            fi
+            echo "::error::Child relationship lookup is unavailable; parent wake-up refused."
+            exit 4
+          fi
+          if ! parent="$(fetch_variable "$GITHUB_REPOSITORY" CONTINUUM_PARENT)"; then
+            rc=$?
+            if [ "$rc" -eq 2 ]; then
+              echo "::error::Child relationship variable CONTINUUM_PARENT is missing; parent wake-up refused."
+              exit 2
+            fi
+            echo "::error::Child relationship lookup is unavailable; parent wake-up refused."
+            exit 4
+          fi
+
+          # Validate the child declaration with the same authoritative parser
+          # used by parent-side delegated discovery. Values are never echoed.
+          printf '::add-mask::%s\n' "$parent"
+          printf '::add-mask::%s\n' "$child_id"
+          if ! python3 "$runtime" verify-child-variables \
+            --role "$child_role" \
+            --declared-id "$child_id" \
+            --declared-parent "$parent" \
+            --child-id "$child_id" \
+            --parent-repository "$parent" >/dev/null 2>&1; then
+            echo "::error::Child relationship declaration is invalid; parent wake-up refused."
+            exit 2
+          fi
+
+          parent_owner="${parent%%/*}"
+          parent_name="${parent#*/}"
+          if [[ ! "$parent" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || [[ "$parent_owner" == "." || "$parent_owner" == ".." || "$parent_name" == "." || "$parent_name" == ".." ]]; then
+            echo "::error::Child relationship declaration is invalid; parent wake-up refused."
+            exit 2
+          fi
+          if [ -z "$child_id" ]; then
+            echo "::error::Bidirectional parent/child verification failed; parent wake-up refused."
+            exit 2
+          fi
+          if ! parent_role="$(fetch_variable "$parent" CONTINUUM_ROLE)"; then
+            rc=$?
+            if [ "$rc" -eq 2 ]; then
+              echo "::error::Parent relationship variable CONTINUUM_ROLE is missing; parent wake-up refused."
+              exit 2
+            fi
+            echo "::error::Parent relationship lookup is unavailable; parent wake-up refused."
+            exit 4
+          fi
+          if ! parent_children="$(fetch_variable "$parent" CONTINUUM_CHILDREN)"; then
+            rc=$?
+            if [ "$rc" -eq 2 ]; then
+              echo "::error::Parent relationship variable CONTINUUM_CHILDREN is missing; parent wake-up refused."
+              exit 2
+            fi
+            echo "::error::Parent relationship lookup is unavailable; parent wake-up refused."
+            exit 4
+          fi
+          if [ -z "${RUNNER_TEMP:-}" ]; then
+            echo "::error::Parent verification lookup is unavailable; parent wake-up refused."
+            exit 4
+          fi
+          if ! parent_ids_err="$(mktemp -p "$RUNNER_TEMP" continuum-parent-ids-err.XXXXXX)"; then
+            echo "::error::Parent verification lookup is unavailable; parent wake-up refused."
+            exit 4
+          fi
+          parent_ids_file="$(mktemp -p "$RUNNER_TEMP" continuum-parent-ids.XXXXXX)" || {
+            echo "::error::Parent verification lookup is unavailable; parent wake-up refused."
+            rm -f "$parent_ids_err"
+            exit 4
+          }
+          if ! python3 "$runtime" parent-variable-ids \
+            --role "$parent_role" \
+            --children-json "$parent_children" >"$parent_ids_file" 2>"$parent_ids_err"; then
+            cat "$parent_ids_err" >&2 || true
+            rm -f "$parent_ids_file" "$parent_ids_err"
+            echo "::error::Parent verification lookup is unavailable; parent wake-up refused."
+            exit 4
+          fi
+          rm -f "$parent_ids_err"
+          if ! grep -Fxq -- "$child_id" "$parent_ids_file"; then
+            rm -f "$parent_ids_file"
+            echo "::error::Bidirectional parent/child verification failed; parent wake-up refused."
+            exit 2
+          fi
+          rm -f "$parent_ids_file"
+          # Exact repository allow-list membership. A substring test would let
+          # `owner/child` match `owner/child2`, so parse CONTINUUM_CHILDREN as
+          # JSON and require exact equality instead. Malformed JSON stays a
+          # verification failure and refuses the wake-up.
+          if ! CHILDREN_JSON="$parent_children" CURRENT_REPO="$GITHUB_REPOSITORY" python3 -c $'import json, os, sys\nraw = os.environ.get("CHILDREN_JSON", "")\nrepo = os.environ.get("CURRENT_REPO", "")\ntry:\n    data = json.loads(raw) if raw else []\nexcept Exception:\n    sys.exit(1)\nrepos = set()\nitems = data if isinstance(data, list) else []\nfor x in items:\n    if isinstance(x, str):\n        repos.add(x)\n    elif isinstance(x, dict):\n        for k in ("repo", "repository", "name"):\n            v = x.get(k, "")\n            if v:\n                repos.add(v)\nsys.exit(0 if repo and repo in repos else 1)'; then
+            echo "::error::Bidirectional parent/child verification failed; parent wake-up refused."
+            exit 2
+          fi
+          if [ -z "${RUNNER_TEMP:-}" ]; then
+            echo "::error::Parent default branch lookup is unavailable; parent wake-up refused."
+            exit 4
+          fi
+          if ! parent_err="$(mktemp -p "$RUNNER_TEMP" continuum-parent-err.XXXXXX)"; then
+            echo "::error::Parent default branch lookup is unavailable; parent wake-up refused."
+            exit 4
+          fi
+          if ! parent_ref="$(gh api "repos/$parent" --jq '.default_branch // ""' 2>"$parent_err")" || \
+             [ -z "$parent_ref" ] || ! git check-ref-format --branch "$parent_ref" >/dev/null 2>&1; then
+            cat "$parent_err" >&2 || true
+            rm -f "$parent_err"
+            echo "::error::Parent default branch lookup is unavailable; parent wake-up refused."
+            exit 4
+          fi
+          rm -f "$parent_err"
+
+          if [ -z "${RUNNER_TEMP:-}" ]; then
+            echo "::error::Parent dispatch lookup is unavailable; parent wake-up refused." >&2
+            exit 4
+          fi
+          if ! dispatch_err="$(mktemp -p "$RUNNER_TEMP" continuum-dispatch-err.XXXXXX)"; then
+            echo "::error::Parent dispatch lookup is unavailable; parent wake-up refused." >&2
+            exit 4
+          fi
+          if ! gh api --method POST \
+            "repos/$parent/actions/workflows/continuum-issue-scheduler.yml/dispatches" \
+            -f ref="$parent_ref" >/dev/null 2>"$dispatch_err"; then
+            cat "$dispatch_err" >&2 || true
+            rm -f "$dispatch_err"
+            echo "::error::Verified parent scheduler could not be dispatched."
+            exit 4
+          fi
+          rm -f "$dispatch_err"
+
+          echo "Woke verified parent scheduler."
+
   schedule:
     # Repository role is the routing authority. A child keeps this workflow
     # installed, but local automatic scheduling is fail-safe disabled.
@@ -259,7 +468,6 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
-          GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
           CHILD_CANDIDATES_FILE: ${{ runner.temp }}/continuum-child-candidates.json
         run: |
           set -euo pipefail
