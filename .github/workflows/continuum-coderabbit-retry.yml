@@ -184,94 +184,108 @@ jobs:
             }
 
             async function latestWorkflowForHead(pr, workflowName) {
-              try {
-                const runs = await github.paginate(
-                  github.rest.actions.listWorkflowRunsForRepo,
-                  {
-                    owner,
-                    repo,
-                    branch: pr.head.ref,
-                    event: 'pull_request',
-                    per_page: 100,
-                  }
-                );
+              const runs = await github.paginate(
+                github.rest.actions.listWorkflowRunsForRepo,
+                {
+                  owner,
+                  repo,
+                  branch: pr.head.ref,
+                  event: 'pull_request',
+                  per_page: 100,
+                }
+              );
 
-                return runs
-                  .filter(run =>
-                    run.name === workflowName &&
-                    run.head_sha === pr.head.sha
-                  )
-                  .sort(
-                    (a, b) =>
-                      (new Date(b.updated_at || b.created_at).getTime() -
-                       new Date(a.updated_at || a.created_at).getTime()) ||
-                      (Number(b.run_attempt || 0) -
-                       Number(a.run_attempt || 0))
-                  )[0] || null;
-              } catch (err) {
-                core.warning(
-                  `PR #${pr.number}: could not inspect workflow '${workflowName}'; treating the gate as unavailable for this pass: ${err.message}`
-                );
-                return null;
-              }
+              return runs
+                .filter(run =>
+                  run.name === workflowName &&
+                  run.head_sha === pr.head.sha
+                )
+                .sort(
+                  (a, b) =>
+                    (new Date(b.updated_at || b.created_at).getTime() -
+                     new Date(a.updated_at || a.created_at).getTime()) ||
+                    (Number(b.run_attempt || 0) -
+                     Number(a.run_attempt || 0))
+                )[0] || null;
             }
 
             async function currentHeadReviewGate(pr) {
-              const ci = await latestWorkflowForHead(pr, 'CI');
-              if (
-                !ci ||
-                ci.status !== 'completed' ||
-                ci.conclusion !== 'success'
-              ) {
-                return {
-                  ready: false,
-                  reason: `CI is ${ci ? `${ci.status}/${ci.conclusion || 'pending'}` : 'missing'}`,
-                };
-              }
+              try {
+                const labelConfigured = Boolean(requiredWorkflowGateLabel);
+                const nameConfigured = Boolean(requiredWorkflowGateName);
+                if (labelConfigured !== nameConfigured) {
+                  core.warning(
+                    'Required workflow gate configuration is incomplete: both CONTINUUM_REQUIRED_WORKFLOW_GATE_LABEL and CONTINUUM_REQUIRED_WORKFLOW_GATE_NAME must be set together.'
+                  );
+                  return {
+                    ready: false,
+                    reason: 'required workflow gate configuration is incomplete',
+                  };
+                }
 
-              // Match auto-merge: Packaging smoke is conditional/path-filtered.
-              // If a run exists for this exact HEAD it must be green before a
-              // scarce full-review slot is spent.
-              const packagingSmoke =
-                await latestWorkflowForHead(pr, 'Packaging smoke');
-              if (
-                packagingSmoke &&
-                (
-                  packagingSmoke.status !== 'completed' ||
-                  packagingSmoke.conclusion !== 'success'
-                )
-              ) {
-                return {
-                  ready: false,
-                  reason:
-                    `Packaging smoke is ${packagingSmoke.status}/${packagingSmoke.conclusion || 'pending'}`,
-                };
-              }
-
-              // Match auto-merge's configurable consumer gate. A PR that cannot
-              // merge because this gate is red/missing must not consume the
-              // repository-wide included CodeRabbit review quota.
-              if (
-                requiredWorkflowGateLabel &&
-                requiredWorkflowGateName &&
-                hasLabel(pr, requiredWorkflowGateLabel)
-              ) {
-                const required =
-                  await latestWorkflowForHead(pr, requiredWorkflowGateName);
+                const ci = await latestWorkflowForHead(pr, 'CI');
                 if (
-                  !required ||
-                  required.status !== 'completed' ||
-                  required.conclusion !== 'success'
+                  !ci ||
+                  ci.status !== 'completed' ||
+                  ci.conclusion !== 'success'
+                ) {
+                  return {
+                    ready: false,
+                    reason: `CI is ${ci ? `${ci.status}/${ci.conclusion || 'pending'}` : 'missing'}`,
+                  };
+                }
+
+                // Match auto-merge: Packaging smoke is conditional/path-filtered.
+                // Absence is allowed; an API inspection failure is not. The
+                // surrounding try/catch fails this PR closed on unknown state.
+                const packagingSmoke =
+                  await latestWorkflowForHead(pr, 'Packaging smoke');
+                if (
+                  packagingSmoke &&
+                  (
+                    packagingSmoke.status !== 'completed' ||
+                    packagingSmoke.conclusion !== 'success'
+                  )
                 ) {
                   return {
                     ready: false,
                     reason:
-                      `required workflow '${requiredWorkflowGateName}' is ${required ? `${required.status}/${required.conclusion || 'pending'}` : 'missing'}`,
+                      `Packaging smoke is ${packagingSmoke.status}/${packagingSmoke.conclusion || 'pending'}`,
                   };
                 }
-              }
 
-              return { ready: true, reason: 'all pre-review merge gates are green' };
+                if (
+                  labelConfigured &&
+                  hasLabel(pr, requiredWorkflowGateLabel)
+                ) {
+                  const required =
+                    await latestWorkflowForHead(pr, requiredWorkflowGateName);
+                  if (
+                    !required ||
+                    required.status !== 'completed' ||
+                    required.conclusion !== 'success'
+                  ) {
+                    return {
+                      ready: false,
+                      reason:
+                        `required workflow '${requiredWorkflowGateName}' is ${required ? `${required.status}/${required.conclusion || 'pending'}` : 'missing'}`,
+                    };
+                  }
+                }
+
+                return {
+                  ready: true,
+                  reason: 'all pre-review merge gates are green',
+                };
+              } catch (err) {
+                core.warning(
+                  `PR #${pr.number}: could not inspect pre-review workflow gates; skipping this PR for this pass: ${err.message}`
+                );
+                return {
+                  ready: false,
+                  reason: 'workflow gate state is unknown',
+                };
+              }
             }
 
             function sourceIssueNumber(pr) {
