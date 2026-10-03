@@ -245,7 +245,7 @@ jobs:
               echo "::error::Child relationship lookup is unavailable; parent wake-up refused." >&2
               return 4
             fi
-            if value="$(gh api "repos/$repository/actions/variables/$name" --jq -r '.value // ""' 2>"$err_file")"; then
+            if value="$(gh api "repos/$repository/actions/variables/$name" --jq '.value // ""' 2>"$err_file")"; then
               rc=0
             else
               rc=$?
@@ -310,11 +310,11 @@ jobs:
             echo "::error::Bidirectional parent/child verification failed; parent wake-up refused."
             exit 2
           fi
-          if ! parent_err="$(mktemp -p "${RUNNER_TEMP:-$GITHUB_WORKSPACE}")"; then
+          if ! parent_err="$(mktemp -p "${RUNNER_TEMP:-$GITHUB_WORKSPACE}" continuum-parent-err.XXXXXX)"; then
             echo "::error::Parent default branch lookup is unavailable; parent wake-up refused."
             exit 4
           fi
-          if ! parent_ref="$(gh api "repos/$parent" --jq -r '.default_branch // ""' 2>"$parent_err")" || \
+          if ! parent_ref="$(gh api "repos/$parent" --jq '.default_branch // ""' 2>"$parent_err")" || \
              [[ ! "$parent_ref" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ ]] || \
              [[ "$parent_ref" == *..* ]] || [[ "$parent_ref" == */ ]] || [[ "$parent_ref" == */.git* ]]; then
             cat "$parent_err" >&2 || true
