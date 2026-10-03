@@ -178,11 +178,22 @@ jobs:
             // marker below makes a second dispatch for the same HEAD a no-op,
             // so a repeated run cannot storm the same HEAD.
             const crypto = require('crypto');
+            // Cross-HEAD identity is logical, not positional. A repair may
+            // shift line/rank metadata without resolving the underlying
+            // structured finding. Keep semantic/path fields authoritative and
+            // discard only known volatile location/ranking metadata.
+            const volatileKeys = new Set([
+              'line', 'line_number', 'start_line', 'end_line', 'position',
+              'start_position', 'end_position', 'rank', 'score',
+            ]);
             const stable = (value) => {
               if (Array.isArray(value)) return value.map(stable);
               if (value && typeof value === 'object') {
                 return Object.fromEntries(
-                  Object.keys(value).sort().map(key => [key, stable(value[key])])
+                  Object.keys(value)
+                    .filter(key => !volatileKeys.has(String(key).toLowerCase()))
+                    .sort()
+                    .map(key => [key, stable(value[key])])
                 );
               }
               return value;
@@ -237,9 +248,23 @@ jobs:
             // is neither the repository owner nor the actions bot identity),
             // and a login allow-list would miss them, leaving `held` false
             // forever and repairing the same HEAD/state repeatedly.
-            const held = comments.some(comment =>
+            const sameHeadHeld = comments.some(comment =>
               String(comment.body || '').includes(marker)
             );
+            // A successful Continuum repair publishes a transition marker
+            // from the reviewed HEAD to the repair-generated HEAD. If a fresh
+            // full review on that exact generated HEAD reports the same
+            // logical structured fingerprint, the episode did not converge.
+            // A user/new-work HEAD has no matching to= transition, so stale
+            // convergence state cannot block genuine new work.
+            const transition = '<!-- continuum-pr-agent-convergence from=';
+            const transitionTail =
+              ' to=' + headSha + ' fingerprint=' + fingerprint + ' -->';
+            const crossHeadHeld = comments.some(comment => {
+              const body = String(comment.body || '');
+              return body.includes(transition) && body.includes(transitionTail);
+            });
+            const held = sameHeadHeld || crossHeadHeld;
             core.setOutput('held', held ? 'true' : 'false');
             if (held) {
               core.notice(
@@ -460,8 +485,12 @@ jobs:
             fi
             exit 1
           fi
+          NEW_HEAD="$(git rev-parse HEAD)"
+          MARKER="<!-- continuum-pr-agent-convergence from=${HEAD_SHA,,} to=${NEW_HEAD,,} fingerprint=${BATCH_FINGERPRINT,,} -->"
+          printf -v BODY \'%s\\n%s\' "$MARKER" "PR-Agent bounded repair advanced the reviewed HEAD. If a fresh full review reports the same logical structured finding set on this repair-generated HEAD, automatic repair is held as non-converging; materially changed findings or genuine new work may resume."
+          gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$BODY"
           echo "classification=settled" >> "$GITHUB_OUTPUT"
-          echo "Pushed one bounded repair to refs/heads/$HEAD_REF for PR #$PR_NUMBER."
+          echo "Pushed one bounded repair to refs/heads/$HEAD_REF for PR #$PR_NUMBER ($HEAD_SHA -> $NEW_HEAD)."
 
       - name: Publish durable PR-Agent repair state
         if: steps.repair_status.outcome == 'success' && steps.repair_pass.outcome == 'success'
