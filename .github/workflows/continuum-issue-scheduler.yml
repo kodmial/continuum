@@ -211,6 +211,8 @@ jobs:
     # private child runner minutes as a polling mechanism.
     if: vars.CONTINUUM_ROLE == 'child' && github.event_name != 'schedule'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     timeout-minutes: ${{ fromJSON(vars.AUTOMATION_SCHEDULER_TIMEOUT_MINUTES || '5') }}
     concurrency:
       group: continuum-child-parent-wakeup
@@ -305,7 +307,8 @@ jobs:
           fi
 
           if ! parent_ref="$(gh api "repos/$parent" --jq -r '.default_branch // ""' 2>/dev/null)" || \
-             [[ ! "$parent_ref" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+             [[ ! "$parent_ref" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ ]] || \
+             [[ "$parent_ref" == *..* ]] || [[ "$parent_ref" == */ ]] || [[ "$parent_ref" == */.git* ]]; then
             echo "::error::Parent default branch lookup is unavailable; parent wake-up refused."
             exit 4
           fi
