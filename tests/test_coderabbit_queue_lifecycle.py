@@ -265,7 +265,7 @@ class WorkflowBindingTests(unittest.TestCase):
         for contract in (
             "await latestWorkflowForHead(pr, 'Packaging smoke')",
             "await unresolvedCodeRabbitThreads(pr)",
-            "reviewNoProgressBlocked",
+            "continuum-coderabbit-no-progress head=",
             "stage: finalReview ? 'final-review' : 'initial-review'",
             "stageRank: finalReview ? 0 : 1",
             "priority: 'unprioritized:p2-fallback'",
