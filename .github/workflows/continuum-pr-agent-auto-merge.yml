@@ -801,12 +801,17 @@ jobs:
                 return;
               }
               const message = String(err.message || err);
-              if (
-                err.status === 409 ||
-                err.status === 422 ||
-                /merge conflict|conflict|not mergeable|cannot be merged/i.test(message)
-              ) {
+              const isConflictMessage =
+                /merge conflict|conflict|not mergeable|cannot be merged/i.test(message);
+              if (err.status === 409 || isConflictMessage) {
                 await dispatchConflictRepair(fresh, message);
+                return;
+              }
+              if (err.status === 422) {
+                core.setFailed(
+                  'Atomic merge rejected with HTTP 422 without conflict evidence: ' +
+                  message
+                );
                 return;
               }
               throw err;
