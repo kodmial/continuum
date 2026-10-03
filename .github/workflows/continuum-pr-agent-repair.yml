@@ -216,16 +216,19 @@ jobs:
               if (typeof value === 'string') return value.trim().replace(/\\s+/g, ' ');
               return value;
             };
-            const findingIds = [...new Set(items.map(item =>
-              crypto.createHash('sha256')
+            const identified = items.map(item => ({
+              id: crypto.createHash('sha256')
                 .update(JSON.stringify(logicalStable(item)))
-                .digest('hex')
-            ))].sort();
+                .digest('hex'),
+              item,
+            }));
+            const findingIds = [...new Set(identified.map(entry => entry.id))].sort();
             core.setOutput('empty', 'false');
             core.setOutput('count', String(items.length));
             core.setOutput('truncated', truncated ? 'true' : 'false');
             core.setOutput('fingerprint', fingerprint);
             core.setOutput('finding_ids', findingIds.join(','));
+            core.setOutput('identified_batch', JSON.stringify(identified));
             core.setOutput('batch', JSON.stringify(items));
             core.notice(
               `PR #${prNumber} HEAD ${headSha}: batching ${keyIssues.length} review finding(s) ` +
@@ -241,6 +244,7 @@ jobs:
           HEAD_SHA: ${{ inputs.head_sha }}
           FINGERPRINT: ${{ steps.batch.outputs.fingerprint }}
           FINDING_IDS: ${{ steps.batch.outputs.finding_ids }}
+          IDENTIFIED_BATCH: ${{ steps.batch.outputs.identified_batch }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
@@ -252,8 +256,16 @@ jobs:
             const findingIds = new Set(
               String(process.env.FINDING_IDS || '').toLowerCase().split(',').filter(Boolean)
             );
-            if (!prNumber || !headSha || !fingerprint || findingIds.size === 0) {
-              core.setFailed('PR-Agent no-progress check requires PR, HEAD, batch fingerprint, and logical finding IDs.');
+            let identified;
+            try {
+              identified = JSON.parse(String(process.env.IDENTIFIED_BATCH || '[]'));
+            } catch (err) {
+              core.setFailed('PR-Agent identified batch is invalid JSON: ' + err.message);
+              return;
+            }
+            if (!prNumber || !headSha || !fingerprint || findingIds.size === 0 ||
+                !Array.isArray(identified) || identified.length === 0) {
+              core.setFailed('PR-Agent no-progress check requires PR, HEAD, batch fingerprint, and identified logical findings.');
               return;
             }
             const marker =
@@ -291,15 +303,20 @@ jobs:
               }
             }
             surviving = [...new Set(surviving)].sort();
-            const crossHeadHeld = surviving.length > 0;
-            const held = sameHeadHeld || crossHeadHeld;
+            const survivingSet = new Set(surviving);
+            const eligible = sameHeadHeld
+              ? []
+              : identified.filter(entry => !survivingSet.has(String(entry.id || '').toLowerCase()));
+            const held = eligible.length === 0;
             core.setOutput('surviving_findings', surviving.join(','));
+            core.setOutput('eligible_count', String(eligible.length));
+            core.setOutput('eligible_batch', JSON.stringify(eligible.map(entry => entry.item)));
             core.setOutput('held', held ? 'true' : 'false');
             if (held) {
               core.notice(
                 'PR #' + prNumber + ' HEAD ' + headSha +
-                ': PR-Agent convergence hold; same-HEAD no-progress or ' +
-                surviving.length + ' logical finding(s) survived a workflow-generated repair HEAD.'
+                ': PR-Agent convergence hold; no eligible logical findings remain (' +
+                surviving.length + ' survived a workflow-generated repair HEAD).'
               );
             }
 
@@ -404,7 +421,7 @@ jobs:
           PR_NUMBER: ${{ inputs.pr_number }}
           HEAD_SHA: ${{ inputs.head_sha }}
           HEAD_REF: ${{ steps.target.outputs.head_ref }}
-          BATCH_JSON: ${{ steps.batch.outputs.batch }}
+          BATCH_JSON: ${{ steps.convergence.outputs.eligible_batch }}
           BATCH_FINGERPRINT: ${{ steps.batch.outputs.fingerprint }}
           FINDING_IDS: ${{ steps.batch.outputs.finding_ids }}
           OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
