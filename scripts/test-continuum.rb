@@ -3452,6 +3452,30 @@ class ContinuumTest < Minitest::Test
     assert_includes body, 'Do not turn a tracking/umbrella issue or a task with unmet prerequisites into a partial PR.'
   end
 
+  # Specialized workflows are tools of the task agent, not alternate
+  # scheduler executors. Operational tasks may therefore complete with no
+  # repository diff, but only when the agent has posted evidence and closed the
+  # issue after satisfying its full Definition of Done.
+  def test_issue_agent_can_orchestrate_workflow_tools_and_complete_no_code_tasks
+    body = workflow_body('continuum-opencode.yml')
+
+    assert_includes body, 'dispatch existing repository workflows when required by the issue'
+    assert_includes body, 'Treat specialized workflows as tools'
+    assert_includes body, 'the scheduler will not reroute the issue for you'
+    assert_includes body, 'close the issue yourself only after every Definition of Done item is verified'
+    assert_includes body, 'Never close an implementation task that still requires code changes.'
+
+    state_check = body.index('ISSUE_STATE="$(gh issue view "$ISSUE_NUMBER"')
+    closed_check = body.index('if [[ "$ISSUE_STATE" == "CLOSED" ]]')
+    pause = body.index('Automation produced no code changes; pausing this issue for manual inspection.')
+    refute_nil state_check, 'no-change handling does not inspect whether the issue was completed'
+    refute_nil closed_check, 'no-change handling does not recognize a completed operational task'
+    refute_nil pause, 'failed no-change tasks must still pause rather than loop'
+    assert_operator state_check, :<, closed_check
+    assert_operator closed_check, :<, pause,
+                    'a successfully closed operational task must exit before the failure pause path'
+  end
+
   # CodeRabbit can submit CHANGES_REQUESTED for a policy/pre-merge failure with
   # no code finding at all. That state is not a coding-agent repair request.
   def test_coderabbit_policy_blocker_is_classified_before_opencode_dispatch
