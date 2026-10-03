@@ -15,7 +15,7 @@ on:
   # serialized queue immediately after RESOLVED/UNRESOLVED instead of waiting
   # for cron or an unrelated status/review event.
   pull_request_review_comment:
-    types: [created]
+    types: [created, edited]
 
   # Manual/safety-net reconciliation.
   workflow_dispatch:
