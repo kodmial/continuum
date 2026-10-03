@@ -15,7 +15,7 @@ class ContinuumTest < Minitest::Test
   # Project-owned entry workflows used only by the Continuum repository itself.
   # They deliberately stay outside the `continuum-` namespace so installer
   # ownership and reusable-engine ownership remain unambiguous.
-  PROJECT_ENTRY_WORKFLOWS = %w[automation.yml ci.yml opencode.yml].freeze
+  PROJECT_ENTRY_WORKFLOWS = %w[automation.yml ci.yml opencode.yml pr-agent.yml].freeze
   # Every caller stub in every layer, for the checks that must not care which
   # layer a file belongs to.
   ALL_STUBS = (CORE_STUBS + TECH_STUBS + PARENT_STUBS).sort
@@ -1278,6 +1278,7 @@ class ContinuumTest < Minitest::Test
     automation.yml
     ci.yml
     opencode.yml
+    pr-agent.yml
     continuum-consumer-child-dispatcher.yml
     continuum-validation.yml
   ].freeze
