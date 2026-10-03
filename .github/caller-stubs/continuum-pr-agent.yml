@@ -27,12 +27,18 @@ on:
   workflow_run:
     workflows: ["CI"]
     types: [completed]
+  schedule:
+    - cron: '*/15 * * * *'
 
 permissions:
   contents: write
   issues: write
   pull-requests: write
   statuses: read
+
+concurrency:
+  group: pr-agent-caller-${{ github.event.issue.number || github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || inputs.pr_number || github.run_id }}
+  cancel-in-progress: false
 
 jobs:
   call:
@@ -56,3 +62,164 @@ jobs:
       expected_head_sha: "${{ inputs.expected_head_sha }}"
       retry_attempt: "${{ inputs.retry_attempt }}"
       retry_workflow: "${{ inputs.retry_workflow }}"
+
+  reconcile-stale-pr-agent:
+    if: >-
+      github.event_name == 'schedule' &&
+      vars.CONTINUUM_REVIEW_PROVIDER == 'pr-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: read
+    steps:
+      - name: Recover one stale or lost PR-Agent lifecycle
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          PR_AGENT_CALLER_WORKFLOW: continuum-pr-agent.yml
+        with:
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const callerWorkflow = String(process.env.PR_AGENT_CALLER_WORKFLOW || '').trim();
+            if (!['continuum-pr-agent.yml', 'pr-agent.yml'].includes(callerWorkflow)) {
+              core.setFailed('Invalid isolated PR-Agent recovery workflow.');
+              return;
+            }
+
+            const REVIEW_CONTEXT = 'continuum/pr-agent-review';
+            const REPAIR_CONTEXT = 'continuum/pr-agent-repair';
+            const REVIEW_STALE_MS = 75 * 60_000;
+            const REPAIR_STALE_MS = 45 * 60_000;
+            const ROUTE_GRACE_MS = 5 * 60_000;
+            const now = Date.now();
+
+            const repoInfo = await github.rest.repos.get({ owner, repo });
+            const defaultBranch = repoInfo.data.default_branch || 'main';
+            const pulls = await github.paginate(github.rest.pulls.list, {
+              owner,
+              repo,
+              state: 'open',
+              base: defaultBranch,
+              per_page: 100,
+            });
+
+            const ordered = pulls
+              .filter(pr =>
+                !pr.draft &&
+                pr.head.repo?.full_name === owner + '/' + repo
+              )
+              .sort((a, b) =>
+                new Date(a.updated_at || 0).getTime() -
+                new Date(b.updated_at || 0).getTime()
+              );
+
+            const latestStatus = (statuses, contextName) =>
+              statuses
+                .filter(status => status.context === contextName)
+                .sort((a, b) =>
+                  new Date(b.updated_at || b.created_at || 0).getTime() -
+                  new Date(a.updated_at || a.created_at || 0).getTime()
+                )[0] || null;
+
+            const ageMs = status =>
+              status
+                ? now - new Date(status.updated_at || status.created_at || 0).getTime()
+                : Number.POSITIVE_INFINITY;
+
+            for (const pr of ordered) {
+              const head = pr.head.sha;
+
+              const combined = await github.rest.repos.getCombinedStatusForRef({
+                owner,
+                repo,
+                ref: head,
+                per_page: 100,
+              });
+              if (combined.data.state !== 'success') continue;
+
+              const comments = await github.paginate(
+                github.rest.issues.listComments,
+                { owner, repo, issue_number: pr.number, per_page: 100 }
+              );
+              const exhausted =
+                '<!-- continuum-pr-agent-retry-exhausted head=' + head.toLowerCase() + ' ';
+              const noProgress =
+                '<!-- continuum-pr-agent-no-progress head=' + head.toLowerCase() + ' ';
+              if (comments.some(comment =>
+                String(comment.body || '').includes(exhausted) ||
+                String(comment.body || '').includes(noProgress)
+              )) {
+                continue;
+              }
+
+              const statuses = combined.data.statuses || [];
+              const review = latestStatus(statuses, REVIEW_CONTEXT);
+              const repair = latestStatus(statuses, REPAIR_CONTEXT);
+
+              let reason = '';
+              if (!review) {
+                reason = 'no durable review state for green exact HEAD';
+              } else if (review.state === 'pending' && ageMs(review) > REVIEW_STALE_MS) {
+                reason = 'review status is stale pending';
+              } else if (review.state === 'failure') {
+                reason = 'review failed without a newer successful retry';
+              } else if (
+                review.state === 'success' &&
+                /actionable/i.test(String(review.description || ''))
+              ) {
+                if (!repair && ageMs(review) > ROUTE_GRACE_MS) {
+                  reason = 'actionable review has no repair state';
+                } else if (
+                  repair?.state === 'pending' &&
+                  ageMs(repair) > REPAIR_STALE_MS
+                ) {
+                  reason = 'repair status is stale pending';
+                } else if (repair?.state === 'failure') {
+                  reason = 'repair failed without a newer successful retry';
+                }
+              }
+
+              if (!reason) continue;
+
+              // Latest-state re-read immediately before dispatch.
+              const fresh = await github.rest.pulls.get({
+                owner, repo, pull_number: pr.number,
+              });
+              if (
+                fresh.data.state !== 'open' ||
+                fresh.data.draft ||
+                fresh.data.head.sha !== head ||
+                fresh.data.head.repo?.full_name !== owner + '/' + repo
+              ) {
+                continue;
+              }
+              const freshCombined =
+                await github.rest.repos.getCombinedStatusForRef({
+                  owner, repo, ref: head,
+                });
+              if (freshCombined.data.state !== 'success') continue;
+
+              await github.rest.actions.createWorkflowDispatch({
+                owner,
+                repo,
+                workflow_id: callerWorkflow,
+                ref: defaultBranch,
+                inputs: {
+                  pr_number: String(pr.number),
+                  expected_head_sha: head,
+                  retry_attempt: '0',
+                  retry_workflow: callerWorkflow,
+                },
+              });
+              core.notice(
+                'Recovered PR #' + pr.number + ' HEAD ' + head +
+                ': ' + reason + '.'
+              );
+
+              // Match the mature controller pattern: one state-changing
+              // recovery decision per reconciliation run.
+              break;
+            }
