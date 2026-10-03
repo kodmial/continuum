@@ -39,6 +39,11 @@ on:
         type: string
         default: ''
         required: false
+      target_child_id:
+        description: Opaque verified child id for delegated execution. Empty targets the caller repository.
+        type: string
+        default: ''
+        required: false
       expected_head_sha:
         description: Exact HEAD SHA the caller observed. Empty resolves from GitHub.
         type: string
@@ -125,7 +130,7 @@ permissions:
   statuses: read
 
 concurrency:
-  group: pr-agent-${{ github.event.issue.number || github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || inputs.pr_number || github.run_id }}
+  group: pr-agent-${{ inputs.target_child_id || 'local' }}-${{ github.event.issue.number || github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || inputs.pr_number || github.run_id }}
   cancel-in-progress: false
 
 jobs:
@@ -252,6 +257,35 @@ jobs:
               'pr_agent_version', pick(process.env.INPUT_PR_AGENT_VERSION, 'CFG_PR_AGENT_VERSION', '0.46.0')
             );
 
+      - name: Resolve PR-Agent target context
+        if: steps.stack.outputs.enabled == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          TARGET_CHILD_ID: ${{ inputs.target_child_id }}
+          CONTINUUM_REF: ${{ inputs.continuum_ref }}
+          CHILD_REPOSITORIES: ${{ secrets.CHILD_RUNTIME_REPOSITORIES }}
+        run: |
+          set -euo pipefail
+          RUNTIME_ROOT="$RUNNER_TEMP/continuum-pr-agent-target-runtime"
+          mkdir -p "$RUNTIME_ROOT/.github/scripts"
+          fetch_runtime_file() {
+            local path="$1" dest="$2"
+            if ! gh api --method GET "repos/kodmial/continuum/contents/$path" -f ref="$CONTINUUM_REF" --jq .content 2>/dev/null \
+              | tr -d '\n' | base64 --decode > "$dest" 2>/dev/null; then
+              echo "::error::Unable to load the Continuum PR-Agent target resolver."
+              exit 1
+            fi
+          }
+          fetch_runtime_file ".github/scripts/pr_agent_target.sh" "$RUNTIME_ROOT/.github/scripts/pr_agent_target.sh"
+          fetch_runtime_file ".github/scripts/delegation_repository.sh" "$RUNTIME_ROOT/.github/scripts/delegation_repository.sh"
+          fetch_runtime_file ".github/scripts/delegation_runtime.py" "$RUNTIME_ROOT/.github/scripts/delegation_runtime.py"
+          PARENT_CONFIG_FILE="$RUNTIME_ROOT/parent.continuum.yml"
+          if ! gh api --method GET "repos/$GITHUB_REPOSITORY/contents/.continuum.yml" --jq .content 2>/dev/null \
+            | tr -d '\n' | base64 --decode > "$PARENT_CONFIG_FILE" 2>/dev/null; then
+            printf 'version: 1\n' > "$PARENT_CONFIG_FILE"
+          fi
+          CONTINUUM_ENGINE_ROOT="$RUNTIME_ROOT" PARENT_CONFIG="$PARENT_CONFIG_FILE" \
+            bash "$RUNTIME_ROOT/.github/scripts/pr_agent_target.sh" "$TARGET_CHILD_ID"
       - name: Report the disabled provider explicitly
         if: steps.stack.outputs.enabled != 'true'
         run: echo "PR-Agent skipped because CONTINUUM_REVIEW_PROVIDER is not pr-agent."
@@ -271,7 +305,9 @@ jobs:
             // has green CI. Anything else is skipped, never reviewed.
             const prNumber = Number(process.env.PR_NUMBER);
             const { data: pr } = await github.rest.pulls.get({
-              owner: context.repo.owner, repo: context.repo.repo, pull_number: prNumber,
+              owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+              repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
+              pull_number: prNumber,
             });
             if (pr.state !== 'open') {
               core.setOutput('admitted', 'false');
@@ -283,7 +319,7 @@ jobs:
               core.notice(`PR #${prNumber} is a draft; skipping PR-Agent review.`);
               return;
             }
-            if (!pr.head.repo || pr.head.repo.full_name !== `${context.repo.owner}/${context.repo.repo}`) {
+            if (!pr.head.repo || pr.head.repo.full_name !== process.env.CONTINUUM_PR_AGENT_TARGET_REPOSITORY) {
               core.setOutput('admitted', 'false');
               core.notice(`PR #${prNumber} is not same-repo; skipping PR-Agent review.`);
               return;
@@ -304,8 +340,8 @@ jobs:
             const runs = await github.paginate(
               github.rest.actions.listWorkflowRunsForRepo,
               {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
+                owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+                repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
                 event: 'pull_request',
                 head_sha: headSha,
                 per_page: 100,
@@ -343,8 +379,8 @@ jobs:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
             await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
+              owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+              repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
               sha: process.env.HEAD_SHA,
               state: 'pending',
               context: 'continuum/pr-agent-review',
@@ -354,13 +390,26 @@ jobs:
                 context.repo.repo + '/actions/runs/' + context.runId,
             });
 
-      - name: Checkout the pull request head
+      - name: Checkout the pull request head without exposing delegated repository metadata
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          fetch-depth: 1
-          persist-credentials: false
-          ref: ${{ steps.admit.outputs.head_sha }}
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          HEAD_SHA: ${{ steps.admit.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          worktree="$RUNNER_TEMP/continuum-pr-agent-review-worktree"
+          rm -rf "$worktree"
+          if ! gh repo clone "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" "$worktree" -- --quiet >/dev/null 2>&1; then
+            echo "::error::Unable to checkout the verified PR-Agent target repository."
+            exit 1
+          fi
+          cd "$worktree"
+          if ! git fetch origin "$HEAD_SHA" --depth=1 --quiet >/dev/null 2>&1 ||
+             ! git checkout --detach "$HEAD_SHA" --quiet >/dev/null 2>&1; then
+            echo "::error::Unable to checkout the exact PR-Agent target HEAD."
+            exit 1
+          fi
+          echo "CONTINUUM_PR_AGENT_WORKTREE=$worktree" >> "$GITHUB_ENV"
 
       - name: Install the pinned upstream PR-Agent release on the runner
         id: install_pragent
@@ -476,13 +525,13 @@ jobs:
           CI_WORKFLOW_NAME: ${{ inputs.ci_workflow_name || vars.CONTINUUM_CI_WORKFLOW_NAME || 'CI' }}
         run: |
           set -euo pipefail
-          CURRENT_SHA="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)"
+          CURRENT_SHA="$(gh pr view "$PR_NUMBER" --repo "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" --json headRefOid --jq .headRefOid)"
           if [[ "${CURRENT_SHA,,}" != "${ADMITTED_SHA,,}" ]]; then
             echo "::error::PR head moved after CI admission ($ADMITTED_SHA -> $CURRENT_SHA); refusing to review an unqualified HEAD."
             exit 1
           fi
           CI_JSON="$RUNNER_TEMP/pr-agent-before-review-ci-runs.json"
-          gh api "repos/$GITHUB_REPOSITORY/actions/runs?event=pull_request&head_sha=$ADMITTED_SHA&per_page=100" > "$CI_JSON"
+          gh api "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/actions/runs?event=pull_request&head_sha=$ADMITTED_SHA&per_page=100" > "$CI_JSON"
           if ! python3 - "$CI_JSON" "$CI_WORKFLOW_NAME" "$ADMITTED_SHA" <<'PY'
           import json, sys
           path, workflow, head = sys.argv[1:4]
@@ -545,10 +594,12 @@ jobs:
           PUSH_OUTPUTS__ENABLE: 'true'
           PUSH_OUTPUTS__CHANNELS: '["file"]'
           PUSH_OUTPUTS__FILE_PATH: 'pr-agent-outputs/continuum.jsonl'
-          PR_URL: https://github.com/${{ github.repository }}/pull/${{ steps.stack.outputs.pr_number }}
+          PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           REVIEWED_SHA: ${{ steps.before.outputs.sha }}
         run: |
           set -euo pipefail
+          cd "$CONTINUUM_PR_AGENT_WORKTREE"
+          PR_URL="https://github.com/${CONTINUUM_PR_AGENT_TARGET_REPOSITORY}/pull/${PR_NUMBER}"
           mkdir -p pr-agent-outputs
           : > pr-agent-outputs/continuum.jsonl
           # The authoritative re-review is CI-gated by this controller: after
@@ -566,21 +617,31 @@ jobs:
           #            (pr-agent-outputs/continuum.jsonl payload.code_suggestions)
           # Check-run publishing stays disabled so persistent finding state
           # remains active (github.publish_as_check_run=false).
-          pr-agent --pr_url "$PR_URL" review \
-            --config.propagate_tool_errors=true \
-            --config.persistent_inline_comments=true \
-            --pr_reviewer.persistent_finding_state=true \
-            --pr_reviewer.inline_key_issues=true \
-            --pr_reviewer.require_merge_recommendation=true \
-            --pr_reviewer.require_ticket_analysis_review=true \
-            --github.publish_as_check_run=false \
-            --github_action_config.enable_output=true \
-            --github_action_config.fail_on_tool_errors=true
-          pr-agent --pr_url "$PR_URL" improve \
-            --config.propagate_tool_errors=true \
-            --pr_code_suggestions.focus_only_on_problems=true \
-            --pr_code_suggestions.suggestions_score_threshold=1 \
-            --github.publish_as_check_run=false
+          run_full_review() {
+            pr-agent --pr_url "$PR_URL" review \
+              --config.propagate_tool_errors=true \
+              --config.persistent_inline_comments=true \
+              --pr_reviewer.persistent_finding_state=true \
+              --pr_reviewer.inline_key_issues=true \
+              --pr_reviewer.require_merge_recommendation=true \
+              --pr_reviewer.require_ticket_analysis_review=true \
+              --github.publish_as_check_run=false \
+              --github_action_config.enable_output=true \
+              --github_action_config.fail_on_tool_errors=true
+            pr-agent --pr_url "$PR_URL" improve \
+              --config.propagate_tool_errors=true \
+              --pr_code_suggestions.focus_only_on_problems=true \
+              --pr_code_suggestions.suggestions_score_threshold=1 \
+              --github.publish_as_check_run=false
+          }
+          if [[ "$CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED" == true ]]; then
+            if ! run_full_review >"$RUNNER_TEMP/pr-agent-delegated-review.log" 2>&1; then
+              echo "::error::Delegated PR-Agent review failed; detailed output remains runner-local."
+              exit 1
+            fi
+          else
+            run_full_review
+          fi
           # Canonical machine source: the structured review JSON is exported
           # as the step output `review` (steps.pragent.outputs.review) for
           # the repair and merge workflows. Prose comments are presentation
@@ -601,6 +662,7 @@ jobs:
         id: improve_output
         run: |
           set -euo pipefail
+          cd "$CONTINUUM_PR_AGENT_WORKTREE"
           [[ -s pr-agent-outputs/continuum.jsonl ]] || {
             echo "::error::Native PR-Agent improve output file is missing."
             exit 1
@@ -626,7 +688,9 @@ jobs:
             const prNumber = Number(process.env.PR_NUMBER);
             const reviewedSha = String(process.env.REVIEWED_SHA || '').toLowerCase();
             const { data: pr } = await github.rest.pulls.get({
-              owner: context.repo.owner, repo: context.repo.repo, pull_number: prNumber,
+              owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+              repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
+              pull_number: prNumber,
             });
             const currentSha = String(pr.head.sha || '').toLowerCase();
             if (currentSha !== reviewedSha) {
@@ -666,7 +730,7 @@ jobs:
           set -euo pipefail
           COMMENTS_JSON="$RUNNER_TEMP/pr-agent-comments.json"
           gh api --paginate --slurp \
-            "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100" \
+            "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100" \
             > "$COMMENTS_JSON"
           python3 - "$COMMENTS_JSON" <<'PY'
           import json
@@ -764,8 +828,8 @@ jobs:
           script: |
             const actionable = process.env.NEEDS_REPAIR === 'true';
             await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
+              owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+              repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
               sha: process.env.HEAD_SHA,
               state: 'success',
               context: 'continuum/pr-agent-review',
@@ -791,8 +855,8 @@ jobs:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
             await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
+              owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+              repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
               sha: process.env.HEAD_SHA,
               state: 'failure',
               context: 'continuum/pr-agent-review',
@@ -817,7 +881,7 @@ jobs:
             echo "No review was admitted; nothing to revalidate."
             exit 0
           fi
-          CURRENT_SHA="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)"
+          CURRENT_SHA="$(gh pr view "$PR_NUMBER" --repo "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" --json headRefOid --jq .headRefOid)"
           if [[ "$CURRENT_SHA" != "$REVIEWED_SHA" ]]; then
             echo "::error::PR head moved during review ($REVIEWED_SHA -> $CURRENT_SHA); the review is stale."
             exit 1
@@ -828,6 +892,7 @@ jobs:
         if: always() && steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
         run: |
           set -euo pipefail
+          cd "$CONTINUUM_PR_AGENT_WORKTREE"
           DIRTY="$(git status --porcelain -- . ':(exclude)pr-agent-outputs')"
           if [[ -n "$DIRTY" ]]; then
             echo "::error::PR-Agent modified the checkout; reviewer-only runs must not."
@@ -862,6 +927,7 @@ jobs:
           RETRY_ATTEMPT: ${{ steps.stack.outputs.retry_attempt }}
           RETRY_WORKFLOW: ${{ steps.stack.outputs.retry_workflow }}
           CURRENT_RECOVERY_KIND: ${{ steps.stack.outputs.recovery_kind }}
+          TARGET_CHILD_ID: ${{ inputs.target_child_id }}
           CI_WORKFLOW_NAME: ${{ inputs.ci_workflow_name || vars.CONTINUUM_CI_WORKFLOW_NAME || 'CI' }}
         run: |
           set -euo pipefail
@@ -877,7 +943,7 @@ jobs:
           if (( attempt >= 2 )); then
             MARKER="<!-- continuum-pr-agent-retry-exhausted head=${HEAD_SHA,,} kind=${CURRENT_RECOVERY_KIND:-review} attempts=$((attempt + 1)) -->"
             printf -v BODY '%s\n%s' "$MARKER" "PR-Agent ${CURRENT_RECOVERY_KIND:-review} recovery exhausted the bounded retry budget for this exact HEAD. A new HEAD or an explicit owner /review starts a fresh evaluation."
-            gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$BODY"
+            gh pr comment "$PR_NUMBER" --repo "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" --body "$BODY"
             echo "Retry budget exhausted for PR #$PR_NUMBER HEAD $HEAD_SHA."
             exit 0
           fi
@@ -886,10 +952,10 @@ jobs:
           delay=$((15 * (1 << attempt)))
           MARKER="<!-- continuum-pr-agent-retry head=${HEAD_SHA,,} kind=${CURRENT_RECOVERY_KIND:-review} attempt=$next -->"
           printf -v BODY '%s\n%s' "$MARKER" "Retrying a transient PR-Agent ${CURRENT_RECOVERY_KIND:-review} recovery/runtime failure for this exact HEAD (attempt $next/3, backoff ${delay}s)."
-          gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$BODY"
+          gh pr comment "$PR_NUMBER" --repo "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" --body "$BODY"
           sleep "$delay"
 
-          if ! current="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid,state,isDraft --jq '[.headRefOid,.state,(.isDraft|tostring)]|@tsv')"; then
+          if ! current="$(gh pr view "$PR_NUMBER" --repo "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" --json headRefOid,state,isDraft --jq '[.headRefOid,.state,(.isDraft|tostring)]|@tsv')"; then
             echo "Could not revalidate PR state after backoff; stale retry cancelled."
             exit 0
           fi
@@ -901,7 +967,7 @@ jobs:
             exit 0
           fi
           CI_JSON="$RUNNER_TEMP/pr-agent-ci-runs.json"
-          if ! gh api "repos/$GITHUB_REPOSITORY/actions/runs?event=pull_request&head_sha=$HEAD_SHA&per_page=100" > "$CI_JSON"; then
+          if ! gh api "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/actions/runs?event=pull_request&head_sha=$HEAD_SHA&per_page=100" > "$CI_JSON"; then
             echo "Could not revalidate exact-HEAD CI after backoff; stale retry cancelled."
             exit 0
           fi
@@ -932,7 +998,7 @@ jobs:
           esac
           if ! [[ "$DEFAULT_BRANCH" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]]; then DEFAULT_BRANCH="main"; fi
           if [[ "$DEFAULT_BRANCH" == */.*/* || "$DEFAULT_BRANCH" == .*/ || "$DEFAULT_BRANCH" == */. ]] || [[ "$DEFAULT_BRANCH" =~ (^|/)\. ]] || [[ "$DEFAULT_BRANCH" =~ \.lock($|/) ]]; then DEFAULT_BRANCH="main"; fi
-          gh workflow run "$RETRY_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH"             -f pr_number="$PR_NUMBER"             -f expected_head_sha="$HEAD_SHA"             -f retry_attempt="$next"             -f retry_workflow="$RETRY_WORKFLOW"             -f recovery_kind="${CURRENT_RECOVERY_KIND:-review}"
+          gh workflow run "$RETRY_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH"             -f pr_number="$PR_NUMBER"             -f expected_head_sha="$HEAD_SHA"             -f retry_attempt="$next"             -f retry_workflow="$RETRY_WORKFLOW"             -f recovery_kind="${CURRENT_RECOVERY_KIND:-review}"             -f target_child_id="$TARGET_CHILD_ID"
           echo "Dispatched isolated PR-Agent retry attempt $next/3 for PR #$PR_NUMBER HEAD $HEAD_SHA."
 
   repair:
@@ -951,6 +1017,7 @@ jobs:
       improve_jsonl: ${{ needs.pr_agent.outputs.improve_jsonl }}
       retry_attempt: ${{ needs.pr_agent.outputs.recovery_kind == 'repair' && needs.pr_agent.outputs.retry_attempt || '0' }}
       retry_workflow: ${{ needs.pr_agent.outputs.retry_workflow }}
+      target_child_id: ${{ inputs.target_child_id }}
 
   merge:
     needs: pr_agent
@@ -967,3 +1034,4 @@ jobs:
       review_json: ${{ needs.pr_agent.outputs.review_json }}
       improve_jsonl: ${{ needs.pr_agent.outputs.improve_jsonl }}
       persistent_state_json: ${{ needs.pr_agent.outputs.persistent_state_json }}
+      target_child_id: ${{ inputs.target_child_id }}
