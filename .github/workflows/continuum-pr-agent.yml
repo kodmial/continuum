@@ -108,7 +108,7 @@ on:
         default: 'continuum-pr-agent.yml'
         required: false
       recovery_kind:
-        description: Durable recovery operation identity: review or repair.
+        description: "Durable recovery operation identity: review or repair."
         type: string
         default: 'review'
         required: false
