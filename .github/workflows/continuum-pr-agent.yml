@@ -97,8 +97,19 @@ on:
         type: string
         default: ''
         required: false
+      retry_attempt:
+        description: Bounded PR-Agent retry attempt number (0 = initial run).
+        type: string
+        default: '0'
+        required: false
+      retry_workflow:
+        description: Caller workflow filename used for isolated PR-Agent retries.
+        type: string
+        default: 'continuum-pr-agent.yml'
+        required: false
 
 permissions:
+  actions: write
   contents: write
   issues: write
   pull-requests: write
@@ -123,6 +134,7 @@ jobs:
       needs_repair: ${{ steps.route.outputs.needs_repair }}
 
     permissions:
+      actions: write
       contents: read
       issues: write
       pull-requests: write
@@ -275,6 +287,7 @@ jobs:
           ref: ${{ steps.admit.outputs.head_sha }}
 
       - name: Install the pinned upstream PR-Agent release on the runner
+        id: install_pragent
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
         env:
           PR_AGENT_VERSION: ${{ steps.stack.outputs.pr_agent_version }}
@@ -291,6 +304,7 @@ jobs:
           pr-agent --version
 
       - name: Install pinned OpenCode CLI for the PR-Agent backend
+        id: install_opencode
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
         run: |
           set -euo pipefail
@@ -307,6 +321,7 @@ jobs:
           done
 
       - name: Start opencode serve on loopback
+        id: start_opencode
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
         env:
           OPENCODE_MODEL: ${{ steps.stack.outputs.opencode_model }}
@@ -351,6 +366,7 @@ jobs:
           echo "bridge_script=$BRIDGE_SCRIPT" >> "$GITHUB_OUTPUT"
 
       - name: Start the OpenAI-compatibility bridge on loopback
+        id: start_bridge
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
         env:
           OPENCODE_SERVER_URL: http://127.0.0.1:${{ steps.stack.outputs.server_port }}
@@ -682,6 +698,58 @@ jobs:
           pkill -f "continuum-pr-agent-bridge.p[y]" || true
           pkill -f "pr_agent_bridge.p[y]" || true
 
+      - name: Schedule bounded retry for retryable PR-Agent review failure
+        if: >-
+          always() &&
+          steps.stack.outputs.enabled == 'true' &&
+          steps.admit.outputs.admitted == 'true' &&
+          failure() &&
+          (steps.install_pragent.outcome == 'failure' ||
+           steps.install_opencode.outcome == 'failure' ||
+           steps.start_opencode.outcome == 'failure' ||
+           steps.runtime.outcome == 'failure' ||
+           steps.start_bridge.outcome == 'failure' ||
+           steps.pragent.outcome == 'failure')
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.admit.outputs.head_sha }}
+          RETRY_ATTEMPT: ${{ inputs.retry_attempt || '0' }}
+          RETRY_WORKFLOW: ${{ inputs.retry_workflow || 'continuum-pr-agent.yml' }}
+        run: |
+          set -euo pipefail
+          attempt="${RETRY_ATTEMPT:-0}"
+          [[ "$attempt" =~ ^[0-9]+$ ]] || attempt=0
+          if (( attempt >= 3 )); then
+            gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "<!-- continuum-pr-agent-retry-exhausted head=${HEAD_SHA,,} kind=review attempts=$attempt -->
+PR-Agent review exhausted the bounded retry budget for this exact HEAD. A new HEAD or an explicit owner /review starts a fresh evaluation."
+            echo "Retry budget exhausted for PR #$PR_NUMBER HEAD $HEAD_SHA."
+            exit 0
+          fi
+
+          next=$((attempt + 1))
+          delay=$((15 * (1 << attempt)))
+          gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "<!-- continuum-pr-agent-retry head=${HEAD_SHA,,} kind=review attempt=$next -->
+Retrying a transient PR-Agent review/runtime failure for this exact HEAD (attempt $next/3, backoff ${delay}s)."
+          sleep "$delay"
+
+          current="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid,state,isDraft --jq '[.headRefOid,.state,(.isDraft|tostring)]|@tsv')"
+          current_sha="$(cut -f1 <<<"$current")"
+          current_state="$(cut -f2 <<<"$current")"
+          current_draft="$(cut -f3 <<<"$current")"
+          if [[ "$current_sha" != "$HEAD_SHA" || "$current_state" != "OPEN" || "$current_draft" == "true" ]]; then
+            echo "PR state changed during retry backoff; stale retry cancelled."
+            exit 0
+          fi
+          combined="$(gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/status" --jq .state)"
+          if [[ "$combined" != "success" ]]; then
+            echo "Exact HEAD no longer has green CI; retry cancelled until a fresh CI event."
+            exit 0
+          fi
+
+          gh workflow run "$RETRY_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref main             -f pr_number="$PR_NUMBER"             -f expected_head_sha="$HEAD_SHA"             -f retry_attempt="$next"
+          echo "Dispatched isolated PR-Agent retry attempt $next/3 for PR #$PR_NUMBER HEAD $HEAD_SHA."
+
   repair:
     needs: pr_agent
     if: >-
@@ -696,6 +764,8 @@ jobs:
       head_sha: ${{ needs.pr_agent.outputs.head_sha }}
       review_json: ${{ needs.pr_agent.outputs.review_json }}
       improve_jsonl: ${{ needs.pr_agent.outputs.improve_jsonl }}
+      retry_attempt: ${{ inputs.retry_attempt }}
+      retry_workflow: ${{ inputs.retry_workflow }}
 
   merge:
     needs: pr_agent
