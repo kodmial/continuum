@@ -1711,6 +1711,12 @@ class ContinuumTest < Minitest::Test
                     'repair must detect ignored files that older branches still track'
     assert_includes repair, 'git restore --source="$START_HEAD"',
                     'repair must restore tracked ignored artifacts to the reviewed HEAD'
+    assert_includes repair, 'PR_DRAFT="$(jq -r',
+                    'repair must refuse a PR that is already draft'
+    assert_includes repair, 'CURRENT_DRAFT="$(cut -f3',
+                    'repair must revalidate draft state immediately before publication'
+    assert_includes repair, 'became closed or draft during repair',
+                    'a mid-repair draft transition must discard local repair changes'
   end
 
   # The free default model must be the single documented fallback everywhere an
