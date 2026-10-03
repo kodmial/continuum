@@ -21,7 +21,9 @@ on:
   workflow_dispatch:
 
 permissions:
-  actions: read
+  # The queue may wake the trusted auto-merge reconciler to re-verify stale
+  # CodeRabbit findings before spending another full-review slot.
+  actions: write
   contents: read
   issues: write
   pull-requests: read
