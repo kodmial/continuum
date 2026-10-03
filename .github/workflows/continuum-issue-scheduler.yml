@@ -274,6 +274,8 @@ jobs:
 
           # Validate the child declaration with the same authoritative parser
           # used by parent-side delegated discovery. Values are never echoed.
+          printf '::add-mask::%s\n' "$parent"
+          printf '::add-mask::%s\n' "$child_id"
           if ! python3 "$runtime" verify-child-variables \
             --role "$child_role" \
             --declared-id "$child_id" \
@@ -284,11 +286,14 @@ jobs:
             exit 2
           fi
 
-          printf '::add-mask::%s\n' "$parent"
-          printf '::add-mask::%s\n' "$child_id"
-
-          if [[ ! "$parent" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+          parent_owner="${parent%%/*}"
+          parent_name="${parent#*/}"
+          if [[ ! "$parent" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || [[ "$parent_owner" == "." || "$parent_owner" == ".." || "$parent_name" == "." || "$parent_name" == ".." ]]; then
             echo "::error::Child relationship declaration is invalid; parent wake-up refused."
+            exit 2
+          fi
+          if [ -z "$child_id" ]; then
+            echo "::error::Bidirectional parent/child verification failed; parent wake-up refused."
             exit 2
           fi
           if ! parent_role="$(fetch_variable "$parent" CONTINUUM_ROLE)"; then
@@ -299,17 +304,20 @@ jobs:
             echo "::error::Parent relationship lookup is unavailable; parent wake-up refused."
             exit 4
           fi
-          if [ -z "$child_id" ]; then
-            echo "::error::Bidirectional parent/child verification failed; parent wake-up refused."
-            exit 2
+          if ! parent_ids_err="$(mktemp -p "${RUNNER_TEMP:-$GITHUB_WORKSPACE}" continuum-parent-ids-err.XXXXXX)"; then
+            echo "::error::Parent verification lookup is unavailable; parent wake-up refused."
+            exit 4
           fi
           if ! python3 "$runtime" parent-variable-ids \
             --role "$parent_role" \
-            --children-json "$parent_children" 2>/dev/null \
+            --children-json "$parent_children" 2>"$parent_ids_err" \
             | grep -Fxq -- "$child_id"; then
+            cat "$parent_ids_err" >&2 || true
+            rm -f "$parent_ids_err"
             echo "::error::Bidirectional parent/child verification failed; parent wake-up refused."
             exit 2
           fi
+          rm -f "$parent_ids_err"
           if ! parent_err="$(mktemp -p "${RUNNER_TEMP:-$GITHUB_WORKSPACE}" continuum-parent-err.XXXXXX)"; then
             echo "::error::Parent default branch lookup is unavailable; parent wake-up refused."
             exit 4
