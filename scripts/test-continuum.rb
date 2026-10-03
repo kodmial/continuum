@@ -3630,95 +3630,53 @@ class ContinuumTest < Minitest::Test
 
   # ------------------------------------------------- promoted fork capabilities
 
-  # (a) Label-driven execution routes. The fork hardcoded three labels and
-  # three workflow file names; core parameterizes the whole table instead, so
-  # a consumer can route to any workflow it owns and a consumer with none gets
-  # nothing at all. The default must therefore be EMPTY, and the parser must be
-  # a live one that fails loudly on a malformed line rather than silently
-  # dropping a route the operator believed was installed.
-  def test_scheduler_execution_routes_are_configured_and_empty_by_default
+  # The old label-driven execution route knob is retained only so existing
+  # installed callers do not break when they still forward the input. It must
+  # not influence scheduling: a ready ordinary issue always reaches OpenCode.
+  def test_scheduler_always_dispatches_ready_issues_to_opencode
     inputs = events(yaml(File.join(ROOT, '.github/workflows/continuum-issue-scheduler.yml')))
              .fetch('workflow_call').fetch('inputs')
 
     routes = inputs.fetch('execution_label_routes')
-    assert_equal '', routes.fetch('default'),
-                 'execution_label_routes must default to empty: core ships no execution workflows'
+    assert_equal '', routes.fetch('default')
     assert_equal 'string', routes.fetch('type')
     assert_equal false, routes.fetch('required')
-    assert_includes routes.fetch('description'), 'vars.CONTINUUM_EXECUTION_LABEL_ROUTES'
+    assert_includes routes.fetch('description'), 'Deprecated compatibility input'
+    assert_includes routes.fetch('description'), 'ignored'
 
+    body = workflow_body('continuum-issue-scheduler.yml')
+    refute_includes body, 'EXECUTION_LABEL_ROUTES:'
+    refute_includes body, "(process.env.EXECUTION_LABEL_ROUTES || '')"
+    refute_includes body, 'const executionRoutes ='
+    refute_includes body, 'const executionRouteLabels ='
+    refute_includes body, 'route.workflow'
+    refute_includes body, 'Routes this issue to a configured execution workflow'
+
+    # The selected issue has exactly the two OpenCode delivery forms: direct
+    # workflow_dispatch for callers without issue_comment, or the normal /oc
+    # comment path. No label can substitute a different executor.
+    assert_includes body, "if (opencodeDispatch === 'workflow')"
+    assert_includes body, "inputs: { mode: 'issue', issue_number: String(issue.number) }"
+    assert_includes body, "body: ['/oc', '', markerComment].join('\\n')"
+  end
+
+  # The downstream child wake-up remains an orchestration notification after a
+  # reconcile pass; it does not replace the executor selected for an issue.
+  def test_scheduler_child_wakeup_remains_optional
+    inputs = events(yaml(File.join(ROOT, '.github/workflows/continuum-issue-scheduler.yml')))
+             .fetch('workflow_call').fetch('inputs')
     child = inputs.fetch('child_dispatch_workflow')
     assert_equal '', child.fetch('default'),
                  'child_dispatch_workflow must default to empty: no core dispatcher is guaranteed to exist'
     assert_includes child.fetch('description'), 'vars.CONTINUUM_CHILD_DISPATCH_WORKFLOW'
 
-    dispatch = inputs.fetch('opencode_dispatch')
-    assert_equal 'comment', dispatch.fetch('default'),
-                 'opencode_dispatch must default to the comment path, which needs no extra permission'
-
     body = workflow_body('continuum-issue-scheduler.yml')
-    # Live parser, not a hardcoded table.
-    assert_includes body, "(process.env.EXECUTION_LABEL_ROUTES || '')"
-    assert_includes body, '"Invalid execution_label_routes line: \'"'
-    assert_includes body, '"\'; expected \'<issue label>|<workflow file name>|<input>=<value>,...\'."'
-    assert_includes body, '"Invalid execution_label_routes input \'"'
-    assert_includes body, 'const executionRouteLabels = new Set('
-
-    # …and the route really dispatches, with the issue number injected so a
-    # route never has to spell out the only input every execution workflow
-    # shares.
-    helper = body[/async function dispatchWorkflow\(workflow, inputs\) \{.*?\n {14}\}/m]
-    refute_nil helper, 'the dispatchWorkflow helper is missing from the scheduler script'
-    assert_includes helper, 'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches'
-    assert_match(
-      /await dispatchWorkflow\(route\.workflow, \{\s*\.\.\.route\.inputs,\s*issue_number: String\(issue\.number\),\s*\}\);/,
-      body,
-      'a configured route must dispatch its own inputs plus the issue number'
-    )
-
-    # A configured label must exist in the repository so an operator can apply
-    # it from the issue page.
-    assert_includes body, '...executionRouteLabels].map(name => ({'
-
-    # (b) the child wake-up is one step, gated on the knob being non-empty.
     wakeup = step_body(body, 'Wake the configured downstream dispatcher')
     refute_nil wakeup, 'the child-dispatch wake-up step is missing'
     assert_includes wakeup, "if: env.CHILD_DISPATCH_WORKFLOW != ''",
                     'the child wake-up must not run when no dispatcher is configured'
     assert_match(%r{repos/\$GITHUB_REPOSITORY/actions/workflows/\$CHILD_DISPATCH_WORKFLOW/dispatches}, wakeup)
     assert_includes wakeup, '::warning::'
-  end
-
-  # The route-line guard must be LIVE, not merely present. Asserting that the
-  # error text exists somewhere in the workflow cannot tell a working guard
-  # from `if (false) {` with the throw left inside: the text is identical in
-  # both, so the malformed-route protection would silently vanish while every
-  # assertion about the strings still passed. Scope each error text to the
-  # guard's own brace-matched body, so neutering the condition drops the text
-  # out of the extracted block and the test fails.
-  def test_scheduler_route_line_guard_is_live_and_owns_its_error_text
-    body = workflow_body('continuum-issue-scheduler.yml')
-
-    guard = js_block(body, 'if (parts.length < 2 || parts.length > 3 || !parts[0] || !parts[1])')
-    refute_nil guard, 'the malformed route-line guard is missing from the scheduler script'
-    assert_includes guard, 'parts.length < 2'
-    assert_includes guard, 'parts.length > 3'
-    assert_includes guard, '!parts[0]'
-    assert_includes guard, '!parts[1]'
-    assert_includes guard, 'throw new Error('
-    assert_includes guard, '"Invalid execution_label_routes line: \'"',
-                    'the line-level error must be raised by the guard, not merely present in the file'
-    assert_includes guard, '"\'; expected \'<issue label>|<workflow file name>|<input>=<value>,...\'."'
-
-    # The input-level guard has the same weakness: its error text exists only
-    # once in the file, so pinning it to the `separator <= 0` body is what
-    # proves a malformed `<input>=<value>` assignment still fails the run.
-    input_guard = js_block(body, 'if (separator <= 0)')
-    refute_nil input_guard, 'the malformed route-input guard is missing from the scheduler script'
-    assert_includes input_guard, 'throw new Error('
-    assert_includes input_guard, '"Invalid execution_label_routes input \'"',
-                    'the input-level error must be raised by the guard, not merely present in the file'
-    assert_includes input_guard, '"\'; expected \'<name>=<value>\'."'
   end
 
   # `opencode_dispatch` selects between two real dispatch forms, so an
