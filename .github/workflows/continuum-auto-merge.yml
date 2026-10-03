@@ -8,14 +8,16 @@ on:
         type: string
         default: main
         required: false
-      require_coderabbit:
+      review_provider:
         description: >-
-          Require a CodeRabbit approval before merging and delegate rate-limited
-          reviews to the CodeRabbit retry controller. Empty falls back to
-          vars.CONTINUUM_REQUIRE_CODERABBIT. CodeRabbit is an optional
-          integration, so the default is OFF: a project that did not ask for
-          CodeRabbit must not be made to wait for an approval nobody will ever
-          give, and must not have a workflow dispatched it does not own.
+          Review provider: none, coderabbit, or pr-agent. Empty falls back to
+          vars.CONTINUUM_REVIEW_PROVIDER, then to none. This is the authoritative
+          review selector.
+        type: string
+        default: ''
+        required: false
+      require_coderabbit:
+        description: Deprecated compatibility input; review_provider is authoritative.
         type: string
         default: ''
         required: false
@@ -85,7 +87,7 @@ jobs:
         # push/merge workflows (version bump, release, PR reconciliation).
         env:
           CONTINUUM_VERSION_FILE: ${{ vars.CONTINUUM_VERSION_FILE || '' }}
-          REQUIRE_CODERABBIT: ${{ inputs.require_coderabbit || vars.CONTINUUM_REQUIRE_CODERABBIT || 'false' }}
+          REVIEW_PROVIDER: ${{ inputs.review_provider || vars.CONTINUUM_REVIEW_PROVIDER || 'none' }}
           POST_MERGE_WAKEUPS: ${{ inputs.post_merge_wakeups || vars.CONTINUUM_POST_MERGE_WAKEUPS }}
           POST_MERGE_WAKEUP_REF: ${{ inputs.post_merge_wakeup_ref || vars.CONTINUUM_POST_MERGE_WAKEUP_REF || github.event.repository.default_branch || 'main' }}
           REQUIRED_WORKFLOW_GATE_LABEL: ${{ inputs.required_workflow_gate_label || vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_LABEL || '' }}
@@ -103,10 +105,23 @@ jobs:
             // CodeRabbit workflow is ever dispatched: requiring an approval
             // nobody will give would hang the PR forever, and dispatching a
             // workflow the repository does not have is a 404.
-            const REQUIRE_CODERABBIT =
-              String(process.env.REQUIRE_CODERABBIT || '').trim().toLowerCase();
-            const requireCodeRabbit =
-              REQUIRE_CODERABBIT === 'true' || REQUIRE_CODERABBIT === '1';
+            const reviewProvider =
+              String(process.env.REVIEW_PROVIDER || 'none').trim().toLowerCase();
+            if (!['none', 'coderabbit', 'pr-agent'].includes(reviewProvider)) {
+              throw new Error(
+                `Invalid CONTINUUM_REVIEW_PROVIDER="${reviewProvider}". Expected none, coderabbit, or pr-agent.`
+              );
+            }
+            // PR-Agent owns a separate exact-head merge gate. The generic
+            // auto-merger must never bypass it.
+            if (reviewProvider === 'pr-agent') {
+              core.notice(
+                'PR-Agent review provider selected; generic auto-merge is disabled. ' +
+                'Only the PR-Agent-specific merge gate may merge.'
+              );
+              return;
+            }
+            const requireCodeRabbit = reviewProvider === 'coderabbit';
             const requiredWorkflowGateLabel =
               String(process.env.REQUIRED_WORKFLOW_GATE_LABEL || '').trim();
             const requiredWorkflowGateName =
