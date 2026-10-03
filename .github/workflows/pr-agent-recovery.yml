@@ -2,6 +2,11 @@ name: PR-Agent recovery dogfood
 
 on:
   workflow_dispatch:
+    inputs:
+      target_child_id:
+        description: Opaque verified child id for delegated PR-Agent recovery
+        required: false
+        type: string
   schedule:
     - cron: "*/10 * * * *"
   pull_request_target:
@@ -25,4 +30,5 @@ jobs:
     secrets: inherit
     with:
       continuum_ref: main
+      target_child_id: "${{ inputs.target_child_id }}"
       review_workflow: pr-agent.yml

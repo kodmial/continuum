@@ -1191,12 +1191,13 @@ class RepairWiringRegressionTests(unittest.TestCase):
     def test_merge_reconciliation_is_serialized_per_pr(self):
         merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
         self.assertIn(
-            "group: pr-agent-merge-${{ inputs.pr_number || github.run_id }}",
+            "group: pr-agent-merge-${{ inputs.target_child_id && format('child-{0}', inputs.target_child_id) || 'local' }}-${{ inputs.pr_number || github.run_id }}",
             merge,
         )
         self.assertIn("cancel-in-progress: false", merge)
-        # Per-PR serialization plus the exact-HEAD marker is the isolation
-        # contract; repository-global active-run probing is forbidden.
+        # Opaque child/local + PR serialization plus the exact-HEAD marker is
+        # the isolation contract; overlapping PR numbers in different children
+        # must not share a merge lock. Repository-global active-run probing is forbidden.
         self.assertNotIn("conflictRepairRunsActive", merge)
 
     def test_active_conflict_repair_wins_over_exhausted_attempt_helper(self):

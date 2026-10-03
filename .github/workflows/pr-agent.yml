@@ -12,6 +12,10 @@ on:
         description: Pull request number for a bounded PR-Agent retry
         required: false
         type: string
+      target_child_id:
+        description: Opaque verified child id for delegated PR-Agent execution
+        required: false
+        type: string
       expected_head_sha:
         description: Exact PR HEAD the retry is allowed to review
         required: false
@@ -44,7 +48,7 @@ permissions:
   statuses: read
 
 concurrency:
-  group: pr-agent-caller-${{ github.event.issue.number || inputs.pr_number || github.run_id }}
+  group: pr-agent-caller-${{ inputs.target_child_id && format('child-{0}', inputs.target_child_id) || 'local' }}-${{ github.event.issue.number || inputs.pr_number || github.run_id }}
   cancel-in-progress: false
 
 jobs:
@@ -60,6 +64,7 @@ jobs:
     with:
       continuum_ref: main
       pr_number: "${{ inputs.pr_number }}"
+      target_child_id: "${{ inputs.target_child_id }}"
       expected_head_sha: "${{ inputs.expected_head_sha }}"
       retry_attempt: "${{ inputs.retry_attempt }}"
       retry_workflow: "${{ inputs.retry_workflow || 'pr-agent.yml' }}"

@@ -20,6 +20,11 @@ on:
         type: string
         default: ''
         required: false
+      target_child_id:
+        description: Opaque verified child id for delegated execution. Empty targets the caller repository.
+        type: string
+        default: ''
+        required: false
       head_sha:
         description: Exact HEAD SHA the review evaluated.
         type: string
@@ -70,7 +75,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: pr-agent-merge-${{ inputs.pr_number || github.run_id }}
+  group: pr-agent-merge-${{ inputs.target_child_id && format('child-{0}', inputs.target_child_id) || 'local' }}-${{ inputs.pr_number || github.run_id }}
   cancel-in-progress: false
 
 jobs:
@@ -114,6 +119,65 @@ jobs:
             }
             core.setOutput('stack', 'pr-agent');
 
+      - name: Resolve PR-Agent target context
+        if: steps.stack.outputs.stack == 'pr-agent'
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          TARGET_CHILD_ID: ${{ inputs.target_child_id }}
+          CONTINUUM_REF: ${{ inputs.continuum_ref }}
+        run: |
+          set -euo pipefail
+          : "${CONTINUUM_REF:?CONTINUUM_REF is required for pinned target resolution}"
+          # Derive the Continuum source repository from the reusable workflow
+          # origin so forks, renames, and mirrors fetch their own runtime.
+          # GITHUB_WORKFLOW_REF looks like <owner>/<repo>/.github/workflows/<file>@<ref>.
+          CONTINUUM_SOURCE_REPO="${GITHUB_WORKFLOW_REF:-}"
+          CONTINUUM_SOURCE_REPO="${CONTINUUM_SOURCE_REPO%%/.github/workflows/*}"
+          if ! [[ "$CONTINUUM_SOURCE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            CONTINUUM_SOURCE_REPO="kodmial/continuum"
+          fi
+          if [[ -z "${TARGET_CHILD_ID:-}" ]]; then
+            # Local fast path: no delegated resolver is needed, so skip every
+            # network fetch and resolve directly from the execution repository.
+            # A previously local-only auto-merge must not fail on resolver-fetch
+            # rate limits, token scopes, or transient network errors.
+            if ! [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+              echo "::error::PR-Agent target repository identity is invalid."
+              exit 2
+            fi
+            {
+              printf 'CONTINUUM_PR_AGENT_TARGET_REPOSITORY=%s\n' "$GITHUB_REPOSITORY"
+              printf 'CONTINUUM_PR_AGENT_TARGET_OWNER=%s\n' "${GITHUB_REPOSITORY%%/*}"
+              printf 'CONTINUUM_PR_AGENT_TARGET_REPO=%s\n' "${GITHUB_REPOSITORY#*/}"
+              printf 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED=%s\n' "false"
+            } >> "$GITHUB_ENV"
+            echo "PR-Agent target context resolved locally."
+            exit 0
+          fi
+          RUNTIME_ROOT="$RUNNER_TEMP/continuum-pr-agent-target-runtime"
+          mkdir -p "$RUNTIME_ROOT/.github/scripts"
+          fetch_runtime_file() {
+            local path="$1" dest="$2"
+            if ! gh api --method GET "repos/$CONTINUUM_SOURCE_REPO/contents/$path" -f ref="$CONTINUUM_REF" --jq .content 2>/dev/null \
+              | tr -d '\n' | base64 --decode > "$dest" 2>/dev/null; then
+              echo "::error::Unable to load the Continuum PR-Agent target resolver."
+              exit 1
+            fi
+            if [[ ! -s "$dest" ]]; then
+              echo "::error::Unable to load the Continuum PR-Agent target resolver."
+              exit 1
+            fi
+          }
+          fetch_runtime_file ".github/scripts/pr_agent_target.sh" "$RUNTIME_ROOT/.github/scripts/pr_agent_target.sh"
+          fetch_runtime_file ".github/scripts/delegation_repository.sh" "$RUNTIME_ROOT/.github/scripts/delegation_repository.sh"
+          fetch_runtime_file ".github/scripts/delegation_runtime.py" "$RUNTIME_ROOT/.github/scripts/delegation_runtime.py"
+          PARENT_CONFIG_FILE="$RUNTIME_ROOT/parent.continuum.yml"
+          if ! gh api --method GET "repos/$GITHUB_REPOSITORY/contents/.continuum.yml" --jq .content 2>/dev/null \
+            | tr -d '\n' | base64 --decode > "$PARENT_CONFIG_FILE" 2>/dev/null; then
+            printf 'version: 1\n' > "$PARENT_CONFIG_FILE"
+          fi
+          CONTINUUM_ENGINE_ROOT="$RUNTIME_ROOT" PARENT_CONFIG="$PARENT_CONFIG_FILE" \
+            bash "$RUNTIME_ROOT/.github/scripts/pr_agent_target.sh" "$TARGET_CHILD_ID"
       - name: Evaluate the exact-head PR-Agent gate
         id: gate
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
@@ -278,14 +342,19 @@ jobs:
           POST_MERGE_WAKEUP_REF: ${{ inputs.post_merge_wakeup_ref || vars.CONTINUUM_POST_MERGE_WAKEUP_REF || github.event.repository.default_branch || 'main' }}
           REQUIRED_WORKFLOW_GATE_LABEL: ${{ inputs.required_workflow_gate_label || vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_LABEL || '' }}
           REQUIRED_WORKFLOW_GATE_NAME: ${{ inputs.required_workflow_gate_name || vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_NAME || '' }}
+          TARGET_CHILD_ID: ${{ inputs.target_child_id }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
             // Work Lock #33 mirrors the mature provider-neutral mechanics from
             // continuum-auto-merge.yml while keeping CodeRabbit untouched.
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const repoFullName = owner + '/' + repo;
+            const executionOwner = context.repo.owner;
+            const executionRepo = context.repo.repo;
+            const owner = process.env.CONTINUUM_PR_AGENT_TARGET_OWNER;
+            const repo = process.env.CONTINUUM_PR_AGENT_TARGET_REPO;
+            const repoFullName = process.env.CONTINUUM_PR_AGENT_TARGET_REPOSITORY;
+            const delegated =
+              process.env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED === 'true';
             const prNumber = Number(process.env.PR_NUMBER);
             const reviewedHead = String(process.env.REVIEWED_HEAD || '').trim().toLowerCase();
             const AUTO_MERGE_BLOCK_LABEL = 'no-auto-merge';
@@ -512,6 +581,11 @@ jobs:
             }
 
             async function dispatchConflictRepair(pr, reason) {
+              // Bounded attempt accounting applies to every surface,
+              // including delegated PRs: the lock label plus the exact-HEAD
+              // marker below is what bounds retries and lets the next pass
+              // clear a stranded lock. Failing before they exist replays the
+              // same failure on every reconciliation with no evidence.
               await ensureLabel(
                 CONFLICT_LOCK_LABEL,
                 'B60205',
@@ -584,6 +658,44 @@ jobs:
                 ].join('\n'),
               });
               try {
+                if (delegated) {
+                  // Delegated surface: a target-local OpenCode dispatch would
+                  // run in the wrong repository, and the parent routing
+                  // controller (future Work Lock #43) does not exist yet.
+                  // Do not consume this HEAD's single bounded attempt and do
+                  // not hold green: remove the lock plus the exact-HEAD
+                  // marker created above and fail explicitly so the conflict
+                  // stays visible and retryable instead of freezing green.
+                  try {
+                    await github.rest.issues.deleteComment({
+                      owner,
+                      repo,
+                      comment_id: attemptComment.data.id,
+                    });
+                  } catch (cleanupErr) {
+                    core.warning(
+                      'PR #' + prNumber +
+                      ': failed to remove uncommitted delegated conflict-attempt marker: ' +
+                      (cleanupErr.message || cleanupErr)
+                    );
+                  }
+                  try {
+                    await releaseConflictLock();
+                  } catch (lockErr) {
+                    core.warning(
+                      'PR #' + prNumber +
+                      ': failed to release delegated conflict lock: ' +
+                      (lockErr.message || lockErr)
+                    );
+                  }
+                  core.setFailed(
+                    'PR #' + prNumber +
+                    ': Delegated PR conflict repair needs the parent routing controller; ' +
+                    'no target-local dispatch was made for HEAD ' + fresh.head.sha +
+                    ' (' + reason + '). Push a new HEAD or rerun once parent routing lands.'
+                  );
+                  return;
+                }
                 await github.request(
                   'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
                   {
@@ -859,8 +971,8 @@ jobs:
                 await github.request(
                   'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
                   {
-                    owner,
-                    repo,
+                    owner: executionOwner,
+                    repo: executionRepo,
                     workflow_id: workflow,
                     ref: postMergeWakeupRef,
                   }

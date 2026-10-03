@@ -18,6 +18,11 @@ on:
         type: string
         default: continuum-pr-agent.yml
         required: false
+      target_child_id:
+        description: Opaque verified child id for delegated execution. Empty targets the caller repository.
+        type: string
+        default: ''
+        required: false
       ci_workflow_name:
         description: Exact workflow name that proves current-head CI.
         type: string
@@ -37,7 +42,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: pr-agent-recovery-${{ github.repository }}
+  group: pr-agent-recovery-${{ inputs.target_child_id && format('child-{0}', inputs.target_child_id) || 'local' }}-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
@@ -55,6 +60,64 @@ jobs:
       statuses: read
 
     steps:
+      - name: Resolve PR-Agent target context
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          TARGET_CHILD_ID: ${{ inputs.target_child_id }}
+          CONTINUUM_REF: ${{ inputs.continuum_ref }}
+        run: |
+          set -euo pipefail
+          : "${CONTINUUM_REF:?CONTINUUM_REF is required for pinned target resolution}"
+          # Derive the Continuum source repository from the reusable workflow
+          # origin so forks, renames, and mirrors fetch their own runtime.
+          # GITHUB_WORKFLOW_REF looks like <owner>/<repo>/.github/workflows/<file>@<ref>.
+          CONTINUUM_SOURCE_REPO="${GITHUB_WORKFLOW_REF:-}"
+          CONTINUUM_SOURCE_REPO="${CONTINUUM_SOURCE_REPO%%/.github/workflows/*}"
+          if ! [[ "$CONTINUUM_SOURCE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            CONTINUUM_SOURCE_REPO="kodmial/continuum"
+          fi
+          if [[ -z "${TARGET_CHILD_ID:-}" ]]; then
+            # Local fast path: no delegated resolver is needed, so skip every
+            # network fetch and resolve directly from the execution repository.
+            # A previously local-only recovery must not fail on resolver-fetch
+            # rate limits, token scopes, or transient network errors.
+            if ! [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+              echo "::error::PR-Agent target repository identity is invalid."
+              exit 2
+            fi
+            {
+              printf 'CONTINUUM_PR_AGENT_TARGET_REPOSITORY=%s\n' "$GITHUB_REPOSITORY"
+              printf 'CONTINUUM_PR_AGENT_TARGET_OWNER=%s\n' "${GITHUB_REPOSITORY%%/*}"
+              printf 'CONTINUUM_PR_AGENT_TARGET_REPO=%s\n' "${GITHUB_REPOSITORY#*/}"
+              printf 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED=%s\n' "false"
+            } >> "$GITHUB_ENV"
+            echo "PR-Agent target context resolved locally."
+            exit 0
+          fi
+          RUNTIME_ROOT="$RUNNER_TEMP/continuum-pr-agent-target-runtime"
+          mkdir -p "$RUNTIME_ROOT/.github/scripts"
+          fetch_runtime_file() {
+            local path="$1" dest="$2"
+            if ! gh api --method GET "repos/$CONTINUUM_SOURCE_REPO/contents/$path" -f ref="$CONTINUUM_REF" --jq .content 2>/dev/null \
+              | tr -d '\n' | base64 --decode > "$dest" 2>/dev/null; then
+              echo "::error::Unable to load the Continuum PR-Agent target resolver."
+              exit 1
+            fi
+            if [[ ! -s "$dest" ]]; then
+              echo "::error::Unable to load the Continuum PR-Agent target resolver."
+              exit 1
+            fi
+          }
+          fetch_runtime_file ".github/scripts/pr_agent_target.sh" "$RUNTIME_ROOT/.github/scripts/pr_agent_target.sh"
+          fetch_runtime_file ".github/scripts/delegation_repository.sh" "$RUNTIME_ROOT/.github/scripts/delegation_repository.sh"
+          fetch_runtime_file ".github/scripts/delegation_runtime.py" "$RUNTIME_ROOT/.github/scripts/delegation_runtime.py"
+          PARENT_CONFIG_FILE="$RUNTIME_ROOT/parent.continuum.yml"
+          if ! gh api --method GET "repos/$GITHUB_REPOSITORY/contents/.continuum.yml" --jq .content 2>/dev/null \
+            | tr -d '\n' | base64 --decode > "$PARENT_CONFIG_FILE" 2>/dev/null; then
+            printf 'version: 1\n' > "$PARENT_CONFIG_FILE"
+          fi
+          CONTINUUM_ENGINE_ROOT="$RUNTIME_ROOT" PARENT_CONFIG="$PARENT_CONFIG_FILE" \
+            bash "$RUNTIME_ROOT/.github/scripts/pr_agent_target.sh" "$TARGET_CHILD_ID"
       - name: Reconcile PR-Agent latest state
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
@@ -62,12 +125,15 @@ jobs:
           CI_WORKFLOW_NAME: ${{ inputs.ci_workflow_name || 'CI' }}
           STALE_MINUTES: ${{ inputs.stale_minutes || vars.PR_AGENT_RECOVERY_STALE_MINUTES || '70' }}
           DISPATCH_GRACE_SECONDS: ${{ inputs.dispatch_grace_seconds || vars.PR_AGENT_RECOVERY_DISPATCH_GRACE_SECONDS || '90' }}
+          TARGET_CHILD_ID: ${{ inputs.target_child_id }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const repoFullName = owner + '/' + repo;
+            const executionOwner = context.repo.owner;
+            const executionRepo = context.repo.repo;
+            const owner = process.env.CONTINUUM_PR_AGENT_TARGET_OWNER;
+            const repo = process.env.CONTINUUM_PR_AGENT_TARGET_REPO;
+            const repoFullName = process.env.CONTINUUM_PR_AGENT_TARGET_REPOSITORY;
             const reviewWorkflow = String(process.env.REVIEW_WORKFLOW || 'continuum-pr-agent.yml').trim();
             const ciWorkflowName = String(process.env.CI_WORKFLOW_NAME || 'CI').trim();
             const maxExecutions = 3;
@@ -186,8 +252,8 @@ jobs:
                 return await github.paginate(
                   github.rest.actions.listWorkflowRuns,
                   {
-                    owner,
-                    repo,
+                    owner: executionOwner,
+                    repo: executionRepo,
                     workflow_id: reviewWorkflow,
                     per_page: 100,
                   }
@@ -217,8 +283,8 @@ jobs:
               if (!match) return { conclusion: null, recoveryKind: null };
               try {
                 const { data: run } = await github.rest.actions.getWorkflowRun({
-                  owner,
-                  repo,
+                  owner: executionOwner,
+                  repo: executionRepo,
                   run_id: Number(match[1]),
                 });
                 const title = String(run.display_title || '');
@@ -363,7 +429,10 @@ jobs:
             }
 
             async function defaultBranch() {
-              const { data } = await github.rest.repos.get({ owner, repo });
+              const { data } = await github.rest.repos.get({
+                owner: executionOwner,
+                repo: executionRepo,
+              });
               return String(data.default_branch || 'main');
             }
 
@@ -464,8 +533,8 @@ jobs:
               try {
                 const ref = await defaultBranch();
                 await github.rest.actions.createWorkflowDispatch({
-                  owner,
-                  repo,
+                  owner: executionOwner,
+                  repo: executionRepo,
                   workflow_id: reviewWorkflow,
                   ref,
                   inputs: {
@@ -474,6 +543,7 @@ jobs:
                     retry_attempt: String(attempt),
                     retry_workflow: reviewWorkflow,
                     recovery_kind: kind,
+                    target_child_id: String(process.env.TARGET_CHILD_ID || ''),
                   },
                 });
                 core.notice(

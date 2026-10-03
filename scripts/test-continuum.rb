@@ -2871,20 +2871,20 @@ class ContinuumTest < Minitest::Test
       head_ref_pattern auto_merge_workflow opencode_workflow
     ],
     'continuum-opencode-unresolved.yml' => %w[continuum_ref],
-    'continuum-pr-agent-recovery.yml' => %w[continuum_ref],
+    'continuum-pr-agent-recovery.yml' => %w[continuum_ref target_child_id],
     'continuum-pr-agent-canary.yml' => %w[
       continuum_ref canary_enabled base_ref opencode_model model max_tokens
       api_base bridge_port server_port pr_agent_version
     ],
     'continuum-pr-agent.yml' => %w[
-      continuum_ref pr_number expected_head_sha retry_attempt retry_workflow recovery_kind
+      continuum_ref pr_number target_child_id expected_head_sha retry_attempt retry_workflow recovery_kind
     ],
     'continuum-pr-agent-repair.yml' => %w[
-      continuum_ref pr_number head_sha review_json improve_jsonl
+      continuum_ref pr_number target_child_id head_sha review_json improve_jsonl
       retry_attempt retry_workflow
     ],
     'continuum-pr-agent-auto-merge.yml' => %w[
-      continuum_ref pr_number head_sha review_json improve_jsonl persistent_state_json
+      continuum_ref pr_number target_child_id head_sha review_json improve_jsonl persistent_state_json
       post_merge_wakeups post_merge_wakeup_ref
       required_workflow_gate_label required_workflow_gate_name
     ],

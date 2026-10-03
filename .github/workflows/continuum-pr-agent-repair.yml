@@ -20,6 +20,11 @@ on:
         type: string
         default: ''
         required: false
+      target_child_id:
+        description: Opaque verified child id for delegated execution. Empty targets the caller repository.
+        type: string
+        default: ''
+        required: false
       head_sha:
         description: Exact HEAD SHA the review evaluated.
         type: string
@@ -53,7 +58,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: pr-agent-repair-${{ inputs.pr_number || github.run_id }}-${{ inputs.head_sha || github.sha }}
+  group: pr-agent-repair-${{ inputs.target_child_id && format('child-{0}', inputs.target_child_id) || 'local' }}-${{ inputs.pr_number || github.run_id }}-${{ inputs.head_sha || github.sha }}
   cancel-in-progress: false
 
 jobs:
@@ -94,6 +99,58 @@ jobs:
             }
             core.setOutput('stack', 'pr-agent');
 
+      - name: Resolve PR-Agent target context
+        if: steps.stack.outputs.stack == 'pr-agent'
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          TARGET_CHILD_ID: ${{ inputs.target_child_id }}
+          CONTINUUM_REF: ${{ inputs.continuum_ref }}
+        run: |
+          set -euo pipefail
+          : "${CONTINUUM_REF:?CONTINUUM_REF is required for pinned target resolution}"
+          CONTINUUM_SOURCE_REPO="${GITHUB_WORKFLOW_REF:-}"
+          CONTINUUM_SOURCE_REPO="${CONTINUUM_SOURCE_REPO%%/.github/workflows/*}"
+          if ! [[ "$CONTINUUM_SOURCE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            CONTINUUM_SOURCE_REPO="kodmial/continuum"
+          fi
+          if [[ -z "${TARGET_CHILD_ID:-}" ]]; then
+            if ! [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+              echo "::error::PR-Agent target repository identity is invalid."
+              exit 2
+            fi
+            {
+              printf 'CONTINUUM_PR_AGENT_TARGET_REPOSITORY=%s\n' "$GITHUB_REPOSITORY"
+              printf 'CONTINUUM_PR_AGENT_TARGET_OWNER=%s\n' "${GITHUB_REPOSITORY%%/*}"
+              printf 'CONTINUUM_PR_AGENT_TARGET_REPO=%s\n' "${GITHUB_REPOSITORY#*/}"
+              printf 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED=%s\n' "false"
+            } >> "$GITHUB_ENV"
+            echo "PR-Agent target context resolved locally."
+            exit 0
+          fi
+          RUNTIME_ROOT="$RUNNER_TEMP/continuum-pr-agent-target-runtime"
+          mkdir -p "$RUNTIME_ROOT/.github/scripts"
+          fetch_runtime_file() {
+            local path="$1" dest="$2"
+            if ! gh api --method GET "repos/$CONTINUUM_SOURCE_REPO/contents/$path" -f ref="$CONTINUUM_REF" --jq .content 2>/dev/null \
+              | tr -d '\n' | base64 --decode > "$dest" 2>/dev/null; then
+              echo "::error::Unable to load the Continuum PR-Agent target resolver."
+              exit 1
+            fi
+            if [[ ! -s "$dest" ]]; then
+              echo "::error::Unable to load the Continuum PR-Agent target resolver."
+              exit 1
+            fi
+          }
+          fetch_runtime_file ".github/scripts/pr_agent_target.sh" "$RUNTIME_ROOT/.github/scripts/pr_agent_target.sh"
+          fetch_runtime_file ".github/scripts/delegation_repository.sh" "$RUNTIME_ROOT/.github/scripts/delegation_repository.sh"
+          fetch_runtime_file ".github/scripts/delegation_runtime.py" "$RUNTIME_ROOT/.github/scripts/delegation_runtime.py"
+          PARENT_CONFIG_FILE="$RUNTIME_ROOT/parent.continuum.yml"
+          if ! gh api --method GET "repos/$GITHUB_REPOSITORY/contents/.continuum.yml" --jq .content 2>/dev/null \
+            | tr -d '\n' | base64 --decode > "$PARENT_CONFIG_FILE" 2>/dev/null; then
+            printf 'version: 1\n' > "$PARENT_CONFIG_FILE"
+          fi
+          CONTINUUM_ENGINE_ROOT="$RUNTIME_ROOT" PARENT_CONFIG="$PARENT_CONFIG_FILE" \
+            bash "$RUNTIME_ROOT/.github/scripts/pr_agent_target.sh" "$TARGET_CHILD_ID"
       - name: Build one bounded repair batch from native outputs
         id: batch
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
@@ -213,8 +270,8 @@ jobs:
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
+            const owner = process.env.CONTINUUM_PR_AGENT_TARGET_OWNER;
+            const repo = process.env.CONTINUUM_PR_AGENT_TARGET_REPO;
             const prNumber = Number(process.env.PR_NUMBER);
             const headSha = String(process.env.HEAD_SHA || '').toLowerCase();
             const fingerprint = String(process.env.FINGERPRINT || '').toLowerCase();
@@ -257,7 +314,7 @@ jobs:
           HEAD_SHA: ${{ inputs.head_sha }}
         run: |
           set -euo pipefail
-          PR_JSON="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")"
+          PR_JSON="$(gh api "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/pulls/$PR_NUMBER")"
           CURRENT_SHA="$(jq -r '.head.sha' <<<"$PR_JSON")"
           HEAD_REF="$(jq -r '.head.ref' <<<"$PR_JSON")"
           HEAD_REPO="$(jq -r '.head.repo.full_name' <<<"$PR_JSON")"
@@ -265,7 +322,7 @@ jobs:
             echo "::error::PR head moved ($HEAD_SHA -> $CURRENT_SHA); discarding this repair batch."
             exit 1
           fi
-          if [[ "$HEAD_REPO" != "$GITHUB_REPOSITORY" ]]; then
+          if [[ "$HEAD_REPO" != "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" ]]; then
             echo "::error::PR-Agent automatic repair supports same-repository PR branches only."
             exit 1
           fi
@@ -286,8 +343,8 @@ jobs:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
             await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
+              owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+              repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
               sha: process.env.HEAD_SHA,
               state: 'pending',
               context: 'continuum/pr-agent-repair',
@@ -297,14 +354,35 @@ jobs:
                 context.repo.repo + '/actions/runs/' + context.runId,
             });
 
-      - name: Checkout the writable PR source branch
+      - name: Checkout the writable PR source branch without exposing delegated repository metadata
         if: steps.batch.outputs.empty != 'true' && steps.convergence.outputs.held != 'true'
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          fetch-depth: 0
-          token: ${{ secrets.TAP_PAT }}
-          persist-credentials: true
-          ref: ${{ steps.target.outputs.head_ref }}
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          HEAD_REF: ${{ steps.target.outputs.head_ref }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+        run: |
+          set -euo pipefail
+          worktree="$RUNNER_TEMP/continuum-pr-agent-repair-worktree"
+          rm -rf "$worktree"
+          mkdir -p "$worktree"
+          cd "$worktree"
+          git init --quiet
+          TOKEN_B64="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
+          git config --local http.https://github.com/.extraheader "AUTHORIZATION: basic $TOKEN_B64"
+          unset TOKEN_B64
+          trap 'git config --local --unset http.https://github.com/.extraheader || true; unset TOKEN_B64 || true' EXIT
+          git remote add origin "https://github.com/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY.git"
+          if ! git check-ref-format "refs/heads/$HEAD_REF" >/dev/null 2>&1; then
+            echo "::error::PR-Agent target branch is not a valid heads ref."
+            exit 1
+          fi
+          if ! git fetch --no-tags --depth=1 origin                "+refs/heads/$HEAD_REF:refs/remotes/origin/continuum-pr-agent-target"                --quiet >/dev/null 2>&1 ||
+             ! git checkout --detach refs/remotes/origin/continuum-pr-agent-target --quiet >/dev/null 2>&1 ||
+             [[ "$(git rev-parse HEAD)" != "${HEAD_SHA,,}" ]]; then
+            echo "::error::Writable PR-Agent target branch does not match the reviewed HEAD."
+            exit 1
+          fi
+          echo "CONTINUUM_PR_AGENT_WORKTREE=$worktree" >> "$GITHUB_ENV"
 
       - name: Confirm the checked-out branch is the reviewed HEAD
         if: steps.batch.outputs.empty != 'true' && steps.convergence.outputs.held != 'true'
@@ -313,7 +391,8 @@ jobs:
           HEAD_REF: ${{ steps.target.outputs.head_ref }}
         run: |
           set -euo pipefail
-          if [[ "$(git rev-parse HEAD)" != "$HEAD_SHA" ]]; then
+          cd "$CONTINUUM_PR_AGENT_WORKTREE"
+          if [[ "$(git rev-parse HEAD)" != "${HEAD_SHA,,}" ]]; then
             echo "::error::Checked-out branch $HEAD_REF does not match reviewed HEAD $HEAD_SHA."
             exit 1
           fi
@@ -348,6 +427,7 @@ jobs:
           OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
         run: |
           set -euo pipefail
+          cd "$CONTINUUM_PR_AGENT_WORKTREE"
           # OpenCode is repairer only: it receives every current native review
           # finding and qualifying improve suggestion in one bounded pass.
           # The workflow, not OpenCode, owns commit/push so publication always
@@ -388,7 +468,7 @@ jobs:
           if [[ -z "$(git status --porcelain)" ]]; then
             MARKER="<!-- continuum-pr-agent-no-progress head=${HEAD_SHA,,} fingerprint=${BATCH_FINGERPRINT,,} -->"
             printf -v BODY '%s\n%s' "$MARKER" "PR-Agent reported actionable structured findings, but the bounded OpenCode repair produced no code change for this exact HEAD/finding state. Automatic same-state repair is held until the HEAD or structured finding state changes."
-            gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$BODY"
+            gh pr comment "$PR_NUMBER" --repo "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" --body "$BODY"
             echo "No repair diff; recorded durable no-progress state for PR #$PR_NUMBER HEAD $HEAD_SHA."
             exit 0
           fi
@@ -396,14 +476,14 @@ jobs:
           if git diff --cached --quiet; then
             MARKER="<!-- continuum-pr-agent-no-progress head=${HEAD_SHA,,} fingerprint=${BATCH_FINGERPRINT,,} -->"
             printf -v BODY '%s\n%s' "$MARKER" "PR-Agent repair staged no effective change for this exact HEAD/finding state. Automatic same-state repair is held until the HEAD or structured finding state changes."
-            gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$BODY"
+            gh pr comment "$PR_NUMBER" --repo "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" --body "$BODY"
             echo "No staged repair diff; recorded durable no-progress state."
             exit 0
           fi
           # Revalidate immediately before publication so a long repair run can
           # never publish against a PR branch that moved after repair started.
-          CURRENT_SHA="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid || true)"
-          REMOTE_SHA="$(git ls-remote origin "refs/heads/$HEAD_REF" | awk '{print $1}' || true)"
+          CURRENT_SHA="$(gh pr view "$PR_NUMBER" --repo "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" --json headRefOid --jq .headRefOid || true)"
+          REMOTE_SHA="$(git ls-remote origin "refs/heads/$HEAD_REF" 2>/dev/null | awk '{print $1}' || true)"
           if [[ -z "$HEAD_SHA" || -z "$CURRENT_SHA" || -z "$REMOTE_SHA" ]]; then
             echo "classification=deterministic" >> "$GITHUB_OUTPUT"
             echo "::error::Unable to revalidate PR branch before publish (reviewed=$HEAD_SHA current=$CURRENT_SHA remote=$REMOTE_SHA); discarding repair."
@@ -422,9 +502,9 @@ jobs:
             echo "::error::Local repair is not based on reviewed HEAD $HEAD_SHA; discarding repair."
             exit 1
           fi
-          if ! git push --force-with-lease="refs/heads/$HEAD_REF:$HEAD_SHA" origin "HEAD:refs/heads/$HEAD_REF"; then
-            CURRENT_AFTER="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid || true)"
-            REMOTE_AFTER="$(git ls-remote origin "refs/heads/$HEAD_REF" | awk '{print $1}' || true)"
+          if ! git push --force-with-lease="refs/heads/$HEAD_REF:$HEAD_SHA" origin "HEAD:refs/heads/$HEAD_REF" >/dev/null 2>&1; then
+            CURRENT_AFTER="$(gh pr view "$PR_NUMBER" --repo "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" --json headRefOid --jq .headRefOid || true)"
+            REMOTE_AFTER="$(git ls-remote origin "refs/heads/$HEAD_REF" 2>/dev/null | awk '{print $1}' || true)"
             if [[ "$CURRENT_AFTER" != "$HEAD_SHA" || "$REMOTE_AFTER" != "$HEAD_SHA" ]]; then
               echo "classification=deterministic" >> "$GITHUB_OUTPUT"
               echo "::error::PR branch moved during publish; stale repair will not be retried."
@@ -446,8 +526,8 @@ jobs:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
             await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
+              owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+              repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
               sha: process.env.HEAD_SHA,
               state: 'success',
               context: 'continuum/pr-agent-repair',
@@ -467,8 +547,8 @@ jobs:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
             await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
+              owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+              repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
               sha: process.env.HEAD_SHA,
               state: 'failure',
               context: 'continuum/pr-agent-repair',
@@ -496,6 +576,7 @@ jobs:
           HEAD_SHA: ${{ inputs.head_sha }}
           RETRY_ATTEMPT: ${{ inputs.retry_attempt || '0' }}
           RETRY_WORKFLOW: ${{ inputs.retry_workflow || 'continuum-pr-agent.yml' }}
+          TARGET_CHILD_ID: ${{ inputs.target_child_id }}
           CI_WORKFLOW_NAME: ${{ vars.CONTINUUM_CI_WORKFLOW_NAME || 'CI' }}
         run: |
           set -euo pipefail
@@ -509,7 +590,7 @@ jobs:
               ;;
           esac
 
-          current_sha="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid || true)"
+          current_sha="$(gh pr view "$PR_NUMBER" --repo "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" --json headRefOid --jq .headRefOid || true)"
           if [[ -z "$current_sha" || "$current_sha" != "$HEAD_SHA" ]]; then
             echo "PR HEAD changed during failed repair; stale retry cancelled."
             exit 0
@@ -518,7 +599,7 @@ jobs:
           if (( attempt >= 2 )); then
             MARKER="<!-- continuum-pr-agent-retry-exhausted head=${HEAD_SHA,,} kind=repair attempts=$((attempt + 1)) -->"
             printf -v BODY '%s\n%s' "$MARKER" "PR-Agent repair exhausted the bounded retry budget for this exact HEAD. A changed HEAD/finding state or explicit owner /review starts a fresh evaluation."
-            gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$BODY"
+            gh pr comment "$PR_NUMBER" --repo "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" --body "$BODY"
             echo "Repair retry budget exhausted for PR #$PR_NUMBER HEAD $HEAD_SHA."
             exit 0
           fi
@@ -527,10 +608,10 @@ jobs:
           delay=$((15 * (1 << attempt)))
           MARKER="<!-- continuum-pr-agent-retry head=${HEAD_SHA,,} kind=repair attempt=$next -->"
           printf -v BODY '%s\n%s' "$MARKER" "Retrying a transient PR-Agent repair/runtime failure through a fresh exact-HEAD review (attempt $next/3, backoff ${delay}s)."
-          gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$BODY"
+          gh pr comment "$PR_NUMBER" --repo "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" --body "$BODY"
           sleep "$delay"
 
-          if ! current="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid,state,isDraft --jq '[.headRefOid,.state,(.isDraft|tostring)]|@tsv')"; then
+          if ! current="$(gh pr view "$PR_NUMBER" --repo "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" --json headRefOid,state,isDraft --jq '[.headRefOid,.state,(.isDraft|tostring)]|@tsv')"; then
             echo "Could not revalidate PR state after backoff; stale retry cancelled."
             exit 0
           fi
@@ -542,7 +623,7 @@ jobs:
             exit 0
           fi
           CI_JSON="$RUNNER_TEMP/pr-agent-repair-ci-runs.json"
-          if ! gh api "repos/$GITHUB_REPOSITORY/actions/runs?event=pull_request&head_sha=$HEAD_SHA&per_page=100" > "$CI_JSON"; then
+          if ! gh api "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/actions/runs?event=pull_request&head_sha=$HEAD_SHA&per_page=100" > "$CI_JSON"; then
             echo "Could not revalidate exact-HEAD CI after backoff; stale retry cancelled."
             exit 0
           fi
@@ -573,5 +654,5 @@ jobs:
           esac
           if ! [[ "$DEFAULT_BRANCH" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]]; then DEFAULT_BRANCH="main"; fi
           if [[ "$DEFAULT_BRANCH" == */.*/* || "$DEFAULT_BRANCH" == .*/ || "$DEFAULT_BRANCH" == */. ]] || [[ "$DEFAULT_BRANCH" =~ (^|/)\. ]] || [[ "$DEFAULT_BRANCH" =~ \.lock($|/) ]]; then DEFAULT_BRANCH="main"; fi
-          gh workflow run "$RETRY_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH"             -f pr_number="$PR_NUMBER"             -f expected_head_sha="$HEAD_SHA"             -f retry_attempt="$next"             -f retry_workflow="$RETRY_WORKFLOW"             -f recovery_kind="repair"
+          gh workflow run "$RETRY_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH"             -f pr_number="$PR_NUMBER"             -f expected_head_sha="$HEAD_SHA"             -f retry_attempt="$next"             -f retry_workflow="$RETRY_WORKFLOW"             -f recovery_kind="repair"             -f target_child_id="$TARGET_CHILD_ID"
           echo "Dispatched isolated PR-Agent repair retry via fresh review attempt $next/3."
