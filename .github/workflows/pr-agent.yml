@@ -17,6 +17,5 @@ jobs:
     secrets: inherit
     with:
       continuum_ref: main
-      # Explicit Continuum self-opt-in, matching the qualified Kodmai consumer.
-      # The provider remains OpenCode-backed and requires no paid LLM secret.
-      enabled: 'true'
+      # Continuum dogfoods the PR-Agent review stack.
+      review_provider: 'pr-agent'
