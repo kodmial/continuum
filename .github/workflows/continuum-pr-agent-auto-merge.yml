@@ -416,13 +416,33 @@ jobs:
               );
             }
 
+            let cachedDefaultBranch = null;
+            async function getDefaultBranch() {
+              if (cachedDefaultBranch) return cachedDefaultBranch;
+              try {
+                const { data: repoInfo } = await github.rest.repos.get({
+                  owner, repo,
+                });
+                const name = String(repoInfo.default_branch || '').trim();
+                cachedDefaultBranch = name || 'main';
+              } catch (err) {
+                core.warning(
+                  'Could not resolve the repository default branch; falling back to main: ' +
+                  (err.message || err)
+                );
+                cachedDefaultBranch = 'main';
+              }
+              return cachedDefaultBranch;
+            }
+
             async function mainSyncDecision(pr) {
+              const defaultBranch = await getDefaultBranch();
               const comparison = await github.request(
                 'GET /repos/{owner}/{repo}/compare/{basehead}',
                 {
                   owner,
                   repo,
-                  basehead: 'main...' + pr.head.sha,
+                  basehead: defaultBranch + '...' + pr.head.sha,
                 }
               );
               if ((comparison.data.behind_by || 0) <= 0) {
@@ -439,7 +459,7 @@ jobs:
                 {
                   owner,
                   repo,
-                  basehead: pr.head.sha + '...main',
+                  basehead: pr.head.sha + '...' + defaultBranch,
                 }
               );
               const files = (reverse.data.files || []).map(file => file.filename);
@@ -460,16 +480,101 @@ jobs:
               };
             }
 
+            async function conflictRepairRunsActive() {
+              // Liveness probe for the stranded-lock (#66) freeze: the
+              // opencode-conflict-repair label is only evidence of an active
+              // repair while a continuum-opencode run is actually still
+              // queued or in progress. A timed-out or otherwise terminal run
+              // leaves no active run behind; treating the bare label as
+              // "already active; waiting" forever would strand the PR.
+              try {
+                const runs = await github.paginate(
+                  github.rest.actions.listWorkflowRunsForRepo,
+                  {
+                    owner,
+                    repo,
+                    event: 'workflow_dispatch',
+                    per_page: 100,
+                  }
+                );
+                return runs.some(run =>
+                  String(run.path || '').endsWith('continuum-opencode.yml') &&
+                  ['queued', 'in_progress', 'waiting', 'requested', 'pending'].includes(run.status)
+                );
+              } catch (err) {
+                core.warning(
+                  'Conflict-repair liveness probe failed; treating the lock as stranded: ' +
+                  (err.message || err)
+                );
+                return false;
+              }
+            }
+
+            function conflictAttemptMarker(headSha) {
+              return '<!-- opencode-conflict-repair-attempt head=' +
+                String(headSha || '').toLowerCase() + ' -->';
+            }
+
+            async function releaseConflictLock() {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner,
+                  repo,
+                  issue_number: prNumber,
+                  name: CONFLICT_LOCK_LABEL,
+                });
+              } catch (err) {
+                if (err.status !== 404) throw err;
+              }
+            }
+
             async function dispatchConflictRepair(pr, reason) {
               await ensureLabel(
                 CONFLICT_LOCK_LABEL,
                 'B60205',
                 'One automatic OpenCode conflict-repair attempt per conflict episode.'
               );
-              const fresh = await getPull();
+              const defaultBranch = await getDefaultBranch();
+              let fresh = await getPull();
               if (hasLabel(fresh, CONFLICT_LOCK_LABEL)) {
-                core.notice(
-                  'PR #' + prNumber + ': conflict repair already active; waiting.'
+                if (await conflictRepairRunsActive()) {
+                  core.notice(
+                    'PR #' + prNumber + ': conflict repair already active; waiting.'
+                  );
+                  return;
+                }
+                // Stranded lock: a previous episode dispatched repair, the run
+                // reached a terminal state (timeout, cancellation, or success
+                // path), and the label was never released. Release it so this
+                // run can make its single bounded attempt instead of waiting
+                // forever.
+                await releaseConflictLock();
+                core.warning(
+                  'PR #' + prNumber +
+                  ': released a stranded opencode-conflict-repair lock with no active repair run.'
+                );
+                fresh = await getPull();
+              }
+
+              // Bounded retry: exactly one automatic conflict-repair attempt
+              // per PR HEAD. A repeat conflict on the same HEAD after an
+              // attempt already ran means OpenCode could not resolve it;
+              // re-dispatching the same full run would replay the whole task
+              // duration with no new information. A new HEAD starts a new
+              // episode.
+              const attemptMarker = conflictAttemptMarker(fresh.head.sha);
+              const priorComments = await github.paginate(
+                github.rest.issues.listComments,
+                { owner, repo, issue_number: prNumber, per_page: 100 }
+              );
+              if (priorComments.some(comment =>
+                String(comment.body || '').includes(attemptMarker)
+              )) {
+                await releaseConflictLock();
+                core.warning(
+                  'PR #' + prNumber + ' HEAD ' + fresh.head.sha +
+                  ': a conflict-repair attempt already ran for this HEAD; ' +
+                  'not re-dispatching. Push a new HEAD to start a new episode.'
                 );
                 return;
               }
@@ -480,6 +585,24 @@ jobs:
                 issue_number: prNumber,
                 labels: [CONFLICT_LOCK_LABEL],
               });
+              // Task-replay record: the repair run merges the default branch
+              // into this exact HEAD and preserves intent from both sides; it
+              // never redoes the original task. The marker bounds retries and
+              // carries the replay coordinates (HEAD, base, reason) so a timed
+              // out episode can be replaced from evidence instead of rerun.
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: prNumber,
+                body: [
+                  attemptMarker,
+                  'Automatic OpenCode conflict repair, attempt 1/1 for HEAD `' +
+                    fresh.head.sha + '` (base `' + defaultBranch + '`, reason: ' +
+                    reason + '). Scope is merge-conflict resolution only; ' +
+                    'the repair merges the base into the PR branch and preserves ' +
+                    'intent from both sides without redoing the original task.',
+                ].join('\n'),
+              });
               try {
                 await github.request(
                   'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
@@ -487,11 +610,13 @@ jobs:
                     owner,
                     repo,
                     workflow_id: 'continuum-opencode.yml',
-                    ref: 'main',
+                    ref: defaultBranch,
                     inputs: {
                       mode: 'resolve-conflict',
                       pr_number: String(prNumber),
-                      head_ref: pr.head.ref,
+                      head_ref: fresh.head.ref,
+                      conflict_strategy: 'merge',
+                      timeout_minutes: '60',
                     },
                   }
                 );
@@ -499,14 +624,7 @@ jobs:
                   'PR #' + prNumber + ': dispatched OpenCode conflict repair (' + reason + ').'
                 );
               } catch (err) {
-                try {
-                  await github.rest.issues.removeLabel({
-                    owner,
-                    repo,
-                    issue_number: prNumber,
-                    name: CONFLICT_LOCK_LABEL,
-                  });
-                } catch (_) {}
+                await releaseConflictLock();
                 throw err;
               }
             }

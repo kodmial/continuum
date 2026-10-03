@@ -67,6 +67,16 @@ REVIEW_MERGE_CHANGES = "changes_required"
 STATE_ACTIVE = "ACTIVE"
 STATE_RESOLVED = "RESOLVED"
 
+CONFLICT_LOCK_LABEL = "opencode-conflict-repair"
+
+CONFLICT_REPAIR_TIMEOUT_MINUTES = 60
+
+CONFLICT_REPAIR_ATTEMPTS_PER_HEAD = 1
+
+RETRY_MAX_ATTEMPTS = 3
+
+RETRY_BASE_DELAY_SECONDS = 15
+
 PR_AGENT_WORKFLOWS = (
     "continuum-pr-agent.yml",
     "continuum-pr-agent-repair.yml",
@@ -470,6 +480,109 @@ def should_dispatch_repair(head_sha: str, already_dispatched: Sequence[str]) -> 
     return normalized not in seen
 
 
+def is_conflict_lock_stranded(
+    *,
+    label_present: bool,
+    active_repair_runs: int,
+) -> bool:
+    """Whether the conflict-repair lock is stranded.
+
+    The label is evidence of an active repair only while a repair run is
+    actually still queued or in progress. A label with no active run behind
+    it is left over from a terminal run (timeout, cancellation, or a success
+    path that never released it). Treating that bare label as "already
+    active" waits forever and permanently excludes the PR from automatic
+    merge, so stranded must release instead of wait.
+    """
+
+    if active_repair_runs < 0:
+        raise LifecycleError("active repair run count cannot be negative")
+    return bool(label_present) and active_repair_runs == 0
+
+
+def conflict_repair_action(
+    *,
+    label_present: bool,
+    active_repair_runs: int,
+    attempts_for_head: int,
+) -> Dict[str, Any]:
+    """Bounded conflict-repair decision for one reconciliation pass.
+
+    Exactly one automatic attempt runs per PR HEAD. A repeat conflict on a
+    HEAD that already consumed its attempt is held (never re-dispatched for
+    the same HEAD); a stranded label with no live run is released so the
+    single bounded attempt for the current HEAD can proceed. A changed HEAD
+    starts a new episode.
+    """
+
+    if attempts_for_head < 0:
+        raise LifecycleError("conflict-repair attempt count cannot be negative")
+    if active_repair_runs < 0:
+        raise LifecycleError("active repair run count cannot be negative")
+    if attempts_for_head >= CONFLICT_REPAIR_ATTEMPTS_PER_HEAD:
+        return {
+            "action": "hold",
+            "release_lock": True,
+            "reason": "a conflict-repair attempt already ran for this HEAD",
+        }
+    if label_present and active_repair_runs > 0:
+        return {
+            "action": "wait",
+            "release_lock": False,
+            "reason": "conflict repair already active",
+        }
+    if label_present:
+        return {
+            "action": "release-and-dispatch",
+            "release_lock": True,
+            "reason": "stranded conflict-repair lock released",
+        }
+    return {
+        "action": "dispatch",
+        "release_lock": False,
+        "reason": "no active repair and no prior attempt for this HEAD",
+    }
+
+
+def retry_allowed(attempt: object, limit: int = RETRY_MAX_ATTEMPTS) -> bool:
+    """Whether another bounded retry attempt may run."""
+
+    try:
+        attempt_number = int(str(attempt).strip())
+    except (TypeError, ValueError):
+        raise LifecycleError("retry attempt must be a non-negative integer")
+    if attempt_number < 0:
+        raise LifecycleError("retry attempt must be a non-negative integer")
+    return attempt_number < limit
+
+
+def retry_backoff_seconds(
+    attempt: object, base: int = RETRY_BASE_DELAY_SECONDS
+) -> int:
+    """Exponential backoff before a bounded retry (15s, 30s, 60s)."""
+
+    try:
+        attempt_number = int(str(attempt).strip())
+    except (TypeError, ValueError):
+        raise LifecycleError("retry attempt must be a non-negative integer")
+    if attempt_number < 0:
+        raise LifecycleError("retry attempt must be a non-negative integer")
+    return base * (1 << attempt_number)
+
+
+def resolve_dispatch_ref(default_branch: object, fallback: object = "main") -> str:
+    """Dispatch ref for retries: the repository default branch, never hardcoded.
+
+    An empty default still falls back to the given fallback (then main), so a
+    retry never targets a ref that does not exist on the repository.
+    """
+
+    name = str(default_branch or "").strip()
+    if not name:
+        name = str(fallback or "").strip()
+    return name or "main"
+
+
 def needs_fresh_review(old_head_sha: str, new_head_sha: str) -> bool:
     """Any HEAD change requires fresh CI plus a complete review pass.
 
@@ -541,6 +654,11 @@ __all__ = [
     "REVIEW_MERGE_CHANGES",
     "STATE_ACTIVE",
     "STATE_RESOLVED",
+    "CONFLICT_LOCK_LABEL",
+    "CONFLICT_REPAIR_TIMEOUT_MINUTES",
+    "CONFLICT_REPAIR_ATTEMPTS_PER_HEAD",
+    "RETRY_MAX_ATTEMPTS",
+    "RETRY_BASE_DELAY_SECONDS",
     "PR_AGENT_WORKFLOWS",
     "CODERABBIT_WORKFLOWS",
     "GENERAL_MERGE_WORKFLOWS",
@@ -563,6 +681,11 @@ __all__ = [
     "ticket_compliance_ok",
     "evaluate_gate",
     "should_dispatch_repair",
+    "is_conflict_lock_stranded",
+    "conflict_repair_action",
+    "retry_allowed",
+    "retry_backoff_seconds",
+    "resolve_dispatch_ref",
     "needs_fresh_review",
     "required_toml",
 ]

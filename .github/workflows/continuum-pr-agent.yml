@@ -749,7 +749,10 @@ jobs:
           gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$BODY"
           sleep "$delay"
 
-          current="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid,state,isDraft --jq '[.headRefOid,.state,(.isDraft|tostring)]|@tsv')"
+          if ! current="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid,state,isDraft --jq '[.headRefOid,.state,(.isDraft|tostring)]|@tsv')"; then
+            echo "Could not revalidate PR state after backoff; stale retry cancelled."
+            exit 0
+          fi
           current_sha="$(cut -f1 <<<"$current")"
           current_state="$(cut -f2 <<<"$current")"
           current_draft="$(cut -f3 <<<"$current")"
@@ -757,13 +760,17 @@ jobs:
             echo "PR state changed during retry backoff; stale retry cancelled."
             exit 0
           fi
-          combined="$(gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/status" --jq .state)"
+          if ! combined="$(gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/status" --jq .state)"; then
+            echo "Could not revalidate exact-HEAD CI after backoff; stale retry cancelled."
+            exit 0
+          fi
           if [[ "$combined" != "success" ]]; then
             echo "Exact HEAD no longer has green CI; retry cancelled until a fresh CI event."
             exit 0
           fi
 
-          gh workflow run "$RETRY_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref main             -f pr_number="$PR_NUMBER"             -f expected_head_sha="$HEAD_SHA"             -f retry_attempt="$next"
+          DEFAULT_BRANCH="$(gh repo view "$GITHUB_REPOSITORY" --json defaultBranchRef --jq .defaultBranchRef.name 2>/dev/null || echo main)"
+          gh workflow run "$RETRY_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "${DEFAULT_BRANCH:-main}"             -f pr_number="$PR_NUMBER"             -f expected_head_sha="$HEAD_SHA"             -f retry_attempt="$next"             -f retry_workflow="$RETRY_WORKFLOW"
           echo "Dispatched isolated PR-Agent retry attempt $next/3 for PR #$PR_NUMBER HEAD $HEAD_SHA."
 
   repair:

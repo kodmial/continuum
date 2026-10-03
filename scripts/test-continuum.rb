@@ -2875,7 +2875,7 @@ class ContinuumTest < Minitest::Test
       api_base bridge_port server_port pr_agent_version
     ],
     'continuum-pr-agent.yml' => %w[
-      continuum_ref pr_number expected_head_sha retry_attempt
+      continuum_ref pr_number expected_head_sha retry_attempt retry_workflow
     ],
     'continuum-pr-agent-repair.yml' => %w[
       continuum_ref pr_number head_sha review_json improve_jsonl
