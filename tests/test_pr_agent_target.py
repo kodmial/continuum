@@ -98,6 +98,22 @@ class PrAgentTargetContextTests(unittest.TestCase):
         self.assertEqual(values, {})
         self.assertIn("failed closed", proc.stderr)
 
+    def test_empty_delegated_resolution_is_fail_closed(self):
+        proc, values, _ = self.run_target(
+            "opaque-a",
+            """
+            #!/usr/bin/env bash
+            set -euo pipefail
+            if [[ "$1" == resolve ]]; then
+              exit 0
+            fi
+            exit 2
+            """,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(values, {})
+        self.assertIn("failed closed", proc.stderr)
+
     def test_invalid_resolved_repository_is_rejected_without_echoing_identity(self):
         proc, values, _ = self.run_target(
             "opaque-a",
