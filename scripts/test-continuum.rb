@@ -3882,13 +3882,14 @@ class ContinuumTest < Minitest::Test
   def test_scheduler_dispatch_ref_env_binding_follows_the_consumer_knob
     body = workflow_body('continuum-issue-scheduler.yml')
 
-    # The scheduler job's own env block, not some other workflow's table.
-    env_block = body[/^jobs:\n  schedule:.*?\n {4}steps:/m]
-    refute_nil env_block, 'the schedule job env block is missing from the scheduler'
-
-    assert_includes env_block,
-                    "DISPATCH_REF: ${{ inputs.dispatch_ref || vars.CONTINUUM_DISPATCH_REF || 'main' }}",
-                    'the scheduler must expose dispatch_ref through DISPATCH_REF for its script'
+    # Read the schedule job structurally so sibling jobs do not make this
+    # assertion depend on schedule being the first job in the workflow.
+    schedule = yaml(File.join(ROOT, '.github/workflows/continuum-issue-scheduler.yml'))
+               .fetch('jobs').fetch('schedule')
+    env_block = schedule.fetch('env')
+    assert_equal "${{ inputs.dispatch_ref || vars.CONTINUUM_DISPATCH_REF || 'main' }}",
+                 env_block.fetch('DISPATCH_REF'),
+                 'the scheduler must expose dispatch_ref through DISPATCH_REF for its script'
 
     # The fallback chain and the declared default must agree, or the input is
     # documented as one thing and bound as another.
