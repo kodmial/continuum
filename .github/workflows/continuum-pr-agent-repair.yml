@@ -178,22 +178,14 @@ jobs:
             // marker below makes a second dispatch for the same HEAD a no-op,
             // so a repeated run cannot storm the same HEAD.
             const crypto = require('crypto');
-            // Cross-HEAD identity is logical, not positional. A repair may
-            // shift line/rank metadata without resolving the underlying
-            // structured finding. Keep semantic/path fields authoritative and
-            // discard only known volatile location/ranking metadata.
-            const volatileKeys = new Set([
-              'line', 'line_number', 'start_line', 'end_line', 'position',
-              'start_position', 'end_position', 'rank', 'score',
-            ]);
+            // #33 compatibility: same-HEAD no-progress identity is the
+            // original full structured batch fingerprint. Do not weaken or
+            // migrate this marker implicitly.
             const stable = (value) => {
               if (Array.isArray(value)) return value.map(stable);
               if (value && typeof value === 'object') {
                 return Object.fromEntries(
-                  Object.keys(value)
-                    .filter(key => !volatileKeys.has(String(key).toLowerCase()))
-                    .sort()
-                    .map(key => [key, stable(value[key])])
+                  Object.keys(value).sort().map(key => [key, stable(value[key])])
                 );
               }
               return value;
