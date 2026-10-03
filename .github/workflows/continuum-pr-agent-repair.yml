@@ -355,16 +355,16 @@ jobs:
           fi
           if [[ -z "$(git status --porcelain)" ]]; then
             MARKER="<!-- continuum-pr-agent-no-progress head=${HEAD_SHA,,} fingerprint=${BATCH_FINGERPRINT,,} -->"
-            gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$MARKER
-PR-Agent reported actionable structured findings, but the bounded OpenCode repair produced no code change for this exact HEAD/finding state. Automatic same-state repair is held until the HEAD or structured finding state changes."
+            printf -v BODY '%s\n%s' "$MARKER" "PR-Agent reported actionable structured findings, but the bounded OpenCode repair produced no code change for this exact HEAD/finding state. Automatic same-state repair is held until the HEAD or structured finding state changes."
+            gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$BODY"
             echo "No repair diff; recorded durable no-progress state for PR #$PR_NUMBER HEAD $HEAD_SHA."
             exit 0
           fi
           git add -A
           if git diff --cached --quiet; then
             MARKER="<!-- continuum-pr-agent-no-progress head=${HEAD_SHA,,} fingerprint=${BATCH_FINGERPRINT,,} -->"
-            gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$MARKER
-PR-Agent repair staged no effective change for this exact HEAD/finding state. Automatic same-state repair is held until the HEAD or structured finding state changes."
+            printf -v BODY '%s\n%s' "$MARKER" "PR-Agent repair staged no effective change for this exact HEAD/finding state. Automatic same-state repair is held until the HEAD or structured finding state changes."
+            gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$BODY"
             echo "No staged repair diff; recorded durable no-progress state."
             exit 0
           fi
