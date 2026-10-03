@@ -135,7 +135,7 @@ jobs:
       retry_workflow: ${{ steps.stack.outputs.retry_workflow }}
 
     permissions:
-          contents: read
+      contents: read
       issues: write
       pull-requests: write
       statuses: read
