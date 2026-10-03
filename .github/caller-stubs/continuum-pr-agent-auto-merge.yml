@@ -25,7 +25,6 @@ on:
         type: string
 
 permissions:
-  actions: write
   contents: write
   issues: write
   pull-requests: write
