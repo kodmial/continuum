@@ -112,6 +112,7 @@ jobs:
       contents: read
       issues: write
       pull-requests: write
+      statuses: read
 
     steps:
       - name: Resolve the isolated PR-Agent stack
