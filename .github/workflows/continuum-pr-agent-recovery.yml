@@ -211,22 +211,34 @@ jobs:
               ) || null;
             }
 
-            async function statusRunConclusion(status) {
+            async function statusRunMetadata(status) {
               const target = String(status?.target_url || '');
               const match = target.match(/\/actions\/runs\/(\d+)(?:$|[/?#])/);
-              if (!match) return null;
+              if (!match) return { conclusion: null, recoveryKind: null };
               try {
                 const { data: run } = await github.rest.actions.getWorkflowRun({
                   owner,
                   repo,
                   run_id: Number(match[1]),
                 });
+                const title = String(run.display_title || '');
+                const identity = title.match(/\[(review|repair):\d+\]/);
+                const recoveryKind = identity ? identity[1] : null;
                 if (activeStatuses.has(String(run.status || '').toLowerCase())) {
-                  return String(run.status || '').toLowerCase();
+                  return {
+                    conclusion: String(run.status || '').toLowerCase(),
+                    recoveryKind,
+                  };
                 }
-                return String(run.conclusion || run.status || '').toLowerCase() || null;
+                return {
+                  conclusion:
+                    String(run.conclusion || run.status || '').toLowerCase() || null,
+                  recoveryKind,
+                };
               } catch (err) {
-                if (err.status === 404) return null;
+                if (err.status === 404) {
+                  return { conclusion: null, recoveryKind: null };
+                }
                 throw err;
               }
             }
@@ -541,13 +553,20 @@ jobs:
               ]);
 
               const reviewStatus = latestContext(statuses, REVIEW_CONTEXT);
+              const reviewRun = reviewStatus
+                ? await statusRunMetadata(reviewStatus)
+                : { conclusion: null, recoveryKind: null };
               let kind = 'review';
               let operationStatus = reviewStatus;
+              let operationRun = reviewRun;
 
               if (reviewStatus?.state === 'success') {
                 if (/actionable/i.test(String(reviewStatus.description || ''))) {
                   kind = 'repair';
                   operationStatus = latestContext(statuses, REPAIR_CONTEXT);
+                  operationRun = operationStatus
+                    ? await statusRunMetadata(operationStatus)
+                    : { conclusion: null, recoveryKind: null };
                 } else {
                   core.info(
                     'PR #' + pr.number + ' HEAD ' + head +
@@ -555,18 +574,26 @@ jobs:
                   );
                   continue;
                 }
+              } else if (
+                reviewRun.recoveryKind === 'repair' &&
+                ['pending', 'failure'].includes(
+                  String(reviewStatus?.state || '').toLowerCase()
+                )
+              ) {
+                // A repair recovery must first reconstruct canonical review/
+                // improve payloads. If that prerequisite review is cancelled,
+                // stale, or fails, it still belongs to the durable repair
+                // operation and must consume/replay the repair budget.
+                kind = 'repair';
               }
 
               const evidence = parseEvidence(comments, head, kind);
               const activeRun = exactActiveRun(reviewRuns, pr.number, kind, head);
-              const runConclusion = operationStatus
-                ? await statusRunConclusion(operationStatus)
-                : null;
               const decision = decide({
                 ciGreen,
                 operationStatus,
                 activeRun,
-                runConclusion,
+                runConclusion: operationRun.conclusion,
                 evidence,
               });
 
