@@ -300,6 +300,10 @@ jobs:
 
           # Validate the child declaration with the same authoritative parser
           # used by parent-side delegated discovery. Values are never echoed.
+          if [[ "$parent" == *$'\n'* || "$child_id" == *$'\n'* || "$parent" == *$'\r'* || "$child_id" == *$'\r'* ]]; then
+            echo "::error::Child relationship declaration is invalid; parent wake-up refused."
+            exit 2
+          fi
           printf '::add-mask::%s\n' "$parent"
           printf '::add-mask::%s\n' "$child_id"
           if ! python3 "$runtime" verify-child-variables \
