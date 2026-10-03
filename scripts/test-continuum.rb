@@ -2874,7 +2874,9 @@ class ContinuumTest < Minitest::Test
       continuum_ref canary_enabled base_ref opencode_model model max_tokens
       api_base bridge_port server_port pr_agent_version
     ],
-    'continuum-pr-agent.yml' => %w[continuum_ref],
+    'continuum-pr-agent.yml' => %w[
+      continuum_ref pr_number expected_head_sha retry_attempt
+    ],
     'continuum-pr-agent-repair.yml' => %w[
       continuum_ref pr_number head_sha review_json improve_jsonl
     ],
