@@ -426,15 +426,11 @@ jobs:
                     // CodeRabbit's semantic RESOLVED reply is authoritative even
                     // when GitHub has not flipped the thread bit yet. The
                     // auto-merger later normalizes that bit with its write token.
-                    const latestRabbitReply = comments
-                      .slice(1)
-                      .filter(comment =>
-                        comment.author?.login?.startsWith('coderabbitai')
-                      )
-                      .at(-1);
+                    const latestComment = comments.at(-1);
                     if (
-                      latestRabbitReply &&
-                      codeRabbitExplicitlyResolved(latestRabbitReply.body || '')
+                      latestComment &&
+                      latestComment.author?.login?.startsWith('coderabbitai') &&
+                      codeRabbitExplicitlyResolved(latestComment.body || '')
                     ) {
                       continue;
                     }
@@ -463,7 +459,7 @@ jobs:
             }
 
             function latestCurrentHeadDecision(reviews, headSha) {
-              return reviews
+              return (reviews || [])
                 .filter(review =>
                   review.user?.login?.startsWith('coderabbitai') &&
                   review.commit_id === headSha &&
@@ -494,7 +490,8 @@ jobs:
               const candidates = [];
 
               for (const listed of pulls) {
-                const { data: pr } = await github.rest.pulls.get({
+                try {
+                  const { data: pr } = await github.rest.pulls.get({
                   owner,
                   repo,
                   pull_number: listed.number,
@@ -792,6 +789,12 @@ jobs:
                   fullReviewCount,
                   ...priority,
                 });
+                } catch (err) {
+                  core.warning(
+                    `PR #${listed.number}: queue reconciliation failed for this PR; skipping it for this pass: ${err.message}`
+                  );
+                  continue;
+                }
               }
 
               const globalNotBefore = latestCompletedReviewAt
