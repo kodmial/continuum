@@ -454,7 +454,7 @@ jobs:
               );
               return comments.some(comment =>
                 comment.pull_request_review_id === reviewId &&
-                comment.user?.login === 'coderabbitai[bot]' &&
+                comment.user?.login?.startsWith('coderabbitai') &&
                 !comment.in_reply_to_id
               );
             }
