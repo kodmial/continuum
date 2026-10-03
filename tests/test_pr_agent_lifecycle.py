@@ -713,7 +713,7 @@ class IsolationTests(unittest.TestCase):
         self.assertNotIn("CONTINUUM_PR_AGENT_ENABLED", body)
         self.assertNotIn("CONTINUUM_REQUIRE_CODERABBIT", body)
         self.assertIn("Install pinned OpenCode CLI for the PR-Agent backend", body)
-        self.assertIn("Resolve the Continuum-owned PR-Agent bridge", body)
+        self.assertIn("Resolve the Continuum-owned PR-Agent runtime bundle", body)
 
     def test_review_routes_only_to_pr_agent_repair_or_merge(self):
         review = read_repo(".github/workflows/continuum-pr-agent.yml")
