@@ -358,8 +358,12 @@ jobs:
             core.setOutput('head_sha', headSha);
             const expected = String(process.env.EXPECTED_HEAD || '').trim().toLowerCase();
             if (expected && expected !== headSha.toLowerCase()) {
-              core.setFailed(
-                `Stale admission: caller observed ${expected} but PR #${prNumber} is now ${headSha}.`
+              // A moved HEAD is a normal race: an earlier review/repair dispatch
+              // may arrive after another repair or main-sync already advanced the
+              // PR. Never publish a red review state for an obsolete SHA.
+              core.setOutput('admitted', 'false');
+              core.notice(
+                `Stale admission ignored: caller observed ${expected} but PR #${prNumber} is now ${headSha}; recovery will evaluate the current HEAD.`
               );
               return;
             }
@@ -775,6 +779,7 @@ jobs:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           REVIEWED_SHA: ${{ steps.result.outputs.head_sha }}
+          REVIEW_JSON: ${{ steps.pragent.outputs.review }}
         run: |
           set -euo pipefail
           COMMENTS_JSON="$RUNNER_TEMP/pr-agent-comments.json"
@@ -800,12 +805,42 @@ jobs:
               if "<!-- pr-agent-review-state:" in str(c.get("body") or "")
           ]
           if not candidates:
-              raise SystemExit("No upstream PR-Agent persistent finding state marker was published.")
-          latest = max(candidates, key=lambda c: str(c.get("updated_at") or c.get("created_at") or ""))
-          parsed = parse_review_state(str(latest.get("body") or ""))
-          if not parsed.present or not parsed.valid or not isinstance(parsed.state, dict):
-              raise SystemExit("Latest upstream PR-Agent persistent finding state is missing or invalid.")
-          state = parsed.state
+              # Upstream v0.46.0 does not always publish a persistent-state
+              # marker for a clean full review with zero key findings. At this
+              # point the structured review has already passed exact-HEAD/schema
+              # validation in the previous step, so synthesize only the one
+              # unambiguous empty state. Any reported review finding still
+              # requires native persistent state and fails closed.
+              try:
+                  review = json.loads(os.environ.get("REVIEW_JSON", ""))
+              except json.JSONDecodeError as exc:
+                  raise SystemExit(f"Cannot validate clean review without persistent state: {exc}")
+              inner = review.get("review", review) if isinstance(review, dict) else None
+              findings = inner.get("key_issues_to_review") if isinstance(inner, dict) else None
+              if not isinstance(findings, list):
+                  raise SystemExit(
+                      "Structured review has no key_issues_to_review list; cannot synthesize empty state."
+                  )
+              if findings:
+                  raise SystemExit(
+                      "Upstream review has key findings but published no persistent finding state."
+                  )
+              state = {
+                  "schema_version": 1,
+                  "findings": [],
+                  "last_run": {
+                      "complete": True,
+                      "kind": "full",
+                      "head_sha": reviewed,
+                      "run_id": f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/commit/{reviewed}",
+                  },
+              }
+          else:
+              latest = max(candidates, key=lambda c: str(c.get("updated_at") or c.get("created_at") or ""))
+              parsed = parse_review_state(str(latest.get("body") or ""))
+              if not parsed.present or not parsed.valid or not isinstance(parsed.state, dict):
+                  raise SystemExit("Latest upstream PR-Agent persistent finding state is missing or invalid.")
+              state = parsed.state
           last = state.get("last_run")
           if not isinstance(last, dict):
               raise SystemExit("Upstream PR-Agent persistent state has no last_run.")

@@ -1687,6 +1687,24 @@ class ContinuumTest < Minitest::Test
     end
   end
 
+  # PR-Agent must not turn normal concurrency races or an upstream clean-review
+  # omission into a permanent red gate. A stale dispatch is ignored and
+  # recovery re-evaluates the current HEAD; a clean structured full review may
+  # synthesize only an empty persistent state, while findings still fail closed.
+  def test_pr_agent_clean_review_and_stale_head_are_non_blocking
+    pr_agent = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent.yml'))
+
+    assert_includes pr_agent, "core.setOutput('admitted', 'false');"
+    assert_includes pr_agent, 'Stale admission ignored:'
+    refute_includes pr_agent, 'Stale admission: caller observed'
+
+    assert_includes pr_agent, 'REVIEW_JSON: ${{ steps.pragent.outputs.review }}'
+    assert_includes pr_agent, '"findings": []'
+    assert_includes pr_agent, '"complete": True'
+    assert_includes pr_agent, '"kind": "full"'
+    assert_includes pr_agent, 'Upstream review has key findings but published no persistent finding state.'
+  end
+
   # The free default model must be the single documented fallback everywhere an
   # OpenCode model is named, otherwise a consumer without OPENCODE_MODEL
   # silently runs a paid model.
