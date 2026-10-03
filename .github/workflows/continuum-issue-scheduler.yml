@@ -209,13 +209,13 @@ jobs:
     # only verify the bidirectional relationship and wake the parent's public
     # scheduler; the caller keeps child cron events skipped to avoid consuming
     # private child runner minutes as a polling mechanism.
-    if: vars.CONTINUUM_ROLE == 'child' && github.event_name != 'schedule'
+    if: vars.CONTINUUM_ROLE == 'child' && (github.event_name == 'issues' || github.event_name == 'issue_comment')
     runs-on: ubuntu-latest
     permissions:
       contents: read
     timeout-minutes: ${{ fromJSON(vars.AUTOMATION_SCHEDULER_TIMEOUT_MINUTES || '5') }}
     concurrency:
-      group: continuum-child-parent-wakeup
+      group: continuum-child-parent-wakeup-${{ github.event.issue.number || github.run_id }}
       cancel-in-progress: false
     steps:
       - name: Checkout Continuum engine for parent wake-up verification
@@ -306,12 +306,16 @@ jobs:
           fi
           printf '::add-mask::%s\n' "$parent"
           printf '::add-mask::%s\n' "$child_id"
+          if [ ! -f "$runtime" ]; then
+            echo "::error::Parent verification lookup is unavailable; parent wake-up refused."
+            exit 4
+          fi
           if ! python3 "$runtime" verify-child-variables \
             --role "$child_role" \
             --declared-id "$child_id" \
             --declared-parent "$parent" \
             --child-id "$child_id" \
-            --parent-repository "$parent" >/dev/null 2>&1; then
+            --parent-repository "$parent" >/dev/null; then
             echo "::error::Child relationship declaration is invalid; parent wake-up refused."
             exit 2
           fi
