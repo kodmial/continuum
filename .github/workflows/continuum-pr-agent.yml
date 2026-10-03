@@ -326,7 +326,7 @@ jobs:
           cat "$RUNNER_TEMP/opencode-serve.log" || true
           exit 1
 
-      - name: Resolve the Continuum-owned PR-Agent bridge
+      - name: Resolve the Continuum-owned PR-Agent runtime bundle
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
         id: runtime
         env:
@@ -334,12 +334,20 @@ jobs:
           CONTINUUM_REF: ${{ inputs.continuum_ref }}
         run: |
           set -euo pipefail
-          BRIDGE_SCRIPT="$RUNNER_TEMP/continuum-pr-agent-bridge.py"
+          RUNTIME_ROOT="$RUNNER_TEMP/continuum-pr-agent-runtime"
+          BRIDGE_SCRIPT="$RUNTIME_ROOT/.github/scripts/pr_agent_bridge.py"
+          mkdir -p "$RUNTIME_ROOT/.github/scripts" "$RUNTIME_ROOT/src/continuum"
           gh api --method GET \
             "repos/kodmial/continuum/contents/.github/scripts/pr_agent_bridge.py" \
             -f ref="$CONTINUUM_REF" --jq .content \
             | tr -d '\n' | base64 --decode > "$BRIDGE_SCRIPT"
-          python3 -m py_compile "$BRIDGE_SCRIPT"
+          gh api --method GET \
+            "repos/kodmial/continuum/contents/src/continuum/pr_agent.py" \
+            -f ref="$CONTINUUM_REF" --jq .content \
+            | tr -d '\n' | base64 --decode > "$RUNTIME_ROOT/src/continuum/pr_agent.py"
+          : > "$RUNTIME_ROOT/src/continuum/__init__.py"
+          PYTHONPATH="$RUNTIME_ROOT/src" python3 -m py_compile \
+            "$BRIDGE_SCRIPT" "$RUNTIME_ROOT/src/continuum/pr_agent.py"
           echo "bridge_script=$BRIDGE_SCRIPT" >> "$GITHUB_OUTPUT"
 
       - name: Start the OpenAI-compatibility bridge on loopback

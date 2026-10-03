@@ -4,7 +4,7 @@ on:
   issue_comment:
     types: [created]
   pull_request_target:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [ready_for_review]
   workflow_run:
     workflows: ["CI"]
     types: [completed]
@@ -18,10 +18,16 @@ permissions:
 jobs:
   call:
     if: >-
-      github.event_name != 'workflow_run' ||
-      (github.event.workflow_run.conclusion == 'success' &&
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.event == 'pull_request' &&
-       github.event.workflow_run.pull_requests[0].number)
+       github.event.workflow_run.pull_requests[0].number) ||
+      (github.event_name == 'pull_request_target' &&
+       github.event.action == 'ready_for_review') ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request &&
+       github.actor == github.repository_owner &&
+       contains(github.event.comment.body, '/review'))
     uses: kodmial/continuum/.github/workflows/continuum-pr-agent.yml@main
     secrets: inherit
     with:
