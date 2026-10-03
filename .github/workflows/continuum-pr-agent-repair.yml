@@ -293,8 +293,24 @@ jobs:
             echo "::error::Repair produced no staged changes for PR #$PR_NUMBER HEAD $HEAD_SHA."
             exit 1
           fi
+          # Revalidate immediately before publication so a long repair run can
+          # never publish against a PR branch that moved after repair started.
+          CURRENT_SHA="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid || true)"
+          REMOTE_SHA="$(git ls-remote origin "refs/heads/$HEAD_REF" | awk '{print $1}' || true)"
+          if [[ -z "$HEAD_SHA" || -z "$CURRENT_SHA" || -z "$REMOTE_SHA" ]]; then
+            echo "::error::Unable to revalidate PR branch before publish (reviewed=$HEAD_SHA current=$CURRENT_SHA remote=$REMOTE_SHA); discarding repair."
+            exit 1
+          fi
+          if [[ "$CURRENT_SHA" != "$HEAD_SHA" || "$REMOTE_SHA" != "$HEAD_SHA" ]]; then
+            echo "::error::PR branch moved before publish (reviewed=$HEAD_SHA current=$CURRENT_SHA remote=$REMOTE_SHA); discarding repair."
+            exit 1
+          fi
           git -c user.name="github-actions[bot]" \
             -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
             commit -m "fix: apply PR-Agent review findings for HEAD $HEAD_SHA"
-          git push origin "HEAD:refs/heads/$HEAD_REF"
+          if ! git merge-base --is-ancestor "$HEAD_SHA" HEAD; then
+            echo "::error::Local repair is not based on reviewed HEAD $HEAD_SHA; discarding repair."
+            exit 1
+          fi
+          git push --force-with-lease="refs/heads/$HEAD_REF:$HEAD_SHA" origin "HEAD:refs/heads/$HEAD_REF"
           echo "Pushed one bounded repair to refs/heads/$HEAD_REF for PR #$PR_NUMBER."

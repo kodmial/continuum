@@ -733,6 +733,14 @@ class IsolationTests(unittest.TestCase):
         self.assertIn("Export native persistent finding state for the reviewed HEAD", review)
         self.assertIn("parse_review_state", review)
 
+    def test_repair_revalidates_branch_immediately_before_publish(self):
+        repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
+        self.assertIn("PR branch moved before publish", repair)
+        self.assertIn('git ls-remote origin "refs/heads/$HEAD_REF"', repair)
+        self.assertIn('gh pr view "$PR_NUMBER"', repair)
+        self.assertLess(repair.index("PR branch moved before publish"), repair.index("git push"))
+        self.assertLess(repair.index('git diff --cached --quiet'), repair.index("PR branch moved before publish"))
+
     def test_repair_targets_real_branch_and_never_truncates_json(self):
         repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
         self.assertNotIn("refs/pull/$PR_NUMBER/head", repair)
