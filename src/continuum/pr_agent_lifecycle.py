@@ -519,17 +519,17 @@ def conflict_repair_action(
         raise LifecycleError("conflict-repair attempt count cannot be negative")
     if active_repair_runs < 0:
         raise LifecycleError("active repair run count cannot be negative")
-    if attempts_for_head >= CONFLICT_REPAIR_ATTEMPTS_PER_HEAD:
-        return {
-            "action": "hold",
-            "release_lock": True,
-            "reason": "a conflict-repair attempt already ran for this HEAD",
-        }
     if label_present and active_repair_runs > 0:
         return {
             "action": "wait",
             "release_lock": False,
             "reason": "conflict repair already active",
+        }
+    if attempts_for_head >= CONFLICT_REPAIR_ATTEMPTS_PER_HEAD:
+        return {
+            "action": "hold",
+            "release_lock": True,
+            "reason": "a conflict-repair attempt already ran for this HEAD",
         }
     if label_present:
         return {
@@ -553,7 +553,10 @@ def retry_allowed(attempt: object, limit: int = RETRY_MAX_ATTEMPTS) -> bool:
         raise LifecycleError("retry attempt must be a non-negative integer")
     if attempt_number < 0:
         raise LifecycleError("retry attempt must be a non-negative integer")
-    return attempt_number < limit
+    # attempt_number is the zero-based index of the current execution.
+    # With limit=3, only executions 0 and 1 may schedule a successor; 2 is
+    # the third and final execution.
+    return (attempt_number + 1) < limit
 
 
 def retry_backoff_seconds(
