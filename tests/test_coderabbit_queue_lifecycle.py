@@ -69,6 +69,19 @@ def may_emit_command(state: QueueState, shared_slot_busy: bool = False) -> bool:
     return eligible_for_full_review(state)
 
 
+def semantic_thread_resolved(comments: list[tuple[str, str]]) -> bool:
+    """A semantic RESOLVED is valid only while CodeRabbit owns the tail comment."""
+    if not comments:
+        return False
+    author, body = comments[-1]
+    if not author.startswith("coderabbitai"):
+        return False
+    upper = body.upper()
+    if "UNRESOLVED" in upper:
+        return False
+    return "RESOLVED" in upper or "REVIEW THREAD RESOLVED" in upper
+
+
 def can_merge(state: QueueState) -> bool:
     """Model the exact-head CodeRabbit half of final auto-merge admission."""
     if not state.ci_green:
@@ -196,6 +209,26 @@ class CodeRabbitQueueLifecycleTests(unittest.TestCase):
             )
         )
 
+    def test_semantic_resolution_is_invalidated_by_any_later_comment(self):
+        self.assertTrue(
+            semantic_thread_resolved(
+                [
+                    ("coderabbitai[bot]", "finding"),
+                    ("kodmial", "please re-check"),
+                    ("coderabbitai[bot]", "RESOLVED"),
+                ]
+            )
+        )
+        self.assertFalse(
+            semantic_thread_resolved(
+                [
+                    ("coderabbitai[bot]", "finding"),
+                    ("coderabbitai[bot]", "RESOLVED"),
+                    ("kodmial", "UNRESOLVED: still reproducible"),
+                ]
+            )
+        )
+
     def test_requested_lock_and_shared_slot_make_duplicate_wakeups_idempotent(self):
         candidate = QueueState()
         self.assertTrue(may_emit_command(candidate))
@@ -274,6 +307,8 @@ class WorkflowBindingTests(unittest.TestCase):
             "labelConfigured !== nameConfigured",
             "workflow gate state is unknown",
             "await unresolvedCodeRabbitThreads(pr)",
+            "const latestComment = comments.at(-1)",
+            "queue reconciliation failed for this PR; skipping it for this pass",
             "continuum-coderabbit-no-progress head=",
             "stage: finalReview ? 'final-review' : 'initial-review'",
             "stageRank: finalReview ? 0 : 1",
