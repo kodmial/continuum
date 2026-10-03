@@ -211,7 +211,7 @@ jobs:
     # private child runner minutes as a polling mechanism.
     if: vars.CONTINUUM_ROLE == 'child'
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: ${{ fromJSON(vars.AUTOMATION_SCHEDULER_TIMEOUT_MINUTES || '5') }}
     concurrency:
       group: continuum-child-parent-wakeup
       cancel-in-progress: true
