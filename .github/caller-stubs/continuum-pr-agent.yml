@@ -49,7 +49,3 @@ jobs:
     secrets: inherit
     with:
       continuum_ref: main
-      pr_number: "${{ inputs.pr_number || '' }}"
-      expected_head_sha: "${{ inputs.expected_head_sha || '' }}"
-      retry_attempt: "${{ inputs.retry_attempt || '0' }}"
-      retry_workflow: "continuum-pr-agent.yml"
