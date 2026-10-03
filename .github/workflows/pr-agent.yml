@@ -26,5 +26,3 @@ jobs:
     secrets: inherit
     with:
       continuum_ref: main
-      pr_number: "${{ github.event_name == 'workflow_run' && github.event.workflow_run.pull_requests[0].number || '' }}"
-      expected_head_sha: "${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || '' }}"

@@ -155,7 +155,11 @@ jobs:
               return;
             }
             const enabled = reviewProvider === 'pr-agent';
-            const eventPr = context.payload.pull_request?.number || context.payload.issue?.number || '';
+            const eventPr =
+              context.payload.pull_request?.number ||
+              context.payload.issue?.number ||
+              context.payload.workflow_run?.pull_requests?.[0]?.number ||
+              '';
             const prNumber = String(process.env.INPUT_PR_NUMBER || eventPr || '').trim();
             if (!prNumber) {
               core.setFailed('PR-Agent could not resolve a pull request number.');
@@ -168,7 +172,11 @@ jobs:
             core.setOutput('enabled', enabled ? 'true' : 'false');
             core.setOutput('stack', enabled ? 'pr-agent' : reviewProvider);
             core.setOutput('pr_number', prNumber);
-            core.setOutput('expected_head', String(process.env.INPUT_EXPECTED_HEAD || '').trim());
+            const eventExpectedHead = context.payload.workflow_run?.head_sha || '';
+            core.setOutput(
+              'expected_head',
+              String(process.env.INPUT_EXPECTED_HEAD || eventExpectedHead || '').trim()
+            );
             core.setOutput('api_base', apiBase);
             core.setOutput('model', pick(process.env.INPUT_MODEL, 'CFG_MODEL', 'openai/continuum-review'));
             core.setOutput('max_tokens', pick(process.env.INPUT_MAX_TOKENS, 'CFG_MAX_TOKENS', '128000'));
