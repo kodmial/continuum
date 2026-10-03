@@ -20,6 +20,11 @@ on:
         type: string
         default: ''
         required: false
+      target_child_id:
+        description: Opaque verified child id for delegated execution. Empty targets the caller repository.
+        type: string
+        default: ''
+        required: false
       head_sha:
         description: Exact HEAD SHA the review evaluated.
         type: string
@@ -70,7 +75,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: pr-agent-merge-${{ inputs.pr_number || github.run_id }}
+  group: pr-agent-merge-${{ inputs.target_child_id || 'local' }}-${{ inputs.pr_number || github.run_id }}
   cancel-in-progress: false
 
 jobs:
@@ -114,6 +119,35 @@ jobs:
             }
             core.setOutput('stack', 'pr-agent');
 
+      - name: Resolve PR-Agent target context
+        if: steps.stack.outputs.stack == 'pr-agent'
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          TARGET_CHILD_ID: ${{ inputs.target_child_id }}
+          CONTINUUM_REF: ${{ inputs.continuum_ref }}
+          CHILD_REPOSITORIES: ${{ secrets.CHILD_RUNTIME_REPOSITORIES }}
+        run: |
+          set -euo pipefail
+          RUNTIME_ROOT="$RUNNER_TEMP/continuum-pr-agent-target-runtime"
+          mkdir -p "$RUNTIME_ROOT/.github/scripts"
+          fetch_runtime_file() {
+            local path="$1" dest="$2"
+            if ! gh api --method GET "repos/kodmial/continuum/contents/$path" -f ref="$CONTINUUM_REF" --jq .content 2>/dev/null \
+              | tr -d '\n' | base64 --decode > "$dest" 2>/dev/null; then
+              echo "::error::Unable to load the Continuum PR-Agent target resolver."
+              exit 1
+            fi
+          }
+          fetch_runtime_file ".github/scripts/pr_agent_target.sh" "$RUNTIME_ROOT/.github/scripts/pr_agent_target.sh"
+          fetch_runtime_file ".github/scripts/delegation_repository.sh" "$RUNTIME_ROOT/.github/scripts/delegation_repository.sh"
+          fetch_runtime_file ".github/scripts/delegation_runtime.py" "$RUNTIME_ROOT/.github/scripts/delegation_runtime.py"
+          PARENT_CONFIG_FILE="$RUNTIME_ROOT/parent.continuum.yml"
+          if ! gh api --method GET "repos/$GITHUB_REPOSITORY/contents/.continuum.yml" --jq .content 2>/dev/null \
+            | tr -d '\n' | base64 --decode > "$PARENT_CONFIG_FILE" 2>/dev/null; then
+            printf 'version: 1\n' > "$PARENT_CONFIG_FILE"
+          fi
+          CONTINUUM_ENGINE_ROOT="$RUNTIME_ROOT" PARENT_CONFIG="$PARENT_CONFIG_FILE" \
+            bash "$RUNTIME_ROOT/.github/scripts/pr_agent_target.sh" "$TARGET_CHILD_ID"
       - name: Evaluate the exact-head PR-Agent gate
         id: gate
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
@@ -283,9 +317,13 @@ jobs:
           script: |
             // Work Lock #33 mirrors the mature provider-neutral mechanics from
             // continuum-auto-merge.yml while keeping CodeRabbit untouched.
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const repoFullName = owner + '/' + repo;
+            const executionOwner = context.repo.owner;
+            const executionRepo = context.repo.repo;
+            const owner = process.env.CONTINUUM_PR_AGENT_TARGET_OWNER;
+            const repo = process.env.CONTINUUM_PR_AGENT_TARGET_REPO;
+            const repoFullName = process.env.CONTINUUM_PR_AGENT_TARGET_REPOSITORY;
+            const delegated =
+              process.env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED === 'true';
             const prNumber = Number(process.env.PR_NUMBER);
             const reviewedHead = String(process.env.REVIEWED_HEAD || '').trim().toLowerCase();
             const AUTO_MERGE_BLOCK_LABEL = 'no-auto-merge';
@@ -512,6 +550,13 @@ jobs:
             }
 
             async function dispatchConflictRepair(pr, reason) {
+              if (delegated) {
+                core.setFailed(
+                  'Delegated PR conflict repair needs the parent routing controller; ' +
+                  'refusing to dispatch a target-local OpenCode workflow.'
+                );
+                return;
+              }
               await ensureLabel(
                 CONFLICT_LOCK_LABEL,
                 'B60205',
@@ -859,8 +904,8 @@ jobs:
                 await github.request(
                   'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
                   {
-                    owner,
-                    repo,
+                    owner: executionOwner,
+                    repo: executionRepo,
                     workflow_id: workflow,
                     ref: postMergeWakeupRef,
                   }
