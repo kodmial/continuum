@@ -161,6 +161,16 @@ on:
         type: string
         default: ''
         required: false
+      capacity_workflow:
+        description: >-
+          Dedicated optimization/profile/capacity decision workflow woken
+          when the authoritative engine classifies a failure as worker
+          capacity. Empty falls back to RENDER_CAPACITY_WORKFLOW and, still
+          empty, holds the source safely instead of dispatching a file the
+          consumer may not have.
+        type: string
+        default: ''
+        required: false
       scheduler_workflow:
         description: Scheduler woken after this controller resolves an issue.
           Empty falls back to RENDER_SCHEDULER_WORKFLOW.
@@ -225,6 +235,7 @@ jobs:
       REPAIR_LABEL: ${{ inputs.repair_label || vars.AUTOMATION_REPAIR_LABEL || 'priority:p0' }}
       E2E_BRANCH_PREFIX: ${{ inputs.e2e_branch_prefix || vars.RENDER_E2E_BRANCH_PREFIX || 'opencode/issue' }}
       CHAIN_WORKFLOW: ${{ inputs.chain_workflow || vars.RENDER_CHAIN_WORKFLOW }}
+      CAPACITY_WORKFLOW: ${{ inputs.capacity_workflow || vars.RENDER_CAPACITY_WORKFLOW }}
       SCHEDULER_WORKFLOW: ${{ inputs.scheduler_workflow || vars.RENDER_SCHEDULER_WORKFLOW || 'continuum-issue-scheduler.yml' }}
 
     steps:
@@ -380,6 +391,46 @@ jobs:
             echo "fingerprint=" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Classify Render failure with the authoritative engine
+        id: engine
+        if: always()
+        env:
+          EXECUTE_OUTCOME: ${{ steps.execute.outcome }}
+          CLEANUP_OUTCOME: ${{ steps.cleanup.outcome }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Authoritative failure classification (kodmial/continuum#263): the
+          # engine reads the durable machine evidence the Render harness
+          # already produced (run result, cgroup memory summary, lifecycle
+          # state with worker replacement/restart evidence, consumer
+          # qualification payload) and classifies before any recovery route
+          # is chosen. A proven capacity/memory-envelope failure never
+          # becomes a repository repair; repository repair requires positive
+          # defect evidence; anything else holds without guessing.
+          ENGINE_OUT="$RUNNER_TEMP/continuum-render-engine-classification.json"
+          PYTHONPATH="$GITHUB_WORKSPACE/src" python3 -m continuum.render_execution \
+            --result "$RENDER_RESULT_FILE" \
+            --memory "$RENDER_MEMORY_SUMMARY_FILE" \
+            --state "$RENDER_STATE_FILE" \
+            --qualification "$RENDER_QUAL_RESULT_FILE" \
+            --execute-outcome "$EXECUTE_OUTCOME" \
+            --cleanup-outcome "$CLEANUP_OUTCOME" \
+            --output "$ENGINE_OUT" || {
+            echo "::error::Authoritative engine classification failed; failing closed to hold without repository repair."
+            jq -n \
+              --arg classification "unknown" \
+              --arg subtype "engine-error" \
+              --arg reason "engine classification failed; holding without repository repair" \
+              --arg fingerprint "engine-error" \
+              '{classification:$classification,subtype:$subtype,reason:$reason,fingerprint:$fingerprint,limit_bytes:null,peak_bytes:null,restarts:0,hold_marker:null,failure_marker:""}' \
+              > "$ENGINE_OUT"
+          }
+          echo "classification=$(jq -r .classification "$ENGINE_OUT")" >> "$GITHUB_OUTPUT"
+          echo "subtype=$(jq -r .subtype "$ENGINE_OUT")" >> "$GITHUB_OUTPUT"
+          echo "fingerprint=$(jq -r .fingerprint "$ENGINE_OUT")" >> "$GITHUB_OUTPUT"
+          echo "reason=$(jq -r .reason "$ENGINE_OUT")" >> "$GITHUB_OUTPUT"
+
       - name: Upload durable Render qualification evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -402,6 +453,10 @@ jobs:
           QUALIFICATION_CLASSIFICATION: ${{ steps.qualification.outputs.classification }}
           QUALIFICATION_SUBTYPE: ${{ steps.qualification.outputs.subtype }}
           QUALIFICATION_FINGERPRINT: ${{ steps.qualification.outputs.fingerprint }}
+          ENGINE_CLASSIFICATION: ${{ steps.engine.outputs.classification }}
+          ENGINE_SUBTYPE: ${{ steps.engine.outputs.subtype }}
+          ENGINE_FINGERPRINT: ${{ steps.engine.outputs.fingerprint }}
+          ENGINE_REASON: ${{ steps.engine.outputs.reason }}
         shell: bash
         run: |
           set -euo pipefail
@@ -417,6 +472,20 @@ jobs:
             gh workflow run "$CHAIN_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DISPATCH_REF"
           }
 
+          # Dedicated optimization/profile/capacity decision route. Empty
+          # holds the source safely instead of dispatching a file the
+          # consumer may not have.
+          wake_capacity() {
+            if [[ -z "$CAPACITY_WORKFLOW" ]]; then
+              echo "No capacity workflow is configured; holding the source safely without dispatching."
+              return 0
+            fi
+            gh workflow run "$CAPACITY_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DISPATCH_REF"
+          }
+
+          # WIP release happens first on every path, including holds: a held
+          # capacity failure must never permanently consume an active WIP
+          # slot, so the reservation label is always removed here.
           gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
             --remove-label "$IN_PROGRESS_LABEL" >/dev/null 2>&1 || true
 
@@ -432,53 +501,126 @@ jobs:
             QUALIFICATION_FAILED="yes"
           fi
 
-          if [[ "$EXECUTE_OUTCOME" != "success" || "$CLEANUP_OUTCOME" != "success" || "$QUALIFICATION_FAILED" == "yes" ]]; then
+          # Authoritative routing (kodmial/continuum#263): the engine
+          # classified the run from durable machine evidence before any
+          # recovery route is chosen. A proven capacity/memory-envelope
+          # failure never creates or keeps a repository-code repair task;
+          # repository repair requires positive defect evidence; transient
+          # infrastructure retries automatically through a bounded budget;
+          # everything else holds safely with a machine-readable reason.
+          # An empty engine verdict fails closed to hold, never to repair.
+          ENGINE_CLASSIFICATION="${ENGINE_CLASSIFICATION:-unknown}"
+          ENGINE_FINGERPRINT="${ENGINE_FINGERPRINT:-}"
+          ENGINE_REASON="${ENGINE_REASON:-no engine reason recorded}"
+
+          COMMENTS_JSON="$(gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER/comments?per_page=100" 2>/dev/null || echo "[]")"
+
+          fingerprint_seen() {
+            local marker="$1"
+            local count
+            count="$(jq --arg marker "$marker" \
+              '[.[][]? | select((.body // "") | contains($marker))] | length' \
+              <<<"$COMMENTS_JSON" 2>/dev/null || echo 0)"
+            [[ "${count:-0}" -ge 1 ]]
+          }
+
+          if [[ "$CLEANUP_OUTCOME" != "success" ]]; then
+            # Mandatory cleanup is independently verified on every path and
+            # a cleanup failure is never a repository defect, so it holds
+            # without creating a repair issue.
             gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
               --add-label "$PAUSE_LABEL" >/dev/null 2>&1 || true
+            gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+              --body "Mandatory Render cleanup failed in run $GITHUB_RUN_ID (execute=$EXECUTE_OUTCOME, cleanup=$CLEANUP_OUTCOME). Cleanup is verified independently on every path; the source is held paused for inspection and no repository repair was created."
+            echo "::error::Mandatory Render cleanup failed"
+            exit 1
+          fi
 
-            if [[ "$CHAIN_QUALIFICATION" == "yes" && ( "$QUALIFICATION_CLASSIFICATION" == "memory" || "$QUALIFICATION_CLASSIFICATION" == "correctness" ) ]]; then
-              gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
-                --body "Qualification classified as $QUALIFICATION_CLASSIFICATION ($QUALIFICATION_SUBTYPE); no infrastructure repair will be created. The durable qualification chain owns the next profile/optimization step."
-              wake_chain
-              echo "::error::Qualification failed with classification=$QUALIFICATION_CLASSIFICATION subtype=$QUALIFICATION_SUBTYPE"
-              exit 1
-            fi
-
-            COMMENTS_JSON="$(gh api --paginate --slurp \
-              "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER/comments?per_page=100" 2>/dev/null || echo "[]")"
-            REPAIR_COUNT="$(jq '[.[][]? | select((.body // "") | contains("<!-- continuum-render-repair-attempt -->"))] | length' \
-              <<<"$COMMENTS_JSON" 2>/dev/null || echo 0)"
-
-            SAME_FAILURE_COUNT=0
-            if [[ "$CHAIN_QUALIFICATION" == "yes" && -n "$QUALIFICATION_FINGERPRINT" ]]; then
-              FAILURE_MARKER="<!-- continuum-render-failure-fingerprint=$QUALIFICATION_FINGERPRINT -->"
-              SAME_FAILURE_COUNT="$(jq --arg marker "$FAILURE_MARKER" \
-                '[.[][]? | select((.body // "") | contains($marker))] | length' \
-                <<<"$COMMENTS_JSON" 2>/dev/null || echo 0)"
-              gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
-                --body "$FAILURE_MARKER"
-
-              if [[ "$SAME_FAILURE_COUNT" -ge 1 ]]; then
+          case "$ENGINE_CLASSIFICATION" in
+            capacity|provider|timeout_unknown|unknown)
+              # Terminal hold: no repository repair, no blind rerun, WIP
+              # already released above. Identical fingerprints coalesce
+              # instead of spawning repeated tasks; a materially changed
+              # runtime artifact/profile produces a new fingerprint and may
+              # explicitly re-arm the source.
+              gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                --add-label "$PAUSE_LABEL" >/dev/null 2>&1 || true
+              FAILURE_MARKER="<!-- continuum-render-failure-fingerprint=$ENGINE_FINGERPRINT -->"
+              if [[ -n "$ENGINE_FINGERPRINT" ]] && fingerprint_seen "$FAILURE_MARKER"; then
                 gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
-                  --body "Identical Render qualification failure fingerprint repeated after a prior repair cycle. Automation remains paused instead of creating another identical repair."
-                wake_chain
-                echo "::error::Repeated identical qualification failure fingerprint: $QUALIFICATION_FINGERPRINT"
+                  --body "Identical Render $ENGINE_CLASSIFICATION failure fingerprint repeated ($ENGINE_FINGERPRINT). Automation remains paused instead of creating another identical task; a materially changed runtime artifact/profile or memory configuration may explicitly re-arm the source."
+                echo "::error::Repeated identical Render failure fingerprint: $ENGINE_FINGERPRINT"
                 exit 1
               fi
-            fi
+              HOLD_MARKER="<!-- continuum-render-capacity-hold fingerprint=$ENGINE_FINGERPRINT -->"
+              gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                --body "$FAILURE_MARKER"
+              gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                --body "$HOLD_MARKER Render $ENGINE_CLASSIFICATION failure in run $GITHUB_RUN_ID ($ENGINE_SUBTYPE): $ENGINE_REASON. No repository repair was created and the workload was not blindly rerun."
+              if [[ "$ENGINE_CLASSIFICATION" == "capacity" && "$CHAIN_QUALIFICATION" == "yes" ]]; then
+                wake_chain
+              fi
+              if [[ "$ENGINE_CLASSIFICATION" == "capacity" ]]; then
+                wake_capacity
+              fi
+              echo "::error::Render execution held after $ENGINE_CLASSIFICATION classification ($ENGINE_SUBTYPE)"
+              exit 1
+              ;;
+            transient)
+              # Bounded automatic infrastructure recovery without a
+              # repository repair issue. The source stays eligible for an
+              # automatic retry; the marker budget stops an endless loop.
+              TRANSIENT_COUNT="$(jq '[.[][]? | select((.body // "") | contains("<!-- continuum-render-transient-attempt -->"))] | length' \
+                <<<"$COMMENTS_JSON" 2>/dev/null || echo 0)"
+              if [[ "${TRANSIENT_COUNT:-0}" -ge "$MAX_RENDER_REPAIR_ATTEMPTS" ]]; then
+                gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                  --add-label "$PAUSE_LABEL" >/dev/null 2>&1 || true
+                gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                  --body "Render transient infrastructure failures repeated $TRANSIENT_COUNT time(s); automatic recovery limit ($MAX_RENDER_REPAIR_ATTEMPTS) is exhausted. Issue remains paused for inspection and no repository repair was created."
+                echo "::error::Transient Render recovery budget exhausted"
+                exit 1
+              fi
+              gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                --body "<!-- continuum-render-transient-attempt --> Transient Render infrastructure failure in run $GITHUB_RUN_ID ($ENGINE_SUBTYPE): $ENGINE_REASON. Bounded automatic recovery attempt $((TRANSIENT_COUNT + 1))/$MAX_RENDER_REPAIR_ATTEMPTS; no repository repair was created."
+              gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                --remove-label "$PAUSE_LABEL" >/dev/null 2>&1 || true
+              gh workflow run "$SCHEDULER_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DISPATCH_REF"
+              echo "::error::Transient Render infrastructure failure; automatic recovery scheduled"
+              exit 1
+              ;;
+            repository)
+              # Evidence-driven repository repair only: the engine found a
+              # code/harness defect with healthy memory. Deduplicated per
+              # source and coalesced per identical fingerprint.
+              gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                --add-label "$PAUSE_LABEL" >/dev/null 2>&1 || true
+              FAILURE_MARKER="<!-- continuum-render-failure-fingerprint=$ENGINE_FINGERPRINT -->"
+              if [[ -n "$ENGINE_FINGERPRINT" ]] && fingerprint_seen "$FAILURE_MARKER"; then
+                gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                  --body "Identical Render repository failure fingerprint repeated ($ENGINE_FINGERPRINT). Automation remains paused instead of creating another identical repair; a materially changed runtime artifact/profile may explicitly re-arm the source."
+                echo "::error::Repeated identical Render repository failure fingerprint: $ENGINE_FINGERPRINT"
+                exit 1
+              fi
+              if [[ -n "$ENGINE_FINGERPRINT" ]]; then
+                gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                  --body "$FAILURE_MARKER"
+              fi
+              REPAIR_COUNT="$(jq '[.[][]? | select((.body // "") | contains("<!-- continuum-render-repair-attempt -->"))] | length' \
+                <<<"$COMMENTS_JSON" 2>/dev/null || echo 0)"
+              if [[ "${REPAIR_COUNT:-0}" -lt "$MAX_RENDER_REPAIR_ATTEMPTS" ]]; then
+                SOURCE_MARKER="<!-- continuum-render-repair source=$ISSUE_NUMBER -->"
+                ALL_ISSUES_JSON="$(gh api --paginate --slurp \
+                  "repos/$GITHUB_REPOSITORY/issues?state=open&per_page=100" 2>/dev/null || echo "[]")"
+                EXISTING_REPAIR="$(jq -r --arg marker "$SOURCE_MARKER" \
+                  '.[][]? | select((.body // "") | contains($marker)) | .number' \
+                  <<<"$ALL_ISSUES_JSON" | head -n 1)"
 
-            if [[ "$REPAIR_COUNT" -lt "$MAX_RENDER_REPAIR_ATTEMPTS" ]]; then
-              SOURCE_MARKER="<!-- continuum-render-repair source=$ISSUE_NUMBER -->"
-              ALL_ISSUES_JSON="$(gh api --paginate --slurp \
-                "repos/$GITHUB_REPOSITORY/issues?state=open&per_page=100" 2>/dev/null || echo "[]")"
-              EXISTING_REPAIR="$(jq -r --arg marker "$SOURCE_MARKER" \
-                '.[][]? | select((.body // "") | contains($marker)) | .number' \
-                <<<"$ALL_ISSUES_JSON" | head -n 1)"
-
-              if [[ -z "$EXISTING_REPAIR" ]]; then
-                REPAIR_BODY="$(cat <<EOF
+                if [[ -z "$EXISTING_REPAIR" ]]; then
+                  REPAIR_BODY="$(cat <<EOF
           $SOURCE_MARKER
           <!-- continuum-render-failed-run=$GITHUB_RUN_ID -->
+          <!-- continuum-render-failure-classification=$ENGINE_CLASSIFICATION -->
 
           ## Goal
 
@@ -498,32 +640,61 @@ jobs:
 
           - Source issue: #$ISSUE_NUMBER
           - Failed run: $GITHUB_RUN_ID
+          - Engine classification: $ENGINE_CLASSIFICATION ($ENGINE_SUBTYPE)
+          - Engine reason: $ENGINE_REASON
           - Execute outcome: $EXECUTE_OUTCOME
           - Cleanup outcome: $CLEANUP_OUTCOME
           - Execution mode: $EXECUTION_MODE
           EOF
-                )"
-                REPAIR_URL="$(gh issue create --repo "$GITHUB_REPOSITORY" \
-                  --title "P0: Repair Render execution failure for #$ISSUE_NUMBER (run $GITHUB_RUN_ID)" \
-                  --label "$REPAIR_LABEL" --body "$REPAIR_BODY")"
-                gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$(cat <<EOF
+                  )"
+                  REPAIR_URL="$(gh issue create --repo "$GITHUB_REPOSITORY" \
+                    --title "P0: Repair Render execution failure for #$ISSUE_NUMBER (run $GITHUB_RUN_ID)" \
+                    --label "$REPAIR_LABEL" --body "$REPAIR_BODY")"
+                  gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$(cat <<EOF
           <!-- continuum-render-repair-attempt -->
-          Render execution failed (execute=$EXECUTE_OUTCOME, cleanup=$CLEANUP_OUTCOME, run=$GITHUB_RUN_ID).
+          Render execution failed with engine classification $ENGINE_CLASSIFICATION ($ENGINE_SUBTYPE, run=$GITHUB_RUN_ID).
           Created automatic recovery issue: $REPAIR_URL
           The source issue remains paused until the recovery PR merges.
           EOF
-                )"
-                gh workflow run "$SCHEDULER_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DISPATCH_REF"
+                  )"
+                  gh workflow run "$SCHEDULER_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DISPATCH_REF"
+                else
+                  gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                    --body "Render execution failed in run $GITHUB_RUN_ID; recovery issue #$EXISTING_REPAIR is already open, so no duplicate repair was created."
+                fi
               else
                 gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
-                  --body "Render execution failed in run $GITHUB_RUN_ID; recovery issue #$EXISTING_REPAIR is already open, so no duplicate repair was created."
+                  --body "Render execution failed in run $GITHUB_RUN_ID. Automatic recovery limit ($MAX_RENDER_REPAIR_ATTEMPTS) is exhausted; issue remains paused for inspection."
               fi
-            else
-              gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
-                --body "Render execution failed in run $GITHUB_RUN_ID. Automatic recovery limit ($MAX_RENDER_REPAIR_ATTEMPTS) is exhausted; issue remains paused for inspection."
-            fi
 
-            echo "::error::Render execution or mandatory cleanup failed"
+              echo "::error::Render execution failed with repository classification"
+              exit 1
+              ;;
+            pass)
+              # Engine confirms success; fall through to the mode branches
+              # below, which still require a successful execute and (for
+              # qualification runs) a passing qualification verdict.
+              ;;
+            *)
+              gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                --add-label "$PAUSE_LABEL" >/dev/null 2>&1 || true
+              gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                --body "Render execution produced an unrecognized engine classification ($ENGINE_CLASSIFICATION) in run $GITHUB_RUN_ID. Failing closed: the source is held paused and no repository repair was created."
+              echo "::error::Unrecognized Render engine classification: $ENGINE_CLASSIFICATION"
+              exit 1
+              ;;
+          esac
+
+          if [[ "$EXECUTE_OUTCOME" != "success" || "$QUALIFICATION_FAILED" == "yes" ]]; then
+            # Fail closed: the engine did not route this failure to a
+            # terminal hold, a bounded retry, or an evidence-driven repair,
+            # so hold without creating a repository repair rather than
+            # guessing a repository defect.
+            gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+              --add-label "$PAUSE_LABEL" >/dev/null 2>&1 || true
+            gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+              --body "Render execution failed in run $GITHUB_RUN_ID (execute=$EXECUTE_OUTCOME, engine=$ENGINE_CLASSIFICATION) without a matching recovery route. Failing closed: the source is held paused and no repository repair was created."
+            echo "::error::Render execution failed without a matching recovery route"
             exit 1
           fi
 
