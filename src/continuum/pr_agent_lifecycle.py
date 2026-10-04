@@ -354,15 +354,40 @@ def _security_value_is_blocking(value: object) -> bool:
 
 # Review-payload keys that carry an explicit tool-error signal when
 # `config.propagate_tool_errors` surfaces a failed tool. Any non-clean
-# entry fails closed; absent keys mean no signal. Only tool-specific keys
-# qualify: generic `errors`/`error` routinely carry ordinary review content
+# entry on a tool-specific key fails closed; absent keys mean no signal.
+# Generic `errors`/`error` routinely carry ordinary review content
 # (e.g. "2 lint errors noted in diff") rather than a failed tool, so they
-# must never force automatic improve on their own.
+# force automatic improve only when they carry explicit tool-failure prose
+# (see _is_generic_tool_failure_text), never on ordinary counts/summaries.
 _TOOL_ERROR_SIGNAL_KEYS = (
     "tool_errors",
     "tool_error",
     "tool_failures",
     "failed_tools",
+)
+
+# Generic review-payload keys that only signal a tool error when their
+# content explicitly describes a tool failure (e.g.
+# "upstream tool failed"). Ordinary code-error summaries
+# (e.g. "2 lint errors noted in diff") must still skip when otherwise clean.
+_GENERIC_TOOL_ERROR_KEYS = (
+    "errors",
+    "error",
+)
+
+# Substrings marking explicit tool-failure prose inside a generic
+# `errors`/`error` value. Matched case-insensitively against the raw text;
+# negation/empty prose is already excluded by _security_value_is_blocking
+# before this check runs.
+_GENERIC_TOOL_FAILURE_MARKERS = (
+    "tool",
+    "failed",
+    "failure",
+    "timeout",
+    "timed out",
+    "traceback",
+    "exception",
+    "unavailable",
 )
 
 # Review-payload keys that carry an explicit coverage signal. Explicit
@@ -372,8 +397,11 @@ _TOOL_ERROR_SIGNAL_KEYS = (
 # `complete`) routinely carry ordinary prose (e.g.
 # `"complete": "completed review summary"`), so only explicit false-like
 # values on those keys count as incomplete; unparseable strings and other
-# shapes are ignored. Absent coverage keys fail closed (see
-# has_incomplete_coverage_signal); the findings-cap truncation check still
+# shapes are ignored. Absent coverage keys carry no incomplete signal (see
+# has_incomplete_coverage_signal): a clean payload without coverage footers
+# still reaches the skip path when the caller explicitly passes
+# review_coverage_complete=True (an omitted flag still fails closed via
+# should_skip_improve); the findings-cap truncation check still
 # applies separately below.
 _COVERAGE_FLAG_KEYS = (
     "review_coverage_complete",
@@ -404,6 +432,28 @@ _COVERAGE_OBJECT_KEYS = (
 )
 
 
+def _is_generic_tool_failure_text(value: object) -> bool:
+    """Whether a generic `errors`/`error` value reports a tool failure.
+
+    Negation/empty prose is clean (no signal). Any other value must
+    explicitly mention a tool-failure marker to count: ordinary code-error
+    summaries such as "2 lint errors noted in diff" stay clean.
+    """
+
+    if isinstance(value, Mapping):
+        return any(_is_generic_tool_failure_text(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        if len(value) == 0:
+            return False
+        return any(_is_generic_tool_failure_text(item) for item in value)
+    if not isinstance(value, str):
+        return False
+    if not _security_value_is_blocking(value):
+        return False
+    lowered = value.strip().lower()
+    return any(marker in lowered for marker in _GENERIC_TOOL_FAILURE_MARKERS)
+
+
 def has_tool_error_signal(review: Mapping[str, Any]) -> bool:
     """Whether the review payload itself reports a tool error (fail closed)."""
 
@@ -412,6 +462,11 @@ def has_tool_error_signal(review: Mapping[str, Any]) -> bool:
         if key not in inner:
             continue
         if _security_value_is_blocking(inner.get(key)):
+            return True
+    for key in _GENERIC_TOOL_ERROR_KEYS:
+        if key not in inner:
+            continue
+        if _is_generic_tool_failure_text(inner.get(key)):
             return True
     return False
 
@@ -518,9 +573,12 @@ def _coverage_flag_value_is_incomplete(key: str, value: object) -> bool:
 def has_incomplete_coverage_signal(review: Mapping[str, Any]) -> bool:
     """Whether the review payload itself reports incomplete coverage.
 
-    Fail closed: a payload with no recognized coverage keys reports
-    incomplete so a truncated/omitted coverage footer can never qualify
-    for an improve skip on missing evidence.
+    Absent coverage keys carry no incomplete signal: a clean payload
+    without coverage footers (e.g. upstream safe_to_merge reviews that
+    omit `coverage`/`coverage_complete`) still reaches the skip path when
+    the caller explicitly passes `review_coverage_complete=True` (an
+    omitted flag still fails closed via should_skip_improve). Unknown or
+    unparseable present coverage shapes still fail closed.
     """
 
     inner = _unwrap_review(review)
@@ -590,11 +648,12 @@ def has_incomplete_coverage_signal(review: Mapping[str, Any]) -> bool:
         # an unrecognized coverage shape: fail closed.
         return True
     if not seen_coverage:
-        # Absent coverage keys are not evidence of complete coverage: fail
-        # closed so a payload that omits coverage footers can never qualify
-        # for an improve skip on missing evidence (the findings-cap
-        # truncation check still applies separately below).
-        return True
+        # Absent coverage keys carry no incomplete signal: a clean payload
+        # without coverage footers must still reach the skip path (the
+        # findings-cap truncation check still applies separately). An
+        # omitted caller flag still fails closed via
+        # review_coverage_complete.
+        return False
     return False
 
 
@@ -670,6 +729,7 @@ def _unwrap_review(review: Mapping[str, Any]) -> Mapping[str, Any]:
         or "merge_recommendation" in review
         or any(key in review for key in BLOCKING_SECURITY_SIGNAL_KEYS)
         or any(key in review for key in _TOOL_ERROR_SIGNAL_KEYS)
+        or any(key in review for key in _GENERIC_TOOL_ERROR_KEYS)
         or any(key in review for key in _COVERAGE_FLAG_KEYS)
         or any(key in review for key in _COVERAGE_OBJECT_KEYS)
     )
@@ -714,6 +774,12 @@ def _unwrap_review(review: Mapping[str, Any]) -> Mapping[str, Any]:
         if key in BLOCKING_SECURITY_SIGNAL_KEYS or key in _TOOL_ERROR_SIGNAL_KEYS:
             # Either side blocking must block the merged view.
             if not _security_value_is_blocking(current) and _security_value_is_blocking(value):
+                merged[key] = value
+            continue
+        if key in _GENERIC_TOOL_ERROR_KEYS:
+            # Either side reporting an explicit generic tool failure must
+            # block the merged view; ordinary summaries stay clean.
+            if not _is_generic_tool_failure_text(current) and _is_generic_tool_failure_text(value):
                 merged[key] = value
             continue
         if key in _COVERAGE_FLAG_KEYS or key in _COVERAGE_OBJECT_KEYS:

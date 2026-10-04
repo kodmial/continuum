@@ -1844,11 +1844,12 @@ class CleanReviewImproveSkipTests(unittest.TestCase):
         self.assertFalse(js["skip"])
 
     def test_error_negation_prose_is_not_a_tool_error_signal(self):
-        # Generic `errors`/`error` keys carry ordinary review content (e.g.
-        # "2 lint errors noted in diff"), not failed tools, so they never
-        # force automatic improve on their own. Only tool-specific keys
-        # (`tool_errors`, `tool_error`, `tool_failures`, `failed_tools`)
-        # with non-negation content block the clean fast path.
+        # Negation prose ("No errors", "No tool errors") is clean, and
+        # ordinary code-error summaries ("2 lint errors noted in diff")
+        # under generic keys are not failed tools, so they never force
+        # automatic improve on their own. Only tool-specific keys with
+        # non-negation content, or generic `errors`/`error` with explicit
+        # tool-failure prose ("upstream tool failed"), block the clean path.
         life = self._life()
         for extra in (
             {"errors": "No errors"},
@@ -1878,8 +1879,6 @@ class CleanReviewImproveSkipTests(unittest.TestCase):
         # Generic code-error summaries must not force improve either.
         for extra in (
             {"errors": "2 lint errors noted in diff"},
-            {"error": "upstream tool failed"},
-            {"errors": "upstream tool failed"},
         ):
             with self.subTest(extra=extra):
                 review = make_review([], extra=extra)
@@ -1899,6 +1898,30 @@ class CleanReviewImproveSkipTests(unittest.TestCase):
                     {"headMatches": True, "reviewCoverageComplete": True, "reviewedHeadSha": "abc"},
                 )
                 self.assertTrue(js["skip"])
+        # Explicit tool-failure prose under generic keys fails closed and
+        # keeps improve for repair value.
+        for extra in (
+            {"error": "upstream tool failed"},
+            {"errors": "upstream tool failed"},
+        ):
+            with self.subTest(extra=extra):
+                review = make_review([], extra=extra)
+                self.assertTrue(life.has_tool_error_signal(review))
+                self.assertTrue(run_tool_error_signal(review))
+                decision = life.should_skip_improve(
+                    review,
+                    make_persistent([], head_sha="abc"),
+                    head_matches=True,
+                    review_coverage_complete=True,
+                    reviewed_head_sha="abc",
+                )
+                self.assertFalse(decision["skip"])
+                js = run_skip_policy(
+                    review,
+                    make_persistent([], head_sha="abc"),
+                    {"headMatches": True, "reviewCoverageComplete": True, "reviewedHeadSha": "abc"},
+                )
+                self.assertFalse(js["skip"])
         # A genuine tool failure still fails closed and keeps improve.
         self.assertTrue(life.has_tool_error_signal(
             make_review([], extra={"tool_errors": ["timeout contacting model"]})
@@ -2087,7 +2110,8 @@ class CleanReviewImproveSkipTests(unittest.TestCase):
 
     def test_generic_error_keys_never_force_improve(self):
         # Otherwise-clean review carrying an ordinary code-error summary
-        # must still skip: generic keys are not tool-error signals.
+        # must still skip: generic keys without explicit tool-failure prose
+        # are not tool-error signals.
         life = self._life()
         review = make_review([], extra={"errors": "2 lint errors noted in diff"})
         self.assertFalse(life.has_tool_error_signal(review))
@@ -2106,6 +2130,34 @@ class CleanReviewImproveSkipTests(unittest.TestCase):
         tool_review = make_review([], extra={"tool_errors": "2 lint errors noted in diff"})
         self.assertTrue(life.has_tool_error_signal(tool_review))
         self.assertTrue(run_tool_error_signal(tool_review))
+
+    def test_production_clean_review_without_coverage_keys_skips(self):
+        # Production shape (e.g. safe_to_merge, empty issues, no
+        # `coverage`/`coverage_complete` keys) must reach the skip path
+        # when the caller explicitly passes review_coverage_complete=True.
+        # Absent coverage keys carry no incomplete signal; an omitted flag
+        # still fails closed.
+        life = self._life()
+        production = {
+            "key_issues_to_review": [],
+            "merge_recommendation": "safe_to_merge",
+        }
+        self.assertFalse(life.has_incomplete_coverage_signal(production))
+        state = make_persistent([], head_sha="abc")
+        explicit = life.should_skip_improve(
+            production, state, head_matches=True,
+            review_coverage_complete=True, reviewed_head_sha="abc",
+        )
+        self.assertTrue(explicit["skip"])
+        explicit_js = run_skip_policy(
+            production, state,
+            {"headMatches": True, "reviewCoverageComplete": True, "reviewedHeadSha": "abc"},
+        )
+        self.assertTrue(explicit_js["skip"])
+        omitted = life.should_skip_improve(
+            production, state, head_matches=True, reviewed_head_sha="abc",
+        )
+        self.assertFalse(omitted["skip"])
 
     def test_merge_gate_greens_for_skipped_clean_improve(self):
         life = self._life()

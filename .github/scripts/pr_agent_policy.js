@@ -351,6 +351,42 @@ const TOOL_ERROR_SIGNAL_KEYS = [
   'failed_tools',
 ];
 
+// Generic keys only signal a tool error when their content explicitly
+// describes a tool failure (e.g. "upstream tool failed"). Ordinary
+// code-error summaries (e.g. "2 lint errors noted in diff") must still
+// skip when otherwise clean.
+const GENERIC_TOOL_ERROR_KEYS = ['errors', 'error'];
+
+// Substrings marking explicit tool-failure prose inside a generic
+// `errors`/`error` value (case-insensitive). Negation/empty prose is
+// already excluded by securityValueIsBlocking before this check runs.
+const GENERIC_TOOL_FAILURE_MARKERS = [
+  'tool',
+  'failed',
+  'failure',
+  'timeout',
+  'timed out',
+  'traceback',
+  'exception',
+  'unavailable',
+];
+
+function isGenericToolFailureText(value) {
+  if (Array.isArray(value)) {
+    if (value.length === 0) return false;
+    return value.some(isGenericToolFailureText);
+  }
+  if (value && typeof value === 'object') {
+    const keys = Object.keys(value);
+    if (keys.length === 0) return false;
+    return keys.some((key) => isGenericToolFailureText(value[key]));
+  }
+  if (typeof value !== 'string') return false;
+  if (!securityValueIsBlocking(value)) return false;
+  const lowered = value.trim().toLowerCase();
+  return GENERIC_TOOL_FAILURE_MARKERS.some((marker) => lowered.includes(marker));
+}
+
 const COVERAGE_FLAG_KEYS = [
   'review_coverage_complete',
   'coverage_complete',
@@ -382,6 +418,10 @@ function hasToolErrorSignal(reviewPayload) {
   for (const key of TOOL_ERROR_SIGNAL_KEYS) {
     if (!(key in review)) continue;
     if (securityValueIsBlocking(review[key])) return true;
+  }
+  for (const key of GENERIC_TOOL_ERROR_KEYS) {
+    if (!(key in review)) continue;
+    if (isGenericToolFailureText(review[key])) return true;
   }
   return false;
 }
@@ -574,6 +614,7 @@ function unwrapReview(reviewPayload) {
     'merge_recommendation' in reviewPayload ||
     BLOCKING_SECURITY_SIGNAL_KEYS.some((key) => key in reviewPayload) ||
     TOOL_ERROR_SIGNAL_KEYS.some((key) => key in reviewPayload) ||
+    GENERIC_TOOL_ERROR_KEYS.some((key) => key in reviewPayload) ||
     COVERAGE_FLAG_KEYS.some((key) => key in reviewPayload) ||
     COVERAGE_OBJECT_KEYS.some((key) => key in reviewPayload);
   if (!outerHasSignal) {
@@ -634,6 +675,14 @@ function unwrapReview(reviewPayload) {
     ) {
       // Either side blocking must block the merged view.
       if (!securityValueIsBlocking(current) && securityValueIsBlocking(value)) {
+        merged[key] = value;
+      }
+      continue;
+    }
+    if (GENERIC_TOOL_ERROR_KEYS.includes(key)) {
+      // Either side reporting an explicit generic tool failure must block
+      // the merged view; ordinary summaries stay clean.
+      if (!isGenericToolFailureText(current) && isGenericToolFailureText(value)) {
         merged[key] = value;
       }
       continue;
