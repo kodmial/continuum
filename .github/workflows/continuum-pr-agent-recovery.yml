@@ -187,7 +187,10 @@ jobs:
                 .filter(comment => String(comment.body || '').includes(CONTROLLER_STATE_MARKER))
                 .sort((a, b) => Number(a.id) - Number(b.id));
               const latest = controller.at(-1);
-              const body = controllerStateBody(stateMarker, summary);
+              const body = controllerStateBody(
+                stateMarker,
+                summary + '\n\nController dispatch run: ' + String(context.runId)
+              );
               let result;
               if (latest) {
                 const { data } = await github.rest.issues.updateComment({
