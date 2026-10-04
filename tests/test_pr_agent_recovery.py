@@ -309,6 +309,7 @@ class RecoveryWiringTests(unittest.TestCase):
             "github.rest.repos.listCommitStatusesForRef",
             "github.rest.issues.listComments",
             "github.rest.repos.get({ owner, repo })",
+            "github.paginate(",
         ):
             with self.subTest(old_pat_read=old_pat_read):
                 self.assertNotIn(old_pat_read, body)
