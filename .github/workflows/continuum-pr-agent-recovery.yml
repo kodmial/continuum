@@ -414,7 +414,9 @@ jobs:
                 }
               };
               for (const comment of comments) {
-                if (!trustedAssociations.has(String(comment.author_association || '').toUpperCase())) {
+                const rawUser = (comment.user && typeof comment.user === 'object') ? comment.user : {};
+                const login = String(rawUser.login || comment.user_login || comment.author || '').trim().toLowerCase();
+                if (!trustedAssociations.has(String(comment.author_association || '').toUpperCase()) && login !== 'github-actions[bot]') {
                   continue;
                 }
                 const body = String(comment.body || '');
@@ -905,12 +907,10 @@ jobs:
               // Always advance to the next index: the dispatch-grace wait
               // above already handles an unobserved dispatch, and replaying
               // the same index would keep attempt >= budget from ever firing.
-              let attempt;
-              if (evidence.latestAttempt === null) {
-                attempt = operationSeen ? 1 : 0;
-              } else {
-                attempt = evidence.latestAttempt + 1;
-              }
+              // First execution is always index 0 with no durable marker, whether or
+              // not operation state was seen, so every path dispatches 0..budget-1.
+              // `operationSeen` is retained for signature compatibility only.
+              const attempt = evidence.latestAttempt === null ? 0 : evidence.latestAttempt + 1;
 
               if (attempt >= maxExecutions) {
                 // Return the budget count (not undefined) so callers can

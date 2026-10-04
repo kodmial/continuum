@@ -634,6 +634,15 @@ def decide_recovery(
             return RecoveryDecision(
                 "wait", None, "newer retry dispatch marker is still inside dispatch grace"
             )
+    if (
+        evidence.latest_attempt is not None
+        and evidence.latest_marker_at is None
+        and status_age_seconds is not None
+        and status_age_seconds < stale_after_seconds
+    ):
+        return RecoveryDecision(
+            "wait", None, "durable dispatch marker age is unknown; staying inside dispatch grace"
+        )
 
     recoverable = False
     operation_seen = state is not None
