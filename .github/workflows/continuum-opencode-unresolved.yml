@@ -60,7 +60,7 @@ jobs:
           else
             MAX_PAGES=5
           fi
-          [[ "$MAX_PAGES" -gt 5 ]] && MAX_PAGES=5
+          if [[ "$MAX_PAGES" -gt 5 ]]; then MAX_PAGES=5; fi
           INCLUDE="$(gh api --include "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/comments?per_page=100&page=1" 2>/dev/null || true)"
           if [[ -z "$INCLUDE" ]]; then
             echo "Could not determine the newest review-comment page; ignoring UNRESOLVED reply."
