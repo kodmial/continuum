@@ -1360,6 +1360,7 @@ jobs:
           RETRY_WORKFLOW: ${{ steps.stack.outputs.retry_workflow }}
           CURRENT_RECOVERY_KIND: ${{ steps.stack.outputs.recovery_kind }}
           TARGET_CHILD_ID: ${{ inputs.target_child_id }}
+          CONTINUUM_REF_INPUT: ${{ inputs.continuum_ref }}
           CI_WORKFLOW_NAME: ${{ inputs.ci_workflow_name || vars.CONTINUUM_CI_WORKFLOW_NAME || 'CI' }}
         run: |
           set -euo pipefail
@@ -1452,8 +1453,10 @@ jobs:
             fi
             return "$dispatch_status"
           }
+          CONTINUUM_REF_INPUT="${CONTINUUM_REF_INPUT:-}"
           if [[ -n "${TARGET_CHILD_ID:-}" ]]; then
-            dispatch_isolated_retry -f pr_number="$PR_NUMBER" -f expected_head_sha="$HEAD_SHA" -f retry_attempt="$next" -f retry_workflow="$RETRY_WORKFLOW" -f recovery_kind="${CURRENT_RECOVERY_KIND:-review}" -f target_child_id="$TARGET_CHILD_ID"
+            : "${CONTINUUM_REF_INPUT:?CONTINUUM_REF is required for delegated retry}"
+            dispatch_isolated_retry -f pr_number="$PR_NUMBER" -f expected_head_sha="$HEAD_SHA" -f retry_attempt="$next" -f retry_workflow="$RETRY_WORKFLOW" -f recovery_kind="${CURRENT_RECOVERY_KIND:-review}" -f target_child_id="$TARGET_CHILD_ID" -f continuum_ref="$CONTINUUM_REF_INPUT"
           else
             dispatch_isolated_retry -f pr_number="$PR_NUMBER" -f expected_head_sha="$HEAD_SHA" -f retry_attempt="$next" -f retry_workflow="$RETRY_WORKFLOW" -f recovery_kind="${CURRENT_RECOVERY_KIND:-review}"
           fi
