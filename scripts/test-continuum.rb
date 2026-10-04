@@ -1874,18 +1874,15 @@ class ContinuumTest < Minitest::Test
     workflow = yaml(File.join(ROOT, '.github/workflows/continuum-pr-agent.yml'))
     stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-pr-agent.yml'))
 
-    # The exact-HEAD workflow-run lookup runs under github.token, so both the
-    # reusable workflow and its caller must grant actions:read (least
-    # privilege: never write). Reusable workflows cannot elevate GITHUB_TOKEN
-    # beyond the caller grant.
-    assert_equal 'read', workflow.fetch('permissions').fetch('actions'),
-                 'reusable workflow must grant actions:read for exact-HEAD CI evidence'
-    assert_equal 'read', workflow.fetch('jobs').fetch('pr_agent').fetch('permissions').fetch('actions'),
-                 'pr_agent job must grant actions:read for exact-HEAD CI evidence'
-    assert_equal 'read', stub.fetch('permissions').fetch('actions'),
-                 'caller stub must grant actions:read because reusable workflows cannot elevate GITHUB_TOKEN'
-    refute_equal 'write', workflow.fetch('permissions').fetch('actions')
-    refute_equal 'write', stub.fetch('permissions').fetch('actions')
+    # The review path now owns same-repository workflow_dispatch for bounded
+    # recovery, so GITHUB_TOKEN needs actions:write end-to-end. Reusable
+    # workflows cannot elevate beyond the caller grant.
+    assert_equal 'write', workflow.fetch('permissions').fetch('actions'),
+                 'reusable workflow must grant actions:write for bounded same-repo review dispatch'
+    assert_equal 'write', workflow.fetch('jobs').fetch('pr_agent').fetch('permissions').fetch('actions'),
+                 'pr_agent job must grant actions:write for bounded same-repo review dispatch'
+    assert_equal 'write', stub.fetch('permissions').fetch('actions'),
+                 'caller stub must grant actions:write because reusable workflows cannot elevate GITHUB_TOKEN'
     # pull-requests read capability is preserved (write implies read; the
     # contract keeps write for the mutating steps below).
     assert_equal 'write', workflow.fetch('jobs').fetch('pr_agent').fetch('permissions').fetch('pull-requests')
@@ -1933,11 +1930,10 @@ class ContinuumTest < Minitest::Test
     assert_includes after, 'PR head moved during review'
     assert_includes moved, 'the review is stale'
 
-    # Mixed read/write/dispatch and cross-repo paths remain PAT-backed.
-    # kodmial/continuum#231 splits the former combined review+improve tool
-    # step: review stays unconditional on the admitted HEAD while automatic
-    # improve runs only when the authoritative review still carries repair
-    # value. Both native tool executions remain PAT-backed.
+    # Review-side same-repository control-plane work is repository-token
+    # backed. Repair/push remains in the separate repair workflow and keeps
+    # its stronger credential contract. The review workflow must not consume
+    # the shared user PAT even for bounded workflow_dispatch recovery.
     runtime = step_body(body, 'Resolve the Continuum-owned PR-Agent runtime bundle')
     retry_step = step_body(body, 'Schedule bounded retry for retryable PR-Agent review failure')
     review_tool = step_body(body, 'Run upstream full review on the exact HEAD')
@@ -1948,29 +1944,29 @@ class ContinuumTest < Minitest::Test
     [runtime, retry_step, review_tool, improve_tool, in_flight, normalize, publish].each { |step| refute_nil step }
     refute_includes body, 'Run upstream full review and full improve on the exact HEAD',
                       'issue #231 splits review and conditional improve; the combined step must stay removed'
-    assert_includes runtime, 'GH_TOKEN: ${{ secrets.TAP_PAT }}',
-                    'runtime-bundle fetch can be cross-repository; it must stay PAT-backed'
+    assert_includes runtime, 'GH_TOKEN: ${{ github.token }}',
+                    'public Continuum runtime-bundle fetch must not consume shared PAT quota'
     assert_includes runtime, 'repos/kodmial/continuum/contents'
-    assert_includes retry_step, 'GH_TOKEN: ${{ secrets.TAP_PAT }}',
-                    'the retry step mixes reads with workflow dispatch; it must stay wholly PAT-backed'
+    assert_includes retry_step, 'GH_TOKEN: ${{ github.token }}',
+                    'bounded same-repo workflow_dispatch must use repository token'
     assert_includes retry_step, 'gh workflow run'
-    refute_includes retry_step, 'github.token',
-                      'the retry step must not be partially migrated to github.token'
     refute_includes before, 'gh workflow run',
                       'the pre-review revalidation must stay read-only'
     refute_includes moved, 'gh workflow run',
                       'the moved-head check must stay read-only'
-    assert_includes review_tool, 'GITHUB__USER_TOKEN: ${{ secrets.TAP_PAT }}',
-                     'PR-Agent review tool execution credentials must stay PAT-backed'
-    assert_includes improve_tool, 'GITHUB__USER_TOKEN: ${{ secrets.TAP_PAT }}',
-                     'PR-Agent improve tool execution credentials must stay PAT-backed'
-    assert_includes in_flight, 'github-token: ${{ secrets.TAP_PAT }}',
-                    'commit-status publishing must stay PAT-backed'
-    assert_includes normalize, 'github-token: ${{ secrets.TAP_PAT }}',
-                    'comment deletion steps must stay PAT-backed'
+    assert_includes review_tool, 'GITHUB__USER_TOKEN: ${{ github.token }}',
+                     'PR-Agent review tool execution must use repository token'
+    assert_includes improve_tool, 'GITHUB__USER_TOKEN: ${{ github.token }}',
+                     'PR-Agent improve tool execution must use repository token'
+    assert_includes in_flight, 'github-token: ${{ github.token }}',
+                    'commit-status publishing must use repository token'
+    assert_includes normalize, 'github-token: ${{ github.token }}',
+                    'comment maintenance must use repository token'
     assert_includes normalize, 'deleteComment'
-    assert_includes publish, 'github-token: ${{ secrets.TAP_PAT }}',
-                    'commit-status publishing must stay PAT-backed'
+    assert_includes publish, 'github-token: ${{ github.token }}',
+                    'commit-status publishing must use repository token'
+    refute_includes body, 'secrets.TAP_PAT',
+                    'review workflow must be completely isolated from shared user PAT quota'
   end
 
   # Work-Lock #58 item 5 (conservative subset, kodmial/continuum#236): only
@@ -2094,12 +2090,12 @@ class ContinuumTest < Minitest::Test
       end
     end
 
-    # The exact-HEAD admission reads Actions runs under github.token: least
-    # privilege is read, never write, and never absent.
-    assert_equal 'read', permissions.fetch('actions'),
-                 'pr-agent.yml dogfood caller must grant actions:read because reusable workflows cannot elevate GITHUB_TOKEN'
-    refute_equal 'write', permissions.fetch('actions'),
-                 'pr-agent.yml dogfood caller must not widen to actions:write'
+    # The same-repo review controller dispatches bounded recovery using
+    # GITHUB_TOKEN, so the dogfood caller must grant actions:write.
+    assert_equal 'write', permissions.fetch('actions'),
+                 'pr-agent.yml dogfood caller must grant actions:write for same-repo workflow_dispatch'
+    assert_equal 'write', permissions.fetch('statuses'),
+                 'pr-agent.yml dogfood caller must grant statuses:write for review lifecycle status'
 
     # The stub and the dogfood caller call the same reusable workflow, so
     # their permission grants must not diverge again.

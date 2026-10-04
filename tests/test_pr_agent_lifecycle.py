@@ -1661,7 +1661,8 @@ class IsolationTests(unittest.TestCase):
         for body in (engine, caller, self_caller):
             self.assertIn("contents: write", body)
             self.assertIn("pull-requests: write", body)
-        self.assertIn("statuses: read", engine)
+        self.assertIn("statuses: write", engine)
+        self.assertIn("actions: write", engine)
 
     def test_improve_uses_env_for_push_outputs_not_forbidden_cli_args(self):
         body = read_repo(".github/workflows/continuum-pr-agent.yml")
@@ -2068,13 +2069,17 @@ class StabilizationParityTests(unittest.TestCase):
                 self.assertIn(r"\.lock($|/)", body)
                 self.assertIn("(^|/)", body)
 
-    def test_pr_agent_callers_do_not_expand_github_token_actions_permission(self):
+    def test_pr_agent_only_review_path_has_actions_write_for_repo_token_dispatch(self):
         for path in (
             ".github/workflows/pr-agent.yml",
             ".github/caller-stubs/continuum-pr-agent.yml",
+            ".github/workflows/continuum-pr-agent.yml",
+        ):
+            with self.subTest(path=path):
+                self.assertIn("actions: write", read_repo(path))
+        for path in (
             ".github/caller-stubs/continuum-pr-agent-repair.yml",
             ".github/caller-stubs/continuum-pr-agent-auto-merge.yml",
-            ".github/workflows/continuum-pr-agent.yml",
             ".github/workflows/continuum-pr-agent-repair.yml",
             ".github/workflows/continuum-pr-agent-auto-merge.yml",
         ):
