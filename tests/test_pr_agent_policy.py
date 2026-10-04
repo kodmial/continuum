@@ -181,6 +181,50 @@ class CleanSkipTests(unittest.TestCase):
         )
         self.assertEqual(clean["action"], "merge")
 
+    def test_clean_review_with_qualifying_improve_routes_to_repair(self):
+        qualifying = (
+            '{"payload": {"code_suggestions": ['
+            '{"relevant_file": "src/app.py", "score": 9}]}}'
+        )
+        result = run_js(
+            "disposition",
+            review=make_review([]),
+            raw=qualifying,
+        )
+        self.assertEqual(result["action"], "repair")
+        self.assertEqual(result["qualifyingSuggestionCount"], 1)
+
+    def test_clean_review_with_sub_threshold_improve_reaches_merge(self):
+        low = (
+            '{"payload": {"code_suggestions": ['
+            '{"relevant_file": "src/app.py", "score": 3}]}}'
+        )
+        result = run_js(
+            "disposition",
+            review=make_review([]),
+            raw=low,
+        )
+        self.assertEqual(result["action"], "merge")
+        self.assertEqual(result["qualifyingSuggestionCount"], 0)
+
+
+class SignalMatrixTests(unittest.TestCase):
+    def test_clean_prose_carries_no_blocking_signal(self):
+        clean_security = make_review([], extra={"security_concerns": "No security concerns found"})
+        self.assertFalse(run_js("security", review=clean_security))
+        ordinary_errors = make_review([], extra={"errors": "2 lint errors noted in diff"})
+        self.assertFalse(run_js("tool", review=ordinary_errors))
+        no_coverage_keys = make_review([])
+        self.assertFalse(run_js("coverage", review=no_coverage_keys))
+
+    def test_blocking_prose_carries_signal(self):
+        blocking_security = make_review([], extra={"security_concerns": "hardcoded credential"})
+        self.assertTrue(run_js("security", review=blocking_security))
+        tool_failure = make_review([], extra={"errors": "upstream tool failed"})
+        self.assertTrue(run_js("tool", review=tool_failure))
+        empty_coverage = make_review([], extra={"coverage_complete": ""})
+        self.assertTrue(run_js("coverage", review=empty_coverage))
+
 
 class ExactHeadSafetyTests(unittest.TestCase):
     def test_stale_head_never_skips(self):
@@ -201,6 +245,18 @@ class ExactHeadSafetyTests(unittest.TestCase):
             options=dict(CLEAN_OPTS),
         )
         self.assertFalse(result["skip"])
+
+    def test_active_persistent_finding_never_skips(self):
+        state = make_persistent(
+            [{"id": "pra-1", "state": "ACTIVE"}], head_sha="abc1234")
+        result = run_js(
+            "skip",
+            review=make_review([]),
+            state=state,
+            options=dict(CLEAN_OPTS),
+        )
+        self.assertFalse(result["skip"])
+        self.assertIn("ACTIVE", result["reason"])
 
     def test_placeholder_and_short_heads_never_skip(self):
         for bad in ("unknown", "a", "123", "abc"):
@@ -249,6 +305,37 @@ class SplitEnvelopeTests(unittest.TestCase):
             "review": make_review([], extra={"coverage_complete": ""})}
         self.assertTrue(run_js("coverage", review=split_coverage))
 
+    def test_outer_and_nested_findings_concatenate_fail_closed(self):
+        split = {
+            "key_issues_to_review": [issue_entry(n=0)],
+            "merge_recommendation": "safe_to_merge",
+            "review": make_review([issue_entry(n=1)]),
+        }
+        merged = run_js("unwrap", review=split)
+        self.assertEqual(len(merged["key_issues_to_review"]), 2)
+
+    def test_conflicting_recommendation_merges_most_restrictive(self):
+        split = {
+            "merge_recommendation": "safe_to_merge",
+            "key_issues_to_review": [],
+            "review": make_review([], recommendation="changes_required"),
+        }
+        merged = run_js("unwrap", review=split)
+        self.assertEqual(merged["merge_recommendation"], "changes_required")
+
+    def test_split_envelope_never_skips_with_actionable_side(self):
+        split = {
+            "coverage_complete": True,
+            "review": make_review([issue_entry(n=0)]),
+        }
+        result = run_js(
+            "skip",
+            review=split,
+            state=make_persistent([], head_sha="abc1234"),
+            options=dict(CLEAN_OPTS),
+        )
+        self.assertFalse(result["skip"])
+
     def test_skipped_clean_marker_is_machine_readable(self):
         skipped = ('{"payload": {"code_suggestions": []}, '
                    '"continuum": {"improve_skipped_clean": true}}')
@@ -256,6 +343,11 @@ class SplitEnvelopeTests(unittest.TestCase):
         self.assertTrue(run_js("skipped", raw=skipped))
         self.assertFalse(run_js("skipped", raw=plain))
         self.assertFalse(run_js("skipped", raw="not json"))
+
+    def test_skipped_marker_with_unparseable_line_fails_closed(self):
+        skipped = ('{"payload": {"code_suggestions": []}, '
+                   '"continuum": {"improve_skipped_clean": true}}\nnot json')
+        self.assertFalse(run_js("skipped", raw=skipped))
 
 
 if __name__ == "__main__":
