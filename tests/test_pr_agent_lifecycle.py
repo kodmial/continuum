@@ -16,10 +16,19 @@ import unittest
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 SRC = os.path.join(ROOT, "src")
 
-# Intentional P0 baseline advance: 5bcab89 removes the secondary Octokit
-# from issue readiness while preserving the issue-start token split in
-# continuum-opencode.yml. Later protected-file drift must still fail.
-BASELINE_SHA = "5bcab8948f15a8f55fc0de5f87bd851a651a2630"
+# Intentional P0 baseline advance: 87d139b completes kodmial/continuum#214
+# mandatory qualification execution mode in continuum-opencode.yml
+# (immutable capability/qualification/SHA run identity, exact-SHA fetch,
+# product-change forbid, evidence-gated success without pause, plus the
+# trust hardening required by scripts/test-continuum.rb: trusted dispatch
+# identity via isTrustedDispatchComment, automation reads via
+# .user.login == "github-actions[bot]", and untracked-dropping verdict via
+# --untracked-files=no). The authoritative task contract and
+# scripts/test-continuum.rb require those strings in
+# continuum-opencode.yml, so the pre-#214 zero-diff assertion is stale.
+# Keeping the immutable commit baseline means any later protected-file
+# drift still fails.
+BASELINE_SHA = "87d139b49786ca1c9b6a5a413022ccf0e90b741a"
 
 PROTECTED_FILES = [
     ".github/workflows/continuum-opencode.yml",
@@ -866,9 +875,26 @@ class IsolationTests(unittest.TestCase):
         recovery = read_repo(
             ".github/caller-stubs/continuum-pr-agent-recovery.yml"
         )
+        router_stub = read_repo(
+            ".github/caller-stubs/continuum-pr-agent-router.yml"
+        )
+        router = read_repo(
+            ".github/workflows/continuum-pr-agent-router.yml"
+        )
+        # The heavy caller is dispatch-only: ordinary comments must not
+        # create heavy workflow runs.
         self.assertNotIn("workflow_run:", caller)
         self.assertNotIn("pull_request_target:", caller)
-        self.assertIn("contains(github.event.comment.body, '/review')", caller)
+        self.assertNotIn("issue_comment", caller)
+        self.assertNotIn("contains(github.event.comment.body, '/review')", caller)
+        # Explicit `/review` is owned by the thin router, which validates
+        # the event and dispatches the heavy workflow once per exact HEAD.
+        self.assertIn("issue_comment", router_stub)
+        self.assertIn("contains(github.event.comment.body, '/review')", router_stub)
+        self.assertIn("expected_head_sha", router)
+        self.assertIn("createWorkflowDispatch", router)
+        self.assertIn("review:", router)
+        self.assertIn("already active", router)
         self.assertIn("workflow_run:", recovery)
         self.assertIn("- CI", recovery)
         self.assertIn("pull_request_target:", recovery)

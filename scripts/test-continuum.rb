@@ -15,7 +15,7 @@ class ContinuumTest < Minitest::Test
   # Project-owned entry workflows used only by the Continuum repository itself.
   # They deliberately stay outside the `continuum-` namespace so installer
   # ownership and reusable-engine ownership remain unambiguous.
-  PROJECT_ENTRY_WORKFLOWS = %w[automation.yml ci.yml opencode.yml pr-agent.yml pr-agent-recovery.yml].freeze
+  PROJECT_ENTRY_WORKFLOWS = %w[automation.yml ci.yml opencode.yml pr-agent.yml pr-agent-recovery.yml pr-agent-router.yml].freeze
   # Every caller stub in every layer, for the checks that must not care which
   # layer a file belongs to.
   ALL_STUBS = (CORE_STUBS + TECH_STUBS + PARENT_STUBS).sort
@@ -857,7 +857,7 @@ class ContinuumTest < Minitest::Test
   # three sets are independent files in one directory, so a one-line edit to the
   # prune candidate list — or a future edit to `"${STUBS[@]}"` — could delete a
   # consumer's whole tech or parent layer with no warning. The growth
-  # 18 -> 19 -> 23 is the observable form of that guarantee.
+  # 19 -> 20 -> 24 is the observable form of that guarantee.
   def test_installing_one_set_does_not_delete_another_sets_callers
     fixture do |dir|
       target = File.join(dir, 'consumer')
@@ -882,11 +882,11 @@ class ContinuumTest < Minitest::Test
           PARENT_STUBS.each { |stub| assert_includes installed, File.basename(stub) }
         end
       end
-      # Each set adds exactly its own files: 18 core, +1 tech, +4 parent.
+      # Each set adds exactly its own files: 19 core, +1 tech, +4 parent.
       assert_equal CORE_STUBS.size, counts['core']
       assert_equal CORE_STUBS.size + TECH_STUBS.size, counts['tech']
       assert_equal ALL_STUBS.size, counts['parent']
-      assert_equal 23, ALL_STUBS.size,
+      assert_equal 24, ALL_STUBS.size,
                    'every caller Continuum ships, across all three layers'
     end
   end
@@ -1280,6 +1280,7 @@ class ContinuumTest < Minitest::Test
     opencode.yml
     pr-agent.yml
     pr-agent-recovery.yml
+    pr-agent-router.yml
     continuum-consumer-child-dispatcher.yml
     continuum-validation.yml
   ].freeze
@@ -1315,9 +1316,9 @@ class ContinuumTest < Minitest::Test
   # count was taken from the workflow tree and then compared against the stub
   # tree, so adding a workflow and its stub together — exactly what a new
   # feature does — moved both sides and passed. A literal is the third,
-  # independent source: to change the eighteen core callers someone has to say so
+  # independent source: to change the nineteen core callers someone has to say so
   # here, which is where a reviewer sees it.
-  CORE_COUNT = 18
+  CORE_COUNT = 19
 
   # Every core workflow is either called by a stub in one of the three layers
   # or is a repository-owned/shared engine intentionally invoked from a
@@ -1717,6 +1718,191 @@ class ContinuumTest < Minitest::Test
                     'repair must revalidate draft state immediately before publication'
     assert_includes repair, 'became closed or draft during repair',
                     'a mid-repair draft transition must discard local repair changes'
+  end
+
+  # Work-Lock #58 item 4 (conservative subset): only the four verified-safe
+  # pure same-repository read-only PR-Agent paths leave the shared TAP_PAT
+  # budget. Mixed read/write/dispatch and cross-repo paths stay PAT-backed so
+  # downstream triggers and actor identity are unchanged.
+  def test_pr_agent_admission_and_revalidation_reads_use_repository_token
+    body = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent.yml'))
+    workflow = yaml(File.join(ROOT, '.github/workflows/continuum-pr-agent.yml'))
+    stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-pr-agent.yml'))
+
+    # The exact-HEAD workflow-run lookup runs under github.token, so both the
+    # reusable workflow and its caller must grant actions:read (least
+    # privilege: never write). Reusable workflows cannot elevate GITHUB_TOKEN
+    # beyond the caller grant.
+    assert_equal 'read', workflow.fetch('permissions').fetch('actions'),
+                 'reusable workflow must grant actions:read for exact-HEAD CI evidence'
+    assert_equal 'read', workflow.fetch('jobs').fetch('pr_agent').fetch('permissions').fetch('actions'),
+                 'pr_agent job must grant actions:read for exact-HEAD CI evidence'
+    assert_equal 'read', stub.fetch('permissions').fetch('actions'),
+                 'caller stub must grant actions:read because reusable workflows cannot elevate GITHUB_TOKEN'
+    refute_equal 'write', workflow.fetch('permissions').fetch('actions')
+    refute_equal 'write', stub.fetch('permissions').fetch('actions')
+    # pull-requests read capability is preserved (write implies read; the
+    # contract keeps write for the mutating steps below).
+    assert_equal 'write', workflow.fetch('jobs').fetch('pr_agent').fetch('permissions').fetch('pull-requests')
+    assert_equal 'write', stub.fetch('permissions').fetch('pull-requests')
+
+    admit = step_body(body, 'Admit only a review-ready PR with green CI on the exact HEAD')
+    before = step_body(body, 'Revalidate the admitted exact HEAD immediately before review')
+    after = step_body(body, 'Revalidate the PR head and native review output after review')
+    moved = step_body(body, 'Fail closed on a moved head')
+    [admit, before, after, moved].each { |step| refute_nil step, 'a verified-safe read step is missing' }
+
+    # 1. Admission: pulls.get plus exact-HEAD CI evidence under github.token.
+    assert_includes admit, 'github-token: ${{ github.token }}'
+    refute_includes admit, 'secrets.TAP_PAT'
+    assert_includes admit, 'github.rest.pulls.get'
+    assert_includes admit, 'github.rest.actions.listWorkflowRunsForRepo'
+
+    # 2. Immediately-before-review revalidation: gh pr view plus exact-HEAD
+    # CI evidence under github.token.
+    assert_includes before, 'GH_TOKEN: ${{ github.token }}'
+    refute_includes before, 'secrets.TAP_PAT'
+    assert_includes before, 'gh pr view'
+    assert_includes before, 'actions/runs?event=pull_request&head_sha='
+
+    # 3. Immediately-after-review revalidation: pulls.get for current PR/head only.
+    assert_includes after, 'github-token: ${{ github.token }}'
+    refute_includes after, 'secrets.TAP_PAT'
+    assert_includes after, 'github.rest.pulls.get'
+
+    # 4. Final fail-closed moved-head check: gh pr view for current PR/head only.
+    assert_includes moved, 'GH_TOKEN: ${{ github.token }}'
+    refute_includes moved, 'secrets.TAP_PAT'
+    assert_includes moved, 'gh pr view'
+
+    # github-script pure reads use the injected client directly: no dynamic
+    # require of @actions/github and no secondary Octokit client to audit.
+    refute_includes body, "require('@actions/github')"
+    refute_includes body, 'require("@actions/github")'
+
+    # Exact-HEAD admission, CI name matching, stale-HEAD rejection and
+    # fail-closed behavior are unchanged.
+    assert_includes admit, 'run.head_sha === headSha'
+    assert_includes admit, 'Stale admission ignored:'
+    assert_includes before, 'refusing to review an unqualified HEAD'
+    assert_includes after, 'PR head moved during review'
+    assert_includes moved, 'the review is stale'
+
+    # Mixed read/write/dispatch and cross-repo paths remain PAT-backed.
+    runtime = step_body(body, 'Resolve the Continuum-owned PR-Agent runtime bundle')
+    retry_step = step_body(body, 'Schedule bounded retry for retryable PR-Agent review failure')
+    tool = step_body(body, 'Run upstream full review and full improve on the exact HEAD')
+    in_flight = step_body(body, 'Mark PR-Agent review in flight')
+    normalize = step_body(body, 'Normalize persistent improve presentation')
+    publish = step_body(body, 'Publish durable PR-Agent review state')
+    [runtime, retry_step, tool, in_flight, normalize, publish].each { |step| refute_nil step }
+    assert_includes runtime, 'GH_TOKEN: ${{ secrets.TAP_PAT }}',
+                    'runtime-bundle fetch can be cross-repository; it must stay PAT-backed'
+    assert_includes runtime, 'repos/kodmial/continuum/contents'
+    assert_includes retry_step, 'GH_TOKEN: ${{ secrets.TAP_PAT }}',
+                    'the retry step mixes reads with workflow dispatch; it must stay wholly PAT-backed'
+    assert_includes retry_step, 'gh workflow run'
+    refute_includes retry_step, 'github.token',
+                      'the retry step must not be partially migrated to github.token'
+    refute_includes before, 'gh workflow run',
+                      'the pre-review revalidation must stay read-only'
+    refute_includes moved, 'gh workflow run',
+                      'the moved-head check must stay read-only'
+    assert_includes tool, 'GITHUB__USER_TOKEN: ${{ secrets.TAP_PAT }}',
+                    'PR-Agent tool execution credentials must stay PAT-backed'
+    assert_includes in_flight, 'github-token: ${{ secrets.TAP_PAT }}',
+                    'commit-status publishing must stay PAT-backed'
+    assert_includes normalize, 'github-token: ${{ secrets.TAP_PAT }}',
+                    'comment deletion steps must stay PAT-backed'
+    assert_includes normalize, 'deleteComment'
+    assert_includes publish, 'github-token: ${{ secrets.TAP_PAT }}',
+                    'commit-status publishing must stay PAT-backed'
+  end
+
+  # kodmial/continuum#229: ordinary PR comments must not create heavy
+  # PR-Agent workflow runs. The heavy entry workflows are dispatch-only;
+  # explicit `/review` is routed through a thin router that validates the
+  # event, resolves the exact HEAD, and coalesces duplicates on the logical
+  # operation key review:<pr>:<head>.
+  def test_pr_agent_heavy_workflows_are_dispatch_only
+    %w[pr-agent.yml].each do |entry|
+      parsed = yaml(File.join(ROOT, '.github/workflows', entry))
+      assert_equal %w[workflow_dispatch], events(parsed).keys,
+                   "#{entry}: heavy PR-Agent entry must not subscribe to issue_comment"
+    end
+    stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-pr-agent.yml'))
+    assert_equal %w[workflow_dispatch], events(stub).keys,
+                 'continuum-pr-agent stub: heavy caller must not subscribe to issue_comment'
+    %w[pr-agent.yml continuum-pr-agent.yml].each do |base|
+      path = base == 'pr-agent.yml' \
+        ? File.join(ROOT, '.github/workflows/pr-agent.yml') \
+        : File.join(ROOT, '.github/caller-stubs/continuum-pr-agent.yml')
+      job = yaml(path).fetch('jobs').fetch('call')
+      assert_includes job.fetch('if').to_s, "github.event_name == 'workflow_dispatch'",
+                      "#{base}: heavy job must only run on workflow_dispatch"
+      refute_includes File.read(path), 'issue_comment',
+                      "#{base}: heavy caller must not mention issue_comment"
+    end
+  end
+
+  def test_pr_agent_router_validates_and_dispatches_exact_head
+    router = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent-router.yml'))
+    # The router validates PR membership, owner-gated actor/policy, and the
+    # actionable command before any dispatch.
+    assert_includes router, '!issue.pull_request',
+                    'router must validate the event belongs to a pull request'
+    assert_includes router, 'context.actor !== context.repo.owner',
+                    'router must validate the actor is allowed'
+    assert_includes router, '/\/review\b/',
+                    'router must validate an actionable /review command'
+    assert_includes router, "!== 'pr-agent'",
+                    'router must validate the review provider policy'
+    # Non-actionable comments exit without dispatching.
+    assert_includes router, 'no actionable /review command',
+                    'ordinary comments must exit without dispatching'
+    # The heavy workflow is dispatched with an explicit PR number and the
+    # exact current HEAD.
+    assert_includes router, 'expected_head_sha',
+                    'router must dispatch the heavy workflow with the exact HEAD'
+    assert_includes router, 'createWorkflowDispatch',
+                    'router must dispatch the heavy workflow via the API'
+    assert_includes router, 'pr.head.sha',
+                    'router must resolve the exact current HEAD from the PR'
+    # Duplicate signals for the same logical operation key are coalesced.
+    assert_includes router, 'review:',
+                    'router must key duplicate detection on the logical operation'
+    assert_includes router, 'already active',
+                    'router must coalesce duplicate exact-HEAD dispatches'
+    assert_includes router, 'coalesced a duplicate dispatch',
+                    'router must log coalesced duplicates instead of dispatching'
+    # The router never enters the heavy scheduling path.
+    assert_includes router, 'pr-agent-router-',
+                    'router must use its own concurrency group, not the heavy one'
+    refute_includes router, 'group: pr-agent-${',
+                    'router must not share the heavy concurrency group'
+    refute_includes router, 'group: pr-agent-caller-',
+                    'router must not share the heavy caller concurrency group'
+  end
+
+  def test_pr_agent_router_wiring_for_entries_and_consumers
+    # The self-hosted entry routes issue_comment through the reusable router
+    # with the local heavy workflow as the dispatch target.
+    entry = yaml(File.join(ROOT, '.github/workflows/pr-agent-router.yml'))
+    assert_includes events(entry).keys, 'issue_comment',
+                    'router entry must subscribe to issue_comment'
+    assert_includes events(entry).keys, 'workflow_dispatch',
+                    'router entry must keep an explicit manual dispatch path'
+    entry_job = entry.fetch('jobs').fetch('call')
+    assert_includes entry_job.fetch('uses'), 'continuum-pr-agent-router.yml'
+    assert_includes entry_job.fetch('with').fetch('review_workflow'), 'pr-agent.yml'
+    # The consumer stub mirrors the entry and calls the same reusable.
+    stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-pr-agent-router.yml'))
+    assert_includes events(stub).keys, 'issue_comment',
+                    'router stub must subscribe to issue_comment'
+    assert_equal entry.fetch('name').sub(' entry', ''), stub.fetch('name'),
+                 'router stub and reusable must share one workflow identity'
+    stub_job = stub.fetch('jobs').fetch('call')
+    assert_includes stub_job.fetch('uses'), 'continuum-pr-agent-router.yml@main'
   end
 
   # The free default model must be the single documented fallback everywhere an
@@ -2927,7 +3113,7 @@ class ContinuumTest < Minitest::Test
       pause_marker max_dispatch_attempts base_ref knowledge_protocol_path
       knowledge_records_dir issue_commit_prefix
       pause_marker max_dispatch_attempts pause_on_failure ci_repair_label
-      packaging_repair_label
+      packaging_repair_label capability_number qualification_number required_sha
     ],
     'continuum-opencode-repair.yml' => %w[
       continuum_ref pr_number head_sha conclusion run_id ci_repair_label
@@ -2941,6 +3127,9 @@ class ContinuumTest < Minitest::Test
     ],
     'continuum-pr-agent.yml' => %w[
       continuum_ref pr_number expected_head_sha retry_attempt retry_workflow recovery_kind
+    ],
+    'continuum-pr-agent-router.yml' => %w[
+      continuum_ref review_workflow review_provider pr_number
     ],
     'continuum-pr-agent-repair.yml' => %w[
       continuum_ref pr_number head_sha review_json improve_jsonl
@@ -4535,6 +4724,86 @@ class ContinuumTest < Minitest::Test
     cli = File.read(File.join(ROOT, '.github/scripts/qualification_gate.py'))
     assert_includes cli, 'from continuum.qualification import',
                     'the CLI must delegate to the canonical gate, not reimplement it'
+  end
+
+  # kodmial/continuum#214: mandatory qualification evidence must be
+  # trustworthy and executable without code changes. Each behavior below is
+  # asserted on the code that acts on it.
+  def test_mandatory_qualification_evidence_is_trusted_and_executable
+    scheduler = workflow_body('continuum-issue-scheduler.yml')
+    opencode = File.read(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
+    engine = File.read(File.join(ROOT, 'src/continuum/qualification.py'))
+    stub = File.read(File.join(ROOT, '.github/caller-stubs/continuum-issue-scheduler.yml'))
+    cli = File.read(File.join(ROOT, '.github/scripts/qualification_gate.py'))
+
+    # Evidence integrity: dispatch prose never counts, only trusted actors
+    # count, exact SHA and issue number remain mandatory, latest trusted wins.
+    assert_includes scheduler, 'TRUSTED_AUTHOR_ASSOCIATIONS'
+    assert_includes scheduler, 'isTrustedQualificationComment'
+    assert_includes scheduler, 'if (commentHasDispatchMarker(body)) continue;'
+    refute_includes scheduler, 'Qualification must publish `<!-- continuum-qualification-result',
+                    'the dispatch note must never embed a parseable result marker'
+    assert_includes engine, 'TRUSTED_AUTHOR_ASSOCIATIONS'
+    assert_includes engine, 'def is_trusted_comment'
+    assert_includes engine, 'if contains_dispatch_marker(body):'
+
+    # Merge-gated start: a bare relation never synthesizes current main, open
+    # blockers wait, and only the merge transition records the first SHA.
+    assert_includes scheduler, 'waiting for the merge transition.'
+    assert_includes scheduler, "return 'no-required-sha';"
+    assert_includes scheduler, "return 'blocked-waiting';"
+    assert_includes engine, 'def should_start_qualification'
+    assert_includes engine, 'no-required-sha'
+
+    # Exact dispatch identity: immutable triple into the run, no retarget by a
+    # later dispatch, duplicates coalesce per SHA, exact SHA fetched by SHA.
+    assert_includes scheduler, "mode: 'qualification',"
+    assert_includes scheduler, 'capability_number: String(capabilityNumber),'
+    assert_includes scheduler, 'required_sha: sha,'
+    assert_includes opencode, "inputs.mode == 'qualification'"
+    assert_includes opencode, 'git fetch origin "$REQUIRED_SHA" --depth 1'
+    assert_includes opencode, 'already-started SHA-A run'
+    assert_includes engine, 'def qualification_run_identity'
+    assert_includes engine, 'def dispatch_matches_run'
+
+    # Qualification execution mode: validate, forbid changes, require one
+    # marker, never close, no-code with evidence succeeds, missing evidence
+    # fails closed recoverably, fail routes to repair.
+    assert_includes opencode, 'Run mandatory qualification at the exact required SHA'
+    assert_includes opencode, 'Qualification mode produced repository changes, which are forbidden'
+    assert_includes opencode, 'leaving the qualification issue open for the scheduler'
+    assert_includes opencode, 'will be retried automatically with the same run identity'
+    assert_includes engine, 'def evaluate_qualification_run'
+    assert_includes engine, 'qualification-mode-cannot-push-product-changes'
+
+    # Recovery stays autonomous: qualification never terminally pauses.
+    assert_includes opencode, 'never terminally paused'
+    assert_includes opencode, 'isQualificationRun'
+    assert_includes engine, 'def qualification_needs_retry'
+    assert_includes engine, 'def next_qualification_retry_delay_seconds'
+
+    # Repair handoff carries the exact failure evidence and refreshes stale bodies.
+    assert_includes scheduler, 'latestTrustedEvidenceBody'
+    assert_includes scheduler, 'Refreshed repair issue #'
+    assert_includes engine, 'def repair_issue_body'
+    assert_includes engine, 'def repair_body_needs_refresh'
+
+    # Event completeness: the consumer caller wakes on result comments while
+    # cron remains the backstop.
+    assert_includes stub, "contains(github.event.comment.body, 'continuum-qualification-result')"
+    assert_includes stub, "contains(github.event.comment.body, 'continuum-docker-qualification-result')"
+    assert_includes stub, "contains(github.event.comment.body, 'continuum-render-qualification-result')"
+    assert_includes stub, 'schedule:'
+    # Trust hardening: result-marker wakes are gated on repository trust so a
+    # public forgery cannot burn Actions minutes; automation evidence reads
+    # user.login (the issue-comments API shape); dispatch trust is checked in
+    # JS; untracked droppings are discarded before the clean-tree verdict.
+    assert_includes stub, "github.event.comment.author_association == 'OWNER'"
+    assert_includes stub, "github.actor == 'github-actions[bot]'"
+    assert_includes opencode, '.user.login == "github-actions[bot]"'
+    assert_includes opencode, 'isTrustedDispatchComment'
+    assert_includes opencode, '--untracked-files=no'
+    assert_includes cli, '--author-association'
   end
 
   end

@@ -63,6 +63,7 @@ CORE_STUBS=(
   continuum-pr-agent-recovery.yml
   continuum-pr-agent.yml
   continuum-pr-agent-repair.yml
+  continuum-pr-agent-router.yml
   continuum-pr-agent-auto-merge.yml
   continuum-remove-review-label.yml
   continuum-render-executor.yml

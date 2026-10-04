@@ -11,7 +11,7 @@ Usage (body via argument, file, or stdin)::
     qualification_gate.py refs --body '...'
     qualification_gate.py refs --body-file issue.md --self 182
     qualification_gate.py has-closing-keyword --body 'Fixes #182' --issue 182
-    qualification_gate.py evidence-state --body-file comment.md --issue 184 --sha <40-hex>
+    qualification_gate.py evidence-state --body-file comment.md --issue 184 --sha <40-hex> --author-association OWNER --author-login owner
     gh api ... --jq .body | qualification_gate.py refs
 
 ``refs`` prints one qualification issue number per line (nothing when the
@@ -19,6 +19,10 @@ body declares none) and always exits 0. ``has-closing-keyword`` and
 ``has-refs`` print ``true``/``false`` and always exit 0.
 ``evidence-state`` prints ``pass``, ``fail``, or ``unknown`` and always
 exits 0. ``required-sha`` prints the latest required main SHA or nothing.
+``evidence-state`` evaluates a single comment with caller-attested authorship:
+pass ``--author-association``/``--author-login`` from the comment API object;
+a bare body without trusted attestation fails closed to ``unknown`` so a
+public forgery can never count as evidence.
 Any usage or I/O failure is reported as ``::error::`` with exit 2.
 
 Standard library only, so it runs on stock ``ubuntu-latest`` runners without
@@ -90,7 +94,18 @@ def _cmd_required_sha(args) -> int:
 
 
 def _cmd_evidence_state(args) -> int:
-    print(qualification_evidence_state([_read_body(args)], args.issue, args.sha))
+    # A bare body string predates author metadata and the engine treats it
+    # as trusted for backward compatibility, so live callers must never
+    # reduce untrusted comments to bodies here. Build a structured comment
+    # so public forgeries fail closed unless the caller explicitly attests
+    # trusted authorship via --author-association/--author-login.
+    comment = {
+        "body": _read_body(args),
+        "author_association": args.author_association,
+        "user": {"login": args.author_login},
+        "author": {"login": args.author_login},
+    }
+    print(qualification_evidence_state([comment], args.issue, args.sha))
     return 0
 
 
@@ -135,6 +150,16 @@ def build_parser() -> argparse.ArgumentParser:
     _add_body_options(evidence)
     evidence.add_argument("--issue", required=True, help="Qualification issue number.")
     evidence.add_argument("--sha", required=True, help="Required 40-hex main SHA.")
+    evidence.add_argument(
+        "--author-association",
+        default="NONE",
+        help="Comment author_association attested by the caller (OWNER/MEMBER/COLLABORATOR trusted).",
+    )
+    evidence.add_argument(
+        "--author-login",
+        default="",
+        help="Comment author login attested by the caller (github-actions[bot] trusted for automation payloads).",
+    )
     evidence.set_defaults(func=_cmd_evidence_state)
 
     return parser
