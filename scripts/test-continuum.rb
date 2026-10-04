@@ -35,6 +35,133 @@ class ContinuumTest < Minitest::Test
     File.read(File.join(ROOT, '.github/workflows', name))
   end
 
+  # The code portion of a workflow line with `#` comments stripped (mirrors
+  # the Python worktree contract `_code_without_comment`). Only a `#`
+  # outside single/double quotes starts a comment, so a quoted `#` is
+  # preserved while a trailing comment is not code. Comment-only lines
+  # yield an empty string and never count as installer/probe/gated/hit
+  # evidence.
+  def code_without_comment(line)
+    in_single = false
+    in_double = false
+    line.each_char.with_index do |char, index|
+      if char == "'" && !in_double
+        in_single = !in_single
+      elsif char == '"' && !in_single
+        in_double = !in_double
+      elsif char == '#' && !in_single && !in_double
+        return line[0...index]
+      end
+    end
+    line
+  end
+
+  # An installer site: any executable line that downloads or installs the
+  # agent runtime. New bootstrap channels (npm/brew/curl of a release asset
+  # or GitHub release) count alongside the canonical installer URL and pip
+  # installs, so an unprobed installer cannot pass coverage by using a new
+  # channel while the expected site count still matches. Shell-aware like
+  # the Python worktree contract: one `run:` line is split into
+  # `;`/`&&`/`||`/`|` segments outside quotes, and `echo`/`printf` docs
+  # segments that merely mention an installer URL are not executable sites
+  # (though other segments on the same line still count).
+  def shell_segments(code)
+    segments = []
+    current = +''
+    in_single = false
+    in_double = false
+    index = 0
+    while index < code.length
+      char = code[index]
+      if char == "'" && !in_double
+        in_single = !in_single
+        current << char
+      elsif char == '"' && !in_single
+        in_double = !in_double
+        current << char
+      elsif !in_single && !in_double
+        two = code[index, 2]
+        if char == ';'
+          segments << current
+          current = +''
+        elsif two == '&&' || two == '||'
+          segments << current
+          current = +''
+          index += 1
+        elsif char == '|'
+          segments << current
+          current = +''
+        else
+          current << char
+        end
+      else
+        current << char
+      end
+      index += 1
+    end
+    segments << current
+    segments
+  end
+
+  def echo_segment?(segment)
+    segment.match?(/^\s*(sudo\s+)?(echo|printf)\b/)
+  end
+
+  def segment_installer?(segment)
+    return true if segment.include?('https://opencode.ai/install')
+    if segment.include?('pip install') || segment.include?('pip3 install')
+      return true if segment.include?('pr-agent') || segment.include?('opencode')
+    end
+    if segment.include?('pipx install')
+      return true if segment.include?('pr-agent') || segment.include?('opencode')
+    end
+    if segment.include?('uv tool install')
+      return true if segment.include?('pr-agent') || segment.include?('opencode')
+    end
+    if segment.include?('uv pip install')
+      return true if segment.include?('pr-agent') || segment.include?('opencode')
+    end
+    if segment.include?('cargo install')
+      return true if segment.include?('pr-agent') || segment.include?('opencode')
+    end
+    if segment.include?('npm install') || segment.include?('npm i ') || segment.include?('npm ci')
+      return true if segment.include?('opencode')
+    end
+    return true if segment.include?('brew install') && segment.include?('opencode')
+    if segment.include?('curl') || segment.include?('wget')
+      return true if segment.include?('releases/download')
+      return true if segment.include?('github.com') && segment.include?('releases')
+      if segment.include?('opencode')
+        return true if segment.include?('.tar.gz') || segment.include?('.zip') || segment.include?('download')
+      end
+    end
+    return true if segment.include?('gh release download') && segment.include?('opencode')
+
+    segment.include?('releases/download') && segment.include?('opencode')
+  end
+
+  def installer_site?(code)
+    executable = shell_segments(code).reject { |segment| echo_segment?(segment) }
+    return false if executable.empty?
+
+    executable.any? { |segment| segment_installer?(segment) }
+  end
+
+  # A write to the image-digest stamp in any spelling: `>`/`>>` redirects
+  # to $STAMP_FILE (quoted, unquoted, or braced) or to the literal
+  # image-digest path, and tee/cp/install/dd/mv writes targeting the
+  # stamp. The probe's own `>/dev/null` redirects, the
+  # `$(cat "$STAMP_FILE")` stamp read, and the `STAMP_FILE=` assignment
+  # never match because the redirect/command target must be the stamp
+  # itself.
+  def stamp_write?(code)
+    return true if code.match?( />+\s*["']?\$[{'"]?STAMP_FILE/ )
+    return true if code.match?( />+\s*["']?(?:~|\$?\{?HOME\}?)\/[^#\n]*image-digest/ )
+    return true if code.match?( /\btee\b[^#\n]*(STAMP_FILE|image-digest)/ )
+
+    code.match?( /\b(cp|install|dd|mv)\b[^#\n]*(STAMP_FILE|image-digest)/ )
+  end
+
   # Only the embedded `script: |` block. Assertions about *engine* literals must
   # not see the `workflow_call.inputs` defaults, which legitimately name the
   # same values as the fallback chain.
@@ -2211,6 +2338,15 @@ class ContinuumTest < Minitest::Test
                     'router needs least-privilege Actions write for workflow_dispatch'
     assert_includes router, 'github-token: ${{ github.token }}',
                     'router must authenticate reads and dispatch with GITHUB_TOKEN'
+    # The shared user PAT is permitted in exactly one place: the
+    # constrained dispatch-only fallback inherited below (permission-denied
+    # 403 only, single workflow_dispatch mutation, never on rate limits).
+    # Every other TAP_PAT consumption stays banned.
+    router_without_dispatch_fallback = router.gsub(
+      'FALLBACK_DISPATCH_TOKEN: ${{ secrets.TAP_PAT }}', ''
+    )
+    refute_includes router_without_dispatch_fallback, 'secrets.TAP_PAT',
+                    'router must not consume the shared user PAT outside the constrained dispatch fallback'
     assert_includes router, 'github.rest.pulls.get(',
                     'PR metadata read must use repository token'
     assert_includes router, 'github.rest.actions.listWorkflowRuns(',
@@ -3393,7 +3529,7 @@ class ContinuumTest < Minitest::Test
     # No paid provider key may be presented as part of the contract. The rule
     # is that no workflow reads one, so naming one in the table would invite a
     # consumer to define a credential nothing consumes.
-    %w[OPENCODE_API_KEY ANTHROPIC_API_KEY GROQ_API_KEY].each do |key|
+    %w[OPENCODE_API_KEY ANTHROPIC_API_KEY GROQ_API_KEY GROQ.KEY].each do |key|
       WORKFLOWS.each do |path|
         refute_includes File.read(path), "secrets.#{key}",
                         "#{File.basename(path)} reads a paid provider key, which the no-paid-provider rule forbids"
@@ -5900,6 +6036,327 @@ class ContinuumTest < Minitest::Test
     cli = File.read(File.join(ROOT, '.github/scripts/qualification_gate.py'))
     assert_includes cli, 'from continuum.qualification import',
                     'the CLI must delegate to the canonical gate, not reimplement it'
+  end
+
+  # kodmial/continuum#179: agent execution is fast from a warm image/cache,
+  # never from warm compute. Every OpenCode/PR-Agent install site probes the
+  # prepared agent runtime first (exact pinned versions + image digest) and
+  # only reconstructs deterministically on a validated cache miss, so normal
+  # (warm) execution performs zero bootstrap downloads. The probe must come
+  # BEFORE the first installer line: a probe after the download proves
+  # nothing about the warm path.
+  def test_agent_runtime_probe_precedes_bootstrap_install
+    {
+      'continuum-opencode.yml' => %w[1.18.34],
+      'continuum-pr-agent.yml' => %w[1.18.34 0.46.0],
+      'continuum-pr-agent-repair.yml' => %w[1.18.34],
+      'continuum-coderabbit-unresolved.yml' => %w[1.18.34],
+      'continuum-consumer-child-worker.yml' => %w[1.18.34],
+      'continuum-consumer-child-review.yml' => %w[1.18.34],
+      'continuum-consumer-child-pr-review.yml' => %w[1.18.34],
+    }.each do |name, pins|
+      body = workflow_body(name)
+      lines = body.lines
+      assert_includes body, 'command -v opencode',
+                      "#{name}: the prepared-runtime probe must check for the preinstalled CLI"
+      assert_includes body.downcase, 'prepared agent runtime',
+                      "#{name}: the install site must name the prepared agent runtime it probes"
+      assert_includes body, 'CONTINUUM_IMAGE_DIGEST',
+                      "#{name}: the probe must key on the immutable image digest"
+      assert_includes body, 'vars.CONTINUUM_IMAGE_DIGEST',
+                      "#{name}: the image digest must be wired from the repository variable into the shell"
+      pins.each do |pin|
+        assert_includes body, pin, "#{name}: the exact pinned version #{pin} must be enforced"
+      end
+      # Every installer site (not just the first) must sit behind a probe:
+      # each line that downloads or pip-installs the runtime must have an
+      # executable probe (`command -v opencode` / `pr-agent --version`) on
+      # an earlier line, and the warm hit must be digest-gated (a line
+      # carrying both the CONTINUUM_IMAGE_DIGEST gate and a real probe) so
+      # an empty or malformed digest cannot take the hit path and skip the
+      # install. Format-only validation is not identity enforcement.
+      # Comment portions never count: a `#`-leading line (or the `#`
+      # comment tail of a code line) mentioning an installer URL is not an
+      # installer site, and a comment mentioning a probe or
+      # `prepared-runtime hit` is not executable evidence.
+      code_lines = lines.map { |line| code_without_comment(line) }
+      installer_lines = code_lines.each_index.select do |i|
+        installer_site?(code_lines[i])
+      end
+      refute_empty installer_lines, "#{name}: the deterministic reconstruction fallback is missing"
+      probe_lines = code_lines.each_index.select do |i|
+        code_lines[i].include?('command -v opencode') || code_lines[i].include?('pr-agent --version')
+      end
+      refute_empty probe_lines, "#{name}: no executable prepared-runtime probe found"
+      gated_lines = code_lines.each_index.select do |i|
+        code_lines[i].include?('CONTINUUM_IMAGE_DIGEST') &&
+          (code_lines[i].include?('command -v opencode') || code_lines[i].include?('pr-agent --version'))
+      end
+      refute_empty gated_lines, "#{name}: the warm hit must be keyed by the image digest (no digest-gated probe line)"
+      assert_match(/CONTINUUM_IMAGE_DIGEST.*=~\s*\^\[0-9a-f\]\{64\}\$/, body,
+                   "#{name}: the digest gate must enforce the 64-char sha256 shape")
+      hit_lines = code_lines.each_index.select { |i| code_lines[i].include?('prepared-runtime hit') }
+      refute_empty hit_lines, "#{name}: a warm probe hit must be logged before any download"
+      # Per-site enforcement: every installer line needs its own
+      # probe-gated hit. Global minima are not enough: in a multi-site
+      # file the earlier site's probe would otherwise satisfy the check
+      # for a later installer whose own digest-gated probe was deleted.
+      # Each site spans (previous installer, installer): the site probe,
+      # digest-gated probe, hit log, and short-circuit must all sit inside
+      # it, ahead of that site's installer.
+      installer_lines.each do |at|
+        prev = installer_lines.select { |i| i < at }.max || -1
+        site_probes = probe_lines.select { |i| i > prev && i < at }
+        assert_operator site_probes.size, :>, 0,
+                        "#{name}: line #{at + 1} installs the runtime without a preceding probe in its own site (warm path downloads nothing)"
+        site_gated = gated_lines.select { |i| i > prev && i < at }
+        assert_operator site_gated.size, :>, 0,
+                        "#{name}: line #{at + 1} has no digest-gated probe in its own site"
+        site_hits = hit_lines.select { |i| i > prev && i < at }
+        assert_operator site_hits.size, :>, 0,
+                        "#{name}: line #{at + 1} has no prepared-runtime hit in its own site before the installer"
+        # The hit path must actually short-circuit the download: exit-0 style
+        # steps stop before the installer, if/else (consumer-child) steps
+        # skip the download branch on a hit. The comparison runs on the
+        # comment-stripped code so a semantically identical
+        # `exit 0 # warm hit` or `else # cache hit` still matches.
+        if name.start_with?('continuum-consumer-child-')
+          else_between = code_lines.each_index.any? do |i|
+            code_lines[i].strip == 'else' && i > site_hits.min && i < at
+          end
+          assert else_between,
+                 "#{name}: line #{at + 1} warm hit branch must skip the download via if/else (no fall-through install)"
+        else
+          exit_between = code_lines.each_index.any? do |i|
+            code_lines[i].strip == 'exit 0' && i > site_hits.min && i < at
+          end
+          assert exit_between,
+                 "#{name}: line #{at + 1} warm hit must short-circuit with exit 0 before any download"
+        end
+      end
+    end
+
+    pr_agent = workflow_body('continuum-pr-agent.yml')
+    pr_lines = pr_agent.lines
+    pr_code = pr_lines.map { |line| code_without_comment(line) }
+    pip_lines = pr_code.each_index.select { |i| pr_code[i].include?('pip install') && pr_code[i].include?('pr-agent') }
+    refute_empty pip_lines, 'continuum-pr-agent.yml: the pinned PR-Agent reconstruction is missing'
+    version_probes = pr_code.each_index.select { |i| pr_code[i].include?('pr-agent --version') }
+    refute_empty version_probes, 'continuum-pr-agent.yml: the PR-Agent prepared-runtime probe is missing'
+    pip_lines.each do |at|
+      prev_pip = pip_lines.select { |i| i < at }.max || -1
+      site_probes = version_probes.select { |i| i > prev_pip && i < at }
+      assert_operator site_probes.size, :>, 0,
+                      'continuum-pr-agent.yml: the PR-Agent probe must precede every pip install in its own site'
+    end
+    assert_includes pr_agent, '0.46.0', 'continuum-pr-agent.yml: the exact pinned PR-Agent version must be enforced'
+  end
+
+  # kodmial/continuum#179: strict ephemeral profiles keep zero live idle
+  # instances and one job per instance. No workflow may pool warm runners or
+  # pin a persistent egress identity between jobs, and no paid-provider key
+  # may appear in the agent execution path.
+  def test_agent_execution_has_no_warm_pool_or_paid_provider_key
+    %w[
+      continuum-opencode.yml
+      continuum-pr-agent.yml
+      continuum-pr-agent-repair.yml
+      continuum-coderabbit-unresolved.yml
+      continuum-consumer-child-worker.yml
+      continuum-consumer-child-review.yml
+      continuum-consumer-child-pr-review.yml
+    ].each do |name|
+      body = workflow_body(name)
+      # Comment portions never count: an explanatory comment naming a key
+      # to document the prohibition must not fail the check; only
+      # executable code reading the key is forbidden.
+      code_body = body.lines.map { |line| code_without_comment(line) }.join
+      %w[OPENCODE_API_KEY ANTHROPIC_API_KEY GROQ_API_KEY GROQ.KEY].each do |key|
+        refute_includes code_body, key, "#{name}: core execution must never read a paid provider key"
+      end
+      refute_match(/idle_instances:\s*["']?[1-9]\d*/, body,
+                   "#{name}: strict profiles keep zero live idle instances")
+      refute_match(/max_uses_per_instance:\s*["']?(0|[2-9]\d*|1\d+)/, body,
+                   "#{name}: one instance may execute exactly one job")
+    end
+
+    engine_path = File.join(ROOT, 'src/continuum/agent_runtime.py')
+    assert File.exist?(engine_path),
+           'src/continuum/agent_runtime.py must exist: the engine is the asserted strict-profile and live-qualification source of truth'
+    harness_path = File.join(ROOT, 'tests/test_agent_runtime.py')
+    assert File.exist?(harness_path),
+           'tests/test_agent_runtime.py must exist: docs claim it as the deterministic qualification harness'
+    engine = File.read(engine_path)
+    assert_includes engine, 'STRICT_MAX_USES_PER_INSTANCE = 1'
+    assert_includes engine, 'STRICT_IDLE_INSTANCES = 0'
+    # Positive proof: the refutes above pass vacuously when neither key is
+    # present (the github-hosted workflows declare no such keys), so the
+    # engine must be proven to declare and enforce the strict values.
+    assert_match(/["']max_uses_per_instance["']\s*:\s*1\b/, engine,
+                 'engine strict profiles must declare max_uses_per_instance: 1')
+    assert_match(/["']idle_instances["']\s*:\s*0\b/, engine,
+                 'engine strict profiles must declare idle_instances: 0')
+    assert_match(/if idle_number != STRICT_IDLE_INSTANCES/, engine,
+                 'engine must reject any idle_instances other than zero')
+    assert_match(/if max_uses_number != STRICT_MAX_USES_PER_INSTANCE/, engine,
+                 'engine must reject any max_uses_per_instance other than one')
+    assert_includes engine, 'idle_instances={} is rejected',
+                    'engine must fail explicitly on non-zero idle_instances'
+    assert_includes engine, 'one instance may execute exactly one job',
+                    'engine must fail explicitly on non-single max_uses_per_instance'
+    assert_includes engine, 'def live_qualification_evidence'
+    assert_includes engine, 'ip_equality_is_not_failure'
+  end
+
+  # kodmial/continuum#179: the prepared-runtime repository variables are a
+  # documented consumer contract. CONTINUUM_IMAGE_DIGEST keys the immutable
+  # image digest probed on the warm path; CONTINUUM_RUNTIME_PRESET selects
+  # the strict ephemeral preset; CONTINUUM_RUNTIME_PROVIDER selects the
+  # provider backend. They are repository variables (vars context), not
+  # reusable-workflow inputs, so no caller stub carries them; this test is
+  # the contract that keeps docs, engine presets/providers, and workflows
+  # in agreement.
+  def test_agent_runtime_variables_are_documented
+    docs = File.read(File.join(ROOT, 'docs/consumer-variables.md'))
+    engine_path = File.join(ROOT, 'src/continuum/agent_runtime.py')
+    assert File.exist?(engine_path),
+           'src/continuum/agent_runtime.py must exist: the preset/provider contract is asserted on it'
+    engine = File.read(engine_path)
+    %w[CONTINUUM_IMAGE_DIGEST CONTINUUM_RUNTIME_PRESET CONTINUUM_RUNTIME_PROVIDER].each do |name|
+      assert_includes docs, name, "docs/consumer-variables.md must document #{name}"
+    end
+    assert_includes engine, 'agent-linux', 'engine must define the agent-linux preset'
+    assert_includes engine, 'github-hosted', 'engine must support the github-hosted provider'
+    assert_includes engine, 'resolve_profile_from_env',
+                     'engine must resolve the preset/provider repository variables'
+    assert_includes engine, 'CONTINUUM_RUNTIME_PRESET',
+                     'engine must read CONTINUUM_RUNTIME_PRESET (not just document it)'
+    assert_includes engine, 'CONTINUUM_RUNTIME_PROVIDER',
+                     'engine must read CONTINUUM_RUNTIME_PROVIDER (not just document it)'
+    assert_includes engine, 'DEFAULT_RUNTIME_PRESET',
+                     'engine must define the preset default for CONTINUUM_RUNTIME_PRESET'
+    assert_includes engine, 'DEFAULT_RUNTIME_PROVIDER',
+                     'engine must define the provider default for CONTINUUM_RUNTIME_PROVIDER'
+    body = workflow_body('continuum-opencode.yml')
+    assert_includes body, 'CONTINUUM_IMAGE_DIGEST',
+                    'continuum-opencode.yml: the probe must key on the immutable image digest'
+  end
+
+  # kodmial/continuum#179: golden-image provenance and per-profile digests.
+  # The literal-path branch of `stamp_write?` must catch a self-stamp via a
+  # literal redirect (`> $HOME/.opencode/image-digest`,
+  # `>> ~/.opencode/image-digest`) exactly like the `$STAMP_FILE` redirects
+  # and tee/cp writes, so a deterministic-reconstruction step can never pass
+  # the no-self-stamp provenance check by spelling the stamp literally.
+  def test_stamp_write_catches_literal_redirect_spellings
+    assert stamp_write?('echo "$digest" > $HOME/.opencode/image-digest'),
+           'literal `> $HOME/.opencode/image-digest` redirect must count as a stamp write'
+    assert stamp_write?('echo "$digest" >> ~/.opencode/image-digest'),
+           'literal `>> ~/.opencode/image-digest` redirect must count as a stamp write'
+    assert stamp_write?('echo "$digest" > "${HOME}/.opencode/image-digest"'),
+           'braced literal redirect must count as a stamp write'
+    assert stamp_write?('echo "$digest" > $STAMP_FILE'),
+           '$STAMP_FILE redirect must count as a stamp write'
+    assert stamp_write?('echo "$digest" | tee "$STAMP_FILE" >/dev/null'),
+           'tee write must count as a stamp write'
+    assert stamp_write?('cp /tmp/digest "$STAMP_FILE"'),
+           'cp write must count as a stamp write'
+    refute stamp_write?('opencode --version >/dev/null'),
+           'probe `>/dev/null` redirect must not count as a stamp write'
+    refute stamp_write?('if [ "$(cat "$STAMP_FILE")" = "$digest" ]; then'),
+           'stamp read must not count as a stamp write'
+    refute stamp_write?('STAMP_FILE="$HOME/.opencode/image-digest"'),
+           'STAMP_FILE assignment must not count as a stamp write'
+  end
+
+  # kodmial/continuum#179: golden-image provenance and per-profile digests.
+  # Only a validated image build (or a provider cache restore of it) may
+  # create the image-digest stamp, so deterministic reconstruction never
+  # self-stamps; and the content-addressed digest is per profile, so the
+  # child worker takes one digest per profile job instead of a single
+  # global variable that a second promotion would evict.
+  def test_prepared_runtime_provenance_and_per_profile_digest
+    opencode = workflow_body('continuum-opencode.yml')
+    assert_includes opencode, 'never records the stamp',
+                    'continuum-opencode.yml: the no-self-stamp provenance rule must be documented at the install sites'
+
+    # Every agent-runtime workflow: deterministic reconstruction never
+    # self-stamps in any spelling (redirect, append, unquoted/braced
+    # path, literal image-digest path, or tee/cp/install/dd/mv write),
+    # so a just-downloaded binary can never masquerade as golden-image
+    # provenance on a backend that reuses filesystem state.
+    %w[
+      continuum-opencode.yml
+      continuum-pr-agent.yml
+      continuum-pr-agent-repair.yml
+      continuum-coderabbit-unresolved.yml
+      continuum-consumer-child-worker.yml
+      continuum-consumer-child-review.yml
+      continuum-consumer-child-pr-review.yml
+    ].each do |name|
+      code = workflow_body(name).lines.map { |line| code_without_comment(line) }
+      writes = code.select { |line| stamp_write?(line) }
+      assert_empty writes,
+                   "#{name}: deterministic reconstruction must never record the stamp: #{writes.inspect}"
+    end
+
+    worker = workflow_body('continuum-consumer-child-worker.yml')
+    worker_inputs = events(yaml(File.join(ROOT, '.github/workflows/continuum-consumer-child-worker.yml')))
+                        .fetch('workflow_call').fetch('inputs')
+    digest_input = worker_inputs.fetch('image_digest')
+    assert_equal 'string', digest_input.fetch('type')
+    assert_equal false, digest_input.fetch('required')
+    assert_equal '', digest_input.fetch('default'),
+                 'image_digest must default to empty so vars.CONTINUUM_IMAGE_DIGEST remains the fallback'
+    assert_includes digest_input.fetch('description').to_s, 'vars.CONTINUUM_IMAGE_DIGEST'
+    assert_includes worker, 'inputs.image_digest || vars.CONTINUUM_IMAGE_DIGEST',
+                    'continuum-consumer-child-worker.yml: the per-profile input must fall back to the repository variable'
+
+    # The review workflows run one job per profile too: they take the same
+    # per-profile input with the same repository-variable fallback so a
+    # second profile promotion cannot evict the first.
+    {
+      'continuum-consumer-child-review.yml' => 'continuum-child-review.yml',
+      'continuum-consumer-child-pr-review.yml' => 'continuum-child-pr-review.yml',
+    }.each do |workflow_name, stub_name|
+      body = workflow_body(workflow_name)
+      inputs = events(yaml(File.join(ROOT, '.github/workflows', workflow_name)))
+               .fetch('workflow_call').fetch('inputs')
+      review_digest = inputs.fetch('image_digest')
+      assert_equal 'string', review_digest.fetch('type')
+      assert_equal false, review_digest.fetch('required')
+      assert_equal '', review_digest.fetch('default'),
+                   "#{workflow_name}: image_digest must default to empty so vars.CONTINUUM_IMAGE_DIGEST remains the fallback"
+      assert_includes review_digest.fetch('description').to_s, 'vars.CONTINUUM_IMAGE_DIGEST'
+      assert_includes body, 'inputs.image_digest || vars.CONTINUUM_IMAGE_DIGEST',
+                      "#{workflow_name}: the per-profile input must fall back to the repository variable"
+
+      stub = yaml(File.join(ROOT, '.github/caller-stubs/parent', stub_name))
+      stub_with = nil
+      stub.fetch('jobs').each_value do |job|
+        stub_with = job['with'] if job['uses']
+      end
+      refute_nil stub_with, "the parent #{stub_name} stub must call the reusable workflow"
+      assert_equal '${{ inputs.image_digest || \'\' }}', stub_with['image_digest'],
+                   "the parent #{stub_name} stub must forward the digest as an explicit empty string when unset"
+    end
+
+    parent_stub = yaml(File.join(ROOT, '.github/caller-stubs/parent/continuum-child-worker.yml'))
+    parent_with = nil
+    parent_stub.fetch('jobs').each_value do |job|
+      parent_with = job['with'] if job['uses']
+    end
+    refute_nil parent_with, 'the parent child-worker stub must call the reusable workflow'
+    assert_equal '${{ inputs.image_digest || \'\' }}', parent_with['image_digest'],
+                 'the parent stub must pass the per-profile digest through to the reusable worker as an explicit empty string when unset'
+
+    engine = File.read(File.join(ROOT, 'src/continuum/agent_runtime.py'))
+    assert_includes engine, 'def execute_manifest_probes',
+                    'engine must execute (not synthesize) the declared version probes at build time'
+    assert_includes engine, 'executed_probes',
+                    'engine must record an explicit probe-execution record distinct from SBOM/provenance version strings'
+    assert_includes engine, 'image carries no executed probe record',
+                    'engine must refuse to serve a generation with echoed metadata but no probe execution'
   end
 
   # kodmial/continuum#214: mandatory qualification evidence must be

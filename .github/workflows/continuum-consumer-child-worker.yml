@@ -26,6 +26,11 @@ on:
         type: string
         required: false
         default: main
+      image_digest:
+        description: Per-profile prepared-image digest for this worker's runtime profile. Takes precedence over the vars.CONTINUUM_IMAGE_DIGEST repository variable when set; multi-profile consumers pass one digest per profile job.
+        type: string
+        required: false
+        default: ''
     secrets:
       CHILD_RUNTIME_TOKEN:
         required: true
@@ -80,6 +85,8 @@ jobs:
 
       - name: Execute child task
         shell: bash
+        env:
+          CONTINUUM_IMAGE_DIGEST: ${{ inputs.image_digest || vars.CONTINUUM_IMAGE_DIGEST }}
         run: |
           set -euo pipefail
           [[ "$TASK_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::Invalid task number."; exit 2; }
@@ -111,8 +118,48 @@ jobs:
           git switch -c "$branch" origin/main >/dev/null 2>&1
           base_sha="$(git rev-parse HEAD)"
 
+          # Continuum #179 prepared agent runtime: the immutable golden image
+          # (or its provider-native cache equivalent) already carries pinned
+          # OpenCode 1.18.34. The warm hit below is keyed by the image digest
+          # in CONTINUUM_IMAGE_DIGEST (wired from the repository variable):
+          # only a set, well-formed digest plus `command -v opencode` and the
+          # exact version takes the hit path with zero downloads. A cache
+          # failure (empty or malformed digest) falls back to deterministic
+          # reconstruction below, never failing closed. The digest is bound
+          # to the runtime by the image-digest stamp
+          # ($HOME/.opencode/image-digest) recorded by the validated image
+          # build: a stale or unrelated
+          # opencode 1.18.34 binary whose stamp does not match the digest
+          # cannot take the hit path. Deterministic reconstruction below
+          # never records the stamp, so a later job cannot take the warm
+          # path from a reconstruction self-stamp.
+          # The digest is content-addressed per runtime profile (Continuum
+          # ref, profile digest including os/arch, base image, toolchain):
+          # the `image_digest` input carries the digest for this worker's
+          # profile (ubuntu-latest / linux-x64 here) and falls back to the
+          # `vars.CONTINUUM_IMAGE_DIGEST` repository variable when unset.
+          # Multi-profile consumers pass one digest per profile job (each
+          # matrix leg wires its own profile digest into `image_digest`)
+          # instead of publishing a single global value that a second
+          # profile promotion would evict; per-job network
+          # attachment, JIT registration, single-use execution, teardown,
+          # and orphan reconciliation are owned by the Continuum
+          # provisioning path, whose warm-with-zero-idle qualification is
+          # recorded by the engine harness.
+          export PATH="$HOME/.opencode/bin:$PATH"
+          STAMP_FILE="$HOME/.opencode/image-digest"
+          if [[ -n "${CONTINUUM_IMAGE_DIGEST:-}" ]] && ! [[ "$CONTINUUM_IMAGE_DIGEST" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::warning::CONTINUUM_IMAGE_DIGEST is malformed; falling back to deterministic reconstruction."
+            CONTINUUM_IMAGE_DIGEST=""
+          fi
+          if [[ "${CONTINUUM_IMAGE_DIGEST:-}" =~ ^[0-9a-f]{64}$ ]] && [[ -f "$STAMP_FILE" ]] && [[ "$(cat "$STAMP_FILE")" == "$CONTINUUM_IMAGE_DIGEST" ]] && command -v opencode >/dev/null 2>&1 && opencode --version 2>&1 | grep -E -q "(^|[^0-9.])1\.18\.34([^0-9.]|$)"; then
+            echo "prepared-runtime hit: opencode 1.18.34 already present (image digest ${CONTINUUM_IMAGE_DIGEST} validated against ${STAMP_FILE})."
+          else
           for attempt in 1 2 3; do
-            if curl -fsSL https://opencode.ai/install | bash >/dev/null 2>&1; then
+            if curl -fsSL --retry 3 --retry-delay 2 https://opencode.ai/install | bash -s -- --version 1.18.34 >/dev/null 2>&1; then
+              # Deterministic reconstruction never records the stamp: only
+              # the validated image build (or a provider cache restore of
+              # it) proves golden-image provenance.
               break
             fi
             if [[ "$attempt" -eq 3 ]]; then
@@ -121,8 +168,11 @@ jobs:
             fi
             sleep $((attempt * 5))
           done
+          fi
           export PATH="$HOME/.opencode/bin:$PATH"
-          test -x "$HOME/.opencode/bin/opencode"
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+          command -v opencode >/dev/null 2>&1
+          opencode --version 2>&1 | grep -E -q "(^|[^0-9.])1\.18\.34([^0-9.]|$)"
 
           # Continuum's global OpenCode instructions, before the first pass.
           # The delegated worktree is a different repository from the parent,
