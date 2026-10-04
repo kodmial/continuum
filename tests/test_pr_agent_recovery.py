@@ -275,9 +275,13 @@ class RecoveryWiringTests(unittest.TestCase):
         self.assertIn("READ_GITHUB_TOKEN: ${{ github.token }}", body)
         self.assertIn("github-token: ${{ secrets.TAP_PAT }}", body)
         self.assertIn("const { getOctokit } = require('@actions/github')", body)
-        self.assertIn("const readGithub = getOctokit(readToken)", body)
+        self.assertIn("const readGithub = readToken ? getOctokit(readToken) : github", body)
+        self.assertIn("using PAT client for PR-Agent recovery reads", body)
+        self.assertIn("let readTokenUnavailable = false", body)
         self.assertIn("async function withReadFallback(fn)", body)
-        self.assertIn("err.status === 401 || err.status === 403", body)
+        self.assertIn("err.status ?? err.response?.status", body)
+        self.assertIn("status === 401 || status === 403 || status === 429", body)
+        self.assertIn("if (readTokenUnavailable || readGithub === github)", body)
 
         for read_call in (
             "client.rest.actions.listWorkflowRuns",
