@@ -109,6 +109,29 @@ jobs:
             const repoFullName = `${owner}/${repo}`;
             const AUTO_MERGE_BLOCK_LABEL = 'no-auto-merge';
             const CONFLICT_LOCK_LABEL = 'opencode-conflict-repair';
+            // Self-healing conflict recovery (issue #246). Every
+            // reconciliation pass rediscovers every open dirty PR, including
+            // PRs that turned dirty before the current wake. Dispatch is
+            // idempotent per PR + exact HEAD and bounded per HEAD; a stale
+            // lock with no active repair run is reconciled and redispatched,
+            // never left to strand the PR. Retry never applies
+            // `automation:paused` and never requires manual label removal.
+            const MAX_CONFLICT_DISPATCHES_PER_HEAD = 3;
+            const CONFLICT_DISPATCH_GRACE_MS = 10 * 60_000;
+            const ACTIVE_REPAIR_STATUSES = new Set([
+              'queued',
+              'in_progress',
+              'waiting',
+              'pending',
+              'requested',
+            ]);
+            const TRUSTED_COMMENT_ASSOCIATIONS = new Set([
+              'OWNER',
+              'MEMBER',
+              'COLLABORATOR',
+            ]);
+            const CONFLICT_MARKER_RE =
+              /<!--\s*continuum-conflict-repair\s+head=([0-9a-f]{7,64})\s+attempt=(\d+)\s*-->/gi;
             // CodeRabbit is an optional integration. When this project did not
             // ask for it, every CodeRabbit gate below is skipped and no
             // CodeRabbit workflow is ever dispatched: requiring an approval
@@ -1067,12 +1090,204 @@ jobs:
               return { ci, noopRelease };
             }
 
+            function resolveOpencodeWorkflow() {
+              // Conflict repair always dispatches the configured consumer
+              // OpenCode caller (Continuum dogfood: opencode.yml). The
+              // reusable engine file owns no workflow_dispatch trigger, so a
+              // hardcoded engine dispatch can never start a repair run.
+              const configured = String(
+                process.env.OPENCODE_WORKFLOW || 'continuum-opencode.yml'
+              ).trim();
+              if (!configured) {
+                throw new Error(
+                  'Conflict repair has no configured OpenCode caller workflow.'
+                );
+              }
+              if (
+                !configured.endsWith('.yml') ||
+                configured.includes('/') ||
+                configured.includes('\\') ||
+                configured.includes('..')
+              ) {
+                throw new Error(
+                  `Invalid OpenCode caller workflow: ${configured}. ` +
+                  'Expected a bare workflow file name such as opencode.yml.'
+                );
+              }
+              return configured;
+            }
+
+            function conflictRepairMarkers(comments, headSha) {
+              const exactHead = String(headSha || '').toLowerCase();
+              const markers = [];
+              for (const comment of comments || []) {
+                const association = String(
+                  comment.author_association || ''
+                ).toUpperCase();
+                const login = String(
+                  comment.user?.login || ''
+                ).toLowerCase();
+                const trusted =
+                  TRUSTED_COMMENT_ASSOCIATIONS.has(association) ||
+                  login === 'github-actions[bot]' ||
+                  login === owner.toLowerCase();
+                if (!trusted) continue;
+                const body = String(comment.body || '');
+                CONFLICT_MARKER_RE.lastIndex = 0;
+                for (const match of body.matchAll(CONFLICT_MARKER_RE)) {
+                  if (String(match[1] || '').toLowerCase() !== exactHead) {
+                    continue;
+                  }
+                  markers.push({
+                    attempt: Number.parseInt(match[2], 10),
+                    createdAt: Date.parse(
+                      String(
+                        comment.updated_at || comment.created_at || ''
+                      )
+                    ),
+                  });
+                }
+              }
+              markers.sort((a, b) => a.attempt - b.attempt);
+              return markers;
+            }
+
+            function conflictRepairMarker(headSha, attempt) {
+              return (
+                `<!-- continuum-conflict-repair head=${headSha} attempt=${attempt} -->\n` +
+                'Continuum dispatched automatic OpenCode conflict repair ' +
+                'for this exact HEAD.'
+              );
+            }
+
+            async function findActiveConflictRepairRun(prNumber) {
+              const opencodeWorkflow = resolveOpencodeWorkflow();
+              let runs;
+              try {
+                runs = await github.paginate(
+                  github.rest.actions.listWorkflowRuns,
+                  {
+                    owner,
+                    repo,
+                    workflow_id: opencodeWorkflow,
+                    per_page: 100,
+                  }
+                );
+              } catch (err) {
+                // A missing caller file surfaces loudly at dispatch time;
+                // the liveness probe itself must not fail the pass.
+                core.warning(
+                  `PR #${prNumber}: could not list ${opencodeWorkflow} runs: ${err.message}`
+                );
+                return null;
+              }
+              // Word-boundary match: `PR #23` must not match the live run
+              // for `PR #237`.
+              const titlePattern = new RegExp(`PR #${prNumber}(?!\\d)`);
+              return runs.find(run =>
+                ACTIVE_REPAIR_STATUSES.has(
+                  String(run.status || '').toLowerCase()
+                ) &&
+                titlePattern.test(String(run.display_title || ''))
+              ) || null;
+            }
+
+            async function removeConflictLock(prNumber) {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner,
+                  repo,
+                  issue_number: prNumber,
+                  name: CONFLICT_LOCK_LABEL,
+                });
+              } catch (err) {
+                if (err.status !== 404) throw err;
+              }
+            }
+
             async function dispatchConflictRepair(pr, reason) {
-              if (hasLabel(pr, CONFLICT_LOCK_LABEL)) {
+              const opencodeWorkflow = resolveOpencodeWorkflow();
+
+              // Exact-HEAD revalidation: the PR may have advanced between the
+              // scan read and this dispatch.
+              const fresh = await getPull(pr.number);
+              if (
+                fresh.state !== 'open' ||
+                fresh.draft ||
+                fresh.head.repo?.full_name !== repoFullName
+              ) {
                 core.info(
-                  `PR #${pr.number}: conflict repair already active; waiting.`
+                  `PR #${pr.number}: no longer an open same-repository PR; cancelling conflict dispatch.`
                 );
                 return;
+              }
+              if (fresh.head.sha !== pr.head.sha) {
+                core.info(
+                  `PR #${pr.number}: head advanced from ${pr.head.sha} to ${fresh.head.sha} before conflict dispatch; re-evaluating.`
+                );
+                return;
+              }
+              pr = fresh;
+              const headSha = pr.head.sha;
+
+              // A live repair run for this PR owns the lock: wait instead of
+              // dispatching a duplicate.
+              const activeRun = await findActiveConflictRepairRun(pr.number);
+              if (activeRun) {
+                core.info(
+                  `PR #${pr.number}: conflict repair run ${activeRun.id} (${activeRun.status}) is already active for this PR; waiting.`
+                );
+                return;
+              }
+
+              const comments = await github.paginate(
+                github.rest.issues.listComments,
+                {
+                  owner,
+                  repo,
+                  issue_number: pr.number,
+                  per_page: 100,
+                }
+              );
+              const markers = conflictRepairMarkers(comments, headSha);
+              const latest = markers.at(-1) || null;
+              const markerAgeMs =
+                latest && Number.isFinite(latest.createdAt)
+                  ? Date.now() - latest.createdAt
+                  : null;
+
+              // Idempotency per PR/current HEAD: a dispatch that just happened
+              // has a fresh marker even before its run becomes visible.
+              if (
+                markers.length > 0 &&
+                markerAgeMs !== null &&
+                markerAgeMs < CONFLICT_DISPATCH_GRACE_MS
+              ) {
+                core.info(
+                  `PR #${pr.number}: conflict-repair dispatch for head ${headSha} is inside its grace window; waiting.`
+                );
+                return;
+              }
+
+              // Bounded autonomy: stop redispatching one unchanged HEAD after
+              // the per-HEAD budget is spent. No pause label is applied and no
+              // manual label removal is required; a new HEAD starts a fresh
+              // budget.
+              if (markers.length >= MAX_CONFLICT_DISPATCHES_PER_HEAD) {
+                core.warning(
+                  `PR #${pr.number}: bounded conflict-repair budget exhausted for head ${headSha} (${markers.length}/${MAX_CONFLICT_DISPATCHES_PER_HEAD}); waiting for a new HEAD.`
+                );
+                return;
+              }
+              const attempt = markers.length;
+
+              // A stale lock with no active run and no fresh marker must not
+              // strand the PR: reconcile it, then redispatch safely.
+              if (hasLabel(pr, CONFLICT_LOCK_LABEL)) {
+                await removeConflictLock(pr.number);
+                core.notice(
+                  `PR #${pr.number}: reconciled stale ${CONFLICT_LOCK_LABEL} lock with no active repair run; redispatching.`
+                );
               }
 
               await github.rest.issues.addLabels({
@@ -1088,9 +1303,7 @@ jobs:
                   {
                     owner,
                     repo,
-                    workflow_id: String(
-                      process.env.OPENCODE_WORKFLOW || 'continuum-opencode.yml'
-                    ).trim(),
+                    workflow_id: opencodeWorkflow,
                     ref: 'main',
                     inputs: {
                       mode: 'resolve-conflict',
@@ -1099,20 +1312,51 @@ jobs:
                     },
                   }
                 );
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: pr.number,
+                  body: conflictRepairMarker(headSha, attempt),
+                });
                 core.notice(
-                  `PR #${pr.number}: dispatched OpenCode conflict repair (${reason}).`
+                  `PR #${pr.number}: dispatched OpenCode conflict repair via ${opencodeWorkflow} for head ${headSha} (attempt ${attempt + 1}/${MAX_CONFLICT_DISPATCHES_PER_HEAD}, ${reason}).`
                 );
               } catch (err) {
-                try {
-                  await github.rest.issues.removeLabel({
-                    owner,
-                    repo,
-                    issue_number: pr.number,
-                    name: CONFLICT_LOCK_LABEL,
-                  });
-                } catch (_) {}
+                await removeConflictLock(pr.number);
                 throw err;
               }
+            }
+
+            // Early self-healing scan for one PR. Returns true when the PR was
+            // handled here (dirty: dispatched, waiting, or bounded hold) and
+            // the caller must continue to the next PR. Returns false when the
+            // PR is clean so the normal CI/review/merge gates evaluate this
+            // same pass; a leftover lock on a clean PR is reconciled first so
+            // CI runs on the repaired HEAD and the lifecycle resumes.
+            // GitHub mergeability of null means "still computing": the normal
+            // sync path (update-branch) remains authoritative for that case.
+            async function reconcileDirtyPr(pr) {
+              const dirty =
+                pr.mergeable === false ||
+                String(pr.mergeable_state || '').toLowerCase() === 'dirty';
+              if (!dirty) {
+                if (
+                  pr.mergeable !== null &&
+                  pr.mergeable !== undefined &&
+                  hasLabel(pr, CONFLICT_LOCK_LABEL)
+                ) {
+                  await removeConflictLock(pr.number);
+                  core.notice(
+                    `PR #${pr.number}: repaired HEAD ${pr.head.sha} is no longer dirty; reconciled ${CONFLICT_LOCK_LABEL} and resuming CI/review lifecycle.`
+                  );
+                }
+                return false;
+              }
+              await dispatchConflictRepair(
+                pr,
+                `mergeable_state=${pr.mergeable_state}`
+              );
+              return true;
             }
 
             async function updateFromMain(pr) {
@@ -1271,6 +1515,16 @@ jobs:
                 core.info(
                   `PR #${pr.number}: ${AUTO_MERGE_BLOCK_LABEL} is set; skipping.`
                 );
+                continue;
+              }
+
+              // Self-healing conflict scan runs on every pass, before the
+              // CI/review gates, so an already-dirty PR is never stranded
+              // behind a red CI check and a PR that predates this controller
+              // revision is rediscovered without any new PR event or manual
+              // command. Clean PRs (including freshly repaired HEADs) fall
+              // through to the normal gates below.
+              if (await reconcileDirtyPr(pr)) {
                 continue;
               }
 
