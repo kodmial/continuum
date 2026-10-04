@@ -511,6 +511,14 @@ jobs:
               console.error("::error::Invalid centralized PR-Agent improve threshold in policy bundle.");
               process.exit(1);
             }
+            if (!/^[0-9]+$/.test(String(p.REVIEW_MAX_FINDINGS))) {
+              console.error("::error::Invalid centralized PR-Agent review findings cap in policy bundle.");
+              process.exit(1);
+            }
+            if (typeof p.REVIEW_MERGE_SAFE !== "string" || !p.REVIEW_MERGE_SAFE.trim()) {
+              console.error("::error::Invalid centralized PR-Agent merge-safe recommendation in policy bundle.");
+              process.exit(1);
+            }
           '
           echo "bridge_script=$BRIDGE_SCRIPT" >> "$GITHUB_OUTPUT"
           echo "policy_script=$POLICY_SCRIPT" >> "$GITHUB_OUTPUT"
@@ -1119,7 +1127,7 @@ jobs:
 
       - name: Normalize persistent improve presentation
         if: >-
-          steps.improve_output.outcome == 'success' &&
+          steps.result.outcome == 'success' &&
           steps.result.outputs.head_sha
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:

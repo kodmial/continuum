@@ -147,6 +147,18 @@ jobs:
                 process.exit(1);
               }
             }
+            if (!/^[0-9]+$/.test(String(p.IMPROVE_REPAIR_THRESHOLD))) {
+              console.error("::error::Invalid centralized PR-Agent improve threshold in policy bundle.");
+              process.exit(1);
+            }
+            if (!/^[0-9]+$/.test(String(p.REVIEW_MAX_FINDINGS))) {
+              console.error("::error::Invalid centralized PR-Agent review findings cap in policy bundle.");
+              process.exit(1);
+            }
+            if (typeof p.REVIEW_MERGE_SAFE !== "string" || !p.REVIEW_MERGE_SAFE.trim()) {
+              console.error("::error::Invalid centralized PR-Agent merge-safe recommendation in policy bundle.");
+              process.exit(1);
+            }
           '
           echo "policy_script=$POLICY_SCRIPT" >> "$GITHUB_OUTPUT"
 
@@ -334,7 +346,7 @@ jobs:
               fail('incomplete improve coverage: failing closed');
               return;
             }
-            if (recommendation !== 'safe_to_merge') {
+            if (recommendation !== policy.REVIEW_MERGE_SAFE) {
               fail(`merge recommendation blocks: ${recommendation}`);
               return;
             }
