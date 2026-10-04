@@ -157,9 +157,15 @@ def derive_fallback_state(
     elif isinstance(outer_issues, list) and isinstance(nested_issues, list):
         key_issues = [*outer_issues, *nested_issues]
     elif isinstance(outer_issues, list):
-        key_issues = outer_issues
-    elif isinstance(nested_issues, list):
+        # Nested side is a non-list invalid shape: preserve it so
+        # validation fails closed instead of silently reading the clean
+        # outer side (mirrors _unwrap_review in pr_agent_lifecycle).
         key_issues = nested_issues
+    elif isinstance(nested_issues, list):
+        # Outer side is a non-list invalid shape: preserve it so
+        # validation fails closed instead of silently reading the clean
+        # nested side (mirrors _unwrap_review in pr_agent_lifecycle).
+        key_issues = outer_issues
     else:
         key_issues = outer_issues
     if key_issues is None:

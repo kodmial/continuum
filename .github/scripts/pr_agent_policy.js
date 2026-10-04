@@ -470,17 +470,19 @@ function hasIncompleteCoverageSignal(reviewPayload) {
       continue;
     }
     if (typeof value === 'string') {
-      const lowered = value.trim().toLowerCase();
-      if (!lowered) continue;
-      const mentionsGap =
-        lowered.includes('partial') || lowered.includes('incomplete') || lowered.includes('truncated');
-      if (mentionsGap) return true;
+      // A coverage-object key expects a mapping with counts/flags; any
+      // string value is an unrecognized shape: fail closed so unknown
+      // coverage never permits an improve skip.
+      return true;
     }
+    // Any other non-mapping value (boolean, number, null, array, ...)
+    // is an unrecognized coverage shape: fail closed.
+    return true;
   }
   if (!seenCoverage) {
-    // No coverage evidence at all is not proof of complete coverage:
-    // fail closed so an omitted coverage signal never permits a skip.
-    return true;
+    // Absent coverage keys mean no signal (coverage is assumed complete
+    // here; the findings-cap truncation check still applies separately).
+    return false;
   }
   return false;
 }
@@ -514,13 +516,13 @@ function coverageSingleValueIsIncomplete(key, value) {
       return false;
     }
     if (typeof value === 'string') {
-      const lowered = value.trim().toLowerCase();
-      if (!lowered) return false;
-      const mentionsGap =
-        lowered.includes('partial') || lowered.includes('incomplete') || lowered.includes('truncated');
-      return mentionsGap;
+      // A coverage-object key expects a mapping with counts/flags; any
+      // string value is an unrecognized shape: fail closed.
+      return true;
     }
-    return false;
+    // Any other non-mapping value (boolean, number, null, array, ...)
+    // is an unrecognized coverage shape: fail closed.
+    return true;
   }
   return false;
 }
@@ -700,8 +702,8 @@ function isCleanReviewForImproveSkip(reviewPayload, persistentState, options = {
   }
   // Fail closed: coverage must be proven complete with an explicit opt-in
   // plus no incomplete signal in the review payload. An omitted flag never
-  // skips, and a review with no coverage evidence never skips (absent
-  // coverage is incomplete).
+  // skips; absent coverage keys mean no signal (assumed complete, with the
+  // findings-cap truncation check applying separately).
   const reviewCoverageComplete =
     opts.reviewCoverageComplete === true && !hasIncompleteCoverageSignal(review);
   if (!reviewCoverageComplete) {

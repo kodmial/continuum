@@ -515,17 +515,18 @@ def has_incomplete_coverage_signal(review: Mapping[str, Any]) -> bool:
                 return True
             continue
         if isinstance(value, str):
-            lowered = value.strip().lower()
-            if not lowered:
-                continue
-            if any(
-                word in lowered for word in ("partial", "incomplete", "truncated")
-            ):
-                return True
-    if not seen_coverage:
-        # No coverage evidence at all is not proof of complete coverage:
-        # fail closed so an omitted coverage signal never permits a skip.
+            # A coverage-object key expects a mapping with counts/flags;
+            # any string value is an unrecognized shape: fail closed so
+            # unknown coverage never permits an improve skip.
+            return True
+        # Any other non-mapping value (bool, number, None, list, ...) is
+        # an unrecognized coverage shape: fail closed.
         return True
+    if not seen_coverage:
+        # Absent coverage keys mean no signal (coverage is assumed
+        # complete here; the findings-cap truncation check still applies
+        # separately below).
+        return False
     return False
 
 
@@ -571,13 +572,12 @@ def _coverage_single_value_is_incomplete(key: str, value: object) -> bool:
                 return True
             return False
         if isinstance(value, str):
-            lowered = value.strip().lower()
-            if not lowered:
-                return False
-            return any(
-                word in lowered for word in ("partial", "incomplete", "truncated")
-            )
-        return False
+            # A coverage-object key expects a mapping with counts/flags;
+            # any string value is an unrecognized shape: fail closed.
+            return True
+        # Any other non-mapping value (bool, number, None, list, ...) is
+        # an unrecognized coverage shape: fail closed.
+        return True
     return False
 
 
@@ -795,13 +795,18 @@ def is_improve_skipped_clean(improve_skipped_success: object) -> bool:
     of relying on the ``False`` default: a skipped-clean HEAD carries an
     empty improve payload, so ``improve_coverage_complete`` stays
     ``False`` and only this flag lets :func:`evaluate_gate` green it.
-    Accepts the workflow step outcome in either boolean or
-    ``'true'``/``'false'`` string form.
+    Accepts the workflow step outcome in boolean form, as
+    ``'true'``/``'success'`` strings (case-insensitive, trimmed), or as
+    the ``${{ steps.improve_skipped.outcome == 'success' }}`` mapping
+    (``'true'``). GitHub step outcomes are ``'success'``/``'failure'``/
+    ``'skipped'``/``'cancelled'``, so the raw ``'success'`` outcome of the
+    ``improve_skipped`` marker step counts as clean; any other outcome
+    (including ``'skipped'`` when the marker step never ran) is not clean.
     """
 
     if isinstance(improve_skipped_success, bool):
         return improve_skipped_success
-    return str(improve_skipped_success or "").strip().lower() == "true"
+    return str(improve_skipped_success or "").strip().lower() in ("true", "success")
 
 
 def parse_improve_push_outputs(text: object) -> List[Dict[str, Any]]:
