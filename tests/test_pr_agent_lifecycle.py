@@ -1120,6 +1120,17 @@ class StabilizationParityTests(unittest.TestCase):
         self.assertIn("identical structured PR-Agent finding state", repair)
         self.assertIn("steps.convergence.outputs.held != 'true'", repair)
 
+    def test_no_progress_and_github_api_failures_are_bounded_retryable(self):
+        repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
+        self.assertIn("explicitRepairRetry", repair)
+        self.assertIn("sameHeadFindings.clear()", repair)
+        self.assertIn('echo "classification=transient" >> "$GITHUB_OUTPUT"', repair)
+        self.assertIn("requesting bounded exact-HEAD re-review/repair", repair)
+        self.assertIn("if: always() && steps.repair_pass.outputs.no_progress == 'true'", repair)
+        self.assertIn('READ_GH_TOKEN: ${{ github.token }}', repair)
+        self.assertIn("GitHub API failure is retryable", repair)
+        self.assertNotIn("No repair diff; controller state will hold", repair)
+
     def test_main_sync_classification_predicate_is_not_inverted(self):
         merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
         # The exact negation is the contract: only a fully non-critical
