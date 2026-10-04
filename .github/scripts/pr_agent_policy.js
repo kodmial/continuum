@@ -384,33 +384,60 @@ function coverageFlagValueIsIncomplete(key, value) {
   if (key === 'truncated' || key === 'partial' || key === 'incomplete') {
     if (value === true) return true;
     if (typeof value === 'boolean') return false;
-    if (typeof value === 'string' && ['1', 'true', 'yes'].includes(value.trim().toLowerCase())) {
+    if (value === null || value === undefined) return true;
+    if (typeof value === 'string') {
+      const lowered = value.trim().toLowerCase();
+      if (!lowered) return false;
+      if (['1', 'true', 'yes'].includes(lowered)) return true;
+      if (['0', 'false', 'no'].includes(lowered)) return false;
+      const numeric = Number(lowered);
+      if (lowered !== '' && Number.isFinite(numeric)) {
+        return numeric !== 0;
+      }
+      // Unknown string coverage state fails closed.
       return true;
     }
-    if (typeof value === 'number' && value !== 0) return true;
-    return false;
+    if (typeof value === 'number') {
+      if (Number.isNaN(value)) return true;
+      if (!Number.isFinite(value)) return true;
+      return value !== 0;
+    }
+    return true;
   }
-  if (value === false) return true;
-  if (typeof value === 'boolean') return false;
-  if (typeof value === 'string' && ['0', 'false', 'no'].includes(value.trim().toLowerCase())) {
+  if (typeof value === 'boolean') return value === false;
+  if (value === null || value === undefined) return true;
+  if (typeof value === 'string') {
+    const lowered = value.trim().toLowerCase();
+    if (!lowered) return false;
+    if (['0', 'false', 'no'].includes(lowered)) return true;
+    if (['1', 'true', 'yes'].includes(lowered)) return false;
+    const numeric = Number(lowered);
+    if (lowered !== '' && Number.isFinite(numeric)) {
+      return numeric === 0;
+    }
+    // Unknown string coverage state fails closed.
     return true;
   }
   if (typeof value === 'number') {
-    if (value === 0) return true;
     if (Number.isNaN(value)) return true; // fail closed
+    if (!Number.isFinite(value)) return true;
+    return value === 0;
   }
-  return false;
+  return true;
 }
 
 function hasIncompleteCoverageSignal(reviewPayload) {
   const review = unwrapReview(reviewPayload);
+  let seenCoverage = false;
   for (const key of COVERAGE_FLAG_KEYS) {
     if (!(key in review)) continue;
+    seenCoverage = true;
     const value = review[key];
     if (coverageFlagValueIsIncomplete(key, value)) return true;
   }
   for (const key of COVERAGE_OBJECT_KEYS) {
     if (!(key in review)) continue;
+    seenCoverage = true;
     const value = review[key];
     if (value && typeof value === 'object' && !Array.isArray(value)) {
       const reviewed = value.reviewed !== undefined ? value.reviewed : value.reviewed_chunks;
@@ -447,9 +474,13 @@ function hasIncompleteCoverageSignal(reviewPayload) {
       if (!lowered) continue;
       const mentionsGap =
         lowered.includes('partial') || lowered.includes('incomplete') || lowered.includes('truncated');
-      const claimsComplete = lowered.replace(/incomplete/g, '').includes('complete');
-      if (mentionsGap && !claimsComplete) return true;
+      if (mentionsGap) return true;
     }
+  }
+  if (!seenCoverage) {
+    // No coverage evidence at all is not proof of complete coverage:
+    // fail closed so an omitted coverage signal never permits a skip.
+    return true;
   }
   return false;
 }
@@ -487,8 +518,7 @@ function coverageSingleValueIsIncomplete(key, value) {
       if (!lowered) return false;
       const mentionsGap =
         lowered.includes('partial') || lowered.includes('incomplete') || lowered.includes('truncated');
-      const claimsComplete = lowered.replace(/incomplete/g, '').includes('complete');
-      return mentionsGap && !claimsComplete;
+      return mentionsGap;
     }
     return false;
   }
@@ -644,16 +674,8 @@ function isCleanReviewForImproveSkip(reviewPayload, persistentState, options = {
   const headMatches = opts.headMatches === true;
   const review = unwrapReview(reviewPayload);
   const toolError = opts.toolError === true || hasToolErrorSignal(review);
-  // Fail closed: coverage must be proven complete with an explicit opt-in.
-  // An omitted flag never skips (a clean review with no coverage object
-  // called without the flag must run improve).
-  const reviewCoverageComplete =
-    opts.reviewCoverageComplete === true && !hasIncompleteCoverageSignal(review);
   if (toolError) {
     return { skip: false, reason: 'tool error: failing closed' };
-  }
-  if (!reviewCoverageComplete) {
-    return { skip: false, reason: 'incomplete review coverage: failing closed' };
   }
   if (!headMatches) {
     return { skip: false, reason: 'stale head: result is not for the current HEAD' };
@@ -665,6 +687,25 @@ function isCleanReviewForImproveSkip(reviewPayload, persistentState, options = {
   const recommendation = String(review.merge_recommendation || '').trim();
   if (!recommendation) {
     throw new Error('PR-Agent review has no merge_recommendation.');
+  }
+  // The exact reviewed HEAD is mandatory for any skip decision: validate it
+  // before interpreting coverage/persistent format variations so a missing
+  // HEAD still fails closed by exception while benign variations with a
+  // known HEAD safely run improve (skip:false).
+  const reviewedHeadSha = String(
+    opts.reviewedHeadSha || opts.reviewed_head_sha || opts.headSha || opts.head_sha || ''
+  ).trim().toLowerCase();
+  if (!reviewedHeadSha) {
+    throw new Error('Cannot decide improve skip without the exact reviewed HEAD.');
+  }
+  // Fail closed: coverage must be proven complete with an explicit opt-in
+  // plus no incomplete signal in the review payload. An omitted flag never
+  // skips, and a review with no coverage evidence never skips (absent
+  // coverage is incomplete).
+  const reviewCoverageComplete =
+    opts.reviewCoverageComplete === true && !hasIncompleteCoverageSignal(review);
+  if (!reviewCoverageComplete) {
+    return { skip: false, reason: 'incomplete review coverage: failing closed' };
   }
   if (recommendation !== REVIEW_MERGE_SAFE) {
     return { skip: false, reason: `merge recommendation blocks: ${recommendation}` };
@@ -679,17 +720,7 @@ function isCleanReviewForImproveSkip(reviewPayload, persistentState, options = {
     return { skip: false, reason: 'blocking security signal remains' };
   }
   if (!persistentState || typeof persistentState !== 'object' || Array.isArray(persistentState)) {
-    throw new Error('Upstream finding state must be the v0.46.0 state object.');
-  }
-  // The exact reviewed HEAD is mandatory for any skip decision: validate it
-  // before interpreting persistent format variations so a missing HEAD
-  // still fails closed by exception while a benign upstream format
-  // variation with a known HEAD safely runs improve (skip:false).
-  const reviewedHeadSha = String(
-    opts.reviewedHeadSha || opts.reviewed_head_sha || opts.headSha || opts.head_sha || ''
-  ).trim().toLowerCase();
-  if (!reviewedHeadSha) {
-    throw new Error('Cannot decide improve skip without the exact reviewed HEAD.');
+    return { skip: false, reason: 'persistent state is not an object: failing closed' };
   }
   if (!Array.isArray(persistentState.findings)) {
     // A benign upstream format variation must still run improve for repair

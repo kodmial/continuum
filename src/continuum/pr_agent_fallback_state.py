@@ -157,6 +157,8 @@ def derive_fallback_state(
     elif isinstance(outer_issues, list) and isinstance(nested_issues, list):
         key_issues = [*outer_issues, *nested_issues]
     elif isinstance(outer_issues, list):
+        key_issues = outer_issues
+    elif isinstance(nested_issues, list):
         key_issues = nested_issues
     else:
         key_issues = outer_issues

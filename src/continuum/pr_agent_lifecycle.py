@@ -394,38 +394,81 @@ def _coverage_flag_value_is_incomplete(key: str, value: object) -> bool:
             return True
         if isinstance(value, bool):
             return False
-        if isinstance(value, str) and value.strip().lower() in ("1", "true", "yes"):
+        if value is None:
             return True
-        if isinstance(value, (int, float)) and value != 0:
-            return True
-        return False
-    if value is False:
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if not lowered:
+                return False
+            if lowered in ("1", "true", "yes"):
+                return True
+            if lowered in ("0", "false", "no"):
+                return False
+            try:
+                numeric = float(lowered)
+            except (TypeError, ValueError):
+                return True
+            if numeric != numeric:  # NaN: fail closed
+                return True
+            if numeric in (float("inf"), float("-inf")):
+                return True
+            return numeric != 0
+        if isinstance(value, (int, float)):
+            if isinstance(value, float) and value != value:  # NaN: fail closed
+                return True
+            if isinstance(value, float) and value in (
+                float("inf"),
+                float("-inf"),
+            ):
+                return True
+            return value != 0
         return True
     if isinstance(value, bool):
-        return False
-    if isinstance(value, str) and value.strip().lower() in ("0", "false", "no"):
+        return value is False
+    if value is None:
         return True
-    if isinstance(value, (int, float)):
-        if value == 0:
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if not lowered:
+            return False
+        if lowered in ("0", "false", "no"):
             return True
+        if lowered in ("1", "true", "yes"):
+            return False
+        try:
+            numeric = float(lowered)
+        except (TypeError, ValueError):
+            return True
+        if numeric != numeric:  # NaN: fail closed
+            return True
+        if numeric in (float("inf"), float("-inf")):
+            return True
+        return numeric == 0
+    if isinstance(value, (int, float)):
         if isinstance(value, float) and value != value:  # NaN: fail closed
             return True
-    return False
+        if isinstance(value, float) and value in (float("inf"), float("-inf")):
+            return True
+        return value == 0
+    return True
 
 
 def has_incomplete_coverage_signal(review: Mapping[str, Any]) -> bool:
     """Whether the review payload itself reports incomplete coverage."""
 
     inner = _unwrap_review(review)
+    seen_coverage = False
     for key in _COVERAGE_FLAG_KEYS:
         if key not in inner:
             continue
+        seen_coverage = True
         value = inner.get(key)
         if _coverage_flag_value_is_incomplete(key, value):
             return True
     for key in _COVERAGE_OBJECT_KEYS:
         if key not in inner:
             continue
+        seen_coverage = True
         value = inner.get(key)
         if isinstance(value, Mapping):
             has_reviewed_key = "reviewed" in value or "reviewed_chunks" in value
@@ -477,8 +520,12 @@ def has_incomplete_coverage_signal(review: Mapping[str, Any]) -> bool:
                 continue
             if any(
                 word in lowered for word in ("partial", "incomplete", "truncated")
-            ) and "complete" not in lowered.replace("incomplete", ""):
+            ):
                 return True
+    if not seen_coverage:
+        # No coverage evidence at all is not proof of complete coverage:
+        # fail closed so an omitted coverage signal never permits a skip.
+        return True
     return False
 
 
@@ -529,7 +576,7 @@ def _coverage_single_value_is_incomplete(key: str, value: object) -> bool:
                 return False
             return any(
                 word in lowered for word in ("partial", "incomplete", "truncated")
-            ) and "complete" not in lowered.replace("incomplete", "")
+            )
         return False
     return False
 
@@ -668,16 +715,14 @@ def should_skip_improve(
     Anything else returns `skip=False` so `improve` may still run to
     generate additional repair suggestions. Invalid review payloads and a
     missing reviewed HEAD raise `LifecycleError` and fail closed instead
-    of skipping; a benign persistent format variation (non-list findings,
-    missing `last_run`, non-full run) with a known HEAD returns
-    `skip=False` so `improve` still runs.
+    of skipping; a benign persistent format variation (non-object state,
+    non-list findings, missing `last_run`, non-full run) with a known HEAD
+    returns `skip=False` so `improve` still runs.
     """
 
     inner = _unwrap_review(review)
     if tool_error or has_tool_error_signal(inner):
         return {"skip": False, "reason": "tool error: failing closed"}
-    if (not review_coverage_complete) or has_incomplete_coverage_signal(inner):
-        return {"skip": False, "reason": "incomplete review coverage: failing closed"}
     if not head_matches:
         return {"skip": False, "reason": "stale head: result is not for the current HEAD"}
     if "key_issues_to_review" not in inner:
@@ -686,6 +731,17 @@ def should_skip_improve(
         recommendation = merge_recommendation(inner)
     except LifecycleError as exc:
         raise LifecycleError(f"cannot decide improve skip: {exc}") from None
+    # The exact reviewed HEAD is mandatory for any skip decision: validate
+    # it before interpreting coverage/persistent format variations so a
+    # missing HEAD still fails closed by exception while benign variations
+    # with a known HEAD safely run improve (skip=False).
+    expected_head = str(reviewed_head_sha or "").strip()
+    if not expected_head:
+        raise LifecycleError(
+            "cannot decide improve skip without the exact reviewed HEAD."
+        )
+    if (not review_coverage_complete) or has_incomplete_coverage_signal(inner):
+        return {"skip": False, "reason": "incomplete review coverage: failing closed"}
     if recommendation != REVIEW_MERGE_SAFE:
         return {"skip": False, "reason": f"merge recommendation blocks: {recommendation}"}
     issues = current_key_issues(inner)
@@ -699,16 +755,7 @@ def should_skip_improve(
     if has_blocking_security_signal(inner):
         return {"skip": False, "reason": "blocking security signal remains"}
     if not isinstance(persistent_state, dict):
-        raise LifecycleError("upstream finding state must be the v0.46.0 state object")
-    # The exact reviewed HEAD is mandatory for any skip decision: validate
-    # it before interpreting persistent format variations so a missing HEAD
-    # still fails closed by exception while a benign upstream format
-    # variation with a known HEAD safely runs improve (skip=False).
-    expected_head = str(reviewed_head_sha or "").strip()
-    if not expected_head:
-        raise LifecycleError(
-            "cannot decide improve skip without the exact reviewed HEAD."
-        )
+        return {"skip": False, "reason": "persistent state is not an object: failing closed"}
     raw_findings = persistent_state.get("findings")
     if not isinstance(raw_findings, list):
         # A benign upstream format variation must still run improve for

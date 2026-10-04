@@ -106,6 +106,9 @@ def make_review(
     review = {
         "key_issues_to_review": list(issues or []),
         "merge_recommendation": recommendation,
+        # Complete-review evidence: a clean review must prove complete
+        # coverage to skip improve (fail closed when absent).
+        "coverage_complete": True,
     }
     if extra:
         review.update(extra)
