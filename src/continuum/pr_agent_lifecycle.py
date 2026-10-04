@@ -248,6 +248,191 @@ BLOCKING_SECURITY_SIGNAL_KEYS = (
     "critical_security_issues",
 )
 
+# Upstream clean reviews commonly report security fields as negation prose
+# ("No", "None", "N/A", "No security concerns found"). Such prose must not
+# block the clean-PR fast path; anything else fails closed and blocks.
+_CLEAN_SECURITY_TEXTS = frozenset(
+    {
+        "no",
+        "none",
+        "n/a",
+        "na",
+        "nil",
+        "null",
+        "nope",
+        "0",
+        "false",
+        "ok",
+        "clear",
+        "clean",
+        "pass",
+        "passed",
+        "not applicable",
+        "none found",
+        "no findings",
+        "no finding",
+        "no issues",
+        "no issue",
+        "no concerns",
+        "no concern",
+        "no risks",
+        "no risk",
+        "no vulnerabilities",
+        "no vulnerability",
+        "no problems",
+        "no problem",
+        "no threats",
+        "no threat",
+        "no security concerns",
+        "no security issues",
+        "no security vulnerabilities",
+        "no critical issues",
+        "no critical security issues",
+    }
+)
+
+_CLEAN_SECURITY_SUFFIXES = (" found", " detected", " identified", " observed")
+
+
+def _is_clean_security_text(value: str) -> bool:
+    """Whether a security-field string is negation/empty prose, not a concern."""
+
+    norm = re.sub(r"[^a-z0-9/ ]+", " ", value.strip().lower())
+    norm = re.sub(r"\s+", " ", norm).strip()
+    if not norm:
+        return True
+    if norm in _CLEAN_SECURITY_TEXTS:
+        return True
+    for suffix in _CLEAN_SECURITY_SUFFIXES:
+        if norm.endswith(suffix) and norm[: -len(suffix)].strip() in _CLEAN_SECURITY_TEXTS:
+            return True
+    return False
+
+
+def _security_value_is_blocking(value: object) -> bool:
+    """Whether a security-field value carries a real concern (fail closed)."""
+
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return not _is_clean_security_text(value)
+    if isinstance(value, Mapping):
+        if len(value) == 0:
+            return False
+        return any(_security_value_is_blocking(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        if len(value) == 0:
+            return False
+        return any(_security_value_is_blocking(item) for item in value)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return bool(value)
+
+
+# Review-payload keys that carry an explicit tool-error signal when
+# `config.propagate_tool_errors` surfaces a failed tool. Any non-clean
+# entry fails closed; absent keys mean no signal.
+_TOOL_ERROR_SIGNAL_KEYS = (
+    "tool_errors",
+    "tool_error",
+    "tool_failures",
+    "failed_tools",
+    "errors",
+    "error",
+)
+
+# Review-payload keys that carry an explicit coverage signal. Absent keys
+# mean no signal (coverage is assumed complete here; the findings-cap
+# truncation check still applies separately below).
+_COVERAGE_FLAG_KEYS = (
+    "review_coverage_complete",
+    "coverage_complete",
+    "coverage_completed",
+    "is_complete",
+    "is_completed",
+    "complete",
+    "truncated",
+    "partial",
+    "incomplete",
+)
+
+_COVERAGE_OBJECT_KEYS = (
+    "coverage",
+    "review_coverage",
+    "chunk_coverage",
+    "review_coverage_footer",
+    "coverage_footer",
+)
+
+
+def has_tool_error_signal(review: Mapping[str, Any]) -> bool:
+    """Whether the review payload itself reports a tool error (fail closed)."""
+
+    inner = _unwrap_review(review)
+    for key in _TOOL_ERROR_SIGNAL_KEYS:
+        if key not in inner:
+            continue
+        if _security_value_is_blocking(inner.get(key)):
+            return True
+    return False
+
+
+def has_incomplete_coverage_signal(review: Mapping[str, Any]) -> bool:
+    """Whether the review payload itself reports incomplete coverage."""
+
+    inner = _unwrap_review(review)
+    for key in _COVERAGE_FLAG_KEYS:
+        if key not in inner:
+            continue
+        value = inner.get(key)
+        if key in ("truncated", "partial", "incomplete"):
+            if value is True:
+                return True
+            if isinstance(value, str) and value.strip().lower() in ("1", "true", "yes"):
+                return True
+            continue
+        if value is False:
+            return True
+        if isinstance(value, str) and value.strip().lower() in ("0", "false", "no"):
+            return True
+    for key in _COVERAGE_OBJECT_KEYS:
+        if key not in inner:
+            continue
+        value = inner.get(key)
+        if isinstance(value, Mapping):
+            reviewed = value.get("reviewed", value.get("reviewed_chunks"))
+            total = value.get("total", value.get("total_chunks"))
+            try:
+                reviewed_num: float | None = (
+                    float(reviewed) if reviewed is not None else None
+                )
+            except (TypeError, ValueError):
+                reviewed_num = None
+            try:
+                total_num: float | None = float(total) if total is not None else None
+            except (TypeError, ValueError):
+                total_num = None
+            if reviewed_num is not None and total_num is not None:
+                if total_num <= 0 or reviewed_num < total_num:
+                    return True
+                continue
+            if value.get("complete") is False:
+                return True
+            if value.get("truncated") is True or value.get("partial") is True:
+                return True
+            continue
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if not lowered:
+                continue
+            if any(
+                word in lowered for word in ("partial", "incomplete", "truncated")
+            ) and "complete" not in lowered.replace("incomplete", ""):
+                return True
+    return False
+
 
 def _unwrap_review(review: Mapping[str, Any]) -> Mapping[str, Any]:
     """Accept the canonical review payload in either envelope shape.
@@ -266,26 +451,19 @@ def _unwrap_review(review: Mapping[str, Any]) -> Mapping[str, Any]:
 
 
 def has_blocking_security_signal(review: Mapping[str, Any]) -> bool:
-    """Whether the review lists an explicit blocking security concern."""
+    """Whether the review lists an explicit blocking security concern.
+
+    Negation/empty prose ("No", "None", "N/A",
+    "No security concerns found") is normalized to clean and does not
+    block; any other non-empty signal fails closed and blocks.
+    """
 
     inner = _unwrap_review(review)
     for key in BLOCKING_SECURITY_SIGNAL_KEYS:
         value = inner.get(key, None)
         if value is None:
             continue
-        if isinstance(value, str):
-            if value.strip():
-                return True
-            continue
-        if isinstance(value, Mapping):
-            if len(value) > 0:
-                return True
-            continue
-        if isinstance(value, (list, tuple)):
-            if len(value) > 0:
-                return True
-            continue
-        if value:
+        if _security_value_is_blocking(value):
             return True
     return False
 
@@ -297,28 +475,38 @@ def should_skip_improve(
     head_matches: bool,
     tool_error: bool = False,
     review_coverage_complete: bool = True,
+    reviewed_head_sha: object = None,
 ) -> Dict[str, Any]:
     """Decide whether the automatic `improve` pass can be skipped.
 
     `review` remains the authoritative merge gate. A skip is allowed only
-    when the review is provably clean for the exact HEAD: no tool error,
-    complete review coverage, matching HEAD, `safe_to_merge`, zero current
-    key issues (a batch at the findings cap is never clean), no explicit
-    blocking security signal, and native persistent state that is a
-    complete full review with no ACTIVE finding.
+    when the review is provably clean for the exact HEAD: no tool error
+    (caller flag or an explicit tool-error signal in the review payload),
+    complete review coverage (caller flag and no incomplete-coverage
+    signal in the review payload), matching HEAD, `safe_to_merge`, zero
+    current key issues (a batch at the findings cap is never clean), no
+    explicit blocking security signal, and native persistent state that
+    is a complete full review for the exact reviewed HEAD with no ACTIVE
+    finding.
+
+    `reviewed_head_sha`, when provided, is compared against
+    `persistent_state.last_run.head_sha`: a mismatch returns `skip=False`
+    so a stale persistent state from a prior HEAD can never authorize a
+    skip. Callers that know the reviewed HEAD must pass it; a missing
+    `last_run.head_sha` always raises `LifecycleError`.
 
     Anything else returns `skip=False` so `improve` may still run to
     generate additional repair suggestions. Invalid review or persistent
     state raises `LifecycleError` and fails closed instead of skipping.
     """
 
-    if tool_error:
+    inner = _unwrap_review(review)
+    if tool_error or has_tool_error_signal(inner):
         return {"skip": False, "reason": "tool error: failing closed"}
-    if not review_coverage_complete:
+    if (not review_coverage_complete) or has_incomplete_coverage_signal(inner):
         return {"skip": False, "reason": "incomplete review coverage: failing closed"}
     if not head_matches:
         return {"skip": False, "reason": "stale head: result is not for the current HEAD"}
-    inner = _unwrap_review(review)
     if "key_issues_to_review" not in inner:
         raise LifecycleError("PR-Agent review JSON has no key_issues_to_review")
     try:
@@ -347,6 +535,12 @@ def should_skip_improve(
         raise LifecycleError("upstream PR-Agent persistent state has no last_run.")
     if last_run.get("complete") is not True or str(last_run.get("kind") or "") != "full":
         raise LifecycleError("Persistent state does not represent a complete full review.")
+    state_head = str(last_run.get("head_sha") or "").strip()
+    if not state_head:
+        raise LifecycleError("upstream PR-Agent persistent state has no last_run.head_sha.")
+    expected_head = str(reviewed_head_sha or "").strip()
+    if expected_head and not is_same_head(state_head, expected_head):
+        return {"skip": False, "reason": "stale persistent state: not for the reviewed HEAD"}
     if upstream_state_has_active(persistent_state):
         return {"skip": False, "reason": "native persistent state has an ACTIVE finding"}
     return {
@@ -956,6 +1150,8 @@ __all__ = [
     "is_potentially_truncated",
     "BLOCKING_SECURITY_SIGNAL_KEYS",
     "has_blocking_security_signal",
+    "has_tool_error_signal",
+    "has_incomplete_coverage_signal",
     "should_skip_improve",
     "parse_improve_push_outputs",
     "qualifying_suggestions",

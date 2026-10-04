@@ -754,6 +754,7 @@ jobs:
           PERSISTENT_STATE_JSON: ${{ steps.persistent.outputs.persistent_state_json }}
           HEAD_SHA: ${{ steps.result.outputs.head_sha }}
           REVIEWED_SHA: ${{ steps.before.outputs.sha }}
+          PRAGENT_OUTCOME: ${{ steps.pragent.outcome }}
           POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
@@ -805,12 +806,32 @@ jobs:
               );
               return;
             }
+            // Wire the real tool-error and review-coverage signals instead
+            // of assuming a clean run: with
+            // github_action_config.fail_on_tool_errors=true a failed
+            // review tool surfaces as steps.pragent.outcome == 'failure',
+            // and partial large-PR coverage surfaces as an explicit
+            // coverage signal inside the review payload. Either must keep
+            // the automatic improve pass (fail closed, never skip).
+            const pragentOutcome = String(process.env.PRAGENT_OUTCOME || '').trim().toLowerCase();
+            let reviewCoverageComplete = true;
+            try {
+              reviewCoverageComplete = !policy.hasIncompleteCoverageSignal(review);
+            } catch (err) {
+              core.setFailed(`Invalid PR-Agent review coverage signal: ${err.message}`);
+              return;
+            }
             let decision;
             try {
               decision = policy.isCleanReviewForImproveSkip(
                 review,
                 persistentState,
-                { headMatches: true, toolError: false, reviewCoverageComplete: true }
+                {
+                  headMatches: true,
+                  toolError: pragentOutcome === 'failure',
+                  reviewCoverageComplete,
+                  reviewedHeadSha: reviewedSha,
+                }
               );
             } catch (err) {
               core.setFailed(err.message);

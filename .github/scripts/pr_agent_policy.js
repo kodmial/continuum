@@ -258,6 +258,171 @@ const BLOCKING_SECURITY_SIGNAL_KEYS = [
   'critical_security_issues',
 ];
 
+// Upstream clean reviews commonly report security fields as negation prose
+// ("No", "None", "N/A", "No security concerns found"). Such prose must not
+// block the clean-PR fast path; anything else fails closed and blocks.
+const CLEAN_SECURITY_TEXTS = new Set([
+  'no',
+  'none',
+  'n/a',
+  'na',
+  'nil',
+  'null',
+  'nope',
+  '0',
+  'false',
+  'ok',
+  'clear',
+  'clean',
+  'pass',
+  'passed',
+  'not applicable',
+  'none found',
+  'no findings',
+  'no finding',
+  'no issues',
+  'no issue',
+  'no concerns',
+  'no concern',
+  'no risks',
+  'no risk',
+  'no vulnerabilities',
+  'no vulnerability',
+  'no problems',
+  'no problem',
+  'no threats',
+  'no threat',
+  'no security concerns',
+  'no security issues',
+  'no security vulnerabilities',
+  'no critical issues',
+  'no critical security issues',
+]);
+
+const CLEAN_SECURITY_SUFFIXES = [' found', ' detected', ' identified', ' observed'];
+
+function normalizeSecurityText(value) {
+  const norm = String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9/ ]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return norm;
+}
+
+function isCleanSecurityText(value) {
+  const norm = normalizeSecurityText(value);
+  if (!norm) return true;
+  if (CLEAN_SECURITY_TEXTS.has(norm)) return true;
+  for (const suffix of CLEAN_SECURITY_SUFFIXES) {
+    if (norm.endsWith(suffix) && CLEAN_SECURITY_TEXTS.has(norm.slice(0, -suffix.length).trim())) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function securityValueIsBlocking(value) {
+  if (value === undefined || value === null) return false;
+  if (typeof value === 'string') return !isCleanSecurityText(value);
+  if (Array.isArray(value)) {
+    if (value.length === 0) return false;
+    return value.some(securityValueIsBlocking);
+  }
+  if (typeof value === 'object') {
+    const keys = Object.keys(value);
+    if (keys.length === 0) return false;
+    return keys.some((key) => securityValueIsBlocking(value[key]));
+  }
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value !== 0;
+  return Boolean(value);
+}
+
+const TOOL_ERROR_SIGNAL_KEYS = [
+  'tool_errors',
+  'tool_error',
+  'tool_failures',
+  'failed_tools',
+  'errors',
+  'error',
+];
+
+const COVERAGE_FLAG_KEYS = [
+  'review_coverage_complete',
+  'coverage_complete',
+  'coverage_completed',
+  'is_complete',
+  'is_completed',
+  'complete',
+  'truncated',
+  'partial',
+  'incomplete',
+];
+
+const COVERAGE_OBJECT_KEYS = [
+  'coverage',
+  'review_coverage',
+  'chunk_coverage',
+  'review_coverage_footer',
+  'coverage_footer',
+];
+
+function hasToolErrorSignal(reviewPayload) {
+  const review = unwrapReview(reviewPayload);
+  for (const key of TOOL_ERROR_SIGNAL_KEYS) {
+    if (!(key in review)) continue;
+    if (securityValueIsBlocking(review[key])) return true;
+  }
+  return false;
+}
+
+function hasIncompleteCoverageSignal(reviewPayload) {
+  const review = unwrapReview(reviewPayload);
+  for (const key of COVERAGE_FLAG_KEYS) {
+    if (!(key in review)) continue;
+    const value = review[key];
+    if (key === 'truncated' || key === 'partial' || key === 'incomplete') {
+      if (value === true) return true;
+      if (typeof value === 'string' && ['1', 'true', 'yes'].includes(value.trim().toLowerCase())) {
+        return true;
+      }
+      continue;
+    }
+    if (value === false) return true;
+    if (typeof value === 'string' && ['0', 'false', 'no'].includes(value.trim().toLowerCase())) {
+      return true;
+    }
+  }
+  for (const key of COVERAGE_OBJECT_KEYS) {
+    if (!(key in review)) continue;
+    const value = review[key];
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      const reviewed = value.reviewed !== undefined ? value.reviewed : value.reviewed_chunks;
+      const total = value.total !== undefined ? value.total : value.total_chunks;
+      const reviewedNum = reviewed === undefined || reviewed === null || reviewed === '' ? null : Number(reviewed);
+      const totalNum = total === undefined || total === null || total === '' ? null : Number(total);
+      if (reviewedNum !== null && totalNum !== null && Number.isFinite(reviewedNum) && Number.isFinite(totalNum)) {
+        if (totalNum <= 0 || reviewedNum < totalNum) return true;
+        continue;
+      }
+      if (value.complete === false) return true;
+      if (value.truncated === true || value.partial === true) return true;
+      continue;
+    }
+    if (typeof value === 'string') {
+      const lowered = value.trim().toLowerCase();
+      if (!lowered) continue;
+      const mentionsGap =
+        lowered.includes('partial') || lowered.includes('incomplete') || lowered.includes('truncated');
+      const claimsComplete = lowered.replace(/incomplete/g, '').includes('complete');
+      if (mentionsGap && !claimsComplete) return true;
+    }
+  }
+  return false;
+}
+
 function unwrapReview(reviewPayload) {
   if (
     reviewPayload &&
@@ -280,19 +445,7 @@ function hasBlockingSecuritySignal(reviewPayload) {
   for (const key of BLOCKING_SECURITY_SIGNAL_KEYS) {
     const value = review[key];
     if (value === undefined || value === null) continue;
-    if (typeof value === 'string') {
-      if (value.trim()) return true;
-      continue;
-    }
-    if (Array.isArray(value)) {
-      if (value.length > 0) return true;
-      continue;
-    }
-    if (typeof value === 'object') {
-      if (Object.keys(value).length > 0) return true;
-      continue;
-    }
-    if (value) return true;
+    if (securityValueIsBlocking(value)) return true;
   }
   return false;
 }
@@ -320,9 +473,11 @@ function persistentHasActive(persistentState) {
 
 function isCleanReviewForImproveSkip(reviewPayload, persistentState, options = {}) {
   const opts = options && typeof options === 'object' ? options : {};
-  const toolError = opts.toolError === true;
-  const reviewCoverageComplete = opts.reviewCoverageComplete !== false;
   const headMatches = opts.headMatches === true;
+  const review = unwrapReview(reviewPayload);
+  const toolError = opts.toolError === true || hasToolErrorSignal(review);
+  const reviewCoverageComplete =
+    opts.reviewCoverageComplete !== false && !hasIncompleteCoverageSignal(review);
   if (toolError) {
     return { skip: false, reason: 'tool error: failing closed' };
   }
@@ -332,7 +487,6 @@ function isCleanReviewForImproveSkip(reviewPayload, persistentState, options = {
   if (!headMatches) {
     return { skip: false, reason: 'stale head: result is not for the current HEAD' };
   }
-  const review = unwrapReview(reviewPayload);
   const keyIssues = review.key_issues_to_review;
   if (!Array.isArray(keyIssues)) {
     throw new Error('PR-Agent review JSON has no key_issues_to_review list.');
@@ -366,6 +520,16 @@ function isCleanReviewForImproveSkip(reviewPayload, persistentState, options = {
   if (lastRun.complete !== true || String(lastRun.kind || '') !== 'full') {
     throw new Error('Persistent state does not represent a complete full review.');
   }
+  const stateHead = String(lastRun.head_sha || lastRun.headSha || '').trim().toLowerCase();
+  if (!stateHead) {
+    throw new Error('Upstream PR-Agent persistent state has no last_run.head_sha.');
+  }
+  const reviewedHeadSha = String(
+    opts.reviewedHeadSha || opts.reviewed_head_sha || opts.headSha || opts.head_sha || ''
+  ).trim().toLowerCase();
+  if (reviewedHeadSha && stateHead !== reviewedHeadSha) {
+    return { skip: false, reason: 'stale persistent state: not for the reviewed HEAD' };
+  }
   if (persistentHasActive(persistentState)) {
     return { skip: false, reason: 'native persistent state has an ACTIVE finding' };
   }
@@ -397,6 +561,8 @@ module.exports = {
   buildRepairBatch,
   controllerStateBody,
   hasBlockingSecuritySignal,
+  hasIncompleteCoverageSignal,
+  hasToolErrorSignal,
   isCleanReviewForImproveSkip,
   logicalFingerprint,
   normalizeProblem,
