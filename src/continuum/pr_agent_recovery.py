@@ -146,22 +146,27 @@ _NEGATED_RECOVERY_ELIGIBLE_RE = re.compile(
 # Deterministic policy hints dominate the recovery token: a description that
 # carries both (e.g. "CI test failure; recovery eligible" synthesized from
 # PR-visible output) must hold, never burn transient budget. Only an
-# explicit failure_transient=True classifier verdict overrides this. Bare
-# ``conflict`` is matched word-initially (``[^a-z]conflict``, mirroring the
-# reconciler workflow) so incidental mentions such as ``conflict-free`` or
-# ``conflicting`` do not strand genuinely transient failures; a real merge
-# conflict still holds via ``merge conflict``.
+# explicit failure_transient=True classifier verdict overrides this.
+# ``unresolved`` alone is not a hint: transient infrastructure text such as
+# ``unresolved host`` or ``unresolved DNS`` must retry through the bounded
+# budget, so only an unresolved review finding (finding/review/thread/
+# comment/conversation) holds. Bare ``conflict`` matches at any position
+# (including position zero) except inside ``conflict-free``/``conflicting``,
+# so incidental mentions dispatch while a real merge conflict still holds
+# via ``merge conflict`` or the bare-conflict pattern.
 _DETERMINISTIC_HINTS = (
     "test failure",
     "tests failed",
-    "unresolved",
     "merge conflict",
     "malformed",
     "stale head",
     "moved head",
     "invalid state",
 )
-_BARE_CONFLICT_RE = re.compile(r"[^a-z]conflict")
+_UNRESOLVED_FINDING_RE = re.compile(
+    r"unresolved\s+(findings?|reviews?|threads?|comments?|conversations?)"
+)
+_BARE_CONFLICT_RE = re.compile(r"(?:^|[^a-z])conflict(?!\s*-\s*free\b)(?!ing\b)")
 TRUSTED_OPERATION_CONTEXTS = frozenset(
     {
         "continuum/pr-agent-review",
@@ -266,8 +271,11 @@ def retry_evidence(
         elif attempt == latest_attempt and created_at is not None:
             if latest_marker_at is None or created_at > latest_marker_at:
                 latest_marker_at = created_at
-                if marker_not_before is not None:
-                    not_before = marker_not_before
+                # Latest write wins, including clearing: a newer
+                # same-attempt marker without not-before lifts the older
+                # reset-aware wait instead of leaving a stale deferral
+                # that waits past the point the latest write cleared it.
+                not_before = marker_not_before
 
     for comment in comments:
         association = str(comment.get("author_association") or "").upper()
@@ -436,13 +444,17 @@ def decide_recovery(
     if (
         marker_newer_than_status
         and evidence.latest_attempt is not None
-        and marker_age_seconds is not None
-        and marker_age_seconds < dispatch_grace_seconds
+        and (
+            marker_age_seconds is None
+            or marker_age_seconds < dispatch_grace_seconds
+        )
     ):
-        # Only a known age inside grace coalesces: an unknown marker age
-        # (missing/unparsable timestamp) cannot prove a dispatch is still
-        # in flight, so waiting on it would never expire and would strand
-        # a healthy PR with neither event nor watchdog wakeups advancing.
+        # Fail closed on unknown marker age, mirroring the reconciler: a
+        # durable marker without a parseable timestamp cannot prove grace
+        # expired, so it stays inside grace instead of dispatching a
+        # likely duplicate. The scheduled safety net keeps waking (caller
+        # stub cron), and newer status activity clears marker_newer, so
+        # this wait always has an expiry path.
         return RecoveryDecision(
             "wait", None, "newer retry dispatch marker is still inside dispatch grace"
         )
@@ -462,13 +474,20 @@ def decide_recovery(
                 "hold", None, "deterministic failure is not automatically retried"
             )
         elif _is_explicit_recovery_eligible(description):
-            if operation_context is not None and str(operation_context or "").strip().lower() not in TRUSTED_OPERATION_CONTEXTS:
+            # Trust gate: the token alone never authorizes a retry unless
+            # it comes from a reconciler-synthesized status in a trusted
+            # context. A missing context is untrusted: PR-visible text is
+            # not a reconciler status, so omitting the context can never
+            # bypass the TRUSTED_OPERATION_CONTEXTS check and burn
+            # transient budget on the token alone.
+            if str(operation_context or "").strip().lower() not in TRUSTED_OPERATION_CONTEXTS:
                 return RecoveryDecision(
                     "hold", None, "recovery token from untrusted context is not automatically retried"
                 )
             lowered = description.lower()
             if (
                 any(hint in lowered for hint in _DETERMINISTIC_HINTS)
+                or _UNRESOLVED_FINDING_RE.search(lowered)
                 or _BARE_CONFLICT_RE.search(lowered)
             ):
                 return RecoveryDecision(

@@ -731,6 +731,68 @@ class TokenPolicyTests(unittest.TestCase):
         self.assertTrue(lifecycle.requires_pat("some_future_unknown_action"))
         self.assertTrue(lifecycle.requires_pat(""))
 
+    def test_read_substring_inside_unknown_action_fails_closed(self):
+        # "thread" contains "read" but is not a read; substring matching
+        # must never route an unknown action to GITHUB_TOKEN.
+        for action in ("thread", "threads", "spreadsheet", "requester"):
+            with self.subTest(action=action):
+                self.assertTrue(lifecycle.requires_pat(action))
+
+    def test_generic_clients_fail_closed_without_read_receiver(self):
+        # Only the client.* receiver defaults generic graphql/request/
+        # paginate to reads; the PAT receiver and bare names require PAT
+        # so a mutation tunneled through a generic client never uses
+        # GITHUB_TOKEN. Mutation content forces PAT on any receiver.
+        for action in ("github.graphql", "github.request", "github.paginate",
+                       "graphql", "request", "paginate"):
+            with self.subTest(action=action):
+                self.assertTrue(lifecycle.requires_pat(action))
+        for action in ("client.graphql", "client.request", "client.paginate"):
+            with self.subTest(action=action):
+                self.assertFalse(lifecycle.requires_pat(action))
+        self.assertTrue(
+            lifecycle.requires_pat(
+                "client.graphql", "mutation { resolveReviewThread }"
+            )
+        )
+        self.assertFalse(
+            lifecycle.requires_pat("client.graphql", "query { reviewThreads }")
+        )
+
+    def test_not_before_without_a_clock_waits_fail_closed(self):
+        # A durable not-before commitment without the live clock must
+        # defer, never dispatch straight through the wait and burn budget.
+        for kwargs in (
+            {"not_before_epoch": 2000},
+            {"evidence": lifecycle.RetryEvidence(not_before_epoch=2000)},
+        ):
+            with self.subTest(kwargs=tuple(kwargs)):
+                decision = lifecycle.decide_recovery(
+                    ci_green=True,
+                    operation_state="failure",
+                    failure_transient=True,
+                    now_epoch=None,
+                    **kwargs,
+                )
+                self.assertEqual(decision.action, "wait")
+                self.assertIsNone(decision.attempt)
+
+    def test_transient_unresolved_infrastructure_dispatches(self):
+        # "unresolved host"/"unresolved DNS" are transient network text and
+        # must dispatch; only an unresolved review finding holds.
+        for description in (
+            "unresolved host; recovery eligible",
+            "unresolved DNS; recovery eligible",
+        ):
+            with self.subTest(description=description):
+                decision = lifecycle.decide_recovery(
+                    ci_green=True,
+                    operation_state="failure",
+                    operation_description=description,
+                    operation_context="continuum/pr-agent-review",
+                )
+                self.assertEqual(decision.action, "dispatch")
+
 
 class CrossStackContractTests(unittest.TestCase):
     def test_one_contract_covers_every_lifecycle_kind(self):

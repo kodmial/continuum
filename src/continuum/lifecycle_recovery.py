@@ -24,6 +24,24 @@ token-policy semantics without changing any provider-specific review policy:
 - duplicate wakeups coalesce onto one per-PR/HEAD lease;
 - same-repository read-only discovery uses the run-scoped ``GITHUB_TOKEN``;
   PAT/TAP_PAT is reserved for mutations/dispatches.
+
+Required caller wiring (without it a stranded PR has no automatic
+rediscovery/redispatch): every reconciler built on this contract must
+combine the pure decisions below with
+
+- event triggers plus a scheduled watchdog (the ``continuum-*.yml``
+  caller stubs provide ``pull_request_target``/``workflow_run`` events
+  and a cron schedule, so every pass rediscovers already-stranded PRs);
+- a repository-global ``concurrency`` group (``cancel-in-progress:false``,
+  so a queued run re-reconciles from latest state instead of racing)
+  plus the per-PR/HEAD in-memory lease (:func:`concurrency_key`,
+  :func:`should_coalesce`) so unrelated PRs never queue behind or
+  starve each other;
+- durable dispatch/exhaustion marker writes (:func:`retry_marker`,
+  :func:`exhausted_marker`) with dispatch-grace coalescing, so a lost
+  dispatch replays the same bounded attempt instead of duplicating;
+- an exact-HEAD/CI/active-run latest-state re-read immediately before
+  every mutation, so a stale queued run becomes a safe no-op.
 """
 
 from __future__ import annotations
@@ -169,14 +187,35 @@ _TRANSIENT_ERROR_PATTERNS = (
 _DETERMINISTIC_HINTS = (
     "test failure",
     "tests failed",
-    "unresolved",
     "merge conflict",
-    "conflict",
     "malformed",
     "stale head",
     "moved head",
     "invalid state",
 )
+# Narrowed matchers shared with :mod:`continuum.pr_agent_recovery` (one
+# recovery contract): bare ``unresolved`` alone is not deterministic —
+# transient infrastructure text such as ``unresolved host`` or
+# ``unresolved DNS`` must retry through the bounded budget, so only an
+# unresolved review finding holds. Bare ``conflict`` matches at any
+# position (including position zero) except inside ``conflict-free`` /
+# ``conflicting``, so incidental mentions dispatch while a real merge
+# conflict still holds.
+_UNRESOLVED_FINDING_RE = re.compile(
+    r"unresolved\s+(findings?|reviews?|threads?|comments?|conversations?)"
+)
+_BARE_CONFLICT_RE = re.compile(r"(?:^|[^a-z])conflict(?!\s*-\s*free\b)(?!ing\b)")
+
+
+def _has_deterministic_hint(text: str) -> bool:
+    """Whether text carries a deterministic policy hint alongside the token."""
+
+    lowered = str(text or "").lower()
+    if any(token in lowered for token in _DETERMINISTIC_HINTS):
+        return True
+    if _UNRESOLVED_FINDING_RE.search(lowered):
+        return True
+    return bool(_BARE_CONFLICT_RE.search(lowered))
 
 
 class LifecycleRecoveryError(ValueError):
@@ -450,11 +489,11 @@ def classify_operation_failure(
         return FailureClassification(False, "malformed lifecycle state is deterministic")
     if ci_failed or "test failure" in text or "tests failed" in text:
         return FailureClassification(False, "current-head CI test failure is deterministic")
-    if has_unresolved_findings or "unresolved" in text:
+    if has_unresolved_findings or _UNRESOLVED_FINDING_RE.search(text):
         return FailureClassification(False, "unresolved review finding is deterministic")
-    if has_merge_conflict or "merge conflict" in text:
+    if has_merge_conflict or "merge conflict" in text or _BARE_CONFLICT_RE.search(text):
         return FailureClassification(False, "merge conflict uses the repair path")
-    if text and any(token in text for token in _DETERMINISTIC_HINTS):
+    if text and _has_deterministic_hint(text):
         return FailureClassification(False, "deterministic policy failure")
     return FailureClassification(False, "no transient infrastructure evidence")
 
@@ -638,7 +677,11 @@ def retry_evidence(
         elif attempt == latest_attempt and created_at is not None:
             if latest_marker_at is None or created_at > latest_marker_at:
                 latest_marker_at = created_at
-                not_before = marker_not_before if marker_not_before is not None else not_before
+                # Latest write wins, including clearing: a newer
+                # same-attempt marker without not-before lifts the older
+                # reset-aware wait instead of leaving a stale deferral
+                # that waits past the point the latest write cleared it.
+                not_before = marker_not_before
 
     for comment in comments:
         association = str(comment.get("author_association") or "").upper()
@@ -800,6 +843,13 @@ def decide_recovery(
         return RecoveryDecision(
             "wait", None, "newer retry dispatch marker is still inside dispatch grace"
         )
+    if (not_before_epoch is not None or evidence.not_before_epoch is not None) and now_epoch is None:
+        # Fail closed without a clock: a durable not-before commitment
+        # must defer to a later wakeup, never dispatch straight through
+        # the wait and burn budget, mirroring the reset-epoch path below.
+        return RecoveryDecision(
+            "wait", None, "durable not-before requires a clock; deferring",
+        )
     if not_before_epoch is not None and now_epoch is not None:
         try:
             if int(now_epoch) < int(not_before_epoch):
@@ -844,7 +894,7 @@ def decide_recovery(
             if str(operation_context or "").strip().lower() not in TRUSTED_OPERATION_CONTEXTS:
                 return RecoveryDecision("hold", None, "recovery token from untrusted context is not automatically retried")
             lowered_description = description.lower()
-            if any(hint in lowered_description for hint in _DETERMINISTIC_HINTS):
+            if _has_deterministic_hint(lowered_description):
                 return RecoveryDecision("hold", None, "deterministic failure is not automatically retried")
             recoverable = True
             transient_failure = True
@@ -1016,7 +1066,7 @@ _PAT_TOKENS = (
 )
 
 
-def requires_pat(action: object) -> bool:
+def requires_pat(action: object, content: object = "") -> bool:
     """Token policy: reads use GITHUB_TOKEN; only mutations require PAT.
 
     Accepts both bare action names (``"list"``) and dotted client paths
@@ -1026,15 +1076,26 @@ def requires_pat(action: object) -> bool:
     cancel, thread resolution, graphql mutations) returns True. Pure
     same-repository discovery reads return False. Unknown actions fail
     closed to True rather than silently widening GITHUB_TOKEN use.
+
+    Read matching is exact-segment/prefix based, never substring: an
+    unknown action such as ``"thread"`` must not match the ``"read"``
+    token inside it. Generic ``graphql``/``request``/``paginate`` paths
+    on the PAT (``github.*``) receiver or with mutation content
+    (``resolve``/``mutation``/``create``/``update``/``delete``) always
+    require PAT; only ``client.*`` generic reads without mutation
+    evidence stay on GITHUB_TOKEN.
     """
 
     name = str(action or "").strip().lower().replace("-", "_").replace(" ", "_")
+    body = str(content or "").strip().lower()
     # Dotted client paths are judged by the leaf operation so
     # "client.rest.pulls.listreviewcomments" (a read) is not confused with
     # "github.rest.issues.createcomment" (a mutation): the leaf carries the
     # verb. Mutation evidence wins over read naming.
     leaf = [segment for segment in name.replace(".", "_").split("_") if segment]
     leaf_word = leaf[-1] if leaf else ""
+    segments = set(leaf)
+    receiver = leaf[0] if leaf else ""
     full = "_".join(leaf)
     mutation_markers = (
         "create", "update", "delete", "addlabel", "removelabel",
@@ -1047,12 +1108,37 @@ def requires_pat(action: object) -> bool:
         # them, so any hit here is a real mutation/dispatch.
         if leaf_word not in {"listreviewcomments", "listcomments", "listreviews"}:
             return True
+    if body and any(marker in body for marker in mutation_markers):
+        # A mutation tunneled through a generic client (graphql/request
+        # body carrying resolve/mutation/create/...) is PAT-backed.
+        return True
+    # Fail closed for generic paths on the PAT receiver or without a
+    # receiver: "github.graphql" is the mutation channel (see the
+    # resolveReviewThread call site) while "client.graphql" is the read
+    # channel, so only the client receiver defaults to a read.
+    if leaf_word in {"graphql", "request", "paginate"} and receiver != "client":
+        return True
     # Explicit write verbs as whole segments (covers bare names like
     # "comment", "label", "release" used as shorthand for writes).
     if leaf_word in {"comment", "label", "release", "write", "submit", "push", "merge", "dispatch", "mutate", "mutation"}:
         return True
     for token in _READ_TOKENS:
-        if token in leaf_word or token in full:
+        # Exact-segment or verb-prefix match only: "thread" must never
+        # match "read" via substring, but concatenated read leaves such
+        # as "listreviews"/"listreviewcomments"/"getcommit" still read.
+        # The generic-receiver check above already forced github.*
+        # generics to PAT, so a False here is always a client-side or
+        # receiver-less specific read, never a PAT-channel mutation.
+        if token == leaf_word or token in segments or leaf_word.startswith(token + "_") or (
+            leaf_word.startswith(token) and leaf_word in {
+                "listreviews", "listreviewcomments", "listcomments",
+                "getcommit", "getbranch", "getpull", "listcommits",
+                "listreviewsforrepo", "getcombinedstatusforref",
+                "listcommitstatusesforref", "listworkflowruns",
+                "listworkflowrunsforrepo", "getworkflowrun",
+                "reviewthreads",
+            }
+        ):
             # A leaf already classified as a mutation above never reaches
             # here; remaining hits are pure discovery reads.
             return False

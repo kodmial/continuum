@@ -227,7 +227,20 @@ jobs:
             // window expires. Mirrors continuum-pr-agent-recovery.yml.
             const MAX_INLINE_WAIT_SECONDS = 60;
             const LIFECYCLE_RETRY_DELAY_SCHEDULE = [0, 10, 30, 60, 180, 300, 600, 1200, 2400, 3600];
-            function resetAwareDelaySeconds({ attempt, retryAfterSeconds, ratelimitResetEpoch, providerResetEpoch, nowEpoch }) {
+            const JITTER_CAP_SECONDS = 5;
+            // Deterministic bounded jitter so concurrent PRs hitting the same
+            // reset window do not redispatch in lockstep and re-hammer the
+            // limit. Mirrors continuum-pr-agent-recovery.yml.
+            function jitterSeconds(key, attempt, cap = JITTER_CAP_SECONDS) {
+              let hash = 2166136261;
+              const text = String(key || 'lifecycle') + ':' + String(attempt);
+              for (let i = 0; i < text.length; i += 1) {
+                hash ^= text.charCodeAt(i);
+                hash = Math.imul(hash, 16777619);
+              }
+              return cap > 0 ? (hash >>> 0) % (cap + 1) : 0;
+            }
+            function resetAwareDelaySeconds({ attempt, retryAfterSeconds, ratelimitResetEpoch, providerResetEpoch, nowEpoch, operationKey }) {
               // Clamp to the last schedule entry: an attempt at or beyond
               // the schedule end still defers the full 60m tail instead of
               // returning 0 and hot-retrying through quota exhaustion.
@@ -235,7 +248,7 @@ jobs:
                 ? 0
                 : LIFECYCLE_RETRY_DELAY_SCHEDULE[
                   Math.min(attempt, LIFECYCLE_RETRY_DELAY_SCHEDULE.length - 1)
-                ];
+                ] + jitterSeconds(operationKey || 'lifecycle', attempt);
               if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds >= 0) {
                 delay = Math.max(delay, retryAfterSeconds);
               }
@@ -1962,18 +1975,18 @@ jobs:
                   ratelimitResetEpoch: signals.ratelimitResetEpoch,
                   providerResetEpoch: signals.providerResetEpoch,
                   nowEpoch: Math.floor(Date.now() / 1000),
+                  operationKey: `${repoFullName}#${pr.number}:${headSha}`,
                 });
-                if (resetDelay > MAX_INLINE_WAIT_SECONDS) {
+                // Never sleep inline: a rate-limited PR must not hold the
+                // single run/loop slot while healthy independent PRs wait
+                // behind it. Short and long waits alike defer to the next
+                // wakeup/scheduled safety net without blocking the loop.
+                if (resetDelay > 0) {
                   core.notice(
                     `PR #${pr.number}: conflict-repair dispatch hit a rate limit; ` +
                     `deferring execution for ~${resetDelay}s to the scheduled safety net ` +
-                    `instead of sleeping the runner: ` + (err.message || err)
+                    `without sleeping the runner: ` + (err.message || err)
                   );
-                } else if (resetDelay > 0) {
-                  core.info(
-                    `PR #${pr.number}: bounded rate-limit backoff ${resetDelay}s before deferring to the next wakeup.`
-                  );
-                  await new Promise(resolve => setTimeout(resolve, resetDelay * 1000));
                 }
                 try {
                   await github.rest.issues.deleteComment({

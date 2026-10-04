@@ -147,6 +147,7 @@ class DurableEvidenceTests(unittest.TestCase):
             ci_green=True,
             operation_state="failure",
             operation_description="transient; recovery eligible",
+            operation_context="continuum/pr-agent-review",
             evidence=evidence,
             now_epoch=1000,
         )
@@ -155,6 +156,7 @@ class DurableEvidenceTests(unittest.TestCase):
             ci_green=True,
             operation_state="failure",
             operation_description="transient; recovery eligible",
+            operation_context="continuum/pr-agent-review",
             evidence=evidence,
             now_epoch=3000,
         )
@@ -176,30 +178,34 @@ class DurableEvidenceTests(unittest.TestCase):
             )
 
     def test_unknown_marker_age_dispatches_instead_of_waiting_forever(self):
-        # Only a known age inside grace coalesces: an unknown marker age
-        # (missing/unparsable timestamp) cannot prove a dispatch is still
-        # in flight, so waiting on it would never expire and would strand
-        # a healthy PR with no wakeup able to advance.
-        dispatch = recovery.decide_recovery(
-            ci_green=True,
-            operation_state="failure",
-            operation_description="transient; recovery eligible",
-            evidence=recovery.RetryEvidence(latest_attempt=2),
-            marker_newer_than_status=True,
-            marker_age_seconds=None,
-        )
-        self.assertEqual(dispatch.action, "dispatch")
-        self.assertEqual(dispatch.attempt, 3)
-        # A known age inside grace still coalesces the duplicate wakeup.
+        # Fail closed on unknown marker age, mirroring the reconciler: a
+        # marker without a parseable timestamp cannot prove grace expired,
+        # so it stays inside grace instead of dispatching a likely
+        # duplicate. The caller-stub schedule keeps waking, and newer
+        # status activity clears the newer-marker condition, so the wait
+        # always has an expiry path.
         waiting = recovery.decide_recovery(
             ci_green=True,
             operation_state="failure",
             operation_description="transient; recovery eligible",
+            operation_context="continuum/pr-agent-review",
+            evidence=recovery.RetryEvidence(latest_attempt=2),
+            marker_newer_than_status=True,
+            marker_age_seconds=None,
+        )
+        self.assertEqual(waiting.action, "wait")
+        self.assertIsNone(waiting.attempt)
+        # A known age inside grace still coalesces the duplicate wakeup.
+        coalesced = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="transient; recovery eligible",
+            operation_context="continuum/pr-agent-review",
             evidence=recovery.RetryEvidence(latest_attempt=2),
             marker_newer_than_status=True,
             marker_age_seconds=10,
         )
-        self.assertEqual(waiting.action, "wait")
+        self.assertEqual(coalesced.action, "wait")
 
     def test_not_before_without_clock_waits_fail_closed(self):
         # A durable reset-aware wait the marker already committed must
@@ -292,6 +298,7 @@ class RecoveryDecisionTests(unittest.TestCase):
             ci_green=True,
             operation_state="failure",
             operation_description="transient; recovery eligible",
+            operation_context="continuum/pr-agent-review",
             evidence=evidence,
             marker_newer_than_status=True,
             marker_age_seconds=10,
@@ -307,6 +314,7 @@ class RecoveryDecisionTests(unittest.TestCase):
             ci_green=True,
             operation_state="failure",
             operation_description="transient; recovery eligible",
+            operation_context="continuum/pr-agent-review",
             evidence=evidence,
             marker_newer_than_status=True,
             marker_age_seconds=recovery.DISPATCH_GRACE_SECONDS + 1,
@@ -319,6 +327,7 @@ class RecoveryDecisionTests(unittest.TestCase):
             ci_green=True,
             operation_state="failure",
             operation_description="PR-Agent review failed: transient; recovery eligible",
+            operation_context="continuum/pr-agent-review",
         )
         self.assertEqual(decision.action, "dispatch")
         self.assertEqual(decision.attempt, 1)
@@ -385,12 +394,14 @@ class RecoveryDecisionTests(unittest.TestCase):
                     ci_green=True,
                     operation_state="failure",
                     operation_description=description,
+                    operation_context="continuum/pr-agent-review",
                 )
                 self.assertEqual(decision.action, "dispatch")
         held = recovery.decide_recovery(
             ci_green=True,
             operation_state="failure",
             operation_description="merge conflict; recovery eligible",
+            operation_context="continuum/pr-agent-review",
         )
         self.assertEqual(held.action, "hold")
         override = recovery.decide_recovery(
@@ -416,6 +427,81 @@ class RecoveryDecisionTests(unittest.TestCase):
             operation_context="continuum/pr-agent-review",
         )
         self.assertEqual(dispatched.action, "dispatch")
+
+    def test_missing_operation_context_never_authorizes_the_token(self):
+        # Omitting the context bypassed the trusted-context check; a
+        # missing context is untrusted and must hold.
+        held = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="transient; recovery eligible",
+        )
+        self.assertEqual(held.action, "hold")
+        self.assertIsNone(held.attempt)
+
+    def test_transient_unresolved_infrastructure_retries(self):
+        # "unresolved host"/"unresolved DNS" are transient network text,
+        # not unresolved review findings, so they burn the bounded budget.
+        for description in (
+            "unresolved host; recovery eligible",
+            "unresolved DNS; recovery eligible",
+        ):
+            with self.subTest(description=description):
+                decision = recovery.decide_recovery(
+                    ci_green=True,
+                    operation_state="failure",
+                    operation_description=description,
+                    operation_context="continuum/pr-agent-review",
+                )
+                self.assertEqual(decision.action, "dispatch")
+        for description in (
+            "unresolved findings; recovery eligible",
+            "unresolved review thread; recovery eligible",
+        ):
+            with self.subTest(description=description):
+                held = recovery.decide_recovery(
+                    ci_green=True,
+                    operation_state="failure",
+                    operation_description=description,
+                    operation_context="continuum/pr-agent-review",
+                )
+                self.assertEqual(held.action, "hold")
+
+    def test_leading_and_mid_string_conflict_positions(self):
+        # A description starting with "conflict" at position zero holds,
+        # while a mid-string "conflict-free" mention dispatches.
+        held = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="conflict detected on merge; recovery eligible",
+            operation_context="continuum/pr-agent-review",
+        )
+        self.assertEqual(held.action, "hold")
+        dispatched = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="run conflict-free; recovery eligible",
+            operation_context="continuum/pr-agent-review",
+        )
+        self.assertEqual(dispatched.action, "dispatch")
+
+    def test_newer_same_attempt_marker_clears_the_wait(self):
+        # A newer same-attempt legacy marker without not-before lifts the
+        # older reset-aware wait instead of waiting past the clearing.
+        head = HEAD
+        comments = [
+            comment(
+                "<!-- continuum-lifecycle-retry head=" + head + " kind=review attempt=2 not-before=2000 -->",
+                age_seconds=3600,
+            ),
+            comment(
+                "<!-- continuum-pr-agent-retry head=" + head + " kind=review attempt=2 -->",
+                age_seconds=0,
+            ),
+        ]
+        evidence = recovery.retry_evidence(comments, head_sha=head, kind="review")
+        self.assertEqual(evidence.latest_attempt, 2)
+        self.assertIsNone(evidence.not_before_epoch)
 
     def test_legacy_short_exhausted_marker_preserves_exhaustion(self):
         short = HEAD[:7]
@@ -447,6 +533,7 @@ class RecoveryDecisionTests(unittest.TestCase):
             ci_green=True,
             operation_state="failure",
             operation_description="transient; recovery eligible",
+            operation_context="continuum/pr-agent-review",
             evidence=recovery.RetryEvidence(latest_attempt=9),
         )
         self.assertEqual(decision.action, "exhaust")
@@ -456,6 +543,7 @@ class RecoveryDecisionTests(unittest.TestCase):
             ci_green=True,
             operation_state="failure",
             operation_description="transient; recovery eligible",
+            operation_context="continuum/pr-agent-review",
             evidence=recovery.RetryEvidence(latest_attempt=2),
         )
         self.assertEqual(decision.action, "dispatch")
@@ -466,6 +554,7 @@ class RecoveryDecisionTests(unittest.TestCase):
             ci_green=True,
             operation_state="failure",
             operation_description="transient; recovery eligible",
+            operation_context="continuum/pr-agent-review",
             evidence=recovery.RetryEvidence(latest_attempt=9, exhausted=True),
         )
         self.assertEqual(decision.action, "hold")
@@ -1040,34 +1129,57 @@ class AutoMergeLoopSafetyTests(unittest.TestCase):
             r"const LIFECYCLE_RETRY_DELAY_SCHEDULE = (\[[^\]]*\]);", body
         )
         self.assertIsNotNone(schedule_match, "retry schedule const is missing")
-        fn_start = body.index("function resetAwareDelaySeconds(")
-        # Start brace counting at the function body, not the destructured
-        # parameter list (which itself contains braces).
-        brace = body.index(") {", fn_start) + 1
-        depth = 0
-        fn_end = None
-        for pos in range(brace, len(body)):
-            if body[pos] == "{":
-                depth += 1
-            elif body[pos] == "}":
-                depth -= 1
-                if depth == 0:
-                    fn_end = pos + 1
-                    break
-        self.assertIsNotNone(fn_end, "could not extract resetAwareDelaySeconds")
-        fn_source = body[fn_start:fn_end]
+        jitter_cap_match = re.search(
+            r"const JITTER_CAP_SECONDS = (\d+);", body
+        )
+        self.assertIsNotNone(jitter_cap_match, "jitter cap const is missing")
+
+        def extract_function(name):
+            fn_start = body.index(f"function {name}(")
+            # Start brace counting at the function body, not the destructured
+            # parameter list (which itself contains braces).
+            brace = body.index(") {", fn_start) + 1
+            depth = 0
+            fn_end = None
+            for pos in range(brace, len(body)):
+                if body[pos] == "{":
+                    depth += 1
+                elif body[pos] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        fn_end = pos + 1
+                        break
+            self.assertIsNotNone(fn_end, f"could not extract {name}")
+            return body[fn_start:fn_end]
+
+        fn_source = extract_function("resetAwareDelaySeconds")
+        jitter_source = extract_function("jitterSeconds")
 
         harness = (
             f"const LIFECYCLE_RETRY_DELAY_SCHEDULE = {schedule_match.group(1)};\n"
+            f"const JITTER_CAP_SECONDS = {jitter_cap_match.group(1)};\n"
+            + jitter_source
+            + "\n"
             + fn_source
             + "\n"
             "const assert = require('assert');\n"
             "const base = {};\n"
             "assert.strictEqual(resetAwareDelaySeconds({ ...base, attempt: 0 }), 0);\n"
-            "assert.strictEqual(resetAwareDelaySeconds({ ...base, attempt: 1 }), 10);\n"
-            "assert.strictEqual(resetAwareDelaySeconds({ ...base, attempt: 9 }), 3600);\n"
-            "assert.strictEqual(resetAwareDelaySeconds({ ...base, attempt: 10 }), 3600);\n"
-            "assert.strictEqual(resetAwareDelaySeconds({ ...base, attempt: 99 }), 3600);\n"
+            "// The canonical schedule is the floor and bounded per-operation\n"
+            "// jitter decorrelates concurrent PRs: retries land in\n"
+            "// [schedule, schedule + cap] instead of an exact value.\n"
+            "const d1 = resetAwareDelaySeconds({ ...base, attempt: 1, operationKey: 'owner/repo#1:head' });\n"
+            "assert.ok(d1 >= 10 && d1 <= 15, 'jittered attempt-1 floor, got ' + d1);\n"
+            "for (const attempt of [9, 10, 99]) {\n"
+            "  const tail = resetAwareDelaySeconds({ ...base, attempt, operationKey: 'owner/repo#1:head' });\n"
+            "  assert.ok(tail >= 3600 && tail <= 3605, 'clamped jittered tail, got ' + tail);\n"
+            "}\n"
+            "// Jitter is deterministic per operation key: the same key and\n"
+            "// attempt always agree, so controllers and tests coincide.\n"
+            "assert.strictEqual(\n"
+            "  resetAwareDelaySeconds({ attempt: 3, operationKey: 'owner/repo#1:head' }),\n"
+            "  resetAwareDelaySeconds({ attempt: 3, operationKey: 'owner/repo#1:head' })\n"
+            ");\n"
             "assert.strictEqual(resetAwareDelaySeconds({ ...base, attempt: 9, retryAfterSeconds: 4000 }), 4000);\n"
             "assert.strictEqual(resetAwareDelaySeconds({ ...base, attempt: 5, ratelimitResetEpoch: 1900, nowEpoch: 1000 }), 900);\n"
             "console.log('CLAMP_OK');\n"

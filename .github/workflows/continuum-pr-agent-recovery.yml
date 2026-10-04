@@ -627,6 +627,12 @@ jobs:
                 if (/rate limit|rate-limit|ratelimit|quota exhaustion|secondary rate limit/i.test(message)) return true;
                 return false;
               }
+              // A cancelled/evicted-run error without runner/run phrasing is
+              // still transient: consume the bounded transient budget and
+              // retry from latest state instead of holding as deterministic.
+              // Mirrors continuum-auto-merge.yml.
+              const retryable = new Set(['cancelled', 'timed_out', 'stale', 'startup_failure']);
+              if (err && retryable.has(String(err.conclusion || '').toLowerCase())) return true;
               return /timeout|timed out|econnreset|econnrefused|eai_again|epipe|socket hang up|network error|network failure|network timeout|network unreachable|dns error|dns failure|dns resolution|tls handshake|tls error|ssl error|connection reset|connection refused|connection aborted|temporarily unavailable|service unavailable|bad gateway|gateway timeout|bootstrap failed|bootstrap error|runner evicted|runner cancelled|runner timeout|runner lost|run evicted|run cancelled/i.test(
                 String((err && err.message) || '')
               );
@@ -773,9 +779,14 @@ jobs:
               }
               // Fail closed on unknown marker age (#224, single lifecycle
               // contract): a durable marker without a parseable timestamp
-              // cannot prove grace expired, so it stays inside grace
-              // instead of dispatching a likely duplicate immediately.
+              // cannot prove grace expired, so an in-flight dispatch
+              // (marker newer than status) stays inside grace instead of
+              // dispatching a likely duplicate immediately. Gated on
+              // markerNewer so a stale timestamp-less marker never strands
+              // the PR forever: once status catches up, reconciliation
+              // proceeds.
               if (
+                markerNewer &&
                 evidence.latestAttempt !== null &&
                 evidence.latestMarkerAt === null
               ) {
@@ -805,7 +816,12 @@ jobs:
                 // transient classifier verdict overrides it, so PR-visible
                 // output containing the token can never spend the budget.
                 const lowered = description.toLowerCase();
-                const hasDeterministicHint = /test failure|tests failed|unresolved|merge conflict|malformed|stale head|moved head|invalid state|[^a-z]conflict/.test(lowered);
+                // Narrowed deterministic hints, mirroring
+                // src/continuum/pr_agent_recovery.py: bare "unresolved"
+                // alone never holds (transient "unresolved host"/DNS text
+                // must retry), and bare "conflict" matches at any position
+                // except inside "conflict-free"/"conflicting".
+                const hasDeterministicHint = /test failure|tests failed|unresolved\s+(findings?|reviews?|threads?|comments?|conversations?)|merge conflict|malformed|stale head|moved head|invalid state|(?:^|[^a-z])conflict(?!\s*-\s*free\b)(?!ing\b)/.test(lowered);
                 if (
                   /\brecovery eligible\b/.test(lowered) &&
                   !/\b(?:not|no|non|never)[\s\-_]*recovery[\s\-_]+eligible\b/.test(lowered) &&
@@ -888,15 +904,28 @@ jobs:
                 // The deferral performs no execution, so it must never burn
                 // budget: persist attempt-1 so the next wakeup re-derives the
                 // same pending attempt index instead of advancing to latest+1
-                // without any execution.
+                // without any execution. Attempt 0 has no predecessor, so
+                // persisting attempt 0 would advance latestAttempt from null
+                // to 0 and burn the first execution for work never attempted:
+                // write nothing and let the next wakeup re-derive attempt 0
+                // when the scheduled safety net redispatches.
                 const notBefore = Math.floor(nowMs() / 1000) + remaining;
-                await upsertControllerState(
-                  pr.number,
-                  retryMarker(head, kind, Math.max(0, attempt - 1), notBefore),
-                  'Deferred PR-Agent ' + kind + ' recovery for exact HEAD ' + head +
-                    ' until ' + new Date(notBefore * 1000).toISOString() +
-                    ' (reset-aware backoff ' + remaining + 's).'
-                );
+                if (attempt > 0) {
+                  await upsertControllerState(
+                    pr.number,
+                    retryMarker(head, kind, attempt - 1, notBefore),
+                    'Deferred PR-Agent ' + kind + ' recovery for exact HEAD ' + head +
+                      ' until ' + new Date(notBefore * 1000).toISOString() +
+                      ' (reset-aware backoff ' + remaining + 's).'
+                  );
+                } else {
+                  core.notice(
+                    'PR #' + pr.number + ' ' + kind +
+                    ': deferring first execution for ' + remaining +
+                    's without persisting a marker (no budget burned); ' +
+                    'the scheduled safety net will redispatch.'
+                  );
+                }
                 core.notice(
                   'PR #' + pr.number + ' ' + kind +
                   ': deferring execution index ' + attempt + ' for ' + remaining +
