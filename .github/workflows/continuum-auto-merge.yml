@@ -1230,6 +1230,41 @@ jobs:
               pr = fresh;
               const headSha = pr.head.sha;
 
+              // Dirty recheck: the PR may have turned clean (or GitHub may
+              // still be recomputing mergeability) between the scan read and
+              // this dispatch. Never dispatch repair for a clean HEAD.
+              {
+                const mergeState = String(
+                  pr.mergeable_state || ''
+                ).toLowerCase();
+                const isDirty =
+                  pr.mergeable === false || mergeState === 'dirty';
+                if (!isDirty) {
+                  const computing =
+                    pr.mergeable == null &&
+                    (mergeState === '' ||
+                      mergeState === 'unknown' ||
+                      mergeState === 'null');
+                  if (computing) {
+                    core.info(
+                      `PR #${pr.number}: mergeability is still being computed for head ${headSha}; waiting.`
+                    );
+                    return;
+                  }
+                  if (hasLabel(pr, CONFLICT_LOCK_LABEL)) {
+                    await removeConflictLock(pr.number);
+                    core.notice(
+                      `PR #${pr.number}: head ${headSha} is no longer dirty; reconciled ${CONFLICT_LOCK_LABEL} and resuming CI/review lifecycle.`
+                    );
+                  } else {
+                    core.info(
+                      `PR #${pr.number}: head ${headSha} is no longer dirty; cancelling conflict dispatch.`
+                    );
+                  }
+                  return;
+                }
+              }
+
               // A live repair run for this PR owns the lock: wait instead of
               // dispatching a duplicate.
               const activeRun = await findActiveConflictRepairRun(pr.number);
@@ -1279,7 +1314,7 @@ jobs:
                 );
                 return;
               }
-              const attempt = markers.length;
+              let attempt = markers.length;
 
               // A stale lock with no active run and no fresh marker must not
               // strand the PR: reconcile it, then redispatch safely.
@@ -1297,6 +1332,62 @@ jobs:
                 labels: [CONFLICT_LOCK_LABEL],
               });
 
+              // Double-checked locking: two overlapping reconciler jobs can
+              // both pass the pre-lock checks before either dispatches. The
+              // lock itself is not atomic, so revalidate after acquiring it
+              // and before dispatching. An overlapping job that won the race
+              // leaves either a visible run or a fresh marker; seeing either
+              // here means waiting instead of dispatching a duplicate. The
+              // acquired lock is shared and left in place on these waits.
+              {
+                const confirmRun =
+                  await findActiveConflictRepairRun(pr.number);
+                if (confirmRun) {
+                  core.info(
+                    `PR #${pr.number}: conflict repair run ${confirmRun.id} (${confirmRun.status}) appeared while acquiring the lock; waiting.`
+                  );
+                  return;
+                }
+                const confirmComments = await github.paginate(
+                  github.rest.issues.listComments,
+                  {
+                    owner,
+                    repo,
+                    issue_number: pr.number,
+                    per_page: 100,
+                  }
+                );
+                const confirmMarkers = conflictRepairMarkers(
+                  confirmComments,
+                  headSha
+                );
+                const confirmLatest = confirmMarkers.at(-1) || null;
+                const confirmAgeMs =
+                  confirmLatest &&
+                  Number.isFinite(confirmLatest.createdAt)
+                    ? Date.now() - confirmLatest.createdAt
+                    : null;
+                if (
+                  confirmMarkers.length > 0 &&
+                  confirmAgeMs !== null &&
+                  confirmAgeMs < CONFLICT_DISPATCH_GRACE_MS
+                ) {
+                  core.info(
+                    `PR #${pr.number}: conflict-repair dispatch for head ${headSha} appeared while acquiring the lock; waiting.`
+                  );
+                  return;
+                }
+                if (
+                  confirmMarkers.length >= MAX_CONFLICT_DISPATCHES_PER_HEAD
+                ) {
+                  core.warning(
+                    `PR #${pr.number}: bounded conflict-repair budget exhausted for head ${headSha} (${confirmMarkers.length}/${MAX_CONFLICT_DISPATCHES_PER_HEAD}); waiting for a new HEAD.`
+                  );
+                  return;
+                }
+                attempt = confirmMarkers.length;
+              }
+
               try {
                 await github.request(
                   'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
@@ -1312,12 +1403,21 @@ jobs:
                     },
                   }
                 );
-                await github.rest.issues.createComment({
-                  owner,
-                  repo,
-                  issue_number: pr.number,
-                  body: conflictRepairMarker(headSha, attempt),
-                });
+                // A successful dispatch owns the lock even if the marker
+                // write fails, so marker failures must never un-lock an
+                // active run (that would invite a duplicate dispatch).
+                try {
+                  await github.rest.issues.createComment({
+                    owner,
+                    repo,
+                    issue_number: pr.number,
+                    body: conflictRepairMarker(headSha, attempt),
+                  });
+                } catch (markerErr) {
+                  core.warning(
+                    `PR #${pr.number}: repair dispatched but marker comment failed: ${markerErr.message}`
+                  );
+                }
                 core.notice(
                   `PR #${pr.number}: dispatched OpenCode conflict repair via ${opencodeWorkflow} for head ${headSha} (attempt ${attempt + 1}/${MAX_CONFLICT_DISPATCHES_PER_HEAD}, ${reason}).`
                 );

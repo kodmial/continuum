@@ -51,6 +51,9 @@ _ACTIVE_RUN_STATUSES = frozenset(
     {"queued", "in_progress", "waiting", "pending", "requested"}
 )
 
+TRUSTED_COMMENT_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
+TRUSTED_AUTOMATION_LOGINS = frozenset({"github-actions[bot]"})
+
 
 class ConflictRepairError(ValueError):
     """Raised when conflict-repair inputs cannot be interpreted safely."""
@@ -129,20 +132,53 @@ def _parse_time(value: object) -> Optional[datetime]:
     return parsed.astimezone(timezone.utc)
 
 
+def _comment_login(comment: Mapping[str, Any]) -> str:
+    """Return the comment author's login, supporting REST shapes."""
+    user = comment.get("user")
+    if isinstance(user, Mapping):
+        login = str(user.get("login") or "").strip()
+        if login:
+            return login.lower()
+    author = comment.get("author")
+    if isinstance(author, Mapping):
+        login = str(author.get("login") or "").strip()
+        if login:
+            return login.lower()
+    for key in ("author_login", "login"):
+        login = str(comment.get(key) or "").strip()
+        if login:
+            return login.lower()
+    return ""
+
+
 def repair_markers_for_head(
     comments: Sequence[Mapping[str, Any]],
     *,
     head_sha: str,
-    trusted_associations: Sequence[str] = ("OWNER", "MEMBER", "COLLABORATOR"),
+    trusted_associations: Sequence[str] = tuple(TRUSTED_COMMENT_ASSOCIATIONS),
+    trusted_logins: Sequence[str] = tuple(TRUSTED_AUTOMATION_LOGINS),
+    owner_login: str = "",
 ) -> list:
-    """Return trusted conflict-repair markers for one exact HEAD, oldest first."""
+    """Return trusted conflict-repair markers for one exact HEAD, oldest first.
+
+    Mirrors the workflow ``conflictRepairMarkers`` trust: a comment is
+    trusted when its author association is OWNER/MEMBER/COLLABORATOR, or
+    when its login is a trusted automation login (``github-actions[bot]``,
+    which posts markers with ``NONE`` association) or the repository owner
+    login.
+    """
 
     head = str(head_sha or "").strip().lower()
     trusted = {str(item).upper() for item in trusted_associations}
+    trusted_login_set = {str(item).lower() for item in trusted_logins}
+    owner = str(owner_login or "").strip().lower()
+    if owner:
+        trusted_login_set.add(owner)
     found: list = []
     for comment in comments:
         association = str(comment.get("author_association") or "").upper()
-        if association not in trusted:
+        login = _comment_login(comment)
+        if association not in trusted and login not in trusted_login_set:
             continue
         body = str(comment.get("body") or "")
         created_at = _parse_time(
@@ -289,6 +325,8 @@ __all__ = [
     "DEFAULT_CALLER",
     "MAX_DISPATCHES_PER_HEAD",
     "DISPATCH_GRACE_SECONDS",
+    "TRUSTED_COMMENT_ASSOCIATIONS",
+    "TRUSTED_AUTOMATION_LOGINS",
     "ConflictRepairError",
     "ConflictDecision",
     "is_conflicted",
