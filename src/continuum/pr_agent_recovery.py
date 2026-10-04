@@ -19,6 +19,7 @@ HEAD resets the episode; deterministic failures never consume the budget.
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Mapping, Optional, Sequence
@@ -109,6 +110,20 @@ class RecoveryDecision:
     action: str
     attempt: Optional[int]
     reason: str
+    not_before_epoch: Optional[int] = None
+    defer_dispatch: bool = False
+
+
+def utc_now_epoch() -> int:
+    """Return the current UTC epoch for dispatch-path clocks.
+
+    Dispatch paths must pass ``now_epoch=utc_now_epoch()`` so a durable
+    reset-aware not-before persists and expires through the scheduled
+    safety net. A clockless wait intentionally defers instead of
+    dispatching with no durable wait.
+    """
+
+    return int(time.time())
 
 
 def operation_key(pr_number: object, head_sha: object, kind: object) -> str:
@@ -175,6 +190,22 @@ TRUSTED_OPERATION_CONTEXTS = frozenset(
         "continuum/pr-agent-repair",
     }
 )
+#: Exact token authorizing a retry from a trusted reconciler-synthesized
+#: status. A bare ``transient`` substring never suffices.
+RECOVERY_TOKEN = "recovery eligible"
+
+
+def is_trusted_operation_context(operation_context: object) -> bool:
+    """Whether a commit-status context is a reconciler-synthesized writer.
+
+    Reconcilers that previously passed only ``operation_description``
+    must pass their synthesized ``operation_context`` (or an explicit
+    ``failure_transient`` verdict) through this gate first: a token from
+    a missing/untrusted context intentionally holds instead of
+    dispatching, so PR-visible text can never burn transient budget.
+    """
+
+    return str(operation_context or "").strip().lower() in TRUSTED_OPERATION_CONTEXTS
 
 
 def _is_explicit_recovery_eligible(description: str) -> bool:
@@ -237,6 +268,30 @@ def safe_operation_key(pr_number: object, head_sha: object, kind: object) -> Opt
         return operation_key(pr_number, head_sha, kind)
     except RecoveryError:
         return None
+
+
+def batch_operation_keys(
+    entries: Sequence[tuple[object, object, object]],
+) -> tuple[list[str], int]:
+    """Build durable identities for one open-PR scan, isolating bad HEADs.
+
+    ``entries`` is ``(pr_number, head_sha, kind)`` per PR. One
+    truncated/malformed HEAD yields a skip (counted) instead of raising
+    out of the repository-global loop, so healthy PRs behind it still
+    reconcile. Prefer this (or :func:`safe_operation_key` /
+    :func:`is_full_head` per PR) over calling :func:`operation_key`
+    directly in a loop.
+    """
+
+    keys: list[str] = []
+    skipped = 0
+    for pr_number, head_sha, kind in entries:
+        key = safe_operation_key(pr_number, head_sha, kind)
+        if key is None:
+            skipped += 1
+            continue
+        keys.append(key)
+    return keys, skipped
 
 
 def _parse_time(value: object) -> Optional[datetime]:
@@ -420,10 +475,19 @@ def backoff_seconds(attempt: int) -> int:
 
     Index 0 runs immediately; retries 1..9 wait ~10s, 30s, 60s, 3m, 5m,
     10m, 20m, 40m, 60m (bounded jitter is added by the caller).
+    Attempts past the schedule end clamp to the 60m tail instead of
+    raising, so external probers never get an exception for a large
+    index; negative attempts raise :class:`RecoveryError`.
+
+    Migration note: the pre-contract ``15 * (1 << (attempt - 1))``
+    unbounded growth is replaced by this capped schedule, shared with
+    :mod:`continuum.lifecycle_recovery`.
     """
 
     if attempt < 0:
         raise RecoveryError("attempt must be non-negative")
+    if attempt >= len(RETRY_DELAY_SCHEDULE):
+        return RETRY_DELAY_SCHEDULE[-1]
     try:
         return _lifecycle_backoff(attempt)
     except ValueError as exc:
@@ -490,10 +554,19 @@ def decide_recovery(
     description without either holds.
 
     Budget pairing: ``max_executions`` must be the same resolved value
-    passed to :func:`retry_evidence` for the same reconciliation. Resolve
+    passed to :func:`decide_recovery` for the same reconciliation. Resolve
     once with :func:`resolve_max_executions` and pass it to both: the
-    exhaustion flag on ``evidence`` and the dispatch/exhaust decision here
-    share one budget, so mismatched values would disagree about exhaustion.
+    exhaustion flag here and the dispatch/exhaust decision there share one
+    budget, so mismatched values would disagree about exhaustion.
+
+    Migration note (budget 3 -> 10, short-SHA -> exact-HEAD): short-SHA
+    markers are ignored entirely and exhaustion requires
+    ``attempts >= budget`` under the new 10-execution contract. A PR
+    exhausted at 3 with a short marker therefore becomes retryable again
+    for up to 10 executions after upgrade, by design: prefix matching
+    could strand an unrelated healthy HEAD with no expiry path, so only
+    full-commit identity carries budget state. Operators auditing the
+    upgrade compare ``attempts`` against :func:`resolve_max_executions`.
     """
 
     state = str(operation_state or "").strip().lower() or None
@@ -515,8 +588,17 @@ def decide_recovery(
         # Fail closed without a clock: a durable reset-aware wait the marker
         # already committed must defer to the scheduled safety net, never
         # dispatch straight through it and burn transient budget on 403/429.
+        # The durable epoch is echoed so the watchdog can schedule the
+        # redispatch instead of polling; callers must pass
+        # ``now_epoch=utc_now_epoch()`` on every dispatch path.
+        try:
+            pending_epoch: Optional[int] = int(evidence.not_before_epoch)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            pending_epoch = None
         return RecoveryDecision(
-            "wait", None, "durable reset-aware not-before requires a clock; deferring"
+            "wait", None, "durable reset-aware not-before requires a clock; deferring",
+            not_before_epoch=pending_epoch,
+            defer_dispatch=True,
         )
     if (
         evidence.not_before_epoch is not None
@@ -529,7 +611,9 @@ def decide_recovery(
             raise RecoveryError("not-before/now epochs must be integers") from exc
         if now < not_before:
             return RecoveryDecision(
-                "wait", None, "durable reset-aware not-before time has not arrived"
+                "wait", None, "durable reset-aware not-before time has not arrived",
+                not_before_epoch=not_before,
+                defer_dispatch=True,
             )
 
     # Dispatch grace with a staleness expiry, mirroring the single
@@ -676,9 +760,13 @@ __all__ = [
     "RecoveryError",
     "RetryEvidence",
     "RecoveryDecision",
+    "utc_now_epoch",
+    "RECOVERY_TOKEN",
+    "is_trusted_operation_context",
     "operation_key",
     "is_full_head",
     "safe_operation_key",
+    "batch_operation_keys",
     "safe_retry_evidence",
     "retry_evidence",
     "resolve_max_executions",

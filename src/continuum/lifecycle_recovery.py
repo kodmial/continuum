@@ -62,6 +62,7 @@ from __future__ import annotations
 import hashlib
 import math
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -305,6 +306,80 @@ class RecoveryDecision:
     reason: str
     not_before_epoch: Optional[int] = None
     defer_dispatch: bool = False
+
+
+def utc_now_epoch() -> int:
+    """Return the current UTC epoch for dispatch-path clocks.
+
+    Every dispatch path must supply ``now_epoch`` (from this helper) so
+    reset-aware and schedule-only waits persist a durable not-before and
+    the scheduled safety net redispatches when the window expires. A
+    clockless retry intentionally waits instead of dispatching with no
+    durable wait.
+    """
+
+    return int(time.time())
+
+
+@dataclass(frozen=True)
+class LatestState:
+    """Validated latest authoritative state for one reconciliation.
+
+    The reconciler performs no GitHub fetch itself by design: the caller
+    must re-read exact-HEAD, CI-green, lease, and staleness immediately
+    before every mutation and pass the result through
+    :func:`validate_latest_state`, which fails closed on a miscomputed or
+    stale input instead of authorizing a mutation for a new HEAD.
+    """
+
+    head_sha: str
+    ci_green: bool
+    active_exact_lease: bool = False
+    active_operation: bool = False
+    status_age_seconds: Optional[int] = None
+
+
+def validate_latest_state(
+    *,
+    head_sha: object,
+    ci_green: object,
+    active_exact_lease: object = False,
+    active_operation: object = False,
+    status_age_seconds: object = None,
+) -> LatestState:
+    """Validate caller-supplied latest state, failing closed on misuse.
+
+    A non-full HEAD, a non-boolean CI/lease flag, or a negative staleness
+    age raises :class:`LifecycleRecoveryError` instead of authorizing a
+    mutation. Callers that already hold a re-read pass its values here;
+    a stale queued run surfaces as ``head_moved`` at the ``decide_recovery``
+    call site, never as a dispatch for a new HEAD.
+    """
+
+    head = normalize_head(head_sha)
+    if not isinstance(ci_green, bool):
+        raise LifecycleRecoveryError("ci_green must be a boolean from a latest-state re-read")
+    for name, flag in (
+        ("active_exact_lease", active_exact_lease),
+        ("active_operation", active_operation),
+    ):
+        if not isinstance(flag, bool):
+            raise LifecycleRecoveryError(f"{name} must be a boolean from a latest-state re-read")
+    age: Optional[int] = None
+    if status_age_seconds is not None:
+        try:
+            age = int(str(status_age_seconds).strip())
+        except (TypeError, ValueError) as exc:
+            raise LifecycleRecoveryError("status_age_seconds must be an integer") from exc
+        if age < 0:
+            raise LifecycleRecoveryError("status_age_seconds must be non-negative")
+    return LatestState(
+        head_sha=head,
+        ci_green=ci_green,
+        active_exact_lease=active_exact_lease,
+        active_operation=active_operation,
+        status_age_seconds=age,
+    )
 
 
 def normalize_head(head_sha: object) -> str:
@@ -1245,6 +1320,130 @@ def should_coalesce(active_leases: Sequence[str], key: str) -> bool:
     return normalized in {str(item or "").strip() for item in active_leases}
 
 
+def pre_mutation_guard(
+    *,
+    active_leases: Sequence[str],
+    concurrency_key_value: str,
+    evidence: RetryEvidence = RetryEvidence(),
+    marker_newer_than_status: bool = False,
+    marker_age_seconds: Optional[int] = None,
+    status_age_seconds: Optional[int] = None,
+    not_before_epoch: Optional[int] = None,
+    now_epoch: Optional[int] = None,
+    dispatch_grace_seconds: int = DISPATCH_GRACE_SECONDS,
+    stale_after_seconds: int = STALE_AFTER_SECONDS,
+) -> tuple[bool, str]:
+    """Combine every durable cross-run guard at the pre-mutation re-read.
+
+    Returns ``(may_mutate, reason)``. Callers invoke this immediately
+    before every mutation, after re-reading latest exact-HEAD state: a
+    stale queued run (lease owned, dispatch grace active, or not-before in
+    the future) returns ``(False, reason)`` and becomes a safe no-op
+    instead of racing the authoritative run. In-memory
+    :func:`should_coalesce` alone is intra-run only and must never gate a
+    mutation without this durable combination plus the repository-global
+    concurrency group.
+    """
+
+    if should_coalesce(active_leases, concurrency_key_value):
+        return False, "exact PR/HEAD lease already owned"
+    if dispatch_grace_active(
+        marker_newer_than_status=marker_newer_than_status,
+        latest_attempt=evidence.latest_attempt,
+        marker_age_seconds=marker_age_seconds,
+        status_age_seconds=status_age_seconds,
+        dispatch_grace_seconds=dispatch_grace_seconds,
+        stale_after_seconds=stale_after_seconds,
+    ):
+        return False, "newer retry dispatch marker is still inside dispatch grace"
+    pending = not_before_epoch if not_before_epoch is not None else evidence.not_before_epoch
+    if pending is not None:
+        if now_epoch is None:
+            return False, "durable not-before requires a clock; deferring"
+        try:
+            if int(now_epoch) < int(pending):
+                return False, "durable not-before time has not arrived"
+        except (TypeError, ValueError) as exc:
+            raise LifecycleRecoveryError("not-before/now epochs must be integers") from exc
+    return True, "pre-mutation guards pass"
+
+
+def batch_operation_keys(
+    entries: Sequence[tuple[object, object, object, object]],
+) -> tuple[list[str], int]:
+    """Build durable identities for one open-PR scan, isolating bad HEADs.
+
+    ``entries`` is ``(repo, pr_number, head_sha, kind)`` per PR. One
+    truncated/malformed HEAD yields a skip (counted) instead of raising
+    out of the repository-global loop, so healthy PRs behind it still
+    reconcile and independent-PR progress holds::
+
+        keys, skipped = batch_operation_keys(entries)
+    """
+
+    keys: list[str] = []
+    skipped = 0
+    for repo, pr_number, head_sha, kind in entries:
+        key = safe_operation_key(repo, pr_number, head_sha, kind)
+        if key is None:
+            skipped += 1
+            continue
+        keys.append(key)
+    return keys, skipped
+
+
+def reconcile_open_prs(
+    entries: Sequence[tuple[object, object, object, object]],
+    *,
+    active_leases: Sequence[str] = (),
+) -> tuple[list[str], list[str], int]:
+    """Wire one watchdog scan: dedupe wakeups, isolate bad HEADs, honor leases.
+
+    Returns ``(ready, coalesced, skipped)`` where ``ready`` holds
+    per-PR/HEAD keys free to reconcile, ``coalesced`` holds keys already
+    owned by ``active_leases``, and ``skipped`` counts malformed
+    identities that were skipped loudly. ``active_leases`` may hold
+    either per-PR/HEAD lease keys (:func:`concurrency_key`) or full
+    operation keys (:func:`operation_key`); each entry is coalesced when
+    either form is owned, so unrelated PRs never queue behind or starve
+    each other. This is the executable form of the required caller
+    wiring in the module docstring: event triggers plus the scheduled
+    watchdog feed entries in, the repository-global concurrency group
+    plus these per-PR/HEAD leases serialize runs, durable
+    dispatch/exhaustion markers gate via :func:`decide_recovery`, and the
+    caller still re-reads exact-HEAD/CI/active-run state (validated via
+    :func:`validate_latest_state`) and calls :func:`pre_mutation_guard`
+    immediately before every mutation.
+    """
+
+    lease_set = {str(item or "").strip() for item in active_leases}
+    key_to_lease: dict[str, str] = {}
+    order: list[str] = []
+    skipped = 0
+    for repo, pr_number, head_sha, kind in entries:
+        operation_key_value = safe_operation_key(repo, pr_number, head_sha, kind)
+        if operation_key_value is None:
+            skipped += 1
+            continue
+        try:
+            lease_key_value = concurrency_key(repo, pr_number, head_sha)
+        except LifecycleRecoveryError:
+            skipped += 1
+            continue
+        if operation_key_value not in key_to_lease:
+            key_to_lease[operation_key_value] = lease_key_value
+            order.append(operation_key_value)
+    ready: list[str] = []
+    coalesced: list[str] = []
+    for key in dedupe_wakeups(order):
+        lease_key_value = key_to_lease[key]
+        if lease_key_value in lease_set or key in lease_set:
+            coalesced.append(key)
+        else:
+            ready.append(key)
+    return ready, coalesced, skipped
+
+
 TRUSTED_OPERATION_CONTEXTS = frozenset(
     {
         "continuum/pr-agent-review",
@@ -1419,6 +1618,9 @@ __all__ = [
     "FailureClassification",
     "RetryEvidence",
     "RecoveryDecision",
+    "utc_now_epoch",
+    "LatestState",
+    "validate_latest_state",
     "normalize_head",
     "is_full_head",
     "safe_operation_key",
@@ -1441,5 +1643,8 @@ __all__ = [
     "forward_progress_clears",
     "dedupe_wakeups",
     "should_coalesce",
+    "pre_mutation_guard",
+    "batch_operation_keys",
+    "reconcile_open_prs",
     "requires_pat",
 ]

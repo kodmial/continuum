@@ -1648,6 +1648,192 @@ class RecoveryRepairTests(unittest.TestCase):
         self.assertIsNone(keys[1])
         self.assertIsNotNone(keys[2])
 
+
+class RepairCompatTests(unittest.TestCase):
+    """Lock the review repairs: batch, token, clock, exhaustion, backoff."""
+
+    def test_batch_operation_keys_isolate_one_bad_head(self):
+        keys, skipped = recovery.batch_operation_keys(
+            [(1, HEAD, "review"), (2, "short", "review"), (3, HEAD, "repair")]
+        )
+        self.assertEqual(len(keys), 2)
+        self.assertEqual(skipped, 1)
+
+    def test_safe_retry_evidence_isolates_one_bad_head(self):
+        self.assertIsNone(
+            recovery.safe_retry_evidence([], head_sha="short", kind="review")
+        )
+        evidence = recovery.safe_retry_evidence([], head_sha=HEAD, kind="review")
+        self.assertIsNotNone(evidence)
+        self.assertIsNone(evidence.latest_attempt)
+
+    def test_trusted_context_gate_is_explicit(self):
+        self.assertTrue(
+            recovery.is_trusted_operation_context("continuum/pr-agent-review")
+        )
+        self.assertFalse(recovery.is_trusted_operation_context(None))
+        self.assertFalse(recovery.is_trusted_operation_context("ci/external"))
+        self.assertEqual(recovery.RECOVERY_TOKEN, "recovery eligible")
+
+    def test_utc_now_epoch_supplies_dispatch_clock(self):
+        now = recovery.utc_now_epoch()
+        self.assertIsInstance(now, int)
+        self.assertGreater(now, 0)
+
+    def test_not_before_wait_echoes_epoch_for_redispatch(self):
+        evidence = recovery.RetryEvidence(latest_attempt=1, not_before_epoch=2000)
+        clockless = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="transient; recovery eligible",
+            operation_context="continuum/pr-agent-review",
+            evidence=evidence,
+            now_epoch=None,
+        )
+        self.assertEqual(clockless.action, "wait")
+        self.assertEqual(clockless.not_before_epoch, 2000)
+        self.assertTrue(clockless.defer_dispatch)
+        early = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="transient; recovery eligible",
+            operation_context="continuum/pr-agent-review",
+            evidence=evidence,
+            now_epoch=1000,
+        )
+        self.assertEqual(early.action, "wait")
+        self.assertEqual(early.not_before_epoch, 2000)
+        late = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="transient; recovery eligible",
+            operation_context="continuum/pr-agent-review",
+            evidence=evidence,
+            now_epoch=3000,
+        )
+        self.assertEqual(late.action, "dispatch")
+
+    def test_upgrade_resurrection_is_by_design_and_observable(self):
+        # Budget 3 -> 10: a full-HEAD attempts=3 marker is retryable again
+        # under the 10-execution contract; only attempts >= 10 exhausts.
+        mid = recovery.retry_evidence(
+            [comment(
+                f"<!-- continuum-pr-agent-retry-exhausted head={HEAD} kind=review attempts=3 -->"
+            )],
+            head_sha=HEAD,
+            kind="review",
+        )
+        self.assertFalse(mid.exhausted)
+        full = recovery.retry_evidence(
+            [comment(
+                f"<!-- continuum-pr-agent-retry-exhausted head={HEAD} kind=review attempts=10 -->"
+            )],
+            head_sha=HEAD,
+            kind="review",
+        )
+        self.assertTrue(full.exhausted)
+
+    def test_backoff_clamps_past_schedule_end(self):
+        self.assertEqual(recovery.backoff_seconds(9), 3600)
+        self.assertEqual(recovery.backoff_seconds(100), 3600)
+        with self.assertRaises(recovery.RecoveryError):
+            recovery.backoff_seconds(-1)
+
+
+class RepairCompatTests(unittest.TestCase):
+    """Lock the review repairs: batch, token, clock, exhaustion, backoff."""
+
+    def test_batch_operation_keys_isolate_one_bad_head(self):
+        keys, skipped = recovery.batch_operation_keys(
+            [(1, HEAD, "review"), (2, "short", "review"), (3, HEAD, "repair")]
+        )
+        self.assertEqual(len(keys), 2)
+        self.assertEqual(skipped, 1)
+
+    def test_safe_retry_evidence_isolates_one_bad_head(self):
+        self.assertIsNone(
+            recovery.safe_retry_evidence([], head_sha="short", kind="review")
+        )
+        evidence = recovery.safe_retry_evidence([], head_sha=HEAD, kind="review")
+        self.assertIsNotNone(evidence)
+        self.assertIsNone(evidence.latest_attempt)
+
+    def test_trusted_context_gate_is_explicit(self):
+        self.assertTrue(
+            recovery.is_trusted_operation_context("continuum/pr-agent-review")
+        )
+        self.assertFalse(recovery.is_trusted_operation_context(None))
+        self.assertFalse(recovery.is_trusted_operation_context("ci/external"))
+        self.assertEqual(recovery.RECOVERY_TOKEN, "recovery eligible")
+
+    def test_utc_now_epoch_supplies_dispatch_clock(self):
+        now = recovery.utc_now_epoch()
+        self.assertIsInstance(now, int)
+        self.assertGreater(now, 0)
+
+    def test_not_before_wait_echoes_epoch_for_redispatch(self):
+        evidence = recovery.RetryEvidence(latest_attempt=1, not_before_epoch=2000)
+        clockless = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="transient; recovery eligible",
+            operation_context="continuum/pr-agent-review",
+            evidence=evidence,
+            now_epoch=None,
+        )
+        self.assertEqual(clockless.action, "wait")
+        self.assertEqual(clockless.not_before_epoch, 2000)
+        self.assertTrue(clockless.defer_dispatch)
+        early = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="transient; recovery eligible",
+            operation_context="continuum/pr-agent-review",
+            evidence=evidence,
+            now_epoch=1000,
+        )
+        self.assertEqual(early.action, "wait")
+        self.assertEqual(early.not_before_epoch, 2000)
+        late = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="transient; recovery eligible",
+            operation_context="continuum/pr-agent-review",
+            evidence=evidence,
+            now_epoch=3000,
+        )
+        self.assertEqual(late.action, "dispatch")
+
+    def test_upgrade_resurrection_is_by_design_and_observable(self):
+        # Budget 3 -> 10: a full-HEAD attempts=3 marker is retryable again
+        # under the 10-execution contract; only attempts >= 10 exhausts.
+        mid = recovery.retry_evidence(
+            [comment(
+                f"<!-- continuum-pr-agent-retry-exhausted head={HEAD} kind=review attempts=3 -->"
+            )],
+            head_sha=HEAD,
+            kind="review",
+        )
+        self.assertFalse(mid.exhausted)
+        full = recovery.retry_evidence(
+            [comment(
+                f"<!-- continuum-pr-agent-retry-exhausted head={HEAD} kind=review attempts=10 -->"
+            )],
+            head_sha=HEAD,
+            kind="review",
+        )
+        self.assertTrue(full.exhausted)
+
+    def test_backoff_clamps_past_schedule_end(self):
+        self.assertEqual(recovery.backoff_seconds(9), 3600)
+        self.assertEqual(recovery.backoff_seconds(100), 3600)
+        with self.assertRaises(recovery.RecoveryError):
+            recovery.backoff_seconds(-1)
+
+    def read(self, path: str) -> str:
+        with open(os.path.join(ROOT, path), "r", encoding="utf-8") as handle:
+            return handle.read()
+
     def test_auto_merge_has_no_sticky_pat_fallback(self):
         body = self.read(".github/workflows/continuum-auto-merge.yml")
         self.assertIn("let readTokenUnavailable = false", body)

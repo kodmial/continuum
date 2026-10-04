@@ -1053,5 +1053,95 @@ class RecoveryRepairTests(unittest.TestCase):
         self.assertEqual(valid, lifecycle.operation_key(REPO, 1, HEAD, "review"))
 
 
+class RepairWiringTests(unittest.TestCase):
+    """Lock the review repairs: wiring, enforcement, and caller trust."""
+
+    def test_utc_now_epoch_supplies_dispatch_clock(self):
+        now = lifecycle.utc_now_epoch()
+        self.assertIsInstance(now, int)
+        self.assertGreater(now, 0)
+
+    def test_validate_latest_state_fails_closed_on_misuse(self):
+        good = lifecycle.validate_latest_state(
+            head_sha=HEAD, ci_green=True, status_age_seconds=0
+        )
+        self.assertEqual(good.head_sha, HEAD)
+        self.assertTrue(good.ci_green)
+        with self.assertRaises(lifecycle.LifecycleRecoveryError):
+            lifecycle.validate_latest_state(head_sha="abc1234", ci_green=True)
+        with self.assertRaises(lifecycle.LifecycleRecoveryError):
+            lifecycle.validate_latest_state(head_sha=HEAD, ci_green="yes")
+        with self.assertRaises(lifecycle.LifecycleRecoveryError):
+            lifecycle.validate_latest_state(
+                head_sha=HEAD, ci_green=True, active_exact_lease="no"
+            )
+        with self.assertRaises(lifecycle.LifecycleRecoveryError):
+            lifecycle.validate_latest_state(
+                head_sha=HEAD, ci_green=True, status_age_seconds=-1
+            )
+
+    def test_pre_mutation_guard_blocks_stale_queued_runs(self):
+        key = lifecycle.concurrency_key(REPO, 1, HEAD)
+        may, _ = lifecycle.pre_mutation_guard(
+            active_leases=[key], concurrency_key_value=key
+        )
+        self.assertFalse(may)
+        may, _ = lifecycle.pre_mutation_guard(
+            active_leases=[],
+            concurrency_key_value=key,
+            evidence=lifecycle.RetryEvidence(latest_attempt=2),
+            marker_newer_than_status=True,
+            marker_age_seconds=10,
+        )
+        self.assertFalse(may)
+        may, _ = lifecycle.pre_mutation_guard(
+            active_leases=[],
+            concurrency_key_value=key,
+            evidence=lifecycle.RetryEvidence(not_before_epoch=2000),
+            now_epoch=1000,
+        )
+        self.assertFalse(may)
+        may, _ = lifecycle.pre_mutation_guard(
+            active_leases=[],
+            concurrency_key_value=key,
+            evidence=lifecycle.RetryEvidence(not_before_epoch=2000),
+            now_epoch=None,
+        )
+        self.assertFalse(may)
+        may, reason = lifecycle.pre_mutation_guard(
+            active_leases=[], concurrency_key_value=key
+        )
+        self.assertTrue(may)
+        self.assertIn("pass", reason)
+
+    def test_batch_keys_and_scan_isolate_one_bad_head(self):
+        entries = [
+            (REPO, 1, HEAD, "review"),
+            (REPO, 2, "short", "review"),
+            (REPO, 3, HEAD, "repair"),
+        ]
+        keys, skipped = lifecycle.batch_operation_keys(entries)
+        self.assertEqual(len(keys), 2)
+        self.assertEqual(skipped, 1)
+        ready, coalesced, skipped = lifecycle.reconcile_open_prs(entries)
+        self.assertEqual(len(ready), 2)
+        self.assertEqual(coalesced, [])
+        self.assertEqual(skipped, 1)
+        # A lease on one PR never starves an unrelated PR.
+        lease = lifecycle.concurrency_key(REPO, 1, HEAD)
+        leased_key = lifecycle.operation_key(REPO, 1, HEAD, "review")
+        ready, coalesced, _ = lifecycle.reconcile_open_prs(
+            [(REPO, 1, HEAD, "review"), (REPO, 2, OLD_HEAD, "review")],
+            active_leases=[lease],
+        )
+        self.assertEqual(len(ready), 1)
+        self.assertEqual(coalesced, [leased_key])
+        # Duplicate wakeups coalesce onto one operation.
+        ready, _, _ = lifecycle.reconcile_open_prs(
+            [(REPO, 1, HEAD, "review"), (REPO, 1, HEAD, "review")]
+        )
+        self.assertEqual(ready, [leased_key])
+
+
 if __name__ == "__main__":
     unittest.main()
