@@ -788,12 +788,17 @@ jobs:
                 } catch (dispatchErr) {
                   const dispatchMessage = String(dispatchErr.message || dispatchErr);
                   const dispatchStatus = Number(dispatchErr.status || 0);
-                  // Any input rejection (HTTP 422 or any input-mentioning
-                  // error, regardless of GitHub's exact wording) on a
-                  // delegated dispatch means the review workflow lacks the
-                  // target_child_id input: refuse the bare retry explicitly
-                  // instead of surfacing a raw API error.
-                  if (recoveryChildId && (dispatchStatus === 422 || /input/i.test(dispatchMessage))) {
+                  // Narrow input-rejection detection: only a 422 whose
+                  // message names the opaque target_child_id input means
+                  // the review workflow lacks the delegated selector. Any
+                  // other 422 (invalid pr_number/expected_head_sha, ref, or
+                  // payload validation) or any message merely containing
+                  // the word "input" is rethrown verbatim so the operator
+                  // fixes the true remediation path.
+                  const isMissingTargetInput =
+                    dispatchStatus === 422 &&
+                    /target_child_id/i.test(dispatchMessage);
+                  if (recoveryChildId && isMissingTargetInput) {
                     throw new Error(
                       'Delegated recovery requires reviewWorkflow ' + reviewWorkflow +
                       ' to declare a target_child_id workflow_dispatch input; ' +

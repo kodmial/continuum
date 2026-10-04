@@ -395,10 +395,12 @@ jobs:
           # Target-aware admission (pulls.get plus exact-HEAD workflow-run
           # evidence against the resolved target repository). Local
           # same-repository reads use github.token; delegated cross-repository
-          # reads require TAP_PAT and fail closed without it (never fall back
-          # to github.token). Only the opaque child id ever selects the
-          # target; concrete repository identity stays runner-local.
-          github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || github.token }}
+          # reads require TAP_PAT. The fallback is gated on non-delegated runs
+          # so a delegated run without PAT yields an empty token instead of
+          # silently reading as github.token (auth itself fails closed before
+          # the embedded script runs). Only the opaque child id ever selects
+          # the target; concrete repository identity stays runner-local.
+          github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           script: |
             // Admission: open, non-draft, same-repo PR whose exact current HEAD
             // has green CI. Anything else is skipped, never reviewed.
@@ -505,9 +507,10 @@ jobs:
         env:
           # Scoped to the resolved target: local same-repository checkout
           # uses github.token so a missing PAT never breaks local-only runs;
-          # delegated cross-repository checkout requires TAP_PAT and fails
-          # closed without it (never falls back to github.token).
-          GH_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || github.token }}
+          # delegated cross-repository checkout requires TAP_PAT. The fallback
+          # is gated on non-delegated runs so a delegated run without PAT
+          # yields an empty token (auth itself fails closed before the guard).
+          GH_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           TAP_PAT: ${{ secrets.TAP_PAT }}
           HEAD_SHA: ${{ steps.admit.outputs.head_sha }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
@@ -694,9 +697,10 @@ jobs:
         env:
           # Target-aware revalidation (gh pr view plus exact-HEAD workflow-run
           # evidence against the resolved target). Local same-repository reads
-          # use github.token; delegated cross-repository reads require TAP_PAT
-          # and fail closed without it (never fall back to github.token).
-          GH_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || github.token }}
+          # use github.token; delegated cross-repository reads require TAP_PAT.
+          # The fallback is gated on non-delegated runs so a delegated run
+          # without PAT yields an empty token (auth itself fails closed).
+          GH_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           TAP_PAT: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           ADMITTED_SHA: ${{ steps.admit.outputs.head_sha }}
@@ -877,9 +881,10 @@ jobs:
         with:
           # Target-aware revalidation (pulls.get for the current PR head only
           # against the resolved target). Local reads use github.token;
-          # delegated cross-repository reads require TAP_PAT and fail closed
-          # without it (never fall back to github.token).
-          github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || github.token }}
+          # delegated cross-repository reads require TAP_PAT. The fallback is
+          # gated on non-delegated runs so a delegated run without PAT yields
+          # an empty token (auth itself fails closed before the script runs).
+          github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           script: |
             if (process.env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED === 'true' &&
                 !String(process.env.TAP_PAT || '').trim()) {
@@ -1205,9 +1210,10 @@ jobs:
         env:
           # Target-aware moved-head check (gh pr view for the current PR head
           # only against the resolved target). Local reads use github.token;
-          # delegated cross-repository reads require TAP_PAT and fail closed
-          # without it (never fall back to github.token).
-          GH_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || github.token }}
+          # delegated cross-repository reads require TAP_PAT. The fallback is
+          # gated on non-delegated runs so a delegated run without PAT yields
+          # an empty token (auth itself fails closed).
+          GH_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           TAP_PAT: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           REVIEWED_SHA: ${{ steps.before.outputs.sha }}

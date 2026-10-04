@@ -527,9 +527,11 @@ jobs:
         env:
           # Target-aware PR resolution (GET the current pull only against the
           # resolved target). Local reads use github.token; delegated
-          # cross-repository reads require TAP_PAT. Every GitHub operation in
-          # this step is read-only and fails closed on mismatch.
-          GH_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || github.token }}
+          # cross-repository reads require TAP_PAT. The fallback is gated on
+          # non-delegated runs so a delegated run without PAT yields an empty
+          # token (auth itself fails closed). Every GitHub operation in this
+          # step is read-only and fails closed on mismatch.
+          GH_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           TAP_PAT: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ inputs.pr_number }}
           HEAD_SHA: ${{ inputs.head_sha }}

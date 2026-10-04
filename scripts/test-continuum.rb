@@ -1777,12 +1777,17 @@ class ContinuumTest < Minitest::Test
     # unconditional github.token while mentioning TAP_PAT elsewhere, so each
     # step must carry the conditional token expression and the fail-closed
     # guard, and must never set an unconditional github.token credential.
-    conditional_token = "CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || github.token"
+    conditional_token = "CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '')"
+    empty_token_tail = "&& github.token || '')"
     assert_includes admit, 'github.token'
     assert_includes admit, 'secrets.TAP_PAT'
     assert_includes admit, 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED'
     assert_includes admit, conditional_token,
                     'admission must select TAP_PAT for delegated reads instead of an unconditional github.token'
+    assert_includes admit, empty_token_tail,
+                    'admission must yield an empty token for delegated runs without PAT so auth itself fails closed'
+    refute_includes admit, 'secrets.TAP_PAT || github.token }}',
+                    'admission must not fall back to github.token for delegated runs without PAT'
     assert_includes admit, 'refusing to fall back to github.token',
                     'admission must fail closed for delegated reads without TAP_PAT'
     refute_includes admit, 'github-token: ${{ github.token }}',
@@ -1799,6 +1804,10 @@ class ContinuumTest < Minitest::Test
     assert_includes before, 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED'
     assert_includes before, conditional_token,
                     'pre-review revalidation must select TAP_PAT for delegated reads instead of an unconditional github.token'
+    assert_includes before, empty_token_tail,
+                    'pre-review revalidation must yield an empty token for delegated runs without PAT so auth itself fails closed'
+    refute_includes before, 'secrets.TAP_PAT || github.token }}',
+                    'pre-review revalidation must not fall back to github.token for delegated runs without PAT'
     assert_includes before, 'refusing to fall back to github.token',
                     'pre-review revalidation must fail closed for delegated reads without TAP_PAT'
     refute_includes before, 'GH_TOKEN: ${{ github.token }}',
@@ -1814,6 +1823,10 @@ class ContinuumTest < Minitest::Test
     assert_includes after, 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED'
     assert_includes after, conditional_token,
                     'post-review revalidation must select TAP_PAT for delegated reads instead of an unconditional github.token'
+    assert_includes after, empty_token_tail,
+                    'post-review revalidation must yield an empty token for delegated runs without PAT so auth itself fails closed'
+    refute_includes after, 'secrets.TAP_PAT || github.token }}',
+                    'post-review revalidation must not fall back to github.token for delegated runs without PAT'
     assert_includes after, 'refusing to fall back to github.token',
                     'post-review revalidation must fail closed for delegated reads without TAP_PAT'
     refute_includes after, 'github-token: ${{ github.token }}',
@@ -1828,6 +1841,10 @@ class ContinuumTest < Minitest::Test
     assert_includes moved, 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED'
     assert_includes moved, conditional_token,
                     'moved-head check must select TAP_PAT for delegated reads instead of an unconditional github.token'
+    assert_includes moved, empty_token_tail,
+                    'moved-head check must yield an empty token for delegated runs without PAT so auth itself fails closed'
+    refute_includes moved, 'secrets.TAP_PAT || github.token }}',
+                    'moved-head check must not fall back to github.token for delegated runs without PAT'
     assert_includes moved, 'refusing to fall back to github.token',
                     'moved-head check must fail closed for delegated reads without TAP_PAT'
     refute_includes moved, 'GH_TOKEN: ${{ github.token }}',
@@ -1903,10 +1920,16 @@ class ContinuumTest < Minitest::Test
     # 1. No-progress check: issues.listComments read plus workflow-owned
     # marker parsing against the resolved target. Local reads use
     # github.token; delegated cross-repository reads require TAP_PAT via the
-    # conditional.
+    # empty-token conditional (delegated runs without PAT yield '' so auth
+    # itself fails closed before the embedded guard runs).
+    fail_closed_token = "CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '')"
     assert_includes convergence, 'github.token'
     assert_includes convergence, 'secrets.TAP_PAT'
     assert_includes convergence, 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED'
+    assert_includes convergence, fail_closed_token,
+                    'the no-progress read must yield an empty token for delegated runs without PAT'
+    refute_includes convergence, 'secrets.TAP_PAT || github.token }}',
+                    'the no-progress read must not fall back to github.token for delegated runs without PAT'
     assert_includes convergence, 'CONTINUUM_PR_AGENT_TARGET_OWNER'
     assert_includes convergence, 'github.rest.issues.listComments'
     assert_includes convergence, 'continuum-pr-agent-no-progress head='
@@ -1922,11 +1945,15 @@ class ContinuumTest < Minitest::Test
     refute_includes convergence, 'git push'
 
     # 2. Writable-branch resolution: GET the current pull only against the
-    # resolved target (conditional token as above). Every GitHub operation in
-    # this step is read-only and fails closed on mismatch.
+    # resolved target (empty-token conditional as above). Every GitHub
+    # operation in this step is read-only and fails closed on mismatch.
     assert_includes target, 'github.token'
     assert_includes target, 'secrets.TAP_PAT'
     assert_includes target, 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED'
+    assert_includes target, fail_closed_token,
+                    'writable-branch resolution must yield an empty token for delegated runs without PAT'
+    refute_includes target, 'secrets.TAP_PAT || github.token }}',
+                    'writable-branch resolution must not fall back to github.token for delegated runs without PAT'
     assert_includes target, 'repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/pulls/$PR_NUMBER'
     assert_includes target, "CURRENT_SHA=\"$(jq -r '.head.sha'"
     assert_includes target, 'PR_STATE="$(jq -r'
@@ -5934,7 +5961,11 @@ class ContinuumTest < Minitest::Test
     assert_includes reconcile, 'recoveryInputs.target_child_id = recoveryChildId',
                       "#{base}: delegated runs must preserve the opaque child selection"
     assert_includes reconcile, 'dispatchStatus === 422',
-                      "#{base}: any 422 on a delegated dispatch must raise the explicit delegated-target refusal, not a raw API error"
+                      "#{base}: delegated input rejection must be detected via HTTP 422"
+    assert_includes reconcile, '/target_child_id/i',
+                      "#{base}: only a 422 naming target_child_id means the review workflow lacks the delegated input; other 422s must rethrow verbatim"
+    refute_includes reconcile, '/input/i.test(dispatchMessage)',
+                      "#{base}: a bare /input/ match misclassifies unrelated input validation as a missing target_child_id input"
     assert_includes reconcile, 'refusing bare retry to preserve the delegated target',
                       "#{base}: a review workflow without the target_child_id input must fail closed explicitly"
   end

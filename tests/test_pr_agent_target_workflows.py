@@ -152,8 +152,12 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
         self.assertIn("recoveryInputs.target_child_id = recoveryChildId", body)
         self.assertIn("TARGET_CHILD_ID: ${{ inputs.target_child_id || vars.CONTINUUM_PR_AGENT_TARGET_CHILD_ID }}", body)
         # A review workflow missing the target_child_id input fails closed
-        # explicitly on any 422, not only on known error wordings.
+        # explicitly only when the 422 names the opaque input; other 422s
+        # (invalid pr_number/expected_head_sha, ref, payload validation)
+        # rethrow verbatim so the operator fixes the true cause.
         self.assertIn("dispatchStatus === 422", body)
+        self.assertIn("/target_child_id/i", body)
+        self.assertNotIn("/input/i.test(dispatchMessage)", body)
         self.assertIn("refusing bare retry to preserve the delegated target", body)
 
     def test_recovery_resolves_locally_scopes_concurrency_and_stays_exact_head(self):
@@ -237,8 +241,10 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
     def test_delegated_reads_fail_closed_without_pat(self):
         body = read(".github/workflows/continuum-pr-agent.yml")
         # A dedicated guard fails the run before any delegated read when
-        # TAP_PAT is empty, so the conditional token can never silently fall
-        # back to github.token for cross-repository reads.
+        # TAP_PAT is empty, and the credential itself yields an empty token
+        # so actions/github-script auth fails closed before the embedded
+        # script runs (never silently reading as github.token).
+        fail_closed_token = "CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '')"
         self.assertIn("Fail closed when delegated without PAT", body)
         self.assertIn("Delegated PR-Agent execution requires TAP_PAT", body)
         self.assertIn("refusing to fall back to github.token", body)
@@ -256,32 +262,61 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
                 self.assertIn("requires TAP_PAT", window)
                 # Presence-only checks would pass a step that reads cross-repo
                 # with an unconditional github.token while mentioning TAP_PAT
-                # elsewhere, so each step must carry the conditional token
-                # expression and the fail-closed guard.
+                # elsewhere, so each step must carry the empty-token
+                # conditional and the fail-closed guard.
                 self.assertIn(
-                    "CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || github.token",
+                    fail_closed_token,
                     window,
                 )
                 self.assertIn("refusing to fall back to github.token", window)
                 self.assertNotIn("github-token: ${{ github.token }}", window)
                 self.assertNotIn("GH_TOKEN: ${{ github.token }}", window)
+                self.assertNotIn("secrets.TAP_PAT || github.token }}", window)
 
     def test_checkout_credential_is_scoped_to_resolved_target(self):
         body = read(".github/workflows/continuum-pr-agent.yml")
         start = body.index("Checkout the pull request head without exposing")
         window = body[start:start + 4000]
-        # Local checkout uses github.token; only delegated checkout uses
-        # TAP_PAT, and delegated runs without PAT fail closed.
+        # Local checkout uses github.token; delegated checkout requires
+        # TAP_PAT and yields an empty token without it (auth itself fails
+        # closed before the guard).
         self.assertIn("github.token", window)
         self.assertIn("secrets.TAP_PAT", window)
         self.assertIn("CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED", window)
         self.assertIn("requires TAP_PAT", window)
         self.assertIn(
-            "CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || github.token",
+            "CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '')",
             window,
         )
         self.assertIn("refusing to fall back to github.token", window)
         self.assertNotIn("GH_TOKEN: ${{ github.token }}", window)
+        self.assertNotIn("secrets.TAP_PAT || github.token }}", window)
+
+    def test_repair_writable_branch_resolution_is_fail_closed_and_target_scoped(self):
+        body = read(".github/workflows/continuum-pr-agent-repair.yml")
+        start = body.index("Resolve the writable PR source branch")
+        window = body[start:start + 4000]
+        # Delegated PR resolution must use the resolved target with an
+        # empty-token fallback so auth itself fails closed without PAT.
+        self.assertIn("CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED", window)
+        self.assertIn(
+            "CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '')",
+            window,
+        )
+        self.assertNotIn("secrets.TAP_PAT || github.token }}", window)
+        self.assertIn("refusing to fall back to github.token", window)
+        self.assertIn("repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/pulls/$PR_NUMBER", window)
+        self.assertNotIn("repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER", window)
+        self.assertIn('"$HEAD_REPO" != "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY"', window)
+
+    def test_recovery_dispatch_error_names_target_child_id_only(self):
+        body = read(".github/workflows/continuum-pr-agent-recovery.yml")
+        # Misleading-error guard: only a 422 naming target_child_id is
+        # reported as a missing delegated input; other 422s rethrow verbatim.
+        self.assertIn("isMissingTargetInput", body)
+        self.assertIn("/target_child_id/i.test(dispatchMessage)", body)
+        self.assertIn("dispatchStatus === 422", body)
+        self.assertNotIn("/input/i.test(dispatchMessage)", body)
 
     def test_delegated_wakeup_never_retries_bare(self):
         body = read(".github/workflows/continuum-pr-agent-auto-merge.yml")
