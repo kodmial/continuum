@@ -57,6 +57,7 @@ jobs:
           INPUT_REVIEW_PROVIDER: ${{ inputs.review_provider }}
           CFG_REVIEW_PROVIDER: ${{ vars.CONTINUUM_REVIEW_PROVIDER }}
           INPUT_PR_NUMBER: ${{ inputs.pr_number }}
+          READ_GITHUB_TOKEN: ${{ github.token }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
@@ -66,6 +67,9 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const repoFullName = owner + '/' + repo;
+            const readGithub = new github.constructor({
+              auth: String(process.env.READ_GITHUB_TOKEN || ''),
+            });
             const reviewWorkflow = String(process.env.INPUT_REVIEW_WORKFLOW || 'continuum-pr-agent.yml').trim();
             if (!['continuum-pr-agent.yml', 'pr-agent.yml'].includes(reviewWorkflow)) {
               core.setFailed(
@@ -115,7 +119,7 @@ jobs:
               return;
             }
 
-            const { data: pr } = await github.rest.pulls.get({
+            const { data: pr } = await readGithub.rest.pulls.get({
               owner, repo, pull_number: Number(prNumber),
             });
             if (pr.state !== 'open') {
@@ -139,10 +143,19 @@ jobs:
             core.notice('PR-Agent review router operation key is ' + operationKey + '.');
 
             const activeStatuses = new Set(['queued', 'in_progress', 'waiting', 'requested', 'pending']);
-            const runs = await github.paginate(
-              github.rest.actions.listWorkflowRuns,
-              { owner, repo, workflow_id: reviewWorkflow, per_page: 100 }
-            );
+            // Coalescing only needs recent active workflow_dispatch runs. Do
+            // not walk repository history: that burned the shared PAT quota
+            // and a historical page-4/page-6 403 prevented useful /review
+            // commands from reaching the heavy workflow.
+            const { data: recentRuns } = await readGithub.rest.actions.listWorkflowRuns({
+              owner,
+              repo,
+              workflow_id: reviewWorkflow,
+              event: 'workflow_dispatch',
+              per_page: 100,
+              page: 1,
+            });
+            const runs = recentRuns.workflow_runs || [];
             const prefix = 'PR-Agent PR #' + prNumber + ' [review:';
             const suffix = 'head=' + head;
             const active = runs.find(run =>
@@ -158,8 +171,7 @@ jobs:
               return;
             }
 
-            const { data: repository } = await github.rest.repos.get({ owner, repo });
-            const ref = String(repository.default_branch || 'main');
+            const ref = String(context.payload.repository?.default_branch || 'main');
             await github.rest.actions.createWorkflowDispatch({
               owner, repo, workflow_id: reviewWorkflow, ref,
               inputs: {
