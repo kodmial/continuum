@@ -186,22 +186,41 @@ jobs:
           # OpenCode 1.18.34. The warm hit below is keyed by the image digest
           # in CONTINUUM_IMAGE_DIGEST (wired from the repository variable):
           # only a set, well-formed digest plus `command -v opencode` and the
-          # exact version takes the hit path with zero downloads; an empty
-          # digest falls through to deterministic reconstruction below.
+          # exact version takes the hit path with zero downloads. A cache
+          # failure (empty or malformed digest) falls back to deterministic
+          # reconstruction below, never failing closed. The digest is bound
+          # to the runtime by the image-digest stamp
+          # ($HOME/.opencode/image-digest) recorded by the validated image
+          # build (or a prior reconstruction): a stale or unrelated
+          # opencode 1.18.34 binary whose stamp does not match the digest
+          # cannot take the hit path.
           export PATH="$HOME/.opencode/bin:$PATH"
+          STAMP_FILE="$HOME/.opencode/image-digest"
           if [[ -n "${CONTINUUM_IMAGE_DIGEST:-}" ]] && ! [[ "$CONTINUUM_IMAGE_DIGEST" =~ ^[0-9a-f]{64}$ ]]; then
-            echo "::error::CONTINUUM_IMAGE_DIGEST must be a 64-char sha256 hex digest when set."
-            exit 1
+            echo "::warning::CONTINUUM_IMAGE_DIGEST is malformed; falling back to deterministic reconstruction."
+            CONTINUUM_IMAGE_DIGEST=""
           fi
-          if [[ "${CONTINUUM_IMAGE_DIGEST:-}" =~ ^[0-9a-f]{64}$ ]] && command -v opencode >/dev/null 2>&1 && opencode --version 2>&1 | grep -E -q "(^|[^0-9.])1\.18\.34([^0-9.]|$)"; then
-            echo "prepared-runtime hit: opencode 1.18.34 already present (image digest ${CONTINUUM_IMAGE_DIGEST})."
+          if [[ "${CONTINUUM_IMAGE_DIGEST:-}" =~ ^[0-9a-f]{64}$ ]] && [[ -f "$STAMP_FILE" ]] && [[ "$(cat "$STAMP_FILE")" == "$CONTINUUM_IMAGE_DIGEST" ]] && command -v opencode >/dev/null 2>&1 && opencode --version 2>&1 | grep -E -q "(^|[^0-9.])1\.18\.34([^0-9.]|$)"; then
+            echo "prepared-runtime hit: opencode 1.18.34 already present (image digest ${CONTINUUM_IMAGE_DIGEST} validated against ${STAMP_FILE})."
             echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
             exit 0
           fi
-          curl -fsSL --retry 3 --retry-delay 2 https://opencode.ai/install | bash -s -- --version 1.18.34
-          export PATH="$HOME/.opencode/bin:$PATH"
-          opencode --version 2>&1 | grep -E -q "(^|[^0-9.])1\.18\.34([^0-9.]|$)" || exit 1
-          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+          for attempt in 1 2 3; do
+            if curl -fsSL --retry 3 --retry-delay 2 https://opencode.ai/install | bash -s -- --version 1.18.34; then
+              export PATH="$HOME/.opencode/bin:$PATH"
+              opencode --version 2>&1 | grep -E -q "(^|[^0-9.])1\.18\.34([^0-9.]|$)" || exit 1
+              if [[ "${CONTINUUM_IMAGE_DIGEST:-}" =~ ^[0-9a-f]{64}$ ]]; then
+                echo "$CONTINUUM_IMAGE_DIGEST" > "$STAMP_FILE"
+              fi
+              echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+              exit 0
+            fi
+            if [[ "$attempt" -eq 3 ]]; then
+              echo "::error::OpenCode installer failed after 3 attempts."
+              exit 1
+            fi
+            sleep $((attempt * 15))
+          done
 
       - name: Fix all unresolved findings in one OpenCode run
         id: fix

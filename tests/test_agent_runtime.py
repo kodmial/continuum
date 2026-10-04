@@ -90,14 +90,14 @@ class AgentRuntimeContractTest(unittest.TestCase):
         self.assertLess(hit_at, installer_at)
         self.assertLess(hit_at, exit_at)
         self.assertLess(exit_at, installer_at)
-        # A probe before the installer without the short-circuit is not a
-        # proven warm path: removing `exit 0` while leaving the probe must
-        # fail the exit-0/else contract even though the Python detector
-        # still classifies it as no bootstrap install.
+        # A probe before the installer without a validated cache-miss guard
+        # is not a proven warm path: removing `exit 0` while leaving the
+        # probe means every run reinstalls, so the detector must report a
+        # bootstrap install even though a probe precedes the installer.
         no_short_circuit = warm_body.replace("            exit 0\n", "")
-        self.assertFalse(
+        self.assertTrue(
             runtime.normal_execution_uses_bootstrap_install(no_short_circuit),
-            "detector still sees the probe first (this is why it is not proof)",
+            "probe without a cache-miss guard (no exit 0/else) still reinstalls every run",
         )
         stripped_lines = no_short_circuit.splitlines()
         hit_line = next(i for i, line in enumerate(stripped_lines) if "prepared-runtime hit" in line)

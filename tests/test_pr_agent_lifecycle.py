@@ -41,6 +41,26 @@ SRC = os.path.join(ROOT, "src")
 # protected-file drift beyond the #179 probe still fails.
 BASELINE_SHA = "197bafdb6b157ad7d4e77888a1fed5a921a3f125"
 
+# Previous protected baseline before the PAUSE_ON_FAILURE advance above.
+# The empty-drift fallback below verifies the old-to-new baseline range
+# carries only the approved #179 probe plus this PAUSE change, so a new
+# baseline bundling unrelated protected-file drift cannot pass via the
+# worktree contract alone.
+PREVIOUS_BASELINE_SHA = "1a93faa"
+
+# PAUSE_ON_FAILURE baseline lines claimed by BASELINE_SHA (kodmial/continuum
+# #248 follow-up): the only non-#179 protected-file drift permitted in the
+# old-to-new baseline range.
+APPROVED_PAUSE_BASELINE_ADDED_LINES = (
+    "      PAUSE_ON_FAILURE: ${{ inputs.pause_on_failure || vars.AUTOMATION_PAUSE_ON_FAILURE || 'true' }}",
+    "              (process.env.PAUSE_ON_FAILURE || 'true') !== 'false';",
+)
+
+APPROVED_PAUSE_BASELINE_REMOVED_LINES = (
+    "      PAUSE_ON_FAILURE: ${{ inputs.pause_on_failure || vars.AUTOMATION_PAUSE_ON_FAILURE || 'false' }}",
+    "              (process.env.PAUSE_ON_FAILURE || 'false') !== 'false';",
+)
+
 PROTECTED_FILES = [
     ".github/workflows/continuum-opencode.yml",
     ".github/workflows/opencode.yml",
@@ -372,15 +392,92 @@ class ProtectedBaselineTests(unittest.TestCase):
                         )
                         self.assertIn("vars.CONTINUUM_IMAGE_DIGEST", baseline_body)
                         self.assertIn("prepared-runtime hit", baseline_body)
-                        self.assertLess(
-                            baseline_body.index(baseline_gated[0]),
-                            baseline_body.index("https://opencode.ai/install"),
-                            f"{path} baseline probe must precede the installer",
+                        # Per-site ordering by line number: both install
+                        # sites carry an identical probe string, so
+                        # str.index() returns the first occurrence for both
+                        # and the second check would pass vacuously.
+                        baseline_lines = baseline_body.splitlines()
+                        baseline_probe_nos = [
+                            i
+                            for i, line in enumerate(baseline_lines)
+                            if "CONTINUUM_IMAGE_DIGEST" in line and "command -v opencode" in line
+                            and line.strip() and not line.strip().startswith("#")
+                        ]
+                        baseline_installer_nos = [
+                            i
+                            for i, line in enumerate(baseline_lines)
+                            if "https://opencode.ai/install" in line
+                        ]
+                        self.assertEqual(
+                            len(baseline_probe_nos),
+                            2,
+                            f"{path} baseline blob must carry two digest-gated probes, "
+                            f"found {len(baseline_probe_nos)}",
+                        )
+                        self.assertEqual(
+                            len(baseline_installer_nos),
+                            2,
+                            f"{path} baseline blob must carry two installers, "
+                            f"found {len(baseline_installer_nos)}",
                         )
                         self.assertLess(
-                            baseline_body.index(baseline_gated[1]),
-                            baseline_body.rindex("https://opencode.ai/install"),
-                            f"{path} baseline probes must precede both site installers",
+                            baseline_probe_nos[0],
+                            baseline_installer_nos[0],
+                            f"{path} baseline first probe must precede the first installer",
+                        )
+                        self.assertLess(
+                            baseline_probe_nos[1],
+                            baseline_installer_nos[1],
+                            f"{path} baseline second probe must precede the second installer",
+                        )
+                        self.assertLess(
+                            baseline_installer_nos[0],
+                            baseline_probe_nos[1],
+                            f"{path} baseline probes must be per-site: second probe must be "
+                            "after first installer",
+                        )
+                        # The empty committed diff must not let a new
+                        # baseline smuggle unrelated protected-file drift:
+                        # verify the old-to-new baseline range carries only
+                        # the approved #179 probe plus the claimed
+                        # PAUSE_ON_FAILURE baseline.
+                        from collections import Counter as _RangeCounter
+                        ranged = subprocess.run(
+                            ["git", "diff", PREVIOUS_BASELINE_SHA, BASELINE_SHA, "--", path],
+                            cwd=ROOT,
+                            capture_output=True,
+                            text=True,
+                            timeout=30,
+                        )
+                        self.assertEqual(ranged.returncode, 0, ranged.stderr)
+                        range_added = []
+                        range_removed = []
+                        for line in ranged.stdout.splitlines():
+                            if line.startswith("+++ ") or line.startswith("--- "):
+                                continue
+                            if line.startswith("+"):
+                                range_added.append(line[1:])
+                            elif line.startswith("-"):
+                                range_removed.append(line[1:])
+                        approved_probe = _RangeCounter(APPROVED_179_OPENCODE_PROBE_LINES)
+                        expected_added = _RangeCounter(
+                            {line: 2 * count for line, count in approved_probe.items()}
+                        )
+                        expected_added.update(APPROVED_PAUSE_BASELINE_ADDED_LINES)
+                        self.assertEqual(
+                            _RangeCounter(range_added),
+                            expected_added,
+                            f"{path} old-to-new baseline range must carry only the approved "
+                            f"#179 probe plus the PAUSE_ON_FAILURE baseline: "
+                            f"extra={sorted(set(range_added) - set(expected_added))} "
+                            f"missing={sorted(set(expected_added) - set(range_added))}",
+                        )
+                        allowed_removed = set(APPROVED_PAUSE_BASELINE_REMOVED_LINES)
+                        self.assertEqual(
+                            sorted(set(range_removed) - allowed_removed),
+                            [],
+                            f"{path} old-to-new baseline range removes unapproved lines: "
+                            f"{sorted(set(range_removed) - allowed_removed)}",
                         )
                     # The probe must actually satisfy the #179 warm-path
                     # contract on the current worktree content.
@@ -417,15 +514,46 @@ class ProtectedBaselineTests(unittest.TestCase):
                         "no ungated warm hit may remain: every "
                         f"`command -v opencode` probe must be digest-gated: {ungated}",
                     )
-                    self.assertLess(
-                        body.index(gated[0]),
-                        body.index("https://opencode.ai/install"),
-                        "the digest-gated prepared-runtime probe must precede the installer",
+                    # Per-site ordering by line number: both install sites
+                    # carry an identical probe string, so str.index()
+                    # returns the first occurrence for both and the second
+                    # check below would otherwise pass vacuously.
+                    body_lines = body.splitlines()
+                    probe_nos = [
+                        i
+                        for i, line in enumerate(body_lines)
+                        if "CONTINUUM_IMAGE_DIGEST" in line and "command -v opencode" in line
+                        and line.strip() and not line.strip().startswith("#")
+                    ]
+                    installer_nos = [
+                        i
+                        for i, line in enumerate(body_lines)
+                        if "https://opencode.ai/install" in line
+                    ]
+                    self.assertEqual(
+                        len(probe_nos),
+                        2,
+                        f"expected two digest-gated probes, found {len(probe_nos)}",
+                    )
+                    self.assertEqual(
+                        len(installer_nos),
+                        2,
+                        f"expected two installers, found {len(installer_nos)}",
                     )
                     self.assertLess(
-                        body.index(gated[1]),
-                        body.rindex("https://opencode.ai/install"),
-                        "both digest-gated probes must precede their site installer",
+                        probe_nos[0],
+                        installer_nos[0],
+                        "the first digest-gated probe must precede the first installer",
+                    )
+                    self.assertLess(
+                        probe_nos[1],
+                        installer_nos[1],
+                        "the second digest-gated probe must precede the second installer",
+                    )
+                    self.assertLess(
+                        installer_nos[0],
+                        probe_nos[1],
+                        "probes must be per-site: second probe must be after first installer",
                     )
                     continue
                 self.assertEqual(

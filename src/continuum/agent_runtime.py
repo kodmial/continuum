@@ -653,8 +653,9 @@ class ImageStore:
 def validate_image(manifest: AgentManifest, profile: RuntimeProfile, generation: ImageGeneration) -> None:
     """Validate an image generation before it may serve jobs.
 
-    Checks exact version identity, platform agreement, probe presence, and
-    that no secret was baked in. Raises on any mismatch.
+    Checks exact version identity, platform agreement, probe presence and
+    execution evidence, and that no secret was baked in. Raises on any
+    mismatch.
     """
 
     if generation.digest != image_digest(manifest, profile):
@@ -665,6 +666,30 @@ def validate_image(manifest: AgentManifest, profile: RuntimeProfile, generation:
         raise AgentRuntimeError("manifest ref does not match profile ref; rebuild for the pinned ref")
     if not manifest.probes:
         raise AgentRuntimeError("manifest declares no validation/version probes")
+    lowered = [str(probe).lower() for probe in manifest.probes]
+    if not any("opencode" in probe for probe in lowered):
+        raise AgentRuntimeError("manifest declares no opencode version probe")
+    if not any("pr-agent" in probe for probe in lowered):
+        raise AgentRuntimeError("manifest declares no pr-agent version probe")
+    if not any("run" in probe for probe in lowered):
+        raise AgentRuntimeError("manifest declares no runner version probe")
+    # The declared probes must actually have been executed at build time: the
+    # generation's SBOM is the probe evidence. A base image carrying correct
+    # metadata but lacking the binaries would otherwise validate on metadata
+    # alone and serve jobs that cannot run.
+    expected_probe_evidence = (
+        "opencode=={}".format(manifest.opencode_version),
+        "pr-agent=={}".format(manifest.pr_agent_version),
+        "actions-runner=={}".format(manifest.runner_version),
+    )
+    sbom = tuple(generation.sbom or ())
+    for expected in expected_probe_evidence:
+        if expected not in sbom:
+            raise AgentRuntimeError(
+                "image probe evidence missing {!r}: refusing to serve unvalidated generation".format(expected)
+            )
+    if not generation.provenance or not str(generation.provenance).strip():
+        raise AgentRuntimeError("image carries no build provenance for its version probes")
     body = {"manifest": manifest.to_canonical(), "profile": profile.describe()}
     offender = image_contains_secret(body)
     if offender is not None:
@@ -1052,6 +1077,18 @@ class EphemeralController:
             )
 
         digest = image_digest(manifest, profile)
+        # Promotion/rollback gate execution: once an image is active, only
+        # the active digest may serve jobs. A queued job requesting any
+        # other digest must wait for an explicit promotion instead of
+        # building/validating and running unpromoted. Demand is kept (not
+        # popped) so the refused job is retried after promotion.
+        active = self.images.active_digest
+        if active is not None and digest != active:
+            raise AgentRuntimeError(
+                "image digest {} is not the active image {}: promote it before serving jobs".format(
+                    digest, active
+                )
+            )
         # Layer C (dependency/build cache): restore validated, scoped cache
         # state before provisioning; a miss (or a disabled dependency cache)
         # falls back to deterministic reconstruction below.
@@ -1492,11 +1529,26 @@ def normal_execution_uses_bootstrap_install(workflow_text: str) -> bool:
     if first_bootstrap is None:
         return False
     # A prepared-runtime probe (exact-version check) on a code line ahead
-    # of the first installer code line means the warm path performs zero
-    # downloads: the installer below is deterministic reconstruction on a
-    # validated cache miss only.
+    # of the first installer code line is not enough on its own: the
+    # installer must be conditionally guarded by a validated cache miss
+    # (the warm hit short-circuits with `exit 0`, or the installer sits in
+    # the `else` reconstruction branch). A bare probe followed by an
+    # unconditional installer reinstalls on every run and still counts as a
+    # bootstrap install.
     if first_probe is not None and first_probe < first_bootstrap:
-        return False
+        guarded = any(
+            stripped == "exit 0"
+            or stripped.startswith("exit 0 ")
+            or stripped.startswith("exit 0;")
+            or stripped == "else"
+            or stripped.startswith("else ")
+            or stripped.startswith("else;")
+            for stripped in (
+                code_lines[index].strip() for index in range(first_probe + 1, first_bootstrap)
+            )
+        )
+        if guarded:
+            return False
     return True
 
 
