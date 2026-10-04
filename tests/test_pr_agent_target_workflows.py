@@ -51,8 +51,10 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
         # carrying the opaque child identity forward.
         self.assertIn('gh workflow run "$RETRY_WORKFLOW" --repo "$GITHUB_REPOSITORY"', body)
         self.assertIn('-f target_child_id="$TARGET_CHILD_ID"', body)
-        # Concurrency is scoped by the opaque id only, never a concrete name.
-        self.assertIn("inputs.target_child_id && format('child-{0}'", body)
+        # Concurrency is scoped by the opaque id only, never a concrete name,
+        # while preserving the exact local group string when empty.
+        self.assertIn("inputs.target_child_id && format('pr-agent-child-{0}-{1}'", body)
+        self.assertIn("format('pr-agent-{0}'", body)
         self.assertNotIn("target_repository", body.lower().replace("continuum_pr_agent_target_repository", ""))
 
     def test_repair_targets_child_branch_and_stays_pat_backed_for_push(self):
@@ -68,6 +70,10 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
         self.assertIn("git push --force-with-lease=", body)
         self.assertIn('gh workflow run "$RETRY_WORKFLOW" --repo "$GITHUB_REPOSITORY"', body)
         self.assertIn('-f target_child_id="$TARGET_CHILD_ID"', body)
+        # Repair concurrency preserves the exact local group string when
+        # empty and scopes delegated runs by the opaque id only.
+        self.assertIn("format('pr-agent-repair-child-{0}-{1}-{2}'", body)
+        self.assertIn("format('pr-agent-repair-{0}-{1}'", body)
 
     def test_merge_keeps_target_and_execution_repository_distinct(self):
         body = read(".github/workflows/continuum-pr-agent-auto-merge.yml")

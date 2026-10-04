@@ -58,7 +58,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: pr-agent-repair-${{ inputs.target_child_id && format('child-{0}', inputs.target_child_id) || 'local' }}-${{ inputs.pr_number || github.run_id }}-${{ inputs.head_sha || github.sha }}
+  group: ${{ inputs.target_child_id && format('pr-agent-repair-child-{0}-{1}-{2}', inputs.target_child_id, inputs.pr_number || github.run_id, inputs.head_sha || github.sha) || format('pr-agent-repair-{0}-{1}', inputs.pr_number || github.run_id, inputs.head_sha || github.sha) }}
   cancel-in-progress: false
 
 jobs:
@@ -106,13 +106,14 @@ jobs:
           CONTINUUM_REF: ${{ inputs.continuum_ref }}
         run: |
           set -euo pipefail
-          : "${CONTINUUM_REF:?CONTINUUM_REF is required for pinned target resolution}"
           CONTINUUM_SOURCE_REPO="${GITHUB_WORKFLOW_REF:-}"
           CONTINUUM_SOURCE_REPO="${CONTINUUM_SOURCE_REPO%%/.github/workflows/*}"
           if ! [[ "$CONTINUUM_SOURCE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
             CONTINUUM_SOURCE_REPO="kodmial/continuum"
           fi
           if [[ -z "${TARGET_CHILD_ID:-}" ]]; then
+            # Local fast path: no delegated resolver is needed and
+            # CONTINUUM_REF is not required for local-only repair.
             if ! [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
               echo "::error::PR-Agent target repository identity is invalid."
               exit 2
@@ -126,6 +127,7 @@ jobs:
             echo "PR-Agent target context resolved locally."
             exit 0
           fi
+          : "${CONTINUUM_REF:?CONTINUUM_REF is required for pinned target resolution}"
           RUNTIME_ROOT="$RUNNER_TEMP/continuum-pr-agent-target-runtime"
           mkdir -p "$RUNTIME_ROOT/.github/scripts"
           fetch_runtime_file() {
@@ -860,6 +862,14 @@ jobs:
           CI_WORKFLOW_NAME: ${{ vars.CONTINUUM_CI_WORKFLOW_NAME || 'CI' }}
         run: |
           set -euo pipefail
+          # Target-aware revalidation runs wholly PAT-backed (GH_TOKEN is
+          # TAP_PAT) so delegated cross-repository reads succeed. Fail
+          # closed when delegated without PAT instead of masking an auth
+          # failure as stale-cancelled via `|| true`.
+          if [[ "${CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED:-false}" == "true" && -z "${GH_TOKEN:-}" ]]; then
+            echo "::error::Delegated repair retry requires TAP_PAT; refusing to silently cancel."
+            exit 1
+          fi
           attempt="${RETRY_ATTEMPT:-0}"
           [[ "$attempt" =~ ^[0-9]+$ ]] || attempt=0
           case "$RETRY_WORKFLOW" in
@@ -928,5 +938,12 @@ jobs:
           esac
           if ! [[ "$DEFAULT_BRANCH" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]]; then DEFAULT_BRANCH="main"; fi
           if [[ "$DEFAULT_BRANCH" == */.*/* || "$DEFAULT_BRANCH" == .*/ || "$DEFAULT_BRANCH" == */. ]] || [[ "$DEFAULT_BRANCH" =~ (^|/)\. ]] || [[ "$DEFAULT_BRANCH" =~ \.lock($|/) ]]; then DEFAULT_BRANCH="main"; fi
-          gh workflow run "$RETRY_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH"             -f pr_number="$PR_NUMBER"             -f expected_head_sha="$HEAD_SHA"             -f retry_attempt="$next"             -f retry_workflow="$RETRY_WORKFLOW"             -f recovery_kind="repair"             -f target_child_id="$TARGET_CHILD_ID"
+          # Local runs dispatch bare: a custom retry_workflow without the
+          # target_child_id workflow_dispatch input rejects unknown inputs,
+          # so an empty value must be omitted (mirrors recovery JS).
+          if [[ -n "${TARGET_CHILD_ID:-}" ]]; then
+            gh workflow run "$RETRY_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH"             -f pr_number="$PR_NUMBER"             -f expected_head_sha="$HEAD_SHA"             -f retry_attempt="$next"             -f retry_workflow="$RETRY_WORKFLOW"             -f recovery_kind="repair"             -f target_child_id="$TARGET_CHILD_ID"
+          else
+            gh workflow run "$RETRY_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH"             -f pr_number="$PR_NUMBER"             -f expected_head_sha="$HEAD_SHA"             -f retry_attempt="$next"             -f retry_workflow="$RETRY_WORKFLOW"             -f recovery_kind="repair"
+          fi
           echo "Dispatched isolated PR-Agent repair retry via fresh review attempt $next/3."

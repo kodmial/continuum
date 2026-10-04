@@ -148,11 +148,12 @@ permissions:
 # never interrupted by serialized review work
 # (repair_is_protected_from_review_preemption): the review group itself
 # is non-preemptive (cancel-in-progress: false). The group is additionally
-# scoped by the opaque delegated child id (`local` when empty): only the
-# opaque id ever appears here, never a concrete child repository name.
+# scoped by the opaque delegated child id while preserving the exact local
+# string when empty: only the opaque id ever appears here, never a concrete
+# child repository name.
 
 concurrency:
-  group: pr-agent-${{ inputs.target_child_id && format('child-{0}', inputs.target_child_id) || 'local' }}-${{ github.event.issue.number || github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || inputs.pr_number || github.run_id }}
+  group: ${{ inputs.target_child_id && format('pr-agent-child-{0}-{1}', inputs.target_child_id, github.event.issue.number || github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || inputs.pr_number || github.run_id) || format('pr-agent-{0}', github.event.issue.number || github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || inputs.pr_number || github.run_id) }}
   cancel-in-progress: false
 
 jobs:
@@ -288,7 +289,6 @@ jobs:
           CONTINUUM_REF: ${{ inputs.continuum_ref }}
         run: |
           set -euo pipefail
-          : "${CONTINUUM_REF:?CONTINUUM_REF is required for pinned target resolution}"
           # Derive the Continuum source repository from the reusable workflow
           # origin so forks, renames, and mirrors fetch their own runtime.
           # GITHUB_WORKFLOW_REF looks like <owner>/<repo>/.github/workflows/<file>@<ref>.
@@ -301,7 +301,8 @@ jobs:
             # Local fast path: no delegated resolver is needed, so skip every
             # network fetch and resolve directly from the execution repository.
             # A previously local-only review must not fail on resolver-fetch
-            # rate limits, token scopes, or transient network errors.
+            # rate limits, token scopes, or transient network errors, and must
+            # not require CONTINUUM_REF.
             if ! [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
               echo "::error::PR-Agent target repository identity is invalid."
               exit 2
@@ -315,6 +316,7 @@ jobs:
             echo "PR-Agent target context resolved locally."
             exit 0
           fi
+          : "${CONTINUUM_REF:?CONTINUUM_REF is required for pinned target resolution}"
           RUNTIME_ROOT="$RUNNER_TEMP/continuum-pr-agent-target-runtime"
           mkdir -p "$RUNTIME_ROOT/.github/scripts"
           fetch_runtime_file() {
@@ -1345,7 +1347,14 @@ jobs:
           esac
           if ! [[ "$DEFAULT_BRANCH" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]]; then DEFAULT_BRANCH="main"; fi
           if [[ "$DEFAULT_BRANCH" == */.*/* || "$DEFAULT_BRANCH" == .*/ || "$DEFAULT_BRANCH" == */. ]] || [[ "$DEFAULT_BRANCH" =~ (^|/)\. ]] || [[ "$DEFAULT_BRANCH" =~ \.lock($|/) ]]; then DEFAULT_BRANCH="main"; fi
-          gh workflow run "$RETRY_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH"             -f pr_number="$PR_NUMBER"             -f expected_head_sha="$HEAD_SHA"             -f retry_attempt="$next"             -f retry_workflow="$RETRY_WORKFLOW"             -f recovery_kind="${CURRENT_RECOVERY_KIND:-review}"             -f target_child_id="$TARGET_CHILD_ID"
+          # Local runs dispatch bare: a custom retry_workflow without the
+          # target_child_id workflow_dispatch input rejects unknown inputs,
+          # so an empty value must be omitted (mirrors recovery JS).
+          if [[ -n "${TARGET_CHILD_ID:-}" ]]; then
+            gh workflow run "$RETRY_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH"             -f pr_number="$PR_NUMBER"             -f expected_head_sha="$HEAD_SHA"             -f retry_attempt="$next"             -f retry_workflow="$RETRY_WORKFLOW"             -f recovery_kind="${CURRENT_RECOVERY_KIND:-review}"             -f target_child_id="$TARGET_CHILD_ID"
+          else
+            gh workflow run "$RETRY_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH"             -f pr_number="$PR_NUMBER"             -f expected_head_sha="$HEAD_SHA"             -f retry_attempt="$next"             -f retry_workflow="$RETRY_WORKFLOW"             -f recovery_kind="${CURRENT_RECOVERY_KIND:-review}"
+          fi
           echo "Dispatched isolated PR-Agent retry attempt $next/3 for PR #$PR_NUMBER HEAD $HEAD_SHA."
 
   repair:

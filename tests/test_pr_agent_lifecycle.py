@@ -1538,7 +1538,10 @@ class RepairWiringRegressionTests(unittest.TestCase):
         # an out-of-order old-HEAD event must not cancel newer
         # exact-HEAD work and same-HEAD duplicates coalesce.
         body = read_repo(".github/workflows/continuum-pr-agent.yml")
-        self.assertIn("group: pr-agent-${{", body)
+        # Local group string is preserved verbatim (pr-agent-<pr>); delegated
+        # runs scope by the opaque child id only, never a concrete name.
+        self.assertIn("format('pr-agent-child-{0}-{1}'", body)
+        self.assertIn("format('pr-agent-{0}'", body)
         self.assertIn("cancel-in-progress: false", body)
         self.assertNotIn("group: pr-agent-caller-", body)
         self.assertNotIn("cancel-in-progress: true", body)
@@ -1558,9 +1561,15 @@ class RepairWiringRegressionTests(unittest.TestCase):
         # The parent run is also non-preemptive at workflow level, so an
         # old-HEAD duplicate can never cancel newer exact-HEAD work.
         repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
+        # Local repair group string is preserved verbatim
+        # (pr-agent-repair-<pr>-<sha>); delegated runs scope by the opaque
+        # child id only.
         self.assertIn(
-            "group: pr-agent-repair-${{ inputs.target_child_id && format('child-{0}', inputs.target_child_id) || 'local' }}-${{ inputs.pr_number || github.run_id }}-"
-            "${{ inputs.head_sha || github.sha }}",
+            "format('pr-agent-repair-child-{0}-{1}-{2}'",
+            repair,
+        )
+        self.assertIn(
+            "format('pr-agent-repair-{0}-{1}'",
             repair,
         )
         self.assertIn("cancel-in-progress: false", repair)
