@@ -3990,9 +3990,12 @@ class ContinuumTest < Minitest::Test
     assert_includes scheduler, 'await github.rest.issues.removeLabel({'
     assert_includes scheduler, 'await github.request('
   end
-  # Child routing is repository-level. A child never schedules locally, but
-  # event-driven caller runs wake only its verified parent. Child schedule events
-  # stay skipped so private child minutes are not used as a polling mechanism.
+  # Child routing is repository-level. A child never schedules locally and,
+  # since kodmial/continuum#261, never invokes the reusable scheduler at all:
+  # every child event is a cheap caller skip allocating zero private child
+  # runner minutes. The retained reusable wake_parent job below is a
+  # best-effort acceleration for already-installed child callers only; the
+  # parent cron reconciler is authoritative for eventual dispatch.
   def test_scheduler_child_role_wakes_verified_parent_without_local_dispatch
     scheduler = workflow_body('continuum-issue-scheduler.yml')
     workflow = yaml(File.join(ROOT, '.github/workflows/continuum-issue-scheduler.yml'))
@@ -4000,32 +4003,16 @@ class ContinuumTest < Minitest::Test
                  workflow.fetch('jobs').fetch('schedule').fetch('if')
     assert_equal "vars.CONTINUUM_ROLE == 'child' && (inputs.caller_event_name == 'issues' || inputs.caller_event_name == 'issue_comment')",
                  workflow.fetch('jobs').fetch('wake_parent').fetch('if'),
-                 'the reusable always sees github.event_name as workflow_call, so the wake gate must read the caller-forwarded event name'
+                 'the reusable always sees github.event_name as workflow_call, so the legacy best-effort wake gate must read the caller-forwarded event name'
 
     stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-issue-scheduler.yml'))
     caller_gate = stub.fetch('jobs').fetch('call').fetch('if')
-    assert_includes caller_gate, "vars.CONTINUUM_ROLE != 'child' || github.event_name == 'issues'"
-    assert_includes caller_gate, "github.event_name == 'issue_comment'",
-                    'a child admits only issue events matching the reusable wake-up job; child push, pull_request_target, workflow_run, and workflow_dispatch stay cheap caller skips'
-    assert_includes caller_gate, "github.event_name != 'issues'",
-                    'child issues wakes must be trust-gated or any user with issue access burns a TAP_PAT parent dispatch'
-    assert_includes caller_gate, "github.event.action == 'opened'",
-                    'child issues wakes must admit only open/reopen/close transitions so bulk label churn cannot fan out to N parent dispatches'
-    assert_includes caller_gate, "github.event.action == 'reopened'",
-                    'child issues wakes must admit only open/reopen/close transitions so bulk label churn cannot fan out to N parent dispatches'
-    assert_includes caller_gate, "github.event.action == 'closed'",
-                    'child issues wakes must admit only open/reopen/close transitions so bulk label churn cannot fan out to N parent dispatches'
-    assert_includes caller_gate, "github.event_name != 'issue_comment'"
-    assert_includes caller_gate, 'github.actor == github.repository_owner',
-                    'the parent wake gate must stay owner-only or any comment wakes a TAP_PAT dispatch'
-    assert_includes caller_gate, "contains(github.event.comment.body, '/oc')",
-                    'the parent wake gate must still require an owner /oc command'
-    assert_includes caller_gate, "contains(github.event.comment.body, '/opencode')",
-                    'the parent wake gate must still require an owner /opencode command'
-    assert_includes caller_gate, "contains(github.event.comment.body, 'continuum-qualification-result')",
-                    'the merged caller must keep the qualification-result wake-up from main'
-    assert_includes caller_gate, "github.event.comment.author_association == 'OWNER'",
-                    'qualification-result wakes must stay trust-gated'
+    assert_includes caller_gate, "vars.CONTINUUM_ROLE != 'child'",
+                    'a child must never invoke the reusable scheduler: every child event stays a cheap caller skip so delegated dispatch cannot depend on private child Actions capacity'
+    refute_includes caller_gate, "vars.CONTINUUM_ROLE != 'child' ||",
+                     'no child event — issues or issue_comment — may admit a runner merely to wake the parent'
+    refute_includes caller_gate, "github.event.action == 'opened'",
+                     'the caller-level skip must not admit any child issue transition: parent cron is the recovery path'
 
     wake_parent = workflow.fetch('jobs').fetch('wake_parent')
     assert_equal true, wake_parent.fetch('concurrency').fetch('cancel-in-progress'),
@@ -4078,6 +4065,88 @@ class ContinuumTest < Minitest::Test
                  'the caller must forward its own trigger name; the reusable otherwise always sees workflow_call'
     assert_equal '${{ github.event.issue.number }}', call_with.fetch('caller_issue_number'),
                  'the caller must forward its issue number; the reusable otherwise sees an empty github.event'
+  end
+
+  # kodmial/continuum#261: delegated child scheduling must be independent of
+  # child Actions availability. The public parent cron reconciler alone must
+  # discover and dispatch eligible child tasks with no successful child job
+  # and no manual kick, while the retained child wake-up stays best-effort.
+  def test_delegated_child_scheduling_survives_unavailable_child_actions
+    workflow_path = File.join(ROOT, '.github/workflows/continuum-issue-scheduler.yml')
+    scheduler = workflow_body('continuum-issue-scheduler.yml')
+    workflow = yaml(workflow_path)
+    stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-issue-scheduler.yml'))
+
+    # 1 + 7. No child job can be required: the child caller skips everything
+    # while the parent cron/push/workflow_run surface still wakes the
+    # reconciler. A new eligible child issue is therefore picked up no later
+    # than the next cron tick with no manual workflow_dispatch/comment/label
+    # intervention.
+    assert_includes stub.fetch('jobs').fetch('call').fetch('if'),
+                    "vars.CONTINUUM_ROLE != 'child'"
+    refute_includes stub.fetch('jobs').fetch('call').fetch('if'),
+                    "vars.CONTINUUM_ROLE != 'child' ||",
+                    'no child event may invoke the reusable scheduler merely to wake the parent'
+    on = events(stub)
+    assert_equal ['7,17,27,37,47,57 * * * *'],
+                 on.fetch('schedule').map { |entry| entry.fetch('cron') },
+                 'parent cron is the bounded-latency recovery path when no child job can start'
+    assert_equal ['main'], on.fetch('push').fetch('branches')
+    assert_equal "vars.CONTINUUM_ROLE != 'child'",
+                 workflow.fetch('jobs').fetch('schedule').fetch('if'),
+                 'the parent reconciler must run for every non-child role without waiting for a child event'
+    assert_includes scheduler, 'Build delegated child queue',
+                    'the parent must discover verified child repositories and their open tasks itself'
+    assert_includes scheduler, 'PARENT_CONFIG=.continuum.yml CHILD_REPOSITORIES="" bash "$resolver" plan',
+                    'delegated discovery runs parent-side from the verified allow-list'
+
+    # 2. A failed child wake-up must not strand work as terminal/paused: the
+    # parent clears stale child pauses every pass and defaults to retrying
+    # instead of pausing.
+    assert_includes scheduler, 'labels/${PAUSE_LABEL//:/%3A}',
+                    'a stale child pause from a failed wake must be clearable by parent reconciliation instead of stranding delegated work'
+    assert_includes scheduler, "select(.name != $pause)",
+                    'cleared pauses must re-enter admission instead of staying terminal'
+    assert_includes scheduler, "PAUSE_ON_FAILURE: ${{ inputs.pause_on_failure || vars.AUTOMATION_PAUSE_ON_FAILURE || 'false' }}",
+                    'delegated retries must default to automatic instead of terminal pause'
+    assert_includes scheduler, 'because pause_on_failure=false',
+                    'an exhausted lease must be retryable without a human label toggle'
+
+    # 3. Duplicate event wake + parent cron coalesce to one logical dispatch:
+    # per-issue wake concurrency plus just-in-time active guards.
+    wake_parent = workflow.fetch('jobs').fetch('wake_parent')
+    assert_equal true, wake_parent.fetch('concurrency').fetch('cancel-in-progress'),
+                     'a newer per-issue wake must supersede queued duplicates'
+    assert_includes wake_parent.fetch('concurrency').fetch('group').to_s, 'inputs.caller_issue_number'
+    assert_includes scheduler, 'task_active "$child_id" task "$task_number" && continue',
+                    'an already-dispatched delegated task must not dispatch twice'
+    assert_includes scheduler, 'grep -Fxq "$task_number" <<<"$open_pr_tasks" && continue',
+                    'an open implementation PR must suppress a duplicate delegated dispatch'
+
+    # 4 + 5. Dependency, priority and global WIP semantics are unchanged.
+    assert_includes scheduler, 'sort_by(._rank, .number)'
+    assert_includes scheduler, "candidates.push({ source: 'local', issue, priority, rank });"
+    assert_includes scheduler, "source: 'child'"
+    assert_includes scheduler, 'a.rank - b.rank'
+    assert_includes scheduler, 'const totalActiveWip = activeIssueNumbers.size + childActiveWip;',
+                    'WIP is enforced globally across local and delegated work'
+    assert_includes scheduler, 'automation-blocked-by',
+                    'declared dependencies still gate delegated dispatch'
+    assert_includes scheduler, 'dependencies/blocked_by',
+                    'native dependencies still gate delegated dispatch'
+
+    # 6. No private child repository identity in public logs/config/artifacts:
+    # run names and notices carry only the opaque SubTask number / child id.
+    assert_includes scheduler, "'Dispatched SubTask #' + child.task_number",
+                    'public dispatch logs must name only the opaque delegated task'
+    refute_match(/core\.(notice|info|warning)\([^)]*child\.repository/, scheduler,
+                 'public scheduler logs must never interpolate the private child repository name')
+    refute_match(/core\.(notice|info|warning)\([^)]*child_repo/, scheduler,
+                 'public scheduler logs must never interpolate the private child repository name')
+    assert_includes scheduler, '2>/dev/null',
+                    'raw API errors embed request URLs naming the private child and must stay out of logs'
+    refute_includes scheduler, 'echo "$child_repo"',
+                    'the private child repository binding must never be echoed to public logs'
   end
 
   # A parent has one scheduling queue. Local issues and verified child issues
