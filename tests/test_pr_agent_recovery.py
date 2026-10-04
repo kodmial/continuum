@@ -58,6 +58,23 @@ class DurableEvidenceTests(unittest.TestCase):
         self.assertEqual(evidence.latest_attempt, 2)
         self.assertFalse(evidence.exhausted)
 
+    def test_edited_controller_marker_uses_updated_timestamp(self):
+        old = datetime.now(timezone.utc) - timedelta(minutes=10)
+        fresh = datetime.now(timezone.utc)
+        comments = [{
+            "body": (
+                "<!-- continuum-pr-agent-controller-state:v1 -->\n"
+                f"<!-- continuum-pr-agent-retry head={HEAD} kind=review attempt=1 -->"
+            ),
+            "author_association": "OWNER",
+            "created_at": old.isoformat(),
+            "updated_at": fresh.isoformat(),
+        }]
+        evidence = recovery.retry_evidence(comments, head_sha=HEAD, kind="review")
+        self.assertEqual(evidence.latest_attempt, 1)
+        self.assertIsNotNone(evidence.latest_marker_at)
+        self.assertLess(abs((evidence.latest_marker_at - fresh).total_seconds()), 1)
+
     def test_external_comment_cannot_forge_retry_budget(self):
         comments = [
             comment(
