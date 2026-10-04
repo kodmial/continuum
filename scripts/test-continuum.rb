@@ -5779,4 +5779,89 @@ class ContinuumTest < Minitest::Test
                     'delegated wakeups must never retry bare against the parent'
   end
 
+  # PR-Agent recovery delegated-execution contract: the opaque
+  # `target_child_id` input (or vars.CONTINUUM_PR_AGENT_TARGET_CHILD_ID for
+  # schedule/workflow_run wakeups) is the only delegated selector. Local runs
+  # resolve without CONTINUUM_REF, target reads use the resolved child while
+  # execution-run inspection and dispatch stay in the parent, local dispatches
+  # stay bare, and only the exact HEAD is ever recovered.
+  def test_pr_agent_recovery_target_resolution_and_execution_split
+    base = 'continuum-pr-agent-recovery.yml'
+    workflow = yaml(File.join(ROOT, '.github/workflows', base))
+    stub = yaml(File.join(ROOT, '.github/caller-stubs', base))
+    body = File.read(File.join(ROOT, '.github/workflows', base))
+
+    call_inputs = events(workflow).fetch('workflow_call').fetch('inputs')
+    assert call_inputs.key?('target_child_id'), "#{base}: workflow_call must declare target_child_id"
+    assert_equal '', call_inputs.fetch('target_child_id').fetch('default'), "#{base}: target_child_id must default empty (local)"
+    assert_equal false, call_inputs.fetch('target_child_id').fetch('required'), "#{base}: target_child_id must not gate the call"
+    assert_equal 'string', call_inputs.fetch('target_child_id').fetch('type'), "#{base}: target_child_id must stay a string input"
+
+    dispatch_inputs = events(stub).fetch('workflow_dispatch').fetch('inputs')
+    assert dispatch_inputs.key?('target_child_id'), "#{base}: caller stub must expose target_child_id"
+    assert_equal 'string', dispatch_inputs.fetch('target_child_id').fetch('type'), "#{base}: caller stub target_child_id must stay a string input"
+    assert_equal false, dispatch_inputs.fetch('target_child_id').fetch('required'), "#{base}: caller stub target_child_id must not gate dispatch"
+    assert_equal '${{ inputs.target_child_id }}', stub.fetch('jobs').fetch('call').fetch('with').fetch('target_child_id'),
+                 "#{base}: caller stub must forward the opaque child id verbatim"
+    refute_includes body, 'target_repository:',
+                      "#{base}: concrete repository identity must never be an input"
+
+    # Schedule/pull_request_target/workflow_run carry no dispatch inputs, so
+    # the reusable falls through to the repository variable before local.
+    assert_includes body, 'inputs.target_child_id || vars.CONTINUUM_PR_AGENT_TARGET_CHILD_ID',
+                      "#{base}: schedule/workflow_run wakeups must fall through to the repository variable"
+    assert_includes body, "format('pr-agent-recovery-child-",
+                      "#{base}: concurrency must scope delegated runs by the opaque id"
+    assert_includes body, "format('pr-agent-recovery-",
+                      "#{base}: concurrency must preserve the exact local group when empty"
+
+    resolve = step_body(body, 'Resolve PR-Agent target context')
+    refute_nil resolve, "#{base}: target-context resolution step is missing"
+    assert_includes resolve, 'TARGET_CHILD_ID: ${{ inputs.target_child_id || vars.CONTINUUM_PR_AGENT_TARGET_CHILD_ID }}',
+                      "#{base}: resolution must honour the input-then-variable fallback"
+    local_guard = resolve.index('if [[ -z "${TARGET_CHILD_ID:-}" ]]; then')
+    ref_require = resolve.index('CONTINUUM_REF is required for pinned target resolution')
+    refute_nil local_guard, "#{base}: local fast path is missing"
+    refute_nil ref_require, "#{base}: delegated CONTINUUM_REF requirement is missing"
+    assert_operator local_guard, :<, ref_require,
+                    "#{base}: local runs must exit before CONTINUUM_REF is required"
+    assert_includes resolve, 'CONTINUUM_PR_AGENT_TARGET_REPOSITORY'
+    assert_includes resolve, 'CONTINUUM_PR_AGENT_TARGET_OWNER'
+    assert_includes resolve, 'CONTINUUM_PR_AGENT_TARGET_REPO'
+    assert_includes resolve, 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED'
+    assert_includes resolve, 'PR-Agent target context resolved locally.'
+    assert_includes resolve, 'exit 0'
+
+    reconcile = step_body(body, 'Reconcile PR-Agent latest state')
+    refute_nil reconcile, "#{base}: reconciliation step is missing"
+    assert_includes reconcile, 'const executionOwner = context.repo.owner;',
+                      "#{base}: execution identity must stay the parent repository"
+    assert_includes reconcile, 'const owner = process.env.CONTINUUM_PR_AGENT_TARGET_OWNER;',
+                      "#{base}: target reads must use the resolved child"
+    assert_includes reconcile, 'const repoFullName = process.env.CONTINUUM_PR_AGENT_TARGET_REPOSITORY;',
+                      "#{base}: same-repository filter must use the resolved child"
+    assert_includes reconcile, 'owner: executionOwner',
+                      "#{base}: execution-run inspection must stay in the parent"
+    assert_includes reconcile, 'repo: executionRepo',
+                      "#{base}: execution-run inspection must stay in the parent"
+    assert_includes reconcile, 'client.rest.pulls.list',
+                      "#{base}: open-PR enumeration must go through the guarded read client"
+    assert_includes reconcile, 'client.rest.pulls.get',
+                      "#{base}: PR revalidation must go through the guarded read client"
+    assert_includes reconcile, 'client.rest.actions.listWorkflowRunsForRepo',
+                      "#{base}: exact-HEAD CI evidence must go through the guarded read client"
+    assert_includes reconcile, 'head_sha: head',
+                      "#{base}: CI evidence must be for the exact HEAD only"
+    assert_includes reconcile, 'run.head_sha === head',
+                      "#{base}: CI match must be for the exact HEAD only"
+    assert_includes reconcile, 'pr.head.repo.full_name !== repoFullName',
+                      "#{base}: fork/same-repo filter must compare against the resolved target"
+    assert_includes reconcile, 'const recoveryChildId',
+                      "#{base}: dispatch must read the opaque child selection"
+    assert_includes reconcile, 'if (recoveryChildId)',
+                      "#{base}: local runs must dispatch bare so custom review workflows stay compatible"
+    assert_includes reconcile, 'recoveryInputs.target_child_id = recoveryChildId',
+                      "#{base}: delegated runs must preserve the opaque child selection"
+  end
+
   end

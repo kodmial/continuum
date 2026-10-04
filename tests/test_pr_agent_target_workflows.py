@@ -147,6 +147,41 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
         self.assertIn("recoveryInputs.target_child_id = recoveryChildId", body)
         self.assertIn("TARGET_CHILD_ID: ${{ inputs.target_child_id || vars.CONTINUUM_PR_AGENT_TARGET_CHILD_ID }}", body)
 
+    def test_recovery_resolves_locally_scopes_concurrency_and_stays_exact_head(self):
+        body = read(".github/workflows/continuum-pr-agent-recovery.yml")
+        # Local fast path: empty id resolves from the execution repository
+        # and exits before CONTINUUM_REF is required for pinned resolution.
+        resolve_at = body.index("Resolve PR-Agent target context")
+        resolve = body[resolve_at : resolve_at + 6000]
+        self.assertIn('if [[ -z "${TARGET_CHILD_ID:-}" ]]; then', resolve)
+        self.assertIn("CONTINUUM_REF is required for pinned target resolution", resolve)
+        self.assertLess(
+            resolve.index('if [[ -z "${TARGET_CHILD_ID:-}" ]]; then'),
+            resolve.index("CONTINUUM_REF is required for pinned target resolution"),
+        )
+        self.assertIn("CONTINUUM_PR_AGENT_TARGET_REPOSITORY", resolve)
+        self.assertIn("CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED", resolve)
+        self.assertIn("PR-Agent target context resolved locally.", resolve)
+        self.assertIn("exit 0", resolve)
+        # Concurrency scopes delegated wakeups by the opaque id (input, then
+        # repository variable for schedule/workflow_run) while preserving the
+        # exact local group string when empty.
+        self.assertIn("format('pr-agent-recovery-child-", body)
+        self.assertIn("format('pr-agent-recovery-", body)
+        self.assertIn(
+            "inputs.target_child_id || vars.CONTINUUM_PR_AGENT_TARGET_CHILD_ID",
+            body,
+        )
+        # Exact-HEAD: CI evidence and dispatch identity are per exact HEAD;
+        # only same-repository PRs against the resolved target are considered.
+        self.assertIn("head_sha: head", body)
+        self.assertIn("run.head_sha === head", body)
+        self.assertIn("pr.head.repo.full_name !== repoFullName", body)
+        # Privacy: only the opaque child id is ever an input; concrete
+        # repository identity stays runner-local via env.
+        self.assertIn("target_child_id:", body)
+        self.assertNotIn("target_repository:", body)
+
     def test_callers_preserve_opaque_child_id_across_retries(self):
         for path in self.callers:
             with self.subTest(path=path):
