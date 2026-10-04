@@ -16,19 +16,22 @@ import unittest
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 SRC = os.path.join(ROOT, "src")
 
-# Intentional P0 baseline advance: 3df3b1e implements kodmial/continuum#248
-# (stop recursive OpenCode runs from arbitrary PR issue comments) in
-# continuum-opencode.yml: the interactive PR issue_comment route now requires
-# a still-open PR, the repository owner, an explicit command at the start of
-# the comment (startsWith /oc or /opencode, never a later-prose substring),
-# and the /oc-cancel exclusion, in both the opencode job gate and the Run
-# OpenCode step gate. The plain-issue, qualification, workflow_dispatch, and
-# review-comment routes keep their existing behavior. The authoritative task
-# contract and scripts/test-continuum.rb require those gate strings in
-# continuum-opencode.yml, so the pre-#248 zero-diff assertion from 87d139b is
-# stale. Keeping the immutable commit baseline means any later
-# protected-file drift still fails.
-BASELINE_SHA = "3df3b1e231c395d425385107e9dea03a8911274d"
+# Intentional P0 baseline advance: c64a1b2 implements kodmial/continuum#254
+# (audit and minimize GitHub API/PAT usage outside #253) in
+# continuum-opencode.yml: unbounded github.paginate() scans are replaced by
+# page-bounded newest-first windows (3 pages for review-comment findings, 5
+# pages for open-PR/marker idempotency checks, 10 pages for attempt-budget
+# scans, 5 pages for the duplicate-guard PAT fallback). The authoritative
+# task contract (#254 sections 1/4, "OpenCode worker/repair/watchdog" and
+# "PR review/repair paths") and scripts/test-continuum.rb
+# (test_api_budget_opencode_scans_are_bounded_but_keep_guard_semantics)
+# require those bounded-scan strings in continuum-opencode.yml, so the
+# pre-#254 zero-diff assertion from 3df3b1e is stale. The #248 anti-recursion
+# gate strings (still-open PR, owner, startsWith /oc|/opencode, /oc-cancel
+# exclusion) remain present and pinned by scripts/test-continuum.rb, and
+# guard semantics are unchanged. Keeping the immutable commit baseline means
+# any later protected-file drift still fails.
+BASELINE_SHA = "c64a1b226bee603942eec71c876470b90d08be6b"
 
 PROTECTED_FILES = [
     ".github/workflows/continuum-opencode.yml",
