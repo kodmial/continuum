@@ -1035,6 +1035,15 @@ class StabilizationParityTests(unittest.TestCase):
         self.assertIn("Normalize persistent improve presentation", review)
         self.assertIn("stale improve presentation removed", review)
 
+    def test_improve_presentation_cleanup_runs_only_after_exact_head_revalidation(self):
+        review = read_repo(".github/workflows/continuum-pr-agent.yml")
+        self.assertLess(
+            review.index("Revalidate the PR head and native review output after review"),
+            review.index("Normalize persistent improve presentation"),
+        )
+        self.assertIn("steps.result.outcome == 'success'", review)
+        self.assertIn("steps.result.outputs.head_sha", review)
+
     def test_retry_and_no_progress_use_one_upsertable_controller_comment(self):
         review = read_repo(".github/workflows/continuum-pr-agent.yml")
         repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
