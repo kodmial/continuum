@@ -239,9 +239,11 @@ jobs:
 
             // Retained for the single-comment coalescing contract: every
             // controller-state change goes through upsertControllerState
-            // (update latest, prune stale). Dispatch commits state only
-            // after a successful createWorkflowDispatch, so a failed
-            // dispatch performs no rollback and leaves updated_at untouched.
+            // (update latest, prune stale). Dispatch records a pre-dispatch
+            // claim via a fresh createComment (never an update, so the
+            // existing comment's updated_at is untouched), deletes that
+            // claim via rollbackControllerState when the dispatch throws,
+            // and coalesces via upsertControllerState after success.
             async function rollbackControllerState(stateWrite) {
               if (!stateWrite || !stateWrite.comment) return;
               if (stateWrite.created) {
@@ -594,13 +596,37 @@ jobs:
               }
 
               const marker = retryMarker(head, kind, attempt);
-              // Durable controller state is committed only after a successful
-              // dispatch. Writing the touch before createWorkflowDispatch (or
-              // rolling it back afterwards) advances updated_at even when the
-              // dispatch throws, so parseEvidence would read the failed
-              // dispatch as a fresh marker inside dispatchGraceMs and coalesce
-              // a retry that never dispatched. A failed dispatch must leave
-              // comment timestamps untouched.
+              const stateSummary =
+                'Automatic PR-Agent ' + kind + ' recovery for exact HEAD ' + head +
+                  ' (execution ' + (attempt + 1) + '/' + maxExecutions + ').';
+              // Exactly-once claim: the durable retry marker is recorded
+              // BEFORE createWorkflowDispatch via a fresh createComment, so a
+              // runner crash after a successful dispatch can never leave the
+              // next wakeup without marker evidence inside grace (which would
+              // dispatch the same attempt again: duplicate recovery
+              // executions, attempt-count drift). A fresh create never touches
+              // the existing controller comment's updated_at; on dispatch
+              // failure the claim is deleted, so a retry that never
+              // dispatched leaves timestamps untouched and is never
+              // coalesced as fresh. A crash between claim and dispatch only
+              // delays the replay until grace expires, then replays the same
+              // bounded attempt instead of duplicating or burning a slot.
+              const claimBody = controllerStateBody(
+                marker,
+                String(stateSummary || '').trim() + '\n\nController dispatch run: ' + String(context.runId)
+              );
+              let claim = null;
+              try {
+                const { data } = await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: pr.number,
+                  body: claimBody,
+                });
+                claim = data;
+              } catch (err) {
+                throw err;
+              }
               try {
                 const ref = await defaultBranch();
                 await github.rest.actions.createWorkflowDispatch({
@@ -621,17 +647,24 @@ jobs:
                   kind + ' recovery execution ' + (attempt + 1) + '/' + maxExecutions + '.'
                 );
               } catch (err) {
+                try {
+                  await rollbackControllerState(
+                    claim ? { comment: claim, created: true, previousBody: '' } : null
+                  );
+                } catch (cleanupErr) {
+                  core.warning(
+                    'PR #' + pr.number + ' ' + kind +
+                    ': pre-dispatch claim cleanup failed: ' +
+                    (cleanupErr.message || cleanupErr)
+                  );
+                }
                 throw err;
               }
-              // A successful dispatch with a failed/lost marker write records
-              // nothing: the next wakeup sees no marker inside grace and
-              // dispatches the same attempt again (duplicate recovery
-              // executions, attempt-count drift). Retry the post-dispatch
-              // write with a bounded backoff and fail loudly when the marker
-              // cannot be recorded instead of reporting success.
-              const stateSummary =
-                'Automatic PR-Agent ' + kind + ' recovery for exact HEAD ' + head +
-                  ' (execution ' + (attempt + 1) + '/' + maxExecutions + ').';
+              // Coalesce the pre-dispatch claim (plus any stale controller
+              // comments) into the single controller comment. The claim
+              // already provides durable evidence, so a coalescing failure
+              // only warns: the next wakeup still sees the claim inside
+              // grace and coalesces instead of duplicating the same attempt.
               let stateError = null;
               for (let stateAttempt = 1; stateAttempt <= 3; stateAttempt++) {
                 try {
@@ -642,7 +675,7 @@ jobs:
                   stateError = err;
                   core.warning(
                     'PR #' + pr.number + ' ' + kind +
-                    ': controller state write ' + stateAttempt + '/3 failed after a successful dispatch: ' +
+                    ': controller state coalescing ' + stateAttempt + '/3 failed after a successful dispatch: ' +
                     (err.message || err)
                   );
                   if (stateAttempt < 3) {
@@ -651,11 +684,11 @@ jobs:
                 }
               }
               if (stateError) {
-                throw new Error(
+                core.warning(
                   'PR #' + pr.number + ' ' + kind +
                   ': dispatched recovery execution ' + (attempt + 1) + '/' + maxExecutions +
-                  ' but the durable dispatch marker could not be recorded; ' +
-                  'a retry without this marker would duplicate the dispatch. ' +
+                  ' but coalescing into one controller comment failed; ' +
+                  'the pre-dispatch claim still guards against duplicate dispatch. ' +
                   (stateError.message || stateError)
                 );
               }

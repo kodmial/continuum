@@ -485,8 +485,10 @@ console.log('sandbox construction OK');
         )
 
         node = shutil.which("node")
-        if node is None:
-            self.skipTest("node is required to execute the shipped JS")
+        self.assertIsNotNone(
+            node,
+            "node is required to execute the shipped JS; failing closed instead of silently skipping",
+        )
 
         marker_match = re.search(
             r"const CONTROLLER_STATE_MARKER = '([^']*)';", body
@@ -564,31 +566,41 @@ console.log('sandbox construction OK');
         self.assertIn("TOUCH_OK", completed.stdout)
 
     def test_failed_dispatch_leaves_controller_state_untouched(self):
-        """A dispatch that throws must not advance comment timestamps.
+        """A dispatch that throws must not advance existing comment timestamps.
 
-        The durable controller write (and any rollback touch) may only happen
-        after a successful createWorkflowDispatch; otherwise parseEvidence
-        reads the failed dispatch as a fresh marker inside the grace window
-        and coalesces a retry that never dispatched.
+        Dispatch records a pre-dispatch claim via a fresh createComment
+        before createWorkflowDispatch (so a crash after a successful
+        dispatch can never leave the next wakeup without marker evidence
+        inside grace, which would duplicate the same attempt), never via
+        updateComment (which would bump updated_at even on failure), and
+        deletes that claim when the dispatch throws, so a retry that never
+        dispatched is never coalesced as fresh. The success path then
+        coalesces the claim via upsertControllerState.
         """
         body = self.read(".github/workflows/continuum-pr-agent-recovery.yml")
         window = body[
             body.index("async function dispatch("): body.index("async function exhaust(")
         ]
+        dispatch_at = window.index("github.rest.actions.createWorkflowDispatch")
         self.assertLess(
-            window.index("github.rest.actions.createWorkflowDispatch"),
-            window.index("await upsertControllerState("),
-            "controller state must commit only after a successful dispatch",
+            window.index("github.rest.issues.createComment"),
+            dispatch_at,
+            "pre-dispatch claim must be recorded before dispatch",
         )
         self.assertNotIn(
+            "github.rest.issues.updateComment",
+            window[:dispatch_at],
+            "pre-dispatch claim must be a fresh create, never an update that bumps updated_at on failure",
+        )
+        self.assertIn(
             "rollbackControllerState",
             window,
-            "a failed dispatch must not touch controller comments",
+            "a failed dispatch must delete the pre-dispatch claim",
         )
-        self.assertNotIn(
-            "await upsertControllerState",
-            window[: window.index("github.rest.actions.createWorkflowDispatch")],
-            "no controller write may precede the dispatch call",
+        self.assertLess(
+            dispatch_at,
+            window.index("await upsertControllerState("),
+            "success path must coalesce the claim into one controller comment",
         )
 
     def test_controller_touch_line_never_consumes_retry_budget(self):
@@ -847,8 +859,10 @@ class CodeRabbitDeadlockWiringTests(unittest.TestCase):
         self.assertIn("isResolved", extracted[-1])
 
         node = shutil.which("node")
-        if node is None:
-            self.skipTest("node is required to execute the shipped JS")
+        self.assertIsNotNone(
+            node,
+            "node is required to execute the shipped JS; failing closed instead of silently skipping",
+        )
 
         head = "a" * 40
         old_head = "b" * 40
