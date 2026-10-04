@@ -623,12 +623,42 @@ jobs:
               } catch (err) {
                 throw err;
               }
-              await upsertControllerState(
-                pr.number,
-                marker,
+              // A successful dispatch with a failed/lost marker write records
+              // nothing: the next wakeup sees no marker inside grace and
+              // dispatches the same attempt again (duplicate recovery
+              // executions, attempt-count drift). Retry the post-dispatch
+              // write with a bounded backoff and fail loudly when the marker
+              // cannot be recorded instead of reporting success.
+              const stateSummary =
                 'Automatic PR-Agent ' + kind + ' recovery for exact HEAD ' + head +
-                  ' (execution ' + (attempt + 1) + '/' + maxExecutions + ').'
-              );
+                  ' (execution ' + (attempt + 1) + '/' + maxExecutions + ').';
+              let stateError = null;
+              for (let stateAttempt = 1; stateAttempt <= 3; stateAttempt++) {
+                try {
+                  await upsertControllerState(pr.number, marker, stateSummary);
+                  stateError = null;
+                  break;
+                } catch (err) {
+                  stateError = err;
+                  core.warning(
+                    'PR #' + pr.number + ' ' + kind +
+                    ': controller state write ' + stateAttempt + '/3 failed after a successful dispatch: ' +
+                    (err.message || err)
+                  );
+                  if (stateAttempt < 3) {
+                    await new Promise(resolve => setTimeout(resolve, 2000 * stateAttempt));
+                  }
+                }
+              }
+              if (stateError) {
+                throw new Error(
+                  'PR #' + pr.number + ' ' + kind +
+                  ': dispatched recovery execution ' + (attempt + 1) + '/' + maxExecutions +
+                  ' but the durable dispatch marker could not be recorded; ' +
+                  'a retry without this marker would duplicate the dispatch. ' +
+                  (stateError.message || stateError)
+                );
+              }
               return true;
             }
 
