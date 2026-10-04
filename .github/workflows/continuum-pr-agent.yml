@@ -917,9 +917,20 @@ jobs:
           findings = state.get("findings")
           if not isinstance(findings, list):
               raise SystemExit("Upstream PR-Agent persistent state findings is not a list.")
+          try:
+              current_review = json.loads(os.environ.get("REVIEW_JSON", ""))
+          except json.JSONDecodeError as exc:
+              raise SystemExit(f"Cannot validate current review against persistent state: {exc}")
+          current_inner = current_review.get("review", current_review) if isinstance(current_review, dict) else None
+          current_key_issues = current_inner.get("key_issues_to_review") if isinstance(current_inner, dict) else None
+          if not isinstance(current_key_issues, list):
+              raise SystemExit("Current exact-HEAD review has no key_issues_to_review list.")
+          current_structured_clean = len(current_key_issues) == 0
+
           valid_states = {"ACTIVE", "RESOLVED"}
           current_findings = []
           stale_active = 0
+          same_head_stale_active = 0
           for finding in findings:
               if not isinstance(finding, dict):
                   raise SystemExit("Upstream PR-Agent persistent state contains a non-object finding.")
@@ -935,8 +946,17 @@ jobs:
                   if last_seen_head != reviewed:
                       stale_active += 1
                       continue
+                  if current_structured_clean:
+                      # A complete machine-readable review just ran for this
+                      # exact HEAD and reports zero current key issues. Upstream
+                      # persistent state is historical presentation and may fail
+                      # to resolve an older same-HEAD finding after a bounded
+                      # re-review. Such history must not veto the authoritative
+                      # current structured result.
+                      same_head_stale_active += 1
+                      continue
               current_findings.append(finding)
-          if stale_active:
+          if stale_active or same_head_stale_active:
               # Persistent state spans review history. The merge contract is
               # exact-HEAD: after a complete full review for this HEAD, an
               # ACTIVE finding last seen only on an older HEAD is historical
@@ -945,10 +965,16 @@ jobs:
               # whose last_seen_head_sha equals the reviewed HEAD.
               state = dict(state)
               state["findings"] = current_findings
-              print(
-                  f"Ignored {stale_active} stale ACTIVE persistent finding(s) "
-                  f"not seen on exact reviewed HEAD {reviewed}."
-              )
+              if stale_active:
+                  print(
+                      f"Ignored {stale_active} stale ACTIVE persistent finding(s) "
+                      f"from older HEADs while reviewing {reviewed}."
+                  )
+              if same_head_stale_active:
+                  print(
+                      f"Ignored {same_head_stale_active} stale same-HEAD ACTIVE persistent "
+                      f"finding(s) absent from the complete current structured review {reviewed}."
+                  )
           compact = json.dumps(state, separators=(",", ":"), ensure_ascii=False)
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
               out.write(f"persistent_state_json={compact}\n")
