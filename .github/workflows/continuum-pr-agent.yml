@@ -587,6 +587,14 @@ jobs:
           PR_REVIEWER__REQUIRE_TICKET_ANALYSIS_REVIEW: 'true'
           PR_REVIEWER__ENABLE_REVIEW_COVERAGE_FOOTER: 'true'
           PR_REVIEWER__NUM_MAX_FINDINGS: '6'
+          PR_REVIEWER__EXTRA_INSTRUCTIONS: >-
+            Large-PR reviews may be chunked. Never infer that implementation, tests,
+            workflow wiring, or ticket requirements are missing merely because a file
+            or symbol is absent from the current review chunk. Report an actionable
+            key issue or lower the merge recommendation only for a concrete defect
+            evidenced by code visible in the current chunk or repository context.
+            When confirmation depends on files outside the current chunk, put it under
+            human verification instead of treating it as an actionable defect.
           PR_CODE_SUGGESTIONS__FOCUS_ONLY_ON_PROBLEMS: 'true'
           PR_CODE_SUGGESTIONS__PERSISTENT_COMMENT: 'true'
           PR_CODE_SUGGESTIONS__PUBLISH_OUTPUT_NO_SUGGESTIONS: 'false'
