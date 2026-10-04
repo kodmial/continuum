@@ -1084,8 +1084,9 @@ jobs:
           # Bounded persistent-state lookup (#254): state markers for the
           # reviewed HEAD are written by recent reviews, so a server-side
           # `since` window answers in one request and keeps the
-          # array-of-pages shape below. Only a full window falls back to a
-          # capped 10-page walk instead of full-history pagination.
+          # array-of-pages shape below. A short window is trusted only when
+          # it contains the reviewed-HEAD marker; otherwise a capped 10-page
+          # walk runs instead of full-history pagination.
           # Target-aware: delegated reads use the resolved child repository.
           SINCE_TS="$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")"
           WINDOW_JSON=""
@@ -1093,7 +1094,7 @@ jobs:
             WINDOW_JSON="$(gh api "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100&since=$SINCE_TS" 2>/dev/null || true)"
           fi
           WINDOW_LEN="$(jq 'length' <<<"$WINDOW_JSON" 2>/dev/null || echo 100)"
-          if [[ "$WINDOW_LEN" =~ ^[0-9]+$ ]] && [[ "$WINDOW_LEN" -lt 100 ]]; then
+          if [[ "$WINDOW_LEN" =~ ^[0-9]+$ ]] && [[ "$WINDOW_LEN" -lt 100 ]] && [[ -n "${REVIEWED_SHA:-}" ]] && jq -e --arg head "$REVIEWED_SHA" 'any(.[]; ((.body // "") | contains($head)))' <<<"$WINDOW_JSON" >/dev/null 2>&1; then
             jq -s '.' <<<"$WINDOW_JSON" > "$COMMENTS_JSON"
           else
             rm -f "$RUNNER_TEMP/pr-agent-comment-pages.jsonl"
