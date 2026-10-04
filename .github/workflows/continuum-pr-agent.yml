@@ -45,6 +45,11 @@ on:
         type: string
         default: ''
         required: false
+      target_child_id:
+        description: Opaque verified child id for delegated execution. Empty targets the caller repository.
+        type: string
+        default: ''
+        required: false
       expected_head_sha:
         description: Exact HEAD SHA the caller observed. Empty resolves from GitHub.
         type: string
@@ -148,10 +153,13 @@ permissions:
 # non-cancellable per-PR-HEAD group in continuum-pr-agent-repair.yml and is
 # never interrupted by serialized review work
 # (repair_is_protected_from_review_preemption): the review group itself
-# is non-preemptive (cancel-in-progress: false).
+# is non-preemptive (cancel-in-progress: false). The group is additionally
+# scoped by the opaque delegated child id while preserving the exact local
+# string when empty: only the opaque id ever appears here, never a concrete
+# child repository name.
 
 concurrency:
-  group: pr-agent-${{ github.event.issue.number || github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || inputs.pr_number || github.run_id }}
+  group: ${{ inputs.target_child_id && format('pr-agent-child-{0}-{1}', inputs.target_child_id, github.event.issue.number || github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || inputs.pr_number || github.run_id) || format('pr-agent-{0}', github.event.issue.number || github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || inputs.pr_number || github.run_id) }}
   cancel-in-progress: false
 
 jobs:
@@ -281,6 +289,95 @@ jobs:
               'pr_agent_version', pick(process.env.INPUT_PR_AGENT_VERSION, 'CFG_PR_AGENT_VERSION', '0.46.0')
             );
 
+      - name: Resolve PR-Agent target context
+        if: steps.stack.outputs.enabled == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          TARGET_CHILD_ID: ${{ inputs.target_child_id }}
+          CONTINUUM_REF: ${{ inputs.continuum_ref }}
+        run: |
+          set -euo pipefail
+          # Derive the Continuum source repository from the reusable workflow
+          # origin so forks, renames, and mirrors fetch their own runtime.
+          # GITHUB_WORKFLOW_REF looks like <owner>/<repo>/.github/workflows/<file>@<ref>.
+          CONTINUUM_SOURCE_REPO="${GITHUB_WORKFLOW_REF:-}"
+          CONTINUUM_SOURCE_REPO="${CONTINUUM_SOURCE_REPO%%/.github/workflows/*}"
+          if ! [[ "$CONTINUUM_SOURCE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || [[ "${CONTINUUM_SOURCE_REPO%%/*}" =~ ^\.+$ ]] || [[ "${CONTINUUM_SOURCE_REPO#*/}" =~ ^\.+$ ]]; then
+            CONTINUUM_SOURCE_REPO="kodmial/continuum"
+          fi
+          if [[ -z "${TARGET_CHILD_ID:-}" ]]; then
+            # Local fast path: no delegated resolver is needed, so skip every
+            # network fetch and resolve directly from the execution repository.
+            # A previously local-only review must not fail on resolver-fetch
+            # rate limits, token scopes, or transient network errors, and must
+            # not require CONTINUUM_REF.
+            if ! [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || [[ "${GITHUB_REPOSITORY%%/*}" =~ ^\.+$ ]] || [[ "${GITHUB_REPOSITORY#*/}" =~ ^\.+$ ]]; then
+              echo "::error::PR-Agent target repository identity is invalid."
+              exit 2
+            fi
+            {
+              printf 'CONTINUUM_PR_AGENT_TARGET_REPOSITORY=%s\n' "$GITHUB_REPOSITORY"
+              printf 'CONTINUUM_PR_AGENT_TARGET_OWNER=%s\n' "${GITHUB_REPOSITORY%%/*}"
+              printf 'CONTINUUM_PR_AGENT_TARGET_REPO=%s\n' "${GITHUB_REPOSITORY#*/}"
+              printf 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED=%s\n' "false"
+            } >> "$GITHUB_ENV"
+            echo "PR-Agent target context resolved locally."
+            exit 0
+          fi
+          : "${CONTINUUM_REF:?CONTINUUM_REF is required for pinned target resolution}"
+          continuum_b64_decode() {
+            if printf '' | base64 --decode >/dev/null 2>&1; then
+              base64 --decode
+            elif printf '' | base64 -d >/dev/null 2>&1; then
+              base64 -d
+            elif printf '' | base64 -D >/dev/null 2>&1; then
+              base64 -D
+            elif command -v python3 >/dev/null 2>&1; then
+              python3 -c 'import sys,base64; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))'
+            else
+              openssl base64 -d
+            fi
+          }
+          RUNTIME_ROOT="$RUNNER_TEMP/continuum-pr-agent-target-runtime"
+          mkdir -p "$RUNTIME_ROOT/.github/scripts"
+          fetch_runtime_file() {
+            local path="$1" dest="$2"
+            if ! gh api --method GET "repos/$CONTINUUM_SOURCE_REPO/contents/$path" -f ref="$CONTINUUM_REF" --jq .content 2>/dev/null \
+              | tr -d '\n' | continuum_b64_decode > "$dest" 2>/dev/null; then
+              echo "::error::Unable to load the Continuum PR-Agent target resolver."
+              exit 1
+            fi
+            if [[ ! -s "$dest" ]]; then
+              echo "::error::Unable to load the Continuum PR-Agent target resolver."
+              exit 1
+            fi
+          }
+          fetch_runtime_file ".github/scripts/pr_agent_target.sh" "$RUNTIME_ROOT/.github/scripts/pr_agent_target.sh"
+          fetch_runtime_file ".github/scripts/delegation_repository.sh" "$RUNTIME_ROOT/.github/scripts/delegation_repository.sh"
+          fetch_runtime_file ".github/scripts/delegation_runtime.py" "$RUNTIME_ROOT/.github/scripts/delegation_runtime.py"
+          PARENT_CONFIG_FILE="$RUNTIME_ROOT/parent.continuum.yml"
+          # The parent config lives in the execution repository: fetch its
+          # default branch, never the Continuum engine pin (which may not
+          # exist in the execution repository).
+          if ! gh api --method GET "repos/$GITHUB_REPOSITORY/contents/.continuum.yml" --jq .content 2>/dev/null \
+            | tr -d '\n' | continuum_b64_decode > "$PARENT_CONFIG_FILE" 2>/dev/null || [[ ! -s "$PARENT_CONFIG_FILE" ]]; then
+            echo "::error::Unable to load the parent Continuum configuration for delegated target resolution; refusing to guess."
+            exit 1
+          fi
+          CONTINUUM_ENGINE_ROOT="$RUNTIME_ROOT" PARENT_CONFIG="$PARENT_CONFIG_FILE" \
+            bash "$RUNTIME_ROOT/.github/scripts/pr_agent_target.sh" "$TARGET_CHILD_ID"
+
+      - name: Fail closed when delegated without PAT
+        if: steps.stack.outputs.enabled == 'true'
+        env:
+          TAP_PAT: ${{ secrets.TAP_PAT }}
+        run: |
+          set -euo pipefail
+          if [[ "${CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED:-false}" == "true" && -z "${TAP_PAT:-}" ]]; then
+            echo "::error::Delegated PR-Agent execution requires TAP_PAT; refusing to fall back to github.token."
+            exit 1
+          fi
+
       - name: Report the disabled provider explicitly
         if: steps.stack.outputs.enabled != 'true'
         run: echo "PR-Agent skipped because CONTINUUM_REVIEW_PROVIDER is not pr-agent."
@@ -293,17 +390,32 @@ jobs:
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           EXPECTED_HEAD: ${{ steps.stack.outputs.expected_head }}
           CI_WORKFLOW_NAME: ${{ inputs.ci_workflow_name || vars.CONTINUUM_CI_WORKFLOW_NAME || 'CI' }}
+          TAP_PAT: ${{ secrets.TAP_PAT }}
         with:
-          # Pure same-repository read-only admission (pulls.get plus
-          # exact-HEAD workflow-run evidence). Repository token is sufficient;
-          # PAT actor identity must not gate admission.
-          github-token: ${{ github.token }}
+          # Target-aware admission (pulls.get plus exact-HEAD workflow-run
+          # evidence against the resolved target repository). Local
+          # same-repository reads use github.token; delegated cross-repository
+          # reads require TAP_PAT. The fallback is gated on non-delegated runs
+          # so a delegated run without PAT yields an empty token instead of
+          # silently reading as github.token (auth itself fails closed before
+          # the embedded script runs). Only the opaque child id ever selects
+          # the target; concrete repository identity stays runner-local.
+          github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           script: |
             // Admission: open, non-draft, same-repo PR whose exact current HEAD
             // has green CI. Anything else is skipped, never reviewed.
+            if (process.env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED === 'true' &&
+                !String(process.env.TAP_PAT || '').trim()) {
+              core.setFailed(
+                'Delegated PR-Agent execution requires TAP_PAT; refusing to fall back to github.token.'
+              );
+              return;
+            }
             const prNumber = Number(process.env.PR_NUMBER);
             const { data: pr } = await github.rest.pulls.get({
-              owner: context.repo.owner, repo: context.repo.repo, pull_number: prNumber,
+              owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+              repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
+              pull_number: prNumber,
             });
             if (pr.state !== 'open') {
               core.setOutput('admitted', 'false');
@@ -315,7 +427,7 @@ jobs:
               core.notice(`PR #${prNumber} is a draft; skipping PR-Agent review.`);
               return;
             }
-            if (!pr.head.repo || pr.head.repo.full_name !== `${context.repo.owner}/${context.repo.repo}`) {
+            if (!pr.head.repo || pr.head.repo.full_name !== process.env.CONTINUUM_PR_AGENT_TARGET_REPOSITORY) {
               core.setOutput('admitted', 'false');
               core.notice(`PR #${prNumber} is not same-repo; skipping PR-Agent review.`);
               return;
@@ -340,8 +452,8 @@ jobs:
             const runs = await github.paginate(
               github.rest.actions.listWorkflowRunsForRepo,
               {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
+                owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+                repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
                 event: 'pull_request',
                 head_sha: headSha,
                 per_page: 100,
@@ -375,12 +487,25 @@ jobs:
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           HEAD_SHA: ${{ steps.admit.outputs.head_sha }}
+          TAP_PAT: ${{ secrets.TAP_PAT }}
         with:
-          github-token: ${{ github.token }}
+          # Target-aware status (createCommitStatus against the resolved
+          # target). Local same-repository writes use github.token;
+          # delegated cross-repository writes require TAP_PAT. The fallback
+          # is gated on non-delegated runs so a delegated run without PAT
+          # yields an empty token (auth itself fails closed).
+          github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           script: |
+            if (process.env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED === 'true' &&
+                !String(process.env.TAP_PAT || '').trim()) {
+              core.setFailed(
+                'Delegated PR-Agent execution requires TAP_PAT; refusing to fall back to github.token.'
+              );
+              return;
+            }
             await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
+              owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+              repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
               sha: process.env.HEAD_SHA,
               state: 'pending',
               context: 'continuum/pr-agent-review',
@@ -390,13 +515,68 @@ jobs:
                 context.repo.repo + '/actions/runs/' + context.runId,
             });
 
-      - name: Checkout the pull request head
+      - name: Checkout the pull request head without exposing delegated repository metadata
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          fetch-depth: 1
-          persist-credentials: false
-          ref: ${{ steps.admit.outputs.head_sha }}
+        env:
+          # Scoped to the resolved target: local same-repository checkout
+          # uses github.token so a missing PAT never breaks local-only runs;
+          # delegated cross-repository checkout requires TAP_PAT. The fallback
+          # is gated on non-delegated runs so a delegated run without PAT
+          # yields an empty token (auth itself fails closed before the guard).
+          GH_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
+          TAP_PAT: ${{ secrets.TAP_PAT }}
+          HEAD_SHA: ${{ steps.admit.outputs.head_sha }}
+          PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+          if [[ "${CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED:-false}" == "true" && -z "${TAP_PAT:-}" ]]; then
+            echo "::error::Delegated PR-Agent execution requires TAP_PAT; refusing to fall back to github.token."
+            exit 1
+          fi
+          : "${CONTINUUM_PR_AGENT_TARGET_REPOSITORY:?PR-Agent target repository is unset; refusing to fall back to the execution repository.}"
+          if ! [[ "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || [[ "${CONTINUUM_PR_AGENT_TARGET_REPOSITORY%%/*}" =~ ^\.+$ ]] || [[ "${CONTINUUM_PR_AGENT_TARGET_REPOSITORY#*/}" =~ ^\.+$ ]]; then
+            echo "::error::PR-Agent target repository identity is invalid."
+            exit 2
+          fi
+          if ! [[ "${HEAD_SHA:-}" =~ ^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$ ]]; then
+            echo "::error::PR-Agent target HEAD is missing or malformed; refusing to checkout."
+            exit 1
+          fi
+          if [[ -n "${PR_NUMBER:-}" ]] && ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "::error::PR-Agent target PR number is malformed; refusing to checkout."
+            exit 1
+          fi
+          worktree="$RUNNER_TEMP/continuum-pr-agent-review-worktree"
+          rm -rf "$worktree"
+          mkdir -p "$worktree"
+          cd "$worktree"
+          git init --quiet
+          gh auth setup-git >/dev/null 2>&1
+          trap 'git config --unset credential.helper || true; git config --unset credential.https://github.com.helper || true; git config --global --unset credential.helper || true; git config --global --unset credential.https://github.com.helper || true' EXIT
+          git remote add origin "https://github.com/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY.git"
+          fetched=false
+          for attempt in 1 2 3; do
+            if git fetch --depth=1 --no-tags origin "$HEAD_SHA" --quiet >/dev/null 2>&1; then
+              fetched=true
+              break
+            fi
+            sleep $((attempt * 5))
+          done
+          if [[ "$fetched" != true && -n "${PR_NUMBER:-}" ]]; then
+            if git fetch --depth=1 --no-tags origin "pull/$PR_NUMBER/head" --quiet >/dev/null 2>&1; then
+              fetched=true
+            fi
+          fi
+          if [[ "$fetched" != true ]]; then
+            echo "::error::Unable to fetch the exact PR-Agent target HEAD."
+            exit 1
+          fi
+          if ! git checkout --detach FETCH_HEAD --quiet >/dev/null 2>&1 ||
+             [[ "$(git rev-parse HEAD)" != "${HEAD_SHA,,}" ]]; then
+            echo "::error::Unable to checkout the exact PR-Agent target HEAD."
+            exit 1
+          fi
+          echo "CONTINUUM_PR_AGENT_WORKTREE=$worktree" >> "$GITHUB_ENV"
 
       - name: Install the pinned upstream PR-Agent release on the runner
         id: install_pragent
@@ -461,6 +641,19 @@ jobs:
           CONTINUUM_REF: ${{ inputs.continuum_ref }}
         run: |
           set -euo pipefail
+          continuum_b64_decode() {
+            if printf '' | base64 --decode >/dev/null 2>&1; then
+              base64 --decode
+            elif printf '' | base64 -d >/dev/null 2>&1; then
+              base64 -d
+            elif printf '' | base64 -D >/dev/null 2>&1; then
+              base64 -D
+            elif command -v python3 >/dev/null 2>&1; then
+              python3 -c 'import sys,base64; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))'
+            else
+              openssl base64 -d
+            fi
+          }
           RUNTIME_ROOT="$RUNNER_TEMP/continuum-pr-agent-runtime"
           BRIDGE_SCRIPT="$RUNTIME_ROOT/.github/scripts/pr_agent_bridge.py"
           POLICY_SCRIPT="$RUNTIME_ROOT/.github/scripts/pr_agent_policy.js"
@@ -469,19 +662,19 @@ jobs:
           gh api --method GET \
             "repos/kodmial/continuum/contents/.github/scripts/pr_agent_bridge.py" \
             -f ref="$CONTINUUM_REF" --jq .content \
-            | tr -d '\n' | base64 --decode > "$BRIDGE_SCRIPT"
+            | tr -d '\n' | continuum_b64_decode > "$BRIDGE_SCRIPT"
           gh api --method GET \
             "repos/kodmial/continuum/contents/src/continuum/pr_agent.py" \
             -f ref="$CONTINUUM_REF" --jq .content \
-            | tr -d '\n' | base64 --decode > "$RUNTIME_ROOT/src/continuum/pr_agent.py"
+            | tr -d '\n' | continuum_b64_decode > "$RUNTIME_ROOT/src/continuum/pr_agent.py"
           gh api --method GET \
             "repos/kodmial/continuum/contents/.github/scripts/pr_agent_policy.js" \
             -f ref="$CONTINUUM_REF" --jq .content \
-            | tr -d '\n' | base64 --decode > "$POLICY_SCRIPT"
+            | tr -d '\n' | continuum_b64_decode > "$POLICY_SCRIPT"
           gh api --method GET \
             "repos/kodmial/continuum/contents/src/continuum/pr_agent_fallback_state.py" \
             -f ref="$CONTINUUM_REF" --jq .content \
-            | tr -d '\n' | base64 --decode > "$FALLBACK_SCRIPT"
+            | tr -d '\n' | continuum_b64_decode > "$FALLBACK_SCRIPT"
           : > "$RUNTIME_ROOT/src/continuum/__init__.py"
           PYTHONPATH="$RUNTIME_ROOT/src" python3 -m py_compile \
             "$BRIDGE_SCRIPT" "$RUNTIME_ROOT/src/continuum/pr_agent.py" "$FALLBACK_SCRIPT"
@@ -553,21 +746,29 @@ jobs:
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
         id: before
         env:
-          # Pure same-repository read-only revalidation (gh pr view plus
-          # exact-HEAD workflow-run evidence). Repository token is sufficient.
-          GH_TOKEN: ${{ github.token }}
+          # Target-aware revalidation (gh pr view plus exact-HEAD workflow-run
+          # evidence against the resolved target). Local same-repository reads
+          # use github.token; delegated cross-repository reads require TAP_PAT.
+          # The fallback is gated on non-delegated runs so a delegated run
+          # without PAT yields an empty token (auth itself fails closed).
+          GH_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
+          TAP_PAT: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           ADMITTED_SHA: ${{ steps.admit.outputs.head_sha }}
           CI_WORKFLOW_NAME: ${{ inputs.ci_workflow_name || vars.CONTINUUM_CI_WORKFLOW_NAME || 'CI' }}
         run: |
           set -euo pipefail
-          CURRENT_SHA="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)"
+          if [[ "${CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED:-false}" == "true" && -z "${TAP_PAT:-}" ]]; then
+            echo "::error::Delegated PR-Agent execution requires TAP_PAT; refusing to fall back to github.token."
+            exit 1
+          fi
+          CURRENT_SHA="$(gh pr view "$PR_NUMBER" --repo "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" --json headRefOid --jq .headRefOid)"
           if [[ "${CURRENT_SHA,,}" != "${ADMITTED_SHA,,}" ]]; then
             echo "::error::PR head moved after CI admission ($ADMITTED_SHA -> $CURRENT_SHA); refusing to review an unqualified HEAD."
             exit 1
           fi
           CI_JSON="$RUNNER_TEMP/pr-agent-before-review-ci-runs.json"
-          gh api "repos/$GITHUB_REPOSITORY/actions/runs?event=pull_request&head_sha=$ADMITTED_SHA&per_page=100" > "$CI_JSON"
+          gh api "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/actions/runs?event=pull_request&head_sha=$ADMITTED_SHA&per_page=100" > "$CI_JSON"
           if ! python3 - "$CI_JSON" "$CI_WORKFLOW_NAME" "$ADMITTED_SHA" <<'PY'
           import json, sys
           path, workflow, head = sys.argv[1:4]
@@ -595,7 +796,13 @@ jobs:
         id: pragent
         env:
           GH_TOKEN: ${{ github.token }}
-          GITHUB__USER_TOKEN: ${{ github.token }}
+          TAP_PAT: ${{ secrets.TAP_PAT }}
+          # Target-aware PR-Agent auth (pr-agent --pr_url against the resolved
+          # target). Local same-repository runs use github.token; delegated
+          # cross-repository runs require TAP_PAT. The fallback is gated on
+          # non-delegated runs so a delegated run without PAT yields an empty
+          # token (auth itself fails closed).
+          GITHUB__USER_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           CONFIG__GIT_PROVIDER: github
           CONFIG__MODEL: ${{ steps.stack.outputs.model }}
           CONFIG__CUSTOM_MODEL_MAX_TOKENS: ${{ steps.stack.outputs.max_tokens }}
@@ -638,11 +845,19 @@ jobs:
           PUSH_OUTPUTS__ENABLE: 'true'
           PUSH_OUTPUTS__CHANNELS: '["file"]'
           PUSH_OUTPUTS__FILE_PATH: 'pr-agent-outputs/continuum.jsonl'
-          PR_URL: https://github.com/${{ github.repository }}/pull/${{ steps.stack.outputs.pr_number }}
+          PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           REVIEWED_SHA: ${{ steps.before.outputs.sha }}
           POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
         run: |
           set -euo pipefail
+          if [[ "${CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED:-false}" == "true" && -z "${TAP_PAT:-}" ]]; then
+            echo "::error::Delegated PR-Agent execution requires TAP_PAT; refusing to fall back to github.token."
+            exit 1
+          fi
+          : "${CONTINUUM_PR_AGENT_WORKTREE:?PR-Agent worktree is unavailable; the manual checkout failed before exporting the worktree.}"
+          : "${CONTINUUM_PR_AGENT_TARGET_REPOSITORY:?PR-Agent target repository is unset; refusing to fall back to the execution repository.}"
+          cd "$CONTINUUM_PR_AGENT_WORKTREE"
+          PR_URL="https://github.com/${CONTINUUM_PR_AGENT_TARGET_REPOSITORY}/pull/${PR_NUMBER}"
           IMPROVE_REPAIR_THRESHOLD="$(node -e 'const p=require(process.env.POLICY_SCRIPT); process.stdout.write(String(p.IMPROVE_REPAIR_THRESHOLD));')"
           [[ "$IMPROVE_REPAIR_THRESHOLD" =~ ^[0-9]+$ ]] || { echo "::error::Invalid centralized PR-Agent improve threshold."; exit 1; }
           mkdir -p pr-agent-outputs
@@ -666,17 +881,27 @@ jobs:
           #             only when the improve-gate step allows it.
           # Check-run publishing stays disabled so persistent finding state
           # remains active (github.publish_as_check_run=false).
-          pr-agent --pr_url "$PR_URL" review \
-            --config.propagate_tool_errors=true \
-            --config.persistent_inline_comments=true \
-            --pr_reviewer.persistent_finding_state=true \
-            --pr_reviewer.final_update_message=false \
-            --pr_reviewer.inline_key_issues=true \
-            --pr_reviewer.require_merge_recommendation=true \
-            --pr_reviewer.require_ticket_analysis_review=true \
-            --github.publish_as_check_run=false \
-            --github_action_config.enable_output=true \
-            --github_action_config.fail_on_tool_errors=true
+          run_review() {
+            pr-agent --pr_url "$PR_URL" review \
+              --config.propagate_tool_errors=true \
+              --config.persistent_inline_comments=true \
+              --pr_reviewer.persistent_finding_state=true \
+              --pr_reviewer.final_update_message=false \
+              --pr_reviewer.inline_key_issues=true \
+              --pr_reviewer.require_merge_recommendation=true \
+              --pr_reviewer.require_ticket_analysis_review=true \
+              --github.publish_as_check_run=false \
+              --github_action_config.enable_output=true \
+              --github_action_config.fail_on_tool_errors=true
+          }
+          if [[ "${CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED:-false}" == "true" ]]; then
+            if ! run_review >"$RUNNER_TEMP/pr-agent-delegated-review.log" 2>&1; then
+              echo "::error::Delegated PR-Agent review failed; detailed output remains runner-local."
+              exit 1
+            fi
+          else
+            run_review
+          fi
           # Canonical machine source: the structured review JSON is exported
           # as the step output `review` (steps.pragent.outputs.review) for
           # the repair and merge workflows. Prose comments are presentation
@@ -697,16 +922,29 @@ jobs:
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           REVIEWED_SHA: ${{ steps.before.outputs.sha }}
           REVIEW_JSON: ${{ steps.pragent.outputs.review }}
+          TAP_PAT: ${{ secrets.TAP_PAT }}
           POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
         with:
-          # Pure same-repository read-only revalidation (pulls.get for the
-          # current PR head only). Repository token is sufficient.
-          github-token: ${{ github.token }}
+          # Target-aware revalidation (pulls.get for the current PR head only
+          # against the resolved target). Local reads use github.token;
+          # delegated cross-repository reads require TAP_PAT. The fallback is
+          # gated on non-delegated runs so a delegated run without PAT yields
+          # an empty token (auth itself fails closed before the script runs).
+          github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           script: |
+            if (process.env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED === 'true' &&
+                !String(process.env.TAP_PAT || '').trim()) {
+              core.setFailed(
+                'Delegated PR-Agent execution requires TAP_PAT; refusing to fall back to github.token.'
+              );
+              return;
+            }
             const prNumber = Number(process.env.PR_NUMBER);
             const reviewedSha = String(process.env.REVIEWED_SHA || '').toLowerCase();
             const { data: pr } = await github.rest.pulls.get({
-              owner: context.repo.owner, repo: context.repo.repo, pull_number: prNumber,
+              owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+              repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
+              pull_number: prNumber,
             });
             const currentSha = String(pr.head.sha || '').toLowerCase();
             if (currentSha !== reviewedSha) {
@@ -758,7 +996,7 @@ jobs:
           set -euo pipefail
           COMMENTS_JSON="$RUNNER_TEMP/pr-agent-comments.json"
           gh api --paginate --slurp \
-            "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100" \
+            "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100" \
             > "$COMMENTS_JSON"
           PYTHONPATH="$FALLBACK_PYTHONPATH" python3 - "$COMMENTS_JSON" <<'PY'
           import json
@@ -966,7 +1204,9 @@ jobs:
             let liveSha = '';
             try {
               const { data: pr } = await github.rest.pulls.get({
-                owner: context.repo.owner, repo: context.repo.repo, pull_number: prNumber,
+                owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+                repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
+                pull_number: prNumber,
               });
               liveSha = String((pr && pr.head && pr.head.sha) || '').trim().toLowerCase();
             } catch (err) {
@@ -1056,8 +1296,19 @@ jobs:
           steps.improve_gate.outputs.skip_improve != 'true'
         id: improve
         env:
-          GH_TOKEN: ${{ github.token }}
-          GITHUB__USER_TOKEN: ${{ github.token }}
+          # Target-aware moved-head check (gh pr view for the current PR head
+          # only against the resolved target). Local reads use github.token;
+          # delegated cross-repository reads require TAP_PAT. The fallback is
+          # gated on non-delegated runs so a delegated run without PAT yields
+          # an empty token (auth itself fails closed).
+          GH_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
+          TAP_PAT: ${{ secrets.TAP_PAT }}
+          # Target-aware PR-Agent auth (pr-agent --pr_url against the resolved
+          # target). Local same-repository runs use github.token; delegated
+          # cross-repository runs require TAP_PAT. The fallback is gated on
+          # non-delegated runs so a delegated run without PAT yields an empty
+          # token (auth itself fails closed).
+          GITHUB__USER_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           CONFIG__GIT_PROVIDER: github
           CONFIG__MODEL: ${{ steps.stack.outputs.model }}
           CONFIG__CUSTOM_MODEL_MAX_TOKENS: ${{ steps.stack.outputs.max_tokens }}
@@ -1075,13 +1326,20 @@ jobs:
           PUSH_OUTPUTS__ENABLE: 'true'
           PUSH_OUTPUTS__CHANNELS: '["file"]'
           PUSH_OUTPUTS__FILE_PATH: 'pr-agent-outputs/continuum.jsonl'
-          PR_URL: https://github.com/${{ github.repository }}/pull/${{ steps.stack.outputs.pr_number }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           REVIEWED_SHA: ${{ steps.before.outputs.sha }}
           POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
         run: |
           set -euo pipefail
-          CURRENT_SHA="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)"
+          if [[ "${CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED:-false}" == "true" && -z "${TAP_PAT:-}" ]]; then
+            echo "::error::Delegated PR-Agent execution requires TAP_PAT; refusing to fall back to github.token."
+            exit 1
+          fi
+          : "${CONTINUUM_PR_AGENT_WORKTREE:?PR-Agent worktree is unavailable; the manual checkout failed before exporting the worktree.}"
+          : "${CONTINUUM_PR_AGENT_TARGET_REPOSITORY:?PR-Agent target repository is unset; refusing to fall back to the execution repository.}"
+          cd "$CONTINUUM_PR_AGENT_WORKTREE"
+          PR_URL="https://github.com/${CONTINUUM_PR_AGENT_TARGET_REPOSITORY}/pull/${PR_NUMBER}"
+          CURRENT_SHA="$(gh pr view "$PR_NUMBER" --repo "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" --json headRefOid --jq .headRefOid)"
           if [[ "${CURRENT_SHA,,}" != "${REVIEWED_SHA,,}" ]]; then
             echo "::error::PR head moved before improve ($REVIEWED_SHA -> $CURRENT_SHA); discarding stale gate decision."
             echo "stale_head=true" >> "$GITHUB_OUTPUT"
@@ -1095,12 +1353,22 @@ jobs:
           # bounded upstream improve pass for additional repair suggestions.
           # The improve payload is consumed only from the runner-local file
           # channel, never by scraping comments.
-          pr-agent --pr_url "$PR_URL" improve \
-            --config.propagate_tool_errors=true \
-            --pr_code_suggestions.focus_only_on_problems=true \
-            --pr_code_suggestions.publish_output_no_suggestions=false \
-            --pr_code_suggestions.suggestions_score_threshold="$IMPROVE_REPAIR_THRESHOLD" \
-            --github.publish_as_check_run=false
+          run_improve() {
+            pr-agent --pr_url "$PR_URL" improve \
+              --config.propagate_tool_errors=true \
+              --pr_code_suggestions.focus_only_on_problems=true \
+              --pr_code_suggestions.publish_output_no_suggestions=false \
+              --pr_code_suggestions.suggestions_score_threshold="$IMPROVE_REPAIR_THRESHOLD" \
+              --github.publish_as_check_run=false
+          }
+          if [[ "${CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED:-false}" == "true" ]]; then
+            if ! run_improve >"$RUNNER_TEMP/pr-agent-delegated-improve.log" 2>&1; then
+              echo "::error::Delegated PR-Agent improve failed; detailed output remains runner-local."
+              exit 1
+            fi
+          else
+            run_improve
+          fi
           if [[ ! -s pr-agent-outputs/continuum.jsonl ]]; then
             echo "No improve suggestions were published; recording an empty payload."
             echo '{"payload": {"code_suggestions": []}}' > pr-agent-outputs/continuum.jsonl
@@ -1117,13 +1385,26 @@ jobs:
           steps.improve_gate.outputs.skip_improve == 'true'
         id: improve_skipped
         env:
-          GH_TOKEN: ${{ github.token }}
+          # Target-aware moved-head check (gh pr view for the current PR head
+          # only against the resolved target). Local reads use github.token;
+          # delegated cross-repository reads require TAP_PAT. The fallback is
+          # gated on non-delegated runs so a delegated run without PAT yields
+          # an empty token (auth itself fails closed).
+          GH_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
+          TAP_PAT: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           REVIEWED_SHA: ${{ steps.before.outputs.sha }}
           POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
         run: |
           set -euo pipefail
-          CURRENT_SHA="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)"
+          if [[ "${CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED:-false}" == "true" && -z "${TAP_PAT:-}" ]]; then
+            echo "::error::Delegated PR-Agent execution requires TAP_PAT; refusing to fall back to github.token."
+            exit 1
+          fi
+          : "${CONTINUUM_PR_AGENT_WORKTREE:?PR-Agent worktree is unavailable; the manual checkout failed before exporting the worktree.}"
+          : "${CONTINUUM_PR_AGENT_TARGET_REPOSITORY:?PR-Agent target repository is unset; refusing to fall back to the execution repository.}"
+          cd "$CONTINUUM_PR_AGENT_WORKTREE"
+          CURRENT_SHA="$(gh pr view "$PR_NUMBER" --repo "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" --json headRefOid --jq .headRefOid)"
           if [[ "${CURRENT_SHA,,}" != "${REVIEWED_SHA,,}" ]]; then
             echo "::error::PR head moved before recording skipped improve ($REVIEWED_SHA -> $CURRENT_SHA); refusing empty payload for the wrong HEAD."
             echo "stale_head=true" >> "$GITHUB_OUTPUT"
@@ -1150,14 +1431,22 @@ jobs:
           (steps.improve.outcome == 'success' || steps.improve_skipped.outcome == 'success')
         id: post_improve
         env:
-          # Pure same-repository read-only check (gh pr view for the current
-          # PR head only). Repository token is sufficient.
-          GH_TOKEN: ${{ github.token }}
+          # Target-aware moved-head check (gh pr view for the current PR head
+          # only against the resolved target). Local reads use github.token;
+          # delegated cross-repository reads require TAP_PAT. The fallback is
+          # gated on non-delegated runs so a delegated run without PAT yields
+          # an empty token (auth itself fails closed).
+          GH_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
+          TAP_PAT: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           REVIEWED_SHA: ${{ steps.before.outputs.sha }}
         run: |
           set -euo pipefail
-          CURRENT_SHA="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)"
+          if [[ "${CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED:-false}" == "true" && -z "${TAP_PAT:-}" ]]; then
+            echo "::error::Delegated PR-Agent execution requires TAP_PAT; refusing to fall back to github.token."
+            exit 1
+          fi
+          CURRENT_SHA="$(gh pr view "$PR_NUMBER" --repo "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" --json headRefOid --jq .headRefOid)"
           if [[ "${CURRENT_SHA,,}" != "${REVIEWED_SHA,,}" ]]; then
             echo "::error::PR head moved during improve ($REVIEWED_SHA -> $CURRENT_SHA); discarding stale improve output."
             echo "stale_head=true" >> "$GITHUB_OUTPUT"
@@ -1174,6 +1463,8 @@ jobs:
         id: improve_output
         run: |
           set -euo pipefail
+          : "${CONTINUUM_PR_AGENT_WORKTREE:?PR-Agent worktree is unavailable; the manual checkout failed before exporting the worktree.}"
+          cd "$CONTINUUM_PR_AGENT_WORKTREE"
           [[ -s pr-agent-outputs/continuum.jsonl ]] || {
             echo "::error::Native PR-Agent improve output file is missing."
             exit 1
@@ -1206,8 +1497,8 @@ jobs:
             const comments = await github.paginate(
               github.rest.issues.listComments,
               {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
+                owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+                repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
                 issue_number: prNumber,
                 per_page: 100,
               }
@@ -1218,8 +1509,8 @@ jobs:
             if (qualifying.length === 0) {
               for (const comment of improveComments) {
                 await github.rest.issues.deleteComment({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
+                  owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+                  repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
                   comment_id: comment.id,
                 });
               }
@@ -1227,8 +1518,8 @@ jobs:
             } else {
               for (const comment of improveComments.slice(0, -1)) {
                 await github.rest.issues.deleteComment({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
+                  owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+                  repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
                   comment_id: comment.id,
                 });
               }
@@ -1322,8 +1613,8 @@ jobs:
             const comments = await github.paginate(
               github.rest.issues.listComments,
               {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
+                owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+                repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
                 issue_number: Number(process.env.PR_NUMBER),
                 per_page: 100,
               }
@@ -1331,8 +1622,8 @@ jobs:
             for (const comment of comments) {
               if (!String(comment.body || '').includes(policy.CONTROLLER_STATE_MARKER)) continue;
               await github.rest.issues.deleteComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
+                owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+                repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
                 comment_id: comment.id,
               });
             }
@@ -1357,8 +1648,8 @@ jobs:
               return;
             }
             await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
+              owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+              repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
               sha: process.env.HEAD_SHA,
               state: 'success',
               context: 'continuum/pr-agent-review',
@@ -1389,7 +1680,8 @@ jobs:
             if (retryable) {
               try {
                 const { data: pr } = await github.rest.pulls.get({
-                  owner: context.repo.owner, repo: context.repo.repo,
+                  owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+                  repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
                   pull_number: Number(process.env.PR_NUMBER),
                 });
                 const liveSha = String((pr && pr.head && pr.head.sha) || '').trim().toLowerCase();
@@ -1401,8 +1693,8 @@ jobs:
               }
             }
             await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
+              owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+              repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
               sha: process.env.HEAD_SHA,
               state: 'failure',
               context: 'continuum/pr-agent-review',
@@ -1418,18 +1710,26 @@ jobs:
       - name: Fail closed on a moved head
         if: steps.stack.outputs.enabled == 'true' && always()
         env:
-          # Pure same-repository read-only check (gh pr view for the current
-          # PR head only). Repository token is sufficient.
-          GH_TOKEN: ${{ github.token }}
+          # Target-aware moved-head check (gh pr view for the current PR head
+          # only against the resolved target). Local reads use github.token;
+          # delegated cross-repository reads require TAP_PAT. The fallback is
+          # gated on non-delegated runs so a delegated run without PAT yields
+          # an empty token (auth itself fails closed).
+          GH_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
+          TAP_PAT: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           REVIEWED_SHA: ${{ steps.before.outputs.sha }}
         run: |
           set -euo pipefail
+          if [[ "${CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED:-false}" == "true" && -z "${TAP_PAT:-}" ]]; then
+            echo "::error::Delegated PR-Agent execution requires TAP_PAT; refusing to fall back to github.token."
+            exit 1
+          fi
           if [[ -z "${REVIEWED_SHA:-}" ]]; then
             echo "No review was admitted; nothing to revalidate."
             exit 0
           fi
-          CURRENT_SHA="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)"
+          CURRENT_SHA="$(gh pr view "$PR_NUMBER" --repo "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" --json headRefOid --jq .headRefOid)"
           if [[ "$CURRENT_SHA" != "$REVIEWED_SHA" ]]; then
             echo "::error::PR head moved during review ($REVIEWED_SHA -> $CURRENT_SHA); the review is stale."
             exit 1
@@ -1440,6 +1740,11 @@ jobs:
         if: always() && steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
         run: |
           set -euo pipefail
+          if [[ -z "${CONTINUUM_PR_AGENT_WORKTREE:-}" ]]; then
+            echo "::error::PR-Agent worktree is unavailable; the manual checkout failed before exporting the worktree."
+            exit 1
+          fi
+          cd "$CONTINUUM_PR_AGENT_WORKTREE"
           DIRTY="$(git status --porcelain -- . ':(exclude)pr-agent-outputs')"
           if [[ -n "$DIRTY" ]]; then
             echo "::error::PR-Agent modified the checkout; reviewer-only runs must not."
@@ -1499,7 +1804,9 @@ jobs:
             // admitted SHA. Fresh CI on the new HEAD recovers on its own.
             try {
               const { data: pr } = await github.rest.pulls.get({
-                owner: context.repo.owner, repo: context.repo.repo, pull_number: prNumber,
+                owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+                repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
+                pull_number: prNumber,
               });
               const liveSha = String((pr && pr.head && pr.head.sha) || '').trim().toLowerCase();
               if (liveSha && liveSha !== head) {
@@ -1527,7 +1834,7 @@ jobs:
             const body = policy.controllerStateBody(stateMarker, summary);
             const comments = await github.paginate(
               github.rest.issues.listComments,
-              { owner: context.repo.owner, repo: context.repo.repo, issue_number: prNumber, per_page: 100 }
+              { owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER, repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO, issue_number: prNumber, per_page: 100 }
             );
             const controller = comments
               .filter(comment => String(comment.body || '').includes(policy.CONTROLLER_STATE_MARKER))
@@ -1535,23 +1842,23 @@ jobs:
             const latest = controller.at(-1);
             if (latest) {
               await github.rest.issues.updateComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
+                owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+                repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
                 comment_id: latest.id,
                 body,
               });
             } else {
               await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
+                owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+                repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
                 issue_number: prNumber,
                 body,
               });
             }
             for (const stale of controller.slice(0, -1)) {
               await github.rest.issues.deleteComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
+                owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+                repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
                 comment_id: stale.id,
               });
             }
@@ -1582,15 +1889,32 @@ jobs:
            steps.improve_skipped.outputs.stale_head != 'true' &&
            steps.post_improve.outputs.stale_head != 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
+          # Target-aware revalidation (gh pr view plus exact-HEAD workflow-run
+          # evidence against the resolved target). Local same-repository reads
+          # use github.token; delegated cross-repository reads require TAP_PAT.
+          # The fallback is gated on non-delegated runs so a delegated run
+          # without PAT yields an empty token (auth itself fails closed).
+          GH_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
+          TAP_PAT: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           HEAD_SHA: ${{ steps.admit.outputs.head_sha }}
           RETRY_ATTEMPT: ${{ steps.stack.outputs.retry_attempt }}
           RETRY_WORKFLOW: ${{ steps.stack.outputs.retry_workflow }}
           CURRENT_RECOVERY_KIND: ${{ steps.stack.outputs.recovery_kind }}
+          TARGET_CHILD_ID: ${{ inputs.target_child_id }}
+          CONTINUUM_REF_INPUT: ${{ inputs.continuum_ref }}
           CI_WORKFLOW_NAME: ${{ inputs.ci_workflow_name || vars.CONTINUUM_CI_WORKFLOW_NAME || 'CI' }}
         run: |
           set -euo pipefail
+          # Target-aware revalidation against the resolved target: local
+          # same-repository reads use github.token while delegated
+          # cross-repository reads require TAP_PAT. Fail closed when
+          # delegated without PAT instead of masking an auth failure as
+          # stale-cancelled via the revalidation branches below.
+          if [[ "${CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED:-false}" == "true" && -z "${TAP_PAT:-}" ]]; then
+            echo "::error::Delegated PR-Agent retry requires TAP_PAT; refusing to silently cancel."
+            exit 1
+          fi
           attempt="${RETRY_ATTEMPT:-0}"
           [[ "$attempt" =~ ^[0-9]+$ ]] || attempt=0
           case "$RETRY_WORKFLOW" in
@@ -1609,7 +1933,7 @@ jobs:
           # flag, but cancel before the backoff anyway so a superseded SHA
           # never sleeps toward a dispatch. The post-backoff revalidation
           # below remains as further defense in depth.
-          if live_head="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid 2>/dev/null)"; then
+          if live_head="$(gh pr view "$PR_NUMBER" --repo "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" --json headRefOid --jq .headRefOid 2>/dev/null)"; then
             if [[ -n "$live_head" && "$live_head" != "$HEAD_SHA" ]]; then
               echo "PR head moved ($HEAD_SHA -> $live_head); stale retry cancelled."
               exit 0
@@ -1620,7 +1944,7 @@ jobs:
           delay=$((15 * (1 << attempt)))
           sleep "$delay"
 
-          if ! current="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid,state,isDraft --jq '[.headRefOid,.state,(.isDraft|tostring)]|@tsv')"; then
+          if ! current="$(gh pr view "$PR_NUMBER" --repo "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" --json headRefOid,state,isDraft --jq '[.headRefOid,.state,(.isDraft|tostring)]|@tsv')"; then
             echo "Could not revalidate PR state after backoff; stale retry cancelled."
             exit 0
           fi
@@ -1632,7 +1956,7 @@ jobs:
             exit 0
           fi
           CI_JSON="$RUNNER_TEMP/pr-agent-ci-runs.json"
-          if ! gh api "repos/$GITHUB_REPOSITORY/actions/runs?event=pull_request&head_sha=$HEAD_SHA&per_page=100" > "$CI_JSON"; then
+          if ! gh api "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/actions/runs?event=pull_request&head_sha=$HEAD_SHA&per_page=100" > "$CI_JSON"; then
             echo "Could not revalidate exact-HEAD CI after backoff; stale retry cancelled."
             exit 0
           fi
@@ -1663,7 +1987,36 @@ jobs:
           esac
           if ! [[ "$DEFAULT_BRANCH" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]]; then DEFAULT_BRANCH="main"; fi
           if [[ "$DEFAULT_BRANCH" == */.*/* || "$DEFAULT_BRANCH" == .*/ || "$DEFAULT_BRANCH" == */. ]] || [[ "$DEFAULT_BRANCH" =~ (^|/)\. ]] || [[ "$DEFAULT_BRANCH" =~ \.lock($|/) ]]; then DEFAULT_BRANCH="main"; fi
-          gh workflow run "$RETRY_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH"             -f pr_number="$PR_NUMBER"             -f expected_head_sha="$HEAD_SHA"             -f retry_attempt="$next"             -f retry_workflow="$RETRY_WORKFLOW"             -f recovery_kind="${CURRENT_RECOVERY_KIND:-review}"
+          # Local runs dispatch bare: a custom retry_workflow without the
+          # target_child_id workflow_dispatch input rejects unknown inputs,
+          # so an empty value must be omitted (mirrors recovery JS). A
+          # delegated dispatch rejected as an unknown input fails closed
+          # here with an explicit message instead of a generic shell error
+          # (mirrors the merge-wakeup 422 detection).
+          dispatch_isolated_retry() {
+            local dispatch_output dispatch_status
+            set +e
+            dispatch_output="$(gh workflow run "$RETRY_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" "$@" 2>&1)"
+            dispatch_status=$?
+            set -e
+            if (( dispatch_status == 0 )); then
+              printf '%s\n' "$dispatch_output"
+              return 0
+            fi
+            printf '%s\n' "$dispatch_output" >&2
+            if [[ -n "${TARGET_CHILD_ID:-}" ]] && [[ "$dispatch_output" == *"422"* ]] && [[ "${dispatch_output,,}" == *"target_child_id"* ]]; then
+              echo "::error::Delegated retry requires retry workflow $RETRY_WORKFLOW to declare a target_child_id workflow_dispatch input; refusing bare retry to preserve the delegated target."
+              return 1
+            fi
+            return "$dispatch_status"
+          }
+          CONTINUUM_REF_INPUT="${CONTINUUM_REF_INPUT:-}"
+          if [[ -n "${TARGET_CHILD_ID:-}" ]]; then
+            : "${CONTINUUM_REF_INPUT:?CONTINUUM_REF is required for delegated retry}"
+            dispatch_isolated_retry -f pr_number="$PR_NUMBER" -f expected_head_sha="$HEAD_SHA" -f retry_attempt="$next" -f retry_workflow="$RETRY_WORKFLOW" -f recovery_kind="${CURRENT_RECOVERY_KIND:-review}" -f target_child_id="$TARGET_CHILD_ID" -f continuum_ref="$CONTINUUM_REF_INPUT"
+          else
+            dispatch_isolated_retry -f pr_number="$PR_NUMBER" -f expected_head_sha="$HEAD_SHA" -f retry_attempt="$next" -f retry_workflow="$RETRY_WORKFLOW" -f recovery_kind="${CURRENT_RECOVERY_KIND:-review}"
+          fi
           echo "Dispatched isolated PR-Agent retry attempt $next/3 for PR #$PR_NUMBER HEAD $HEAD_SHA."
 
   repair:
@@ -1682,6 +2035,7 @@ jobs:
       improve_jsonl: ${{ needs.pr_agent.outputs.improve_jsonl }}
       retry_attempt: ${{ needs.pr_agent.outputs.recovery_kind == 'repair' && needs.pr_agent.outputs.retry_attempt || '0' }}
       retry_workflow: ${{ needs.pr_agent.outputs.retry_workflow }}
+      target_child_id: ${{ inputs.target_child_id }}
 
   merge:
     needs: pr_agent
@@ -1698,3 +2052,4 @@ jobs:
       review_json: ${{ needs.pr_agent.outputs.review_json }}
       improve_jsonl: ${{ needs.pr_agent.outputs.improve_jsonl }}
       persistent_state_json: ${{ needs.pr_agent.outputs.persistent_state_json }}
+      target_child_id: ${{ inputs.target_child_id }}

@@ -887,9 +887,27 @@ class IsolationTests(unittest.TestCase):
 
     def test_pr_agent_review_uses_repository_token_not_shared_pat(self):
         body = read_repo(".github/workflows/continuum-pr-agent.yml")
-        self.assertNotIn("secrets.TAP_PAT", body)
-        self.assertIn("GITHUB__USER_TOKEN: ${{ github.token }}", body)
+        # Target-aware (#243) delegated cross-repository reads require
+        # TAP_PAT through the fail-closed conditional, so the review
+        # workflow is no longer entirely PAT-free. The repository-token
+        # contract is preserved in scoped form: local control-plane runs
+        # stay repository-token backed, the shared PAT is never consumed
+        # unconditionally, and delegated runs without PAT fail closed
+        # instead of silently falling back to github.token. PR-Agent tool
+        # execution (pr-agent --pr_url against the resolved target) follows
+        # the same target-aware contract: TAP_PAT when delegated,
+        # github.token locally.
+        self.assertNotIn("secrets.TAP_PAT || github.token }}", body)
+        self.assertNotIn("GITHUB__USER_TOKEN: ${{ secrets.TAP_PAT }}", body)
+        self.assertIn(
+            "GITHUB__USER_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED",
+            body,
+        )
         self.assertIn("GH_TOKEN: ${{ github.token }}", body)
+        self.assertIn(
+            "CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT",
+            body,
+        )
         self.assertIn("actions: write", body)
         self.assertIn("statuses: write", body)
 
@@ -1148,8 +1166,15 @@ class StabilizationParityTests(unittest.TestCase):
         self.assertIn('echo "classification=transient" >> "$GITHUB_OUTPUT"', repair)
         self.assertIn("requesting bounded exact-HEAD re-review/repair", repair)
         self.assertIn("if: always() && steps.repair_pass.outputs.no_progress == 'true'", repair)
+        # Target-aware merge: the repair pass stays wholly PAT-backed
+        # (GH_TOKEN is TAP_PAT) so delegated cross-repository reads succeed;
+        # a same-repository github.token read cannot target the child. The
+        # bounded-retry contract is preserved via transient classification
+        # and retryable API-failure handling against the resolved target.
         self.assertIn('GH_TOKEN: ${{ secrets.TAP_PAT }}', repair)
         self.assertNotIn('READ_GH_TOKEN: ${{ github.token }}', repair)
+        self.assertIn('repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/issues/$PR_NUMBER/comments', repair)
+        self.assertIn('gh pr view "$PR_NUMBER" --repo "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY"', repair)
         self.assertIn("GitHub API failure is retryable", repair)
         self.assertNotIn("No repair diff; controller state will hold", repair)
 
@@ -1477,10 +1502,18 @@ class RepairWiringRegressionTests(unittest.TestCase):
 
     def test_merge_reconciliation_is_serialized_per_pr(self):
         merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
+        # Target-aware: the group is additionally scoped by the opaque child
+        # id; only the opaque id ever appears, never a concrete repository
+        # name. The local branch preserves current-main's exact group string
+        # (pr-agent-merge-{pr_number}) via format('pr-agent-merge-{0}', ...),
+        # so local behavior is unchanged while delegated runs serialize per
+        # child id plus PR.
         self.assertIn(
-            "group: pr-agent-merge-${{ inputs.pr_number || github.run_id }}",
+            "group: ${{ inputs.target_child_id && format('pr-agent-merge-child-{0}-{1}', inputs.target_child_id, inputs.pr_number || github.run_id) || format('pr-agent-merge-{0}', inputs.pr_number || github.run_id) }}",
             merge,
         )
+        self.assertIn("inputs.target_child_id", merge)
+        self.assertNotIn("target_repository:", merge)
         self.assertIn("cancel-in-progress: false", merge)
         # Per-PR serialization plus the exact-HEAD marker is the isolation
         # contract; repository-global active-run probing is forbidden.
@@ -1583,7 +1616,10 @@ class RepairWiringRegressionTests(unittest.TestCase):
         # an out-of-order old-HEAD event must not cancel newer
         # exact-HEAD work and same-HEAD duplicates coalesce.
         body = read_repo(".github/workflows/continuum-pr-agent.yml")
-        self.assertIn("group: pr-agent-${{", body)
+        # Local group string is preserved verbatim (pr-agent-<pr>); delegated
+        # runs scope by the opaque child id only, never a concrete name.
+        self.assertIn("format('pr-agent-child-{0}-{1}'", body)
+        self.assertIn("format('pr-agent-{0}'", body)
         self.assertIn("cancel-in-progress: false", body)
         self.assertNotIn("group: pr-agent-caller-", body)
         self.assertNotIn("cancel-in-progress: true", body)
@@ -1603,9 +1639,15 @@ class RepairWiringRegressionTests(unittest.TestCase):
         # The parent run is also non-preemptive at workflow level, so an
         # old-HEAD duplicate can never cancel newer exact-HEAD work.
         repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
+        # Local repair group string is preserved verbatim
+        # (pr-agent-repair-<pr>-<sha>); delegated runs scope by the opaque
+        # child id only.
         self.assertIn(
-            "group: pr-agent-repair-${{ inputs.pr_number || github.run_id }}-"
-            "${{ inputs.head_sha || github.sha }}",
+            "format('pr-agent-repair-child-{0}-{1}-{2}'",
+            repair,
+        )
+        self.assertIn(
+            "format('pr-agent-repair-{0}-{1}'",
             repair,
         )
         self.assertIn("cancel-in-progress: false", repair)
@@ -2288,7 +2330,10 @@ class ImproveSkipWorkflowTests(unittest.TestCase):
     def test_improve_gate_is_exact_head_safe(self):
         body = read_repo(".github/workflows/continuum-pr-agent.yml")
         gate = body.index("Decide whether automatic improve can be skipped")
-        window = body[gate:gate + 6000]
+        # The window must cover the whole gate step. Delegated target-aware
+        # live-head revalidation uses longer owner/repo lines than a
+        # same-repository lookup, so allow margin beyond the gate body.
+        window = body[gate:gate + 7000]
         self.assertIn("REVIEWED_SHA", window)
         self.assertIn("HEAD_SHA", window)
         self.assertIn("headSha !== reviewedSha", window)
@@ -2306,7 +2351,9 @@ class ImproveSkipWorkflowTests(unittest.TestCase):
         gate = body.index("Decide whether automatic improve can be skipped")
         # The window must cover the whole gate step: the three stale-head
         # discards each carry their own flag before the live-head decision.
-        window = body[gate:gate + 6200]
+        # Delegated target-aware revalidation is longer than a same-repository
+        # lookup, so allow margin beyond the gate body.
+        window = body[gate:gate + 7000]
         self.assertIn("pulls.get", window)
         self.assertIn("liveSha", window)
         self.assertIn("reviewedHeadSha", window)
