@@ -2086,13 +2086,14 @@ class CleanReviewImproveSkipTests(unittest.TestCase):
 
     def test_missing_reviewed_head_never_skips(self):
         life = self._life()
-        with self.assertRaises(life.LifecycleError):
-            life.should_skip_improve(
-                make_review([]),
-                make_persistent([], head_sha="abc1234"),
-                head_matches=True,
-                review_coverage_complete=True,
-            )
+        missing = life.should_skip_improve(
+            make_review([]),
+            make_persistent([], head_sha="abc1234"),
+            head_matches=True,
+            review_coverage_complete=True,
+        )
+        self.assertFalse(missing["skip"])
+        self.assertIn("reviewed HEAD", missing["reason"])
         stale = life.should_skip_improve(
             make_review([]),
             make_persistent([], head_sha="abc1234"),
@@ -3250,10 +3251,11 @@ process.stdout.write(JSON.stringify(result === undefined ? null : result));
                     review_coverage_complete=True, reviewed_head_sha=bad_head or "unknown",
                 )
                 self.assertFalse(decision["skip"])
-        with self.assertRaises(life.LifecycleError):
-            life.should_skip_improve(
-                clean, state, head_matches=True, review_coverage_complete=True,
-            )
+        missing_py = life.should_skip_improve(
+            clean, state, head_matches=True, review_coverage_complete=True,
+        )
+        self.assertFalse(missing_py["skip"])
+        self.assertIn("reviewed HEAD", missing_py["reason"])
         missing = run_skip_policy_raw(
             json.dumps(clean), json.dumps(state),
             {"headMatches": True, "reviewCoverageComplete": True},

@@ -12,10 +12,22 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import unittest
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 POLICY_MODULE = os.path.join(ROOT, ".github", "scripts", "pr_agent_policy.js")
+SRC = os.path.join(ROOT, "src")
+
+
+def _life():
+    sys.path.insert(0, SRC)
+    try:
+        from continuum import pr_agent_lifecycle as life
+
+        return life
+    finally:
+        sys.path.remove(SRC)
 
 
 def run_js(expression, review=None, state=None, options=None, raw=None):
@@ -587,6 +599,140 @@ class PrAgentWorkflowContractTests(unittest.TestCase):
         )
         self.assertIn("truncated/invalid improve payload", merge)
         self.assertIn("incomplete improve coverage", merge)
+
+
+class PythonDirectPolicyTests(unittest.TestCase):
+    """Direct Python coverage for the parity helpers (no node subprocess).
+
+    Guards Python-only regressions and Python/JS parity drift for the DoD
+    triad: clean-skip, actionable-improve, and exact-HEAD safety.
+    """
+
+    def test_python_clean_exact_head_skips(self):
+        life = _life()
+        decision = life.should_skip_improve(
+            make_review([]),
+            make_persistent([], head_sha="abc1234"),
+            head_matches=True,
+            review_coverage_complete=True,
+            reviewed_head_sha="abc1234",
+        )
+        self.assertTrue(decision["skip"])
+
+    def test_python_actionable_review_never_skips(self):
+        life = _life()
+        state = make_persistent([], head_sha="abc1234")
+        for review in (
+            make_review([issue_entry(n=0)]),
+            make_review([], recommendation="changes_required"),
+            make_review([], extra={"errors": "API timeout contacting model"}),
+            make_review([], extra={"truncated": ""}),
+            make_review([], extra={"security_concerns": "hardcoded credential"}),
+        ):
+            with self.subTest(review=review):
+                decision = life.should_skip_improve(
+                    review,
+                    state,
+                    head_matches=True,
+                    review_coverage_complete=True,
+                    reviewed_head_sha="abc1234",
+                )
+                self.assertFalse(decision["skip"])
+
+    def test_python_exact_head_safety_fail_closed_without_throwing(self):
+        life = _life()
+        state = make_persistent([], head_sha="abc1234")
+        stale = life.should_skip_improve(
+            make_review([]),
+            state,
+            head_matches=False,
+            review_coverage_complete=True,
+            reviewed_head_sha="abc1234",
+        )
+        self.assertFalse(stale["skip"])
+        # Missing reviewed HEAD must run improve (skip=False), never raise,
+        # mirroring the JS isCleanReviewForImproveSkip contract.
+        missing = life.should_skip_improve(
+            make_review([]),
+            state,
+            head_matches=True,
+            review_coverage_complete=True,
+        )
+        self.assertFalse(missing["skip"])
+        self.assertIn("reviewed HEAD", missing["reason"])
+
+    def test_python_signal_helpers(self):
+        life = _life()
+        self.assertTrue(
+            life.has_tool_error_signal(
+                make_review([], extra={"errors": "upstream tool failed"})
+            )
+        )
+        self.assertFalse(
+            life.has_tool_error_signal(
+                make_review([], extra={"errors": "2 checks failed in diff"})
+            )
+        )
+        self.assertTrue(
+            life.has_incomplete_coverage_signal(
+                make_review([], extra={"truncated": ""})
+            )
+        )
+        self.assertFalse(
+            life.has_incomplete_coverage_signal(make_review([]))
+        )
+        self.assertTrue(
+            life.has_blocking_security_signal(
+                make_review([], extra={"security_concerns": "hardcoded credential"})
+            )
+        )
+        self.assertFalse(
+            life.has_blocking_security_signal(
+                make_review([], extra={"security_concerns": "No concerns"})
+            )
+        )
+
+    def test_python_unwrap_and_skipped_clean_helpers(self):
+        life = _life()
+        nested = {
+            "review": make_review([issue_entry(n=0)]),
+            "coverage_complete": True,
+        }
+        merged = life._unwrap_review(nested)
+        self.assertEqual(len(merged["key_issues_to_review"]), 1)
+        self.assertTrue(life.is_improve_skipped_clean(True))
+        self.assertTrue(life.is_improve_skipped_clean("success"))
+        self.assertFalse(life.is_improve_skipped_clean(False))
+        self.assertFalse(life.is_improve_skipped_clean("skipped"))
+
+    def test_python_evaluate_gate_skip_leg(self):
+        life = _life()
+        green = life.evaluate_gate(
+            life.GateInputs(
+                review=make_review([]),
+                qualifying_improve=[],
+                persistent_state=make_persistent([], head_sha="abc1234"),
+                ci_green_on_exact_head=True,
+                head_matches=True,
+                review_coverage_complete=True,
+                improve_coverage_complete=False,
+                improve_skipped_clean=True,
+            )
+        )
+        self.assertTrue(green["green"])
+        held = life.evaluate_gate(
+            life.GateInputs(
+                review=make_review([]),
+                qualifying_improve=[{"relevant_file": "src/app.py", "score": 9}],
+                persistent_state=make_persistent([], head_sha="abc1234"),
+                ci_green_on_exact_head=True,
+                head_matches=True,
+                review_coverage_complete=True,
+                improve_coverage_complete=False,
+                improve_skipped_clean=True,
+            )
+        )
+        self.assertFalse(held["green"])
 
 
 if __name__ == "__main__":

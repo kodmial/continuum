@@ -921,20 +921,21 @@ def should_skip_improve(
     finding.
 
     `reviewed_head_sha` is mandatory for any `skip=True`: it is compared
-    against `persistent_state.last_run.head_sha` and a missing value raises
-    `LifecycleError` (fail closed) so a stale persistent state from a prior
-    HEAD can never authorize a skip. Callers must pass the exact reviewed
-    HEAD. A missing `last_run.head_sha` (or an unrecognized HEAD shape such
-    as a placeholder) returns `skip=False` so `improve` still runs for
-    repair value instead of crashing the orchestrator; only a plausible
-    hex HEAD that exactly matches the reviewed HEAD can allow a skip.
+    against `persistent_state.last_run.head_sha` and a missing value returns
+    `skip=False` (fail closed, never raises) so a stale persistent state
+    from a prior HEAD can never authorize a skip and the orchestrator still
+    runs `improve` for repair value instead of crashing (parity with the JS
+    `isCleanReviewForImproveSkip` contract). Callers must pass the exact
+    reviewed HEAD. A missing `last_run.head_sha` (or an unrecognized HEAD
+    shape such as a placeholder) likewise returns `skip=False`; only a
+    plausible hex HEAD that exactly matches the reviewed HEAD can allow a
+    skip.
 
     Anything else returns `skip=False` so `improve` may still run to
     generate additional repair suggestions. An invalid review payload
     (unparseable envelope, missing/non-list `key_issues_to_review`, or
     missing `merge_recommendation`) returns `skip=False` so `improve`
-    still runs for repair value; only a missing reviewed HEAD raises
-    `LifecycleError` and fails closed instead of skipping. A benign
+    still runs for repair value, as does a missing reviewed HEAD. A benign
     persistent format variation (non-object state, non-list findings,
     missing `last_run`, non-full run, missing or placeholder `head_sha`)
     with a known HEAD returns `skip=False` so `improve` still runs.
@@ -967,13 +968,15 @@ def should_skip_improve(
         }
     # The exact reviewed HEAD is mandatory for any skip decision: validate
     # it before interpreting coverage/persistent format variations so a
-    # missing HEAD still fails closed by exception while benign variations
-    # with a known HEAD safely run improve (skip=False).
+    # missing HEAD fails closed to skip=False (never to an exception,
+    # mirroring the JS contract) while benign variations with a known HEAD
+    # likewise safely run improve (skip=False).
     expected_head = str(reviewed_head_sha or "").strip()
     if not expected_head:
-        raise LifecycleError(
-            "cannot decide improve skip without the exact reviewed HEAD."
-        )
+        return {
+            "skip": False,
+            "reason": "cannot decide improve skip without the exact reviewed HEAD: failing closed",
+        }
     if (review_coverage_complete is not True) or has_incomplete_coverage_signal(inner):
         return {"skip": False, "reason": "incomplete review coverage: failing closed"}
     if recommendation != REVIEW_MERGE_SAFE:
