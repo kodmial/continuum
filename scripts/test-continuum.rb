@@ -109,7 +109,7 @@ class ContinuumTest < Minitest::Test
 
   def segment_installer?(segment)
     return true if segment.include?('https://opencode.ai/install')
-    if segment.include?('pip install')
+    if segment.include?('pip install') || segment.include?('pip3 install')
       return true if segment.include?('pr-agent') || segment.include?('opencode')
     end
     if segment.include?('pipx install')

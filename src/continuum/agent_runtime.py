@@ -1104,7 +1104,7 @@ class CacheEntry:
 #: Shell-executable syntax that cached dependency content must never carry:
 #: command substitution, backticks, pipes, chaining, or newlines would
 #: execute if a consumer sourced or evaluated the payload.
-_CACHE_EXECUTABLE_RE = re.compile(r"(\$\(|`|\$\{|[;|]|\n|\r|\0)")
+_CACHE_EXECUTABLE_RE = re.compile(r"(\$|`|&|[;|<>]|\n|\r|\0)")
 
 
 def _validate_cache_payload(payload: Any, _depth: int = 0) -> bool:
@@ -1854,8 +1854,8 @@ class CloudCliProvider(FakeProvider):
         if persistent:
             raise AgentRuntimeError("per-job network attachment must not be persistent")
         cli = self._require_cli()
-        tags = "continuum-job={}".format(job_id)
         name = _cloud_resource_name(job_id, profile_digest)
+        tags = "continuum-job={}".format(name)
         if self._backend == "gce":
             self._run_cli([cli, "compute", "firewall-rules", "create",
                             name,
@@ -1896,7 +1896,7 @@ class CloudCliProvider(FakeProvider):
             real_id = name
         elif self._backend == "ec2":
             output = self._run_cli([cli, "ec2", "run-instances", "--tag-specifications",
-                            "ResourceType=instance,Tags=[{Key=continuum-job,Value=" + job_id + "}]"]
+                            "ResourceType=instance,Tags=[{Key=continuum-job,Value=" + name + "}]"]
                            + list(self.extra_args))
             try:
                 parsed = json.loads(output or "{}")

@@ -117,7 +117,7 @@ def _is_echo_segment(segment):
 def _segment_is_installer(segment):
     if "https://opencode.ai/install" in segment:
         return True
-    elif "pip install" in segment and ("pr-agent" in segment or "opencode" in segment):
+    elif ("pip install" in segment or "pip3 install" in segment) and ("pr-agent" in segment or "opencode" in segment):
         return True
     elif "pipx install" in segment and ("pr-agent" in segment or "opencode" in segment):
         return True

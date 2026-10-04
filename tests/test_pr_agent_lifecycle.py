@@ -551,6 +551,21 @@ class ProtectedBaselineTests(unittest.TestCase):
                             text=True,
                             timeout=30,
                         )
+                        if ancestor.returncode != 0:
+                            fetched_history = subprocess.run(
+                                ["git", "fetch", "--deepen", "50", "origin", "HEAD"],
+                                cwd=ROOT,
+                                capture_output=True,
+                                text=True,
+                                timeout=120,
+                            )
+                            ancestor = subprocess.run(
+                                ["git", "merge-base", "--is-ancestor", BASELINE_SHA, "HEAD"],
+                                cwd=ROOT,
+                                capture_output=True,
+                                text=True,
+                                timeout=30,
+                            )
                         _assert_git_ok(
                             ancestor,
                             f"{path} baseline {BASELINE_SHA} is not an ancestor of HEAD",
