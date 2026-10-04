@@ -3329,7 +3329,7 @@ class ContinuumTest < Minitest::Test
       head_ref_pattern auto_merge_workflow opencode_workflow
     ],
     'continuum-opencode-unresolved.yml' => %w[continuum_ref],
-    'continuum-pr-agent-recovery.yml' => %w[continuum_ref],
+    'continuum-pr-agent-recovery.yml' => %w[continuum_ref max_executions],
     'continuum-pr-agent-canary.yml' => %w[
       continuum_ref canary_enabled base_ref opencode_model model max_tokens
       api_base bridge_port server_port pr_agent_version
@@ -4294,7 +4294,170 @@ class ContinuumTest < Minitest::Test
     refute_nil sync_guard
     refute_nil generic_ci
     assert_operator sync_guard, :<, generic_ci,
-                    'PR-Agent sync-only mode must exit before generic review/merge gates'
+                     'PR-Agent sync-only mode must exit before generic review/merge gates'
+  end
+
+  # The transient budget is 10 total executions per exact PR/HEAD/operation by
+  # default (#224), configurable through a safe bounded Continuum variable. A
+  # misconfigured value can neither silence recovery nor grant an unbounded
+  # budget: the workflow clamps to 1..10.
+  def test_pr_agent_recovery_budget_is_ten_executions_and_variable_driven
+    inputs = events(yaml(File.join(ROOT, '.github/workflows/continuum-pr-agent-recovery.yml')))
+             .fetch('workflow_call').fetch('inputs')
+    knob = inputs.fetch('max_executions')
+    assert_equal '', knob.fetch('default'),
+                 "max_executions must default to empty so vars.PR_AGENT_RECOVERY_MAX_EXECUTIONS decides"
+    assert_equal 'string', knob.fetch('type')
+    assert_equal false, knob.fetch('required')
+
+    body = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent-recovery.yml'))
+    # The operator fallback survives a truthy-but-non-numeric override:
+    # raw input and vars fallback travel in separate envs so a bad
+    # input falls back to vars instead of widening to hardcoded 10.
+    assert_includes body, 'MAX_EXECUTIONS_RAW: ${{ inputs.max_executions }}'
+    assert_includes body, "MAX_EXECUTIONS_FALLBACK: ${{ vars.PR_AGENT_RECOVERY_MAX_EXECUTIONS || '10' }}"
+    assert_includes body, 'process.env.MAX_EXECUTIONS_RAW'
+    assert_includes body, 'process.env.MAX_EXECUTIONS_FALLBACK'
+    assert_includes body, 'const MAX_TRANSIENT_EXECUTIONS = 10;'
+    assert_includes body, 'Math.max(MIN_TRANSIENT_EXECUTIONS, parsed)'
+
+    stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-pr-agent-recovery.yml'))
+    with = stub.fetch('jobs').fetch('call').fetch('with')
+    assert_match(/\A\$\{\{ inputs\.max_executions/, with.fetch('max_executions').to_s,
+                 'the stub must pass max_executions through instead of pinning a literal')
+  end
+
+  # Lifecycle self-healing DoD (#224): one deterministic contract test per
+  # guarantee so a regression in any behavior fails fast here.
+  def test_pr_agent_recovery_lifecycle_dod_contract
+    recovery = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent-recovery.yml'))
+    automerge = File.read(File.join(ROOT, '.github/workflows/continuum-auto-merge.yml'))
+
+    # Rate-limit reset resumption without sleeping a runner.
+    assert_includes recovery, 'extractRateLimitSignals'
+    assert_includes recovery, 'retry-after'
+    assert_includes recovery, 'ratelimitResetEpoch'
+    assert_includes recovery, 'resetAwareDelaySeconds'
+    assert_includes recovery, 'MAX_INLINE_WAIT_SECONDS'
+    assert_includes recovery, 'scheduled safety net will redispatch'
+
+    # Bounded retry classification: 429/5xx/network/cancelled retry via the
+    # transient classifier; deterministic failures hold loudly per PR.
+    assert_includes recovery, 'isTransientApiError'
+    assert_includes recovery, 'retryableConclusions'
+    assert_includes recovery, 'deterministicFailure'
+    assert_includes recovery, 'skipping PR but continuing run'
+    assert_includes automerge, 'deterministic fetch error; skipping PR'
+    assert_includes automerge, 'transient fetch error; deferred to next wakeup'
+
+    # Watchdog resume, duplicate-wakeup coalescing, independent-PR progress.
+    assert_includes recovery, 'tryAcquireLease'
+    assert_includes recovery, 'leaseKey'
+    assert_includes recovery, 'ownedLeases'
+    assert_includes automerge, 'tryAcquireLease'
+    assert_includes automerge, 'cancel-in-progress: false'
+
+    # Old-HEAD isolation: exact full-commit identity, no prefix overlap.
+    assert_includes recovery, '[0-9a-f]{40,64}'
+    refute_includes recovery, '[0-9a-f]{7,64}'
+    assert_includes recovery, 'marker === current'
+
+    # Success clears state; exhaustion is observable and fail-closed.
+    assert_includes recovery, 'operation already settled'
+    assert_includes recovery, 'continuum-lifecycle-retry-exhausted'
+    assert_includes recovery, 'attempts='
+    assert_includes recovery, "action: 'exhaust'"
+
+    # No TAP_PAT reads on watchdog wakeups: same-repository scans use the
+    # repository-token client; dispatches/mutations stay PAT-backed.
+    assert_includes recovery, 'READ_GITHUB_TOKEN'
+    assert_includes recovery, 'withReadFallback'
+    assert_includes automerge, 'READ_GITHUB_TOKEN: ${{ github.token }}'
+    assert_includes automerge, 'new github.constructor({ auth: readToken, baseUrl: readBaseUrl })'
+    assert_includes automerge, 'async function withReadFallback(fn)'
+    assert_includes automerge, 'client.rest.pulls.get'
+    assert_includes automerge, 'client.rest.pulls.list'
+    assert_includes automerge, 'client.rest.repos.getCombinedStatusForRef'
+    assert_includes automerge, 'client.rest.issues.listComments'
+    assert_includes automerge, 'client.rest.repos.getCommit'
+    assert_includes automerge, 'client.rest.repos.getBranch'
+    assert_includes automerge, 'client.rest.pulls.listReviews'
+    assert_includes automerge, 'client.rest.pulls.listReviewComments'
+    assert_includes automerge, 'client.rest.actions.listWorkflowRunsForRepo'
+    assert_includes automerge, 'client.rest.actions.listWorkflowRuns'
+    assert_includes automerge, 'client.graphql'
+    refute_includes automerge, 'github.rest.pulls.listReviews'
+    refute_includes automerge, 'github.rest.actions.listWorkflowRunsForRepo'
+    refute_includes automerge, 'github.paginate('
+    assert_includes automerge, 'github.graphql('
+    assert_includes automerge, 'github.rest.pulls.merge'
+    assert_includes automerge, 'github.rest.issues.createComment'
+    assert_includes automerge, 'github.rest.issues.addLabels'
+    assert_includes automerge, 'github.rest.actions.createWorkflowDispatch'
+
+    # Shared transient/reset/lease vocabulary lives in both reconcilers.
+    assert_includes recovery, 'x-ratelimit-remaining'
+    assert_includes automerge, 'x-ratelimit-remaining'
+    assert_includes automerge, 'resetAwareDelaySeconds'
+    assert_includes automerge, 'MAX_INLINE_WAIT_SECONDS'
+    assert_includes automerge, 'extractRateLimitSignals'
+    assert_includes recovery, 'not-before='
+    assert_includes automerge, 'deferring the whole scan to the next wakeup'
+    assert_includes recovery, 'deferring the whole scan to the next wakeup'
+    assert_includes automerge, 'already queued; skipping this scan'
+
+    # Durable identity and fail-closed behavior.
+    assert_includes recovery, 'requireFullHead'
+    assert_includes recovery, 'non-full commit id'
+    assert_includes recovery, 'staying inside dispatch grace'
+    assert_includes recovery, 'dispatch was rate-limited; deferred'
+    assert_includes recovery, 'deterministicFailure'
+    assert_includes recovery, 'skipping PR but continuing run'
+    assert_includes recovery, 'core.setFailed('
+    assert_includes automerge, 'liveBeforeSync'
+    assert_includes automerge, 'holding stale reconciliation'
+    assert_includes automerge, 'sha: pr.head.sha'
+    # Exact-HEAD isolation: short-SHA markers are ignored entirely so an
+    # old HEAD sharing a 7-char prefix can never strand a new HEAD. No
+    # short retry regex may feed latestAttempt and no prefix match may
+    # preserve exhaustion.
+    assert_includes recovery, 'short-SHA markers are ignored'
+    refute_includes recovery, 'exactHead.startsWith(shortHead)'
+    refute_includes recovery, 'legacyShortRetryRe'
+    refute_includes recovery, 'startsWith(marker)'
+
+    # Behavioral wiring: the strings above must feed the decisions below.
+    # Dead or unwired helpers containing those names still fail here.
+    # Reset-aware minimums: extracted signals flow into the delay computer,
+    # and the computer enforces the server reset floor over schedule+jitter.
+    assert_includes recovery, 'const signals = extractRateLimitSignals(err);'
+    assert_includes recovery, 'retryAfterSeconds: signals.retryAfterSeconds,'
+    assert_includes recovery, 'ratelimitResetEpoch: signals.ratelimitResetEpoch,'
+    assert_includes recovery, 'delay = Math.max(delay, retryAfterSeconds);'
+    assert_includes recovery, 'delay = Math.max(delay, Math.max(0, resetEpoch - nowEpoch));'
+    assert_includes recovery, 'resetFloor = Math.max(resetFloor, signals.retryAfterSeconds);'
+    # No-sleeping-runner deferral: a long reset-aware wait defers to the
+    # scheduled safety net instead of sleeping the runner inline.
+    assert_includes recovery, 'if (remaining > MAX_INLINE_WAIT_SECONDS) {'
+    assert_match(/remaining > MAX_INLINE_WAIT_SECONDS[\s\S]{0,3000}scheduled safety net will redispatch/m, recovery)
+    # Lease coalescing: the per-PR lease key feeds the acquire gate, and the
+    # repository-global scan coalesces through that gate.
+    assert_includes recovery, 'const key = leaseKey(prNumber, head, kind);'
+    assert_includes recovery, "if (!tryAcquireLease(pr.number, head, 'reconciler')) {"
+    assert_match(/function tryAcquireLease[\s\S]{0,300}leaseKey\(/m, recovery)
+    # Old-HEAD isolation: evidence filters on exact identity and every
+    # dispatch/evidence entry point requires a full commit id.
+    assert_includes recovery, 'if (markerKind !== kind || !sameHead(markerHead, exactHead)) return;'
+    assert_includes recovery, "const exactHead = requireFullHead(head, 'retry evidence read');"
+    assert_includes recovery, "requireFullHead(head, 'recovery dispatch');"
+    # Dispatch-grace / active-run coalescing: the pre-mutation re-read checks
+    # the exact run and the refreshed not-before before mutating.
+    assert_includes recovery, 'const refreshedRuns = await listReviewRuns();'
+    assert_includes recovery, 'if (exactActiveRun(refreshedRuns, pr.number, kind, head)) {'
+    assert_includes recovery, 'const activeRun = exactActiveRun(reviewRuns, pr.number, kind, head);'
+    assert_includes recovery, 'const refreshedEvidence = parseEvidence(refreshedComments, head, kind);'
+    assert_includes recovery, 'Number.isFinite(refreshedEvidence.notBeforeEpoch)'
+    assert_includes recovery, 'await operationIsActive(pr.number, head, kind)'
   end
 
   # Both branches of the flag, checked in the body that acts on them. Asserting
@@ -5486,14 +5649,22 @@ class ContinuumTest < Minitest::Test
     assert_equal 'write', workflow.fetch('jobs').fetch('controller').fetch('permissions').fetch('contents')
     assert_equal 'write', workflow.fetch('jobs').fetch('controller').fetch('permissions').fetch('pull-requests')
 
-    # Gate reads outside housekeeping stay on the PAT path: the exact-HEAD CI
-    # lookup is merge-gate evidence, not housekeeping, and is not migrated.
+    # Same-repository gate reads use the repository token so watchdog
+    # wakeups never spend shared TAP_PAT budget on polling (#224): the
+    # exact-HEAD CI lookup is a read like any other; only
+    # mutations/dispatches stay PAT-backed.
     assert_includes body, 'async function latestWorkflowForHead',
                     'the CI gate lookup must still exist'
     gate = js_block(body, 'async function latestWorkflowForHead')
     refute_nil gate
-    assert_includes gate, 'github.paginate(',
-                    'the branch-scoped CI gate keeps its existing client; only housekeeping moves'
+    assert_includes gate, 'withReadFallback',
+                    'the branch-scoped CI gate must read via the repository token'
+    assert_includes gate, 'client.rest.actions.listWorkflowRunsForRepo',
+                    'the CI gate listing must use the repository-token client'
+    refute_includes gate, 'github.paginate(',
+                    'the CI gate must not poll on TAP_PAT'
+    refute_includes gate, 'github.rest.actions.listWorkflowRunsForRepo',
+                    'the CI gate listing must not use TAP_PAT'
   end
 
   # Covers DoD regression items 5 and 6: a rate-limit/transient failure on

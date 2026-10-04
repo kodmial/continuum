@@ -7,34 +7,83 @@ Durable retry evidence is scoped by PR + exact HEAD + operation kind
 ("review" or "repair").  GitHub issue comments are accepted as retry evidence
 only when their author association is trusted by the repository; arbitrary
 external comments must never consume or exhaust the automatic retry budget.
+
+The budget, schedule, and trust roots are the single lifecycle contract in
+:mod:`continuum.lifecycle_recovery` (#224): 10 total transient executions by
+default (configurable through a safe bounded Continuum variable), the
+~10s/30s/60s/3m/5m/10m/20m/40m/60m retry schedule with bounded jitter,
+reset-aware minimums, and durable not-before redispatch.  A success or a new
+HEAD resets the episode; deterministic failures never consume the budget.
 """
 
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Mapping, Optional, Sequence
 
-
-MAX_EXECUTIONS = 3
-STALE_AFTER_SECONDS = 70 * 60
-DISPATCH_GRACE_SECONDS = 90
-TRUSTED_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
-RETRYABLE_RUN_CONCLUSIONS = frozenset(
-    {"cancelled", "timed_out", "stale", "startup_failure"}
+from continuum.lifecycle_recovery import (
+    DISPATCH_GRACE_SECONDS as _LIFECYCLE_DISPATCH_GRACE,
 )
+from continuum.lifecycle_recovery import (
+    MAX_TRANSIENT_EXECUTIONS as _LIFECYCLE_MAX_EXECUTIONS,
+)
+from continuum.lifecycle_recovery import (
+    RETRYABLE_RUN_CONCLUSIONS as _LIFECYCLE_RETRYABLE,
+)
+from continuum.lifecycle_recovery import STALE_AFTER_SECONDS as _LIFECYCLE_STALE
+from continuum.lifecycle_recovery import (
+    TRUSTED_ASSOCIATIONS as _LIFECYCLE_TRUSTED,
+)
+from continuum.lifecycle_recovery import exponential_backoff_seconds as _lifecycle_backoff
+from continuum.lifecycle_recovery import resolve_max_executions as _resolve_budget
+
+
+MAX_EXECUTIONS = _LIFECYCLE_MAX_EXECUTIONS
+MIN_EXECUTIONS = 1
+RETRY_DELAY_SCHEDULE = (0, 10, 30, 60, 180, 300, 600, 1200, 2400, 3600)
+STALE_AFTER_SECONDS = _LIFECYCLE_STALE
+DISPATCH_GRACE_SECONDS = _LIFECYCLE_DISPATCH_GRACE
+TRUSTED_ASSOCIATIONS = _LIFECYCLE_TRUSTED
+RETRYABLE_RUN_CONCLUSIONS = _LIFECYCLE_RETRYABLE
 KINDS = frozenset({"review", "repair"})
 
 _RETRY_RE = re.compile(
     r"<!--\s*continuum-pr-agent-retry\s+"
-    r"head=([0-9a-fA-F]{7,64})\s+"
+    r"head=([0-9a-fA-F]{40,64})\s+"
     r"kind=(review|repair)\s+"
     r"attempt=(\d+)\s*-->"
 )
+# Canonical lifecycle markers (#224) carry the same review/repair budget with
+# an optional durable ``not-before=<epoch>`` inside the marker. They are read
+# here so the two helpers share one compatible recovery contract; new writes
+# use the lifecycle prefix.
+_LIFECYCLE_RETRY_RE = re.compile(
+    r"<!--\s*continuum-lifecycle-retry\s+"
+    r"head=([0-9a-fA-F]{40,64})\s+"
+    r"kind=(review|repair)\s+"
+    r"attempt=(\d+)"
+    r"(?:\s+not-before=(\d+))?"
+    r"[^>]*-->"
+)
 _EXHAUSTED_RE = re.compile(
     r"<!--\s*continuum-pr-agent-retry-exhausted\s+"
-    r"head=([0-9a-fA-F]{7,64})\s+"
+    r"head=([0-9a-fA-F]{40,64})\s+"
+    r"kind=(review|repair)\s+"
+    r"attempts=(\d+)\s*-->"
+)
+# Short-SHA markers (7-39 hex) predate exact-HEAD safety and are ignored
+# entirely: no short marker -- retry or exhausted -- ever authorizes an
+# attempt or preserves exhaustion. Two distinct commits can share a 7-char
+# prefix, so prefix matching would let old-HEAD evidence strand an
+# unrelated healthy HEAD with no expiry path. Exact-HEAD isolation
+# requires full-commit identity only; there is deliberately no short-SHA
+# regex feeding any evidence.
+_LIFECYCLE_EXHAUSTED_RE = re.compile(
+    r"<!--\s*continuum-lifecycle-retry-exhausted\s+"
+    r"head=([0-9a-fA-F]{40,64})\s+"
     r"kind=(review|repair)\s+"
     r"attempts=(\d+)\s*-->"
 )
@@ -51,6 +100,7 @@ class RetryEvidence:
     latest_attempt: Optional[int] = None
     latest_marker_at: Optional[datetime] = None
     exhausted: bool = False
+    not_before_epoch: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -60,10 +110,28 @@ class RecoveryDecision:
     action: str
     attempt: Optional[int]
     reason: str
+    not_before_epoch: Optional[int] = None
+    defer_dispatch: bool = False
+
+
+def utc_now_epoch() -> int:
+    """Return the current UTC epoch for dispatch-path clocks.
+
+    Dispatch paths must pass ``now_epoch=utc_now_epoch()`` so a durable
+    reset-aware not-before persists and expires through the scheduled
+    safety net. A clockless wait intentionally defers instead of
+    dispatching with no durable wait.
+    """
+
+    return int(time.time())
 
 
 def operation_key(pr_number: object, head_sha: object, kind: object) -> str:
-    """Return the durable PR + exact HEAD + operation identity."""
+    """Return the durable PR + exact HEAD + operation identity.
+
+    Batch callers must isolate per-PR failures (catch per PR and continue,
+    or pre-check with :func:`is_full_head`) so one short/truncated SHA
+    never aborts a repository-global open-PR scan."""
 
     try:
         number = int(str(pr_number).strip())
@@ -73,11 +141,157 @@ def operation_key(pr_number: object, head_sha: object, kind: object) -> str:
     normalized_kind = str(kind or "").strip().lower()
     if number <= 0:
         raise RecoveryError("pr_number must be a positive integer")
-    if not re.fullmatch(r"[0-9a-f]{7,64}", head):
-        raise RecoveryError("head_sha must be a hexadecimal commit id")
+    # Exact-HEAD identity requires a full commit id; short prefixes would
+    # split the retry budget and weaken the old-HEAD-cannot-mutate guarantee.
+    # Migration note: short SHAs were rejected here (and by every durable
+    # marker reader) since exact-HEAD safety was introduced, so producers
+    # must pass the full commit id from the PR HEAD (``pr.head.sha``).
+    if not re.fullmatch(r"[0-9a-f]{40,64}", head):
+        raise RecoveryError(
+            "head_sha must be a full hexadecimal commit id "
+            "(40-hex SHA-1 or 64-hex SHA-256); short prefixes are rejected"
+        )
     if normalized_kind not in KINDS:
         raise RecoveryError("kind must be review or repair")
     return f"{number}:{head}:{normalized_kind}"
+
+
+_RECOVERY_ELIGIBLE_RE = re.compile(r"\brecovery eligible\b")
+_NEGATED_RECOVERY_ELIGIBLE_RE = re.compile(
+    r"\b(?:not|no|non|never)[\s\-_]*recovery[\s\-_]+eligible\b"
+)
+# Deterministic policy hints dominate the recovery token: a description that
+# carries both (e.g. "CI test failure; recovery eligible" synthesized from
+# PR-visible output) must hold, never burn transient budget. Only an
+# explicit failure_transient=True classifier verdict overrides this.
+# ``unresolved`` alone is not a hint: transient infrastructure text such as
+# ``unresolved host`` or ``unresolved DNS`` must retry through the bounded
+# budget, so only an unresolved review finding (finding/review/thread/
+# comment/conversation) holds. Bare ``conflict`` matches at any position
+# (including position zero) except inside ``conflict-free``/``conflicting``,
+# so incidental mentions dispatch while a real merge conflict still holds
+# via ``merge conflict`` or the bare-conflict pattern.
+_DETERMINISTIC_HINTS = (
+    "test failure",
+    "tests failed",
+    "merge conflict",
+    "malformed",
+    "stale head",
+    "moved head",
+    "invalid state",
+)
+_UNRESOLVED_FINDING_RE = re.compile(
+    r"unresolved\s+(findings?|reviews?|threads?|comments?|conversations?)"
+)
+_BARE_CONFLICT_RE = re.compile(r"(?:^|[^a-z])conflict(?!\s*-\s*free\b)(?!ing\b)")
+TRUSTED_OPERATION_CONTEXTS = frozenset(
+    {
+        "continuum/pr-agent-review",
+        "continuum/pr-agent-repair",
+    }
+)
+#: Exact token authorizing a retry from a trusted reconciler-synthesized
+#: status. A bare ``transient`` substring never suffices.
+RECOVERY_TOKEN = "recovery eligible"
+
+
+def is_trusted_operation_context(operation_context: object) -> bool:
+    """Whether a commit-status context is a reconciler-synthesized writer.
+
+    Reconcilers that previously passed only ``operation_description``
+    must pass their synthesized ``operation_context`` (or an explicit
+    ``failure_transient`` verdict) through this gate first: a token from
+    a missing/untrusted context intentionally holds instead of
+    dispatching, so PR-visible text can never burn transient budget.
+    """
+
+    return str(operation_context or "").strip().lower() in TRUSTED_OPERATION_CONTEXTS
+
+
+def _is_explicit_recovery_eligible(description: str) -> bool:
+    """Whether a status description carries the explicit recovery token.
+
+    Mirrors the single lifecycle contract in
+    :mod:`continuum.lifecycle_recovery`: only the exact ``recovery
+    eligible`` token authorizes a retry, and negated forms (``not/no/non/
+    never`` plus any space/hyphen/underscore separator, including the
+    concatenated ``nonrecovery eligible``) hold.
+    """
+
+    text = str(description or "")
+    if not _RECOVERY_ELIGIBLE_RE.search(text.lower()):
+        return False
+    if _NEGATED_RECOVERY_ELIGIBLE_RE.search(text.lower()):
+        return False
+    return True
+
+
+def _same_head(marker_head: str, head: str) -> bool:
+    """Whether a durable marker refers to the same logical HEAD.
+
+    Identity is the exact full commit id (case-insensitive). Prefix
+    matching is rejected: two distinct commits can share a 7-char prefix,
+    so a prefix match would let old-HEAD budget/exhaustion authorize a new
+    HEAD.
+    """
+
+    marker = str(marker_head or "").strip().lower()
+    current = str(head or "").strip().lower()
+    return bool(marker) and marker == current
+
+
+def is_full_head(head_sha: object) -> bool:
+    """Whether a value is a full commit id usable as recovery identity.
+
+    Batch loops use this as a per-PR guard (`continue` on False) so one
+    malformed HEAD skips loudly instead of raising out of the whole scan.
+    """
+
+    return bool(re.fullmatch(r"[0-9a-f]{40,64}", str(head_sha or "").strip().lower()))
+
+
+def safe_operation_key(pr_number: object, head_sha: object, kind: object) -> Optional[str]:
+    """Batch-safe identity: returns None for one bad HEAD instead of aborting.
+
+    Open-PR scans must never let one truncated/malformed HEAD strand
+    independent healthy PRs behind it. Guard with :func:`is_full_head`
+    (`continue` on False) or use this helper, which isolates the
+    per-PR failure and lets the loop continue::
+
+        for pr in open_prs:
+            key = safe_operation_key(pr.number, pr.head.sha, kind)
+            if key is None:
+                continue  # loud skip; healthy PRs behind it still reconcile
+    """
+
+    try:
+        return operation_key(pr_number, head_sha, kind)
+    except RecoveryError:
+        return None
+
+
+def batch_operation_keys(
+    entries: Sequence[tuple[object, object, object]],
+) -> tuple[list[str], int]:
+    """Build durable identities for one open-PR scan, isolating bad HEADs.
+
+    ``entries`` is ``(pr_number, head_sha, kind)`` per PR. One
+    truncated/malformed HEAD yields a skip (counted) instead of raising
+    out of the repository-global loop, so healthy PRs behind it still
+    reconcile. Prefer this (or :func:`safe_operation_key` /
+    :func:`is_full_head` per PR) over calling :func:`operation_key`
+    directly in a loop.
+    """
+
+    keys: list[str] = []
+    skipped = 0
+    for pr_number, head_sha, kind in entries:
+        key = safe_operation_key(pr_number, head_sha, kind)
+        if key is None:
+            skipped += 1
+            continue
+        keys.append(key)
+    return keys, skipped
 
 
 def _parse_time(value: object) -> Optional[datetime]:
@@ -96,69 +310,188 @@ def _parse_time(value: object) -> Optional[datetime]:
     return parsed.astimezone(timezone.utc)
 
 
+def safe_retry_evidence(
+    comments: Sequence[Mapping[str, Any]],
+    *,
+    head_sha: object,
+    kind: object,
+    max_executions: int = MAX_EXECUTIONS,
+) -> Optional[RetryEvidence]:
+    """Batch-safe evidence read: ``None`` for one bad HEAD/kind, no abort.
+
+    Repository-global open-PR loops must never let one truncated/malformed
+    HEAD strand independent healthy PRs behind it. Guard with
+    :func:`is_full_head` (``continue`` on False) or use this helper, which
+    isolates the per-PR failure and lets the loop continue::
+
+        for pr, head_sha, comments in open_prs:
+            evidence = safe_retry_evidence(
+                comments, head_sha=head_sha, kind=kind,
+                max_executions=max_executions,
+            )
+            if evidence is None:
+                continue  # loud skip; healthy PRs behind it still reconcile
+    """
+
+    try:
+        return retry_evidence(
+            comments,
+            head_sha=head_sha,  # type: ignore[arg-type]
+            kind=kind,  # type: ignore[arg-type]
+            max_executions=max_executions,
+        )
+    except RecoveryError:
+        return None
+
+
 def retry_evidence(
     comments: Sequence[Mapping[str, Any]],
     *,
     head_sha: str,
     kind: str,
+    max_executions: int = MAX_EXECUTIONS,
 ) -> RetryEvidence:
     """Read trusted durable retry markers for one exact operation.
 
     Association rather than login is used so a PAT owned by an organization
     member/collaborator remains usable, while arbitrary external commenters
-    cannot forge retry/exhaustion state.
+    cannot forge retry/exhaustion state. Like :func:`operation_key`, the
+    ``head_sha`` must be a full commit id: batch callers must isolate
+    per-PR failures (catch per PR and continue, pre-check with
+    :func:`is_full_head`, or use :func:`safe_retry_evidence`) so one
+    short/truncated SHA never aborts a repository-global open-PR scan.
+
+    Budget pairing: ``max_executions`` must be the same resolved value
+    passed to :func:`decide_recovery` for the same reconciliation. Resolve
+    once with :func:`resolve_max_executions` and pass it to both: the
+    exhaustion flag here and the dispatch/exhaust decision there share one
+    budget, so mismatched values would disagree about exhaustion.
     """
 
     head = str(head_sha or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40,64}", head):
+        raise RecoveryError(
+            "head_sha must be a full hexadecimal commit id "
+            "(40-hex SHA-1 or 64-hex SHA-256); short prefixes are rejected"
+        )
     normalized_kind = str(kind or "").strip().lower()
     if normalized_kind not in KINDS:
         raise RecoveryError("kind must be review or repair")
 
+    budget = _resolve_budget(max_executions)
     latest_attempt: Optional[int] = None
     latest_marker_at: Optional[datetime] = None
+    not_before: Optional[int] = None
     exhausted = False
+
+    def consider(
+        marker_head: str,
+        marker_kind: str,
+        attempt_text: str,
+        marker_not_before: Optional[int],
+        created_at: Optional[datetime],
+    ) -> None:
+        nonlocal latest_attempt, latest_marker_at, not_before
+        if marker_kind != normalized_kind or not _same_head(marker_head, head):
+            return
+        attempt = int(attempt_text)
+        if latest_attempt is None or attempt > latest_attempt:
+            latest_attempt = attempt
+            latest_marker_at = created_at
+            not_before = marker_not_before
+        elif attempt == latest_attempt and created_at is not None:
+            if latest_marker_at is None or created_at > latest_marker_at:
+                latest_marker_at = created_at
+                # Latest write wins, including clearing: a newer
+                # same-attempt marker without not-before lifts the older
+                # reset-aware wait instead of leaving a stale deferral
+                # that waits past the point the latest write cleared it.
+                not_before = marker_not_before
 
     for comment in comments:
         association = str(comment.get("author_association") or "").upper()
-        if association not in TRUSTED_ASSOCIATIONS:
+        raw_user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
+        login = str(
+            raw_user.get("login") or comment.get("user_login") or comment.get("author") or ""
+        ).strip().lower()
+        # Automation writes durable markers as github-actions[bot], which
+        # commonly carries NONE/unknown association. Trust the bot login
+        # explicitly so its latest_attempt/exhaustion is honored and the
+        # bounded budget cannot be bypassed into duplicate dispatches.
+        if association not in TRUSTED_ASSOCIATIONS and login != "github-actions[bot]":
             continue
         body = str(comment.get("body") or "")
         created_at = _parse_time(comment.get("updated_at") or comment.get("created_at"))
 
+        for match in _LIFECYCLE_RETRY_RE.finditer(body):
+            marker_head, marker_kind, attempt_text, not_before_text = match.groups()
+            marker_not_before = int(not_before_text) if not_before_text else None
+            consider(marker_head, marker_kind, attempt_text, marker_not_before, created_at)
         for match in _RETRY_RE.finditer(body):
             marker_head, marker_kind, attempt_text = match.groups()
-            if marker_head.lower() != head or marker_kind != normalized_kind:
-                continue
-            attempt = int(attempt_text)
-            if latest_attempt is None or attempt > latest_attempt:
-                latest_attempt = attempt
-                latest_marker_at = created_at
-            elif attempt == latest_attempt and created_at is not None:
-                if latest_marker_at is None or created_at > latest_marker_at:
-                    latest_marker_at = created_at
+            # Legacy markers predate durable not-before and carry none; a
+            # stray ``not-before=`` outside any canonical marker is ignored.
+            consider(marker_head, marker_kind, attempt_text, None, created_at)
 
+        for match in _LIFECYCLE_EXHAUSTED_RE.finditer(body):
+            marker_head, marker_kind, attempts_text = match.groups()
+            if marker_kind != normalized_kind or not _same_head(marker_head, head):
+                continue
+            if int(attempts_text) >= budget:
+                exhausted = True
         for match in _EXHAUSTED_RE.finditer(body):
             marker_head, marker_kind, attempts_text = match.groups()
-            if marker_head.lower() != head or marker_kind != normalized_kind:
+            if marker_kind != normalized_kind or not _same_head(marker_head, head):
                 continue
-            if int(attempts_text) >= MAX_EXECUTIONS:
+            if int(attempts_text) >= budget:
                 exhausted = True
+        # Short-SHA markers are ignored entirely: two distinct commits can
+        # share a 7-char prefix, so prefix matching would let old-HEAD
+        # evidence strand an unrelated healthy HEAD with no expiry path.
+        # Exact-HEAD isolation requires full-commit identity only.
 
     return RetryEvidence(
         latest_attempt=latest_attempt,
         latest_marker_at=latest_marker_at,
         exhausted=exhausted,
+        not_before_epoch=not_before,
     )
 
 
+def resolve_max_executions(raw: object = None, default: int = MAX_EXECUTIONS) -> int:
+    """Resolve the bounded transient-execution budget (1..10, default 10)."""
+
+    return _resolve_budget(raw, default)
+
+
+def retry_delay_schedule() -> tuple[int, ...]:
+    """Return the canonical per-execution delay schedule (index 0..9)."""
+
+    return RETRY_DELAY_SCHEDULE
+
+
 def backoff_seconds(attempt: int) -> int:
-    """Delay before execution index 1/2; initial execution index 0 is immediate."""
+    """Delay for execution index 0..9 from the single lifecycle schedule.
+
+    Index 0 runs immediately; retries 1..9 wait ~10s, 30s, 60s, 3m, 5m,
+    10m, 20m, 40m, 60m (bounded jitter is added by the caller).
+    Attempts past the schedule end clamp to the 60m tail instead of
+    raising, so external probers never get an exception for a large
+    index; negative attempts raise :class:`RecoveryError`.
+
+    Migration note: the pre-contract ``15 * (1 << (attempt - 1))``
+    unbounded growth is replaced by this capped schedule, shared with
+    :mod:`continuum.lifecycle_recovery`.
+    """
 
     if attempt < 0:
         raise RecoveryError("attempt must be non-negative")
-    if attempt == 0:
-        return 0
-    return 15 * (1 << (attempt - 1))
+    if attempt >= len(RETRY_DELAY_SCHEDULE):
+        return RETRY_DELAY_SCHEDULE[-1]
+    try:
+        return _lifecycle_backoff(attempt)
+    except ValueError as exc:
+        raise RecoveryError(str(exc)) from exc
 
 
 def _next_attempt(
@@ -167,15 +500,18 @@ def _next_attempt(
     evidence: RetryEvidence,
     marker_newer_than_status: bool,
 ) -> int:
-    """Return the next execution index without double-consuming a lost dispatch."""
+    """Return the next execution index, always advancing.
+
+    The dispatch-grace wait handles an unobserved dispatch; replaying the
+    same index when the marker is newer would keep ``attempt >= budget``
+    from ever firing and bypass the bounded budget. The first execution
+    is always index 0 with no durable marker, whether or not operation
+    state was seen, so every path dispatches 0..budget-1 consistently.
+    ``operation_seen`` is retained for signature compatibility only.
+    """
 
     if evidence.latest_attempt is None:
-        return 1 if operation_seen else 0
-    if marker_newer_than_status:
-        # The marker was written for a dispatch that has not produced any newer
-        # operation state.  If its run vanished, replay that same bounded
-        # attempt instead of burning the next slot.
-        return evidence.latest_attempt
+        return 0
     return evidence.latest_attempt + 1
 
 
@@ -184,6 +520,8 @@ def decide_recovery(
     ci_green: bool,
     operation_state: Optional[str],
     operation_description: str = "",
+    operation_context: Optional[str] = None,
+    failure_transient: Optional[bool] = None,
     active_exact_run: bool = False,
     run_conclusion: Optional[str] = None,
     status_age_seconds: Optional[int] = None,
@@ -192,52 +530,206 @@ def decide_recovery(
     marker_age_seconds: Optional[int] = None,
     stale_after_seconds: int = STALE_AFTER_SECONDS,
     dispatch_grace_seconds: int = DISPATCH_GRACE_SECONDS,
+    max_executions: int = MAX_EXECUTIONS,
+    now_epoch: Optional[int] = None,
 ) -> RecoveryDecision:
-    """Reconcile one review/repair operation from latest authoritative state."""
+    """Reconcile one review/repair operation from latest authoritative state.
 
+    The budget defaults to the single lifecycle contract (10 total transient
+    executions, safe-bounded).  Deterministic failures never consume it; a
+    success or a new HEAD resets the episode.  A durable reset-aware
+    not-before (canonical marker, redispatch via the scheduled safety net)
+    waits instead of dispatching early.
+
+    ``failure_transient`` carries the caller's explicit classifier verdict:
+    True dispatches even without the token (so classifier-proven transient
+    infrastructure gaps never strand for lack of a token), False holds even
+    with the token. When None, only the explicit reconciler-synthesized
+    ``recovery eligible`` token from a trusted commit-status context
+    authorizes a retry; a bare ``transient`` substring never suffices, and
+    a deterministic policy hint alongside the token still holds. Callers
+    that previously relied on the token alone must pass
+    ``operation_context`` (the reconciler-synthesized commit-status
+    context) or an explicit ``failure_transient`` verdict; a token-bearing
+    description without either holds.
+
+    Budget pairing: ``max_executions`` must be the same resolved value
+    passed to :func:`decide_recovery` for the same reconciliation. Resolve
+    once with :func:`resolve_max_executions` and pass it to both: the
+    exhaustion flag here and the dispatch/exhaust decision there share one
+    budget, so mismatched values would disagree about exhaustion.
+
+    Migration note (budget 3 -> 10, short-SHA -> exact-HEAD): short-SHA
+    markers are ignored entirely and exhaustion requires
+    ``attempts >= budget`` under the new 10-execution contract. A PR
+    exhausted at 3 with a short marker therefore becomes retryable again
+    for up to 10 executions after upgrade, by design: prefix matching
+    could strand an unrelated healthy HEAD with no expiry path, so only
+    full-commit identity carries budget state. Operators auditing the
+    upgrade compare ``attempts`` against :func:`resolve_max_executions`.
+    """
+
+    state = str(operation_state or "").strip().lower() or None
+    conclusion = str(run_conclusion or "").strip().lower() or None
+    description = str(operation_description or "")
+
+    # Settled dominates every wait/hold below so a success clears obsolete
+    # durable state (exhaustion markers, stale leases, not-before waits)
+    # via the success path instead of holding on stale evidence.
+    if state == "success":
+        return RecoveryDecision("settled", None, "operation already settled")
     if not ci_green:
         return RecoveryDecision("wait", None, "exact HEAD CI is not green")
     if evidence.exhausted:
         return RecoveryDecision("hold", None, "retry budget already exhausted")
     if active_exact_run:
         return RecoveryDecision("wait", None, "exact operation already active")
-
-    state = str(operation_state or "").strip().lower() or None
-    conclusion = str(run_conclusion or "").strip().lower() or None
-    description = str(operation_description or "")
-
+    if evidence.not_before_epoch is not None and now_epoch is None:
+        # Fail closed without a clock: a durable reset-aware wait the marker
+        # already committed must defer to the scheduled safety net, never
+        # dispatch straight through it and burn transient budget on 403/429.
+        # The durable epoch is echoed so the watchdog can schedule the
+        # redispatch instead of polling; callers must pass
+        # ``now_epoch=utc_now_epoch()`` on every dispatch path.
+        try:
+            pending_epoch: Optional[int] = int(evidence.not_before_epoch)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            pending_epoch = None
+        return RecoveryDecision(
+            "wait", None, "durable reset-aware not-before requires a clock; deferring",
+            not_before_epoch=pending_epoch,
+            defer_dispatch=True,
+        )
     if (
-        marker_newer_than_status
-        and evidence.latest_attempt is not None
-        and marker_age_seconds is not None
-        and marker_age_seconds < dispatch_grace_seconds
+        evidence.not_before_epoch is not None
+        and now_epoch is not None
+    ):
+        try:
+            not_before = int(evidence.not_before_epoch)
+            now = int(now_epoch)
+        except (TypeError, ValueError) as exc:
+            raise RecoveryError("not-before/now epochs must be integers") from exc
+        if now < not_before:
+            return RecoveryDecision(
+                "wait", None, "durable reset-aware not-before time has not arrived",
+                not_before_epoch=not_before,
+                defer_dispatch=True,
+            )
+
+    # Dispatch grace with a staleness expiry, mirroring the single
+    # lifecycle contract: an unknown-age marker stays inside grace
+    # only while status is known-fresh. When the status age is also
+    # unknown there is no proof of freshness, so expire instead of
+    # waiting forever on a timestamp-less marker.
+    if marker_newer_than_status and evidence.latest_attempt is not None:
+        if marker_age_seconds is None:
+            if (
+                status_age_seconds is not None
+                and status_age_seconds < stale_after_seconds
+            ):
+                return RecoveryDecision(
+                    "wait", None, "newer retry dispatch marker is still inside dispatch grace"
+                )
+        elif marker_age_seconds < dispatch_grace_seconds:
+            return RecoveryDecision(
+                "wait", None, "newer retry dispatch marker is still inside dispatch grace"
+            )
+    if (
+        evidence.latest_attempt is not None
+        and evidence.latest_marker_at is None
+        and status_age_seconds is not None
+        and status_age_seconds < stale_after_seconds
     ):
         return RecoveryDecision(
-            "wait", None, "newer retry dispatch marker is still inside dispatch grace"
+            "wait", None, "durable dispatch marker age is unknown; staying inside dispatch grace"
         )
 
     recoverable = False
     operation_seen = state is not None
 
     if state is None:
+        # A missing status never proves transient on its own: an explicit
+        # deterministic verdict or a deterministic policy hint in the
+        # description holds instead of burning the transient budget.
+        if failure_transient is False:
+            return RecoveryDecision(
+                "hold", None, "deterministic failure is not automatically retried"
+            )
+        lowered_missing = description.lower()
+        if (
+            any(hint in lowered_missing for hint in _DETERMINISTIC_HINTS)
+            or _UNRESOLVED_FINDING_RE.search(lowered_missing)
+            or _BARE_CONFLICT_RE.search(lowered_missing)
+        ):
+            return RecoveryDecision(
+                "hold", None, "deterministic failure is not automatically retried"
+            )
         recoverable = True
     elif state == "success":
         return RecoveryDecision("settled", None, "operation already settled")
     elif state == "failure":
-        if "recovery eligible" in description.lower() or "transient" in description.lower():
+        if failure_transient is True:
+            recoverable = True
+        elif failure_transient is False:
+            return RecoveryDecision(
+                "hold", None, "deterministic failure is not automatically retried"
+            )
+        elif _is_explicit_recovery_eligible(description):
+            # Trust gate: the token alone never authorizes a retry unless
+            # it comes from a reconciler-synthesized status in a trusted
+            # context. A missing context is untrusted: PR-visible text is
+            # not a reconciler status, so omitting the context can never
+            # bypass the TRUSTED_OPERATION_CONTEXTS check and burn
+            # transient budget on the token alone.
+            if str(operation_context or "").strip().lower() not in TRUSTED_OPERATION_CONTEXTS:
+                # Backward-compatibility note: reconcilers that previously
+                # called with only operation_description (token substring
+                # alone) must now pass the reconciler-synthesized
+                # operation_context or an explicit failure_transient
+                # verdict; without either the token holds instead of
+                # dispatching, so PR-visible text can never burn budget.
+                # Lost/missing operation state (state None) still
+                # self-heals via the watchdog path above.
+                return RecoveryDecision(
+                    "hold", None, "recovery token from untrusted context is not automatically retried; pass operation_context or failure_transient"
+                )
+            lowered = description.lower()
+            if (
+                any(hint in lowered for hint in _DETERMINISTIC_HINTS)
+                or _UNRESOLVED_FINDING_RE.search(lowered)
+                or _BARE_CONFLICT_RE.search(lowered)
+            ):
+                return RecoveryDecision(
+                    "hold", None, "deterministic failure is not automatically retried"
+                )
             recoverable = True
         else:
             return RecoveryDecision(
                 "hold", None, "deterministic failure is not automatically retried"
             )
     elif state == "pending":
-        if conclusion in RETRYABLE_RUN_CONCLUSIONS:
+        # An explicit deterministic verdict dominates staleness, mirroring
+        # the single lifecycle contract; an explicit transient verdict
+        # dispatches immediately without waiting for staleness.
+        if failure_transient is False:
+            return RecoveryDecision(
+                "hold", None, "deterministic failure is not automatically retried"
+            )
+        if failure_transient is True:
+            recoverable = True
+        elif conclusion in RETRYABLE_RUN_CONCLUSIONS:
             recoverable = True
         elif (
             status_age_seconds is not None
             and status_age_seconds >= stale_after_seconds
-            and conclusion not in {"queued", "in_progress", "waiting", "requested"}
+            and (
+                conclusion is None
+                or conclusion in RETRYABLE_RUN_CONCLUSIONS
+            )
         ):
+            # Stale alone never proves transient: a stale deterministic
+            # failure/success conclusion waits instead of dispatching and
+            # burning the transient budget.
             recoverable = True
         else:
             return RecoveryDecision("wait", None, "pending operation is not stale")
@@ -247,13 +739,26 @@ def decide_recovery(
     if not recoverable:
         return RecoveryDecision("hold", None, "operation is not recoverable")
 
+    budget = _resolve_budget(max_executions)
     attempt = _next_attempt(
         operation_seen=operation_seen,
         evidence=evidence,
         marker_newer_than_status=marker_newer_than_status,
     )
-    if attempt >= MAX_EXECUTIONS:
-        return RecoveryDecision("exhaust", None, "automatic execution budget exhausted")
+    if attempt >= budget:
+        # Return the budget count so callers can persist it in the durable
+        # exhaustion marker instead of receiving None with no count.
+        return RecoveryDecision("exhaust", budget, "automatic execution budget exhausted")
+    if now_epoch is None and attempt > 0:
+        # Fail closed without a clock: a retry cannot persist a durable
+        # not-before without now, so dispatching it would let the next
+        # watchdog retry immediately and compress the canonical backoff,
+        # burning the bounded budget faster than specified. Defer to a
+        # clocked wakeup instead. Attempt 0 still runs immediately below;
+        # only retries carry backoff.
+        return RecoveryDecision(
+            "wait", None, "retry backoff requires a clock; deferring"
+        )
     return RecoveryDecision(
         "dispatch",
         attempt,
@@ -263,16 +768,28 @@ def decide_recovery(
 
 __all__ = [
     "MAX_EXECUTIONS",
+    "MIN_EXECUTIONS",
+    "RETRY_DELAY_SCHEDULE",
     "STALE_AFTER_SECONDS",
     "DISPATCH_GRACE_SECONDS",
     "TRUSTED_ASSOCIATIONS",
+    "TRUSTED_OPERATION_CONTEXTS",
     "RETRYABLE_RUN_CONCLUSIONS",
     "KINDS",
     "RecoveryError",
     "RetryEvidence",
     "RecoveryDecision",
+    "utc_now_epoch",
+    "RECOVERY_TOKEN",
+    "is_trusted_operation_context",
     "operation_key",
+    "is_full_head",
+    "safe_operation_key",
+    "batch_operation_keys",
+    "safe_retry_evidence",
     "retry_evidence",
+    "resolve_max_executions",
+    "retry_delay_schedule",
     "backoff_seconds",
     "decide_recovery",
 ]
