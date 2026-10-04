@@ -216,7 +216,10 @@ class RecoveryDecisionTests(unittest.TestCase):
         )
         self.assertEqual(decision.action, "wait")
 
-    def test_lost_dispatch_replays_same_attempt_instead_of_burning_slot(self):
+    def test_lost_dispatch_advances_after_grace_instead_of_replaying_forever(self):
+        # The dispatch-grace wait handles an unobserved dispatch; once grace
+        # expires the next index must advance so attempt >= budget can fire.
+        # Replaying the same index forever would bypass the bounded budget.
         evidence = recovery.RetryEvidence(latest_attempt=1)
         decision = recovery.decide_recovery(
             ci_green=True,
@@ -227,7 +230,7 @@ class RecoveryDecisionTests(unittest.TestCase):
             marker_age_seconds=recovery.DISPATCH_GRACE_SECONDS + 1,
         )
         self.assertEqual(decision.action, "dispatch")
-        self.assertEqual(decision.attempt, 1)
+        self.assertEqual(decision.attempt, 2)
 
     def test_transient_failure_retries(self):
         decision = recovery.decide_recovery(
@@ -362,7 +365,10 @@ class RecoveryWiringTests(unittest.TestCase):
         self.assertIn("new github.constructor({ auth: readToken, baseUrl: readBaseUrl })", body)
         self.assertIn("github.request.endpoint.DEFAULTS.baseUrl", body)
         self.assertIn("process.env.GITHUB_API_URL", body)
-        self.assertIn("using PAT client for PR-Agent recovery reads", body)
+        # An empty repository token must fail loudly instead of silently
+        # falling back to PAT-heavy polling that spends the shared budget.
+        self.assertIn("must not fall back to TAP_PAT", body)
+        self.assertNotIn("using PAT client for PR-Agent recovery reads", body)
         self.assertIn("let readTokenUnavailable = false", body)
         self.assertIn("async function withReadFallback(fn)", body)
         self.assertIn("err.status ?? err.response?.status", body)

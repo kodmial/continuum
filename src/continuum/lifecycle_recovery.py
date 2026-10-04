@@ -29,9 +29,11 @@ token-policy semantics without changing any provider-specific review policy:
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Mapping, Optional, Sequence
 
 
@@ -89,16 +91,18 @@ _LIFECYCLE_EXHAUSTED_RE = re.compile(
     r"attempts=(\d+)\s*-->"
 )
 # Work Lock #38 markers remain readable so PR-Agent durable state survives
-# the generalization; new markers use the lifecycle prefix.
+# the generalization; new markers use the lifecycle prefix. Legacy patterns
+# keep the original 7..64 width so pre-existing short-SHA markers still count
+# toward the budget instead of resetting it.
 _LEGACY_RETRY_RE = re.compile(
     r"<!--\s*continuum-pr-agent-retry\s+"
-    r"head=([0-9a-fA-F]{40,64})\s+"
+    r"head=([0-9a-fA-F]{7,64})\s+"
     r"kind=(review|repair)\s+"
     r"attempt=(\d+)\s*-->"
 )
 _LEGACY_EXHAUSTED_RE = re.compile(
     r"<!--\s*continuum-pr-agent-retry-exhausted\s+"
-    r"head=([0-9a-fA-F]{40,64})\s+"
+    r"head=([0-9a-fA-F]{7,64})\s+"
     r"kind=(review|repair)\s+"
     r"attempts=(\d+)\s*-->"
 )
@@ -241,12 +245,57 @@ def concurrency_key(repo: object, pr_number: object, head_sha: object) -> str:
     return f"{repository}#{number}:{normalize_head(head_sha)}"
 
 
+def _same_head(marker_head: str, head: str) -> bool:
+    """Whether a durable marker refers to the same logical HEAD.
+
+    New writes always carry a full commit id, but pre-existing markers may
+    carry a short prefix. A short marker that prefixes the full HEAD (minimum
+    7 hex chars) is the same logical commit and must still count; otherwise
+    the budget would reset and re-retry an exhausted operation.
+    """
+
+    marker = str(marker_head or "").strip().lower()
+    current = str(head or "").strip().lower()
+    if marker == current:
+        return True
+    if len(marker) >= 7 and len(current) >= 7:
+        if current.startswith(marker) or marker.startswith(current):
+            return True
+    return False
+
+
 def _parse_int(value: object) -> Optional[int]:
     try:
         number = int(str(value).strip())
     except (TypeError, ValueError):
         return None
     return number
+
+
+def _parse_retry_after_seconds(value: object) -> Optional[int]:
+    """Parse a Retry-After header in seconds or HTTP-date form.
+
+    Numeric form returns seconds directly. HTTP-date form returns the
+    non-negative delay until that time so reset-aware scheduling honors the
+    server-requested time instead of falling back to schedule+jitter.
+    """
+
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if re.fullmatch(r"\d+", text):
+        number = int(text)
+        return number if number >= 0 else None
+    try:
+        when = parsedate_to_datetime(text)
+    except (TypeError, ValueError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    return max(0, int(math.ceil((when - now).total_seconds())))
 
 
 def _parse_time(value: object) -> Optional[datetime]:
@@ -296,7 +345,7 @@ def classify_infrastructure_failure(
 
     def retry_after() -> Optional[int]:
         for key in ("retry-after", "retry_after"):
-            seconds = _parse_int(norm_headers.get(key, ""))
+            seconds = _parse_retry_after_seconds(norm_headers.get(key, ""))
             if seconds is not None and seconds >= 0:
                 return seconds
         return None
@@ -535,7 +584,7 @@ def retry_evidence(
         created_at: Optional[datetime],
     ) -> None:
         nonlocal latest_attempt, latest_marker_at, not_before
-        if match_head.lower() != head or match_kind.lower() != normalized_kind:
+        if match_kind.lower() != normalized_kind or not _same_head(match_head, head):
             return
         attempt = int(attempt_text)
         if latest_attempt is None or attempt > latest_attempt:
@@ -566,13 +615,13 @@ def retry_evidence(
                 consider(marker_head, marker_kind, attempt_text, None, created_at)
         for match in _LIFECYCLE_EXHAUSTED_RE.finditer(body):
             marker_head, marker_kind, attempts_text = match.groups()
-            if marker_head.lower() == head and marker_kind.lower() == normalized_kind:
+            if _same_head(marker_head, head) and marker_kind.lower() == normalized_kind:
                 if int(attempts_text) >= budget:
                     exhausted = True
         if normalized_kind in PR_AGENT_KINDS:
             for match in _LEGACY_EXHAUSTED_RE.finditer(body):
                 marker_head, marker_kind, attempts_text = match.groups()
-                if marker_head.lower() == head and marker_kind.lower() == normalized_kind:
+                if _same_head(marker_head, head) and marker_kind.lower() == normalized_kind:
                     if int(attempts_text) >= budget:
                         exhausted = True
 
@@ -590,10 +639,13 @@ def _next_attempt(
     evidence: RetryEvidence,
     marker_newer_than_status: bool,
 ) -> int:
+    # Always advance to the next index: returning latest_attempt unchanged
+    # when the marker is newer would re-dispatch the same execution index
+    # forever, so attempt >= budget would never fire and the bounded budget
+    # would be bypassed. The dispatch-grace wait above already handles the
+    # unobserved-dispatch case.
     if evidence.latest_attempt is None:
         return 1 if operation_seen else 0
-    if marker_newer_than_status:
-        return evidence.latest_attempt
     return evidence.latest_attempt + 1
 
 
@@ -726,6 +778,16 @@ def decide_recovery(
     )
     if attempt >= budget:
         return RecoveryDecision("exhaust", None, "automatic transient budget exhausted")
+
+    if now_epoch is None and (
+        ratelimit_reset_epoch is not None or provider_reset_epoch is not None
+    ):
+        # Fail closed without throwing: a rate-limit/reset signal without the
+        # live clock must defer to a later wakeup, never abort reconciliation
+        # or dispatch straight through the limit.
+        return RecoveryDecision(
+            "wait", None, "reset-aware rate-limit signal requires a clock; deferring"
+        )
 
     delay = next_retry_delay_seconds(
         attempt=attempt,

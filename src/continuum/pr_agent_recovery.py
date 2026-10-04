@@ -51,7 +51,7 @@ KINDS = frozenset({"review", "repair"})
 
 _RETRY_RE = re.compile(
     r"<!--\s*continuum-pr-agent-retry\s+"
-    r"head=([0-9a-fA-F]{40,64})\s+"
+    r"head=([0-9a-fA-F]{7,64})\s+"
     r"kind=(review|repair)\s+"
     r"attempt=(\d+)\s*-->"
 )
@@ -69,7 +69,7 @@ _LIFECYCLE_RETRY_RE = re.compile(
 )
 _EXHAUSTED_RE = re.compile(
     r"<!--\s*continuum-pr-agent-retry-exhausted\s+"
-    r"head=([0-9a-fA-F]{40,64})\s+"
+    r"head=([0-9a-fA-F]{7,64})\s+"
     r"kind=(review|repair)\s+"
     r"attempts=(\d+)\s*-->"
 )
@@ -124,6 +124,26 @@ def operation_key(pr_number: object, head_sha: object, kind: object) -> str:
     return f"{number}:{head}:{normalized_kind}"
 
 
+def _same_head(marker_head: str, head: str) -> bool:
+    """Whether a durable marker refers to the same logical HEAD.
+
+    New writes always carry a full commit id, but pre-existing Work Lock #38
+    markers may carry a short prefix. A short marker that is a prefix of the
+    full HEAD (or vice versa, minimum 7 hex chars) is the same logical commit
+    and must still count toward the budget; otherwise tightening the pattern
+    would reset prior attempts/exhaustion and re-retry an exhausted operation.
+    """
+
+    marker = str(marker_head or "").strip().lower()
+    current = str(head or "").strip().lower()
+    if marker == current:
+        return True
+    if len(marker) >= 7 and len(current) >= 7:
+        if current.startswith(marker) or marker.startswith(current):
+            return True
+    return False
+
+
 def _parse_time(value: object) -> Optional[datetime]:
     if not value:
         return None
@@ -173,7 +193,7 @@ def retry_evidence(
         created_at: Optional[datetime],
     ) -> None:
         nonlocal latest_attempt, latest_marker_at, not_before
-        if marker_head.lower() != head or marker_kind != normalized_kind:
+        if marker_kind != normalized_kind or not _same_head(marker_head, head):
             return
         attempt = int(attempt_text)
         if latest_attempt is None or attempt > latest_attempt:
@@ -205,13 +225,13 @@ def retry_evidence(
 
         for match in _LIFECYCLE_EXHAUSTED_RE.finditer(body):
             marker_head, marker_kind, attempts_text = match.groups()
-            if marker_head.lower() != head or marker_kind != normalized_kind:
+            if marker_kind != normalized_kind or not _same_head(marker_head, head):
                 continue
             if int(attempts_text) >= budget:
                 exhausted = True
         for match in _EXHAUSTED_RE.finditer(body):
             marker_head, marker_kind, attempts_text = match.groups()
-            if marker_head.lower() != head or marker_kind != normalized_kind:
+            if marker_kind != normalized_kind or not _same_head(marker_head, head):
                 continue
             if int(attempts_text) >= budget:
                 exhausted = True
@@ -257,15 +277,15 @@ def _next_attempt(
     evidence: RetryEvidence,
     marker_newer_than_status: bool,
 ) -> int:
-    """Return the next execution index without double-consuming a lost dispatch."""
+    """Return the next execution index, always advancing.
+
+    The dispatch-grace wait handles an unobserved dispatch; replaying the
+    same index when the marker is newer would keep ``attempt >= budget``
+    from ever firing and bypass the bounded budget.
+    """
 
     if evidence.latest_attempt is None:
         return 1 if operation_seen else 0
-    if marker_newer_than_status:
-        # The marker was written for a dispatch that has not produced any newer
-        # operation state.  If its run vanished, replay that same bounded
-        # attempt instead of burning the next slot.
-        return evidence.latest_attempt
     return evidence.latest_attempt + 1
 
 

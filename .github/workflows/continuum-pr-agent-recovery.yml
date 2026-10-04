@@ -102,6 +102,11 @@ jobs:
               if (raw === undefined || raw === null || String(raw).trim() === '') {
                 return toBounded(fallback);
               }
+              // A non-numeric override must honor the operator fallback (vars),
+              // not silently widen to 10 executions beyond operator intent.
+              if (!Number.isFinite(Number.parseInt(String(raw).trim(), 10))) {
+                return toBounded(fallback);
+              }
               return toBounded(raw);
             }
             const maxExecutions = resolveMaxExecutions(process.env.MAX_EXECUTIONS);
@@ -139,12 +144,11 @@ jobs:
                 github.request.endpoint.DEFAULTS && github.request.endpoint.DEFAULTS.baseUrl) ||
               process.env.GITHUB_API_URL || 'https://api.github.com'
             );
-            const readGithub = readToken
-              ? new github.constructor({ auth: readToken, baseUrl: readBaseUrl })
-              : github;
             if (!readToken) {
-              core.warning('READ_GITHUB_TOKEN is empty; using PAT client for PR-Agent recovery reads.');
+              core.setFailed('READ_GITHUB_TOKEN is empty; same-repository reads require GITHUB_TOKEN and must not fall back to TAP_PAT.');
+              return;
             }
+            const readGithub = new github.constructor({ auth: readToken, baseUrl: readBaseUrl });
             let readTokenUnavailable = false;
             function isRateLimitError(err, status) {
               if (status === 429) return true;
@@ -329,20 +333,33 @@ jobs:
             }
             function parseEvidence(comments, head, kind) {
               const exactHead = String(head).toLowerCase();
+              // Legacy Work Lock #38 markers may carry a short prefix; the
+              // alternation below covers 7..64 without resetting prior
+              // attempts/exhaustion for the same logical HEAD. New canonical
+              // markers always carry a full commit id.
+              function sameHead(markerHead, currentHead) {
+                const marker = String(markerHead || '').toLowerCase();
+                const current = String(currentHead || '').toLowerCase();
+                if (marker === current) return true;
+                if (marker.length >= 7 && current.length >= 7) {
+                  if (current.startsWith(marker) || marker.startsWith(current)) return true;
+                }
+                return false;
+              }
               const retryRe =
                 /<!--\s*continuum-lifecycle-retry\s+head=([0-9a-f]{40,64})\s+kind=(review|repair)\s+attempt=(\d+)(?:\s+not-before=(\d+))?[^>]*-->/ig;
               const legacyRetryRe =
-                /<!--\s*continuum-pr-agent-retry\s+head=([0-9a-f]{40,64})\s+kind=(review|repair)\s+attempt=(\d+)[^>]*-->/ig;
+                /<!--\s*continuum-pr-agent-retry\s+head=([0-9a-f]{7,39}|[0-9a-f]{40,64})\s+kind=(review|repair)\s+attempt=(\d+)[^>]*-->/ig;
               const exhaustedRe =
                 /<!--\s*continuum-lifecycle-retry-exhausted\s+head=([0-9a-f]{40,64})\s+kind=(review|repair)\s+attempts=(\d+)\s*-->/ig;
               const legacyExhaustedRe =
-                /<!--\s*continuum-pr-agent-retry-exhausted\s+head=([0-9a-f]{40,64})\s+kind=(review|repair)\s+attempts=(\d+)\s*-->/ig;
+                /<!--\s*continuum-pr-agent-retry-exhausted\s+head=([0-9a-f]{7,39}|[0-9a-f]{40,64})\s+kind=(review|repair)\s+attempts=(\d+)\s*-->/ig;
               let latestAttempt = null;
               let latestMarkerAt = null;
               let notBeforeEpoch = null;
               let exhausted = false;
               const consider = (markerHead, markerKind, attemptText, markerNotBeforeEpoch, createdAt) => {
-                if (markerHead.toLowerCase() !== exactHead || markerKind !== kind) return;
+                if (markerKind !== kind || !sameHead(markerHead, exactHead)) return;
                 const attempt = Number.parseInt(attemptText, 10);
                 if (
                   latestAttempt === null ||
@@ -376,7 +393,7 @@ jobs:
                 }
                 for (const match of body.matchAll(exhaustedRe)) {
                   if (
-                    match[1].toLowerCase() === exactHead &&
+                    sameHead(match[1], exactHead) &&
                     match[2] === kind &&
                     Number.parseInt(match[3], 10) >= maxExecutions
                   ) {
@@ -385,7 +402,7 @@ jobs:
                 }
                 for (const match of body.matchAll(legacyExhaustedRe)) {
                   if (
-                    match[1].toLowerCase() === exactHead &&
+                    sameHead(match[1], exactHead) &&
                     match[2] === kind &&
                     Number.parseInt(match[3], 10) >= maxExecutions
                   ) {
@@ -577,8 +594,19 @@ jobs:
               const retryAfterRaw = lowered['retry-after'];
               let retryAfterSeconds;
               if (retryAfterRaw !== undefined && retryAfterRaw !== null && String(retryAfterRaw).trim() !== '') {
-                const parsed = Number.parseInt(String(retryAfterRaw).trim(), 10);
-                if (Number.isFinite(parsed) && parsed >= 0) retryAfterSeconds = parsed;
+                const text = String(retryAfterRaw).trim();
+                const parsed = Number.parseInt(text, 10);
+                if (Number.isFinite(parsed) && parsed >= 0 && /^\d+/.test(text)) {
+                  retryAfterSeconds = parsed;
+                } else {
+                  // HTTP-date form (e.g. "Wed, 21 Oct 2015 07:28:00 GMT"):
+                  // honor the server-requested time instead of falling back
+                  // to schedule+jitter and retrying too early.
+                  const when = Date.parse(text);
+                  if (Number.isFinite(when)) {
+                    retryAfterSeconds = Math.max(0, Math.ceil((when - Date.now()) / 1000));
+                  }
+                }
               }
               const resetRaw = lowered['x-ratelimit-reset'] ?? lowered['ratelimit-reset'];
               let ratelimitResetEpoch;
@@ -700,11 +728,12 @@ jobs:
                 return { action: 'hold', reason: 'operation is not recoverable' };
               }
 
+              // Always advance to the next index: the dispatch-grace wait
+              // above already handles an unobserved dispatch, and replaying
+              // the same index would keep attempt >= budget from ever firing.
               let attempt;
               if (evidence.latestAttempt === null) {
                 attempt = operationSeen ? 1 : 0;
-              } else if (markerNewer) {
-                attempt = evidence.latestAttempt;
               } else {
                 attempt = evidence.latestAttempt + 1;
               }
