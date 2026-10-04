@@ -817,7 +817,10 @@ jobs:
                 rm -f "$controller_page_file"
                 break
               fi
-              controller_page_len="$(jq 'length' "$controller_page_file" 2>/dev/null || echo 0)"
+              if ! controller_page_len="$(jq 'length' "$controller_page_file" 2>/dev/null)"; then
+                rm -f "$controller_page_file"
+                break
+              fi
               [[ "$controller_page_len" =~ ^[0-9]+$ ]] || { rm -f "$controller_page_file"; break; }
               cat "$controller_page_file" >> "$CONTROLLER_JSON.pages"
               echo >> "$CONTROLLER_JSON.pages"

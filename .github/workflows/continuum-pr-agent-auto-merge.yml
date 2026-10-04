@@ -631,7 +631,12 @@ jobs:
             }
 
             // Single-pass gate memo (#254): CI/packaging/required checks
-            // share one branch listing per workflow name.
+            // share one branch listing per workflow name within a single
+            // gate evaluation. The memo is per-evaluation only: it is
+            // cleared on every currentHeadGates entry and misses (null or
+            // incomplete runs) are never cached, so a gate that first sees
+            // no completed run re-reads fresh runs on the next evaluation
+            // instead of returning a stale null.
             const gateCache = new Map();
             async function latestWorkflowForHead(pr, headSha, workflowName) {
               const cacheKey = `${pr.head.ref}|${headSha}|${workflowName}`;
@@ -661,11 +666,19 @@ jobs:
                   new Date(b.created_at || 0).getTime() -
                   new Date(a.created_at || 0).getTime()
                 )[0] || null;
-              gateCache.set(cacheKey, latest);
+              // Cache only completed runs: misses and in-progress runs are
+              // re-read on the next evaluation so newly finished runs are
+              // always observed.
+              if (latest && latest.status === 'completed') {
+                gateCache.set(cacheKey, latest);
+              }
               return latest;
             }
 
             async function currentHeadGates(pr) {
+              // Per-evaluation memo only: each gate check starts fresh so
+              // initial/final/pre-merge evaluations never reuse a stale entry.
+              gateCache.clear();
               const ci = await latestWorkflowForHead(pr, pr.head.sha, 'CI');
               if (!ci || ci.status !== 'completed' || ci.conclusion !== 'success') {
                 return { ok: false, reason: 'Current-head CI is not successful' };
