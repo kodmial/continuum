@@ -110,13 +110,14 @@ jobs:
             const MAX_SCAN_PAGES = 5;
             const MAX_FILES_PAGES = 10;
             async function boundedPages(request, params) {
+              const perPage = params.per_page || 100;
               const items = [];
               for (let page = 1; page <= MAX_SCAN_PAGES; page += 1) {
-                const { data } = await request({ ...params, page });
+                const { data } = await request({ ...params, per_page: perPage, page });
                 noteRead();
                 if (!Array.isArray(data) || data.length === 0) break;
                 items.push(...data);
-                if (data.length < (params.per_page || 100)) break;
+                if (data.length < perPage) break;
               }
               return items;
             }

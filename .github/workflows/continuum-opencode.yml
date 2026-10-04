@@ -2015,9 +2015,13 @@ jobs:
             }
 
             // Bounded comment scan (#254): dispatch/qualification markers
-            // accumulate in the newest window with every retry, so ten
-            // pages preserve the attempt budget without walking history.
+            // accumulate in the newest window with every retry, so the
+            // newest-first ten pages preserve the attempt budget without
+            // walking history. A full ten-page window is truncated, so it
+            // clamps to the budget (fail closed to pause, never to extra
+            // retries).
             const comments = [];
+            let commentsTruncated = false;
             for (let page = 1; page <= 10; page += 1) {
               const { data } = await github.rest.issues.listComments({
                 owner,
@@ -2025,14 +2029,18 @@ jobs:
                 issue_number: issueNumber,
                 per_page: 100,
                 page,
+                sort: 'created',
+                direction: 'desc',
               });
               if (!Array.isArray(data) || data.length === 0) break;
               comments.push(...data);
               if (data.length < 100) break;
+              if (page === 10) commentsTruncated = true;
             }
-            const attempts = comments.filter(comment =>
+            let attempts = comments.filter(comment =>
               (comment.body || '').includes(marker)
             ).length;
+            if (commentsTruncated) attempts = Math.max(attempts, maxAttempts);
 
             // Mandatory qualification must never strand behind a terminal
             // human-gated pause: exhausted immediate retries fall back to a

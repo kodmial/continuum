@@ -475,7 +475,7 @@ jobs:
                     core.warning(
                       `PR #${pr.number}: review-thread scan hit the ${MAX_THREAD_PAGES}-page budget; skipping this PR for this pass.`
                     );
-                    return null;
+                    throw new Error(`CONTINUUM_THREAD_BUDGET_EXCEEDED pr=${pr.number}`);
                   }
                   const data = await readGithub.graphql(
                     `query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
@@ -549,6 +549,10 @@ jobs:
 
                 return unresolved;
               } catch (err) {
+                // The thread-budget sentinel must reach the outer per-PR
+                // skip path instead of collapsing into a null return that
+                // callers could misread as zero unresolved threads.
+                if (String(err?.message || '').includes('CONTINUUM_THREAD_BUDGET_EXCEEDED')) throw err;
                 // A transient query/permission/deletion race on one PR must not
                 // abort reconciliation for every other PR. Fail closed for this
                 // PR and let the next event or safety-net pass retry it.
