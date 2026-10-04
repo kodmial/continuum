@@ -178,13 +178,23 @@ class DurableEvidenceTests(unittest.TestCase):
             )
 
     def test_unknown_marker_age_dispatches_instead_of_waiting_forever(self):
-        # Fail closed on unknown marker age, mirroring the reconciler: a
-        # marker without a parseable timestamp cannot prove grace expired,
-        # so it stays inside grace instead of dispatching a likely
-        # duplicate. The caller-stub schedule keeps waking, and newer
-        # status activity clears the newer-marker condition, so the wait
-        # always has an expiry path.
-        waiting = recovery.decide_recovery(
+        # Unknown marker age stays inside grace only while status is
+        # known-fresh; when the status age is also unknown there is no
+        # proof of freshness, so grace expires and the retry fires instead
+        # of waiting forever on a timestamp-less marker.
+        fresh_waiting = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="transient; recovery eligible",
+            operation_context="continuum/pr-agent-review",
+            evidence=recovery.RetryEvidence(latest_attempt=2),
+            marker_newer_than_status=True,
+            marker_age_seconds=None,
+            status_age_seconds=0,
+        )
+        self.assertEqual(fresh_waiting.action, "wait")
+        self.assertIsNone(fresh_waiting.attempt)
+        expired = recovery.decide_recovery(
             ci_green=True,
             operation_state="failure",
             operation_description="transient; recovery eligible",
@@ -193,8 +203,8 @@ class DurableEvidenceTests(unittest.TestCase):
             marker_newer_than_status=True,
             marker_age_seconds=None,
         )
-        self.assertEqual(waiting.action, "wait")
-        self.assertIsNone(waiting.attempt)
+        self.assertEqual(expired.action, "dispatch")
+        self.assertEqual(expired.attempt, 3)
         # A known age inside grace still coalesces the duplicate wakeup.
         coalesced = recovery.decide_recovery(
             ci_green=True,

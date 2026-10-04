@@ -913,7 +913,13 @@ jobs:
               }
 
               if (attempt >= maxExecutions) {
-                return { action: 'exhaust', reason: 'automatic execution budget exhausted' };
+                // Return the budget count (not undefined) so callers can
+                // persist it in the durable exhaustion marker via
+                // exhaustedMarker(head, kind), matching
+                // decide_recovery in src/continuum/pr_agent_recovery.py.
+                // Callers must branch on action === 'exhaust', never on
+                // attempt == null, to detect exhaustion.
+                return { action: 'exhaust', attempt: maxExecutions, reason: 'automatic execution budget exhausted' };
               }
               return {
                 action: 'dispatch',

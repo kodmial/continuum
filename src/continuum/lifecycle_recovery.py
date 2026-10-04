@@ -879,12 +879,16 @@ def dispatch_grace_active(
     if not marker_newer_than_status or latest_attempt is None:
         return False
     if marker_age_seconds is None:
+        # Unknown marker age stays inside grace only while status is
+        # known-fresh. When the status age is also unknown there is no
+        # proof of freshness, so expire instead of waiting forever on a
+        # timestamp-less marker with no stale-after expiry.
         if (
             status_age_seconds is not None
-            and status_age_seconds >= stale_after_seconds
+            and status_age_seconds < stale_after_seconds
         ):
-            return False
-        return True
+            return True
+        return False
     return marker_age_seconds < dispatch_grace_seconds
 
 
@@ -1128,6 +1132,17 @@ def decide_recovery(
         provider_reset_epoch=provider_reset_epoch,
         now_epoch=now_epoch,
     )
+    if now_epoch is None and attempt > 0:
+        # Fail closed without a clock: a retry cannot persist a durable
+        # not-before without now, so dispatching it with defer=true and
+        # not_before=None would let the next watchdog (when the caller
+        # exits instead of sleeping inline) retry immediately and compress
+        # the canonical 10s/30s/60s backoff, burning the bounded budget
+        # faster than specified. Defer to a clocked wakeup instead.
+        # Attempt 0 still runs immediately below; only retries carry backoff.
+        return RecoveryDecision(
+            "wait", None, "retry backoff requires a clock; deferring"
+        )
     if now_epoch is None and should_defer_dispatch(delay):
         # Fail closed without a clock: a schedule/signal floor beyond the
         # inline ceiling (the 10m/20m/40m/60m tail, or a long Retry-After)
@@ -1154,15 +1169,11 @@ def decide_recovery(
         # this, a schedule-only long wait returns defer=true with no durable
         # wait and the next watchdog retries immediately, burning the budget.
         computed_not_before = int(now_epoch) + delay
-    # Without a clock the 10s/30s/60s schedule cannot persist a durable
-    # not-before, so a retry (attempt > 0) must still signal deferral instead
-    # of dispatching as immediate (defer=false): the caller then sleeps or
-    # defers to the next wakeup instead of letting the next watchdog retry
-    # immediately and compress the canonical backoff. Attempt 0 runs
-    # immediately; only retries carry backoff.
-    defer_dispatch = should_defer_dispatch(delay) or (
-        now_epoch is None and attempt > 0 and delay > 0
-    )
+    # A clocked dispatch persists its durable not-before below; a clockless
+    # attempt 0 has no backoff to persist and runs immediately. Clockless
+    # retries already returned as wait above, so reaching here without a
+    # clock means attempt 0 with a short delay only.
+    defer_dispatch = should_defer_dispatch(delay)
     return RecoveryDecision(
         "dispatch",
         attempt,

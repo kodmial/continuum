@@ -486,23 +486,21 @@ def decide_recovery(
                 "wait", None, "durable reset-aware not-before time has not arrived"
             )
 
-    if (
-        marker_newer_than_status
-        and evidence.latest_attempt is not None
-        and (
-            marker_age_seconds is None
-            or marker_age_seconds < dispatch_grace_seconds
-        )
-    ):
-        # Dispatch grace with a staleness expiry, mirroring the single
-        # lifecycle contract: an unknown-age marker stays inside grace
-        # while status is fresh, but once the status itself is stale the
-        # wait expires and the retry fires instead of recurring forever.
-        status_stale = (
-            status_age_seconds is not None
-            and status_age_seconds >= stale_after_seconds
-        )
-        if not (marker_age_seconds is None and status_stale):
+    # Dispatch grace with a staleness expiry, mirroring the single
+    # lifecycle contract: an unknown-age marker stays inside grace
+    # only while status is known-fresh. When the status age is also
+    # unknown there is no proof of freshness, so expire instead of
+    # waiting forever on a timestamp-less marker.
+    if marker_newer_than_status and evidence.latest_attempt is not None:
+        if marker_age_seconds is None:
+            if (
+                status_age_seconds is not None
+                and status_age_seconds < stale_after_seconds
+            ):
+                return RecoveryDecision(
+                    "wait", None, "newer retry dispatch marker is still inside dispatch grace"
+                )
+        elif marker_age_seconds < dispatch_grace_seconds:
             return RecoveryDecision(
                 "wait", None, "newer retry dispatch marker is still inside dispatch grace"
             )

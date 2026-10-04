@@ -266,6 +266,20 @@ class ResetAwareBackoffTests(unittest.TestCase):
         )
         self.assertEqual(decision.action, "wait")
         self.assertIsNone(decision.attempt)
+        # A short retry without a clock must also wait instead of
+        # dispatching with defer=true and no durable not-before: when the
+        # caller exits instead of sleeping inline, the next watchdog would
+        # otherwise retry immediately and compress the canonical 10s/30s/60s
+        # backoff. Attempt 0 still runs immediately below.
+        short_retry = lifecycle.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            failure_transient=True,
+            evidence=lifecycle.RetryEvidence(latest_attempt=0),
+            now_epoch=None,
+        )
+        self.assertEqual(short_retry.action, "wait")
+        self.assertIsNone(short_retry.attempt)
         # A short wait without a clock still dispatches immediately: there
         # is nothing durable to lose when no deferral is required.
         immediate = lifecycle.decide_recovery(
@@ -275,9 +289,10 @@ class ResetAwareBackoffTests(unittest.TestCase):
         self.assertFalse(immediate.defer_dispatch)
 
     def test_unknown_marker_age_stays_inside_dispatch_grace(self):
-        # Fail closed: a marker newer than status whose age is unknown
-        # (missing/unparsable timestamp) cannot prove grace expired, so it
-        # waits instead of dispatching a likely duplicate.
+        # An unknown-age marker stays inside grace only while status is
+        # known-fresh; when the status age is also unknown there is no
+        # proof of freshness, so grace expires instead of stranding the PR
+        # forever on a timestamp-less marker.
         decision = lifecycle.decide_recovery(
             ci_green=True,
             operation_state="failure",
@@ -285,8 +300,20 @@ class ResetAwareBackoffTests(unittest.TestCase):
             evidence=lifecycle.RetryEvidence(latest_attempt=2),
             marker_newer_than_status=True,
             marker_age_seconds=None,
+            status_age_seconds=0,
+            now_epoch=1000,
         )
         self.assertEqual(decision.action, "wait")
+        expired = lifecycle.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            failure_transient=True,
+            evidence=lifecycle.RetryEvidence(latest_attempt=2),
+            marker_newer_than_status=True,
+            marker_age_seconds=None,
+            now_epoch=1000,
+        )
+        self.assertEqual(expired.action, "dispatch")
         # A known age past grace still proceeds to dispatch.
         past_grace = lifecycle.decide_recovery(
             ci_green=True,
