@@ -6004,4 +6004,47 @@ class ContinuumTest < Minitest::Test
     end
   end
 
+  # Delegated conflict-repair dispatch and post-merge wakeup share the
+  # narrow 422 contract: only a 422 naming the opaque target_child_id
+  # input (wakeup additionally accepts GitHub's unexpected/unknown-input
+  # wording) is an input-rejection; any other 422 rethrows verbatim so a
+  # ref or payload validation failure keeps its true remediation path.
+  # The repair reusable must declare the input, otherwise the delegated
+  # dispatch is unreachable.
+  def test_pr_agent_repair_dispatch_and_wakeup_narrow_422
+    repair_inputs = events(yaml(File.join(ROOT, '.github/workflows/continuum-pr-agent-repair.yml')))
+      .fetch('workflow_call').fetch('inputs')
+    assert repair_inputs.key?('target_child_id'),
+           'continuum-pr-agent-repair.yml must declare target_child_id or delegated repair dispatch is unreachable'
+
+    merge = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent-auto-merge.yml'))
+    repair_window = merge[merge.index('async function dispatchConflictRepair')..]
+    assert_includes repair_window, "workflow_id: 'continuum-pr-agent-repair.yml'",
+                    'delegated conflict repair must dispatch the repair reusable'
+    assert_includes repair_window, 'target_child_id: targetChildId',
+                    'delegated conflict repair must forward the opaque child id'
+    assert_includes repair_window, 'isMissingTargetInput',
+                    'delegated conflict-repair dispatch must detect 422 input rejection like recovery/wakeup'
+    assert_includes repair_window, '/target_child_id/i.test(dispatchMessage)',
+                    'conflict-repair 422 detection must name the opaque input explicitly'
+    assert_includes repair_window, 'dispatchStatus === 422',
+                    'conflict-repair input rejection must be gated on HTTP 422'
+    assert_includes repair_window, 'refusing bare retry to preserve the delegated target',
+                    'conflict-repair without the repair input must fail closed explicitly, never dispatch bare'
+    assert_includes repair_window, 'recovery per #224',
+                    'a transient repair dispatch must be reconciled by recovery'
+
+    wakeup_window = merge[merge.index('for (const workflow of postMergeWakeups)')..]
+    assert_includes wakeup_window, '/(target_child_id|unexpected',
+                    'wakeup 422 detection must name the opaque input plus unexpected/unknown-input wording'
+    assert_includes wakeup_window, 'unknown\\s+inputs?',
+                    'wakeup 422 detection must accept unknown-input wording'
+    refute_includes wakeup_window, 'invalid\\s+inputs?',
+                    'wakeup 422 detection must not match generic invalid-inputs messages'
+    refute_includes wakeup_window, 'unrecognized',
+                    'wakeup 422 detection must not match unrecognized-input wording'
+    refute_includes wakeup_window, 'inputs?\\s+not\\s+(accepted',
+                    'wakeup 422 detection must not match inputs-not-accepted wording'
+  end
+
   end

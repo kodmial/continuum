@@ -693,20 +693,44 @@ jobs:
                     );
                     return;
                   }
-                  await github.request(
-                    'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
-                    {
-                      owner: executionOwner,
-                      repo: executionRepo,
-                      workflow_id: 'continuum-pr-agent-repair.yml',
-                      ref: defaultBranch,
-                      inputs: {
-                        pr_number: String(prNumber),
-                        head_sha: fresh.head.sha,
-                        target_child_id: targetChildId,
-                      },
+                  try {
+                    await github.request(
+                      'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
+                      {
+                        owner: executionOwner,
+                        repo: executionRepo,
+                        workflow_id: 'continuum-pr-agent-repair.yml',
+                        ref: defaultBranch,
+                        inputs: {
+                          pr_number: String(prNumber),
+                          head_sha: fresh.head.sha,
+                          target_child_id: targetChildId,
+                        },
+                      }
+                    );
+                  } catch (dispatchErr) {
+                    const dispatchMessage = String(dispatchErr.message || dispatchErr);
+                    const dispatchStatus = Number(dispatchErr.status || 0);
+                    // Narrow input-rejection detection (mirrors recovery/wakeup):
+                    // only a 422 naming the opaque target_child_id input means
+                    // the repair workflow lacks the delegated selector. Any
+                    // other 422 or message is a transient/payload failure and
+                    // is rethrown for the outer cleanup; the marker/lock are
+                    // removed there so recovery per #224 can reconcile a
+                    // transient dispatch on its next wakeup.
+                    const isMissingTargetInput =
+                      dispatchStatus === 422 &&
+                      /target_child_id/i.test(dispatchMessage);
+                    if (isMissingTargetInput) {
+                      throw new Error(
+                        'PR #' + prNumber +
+                        ': delegated conflict repair requires continuum-pr-agent-repair.yml ' +
+                        'to declare a target_child_id input; refusing bare retry to preserve the delegated target: ' +
+                        dispatchMessage
+                      );
                     }
-                  );
+                    throw dispatchErr;
+                  }
                   core.notice(
                     'PR #' + prNumber + ': dispatched delegated conflict repair via parent (' + reason + ').'
                   );
@@ -1008,12 +1032,12 @@ jobs:
                   // message names the opaque input (or GitHub's
                   // unexpected/unknown-input wording) means the wakeup
                   // target does not accept target_child_id. Any other
-                  // 422 (invalid ref, payload validation) or any message
-                  // merely containing the word "input" is rethrown
-                  // verbatim so reviewers get the true remediation path.
+                  // 422 (invalid ref, payload validation, or a message
+                  // merely mentioning inputs) is rethrown verbatim so
+                  // reviewers get the true remediation path.
                   const isInputRejection =
                     dispatchStatus === 422 &&
-                    /(target_child_id|unexpected\s+inputs?|unknown\s+inputs?|unrecognized\s+inputs?|invalid\s+inputs?|inputs?\s+not\s+(accepted|recognized|allowed|supported))/i.test(dispatchMessage);
+                    /(target_child_id|unexpected\s+inputs?|unknown\s+inputs?)/i.test(dispatchMessage);
                   if (dispatchParams.inputs && isInputRejection) {
                     // A delegated wakeup must never retry bare: a bare
                     // dispatch would wake the execution repository instead of

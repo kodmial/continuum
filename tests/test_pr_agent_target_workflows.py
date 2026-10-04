@@ -369,6 +369,31 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
         self.assertIn("if (targetChildId)", body)
         self.assertNotIn("skipping bare retry to preserve the delegated target", body)
         self.assertNotIn("retrying bare", body)
+        # Narrow input-rejection: only the opaque input plus
+        # unexpected/unknown-input wording. Generic invalid-inputs or
+        # inputs-not-accepted wording would misclassify ref/payload 422s.
+        self.assertIn("/(target_child_id|unexpected", body)
+        self.assertIn("unknown\\s+inputs?", body)
+        self.assertNotIn("invalid\\s+inputs?", body)
+        self.assertNotIn("unrecognized", body)
+        self.assertNotIn("inputs?\\s+not\\s+(accepted", body)
+
+    def test_delegated_conflict_repair_dispatch_handles_422(self):
+        body = read(".github/workflows/continuum-pr-agent-auto-merge.yml")
+        start = body.index("async function dispatchConflictRepair")
+        window = body[start : start + 8000]
+        self.assertIn("workflow_id: 'continuum-pr-agent-repair.yml'", window)
+        self.assertIn("target_child_id: targetChildId", window)
+        # Like recovery/wakeup: a 422 naming the opaque input fails closed
+        # explicitly; any other dispatch error rethrows transiently so the
+        # outer cleanup removes the marker/lock and recovery reconciles it.
+        self.assertIn("isMissingTargetInput", window)
+        self.assertIn("/target_child_id/i.test(dispatchMessage)", window)
+        self.assertIn("dispatchStatus === 422", window)
+        self.assertIn("refusing bare retry to preserve the delegated target", window)
+        self.assertIn("recovery per #224", window)
+        repair = read(".github/workflows/continuum-pr-agent-repair.yml")
+        self.assertIn("target_child_id:", repair)
 
     def test_auto_merge_exact_head_and_privacy(self):
         body = read(".github/workflows/continuum-pr-agent-auto-merge.yml")
