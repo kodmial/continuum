@@ -151,16 +151,18 @@ def is_same_head(expected_sha: str, actual_sha: str) -> bool:
 def _is_plausible_head_sha(value: object) -> bool:
     """Whether a HEAD value looks like a commit SHA, not a placeholder.
 
-    Production HEADs are 40/64 lowercase hex; unit fixtures use short hex
-    (e.g. "abc"). Identical placeholders such as "unknown" contain
-    non-hex characters and must never satisfy the exact-HEAD skip check,
-    so require a non-empty hex string instead of mere non-emptiness.
+    Production HEADs are 40/64 lowercase hex; abbreviated SHAs are at
+    least 7 hex characters. Identical placeholders such as "unknown"
+    contain non-hex characters and must never satisfy the exact-HEAD
+    skip check, and trivially short hex fragments (e.g. "a", "123",
+    "abc") from a bug or mocked HEAD must not authorize a skip either,
+    so require at least short-SHA length instead of mere non-emptiness.
     """
 
     text = str(value or "").strip().lower()
     if not text:
         return False
-    return re.fullmatch(r"[0-9a-f]+", text) is not None
+    return re.fullmatch(r"[0-9a-f]{7,64}", text) is not None
 
 
 def admission_allowed(
@@ -1286,8 +1288,12 @@ def evaluate_gate(decision: GateInputs) -> Dict[str, Any]:
     set ``improve_skipped_clean`` via :func:`is_improve_skipped_clean`
     from the ``improve_skipped`` step outcome, otherwise the gate fails
     closed on incomplete improve coverage and negates the skip's latency
-    win. A skipped HEAD with remaining qualifying suggestions never
-    greens.
+    win.     A skipped HEAD with remaining qualifying suggestions never
+    greens. The skip waives improve coverage, never review cleanliness:
+    when ``improve_skipped_clean`` is set the gate re-validates the
+    review payload's own tool-error, coverage, and security signals
+    fail-closed, so a stale or miswired skip flag for a dirty review
+    still blocks.
     """
 
     if decision.tool_error:
@@ -1301,6 +1307,19 @@ def evaluate_gate(decision: GateInputs) -> Dict[str, Any]:
             "green": False,
             "reason": "improve was skipped but qualifying suggestions remain",
         }
+    if decision.improve_skipped_clean:
+        try:
+            skipped_tool_error = has_tool_error_signal(decision.review)
+            skipped_coverage_gap = has_incomplete_coverage_signal(decision.review)
+            skipped_security = has_blocking_security_signal(decision.review)
+        except LifecycleError as exc:
+            return {"green": False, "reason": f"invalid review JSON: {exc}"}
+        if skipped_tool_error:
+            return {"green": False, "reason": "tool error: failing closed"}
+        if skipped_coverage_gap:
+            return {"green": False, "reason": "incomplete review coverage: failing closed"}
+        if skipped_security:
+            return {"green": False, "reason": "blocking security signal remains"}
     if not decision.ci_green_on_exact_head:
         return {"green": False, "reason": "current-head CI is not green"}
     if not decision.head_matches:

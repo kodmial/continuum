@@ -767,11 +767,13 @@ function persistentHasActive(persistentState) {
 }
 
 function isPlausibleHeadSha(value) {
-  // Production HEADs are 40/64 hex; fixtures use short hex (e.g. "abc").
-  // Placeholders such as "unknown" contain non-hex characters and must
-  // never satisfy the exact-HEAD skip check.
+  // Production HEADs are 40/64 hex; abbreviated SHAs are at least 7 hex
+  // characters. Placeholders such as "unknown" contain non-hex characters
+  // and must never satisfy the exact-HEAD skip check, and trivially short
+  // hex fragments (e.g. "a", "123", "abc") from a bug or mocked HEAD must
+  // not authorize a skip either.
   const text = String(value || '').trim().toLowerCase();
-  return /^[0-9a-f]+$/.test(text);
+  return /^[0-9a-f]{7,64}$/.test(text);
 }
 
 function isCleanReviewForImproveSkip(reviewPayload, persistentState, options = {}) {
