@@ -866,9 +866,26 @@ class IsolationTests(unittest.TestCase):
         recovery = read_repo(
             ".github/caller-stubs/continuum-pr-agent-recovery.yml"
         )
+        router_stub = read_repo(
+            ".github/caller-stubs/continuum-pr-agent-router.yml"
+        )
+        router = read_repo(
+            ".github/workflows/continuum-pr-agent-router.yml"
+        )
+        # The heavy caller is dispatch-only: ordinary comments must not
+        # create heavy workflow runs.
         self.assertNotIn("workflow_run:", caller)
         self.assertNotIn("pull_request_target:", caller)
-        self.assertIn("contains(github.event.comment.body, '/review')", caller)
+        self.assertNotIn("issue_comment", caller)
+        self.assertNotIn("contains(github.event.comment.body, '/review')", caller)
+        # Explicit `/review` is owned by the thin router, which validates
+        # the event and dispatches the heavy workflow once per exact HEAD.
+        self.assertIn("issue_comment", router_stub)
+        self.assertIn("contains(github.event.comment.body, '/review')", router_stub)
+        self.assertIn("expected_head_sha", router)
+        self.assertIn("createWorkflowDispatch", router)
+        self.assertIn("review:", router)
+        self.assertIn("already active", router)
         self.assertIn("workflow_run:", recovery)
         self.assertIn("- CI", recovery)
         self.assertIn("pull_request_target:", recovery)

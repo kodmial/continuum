@@ -33,8 +33,6 @@ on:
         options:
           - review
           - repair
-  issue_comment:
-    types: [created]
 
 permissions:
   contents: write
@@ -51,12 +49,7 @@ permissions:
 
 jobs:
   call:
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'issue_comment' &&
-       github.event.issue.pull_request &&
-       github.actor == github.repository_owner &&
-       contains(github.event.comment.body, '/review'))
+    if: github.event_name == 'workflow_dispatch'
     uses: kodmial/continuum/.github/workflows/continuum-pr-agent.yml@main
     secrets: inherit
     with:

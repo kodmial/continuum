@@ -1,0 +1,45 @@
+name: PR-Agent review router entry
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number for an explicit manual route
+        required: false
+        type: string
+      review_workflow:
+        description: Heavy PR-Agent caller workflow file to dispatch
+        required: false
+        type: string
+      review_provider:
+        description: Review provider selector override
+        required: false
+        type: string
+  issue_comment:
+    types: [created]
+
+permissions:
+  actions: read
+  contents: read
+  issues: read
+  pull-requests: read
+
+concurrency:
+  group: pr-agent-router-entry-${{ github.event.issue.number || inputs.pr_number || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  call:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request &&
+       github.actor == github.repository_owner &&
+       contains(github.event.comment.body, '/review'))
+    uses: ./.github/workflows/continuum-pr-agent-router.yml
+    secrets: inherit
+    with:
+      continuum_ref: main
+      review_workflow: "${{ inputs.review_workflow || 'pr-agent.yml' }}"
+      review_provider: "${{ inputs.review_provider }}"
+      pr_number: "${{ inputs.pr_number }}"
