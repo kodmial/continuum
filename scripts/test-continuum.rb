@@ -1879,8 +1879,21 @@ class ContinuumTest < Minitest::Test
     assert_includes runtime, 'GH_TOKEN: ${{ github.token }}',
                     'public Continuum runtime-bundle fetch must not consume shared PAT quota'
     assert_includes runtime, 'repos/kodmial/continuum/contents'
-    assert_includes retry_step, 'GH_TOKEN: ${{ github.token }}',
-                    'bounded same-repo workflow_dispatch must use repository token'
+    # Target-aware (#243) retry revalidation reads the resolved target:
+    # local same-repository reads use github.token while delegated
+    # cross-repository reads require TAP_PAT with a fail-closed empty token
+    # (delegated runs without PAT yield '' so auth itself fails closed
+    # instead of silently reading the parent with github.token).
+    assert_includes retry_step, conditional_token,
+                    'bounded retry revalidation must select TAP_PAT for delegated reads instead of an unconditional github.token'
+    assert_includes retry_step, empty_token_tail,
+                    'bounded retry revalidation must yield an empty token for delegated runs without PAT so auth itself fails closed'
+    refute_includes retry_step, 'secrets.TAP_PAT || github.token }}',
+                    'bounded retry revalidation must not fall back to github.token for delegated runs without PAT'
+    assert_includes retry_step, 'Delegated PR-Agent retry requires TAP_PAT',
+                    'bounded retry revalidation must fail closed for delegated reads without TAP_PAT'
+    assert_includes retry_step, 'CONTINUUM_PR_AGENT_TARGET_REPOSITORY',
+                    'bounded retry revalidation must read the resolved target, never the parent by default'
     assert_includes retry_step, 'gh workflow run'
     refute_includes before, 'gh workflow run',
                       'the pre-review revalidation must stay read-only'
@@ -1896,9 +1909,32 @@ class ContinuumTest < Minitest::Test
                     'comment maintenance must use repository token'
     assert_includes normalize, 'deleteComment'
     assert_includes publish, 'github-token: ${{ github.token }}',
-                    'commit-status publishing must use repository token'
-    refute_includes body, 'secrets.TAP_PAT',
-                    'review workflow must be completely isolated from shared user PAT quota'
+                     'commit-status publishing must use repository token'
+    # Target-aware (#243) delegated reads require TAP_PAT, so the review
+    # workflow is no longer entirely PAT-free: the admission/revalidation
+    # steps above legitimately carry the fail-closed conditional. The
+    # PAT-quota isolation contract is preserved in scoped form: local
+    # control-plane steps stay repository-token backed (asserted per step
+    # above), tool execution never consumes the shared PAT, there is no
+    # unconditional fallback to github.token for delegated runs, and the
+    # only bare TAP_PAT credential is the target-resolution fetch itself.
+    refute_includes body, 'secrets.TAP_PAT || github.token }}',
+                    'review workflow must never fall back to github.token for delegated runs without PAT'
+    refute_includes body, 'GITHUB__USER_TOKEN: ${{ secrets.TAP_PAT }}',
+                    'review tool execution must never consume the shared user PAT'
+    resolve = step_body(body, 'Resolve PR-Agent target context')
+    refute_nil resolve, 'the target-context resolution step is missing'
+    assert_includes resolve, 'GH_TOKEN: ${{ secrets.TAP_PAT }}',
+                    'target resolution fetches cross-repo child config with TAP_PAT'
+    assert_equal 1, body.scan('GH_TOKEN: ${{ secrets.TAP_PAT }}').size,
+                 'only target resolution may use a bare TAP_PAT credential; every read must use the fail-closed conditional'
+    body.each_line.with_index(1) do |line, lineno|
+      next unless line.include?('secrets.TAP_PAT')
+      allowed = line.include?('CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED') ||
+                line.include?('TAP_PAT: ${{ secrets.TAP_PAT }}') ||
+                resolve.include?(line.strip)
+      assert allowed, "line #{lineno} consumes TAP_PAT outside the gated target-aware contract: #{line.strip}"
+    end
   end
 
   # Work-Lock #58 item 5 (conservative subset, kodmial/continuum#236): only
@@ -2077,10 +2113,21 @@ class ContinuumTest < Minitest::Test
 
   def test_pr_agent_review_workflow_uses_repository_token_not_shared_pat
     body = workflow_body('continuum-pr-agent.yml')
-    refute_includes body, 'secrets.TAP_PAT',
-                    'review workflow must not consume the shared user PAT'
+    # Target-aware (#243) delegated cross-repository reads require TAP_PAT
+    # through the fail-closed conditional, so the review workflow is no
+    # longer entirely PAT-free. The repository-token contract is preserved
+    # in scoped form: local control-plane and tool execution stay
+    # repository-token backed, the shared PAT is never consumed
+    # unconditionally, and delegated runs without PAT fail closed instead
+    # of silently falling back to github.token.
+    refute_includes body, 'secrets.TAP_PAT || github.token }}',
+                    'review workflow must never fall back to github.token for delegated runs without PAT'
+    refute_includes body, 'GITHUB__USER_TOKEN: ${{ secrets.TAP_PAT }}',
+                    'review workflow must not consume the shared user PAT for tool execution'
     assert_includes body, 'GITHUB__USER_TOKEN: ${{ github.token }}'
     assert_includes body, 'GH_TOKEN: ${{ github.token }}'
+    assert_includes body, "CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT",
+                    'delegated target-aware reads must select TAP_PAT through the fail-closed conditional'
     workflow = yaml(File.join(ROOT, '.github/caller-stubs/continuum-pr-agent.yml'))
     permissions = workflow.fetch('permissions')
     assert_equal 'write', permissions.fetch('actions')

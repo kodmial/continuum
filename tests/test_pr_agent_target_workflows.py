@@ -295,8 +295,14 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
             "Fail closed on a moved head",
         ):
             with self.subTest(step=step):
-                start = body.index(step)
-                window = body[start:start + 4000]
+                # Scope assertions to the step's own block: a fixed-width
+                # window bleeds into the following step (e.g. the review
+                # tool, which legitimately runs on github.token), turning
+                # a neighbor's repository-token credential into a false
+                # failure for this step.
+                start = body.index("      - name: " + step)
+                following = body.find("\n      - name: ", start + 1)
+                window = body[start:following if following != -1 else start + 4000]
                 self.assertIn("CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED", window)
                 self.assertIn("TAP_PAT", window)
                 self.assertIn("requires TAP_PAT", window)
