@@ -749,6 +749,59 @@ def needs_fresh_review(old_head_sha: str, new_head_sha: str) -> bool:
     return old_head_sha.strip().lower() != new_head_sha.strip().lower()
 
 
+def caller_review_event_is_actionable(
+    event_name: object,
+    *,
+    is_pull_request_comment: bool = False,
+    actor_is_owner: bool = False,
+    comment_body: object = "",
+) -> bool:
+    """Whether a caller event may invoke the reusable PR-Agent operation layer.
+
+    Mirrors the `jobs.call.if` gate in `pr-agent.yml` and
+    `.github/caller-stubs/continuum-pr-agent.yml`: workflow_dispatch
+    (bounded retries/recovery) is always actionable, while issue_comment is
+    actionable only for an owner `/review` comment on a pull request.
+    Every other event is a no-op that must never hold a per-PR lock.
+    """
+
+    name = str(event_name or "").strip()
+    if name == "workflow_dispatch":
+        return True
+    if name != "issue_comment":
+        return False
+    if not is_pull_request_comment or not actor_is_owner:
+        return False
+    return "/review" in str(comment_body or "")
+
+
+def stale_review_may_be_cancelled(running_head_sha: object, current_head_sha: object) -> bool:
+    """Whether a running/queued review may be cancelled for a newer HEAD.
+
+    A review is stale exactly when the PR HEAD moved: the newer HEAD needs
+    fresh CI plus a complete review, so the older run may be coalesced
+    without losing useful work. Same-HEAD duplicates are also safe to
+    coalesce because exact-HEAD work is idempotent.
+    """
+
+    running = str(running_head_sha or "").strip().lower()
+    current = str(current_head_sha or "").strip().lower()
+    if not running or not current:
+        return False
+    return running != current
+
+
+def repair_is_protected_from_review_preemption() -> bool:
+    """Whether repair publication is protected from review cancellation.
+
+    Repair mutates and publishes the PR branch under exact-HEAD
+    revalidation plus force-with-lease. A newer review event must never
+    interrupt that publication: reviews are cancellable, repairs are not.
+    """
+
+    return True
+
+
 def required_toml() -> Dict[str, Any]:
     """Minimum upstream configuration this stack requires."""
 
@@ -841,5 +894,8 @@ __all__ = [
     "retry_backoff_seconds",
     "resolve_dispatch_ref",
     "needs_fresh_review",
+    "caller_review_event_is_actionable",
+    "stale_review_may_be_cancelled",
+    "repair_is_protected_from_review_preemption",
     "required_toml",
 ]
