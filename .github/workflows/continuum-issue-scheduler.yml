@@ -197,7 +197,10 @@ on:
 # the TAP_PAT classic PAT (repo + workflow scopes), exactly like every other
 # Continuum dispatcher, so the caller's GITHUB_TOKEN keeps its narrow grant.
 permissions:
+  actions: read
   contents: read
+  issues: read
+  pull-requests: read
 
 concurrency:
   group: issue-scheduler
@@ -234,6 +237,7 @@ jobs:
       CHILD_PR_REVIEW_WORKFLOW: ${{ vars.CONTINUUM_CHILD_PR_REVIEW_WORKFLOW || 'continuum-child-pr-review.yml' }}
       COUNT_OPEN_PRS_AS_WIP: ${{ inputs.count_open_prs_as_wip || vars.AUTOMATION_COUNT_OPEN_PRS_AS_WIP || 'true' }}
       PAUSE_ON_FAILURE: ${{ inputs.pause_on_failure || vars.AUTOMATION_PAUSE_ON_FAILURE || 'true' }}
+      READ_GITHUB_TOKEN: ${{ github.token }}
 
     steps:
       - name: Checkout parent control plane for delegated scheduling
@@ -613,6 +617,21 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const repoFullName = owner + '/' + repo;
+            const readToken = String(process.env.READ_GITHUB_TOKEN || '').trim();
+            if (!readToken) {
+              throw new Error(
+                'READ_GITHUB_TOKEN is required for same-repository scheduler reads.'
+              );
+            }
+            const readBaseUrl = (
+              github?.request?.endpoint?.DEFAULTS?.baseUrl ||
+              process.env.GITHUB_API_URL ||
+              'https://api.github.com'
+            );
+            const readGithub = new github.constructor({
+              auth: readToken,
+              baseUrl: readBaseUrl,
+            });
             const childWorkerWorkflow =
               process.env.CHILD_WORKER_WORKFLOW || 'continuum-child-worker.yml';
             const childActiveWipParsed = Number.parseInt(
@@ -769,7 +788,9 @@ jobs:
               const open = [];
               for (const blockerNumber of declaredDependencyNumbers(issue)) {
                 if (blockerNumber === issue.number) continue;
-                const response = await github.rest.issues.get({
+                const readClient =
+                  targetOwner === owner && targetRepo === repo ? readGithub : github;
+                const response = await readClient.rest.issues.get({
                   owner: targetOwner,
                   repo: targetRepo,
                   issue_number: blockerNumber,
@@ -1010,7 +1031,7 @@ jobs:
             let cachedMainSha = null;
             async function currentMainSha() {
               if (cachedMainSha) return cachedMainSha;
-              const { data } = await github.rest.repos.getBranch({
+              const { data } = await readGithub.rest.repos.getBranch({
                 owner,
                 repo,
                 branch: 'main',
@@ -1020,8 +1041,8 @@ jobs:
             }
 
             async function issueCommentsBodies(issueNumber) {
-              const comments = await github.paginate(
-                github.rest.issues.listComments,
+              const comments = await readGithub.paginate(
+                readGithub.rest.issues.listComments,
                 { owner, repo, issue_number: issueNumber, per_page: 100 }
               );
               return comments.map(comment => ({
@@ -1046,7 +1067,7 @@ jobs:
               if (!sha) return 'no-required-sha';
               let qual;
               try {
-                qual = (await github.rest.issues.get({
+                qual = (await readGithub.rest.issues.get({
                   owner,
                   repo,
                   issue_number: qualificationNumber,
@@ -1289,8 +1310,8 @@ jobs:
               requiredSha,
               evidenceBodiesByRef
             ) {
-              const openIssues = await github.paginate(
-                github.rest.issues.listForRepo,
+              const openIssues = await readGithub.paginate(
+                readGithub.rest.issues.listForRepo,
                 { owner, repo, state: 'open', per_page: 100 }
               );
               for (const failure of failures) {
@@ -1389,7 +1410,7 @@ jobs:
             ) {
               let fresh;
               try {
-                fresh = (await github.rest.issues.get({
+                fresh = (await readGithub.rest.issues.get({
                   owner,
                   repo,
                   issue_number: issueNumber,
@@ -1619,7 +1640,7 @@ jobs:
                 if (match) {
                   const issueNumber = Number(match[1]);
                   try {
-                    const response = await github.rest.issues.get({
+                    const response = await readGithub.rest.issues.get({
                       owner,
                       repo,
                       issue_number: issueNumber,
@@ -1662,7 +1683,7 @@ jobs:
                         );
                       }
                     } else {
-                      const blockers = await github.paginate(
+                      const blockers = await readGithub.paginate(
                         'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
                         {
                           owner,
@@ -1710,8 +1731,8 @@ jobs:
             // retain an implementation reservation. Reconcile this in the
             // shared engine rather than in a consumer caller so every consumer
             // releases stale WIP immediately after an issue is closed.
-            const closedLeasedIssues = await github.paginate(
-              github.rest.issues.listForRepo,
+            const closedLeasedIssues = await readGithub.paginate(
+              readGithub.rest.issues.listForRepo,
               {
                 owner,
                 repo,
@@ -1730,7 +1751,7 @@ jobs:
               );
             }
 
-            let issues = await github.paginate(github.rest.issues.listForRepo, {
+            let issues = await readGithub.paginate(readGithub.rest.issues.listForRepo, {
               owner,
               repo,
               state: 'open',
@@ -1758,7 +1779,7 @@ jobs:
             // applied. The latest closed issues are bounded (one page), so
             // this sweep costs one API call plus follow-ups only for
             // capabilities that declare mandatory qualification.
-            const { data: recentlyClosed } = await github.rest.issues.listForRepo({
+            const { data: recentlyClosed } = await readGithub.rest.issues.listForRepo({
               owner,
               repo,
               state: 'closed',
@@ -1906,7 +1927,7 @@ jobs:
             // Read every OpenCode issue PR, not just open ones. This lets the
             // cron run reconcile missed PR-close events from current repository
             // state rather than depending on a permanent dispatch marker.
-            const pulls = await github.paginate(github.rest.pulls.list, {
+            const pulls = await readGithub.paginate(readGithub.rest.pulls.list, {
               owner,
               repo,
               state: 'all',
@@ -1949,7 +1970,7 @@ jobs:
             const workflowRuns = [];
             for (let page = 1; page <= 3; page += 1) {
               const { data } =
-                await github.rest.actions.listWorkflowRunsForRepo({
+                await readGithub.rest.actions.listWorkflowRunsForRepo({
                   owner,
                   repo,
                   per_page: 100,
@@ -2025,7 +2046,7 @@ jobs:
               // dispatch lease still exists. Once the actual OpenCode run is
               // gone, release the reservation immediately so blocked work does
               // not consume WIP capacity or get resurrected from old comments.
-              const reservationBlockers = await github.paginate(
+              const reservationBlockers = await readGithub.paginate(
                 'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
                 {
                   owner,
@@ -2052,8 +2073,8 @@ jobs:
                 continue;
               }
 
-              const comments = await github.paginate(
-                github.rest.issues.listComments,
+              const comments = await readGithub.paginate(
+                readGithub.rest.issues.listComments,
                 {
                   owner,
                   repo,
@@ -2091,7 +2112,7 @@ jobs:
                   if (latestPr.merged_at) {
                     let mergeSha = null;
                     try {
-                      const fullPr = (await github.rest.pulls.get({
+                      const fullPr = (await readGithub.rest.pulls.get({
                         owner,
                         repo,
                         pull_number: latestPr.number,
@@ -2305,7 +2326,7 @@ jobs:
                 continue;
               }
 
-              const blockers = await github.paginate(
+              const blockers = await readGithub.paginate(
                 'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
                 {
                   owner,
@@ -2427,7 +2448,7 @@ jobs:
               // landed while this scheduler run was already evaluating the
               // backlog. Without this JIT guard an older scheduler run can
               // enqueue a duplicate OpenCode run after a manual /oc.
-              const freshIssueResponse = await github.rest.issues.get({
+              const freshIssueResponse = await readGithub.rest.issues.get({
                 owner,
                 repo,
                 issue_number: issue.number,
@@ -2460,7 +2481,7 @@ jobs:
                 continue;
               }
 
-              const freshBlockers = await github.paginate(
+              const freshBlockers = await readGithub.paginate(
                 'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
                 {
                   owner,
@@ -2486,8 +2507,8 @@ jobs:
                 continue;
               }
 
-              const freshComments = await github.paginate(
-                github.rest.issues.listComments,
+              const freshComments = await readGithub.paginate(
+                readGithub.rest.issues.listComments,
                 {
                   owner,
                   repo,
@@ -2532,7 +2553,7 @@ jobs:
                   // Opt-in: drop previously recorded dispatch markers so the
                   // issue starts from a fresh attempt budget. Consumers that
                   // rely on markers as an audit trail leave this off.
-                  const previous = await github.paginate(
+                  const previous = await readGithub.paginate(
                     'GET /repos/{owner}/{repo}/issues/{issue_number}/comments',
                     {
                       owner,
