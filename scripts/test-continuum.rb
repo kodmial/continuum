@@ -462,6 +462,16 @@ class ContinuumTest < Minitest::Test
     watchdog_inputs = automation.fetch('jobs').fetch('watchdog').fetch('with')
     assert_equal 'OpenCode agent', watchdog_inputs.fetch('watched_workflow')
 
+    # The global PR watchdog is the one direct job in this control plane: a
+    # central wake-up that runs from Continuum itself, so it cannot be a
+    # reusable call. It must stay exactly one job, and the four reusable
+    # callees above must stay exactly four.
+    global_watchdog = automation.fetch('jobs').fetch('global-pr-watchdog')
+    assert_nil global_watchdog['uses'],
+               'global-pr-watchdog must be a direct job, not another reusable call'
+    assert_equal %w[scheduler watchdog repair auto-merge global-pr-watchdog].sort,
+                 automation.fetch('jobs').keys.sort
+
     # A custom run-name changes workflow_run.name in the delivered payload on
     # current GitHub Actions, even though workflow_run.workflows is matched by
     # the workflow identity. Route completed self-entry runs by their stable
@@ -2821,6 +2831,186 @@ class ContinuumTest < Minitest::Test
   # is capability-only.
   def test_watchdog_has_no_runner_pinned_guard
     refute_match(/if: startsWith\(runner/, watchdog_body)
+  end
+
+  # --------------------------------------- global PR watchdog (cross-repo wake-up)
+
+  GLOBAL_PR_WATCHDOG_HELPER = File.join(ROOT, '.github/scripts/global_pr_watchdog.js').freeze
+  GLOBAL_PR_WATCHDOG_JOB = 'global-pr-watchdog'.freeze
+
+  def global_watchdog_helper_body
+    File.read(GLOBAL_PR_WATCHDOG_HELPER)
+  end
+
+  # The raw YAML of the global-pr-watchdog job: from its own header up to the
+  # next top-level job. Scoping contract assertions to this block is what
+  # distinguishes the watchdog's own surface from the repair job's
+  # continuum-opencode-repair.yml reference or the OpenCode watchdog's
+  # history reads elsewhere in the same file.
+  def global_watchdog_job_body
+    lines = File.read(File.join(ROOT, '.github/workflows/automation.yml')).lines
+    start = lines.index { |line| line == "  #{GLOBAL_PR_WATCHDOG_JOB}:\n" }
+    raise "#{GLOBAL_PR_WATCHDOG_JOB} job is missing from automation.yml" if start.nil?
+
+    rest = lines[(start + 1)..]
+    stop = rest.index { |line| line.match?(/^  [a-z0-9-]+:\s*$/) }
+    (stop ? lines[start...(start + 1 + stop)] : lines[start..]).join
+  end
+
+  # The watchdog reuses the existing 17,47 safety-net slot and manual
+  # dispatch. A new `schedule:` entry would create another scheduled Actions
+  # wake-up, which the task explicitly forbids.
+  def test_global_pr_watchdog_reuses_the_existing_schedule_slot
+    automation = yaml(File.join(ROOT, '.github/workflows/automation.yml'))
+    crons = events(automation).fetch('schedule').map { |entry| entry.fetch('cron') }.sort
+    assert_equal ['*/15 * * * *', '17,47 * * * *'], crons,
+                 'automation.yml must keep exactly its two existing cron entries'
+
+    job = automation.fetch('jobs').fetch(GLOBAL_PR_WATCHDOG_JOB)
+    guard = job.fetch('if')
+    assert_includes guard, "github.event_name == 'workflow_dispatch'",
+                    'the watchdog must run manually'
+    assert_includes guard, "github.event_name == 'schedule' && github.event.schedule == '17,47 * * * *'",
+                    'the watchdog must run only on the existing 17,47 safety-net slot'
+    refute_includes guard, '*/15',
+                    'the 15-minute scheduler slot must not wake the global scan'
+  end
+
+  # No overlapping global scans: one fixed concurrency key, never cancelled.
+  def test_global_pr_watchdog_runs_alone
+    job = yaml(File.join(ROOT, '.github/workflows/automation.yml'))
+          .fetch('jobs').fetch(GLOBAL_PR_WATCHDOG_JOB)
+    concurrency = job.fetch('concurrency')
+    assert_equal 'continuum-global-pr-watchdog', concurrency.fetch('group')
+    assert_equal false, concurrency.fetch('cancel-in-progress')
+  end
+
+  # All cross-repository REST calls use the existing TAP_PAT credential. The
+  # token is handed to the script through the environment exactly once and is
+  # never echoed; headers carry the versioned JSON contract.
+  def test_global_pr_watchdog_uses_the_cross_repository_credential
+    job_body = global_watchdog_job_body
+    assert_includes job_body, 'TAP_PAT: ${{ secrets.TAP_PAT }}'
+    assert_equal 1, job_body.scan('secrets.TAP_PAT').size,
+                 'the token must enter through one env mapping, never inline'
+    refute_match(/echo.*TAP_PAT/, job_body, 'the token must never be printed')
+
+    assert_includes job_body, 'CONTINUUM_REPO: ${{ github.repository }}',
+                    'the expected consumer-marker source derives from the watchdog repository itself'
+    assert_includes job_body, 'CONTINUUM_REPO_ID: ${{ github.event.repository.id }}',
+                    'self-exclusion resolves the watchdog repository id from the event'
+
+    helper = global_watchdog_helper_body
+    assert_includes helper, "ACCEPT_HEADER = 'application/vnd.github+json'"
+    assert_includes helper, 'Accept: ACCEPT_HEADER'
+    assert_includes helper, "API_VERSION = '2026-03-10'"
+    assert_includes helper, 'X-GitHub-Api-Version'
+  end
+
+  # Bounded discovery and shared-budget guards, as literals a future edit has
+  # to change out loud: at most 10 repository pages of 100, the low-water
+  # mark floors at 500 (10% above it), and the budget is rechecked every 25
+  # inspected repositories.
+  def test_global_pr_watchdog_bounds_discovery_and_budget
+    helper = global_watchdog_helper_body
+    assert_includes helper, 'MAX_REPOSITORY_PAGES = 10'
+    assert_includes helper, 'REPOS_PER_PAGE = 100'
+    assert_includes helper, 'RATE_LIMIT_RECHECK_EVERY = 25'
+    assert_includes helper, 'Math.max(500, Math.ceil('
+  end
+
+  # Exactly the three approved idempotent repo-local reconcilers may be
+  # woken, and each dispatch carries only the default-branch ref with no
+  # inputs.
+  def test_global_pr_watchdog_wakes_only_the_three_reconcilers
+    helper = global_watchdog_helper_body
+    allowed = helper[/ALLOWED_DISPATCH_WORKFLOWS = Object\.freeze\(\[(.*?)\]\)/m, 1]
+    refute_nil allowed, 'the dispatch allowlist is missing from the helper'
+    dispatched = allowed.scan(/'([^']+)'/).flatten.sort
+    assert_equal %w[
+      continuum-auto-merge.yml
+      continuum-coderabbit-retry.yml
+      continuum-pr-agent-recovery.yml
+    ].sort, dispatched
+
+    assert_includes helper, 'dispatchWorkflow(owner, name, workflowFile, ref)',
+                    'dispatches carry the repository default branch and nothing else'
+    assert_includes global_watchdog_job_body, 'watchdog.DISPATCH_OPERATIONS[workflowFile]'
+  end
+
+  # Fails if a future change adds an unapproved cross-repository endpoint to
+  # this watchdog: no run-history scan, no run rerun, no PR merge, branch
+  # update, or comment mutation, and never the repair workflow (whose
+  # workflow_dispatch contract requires exact PR/HEAD/CI inputs).
+  def test_global_pr_watchdog_uses_no_unapproved_endpoint
+    %w[
+      actions/runs
+      rerun
+      /merges
+      update-branch
+      /comments
+      opencode-repair
+    ].each do |needle|
+      refute_includes global_watchdog_helper_body, needle,
+                      "global_pr_watchdog.js must not reference #{needle}"
+      refute_includes global_watchdog_job_body, needle,
+                      "the #{GLOBAL_PR_WATCHDOG_JOB} job must not reference #{needle}"
+    end
+
+    # The send-time gate is what enforces the allowlist at run time, so it
+    # must exist in the helper and be called before every request.
+    assert_includes global_watchdog_helper_body, 'function assertApprovedEndpoint'
+    assert_includes global_watchdog_job_body, 'watchdog.assertApprovedEndpoint(method, path)'
+
+    # Every cross-repository path the helper builds matches the documented
+    # contract: rate limit, bounded discovery, the single caller marker, the
+    # open-PR probe, or an allowlisted reconciler dispatch.
+    built = global_watchdog_helper_body.scan(%r{return [`'](/[A-Za-z0-9_${}/?.=&+-]+)[`']}).flatten
+    refute_empty built, 'no request paths found in the helper'
+    built.each do |path|
+      approved = path == '/rate_limit' ||
+                 path.start_with?('/user/repos?') ||
+                 path.include?('/contents/.github/workflows/continuum-auto-merge.yml') ||
+                 path.include?('/pulls?state=open') ||
+                 (path.include?('/actions/workflows/') && path.end_with?('/dispatches'))
+      assert approved, "unapproved cross-repository endpoint built by the helper: #{path}"
+    end
+  end
+
+  # Privacy: per-repository diagnostics carry only the opaque repo key. The
+  # helper knows no Actions toolkit to leak through, and the job's only log
+  # calls forward the helper's own sanitized message unchanged.
+  def test_global_pr_watchdog_keeps_consumer_names_out_of_logs
+    helper = global_watchdog_helper_body
+    assert_includes helper, "createHash('sha256')"
+    assert_includes helper, 'slice(0, 12)'
+    %w[full_name clone_url setFailed console. core.].each do |needle|
+      refute_includes helper, needle,
+                      "global_pr_watchdog.js must not contain #{needle}"
+    end
+
+    job_body = global_watchdog_job_body
+    log_calls = job_body.scan(/core\.(info|warning)\((.*?)\)/).map { |kind, arg| "#{kind}(#{arg.strip})" }
+    refute_empty log_calls, 'the job must surface the aggregate summary through core'
+    log_calls.each do |call|
+      assert_match(/\A(info|warning)\(msg\)\z/, call,
+                   "log calls must forward the helper's sanitized message only, without interpolation: #{call}")
+    end
+    job_body.scan(/core\.setFailed\((.*?)\)/).flatten.each do |arg|
+      refute_match(/\$\{/, arg,
+                   "setFailed must carry a static message, never an interpolated one: #{arg}")
+    end
+  end
+
+  # No sleeps or backoff loops: the 30-minute schedule slot is the only wake
+  # mechanism, and retry timing stays owned by the repo-local reconcilers.
+  def test_global_pr_watchdog_keeps_no_retry_state
+    %w[setTimeout setInterval sleep waitFor].each do |needle|
+      refute_includes global_watchdog_helper_body, needle,
+                      "global_pr_watchdog.js must not contain #{needle}"
+      refute_includes global_watchdog_job_body, needle,
+                      "the #{GLOBAL_PR_WATCHDOG_JOB} job must not contain #{needle}"
+    end
   end
 
   # ------------------------------------------------- opencode-repair dispatch
