@@ -629,8 +629,53 @@ jobs:
             echo "$DELIMITER"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Normalize persistent improve presentation
+      - name: Revalidate the PR head and native review output after review
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
+        id: result
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
+          REVIEWED_SHA: ${{ steps.before.outputs.sha }}
+          REVIEW_JSON: ${{ steps.pragent.outputs.review }}
+        with:
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            const prNumber = Number(process.env.PR_NUMBER);
+            const reviewedSha = String(process.env.REVIEWED_SHA || '').toLowerCase();
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner, repo: context.repo.repo, pull_number: prNumber,
+            });
+            const currentSha = String(pr.head.sha || '').toLowerCase();
+            if (currentSha !== reviewedSha) {
+              core.setFailed(
+                `PR head moved during review (${reviewedSha} -> ${currentSha}); ` +
+                'discarding both results and waiting for fresh CI on the new HEAD.'
+              );
+              return;
+            }
+            const raw = String(process.env.REVIEW_JSON || '').trim();
+            if (!raw) {
+              core.setFailed('Upstream PR-Agent produced no structured review output.');
+              return;
+            }
+            let review;
+            try {
+              review = JSON.parse(raw);
+            } catch (err) {
+              core.setFailed(`Upstream PR-Agent review output is invalid JSON: ${err.message}`);
+              return;
+            }
+            if (!review || typeof review !== 'object' || !Array.isArray(review.key_issues_to_review)) {
+              core.setFailed('Upstream PR-Agent review output does not match the expected PRReview schema.');
+              return;
+            }
+            core.setOutput('head_sha', currentSha);
+            core.notice(`Native PR-Agent review output for ${reviewedSha} is current and machine-readable.`);
+
+      - name: Normalize persistent improve presentation
+        if: >-
+          steps.result.outcome == 'success' &&
+          steps.result.outputs.head_sha
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
@@ -678,49 +723,6 @@ jobs:
                 qualifying.length + ' high-signal suggestion(s).'
               );
             }
-
-      - name: Revalidate the PR head and native review output after review
-        if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
-        id: result
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
-        env:
-          PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
-          REVIEWED_SHA: ${{ steps.before.outputs.sha }}
-          REVIEW_JSON: ${{ steps.pragent.outputs.review }}
-        with:
-          github-token: ${{ secrets.TAP_PAT }}
-          script: |
-            const prNumber = Number(process.env.PR_NUMBER);
-            const reviewedSha = String(process.env.REVIEWED_SHA || '').toLowerCase();
-            const { data: pr } = await github.rest.pulls.get({
-              owner: context.repo.owner, repo: context.repo.repo, pull_number: prNumber,
-            });
-            const currentSha = String(pr.head.sha || '').toLowerCase();
-            if (currentSha !== reviewedSha) {
-              core.setFailed(
-                `PR head moved during review (${reviewedSha} -> ${currentSha}); ` +
-                'discarding both results and waiting for fresh CI on the new HEAD.'
-              );
-              return;
-            }
-            const raw = String(process.env.REVIEW_JSON || '').trim();
-            if (!raw) {
-              core.setFailed('Upstream PR-Agent produced no structured review output.');
-              return;
-            }
-            let review;
-            try {
-              review = JSON.parse(raw);
-            } catch (err) {
-              core.setFailed(`Upstream PR-Agent review output is invalid JSON: ${err.message}`);
-              return;
-            }
-            if (!review || typeof review !== 'object' || !Array.isArray(review.key_issues_to_review)) {
-              core.setFailed('Upstream PR-Agent review output does not match the expected PRReview schema.');
-              return;
-            }
-            core.setOutput('head_sha', currentSha);
-            core.notice(`Native PR-Agent review output for ${reviewedSha} is current and machine-readable.`);
 
       - name: Export native persistent finding state for the reviewed HEAD
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
