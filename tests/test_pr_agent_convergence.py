@@ -166,7 +166,8 @@ class WorkflowWiringTests(unittest.TestCase):
     def test_cross_head_state_is_per_finding(self):
         self.assertIn("finding_ids", self.workflow)
         self.assertIn("identified_batch", self.workflow)
-        self.assertIn("findings=${FINDING_IDS,,}", self.workflow)
+        self.assertIn('FINDING_IDS_LOWER="${FINDING_IDS,,}"', self.workflow)
+        self.assertIn("findings=${FINDING_IDS_LOWER}", self.workflow)
         self.assertNotIn("to=${NEW_HEAD,,} fingerprint=${BATCH_FINGERPRINT,,}", self.workflow)
 
     def test_partial_survivors_are_filtered_not_global_hold(self):
