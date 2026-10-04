@@ -1678,6 +1678,14 @@ class IsolationTests(unittest.TestCase):
         self.assertIn("contents/src/continuum/pr_agent.py", body)
         self.assertIn("continuum-pr-agent-runtime", body)
 
+    def test_pr_agent_review_uses_repository_token_not_shared_pat(self):
+        body = read_repo(".github/workflows/continuum-pr-agent.yml")
+        self.assertNotIn("secrets.TAP_PAT", body)
+        self.assertIn("GITHUB__USER_TOKEN: ${{ github.token }}", body)
+        self.assertIn("GH_TOKEN: ${{ github.token }}", body)
+        self.assertIn("actions: write", body)
+        self.assertIn("statuses: write", body)
+
     def test_pre_ci_skip_does_not_run_checkout_integrity_guard(self):
         body = read_repo(".github/workflows/continuum-pr-agent.yml")
         self.assertIn(
