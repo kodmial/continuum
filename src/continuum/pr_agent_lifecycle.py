@@ -59,7 +59,7 @@ PUSH_OUTPUTS_FILE_PATH = "pr-agent-outputs/continuum.jsonl"
 
 NUM_MAX_FINDINGS = 6
 
-SUGGESTIONS_SCORE_THRESHOLD = 1
+SUGGESTIONS_SCORE_THRESHOLD = 7
 
 REVIEW_MERGE_SAFE = "safe_to_merge"
 REVIEW_MERGE_CAUTION = "merge_with_caution"
@@ -293,30 +293,141 @@ def qualifying_suggestions(
     suggestions: Sequence[Mapping[str, Any]],
     threshold: int = SUGGESTIONS_SCORE_THRESHOLD,
 ) -> List[Dict[str, Any]]:
-    """Qualifying native improve suggestions for the same repair batch.
+    """High-signal native improve suggestions eligible for autonomous repair.
 
-    The threshold of 1 is intentional: actionable native suggestions must
-    not be silently discarded by an arbitrary Continuum severity filter.
-    A missing score is treated conservatively as qualifying.
+    Work Lock #37 raises the autonomous threshold to 7. Missing or malformed
+    scores remain visible presentation data but do not trigger automatic code
+    changes or block the merge gate.
     """
 
     out: List[Dict[str, Any]] = []
     for entry in suggestions:
         score = entry.get("score", None)
         if score is None:
-            out.append(dict(entry))
             continue
         try:
-            numeric = int(score)
+            numeric = float(score)
         except (TypeError, ValueError):
-            try:
-                numeric = int(float(str(score)))
-            except (TypeError, ValueError):
-                out.append(dict(entry))
-                continue
+            continue
         if numeric >= threshold:
             out.append(dict(entry))
     return out
+
+
+_PATH_KEYS = ("relevant_file", "path", "file", "filename")
+_START_KEYS = ("relevant_lines_start", "line_start", "start_line", "line")
+_END_KEYS = ("relevant_lines_end", "line_end", "end_line", "line")
+_REVIEW_TEXT_KEYS = ("issue_header", "issue_content", "title", "body", "description")
+_IMPROVE_TEXT_KEYS = (
+    "one_sentence_summary",
+    "suggestion_content",
+    "title",
+    "body",
+    "description",
+    "label",
+)
+
+
+def _first_string(entry: Mapping[str, Any], keys: Sequence[str]) -> str:
+    for key in keys:
+        value = entry.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _first_number(entry: Mapping[str, Any], keys: Sequence[str]) -> int | None:
+    for key in keys:
+        value = entry.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _normalize_path(entry: Mapping[str, Any]) -> str:
+    return (
+        _first_string(entry, _PATH_KEYS)
+        .removeprefix("./")
+        .strip("'\"` ")
+        .lower()
+    )
+
+
+def _line_range(entry: Mapping[str, Any]) -> tuple[int | None, int | None]:
+    start = _first_number(entry, _START_KEYS)
+    end = _first_number(entry, _END_KEYS)
+    raw = entry.get("relevant_lines")
+    if (start is None or end is None) and isinstance(raw, str):
+        pair = re.search(r"(\d+)\D+(\d+)", raw)
+        if pair:
+            start = start if start is not None else int(pair.group(1))
+            end = end if end is not None else int(pair.group(2))
+        else:
+            one = re.search(r"\d+", raw)
+            if one:
+                start = start if start is not None else int(one.group(0))
+                end = end if end is not None else int(one.group(0))
+    if start is not None and end is None:
+        end = start
+    if end is not None and start is None:
+        start = end
+    if start is not None and end is not None and end < start:
+        start, end = end, start
+    return start, end
+
+
+def _normalize_problem(entry: Mapping[str, Any], source: str) -> str:
+    keys = _REVIEW_TEXT_KEYS if source == "review" else _IMPROVE_TEXT_KEYS
+    text = " ".join(
+        str(entry.get(key) or "") for key in keys if isinstance(entry.get(key), str)
+    )
+    text = re.sub(r"https?://\S+", " ", text)
+    text = re.sub(r"[\`*_>#()\[\]{}]", " ", text)
+    text = re.sub(r"[^\w./-]+", " ", text.lower(), flags=re.UNICODE)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _equivalent_problem(left: str, right: str) -> bool:
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    shorter, longer = sorted((left, right), key=len)
+    if len(shorter) >= 32 and shorter in longer:
+        return True
+    left_tokens = {token for token in left.split() if len(token) >= 3}
+    right_tokens = {token for token in right.split() if len(token) >= 3}
+    if not left_tokens or not right_tokens:
+        return False
+    common = len(left_tokens & right_tokens)
+    union = len(left_tokens | right_tokens)
+    jaccard = common / union if union else 0.0
+    containment = common / min(len(left_tokens), len(right_tokens))
+    return common >= 5 and (jaccard >= 0.75 or containment >= 0.85)
+
+
+def _same_logical_defect(
+    review_finding: Mapping[str, Any],
+    improve_suggestion: Mapping[str, Any],
+) -> bool:
+    if _normalize_path(review_finding) != _normalize_path(improve_suggestion):
+        return False
+    if not _normalize_path(review_finding):
+        return False
+    r_start, r_end = _line_range(review_finding)
+    i_start, i_end = _line_range(improve_suggestion)
+    if None in (r_start, r_end, i_start, i_end):
+        return False
+    if not (r_start <= i_end and i_start <= r_end):
+        return False
+    return _equivalent_problem(
+        _normalize_problem(review_finding, "review"),
+        _normalize_problem(improve_suggestion, "improve"),
+    )
 
 
 @dataclass
@@ -341,21 +452,26 @@ def build_repair_batch(
     *,
     head_sha: str,
 ) -> RepairBatch:
-    """Batch every current review finding plus every qualifying suggestion.
+    """Batch current review findings plus unique high-signal suggestions.
 
-    Each item preserves its native source (review or improve). The batch
-    processes every item together; it never stops after the first finding
-    and never dispatches one agent per finding. The OpenCode pass itself
-    is bounded; the item list is complete, never truncated.
+    Native review findings are authoritative when /review and /improve emit
+    the same logical defect at an overlapping location. Distinct findings are
+    retained even when they touch the same file.
     """
 
     if not head_sha or not head_sha.strip():
         raise LifecycleError("repair batch requires the exact reviewed HEAD")
-    items: List[Dict[str, Any]] = []
-    for index, finding in enumerate(current_key_issues(review)):
-        items.append({"source": "review", "index": index, "finding": dict(finding)})
+    review_findings = current_key_issues(review)
+    items: List[Dict[str, Any]] = [
+        {"source": "review", "index": index, "finding": dict(finding)}
+        for index, finding in enumerate(review_findings)
+    ]
     for index, suggestion in enumerate(qualifying_suggestions(suggestions)):
-        items.append({"source": "improve", "index": index, "suggestion": dict(suggestion)})
+        if any(_same_logical_defect(finding, suggestion) for finding in review_findings):
+            continue
+        items.append(
+            {"source": "improve", "index": index, "suggestion": dict(suggestion)}
+        )
     return RepairBatch(head_sha=head_sha.strip(), items=items, bounded=True)
 
 
@@ -633,6 +749,141 @@ def needs_fresh_review(old_head_sha: str, new_head_sha: str) -> bool:
     return old_head_sha.strip().lower() != new_head_sha.strip().lower()
 
 
+def caller_review_event_is_actionable(
+    event_name: object,
+    *,
+    is_pull_request_comment: bool = False,
+    actor_is_owner: bool = False,
+    comment_body: object = "",
+) -> bool:
+    """Whether a caller event may invoke the reusable PR-Agent operation layer.
+
+    Mirrors the thin-router gate in `continuum-pr-agent-router.yml` (heavy
+    callers are dispatch-only): workflow_dispatch (bounded retries/recovery)
+    is always actionable, while issue_comment is actionable only for an
+    owner `/review` comment on a pull request. Every other event is a no-op
+    that must never create a heavy run or hold a per-PR lock.
+    """
+
+    name = str(event_name or "").strip()
+    if name == "workflow_dispatch":
+        return True
+    if name != "issue_comment":
+        return False
+    if not is_pull_request_comment or not actor_is_owner:
+        return False
+    return "/review" in str(comment_body or "")
+
+
+def stale_review_may_be_cancelled(running_head_sha: object, current_head_sha: object) -> bool:
+    """Whether a running/queued review may be superseded for a newer HEAD.
+
+    A review is stale exactly when the PR HEAD moved: the newer HEAD needs
+    fresh CI plus a complete review, so the older run may be superseded
+    without losing useful work. Same-HEAD duplicates must coalesce instead
+    of cancelling/restarting because exact-HEAD work is idempotent.
+    Missing SHAs fail closed to False: never discard work blindly.
+
+    The reusable workflow implements this predicate with exact-HEAD
+    admission, before/after review revalidation, and retry-backoff HEAD
+    rechecks. Native `cancel-in-progress` is never used for preemption
+    because it cannot compare HEADs: an out-of-order old-HEAD event
+    starting later must not cancel newer exact-HEAD work.
+    """
+
+    running = str(running_head_sha or "").strip().lower()
+    current = str(current_head_sha or "").strip().lower()
+    if not running or not current:
+        return False
+    return running != current
+
+
+def repair_is_protected_from_review_preemption(
+    *,
+    repair_active: bool = False,
+    repair_head_sha: object = "",
+    review_head_sha: object = "",
+) -> bool:
+    """Whether an active repair publication blocks review preemption.
+
+    Repair mutates and publishes the PR branch under exact-HEAD
+    revalidation plus force-with-lease. While such a publication is
+    active for the HEAD under review, a newer review event must wait
+    rather than interrupt it: reviews are serializable, repairs are not
+    interruptible. With no active repair there is nothing to protect.
+    Unknown HEADs fail closed to protected so a blind preemption can
+    never interrupt a publish it cannot identify; a repair for a
+    different HEAD does not block the review because that stale repair
+    fails closed on its own exact-HEAD check.
+    """
+
+    if not repair_active:
+        return False
+    repair = str(repair_head_sha or "").strip().lower()
+    review = str(review_head_sha or "").strip().lower()
+    if not repair or not review:
+        return True
+    return repair == review
+
+
+def review_supersession_decision(
+    running_head_sha: object,
+    current_head_sha: object,
+    *,
+    repair_active: bool = False,
+    repair_head_sha: object = "",
+    review_head_sha: object = "",
+    event_name: object = "workflow_dispatch",
+    is_pull_request_comment: bool = False,
+    actor_is_owner: bool = False,
+    comment_body: object = "",
+) -> Dict[str, Any]:
+    """Single HEAD-guarded scheduling decision for PR-Agent review work.
+
+    Composition root wiring the three scheduling predicates so none is
+    dead code: non-actionable caller events are ignored before any HEAD
+    comparison (caller_review_event_is_actionable), an active repair for
+    the HEAD under review blocks preemption
+    (repair_is_protected_from_review_preemption), and only a moved HEAD
+    supersedes older review work (stale_review_may_be_cancelled).
+    Same-HEAD duplicates coalesce; a current HEAD with no running review
+    proceeds; missing SHAs fail closed to wait rather than discard
+    blindly. The reusable workflow implements this decision with
+    workflow-level serialization (no native preemption) plus exact-HEAD
+    admission, before/after revalidation, and retry-backoff HEAD rechecks:
+    `proceed` enters the admission path, `supersede` means the stale
+    run's results are discarded by those exact-HEAD checks and the newer
+    HEAD is reviewed fresh once the lock frees (a stale running review is
+    never interrupted mid-flight), `coalesce` skips duplicate same-HEAD
+    work, and `wait` holds while a same-HEAD repair publishes or a HEAD
+    is still unknown.
+    """
+
+    if not caller_review_event_is_actionable(
+        event_name,
+        is_pull_request_comment=is_pull_request_comment,
+        actor_is_owner=actor_is_owner,
+        comment_body=comment_body,
+    ):
+        return {"action": "ignore", "reason": "non-actionable caller event"}
+    review_head = str(review_head_sha or current_head_sha or "").strip().lower()
+    if repair_is_protected_from_review_preemption(
+        repair_active=repair_active,
+        repair_head_sha=repair_head_sha,
+        review_head_sha=review_head,
+    ):
+        return {"action": "wait", "reason": "repair publication in flight"}
+    if stale_review_may_be_cancelled(running_head_sha, current_head_sha):
+        return {"action": "supersede", "reason": "HEAD moved: fresh review required"}
+    running = str(running_head_sha or "").strip().lower()
+    current = str(current_head_sha or "").strip().lower()
+    if running and current and running == current:
+        return {"action": "coalesce", "reason": "same HEAD: exact-HEAD work is idempotent"}
+    if current and not running:
+        return {"action": "proceed", "reason": "no active review: admit fresh HEAD"}
+    return {"action": "wait", "reason": "missing HEAD: fail closed"}
+
+
 def required_toml() -> Dict[str, Any]:
     """Minimum upstream configuration this stack requires."""
 
@@ -725,5 +976,9 @@ __all__ = [
     "retry_backoff_seconds",
     "resolve_dispatch_ref",
     "needs_fresh_review",
+    "caller_review_event_is_actionable",
+    "stale_review_may_be_cancelled",
+    "repair_is_protected_from_review_preemption",
+    "review_supersession_decision",
     "required_toml",
 ]

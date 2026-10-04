@@ -114,7 +114,10 @@ on:
     types: [completed]
 
 permissions:
+  actions: read
   contents: read
+  issues: read
+  pull-requests: read
 
 jobs:
   call:
@@ -122,12 +125,23 @@ jobs:
     # the reusable scheduler so it can wake the verified parent immediately.
     # Child cron stays skipped: polling belongs to the parent and must not burn
     # private child runner minutes. Unrelated issue comments remain cheap skips.
+    # A manual owner `/oc` is in-flight work the scheduler must reserve, and
+    # trusted qualification result comments wake the scheduler immediately;
+    # cron remains the missed-event backstop.
     if: >-
       (vars.CONTINUUM_ROLE != 'child' || github.event_name != 'schedule') &&
       (github.event_name != 'issue_comment' ||
        (github.actor == github.repository_owner &&
         (contains(github.event.comment.body, '/oc') ||
-         contains(github.event.comment.body, '/opencode'))))
+         contains(github.event.comment.body, '/opencode'))) ||
+       ((github.actor == github.repository_owner ||
+         github.actor == 'github-actions[bot]' ||
+         github.event.comment.author_association == 'OWNER' ||
+         github.event.comment.author_association == 'MEMBER' ||
+         github.event.comment.author_association == 'COLLABORATOR') &&
+        (contains(github.event.comment.body, 'continuum-qualification-result') ||
+         contains(github.event.comment.body, 'continuum-docker-qualification-result') ||
+         contains(github.event.comment.body, 'continuum-render-qualification-result'))))
     uses: kodmial/continuum/.github/workflows/continuum-issue-scheduler.yml@main
     secrets: inherit
     with:
