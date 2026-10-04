@@ -1128,7 +1128,8 @@ jobs:
       - name: Normalize persistent improve presentation
         if: >-
           steps.result.outcome == 'success' &&
-          steps.result.outputs.head_sha
+          steps.result.outputs.head_sha &&
+          steps.improve_output.outcome == 'success'
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}

@@ -350,5 +350,135 @@ class SplitEnvelopeTests(unittest.TestCase):
         self.assertFalse(run_js("skipped", raw=skipped))
 
 
+class GenericToolConjunctionTests(unittest.TestCase):
+    def test_failure_word_without_tool_stays_clean(self):
+        for text in (
+            "2 checks failed in diff",
+            "errors: missing timeout handling",
+            "traceback noted in code comment",
+            "exception handling added in diff",
+        ):
+            with self.subTest(text=text):
+                review = make_review([], extra={"errors": text})
+                self.assertFalse(run_js("tool", review=review))
+
+    def test_tool_plus_failure_blocks(self):
+        for text in (
+            "upstream tool failed",
+            "upstream tools failed",
+            "tool timeout contacting model",
+            "tool unavailable during review",
+        ):
+            with self.subTest(text=text):
+                review = make_review([], extra={"errors": text})
+                self.assertTrue(run_js("tool", review=review))
+
+
+class ConflictingNonSafeRecommendationTests(unittest.TestCase):
+    def test_caution_vs_changes_required_keeps_most_restrictive(self):
+        outer_caution = {
+            "merge_recommendation": "merge_with_caution",
+            "key_issues_to_review": [],
+            "review": make_review([], recommendation="changes_required"),
+        }
+        self.assertEqual(
+            run_js("unwrap", review=outer_caution)["merge_recommendation"],
+            "changes_required",
+        )
+        outer_changes = {
+            "merge_recommendation": "changes_required",
+            "key_issues_to_review": [],
+            "review": make_review([], recommendation="merge_with_caution"),
+        }
+        self.assertEqual(
+            run_js("unwrap", review=outer_changes)["merge_recommendation"],
+            "changes_required",
+        )
+
+
+class AutoMergeImproveCoverageLegTests(unittest.TestCase):
+    def _gate(self, review, raw):
+        skipped = run_js("skipped", raw=raw)
+        try:
+            disposition = run_js("disposition", review=review, raw=raw)
+        except Exception:
+            return {"green": False, "reason": "incomplete improve coverage"}
+        if not raw.strip() and not skipped:
+            return {"green": False, "reason": "incomplete improve coverage"}
+        if skipped:
+            qualifying = disposition["qualifyingSuggestionCount"]
+            if qualifying > 0:
+                return {
+                    "green": False,
+                    "reason": "improve was skipped but qualifying suggestions remain",
+                }
+        if disposition["action"] != "merge":
+            return {"green": False, "reason": disposition["reason"]}
+        return {"green": True, "reason": "review portion satisfied"}
+
+    def test_skipped_clean_empty_payload_greens(self):
+        skipped = ('{"payload": {"code_suggestions": []}, '
+                   '"continuum": {"improve_skipped_clean": true}}')
+        self.assertTrue(run_js("skipped", raw=skipped))
+        gate = self._gate(make_review([]), skipped)
+        self.assertTrue(gate["green"])
+
+    def test_empty_improve_without_marker_fails_closed(self):
+        self.assertFalse(run_js("skipped", raw=""))
+        gate = self._gate(make_review([]), "")
+        self.assertFalse(gate["green"])
+        self.assertIn("incomplete improve coverage", gate["reason"])
+
+    def test_skipped_marker_with_qualifying_suggestions_fails_closed(self):
+        skipped_qualifying = (
+            '{"payload": {"code_suggestions": ['
+            '{"relevant_file": "src/app.py", "score": 9}]}, '
+            '"continuum": {"improve_skipped_clean": true}}'
+        )
+        self.assertTrue(run_js("skipped", raw=skipped_qualifying))
+        gate = self._gate(make_review([]), skipped_qualifying)
+        self.assertFalse(gate["green"])
+        self.assertIn("qualifying", gate["reason"])
+
+    def test_truncated_improve_payload_fails_closed(self):
+        with self.assertRaises(Exception):
+            run_js("disposition", review=make_review([]), raw="not json")
+        with self.assertRaises(Exception):
+            run_js(
+                "disposition",
+                review=make_review([]),
+                raw='{"payload": {"code_suggestions": [',
+            )
+
+
+class PrAgentWorkflowContractTests(unittest.TestCase):
+    def _read(self, *parts):
+        with open(os.path.join(ROOT, *parts), encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_normalize_runs_only_on_successful_improve_output(self):
+        body = self._read(".github", "workflows", "continuum-pr-agent.yml")
+        self.assertIn("Normalize persistent improve presentation", body)
+        self.assertIn("steps.improve_output.outcome == 'success'", body)
+
+    def test_clean_skip_producer_writes_marked_payload(self):
+        body = self._read(".github", "workflows", "continuum-pr-agent.yml")
+        self.assertIn("steps.improve_gate.outputs.skip_improve != 'true'", body)
+        self.assertIn("steps.improve_gate.outputs.skip_improve == 'true'", body)
+        self.assertIn("improve_skipped_clean", body)
+        merge = self._read(
+            ".github", "workflows", "continuum-pr-agent-auto-merge.yml"
+        )
+        self.assertIn("isSkippedCleanImprovePayload", merge)
+        self.assertIn("incomplete improve coverage: failing closed", merge)
+
+    def test_truncated_improve_payload_has_explicit_coverage_leg(self):
+        merge = self._read(
+            ".github", "workflows", "continuum-pr-agent-auto-merge.yml"
+        )
+        self.assertIn("truncated/invalid improve payload", merge)
+        self.assertIn("incomplete improve coverage", merge)
+
+
 if __name__ == "__main__":
     unittest.main()

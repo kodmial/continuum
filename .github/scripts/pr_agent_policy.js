@@ -251,6 +251,18 @@ function buildRepairBatch(reviewPayload, improveJsonl, threshold = IMPROVE_REPAI
 const REVIEW_MERGE_SAFE = 'safe_to_merge';
 const REVIEW_MAX_FINDINGS = 6;
 
+// Severity ranking for conflicting split-envelope merge recommendations.
+// Higher wins so the merged view never understates severity:
+// changes_required > merge_with_caution > safe_to_merge, with unknown
+// non-empty prose failing closed as most restrictive.
+function mergeRecommendationSeverity(text) {
+  const normalized = String(text || '').trim();
+  if (normalized === 'safe_to_merge') return 0;
+  if (normalized === 'merge_with_caution') return 1;
+  if (normalized === 'changes_required') return 2;
+  return 3;
+}
+
 const BLOCKING_SECURITY_SIGNAL_KEYS = [
   'security_concerns',
   'security_issues',
@@ -357,15 +369,21 @@ const TOOL_ERROR_SIGNAL_KEYS = [
 // skip when otherwise clean.
 const GENERIC_TOOL_ERROR_KEYS = ['errors', 'error'];
 
-// Words marking explicit tool-failure prose inside a generic
-// `errors`/`error` value (whole-word, case-insensitive). Negation/empty
-// prose is already excluded by securityValueIsBlocking before this check
-// runs. Whole-word matching keeps ordinary summaries containing `tool` as
-// a substring (e.g. "tooling notes in diff") clean while still catching
-// explicit prose such as "upstream tool failed".
-const GENERIC_TOOL_FAILURE_MARKERS = [
-  'tool',
-  'tools',
+// Tool words and failure words marking explicit tool-failure prose inside
+// a generic `errors`/`error` value (whole-word, case-insensitive).
+// Negation/empty prose is already excluded by securityValueIsBlocking
+// before this check runs. A generic summary counts as a tool failure only
+// when it names the tool (`tool`/`tools`) AND reports a failure
+// (`failed`, `failure`, `timeout`, `timed out`, `traceback`, `exception`,
+// `unavailable`, `error`/`errors`). Requiring the conjunction keeps
+// ordinary code summaries such as `errors: 2 checks failed in diff` or
+// `errors: missing timeout handling` (failure word without a tool mention)
+// clean while still catching explicit prose such as "upstream tool failed"
+// or "tool timeout contacting model". Whole-word matching additionally
+// keeps substrings such as "tooling" or "exceptional" clean.
+const GENERIC_TOOL_WORDS = ['tool', 'tools'];
+
+const GENERIC_TOOL_FAILURE_WORDS = [
   'failed',
   'failure',
   'timeout',
@@ -373,13 +391,19 @@ const GENERIC_TOOL_FAILURE_MARKERS = [
   'traceback',
   'exception',
   'unavailable',
+  'error',
+  'errors',
 ];
 
 function escapeRegExp(text) {
   return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-const GENERIC_TOOL_FAILURE_PATTERNS = GENERIC_TOOL_FAILURE_MARKERS.map(
+const GENERIC_TOOL_WORD_PATTERNS = GENERIC_TOOL_WORDS.map(
+  (marker) => new RegExp(`\\b${escapeRegExp(marker)}\\b`, 'i')
+);
+
+const GENERIC_TOOL_FAILURE_PATTERNS = GENERIC_TOOL_FAILURE_WORDS.map(
   (marker) => new RegExp(`\\b${escapeRegExp(marker)}\\b`, 'i')
 );
 
@@ -396,6 +420,7 @@ function isGenericToolFailureText(value) {
   if (typeof value !== 'string') return false;
   if (!securityValueIsBlocking(value)) return false;
   const text = value.trim();
+  if (!GENERIC_TOOL_WORD_PATTERNS.some((pattern) => pattern.test(text))) return false;
   return GENERIC_TOOL_FAILURE_PATTERNS.some((pattern) => pattern.test(text));
 }
 
@@ -676,8 +701,10 @@ function unwrapReview(reviewPayload) {
       } else if (!outerText) {
         // Keep the present recommendation.
       } else if (currentText !== outerText) {
-        // Most restrictive wins: any non-safe recommendation blocks.
-        if (currentText === REVIEW_MERGE_SAFE && outerText !== REVIEW_MERGE_SAFE) {
+        // Most restrictive wins so split envelopes never understate
+        // severity: changes_required > merge_with_caution > safe_to_merge,
+        // with unknown non-empty prose failing closed as most restrictive.
+        if (mergeRecommendationSeverity(outerText) > mergeRecommendationSeverity(currentText)) {
           merged[key] = value;
         }
       }

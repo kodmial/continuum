@@ -234,7 +234,15 @@ jobs:
             try {
               qualifying = policy.qualifyingImproveSuggestions(raw);
             } catch (err) {
-              core.setFailed(err.message);
+              // A non-empty but truncated/invalid improve payload must fail
+              // closed on the improve-coverage leg explicitly, not as a
+              // generic error: no complete improve evidence exists for this
+              // HEAD.
+              core.setOutput('green', 'false');
+              core.setOutput('reason', 'incomplete improve coverage: failing closed');
+              core.setFailed(
+                `PR-Agent gate blocks PR #${prNumber}: incomplete improve coverage: failing closed (${err.message})`
+              );
               return;
             }
             let disposition;
@@ -341,7 +349,13 @@ jobs:
             // payload) or the payload carries the skipped-clean marker. An
             // empty payload without the marker means improve never produced
             // coverage here, so the gate fails closed instead of merging on
-            // missing evidence.
+            // missing evidence. Producer: continuum-pr-agent.yml
+            // `improve_gate` (skip_improve decision) plus the
+            // `improve_skipped` step, which writes the marked empty payload
+            // `{"payload": {"code_suggestions": []}, "continuum":
+            // {"improve_skipped_clean": true}}` for the exact clean HEAD and
+            // forwards it here as `improve_jsonl`; the `improve` step runs
+            // only when `skip_improve != 'true'`.
             if (!raw.trim() && !improveSkippedClean) {
               fail('incomplete improve coverage: failing closed');
               return;

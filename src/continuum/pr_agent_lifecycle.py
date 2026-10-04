@@ -65,6 +65,19 @@ REVIEW_MERGE_SAFE = "safe_to_merge"
 REVIEW_MERGE_CAUTION = "merge_with_caution"
 REVIEW_MERGE_CHANGES = "changes_required"
 
+# Severity ranking for conflicting split-envelope merge recommendations.
+# Higher wins so the merged view never understates severity: an unknown
+# non-empty recommendation fails closed as most restrictive.
+_MERGE_RECOMMENDATION_SEVERITY = {
+    REVIEW_MERGE_SAFE: 0,
+    REVIEW_MERGE_CAUTION: 1,
+    REVIEW_MERGE_CHANGES: 2,
+}
+
+
+def _merge_recommendation_severity(text: object) -> int:
+    return _MERGE_RECOMMENDATION_SEVERITY.get(str(text or "").strip(), 3)
+
 STATE_ACTIVE = "ACTIVE"
 STATE_RESOLVED = "RESOLVED"
 
@@ -377,16 +390,25 @@ _GENERIC_TOOL_ERROR_KEYS = (
     "error",
 )
 
-# Tool-failure words marking explicit tool-failure prose inside a generic
-# `errors`/`error` value. Matched as whole words (case-insensitive) against
-# the raw text; negation/empty prose is already excluded by
-# _security_value_is_blocking before this check runs. Whole-word matching
-# keeps ordinary summaries containing `tool` as a substring (e.g. "tooling
-# notes in diff") clean while still catching explicit prose such as
-# "upstream tool failed".
-_GENERIC_TOOL_FAILURE_MARKERS = (
+# Tool words and failure words marking explicit tool-failure prose inside a
+# generic `errors`/`error` value. Both groups are matched as whole words
+# (case-insensitive) against the raw text; negation/empty prose is already
+# excluded by _security_value_is_blocking before this check runs. A generic
+# summary counts as a tool failure only when it names the tool (`tool`/`tools`)
+# AND reports a failure (`failed`, `failure`, `timeout`, `timed out`,
+# `traceback`, `exception`, `unavailable`, `error`/`errors`). Requiring the
+# conjunction keeps ordinary code summaries such as `errors: 2 checks failed
+# in diff` or `errors: missing timeout handling` (failure word without a tool
+# mention) clean, while still catching explicit prose such as
+# "upstream tool failed" or "tool timeout contacting model". Whole-word
+# matching additionally keeps substrings such as "tooling" or "exceptional"
+# clean.
+_GENERIC_TOOL_WORDS = (
     "tool",
     "tools",
+)
+
+_GENERIC_TOOL_FAILURE_WORDS = (
     "failed",
     "failure",
     "timeout",
@@ -394,10 +416,16 @@ _GENERIC_TOOL_FAILURE_MARKERS = (
     "traceback",
     "exception",
     "unavailable",
+    "error",
+    "errors",
+)
+
+_GENERIC_TOOL_WORD_PATTERNS = tuple(
+    re.compile(r"\b" + re.escape(marker) + r"\b") for marker in _GENERIC_TOOL_WORDS
 )
 
 _GENERIC_TOOL_FAILURE_PATTERNS = tuple(
-    re.compile(r"\b" + re.escape(marker) + r"\b") for marker in _GENERIC_TOOL_FAILURE_MARKERS
+    re.compile(r"\b" + re.escape(marker) + r"\b") for marker in _GENERIC_TOOL_FAILURE_WORDS
 )
 
 # Review-payload keys that carry an explicit coverage signal. Explicit
@@ -445,10 +473,11 @@ _COVERAGE_OBJECT_KEYS = (
 def _is_generic_tool_failure_text(value: object) -> bool:
     """Whether a generic `errors`/`error` value reports a tool failure.
 
-    Negation/empty prose is clean (no signal). Any other value must
-    explicitly mention a tool-failure word (whole-word match) to count:
-    ordinary code-error summaries such as "2 lint errors noted in diff"
-    or "tooling notes in diff" stay clean.
+    Negation/empty prose is clean (no signal). Any other value must name
+    the tool AND report a failure (whole-word conjunction): ordinary
+    code-error summaries such as "2 checks failed in diff" or
+    "missing timeout handling" (failure word without a tool mention) and
+    "tooling notes in diff" (substring, not a tool word) stay clean.
     """
 
     if isinstance(value, Mapping):
@@ -462,6 +491,9 @@ def _is_generic_tool_failure_text(value: object) -> bool:
     if not _security_value_is_blocking(value):
         return False
     lowered = value.strip().lower()
+    has_tool = any(pattern.search(lowered) is not None for pattern in _GENERIC_TOOL_WORD_PATTERNS)
+    if not has_tool:
+        return False
     return any(pattern.search(lowered) is not None for pattern in _GENERIC_TOOL_FAILURE_PATTERNS)
 
 
@@ -780,8 +812,13 @@ def _unwrap_review(review: Mapping[str, Any]) -> Mapping[str, Any]:
             elif not outer_text:
                 pass
             elif current_text != outer_text:
-                # Most restrictive wins: any non-safe blocks.
-                if current_text == REVIEW_MERGE_SAFE and outer_text != REVIEW_MERGE_SAFE:
+                # Most restrictive wins so split envelopes never understate
+                # severity: changes_required > merge_with_caution >
+                # safe_to_merge, with unknown non-empty prose failing closed
+                # as most restrictive.
+                if _merge_recommendation_severity(outer_text) > _merge_recommendation_severity(
+                    current_text
+                ):
                     merged[key] = value
             continue
         if key in BLOCKING_SECURITY_SIGNAL_KEYS or key in _TOOL_ERROR_SIGNAL_KEYS:
