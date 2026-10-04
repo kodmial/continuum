@@ -1425,12 +1425,17 @@ class RepairWiringRegressionTests(unittest.TestCase):
     def test_merge_reconciliation_is_serialized_per_pr(self):
         merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
         # Target-aware: the group is additionally scoped by the opaque child
-        # id (local when empty); only the opaque id ever appears, never a
-        # concrete repository name.
+        # id; only the opaque id ever appears, never a concrete repository
+        # name. The local branch preserves current-main's exact group string
+        # (pr-agent-merge-{pr_number}) via format('pr-agent-merge-{0}', ...),
+        # so local behavior is unchanged while delegated runs serialize per
+        # child id plus PR.
         self.assertIn(
-            "group: pr-agent-merge-${{ inputs.target_child_id && format('child-{0}', inputs.target_child_id) || 'local' }}-${{ inputs.pr_number || github.run_id }}",
+            "group: ${{ inputs.target_child_id && format('pr-agent-merge-child-{0}-{1}', inputs.target_child_id, inputs.pr_number || github.run_id) || format('pr-agent-merge-{0}', inputs.pr_number || github.run_id) }}",
             merge,
         )
+        self.assertIn("inputs.target_child_id", merge)
+        self.assertNotIn("target_repository:", merge)
         self.assertIn("cancel-in-progress: false", merge)
         # Per-PR serialization plus the exact-HEAD marker is the isolation
         # contract; repository-global active-run probing is forbidden.

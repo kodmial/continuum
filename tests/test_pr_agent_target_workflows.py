@@ -84,7 +84,15 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
         self.assertIn("const owner = process.env.CONTINUUM_PR_AGENT_TARGET_OWNER;", body)
         self.assertIn("owner: executionOwner", body)
         self.assertIn("repo: executionRepo", body)
-        self.assertIn("target_child_id: String(process.env.TARGET_CHILD_ID || '')", body)
+        # Delegated recovery forwards the opaque child selection while local
+        # runs dispatch bare: a custom reviewWorkflow without the
+        # target_child_id workflow_dispatch input would reject an empty
+        # value, breaking local recovery. This mirrors the auto-merge
+        # delegated-wakeup contract (never retries bare for delegated,
+        # dispatches bare for local).
+        self.assertIn("const recoveryChildId = String(process.env.TARGET_CHILD_ID || '')", body)
+        self.assertIn("if (recoveryChildId)", body)
+        self.assertIn("recoveryInputs.target_child_id = recoveryChildId", body)
         self.assertIn("TARGET_CHILD_ID: ${{ inputs.target_child_id || vars.CONTINUUM_PR_AGENT_TARGET_CHILD_ID }}", body)
 
     def test_callers_preserve_opaque_child_id_across_retries(self):
