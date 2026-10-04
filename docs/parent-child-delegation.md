@@ -118,10 +118,14 @@ Priority labels remain optional scheduling metadata only: when present,
 `priority:p0`, `priority:p1`, and `priority:p2` order work ahead of
 unprioritized issues. They never decide whether an issue belongs to the parent.
 
-The local issue scheduler remains installed in the child repository, but both the
-installed caller and the reusable scheduler fail safe: when
-`CONTINUUM_ROLE=child`, local automatic scheduling is skipped. Workflow files
-are never added or removed when repository role variables change.
+The local Issue scheduler caller remains installed in the child repository. When
+`CONTINUUM_ROLE=child`, the reusable scheduler never dispatches local work;
+instead, event-driven caller runs verify `CONTINUUM_CHILD_ID`,
+`CONTINUUM_PARENT`, and the parent's `CONTINUUM_CHILDREN` allow-list, then wake
+the verified parent's Issue scheduler. The child caller deliberately skips its
+own scheduled/cron events so private child runner minutes are not used for
+polling. Workflow files are never added or removed when repository role
+variables change.
 
 A repository-owner `/oc` or `/opencode` comment is deliberately still allowed
 to start the existing local OpenCode workflow in the child. The parent Issue scheduler
@@ -187,8 +191,12 @@ manual OpenCode entry point.
 
 The parent Issue scheduler uses the same triggers as the ordinary core
 scheduler and is additionally woken when child task/review workflows complete.
-Task execution and independent review remain separate; completed tasks are not resurrected, dependency-blocked
-tasks stay blocked, and owner-created PRs use the independent PR review workflow.
+A child repository event that reaches its installed scheduler caller also wakes
+the verified parent immediately, so new child issues do not depend on GitHub's
+best-effort scheduled-event delivery. The parent's cron remains a safety net.
+Task execution and independent review remain separate; completed tasks are not
+resurrected, dependency-blocked tasks stay blocked, and owner-created PRs use
+the independent PR review workflow.
 
 ## Migration baseline
 
