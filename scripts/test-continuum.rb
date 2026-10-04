@@ -5568,9 +5568,12 @@ class ContinuumTest < Minitest::Test
       assert call_inputs.key?('target_child_id'), "#{base}: workflow_call must declare target_child_id"
       assert_equal '', call_inputs.fetch('target_child_id').fetch('default'), "#{base}: target_child_id must default empty (local)"
       assert_equal false, call_inputs.fetch('target_child_id').fetch('required'), "#{base}: target_child_id must not gate the call"
+      assert_equal 'string', call_inputs.fetch('target_child_id').fetch('type'), "#{base}: target_child_id must stay a string input"
 
       dispatch_inputs = events(stub).fetch('workflow_dispatch').fetch('inputs')
       assert dispatch_inputs.key?('target_child_id'), "#{base}: caller stub must expose target_child_id"
+      assert_equal 'string', dispatch_inputs.fetch('target_child_id').fetch('type'), "#{base}: caller stub target_child_id must stay a string input"
+      assert_equal false, dispatch_inputs.fetch('target_child_id').fetch('required'), "#{base}: caller stub target_child_id must not gate dispatch"
       assert_equal '${{ inputs.target_child_id }}', stub.fetch('jobs').fetch('call').fetch('with').fetch('target_child_id'),
                    "#{base}: caller stub must forward the opaque child id verbatim"
       refute_includes body, 'target_repository:',
@@ -5599,10 +5602,39 @@ class ContinuumTest < Minitest::Test
   # github.token and surface as 404/permission errors.
   def test_pr_agent_delegated_reads_fail_closed_and_use_target
     repair = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent-repair.yml'))
+    resolve = step_body(repair, 'Resolve PR-Agent target context')
+    validate = step_body(repair, 'Validate PR-Agent target context')
     convergence = step_body(repair, 'Check durable PR-Agent no-progress state')
     target = step_body(repair, 'Resolve the writable PR source branch')
+    checkout = step_body(repair, 'Checkout the writable PR source branch')
+    refute_nil resolve, 'the target-context resolution step is missing'
+    refute_nil validate, 'the target-context validation step is missing'
     refute_nil convergence
     refute_nil target
+    refute_nil checkout, 'the target checkout step is missing'
+    # The validation must run immediately after resolution and before any
+    # checkout/push/comment so an empty target can never fall back to the
+    # execution repository.
+    resolve_at = repair.index('Resolve PR-Agent target context')
+    validate_at = repair.index('Validate PR-Agent target context')
+    checkout_at = repair.index('Checkout the writable PR source branch')
+    refute_nil resolve_at
+    refute_nil validate_at
+    refute_nil checkout_at
+    assert_operator resolve_at, :<, validate_at,
+                    'target validation must run after target resolution'
+    assert_operator validate_at, :<, checkout_at,
+                    'target validation must run before checkout'
+    assert_includes validate, 'CONTINUUM_PR_AGENT_TARGET_REPOSITORY:?'
+    assert_includes validate, 'CONTINUUM_PR_AGENT_TARGET_OWNER:?'
+    assert_includes validate, 'CONTINUUM_PR_AGENT_TARGET_REPO:?'
+    assert_includes validate, 'PR-Agent target repository identity is invalid'
+    assert_includes validate, 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED'
+    assert_includes validate, 'TAP_PAT: ${{ secrets.TAP_PAT }}'
+    assert_includes validate, 'Delegated PR-Agent execution requires TAP_PAT'
+    assert_includes validate, 'refusing to fall back to github.token'
+    assert_includes checkout, 'repository: ${{ env.CONTINUUM_PR_AGENT_TARGET_REPOSITORY }}',
+                    'checkout must target the validated resolved repository, never the parent by default'
     [convergence, target].each do |step|
       assert_includes step, 'github.token'
       assert_includes step, 'secrets.TAP_PAT'

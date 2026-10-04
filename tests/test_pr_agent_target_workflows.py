@@ -62,6 +62,8 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
         self.assertIn("CONTINUUM_PR_AGENT_TARGET_REPOSITORY", body)
         self.assertIn('gh api "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/pulls/$PR_NUMBER"', body)
         self.assertIn('"$HEAD_REPO" != "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY"', body)
+        self.assertNotIn('repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER', body)
+        self.assertNotIn('gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY"', body)
         # Checkout targets the verified repository via an opaque env
         # reference (no concrete name in committed config); push still uses
         # force-with-lease and the retry dispatch stays in the parent.
@@ -74,6 +76,46 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
         # empty and scopes delegated runs by the opaque id only.
         self.assertIn("format('pr-agent-repair-child-{0}-{1}-{2}'", body)
         self.assertIn("format('pr-agent-repair-{0}-{1}'", body)
+        # Exact-HEAD holds end to end: the writable branch must match the
+        # reviewed SHA, the checkout must equal the reviewed SHA, a long
+        # repair run revalidates before publication, and the new HEAD must
+        # descend from the reviewed HEAD.
+        self.assertIn('"$CURRENT_SHA" != "$HEAD_SHA"', body)
+        self.assertIn('if [[ "$(git rev-parse HEAD)" != "$HEAD_SHA" ]]', body)
+        self.assertIn('if [[ "$CURRENT_SHA" != "$HEAD_SHA" || "$REMOTE_SHA" != "$HEAD_SHA" ]]', body)
+        self.assertIn('git merge-base --is-ancestor "$HEAD_SHA" HEAD', body)
+        self.assertIn('git push --force-with-lease="refs/heads/$HEAD_REF:$HEAD_SHA"', body)
+        # Privacy: only the opaque child id is ever an input or concurrency
+        # scope; concrete repository identity stays runner-local via env.
+        self.assertIn("target_child_id:", body)
+        self.assertNotIn("target_repository:", body)
+        # Local behavior is unchanged: the empty-id fast path resolves from
+        # the execution repository and exits before CONTINUUM_REF is required.
+        resolve_at = body.index("Resolve PR-Agent target context")
+        resolve = body[resolve_at:resolve_at + 6000]
+        self.assertIn('if [[ -z "${TARGET_CHILD_ID:-}" ]]; then', resolve)
+        self.assertIn('CONTINUUM_REF is required for pinned target resolution', resolve)
+        self.assertLess(
+            resolve.index('if [[ -z "${TARGET_CHILD_ID:-}" ]]; then'),
+            resolve.index('CONTINUUM_REF is required for pinned target resolution'),
+        )
+
+    def test_repair_validates_target_before_checkout(self):
+        body = read(".github/workflows/continuum-pr-agent-repair.yml")
+        self.assertIn("Validate PR-Agent target context", body)
+        resolve_at = body.index("Resolve PR-Agent target context")
+        validate_at = body.index("Validate PR-Agent target context")
+        checkout_at = body.index("Checkout the writable PR source branch")
+        self.assertLess(resolve_at, validate_at)
+        self.assertLess(validate_at, checkout_at)
+        validate = body[validate_at:validate_at + 4000]
+        self.assertIn("CONTINUUM_PR_AGENT_TARGET_REPOSITORY:?", validate)
+        self.assertIn("CONTINUUM_PR_AGENT_TARGET_OWNER:?", validate)
+        self.assertIn("CONTINUUM_PR_AGENT_TARGET_REPO:?", validate)
+        self.assertIn("PR-Agent target repository identity is invalid", validate)
+        self.assertIn("CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED", validate)
+        self.assertIn("Delegated PR-Agent execution requires TAP_PAT", validate)
+        self.assertIn("refusing to fall back to github.token", validate)
 
     def test_merge_keeps_target_and_execution_repository_distinct(self):
         body = read(".github/workflows/continuum-pr-agent-auto-merge.yml")
