@@ -26,11 +26,11 @@ concurrency:
   # Do not derive this from github.workflow; a second caller name must not create
   # an independent CodeRabbit slot.
   group: coderabbit-rate-limit-controller-${{ github.repository }}
-  # This controller deliberately sleeps until the next shared quota slot.
-  # Cancelling it on every wake-up resets that timer and can starve the queue
-  # forever when status/review events keep arriving. Keep one runner alive;
-  # GitHub concurrency retains at most one pending successor behind it.
-  cancel-in-progress: false
+  # The controller is a short latest-state reconciler. When the next legal
+  # review slot is in the future it exits immediately; durable CodeRabbit
+  # comments/review timestamps retain the due time and existing event/safety-net
+  # wake-ups reconcile again later. Newer wake-ups supersede stale scans.
+  cancel-in-progress: true
 
 jobs:
   controller:
@@ -49,7 +49,7 @@ jobs:
        startsWith(github.event.comment.user.login, 'coderabbitai') &&
        github.event.pull_request.state == 'open'))
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 15
 
     permissions:
       actions: read
@@ -91,7 +91,6 @@ jobs:
             // window for every other PR, even if their old per-PR timer expired.
             const REVIEW_COOLDOWN_MS = 60 * 60_000;
             const SAFETY_MARGIN_MS = 30_000;
-            const MAX_WAIT_MS = 5 * 60 * 60_000 + 45 * 60_000;
             const IN_FLIGHT_TIMEOUT_MS = 30 * 60_000;
 
             function retryWindowText(body = '') {
@@ -852,7 +851,7 @@ jobs:
                 .sort(candidateOrder)[0] || null;
             }
 
-            async function waitForNextCandidate(state) {
+            function deferUntilNextCandidate(state) {
               if (state.candidates.length === 0) {
                 core.notice('No CodeRabbit review is currently queued.');
                 return false;
@@ -861,14 +860,7 @@ jobs:
               const nextAt = Math.min(
                 ...state.candidates.map(candidate => candidate.effectiveDueAt)
               );
-              const waitMs = Math.max(0, nextAt - Date.now());
-
-              if (waitMs === 0) return true;
-              if (waitMs > MAX_WAIT_MS) {
-                throw new Error(
-                  `Next CodeRabbit retry is ${Math.ceil(waitMs / 1000)}s away, beyond the supported controller window.`
-                );
-              }
+              if (nextAt <= Date.now()) return true;
 
               const queue = [...state.candidates]
                 .sort(candidateOrder)
@@ -878,14 +870,15 @@ jobs:
                 .join(', ');
 
               core.notice(
-                `CodeRabbit queue: ${queue}. Sleeping until ${new Date(nextAt).toISOString()}.`
+                `CodeRabbit queue: ${queue}. Deferred until ${new Date(nextAt).toISOString()}; no runner sleep. Existing review/status events and the auto-merge safety-net reconciliation will wake the controller again.`
               );
-              await new Promise(resolve => setTimeout(resolve, waitMs));
-              return true;
+              return false;
             }
 
-            // Reconcile, wait for the earliest legal shared-quota slot if
-            // necessary, then rebuild state before making exactly one write.
+            // Reconcile once. If the earliest legal shared-quota slot is still
+            // in the future, leave the runner immediately; the due time is
+            // derived from durable review/comment timestamps and will be
+            // re-evaluated by existing event/safety-net wake-ups.
             let state = await collectState();
 
             if (state.latestInFlightCommand) {
@@ -905,7 +898,7 @@ jobs:
             let selected = await chooseDueCandidate(state);
 
             if (!selected) {
-              if (!(await waitForNextCandidate(state))) return;
+              if (!deferUntilNextCandidate(state)) return;
               state = await collectState();
 
               if (state.latestInFlightCommand) {
@@ -924,7 +917,7 @@ jobs:
 
             if (!selected) {
               core.notice(
-                'Queue changed while waiting; a newer event will reconcile it.'
+                'Queue changed during final revalidation; a newer event will reconcile it.'
               );
               return;
             }
