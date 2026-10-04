@@ -925,7 +925,9 @@ class IsolationTests(unittest.TestCase):
         self.assertIn("uses: ./.github/workflows/continuum-pr-agent-repair.yml", review)
         self.assertIn("uses: ./.github/workflows/continuum-pr-agent-auto-merge.yml", review)
         self.assertIn("needs.pr_agent.outputs.needs_repair == 'true'", review)
-        self.assertIn("needs.pr_agent.outputs.needs_repair == 'false'", review)
+        self.assertIn("needs.pr_agent.outputs.ready_to_merge == 'true'", review)
+        self.assertNotIn("needs.pr_agent.outputs.needs_repair == 'false'", review)
+        self.assertIn("needs_rereview", review)
         self.assertIn("Export native persistent finding state for the reviewed HEAD", review)
         self.assertIn("parse_review_state", review)
 
@@ -1096,7 +1098,8 @@ class StabilizationParityTests(unittest.TestCase):
             self.assertIn("pr_agent_policy.js", body)
         self.assertIn("IMPROVE_REPAIR_THRESHOLD", review)
         self.assertIn("policy.buildRepairBatch", repair)
-        self.assertIn("policy.qualifyingImproveSuggestions", merge)
+        self.assertIn("policy.reviewDisposition(", review)
+        self.assertIn("policy.reviewDisposition(", merge)
 
     def test_no_progress_uses_structured_fingerprint_and_head(self):
         repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
@@ -1812,19 +1815,22 @@ class FallbackPersistentStateTests(unittest.TestCase):
 
     def test_validated_findings_route_reaches_repair(self):
         body = read_repo(".github/workflows/continuum-pr-agent.yml")
-        # The persistent export (now with fallback) precedes routing, and
-        # routing still decides from the current structured review plus
-        # qualifying improve suggestions.
+        policy = read_repo(".github/scripts/pr_agent_policy.js")
+        # The persistent export (now with fallback) precedes routing, and one
+        # canonical policy decides repair / bounded re-review / merge.
         self.assertLess(
             body.index("Export native persistent finding state"),
             body.index("Route the current PR-Agent result"),
         )
         route = body[body.index("Route the current PR-Agent result"):]
-        self.assertIn("key_issues_to_review", route)
-        self.assertIn("qualifyingImproveSuggestions", route)
+        self.assertIn("policy.reviewDisposition(", route)
         self.assertIn("needs_repair", route)
-        # Actionable results reach repair; only a clean HEAD reaches merge.
+        self.assertIn("key_issues_to_review", policy)
+        self.assertIn("qualifyingImproveSuggestions", policy)
+        # Actionable results reach repair; only the explicit ready_to_merge
+        # disposition can reach the merge workflow.
         self.assertIn("needs.pr_agent.outputs.needs_repair == 'true'", body)
+        self.assertIn("needs.pr_agent.outputs.ready_to_merge == 'true'", body)
         repair_use = body.index(
             "continuum-pr-agent-repair.yml",
             body.index("needs.pr_agent.outputs.needs_repair == 'true'"),
