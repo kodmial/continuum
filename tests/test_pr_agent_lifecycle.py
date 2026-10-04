@@ -39,11 +39,17 @@ PROTECTED_FILES = [
 # normal agent execution to stop reinstalling OpenCode/PR-Agent and instead
 # probe the prepared immutable runtime first. That task therefore requires a
 # narrow, auditable change to .github/workflows/continuum-opencode.yml: a
-# prepared-runtime probe (exact pinned version + CONTINUUM_IMAGE_DIGEST)
-# ahead of the deterministic reconstruction fallback. The zero-diff assertion
-# below is stale for that one file unless it allowlists exactly this probe;
-# any other drift must still fail. Each entry is a full added line without
-# the leading "+" as produced by `git diff`.
+# prepared-runtime probe (exact pinned version via `grep -F` + CONTINUUM_IMAGE_DIGEST
+# + GITHUB_PATH export) ahead of the deterministic reconstruction fallback.
+# The zero-diff assertion below is stale for that one file unless it
+# allowlists exactly this probe; any other drift must still fail. Each entry
+# is a full added line without the leading "+" as produced by `git diff`.
+# The GITHUB_PATH export on the warm hit is required: the cold fallback does
+# `echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"`, so a warm hit that exits
+# without it would leave later steps without opencode on PATH and prove no
+# useful work. `grep -F` is required for the task's "exact version" probe:
+# without -F the dots in "1.18.34" are regex wildcards. Both install sites
+# carry the same 13-line probe (26 added lines total).
 APPROVED_179_OPENCODE_PROBE_LINES = frozenset([
     "          # Continuum #179 prepared agent runtime: the immutable golden image",
     "          # (or its provider-native cache equivalent keyed by the image digest",
@@ -53,8 +59,9 @@ APPROVED_179_OPENCODE_PROBE_LINES = frozenset([
     "          # only a validated cache miss falls through to deterministic",
     "          # reconstruction below.",
     '          export PATH="$HOME/.opencode/bin:$PATH"',
-    '          if command -v opencode >/dev/null 2>&1 && opencode --version 2>/dev/null | grep -q "1.18.34"; then',
+    '          if command -v opencode >/dev/null 2>&1 && opencode --version 2>/dev/null | grep -F -q "1.18.34"; then',
     '            echo "prepared-runtime hit: opencode 1.18.34 already present (image digest ${CONTINUUM_IMAGE_DIGEST:-unresolved})."',
+    '            echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"',
     "            exit 0",
     "          fi",
 ])
@@ -194,8 +201,8 @@ class ProtectedBaselineTests(unittest.TestCase):
                     # probe in this file. Accept only pure additions drawn
                     # exactly from APPROVED_179_OPENCODE_PROBE_LINES; any
                     # deletion, modification, or unapproved addition still
-                    # fails. Both install sites carry the same 12-line probe
-                    # (24 added lines total), each ahead of its installer.
+                    # fails. Both install sites carry the same 13-line probe
+                    # (26 added lines total), each ahead of its installer.
                     added = []
                     deleted = []
                     for line in out.stdout.splitlines():
