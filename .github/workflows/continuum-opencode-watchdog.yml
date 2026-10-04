@@ -90,6 +90,11 @@ jobs:
     timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || vars.AUTOMATION_WATCHDOG_TIMEOUT_MINUTES || '5') }}
 
     permissions:
+      # Same-repository reads below run on READ_GITHUB_TOKEN (`github.token`),
+      # so they honour these job permissions (unlike PAT reads): issues for
+      # issues.get/listForRepo/listComments, pull-requests for pulls.list, and
+      # actions for listWorkflowRunsForRepo. The caller stub must grant at
+      # least the same scopes.
       actions: read
       contents: read
       issues: write
@@ -139,6 +144,26 @@ jobs:
               auth: readToken,
               baseUrl: github.request.endpoint.DEFAULTS.baseUrl,
             });
+            // github-script supplies the plugin-composed Octokit class, so
+            // reusing its constructor keeps the `paginate`/`rest` plugins
+            // (dynamically requiring `@actions/github` is not resolvable from
+            // the script sandbox). Confirm the composition at runtime so a
+            // future actions/github-script upgrade that returns a bare core
+            // fails fast here instead of mid-recovery with
+            // `readGithub.paginate is not a function`.
+            if (
+              typeof readGithub.paginate !== 'function' ||
+              typeof readGithub.rest?.issues?.get !== 'function' ||
+              typeof readGithub.rest?.issues?.listForRepo !== 'function' ||
+              typeof readGithub.rest?.issues?.listComments !== 'function' ||
+              typeof readGithub.rest?.pulls?.list !== 'function' ||
+              typeof readGithub.rest?.actions?.listWorkflowRunsForRepo !== 'function'
+            ) {
+              throw new Error(
+                'readGithub client lacks the paginate/rest plugins; ' +
+                'cannot perform same-repository watchdog reads.'
+              );
+            }
             let issueNumber = null;
             // Consumers that give their OpenCode caller a `run-name` of
             // `OpenCode issue #<n>` get an exact, unambiguous issue number here.
