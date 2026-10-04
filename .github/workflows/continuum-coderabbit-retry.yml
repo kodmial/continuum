@@ -132,7 +132,7 @@ jobs:
               return items;
             }
             // Single-pass memoization (#254): gate listings are shared per
-            // branch/event/workflow and issue priority per issue number, so
+            // branch/sha/event/workflow and issue priority per issue number, so
             // repeated checks in one reconciliation never re-fetch.
             const gateCache = new Map();
             const issueCache = new Map();
@@ -252,7 +252,7 @@ jobs:
             }
 
             async function latestWorkflowForHead(pr, workflowName) {
-              const cacheKey = `${pr.head.ref}|pull_request|${workflowName}`;
+              const cacheKey = `${pr.head.ref}|${pr.head.sha}|pull_request|${workflowName}`;
               if (gateCache.has(cacheKey)) return gateCache.get(cacheKey);
               // Branch/event-filtered server-side; only the newest runs can
               // decide the gate, so two pages bound the cost.

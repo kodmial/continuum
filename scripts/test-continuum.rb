@@ -5794,8 +5794,8 @@ class ContinuumTest < Minitest::Test
       'continuum-render-executor.yml' => ['continuum_bounded_slurp', 'CONTINUUM_MAX_PAGES', 'continuum-api-budget:'],
       'continuum-pr-agent.yml' => ['pr-agent-comment-page', 'SINCE_TS'],
       'continuum-pr-agent-repair.yml' => ['CONTROLLER_WINDOW_COMPLETE', 'SINCE_TS'],
-      'continuum-issue-scheduler.yml' => ['CONTINUUM_DEP_STATE', 'dep_state state', 'override_page in 1 2 3 4 5'],
-      'continuum-consumer-child-dispatcher.yml' => ['CONTINUUM_DEP_STATE', 'dep_state state', 'override_page in 1 2 3 4 5'],
+      'continuum-issue-scheduler.yml' => ['CONTINUUM_DEP_STATE', 'dep_state state', 'override_first_page', 'override_last_page'],
+      'continuum-consumer-child-dispatcher.yml' => ['CONTINUUM_DEP_STATE', 'dep_state state', 'override_first_page', 'override_last_page'],
     }.each do |name, markers|
       body = workflow_body(name)
       markers.each do |marker|
@@ -5881,7 +5881,7 @@ class ContinuumTest < Minitest::Test
   def test_api_budget_child_and_qualification_reads_are_coalesced
     worker = workflow_body('continuum-consumer-child-worker.yml')
     assert_includes worker, 'CHILD_ISSUE_JSON'
-    assert_includes worker, 'jq -r \'.title\' <"$CHILD_ISSUE_JSON"'
+    assert_includes worker, 'jq -r \'.title // ""\' <"$CHILD_ISSUE_JSON"'
 
     review = workflow_body('continuum-consumer-child-review.yml')
     assert_includes review, '--json state,mergedAt,headRefName,baseRefName'

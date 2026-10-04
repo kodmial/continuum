@@ -659,6 +659,14 @@ jobs:
               exit 1
             fi
           fi
+          # Normalize to a flat comment array: the `since` fast-path and the
+          # 5-page fallback must share one shape for the `.[]` scan below.
+          # Flatten an accidental array-of-pages so markers are never missed.
+          if jq -e 'type == "array" and length > 0 and (.[0] | type) == "array"' "$CONTROLLER_JSON" >/dev/null 2>&1; then
+            jq 'add // []' "$CONTROLLER_JSON" > "$CONTROLLER_JSON.flat" 2>/dev/null \
+              && mv "$CONTROLLER_JSON.flat" "$CONTROLLER_JSON" \
+              || echo "[]" > "$CONTROLLER_JSON"
+          fi
           mapfile -t CONTROLLER_IDS < <(
             jq -r '.[] | select(.body | contains("<!-- continuum-pr-agent-controller-state:v1 -->")) | .id' "$CONTROLLER_JSON"
           )

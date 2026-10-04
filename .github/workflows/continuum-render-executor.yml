@@ -422,10 +422,11 @@ jobs:
           # shape callers already parse with `.[][]?`, capped at
           # CONTINUUM_MAX_PAGES instead of full-history pagination.
           continuum_bounded_slurp() {
-            local url="$1" page=1 pages_out=""
+            local url="$1" page=1 pages_out="" sep="?"
+            [[ "$url" == *"?"* ]] && sep="&"
             while [[ "$page" -le "$CONTINUUM_MAX_PAGES" ]]; do
               local page_json count
-              if ! page_json="$(continuum_api_get "${url}?per_page=100&page=${page}" 2>/dev/null)"; then
+              if ! page_json="$(continuum_api_get "${url}${sep}per_page=100&page=${page}" 2>/dev/null)"; then
                 break
               fi
               count="$(jq 'length' <<<"$page_json" 2>/dev/null || echo 0)"

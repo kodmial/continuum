@@ -629,7 +629,7 @@ jobs:
             declare -A CONTINUUM_DEP_STATE=()
             dep_state() {
               local __out="$1" __dep="$2" __cached="__missing__"
-              if [[ -v 'CONTINUUM_DEP_STATE[$__dep]' ]]; then
+              if [[ -v CONTINUUM_DEP_STATE[$__dep] ]]; then
                 __cached="${CONTINUUM_DEP_STATE[$__dep]}"
               fi
               if [[ "$__cached" == "__missing__" ]]; then
@@ -734,14 +734,19 @@ jobs:
               fi
               [[ -n "$child_owner" ]] || return 1
               # Bounded comment window (#254): owner override commands are
-              # recent by construction, so five pages bound the cost
-              # without walking full comment history. A truncated window
-              # only misses an override older than 500 comments, in which
-              # case the next pass re-checks; dispatch races were already
-              # possible with polled run/PR state.
+              # recent by construction, so the newest five pages bound the
+              # cost without walking full comment history. Comments list
+              # oldest-first, so pages 1-5 would miss a recent override on
+              # a long thread; scan newest-first instead.
               recent_command=""
               override_seen=""
-              for override_page in 1 2 3 4 5; do
+              override_total="$(gh api "repos/$child_repo/issues/$task_number" --jq '.comments // 0' 2>/dev/null || echo 0)"
+              [[ "$override_total" =~ ^[0-9]+$ ]] || override_total=0
+              override_last_page=$(( (override_total + 99) / 100 ))
+              [[ "$override_last_page" -ge 1 ]] || override_last_page=1
+              override_first_page=$(( override_last_page - 4 ))
+              [[ "$override_first_page" -ge 1 ]] || override_first_page=1
+              for override_page in $(seq "$override_first_page" "$override_last_page"); do
                 override_json="$(
                   gh api "repos/$child_repo/issues/$task_number/comments?per_page=100&page=$override_page" \
                     2>/dev/null || true

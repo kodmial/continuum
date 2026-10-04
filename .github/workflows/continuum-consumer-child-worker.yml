@@ -97,7 +97,7 @@ jobs:
           # the open gate is re-checked by the dispatcher/review passes.
           CHILD_ISSUE_JSON="$RUNNER_TEMP/continuum-child-issue.json"
           gh api "repos/$child_repo/issues/$TASK_NUMBER" > "$CHILD_ISSUE_JSON" 2>/dev/null || true
-          issue_state="$(jq -r '.state // ""' <"$CHILD_ISSUE_JSON")"
+          issue_state="$(jq -r '.state // ""' <"$CHILD_ISSUE_JSON" 2>/dev/null || echo "")"
           [[ "$issue_state" == "open" ]] || exit 0
 
           workdir="$RUNNER_TEMP/continuum-child-target"
@@ -143,8 +143,8 @@ jobs:
           python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/opencode_instructions.py" install \
             --source "$CONTINUUM_ENGINE_ROOT/.github/agents/AGENTS.md"
 
-          issue_title="$(jq -r '.title' <"$CHILD_ISSUE_JSON")"
-          issue_body="$(jq -r '.body // ""' <"$CHILD_ISSUE_JSON")"
+          issue_title="$(jq -r '.title // ""' <"$CHILD_ISSUE_JSON" 2>/dev/null || echo "")"
+          issue_body="$(jq -r '.body // ""' <"$CHILD_ISSUE_JSON" 2>/dev/null || echo "")"
 
           mkdir -p "$(dirname "$result_file")"
           prompt="$RUNNER_TEMP/continuum-child-task.txt"
