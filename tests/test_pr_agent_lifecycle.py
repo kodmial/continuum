@@ -2124,6 +2124,37 @@ class ReviewDispositionIntegrationTests(unittest.TestCase):
             ).get("action"),
             "rereview",
         )
+        non_actionable_caution = make_review(
+            [],
+            recommendation="merge_with_caution",
+            extra={
+                "security_concerns": "No",
+                "ticket_compliance_check": [
+                    {"not_compliant_requirements": "-"}
+                ],
+            },
+        )
+        self.assertEqual(
+            run_policy(
+                "disposition",
+                {"review": non_actionable_caution},
+            ).get("action"),
+            "merge",
+        )
+        caution_with_gap = make_review(
+            [],
+            recommendation="merge_with_caution",
+            extra={
+                "security_concerns": "No",
+                "ticket_compliance_check": [
+                    {"not_compliant_requirements": "- missing lifecycle test"}
+                ],
+            },
+        )
+        self.assertEqual(
+            run_policy("disposition", {"review": caution_with_gap}).get("action"),
+            "rereview",
+        )
         self.assertEqual(
             run_policy(
                 "disposition",
