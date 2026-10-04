@@ -148,7 +148,7 @@ jobs:
                   if (match) lastPage = Math.max(lastPage, Number(match[1]));
                 }
                 const data = response && response.data;
-                const batch = Array.isArray(data) ? data : (data.workflow_runs || []);
+                const batch = Array.isArray(data) ? data : ((data && data.workflow_runs) || []);
                 if (batch.length === 0) break;
                 items.push(...batch);
                 if (batch.length < (params.per_page || 100)) break;

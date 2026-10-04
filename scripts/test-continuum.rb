@@ -7130,12 +7130,21 @@ class ContinuumTest < Minitest::Test
   def test_api_budget_coderabbit_unresolved_scans_newest_first_and_bounded
     body = workflow_body('continuum-coderabbit-unresolved.yml')
 
-    assert_includes body, "direction: 'desc'",
-                    'unresolved batching must read newest-first within its window'
-    assert_includes body, 'for (let page = 1; page <= 10; page += 1)',
-                    'batch collection must be page-bounded'
-    assert_includes body, 'for (let page = 1; page <= 3; page += 1)',
-                    'verification duplicate checks must be page-bounded'
+    # listReviewComments lists oldest-first and ignores sort/direction, so
+    # pages 1..N would scan only the oldest window. Both scans must anchor
+    # at the newest end via the review-comment total instead.
+    assert_includes body, 'review_comments',
+                    'unresolved batching must anchor at the newest review-comment page'
+    assert_includes body, 'lastReviewPage',
+                    'batch collection must anchor at the newest page instead of pages 1..N oldest-first'
+    assert_includes body, 'firstReviewPage',
+                    'batch collection must walk a bounded newest window'
+    assert_includes body, 'lastVerifyPage',
+                    'verification duplicate checks must anchor at the newest page'
+    assert_includes body, 'firstVerifyPage',
+                    'verification duplicate checks must walk a bounded newest window'
+    refute_includes body, "sort: 'created'",
+                    'unresolved scans must not rely on server-side sort/direction, which the endpoint ignores'
     refute_includes body, 'github.paginate(',
                     'unresolved scans must not paginate unbounded history'
   end

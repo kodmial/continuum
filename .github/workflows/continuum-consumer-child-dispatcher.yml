@@ -212,18 +212,25 @@ jobs:
               # `pending` is not a valid workflow-run status filter while
               # `action_required` (e.g. waiting for approval) is a valid
               # non-completed status: querying it keeps such runs visible so
-              # they never read as idle and dispatch twice.
+              # they never read as idle and dispatch twice. A fetch or parse
+              # failure must fail closed as active (sentinel __unknown__) so
+              # a transient error never reads as idle and double-dispatches.
               for run_status in in_progress queued waiting requested action_required; do
                 for page in 1 2 3; do
-                  run_json="$(gh api "repos/$child_repo/actions/runs?per_page=100&page=$page&status=$run_status" 2>/dev/null || true)"
-                  run_count="$(jq '.workflow_runs | length' <<<"$run_json" 2>/dev/null || echo 0)"
-                  [[ "$run_count" =~ ^[0-9]+$ ]] && [[ "$run_count" -gt 0 ]] || break
+                  if ! run_json="$(gh api "repos/$child_repo/actions/runs?per_page=100&page=$page&status=$run_status" 2>/dev/null)"; then
+                    echo "::warning::run lookup failed for status=$run_status page=$page; assuming active to avoid double-dispatch." >&2
+                    echo "__unknown__"
+                    break 2
+                  fi
+                  run_count="$(jq '.workflow_runs | length' <<<"$run_json" 2>/dev/null || echo -1)"
+                  [[ "$run_count" =~ ^[0-9]+$ ]] || { echo "__unknown__"; break 2; }
+                  [[ "$run_count" -gt 0 ]] || break
                   jq -r '.workflow_runs[]
                       | select(.status != "completed")
                       | .display_title
                       | select(test("^OpenCode issue #[0-9]+$"))
                       | capture("^OpenCode issue #(?<task>[0-9]+)$").task' \
-                    <<<"$run_json" 2>/dev/null || break
+                    <<<"$run_json" 2>/dev/null || { echo "__unknown__"; break 2; }
                   [[ "$run_count" -lt 100 ]] && break
                 done
               done
@@ -235,6 +242,11 @@ jobs:
               local task_number="$1"
               local recent_command command_epoch now_epoch
 
+              # Fail closed: an unknown run-lookup state means active work
+              # cannot be ruled out, so never dispatch behind it.
+              if grep -Fxq "__unknown__" <<<"$local_opencode_run_tasks"; then
+                return 0
+              fi
               if grep -Fxq "$task_number" <<<"$local_opencode_pr_tasks" ||
                  grep -Fxq "$task_number" <<<"$local_opencode_run_tasks"; then
                 return 0

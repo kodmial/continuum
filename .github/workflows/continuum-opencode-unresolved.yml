@@ -54,7 +54,13 @@ jobs:
           # CONTINUUM_MAX_COMMENT_PAGES pages instead, enforcing
           # newest-first client-side. A truncated or unanchorable window
           # fails closed (dispatch=false) and never fires a stale retry.
-          MAX_PAGES="${CONTINUUM_MAX_COMMENT_PAGES:-5}"
+          MAX_PAGES_RAW="${CONTINUUM_MAX_COMMENT_PAGES:-5}"
+          if [[ "$MAX_PAGES_RAW" =~ ^[0-9]+$ ]] && [[ "$MAX_PAGES_RAW" -ge 1 ]]; then
+            MAX_PAGES="$MAX_PAGES_RAW"
+          else
+            MAX_PAGES=5
+          fi
+          [[ "$MAX_PAGES" -gt 5 ]] && MAX_PAGES=5
           INCLUDE="$(gh api --include "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/comments?per_page=100&page=1" 2>/dev/null || true)"
           HEADERS="$(tr -d '\r' <<<"$INCLUDE" | sed -n '1,/^$/p')"
           LINK_LAST="$(grep -i '^link:' <<<"$HEADERS" | tr '[:upper:]' '[:lower:]' | sed -nE 's/.*<[^>]*[?&]page=([0-9]+)[^>]*>[[:space:]]*;[[:space:]]*rel="last".*/\1/p' | tail -n 1)"
@@ -80,6 +86,7 @@ jobs:
           page="$FIRST_PAGE"
           while [[ "$page" -le "$LAST_PAGE" ]]; do
             page_json="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/comments?per_page=100&page=${page}" 2>/dev/null || true)"
+            if ! jq -e 'type == "array"' <<<"$page_json" >/dev/null 2>&1; then page=$((page + 1)); continue; fi
             count="$(jq 'length' <<<"$page_json" 2>/dev/null || echo 0)"
             [[ "$count" =~ ^[0-9]+$ ]] && [[ "$count" -gt 0 ]] || { page=$((page + 1)); continue; }
             COMMENT_PAGES+="$page_json"$'\n'
@@ -87,8 +94,10 @@ jobs:
           done
           if [[ -z "$COMMENT_PAGES" ]]; then
             COMMENTS="[]"
-          else
-            COMMENTS="$(jq -s 'add // []' <<<"$(grep -v '^$' <<<"$COMMENT_PAGES" || true)")"
+          elif ! COMMENTS="$(jq -s 'add // []' <<<"$(grep -v '^$' <<<"$COMMENT_PAGES" || true)")"; then
+            echo "Could not aggregate review-comment pages; ignoring UNRESOLVED reply."
+            echo "dispatch=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
           VERIFICATION=$(jq -c \
@@ -127,7 +136,7 @@ jobs:
           echo "dispatch=true" >> "$GITHUB_OUTPUT"
           echo "review_id=$REVIEW_ID" >> "$GITHUB_OUTPUT"
           echo "Matched UNRESOLVED comment $UNRESOLVED_COMMENT_ID to finding $FINDING_ID, review $REVIEW_ID, HEAD $HEAD_SHA."
-          echo "continuum-api-budget: comment_pages=$(( LAST_PAGE - FIRST_PAGE + 1 )) max_pages=${CONTINUUM_MAX_COMMENT_PAGES:-5}"
+          echo "continuum-api-budget: comment_pages=$(( LAST_PAGE - FIRST_PAGE + 1 )) max_pages=${MAX_PAGES} raw_CONTINUUM_MAX_COMMENT_PAGES=${CONTINUUM_MAX_COMMENT_PAGES:-5}"
 
       - name: Dispatch OpenCode retry
         if: steps.context.outputs.dispatch == 'true'
