@@ -336,6 +336,150 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+      # One authoritative task-context resolver is shared by initial issue
+      # implementation and later CI repair. PR metadata and failing logs are
+      # diagnostic evidence; the resolved issue body/DoD remains the task spec.
+      - name: Resolve authoritative task context
+        id: task_context
+        if: >-
+          (github.event_name == 'workflow_dispatch' &&
+           (inputs.mode == 'issue' || inputs.mode == 'ci-fix')) ||
+          (github.event_name == 'issue_comment' &&
+           !github.event.issue.pull_request &&
+           github.actor == github.repository_owner &&
+           (contains(github.event.comment.body, '/oc') ||
+            contains(github.event.comment.body, '/opencode')) &&
+           !contains(github.event.comment.body, '/oc-cancel'))
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          MODE: ${{ inputs.mode }}
+          ISSUE_NUMBER: ${{ inputs.issue_number || github.event.issue.number || '' }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        with:
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const repository = `${owner}/${repo}`;
+            const mode = String(process.env.MODE || '').trim();
+            const issueEventNumber = Number(process.env.ISSUE_NUMBER || 0);
+            const prNumber = Number(process.env.PR_NUMBER || 0);
+
+            let taskRepository = '';
+            let taskNumber = 0;
+            let source = '';
+            let prTitle = '';
+            let prBody = '';
+
+            if (mode === 'issue' || (!mode && issueEventNumber > 0)) {
+              if (!Number.isInteger(issueEventNumber) || issueEventNumber <= 0) {
+                core.setFailed('Issue implementation has no valid authoritative issue number.');
+                return;
+              }
+              taskRepository = repository;
+              taskNumber = issueEventNumber;
+              source = 'issue-dispatch';
+            } else if (mode === 'ci-fix') {
+              if (!Number.isInteger(prNumber) || prNumber <= 0) {
+                core.setFailed('CI repair has no valid pull request number.');
+                return;
+              }
+              let pr;
+              try {
+                ({ data: pr } = await github.rest.pulls.get({
+                  owner, repo, pull_number: prNumber,
+                }));
+              } catch (err) {
+                core.setFailed(`CI repair could not fetch pull request #${prNumber}: ${err.message || err}`);
+                return;
+              }
+              prTitle = String(pr.title || '');
+              prBody = String(pr.body || '');
+
+              const marker = prBody.match(
+                /<!--\s*continuum-task-context\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s*-->/i
+              );
+              if (marker) {
+                taskRepository = marker[1];
+                taskNumber = Number(marker[2]);
+                source = 'canonical-marker';
+              }
+
+              if (!taskNumber) {
+                const crossRepo = prBody.match(
+                  /(?:implements|closes|fixes|resolves|relates\s+to)\s+(?:https:\/\/github\.com\/)?([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)(?:\/issues\/|#)(\d+)/i
+                );
+                if (crossRepo) {
+                  taskRepository = crossRepo[1];
+                  taskNumber = Number(crossRepo[2]);
+                  source = 'legacy-cross-repo-reference';
+                }
+              }
+
+              if (!taskNumber) {
+                const sameRepo = prBody.match(
+                  /(?:implements|closes|fixes|resolves|relates\s+to|automated\s+implementation\s+for)\s+#(\d+)/i
+                );
+                if (sameRepo) {
+                  taskRepository = repository;
+                  taskNumber = Number(sameRepo[1]);
+                  source = 'legacy-same-repo-reference';
+                }
+              }
+
+              if (!taskNumber) {
+                const headFullName = String(pr.head?.repo?.full_name || '').toLowerCase();
+                const branchIssue = String(pr.head?.ref || '').match(/^opencode\/issue(\d+)-/i);
+                if (branchIssue && headFullName === repository.toLowerCase()) {
+                  taskRepository = repository;
+                  taskNumber = Number(branchIssue[1]);
+                  source = 'legacy-branch-identity';
+                }
+              }
+            }
+
+            core.setOutput('pr_title', prTitle);
+            core.setOutput('pr_body', prBody);
+
+            if (!taskRepository || !Number.isInteger(taskNumber) || taskNumber <= 0) {
+              core.setOutput('present', 'false');
+              core.setOutput('source', 'none');
+              core.notice('No authoritative task issue could be resolved; repair must not invent one.');
+              return;
+            }
+
+            const parts = taskRepository.split('/');
+            if (parts.length !== 2 || parts.some(part => !part)) {
+              core.setFailed(`Invalid task repository '${taskRepository}'.`);
+              return;
+            }
+
+            let issue;
+            try {
+              const response = await github.rest.issues.get({
+                owner: parts[0], repo: parts[1], issue_number: taskNumber,
+              });
+              issue = response.data;
+            } catch (err) {
+              core.setFailed(
+                `Authoritative task ${taskRepository}#${taskNumber} could not be fetched: ${err.message || err}`
+              );
+              return;
+            }
+            if (issue.pull_request) {
+              core.setFailed(`Resolved task ${taskRepository}#${taskNumber} is a pull request, not an issue.`);
+              return;
+            }
+
+            core.setOutput('present', 'true');
+            core.setOutput('source', source);
+            core.setOutput('task_repo', taskRepository);
+            core.setOutput('task_number', String(taskNumber));
+            core.setOutput('task_title', String(issue.title || ''));
+            core.setOutput('task_body', String(issue.body || ''));
+            core.setOutput('task_url', String(issue.html_url || ''));
+            core.notice(`Resolved authoritative task ${taskRepository}#${taskNumber} via ${source}.`);
+
       - name: Check issue Definition of Ready
         id: issue_readiness
         if: >-
@@ -653,10 +797,11 @@ jobs:
           # qualification gate, so a qualifying issue gets a non-closing
           # body and the gate completes it only on exact-SHA evidence.
           RECOVER_ISSUE_BODY="$(gh issue view "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --json body --jq '.body // ""')"
+          TASK_MARKER="<!-- continuum-task-context repo=${GITHUB_REPOSITORY} issue=${ISSUE_NUMBER} -->"
           if grep -Eqi '<!--[[:space:]]*automation-qualification:' <<<"$RECOVER_ISSUE_BODY"; then
-            BODY="$(printf 'Recovered automatically after the OpenCode agent changed branches during issue #%s execution.\n\nRelates to #%s\n\nMandatory live qualification is declared on #%s; this PR must not auto-close it. The qualification gate completes it only on exact-SHA pass evidence.' "$ISSUE_NUMBER" "$ISSUE_NUMBER" "$ISSUE_NUMBER")"
+            BODY="$(printf '%s\n\nRecovered automatically after the OpenCode agent changed branches during issue #%s execution.\n\nRelates to #%s\n\nMandatory live qualification is declared on #%s; this PR must not auto-close it. The qualification gate completes it only on exact-SHA pass evidence.' "$TASK_MARKER" "$ISSUE_NUMBER" "$ISSUE_NUMBER" "$ISSUE_NUMBER")"
           else
-            BODY="$(printf 'Recovered automatically after the OpenCode agent changed branches during issue #%s execution.\n\nCloses #%s' "$ISSUE_NUMBER" "$ISSUE_NUMBER")"
+            BODY="$(printf '%s\n\nRecovered automatically after the OpenCode agent changed branches during issue #%s execution.\n\nCloses #%s' "$TASK_MARKER" "$ISSUE_NUMBER" "$ISSUE_NUMBER")"
           fi
           gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$CURRENT_BRANCH" --title "$TITLE" --body "$BODY"
 
@@ -676,6 +821,12 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
           OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
           ISSUE_NUMBER: ${{ inputs.issue_number || github.event.issue.number }}
+          TASK_CONTEXT_PRESENT: ${{ steps.task_context.outputs.present }}
+          TASK_REPO: ${{ steps.task_context.outputs.task_repo }}
+          TASK_NUMBER: ${{ steps.task_context.outputs.task_number }}
+          ISSUE_TITLE: ${{ steps.task_context.outputs.task_title }}
+          ISSUE_BODY: ${{ steps.task_context.outputs.task_body }}
+          ISSUE_URL: ${{ steps.task_context.outputs.task_url }}
           BASE_REF: ${{ inputs.base_ref || vars.CONTINUUM_ISSUE_BASE_REF || 'main' }}
           KNOWLEDGE_PROTOCOL_PATH: ${{ inputs.knowledge_protocol_path }}
           KNOWLEDGE_RECORDS_DIR: ${{ inputs.knowledge_records_dir }}
@@ -685,11 +836,12 @@ jobs:
           CI_WORKFLOW_ID: ${{ inputs.ci_workflow_id }}
         run: |
           set -euo pipefail
-          [[ -n "$ISSUE_NUMBER" ]] || { echo "::error::Missing issue number for issue mode."; exit 1; }
-
-          ISSUE_JSON="$(gh issue view "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --json title,body,url)"
-          ISSUE_TITLE="$(jq -r .title <<<"$ISSUE_JSON")"
-          ISSUE_BODY="$(jq -r '.body // ""' <<<"$ISSUE_JSON")"
+          [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::Missing or invalid issue number for issue mode: '${ISSUE_NUMBER}'."; exit 1; }
+          [[ "$TASK_CONTEXT_PRESENT" == "true" ]] || { echo "::error::Authoritative task context was not resolved."; exit 1; }
+          [[ "${TASK_REPO,,}" == "${GITHUB_REPOSITORY,,}" && "$TASK_NUMBER" == "$ISSUE_NUMBER" ]] || {
+            echo "::error::Resolved task context $TASK_REPO#$TASK_NUMBER does not match issue mode $GITHUB_REPOSITORY#$ISSUE_NUMBER."
+            exit 1
+          }
 
           # Mandatory qualification execution mode. When this issue was
           # dispatched from a continuum-qualification-dispatch marker, the
@@ -802,12 +954,15 @@ jobs:
           git switch -c "$BRANCH"
 
           PROMPT="$(cat <<EOF
-          Implement GitHub issue #${ISSUE_NUMBER} completely.
+          Implement the authoritative task ${TASK_REPO}#${TASK_NUMBER} completely.
+
+          Task URL:
+          ${ISSUE_URL}
 
           Title:
           ${ISSUE_TITLE}
 
-          Specification:
+          Specification / Definition of Done:
           ${ISSUE_BODY}
 
           Requirements:
@@ -907,10 +1062,11 @@ jobs:
             # auto-closed by PR keywords: `Closes #N` would bypass the
             # qualification gate, so a qualifying issue gets a non-closing
             # body and the gate completes it only on exact-SHA evidence.
+            TASK_MARKER="<!-- continuum-task-context repo=${GITHUB_REPOSITORY} issue=${ISSUE_NUMBER} -->"
             if grep -Eqi '<!--[[:space:]]*automation-qualification:' <<<"$ISSUE_BODY"; then
-              PR_BODY="$(printf 'Automated implementation for #%s.\n\nRelates to #%s\n\nMandatory live qualification is declared on #%s; this PR must not auto-close it. The qualification gate records the merged main SHA and dispatches qualification after merge.' "$ISSUE_NUMBER" "$ISSUE_NUMBER" "$ISSUE_NUMBER")"
+              PR_BODY="$(printf '%s\n\nAutomated implementation for #%s.\n\nRelates to #%s\n\nMandatory live qualification is declared on #%s; this PR must not auto-close it. The qualification gate records the merged main SHA and dispatches qualification after merge.' "$TASK_MARKER" "$ISSUE_NUMBER" "$ISSUE_NUMBER" "$ISSUE_NUMBER")"
             else
-              PR_BODY="$(printf 'Automated implementation for #%s.\n\nCloses #%s' "$ISSUE_NUMBER" "$ISSUE_NUMBER")"
+              PR_BODY="$(printf '%s\n\nAutomated implementation for #%s.\n\nCloses #%s' "$TASK_MARKER" "$ISSUE_NUMBER" "$ISSUE_NUMBER")"
             fi
             PR_URL="$(gh pr create --repo "$GITHUB_REPOSITORY" \
               --base "$BASE_REF" \
@@ -1178,24 +1334,59 @@ jobs:
           PR_NUMBER: ${{ inputs.pr_number }}
           RUN_ID: ${{ inputs.run_id }}
           HEAD_REF: ${{ inputs.head_ref }}
+          TASK_CONTEXT_PRESENT: ${{ steps.task_context.outputs.present }}
+          TASK_CONTEXT_SOURCE: ${{ steps.task_context.outputs.source }}
+          TASK_REPO: ${{ steps.task_context.outputs.task_repo }}
+          TASK_NUMBER: ${{ steps.task_context.outputs.task_number }}
+          TASK_TITLE: ${{ steps.task_context.outputs.task_title }}
+          TASK_BODY: ${{ steps.task_context.outputs.task_body }}
+          TASK_URL: ${{ steps.task_context.outputs.task_url }}
+          PR_TITLE: ${{ steps.task_context.outputs.pr_title }}
+          PR_BODY: ${{ steps.task_context.outputs.pr_body }}
         run: |
           set -euo pipefail
-          PROMPT=$(cat <<EOF
-          Fix the failed blocking workflow for pull request #${PR_NUMBER}.
 
-          Context:
-          - The current checkout is the existing PR head branch: ${HEAD_REF}.
-          - The failed workflow run id is ${RUN_ID}.
-          - Inspect that run, its workflow name, failed jobs and logs using GitHub CLI/API before changing code.
+          if [[ "$TASK_CONTEXT_PRESENT" == "true" ]]; then
+            TASK_CONTEXT_BLOCK="$(cat <<EOF
+          Authoritative task (resolved via ${TASK_CONTEXT_SOURCE}):
+          ${TASK_REPO}#${TASK_NUMBER}
+          ${TASK_URL}
+
+          Task title:
+          ${TASK_TITLE}
+
+          Task specification / Definition of Done:
+          ${TASK_BODY}
+          EOF
+            )"
+          else
+            TASK_CONTEXT_BLOCK="No authoritative task issue was resolved for this legacy PR. Do not fabricate one; constrain changes to the existing PR intent and the concrete failing validation."
+          fi
+
+          PROMPT=$(cat <<EOF
+          Repair pull request #${PR_NUMBER} without losing the task contract.
+
+          ${TASK_CONTEXT_BLOCK}
+
+          Current PR:
+          Title: ${PR_TITLE}
+          Body:
+          ${PR_BODY}
+
+          Failure evidence:
+          - Current checkout/PR head branch: ${HEAD_REF}.
+          - Failed blocking workflow run id: ${RUN_ID}.
+          - Inspect that exact run, failed jobs and logs using GitHub CLI/API before changing code.
 
           Requirements:
-          - Identify the concrete workflow failure from the logs and fix its root cause.
-          - Keep the change scoped to the failure; do not make unrelated refactors.
-          - If the failure is clearly transient or external infrastructure, do not make a
-            speculative code change; explain the reason in the existing PR conversation.
-          - Work only in the current checked-out PR branch. Do not create or switch to
-            another branch and do not create a new pull request.
-          - Run the relevant tests, linters, or validation locally in the runner when practical.
+          - When authoritative task context is present, treat its specification and Definition of Done as authoritative, exactly as the initial implementation run does.
+          - Use the PR diff and failed workflow logs to diagnose the defect; they do not replace or narrow the task contract.
+          - Identify the concrete workflow failure and fix the root cause while preserving the complete task intent.
+          - Never weaken, delete, skip, or special-case a validation merely to make CI green. If a validation assertion is stale, change it only after proving from the authoritative task and current implementation contract that the assertion is wrong.
+          - Keep the change scoped to the failure and task contract; do not make unrelated refactors.
+          - If the failure is clearly transient or external infrastructure, do not make a speculative code change; explain the reason in the existing PR conversation.
+          - Work only in the current checked-out PR branch. Do not create or switch to another branch and do not create a new pull request.
+          - Run the repository's complete relevant validation locally after the final edit when possible.
           - Commit and push any required fix to the current PR branch so the existing PR updates.
           - Keep all comments and commit messages in English.
           EOF

@@ -16,7 +16,10 @@ import unittest
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 SRC = os.path.join(ROOT, "src")
 
-BASELINE_SHA = "5833457ec6036188d1ec1a11d7c85cab8b2a7c73"
+# Protected OpenCode files may move only through an explicit, independently
+# reviewed core change. Issue #212 intentionally advances the handoff contract;
+# PR-Agent isolation remains a zero-diff check from this new baseline.
+BASELINE_SHA = "4a52c185ca92aa7268b7b404ba7dff29ebd03897"
 
 PROTECTED_FILES = [
     ".github/workflows/continuum-opencode.yml",
