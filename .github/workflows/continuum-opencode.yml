@@ -1263,12 +1263,14 @@ jobs:
           )"
           opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
 
-          # Qualification mode cannot push product changes: any working-tree
-          # diff is forbidden. Discard tool droppings that are not product
-          # changes, then fail closed when product files changed.
-          if [[ -n "$(git status --porcelain)" ]]; then
+          # Qualification mode cannot push product changes: untracked tool
+          # droppings are discarded silently, and only tracked working-tree
+          # diffs are forbidden. Discard untracked files first so a leftover
+          # log/tmp file next to valid evidence does not fail the run.
+          git clean -fd >/dev/null 2>&1 || true
+          if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
             echo "::error::Qualification mode produced repository changes, which are forbidden. Discarding them."
-            git status --porcelain
+            git status --porcelain --untracked-files=no
             git reset --hard HEAD >/dev/null 2>&1 || true
             git clean -fd >/dev/null 2>&1 || true
             gh issue comment "$QUALIFICATION_NUMBER" --repo "$GITHUB_REPOSITORY" \
@@ -1283,7 +1285,7 @@ jobs:
             [ .[] |
               select(
                 ( .author_association == "OWNER" or .author_association == "MEMBER" or
-                  .author_association == "COLLABORATOR" or .author.login == "github-actions[bot]" )
+                  .author_association == "COLLABORATOR" or .user.login == "github-actions[bot]" or .author.login == "github-actions[bot]" )
                 and ( (.body // "") | contains("continuum-qualification-dispatch") | not )
                 and (
                   ((.body // "") | test("<!--[ \\t]*continuum-qualification-result[ \\t>]")) or
@@ -1825,10 +1827,21 @@ jobs:
             // human-gated pause: exhausted immediate retries fall back to a
             // bounded lease/backoff and resume automatically with the same
             // immutable run identity (capability + qualification + SHA).
+            // A dispatch marker counts only from a trusted author
+            // (OWNER/MEMBER/COLLABORATOR or repository automation); a public
+            // forgery must never switch a normal failure into the
+            // qualification unpause-and-retry path.
+            const isTrustedDispatchComment = comment => {
+              const association = String(comment?.author_association || '').toUpperCase();
+              if (['OWNER', 'MEMBER', 'COLLABORATOR'].includes(association)) return true;
+              const login = String(comment?.user?.login || comment?.author?.login || '');
+              return login === 'github-actions[bot]';
+            };
             const isQualificationRun =
               (context.payload.inputs?.mode === 'qualification') ||
               '${{ inputs.mode }}' === 'qualification' ||
               comments.some(comment =>
+                isTrustedDispatchComment(comment) &&
                 (comment.body || '').includes('continuum-qualification-dispatch')
               );
 

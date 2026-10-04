@@ -246,8 +246,12 @@ def is_trusted_comment(comment: object, allow_automation: bool = False) -> bool:
     automation (``github-actions[bot]``) is trusted only where the caller
     explicitly allows it (dispatch control and controller result payloads).
     Plain string bodies predate author metadata and are treated as trusted
-    for backward compatibility; structured callers must pass mappings so
-    public forgeries are rejected.
+    for backward compatibility of already-vetted local inputs only; live
+    callers aggregating issue comments must pass mappings carrying
+    ``author_association``/``user.login`` so public forgeries are rejected
+    (see ``qualification_gate.py evidence-state``, which builds a
+    structured comment from caller-attested authorship instead of passing
+    a bare body).
     """
 
     if isinstance(comment, str):

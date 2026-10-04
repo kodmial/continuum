@@ -4545,6 +4545,7 @@ class ContinuumTest < Minitest::Test
     opencode = File.read(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
     engine = File.read(File.join(ROOT, 'src/continuum/qualification.py'))
     stub = File.read(File.join(ROOT, '.github/caller-stubs/continuum-issue-scheduler.yml'))
+    cli = File.read(File.join(ROOT, '.github/scripts/qualification_gate.py'))
 
     # Evidence integrity: dispatch prose never counts, only trusted actors
     # count, exact SHA and issue number remain mandatory, latest trusted wins.
@@ -4604,6 +4605,16 @@ class ContinuumTest < Minitest::Test
     assert_includes stub, "contains(github.event.comment.body, 'continuum-docker-qualification-result')"
     assert_includes stub, "contains(github.event.comment.body, 'continuum-render-qualification-result')"
     assert_includes stub, 'schedule:'
+    # Trust hardening: result-marker wakes are gated on repository trust so a
+    # public forgery cannot burn Actions minutes; automation evidence reads
+    # user.login (the issue-comments API shape); dispatch trust is checked in
+    # JS; untracked droppings are discarded before the clean-tree verdict.
+    assert_includes stub, "github.event.comment.author_association == 'OWNER'"
+    assert_includes stub, "github.actor == 'github-actions[bot]'"
+    assert_includes opencode, '.user.login == "github-actions[bot]"'
+    assert_includes opencode, 'isTrustedDispatchComment'
+    assert_includes opencode, '--untracked-files=no'
+    assert_includes cli, '--author-association'
   end
 
   end
