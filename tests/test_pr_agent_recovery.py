@@ -193,6 +193,21 @@ class RecoveryDecisionTests(unittest.TestCase):
         )
         self.assertEqual(decision.action, "wait")
 
+    def test_dispatch_grace_rechecks_exact_active_operation(self):
+        body = self.read(".github/workflows/continuum-pr-agent-recovery.yml")
+        helper_start = body.index("async function operationIsActive")
+        helper_end = body.index("async function statusRunMetadata", helper_start)
+        helper = body[helper_start:helper_end]
+        self.assertIn("const runs = await listReviewRuns();", helper)
+        self.assertIn(
+            "return Boolean(exactActiveRun(runs, prNumber, kind, head));",
+            helper,
+        )
+        self.assertIn(
+            "await operationIsActive(pr.number, head, kind)",
+            body,
+        )
+
     def test_lost_dispatch_replays_same_attempt_instead_of_burning_slot(self):
         evidence = recovery.RetryEvidence(latest_attempt=1)
         decision = recovery.decide_recovery(
