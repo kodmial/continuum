@@ -277,7 +277,7 @@ jobs:
           - Fix defects directly on this PR branch and rerun verification.
           - Never expose credentials or secret values.
           - Do not upload child source, diffs, issue text, logs, or transcripts to the parent repository.
-          - You may make local commits. Do not push; the outer review job pushes the branch.
+          - Leave fixes as working-tree changes; do not commit or push. The outer review job publishes one bot-identity commit.
           - Before finishing, create or update exactly: $review_file
           - Record findings, repairs, verification executed, observed results, remaining risks.
           - End with a standalone line exactly: Review: PASS
@@ -347,7 +347,8 @@ jobs:
 
           if [[ -n "$(git status --porcelain)" ]]; then
             git add -A
-            git commit -m "task #$TASK_NUMBER: delegated independent review" >/dev/null 2>&1
+            # kodmial/continuum#260: bot identity plus component trailer.
+            git commit -m "task #$TASK_NUMBER: delegated independent review" -m "Continuum-Component: delegation-review" >/dev/null 2>&1
           fi
           if [[ "$(git rev-list --count "origin/$head_ref"..HEAD)" -gt 0 ]]; then
             git push origin "HEAD:$head_ref" >/dev/null 2>&1

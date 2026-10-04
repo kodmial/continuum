@@ -304,7 +304,9 @@ jobs:
           fi
 
           git add -A
-          git commit -m "fix: address unresolved CodeRabbit findings"
+          # kodmial/continuum#260: workflow-owned repair commit uses the bot
+          # identity (see Configure Git identity) plus the component trailer.
+          git commit -m "fix: address unresolved CodeRabbit findings" -m "Continuum-Component: coderabbit-unresolved"
           git push origin "HEAD:${HEAD_REF}"
           echo "changed=true" >> "$GITHUB_OUTPUT"
           echo "verify=true" >> "$GITHUB_OUTPUT"

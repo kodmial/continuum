@@ -205,7 +205,7 @@ jobs:
           - Run relevant tests and any live/integration verification required by the issue.
           - Never print, persist, or expose credentials or secret values.
           - Do not upload child source, diffs, issue text, logs, or agent transcripts to the parent repository.
-          - You may use local git operations, including commits. Do not push; the outer worker publishes the branch.
+          - You may use local git reads; do not commit or push. Leave changes in the working tree; the outer worker publishes one bot-identity commit.
           - Before finishing, create or update exactly: $result_file
           - Record scope, files/areas changed, verification executed, observed results, remaining risks.
           - End with a standalone line exactly: Acceptance: PASS
@@ -259,7 +259,9 @@ jobs:
 
           if [[ -n "$(git status --porcelain)" ]]; then
             git add -A
-            git commit -m "task #$TASK_NUMBER: delegated implementation" >/dev/null 2>&1
+            # kodmial/continuum#260: workflow-owned delegated commit uses the
+            # bot identity plus the component trailer (never the child repo).
+            git commit -m "task #$TASK_NUMBER: delegated implementation" -m "Continuum-Component: delegation-worker" >/dev/null 2>&1
           fi
           [[ "$(git rev-list --count "$base_sha"..HEAD)" -gt 0 ]] || exit 32
 
