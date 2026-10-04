@@ -1883,6 +1883,16 @@ class FallbackPersistentStateTests(unittest.TestCase):
         self.assertIn("PR head moved during review", body)
         self.assertIn("the review is stale", body)
 
+    def test_persistent_active_findings_are_scoped_to_exact_reviewed_head(self):
+        body = read_repo(".github/workflows/continuum-pr-agent.yml")
+        self.assertIn('finding.get("last_seen_head_sha")', body)
+        self.assertIn(
+            "ACTIVE PR-Agent persistent finding has no last_seen_head_sha; failing closed.",
+            body,
+        )
+        self.assertIn("last_seen_head != reviewed", body)
+        self.assertIn("Ignored {stale_active} stale ACTIVE persistent finding(s)", body)
+
     def test_improve_only_repair_path_remains_functional(self):
         suggestion = {
             "relevant_file": "src/app.py",
