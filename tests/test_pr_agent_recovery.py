@@ -240,7 +240,9 @@ class RecoveryDecisionTests(unittest.TestCase):
             evidence=recovery.RetryEvidence(),
         )
         self.assertEqual(decision.action, "dispatch")
-        self.assertEqual(decision.attempt, 1)
+        # Consistent 10-execution contract: first execution is index 0 on
+        # every path (no marker means no recovery execution has run yet).
+        self.assertEqual(decision.attempt, 0)
 
     def test_timed_out_repair_recovers(self):
         decision = recovery.decide_recovery(
@@ -260,7 +262,8 @@ class RecoveryDecisionTests(unittest.TestCase):
             status_age_seconds=recovery.STALE_AFTER_SECONDS + 1,
         )
         self.assertEqual(decision.action, "dispatch")
-        self.assertEqual(decision.attempt, 1)
+        # Consistent 10-execution contract: first execution is index 0.
+        self.assertEqual(decision.attempt, 0)
 
     def test_active_exact_run_coalesces_duplicate_wakeup(self):
         decision = recovery.decide_recovery(
@@ -330,7 +333,9 @@ class RecoveryDecisionTests(unittest.TestCase):
             operation_context="continuum/pr-agent-review",
         )
         self.assertEqual(decision.action, "dispatch")
-        self.assertEqual(decision.attempt, 1)
+        # Consistent 10-execution contract: first execution is index 0 on
+        # every path, so failure and lost-wakeup both dispatch 0..9.
+        self.assertEqual(decision.attempt, 0)
 
     def test_deterministic_failure_is_not_retried(self):
         decision = recovery.decide_recovery(
@@ -1564,6 +1569,101 @@ console.log('CASES:' + JSON.stringify(results));
         for case, green in results.items():
             with self.subTest(case=case):
                 self.assertTrue(green, f"deadlock fixture {case} regressed")
+
+
+class RecoveryRepairTests(unittest.TestCase):
+    def read(self, path: str) -> str:
+        with open(os.path.join(ROOT, path), "r", encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_bot_markers_count_but_external_cannot_forge(self):
+        marker = (
+            "<!-- continuum-pr-agent-retry head=" + HEAD + " kind=review attempt=2 -->"
+        )
+        bot = {
+            "body": marker,
+            "author_association": "NONE",
+            "user": {"login": "github-actions[bot]"},
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.assertEqual(
+            recovery.retry_evidence([bot], head_sha=HEAD, kind="review").latest_attempt,
+            2,
+        )
+        external = dict(bot)
+        external["user"] = {"login": "someone-else"}
+        external["author_association"] = "CONTRIBUTOR"
+        self.assertIsNone(
+            recovery.retry_evidence(
+                [external], head_sha=HEAD, kind="review"
+            ).latest_attempt
+        )
+
+    def test_exhaust_returns_budget_count(self):
+        decision = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="transient; recovery eligible",
+            operation_context="continuum/pr-agent-review",
+            evidence=recovery.RetryEvidence(latest_attempt=9),
+        )
+        self.assertEqual(decision.action, "exhaust")
+        self.assertEqual(decision.attempt, recovery.MAX_EXECUTIONS)
+
+    def test_lost_wakeup_holds_on_deterministic_hint(self):
+        held = recovery.decide_recovery(
+            ci_green=True,
+            operation_state=None,
+            operation_description="merge conflict on HEAD",
+        )
+        self.assertEqual(held.action, "hold")
+        dispatched = recovery.decide_recovery(
+            ci_green=True, operation_state=None
+        )
+        self.assertEqual(dispatched.action, "dispatch")
+        self.assertEqual(dispatched.attempt, 0)
+
+    def test_safe_operation_key_isolates_one_bad_head(self):
+        self.assertIsNone(recovery.safe_operation_key(1, "abc1234", "review"))
+        self.assertEqual(
+            recovery.safe_operation_key(1, HEAD, "review"),
+            recovery.operation_key(1, HEAD, "review"),
+        )
+        # A batch scan over mixed heads keeps healthy PRs behind one bad entry.
+        keys = [
+            recovery.safe_operation_key(n, h, "review")
+            for n, h in [(1, HEAD), (2, "short"), (3, HEAD)]
+        ]
+        self.assertIsNotNone(keys[0])
+        self.assertIsNone(keys[1])
+        self.assertIsNotNone(keys[2])
+
+    def test_auto_merge_has_no_sticky_pat_fallback(self):
+        body = self.read(".github/workflows/continuum-auto-merge.yml")
+        self.assertIn("let readTokenUnavailable = false", body)
+        self.assertIn("async function withReadFallback(fn)", body)
+        # Per-call fallback only: one per-PR blip must not flip the rest
+        # of the watchdog scan to PAT-heavy polling.
+        self.assertNotIn("readTokenUnavailable = true", body)
+
+    def test_auto_merge_outer_catch_uses_loop_stable_number(self):
+        body = self.read(".github/workflows/continuum-auto-merge.yml")
+        self.assertIn("`PR #${listed.number}: transient reconciliation error", body)
+        self.assertIn(
+            "`PR #${listed.number}: deterministic reconciliation error", body
+        )
+        self.assertNotIn("`PR #${pr.number}: transient reconciliation error", body)
+        self.assertNotIn(
+            "`PR #${pr.number}: deterministic reconciliation error", body
+        )
+
+    def test_auto_merge_defers_only_on_transient_dispatch(self):
+        body = self.read(".github/workflows/continuum-auto-merge.yml")
+        self.assertIn("const isDispatchTransient = isTransientApiError(err);", body)
+        self.assertIn(
+            "const signals = isDispatchTransient ? extractRateLimitSignals(err) : {};",
+            body,
+        )
 
 
 if __name__ == "__main__":

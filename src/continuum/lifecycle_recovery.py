@@ -25,14 +25,18 @@ token-policy semantics without changing any provider-specific review policy:
 - same-repository read-only discovery uses the run-scoped ``GITHUB_TOKEN``;
   PAT/TAP_PAT is reserved for mutations/dispatches.
 
-Required caller wiring (every reconciler built on the pure decisions
-below must combine them with the following, so a stranded PR has an
-automatic rediscovery/redispatch path):
+Required caller wiring (this module alone provides only pure decisions
+and rediscovers nothing: every reconciler built on them must combine
+them with the following, so a stranded PR has an automatic
+rediscovery/redispatch path):
 
 - event triggers plus a scheduled watchdog (for PR-Agent review/repair
   provided by ``.github/workflows/continuum-pr-agent-recovery.yml`` and
-  ``.github/caller-stubs/continuum-pr-agent-recovery.yml``; every other
-  operation kind provides its own equivalent triggers);
+  ``.github/caller-stubs/continuum-pr-agent-recovery.yml``; for
+  automerge/main-sync/merge provided by
+  ``.github/workflows/continuum-auto-merge.yml`` and its caller stub;
+  every other operation kind provides its own equivalent triggers and
+  its own open-PR scan loop that re-reads latest state per PR);
 - a repository-global ``concurrency`` group (``cancel-in-progress:false``,
   so a queued run re-reconciles from latest state instead of racing)
   plus the per-PR/HEAD lease key (:func:`concurrency_key`,
@@ -325,6 +329,25 @@ def is_full_head(head_sha: object) -> bool:
     """
 
     return bool(re.fullmatch(r"[0-9a-f]{40,64}", str(head_sha or "").strip().lower()))
+
+
+def safe_operation_key(repo: object, pr_number: object, head_sha: object, kind: object) -> Optional[str]:
+    """Batch-safe identity: returns None for one bad HEAD instead of aborting.
+
+    Open-PR scans must isolate per-PR failures (catch per PR and continue,
+    or pre-check with :func:`is_full_head`) so one truncated/malformed
+    HEAD never aborts a repository-global scan and strands healthy PRs::
+
+        for pr in open_prs:
+            key = safe_operation_key(repo, pr.number, pr.head.sha, kind)
+            if key is None:
+                continue  # loud skip; healthy PRs behind it still reconcile
+    """
+
+    try:
+        return operation_key(repo, pr_number, head_sha, kind)
+    except LifecycleRecoveryError:
+        return None
 
 
 def normalize_kind(kind: object) -> str:
@@ -763,7 +786,17 @@ def retry_evidence(
 
     for comment in comments:
         association = str(comment.get("author_association") or "").upper()
-        if association not in TRUSTED_ASSOCIATIONS:
+        raw_user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
+        login = str(
+            raw_user.get("login") or comment.get("user_login") or comment.get("author") or ""
+        ).strip().lower()
+        # Automation writes durable markers as github-actions[bot], which
+        # commonly carries NONE/unknown association. Trust the bot login
+        # explicitly so its latest_attempt/exhaustion is honored and the
+        # bounded budget cannot be bypassed into duplicate dispatches.
+        # Arbitrary external commenters (non-trusted association, non-bot
+        # login) still cannot forge budget state.
+        if association not in TRUSTED_ASSOCIATIONS and login != "github-actions[bot]":
             continue
         body = str(comment.get("body") or "")
         created_at = _parse_time(comment.get("updated_at") or comment.get("created_at"))
@@ -813,9 +846,13 @@ def _next_attempt(
     # when the marker is newer would re-dispatch the same execution index
     # forever, so attempt >= budget would never fire and the bounded budget
     # would be bypassed. The dispatch-grace wait above already handles the
-    # unobserved-dispatch case.
+    # unobserved-dispatch case. The first execution is always index 0,
+    # whether the wakeup saw operation state or not: with no durable
+    # marker no recovery execution has run yet, so both paths dispatch
+    # 0..budget-1 (10 executions by default) for one consistent contract.
+    # ``operation_seen`` is retained for signature compatibility only.
     if evidence.latest_attempt is None:
-        return 1 if operation_seen else 0
+        return 0
     return evidence.latest_attempt + 1
 
 
@@ -983,6 +1020,16 @@ def decide_recovery(
 
     if state is None:
         # Lost wakeup: no operation state for a healthy open PR HEAD.
+        # A missing status never proves transient on its own: deterministic
+        # blocks (explicit deterministic verdict, merge-blocked flag, or a
+        # deterministic policy hint in the description) hold instead of
+        # dispatching and burning transient budget.
+        if failure_transient is False:
+            return RecoveryDecision("hold", None, "deterministic failure is not automatically retried")
+        if merge_blocked_deterministic:
+            return RecoveryDecision("hold", None, "deterministic merge block is not automatically retried")
+        if _has_deterministic_hint(description.lower()):
+            return RecoveryDecision("hold", None, "deterministic failure is not automatically retried")
         recoverable = True
         transient_failure = True
     elif state == "success":
@@ -1000,7 +1047,7 @@ def decide_recovery(
             # context is untrusted: PR-visible text is not a reconciler
             # status, so it can never burn transient budget on its own.
             if str(operation_context or "").strip().lower() not in TRUSTED_OPERATION_CONTEXTS:
-                return RecoveryDecision("hold", None, "recovery token from untrusted context is not automatically retried")
+                return RecoveryDecision("hold", None, "recovery token from untrusted context is not automatically retried; pass operation_context or failure_transient")
             lowered_description = description.lower()
             if _has_deterministic_hint(lowered_description):
                 return RecoveryDecision("hold", None, "deterministic failure is not automatically retried")
@@ -1058,7 +1105,10 @@ def decide_recovery(
         marker_newer_than_status=marker_newer_than_status,
     )
     if attempt >= budget:
-        return RecoveryDecision("exhaust", None, "automatic transient budget exhausted")
+        # Return the budget count (not None) so callers can persist it in
+        # the durable exhaustion marker via exhausted_marker(head, kind,
+        # attempts=decision.attempt).
+        return RecoveryDecision("exhaust", budget, "automatic transient budget exhausted")
 
     if now_epoch is None and (
         ratelimit_reset_epoch is not None or provider_reset_epoch is not None
@@ -1243,12 +1293,17 @@ def requires_pat(action: object, content: object = "") -> bool:
     evidence stay on GITHUB_TOKEN.
     """
 
-    name = str(action or "").strip().lower().replace("-", "_").replace(" ", "_")
+    raw_name = str(action or "").strip()
     body = str(content or "").strip().lower()
-    # Dotted client paths are judged by the leaf operation so
-    # "client.rest.pulls.listreviewcomments" (a read) is not confused with
-    # "github.rest.issues.createcomment" (a mutation): the leaf carries the
-    # verb. Mutation evidence wins over read naming.
+    # Split camelCase boundaries before lowercasing so dotted client paths
+    # such as "client.rest.issues.listLabels" expose their verb ("list")
+    # instead of collapsing to an opaque "listlabels" leaf that fails
+    # closed to PAT. Dotted paths are still judged by the leaf operation
+    # so "client.rest.pulls.listReviewComments" (a read) is not confused
+    # with "github.rest.issues.createComment" (a mutation): the leaf
+    # carries the verb. Mutation evidence wins over read naming.
+    camel_split = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", raw_name)
+    name = camel_split.strip().lower().replace("-", "_").replace(" ", "_")
     leaf = [segment for segment in name.replace(".", "_").split("_") if segment]
     leaf_word = leaf[-1] if leaf else ""
     segments = set(leaf)
@@ -1285,6 +1340,13 @@ def requires_pat(action: object, content: object = "") -> bool:
     # "comment", "label", "release" used as shorthand for writes).
     if leaf_word in {"comment", "label", "release", "write", "submit", "push", "merge", "dispatch", "mutate", "mutation"}:
         return True
+    # Discovery reads share list*/get* verbs across labels/issues/check-runs.
+    # A leaf already classified as a mutation above never reaches here, so a
+    # list/get prefix is always a pure discovery read (covers lowercased
+    # concatenations like "listlabels" where no camel boundary survives).
+    # Other verbs ("requester", "thread", "spreadsheet") stay fail-closed.
+    if leaf_word.startswith("list") or leaf_word.startswith("get"):
+        return False
     for token in _READ_TOKENS:
         # Exact-segment or verb-prefix match only: "thread" must never
         # match "read" via substring, but concatenated read leaves such
@@ -1342,6 +1404,7 @@ __all__ = [
     "RecoveryDecision",
     "normalize_head",
     "is_full_head",
+    "safe_operation_key",
     "normalize_kind",
     "operation_key",
     "concurrency_key",

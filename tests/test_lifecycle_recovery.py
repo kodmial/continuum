@@ -950,5 +950,81 @@ class CrossStackContractTests(unittest.TestCase):
         self.assertEqual(waiting.action, "wait")
 
 
+class RecoveryRepairTests(unittest.TestCase):
+    def test_unlisted_discovery_reads_stay_off_pat(self):
+        for read_call in (
+            "client.rest.issues.listLabels",
+            "client.rest.issues.listLabelsForRepo",
+            "client.rest.issues.listComments",
+            "client.rest.checks.listCheckRuns",
+            "client.rest.issues.listIssues",
+        ):
+            with self.subTest(read_call=read_call):
+                self.assertFalse(lifecycle.requires_pat(read_call))
+
+    def test_bot_markers_count_but_external_cannot_forge(self):
+        marker = lifecycle.retry_marker(HEAD, "review", 3)
+        bot = {
+            "body": marker,
+            "author_association": "NONE",
+            "user": {"login": "github-actions[bot]"},
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.assertEqual(
+            lifecycle.retry_evidence([bot], head_sha=HEAD, kind="review").latest_attempt,
+            3,
+        )
+        external = {
+            "body": marker,
+            "author_association": "CONTRIBUTOR",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.assertIsNone(
+            lifecycle.retry_evidence([external], head_sha=HEAD, kind="review").latest_attempt
+        )
+
+    def test_first_execution_is_zero_on_every_path(self):
+        lost = lifecycle.decide_recovery(ci_green=True, operation_state=None)
+        self.assertEqual(lost.action, "dispatch")
+        self.assertEqual(lost.attempt, 0)
+        first_failure = lifecycle.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            failure_transient=True,
+        )
+        self.assertEqual(first_failure.action, "dispatch")
+        self.assertEqual(first_failure.attempt, 0)
+
+    def test_exhaust_returns_budget_count(self):
+        decision = lifecycle.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            failure_transient=True,
+            evidence=lifecycle.RetryEvidence(latest_attempt=9),
+        )
+        self.assertEqual(decision.action, "exhaust")
+        self.assertEqual(decision.attempt, lifecycle.MAX_TRANSIENT_ATTEMPTS)
+
+    def test_lost_wakeup_holds_on_deterministic_blocks(self):
+        held = lifecycle.decide_recovery(
+            ci_green=True,
+            operation_state=None,
+            operation_description="merge conflict; recovery eligible",
+            merge_blocked_deterministic=True,
+        )
+        self.assertEqual(held.action, "hold")
+        hinted = lifecycle.decide_recovery(
+            ci_green=True,
+            operation_state=None,
+            operation_description="unresolved findings need review",
+        )
+        self.assertEqual(hinted.action, "hold")
+
+    def test_safe_operation_key_isolates_one_bad_head(self):
+        self.assertIsNone(lifecycle.safe_operation_key(REPO, 1, "abc1234", "review"))
+        valid = lifecycle.safe_operation_key(REPO, 1, HEAD, "review")
+        self.assertEqual(valid, lifecycle.operation_key(REPO, 1, HEAD, "review"))
+
+
 if __name__ == "__main__":
     unittest.main()

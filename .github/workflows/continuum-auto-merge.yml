@@ -172,6 +172,11 @@ jobs:
               );
             }
             async function withReadFallback(fn) {
+              // Per-call fallback only: a single per-PR 401/non-rate-limit
+              // 403 falls back for that call alone and never flips the rest
+              // of the watchdog scan to PAT-heavy polling. (readTokenUnavailable
+              // is retained only so the repository-token health check above
+              // keeps its shape; it is never set sticky here.)
               if (readTokenUnavailable || readGithub === github) {
                 return await fn(github);
               }
@@ -184,9 +189,8 @@ jobs:
                 // the caller warns and defers to the next wakeup instead of
                 // re-issuing the same scan on the PAT client. Only
                 // authentication/permission gaps (401, non-rate-limit 403)
-                // fall back to the PAT client.
+                // fall back to the PAT client, one call at a time.
                 if (status === 401 || (status === 403 && !isRateLimitError(err, status))) {
-                  readTokenUnavailable = true;
                   core.warning('Repository-token read failed (' + status + '); retrying with PAT client: ' + err.message);
                   return await fn(github);
                 }
@@ -2031,15 +2035,19 @@ jobs:
                 // when the window expires) and no runner sleeps. The claim
                 // is still deleted so a deferred wait never consumes the
                 // bounded per-HEAD budget for work that never executed.
-                const signals = extractRateLimitSignals(err);
-                const resetDelay = resetAwareDelaySeconds({
+                // Deferral is transient-only: a deterministic dispatch
+                // error (404/422) must surface immediately, never persist
+                // a schedule-derived wait that hides the real failure.
+                const isDispatchTransient = isTransientApiError(err);
+                const signals = isDispatchTransient ? extractRateLimitSignals(err) : {};
+                const resetDelay = isDispatchTransient ? resetAwareDelaySeconds({
                   attempt,
                   retryAfterSeconds: signals.retryAfterSeconds,
                   ratelimitResetEpoch: signals.ratelimitResetEpoch,
                   providerResetEpoch: signals.providerResetEpoch,
                   nowEpoch: Math.floor(Date.now() / 1000),
                   operationKey: `${repoFullName}#${pr.number}:${headSha}`,
-                });
+                }) : 0;
                 // Never sleep inline: a rate-limited PR must not hold the
                 // single run/loop slot while healthy independent PRs wait
                 // behind it. Short and long waits alike defer to the next
@@ -2806,15 +2814,17 @@ jobs:
                 // event/scheduled wakeup from latest state. A deterministic
                 // per-PR failure is loud but never aborts the loop: one
                 // malformed PR, red CI fetcher error, or permission failure
-                // must not strand healthy PRs behind it.
+                // must not strand healthy PRs behind it. `listed.number` is
+                // loop-stable; `pr` is let-scoped inside the try above and
+                // is not visible here.
                 if (isTransientApiError(err)) {
                   core.warning(
-                    `PR #${pr.number}: transient reconciliation error; a later wakeup retries from latest state: ` +
+                    `PR #${listed.number}: transient reconciliation error; a later wakeup retries from latest state: ` +
                     (err.message || err)
                   );
                 } else {
                   core.error(
-                    `PR #${pr.number}: deterministic reconciliation error; skipping PR but continuing run: ` +
+                    `PR #${listed.number}: deterministic reconciliation error; skipping PR but continuing run: ` +
                     (err.stack || err.message || err)
                   );
                   if (!deterministicFailure) deterministicFailure = err;

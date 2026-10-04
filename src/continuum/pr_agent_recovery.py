@@ -219,6 +219,26 @@ def is_full_head(head_sha: object) -> bool:
     return bool(re.fullmatch(r"[0-9a-f]{40,64}", str(head_sha or "").strip().lower()))
 
 
+def safe_operation_key(pr_number: object, head_sha: object, kind: object) -> Optional[str]:
+    """Batch-safe identity: returns None for one bad HEAD instead of aborting.
+
+    Open-PR scans must never let one truncated/malformed HEAD strand
+    independent healthy PRs behind it. Guard with :func:`is_full_head`
+    (`continue` on False) or use this helper, which isolates the
+    per-PR failure and lets the loop continue::
+
+        for pr in open_prs:
+            key = safe_operation_key(pr.number, pr.head.sha, kind)
+            if key is None:
+                continue  # loud skip; healthy PRs behind it still reconcile
+    """
+
+    try:
+        return operation_key(pr_number, head_sha, kind)
+    except RecoveryError:
+        return None
+
+
 def _parse_time(value: object) -> Optional[datetime]:
     if not value:
         return None
@@ -295,7 +315,15 @@ def retry_evidence(
 
     for comment in comments:
         association = str(comment.get("author_association") or "").upper()
-        if association not in TRUSTED_ASSOCIATIONS:
+        raw_user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
+        login = str(
+            raw_user.get("login") or comment.get("user_login") or comment.get("author") or ""
+        ).strip().lower()
+        # Automation writes durable markers as github-actions[bot], which
+        # commonly carries NONE/unknown association. Trust the bot login
+        # explicitly so its latest_attempt/exhaustion is honored and the
+        # bounded budget cannot be bypassed into duplicate dispatches.
+        if association not in TRUSTED_ASSOCIATIONS and login != "github-actions[bot]":
             continue
         body = str(comment.get("body") or "")
         created_at = _parse_time(comment.get("updated_at") or comment.get("created_at"))
@@ -372,11 +400,14 @@ def _next_attempt(
 
     The dispatch-grace wait handles an unobserved dispatch; replaying the
     same index when the marker is newer would keep ``attempt >= budget``
-    from ever firing and bypass the bounded budget.
+    from ever firing and bypass the bounded budget. The first execution
+    is always index 0 with no durable marker, whether or not operation
+    state was seen, so every path dispatches 0..budget-1 consistently.
+    ``operation_seen`` is retained for signature compatibility only.
     """
 
     if evidence.latest_attempt is None:
-        return 1 if operation_seen else 0
+        return 0
     return evidence.latest_attempt + 1
 
 
@@ -480,6 +511,22 @@ def decide_recovery(
     operation_seen = state is not None
 
     if state is None:
+        # A missing status never proves transient on its own: an explicit
+        # deterministic verdict or a deterministic policy hint in the
+        # description holds instead of burning the transient budget.
+        if failure_transient is False:
+            return RecoveryDecision(
+                "hold", None, "deterministic failure is not automatically retried"
+            )
+        lowered_missing = description.lower()
+        if (
+            any(hint in lowered_missing for hint in _DETERMINISTIC_HINTS)
+            or _UNRESOLVED_FINDING_RE.search(lowered_missing)
+            or _BARE_CONFLICT_RE.search(lowered_missing)
+        ):
+            return RecoveryDecision(
+                "hold", None, "deterministic failure is not automatically retried"
+            )
         recoverable = True
     elif state == "success":
         return RecoveryDecision("settled", None, "operation already settled")
@@ -498,8 +545,16 @@ def decide_recovery(
             # bypass the TRUSTED_OPERATION_CONTEXTS check and burn
             # transient budget on the token alone.
             if str(operation_context or "").strip().lower() not in TRUSTED_OPERATION_CONTEXTS:
+                # Backward-compatibility note: reconcilers that previously
+                # called with only operation_description (token substring
+                # alone) must now pass the reconciler-synthesized
+                # operation_context or an explicit failure_transient
+                # verdict; without either the token holds instead of
+                # dispatching, so PR-visible text can never burn budget.
+                # Lost/missing operation state (state None) still
+                # self-heals via the watchdog path above.
                 return RecoveryDecision(
-                    "hold", None, "recovery token from untrusted context is not automatically retried"
+                    "hold", None, "recovery token from untrusted context is not automatically retried; pass operation_context or failure_transient"
                 )
             lowered = description.lower()
             if (
@@ -554,7 +609,9 @@ def decide_recovery(
         marker_newer_than_status=marker_newer_than_status,
     )
     if attempt >= budget:
-        return RecoveryDecision("exhaust", None, "automatic execution budget exhausted")
+        # Return the budget count so callers can persist it in the durable
+        # exhaustion marker instead of receiving None with no count.
+        return RecoveryDecision("exhaust", budget, "automatic execution budget exhausted")
     return RecoveryDecision(
         "dispatch",
         attempt,
@@ -577,6 +634,7 @@ __all__ = [
     "RecoveryDecision",
     "operation_key",
     "is_full_head",
+    "safe_operation_key",
     "retry_evidence",
     "resolve_max_executions",
     "retry_delay_schedule",

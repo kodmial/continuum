@@ -165,6 +165,9 @@ jobs:
               );
             }
             async function withReadFallback(fn) {
+              // Per-call fallback only: one per-PR auth gap falls back for
+              // that call alone and never flips the rest of the scan to PAT.
+              // (readTokenUnavailable is retained for shape; never set sticky.)
               if (readTokenUnavailable || readGithub === github) {
                 return await fn(github);
               }
@@ -176,9 +179,8 @@ jobs:
                 // a 429 or a rate-limited 403 must surface so the caller
                 // defers to the next wakeup instead of re-issuing the scan
                 // on the PAT client. Only authentication/permission gaps
-                // (401, non-rate-limit 403) fall back.
+                // (401, non-rate-limit 403) fall back, one call at a time.
                 if (status === 401 || (status === 403 && !isRateLimitError(err, status))) {
-                  readTokenUnavailable = true;
                   core.warning('Repository-token read failed (' + status + '); retrying with PAT client: ' + err.message);
                   return await fn(github);
                 }
