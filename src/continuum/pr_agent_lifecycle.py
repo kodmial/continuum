@@ -237,6 +237,127 @@ def is_potentially_truncated(review: Mapping[str, Any], cap: int = NUM_MAX_FINDI
     return len(current_key_issues(review)) == cap
 
 
+# Explicit security-concern fields that block the automatic-improve skip.
+# The upstream merge recommendation already aggregates security posture, but
+# an explicit non-empty concern list must never be skipped over: a clean
+# skip requires both `safe_to_merge` and no listed security concern.
+BLOCKING_SECURITY_SIGNAL_KEYS = (
+    "security_concerns",
+    "security_issues",
+    "security_vulnerabilities",
+    "critical_security_issues",
+)
+
+
+def _unwrap_review(review: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Accept the canonical review payload in either envelope shape.
+
+    The GitHub Action output may be the flat PRReview object or
+    `{"review": <PRReview>}`; both are canonical machine sources.
+    """
+
+    if isinstance(review, Mapping):
+        inner = review.get("review", None)
+        if isinstance(inner, dict):
+            return inner
+    if not isinstance(review, Mapping):
+        raise LifecycleError("PR-Agent review JSON must be an object")
+    return review
+
+
+def has_blocking_security_signal(review: Mapping[str, Any]) -> bool:
+    """Whether the review lists an explicit blocking security concern."""
+
+    inner = _unwrap_review(review)
+    for key in BLOCKING_SECURITY_SIGNAL_KEYS:
+        value = inner.get(key, None)
+        if value is None:
+            continue
+        if isinstance(value, str):
+            if value.strip():
+                return True
+            continue
+        if isinstance(value, Mapping):
+            if len(value) > 0:
+                return True
+            continue
+        if isinstance(value, (list, tuple)):
+            if len(value) > 0:
+                return True
+            continue
+        if value:
+            return True
+    return False
+
+
+def should_skip_improve(
+    review: Mapping[str, Any],
+    persistent_state: object,
+    *,
+    head_matches: bool,
+    tool_error: bool = False,
+    review_coverage_complete: bool = True,
+) -> Dict[str, Any]:
+    """Decide whether the automatic `improve` pass can be skipped.
+
+    `review` remains the authoritative merge gate. A skip is allowed only
+    when the review is provably clean for the exact HEAD: no tool error,
+    complete review coverage, matching HEAD, `safe_to_merge`, zero current
+    key issues (a batch at the findings cap is never clean), no explicit
+    blocking security signal, and native persistent state that is a
+    complete full review with no ACTIVE finding.
+
+    Anything else returns `skip=False` so `improve` may still run to
+    generate additional repair suggestions. Invalid review or persistent
+    state raises `LifecycleError` and fails closed instead of skipping.
+    """
+
+    if tool_error:
+        return {"skip": False, "reason": "tool error: failing closed"}
+    if not review_coverage_complete:
+        return {"skip": False, "reason": "incomplete review coverage: failing closed"}
+    if not head_matches:
+        return {"skip": False, "reason": "stale head: result is not for the current HEAD"}
+    inner = _unwrap_review(review)
+    if "key_issues_to_review" not in inner:
+        raise LifecycleError("PR-Agent review JSON has no key_issues_to_review")
+    try:
+        recommendation = merge_recommendation(inner)
+    except LifecycleError as exc:
+        raise LifecycleError(f"cannot decide improve skip: {exc}") from None
+    if recommendation != REVIEW_MERGE_SAFE:
+        return {"skip": False, "reason": f"merge recommendation blocks: {recommendation}"}
+    issues = current_key_issues(inner)
+    if issues:
+        if is_potentially_truncated(inner):
+            return {
+                "skip": False,
+                "reason": "review batch reached the findings cap: potentially truncated",
+            }
+        return {"skip": False, "reason": f"{len(issues)} current key issue(s) remain"}
+    if has_blocking_security_signal(inner):
+        return {"skip": False, "reason": "blocking security signal remains"}
+    if not isinstance(persistent_state, dict):
+        raise LifecycleError("upstream finding state must be the v0.46.0 state object")
+    raw_findings = persistent_state.get("findings")
+    if not isinstance(raw_findings, list):
+        raise LifecycleError("upstream finding state findings must be a list")
+    last_run = persistent_state.get("last_run")
+    if not isinstance(last_run, dict):
+        raise LifecycleError("upstream PR-Agent persistent state has no last_run.")
+    if last_run.get("complete") is not True or str(last_run.get("kind") or "") != "full":
+        raise LifecycleError("Persistent state does not represent a complete full review.")
+    if upstream_state_has_active(persistent_state):
+        return {"skip": False, "reason": "native persistent state has an ACTIVE finding"}
+    return {
+        "skip": True,
+        "reason": (
+            "clean exact HEAD: safe_to_merge with zero findings and complete "
+            "state; automatic improve skipped"
+        ),
+    }
+
+
 def parse_improve_push_outputs(text: object) -> List[Dict[str, Any]]:
     """Capture native improve suggestions via the runner-local file channel.
 
@@ -541,6 +662,7 @@ class GateInputs:
     review_coverage_complete: bool
     improve_coverage_complete: bool
     tool_error: bool = False
+    improve_skipped_clean: bool = False
 
 
 def evaluate_gate(decision: GateInputs) -> Dict[str, Any]:
@@ -557,8 +679,13 @@ def evaluate_gate(decision: GateInputs) -> Dict[str, Any]:
         return {"green": False, "reason": "tool error: failing closed"}
     if not decision.review_coverage_complete:
         return {"green": False, "reason": "incomplete review coverage: failing closed"}
-    if not decision.improve_coverage_complete:
+    if not decision.improve_coverage_complete and not decision.improve_skipped_clean:
         return {"green": False, "reason": "incomplete improve coverage: failing closed"}
+    if decision.improve_skipped_clean and decision.qualifying_improve:
+        return {
+            "green": False,
+            "reason": "improve was skipped but qualifying suggestions remain",
+        }
     if not decision.ci_green_on_exact_head:
         return {"green": False, "reason": "current-head CI is not green"}
     if not decision.head_matches:
@@ -827,6 +954,9 @@ __all__ = [
     "current_key_issues",
     "merge_recommendation",
     "is_potentially_truncated",
+    "BLOCKING_SECURITY_SIGNAL_KEYS",
+    "has_blocking_security_signal",
+    "should_skip_improve",
     "parse_improve_push_outputs",
     "qualifying_suggestions",
     "build_repair_batch",

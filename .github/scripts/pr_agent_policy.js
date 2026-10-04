@@ -248,6 +248,133 @@ function buildRepairBatch(reviewPayload, improveJsonl, threshold = IMPROVE_REPAI
   };
 }
 
+const REVIEW_MERGE_SAFE = 'safe_to_merge';
+const REVIEW_MAX_FINDINGS = 6;
+
+const BLOCKING_SECURITY_SIGNAL_KEYS = [
+  'security_concerns',
+  'security_issues',
+  'security_vulnerabilities',
+  'critical_security_issues',
+];
+
+function unwrapReview(reviewPayload) {
+  if (
+    reviewPayload &&
+    typeof reviewPayload === 'object' &&
+    !Array.isArray(reviewPayload) &&
+    reviewPayload.review &&
+    typeof reviewPayload.review === 'object' &&
+    !Array.isArray(reviewPayload.review)
+  ) {
+    return reviewPayload.review;
+  }
+  if (!reviewPayload || typeof reviewPayload !== 'object' || Array.isArray(reviewPayload)) {
+    throw new Error('PR-Agent review JSON must be an object.');
+  }
+  return reviewPayload;
+}
+
+function hasBlockingSecuritySignal(reviewPayload) {
+  const review = unwrapReview(reviewPayload);
+  for (const key of BLOCKING_SECURITY_SIGNAL_KEYS) {
+    const value = review[key];
+    if (value === undefined || value === null) continue;
+    if (typeof value === 'string') {
+      if (value.trim()) return true;
+      continue;
+    }
+    if (Array.isArray(value)) {
+      if (value.length > 0) return true;
+      continue;
+    }
+    if (typeof value === 'object') {
+      if (Object.keys(value).length > 0) return true;
+      continue;
+    }
+    if (value) return true;
+  }
+  return false;
+}
+
+function persistentHasActive(persistentState) {
+  if (!persistentState || typeof persistentState !== 'object' || Array.isArray(persistentState)) {
+    throw new Error('Upstream finding state must be the v0.46.0 state object.');
+  }
+  const findings = persistentState.findings;
+  if (!Array.isArray(findings)) {
+    throw new Error('Upstream finding state findings must be a list.');
+  }
+  for (const entry of findings) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      throw new Error('Upstream finding state contains a non-object finding.');
+    }
+    const state = String(entry.state || '').trim().toUpperCase();
+    if (state !== 'ACTIVE' && state !== 'RESOLVED') {
+      throw new Error('Upstream finding state contains an unknown state.');
+    }
+    if (state === 'ACTIVE') return true;
+  }
+  return false;
+}
+
+function isCleanReviewForImproveSkip(reviewPayload, persistentState, options = {}) {
+  const opts = options && typeof options === 'object' ? options : {};
+  const toolError = opts.toolError === true;
+  const reviewCoverageComplete = opts.reviewCoverageComplete !== false;
+  const headMatches = opts.headMatches === true;
+  if (toolError) {
+    return { skip: false, reason: 'tool error: failing closed' };
+  }
+  if (!reviewCoverageComplete) {
+    return { skip: false, reason: 'incomplete review coverage: failing closed' };
+  }
+  if (!headMatches) {
+    return { skip: false, reason: 'stale head: result is not for the current HEAD' };
+  }
+  const review = unwrapReview(reviewPayload);
+  const keyIssues = review.key_issues_to_review;
+  if (!Array.isArray(keyIssues)) {
+    throw new Error('PR-Agent review JSON has no key_issues_to_review list.');
+  }
+  const recommendation = String(review.merge_recommendation || '').trim();
+  if (!recommendation) {
+    throw new Error('PR-Agent review has no merge_recommendation.');
+  }
+  if (recommendation !== REVIEW_MERGE_SAFE) {
+    return { skip: false, reason: `merge recommendation blocks: ${recommendation}` };
+  }
+  if (keyIssues.length > 0) {
+    if (keyIssues.length === REVIEW_MAX_FINDINGS) {
+      return { skip: false, reason: 'review batch reached the findings cap: potentially truncated' };
+    }
+    return { skip: false, reason: `${keyIssues.length} current key issue(s) remain` };
+  }
+  if (hasBlockingSecuritySignal(review)) {
+    return { skip: false, reason: 'blocking security signal remains' };
+  }
+  if (!persistentState || typeof persistentState !== 'object' || Array.isArray(persistentState)) {
+    throw new Error('Upstream finding state must be the v0.46.0 state object.');
+  }
+  if (!Array.isArray(persistentState.findings)) {
+    throw new Error('Upstream finding state findings must be a list.');
+  }
+  const lastRun = persistentState.last_run;
+  if (!lastRun || typeof lastRun !== 'object') {
+    throw new Error('Upstream PR-Agent persistent state has no last_run.');
+  }
+  if (lastRun.complete !== true || String(lastRun.kind || '') !== 'full') {
+    throw new Error('Persistent state does not represent a complete full review.');
+  }
+  if (persistentHasActive(persistentState)) {
+    return { skip: false, reason: 'native persistent state has an ACTIVE finding' };
+  }
+  return {
+    skip: true,
+    reason: 'clean exact HEAD: safe_to_merge with zero findings and complete state; automatic improve skipped',
+  };
+}
+
 function controllerStateBody(stateMarker, summary) {
   return [
     CONTROLLER_STATE_MARKER,
@@ -262,14 +389,21 @@ function controllerStateBody(stateMarker, summary) {
 }
 
 module.exports = {
+  BLOCKING_SECURITY_SIGNAL_KEYS,
   CONTROLLER_STATE_MARKER,
   IMPROVE_REPAIR_THRESHOLD,
+  REVIEW_MAX_FINDINGS,
+  REVIEW_MERGE_SAFE,
   buildRepairBatch,
   controllerStateBody,
+  hasBlockingSecuritySignal,
+  isCleanReviewForImproveSkip,
   logicalFingerprint,
   normalizeProblem,
   overlappingLocation,
   parseImproveJsonl,
+  persistentHasActive,
   qualifyingImproveSuggestions,
   sameLogicalDefect,
+  unwrapReview,
 };

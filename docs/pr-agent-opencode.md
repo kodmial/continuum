@@ -98,11 +98,16 @@ may tune review *behavior*, but provider routing is forced through the
 The installed PR-Agent caller wakes on PR events and again when the repository's
 `CI` workflow completes successfully for a pull request. The reusable workflow
 admits one exact CI-qualified HEAD, runs upstream PR-Agent v0.46.0 full
-`review` and full `improve`, reads the native v0.46.0 persistent finding
-state for that exact HEAD, and routes the result automatically:
+`review`, reads the native v0.46.0 persistent finding state for that exact
+HEAD, and runs a conditional automatic `improve`: a clean authoritative
+review (`safe_to_merge`, zero `key_issues_to_review`, complete full
+persistent state for the exact HEAD, no blocking security/tool/coverage
+signal) skips the second LLM pass and routes directly to the merge gate,
+while a review with actionable findings still runs `improve` for additional
+repair suggestions. The result is routed automatically:
 
 ```text
-CI -> review + improve
+CI -> review -> clean? merge gate : improve
    -> actionable items -> PR-Agent repair -> writable PR branch -> CI -> fresh review
    -> no actionable items -> PR-Agent exact-HEAD merge gate
 ```

@@ -516,7 +516,7 @@ jobs:
           echo "sha=$ADMITTED_SHA" >> "$GITHUB_OUTPUT"
           echo "Exact CI-qualified HEAD $ADMITTED_SHA is still current."
 
-      - name: Run upstream full review and full improve on the exact HEAD
+      - name: Run upstream full review on the exact HEAD
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
         id: pragent
         env:
@@ -561,23 +561,25 @@ jobs:
           POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
         run: |
           set -euo pipefail
-          IMPROVE_REPAIR_THRESHOLD="$(node -e 'const p=require(process.env.POLICY_SCRIPT); process.stdout.write(String(p.IMPROVE_REPAIR_THRESHOLD));')"
-          [[ "$IMPROVE_REPAIR_THRESHOLD" =~ ^[0-9]+$ ]] || { echo "::error::Invalid centralized PR-Agent improve threshold."; exit 1; }
           mkdir -p pr-agent-outputs
           : > pr-agent-outputs/continuum.jsonl
           # The authoritative re-review is CI-gated by this controller: after
           # OpenCode pushes a repair, a new HEAD waits for CI success and then
-          # receives a complete upstream review plus a complete upstream
-          # improve on that exact HEAD. Push-command handling is disabled
+          # receives a complete upstream review on that exact HEAD. An
+          # automatic improve pass runs only when the authoritative review
+          # still carries actionable repair value (see the improve-gate step
+          # below); a clean review reaches the merge gate without paying a
+          # second LLM pass. Push-command handling is disabled
           # (handle_push_trigger=false), so the default bot-commit push filter
           # cannot skip OpenCode-authored repair commits.
           #
-          # Upstream reviewer is PR-Agent v0.46.0 (pinned above). Both native
-          # tools run in full on the admitted HEAD:
+          # Upstream reviewer is PR-Agent v0.46.0 (pinned above). The native
+          # tools run on the admitted HEAD:
           #   review  -> structured review output (steps.pragent.outputs.review)
           #   improve -> native code suggestions via the runner-local
           #             push_outputs file channel
           #            (pr-agent-outputs/continuum.jsonl payload.code_suggestions)
+          #             only when the improve-gate step allows it.
           # Check-run publishing stays disabled so persistent finding state
           # remains active (github.publish_as_check_run=false).
           pr-agent --pr_url "$PR_URL" review \
@@ -591,43 +593,16 @@ jobs:
             --github.publish_as_check_run=false \
             --github_action_config.enable_output=true \
             --github_action_config.fail_on_tool_errors=true
-          pr-agent --pr_url "$PR_URL" improve \
-            --config.propagate_tool_errors=true \
-            --pr_code_suggestions.focus_only_on_problems=true \
-            --pr_code_suggestions.publish_output_no_suggestions=false \
-            --pr_code_suggestions.suggestions_score_threshold="$IMPROVE_REPAIR_THRESHOLD" \
-            --github.publish_as_check_run=false
           # Canonical machine source: the structured review JSON is exported
           # as the step output `review` (steps.pragent.outputs.review) for
           # the repair and merge workflows. Prose comments are presentation
           # only and are never the primary protocol.
-          if [[ ! -s pr-agent-outputs/continuum.jsonl ]]; then
-            echo "No improve suggestions were published; recording an empty payload."
-            echo '{"payload": {"code_suggestions": []}}' > pr-agent-outputs/continuum.jsonl
-          fi
           echo "review_head=$REVIEWED_SHA" >> "$GITHUB_OUTPUT"
-          echo "improve_repair_threshold=$IMPROVE_REPAIR_THRESHOLD" >> "$GITHUB_OUTPUT"
           # Persist the push_outputs file payload for the repair workflow.
           # The improve payload is consumed only from this runner-local file
           # channel, never by scraping comments.
           echo "improve_file=pr-agent-outputs/continuum.jsonl" >> "$GITHUB_OUTPUT"
-          echo "Upstream review and improve completed for $REVIEWED_SHA."
-
-      - name: Export native improve output
-        if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
-        id: improve_output
-        run: |
-          set -euo pipefail
-          [[ -s pr-agent-outputs/continuum.jsonl ]] || {
-            echo "::error::Native PR-Agent improve output file is missing."
-            exit 1
-          }
-          DELIMITER="__CONTINUUM_PR_AGENT_IMPROVE_EOF__"
-          {
-            echo "improve_jsonl<<$DELIMITER"
-            cat pr-agent-outputs/continuum.jsonl
-            echo "$DELIMITER"
-          } >> "$GITHUB_OUTPUT"
+          echo "Upstream review completed for $REVIEWED_SHA; improve is gated below."
 
       - name: Revalidate the PR head and native review output after review
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
@@ -649,7 +624,7 @@ jobs:
             if (currentSha !== reviewedSha) {
               core.setFailed(
                 `PR head moved during review (${reviewedSha} -> ${currentSha}); ` +
-                'discarding both results and waiting for fresh CI on the new HEAD.'
+                'discarding the review result and waiting for fresh CI on the new HEAD.'
               );
               return;
             }
@@ -665,64 +640,13 @@ jobs:
               core.setFailed(`Upstream PR-Agent review output is invalid JSON: ${err.message}`);
               return;
             }
-            if (!review || typeof review !== 'object' || !Array.isArray(review.key_issues_to_review)) {
+            const inner = review.review || review;
+            if (!inner || typeof inner !== 'object' || !Array.isArray(inner.key_issues_to_review)) {
               core.setFailed('Upstream PR-Agent review output does not match the expected PRReview schema.');
               return;
             }
             core.setOutput('head_sha', currentSha);
             core.notice(`Native PR-Agent review output for ${reviewedSha} is current and machine-readable.`);
-
-      - name: Normalize persistent improve presentation
-        if: >-
-          steps.result.outcome == 'success' &&
-          steps.result.outputs.head_sha
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
-        env:
-          PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
-          POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
-          IMPROVE_JSONL: ${{ steps.improve_output.outputs.improve_jsonl }}
-        with:
-          github-token: ${{ secrets.TAP_PAT }}
-          script: |
-            const policy = require(process.env.POLICY_SCRIPT);
-            const prNumber = Number(process.env.PR_NUMBER);
-            const qualifying = policy.qualifyingImproveSuggestions(
-              String(process.env.IMPROVE_JSONL || '')
-            );
-            const comments = await github.paginate(
-              github.rest.issues.listComments,
-              {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: prNumber,
-                per_page: 100,
-              }
-            );
-            const improveComments = comments
-              .filter(comment => String(comment.body || '').includes('<!-- pr-agent:improve:'))
-              .sort((a, b) => Number(a.id) - Number(b.id));
-            if (qualifying.length === 0) {
-              for (const comment of improveComments) {
-                await github.rest.issues.deleteComment({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  comment_id: comment.id,
-                });
-              }
-              core.notice('No high-signal /improve suggestions; stale improve presentation removed.');
-            } else {
-              for (const comment of improveComments.slice(0, -1)) {
-                await github.rest.issues.deleteComment({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  comment_id: comment.id,
-                });
-              }
-              core.notice(
-                'Kept one persistent /improve comment for ' +
-                qualifying.length + ' high-signal suggestion(s).'
-              );
-            }
 
       - name: Export native persistent finding state for the reviewed HEAD
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
@@ -817,6 +741,223 @@ jobs:
               out.write(f"persistent_state_json={compact}\n")
           PY
 
+      - name: Decide whether automatic improve can be skipped
+        if: >-
+          steps.stack.outputs.enabled == 'true' &&
+          steps.admit.outputs.admitted == 'true' &&
+          steps.result.outcome == 'success' &&
+          steps.persistent.outcome == 'success'
+        id: improve_gate
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          REVIEW_JSON: ${{ steps.pragent.outputs.review }}
+          PERSISTENT_STATE_JSON: ${{ steps.persistent.outputs.persistent_state_json }}
+          HEAD_SHA: ${{ steps.result.outputs.head_sha }}
+          REVIEWED_SHA: ${{ steps.before.outputs.sha }}
+          POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
+        with:
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            // Automatic-improve gate: review is the authoritative merge gate.
+            // A clean authoritative review (safe_to_merge, zero
+            // key_issues_to_review, complete full persistent state for the
+            // exact HEAD, no blocking security/tool/coverage signal) skips the
+            // second LLM pass and routes directly to the merge gate. A review
+            // with actionable findings still runs improve for repair
+            // suggestions. Exact-HEAD mismatch or invalid state fails closed
+            // and never skips. Explicit manual improve remains available by
+            // invoking the improve tool directly; this gate only governs the
+            // automatic pass.
+            const policy = require(process.env.POLICY_SCRIPT);
+            const headSha = String(process.env.HEAD_SHA || '').trim().toLowerCase();
+            const reviewedSha = String(process.env.REVIEWED_SHA || '').trim().toLowerCase();
+            if (!headSha || !reviewedSha) {
+              core.setFailed('Improve gate requires the exact reviewed HEAD.');
+              return;
+            }
+            if (headSha !== reviewedSha) {
+              core.setFailed(
+                `PR head moved before the improve gate (${reviewedSha} -> ${headSha}); ` +
+                'discarding the review result and waiting for fresh CI on the new HEAD.'
+              );
+              return;
+            }
+            let review;
+            try {
+              review = JSON.parse(String(process.env.REVIEW_JSON || ''));
+            } catch (err) {
+              core.setFailed(`Invalid PR-Agent review JSON: ${err.message}`);
+              return;
+            }
+            let persistentState;
+            try {
+              persistentState = JSON.parse(String(process.env.PERSISTENT_STATE_JSON || ''));
+            } catch (err) {
+              core.setFailed(`Invalid PR-Agent persistent state JSON: ${err.message}`);
+              return;
+            }
+            const stateHead = String(
+              (persistentState && persistentState.last_run && persistentState.last_run.head_sha) || ''
+            ).trim().toLowerCase();
+            if (!stateHead || stateHead !== reviewedSha) {
+              core.setFailed(
+                `PR-Agent persistent state is stale: last_run.head_sha=${stateHead || '<empty>'}, reviewed=${reviewedSha}.`
+              );
+              return;
+            }
+            let decision;
+            try {
+              decision = policy.isCleanReviewForImproveSkip(
+                review,
+                persistentState,
+                { headMatches: true, toolError: false, reviewCoverageComplete: true }
+              );
+            } catch (err) {
+              core.setFailed(err.message);
+              return;
+            }
+            core.setOutput('skip_improve', decision.skip ? 'true' : 'false');
+            core.setOutput('reason', String(decision.reason || ''));
+            core.notice(
+              decision.skip
+                ? `Clean authoritative review at ${reviewedSha}; skipping automatic improve: ${decision.reason}`
+                : `Automatic improve still required at ${reviewedSha}: ${decision.reason}`
+            );
+
+      - name: Run upstream improve on the exact HEAD when repair value remains
+        if: >-
+          steps.stack.outputs.enabled == 'true' &&
+          steps.admit.outputs.admitted == 'true' &&
+          steps.improve_gate.outcome == 'success' &&
+          steps.improve_gate.outputs.skip_improve != 'true'
+        id: improve
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          GITHUB__USER_TOKEN: ${{ secrets.TAP_PAT }}
+          CONFIG__GIT_PROVIDER: github
+          CONFIG__MODEL: ${{ steps.stack.outputs.model }}
+          CONFIG__CUSTOM_MODEL_MAX_TOKENS: ${{ steps.stack.outputs.max_tokens }}
+          CONFIG__PROPAGATE_TOOL_ERRORS: 'true'
+          OPENAI__API_BASE: ${{ steps.stack.outputs.api_base }}
+          OPENAI__KEY: continuum-loopback
+          GITHUB__PUBLISH_AS_CHECK_RUN: 'false'
+          GITHUB_ACTION_CONFIG__FAIL_ON_TOOL_ERRORS: 'true'
+          PR_CODE_SUGGESTIONS__FOCUS_ONLY_ON_PROBLEMS: 'true'
+          PR_CODE_SUGGESTIONS__PERSISTENT_COMMENT: 'true'
+          PR_CODE_SUGGESTIONS__PUBLISH_OUTPUT_NO_SUGGESTIONS: 'false'
+          PR_CODE_SUGGESTIONS__MAX_SUGGESTIONS_PER_FILE: '0'
+          PR_CODE_SUGGESTIONS__MAX_NUMBER_OF_CALLS: '3'
+          PR_CODE_SUGGESTIONS__ENABLE_SUGGESTIONS_COVERAGE_FOOTER: 'true'
+          PUSH_OUTPUTS__ENABLE: 'true'
+          PUSH_OUTPUTS__CHANNELS: '["file"]'
+          PUSH_OUTPUTS__FILE_PATH: 'pr-agent-outputs/continuum.jsonl'
+          PR_URL: https://github.com/${{ github.repository }}/pull/${{ steps.stack.outputs.pr_number }}
+          REVIEWED_SHA: ${{ steps.before.outputs.sha }}
+          POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
+        run: |
+          set -euo pipefail
+          IMPROVE_REPAIR_THRESHOLD="$(node -e 'const p=require(process.env.POLICY_SCRIPT); process.stdout.write(String(p.IMPROVE_REPAIR_THRESHOLD));')"
+          [[ "$IMPROVE_REPAIR_THRESHOLD" =~ ^[0-9]+$ ]] || { echo "::error::Invalid centralized PR-Agent improve threshold."; exit 1; }
+          mkdir -p pr-agent-outputs
+          : > pr-agent-outputs/continuum.jsonl
+          # The authoritative review carried actionable findings, so run one
+          # bounded upstream improve pass for additional repair suggestions.
+          # The improve payload is consumed only from the runner-local file
+          # channel, never by scraping comments.
+          pr-agent --pr_url "$PR_URL" improve \
+            --config.propagate_tool_errors=true \
+            --pr_code_suggestions.focus_only_on_problems=true \
+            --pr_code_suggestions.publish_output_no_suggestions=false \
+            --pr_code_suggestions.suggestions_score_threshold="$IMPROVE_REPAIR_THRESHOLD" \
+            --github.publish_as_check_run=false
+          if [[ ! -s pr-agent-outputs/continuum.jsonl ]]; then
+            echo "No improve suggestions were published; recording an empty payload."
+            echo '{"payload": {"code_suggestions": []}}' > pr-agent-outputs/continuum.jsonl
+          fi
+          echo "improve_repair_threshold=$IMPROVE_REPAIR_THRESHOLD" >> "$GITHUB_OUTPUT"
+          echo "improve_file=pr-agent-outputs/continuum.jsonl" >> "$GITHUB_OUTPUT"
+          echo "Upstream improve completed for $REVIEWED_SHA."
+
+      - name: Record skipped automatic improve for the clean HEAD
+        if: >-
+          steps.stack.outputs.enabled == 'true' &&
+          steps.admit.outputs.admitted == 'true' &&
+          steps.improve_gate.outcome == 'success' &&
+          steps.improve_gate.outputs.skip_improve == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p pr-agent-outputs
+          echo '{"payload": {"code_suggestions": []}}' > pr-agent-outputs/continuum.jsonl
+          echo "Automatic improve skipped for clean HEAD ${{ steps.result.outputs.head_sha }}; empty payload recorded."
+
+      - name: Export native improve output
+        if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
+        id: improve_output
+        run: |
+          set -euo pipefail
+          [[ -s pr-agent-outputs/continuum.jsonl ]] || {
+            echo "::error::Native PR-Agent improve output file is missing."
+            exit 1
+          }
+          DELIMITER="__CONTINUUM_PR_AGENT_IMPROVE_EOF__"
+          {
+            echo "improve_jsonl<<$DELIMITER"
+            cat pr-agent-outputs/continuum.jsonl
+            echo "$DELIMITER"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Normalize persistent improve presentation
+        if: >-
+          steps.result.outcome == 'success' &&
+          steps.result.outputs.head_sha
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
+          POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
+          IMPROVE_JSONL: ${{ steps.improve_output.outputs.improve_jsonl }}
+        with:
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            const policy = require(process.env.POLICY_SCRIPT);
+            const prNumber = Number(process.env.PR_NUMBER);
+            const qualifying = policy.qualifyingImproveSuggestions(
+              String(process.env.IMPROVE_JSONL || '')
+            );
+            const comments = await github.paginate(
+              github.rest.issues.listComments,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                per_page: 100,
+              }
+            );
+            const improveComments = comments
+              .filter(comment => String(comment.body || '').includes('<!-- pr-agent:improve:'))
+              .sort((a, b) => Number(a.id) - Number(b.id));
+            if (qualifying.length === 0) {
+              for (const comment of improveComments) {
+                await github.rest.issues.deleteComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: comment.id,
+                });
+              }
+              core.notice('No high-signal /improve suggestions; stale improve presentation removed.');
+            } else {
+              for (const comment of improveComments.slice(0, -1)) {
+                await github.rest.issues.deleteComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: comment.id,
+                });
+              }
+              core.notice(
+                'Kept one persistent /improve comment for ' +
+                qualifying.length + ' high-signal suggestion(s).'
+              );
+            }
+
       - name: Route the current PR-Agent result
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
         id: route
@@ -908,7 +1049,7 @@ jobs:
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           HEAD_SHA: ${{ steps.admit.outputs.head_sha }}
-          RETRYABLE_FAILURE: ${{ (steps.install_pragent.outcome == 'failure' || steps.install_opencode.outcome == 'failure' || steps.start_opencode.outcome == 'failure' || steps.runtime.outcome == 'failure' || steps.start_bridge.outcome == 'failure' || steps.pragent.outcome == 'failure') && 'true' || 'false' }}
+          RETRYABLE_FAILURE: ${{ (steps.install_pragent.outcome == 'failure' || steps.install_opencode.outcome == 'failure' || steps.start_opencode.outcome == 'failure' || steps.runtime.outcome == 'failure' || steps.start_bridge.outcome == 'failure' || steps.pragent.outcome == 'failure' || steps.improve.outcome == 'failure') && 'true' || 'false' }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
@@ -976,7 +1117,8 @@ jobs:
            steps.start_opencode.outcome == 'failure' ||
            steps.runtime.outcome == 'failure' ||
            steps.start_bridge.outcome == 'failure' ||
-           steps.pragent.outcome == 'failure')
+           steps.pragent.outcome == 'failure' ||
+           steps.improve.outcome == 'failure')
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
@@ -1045,7 +1187,8 @@ jobs:
            steps.start_opencode.outcome == 'failure' ||
            steps.runtime.outcome == 'failure' ||
            steps.start_bridge.outcome == 'failure' ||
-           steps.pragent.outcome == 'failure')
+           steps.pragent.outcome == 'failure' ||
+           steps.improve.outcome == 'failure')
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}

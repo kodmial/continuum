@@ -1540,5 +1540,321 @@ class RepairWiringRegressionTests(unittest.TestCase):
         self.assertIn('retry_attempt: "${{ inputs.retry_attempt }}"', caller)
 
 
+def run_skip_policy(review, persistent_state, options=None):
+    env = os.environ.copy()
+    env["POLICY_MODULE"] = POLICY_MODULE
+    env["POLICY_REVIEW"] = json.dumps(review)
+    env["POLICY_STATE"] = json.dumps(persistent_state)
+    env["POLICY_OPTIONS"] = json.dumps(options or {})
+    code = r"""
+const policy = require(process.env.POLICY_MODULE);
+const review = JSON.parse(process.env.POLICY_REVIEW || 'null');
+const state = JSON.parse(process.env.POLICY_STATE || 'null');
+const options = JSON.parse(process.env.POLICY_OPTIONS || '{}');
+process.stdout.write(JSON.stringify(policy.isCleanReviewForImproveSkip(review, state, options)));
+"""
+    completed = subprocess.run(
+        ["node", "-e", code],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(completed.stderr)
+    return json.loads(completed.stdout)
+
+
+def run_skip_policy_raw(review_raw, state_raw, options=None):
+    env = os.environ.copy()
+    env["POLICY_MODULE"] = POLICY_MODULE
+    env["POLICY_REVIEW"] = review_raw
+    env["POLICY_STATE"] = state_raw
+    env["POLICY_OPTIONS"] = json.dumps(options or {})
+    code = r"""
+const policy = require(process.env.POLICY_MODULE);
+let review;
+try {
+  review = JSON.parse(process.env.POLICY_REVIEW || 'null');
+} catch (err) {
+  process.stdout.write(JSON.stringify({parse_error: 'review:' + err.message}));
+  process.exit(0);
+}
+let state;
+try {
+  state = JSON.parse(process.env.POLICY_STATE || 'null');
+} catch (err) {
+  process.stdout.write(JSON.stringify({parse_error: 'state:' + err.message}));
+  process.exit(0);
+}
+const options = JSON.parse(process.env.POLICY_OPTIONS || '{}');
+try {
+  process.stdout.write(JSON.stringify(policy.isCleanReviewForImproveSkip(review, state, options)));
+} catch (err) {
+  process.stdout.write(JSON.stringify({threw: err.message}));
+}
+"""
+    completed = subprocess.run(
+        ["node", "-e", code],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(completed.stderr)
+    return json.loads(completed.stdout)
+
+
+class CleanReviewImproveSkipTests(unittest.TestCase):
+    """Issue #231: a clean authoritative review skips automatic improve."""
+
+    def _life(self):
+        import sys
+
+        sys.path.insert(0, SRC)
+        try:
+            from continuum import pr_agent_lifecycle as life
+        finally:
+            sys.path.remove(SRC)
+        return life
+
+    def test_clean_review_skips_automatic_improve(self):
+        life = self._life()
+        decision = life.should_skip_improve(
+            make_review([]),
+            make_persistent([], head_sha="abc"),
+            head_matches=True,
+        )
+        self.assertTrue(decision["skip"])
+        js = run_skip_policy(
+            make_review([]),
+            make_persistent([], head_sha="abc"),
+            {"headMatches": True},
+        )
+        self.assertTrue(js["skip"])
+
+    def test_actionable_review_still_runs_improve(self):
+        life = self._life()
+        cases = [
+            make_review([issue_entry(n=0)]),
+            make_review([], recommendation="merge_with_caution"),
+            make_review([], recommendation="changes_required"),
+            make_review([issue_entry(n=i) for i in range(6)]),
+        ]
+        for review in cases:
+            with self.subTest(review=review):
+                decision = life.should_skip_improve(
+                    review,
+                    make_persistent([], head_sha="abc"),
+                    head_matches=True,
+                )
+                self.assertFalse(decision["skip"])
+                js = run_skip_policy(
+                    review,
+                    make_persistent([], head_sha="abc"),
+                    {"headMatches": True},
+                )
+                self.assertFalse(js["skip"])
+
+    def test_active_persistent_state_still_runs_improve(self):
+        life = self._life()
+        state = make_persistent([{"state": "ACTIVE"}], head_sha="abc")
+        decision = life.should_skip_improve(
+            make_review([]), state, head_matches=True
+        )
+        self.assertFalse(decision["skip"])
+        js = run_skip_policy(
+            make_review([]), state, {"headMatches": True}
+        )
+        self.assertFalse(js["skip"])
+
+    def test_blocking_security_signal_still_runs_improve(self):
+        life = self._life()
+        review = make_review(
+            [], extra={"security_concerns": ["hardcoded credential"]}
+        )
+        decision = life.should_skip_improve(
+            review, make_persistent([], head_sha="abc"), head_matches=True
+        )
+        self.assertFalse(decision["skip"])
+        js = run_skip_policy(
+            review, make_persistent([], head_sha="abc"), {"headMatches": True}
+        )
+        self.assertFalse(js["skip"])
+
+    def test_tool_error_and_incomplete_coverage_still_run_improve(self):
+        life = self._life()
+        for kwargs in (
+            {"tool_error": True},
+            {"review_coverage_complete": False},
+        ):
+            with self.subTest(kwargs=kwargs):
+                decision = life.should_skip_improve(
+                    make_review([]),
+                    make_persistent([], head_sha="abc"),
+                    head_matches=True,
+                    **kwargs,
+                )
+                self.assertFalse(decision["skip"])
+        js = run_skip_policy(
+            make_review([]),
+            make_persistent([], head_sha="abc"),
+            {"headMatches": True, "toolError": True},
+        )
+        self.assertFalse(js["skip"])
+        js = run_skip_policy(
+            make_review([]),
+            make_persistent([], head_sha="abc"),
+            {"headMatches": True, "reviewCoverageComplete": False},
+        )
+        self.assertFalse(js["skip"])
+
+    def test_exact_head_mismatch_never_skips(self):
+        life = self._life()
+        decision = life.should_skip_improve(
+            make_review([]),
+            make_persistent([], head_sha="abc"),
+            head_matches=False,
+        )
+        self.assertFalse(decision["skip"])
+        js = run_skip_policy(
+            make_review([]),
+            make_persistent([], head_sha="abc"),
+            {"headMatches": False},
+        )
+        self.assertFalse(js["skip"])
+
+    def test_invalid_review_or_state_fails_closed_not_skip(self):
+        life = self._life()
+        with self.assertRaises(life.LifecycleError):
+            life.should_skip_improve(
+                {"merge_recommendation": "safe_to_merge"},
+                make_persistent([], head_sha="abc"),
+                head_matches=True,
+            )
+        with self.assertRaises(life.LifecycleError):
+            life.should_skip_improve(
+                make_review([]),
+                {"findings": [], "last_run": {"complete": False, "kind": "full"}},
+                head_matches=True,
+            )
+        with self.assertRaises(life.LifecycleError):
+            life.should_skip_improve(
+                make_review([]), {"not": "state"}, head_matches=True
+            )
+        bad_review = run_skip_policy_raw(
+            '{"nope": true}', json.dumps(make_persistent([], head_sha="abc")),
+            {"headMatches": True},
+        )
+        self.assertIn("threw", bad_review)
+        bad_state = run_skip_policy_raw(
+            json.dumps(make_review([])), '{"not": "state"}',
+            {"headMatches": True},
+        )
+        self.assertIn("threw", bad_state)
+
+    def test_wrapped_review_envelope_skips_when_clean(self):
+        life = self._life()
+        wrapped = {"review": make_review([])}
+        decision = life.should_skip_improve(
+            wrapped, make_persistent([], head_sha="abc"), head_matches=True
+        )
+        self.assertTrue(decision["skip"])
+        js = run_skip_policy(
+            wrapped, make_persistent([], head_sha="abc"), {"headMatches": True}
+        )
+        self.assertTrue(js["skip"])
+
+    def test_merge_gate_greens_for_skipped_clean_improve(self):
+        life = self._life()
+        gate = life.evaluate_gate(life.GateInputs(
+            review=make_review([]),
+            qualifying_improve=[],
+            persistent_state=make_persistent([], head_sha="abc"),
+            ci_green_on_exact_head=True,
+            head_matches=True,
+            review_coverage_complete=True,
+            improve_coverage_complete=False,
+            improve_skipped_clean=True,
+        ))
+        self.assertTrue(gate["green"])
+        held = life.evaluate_gate(life.GateInputs(
+            review=make_review([]),
+            qualifying_improve=[{"file": "a.py", "score": 9}],
+            persistent_state=make_persistent([], head_sha="abc"),
+            ci_green_on_exact_head=True,
+            head_matches=True,
+            review_coverage_complete=True,
+            improve_coverage_complete=False,
+            improve_skipped_clean=True,
+        ))
+        self.assertFalse(held["green"])
+        incomplete = life.evaluate_gate(life.GateInputs(
+            review=make_review([]),
+            qualifying_improve=[],
+            persistent_state=make_persistent([], head_sha="abc"),
+            ci_green_on_exact_head=True,
+            head_matches=True,
+            review_coverage_complete=True,
+            improve_coverage_complete=False,
+        ))
+        self.assertFalse(incomplete["green"])
+
+
+class ImproveSkipWorkflowTests(unittest.TestCase):
+    def test_review_runs_before_improve_gate_and_improve_is_conditional(self):
+        body = read_repo(".github/workflows/continuum-pr-agent.yml")
+        self.assertIn("Run upstream full review on the exact HEAD", body)
+        self.assertNotIn("Run upstream full review and full improve on the exact HEAD", body)
+        self.assertIn("Decide whether automatic improve can be skipped", body)
+        self.assertIn("isCleanReviewForImproveSkip", body)
+        self.assertIn(
+            "Run upstream improve on the exact HEAD when repair value remains", body
+        )
+        self.assertIn("Record skipped automatic improve for the clean HEAD", body)
+        # The conditional improve still runs the pinned upstream tool in full.
+        self.assertIn('pr-agent --pr_url "$PR_URL" review', body)
+        self.assertIn('pr-agent --pr_url "$PR_URL" improve', body)
+        gate = body.index("Decide whether automatic improve can be skipped")
+        improve = body.index("Run upstream improve on the exact HEAD when repair value remains")
+        skip_record = body.index("Record skipped automatic improve for the clean HEAD")
+        export = body.index("Export native improve output", gate)
+        normalize = body.index("Normalize persistent improve presentation")
+        self.assertLess(gate, improve)
+        self.assertLess(improve, skip_record)
+        self.assertLess(skip_record, export)
+        self.assertLess(export, normalize)
+        self.assertIn("steps.improve_gate.outputs.skip_improve != 'true'", body)
+        self.assertIn("steps.improve_gate.outputs.skip_improve == 'true'", body)
+
+    def test_persistent_state_precedes_the_improve_gate(self):
+        body = read_repo(".github/workflows/continuum-pr-agent.yml")
+        persistent = body.index("Export native persistent finding state for the reviewed HEAD")
+        gate = body.index("Decide whether automatic improve can be skipped")
+        self.assertLess(persistent, gate)
+        gate_window = body[gate:gate + 6000]
+        self.assertIn("PERSISTENT_STATE_JSON", gate_window)
+        self.assertIn("last_run", gate_window)
+
+    def test_improve_gate_is_exact_head_safe(self):
+        body = read_repo(".github/workflows/continuum-pr-agent.yml")
+        gate = body.index("Decide whether automatic improve can be skipped")
+        window = body[gate:gate + 6000]
+        self.assertIn("REVIEWED_SHA", window)
+        self.assertIn("HEAD_SHA", window)
+        self.assertIn("headSha !== reviewedSha", window)
+        self.assertIn("PR head moved before the improve gate", window)
+        self.assertIn("persistent state is stale", window)
+        self.assertIn("headMatches: true", window)
+
+    def test_improve_failure_remains_retryable(self):
+        body = read_repo(".github/workflows/continuum-pr-agent.yml")
+        self.assertIn("steps.improve.outcome == 'failure'", body)
+        self.assertGreaterEqual(body.count("steps.improve.outcome == 'failure'"), 3)
+
+
 if __name__ == "__main__":
     unittest.main()
