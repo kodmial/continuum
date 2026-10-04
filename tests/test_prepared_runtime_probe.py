@@ -261,14 +261,19 @@ class PreparedRuntimeProbeTests(unittest.TestCase):
                         # closed: the guard clears the digest instead of
                         # exiting, so every `exit 1` left in the site is a
                         # post-install version verification (`|| exit 1`).
+                        # Any other `exit 1` command form — bare, `; exit 1`,
+                        # `&& exit 1`, or single-pipe `| exit 1` — would fail
+                        # closed on a recoverable cache failure instead of
+                        # warning and falling back.
                         self.assertIn(
                             "::warning::CONTINUUM_IMAGE_DIGEST is malformed", text)
                         self.assertIn('CONTINUUM_IMAGE_DIGEST=""', text)
                         for line in site_lines:
-                            code = code_without_comment(line).strip()
-                            if code == "exit 1":
+                            code = code_without_comment(line)
+                            scrubbed = re.sub(r"\|\|\s*exit\s+1\b", "", code)
+                            if re.search(r"(^|[;|&()])\s*exit\s+1\b", scrubbed):
                                 self.fail(
-                                    "{}: bare `exit 1` would fail closed on a "
+                                    "{}: `exit 1` outside `|| exit 1` would fail closed on a "
                                     "cache failure: {}".format(name, line))
                         # Stamp binding: the hit requires the image-digest
                         # stamp to match the digest.
@@ -277,7 +282,7 @@ class PreparedRuntimeProbeTests(unittest.TestCase):
                         self.assertIn("CONTINUUM_IMAGE_DIGEST", condition)
                         # Exact version grep with boundary anchors (plain
                         # substring matching false-hits on "1.18.340").
-                        escaped = version.replace(".", r"\.")
+                        escaped = re.escape(version)
                         self.assertIn(
                             "grep -E -q \"(^|[^0-9.]){}([^0-9.]|$)\"".format(escaped),
                             condition)

@@ -56,30 +56,83 @@ class ContinuumTest < Minitest::Test
     line
   end
 
-  # An installer site: any line that downloads or installs the agent
-  # runtime. New bootstrap channels (npm/brew/curl of a release asset or
-  # GitHub release) count alongside the canonical installer URL and pip
+  # An installer site: any executable line that downloads or installs the
+  # agent runtime. New bootstrap channels (npm/brew/curl of a release asset
+  # or GitHub release) count alongside the canonical installer URL and pip
   # installs, so an unprobed installer cannot pass coverage by using a new
-  # channel while the expected site count still matches.
-  def installer_site?(code)
-    return true if code.include?('https://opencode.ai/install')
-    if code.include?('pip install')
-      return true if code.include?('pr-agent') || code.include?('opencode')
+  # channel while the expected site count still matches. Shell-aware like
+  # the Python worktree contract: one `run:` line is split into
+  # `;`/`&&`/`||`/`|` segments outside quotes, and `echo`/`printf` docs
+  # segments that merely mention an installer URL are not executable sites
+  # (though other segments on the same line still count).
+  def shell_segments(code)
+    segments = []
+    current = +''
+    in_single = false
+    in_double = false
+    index = 0
+    while index < code.length
+      char = code[index]
+      if char == "'" && !in_double
+        in_single = !in_single
+        current << char
+      elsif char == '"' && !in_single
+        in_double = !in_double
+        current << char
+      elsif !in_single && !in_double
+        two = code[index, 2]
+        if char == ';'
+          segments << current
+          current = +''
+        elsif two == '&&' || two == '||'
+          segments << current
+          current = +''
+          index += 1
+        elsif char == '|'
+          segments << current
+          current = +''
+        else
+          current << char
+        end
+      else
+        current << char
+      end
+      index += 1
     end
-    if code.include?('npm install') || code.include?('npm i ') || code.include?('npm ci')
-      return true if code.include?('opencode')
+    segments << current
+    segments
+  end
+
+  def echo_segment?(segment)
+    segment.match?(/^\s*(sudo\s+)?(echo|printf)\b/)
+  end
+
+  def segment_installer?(segment)
+    return true if segment.include?('https://opencode.ai/install')
+    if segment.include?('pip install')
+      return true if segment.include?('pr-agent') || segment.include?('opencode')
     end
-    return true if code.include?('brew install') && code.include?('opencode')
-    if code.include?('curl') || code.include?('wget')
-      return true if code.include?('releases/download')
-      return true if code.include?('github.com') && code.include?('releases')
-      if code.include?('opencode')
-        return true if code.include?('.tar.gz') || code.include?('.zip') || code.include?('download')
+    if segment.include?('npm install') || segment.include?('npm i ') || segment.include?('npm ci')
+      return true if segment.include?('opencode')
+    end
+    return true if segment.include?('brew install') && segment.include?('opencode')
+    if segment.include?('curl') || segment.include?('wget')
+      return true if segment.include?('releases/download')
+      return true if segment.include?('github.com') && segment.include?('releases')
+      if segment.include?('opencode')
+        return true if segment.include?('.tar.gz') || segment.include?('.zip') || segment.include?('download')
       end
     end
-    return true if code.include?('gh release download') && code.include?('opencode')
+    return true if segment.include?('gh release download') && segment.include?('opencode')
 
-    code.include?('releases/download') && code.include?('opencode')
+    segment.include?('releases/download') && segment.include?('opencode')
+  end
+
+  def installer_site?(code)
+    executable = shell_segments(code).reject { |segment| echo_segment?(segment) }
+    return false if executable.empty?
+
+    executable.any? { |segment| segment_installer?(segment) }
   end
 
   # A write to the image-digest stamp in any spelling: `>`/`>>` redirects
@@ -91,7 +144,7 @@ class ContinuumTest < Minitest::Test
   # itself.
   def stamp_write?(code)
     return true if code.match?( />+\s*["']?\$[{'"]?STAMP_FILE/ )
-    return true if code.match?( />+\s*["']?\$?\{?HOME\}?\/[^#\n]*image-digest/ )
+    return true if code.match?( />+\s*["']?(?:~|\$?\{?HOME\}?)\/[^#\n]*image-digest/ )
     return true if code.match?( /\btee\b[^#\n]*(STAMP_FILE|image-digest)/ )
 
     code.match?( /\b(cp|install|dd|mv)\b[^#\n]*(STAMP_FILE|image-digest)/ )

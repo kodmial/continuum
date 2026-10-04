@@ -12,6 +12,7 @@ pinned-ref stability.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import tempfile
 import unittest
@@ -34,8 +35,10 @@ def _write_probe_stub(path: str, version: str) -> None:
 def setUpModule() -> None:
     # Manifest probes are really executed at build time, so the suite
     # provides deterministic stub binaries reporting the pinned versions.
-    # The stubs live under .opencode-tmp inside the worktree and shadow
-    # any ambient binaries via PATH for the duration of the module.
+    # The stubs live under .opencode-tmp inside the worktree. PATH shadowing
+    # is applied per-test in AgentRuntimeContractTest.setUp (restored after
+    # each test) so parallel or neighboring modules never observe the stubs
+    # outside a running test.
     global _STUB_BIN_DIR, _SAVED_PATH
     tmp_root = os.path.abspath(
         os.path.join(os.path.dirname(__file__), "..", ".opencode-tmp"))
@@ -48,14 +51,11 @@ def setUpModule() -> None:
     _write_probe_stub(
         os.path.join(_STUB_BIN_DIR, "runner"), runtime.RUNNER_VERSION)
     _SAVED_PATH = os.environ.get("PATH", "")
-    os.environ["PATH"] = _STUB_BIN_DIR + os.pathsep + _SAVED_PATH
 
 
 def tearDownModule() -> None:
     global _STUB_BIN_DIR, _SAVED_PATH
-    if _SAVED_PATH is not None:
-        os.environ["PATH"] = _SAVED_PATH
-        _SAVED_PATH = None
+    _SAVED_PATH = None
     if _STUB_BIN_DIR and os.path.isdir(_STUB_BIN_DIR):
         shutil.rmtree(_STUB_BIN_DIR, ignore_errors=True)
         _STUB_BIN_DIR = None
@@ -68,14 +68,30 @@ def _controller(project="proj-a"):
 
 
 def _manifest(profile=None, **overrides):
+    if profile is not None and overrides:
+        raise ValueError(
+            "_manifest() got both a profile and overrides: pass one or the other")
     os_name = profile.os if profile is not None else overrides.pop("os", "linux")
     arch = profile.arch if profile is not None else overrides.pop("arch", "x64")
     ref = profile.continuum_ref if profile is not None else overrides.pop("continuum_ref", "main")
     toolchain = profile.toolchain if profile is not None else overrides.pop("toolchain", ())
+    if overrides:
+        raise ValueError(
+            "_manifest() got unexpected overrides: {}".format(sorted(overrides)))
     return runtime.canonical_manifest(os_name, arch, ref, toolchain)
 
 
 class AgentRuntimeContractTest(unittest.TestCase):
+    def setUp(self) -> None:
+        # Scope the stub-binary PATH override to each test (not the whole
+        # module): neighboring or parallel modules executing real probes
+        # must never observe these stubs outside a running test.
+        self._saved_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = _STUB_BIN_DIR + os.pathsep + self._saved_path
+        self.addCleanup(self._restore_path)
+
+    def _restore_path(self) -> None:
+        os.environ["PATH"] = self._saved_path
     def test_01_same_manifest_profile_same_digest(self):
         manifest_a = runtime.canonical_manifest("linux", "x64", "main")
         manifest_b = runtime.canonical_manifest("linux", "x64", "main")
@@ -101,7 +117,7 @@ class AgentRuntimeContractTest(unittest.TestCase):
         # The pin tracks the canonical runtime.OPENCODE_VERSION so a bump
         # exercises the new literal instead of silently testing the old one.
         _opencode_version = runtime.OPENCODE_VERSION
-        _escaped = _opencode_version.replace(".", "\\.")
+        _escaped = re.escape(_opencode_version)
         warm_body = (
             "        env:\n"
             "          CONTINUUM_IMAGE_DIGEST: ${{ vars.CONTINUUM_IMAGE_DIGEST }}\n"
@@ -869,7 +885,7 @@ class AgentRuntimeContractTest(unittest.TestCase):
         _expired_now = 1000.0 + controller.global_max_age + 1.0
         self.assertGreaterEqual(
             controller.live_idle_count(now=_expired_now), 1)
-        self.assertGreaterEqual(controller.live_idle_count(now=_expired_now), 1)
+        self.assertGreaterEqual(controller.live_instance_count(), 1)
 
     def test_resolve_profile_from_env_reads_preset_and_provider(self):
         profile = runtime.resolve_profile_from_env(

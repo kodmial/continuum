@@ -1007,20 +1007,27 @@ def validate_image(manifest: AgentManifest, profile: RuntimeProfile, generation:
         raise AgentRuntimeError("manifest ref does not match profile ref; rebuild for the pinned ref")
     if not manifest.probes:
         raise AgentRuntimeError("manifest declares no validation/version probes")
-    lowered = [str(probe).lower() for probe in manifest.probes]
     # Probes must be executable version checks, not bare name mentions: a
-    # substring test (`"runner" in probe`) accepts `echo runner` as a runner
-    # probe. Require an executable form (`--version` or `command -v`)
-    # naming the runner binary so the declared probe could actually prove
-    # the binary exists and reports its version.
-    if not any("opencode" in probe and ("--version" in probe or "command -v" in probe)
-               for probe in lowered):
+    # substring test (`"runner" in probe`) accepts `echo runner --version`
+    # as a runner probe even though it could never pass the build-time
+    # execution path. Gate on the strict execution allowlist
+    # (`_validated_probe_argv`) so declared probes must be exactly
+    # `<binary> --version` / `command -v <binary>` (extra whitespace
+    # tolerated) naming the runner binary.
+    def _has_executable_probe(binary: str) -> bool:
+        for probe in manifest.probes:
+            try:
+                _validated_probe_argv(str(probe))
+            except AgentRuntimeError:
+                continue
+            if binary in str(probe).lower():
+                return True
+        return False
+    if not _has_executable_probe("opencode"):
         raise AgentRuntimeError("manifest declares no opencode version probe")
-    if not any("pr-agent" in probe and ("--version" in probe or "command -v" in probe)
-               for probe in lowered):
+    if not _has_executable_probe("pr-agent"):
         raise AgentRuntimeError("manifest declares no pr-agent version probe")
-    if not any("runner" in probe and ("--version" in probe or "command -v" in probe)
-               for probe in lowered):
+    if not _has_executable_probe("runner"):
         raise AgentRuntimeError("manifest declares no runner version probe")
     # The declared probes must actually have been executed at build time:
     # SBOM and provenance version strings are synthesized from manifest
@@ -1716,8 +1723,7 @@ class CustomProvider(FakeProvider):
             return super().destroy(instance, now)
         destroyed = bool(self._destroy_fn(instance, now))
         if destroyed:
-            super().destroy(instance, now)
-            return True
+            return super().destroy(instance, now)
         return False
 
 
@@ -1946,13 +1952,14 @@ class EphemeralController:
     def queue_job(self, repository: str, profile: RuntimeProfile, run_id: str = "") -> str:
         """Queue one job. No compute is created by queueing alone."""
 
-        self._job_counter += 1
-        job_id = "job-{:06d}".format(self._job_counter)
-        self.queued.append(
-            {"job_id": job_id, "repository": repository, "profile": profile, "run_id": run_id or job_id}
-        )
-        self.diagnostics.append("queued {} for {}".format(job_id, repository))
-        return job_id
+        with self._provisioning_lock:
+            self._job_counter += 1
+            job_id = "job-{:06d}".format(self._job_counter)
+            self.queued.append(
+                {"job_id": job_id, "repository": repository, "profile": profile, "run_id": run_id or job_id}
+            )
+            self.diagnostics.append("queued {} for {}".format(job_id, repository))
+            return job_id
 
     def live_idle_count(self, now: Optional[float] = None) -> int:
         """Live instances not bound to a live job lease (idle/orphan compute).
@@ -2279,7 +2286,11 @@ class EphemeralController:
             effective_now = float(now) + float(attempt) * float(DEFAULT_TEARDOWN_RETRY_BASE_SECONDS)
             if effective_now > deadline:
                 break
-            if self.provider.destroy(instance, now=effective_now):
+            try:
+                destroyed = bool(self.provider.destroy(instance, now=effective_now))
+            except Exception:
+                destroyed = False
+            if destroyed:
                 self.diagnostics.append("destroyed {}".format(instance.id))
                 return True
         self.diagnostics.append("teardown-retry-exhausted {}".format(instance.id))
@@ -2324,7 +2335,13 @@ class EphemeralController:
                 elif lease.state == "running" and now >= lease.lease_expires_at:
                     orphan, reason = True, "job-lifetime-exceeded"
             if orphan:
-                if self.provider.destroy(instance, now=now):
+                try:
+                    destroyed = bool(self.provider.destroy(instance, now=now))
+                except Exception as exc:
+                    self.diagnostics.append(
+                        "reconciled-orphan-destroy-failed {} ({}): {}".format(instance.id, reason, exc))
+                    continue
+                if destroyed:
                     self.leases.pop(instance.id, None)
                     removed.append(instance.id)
                     self.diagnostics.append("reconciled-orphan {} ({})".format(instance.id, reason))
@@ -2364,6 +2381,7 @@ class EphemeralController:
             orphan_grace_seconds=self.orphan_grace,
             global_max_age_seconds=self.global_max_age,
             retry_limit=self.retry_limit,
+            probe_executor=self.probe_executor,
         )
         restarted.leases = deepcopy(self.leases)
         restarted.queued = deepcopy(self.queued)
