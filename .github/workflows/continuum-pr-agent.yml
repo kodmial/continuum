@@ -130,11 +130,11 @@ on:
         required: false
 
 permissions:
-  actions: read
+  actions: write
   contents: write
   issues: write
   pull-requests: write
-  statuses: read
+  statuses: write
 
 # Orchestration serialization (issue #227): this reusable layer owns the only
 # authoritative per-PR serialization for PR-Agent operations. The
@@ -182,11 +182,11 @@ jobs:
       recovery_kind: ${{ steps.stack.outputs.recovery_kind }}
 
     permissions:
-      actions: read
+      actions: write
       contents: read
       issues: write
       pull-requests: write
-      statuses: read
+      statuses: write
 
     steps:
       - name: Resolve the isolated PR-Agent stack
@@ -215,7 +215,7 @@ jobs:
           CFG_SERVER_PORT: ${{ vars.PR_AGENT_OPENCODE_PORT }}
           CFG_PR_AGENT_VERSION: ${{ vars.PR_AGENT_VERSION }}
         with:
-          github-token: ${{ secrets.TAP_PAT }}
+          github-token: ${{ github.token }}
           script: |
             // A single selector owns the whole review stack.
             const pick = (input, vars, fallback) =>
@@ -488,7 +488,7 @@ jobs:
         env:
           HEAD_SHA: ${{ steps.admit.outputs.head_sha }}
         with:
-          github-token: ${{ secrets.TAP_PAT }}
+          github-token: ${{ github.token }}
           script: |
             await github.rest.repos.createCommitStatus({
               owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
@@ -624,7 +624,7 @@ jobs:
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
         id: runtime
         env:
-          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          GH_TOKEN: ${{ github.token }}
           CONTINUUM_REF: ${{ inputs.continuum_ref }}
         run: |
           set -euo pipefail
@@ -782,8 +782,8 @@ jobs:
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
         id: pragent
         env:
-          GH_TOKEN: ${{ secrets.TAP_PAT }}
-          GITHUB__USER_TOKEN: ${{ secrets.TAP_PAT }}
+          GH_TOKEN: ${{ github.token }}
+          GITHUB__USER_TOKEN: ${{ github.token }}
           CONFIG__GIT_PROVIDER: github
           CONFIG__MODEL: ${{ steps.stack.outputs.model }}
           CONFIG__CUSTOM_MODEL_MAX_TOKENS: ${{ steps.stack.outputs.max_tokens }}
@@ -964,7 +964,7 @@ jobs:
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
         id: persistent
         env:
-          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           REVIEWED_SHA: ${{ steps.result.outputs.head_sha }}
           REVIEW_JSON: ${{ steps.pragent.outputs.review }}
@@ -1143,7 +1143,7 @@ jobs:
           PRAGENT_OUTCOME: ${{ steps.pragent.outcome }}
           POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
         with:
-          github-token: ${{ secrets.TAP_PAT }}
+          github-token: ${{ github.token }}
           script: |
             // Automatic-improve gate: review is the authoritative merge gate.
             // A clean authoritative review (safe_to_merge, zero
@@ -1273,8 +1273,8 @@ jobs:
           steps.improve_gate.outputs.skip_improve != 'true'
         id: improve
         env:
-          GH_TOKEN: ${{ secrets.TAP_PAT }}
-          GITHUB__USER_TOKEN: ${{ secrets.TAP_PAT }}
+          GH_TOKEN: ${{ github.token }}
+          GITHUB__USER_TOKEN: ${{ github.token }}
           CONFIG__GIT_PROVIDER: github
           CONFIG__MODEL: ${{ steps.stack.outputs.model }}
           CONFIG__CUSTOM_MODEL_MAX_TOKENS: ${{ steps.stack.outputs.max_tokens }}
@@ -1347,7 +1347,7 @@ jobs:
           steps.improve_gate.outputs.skip_improve == 'true'
         id: improve_skipped
         env:
-          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           REVIEWED_SHA: ${{ steps.before.outputs.sha }}
           POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
@@ -1439,7 +1439,7 @@ jobs:
           POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
           IMPROVE_JSONL: ${{ steps.improve_output.outputs.improve_jsonl }}
         with:
-          github-token: ${{ secrets.TAP_PAT }}
+          github-token: ${{ github.token }}
           script: |
             const policy = require(process.env.POLICY_SCRIPT);
             const prNumber = Number(process.env.PR_NUMBER);
@@ -1494,7 +1494,7 @@ jobs:
           IMPROVE_SKIPPED: ${{ steps.improve_skipped.outcome == 'success' }}
           POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
         with:
-          github-token: ${{ secrets.TAP_PAT }}
+          github-token: ${{ github.token }}
           script: |
             const policy = require(process.env.POLICY_SCRIPT);
             const review = JSON.parse(String(process.env.REVIEW_JSON || ''));
@@ -1559,7 +1559,7 @@ jobs:
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
         with:
-          github-token: ${{ secrets.TAP_PAT }}
+          github-token: ${{ github.token }}
           script: |
             const policy = require(process.env.POLICY_SCRIPT);
             const comments = await github.paginate(
@@ -1587,7 +1587,7 @@ jobs:
           HEAD_SHA: ${{ steps.result.outputs.head_sha }}
           REVIEW_DISPOSITION: ${{ steps.route.outputs.review_disposition }}
         with:
-          github-token: ${{ secrets.TAP_PAT }}
+          github-token: ${{ github.token }}
           script: |
             const disposition = String(process.env.REVIEW_DISPOSITION || '').trim();
             const descriptions = {
@@ -1623,7 +1623,7 @@ jobs:
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           RETRYABLE_FAILURE: ${{ (steps.install_pragent.outcome == 'failure' || steps.install_opencode.outcome == 'failure' || steps.start_opencode.outcome == 'failure' || steps.runtime.outcome == 'failure' || steps.start_bridge.outcome == 'failure' || steps.pragent.outcome == 'failure' || steps.result.outcome == 'failure' || steps.persistent.outcome == 'failure' || steps.improve_gate.outcome == 'failure' || steps.improve.outcome == 'failure' || steps.improve_skipped.outcome == 'failure' || steps.post_improve.outcome == 'failure' || steps.improve_output.outcome == 'failure') && steps.result.outputs.stale_head != 'true' && steps.persistent.outputs.stale_head != 'true' && steps.improve_gate.outputs.stale_head != 'true' && steps.improve.outputs.stale_head != 'true' && steps.improve_skipped.outputs.stale_head != 'true' && steps.post_improve.outputs.stale_head != 'true' && 'true' || 'false' }}
         with:
-          github-token: ${{ secrets.TAP_PAT }}
+          github-token: ${{ github.token }}
           script: |
             // Defense in depth: every stale-head discard above carries its
             // own flag, but revalidate the live PR head anyway so a
@@ -1745,7 +1745,7 @@ jobs:
           RECOVERY_KIND: ${{ steps.stack.outputs.recovery_kind }}
           POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
         with:
-          github-token: ${{ secrets.TAP_PAT }}
+          github-token: ${{ github.token }}
           script: |
             const policy = require(process.env.POLICY_SCRIPT);
             const prNumber = Number(process.env.PR_NUMBER);
@@ -1841,7 +1841,12 @@ jobs:
            steps.improve_skipped.outputs.stale_head != 'true' &&
            steps.post_improve.outputs.stale_head != 'true'
         env:
-          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          # Target-aware revalidation (gh pr view plus exact-HEAD workflow-run
+          # evidence against the resolved target). Local same-repository reads
+          # use github.token; delegated cross-repository reads require TAP_PAT.
+          # The fallback is gated on non-delegated runs so a delegated run
+          # without PAT yields an empty token (auth itself fails closed).
+          GH_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           TAP_PAT: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           HEAD_SHA: ${{ steps.admit.outputs.head_sha }}
@@ -1853,10 +1858,11 @@ jobs:
           CI_WORKFLOW_NAME: ${{ inputs.ci_workflow_name || vars.CONTINUUM_CI_WORKFLOW_NAME || 'CI' }}
         run: |
           set -euo pipefail
-          # Target-aware revalidation runs wholly PAT-backed (GH_TOKEN is
-          # TAP_PAT) so delegated cross-repository reads succeed. Fail
-          # closed when delegated without PAT instead of masking an auth
-          # failure as stale-cancelled via the revalidation branches below.
+          # Target-aware revalidation against the resolved target: local
+          # same-repository reads use github.token while delegated
+          # cross-repository reads require TAP_PAT. Fail closed when
+          # delegated without PAT instead of masking an auth failure as
+          # stale-cancelled via the revalidation branches below.
           if [[ "${CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED:-false}" == "true" && -z "${TAP_PAT:-}" ]]; then
             echo "::error::Delegated PR-Agent retry requires TAP_PAT; refusing to silently cancel."
             exit 1

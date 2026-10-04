@@ -1747,18 +1747,15 @@ class ContinuumTest < Minitest::Test
     workflow = yaml(File.join(ROOT, '.github/workflows/continuum-pr-agent.yml'))
     stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-pr-agent.yml'))
 
-    # The exact-HEAD workflow-run lookup runs under github.token, so both the
-    # reusable workflow and its caller must grant actions:read (least
-    # privilege: never write). Reusable workflows cannot elevate GITHUB_TOKEN
-    # beyond the caller grant.
-    assert_equal 'read', workflow.fetch('permissions').fetch('actions'),
-                 'reusable workflow must grant actions:read for exact-HEAD CI evidence'
-    assert_equal 'read', workflow.fetch('jobs').fetch('pr_agent').fetch('permissions').fetch('actions'),
-                 'pr_agent job must grant actions:read for exact-HEAD CI evidence'
-    assert_equal 'read', stub.fetch('permissions').fetch('actions'),
-                 'caller stub must grant actions:read because reusable workflows cannot elevate GITHUB_TOKEN'
-    refute_equal 'write', workflow.fetch('permissions').fetch('actions')
-    refute_equal 'write', stub.fetch('permissions').fetch('actions')
+    # The review path now owns same-repository workflow_dispatch for bounded
+    # recovery, so GITHUB_TOKEN needs actions:write end-to-end. Reusable
+    # workflows cannot elevate beyond the caller grant.
+    assert_equal 'write', workflow.fetch('permissions').fetch('actions'),
+                 'reusable workflow must grant actions:write for bounded same-repo review dispatch'
+    assert_equal 'write', workflow.fetch('jobs').fetch('pr_agent').fetch('permissions').fetch('actions'),
+                 'pr_agent job must grant actions:write for bounded same-repo review dispatch'
+    assert_equal 'write', stub.fetch('permissions').fetch('actions'),
+                 'caller stub must grant actions:write because reusable workflows cannot elevate GITHUB_TOKEN'
     # pull-requests read capability is preserved (write implies read; the
     # contract keeps write for the mutating steps below).
     assert_equal 'write', workflow.fetch('jobs').fetch('pr_agent').fetch('permissions').fetch('pull-requests')
@@ -2040,12 +2037,12 @@ class ContinuumTest < Minitest::Test
       end
     end
 
-    # The exact-HEAD admission reads Actions runs under github.token: least
-    # privilege is read, never write, and never absent.
-    assert_equal 'read', permissions.fetch('actions'),
-                 'pr-agent.yml dogfood caller must grant actions:read because reusable workflows cannot elevate GITHUB_TOKEN'
-    refute_equal 'write', permissions.fetch('actions'),
-                 'pr-agent.yml dogfood caller must not widen to actions:write'
+    # The same-repo review controller dispatches bounded recovery using
+    # GITHUB_TOKEN, so the dogfood caller must grant actions:write.
+    assert_equal 'write', permissions.fetch('actions'),
+                 'pr-agent.yml dogfood caller must grant actions:write for same-repo workflow_dispatch'
+    assert_equal 'write', permissions.fetch('statuses'),
+                 'pr-agent.yml dogfood caller must grant statuses:write for review lifecycle status'
 
     # The stub and the dogfood caller call the same reusable workflow, so
     # their permission grants must not diverge again.
@@ -2079,6 +2076,18 @@ class ContinuumTest < Minitest::Test
     end
   end
 
+  def test_pr_agent_review_workflow_uses_repository_token_not_shared_pat
+    body = workflow_body('continuum-pr-agent.yml')
+    refute_includes body, 'secrets.TAP_PAT',
+                    'review workflow must not consume the shared user PAT'
+    assert_includes body, 'GITHUB__USER_TOKEN: ${{ github.token }}'
+    assert_includes body, 'GH_TOKEN: ${{ github.token }}'
+    workflow = yaml(File.join(ROOT, '.github/caller-stubs/continuum-pr-agent.yml'))
+    permissions = workflow.fetch('permissions')
+    assert_equal 'write', permissions.fetch('actions')
+    assert_equal 'write', permissions.fetch('statuses')
+  end
+
   def test_pr_agent_router_validates_and_dispatches_exact_head
     router = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent-router.yml'))
     # The router validates PR membership, owner-gated actor/policy, and the
@@ -2109,6 +2118,27 @@ class ContinuumTest < Minitest::Test
                     'router must coalesce duplicate exact-HEAD dispatches'
     assert_includes router, 'coalesced a duplicate dispatch',
                     'router must log coalesced duplicates instead of dispatching'
+    # The same-repo router uses only the repository-scoped token. GitHub
+    # explicitly permits workflow_dispatch events created with GITHUB_TOKEN,
+    # so the shared user PAT is unnecessary here.
+    assert_includes router, 'actions: write',
+                    'router needs least-privilege Actions write for workflow_dispatch'
+    assert_includes router, 'github-token: ${{ github.token }}',
+                    'router must authenticate reads and dispatch with GITHUB_TOKEN'
+    refute_includes router, 'secrets.TAP_PAT',
+                    'router must not consume the shared user PAT'
+    assert_includes router, 'github.rest.pulls.get(',
+                    'PR metadata read must use repository token'
+    assert_includes router, 'github.rest.actions.listWorkflowRuns(',
+                    'active-run coalescing read must use repository token'
+    refute_includes router, 'github.paginate(',
+                    'router must not scan unbounded workflow history'
+    assert_includes router, "event: 'workflow_dispatch'",
+                    'router active-run lookup must stay scoped to dispatch runs'
+    assert_includes router, 'page: 1',
+                    'router active-run lookup must remain bounded to one page'
+    assert_includes router, 'github.rest.actions.createWorkflowDispatch(',
+                    'same-repo workflow dispatch must use repository token'
     # The router never holds a per-PR lock: the actionable filter and the
     # operation-key coalescing run inside the route step, so a plain
     # non-/review comment run can never queue ahead of a useful dispatch.

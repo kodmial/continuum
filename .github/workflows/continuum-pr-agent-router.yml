@@ -44,7 +44,7 @@ jobs:
     timeout-minutes: 10
 
     permissions:
-      actions: read
+      actions: write
       contents: read
       issues: read
       pull-requests: read
@@ -58,7 +58,7 @@ jobs:
           CFG_REVIEW_PROVIDER: ${{ vars.CONTINUUM_REVIEW_PROVIDER }}
           INPUT_PR_NUMBER: ${{ inputs.pr_number }}
         with:
-          github-token: ${{ secrets.TAP_PAT }}
+          github-token: ${{ github.token }}
           script: |
             // Thin event router: ordinary comments exit without dispatching.
             // Only an actionable `/review` on a pull request dispatches the
@@ -139,10 +139,19 @@ jobs:
             core.notice('PR-Agent review router operation key is ' + operationKey + '.');
 
             const activeStatuses = new Set(['queued', 'in_progress', 'waiting', 'requested', 'pending']);
-            const runs = await github.paginate(
-              github.rest.actions.listWorkflowRuns,
-              { owner, repo, workflow_id: reviewWorkflow, per_page: 100 }
-            );
+            // Coalescing only needs recent active workflow_dispatch runs.
+            // Use the repository-scoped GITHUB_TOKEN for both bounded reads
+            // and same-repo workflow_dispatch. This keeps the user PAT out of
+            // the router entirely and avoids shared-user core-rate exhaustion.
+            const { data: recentRuns } = await github.rest.actions.listWorkflowRuns({
+              owner,
+              repo,
+              workflow_id: reviewWorkflow,
+              event: 'workflow_dispatch',
+              per_page: 100,
+              page: 1,
+            });
+            const runs = recentRuns.workflow_runs || [];
             const prefix = 'PR-Agent PR #' + prNumber + ' [review:';
             const suffix = 'head=' + head;
             const active = runs.find(run =>
@@ -158,8 +167,7 @@ jobs:
               return;
             }
 
-            const { data: repository } = await github.rest.repos.get({ owner, repo });
-            const ref = String(repository.default_branch || 'main');
+            const ref = String(context.payload.repository?.default_branch || 'main');
             await github.rest.actions.createWorkflowDispatch({
               owner, repo, workflow_id: reviewWorkflow, ref,
               inputs: {
