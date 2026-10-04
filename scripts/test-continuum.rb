@@ -112,6 +112,18 @@ class ContinuumTest < Minitest::Test
     if segment.include?('pip install')
       return true if segment.include?('pr-agent') || segment.include?('opencode')
     end
+    if segment.include?('pipx install')
+      return true if segment.include?('pr-agent') || segment.include?('opencode')
+    end
+    if segment.include?('uv tool install')
+      return true if segment.include?('pr-agent') || segment.include?('opencode')
+    end
+    if segment.include?('uv pip install')
+      return true if segment.include?('pr-agent') || segment.include?('opencode')
+    end
+    if segment.include?('cargo install')
+      return true if segment.include?('pr-agent') || segment.include?('opencode')
+    end
     if segment.include?('npm install') || segment.include?('npm i ') || segment.include?('npm ci')
       return true if segment.include?('opencode')
     end
@@ -5415,6 +5427,16 @@ class ContinuumTest < Minitest::Test
     end
     assert_includes engine, 'agent-linux', 'engine must define the agent-linux preset'
     assert_includes engine, 'github-hosted', 'engine must support the github-hosted provider'
+    assert_includes engine, 'resolve_profile_from_env',
+                     'engine must resolve the preset/provider repository variables'
+    assert_includes engine, 'CONTINUUM_RUNTIME_PRESET',
+                     'engine must read CONTINUUM_RUNTIME_PRESET (not just document it)'
+    assert_includes engine, 'CONTINUUM_RUNTIME_PROVIDER',
+                     'engine must read CONTINUUM_RUNTIME_PROVIDER (not just document it)'
+    assert_includes engine, 'DEFAULT_RUNTIME_PRESET',
+                     'engine must define the preset default for CONTINUUM_RUNTIME_PRESET'
+    assert_includes engine, 'DEFAULT_RUNTIME_PROVIDER',
+                     'engine must define the provider default for CONTINUUM_RUNTIME_PROVIDER'
     body = workflow_body('continuum-opencode.yml')
     assert_includes body, 'CONTINUUM_IMAGE_DIGEST',
                     'continuum-opencode.yml: the probe must key on the immutable image digest'

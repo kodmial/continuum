@@ -1634,9 +1634,10 @@ class GitHubHostedProvider(FakeProvider):
             return
         token = _provider_github_token(self._explicit_token)
         if not (token and instance.repository and "/" in instance.repository):
-            self.registrations.pop(jit_id, None)
-            instance.jit_registered = False
-            return
+            raise AgentRuntimeError(
+                "github-hosted deregistration for runner {} needs TAP_PAT/GITHUB_TOKEN "
+                "and repository 'owner/repo': refusing to drop local registration "
+                "while remote teardown is unattempted".format(runner_id))
         url = "{}/repos/{}/actions/runners/{}".format(self.api_base, instance.repository, runner_id)
         # Attempt the remote DELETE before clearing local state, and let
         # failures propagate: swallowing them while popping the
@@ -1756,6 +1757,37 @@ class CustomProvider(FakeProvider):
         return False
 
 
+def _sanitize_cloud_resource_token(value: str, fallback: str = "job") -> str:
+    """Normalize one free-form token into a cloud-safe name fragment."""
+
+    text = str(value or "").lower()
+    text = re.sub(r"[^a-z0-9-]", "-", text)
+    text = re.sub(r"-+", "-", text).strip("-")
+    if not text:
+        return fallback
+    return text
+
+
+def _cloud_resource_name(job_id: str, profile_digest: str) -> str:
+    """Build a CLI-safe per-job resource name (GCE/EC2/Azure compatible).
+
+    Raw job ids may carry slashes, spaces, uppercase, or excessive length;
+    embedding them verbatim fails CLI validation or collides. Normalize to
+    lowercase alphanumeric plus hyphens, bound the total to the 63-char GCE
+    limit, and keep the profile slice so distinct profiles do not collide.
+    """
+
+    job = _sanitize_cloud_resource_token(job_id)
+    digest = _sanitize_cloud_resource_token(str(profile_digest or "")[:8], fallback="profile")
+    max_job = 63 - len("continuum--") - 8
+    if len(job) > max_job:
+        job = job[:max_job].rstrip("-") or "job"
+    name = "continuum-{}-{}".format(job, digest[:8])
+    if not name[0].isalpha():
+        name = "c" + name[1:]
+    return name[:63].strip("-") or "continuum-job-profile"
+
+
 class CloudCliProvider(FakeProvider):
     """Real VM-backed provider that shells out to the cloud CLI (no SDK).
 
@@ -1783,6 +1815,10 @@ class CloudCliProvider(FakeProvider):
         self.project = str(project or "")
         self.region = str(region or "")
         self.extra_args: Tuple[str, ...] = tuple(extra_args or ())
+        # Local instance id -> real provider identity (EC2 InstanceId or
+        # GCE/Azure resource name). Teardown must address real compute, never
+        # the local "i-000001" key.
+        self._provider_instance_ids: Dict[str, str] = {}
 
     @property
     def backend(self) -> str:
@@ -1819,17 +1855,18 @@ class CloudCliProvider(FakeProvider):
             raise AgentRuntimeError("per-job network attachment must not be persistent")
         cli = self._require_cli()
         tags = "continuum-job={}".format(job_id)
+        name = _cloud_resource_name(job_id, profile_digest)
         if self._backend == "gce":
             self._run_cli([cli, "compute", "firewall-rules", "create",
-                            "continuum-{}-{}".format(job_id, profile_digest[:8]),
+                            name,
                             "--allow=tcp:22", "--description={}".format(tags)] + list(self.extra_args))
         elif self._backend == "ec2":
             self._run_cli([cli, "ec2", "create-security-group",
-                            "--group-name", "continuum-{}-{}".format(job_id, profile_digest[:8]),
+                            "--group-name", name,
                             "--description", tags] + list(self.extra_args))
         else:
             self._run_cli([cli, "network", "nsg", "create",
-                            "--name", "continuum-{}-{}".format(job_id, profile_digest[:8]),
+                            "--name", name,
                             "--tags", tags] + list(self.extra_args))
         return super().create_network(
             profile_digest=profile_digest, job_id=job_id, now=now, persistent=False
@@ -1851,35 +1888,70 @@ class CloudCliProvider(FakeProvider):
             raise AgentRuntimeError(
                 "{} provider requires an explicit project/account: refusing to fake real compute".format(self._backend)
             )
-        name = "continuum-{}-{}".format(job_id, profile_digest[:8])
+        name = _cloud_resource_name(job_id, profile_digest)
+        real_id = ""
         if self._backend == "gce":
             self._run_cli([cli, "compute", "instances", "create", name,
                             "--project", self.project] + list(self.extra_args))
+            real_id = name
         elif self._backend == "ec2":
-            self._run_cli([cli, "ec2", "run-instances", "--tag-specifications",
+            output = self._run_cli([cli, "ec2", "run-instances", "--tag-specifications",
                             "ResourceType=instance,Tags=[{Key=continuum-job,Value=" + job_id + "}]"]
                            + list(self.extra_args))
+            try:
+                parsed = json.loads(output or "{}")
+                instances = parsed.get("Instances") if isinstance(parsed, dict) else None
+                first = instances[0] if isinstance(instances, list) and instances else {}
+                if isinstance(first, dict):
+                    real_id = str(first.get("InstanceId") or "")
+            except Exception:
+                real_id = ""
+            if not real_id:
+                match = re.search(r"\bi-[0-9a-fA-F]{8,17}\b", output or "")
+                real_id = match.group(0) if match else ""
+            if not real_id:
+                raise AgentRuntimeError("ec2 provider returned no InstanceId: refusing to fake real compute")
         else:
             self._run_cli([cli, "vm", "create", "--name", name,
                             "--resource-group", self.project] + list(self.extra_args))
+            real_id = name
         instance = super().create_instance(
             project_id=project_id, repository=repository, profile_digest=profile_digest,
             digest=digest, job_id=job_id, network_id=network_id, now=now,
         )
+        self._provider_instance_ids[instance.id] = real_id
         return instance
+
+    def _delete_remote_network_rule(self, cli: str, name: str) -> None:
+        if self._backend == "gce":
+            self._run_cli([cli, "compute", "firewall-rules", "delete", name, "--quiet"])
+        elif self._backend == "ec2":
+            self._run_cli([cli, "ec2", "delete-security-group", "--group-name", name])
+        else:
+            self._run_cli([cli, "network", "nsg", "delete", "--name", name,
+                            "--resource-group", self.project, "--yes"])
 
     def destroy(self, instance: RunnerInstance, now: float) -> bool:
         if instance.destroyed_at is not None:
             return True
         cli = self._require_cli()
-        name = "continuum-{}-{}".format(instance.job_id or instance.id, instance.profile_digest[:8])
+        name = _cloud_resource_name(instance.job_id or instance.id, instance.profile_digest)
         if self._backend == "gce":
             self._run_cli([cli, "compute", "instances", "delete", name, "--quiet"])
         elif self._backend == "ec2":
-            self._run_cli([cli, "ec2", "terminate-instances", "--instance-ids", instance.id])
+            real_id = self._provider_instance_ids.get(instance.id, "")
+            if not real_id:
+                raise AgentRuntimeError(
+                    "ec2 teardown has no recorded provider InstanceId for {}: "
+                    "refusing to terminate local id as real compute".format(instance.id))
+            self._run_cli([cli, "ec2", "terminate-instances", "--instance-ids", real_id])
         else:
             self._run_cli([cli, "vm", "delete", "--name", name, "--yes"])
-        return super().destroy(instance, now)
+        self._delete_remote_network_rule(cli, name)
+        destroyed = super().destroy(instance, now)
+        if destroyed:
+            self._provider_instance_ids.pop(instance.id, None)
+        return destroyed
 
 
 def create_provider(backend: str, **kwargs: Any) -> FakeProvider:
@@ -2327,6 +2399,10 @@ class EphemeralController:
 
     # -- reconciliation (section 7) ------------------------------------
     def sweep_orphans(self, now: float) -> List[str]:
+        with self._provisioning_lock:
+            return self._sweep_orphans_impl(now)
+
+    def _sweep_orphans_impl(self, now: float) -> List[str]:
         """Scheduled orphan sweep: destroy expired/over-age/stale resources.
 
         Covers provisioning timeouts, maximum job lifetime, global maximum
@@ -2549,6 +2625,14 @@ _BOOTSTRAP_PATTERNS = (
     "pip install 'pr-agent==",
     "pip install pr-agent==",
     "pip install opencode",
+    "pipx install pr-agent",
+    "pipx install opencode",
+    "uv tool install pr-agent",
+    "uv tool install opencode",
+    "uv pip install pr-agent",
+    "uv pip install opencode",
+    "cargo install pr-agent",
+    "cargo install opencode",
     "npm install opencode",
     "npm i opencode",
     "brew install opencode",

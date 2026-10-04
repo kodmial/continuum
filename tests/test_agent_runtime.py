@@ -472,11 +472,18 @@ class AgentRuntimeContractTest(unittest.TestCase):
             created_at=1000.0, lease_expires_at=1000.0 + controller.max_job_lifetime,
             max_age_at=1000.0 + controller.global_max_age, state="running")
         controller.queue_job("acme/app", profile)
+        networks_before = set(provider.networks.keys())
         with self.assertRaises(runtime.AgentRuntimeError):
             controller.run_next_job(manifest, now=1100.0)
         # Refused demand is kept, not dropped; the live instance is untouched.
         self.assertEqual(len(controller.queued), 1)
         self.assertEqual(controller.live_instance_count(), 1)
+        # Concurrency refusal must not create a per-job network attachment:
+        # the limit check runs before create_network, so refused demand
+        # leaves provider networks untouched.
+        self.assertEqual(set(provider.networks.keys()), networks_before)
+        live_networks = [n for n in provider.networks.values() if n.destroyed_at is None]
+        self.assertEqual(len(live_networks), 1)
 
     def test_18_linux_and_macos_derive_from_same_contract(self):
         linux = runtime.LinuxAdapter().manifest("main")
@@ -685,6 +692,11 @@ class AgentRuntimeContractTest(unittest.TestCase):
         self.assertEqual(len(controller.queued), 1)
         self.assertEqual(controller.live_idle_count(), 1 - 1)  # network cleaned, nothing live-idle leaked
         self.assertEqual(controller.live_instance_count(), 0)
+        # The per-job network created before the instance failure must be
+        # reclaimed: instance-only counts cannot prove the attachment is
+        # gone, so assert no live network remains.
+        live_networks = [n for n in controller.provider.networks.values() if n.destroyed_at is None]
+        self.assertEqual(live_networks, [])
 
     def test_restart_deep_copies_leases(self):
         controller = _controller()

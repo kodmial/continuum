@@ -388,37 +388,15 @@ class ProtectedBaselineTests(unittest.TestCase):
             )
             if present.returncode == 0:
                 return True
-            # A depth-1 fetch leaves parents missing, so `git merge-base
-            # --is-ancestor` cannot prove ancestry even when it holds, and
-            # a depth-1 checkout leaves HEAD itself shallow for the same
-            # reason. Fetch full history instead: unshallow the checkout
-            # when it is shallow (so HEAD gains its parents), then fetch
-            # the baseline object with its history.
-            unshallow = subprocess.run(
-                ["git", "fetch", "--unshallow", "origin"],
-                cwd=ROOT,
-                capture_output=True,
-                text=True,
-                timeout=300,
-            )
-            present = subprocess.run(
-                ["git", "cat-file", "-e", sha],
-                cwd=ROOT,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            if present.returncode == 0:
-                return True
-            # `--unshallow` fails on a complete clone (or when the remote
-            # is unreachable); fall back to a full (unbounded-depth)
-            # fetch of the baseline object itself.
+            # A depth-1 checkout leaves the baseline object missing. Fetch
+            # just that one object with depth 1 (not full history) so the
+            # validation workflow's shallow checkout stays cheap.
             fetched = subprocess.run(
-                ["git", "fetch", "origin", sha],
+                ["git", "fetch", "--depth", "1", "origin", sha],
                 cwd=ROOT,
                 capture_output=True,
                 text=True,
-                timeout=300,
+                timeout=60,
             )
             if fetched.returncode != 0:
                 return False
