@@ -76,7 +76,7 @@ PR_AGENT_KINDS = frozenset({"review", "repair"})
 
 _LIFECYCLE_RETRY_RE = re.compile(
     r"<!--\s*continuum-lifecycle-retry\s+"
-    r"head=([0-9a-fA-F]{7,64})\s+"
+    r"head=([0-9a-fA-F]{40,64})\s+"
     r"kind=([A-Za-z][A-Za-z0-9-]*)\s+"
     r"attempt=(\d+)"
     r"(?:\s+not-before=(\d+))?"
@@ -84,7 +84,7 @@ _LIFECYCLE_RETRY_RE = re.compile(
 )
 _LIFECYCLE_EXHAUSTED_RE = re.compile(
     r"<!--\s*continuum-lifecycle-retry-exhausted\s+"
-    r"head=([0-9a-fA-F]{7,64})\s+"
+    r"head=([0-9a-fA-F]{40,64})\s+"
     r"kind=([A-Za-z][A-Za-z0-9-]*)\s+"
     r"attempts=(\d+)\s*-->"
 )
@@ -92,13 +92,13 @@ _LIFECYCLE_EXHAUSTED_RE = re.compile(
 # the generalization; new markers use the lifecycle prefix.
 _LEGACY_RETRY_RE = re.compile(
     r"<!--\s*continuum-pr-agent-retry\s+"
-    r"head=([0-9a-fA-F]{7,64})\s+"
+    r"head=([0-9a-fA-F]{40,64})\s+"
     r"kind=(review|repair)\s+"
     r"attempt=(\d+)\s*-->"
 )
 _LEGACY_EXHAUSTED_RE = re.compile(
     r"<!--\s*continuum-pr-agent-retry-exhausted\s+"
-    r"head=([0-9a-fA-F]{7,64})\s+"
+    r"head=([0-9a-fA-F]{40,64})\s+"
     r"kind=(review|repair)\s+"
     r"attempts=(\d+)\s*-->"
 )
@@ -193,8 +193,12 @@ class RecoveryDecision:
 
 def normalize_head(head_sha: object) -> str:
     head = str(head_sha or "").strip().lower()
-    if not re.fullmatch(r"[0-9a-f]{7,64}", head):
-        raise LifecycleRecoveryError("head_sha must be a hexadecimal commit id")
+    # Exact-HEAD identity requires a full commit id (40-hex SHA-1 or 64-hex
+    # SHA-256). Short prefixes are rejected: a short-SHA identity and a
+    # full-SHA identity for the same commit would split budget/exhaustion
+    # and let stale recovery authorize a new HEAD.
+    if not re.fullmatch(r"[0-9a-f]{40,64}", head):
+        raise LifecycleRecoveryError("head_sha must be a full hexadecimal commit id")
     return head
 
 
@@ -437,10 +441,19 @@ def next_retry_delay_seconds(
     longer becomes the delay.  ``provider_reset_epoch`` is an explicit alias
     for a non-GitHub provider reset so callers can name it without routing
     through the GitHub header name.
+
+    A reset epoch without ``now_epoch`` fails closed: silently ignoring the
+    server-provided minimum would dispatch straight through a rate limit,
+    burning the shared budget with further 403/429s.
     """
 
     if attempt < 0:
         raise LifecycleRecoveryError("attempt must be non-negative")
+    for reset_epoch in (ratelimit_reset_epoch, provider_reset_epoch):
+        if reset_epoch is not None and now_epoch is None:
+            raise LifecycleRecoveryError(
+                "now_epoch is required when a reset epoch is supplied"
+            )
     delay = exponential_backoff_seconds(attempt) + jitter_seconds(
         operation_key_value or "lifecycle", attempt
     )
@@ -723,11 +736,12 @@ def decide_recovery(
         now_epoch=now_epoch,
     )
     computed_not_before: Optional[int] = None
-    if now_epoch is not None and (
-        retry_after_seconds is not None
-        or ratelimit_reset_epoch is not None
-        or provider_reset_epoch is not None
-    ):
+    if now_epoch is not None:
+        # Durable backoff: every deferred dispatch persists its next-attempt
+        # time so the scheduled safety net honors the full schedule (40m/60m
+        # tail included), not just server-provided reset windows. Without
+        # this, a schedule-only long wait returns defer=true with no durable
+        # wait and the next watchdog retries immediately, burning the budget.
         computed_not_before = int(now_epoch) + delay
     return RecoveryDecision(
         "dispatch",

@@ -51,7 +51,7 @@ KINDS = frozenset({"review", "repair"})
 
 _RETRY_RE = re.compile(
     r"<!--\s*continuum-pr-agent-retry\s+"
-    r"head=([0-9a-fA-F]{7,64})\s+"
+    r"head=([0-9a-fA-F]{40,64})\s+"
     r"kind=(review|repair)\s+"
     r"attempt=(\d+)\s*-->"
 )
@@ -61,7 +61,7 @@ _RETRY_RE = re.compile(
 # use the lifecycle prefix.
 _LIFECYCLE_RETRY_RE = re.compile(
     r"<!--\s*continuum-lifecycle-retry\s+"
-    r"head=([0-9a-fA-F]{7,64})\s+"
+    r"head=([0-9a-fA-F]{40,64})\s+"
     r"kind=(review|repair)\s+"
     r"attempt=(\d+)"
     r"(?:\s+not-before=(\d+))?"
@@ -69,13 +69,13 @@ _LIFECYCLE_RETRY_RE = re.compile(
 )
 _EXHAUSTED_RE = re.compile(
     r"<!--\s*continuum-pr-agent-retry-exhausted\s+"
-    r"head=([0-9a-fA-F]{7,64})\s+"
+    r"head=([0-9a-fA-F]{40,64})\s+"
     r"kind=(review|repair)\s+"
     r"attempts=(\d+)\s*-->"
 )
 _LIFECYCLE_EXHAUSTED_RE = re.compile(
     r"<!--\s*continuum-lifecycle-retry-exhausted\s+"
-    r"head=([0-9a-fA-F]{7,64})\s+"
+    r"head=([0-9a-fA-F]{40,64})\s+"
     r"kind=(review|repair)\s+"
     r"attempts=(\d+)\s*-->"
 )
@@ -115,8 +115,10 @@ def operation_key(pr_number: object, head_sha: object, kind: object) -> str:
     normalized_kind = str(kind or "").strip().lower()
     if number <= 0:
         raise RecoveryError("pr_number must be a positive integer")
-    if not re.fullmatch(r"[0-9a-f]{7,64}", head):
-        raise RecoveryError("head_sha must be a hexadecimal commit id")
+    # Exact-HEAD identity requires a full commit id; short prefixes would
+    # split the retry budget and weaken the old-HEAD-cannot-mutate guarantee.
+    if not re.fullmatch(r"[0-9a-f]{40,64}", head):
+        raise RecoveryError("head_sha must be a full hexadecimal commit id")
     if normalized_kind not in KINDS:
         raise RecoveryError("kind must be review or repair")
     return f"{number}:{head}:{normalized_kind}"

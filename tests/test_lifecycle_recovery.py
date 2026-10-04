@@ -213,6 +213,45 @@ class ResetAwareBackoffTests(unittest.TestCase):
         self.assertGreaterEqual(first, 0)
         self.assertLessEqual(first, lifecycle.JITTER_CAP_SECONDS)
 
+    def test_reset_epoch_without_clock_fails_closed(self):
+        # A reset minimum without the live clock must never be silently
+        # dropped (which would dispatch straight through a rate limit).
+        with self.assertRaises(lifecycle.LifecycleRecoveryError):
+            lifecycle.next_retry_delay_seconds(
+                attempt=1, ratelimit_reset_epoch=2000
+            )
+        with self.assertRaises(lifecycle.LifecycleRecoveryError):
+            lifecycle.next_retry_delay_seconds(
+                attempt=1, provider_reset_epoch=2000
+            )
+
+    def test_short_sha_identity_is_rejected(self):
+        # Exact-HEAD identity requires a full commit id: a 7-char prefix
+        # must not create a split-budget identity for the same commit.
+        with self.assertRaises(lifecycle.LifecycleRecoveryError):
+            lifecycle.normalize_head("a" * 7)
+        with self.assertRaises(lifecycle.LifecycleRecoveryError):
+            lifecycle.operation_key(REPO, 1, "a" * 7, "review")
+        # Full SHAs (40-hex SHA-1 and 64-hex SHA-256) are accepted.
+        self.assertEqual(lifecycle.normalize_head("A" * 40), "a" * 40)
+        self.assertEqual(lifecycle.normalize_head("B" * 64), "b" * 64)
+
+    def test_schedule_only_long_wait_persists_durable_not_before(self):
+        # A large schedule-only delay (no Retry-After/reset headers) must
+        # still persist not-before so the watchdog honors backoff instead
+        # of retrying immediately and burning the budget.
+        decision = lifecycle.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            failure_transient=True,
+            evidence=lifecycle.RetryEvidence(latest_attempt=7),
+            now_epoch=1000,
+        )
+        self.assertEqual(decision.action, "dispatch")
+        self.assertTrue(decision.defer_dispatch)
+        self.assertIsNotNone(decision.not_before_epoch)
+        self.assertGreater(decision.not_before_epoch, 1000)
+
 
 class LatestStateReconciliationTests(unittest.TestCase):
     def test_rate_limit_failure_resumes_exact_head(self):
@@ -553,6 +592,42 @@ class CrossStackContractTests(unittest.TestCase):
         # auto-merge reconciler queues instead of cancelling, and the
         # per-PR/HEAD lease inside is authoritative.
         self.assertIn("cancel-in-progress: false", automerge)
+
+    def test_deterministic_per_pr_failures_do_not_abort_the_loop(self):
+        # One malformed PR must not strand healthy PRs: both reconcilers
+        # log loudly and continue, failing the run only at the end.
+        for path in (
+            ".github/workflows/continuum-pr-agent-recovery.yml",
+            ".github/workflows/continuum-auto-merge.yml",
+        ):
+            with self.subTest(path=path):
+                body = self.read(path)
+                self.assertIn("deterministicFailure", body)
+                self.assertIn("skipping PR but continuing run", body)
+                self.assertIn("core.setFailed(", body)
+
+    def test_dispatch_rate_limit_signals_are_wired_to_durable_wait(self):
+        body = self.read(
+            ".github/workflows/continuum-pr-agent-recovery.yml"
+        )
+        self.assertIn("extractRateLimitSignals", body)
+        self.assertIn("retry-after", body)
+        self.assertIn("dispatch was rate-limited; deferred", body)
+
+    def test_mutations_revalidate_exact_head_before_writing(self):
+        automerge = self.read(".github/workflows/continuum-auto-merge.yml")
+        self.assertIn("liveBeforeSync", automerge)
+        self.assertIn("holding stale reconciliation", automerge)
+        # The merge itself keeps the atomic sha guard plus full gate
+        # revalidation on the fresh HEAD.
+        self.assertIn("sha: pr.head.sha", automerge)
+
+    def test_recovery_identity_requires_full_commit_ids(self):
+        body = self.read(
+            ".github/workflows/continuum-pr-agent-recovery.yml"
+        )
+        self.assertIn("[0-9a-f]{40,64}", body)
+        self.assertNotIn("[0-9a-f]{7,64}", body)
 
 
 if __name__ == "__main__":

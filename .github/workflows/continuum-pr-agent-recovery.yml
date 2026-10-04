@@ -312,13 +312,13 @@ jobs:
             function parseEvidence(comments, head, kind) {
               const exactHead = String(head).toLowerCase();
               const retryRe =
-                /<!--\s*continuum-lifecycle-retry\s+head=([0-9a-f]{7,64})\s+kind=(review|repair)\s+attempt=(\d+)(?:\s+not-before=(\d+))?[^>]*-->/ig;
+                /<!--\s*continuum-lifecycle-retry\s+head=([0-9a-f]{40,64})\s+kind=(review|repair)\s+attempt=(\d+)(?:\s+not-before=(\d+))?[^>]*-->/ig;
               const legacyRetryRe =
-                /<!--\s*continuum-pr-agent-retry\s+head=([0-9a-f]{7,64})\s+kind=(review|repair)\s+attempt=(\d+)[^>]*-->/ig;
+                /<!--\s*continuum-pr-agent-retry\s+head=([0-9a-f]{40,64})\s+kind=(review|repair)\s+attempt=(\d+)[^>]*-->/ig;
               const exhaustedRe =
-                /<!--\s*continuum-lifecycle-retry-exhausted\s+head=([0-9a-f]{7,64})\s+kind=(review|repair)\s+attempts=(\d+)\s*-->/ig;
+                /<!--\s*continuum-lifecycle-retry-exhausted\s+head=([0-9a-f]{40,64})\s+kind=(review|repair)\s+attempts=(\d+)\s*-->/ig;
               const legacyExhaustedRe =
-                /<!--\s*continuum-pr-agent-retry-exhausted\s+head=([0-9a-f]{7,64})\s+kind=(review|repair)\s+attempts=(\d+)\s*-->/ig;
+                /<!--\s*continuum-pr-agent-retry-exhausted\s+head=([0-9a-f]{40,64})\s+kind=(review|repair)\s+attempts=(\d+)\s*-->/ig;
               let latestAttempt = null;
               let latestMarkerAt = null;
               let notBeforeEpoch = null;
@@ -543,6 +543,38 @@ jobs:
                 }
               }
               return delay;
+            }
+
+            // Reset-signal extraction (#224): server-provided Retry-After /
+            // X-RateLimit-Reset / provider reset minimums are read from the
+            // failed call's headers so a 429/403 does not fall back to
+            // schedule+jitter alone. Callers always pass the live clock, so a
+            // reset epoch is never silently dropped.
+            function extractRateLimitSignals(err) {
+              const headers = (err && ((err.response && err.response.headers) || err.headers)) || {};
+              const lowered = {};
+              for (const [key, value] of Object.entries(headers)) {
+                lowered[String(key).toLowerCase()] = value;
+              }
+              const retryAfterRaw = lowered['retry-after'];
+              let retryAfterSeconds;
+              if (retryAfterRaw !== undefined && retryAfterRaw !== null && String(retryAfterRaw).trim() !== '') {
+                const parsed = Number.parseInt(String(retryAfterRaw).trim(), 10);
+                if (Number.isFinite(parsed) && parsed >= 0) retryAfterSeconds = parsed;
+              }
+              const resetRaw = lowered['x-ratelimit-reset'] ?? lowered['ratelimit-reset'];
+              let ratelimitResetEpoch;
+              if (resetRaw !== undefined && resetRaw !== null && String(resetRaw).trim() !== '') {
+                const parsed = Number.parseInt(String(resetRaw).trim(), 10);
+                if (Number.isFinite(parsed) && parsed > 0) ratelimitResetEpoch = parsed;
+              }
+              const providerRaw = lowered['x-provider-reset'] ?? lowered['provider-reset'];
+              let providerResetEpoch;
+              if (providerRaw !== undefined && providerRaw !== null && String(providerRaw).trim() !== '') {
+                const parsed = Number.parseInt(String(providerRaw).trim(), 10);
+                if (Number.isFinite(parsed) && parsed > 0) providerResetEpoch = parsed;
+              }
+              return { retryAfterSeconds, ratelimitResetEpoch, providerResetEpoch };
             }
 
             // Per-PR/HEAD/operation lease (#224): the in-memory Set below only
@@ -838,6 +870,42 @@ jobs:
                     (cleanupErr.message || cleanupErr)
                   );
                 }
+                // Reset-aware deferral (#224): when the dispatch itself is
+                // rate-limited, persist the server-provided minimum as a
+                // durable not-before marker so the scheduled safety net
+                // honors it instead of retrying on schedule+jitter alone.
+                // The runner still exits; nothing sleeps.
+                if (isTransientApiError(err)) {
+                  const signals = extractRateLimitSignals(err);
+                  if (
+                    signals.retryAfterSeconds !== undefined ||
+                    signals.ratelimitResetEpoch !== undefined ||
+                    signals.providerResetEpoch !== undefined
+                  ) {
+                    const delaySeconds = resetAwareDelaySeconds({
+                      attempt,
+                      retryAfterSeconds: signals.retryAfterSeconds,
+                      ratelimitResetEpoch: signals.ratelimitResetEpoch,
+                      providerResetEpoch: signals.providerResetEpoch,
+                      nowEpoch: Math.floor(nowMs() / 1000),
+                      operationKey: repoFullName + '#' + pr.number + ':' + head + ':' + kind,
+                    });
+                    const notBefore = Math.floor(nowMs() / 1000) + delaySeconds;
+                    await upsertControllerState(
+                      pr.number,
+                      retryMarker(head, kind, attempt, notBefore),
+                      'Deferred PR-Agent ' + kind + ' recovery for exact HEAD ' + head +
+                        ' until ' + new Date(notBefore * 1000).toISOString() +
+                        ' (dispatch was rate-limited; reset-aware backoff ' + delaySeconds + 's).'
+                    );
+                    core.warning(
+                      'PR #' + pr.number + ' ' + kind +
+                      ': dispatch was rate-limited; deferred to ' +
+                      new Date(notBefore * 1000).toISOString() +
+                      ' for the scheduled safety net to redispatch.'
+                    );
+                  }
+                }
                 throw err;
               }
             }
@@ -871,6 +939,9 @@ jobs:
               )
             );
             let reviewRuns = await listReviewRuns();
+            // Deterministic per-PR failures must not strand healthy PRs
+            // behind one bad PR in the same run: record loudly and continue.
+            let deterministicFailure = null;
 
             for (const pr of openPrs) {
               if (
@@ -988,7 +1059,9 @@ jobs:
               } catch (err) {
                 // Generic transient classification (#224): infrastructure
                 // gaps retry via the next event/scheduled wakeup from latest
-                // state; deterministic reconciliation bugs hold loudly.
+                // state. A deterministic per-PR failure is loud but never
+                // aborts the repository-global loop: one malformed PR must
+                // not strand healthy PRs behind it.
                 if (isTransientApiError(err)) {
                   core.warning(
                     'PR #' + pr.number + ' HEAD ' + head +
@@ -996,7 +1069,18 @@ jobs:
                     (err.message || err)
                   );
                 } else {
-                  throw err;
+                  core.error(
+                    'PR #' + pr.number + ' HEAD ' + head +
+                    ': deterministic reconciliation error; skipping PR but continuing run: ' +
+                    (err.stack || err.message || err)
+                  );
+                  if (!deterministicFailure) deterministicFailure = err;
                 }
               }
+            }
+            if (deterministicFailure) {
+              core.setFailed(
+                'Deterministic PR-Agent reconciliation failure(s) held loudly: ' +
+                (deterministicFailure.message || deterministicFailure)
+              );
             }

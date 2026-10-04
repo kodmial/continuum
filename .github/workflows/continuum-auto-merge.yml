@@ -1244,6 +1244,20 @@ jobs:
 
             async function updateFromMain(pr) {
               const oldHead = pr.head.sha;
+              // Exact-HEAD revalidation immediately before mutation (#224):
+              // the caller reconciles from a snapshot taken earlier in a long
+              // loop. If the HEAD moved since, hold instead of syncing stale
+              // state: the next wakeup reconciles the new HEAD from latest.
+              const liveBeforeSync = await getPull(pr.number);
+              if (
+                liveBeforeSync.state !== 'open' ||
+                liveBeforeSync.head.sha !== oldHead
+              ) {
+                core.info(
+                  `PR #${pr.number}: HEAD moved ${oldHead} -> ${liveBeforeSync.head.sha} before main sync; holding stale reconciliation.`
+                );
+                return false;
+              }
               const { data: mainBranch } = await withReadFallback(client =>
                 client.rest.repos.getBranch({
                   owner,
@@ -1388,6 +1402,9 @@ jobs:
             );
 
             let codeRabbitRetryControllerDispatched = false;
+            // Deterministic per-PR failures must not strand healthy PRs
+            // behind one bad PR: record loudly and continue the loop.
+            let deterministicFailure = null;
 
             for (const listed of pulls) {
               let pr = await getPull(listed.number);
@@ -1781,17 +1798,29 @@ jobs:
               break;
               } catch (err) {
                 // Transient infrastructure gaps warn and defer to the next
-                // event/scheduled wakeup from latest state; deterministic
-                // reconciliation failures stay loud.
+                // event/scheduled wakeup from latest state. A deterministic
+                // per-PR failure is loud but never aborts the loop: one
+                // malformed PR, red CI fetcher error, or permission failure
+                // must not strand healthy PRs behind it.
                 if (isTransientApiError(err)) {
                   core.warning(
                     `PR #${pr.number}: transient reconciliation error; a later wakeup retries from latest state: ` +
                     (err.message || err)
                   );
                 } else {
-                  throw err;
+                  core.error(
+                    `PR #${pr.number}: deterministic reconciliation error; skipping PR but continuing run: ` +
+                    (err.stack || err.message || err)
+                  );
+                  if (!deterministicFailure) deterministicFailure = err;
                 }
               } finally {
                 releaseLease(pr.number, leaseHead);
               }
+            }
+            if (deterministicFailure) {
+              core.setFailed(
+                'Deterministic auto-merge reconciliation failure(s) held loudly: ' +
+                (deterministicFailure.message || deterministicFailure)
+              );
             }
