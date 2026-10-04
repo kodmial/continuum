@@ -193,7 +193,18 @@ jobs:
                 .filter(comment => String(comment.body || '').includes(CONTROLLER_STATE_MARKER))
                 .sort((a, b) => Number(a.id) - Number(b.id));
               const latest = controller.at(-1);
-              const body = controllerStateBody(stateMarker, summary);
+              // Presentation-only liveness touch. The durable retry identity
+              // is the stateMarker line alone (parseEvidence matches only
+              // continuum-pr-agent-retry markers). This summary line only
+              // forces a body change so GitHub advances updated_at on every
+              // committed dispatch; it is never parsed as retry state and its
+              // literal prefix cannot match the retry/exhausted regexes.
+              // The summary is coerced null-safe: a missing/non-string
+              // summary must render as empty, never as "undefined"/"null".
+              const body = controllerStateBody(
+                stateMarker,
+                String(summary || '').trim() + '\n\nController dispatch run: ' + String(context.runId)
+              );
               let result;
               if (latest) {
                 const { data } = await github.rest.issues.updateComment({
@@ -226,6 +237,13 @@ jobs:
               return result;
             }
 
+            // Retained for the single-comment coalescing contract: every
+            // controller-state change goes through upsertControllerState
+            // (update latest, prune stale). Dispatch records a pre-dispatch
+            // claim via a fresh createComment (never an update, so the
+            // existing comment's updated_at is untouched), deletes that
+            // claim via rollbackControllerState when the dispatch throws,
+            // and coalesces via upsertControllerState after success.
             async function rollbackControllerState(stateWrite) {
               if (!stateWrite || !stateWrite.comment) return;
               if (stateWrite.created) {
@@ -570,6 +588,45 @@ jobs:
                 refreshedEvidence.latestMarkerAt !== null &&
                 nowMs() - refreshedEvidence.latestMarkerAt < dispatchGraceMs
               ) {
+                // The claim from the successful dispatch is already durable
+                // evidence, but a prior coalescing failure can leave it plus
+                // an older controller comment behind. Re-read fresh before
+                // pruning so an interleaved controller write after the
+                // pre-dispatch snapshot is never invisible: pruning the stale
+                // snapshot could delete pre-existing comments while leaving
+                // both the local claim and a concurrent claim (breaking the
+                // bounded-at-one invariant), and the generic controller
+                // marker alone cannot distinguish another head/kind. Keeping
+                // the fresh latest preserves a concurrent writer's state;
+                // the next successful upsert finishes coalescing.
+                try {
+                  const graceComments = await withReadFallback(client =>
+                    client.paginate(
+                      client.rest.issues.listComments,
+                      { owner, repo, issue_number: pr.number, per_page: 100 }
+                    )
+                  );
+                  const controllerDupes = graceComments
+                    .filter(comment => String(comment.body || '').includes(CONTROLLER_STATE_MARKER))
+                    .sort((a, b) => Number(a.id) - Number(b.id));
+                  for (const stale of controllerDupes.slice(0, -1)) {
+                    try {
+                      await github.rest.issues.deleteComment({
+                        owner,
+                        repo,
+                        comment_id: stale.id,
+                      });
+                    } catch (deleteErr) {
+                      if (deleteErr.status !== 404) throw deleteErr;
+                    }
+                  }
+                } catch (pruneErr) {
+                  core.warning(
+                    'PR #' + pr.number + ' ' + kind +
+                    ': dispatch-grace duplicate prune failed: ' +
+                    (pruneErr.message || pruneErr)
+                  );
+                }
                 core.info(
                   'PR #' + pr.number + ' ' + kind +
                   ': matching retry marker is inside dispatch grace; duplicate wakeup coalesced.'
@@ -578,13 +635,37 @@ jobs:
               }
 
               const marker = retryMarker(head, kind, attempt);
-              const markerState = await upsertControllerState(
-                pr.number,
-                marker,
+              const stateSummary =
                 'Automatic PR-Agent ' + kind + ' recovery for exact HEAD ' + head +
-                  ' (execution ' + (attempt + 1) + '/' + maxExecutions + ').'
+                  ' (execution ' + (attempt + 1) + '/' + maxExecutions + ').';
+              // Exactly-once claim: the durable retry marker is recorded
+              // BEFORE createWorkflowDispatch via a fresh createComment, so a
+              // runner crash after a successful dispatch can never leave the
+              // next wakeup without marker evidence inside grace (which would
+              // dispatch the same attempt again: duplicate recovery
+              // executions, attempt-count drift). A fresh create never touches
+              // the existing controller comment's updated_at; on dispatch
+              // failure the claim is deleted, so a retry that never
+              // dispatched leaves timestamps untouched and is never
+              // coalesced as fresh. A crash between claim and dispatch only
+              // delays the replay until grace expires, then replays the same
+              // bounded attempt instead of duplicating or burning a slot.
+              const claimBody = controllerStateBody(
+                marker,
+                String(stateSummary || '').trim() + '\n\nController dispatch run: ' + String(context.runId)
               );
-
+              let claim = null;
+              try {
+                const { data } = await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: pr.number,
+                  body: claimBody,
+                });
+                claim = data;
+              } catch (err) {
+                throw err;
+              }
               try {
                 const ref = await defaultBranch();
                 await github.rest.actions.createWorkflowDispatch({
@@ -604,18 +685,95 @@ jobs:
                   'PR #' + pr.number + ' HEAD ' + head + ': dispatched ' +
                   kind + ' recovery execution ' + (attempt + 1) + '/' + maxExecutions + '.'
                 );
-                return true;
               } catch (err) {
                 try {
-                  await rollbackControllerState(markerState);
+                  await rollbackControllerState(
+                    claim ? { comment: claim, created: true, previousBody: '' } : null
+                  );
                 } catch (cleanupErr) {
                   core.warning(
-                    'Could not roll back uncommitted recovery controller state: ' +
+                    'PR #' + pr.number + ' ' + kind +
+                    ': pre-dispatch claim cleanup failed: ' +
                     (cleanupErr.message || cleanupErr)
                   );
                 }
                 throw err;
               }
+              // Coalesce the pre-dispatch claim (plus any stale controller
+              // comments) into the single controller comment. The claim is a
+              // fresh controller-state comment, so on persistent upsert
+              // failure delete only pre-existing snapshot comments older
+              // than the claim and keep both the claim and any concurrent
+              // write: exactly-once evidence for both attempts survives and
+              // the next wakeup coalesces via grace. The dispatch already
+              // succeeded, so this path warns and returns true instead of
+              // throwing: a red run for a dispatched recovery would invite a
+              // manual retry that duplicates the same attempt once grace
+              // expires, and callers expect boolean dispatch() success.
+              let stateError = null;
+              for (let stateAttempt = 1; stateAttempt <= 3; stateAttempt++) {
+                try {
+                  await upsertControllerState(pr.number, marker, stateSummary);
+                  stateError = null;
+                  break;
+                } catch (err) {
+                  stateError = err;
+                  core.warning(
+                    'PR #' + pr.number + ' ' + kind +
+                    ': controller state coalescing ' + stateAttempt + '/3 failed after a successful dispatch: ' +
+                    (err.message || err)
+                  );
+                  if (stateAttempt < 3) {
+                    await new Promise(resolve => setTimeout(resolve, 2000 * stateAttempt));
+                  }
+                }
+              }
+              if (stateError) {
+                try {
+                  const freshController = await withReadFallback(client =>
+                    client.paginate(
+                      client.rest.issues.listComments,
+                      { owner, repo, issue_number: pr.number, per_page: 100 }
+                    )
+                  );
+                  const snapshotIds = new Set(
+                    refreshedComments.map(comment => Number(comment.id))
+                  );
+                  const claimId = Number(claim && claim.id);
+                  const priorController = freshController
+                    .filter(comment => String(comment.body || '').includes(CONTROLLER_STATE_MARKER))
+                    .filter(comment => snapshotIds.has(Number(comment.id)))
+                    .filter(comment => Number(comment.id) !== claimId && Number(comment.id) < claimId)
+                    .sort((a, b) => Number(a.id) - Number(b.id));
+                  for (const stale of priorController) {
+                    try {
+                      await github.rest.issues.deleteComment({
+                        owner,
+                        repo,
+                        comment_id: stale.id,
+                      });
+                    } catch (deleteErr) {
+                      if (deleteErr.status !== 404) throw deleteErr;
+                    }
+                  }
+                } catch (pruneErr) {
+                  core.warning(
+                    'PR #' + pr.number + ' ' + kind +
+                    ': post-dispatch duplicate prune failed: ' +
+                    (pruneErr.message || pruneErr)
+                  );
+                }
+                core.warning(
+                  'PR #' + pr.number + ' ' + kind +
+                  ': dispatched recovery execution ' + (attempt + 1) + '/' + maxExecutions +
+                  ' but coalescing into one controller comment failed; ' +
+                  'kept the pre-dispatch claim plus any concurrent controller write. ' +
+                  'The next wakeup coalesces via dispatch grace; no duplicate dispatch was issued. ' +
+                  (stateError.message || stateError)
+                );
+                return true;
+              }
+              return true;
             }
 
             async function exhaust(pr, head, kind, comments) {
