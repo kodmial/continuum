@@ -655,13 +655,28 @@ jobs:
 
                 // Fail closed on truncation: both listings are oldest-first,
                 // so a truncated window hides the newest records that decide
-                // eligibility. Defer the PR to the next wake-up instead of
-                // deciding on partial oldest data.
+                // eligibility. Re-confirm via the newest comment page before
+                // skipping so a chatty PR cannot starve forever while its
+                // history only grows; a truncated review scan still defers.
                 if (reviews.truncated || comments.truncated) {
-                  core.warning(
-                    `PR #${pr.number}: comment/review scan hit the ${MAX_THREAD_PAGES}-page budget; skipping this PR for this pass.`
-                  );
-                  continue;
+                  try {
+                    const { data: meta } = await readGithub.rest.issues.get({ owner, repo, issue_number: pr.number });
+                    noteRead();
+                    const total = Number(meta?.comments || comments.length || 0);
+                    const lastPage = Math.max(1, Math.ceil(total / 100));
+                    const { data: newest } = await readGithub.rest.issues.listComments({ owner, repo, issue_number: pr.number, per_page: 100, page: lastPage });
+                    noteRead();
+                    if (Array.isArray(newest)) {
+                      for (const c of newest) { if (!comments.some(e => e.id === c.id)) comments.push(c); }
+                    }
+                  } catch {
+                    core.warning(`PR #${pr.number}: comment/review scan hit budget and newest-page confirm failed; skipping this pass.`);
+                    continue;
+                  }
+                  if (reviews.truncated) {
+                    core.warning(`PR #${pr.number}: review scan hit the ${MAX_THREAD_PAGES}-page budget; skipping this PR for this pass.`);
+                    continue;
+                  }
                 }
 
                 const carriedApprovalMarker = comments.some(comment =>

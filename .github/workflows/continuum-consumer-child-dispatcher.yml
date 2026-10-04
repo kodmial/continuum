@@ -203,16 +203,19 @@ jobs:
                 | sed -nE 's#^opencode/issue([0-9]+)-.*#\1#p'
             )"
             local_opencode_run_tasks="$(
-              # Only recent active work matters here. Bound the lookup to the
-              # latest 300 runs instead of paginating the full Actions history.
-              for page in 1 2 3; do
-                gh api "repos/$child_repo/actions/runs?per_page=100&page=$page" \
-                  --jq '.workflow_runs[]
-                    | select(.status != "completed")
-                    | .display_title
-                    | select(test("^OpenCode issue #[0-9]+$"))
-                    | capture("^OpenCode issue #(?<task>[0-9]+)$").task' \
-                  2>/dev/null || break
+              # Only recent active work matters here. Filter server-side by
+              # active status so a long-lived run cannot fall outside the
+              # window behind newer completed runs and read as idle.
+              for run_status in in_progress queued waiting requested pending; do
+                for page in 1 2 3; do
+                  gh api "repos/$child_repo/actions/runs?per_page=100&page=$page&status=$run_status" \
+                    --jq '.workflow_runs[]
+                      | select(.status != "completed")
+                      | .display_title
+                      | select(test("^OpenCode issue #[0-9]+$"))
+                      | capture("^OpenCode issue #(?<task>[0-9]+)$").task' \
+                    2>/dev/null || break
+                done
               done
             )"
             child_owner="$(gh api "repos/$child_repo" --jq '.owner.login' 2>/dev/null || true)"

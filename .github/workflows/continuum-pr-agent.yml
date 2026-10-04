@@ -1098,7 +1098,23 @@ jobs:
             jq -s '.' <<<"$WINDOW_JSON" > "$COMMENTS_JSON"
           else
             rm -f "$RUNNER_TEMP/pr-agent-comment-pages.jsonl"
-            for comment_page in 1 2 3 4 5 6 7 8 9 10; do
+            # Newest-first window: comments list oldest-first, so pages
+            # 1-10 would miss a recent reviewed-HEAD marker on a PR with
+            # >1000 comments. Derive the last page from the issue total
+            # and scan the newest 10 pages instead.
+            EXPORT_TOTAL_RAW="$(gh api "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/issues/$PR_NUMBER" --jq '.comments // 0' 2>/dev/null || echo unknown)"
+            if [[ "$EXPORT_TOTAL_RAW" =~ ^[0-9]+$ ]]; then
+              EXPORT_LAST_PAGE=$(( (EXPORT_TOTAL_RAW + 99) / 100 ))
+              [[ "$EXPORT_LAST_PAGE" -ge 1 ]] || EXPORT_LAST_PAGE=1
+              EXPORT_FIRST_PAGE=$(( EXPORT_LAST_PAGE - 9 ))
+              [[ "$EXPORT_FIRST_PAGE" -ge 1 ]] || EXPORT_FIRST_PAGE=1
+            else
+              # Issue-total lookup failed; keep the previous oldest-first
+              # 10-page bound rather than narrowing to a single page.
+              EXPORT_FIRST_PAGE=1
+              EXPORT_LAST_PAGE=10
+            fi
+            for comment_page in $(seq "$EXPORT_FIRST_PAGE" "$EXPORT_LAST_PAGE"); do
               if ! gh api "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100&page=$comment_page" \
                 > "$RUNNER_TEMP/pr-agent-comment-page.json" 2>/dev/null; then
                 echo "::error::Could not read PR comments for persistent-state export."
@@ -1111,7 +1127,6 @@ jobs:
               cat "$RUNNER_TEMP/pr-agent-comment-page.json" >> "$RUNNER_TEMP/pr-agent-comment-pages.jsonl"
               echo >> "$RUNNER_TEMP/pr-agent-comment-pages.jsonl"
               rm -f "$RUNNER_TEMP/pr-agent-comment-page.json"
-              [[ "$PAGE_LEN" -lt 100 ]] && break
             done
             jq -s '.' "$RUNNER_TEMP/pr-agent-comment-pages.jsonl" > "$COMMENTS_JSON"
             rm -f "$RUNNER_TEMP/pr-agent-comment-pages.jsonl"
