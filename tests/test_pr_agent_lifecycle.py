@@ -73,6 +73,9 @@ switch (process.env.POLICY_OP) {
   case 'build':
     result = policy.buildRepairBatch(payload.review, payload.improve_jsonl || '');
     break;
+  case 'disposition':
+    result = policy.reviewDisposition(payload.review, payload.improve_jsonl || '');
+    break;
   case 'same':
     result = policy.sameLogicalDefect(payload.review, payload.improve);
     break;
@@ -922,7 +925,9 @@ class IsolationTests(unittest.TestCase):
         self.assertIn("uses: ./.github/workflows/continuum-pr-agent-repair.yml", review)
         self.assertIn("uses: ./.github/workflows/continuum-pr-agent-auto-merge.yml", review)
         self.assertIn("needs.pr_agent.outputs.needs_repair == 'true'", review)
-        self.assertIn("needs.pr_agent.outputs.needs_repair == 'false'", review)
+        self.assertIn("needs.pr_agent.outputs.ready_to_merge == 'true'", review)
+        self.assertNotIn("needs.pr_agent.outputs.needs_repair == 'false'", review)
+        self.assertIn("needs_rereview", review)
         self.assertIn("Export native persistent finding state for the reviewed HEAD", review)
         self.assertIn("parse_review_state", review)
 
@@ -1093,7 +1098,8 @@ class StabilizationParityTests(unittest.TestCase):
             self.assertIn("pr_agent_policy.js", body)
         self.assertIn("IMPROVE_REPAIR_THRESHOLD", review)
         self.assertIn("policy.buildRepairBatch", repair)
-        self.assertIn("policy.qualifyingImproveSuggestions", merge)
+        self.assertIn("policy.reviewDisposition(", review)
+        self.assertIn("policy.reviewDisposition(", merge)
 
     def test_no_progress_uses_structured_fingerprint_and_head(self):
         repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
@@ -1817,28 +1823,31 @@ class FallbackPersistentStateTests(unittest.TestCase):
         # The fallback exists only in the native-absent branch; a published
         # native marker is parsed and used verbatim instead.
         self.assertIn("parse_review_state", body)
+        self.assertIn("derive_fallback_state", body)
         absent = body.index("if not candidates:")
-        self.assertLess(absent, body.index("reconcile_review_findings("))
-        self.assertLess(
-            body.index("reconcile_review_findings("),
-            body.index("parsed = parse_review_state"),
-        )
+        fallback = body.index("state = derive_fallback_state(")
+        native = body.index("parsed = parse_review_state")
+        self.assertLess(absent, fallback)
+        self.assertLess(fallback, native)
 
     def test_validated_findings_route_reaches_repair(self):
         body = read_repo(".github/workflows/continuum-pr-agent.yml")
-        # The persistent export (now with fallback) precedes routing, and
-        # routing still decides from the current structured review plus
-        # qualifying improve suggestions.
+        policy = read_repo(".github/scripts/pr_agent_policy.js")
+        # The persistent export (now with fallback) precedes routing, and one
+        # canonical policy decides repair / bounded re-review / merge.
         self.assertLess(
             body.index("Export native persistent finding state"),
             body.index("Route the current PR-Agent result"),
         )
         route = body[body.index("Route the current PR-Agent result"):]
-        self.assertIn("key_issues_to_review", route)
-        self.assertIn("qualifyingImproveSuggestions", route)
+        self.assertIn("policy.reviewDisposition(", route)
         self.assertIn("needs_repair", route)
-        # Actionable results reach repair; only a clean HEAD reaches merge.
+        self.assertIn("key_issues_to_review", policy)
+        self.assertIn("qualifyingImproveSuggestions", policy)
+        # Actionable results reach repair; only the explicit ready_to_merge
+        # disposition can reach the merge workflow.
         self.assertIn("needs.pr_agent.outputs.needs_repair == 'true'", body)
+        self.assertIn("needs.pr_agent.outputs.ready_to_merge == 'true'", body)
         repair_use = body.index(
             "continuum-pr-agent-repair.yml",
             body.index("needs.pr_agent.outputs.needs_repair == 'true'"),
@@ -1849,13 +1858,12 @@ class FallbackPersistentStateTests(unittest.TestCase):
 
     def test_workflow_fails_closed_on_unrepresentable_finding(self):
         body = read_repo(".github/workflows/continuum-pr-agent.yml")
-        self.assertIn("normalize_finding", body)
-        self.assertIn(
-            "represented as persistent finding state; failing closed",
-            body,
-        )
-        self.assertIn("cannot derive fallback state", body)
+        self.assertIn("FallbackStateError", body)
+        self.assertIn("derive_fallback_state", body)
+        self.assertIn("Cannot derive fallback persistent state", body)
         self.assertIn("No validated reviewed HEAD", body)
+        self.assertIn("pr_agent_fallback_state.py", body)
+        self.assertIn("fallback_pythonpath", body)
 
     def test_stale_head_is_rejected(self):
         body = read_repo(".github/workflows/continuum-pr-agent.yml")
@@ -2075,6 +2083,92 @@ class SchedulingSemanticsTests(unittest.TestCase):
                 body = read_repo(path)
                 self.assertNotIn("concurrency:", body)
                 self.assertNotIn("cancel-in-progress", body)
+
+
+class ReviewDispositionIntegrationTests(unittest.TestCase):
+    """Issues #252/#257: one policy owns repair/merge/re-review routing."""
+
+    def test_policy_disposition_is_total_and_fail_closed(self):
+        self.assertEqual(
+            run_policy("disposition", {"review": make_review([])}).get("action"),
+            "merge",
+        )
+        self.assertEqual(
+            run_policy(
+                "disposition",
+                {"review": make_review([], recommendation="merge_with_caution")},
+            ).get("action"),
+            "rereview",
+        )
+        self.assertEqual(
+            run_policy(
+                "disposition",
+                {"review": make_review([], recommendation="changes_required")},
+            ).get("action"),
+            "rereview",
+        )
+        self.assertEqual(
+            run_policy(
+                "disposition",
+                {"review": make_review([issue_entry(n=1)], recommendation="changes_required")},
+            ).get("action"),
+            "repair",
+        )
+        suggestion = {
+            "relevant_file": "src/app.py",
+            "one_sentence_summary": "Fix race",
+            "suggestion_content": "Use an atomic update",
+            "score": 8,
+        }
+        self.assertEqual(
+            run_policy(
+                "disposition",
+                {
+                    "review": make_review([]),
+                    "improve_jsonl": json.dumps(
+                        {"payload": {"code_suggestions": [suggestion]}}
+                    ),
+                },
+            ).get("action"),
+            "repair",
+        )
+
+    def test_route_and_merge_gate_share_the_same_policy(self):
+        review = read_repo(".github/workflows/continuum-pr-agent.yml")
+        merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
+        recovery = read_repo(".github/workflows/continuum-pr-agent-recovery.yml")
+        self.assertIn("policy.reviewDisposition(", review)
+        self.assertIn("policy.reviewDisposition(", merge)
+        self.assertIn("ready_to_merge", review)
+        self.assertIn("needs_rereview", review)
+        self.assertIn(
+            "needs.pr_agent.outputs.ready_to_merge == 'true'",
+            review,
+        )
+        self.assertIn(
+            "PR-Agent review complete: blocking; recovery eligible",
+            review,
+        )
+        self.assertIn("blocking; recovery eligible", recovery)
+        self.assertIn(
+            "PR-Agent blocking review: recovery eligible",
+            recovery,
+        )
+        self.assertNotIn(
+            "needs.pr_agent.outputs.needs_repair == 'false'",
+            review,
+        )
+
+    def test_runtime_fallback_is_loaded_from_continuum_ref(self):
+        review = read_repo(".github/workflows/continuum-pr-agent.yml")
+        self.assertIn(
+            "contents/src/continuum/pr_agent_fallback_state.py",
+            review,
+        )
+        self.assertIn('FALLBACK_PYTHONPATH:', review)
+        self.assertIn('PYTHONPATH="$FALLBACK_PYTHONPATH" python3', review)
+        self.assertIn("state = derive_fallback_state(", review)
+        self.assertNotIn("state = reconciled.state", review)
 
 if __name__ == "__main__":
     unittest.main()

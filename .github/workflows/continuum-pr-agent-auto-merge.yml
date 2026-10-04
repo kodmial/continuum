@@ -234,22 +234,11 @@ jobs:
               core.setFailed(`Invalid PR-Agent review JSON: ${err.message}`);
               return;
             }
-            const inner = review.review || review;
-            const keyIssues = inner.key_issues_to_review;
-            if (!Array.isArray(keyIssues)) {
-              core.setFailed('PR-Agent review JSON has no key_issues_to_review list.');
-              return;
-            }
-            const recommendation = String(inner.merge_recommendation || '').trim();
-            if (!recommendation) {
-              core.setFailed('PR-Agent review has no merge_recommendation (require_merge_recommendation).');
-              return;
-            }
             const policy = require(process.env.POLICY_SCRIPT);
             const raw = String(process.env.IMPROVE_JSONL || '').trim();
-            let qualifying;
+            let disposition;
             try {
-              qualifying = policy.qualifyingImproveSuggestions(raw);
+              disposition = policy.reviewDisposition(review, raw);
             } catch (err) {
               core.setFailed(err.message);
               return;
@@ -308,20 +297,8 @@ jobs:
               core.setOutput('reason', reason);
               core.setFailed(`PR-Agent gate blocks PR #${prNumber}: ${reason}`);
             };
-            if (recommendation !== 'safe_to_merge') {
-              fail(`merge recommendation blocks: ${recommendation}`);
-              return;
-            }
-            if (keyIssues.length > 0) {
-              if (keyIssues.length === 6) {
-                fail('review batch reached the findings cap: potentially truncated');
-              } else {
-                fail(`${keyIssues.length} current key issue(s) remain`);
-              }
-              return;
-            }
-            if (qualifying.length > 0) {
-              fail(`${qualifying.length} qualifying suggestion(s) remain`);
+            if (disposition.action !== 'merge') {
+              fail(disposition.reason);
               return;
             }
             if (hasActive) {
