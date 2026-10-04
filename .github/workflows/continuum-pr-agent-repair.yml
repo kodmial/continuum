@@ -421,8 +421,13 @@ jobs:
               return;
             }
             // Bounded comment scan (#254): marker state decides whether the
-            // same HEAD/state may be repaired again, so a truncated window
-            // fails closed (held) instead of deciding on partial data.
+            // same HEAD/state may be repaired again. `listComments` is
+            // oldest-first and ignores sort/direction, so a truncated
+            // oldest-first window would hide the recent no-progress marker;
+            // recover the bounded newest window (derived from the issue
+            // total) and decide on the merged oldest+newest window. Only
+            // a newest-recovery failure holds repair instead of deciding
+            // on a truncated window.
             const comments = [];
             let commentsTruncated = false;
             for (let page = 1; page <= 10; page += 1) {
@@ -435,8 +440,31 @@ jobs:
               if (page === 10) commentsTruncated = true;
             }
             if (commentsTruncated) {
-              failClosed('PR-Agent comment scan hit the 10-page budget; holding repair instead of deciding on a truncated window.');
-              return;
+              try {
+                const noProgressTotal = (await github.rest.issues.get({ owner, repo, issue_number: prNumber })).data.comments || 0;
+                const noProgressLastPage = Math.max(1, Math.ceil(noProgressTotal / 100));
+                if (!noProgressLastPage) throw new Error('cannot anchor newest comments window');
+                const seen = new Set(comments.map(entry => entry && entry.id));
+                for (let page = 1; page <= 10; page += 1) {
+                  const targetPage = noProgressLastPage - (page - 1);
+                  if (targetPage < 1) break;
+                  const { data } = await github.rest.issues.listComments(
+                    { owner, repo, issue_number: prNumber, per_page: 100, page: targetPage }
+                  );
+                  if (!Array.isArray(data) || data.length === 0) continue;
+                  for (const entry of data) {
+                    if (!entry || seen.has(entry.id)) continue;
+                    seen.add(entry.id);
+                    comments.push(entry);
+                  }
+                }
+                core.warning(
+                  'PR-Agent comment scan hit the 10-page budget; deciding on the merged oldest+newest window.'
+                );
+              } catch (recoveryErr) {
+                failClosed('PR-Agent comment scan hit the 10-page budget and newest-window recovery failed; holding repair instead of deciding on a truncated window: ' + recoveryErr.message);
+                return;
+              }
             }
             // The marker carries the exact HEAD plus the structured finding
             // state token. It is written only by this workflow through the
