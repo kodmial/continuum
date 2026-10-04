@@ -653,6 +653,7 @@ jobs:
             });
             const currentSha = String(pr.head.sha || '').toLowerCase();
             if (currentSha !== reviewedSha) {
+              core.setOutput('stale_head', 'true');
               core.setFailed(
                 `PR head moved during review (${reviewedSha} -> ${currentSha}); ` +
                 'discarding the review result and waiting for fresh CI on the new HEAD.'
@@ -753,6 +754,11 @@ jobs:
               raise SystemExit("Upstream PR-Agent persistent state has no last_run.")
           state_head = str(last.get("head_sha") or "").strip().lower()
           if state_head != reviewed:
+              # Expected stale-head discard, not a retryable tool error: flag
+              # it so the bounded-retry controller does not reschedule the
+              # already-superseded admitted SHA and simply waits for fresh CI.
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+                  out.write("stale_head=true\n")
               raise SystemExit(
                   f"Persistent state is stale: last_run.head_sha={state_head or '<empty>'}, reviewed={reviewed}."
               )
@@ -942,6 +948,7 @@ jobs:
           CURRENT_SHA="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)"
           if [[ "${CURRENT_SHA,,}" != "${REVIEWED_SHA,,}" ]]; then
             echo "::error::PR head moved before improve ($REVIEWED_SHA -> $CURRENT_SHA); discarding stale gate decision."
+            echo "stale_head=true" >> "$GITHUB_OUTPUT"
             exit 1
           fi
           IMPROVE_REPAIR_THRESHOLD="$(node -e 'const p=require(process.env.POLICY_SCRIPT); process.stdout.write(String(p.IMPROVE_REPAIR_THRESHOLD));')"
@@ -983,6 +990,7 @@ jobs:
           CURRENT_SHA="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)"
           if [[ "${CURRENT_SHA,,}" != "${REVIEWED_SHA,,}" ]]; then
             echo "::error::PR head moved before recording skipped improve ($REVIEWED_SHA -> $CURRENT_SHA); refusing empty payload for the wrong HEAD."
+            echo "stale_head=true" >> "$GITHUB_OUTPUT"
             exit 1
           fi
           IMPROVE_REPAIR_THRESHOLD="$(node -e 'const p=require(process.env.POLICY_SCRIPT); process.stdout.write(String(p.IMPROVE_REPAIR_THRESHOLD));')"
@@ -1152,10 +1160,30 @@ jobs:
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           HEAD_SHA: ${{ steps.admit.outputs.head_sha }}
-          RETRYABLE_FAILURE: ${{ (steps.install_pragent.outcome == 'failure' || steps.install_opencode.outcome == 'failure' || steps.start_opencode.outcome == 'failure' || steps.runtime.outcome == 'failure' || steps.start_bridge.outcome == 'failure' || steps.pragent.outcome == 'failure' || steps.result.outcome == 'failure' || steps.persistent.outcome == 'failure' || steps.improve_gate.outcome == 'failure' || steps.improve.outcome == 'failure' || steps.improve_skipped.outcome == 'failure' || steps.improve_output.outcome == 'failure') && 'true' || 'false' }}
+          PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
+          RETRYABLE_FAILURE: ${{ (steps.install_pragent.outcome == 'failure' || steps.install_opencode.outcome == 'failure' || steps.start_opencode.outcome == 'failure' || steps.runtime.outcome == 'failure' || steps.start_bridge.outcome == 'failure' || steps.pragent.outcome == 'failure' || steps.result.outcome == 'failure' || steps.persistent.outcome == 'failure' || steps.improve_gate.outcome == 'failure' || steps.improve.outcome == 'failure' || steps.improve_skipped.outcome == 'failure' || steps.improve_output.outcome == 'failure') && steps.result.outputs.stale_head != 'true' && steps.persistent.outputs.stale_head != 'true' && steps.improve.outputs.stale_head != 'true' && steps.improve_skipped.outputs.stale_head != 'true' && 'true' || 'false' }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
+            // A stale-head discard without its own flag (e.g. the improve
+            // gate's live-head revalidation) still reports through the
+            // outcome list above: revalidate the live PR head so a
+            // superseded SHA is never reported as recovery-eligible.
+            let retryable = process.env.RETRYABLE_FAILURE === 'true';
+            if (retryable) {
+              try {
+                const { data: pr } = await github.rest.pulls.get({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  pull_number: Number(process.env.PR_NUMBER),
+                });
+                const liveSha = String((pr && pr.head && pr.head.sha) || '').trim().toLowerCase();
+                if (liveSha && liveSha !== String(process.env.HEAD_SHA || '').trim().toLowerCase()) {
+                  retryable = false;
+                }
+              } catch (err) {
+                core.warning(`Could not revalidate the live PR head: ${err.message}`);
+              }
+            }
             await github.rest.repos.createCommitStatus({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -1163,7 +1191,7 @@ jobs:
               state: 'failure',
               context: 'continuum/pr-agent-review',
               description:
-                process.env.RETRYABLE_FAILURE === 'true'
+                retryable
                   ? 'PR-Agent review failed: transient; recovery eligible'
                   : 'PR-Agent review failed: deterministic; recovery held',
               target_url:
@@ -1228,7 +1256,11 @@ jobs:
            steps.improve_gate.outcome == 'failure' ||
            steps.improve.outcome == 'failure' ||
            steps.improve_skipped.outcome == 'failure' ||
-           steps.improve_output.outcome == 'failure')
+           steps.improve_output.outcome == 'failure') &&
+          steps.result.outputs.stale_head != 'true' &&
+          steps.persistent.outputs.stale_head != 'true' &&
+          steps.improve.outputs.stale_head != 'true' &&
+          steps.improve_skipped.outputs.stale_head != 'true')
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
@@ -1242,6 +1274,26 @@ jobs:
             const policy = require(process.env.POLICY_SCRIPT);
             const prNumber = Number(process.env.PR_NUMBER);
             const head = String(process.env.HEAD_SHA || '').toLowerCase();
+            // Stale-head discards without their own flag (e.g. the improve
+            // gate's live-head revalidation) reach this step through the
+            // outcome list above: revalidate the live PR head first so a
+            // bounded retry is never scheduled for an already-superseded
+            // admitted SHA. Fresh CI on the new HEAD recovers on its own.
+            try {
+              const { data: pr } = await github.rest.pulls.get({
+                owner: context.repo.owner, repo: context.repo.repo, pull_number: prNumber,
+              });
+              const liveSha = String((pr && pr.head && pr.head.sha) || '').trim().toLowerCase();
+              if (liveSha && liveSha !== head) {
+                core.notice(
+                  'PR head moved during review (' + head + ' -> ' + liveSha + '); ' +
+                  'stale retry cancelled, waiting for fresh CI on the new HEAD.'
+                );
+                return;
+              }
+            } catch (err) {
+              core.warning(`Could not revalidate the live PR head: ${err.message}`);
+            }
             const kind = String(process.env.RECOVERY_KIND || 'review').toLowerCase();
             const attempt = Number(process.env.RETRY_ATTEMPT || '0');
             const exhausted = Number.isInteger(attempt) && attempt >= 2;
@@ -1303,7 +1355,11 @@ jobs:
            steps.improve_gate.outcome == 'failure' ||
            steps.improve.outcome == 'failure' ||
            steps.improve_skipped.outcome == 'failure' ||
-           steps.improve_output.outcome == 'failure')
+           steps.improve_output.outcome == 'failure') &&
+          steps.result.outputs.stale_head != 'true' &&
+          steps.persistent.outputs.stale_head != 'true' &&
+          steps.improve.outputs.stale_head != 'true' &&
+          steps.improve_skipped.outputs.stale_head != 'true')
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
@@ -1326,6 +1382,18 @@ jobs:
           if (( attempt >= 2 )); then
             echo "Retry budget exhausted for PR #$PR_NUMBER HEAD $HEAD_SHA."
             exit 0
+          fi
+
+          # Stale-head discards without their own flag (e.g. the improve
+          # gate's live-head revalidation) still satisfy the outcome list
+          # above: cancel before the backoff so a superseded SHA never
+          # sleeps toward a dispatch. The post-backoff revalidation below
+          # remains as defense in depth.
+          if live_head="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid 2>/dev/null)"; then
+            if [[ -n "$live_head" && "$live_head" != "$HEAD_SHA" ]]; then
+              echo "PR head moved ($HEAD_SHA -> $live_head); stale retry cancelled."
+              exit 0
+            fi
           fi
 
           next=$((attempt + 1))

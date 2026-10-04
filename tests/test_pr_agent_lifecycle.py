@@ -1699,6 +1699,28 @@ try {
     return json.loads(completed.stdout)
 
 
+def run_tool_error_signal(review):
+    env = os.environ.copy()
+    env["POLICY_MODULE"] = POLICY_MODULE
+    env["POLICY_REVIEW"] = json.dumps(review)
+    code = r"""
+const policy = require(process.env.POLICY_MODULE);
+const review = JSON.parse(process.env.POLICY_REVIEW || 'null');
+process.stdout.write(JSON.stringify(policy.hasToolErrorSignal(review)));
+"""
+    completed = subprocess.run(
+        ["node", "-e", code],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(completed.stderr)
+    return json.loads(completed.stdout)
+
+
 class CleanReviewImproveSkipTests(unittest.TestCase):
     """Issue #231: a clean authoritative review skips automatic improve."""
 
@@ -1807,6 +1829,77 @@ class CleanReviewImproveSkipTests(unittest.TestCase):
             {"headMatches": True, "reviewCoverageComplete": False, "reviewedHeadSha": "abc"},
         )
         self.assertFalse(js["skip"])
+
+    def test_error_negation_prose_is_not_a_tool_error_signal(self):
+        # A clean review reporting `errors: "No errors"` (or the
+        # `error: "No tool errors"` mirror) must not force an automatic
+        # improve: negation prose is clean, not a blocking tool error.
+        life = self._life()
+        for extra in (
+            {"errors": "No errors"},
+            {"error": "No tool errors"},
+            {"error": "no error"},
+            {"tool_errors": "No errors found"},
+        ):
+            with self.subTest(extra=extra):
+                review = make_review([], extra=extra)
+                self.assertFalse(life.has_tool_error_signal(review))
+                decision = life.should_skip_improve(
+                    review,
+                    make_persistent([], head_sha="abc"),
+                    head_matches=True,
+                    reviewed_head_sha="abc",
+                )
+                self.assertTrue(decision["skip"])
+        for extra in (
+            {"errors": "No errors"},
+            {"error": "No tool errors"},
+            {"error": "no error"},
+            {"tool_errors": "No errors found"},
+        ):
+            with self.subTest(extra=extra):
+                self.assertFalse(run_tool_error_signal(make_review([], extra=extra)))
+        # A genuine tool failure still fails closed and keeps improve.
+        self.assertTrue(life.has_tool_error_signal(
+            make_review([], extra={"tool_errors": ["timeout contacting model"]})
+        ))
+        self.assertTrue(run_tool_error_signal(
+            make_review([], extra={"errors": "upstream tool failed"})
+        ))
+        decision = life.should_skip_improve(
+            make_review([], extra={"errors": "upstream tool failed"}),
+            make_persistent([], head_sha="abc"),
+            head_matches=True,
+            reviewed_head_sha="abc",
+        )
+        self.assertFalse(decision["skip"])
+        js = run_skip_policy(
+            make_review([], extra={"errors": "upstream tool failed"}),
+            make_persistent([], head_sha="abc"),
+            {"headMatches": True, "reviewedHeadSha": "abc"},
+        )
+        self.assertFalse(js["skip"])
+
+    def test_stale_head_discards_do_not_schedule_a_retry(self):
+        # Expected stale-head discards (head moved / stale persistent state)
+        # must not mark the failure retryable: the bounded retry targets the
+        # already-superseded admitted SHA instead of waiting for fresh CI.
+        # Flagged steps carry a stale_head output that the retry gates
+        # exclude; the remaining consumers revalidate the live PR head, so a
+        # discard without its own flag (e.g. the improve gate's live-head
+        # revalidation) still never dispatches for a superseded SHA.
+        body = read_repo(".github/workflows/continuum-pr-agent.yml")
+        for step in ("result", "persistent", "improve", "improve_skipped"):
+            with self.subTest(step=step):
+                self.assertIn(
+                    f"steps.{step}.outputs.stale_head != 'true'", body,
+                    f"the retry gate must ignore stale-head discards from {step}",
+                )
+        self.assertIn("core.setOutput('stale_head', 'true')", body)
+        self.assertIn('echo "stale_head=true" >> "$GITHUB_OUTPUT"', body)
+        self.assertIn("Persistent state is stale", body)
+        self.assertIn("stale retry cancelled", body)
+        self.assertIn("cancel before the backoff", body)
 
     def test_exact_head_mismatch_never_skips(self):
         life = self._life()
