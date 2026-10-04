@@ -4706,14 +4706,16 @@ class ContinuumTest < Minitest::Test
 
   # Hour-scale CodeRabbit quota waits must never pin a GitHub runner. The
   # controller keeps the due time in durable review/comment timestamps and
-  # exits; existing event-driven and auto-merge safety-net wake-ups reconcile
-  # the queue later.
+  # exits; existing event-driven and scheduled safety-net wake-ups reconcile
+  # the queue later. Queue liveness never depends on a separate auto-merge
+  # cron.
   def test_coderabbit_review_queue_defers_without_sleeping_runner
     body = workflow_body('continuum-coderabbit-retry.yml')
 
     assert_includes body, 'function deferUntilNextCandidate(state)'
     assert_includes body, 'no runner sleep'
-    assert_includes body, 'auto-merge safety-net reconciliation will wake the controller again'
+    assert_includes body, "this caller's scheduled safety-net tick will wake the controller again"
+    refute_includes body, 'auto-merge safety-net'
     assert_includes body, 'timeout-minutes: 15'
     assert_includes body, 'cancel-in-progress: true'
     refute_includes body, 'MAX_WAIT_MS'
@@ -4742,6 +4744,49 @@ class ContinuumTest < Minitest::Test
     assert_includes stub, 'actions: read'
     refute_includes stub, 'actions: write'
     refute_includes body, "workflow_id: 'continuum-auto-merge.yml'"
+  end
+
+  # A queue deferred to a future dueAt must be woken by a repository-local
+  # bounded tick even when no review/comment/status event arrives. The stub
+  # carries the periodic trigger and the controller accepts the schedule
+  # event inside the coderabbit provider gate, so disabled consumers stay
+  # no-op and parity cannot silently drift.
+  def test_coderabbit_retry_has_a_bounded_scheduled_safety_net
+    body = workflow_body('continuum-coderabbit-retry.yml')
+    stub_body = File.read(
+      File.join(ROOT, '.github/caller-stubs/continuum-coderabbit-retry.yml')
+    )
+    stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-coderabbit-retry.yml'))
+
+    schedule = events(stub).fetch('schedule')
+    crons = schedule.map { |entry| entry.fetch('cron') }
+    assert_equal ['3,13,23,33,43,53 * * * *'], crons,
+                 'the retry caller must wake every 10 minutes on a non-hour-boundary offset'
+    assert_includes stub_body, 'scheduled safety-net tick'
+
+    # The controller stays non-blocking: due time is derived from durable
+    # timestamps, future slots exit without sleeping, and the schedule event
+    # flows through the same serialized single-command reconciler.
+    assert_includes body, "github.event_name == 'schedule'"
+    provider_gate = body.index("== 'coderabbit'")
+    schedule_gate = body.index("github.event_name == 'schedule'")
+    assert_operator provider_gate, :<, schedule_gate,
+                    'the schedule wake-up must sit inside the coderabbit provider gate'
+    assert_includes body, 'chooseDueCandidate(state)'
+    assert_includes body, 'no second review command will be emitted'
+    assert_includes body, 'candidate.effectiveDueAt <= now'
+    refute_includes body, 'auto-merge safety-net'
+
+    # Parity: the trigger the stub produces is the trigger the controller
+    # accepts. No new secret and no consumer repository literal may ride along.
+    %w[OPENCODE_API_KEY ANTHROPIC_API_KEY GROQ_API_KEY].each do |secret|
+      refute_includes stub_body, secret
+      refute_includes body, secret
+    end
+    foreign = stub_body.scan(%r{kodmial/([A-Za-z0-9._-]+)}).flatten
+      .reject { |name| name == 'continuum' }
+    assert_empty foreign,
+                 "the retry caller must name no consumer repository: #{foreign.uniq.join(', ')}"
   end
 
   # ------------------------------------------------- auto-merge / CodeRabbit

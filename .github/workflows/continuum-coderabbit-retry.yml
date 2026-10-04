@@ -28,8 +28,9 @@ concurrency:
   group: coderabbit-rate-limit-controller-${{ github.repository }}
   # The controller is a short latest-state reconciler. When the next legal
   # review slot is in the future it exits immediately; durable CodeRabbit
-  # comments/review timestamps retain the due time and existing event/safety-net
-  # wake-ups reconcile again later. Newer wake-ups supersede stale scans.
+  # comments/review timestamps retain the due time and existing event and
+  # scheduled safety-net wake-ups reconcile again later. Newer wake-ups
+  # supersede stale scans.
   cancel-in-progress: true
 
 jobs:
@@ -37,6 +38,7 @@ jobs:
     if: >-
       (inputs.review_provider || vars.CONTINUUM_REVIEW_PROVIDER || 'none') == 'coderabbit' &&
       (github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule' ||
       (github.event_name == 'issue_comment' &&
        github.event.issue.pull_request != null &&
        github.event.comment.user.login == 'coderabbitai[bot]' &&
@@ -977,7 +979,7 @@ jobs:
                 .join(', ');
 
               core.notice(
-                `CodeRabbit queue: ${queue}. Deferred until ${new Date(nextAt).toISOString()}; no runner sleep. Existing review/status events and the auto-merge safety-net reconciliation will wake the controller again.`
+                `CodeRabbit queue: ${queue}. Deferred until ${new Date(nextAt).toISOString()}; no runner sleep. Existing review/status events and this caller's scheduled safety-net tick will wake the controller again.`
               );
               return false;
             }
@@ -985,7 +987,8 @@ jobs:
             // Reconcile once. If the earliest legal shared-quota slot is still
             // in the future, leave the runner immediately; the due time is
             // derived from durable review/comment timestamps and will be
-            // re-evaluated by existing event/safety-net wake-ups.
+            // re-evaluated by existing event and scheduled safety-net wake-ups.
+            // The queue never depends on a separate auto-merge cron for liveness.
             let state = await collectState();
 
             if (state.latestInFlightCommand) {
