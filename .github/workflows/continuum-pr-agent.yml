@@ -119,6 +119,7 @@ on:
         required: false
 
 permissions:
+  actions: read
   contents: write
   issues: write
   pull-requests: write
@@ -146,6 +147,7 @@ jobs:
       recovery_kind: ${{ steps.stack.outputs.recovery_kind }}
 
     permissions:
+      actions: read
       contents: read
       issues: write
       pull-requests: write
@@ -265,7 +267,10 @@ jobs:
           EXPECTED_HEAD: ${{ steps.stack.outputs.expected_head }}
           CI_WORKFLOW_NAME: ${{ inputs.ci_workflow_name || vars.CONTINUUM_CI_WORKFLOW_NAME || 'CI' }}
         with:
-          github-token: ${{ secrets.TAP_PAT }}
+          # Pure same-repository read-only admission (pulls.get plus
+          # exact-HEAD workflow-run evidence). Repository token is sufficient;
+          # PAT actor identity must not gate admission.
+          github-token: ${{ github.token }}
           script: |
             // Admission: open, non-draft, same-repo PR whose exact current HEAD
             // has green CI. Anything else is skipped, never reviewed.
@@ -481,7 +486,9 @@ jobs:
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
         id: before
         env:
-          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          # Pure same-repository read-only revalidation (gh pr view plus
+          # exact-HEAD workflow-run evidence). Repository token is sufficient.
+          GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           ADMITTED_SHA: ${{ steps.admit.outputs.head_sha }}
           CI_WORKFLOW_NAME: ${{ inputs.ci_workflow_name || vars.CONTINUUM_CI_WORKFLOW_NAME || 'CI' }}
@@ -638,7 +645,9 @@ jobs:
           REVIEWED_SHA: ${{ steps.before.outputs.sha }}
           REVIEW_JSON: ${{ steps.pragent.outputs.review }}
         with:
-          github-token: ${{ secrets.TAP_PAT }}
+          # Pure same-repository read-only revalidation (pulls.get for the
+          # current PR head only). Repository token is sufficient.
+          github-token: ${{ github.token }}
           script: |
             const prNumber = Number(process.env.PR_NUMBER);
             const reviewedSha = String(process.env.REVIEWED_SHA || '').toLowerCase();
@@ -930,7 +939,9 @@ jobs:
       - name: Fail closed on a moved head
         if: steps.stack.outputs.enabled == 'true' && always()
         env:
-          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          # Pure same-repository read-only check (gh pr view for the current
+          # PR head only). Repository token is sufficient.
+          GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           REVIEWED_SHA: ${{ steps.before.outputs.sha }}
         run: |
