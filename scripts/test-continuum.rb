@@ -1819,6 +1819,39 @@ class ContinuumTest < Minitest::Test
                     'commit-status publishing must stay PAT-backed'
   end
 
+  # kodmial/continuum#239: the dogfood PR-Agent caller is a direct caller
+  # of the reusable PR-Agent workflow, just like the installed caller stub.
+  # An explicitly-scoped caller leaves unspecified permissions as none, and a
+  # called reusable workflow cannot elevate that token, so the dogfood caller
+  # must grant every permission the reusable workflow requires. The stub-only
+  # contract in test_callers_grant_required_permissions cannot see this file.
+  def test_pr_agent_dogfood_caller_grants_required_permissions
+    reusable = yaml(File.join(ROOT, '.github/workflows/continuum-pr-agent.yml'))
+    stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-pr-agent.yml'))
+    caller = yaml(File.join(ROOT, '.github/workflows/pr-agent.yml'))
+    rank = { 'none' => 0, 'read' => 1, 'write' => 2 }
+
+    permissions = caller.fetch('permissions')
+    ([reusable['permissions']] + reusable['jobs'].values.map { |job| job['permissions'] }).compact.each do |required|
+      required.each do |key, value|
+        assert_operator rank.fetch(permissions.fetch(key, 'none')), :>=, rank.fetch(value),
+                        "pr-agent.yml dogfood caller: #{key} grants #{permissions.fetch(key, 'none')}, needs #{value}"
+      end
+    end
+
+    # The exact-HEAD admission reads Actions runs under github.token: least
+    # privilege is read, never write, and never absent.
+    assert_equal 'read', permissions.fetch('actions'),
+                 'pr-agent.yml dogfood caller must grant actions:read because reusable workflows cannot elevate GITHUB_TOKEN'
+    refute_equal 'write', permissions.fetch('actions'),
+                 'pr-agent.yml dogfood caller must not widen to actions:write'
+
+    # The stub and the dogfood caller call the same reusable workflow, so
+    # their permission grants must not diverge again.
+    assert_equal stub.fetch('permissions'), permissions,
+                 'pr-agent.yml dogfood caller and continuum-pr-agent.yml stub must grant the same permissions'
+  end
+
   # kodmial/continuum#229: ordinary PR comments must not create heavy
   # PR-Agent workflow runs. The heavy entry workflows are dispatch-only;
   # explicit `/review` is routed through a thin router that validates the
@@ -3127,7 +3160,7 @@ class ContinuumTest < Minitest::Test
       pause_marker max_dispatch_attempts base_ref knowledge_protocol_path
       knowledge_records_dir issue_commit_prefix
       pause_marker max_dispatch_attempts pause_on_failure ci_repair_label
-      packaging_repair_label
+      packaging_repair_label capability_number qualification_number required_sha
     ],
     'continuum-opencode-repair.yml' => %w[
       continuum_ref pr_number head_sha conclusion run_id ci_repair_label
@@ -4738,6 +4771,86 @@ class ContinuumTest < Minitest::Test
     cli = File.read(File.join(ROOT, '.github/scripts/qualification_gate.py'))
     assert_includes cli, 'from continuum.qualification import',
                     'the CLI must delegate to the canonical gate, not reimplement it'
+  end
+
+  # kodmial/continuum#214: mandatory qualification evidence must be
+  # trustworthy and executable without code changes. Each behavior below is
+  # asserted on the code that acts on it.
+  def test_mandatory_qualification_evidence_is_trusted_and_executable
+    scheduler = workflow_body('continuum-issue-scheduler.yml')
+    opencode = File.read(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
+    engine = File.read(File.join(ROOT, 'src/continuum/qualification.py'))
+    stub = File.read(File.join(ROOT, '.github/caller-stubs/continuum-issue-scheduler.yml'))
+    cli = File.read(File.join(ROOT, '.github/scripts/qualification_gate.py'))
+
+    # Evidence integrity: dispatch prose never counts, only trusted actors
+    # count, exact SHA and issue number remain mandatory, latest trusted wins.
+    assert_includes scheduler, 'TRUSTED_AUTHOR_ASSOCIATIONS'
+    assert_includes scheduler, 'isTrustedQualificationComment'
+    assert_includes scheduler, 'if (commentHasDispatchMarker(body)) continue;'
+    refute_includes scheduler, 'Qualification must publish `<!-- continuum-qualification-result',
+                    'the dispatch note must never embed a parseable result marker'
+    assert_includes engine, 'TRUSTED_AUTHOR_ASSOCIATIONS'
+    assert_includes engine, 'def is_trusted_comment'
+    assert_includes engine, 'if contains_dispatch_marker(body):'
+
+    # Merge-gated start: a bare relation never synthesizes current main, open
+    # blockers wait, and only the merge transition records the first SHA.
+    assert_includes scheduler, 'waiting for the merge transition.'
+    assert_includes scheduler, "return 'no-required-sha';"
+    assert_includes scheduler, "return 'blocked-waiting';"
+    assert_includes engine, 'def should_start_qualification'
+    assert_includes engine, 'no-required-sha'
+
+    # Exact dispatch identity: immutable triple into the run, no retarget by a
+    # later dispatch, duplicates coalesce per SHA, exact SHA fetched by SHA.
+    assert_includes scheduler, "mode: 'qualification',"
+    assert_includes scheduler, 'capability_number: String(capabilityNumber),'
+    assert_includes scheduler, 'required_sha: sha,'
+    assert_includes opencode, "inputs.mode == 'qualification'"
+    assert_includes opencode, 'git fetch origin "$REQUIRED_SHA" --depth 1'
+    assert_includes opencode, 'already-started SHA-A run'
+    assert_includes engine, 'def qualification_run_identity'
+    assert_includes engine, 'def dispatch_matches_run'
+
+    # Qualification execution mode: validate, forbid changes, require one
+    # marker, never close, no-code with evidence succeeds, missing evidence
+    # fails closed recoverably, fail routes to repair.
+    assert_includes opencode, 'Run mandatory qualification at the exact required SHA'
+    assert_includes opencode, 'Qualification mode produced repository changes, which are forbidden'
+    assert_includes opencode, 'leaving the qualification issue open for the scheduler'
+    assert_includes opencode, 'will be retried automatically with the same run identity'
+    assert_includes engine, 'def evaluate_qualification_run'
+    assert_includes engine, 'qualification-mode-cannot-push-product-changes'
+
+    # Recovery stays autonomous: qualification never terminally pauses.
+    assert_includes opencode, 'never terminally paused'
+    assert_includes opencode, 'isQualificationRun'
+    assert_includes engine, 'def qualification_needs_retry'
+    assert_includes engine, 'def next_qualification_retry_delay_seconds'
+
+    # Repair handoff carries the exact failure evidence and refreshes stale bodies.
+    assert_includes scheduler, 'latestTrustedEvidenceBody'
+    assert_includes scheduler, 'Refreshed repair issue #'
+    assert_includes engine, 'def repair_issue_body'
+    assert_includes engine, 'def repair_body_needs_refresh'
+
+    # Event completeness: the consumer caller wakes on result comments while
+    # cron remains the backstop.
+    assert_includes stub, "contains(github.event.comment.body, 'continuum-qualification-result')"
+    assert_includes stub, "contains(github.event.comment.body, 'continuum-docker-qualification-result')"
+    assert_includes stub, "contains(github.event.comment.body, 'continuum-render-qualification-result')"
+    assert_includes stub, 'schedule:'
+    # Trust hardening: result-marker wakes are gated on repository trust so a
+    # public forgery cannot burn Actions minutes; automation evidence reads
+    # user.login (the issue-comments API shape); dispatch trust is checked in
+    # JS; untracked droppings are discarded before the clean-tree verdict.
+    assert_includes stub, "github.event.comment.author_association == 'OWNER'"
+    assert_includes stub, "github.actor == 'github-actions[bot]'"
+    assert_includes opencode, '.user.login == "github-actions[bot]"'
+    assert_includes opencode, 'isTrustedDispatchComment'
+    assert_includes opencode, '--untracked-files=no'
+    assert_includes cli, '--author-association'
   end
 
   end
