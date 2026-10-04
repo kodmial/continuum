@@ -110,7 +110,10 @@ jobs:
             gh api --method DELETE \
               "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/$CI_REPAIR_LABEL" \
               >/dev/null 2>&1 || true
-            echo "Reset per-head CI-repair lock for PR #$PR_NUMBER ($PR_ACTION)."
+            gh api --method DELETE \
+              "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/opencode-conflict-repair" \
+              >/dev/null 2>&1 || true
+            echo "Reset per-head CI/conflict repair locks for PR #$PR_NUMBER ($PR_ACTION)."
           fi
 
           gh label create opencode-conflict-repair --repo "$GITHUB_REPOSITORY" --color B60205 \

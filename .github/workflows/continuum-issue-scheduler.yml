@@ -515,7 +515,7 @@ jobs:
       CHILD_REVIEW_WORKFLOW: ${{ vars.CONTINUUM_CHILD_REVIEW_WORKFLOW || 'continuum-child-review.yml' }}
       CHILD_PR_REVIEW_WORKFLOW: ${{ vars.CONTINUUM_CHILD_PR_REVIEW_WORKFLOW || 'continuum-child-pr-review.yml' }}
       COUNT_OPEN_PRS_AS_WIP: ${{ inputs.count_open_prs_as_wip || vars.AUTOMATION_COUNT_OPEN_PRS_AS_WIP || 'true' }}
-      PAUSE_ON_FAILURE: ${{ inputs.pause_on_failure || vars.AUTOMATION_PAUSE_ON_FAILURE || 'true' }}
+      PAUSE_ON_FAILURE: ${{ inputs.pause_on_failure || vars.AUTOMATION_PAUSE_ON_FAILURE || 'false' }}
       READ_GITHUB_TOKEN: ${{ github.token }}
 
     steps:
@@ -1042,7 +1042,7 @@ jobs:
             const countOpenPrsAsWip =
               (process.env.COUNT_OPEN_PRS_AS_WIP || 'true') !== 'false';
             const pauseOnFailure =
-              (process.env.PAUSE_ON_FAILURE || 'true') !== 'false';
+              (process.env.PAUSE_ON_FAILURE || 'false') !== 'false';
 
             // Byte-for-byte the marker the watchdog parses. A doubled backslash
             // here would silently disable declared-dependency blocking.
