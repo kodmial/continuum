@@ -1794,7 +1794,7 @@ class CustomProvider(FakeProvider):
             return False
         if instance.destroyed_at is not None:
             return True
-        FakeProvider.jit_deregister(self, instance)
+        self.jit_deregister(instance)
         network = self.networks.get(instance.network_id or "")
         if network is not None and network.destroyed_at is None:
             network.destroyed_at = now
