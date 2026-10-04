@@ -274,19 +274,21 @@ class RecoveryWiringTests(unittest.TestCase):
         body = self.read(".github/workflows/continuum-pr-agent-recovery.yml")
         self.assertIn("READ_GITHUB_TOKEN: ${{ github.token }}", body)
         self.assertIn("github-token: ${{ secrets.TAP_PAT }}", body)
-        self.assertIn("const readRequest = github.request.defaults", body)
-        for route in (
-            "GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs",
-            "GET /repos/{owner}/{repo}/actions/runs/{run_id}",
-            "GET /repos/{owner}/{repo}/actions/runs",
-            "GET /repos/{owner}/{repo}",
-            "GET /repos/{owner}/{repo}/pulls/{pull_number}",
-            "GET /repos/{owner}/{repo}/pulls",
-            "GET /repos/{owner}/{repo}/issues/{issue_number}/comments",
-            "GET /repos/{owner}/{repo}/commits/{ref}/statuses",
+        self.assertIn("const { getOctokit } = require('@actions/github')", body)
+        self.assertIn("const readGithub = getOctokit(readToken)", body)
+
+        for read_call in (
+            "readGithub.rest.actions.listWorkflowRuns",
+            "readGithub.rest.actions.getWorkflowRun",
+            "readGithub.rest.actions.listWorkflowRunsForRepo",
+            "readGithub.rest.pulls.list",
+            "readGithub.rest.pulls.get",
+            "readGithub.rest.repos.listCommitStatusesForRef",
+            "readGithub.rest.issues.listComments",
+            "readGithub.rest.repos.get({ owner, repo })",
         ):
-            with self.subTest(route=route):
-                self.assertIn(route, body)
+            with self.subTest(read_call=read_call):
+                self.assertIn(read_call, body)
 
         # Item 1 keeps all mutation/dispatch calls on the PAT-authenticated
         # action client, preserving actor and event fan-out semantics.
