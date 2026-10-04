@@ -1158,11 +1158,20 @@ class StabilizationParityTests(unittest.TestCase):
         self.assertIn("combined status is ", merge)
 
     def test_finding_fingerprint_is_order_independent(self):
-        repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
-        self.assertIn(
-            "stable(items).map(entry => JSON.stringify(entry)).sort()", repair
+        first = issue_entry(n=0)
+        second = issue_entry(n=1)
+        forward = run_policy(
+            "build",
+            {"review": make_review([first, second]), "improve_jsonl": ""},
         )
-        self.assertIn("JSON.stringify(canonical)", repair)
+        reverse = run_policy(
+            "build",
+            {"review": make_review([second, first]), "improve_jsonl": ""},
+        )
+        self.assertEqual(forward["fingerprint"], reverse["fingerprint"])
+        policy = read_repo(".github/scripts/pr_agent_policy.js")
+        self.assertIn("function logicalFingerprint", policy)
+        self.assertIn(".sort()", policy)
 
     def test_default_branch_resolution_is_validated(self):
         merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
