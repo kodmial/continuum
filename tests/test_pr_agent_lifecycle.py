@@ -1121,7 +1121,8 @@ class StabilizationParityTests(unittest.TestCase):
         self.assertIn('echo "classification=transient" >> "$GITHUB_OUTPUT"', repair)
         self.assertIn("requesting bounded exact-HEAD re-review/repair", repair)
         self.assertIn("if: always() && steps.repair_pass.outputs.no_progress == 'true'", repair)
-        self.assertIn('READ_GH_TOKEN: ${{ github.token }}', repair)
+        self.assertIn('GH_TOKEN: ${{ secrets.TAP_PAT }}', repair)
+        self.assertNotIn('READ_GH_TOKEN: ${{ github.token }}', repair)
         self.assertIn("GitHub API failure is retryable", repair)
         self.assertNotIn("No repair diff; controller state will hold", repair)
 
