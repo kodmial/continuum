@@ -63,7 +63,7 @@ jobs:
           if [[ -z "$COMMENT_PAGES" ]]; then
             COMMENTS="[]"
           else
-            COMMENTS="$(jq -s '.' <<<"$(grep -v '^$' <<<"$COMMENT_PAGES" || true)")"
+            COMMENTS="$(jq -s 'add // []' <<<"$(grep -v '^$' <<<"$COMMENT_PAGES" || true)")"
           fi
 
           VERIFICATION=$(jq -c \
@@ -71,7 +71,7 @@ jobs:
             --argjson unresolved "$UNRESOLVED_COMMENT_ID" \
             --arg owner "$REPO_OWNER" \
             --arg head "$HEAD_SHA" '
-              [ .[][]
+              [ .[]
                 | select(.in_reply_to_id == $finding)
                 | select(.id < $unresolved)
                 | select(.user.login == $owner)

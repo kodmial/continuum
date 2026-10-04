@@ -758,7 +758,7 @@ jobs:
                   <<<"$override_json" 2>/dev/null)"$'\n'
                 [[ "$override_count" -lt 100 ]] && break
               done
-              recent_command="$(grep -v '^$' <<<"$override_seen" | tail -n 1 | tr -d '[:space:]')"
+              recent_command="$(grep -v '^$' <<<"$override_seen" | tail -n 1 | tr -d '[:space:]' || true)"
               [[ -n "$recent_command" ]] || return 1
               command_epoch="$(date -d "$recent_command" +%s 2>/dev/null || echo 0)"
               now_epoch="$(date +%s)"

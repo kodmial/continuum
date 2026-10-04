@@ -207,11 +207,11 @@ jobs:
           # One pulls.get serves every guard plus the lock check below: the
           # PR representation already carries labels, so no second
           # labels-list read is needed (#254).
-          PR_JSON="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")"
+          PR_JSON="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")" || PR_JSON='{}'
           read -r pr_state head_ref head_sha head_repo < <(
             jq -r '[.state, .head.ref, .head.sha, .head.repo.full_name] | @tsv' <<<"$PR_JSON"
           )
-          PR_LABELS="$(jq -r '[.labels[].name][]' <<<"$PR_JSON")"
+          PR_LABELS="$(jq -r '[.labels[]?.name? // empty][]?' <<<"$PR_JSON" 2>/dev/null || true)"
 
           if [[ "$pr_state" != "open" || "$head_repo" != "$GITHUB_REPOSITORY" ]]; then
             echo "PR #$PR_NUMBER is not an open same-repository PR; ignoring the reported CI result."
@@ -320,11 +320,11 @@ jobs:
 
           # One pulls.get serves the guards plus the lock check below: the
           # PR representation already carries labels (#254).
-          PR_JSON="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr")"
+          PR_JSON="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr")" || PR_JSON='{}'
           read -r head_ref head_sha head_repo < <(
             jq -r '[.head.ref, .head.sha, .head.repo.full_name] | @tsv' <<<"$PR_JSON"
           )
-          PR_LABELS="$(jq -r '[.labels[].name][]' <<<"$PR_JSON")"
+          PR_LABELS="$(jq -r '[.labels[]?.name? // empty][]?' <<<"$PR_JSON" 2>/dev/null || true)"
 
           # Unchanged on purpose: the workflow_run path has always accepted any
           # `opencode/*` branch. The stricter OpenCode issue-branch pattern is
