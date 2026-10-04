@@ -62,6 +62,9 @@ jobs:
           CI_WORKFLOW_NAME: ${{ inputs.ci_workflow_name || 'CI' }}
           STALE_MINUTES: ${{ inputs.stale_minutes || vars.PR_AGENT_RECOVERY_STALE_MINUTES || '70' }}
           DISPATCH_GRACE_SECONDS: ${{ inputs.dispatch_grace_seconds || vars.PR_AGENT_RECOVERY_DISPATCH_GRACE_SECONDS || '90' }}
+          # Item 1 of Work Lock #58: same-repo reads use the repository-scoped
+          # installation token. PAT remains the mutation/dispatch identity.
+          READ_GITHUB_TOKEN: ${{ github.token }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
@@ -90,6 +93,41 @@ jobs:
             ]);
             const REVIEW_CONTEXT = 'continuum/pr-agent-review';
             const REPAIR_CONTEXT = 'continuum/pr-agent-repair';
+
+            // Keep the action client PAT-authenticated for mutations/dispatch.
+            // Read-only same-repository calls use github.token so they do not
+            // consume the shared TAP_PAT user's core REST budget.
+            const readToken = String(process.env.READ_GITHUB_TOKEN || '').trim();
+            if (!readToken) {
+              core.setFailed('READ_GITHUB_TOKEN is required for PR-Agent recovery reads.');
+              return;
+            }
+            const readRequest = github.request.defaults({
+              headers: {
+                authorization: 'bearer ' + readToken,
+              },
+            });
+
+            async function readPaginate(route, params, collectionKey = null) {
+              const items = [];
+              for (let page = 1; ; page += 1) {
+                const { data } = await readRequest(route, {
+                  ...params,
+                  per_page: 100,
+                  page,
+                });
+                const pageItems = collectionKey === null ? data : data?.[collectionKey];
+                if (!Array.isArray(pageItems)) {
+                  throw new Error(
+                    'Unexpected paginated read response for ' + route +
+                    (collectionKey === null ? '' : ' collection ' + collectionKey)
+                  );
+                }
+                items.push(...pageItems);
+                if (pageItems.length < 100) break;
+              }
+              return items;
+            }
 
             if (!['continuum-pr-agent.yml', 'pr-agent.yml'].includes(reviewWorkflow)) {
               core.setFailed(
@@ -183,14 +221,14 @@ jobs:
 
             async function listReviewRuns() {
               try {
-                return await github.paginate(
-                  github.rest.actions.listWorkflowRuns,
+                return await readPaginate(
+                  'GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs',
                   {
                     owner,
                     repo,
                     workflow_id: reviewWorkflow,
-                    per_page: 100,
-                  }
+                  },
+                  'workflow_runs'
                 );
               } catch (err) {
                 core.setFailed(
@@ -216,11 +254,14 @@ jobs:
               const match = target.match(/\/actions\/runs\/(\d+)(?:$|[/?#])/);
               if (!match) return { conclusion: null, recoveryKind: null };
               try {
-                const { data: run } = await github.rest.actions.getWorkflowRun({
-                  owner,
-                  repo,
-                  run_id: Number(match[1]),
-                });
+                const { data: run } = await readRequest(
+                  'GET /repos/{owner}/{repo}/actions/runs/{run_id}',
+                  {
+                    owner,
+                    repo,
+                    run_id: Number(match[1]),
+                  }
+                );
                 const title = String(run.display_title || '');
                 const identity = title.match(/\[(review|repair):\d+\]/);
                 const recoveryKind = identity ? identity[1] : null;
@@ -244,15 +285,15 @@ jobs:
             }
 
             async function exactHeadCiGreen(head) {
-              const runs = await github.paginate(
-                github.rest.actions.listWorkflowRunsForRepo,
+              const runs = await readPaginate(
+                'GET /repos/{owner}/{repo}/actions/runs',
                 {
                   owner,
                   repo,
                   event: 'pull_request',
                   head_sha: head,
-                  per_page: 100,
-                }
+                },
+                'workflow_runs'
               );
               const latest = runs
                 .filter(run => run.name === ciWorkflowName && run.head_sha === head)
@@ -363,7 +404,10 @@ jobs:
             }
 
             async function defaultBranch() {
-              const { data } = await github.rest.repos.get({ owner, repo });
+              const { data } = await readRequest(
+                'GET /repos/{owner}/{repo}',
+                { owner, repo }
+              );
               return String(data.default_branch || 'main');
             }
 
@@ -384,11 +428,14 @@ jobs:
                 await new Promise(resolve => setTimeout(resolve, remaining * 1000));
               }
 
-              const { data: fresh } = await github.rest.pulls.get({
-                owner,
-                repo,
-                pull_number: pr.number,
-              });
+              const { data: fresh } = await readRequest(
+                'GET /repos/{owner}/{repo}/pulls/{pull_number}',
+                {
+                  owner,
+                  repo,
+                  pull_number: pr.number,
+                }
+              );
               if (
                 fresh.state !== 'open' ||
                 fresh.draft ||
@@ -418,9 +465,9 @@ jobs:
                 return false;
               }
 
-              const refreshedComments = await github.paginate(
-                github.rest.issues.listComments,
-                { owner, repo, issue_number: pr.number, per_page: 100 }
+              const refreshedComments = await readPaginate(
+                'GET /repos/{owner}/{repo}/issues/{issue_number}/comments',
+                { owner, repo, issue_number: pr.number }
               );
               const refreshedEvidence = parseEvidence(refreshedComments, head, kind);
               if (refreshedEvidence.exhausted) {
@@ -518,9 +565,9 @@ jobs:
               });
             }
 
-            const openPrs = await github.paginate(
-              github.rest.pulls.list,
-              { owner, repo, state: 'open', per_page: 100 }
+            const openPrs = await readPaginate(
+              'GET /repos/{owner}/{repo}/pulls',
+              { owner, repo, state: 'open' }
             );
             let reviewRuns = await listReviewRuns();
 
@@ -542,13 +589,13 @@ jobs:
               }
 
               const [statuses, comments] = await Promise.all([
-                github.paginate(
-                  github.rest.repos.listCommitStatusesForRef,
-                  { owner, repo, ref: head, per_page: 100 }
+                readPaginate(
+                  'GET /repos/{owner}/{repo}/commits/{ref}/statuses',
+                  { owner, repo, ref: head }
                 ),
-                github.paginate(
-                  github.rest.issues.listComments,
-                  { owner, repo, issue_number: pr.number, per_page: 100 }
+                readPaginate(
+                  'GET /repos/{owner}/{repo}/issues/{issue_number}/comments',
+                  { owner, repo, issue_number: pr.number }
                 ),
               ]);
 
