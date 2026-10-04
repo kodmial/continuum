@@ -1130,6 +1130,9 @@ class StabilizationParityTests(unittest.TestCase):
         self.assertIn("policy.buildRepairBatch", repair)
         self.assertIn("policy.reviewDisposition(", review)
         self.assertIn("policy.reviewDisposition(", merge)
+        self.assertIn("disposition.action !== 'merge'", merge)
+        self.assertNotIn("recommendation !== policy.REVIEW_MERGE_SAFE", merge)
+        self.assertIn("central review disposition blocks merge", merge)
 
     def test_no_progress_uses_structured_fingerprint_and_head(self):
         repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
