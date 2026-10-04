@@ -66,6 +66,15 @@ on:
         required: false
         type: string
         default: ''
+      pause_on_failure:
+        description: >-
+          Whether exhausted watchdog recovery enters a terminal pause. Empty
+          falls back to AUTOMATION_PAUSE_ON_FAILURE. When false, the watchdog
+          leaves the reservation to the scheduler lease/backoff instead of
+          requiring human intervention.
+        required: false
+        type: string
+        default: ''
 
 permissions: {}
 
@@ -93,6 +102,7 @@ jobs:
       IN_PROGRESS_LABEL: ${{ inputs.in_progress_label || vars.AUTOMATION_IN_PROGRESS_LABEL || 'automation:in-progress' }}
       PAUSE_LABEL: ${{ inputs.pause_marker || vars.AUTOMATION_PAUSE_LABEL || 'automation:paused' }}
       DISPATCH_MARKER: ${{ inputs.dispatch_marker || vars.AUTOMATION_DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->' }}
+      PAUSE_ON_FAILURE: ${{ inputs.pause_on_failure || vars.AUTOMATION_PAUSE_ON_FAILURE || 'true' }}
 
     steps:
       - name: Recover failed OpenCode issue run
@@ -112,6 +122,8 @@ jobs:
             const inProgressLabel = process.env.IN_PROGRESS_LABEL || 'automation:in-progress';
             const pausedLabel = process.env.PAUSE_LABEL || 'automation:paused';
             const dispatchMarker = process.env.DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->';
+            const pauseOnFailure =
+              (process.env.PAUSE_ON_FAILURE || 'true') !== 'false';
 
             let issueNumber = null;
             // Consumers that give their OpenCode caller a `run-name` of
@@ -447,6 +459,19 @@ jobs:
             );
 
             if (previousRetries >= maxRetries) {
+              if (!pauseOnFailure) {
+                // Keep the reservation so the scheduler lease provides a
+                // bounded cooldown. The scheduler releases and retries it
+                // automatically after lease expiry, avoiding both a terminal
+                // human pause and a tight retry loop.
+                await removeLabel(pausedLabel);
+                core.warning(
+                  'Issue #' + issueNumber +
+                    ' exhausted automatic OpenCode recovery; pause_on_failure=false, ' +
+                    'so scheduler lease/backoff remains authoritative.'
+                );
+                return;
+              }
               await removeLabel(inProgressLabel);
               await addLabel(pausedLabel);
               await github.rest.issues.createComment({
