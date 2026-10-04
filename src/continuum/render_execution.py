@@ -409,8 +409,6 @@ def _distinct_instance_ids(*payloads: object) -> int:
                 "instance_ids",
                 "worker_id",
                 "worker_ids",
-                "service_id",
-                "deployment_id",
             ):
                 continue
             if isinstance(value, (list, tuple)):
@@ -642,9 +640,18 @@ def classify_render_failure(
     if instance_ids >= 3:
         restarts = max(restarts, instance_ids - 1)
     # Textual storm evidence ("restart storm", repeated replacement notes)
-    # counts when structured counters are absent.
-    if restarts == 0 and ("restart storm" in text or text.count("replacement") >= 2):
-        restarts = RESTART_STORM_THRESHOLD
+    # counts when structured counters are absent. Only string values are
+    # inspected so JSON key names alone cannot fabricate a storm.
+    if restarts == 0:
+        value_chunks = []
+        for _payload in (result, memory_summary, state, qualification):
+            if isinstance(_payload, Mapping):
+                for _key, _value in _walk_values(_payload):
+                    if isinstance(_value, str):
+                        value_chunks.append(_value.lower())
+        _value_text = "\n".join(value_chunks)
+        if "restart storm" in _value_text or _value_text.count("replacement") >= 2:
+            restarts = RESTART_STORM_THRESHOLD
     events = _memory_events(memory_summary)
     for other in (result, state):
         other_events = _memory_events(other)
@@ -654,12 +661,13 @@ def classify_render_failure(
 
     pinned_ratio: Optional[float] = None
     if limit and limit > 0:
-        observed = peak or current
+        candidates = [v for v in (peak, current) if isinstance(v, int) and v > 0]
+        observed = max(candidates) if candidates else None
         if observed:
             pinned_ratio = observed / limit
     pinned = pinned_ratio is not None and pinned_ratio >= PINNED_RATIO
     near_limit = pinned_ratio is not None and pinned_ratio >= NEAR_LIMIT_RATIO
-    peak_over_limit = bool(limit and peak and peak > limit)
+    peak_over_limit = bool(limit and limit > 0 and any(isinstance(v, int) and v > limit for v in (peak, current)))
 
     profile = _profile_identity(result, state, qualification)
     error = _error_key(text)
