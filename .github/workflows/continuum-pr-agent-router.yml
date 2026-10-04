@@ -1,0 +1,176 @@
+name: PR-Agent review router
+
+on:
+  workflow_call:
+    inputs:
+      continuum_ref:
+        description: Continuum revision supplying fallback scripts
+        type: string
+        default: main
+        required: false
+      review_workflow:
+        description: Heavy PR-Agent caller workflow file to dispatch.
+        type: string
+        default: continuum-pr-agent.yml
+        required: false
+      review_provider:
+        description: >-
+          Review provider selector; empty falls back to CONTINUUM_REVIEW_PROVIDER.
+        type: string
+        default: ''
+        required: false
+      pr_number:
+        description: >-
+          Pull request number for an explicit manual route. Empty resolves
+          from the issue_comment event.
+        type: string
+        default: ''
+        required: false
+
+permissions: {}
+
+# No workflow-level concurrency by design (issue #227): the actionable
+# /review filter and the operation-key active-run coalescing run inside the
+# `route` step, which executes only after a workflow-level lock would already
+# have queued this run. A per-PR router lock would let a plain non-`/review`
+# comment run queue ahead of a useful exact-HEAD dispatch for the same PR.
+# The heavy operation layer owns the only per-PR serialization
+# (continuum-pr-agent.yml); the router itself never holds a per-PR lock and
+# never preempts (native cancellation cannot compare HEADs).
+
+jobs:
+  route:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      actions: read
+      contents: read
+      issues: read
+      pull-requests: read
+
+    steps:
+      - name: Route an actionable /review comment to the heavy workflow
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          INPUT_REVIEW_WORKFLOW: ${{ inputs.review_workflow }}
+          INPUT_REVIEW_PROVIDER: ${{ inputs.review_provider }}
+          CFG_REVIEW_PROVIDER: ${{ vars.CONTINUUM_REVIEW_PROVIDER }}
+          INPUT_PR_NUMBER: ${{ inputs.pr_number }}
+        with:
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            // Thin event router: ordinary comments exit without dispatching.
+            // Only an actionable `/review` on a pull request dispatches the
+            // heavy workflow once per logical operation key review:<pr>:<head>.
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const repoFullName = owner + '/' + repo;
+            const reviewWorkflow = String(process.env.INPUT_REVIEW_WORKFLOW || 'continuum-pr-agent.yml').trim();
+            if (!['continuum-pr-agent.yml', 'pr-agent.yml'].includes(reviewWorkflow)) {
+              core.setFailed(
+                'Invalid PR-Agent review workflow: ' + reviewWorkflow +
+                '. Expected continuum-pr-agent.yml or pr-agent.yml.'
+              );
+              return;
+            }
+            const provider = String(
+              process.env.INPUT_REVIEW_PROVIDER || process.env.CFG_REVIEW_PROVIDER || 'none'
+            ).trim().toLowerCase();
+            if (provider !== 'pr-agent') {
+              core.notice(
+                'PR-Agent review router exits: review provider is not pr-agent (' + provider + ').'
+              );
+              return;
+            }
+
+            let prNumber = String(process.env.INPUT_PR_NUMBER || '').trim();
+            if (context.eventName === 'issue_comment') {
+              const issue = context.payload.issue;
+              if (!issue || !issue.pull_request) {
+                core.notice('PR-Agent review router exits: comment does not belong to a pull request.');
+                return;
+              }
+              if (context.actor !== context.repo.owner) {
+                core.notice('PR-Agent review router exits: actor is not allowed.');
+                return;
+              }
+              const body = String(context.payload.comment?.body || '');
+              if (!/\/review\b/.test(body)) {
+                core.notice('PR-Agent review router exits: no actionable /review command.');
+                return;
+              }
+              prNumber = String(issue.number || '').trim();
+            } else if (context.eventName === 'workflow_dispatch') {
+              if (!prNumber) {
+                core.notice('PR-Agent review router exits: workflow_dispatch needs an explicit pr_number.');
+                return;
+              }
+            } else {
+              core.notice('PR-Agent review router exits: unsupported event ' + context.eventName + '.');
+              return;
+            }
+            if (!prNumber) {
+              core.setFailed('PR-Agent review router could not resolve a pull request number.');
+              return;
+            }
+
+            const { data: pr } = await github.rest.pulls.get({
+              owner, repo, pull_number: Number(prNumber),
+            });
+            if (pr.state !== 'open') {
+              core.notice('PR-Agent review router exits: PR #' + prNumber + ' is not open.');
+              return;
+            }
+            if (pr.draft) {
+              core.notice('PR-Agent review router exits: PR #' + prNumber + ' is a draft.');
+              return;
+            }
+            if (!pr.head.repo || pr.head.repo.full_name !== repoFullName) {
+              core.notice('PR-Agent review router exits: PR #' + prNumber + ' is not same-repo.');
+              return;
+            }
+            const head = String(pr.head.sha || '').toLowerCase();
+            if (!head) {
+              core.setFailed('PR-Agent review router could not resolve the current PR HEAD.');
+              return;
+            }
+            const operationKey = 'review:' + prNumber + ':' + head;
+            core.notice('PR-Agent review router operation key is ' + operationKey + '.');
+
+            const activeStatuses = new Set(['queued', 'in_progress', 'waiting', 'requested', 'pending']);
+            const runs = await github.paginate(
+              github.rest.actions.listWorkflowRuns,
+              { owner, repo, workflow_id: reviewWorkflow, per_page: 100 }
+            );
+            const prefix = 'PR-Agent PR #' + prNumber + ' [review:';
+            const suffix = 'head=' + head;
+            const active = runs.find(run =>
+              String(run.display_title || '').startsWith(prefix) &&
+              String(run.display_title || '').endsWith(suffix) &&
+              activeStatuses.has(String(run.status || '').toLowerCase())
+            );
+            if (active) {
+              core.notice(
+                'PR-Agent review router coalesced a duplicate dispatch for ' + operationKey +
+                ' (run ' + active.id + ' is already active).'
+              );
+              return;
+            }
+
+            const { data: repository } = await github.rest.repos.get({ owner, repo });
+            const ref = String(repository.default_branch || 'main');
+            await github.rest.actions.createWorkflowDispatch({
+              owner, repo, workflow_id: reviewWorkflow, ref,
+              inputs: {
+                pr_number: String(prNumber),
+                expected_head_sha: head,
+                retry_attempt: '0',
+                retry_workflow: reviewWorkflow,
+                recovery_kind: 'review',
+              },
+            });
+            core.notice(
+              'PR-Agent review router dispatched ' + operationKey +
+              ' to ' + reviewWorkflow + ' with exact HEAD ' + head + '.'
+            );

@@ -102,8 +102,14 @@ jobs:
             // github-script already supplies the plugin-composed Octokit class.
             // Reuse its constructor instead of dynamically requiring
             // @actions/github, which is not resolvable from the script sandbox.
+            // Preserve the enterprise base URL so GitHub Enterprise reads keep working.
+            const readBaseUrl = (
+              (github && github.request && github.request.endpoint &&
+                github.request.endpoint.DEFAULTS && github.request.endpoint.DEFAULTS.baseUrl) ||
+              process.env.GITHUB_API_URL || 'https://api.github.com'
+            );
             const readGithub = readToken
-              ? new github.constructor({ auth: readToken })
+              ? new github.constructor({ auth: readToken, baseUrl: readBaseUrl })
               : github;
             if (!readToken) {
               core.warning('READ_GITHUB_TOKEN is empty; using PAT client for PR-Agent recovery reads.');

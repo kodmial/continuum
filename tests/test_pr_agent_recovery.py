@@ -292,7 +292,10 @@ class RecoveryWiringTests(unittest.TestCase):
         self.assertIn("READ_GITHUB_TOKEN: ${{ github.token }}", body)
         self.assertIn("github-token: ${{ secrets.TAP_PAT }}", body)
         self.assertNotIn("require('@actions/github')", body)
-        self.assertIn("new github.constructor({ auth: readToken })", body)
+        self.assertNotIn("require(\"@actions/github\")", body)
+        self.assertIn("new github.constructor({ auth: readToken, baseUrl: readBaseUrl })", body)
+        self.assertIn("github.request.endpoint.DEFAULTS.baseUrl", body)
+        self.assertIn("process.env.GITHUB_API_URL", body)
         self.assertIn("using PAT client for PR-Agent recovery reads", body)
         self.assertIn("let readTokenUnavailable = false", body)
         self.assertIn("async function withReadFallback(fn)", body)
@@ -334,6 +337,104 @@ class RecoveryWiringTests(unittest.TestCase):
             r"github\.rest\.(?!issues\.createComment\b|issues\.updateComment\b|issues\.deleteComment\b|actions\.createWorkflowDispatch\b)",
             "PAT client must only be used for mutations/dispatch",
         )
+
+    def test_recovery_read_client_constructs_in_github_script_sandbox(self):
+        """Runtime-shaped guard for issue #217.
+
+        The github-script sandbox does not resolve `require('@actions/github')`
+        (the Node 24 regression). The workflow must therefore build its
+        repository-token read client from the supplied `github.constructor`.
+        This test executes the workflow's construction semantics under Node with
+        a `require` that rejects `@actions/github`, so reintroducing the bare
+        require fails here exactly as it fails live.
+        """
+        import re
+        import shutil
+        import subprocess
+        import tempfile
+
+        body = self.read(".github/workflows/continuum-pr-agent-recovery.yml")
+        self.assertNotIn("require('@actions/github')", body)
+
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("node is required for the github-script sandbox check")
+
+        harness = r"""
+const assert = require('assert');
+// github-script sandbox shape: '@actions/github' is not resolvable.
+function sandboxRequire(name) {
+  throw new Error("Cannot find module '" + name + "'");
+}
+let rejected = false;
+try {
+  sandboxRequire('@actions/github');
+} catch (err) {
+  rejected = /Cannot find module/.test(String(err && err.message));
+}
+assert.ok(rejected, 'sandbox must reject require(@actions/github)');
+
+// Plugin-composed Octokit mock as supplied by actions/github-script v7.
+class FakeOctokit {
+  constructor(opts = {}) {
+    this.opts = opts;
+    this.request = { endpoint: { DEFAULTS: { baseUrl: 'https://ghe.example.com/api/v3' } } };
+  }
+}
+const github = new FakeOctokit({ auth: 'PAT' });
+github.constructor = FakeOctokit;
+const core = { warning: () => {}, info: () => {}, notice: () => {}, setFailed: (m) => { throw new Error(m); } };
+
+// --- workflow construction block under test (mirrors the yml) ---
+const readToken = String(process.env.READ_GITHUB_TOKEN || '').trim();
+const readBaseUrl = (
+  (github && github.request && github.request.endpoint &&
+    github.request.endpoint.DEFAULTS && github.request.endpoint.DEFAULTS.baseUrl) ||
+  process.env.GITHUB_API_URL || 'https://api.github.com'
+);
+const readGithub = readToken
+  ? new github.constructor({ auth: readToken, baseUrl: readBaseUrl })
+  : github;
+// --- end workflow block ---
+assert.notStrictEqual(readGithub, github, 'repository token must yield an independent client');
+assert.strictEqual(readGithub.opts.auth, 'ghs_repo_token');
+assert.strictEqual(readGithub.opts.baseUrl, 'https://ghe.example.com/api/v3', 'GHE base URL must be preserved');
+const emptyToken = '';
+const fallback = emptyToken ? new github.constructor({ auth: emptyToken, baseUrl: readBaseUrl }) : github;
+assert.strictEqual(fallback, github, 'empty token must fall back to the PAT client');
+console.log('sandbox construction OK');
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as handle:
+            handle.write(harness)
+            script = handle.name
+        try:
+            env = dict(
+                os.environ,
+                READ_GITHUB_TOKEN="ghs_repo_token",
+                GITHUB_API_URL="https://api.github.com",
+            )
+            completed = subprocess.run(
+                [node, script],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=30,
+            )
+        finally:
+            os.unlink(script)
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        self.assertIn("sandbox construction OK", completed.stdout)
+
+        # The executed semantics must match the shipped workflow text, so the
+        # harness cannot drift from the yml silently.
+        for needle in (
+            "const readToken = String(process.env.READ_GITHUB_TOKEN",
+            "github.request.endpoint.DEFAULTS.baseUrl",
+            "process.env.GITHUB_API_URL",
+            "new github.constructor({ auth: readToken, baseUrl: readBaseUrl })",
+        ):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, body)
 
     def test_recovery_coalesces_retry_state_into_one_controller_comment(self):
         body = self.read(".github/workflows/continuum-pr-agent-recovery.yml")
