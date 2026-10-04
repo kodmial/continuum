@@ -16,10 +16,10 @@ import unittest
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 SRC = os.path.join(ROOT, "src")
 
-# Intentional P0 baseline advance: fcee15d changes only the authoritative
-# task-context credential routing in continuum-opencode.yml. Keeping the
+# Intentional P0 baseline advance: bd6a658 changes only the issue-start
+# control-plane credential routing in continuum-opencode.yml. Keeping the
 # immutable commit baseline means any later protected-file drift still fails.
-BASELINE_SHA = "fcee15de97a7fee64c8f0a893f63519535ad2f96"
+BASELINE_SHA = "bd6a65875fd153c27d785acab7c49737037e5b6c"
 
 PROTECTED_FILES = [
     ".github/workflows/continuum-opencode.yml",
