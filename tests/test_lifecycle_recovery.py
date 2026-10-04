@@ -252,6 +252,73 @@ class ResetAwareBackoffTests(unittest.TestCase):
         self.assertIsNotNone(decision.not_before_epoch)
         self.assertGreater(decision.not_before_epoch, 1000)
 
+    def test_schedule_only_long_wait_without_clock_defers(self):
+        # Fail closed without a clock: a schedule-only tail delay (10m+)
+        # cannot persist a durable not-before, so it must wait instead of
+        # dispatching with defer=true and no durable wait (which would let
+        # the next watchdog retry immediately and burn the budget).
+        decision = lifecycle.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            failure_transient=True,
+            evidence=lifecycle.RetryEvidence(latest_attempt=7),
+            now_epoch=None,
+        )
+        self.assertEqual(decision.action, "wait")
+        self.assertIsNone(decision.attempt)
+        # A short wait without a clock still dispatches immediately: there
+        # is nothing durable to lose when no deferral is required.
+        immediate = lifecycle.decide_recovery(
+            ci_green=True, operation_state=None, now_epoch=None
+        )
+        self.assertEqual(immediate.action, "dispatch")
+        self.assertFalse(immediate.defer_dispatch)
+
+    def test_unknown_marker_age_stays_inside_dispatch_grace(self):
+        # Fail closed: a marker newer than status whose age is unknown
+        # (missing/unparsable timestamp) cannot prove grace expired, so it
+        # waits instead of dispatching a likely duplicate.
+        decision = lifecycle.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            failure_transient=True,
+            evidence=lifecycle.RetryEvidence(latest_attempt=2),
+            marker_newer_than_status=True,
+            marker_age_seconds=None,
+        )
+        self.assertEqual(decision.action, "wait")
+        # A known age past grace still proceeds to dispatch.
+        past_grace = lifecycle.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            failure_transient=True,
+            evidence=lifecycle.RetryEvidence(latest_attempt=2),
+            marker_newer_than_status=True,
+            marker_age_seconds=lifecycle.DISPATCH_GRACE_SECONDS + 1,
+            now_epoch=1000,
+        )
+        self.assertEqual(past_grace.action, "dispatch")
+
+    def test_malformed_durable_not_before_fails_closed(self):
+        # Both the live parameter and the durable evidence value must raise
+        # the documented fail-closed error, never a raw ValueError.
+        with self.assertRaises(lifecycle.LifecycleRecoveryError):
+            lifecycle.decide_recovery(
+                ci_green=True,
+                operation_state="failure",
+                failure_transient=True,
+                not_before_epoch="not-an-epoch",
+                now_epoch=1000,
+            )
+        with self.assertRaises(lifecycle.LifecycleRecoveryError):
+            lifecycle.decide_recovery(
+                ci_green=True,
+                operation_state="failure",
+                failure_transient=True,
+                evidence=lifecycle.RetryEvidence(not_before_epoch="not-an-epoch"),
+                now_epoch=1000,
+            )
+
 
 class LatestStateReconciliationTests(unittest.TestCase):
     def test_rate_limit_failure_resumes_exact_head(self):
@@ -294,6 +361,28 @@ class LatestStateReconciliationTests(unittest.TestCase):
         )
         self.assertEqual(decision.action, "dispatch")
         self.assertLess(decision.attempt, lifecycle.MAX_TRANSIENT_ATTEMPTS)
+
+    def test_pending_explicit_transient_dispatches_without_staleness(self):
+        # An explicit transient verdict in pending state dispatches on
+        # reset-aware backoff immediately, mirroring the failure path,
+        # instead of waiting for a retryable conclusion or staleness.
+        decision = lifecycle.decide_recovery(
+            ci_green=True,
+            operation_state="pending",
+            run_conclusion="failure",
+            status_age_seconds=0,
+            failure_transient=True,
+        )
+        self.assertEqual(decision.action, "dispatch")
+        # An explicit deterministic verdict still dominates staleness.
+        deterministic = lifecycle.decide_recovery(
+            ci_green=True,
+            operation_state="pending",
+            run_conclusion="cancelled",
+            status_age_seconds=lifecycle.STALE_AFTER_SECONDS + 1,
+            failure_transient=False,
+        )
+        self.assertEqual(deterministic.action, "hold")
 
     def test_deterministic_ci_failure_does_not_burn_budget(self):
         classified = lifecycle.classify_operation_failure(ci_failed=True)
@@ -699,6 +788,62 @@ class CrossStackContractTests(unittest.TestCase):
         # auto-merge reconciler queues instead of cancelling, and the
         # per-PR/HEAD lease inside is authoritative.
         self.assertIn("cancel-in-progress: false", automerge)
+
+    def test_both_reconcilers_share_reset_aware_deferral(self):
+        # The single lifecycle contract is wired through both reconcilers,
+        # not just the PR-Agent recovery one: reset-aware delays, the
+        # inline-wait ceiling, and rate-limit signal extraction live in
+        # both workflow scripts.
+        for path in (
+            ".github/workflows/continuum-pr-agent-recovery.yml",
+            ".github/workflows/continuum-auto-merge.yml",
+        ):
+            with self.subTest(path=path):
+                body = self.read(path)
+                self.assertIn("MAX_INLINE_WAIT_SECONDS", body)
+                self.assertIn("resetAwareDelaySeconds", body)
+                self.assertIn("extractRateLimitSignals", body)
+                self.assertIn("scheduled safety net", body)
+
+    def test_rate_limited_discovery_defers_green(self):
+        # Top-level open-PR scans sit outside the per-PR loop: a
+        # 429/rate-limited 403 there defers green to the next wakeup
+        # (never spending PAT budget) instead of failing the watchdog red.
+        for path in (
+            ".github/workflows/continuum-pr-agent-recovery.yml",
+            ".github/workflows/continuum-auto-merge.yml",
+        ):
+            with self.subTest(path=path):
+                body = self.read(path)
+                self.assertIn(
+                    "deferring the whole scan to the next wakeup", body
+                )
+
+    def test_queued_burst_coalesces_onto_newest_run(self):
+        # With cancel-in-progress:false every trigger queues a run; a run
+        # that starts behind a newer queued run skips its scan so a burst
+        # coalesces onto the latest reconciliation.
+        automerge = self.read(".github/workflows/continuum-auto-merge.yml")
+        self.assertIn("already queued; skipping this scan", automerge)
+        self.assertIn("listWorkflowRunsForRepo", automerge)
+
+    def test_full_sha_producers_fail_loudly(self):
+        # Durable markers always carry full commit ids: producers validate
+        # before writing/reading so a short SHA can never be silently
+        # ignored (which would reset the bounded budget).
+        body = self.read(
+            ".github/workflows/continuum-pr-agent-recovery.yml"
+        )
+        self.assertIn("requireFullHead", body)
+        self.assertIn("non-full commit id", body)
+
+    def test_unknown_marker_age_waits_in_workflow_decide(self):
+        # The workflow decide() mirrors the Python contract: unknown marker
+        # age stays inside dispatch grace instead of dispatching.
+        body = self.read(
+            ".github/workflows/continuum-pr-agent-recovery.yml"
+        )
+        self.assertIn("staying inside dispatch grace", body)
 
     def test_deterministic_per_pr_failures_do_not_abort_the_loop(self):
         # One malformed PR must not strand healthy PRs: both reconcilers

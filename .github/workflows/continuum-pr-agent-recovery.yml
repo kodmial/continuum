@@ -219,18 +219,36 @@ jobs:
             // continuum-lifecycle-retry prefix.
             const LIFECYCLE_RETRY_PREFIX = 'continuum-lifecycle-retry';
             const LIFECYCLE_EXHAUSTED_PREFIX = 'continuum-lifecycle-retry-exhausted';
+            // Exact-HEAD producer contract (#224): every durable marker
+            // carries a full commit id (40-hex SHA-1 or 64-hex SHA-256).
+            // Short SHAs fail loudly here at write/parse time so a short
+            // marker can never be silently ignored (which would reset the
+            // bounded budget) and can never split budget/exhaustion across
+            // identities. All producers pass the full `pr.head.sha`.
+            const FULL_HEAD_RE = /^[0-9a-f]{40,64}$/i;
+            function requireFullHead(head, what) {
+              if (!FULL_HEAD_RE.test(String(head || '').trim())) {
+                throw new Error(
+                  'Refusing ' + what + ' with a non-full commit id; ' +
+                  'producers must pass the full 40-hex (or 64-hex) HEAD.'
+                );
+              }
+              return String(head).toLowerCase();
+            }
             function retryMarker(head, kind, attempt, notBefore) {
+              const fullHead = requireFullHead(head, 'retry marker');
               const suffix = Number.isFinite(Number(notBefore)) && Number(notBefore) > 0
                 ? ' not-before=' + Number(notBefore)
                 : '';
               return '<!-- ' + LIFECYCLE_RETRY_PREFIX + ' head=' +
-                String(head).toLowerCase() + ' kind=' + kind +
+                fullHead + ' kind=' + kind +
                 ' attempt=' + String(attempt) + suffix + ' -->';
             }
 
             function exhaustedMarker(head, kind) {
+              const fullHead = requireFullHead(head, 'exhaustion marker');
               return '<!-- ' + LIFECYCLE_EXHAUSTED_PREFIX + ' head=' +
-                String(head).toLowerCase() + ' kind=' + kind +
+                fullHead + ' kind=' + kind +
                 ' attempts=' + String(maxExecutions) + ' -->';
             }
 
@@ -336,7 +354,12 @@ jobs:
               return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
             }
             function parseEvidence(comments, head, kind) {
-              const exactHead = String(head).toLowerCase();
+              // Fail closed on short SHAs: every producer writes the full
+              // HEAD, so a short identity here is a programming error, not
+              // a legacy marker worth prefix-matching (two commits can share
+              // a 7-char prefix, which would let old-HEAD evidence authorize
+              // a new HEAD and silently reset the budget).
+              const exactHead = requireFullHead(head, 'retry evidence read');
               // Exact-HEAD identity only: prefix matching is rejected
               // because two distinct commits can share a 7-char prefix,
               // which would let old-HEAD evidence authorize a new HEAD.
@@ -442,6 +465,10 @@ jobs:
                   )
                 );
               } catch (err) {
+                // A transient/rate-limit read must never fail the run here:
+                // callers defer green to the next wakeup instead of spending
+                // PAT budget. Only deterministic errors fail loudly.
+                if (isTransientApiError(err)) throw err;
                 core.setFailed(
                   'Could not inspect PR-Agent caller runs for ' + reviewWorkflow +
                   ': ' + (err.message || err)
@@ -697,12 +724,24 @@ jobs:
               if (
                 markerNewer &&
                 evidence.latestAttempt !== null &&
-                markerAge !== null &&
-                markerAge < dispatchGraceMs
+                (markerAge === null || markerAge < dispatchGraceMs)
               ) {
                 return {
                   action: 'wait',
                   reason: 'newer durable dispatch marker is inside grace window',
+                };
+              }
+              // Fail closed on unknown marker age (#224, single lifecycle
+              // contract): a durable marker without a parseable timestamp
+              // cannot prove grace expired, so it stays inside grace
+              // instead of dispatching a likely duplicate immediately.
+              if (
+                evidence.latestAttempt !== null &&
+                evidence.latestMarkerAt === null
+              ) {
+                return {
+                  action: 'wait',
+                  reason: 'durable dispatch marker age is unknown; staying inside dispatch grace',
                 };
               }
 
@@ -780,6 +819,7 @@ jobs:
             }
 
             async function dispatch(pr, kind, head, attempt, status, signals = {}) {
+              requireFullHead(head, 'recovery dispatch');
               const delaySeconds = resetAwareDelaySeconds({
                 attempt,
                 retryAfterSeconds: signals.retryAfterSeconds,
@@ -1184,13 +1224,44 @@ jobs:
               );
             }
 
-            const openPrs = await withReadFallback(client =>
-              client.paginate(
-                client.rest.pulls.list,
-                { owner, repo, state: 'open', per_page: 100 }
-              )
-            );
-            let reviewRuns = await listReviewRuns();
+            let openPrs;
+            try {
+              openPrs = await withReadFallback(client =>
+                client.paginate(
+                  client.rest.pulls.list,
+                  { owner, repo, state: 'open', per_page: 100 }
+                )
+              );
+            } catch (err) {
+              // Top-level discovery sits outside the per-PR loop, so a
+              // 429/rate-limited 403 here must defer green to the next
+              // wakeup (PAT budget is never spent on the retry) instead of
+              // failing the whole watchdog run red. Deterministic errors
+              // still throw and fail loudly.
+              if (isTransientApiError(err)) {
+                core.warning(
+                  'Open-PR discovery hit a transient/rate-limit read; ' +
+                  'deferring the whole scan to the next wakeup: ' +
+                  (err.message || err)
+                );
+                return;
+              }
+              throw err;
+            }
+            let reviewRuns;
+            try {
+              reviewRuns = await listReviewRuns();
+            } catch (err) {
+              if (isTransientApiError(err)) {
+                core.warning(
+                  'Review-run discovery hit a transient/rate-limit read; ' +
+                  'deferring the whole scan to the next wakeup: ' +
+                  (err.message || err)
+                );
+                return;
+              }
+              throw err;
+            }
             // Deterministic per-PR failures must not strand healthy PRs
             // behind one bad PR in the same run: record loudly and continue.
             let deterministicFailure = null;

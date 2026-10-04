@@ -117,8 +117,14 @@ def operation_key(pr_number: object, head_sha: object, kind: object) -> str:
         raise RecoveryError("pr_number must be a positive integer")
     # Exact-HEAD identity requires a full commit id; short prefixes would
     # split the retry budget and weaken the old-HEAD-cannot-mutate guarantee.
+    # Migration note: short SHAs were rejected here (and by every durable
+    # marker reader) since exact-HEAD safety was introduced, so producers
+    # must pass the full commit id from the PR HEAD (``pr.head.sha``).
     if not re.fullmatch(r"[0-9a-f]{40,64}", head):
-        raise RecoveryError("head_sha must be a full hexadecimal commit id")
+        raise RecoveryError(
+            "head_sha must be a full hexadecimal commit id "
+            "(40-hex SHA-1 or 64-hex SHA-256); short prefixes are rejected"
+        )
     if normalized_kind not in KINDS:
         raise RecoveryError("kind must be review or repair")
     return f"{number}:{head}:{normalized_kind}"
@@ -194,7 +200,10 @@ def retry_evidence(
 
     head = str(head_sha or "").strip().lower()
     if not re.fullmatch(r"[0-9a-f]{40,64}", head):
-        raise RecoveryError("head_sha must be a full hexadecimal commit id")
+        raise RecoveryError(
+            "head_sha must be a full hexadecimal commit id "
+            "(40-hex SHA-1 or 64-hex SHA-256); short prefixes are rejected"
+        )
     normalized_kind = str(kind or "").strip().lower()
     if normalized_kind not in KINDS:
         raise RecoveryError("kind must be review or repair")
@@ -352,18 +361,27 @@ def decide_recovery(
     if (
         evidence.not_before_epoch is not None
         and now_epoch is not None
-        and int(now_epoch) < int(evidence.not_before_epoch)
     ):
-        return RecoveryDecision(
-            "wait", None, "durable reset-aware not-before time has not arrived"
-        )
+        try:
+            not_before = int(evidence.not_before_epoch)
+            now = int(now_epoch)
+        except (TypeError, ValueError) as exc:
+            raise RecoveryError("not-before/now epochs must be integers") from exc
+        if now < not_before:
+            return RecoveryDecision(
+                "wait", None, "durable reset-aware not-before time has not arrived"
+            )
 
     if (
         marker_newer_than_status
         and evidence.latest_attempt is not None
-        and marker_age_seconds is not None
-        and marker_age_seconds < dispatch_grace_seconds
+        and (
+            marker_age_seconds is None
+            or marker_age_seconds < dispatch_grace_seconds
+        )
     ):
+        # Fail closed like the single lifecycle contract: unknown marker
+        # age cannot prove grace expired, so it stays inside grace.
         return RecoveryDecision(
             "wait", None, "newer retry dispatch marker is still inside dispatch grace"
         )

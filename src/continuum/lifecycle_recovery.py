@@ -743,9 +743,15 @@ def decide_recovery(
     if (
         marker_newer_than_status
         and evidence.latest_attempt is not None
-        and marker_age_seconds is not None
-        and marker_age_seconds < dispatch_grace_seconds
+        and (
+            marker_age_seconds is None
+            or marker_age_seconds < dispatch_grace_seconds
+        )
     ):
+        # Fail closed: a marker that is newer than status but whose age is
+        # unknown (missing/unparsable timestamp) cannot prove grace
+        # expired, so it stays inside grace instead of dispatching a
+        # likely duplicate.
         return RecoveryDecision(
             "wait", None, "newer retry dispatch marker is still inside dispatch grace"
         )
@@ -759,11 +765,14 @@ def decide_recovery(
         except (TypeError, ValueError) as exc:
             raise LifecycleRecoveryError("not-before/now epochs must be integers") from exc
     if evidence.not_before_epoch is not None and now_epoch is not None:
-        if int(now_epoch) < int(evidence.not_before_epoch):
-            return RecoveryDecision(
-                "wait", None, "durable not-before time has not arrived",
-                not_before_epoch=int(evidence.not_before_epoch),
-            )
+        try:
+            if int(now_epoch) < int(evidence.not_before_epoch):
+                return RecoveryDecision(
+                    "wait", None, "durable not-before time has not arrived",
+                    not_before_epoch=int(evidence.not_before_epoch),
+                )
+        except (TypeError, ValueError) as exc:
+            raise LifecycleRecoveryError("not-before/now epochs must be integers") from exc
 
     recoverable = False
     transient_failure = False
@@ -797,7 +806,14 @@ def decide_recovery(
         # the failure path would hold.
         if failure_transient is False:
             return RecoveryDecision("hold", None, "deterministic failure is not automatically retried")
-        if conclusion in RETRYABLE_RUN_CONCLUSIONS:
+        if failure_transient is True:
+            # An explicit transient verdict (5xx/timeout/infrastructure gap
+            # already classified by the caller) dispatches on reset-aware
+            # backoff immediately instead of waiting for run-conclusion or
+            # staleness signals, mirroring the failure-state path.
+            recoverable = True
+            transient_failure = True
+        elif conclusion in RETRYABLE_RUN_CONCLUSIONS:
             recoverable = True
             transient_failure = True
         elif (
@@ -843,6 +859,21 @@ def decide_recovery(
         provider_reset_epoch=provider_reset_epoch,
         now_epoch=now_epoch,
     )
+    if now_epoch is None and should_defer_dispatch(delay):
+        # Fail closed without a clock: a schedule/signal floor beyond the
+        # inline ceiling (the 10m/20m/40m/60m tail, or a long Retry-After)
+        # cannot persist a durable not-before without now, so dispatching
+        # it with defer=true and not_before=None would let the next
+        # watchdog retry immediately and burn the budget. Bounded jitter
+        # around the 60s inline threshold is runner-local noise, not a
+        # scheduling commitment, so mid-budget attempts still dispatch.
+        floor = exponential_backoff_seconds(attempt)
+        if retry_after_seconds is not None and retry_after_seconds >= 0:
+            floor = max(floor, int(retry_after_seconds))
+        if floor > MAX_INLINE_WAIT_SECONDS:
+            return RecoveryDecision(
+                "wait", None, "schedule-only long wait requires a clock; deferring"
+            )
     computed_not_before: Optional[int] = None
     if now_epoch is not None:
         # Durable backoff: every deferred dispatch persists its next-attempt

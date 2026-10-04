@@ -210,6 +210,69 @@ jobs:
                 String((err && err.message) || '')
               );
             }
+            // Reset-aware scheduling (#224, single lifecycle contract): the
+            // canonical retry schedule plus bounded jitter is the floor and
+            // any Retry-After / X-RateLimit-Reset / provider reset wait that
+            // is longer wins. A runner never sleeps through a long wait:
+            // delays beyond the inline threshold defer to the scheduled
+            // safety net (the cron caller stub), which redispatches when the
+            // window expires. Mirrors continuum-pr-agent-recovery.yml.
+            const MAX_INLINE_WAIT_SECONDS = 60;
+            const LIFECYCLE_RETRY_DELAY_SCHEDULE = [0, 10, 30, 60, 180, 300, 600, 1200, 2400, 3600];
+            function resetAwareDelaySeconds({ attempt, retryAfterSeconds, ratelimitResetEpoch, providerResetEpoch, nowEpoch }) {
+              let delay = attempt > 0 && attempt < LIFECYCLE_RETRY_DELAY_SCHEDULE.length
+                ? LIFECYCLE_RETRY_DELAY_SCHEDULE[attempt]
+                : 0;
+              if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds >= 0) {
+                delay = Math.max(delay, retryAfterSeconds);
+              }
+              for (const resetEpoch of [ratelimitResetEpoch, providerResetEpoch]) {
+                if (Number.isFinite(resetEpoch) && Number.isFinite(nowEpoch)) {
+                  delay = Math.max(delay, Math.max(0, resetEpoch - nowEpoch));
+                }
+              }
+              return delay;
+            }
+
+            // Reset-signal extraction (#224): server-provided Retry-After /
+            // X-RateLimit-Reset / provider reset minimums are read from the
+            // failed call's headers so a 429/403 does not fall back to an
+            // immediate retry that hammers the limit. Callers always pass
+            // the live clock, so a reset epoch is never silently dropped.
+            function extractRateLimitSignals(err) {
+              const headers = (err && ((err.response && err.response.headers) || err.headers)) || {};
+              const lowered = {};
+              for (const [key, value] of Object.entries(headers)) {
+                lowered[String(key).toLowerCase()] = value;
+              }
+              const retryAfterRaw = lowered['retry-after'];
+              let retryAfterSeconds;
+              if (retryAfterRaw !== undefined && retryAfterRaw !== null && String(retryAfterRaw).trim() !== '') {
+                const text = String(retryAfterRaw).trim();
+                const parsed = Number.parseInt(text, 10);
+                if (Number.isFinite(parsed) && parsed >= 0 && /^\d+/.test(text)) {
+                  retryAfterSeconds = parsed;
+                } else {
+                  const when = Date.parse(text);
+                  if (Number.isFinite(when)) {
+                    retryAfterSeconds = Math.max(0, Math.ceil((when - Date.now()) / 1000));
+                  }
+                }
+              }
+              const resetRaw = lowered['x-ratelimit-reset'] ?? lowered['ratelimit-reset'];
+              let ratelimitResetEpoch;
+              if (resetRaw !== undefined && resetRaw !== null && String(resetRaw).trim() !== '') {
+                const parsed = Number.parseInt(String(resetRaw).trim(), 10);
+                if (Number.isFinite(parsed) && parsed > 0) ratelimitResetEpoch = parsed;
+              }
+              const providerRaw = lowered['x-provider-reset'] ?? lowered['provider-reset'];
+              let providerResetEpoch;
+              if (providerRaw !== undefined && providerRaw !== null && String(providerRaw).trim() !== '') {
+                const parsed = Number.parseInt(String(providerRaw).trim(), 10);
+                if (Number.isFinite(parsed) && parsed > 0) providerResetEpoch = parsed;
+              }
+              return { retryAfterSeconds, ratelimitResetEpoch, providerResetEpoch };
+            }
             // Per-PR/HEAD lease (#224): at most one authoritative
             // reconciliation owns a PR/HEAD transition at a time. Duplicate
             // wakeups for the same key coalesce; independent PRs never block
@@ -1870,6 +1933,35 @@ jobs:
                 // next retry). Best-effort cleanup must never mask the
                 // original dispatch error needed to diagnose a bad caller
                 // name or a missing workflow_dispatch trigger.
+                //
+                // Reset-aware deferral (#224, single lifecycle contract):
+                // honor the server-provided reset wait instead of retrying
+                // immediately on the next wakeup and hammering the limit.
+                // Short waits sleep inline; long waits defer to the
+                // scheduled safety net (the cron caller stub redispatches
+                // when the window expires) and no runner sleeps. The claim
+                // is still deleted so a deferred wait never consumes the
+                // bounded per-HEAD budget for work that never executed.
+                const signals = extractRateLimitSignals(err);
+                const resetDelay = resetAwareDelaySeconds({
+                  attempt,
+                  retryAfterSeconds: signals.retryAfterSeconds,
+                  ratelimitResetEpoch: signals.ratelimitResetEpoch,
+                  providerResetEpoch: signals.providerResetEpoch,
+                  nowEpoch: Math.floor(Date.now() / 1000),
+                });
+                if (resetDelay > MAX_INLINE_WAIT_SECONDS) {
+                  core.notice(
+                    `PR #${pr.number}: conflict-repair dispatch hit a rate limit; ` +
+                    `deferring execution for ~${resetDelay}s to the scheduled safety net ` +
+                    `instead of sleeping the runner: ` + (err.message || err)
+                  );
+                } else if (resetDelay > 0) {
+                  core.info(
+                    `PR #${pr.number}: bounded rate-limit backoff ${resetDelay}s before deferring to the next wakeup.`
+                  );
+                  await new Promise(resolve => setTimeout(resolve, resetDelay * 1000));
+                }
                 try {
                   await github.rest.issues.deleteComment({
                     owner,
@@ -2061,15 +2153,80 @@ jobs:
               }
             }
 
-            const pulls = await withReadFallback(client =>
-              client.paginate(client.rest.pulls.list, {
-                owner,
-                repo,
-                state: 'open',
-                base: 'main',
-                per_page: 100,
-              })
-            );
+            // Storm coalescing (#224): cancel-in-progress:false serializes
+            // runs, so a burst of triggers queues full-scan runs back to
+            // back. A run that starts while a NEWER run of this workflow is
+            // already queued skips its scan entirely: the newer run
+            // re-reconciles from latest state when it starts, so this run
+            // would only duplicate its work and its read API load. The probe
+            // is one single-page read (never paginated); if it fails
+            // deterministically the run scans anyway (fail-open: a broken
+            // probe must never strand reconciliation), and a transient probe
+            // failure defers green to the next wakeup.
+            try {
+              const { data: recentRuns } = await withReadFallback(client =>
+                client.rest.actions.listWorkflowRunsForRepo({
+                  owner,
+                  repo,
+                  per_page: 100,
+                })
+              );
+              const queuedStatuses = new Set(['queued', 'waiting', 'requested', 'pending']);
+              const newerQueued = (recentRuns.workflow_runs || []).some(run =>
+                run.name === context.workflow &&
+                typeof run.id === 'number' &&
+                run.id > context.runId &&
+                queuedStatuses.has(String(run.status || '').toLowerCase())
+              );
+              if (newerQueued) {
+                core.info(
+                  'A newer run of this workflow is already queued; skipping this scan ' +
+                  'so the burst coalesces onto the latest reconciliation.'
+                );
+                return;
+              }
+            } catch (err) {
+              if (isTransientApiError(err)) {
+                core.warning(
+                  'Storm-coalescing probe hit a transient/rate-limit read; ' +
+                  'deferring the whole scan to the next wakeup: ' +
+                  (err.message || err)
+                );
+                return;
+              }
+              core.warning(
+                'Storm-coalescing probe failed; scanning anyway: ' +
+                (err.message || err)
+              );
+            }
+
+            let pulls;
+            try {
+              pulls = await withReadFallback(client =>
+                client.paginate(client.rest.pulls.list, {
+                  owner,
+                  repo,
+                  state: 'open',
+                  base: 'main',
+                  per_page: 100,
+                })
+              );
+            } catch (err) {
+              // Top-level discovery sits outside the per-PR loop, so a
+              // 429/rate-limited 403 here must defer green to the next
+              // wakeup (PAT budget is never spent on the retry) instead of
+              // failing the whole watchdog run red. Deterministic errors
+              // still throw and fail loudly.
+              if (isTransientApiError(err)) {
+                core.warning(
+                  'Open-PR discovery hit a transient/rate-limit read; ' +
+                  'deferring the whole scan to the next wakeup: ' +
+                  (err.message || err)
+                );
+                return;
+              }
+              throw err;
+            }
 
             const cancelledRuns = await cancelObsoleteRuns(pulls);
             if (cancelledRuns.ci > 0 || cancelledRuns.noopRelease > 0) {

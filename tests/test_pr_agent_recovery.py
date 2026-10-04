@@ -47,6 +47,12 @@ class IdentityTests(unittest.TestCase):
         with self.assertRaises(recovery.RecoveryError):
             recovery.operation_key(1, HEAD, "merge")
 
+    def test_short_sha_rejection_names_full_commit_id(self):
+        # Short-SHA callers get a migration-pointing error (pass the full
+        # HEAD), never a silently ignored marker / split budget.
+        with self.assertRaisesRegex(recovery.RecoveryError, "full"):
+            recovery.operation_key(1, "a" * 7, "review")
+
 
 class DurableEvidenceTests(unittest.TestCase):
     def test_retry_state_survives_independent_wakeups(self):
@@ -153,6 +159,34 @@ class DurableEvidenceTests(unittest.TestCase):
             now_epoch=3000,
         )
         self.assertEqual(late.action, "dispatch")
+
+    def test_malformed_durable_not_before_fails_closed(self):
+        # A malformed durable value must raise the documented fail-closed
+        # error, never a raw ValueError, matching the lifecycle contract.
+        evidence = recovery.RetryEvidence(
+            latest_attempt=1, not_before_epoch="not-an-epoch"
+        )
+        with self.assertRaises(recovery.RecoveryError):
+            recovery.decide_recovery(
+                ci_green=True,
+                operation_state="failure",
+                operation_description="transient; recovery eligible",
+                evidence=evidence,
+                now_epoch=1000,
+            )
+
+    def test_unknown_marker_age_stays_inside_dispatch_grace(self):
+        # Fail closed like the single lifecycle contract: a marker newer
+        # than status whose age is unknown cannot prove grace expired.
+        decision = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="transient; recovery eligible",
+            evidence=recovery.RetryEvidence(latest_attempt=2),
+            marker_newer_than_status=True,
+            marker_age_seconds=None,
+        )
+        self.assertEqual(decision.action, "wait")
 
 
 class RecoveryDecisionTests(unittest.TestCase):
