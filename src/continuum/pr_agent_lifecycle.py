@@ -425,6 +425,8 @@ def has_incomplete_coverage_signal(review: Mapping[str, Any]) -> bool:
             continue
         value = inner.get(key)
         if isinstance(value, Mapping):
+            has_reviewed_key = "reviewed" in value or "reviewed_chunks" in value
+            has_total_key = "total" in value or "total_chunks" in value
             reviewed = value.get("reviewed", value.get("reviewed_chunks"))
             total = value.get("total", value.get("total_chunks"))
             try:
@@ -437,7 +439,20 @@ def has_incomplete_coverage_signal(review: Mapping[str, Any]) -> bool:
                 total_num: float | None = float(total) if total is not None else None
             except (TypeError, ValueError):
                 total_num = None
-            if reviewed_num is not None and total_num is not None:
+            has_count_signal = has_reviewed_key or has_total_key
+            has_flag_signal = any(flag_key in value for flag_key in _COVERAGE_FLAG_KEYS)
+            if has_count_signal:
+                # Fail closed on unparseable counts: a present-but-unrecognized
+                # count never reads as complete coverage.
+                if reviewed_num is None or total_num is None:
+                    return True
+                if (
+                    reviewed_num != reviewed_num
+                    or total_num != total_num
+                    or reviewed_num in (float("inf"), float("-inf"))
+                    or total_num in (float("inf"), float("-inf"))
+                ):
+                    return True
                 if total_num <= 0 or reviewed_num < total_num:
                     return True
             # Flags are independent of counts: a full count never masks an
@@ -447,6 +462,11 @@ def has_incomplete_coverage_signal(review: Mapping[str, Any]) -> bool:
                     flag_key, value.get(flag_key)
                 ):
                     return True
+            # A coverage object with no recognized counts or flags (e.g. {}
+            # or only unknown fields) is not evidence of complete coverage:
+            # fail closed so unknown coverage never permits an improve skip.
+            if not has_count_signal and not has_flag_signal:
+                return True
             continue
         if isinstance(value, str):
             lowered = value.strip().lower()
@@ -521,8 +541,11 @@ def should_skip_improve(
     HEAD; a missing `last_run.head_sha` always raises `LifecycleError`.
 
     Anything else returns `skip=False` so `improve` may still run to
-    generate additional repair suggestions. Invalid review or persistent
-    state raises `LifecycleError` and fails closed instead of skipping.
+    generate additional repair suggestions. Invalid review payloads and a
+    missing reviewed HEAD raise `LifecycleError` and fail closed instead
+    of skipping; a benign persistent format variation (non-list findings,
+    missing `last_run`, non-full run) with a known HEAD returns
+    `skip=False` so `improve` still runs.
     """
 
     inner = _unwrap_review(review)
@@ -552,22 +575,29 @@ def should_skip_improve(
         return {"skip": False, "reason": "blocking security signal remains"}
     if not isinstance(persistent_state, dict):
         raise LifecycleError("upstream finding state must be the v0.46.0 state object")
-    raw_findings = persistent_state.get("findings")
-    if not isinstance(raw_findings, list):
-        raise LifecycleError("upstream finding state findings must be a list")
-    last_run = persistent_state.get("last_run")
-    if not isinstance(last_run, dict):
-        raise LifecycleError("upstream PR-Agent persistent state has no last_run.")
-    if last_run.get("complete") is not True or str(last_run.get("kind") or "") != "full":
-        raise LifecycleError("Persistent state does not represent a complete full review.")
-    state_head = str(last_run.get("head_sha") or "").strip()
-    if not state_head:
-        raise LifecycleError("upstream PR-Agent persistent state has no last_run.head_sha.")
+    # The exact reviewed HEAD is mandatory for any skip decision: validate
+    # it before interpreting persistent format variations so a missing HEAD
+    # still fails closed by exception while a benign upstream format
+    # variation with a known HEAD safely runs improve (skip=False).
     expected_head = str(reviewed_head_sha or "").strip()
     if not expected_head:
         raise LifecycleError(
             "cannot decide improve skip without the exact reviewed HEAD."
         )
+    raw_findings = persistent_state.get("findings")
+    if not isinstance(raw_findings, list):
+        # A benign upstream format variation must still run improve for
+        # repair value instead of crashing the orchestrator: fail closed
+        # to skip=False, never to an exception.
+        return {"skip": False, "reason": "persistent state findings is not a list: failing closed"}
+    last_run = persistent_state.get("last_run")
+    if not isinstance(last_run, dict):
+        return {"skip": False, "reason": "persistent state has no last_run: failing closed"}
+    if last_run.get("complete") is not True or str(last_run.get("kind") or "") != "full":
+        return {"skip": False, "reason": "persistent state is not from a complete full review: failing closed"}
+    state_head = str(last_run.get("head_sha") or "").strip()
+    if not state_head:
+        raise LifecycleError("upstream PR-Agent persistent state has no last_run.head_sha.")
     if not is_same_head(state_head, expected_head):
         return {"skip": False, "reason": "stale persistent state: not for the reviewed HEAD"}
     if upstream_state_has_active(persistent_state):

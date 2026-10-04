@@ -265,6 +265,41 @@ jobs:
               core.setOutput('reason', reason);
               core.setFailed(`PR-Agent gate blocks PR #${prNumber}: ${reason}`);
             };
+            // Tool-error and review-coverage legs: a failing tool or a
+            // partial review never greens, even with zero findings.
+            let toolError = false;
+            try {
+              toolError = policy.hasToolErrorSignal(review);
+            } catch (err) {
+              core.setFailed(err.message);
+              return;
+            }
+            if (toolError) {
+              fail('tool error: failing closed');
+              return;
+            }
+            let reviewCoverageIncomplete = false;
+            try {
+              reviewCoverageIncomplete = policy.hasIncompleteCoverageSignal(review);
+            } catch (err) {
+              core.setFailed(err.message);
+              return;
+            }
+            if (reviewCoverageIncomplete) {
+              fail('incomplete review coverage: failing closed');
+              return;
+            }
+            // Improve-coverage leg wired to the skipped-clean flag
+            // (mirrors GateInputs.improve_skipped_clean): an empty improve
+            // payload only greens when improve ran for this HEAD (non-empty
+            // payload) or the payload carries the skipped-clean marker. An
+            // empty payload without the marker means improve never produced
+            // coverage here, so the gate fails closed instead of merging on
+            // missing evidence.
+            if (!raw && !improveSkippedClean) {
+              fail('incomplete improve coverage: failing closed');
+              return;
+            }
             if (recommendation !== 'safe_to_merge') {
               fail(`merge recommendation blocks: ${recommendation}`);
               return;

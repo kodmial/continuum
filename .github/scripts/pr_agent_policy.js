@@ -417,9 +417,18 @@ function hasIncompleteCoverageSignal(reviewPayload) {
     if (value && typeof value === 'object' && !Array.isArray(value)) {
       const reviewed = value.reviewed !== undefined ? value.reviewed : value.reviewed_chunks;
       const total = value.total !== undefined ? value.total : value.total_chunks;
+      const hasReviewedKey = value.reviewed !== undefined || value.reviewed_chunks !== undefined;
+      const hasTotalKey = value.total !== undefined || value.total_chunks !== undefined;
       const reviewedNum = reviewed === undefined || reviewed === null || reviewed === '' ? null : Number(reviewed);
       const totalNum = total === undefined || total === null || total === '' ? null : Number(total);
-      if (reviewedNum !== null && totalNum !== null && Number.isFinite(reviewedNum) && Number.isFinite(totalNum)) {
+      const hasCountSignal = hasReviewedKey || hasTotalKey;
+      const hasFlagSignal = COVERAGE_FLAG_KEYS.some((flagKey) => flagKey in value);
+      if (hasCountSignal) {
+        // Fail closed on unparseable counts: a present-but-unrecognized
+        // count never reads as complete coverage.
+        if (reviewedNum === null || totalNum === null || !Number.isFinite(reviewedNum) || !Number.isFinite(totalNum)) {
+          return true;
+        }
         if (totalNum <= 0 || reviewedNum < totalNum) return true;
       }
       // Flags are independent of counts: a full count never masks an
@@ -429,6 +438,10 @@ function hasIncompleteCoverageSignal(reviewPayload) {
           return true;
         }
       }
+      // A coverage object with no recognized counts or flags (e.g. {} or
+      // only unknown fields) is not evidence of complete coverage: fail
+      // closed so unknown coverage never permits an improve skip.
+      if (!hasCountSignal && !hasFlagSignal) return true;
       continue;
     }
     if (typeof value === 'string') {
@@ -530,25 +543,32 @@ function isCleanReviewForImproveSkip(reviewPayload, persistentState, options = {
   if (!persistentState || typeof persistentState !== 'object' || Array.isArray(persistentState)) {
     throw new Error('Upstream finding state must be the v0.46.0 state object.');
   }
-  if (!Array.isArray(persistentState.findings)) {
-    throw new Error('Upstream finding state findings must be a list.');
-  }
-  const lastRun = persistentState.last_run;
-  if (!lastRun || typeof lastRun !== 'object') {
-    throw new Error('Upstream PR-Agent persistent state has no last_run.');
-  }
-  if (lastRun.complete !== true || String(lastRun.kind || '') !== 'full') {
-    throw new Error('Persistent state does not represent a complete full review.');
-  }
-  const stateHead = String(lastRun.head_sha || lastRun.headSha || '').trim().toLowerCase();
-  if (!stateHead) {
-    throw new Error('Upstream PR-Agent persistent state has no last_run.head_sha.');
-  }
+  // The exact reviewed HEAD is mandatory for any skip decision: validate it
+  // before interpreting persistent format variations so a missing HEAD
+  // still fails closed by exception while a benign upstream format
+  // variation with a known HEAD safely runs improve (skip:false).
   const reviewedHeadSha = String(
     opts.reviewedHeadSha || opts.reviewed_head_sha || opts.headSha || opts.head_sha || ''
   ).trim().toLowerCase();
   if (!reviewedHeadSha) {
     throw new Error('Cannot decide improve skip without the exact reviewed HEAD.');
+  }
+  if (!Array.isArray(persistentState.findings)) {
+    // A benign upstream format variation must still run improve for repair
+    // value instead of crashing the orchestrator: fail closed to
+    // skip:false, never to an exception.
+    return { skip: false, reason: 'persistent state findings is not a list: failing closed' };
+  }
+  const lastRun = persistentState.last_run;
+  if (!lastRun || typeof lastRun !== 'object') {
+    return { skip: false, reason: 'persistent state has no last_run: failing closed' };
+  }
+  if (lastRun.complete !== true || String(lastRun.kind || '') !== 'full') {
+    return { skip: false, reason: 'persistent state is not from a complete full review: failing closed' };
+  }
+  const stateHead = String(lastRun.head_sha || lastRun.headSha || '').trim().toLowerCase();
+  if (!stateHead) {
+    throw new Error('Upstream PR-Agent persistent state has no last_run.head_sha.');
   }
   if (stateHead !== reviewedHeadSha) {
     return { skip: false, reason: 'stale persistent state: not for the reviewed HEAD' };
@@ -569,9 +589,13 @@ function isSkippedCleanImprovePayload(raw) {
   // can tell "improve skipped for a clean HEAD" apart from "improve never
   // ran": only the former satisfies the improve-coverage leg with an empty
   // payload (mirrors GateInputs.improve_skipped_clean). Extra keys never
-  // affect suggestion parsing. Unparseable lines are not clean.
+  // affect suggestion parsing. Every line must parse: any unparseable line
+  // means the payload is not clean, regardless of where the marker appears.
+  let foundMarker = false;
+  let sawLine = false;
   for (const line of String(raw || '').split('\n')) {
     if (!line.trim()) continue;
+    sawLine = true;
     let record;
     try {
       record = JSON.parse(line);
@@ -584,11 +608,11 @@ function isSkippedCleanImprovePayload(raw) {
         marker && typeof marker === 'object' && !Array.isArray(marker) &&
         marker.improve_skipped_clean === true
       ) {
-        return true;
+        foundMarker = true;
       }
     }
   }
-  return false;
+  return sawLine && foundMarker;
 }
 
 function controllerStateBody(stateMarker, summary) {

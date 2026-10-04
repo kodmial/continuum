@@ -1048,11 +1048,34 @@ jobs:
           echo "improve_file=pr-agent-outputs/continuum.jsonl" >> "$GITHUB_OUTPUT"
           echo "Automatic improve skipped for clean HEAD $REVIEWED_SHA; empty payload recorded."
 
-      - name: Export native improve output
+      - name: Revalidate the PR head after improve
         if: >-
           steps.stack.outputs.enabled == 'true' &&
           steps.admit.outputs.admitted == 'true' &&
           (steps.improve.outcome == 'success' || steps.improve_skipped.outcome == 'success')
+        id: post_improve
+        env:
+          # Pure same-repository read-only check (gh pr view for the current
+          # PR head only). Repository token is sufficient.
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
+          REVIEWED_SHA: ${{ steps.before.outputs.sha }}
+        run: |
+          set -euo pipefail
+          CURRENT_SHA="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)"
+          if [[ "${CURRENT_SHA,,}" != "${REVIEWED_SHA,,}" ]]; then
+            echo "::error::PR head moved during improve ($REVIEWED_SHA -> $CURRENT_SHA); discarding stale improve output."
+            echo "stale_head=true" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          echo "Improve output for $REVIEWED_SHA is still current."
+
+      - name: Export native improve output
+        if: >-
+          steps.stack.outputs.enabled == 'true' &&
+          steps.admit.outputs.admitted == 'true' &&
+          (steps.improve.outcome == 'success' || steps.improve_skipped.outcome == 'success') &&
+          steps.post_improve.outcome == 'success'
         id: improve_output
         run: |
           set -euo pipefail
@@ -1069,7 +1092,7 @@ jobs:
 
       - name: Normalize persistent improve presentation
         if: >-
-          steps.result.outcome == 'success' &&
+          steps.improve_output.outcome == 'success' &&
           steps.result.outputs.head_sha
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
@@ -1120,7 +1143,10 @@ jobs:
             }
 
       - name: Route the current PR-Agent result
-        if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
+        if: >-
+          steps.stack.outputs.enabled == 'true' &&
+          steps.admit.outputs.admitted == 'true' &&
+          steps.post_improve.outcome == 'success'
         id: route
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
@@ -1230,7 +1256,7 @@ jobs:
         env:
           HEAD_SHA: ${{ steps.admit.outputs.head_sha }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
-          RETRYABLE_FAILURE: ${{ (steps.install_pragent.outcome == 'failure' || steps.install_opencode.outcome == 'failure' || steps.start_opencode.outcome == 'failure' || steps.runtime.outcome == 'failure' || steps.start_bridge.outcome == 'failure' || steps.pragent.outcome == 'failure' || steps.result.outcome == 'failure' || steps.persistent.outcome == 'failure' || steps.improve_gate.outcome == 'failure' || steps.improve.outcome == 'failure' || steps.improve_skipped.outcome == 'failure' || steps.improve_output.outcome == 'failure') && steps.result.outputs.stale_head != 'true' && steps.persistent.outputs.stale_head != 'true' && steps.improve_gate.outputs.stale_head != 'true' && steps.improve.outputs.stale_head != 'true' && steps.improve_skipped.outputs.stale_head != 'true' && 'true' || 'false' }}
+          RETRYABLE_FAILURE: ${{ (steps.install_pragent.outcome == 'failure' || steps.install_opencode.outcome == 'failure' || steps.start_opencode.outcome == 'failure' || steps.runtime.outcome == 'failure' || steps.start_bridge.outcome == 'failure' || steps.pragent.outcome == 'failure' || steps.result.outcome == 'failure' || steps.persistent.outcome == 'failure' || steps.improve_gate.outcome == 'failure' || steps.improve.outcome == 'failure' || steps.improve_skipped.outcome == 'failure' || steps.post_improve.outcome == 'failure' || steps.improve_output.outcome == 'failure') && steps.result.outputs.stale_head != 'true' && steps.persistent.outputs.stale_head != 'true' && steps.improve_gate.outputs.stale_head != 'true' && steps.improve.outputs.stale_head != 'true' && steps.improve_skipped.outputs.stale_head != 'true' && steps.post_improve.outputs.stale_head != 'true' && 'true' || 'false' }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
@@ -1324,12 +1350,14 @@ jobs:
            steps.improve_gate.outcome == 'failure' ||
            steps.improve.outcome == 'failure' ||
            steps.improve_skipped.outcome == 'failure' ||
+           steps.post_improve.outcome == 'failure' ||
            steps.improve_output.outcome == 'failure') &&
            steps.result.outputs.stale_head != 'true' &&
            steps.persistent.outputs.stale_head != 'true' &&
            steps.improve_gate.outputs.stale_head != 'true' &&
            steps.improve.outputs.stale_head != 'true' &&
-           steps.improve_skipped.outputs.stale_head != 'true'
+           steps.improve_skipped.outputs.stale_head != 'true' &&
+           steps.post_improve.outputs.stale_head != 'true'
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
@@ -1423,12 +1451,14 @@ jobs:
            steps.improve_gate.outcome == 'failure' ||
            steps.improve.outcome == 'failure' ||
            steps.improve_skipped.outcome == 'failure' ||
+           steps.post_improve.outcome == 'failure' ||
            steps.improve_output.outcome == 'failure') &&
            steps.result.outputs.stale_head != 'true' &&
            steps.persistent.outputs.stale_head != 'true' &&
            steps.improve_gate.outputs.stale_head != 'true' &&
            steps.improve.outputs.stale_head != 'true' &&
-           steps.improve_skipped.outputs.stale_head != 'true'
+           steps.improve_skipped.outputs.stale_head != 'true' &&
+           steps.post_improve.outputs.stale_head != 'true'
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
