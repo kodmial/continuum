@@ -874,7 +874,11 @@ jobs:
               [[ "$controller_page_len" -lt 100 ]] && break
             done
             if [[ -f "$CONTROLLER_JSON.pages" ]]; then
-              jq -s 'add // []' "$CONTROLLER_JSON.pages" > "$CONTROLLER_JSON" 2>/dev/null || echo "[]" > "$CONTROLLER_JSON"
+              if ! jq -s 'add // []' "$CONTROLLER_JSON.pages" > "$CONTROLLER_JSON" 2>/dev/null; then
+                echo "classification=transient" >> "$GITHUB_OUTPUT"
+                echo "::error::Could not merge controller comments; GitHub API failure is retryable."
+                exit 1
+              fi
               rm -f "$CONTROLLER_JSON.pages"
             else
               echo "classification=transient" >> "$GITHUB_OUTPUT"

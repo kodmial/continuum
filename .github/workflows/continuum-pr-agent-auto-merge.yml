@@ -877,7 +877,7 @@ jobs:
               const priorComments = [];
               for (let page = 1; page <= 10; page += 1) {
                 const { data } = await github.rest.issues.listComments(
-                  { owner, repo, issue_number: prNumber, per_page: 100, page }
+                  { owner, repo, issue_number: prNumber, per_page: 100, page, sort: 'created', direction: 'desc' }
                 );
                 if (!Array.isArray(data) || data.length === 0) break;
                 priorComments.push(...data);

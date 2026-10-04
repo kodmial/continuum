@@ -1103,7 +1103,9 @@ jobs:
                 echo "::error::Could not read PR comments for persistent-state export."
                 exit 1
               fi
-              PAGE_LEN="$(jq 'length' "$RUNNER_TEMP/pr-agent-comment-page.json" 2>/dev/null || echo 0)"
+              if ! PAGE_LEN="$(jq 'length' "$RUNNER_TEMP/pr-agent-comment-page.json" 2>/dev/null)"; then
+                echo "::error::Could not parse PR comments page."; exit 1
+              fi
               [[ "$PAGE_LEN" =~ ^[0-9]+$ ]] || { echo "::error::Could not parse PR comments page."; exit 1; }
               cat "$RUNNER_TEMP/pr-agent-comment-page.json" >> "$RUNNER_TEMP/pr-agent-comment-pages.jsonl"
               echo >> "$RUNNER_TEMP/pr-agent-comment-pages.jsonl"

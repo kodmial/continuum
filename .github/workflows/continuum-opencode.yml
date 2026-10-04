@@ -1965,7 +1965,8 @@ jobs:
 
             // Bounded comment scan (#254): dispatch/qualification markers
             // accumulate in the newest window with every retry, so ten
-            // pages preserve the attempt budget without walking history.
+            // newest-first pages preserve the attempt budget without
+            // walking history.
             const comments = [];
             for (let page = 1; page <= 10; page += 1) {
               const { data } = await github.rest.issues.listComments({
@@ -1974,6 +1975,8 @@ jobs:
                 issue_number: issueNumber,
                 per_page: 100,
                 page,
+                sort: 'created',
+                direction: 'desc',
               });
               if (!Array.isArray(data) || data.length === 0) break;
               comments.push(...data);

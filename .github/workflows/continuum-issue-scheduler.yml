@@ -791,9 +791,9 @@ jobs:
               override_last_page=5
               for override_page in $(seq "$override_first_page" "$override_last_page"); do
                 override_json="$(gh api "repos/$child_repo/issues/$task_number/comments?per_page=100&page=$override_page&since=$grace_since" 2>/dev/null || true)"
-                override_count="$(jq 'length' <<<"$override_json" 2>/dev/null)"
+                override_count="$(jq 'length' <<<"$override_json" 2>/dev/null || echo 0)"
                 [[ "$override_count" =~ ^[0-9]+$ ]] || continue
-                override_seen+="$(jq -r '.[] | select(.user.login == "'"$child_owner"'") | select((.body // "") | test("(^|[[:space:]])/(oc|opencode)([[:space:]]|$)")) | .created_at' <<<"$override_json" 2>/dev/null)"$'\n'
+                override_seen+="$(jq -r '.[] | select(.user.login == "'"$child_owner"'") | select((.body // "") | test("(^|[[:space:]])/(oc|opencode)([[:space:]]|$)")) | .created_at' <<<"$override_json" 2>/dev/null || true)"$'\n'
                 [[ "$override_count" -ge 100 ]] || break
               done
               recent_command="$(grep -v '^$' <<<"$override_seen" | tail -n 1 | tr -d '[:space:]' || true)"
