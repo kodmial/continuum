@@ -379,6 +379,22 @@ def has_tool_error_signal(review: Mapping[str, Any]) -> bool:
     return False
 
 
+def _coverage_flag_value_is_incomplete(key: str, value: object) -> bool:
+    """Whether one coverage flag entry reports incomplete coverage (fail closed)."""
+
+    if key in ("truncated", "partial", "incomplete"):
+        if value is True:
+            return True
+        if isinstance(value, str) and value.strip().lower() in ("1", "true", "yes"):
+            return True
+        return False
+    if value is False:
+        return True
+    if isinstance(value, str) and value.strip().lower() in ("0", "false", "no"):
+        return True
+    return False
+
+
 def has_incomplete_coverage_signal(review: Mapping[str, Any]) -> bool:
     """Whether the review payload itself reports incomplete coverage."""
 
@@ -417,11 +433,13 @@ def has_incomplete_coverage_signal(review: Mapping[str, Any]) -> bool:
             if reviewed_num is not None and total_num is not None:
                 if total_num <= 0 or reviewed_num < total_num:
                     return True
-                continue
-            if value.get("complete") is False:
-                return True
-            if value.get("truncated") is True or value.get("partial") is True:
-                return True
+            # Flags are independent of counts: a full count never masks an
+            # explicit incomplete flag (fail closed).
+            for flag_key in _COVERAGE_FLAG_KEYS:
+                if flag_key in value and _coverage_flag_value_is_incomplete(
+                    flag_key, value.get(flag_key)
+                ):
+                    return True
             continue
         if isinstance(value, str):
             lowered = value.strip().lower()
@@ -489,11 +507,11 @@ def should_skip_improve(
     is a complete full review for the exact reviewed HEAD with no ACTIVE
     finding.
 
-    `reviewed_head_sha`, when provided, is compared against
-    `persistent_state.last_run.head_sha`: a mismatch returns `skip=False`
-    so a stale persistent state from a prior HEAD can never authorize a
-    skip. Callers that know the reviewed HEAD must pass it; a missing
-    `last_run.head_sha` always raises `LifecycleError`.
+    `reviewed_head_sha` is mandatory for any `skip=True`: it is compared
+    against `persistent_state.last_run.head_sha` and a missing value raises
+    `LifecycleError` (fail closed) so a stale persistent state from a prior
+    HEAD can never authorize a skip. Callers must pass the exact reviewed
+    HEAD; a missing `last_run.head_sha` always raises `LifecycleError`.
 
     Anything else returns `skip=False` so `improve` may still run to
     generate additional repair suggestions. Invalid review or persistent
@@ -539,7 +557,11 @@ def should_skip_improve(
     if not state_head:
         raise LifecycleError("upstream PR-Agent persistent state has no last_run.head_sha.")
     expected_head = str(reviewed_head_sha or "").strip()
-    if expected_head and not is_same_head(state_head, expected_head):
+    if not expected_head:
+        raise LifecycleError(
+            "cannot decide improve skip without the exact reviewed HEAD."
+        )
+    if not is_same_head(state_head, expected_head):
         return {"skip": False, "reason": "stale persistent state: not for the reviewed HEAD"}
     if upstream_state_has_active(persistent_state):
         return {"skip": False, "reason": "native persistent state has an ACTIVE finding"}

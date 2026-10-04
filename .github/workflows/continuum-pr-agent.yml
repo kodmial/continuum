@@ -766,6 +766,7 @@ jobs:
           PERSISTENT_STATE_JSON: ${{ steps.persistent.outputs.persistent_state_json }}
           HEAD_SHA: ${{ steps.result.outputs.head_sha }}
           REVIEWED_SHA: ${{ steps.before.outputs.sha }}
+          PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           PRAGENT_OUTCOME: ${{ steps.pragent.outcome }}
           POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
         with:
@@ -791,6 +792,35 @@ jobs:
             if (headSha !== reviewedSha) {
               core.setFailed(
                 `PR head moved before the improve gate (${reviewedSha} -> ${headSha}); ` +
+                'discarding the review result and waiting for fresh CI on the new HEAD.'
+              );
+              return;
+            }
+            // Stored step outputs alone cannot prove the HEAD is still
+            // current: a push after `result`/`persistent` leaves old==old.
+            // Revalidate against the live PR head before deciding.
+            const prNumber = Number(process.env.PR_NUMBER);
+            if (!Number.isInteger(prNumber) || prNumber <= 0) {
+              core.setFailed('Improve gate requires a pull request number for live HEAD validation.');
+              return;
+            }
+            let liveSha = '';
+            try {
+              const { data: pr } = await github.rest.pulls.get({
+                owner: context.repo.owner, repo: context.repo.repo, pull_number: prNumber,
+              });
+              liveSha = String((pr && pr.head && pr.head.sha) || '').trim().toLowerCase();
+            } catch (err) {
+              core.setFailed(`Improve gate could not revalidate the live PR head: ${err.message}`);
+              return;
+            }
+            if (!liveSha) {
+              core.setFailed('Improve gate requires the exact reviewed HEAD.');
+              return;
+            }
+            if (liveSha !== reviewedSha || liveSha !== headSha) {
+              core.setFailed(
+                `PR head moved before the improve gate (${reviewedSha} -> ${liveSha}); ` +
                 'discarding the review result and waiting for fresh CI on the new HEAD.'
               );
               return;
@@ -885,10 +915,16 @@ jobs:
           PUSH_OUTPUTS__CHANNELS: '["file"]'
           PUSH_OUTPUTS__FILE_PATH: 'pr-agent-outputs/continuum.jsonl'
           PR_URL: https://github.com/${{ github.repository }}/pull/${{ steps.stack.outputs.pr_number }}
+          PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           REVIEWED_SHA: ${{ steps.before.outputs.sha }}
           POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
         run: |
           set -euo pipefail
+          CURRENT_SHA="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)"
+          if [[ "${CURRENT_SHA,,}" != "${REVIEWED_SHA,,}" ]]; then
+            echo "::error::PR head moved before improve ($REVIEWED_SHA -> $CURRENT_SHA); discarding stale gate decision."
+            exit 1
+          fi
           IMPROVE_REPAIR_THRESHOLD="$(node -e 'const p=require(process.env.POLICY_SCRIPT); process.stdout.write(String(p.IMPROVE_REPAIR_THRESHOLD));')"
           [[ "$IMPROVE_REPAIR_THRESHOLD" =~ ^[0-9]+$ ]] || { echo "::error::Invalid centralized PR-Agent improve threshold."; exit 1; }
           mkdir -p pr-agent-outputs
@@ -919,16 +955,24 @@ jobs:
           steps.improve_gate.outputs.skip_improve == 'true'
         id: improve_skipped
         env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
+          REVIEWED_SHA: ${{ steps.before.outputs.sha }}
           POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
         run: |
           set -euo pipefail
+          CURRENT_SHA="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)"
+          if [[ "${CURRENT_SHA,,}" != "${REVIEWED_SHA,,}" ]]; then
+            echo "::error::PR head moved before recording skipped improve ($REVIEWED_SHA -> $CURRENT_SHA); refusing empty payload for the wrong HEAD."
+            exit 1
+          fi
           IMPROVE_REPAIR_THRESHOLD="$(node -e 'const p=require(process.env.POLICY_SCRIPT); process.stdout.write(String(p.IMPROVE_REPAIR_THRESHOLD));')"
           [[ "$IMPROVE_REPAIR_THRESHOLD" =~ ^[0-9]+$ ]] || { echo "::error::Invalid centralized PR-Agent improve threshold."; exit 1; }
           mkdir -p pr-agent-outputs
           echo '{"payload": {"code_suggestions": []}}' > pr-agent-outputs/continuum.jsonl
           echo "improve_repair_threshold=$IMPROVE_REPAIR_THRESHOLD" >> "$GITHUB_OUTPUT"
           echo "improve_file=pr-agent-outputs/continuum.jsonl" >> "$GITHUB_OUTPUT"
-          echo "Automatic improve skipped for clean HEAD ${{ steps.result.outputs.head_sha }}; empty payload recorded."
+          echo "Automatic improve skipped for clean HEAD $REVIEWED_SHA; empty payload recorded."
 
       - name: Export native improve output
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
@@ -1089,7 +1133,7 @@ jobs:
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           HEAD_SHA: ${{ steps.admit.outputs.head_sha }}
-          RETRYABLE_FAILURE: ${{ (steps.install_pragent.outcome == 'failure' || steps.install_opencode.outcome == 'failure' || steps.start_opencode.outcome == 'failure' || steps.runtime.outcome == 'failure' || steps.start_bridge.outcome == 'failure' || steps.pragent.outcome == 'failure' || steps.result.outcome == 'failure' || steps.persistent.outcome == 'failure' || steps.improve_gate.outcome == 'failure' || steps.improve.outcome == 'failure' || steps.improve_output.outcome == 'failure') && 'true' || 'false' }}
+          RETRYABLE_FAILURE: ${{ (steps.install_pragent.outcome == 'failure' || steps.install_opencode.outcome == 'failure' || steps.start_opencode.outcome == 'failure' || steps.runtime.outcome == 'failure' || steps.start_bridge.outcome == 'failure' || steps.pragent.outcome == 'failure' || steps.result.outcome == 'failure' || steps.persistent.outcome == 'failure' || steps.improve_gate.outcome == 'failure' || steps.improve.outcome == 'failure' || steps.improve_skipped.outcome == 'failure' || steps.improve_output.outcome == 'failure') && 'true' || 'false' }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
@@ -1164,6 +1208,7 @@ jobs:
            steps.persistent.outcome == 'failure' ||
            steps.improve_gate.outcome == 'failure' ||
            steps.improve.outcome == 'failure' ||
+           steps.improve_skipped.outcome == 'failure' ||
            steps.improve_output.outcome == 'failure')
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
@@ -1238,6 +1283,7 @@ jobs:
            steps.persistent.outcome == 'failure' ||
            steps.improve_gate.outcome == 'failure' ||
            steps.improve.outcome == 'failure' ||
+           steps.improve_skipped.outcome == 'failure' ||
            steps.improve_output.outcome == 'failure')
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}

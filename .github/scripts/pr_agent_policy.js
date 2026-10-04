@@ -378,6 +378,21 @@ function hasToolErrorSignal(reviewPayload) {
   return false;
 }
 
+function coverageFlagValueIsIncomplete(key, value) {
+  if (key === 'truncated' || key === 'partial' || key === 'incomplete') {
+    if (value === true) return true;
+    if (typeof value === 'string' && ['1', 'true', 'yes'].includes(value.trim().toLowerCase())) {
+      return true;
+    }
+    return false;
+  }
+  if (value === false) return true;
+  if (typeof value === 'string' && ['0', 'false', 'no'].includes(value.trim().toLowerCase())) {
+    return true;
+  }
+  return false;
+}
+
 function hasIncompleteCoverageSignal(reviewPayload) {
   const review = unwrapReview(reviewPayload);
   for (const key of COVERAGE_FLAG_KEYS) {
@@ -405,10 +420,14 @@ function hasIncompleteCoverageSignal(reviewPayload) {
       const totalNum = total === undefined || total === null || total === '' ? null : Number(total);
       if (reviewedNum !== null && totalNum !== null && Number.isFinite(reviewedNum) && Number.isFinite(totalNum)) {
         if (totalNum <= 0 || reviewedNum < totalNum) return true;
-        continue;
       }
-      if (value.complete === false) return true;
-      if (value.truncated === true || value.partial === true) return true;
+      // Flags are independent of counts: a full count never masks an
+      // explicit incomplete flag (fail closed).
+      for (const flagKey of COVERAGE_FLAG_KEYS) {
+        if (flagKey in value && coverageFlagValueIsIncomplete(flagKey, value[flagKey])) {
+          return true;
+        }
+      }
       continue;
     }
     if (typeof value === 'string') {
@@ -527,7 +546,10 @@ function isCleanReviewForImproveSkip(reviewPayload, persistentState, options = {
   const reviewedHeadSha = String(
     opts.reviewedHeadSha || opts.reviewed_head_sha || opts.headSha || opts.head_sha || ''
   ).trim().toLowerCase();
-  if (reviewedHeadSha && stateHead !== reviewedHeadSha) {
+  if (!reviewedHeadSha) {
+    throw new Error('Cannot decide improve skip without the exact reviewed HEAD.');
+  }
+  if (stateHead !== reviewedHeadSha) {
     return { skip: false, reason: 'stale persistent state: not for the reviewed HEAD' };
   }
   if (persistentHasActive(persistentState)) {
