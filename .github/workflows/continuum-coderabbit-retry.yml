@@ -572,6 +572,9 @@ jobs:
 
 
             async function collectState() {
+              // Refresh per-pass memoization: gate/issue state may advance between passes, so never reuse the previous pass.
+              gateCache.clear();
+              issueCache.clear();
               // Bounded queue scan (#254): the priority queue only needs
               // currently open PRs against main, capped at MAX_QUEUE_PAGES.
               const pulls = await boundedList(
