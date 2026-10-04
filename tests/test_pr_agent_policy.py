@@ -270,13 +270,14 @@ class ExactHeadSafetyTests(unittest.TestCase):
                 )
                 self.assertFalse(result["skip"])
 
-    def test_missing_reviewed_head_throws_fail_closed(self):
+    def test_missing_reviewed_head_runs_improve_fail_closed(self):
         result = run_skip_raw(
             json.dumps(make_review([])),
             json.dumps(make_persistent([], head_sha="abc1234")),
             {"headMatches": True, "reviewCoverageComplete": True},
         )
-        self.assertIn("threw", result)
+        self.assertFalse(result["skip"])
+        self.assertNotIn("threw", result)
 
     def test_missing_key_issues_runs_improve_fail_closed(self):
         result = run_skip_raw(

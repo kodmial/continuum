@@ -2089,7 +2089,8 @@ class CleanReviewImproveSkipTests(unittest.TestCase):
             json.dumps(make_persistent([], head_sha="abc1234")),
             {"headMatches": True, "reviewCoverageComplete": True},
         )
-        self.assertIn("threw", missing)
+        self.assertFalse(missing["skip"])
+        self.assertNotIn("threw", missing)
 
     def test_omitted_coverage_flag_never_skips_clean_review(self):
         # Fail-closed default: a clean review with no coverage object called
@@ -3234,7 +3235,8 @@ process.stdout.write(JSON.stringify(result === undefined ? null : result));
             json.dumps(clean), json.dumps(state),
             {"headMatches": True, "reviewCoverageComplete": True},
         )
-        self.assertIn("threw", missing)
+        self.assertFalse(missing["skip"])
+        self.assertNotIn("threw", missing)
 
     def test_split_envelope_merges_fail_closed_in_both_stacks(self):
         life = self._life()

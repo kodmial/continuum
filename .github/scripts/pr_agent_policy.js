@@ -844,15 +844,15 @@ function isCleanReviewForImproveSkip(reviewPayload, persistentState, options = {
   if (!recommendation) {
     return { skip: false, reason: 'review has no merge_recommendation: failing closed' };
   }
-  // The exact reviewed HEAD is mandatory for any skip decision: validate it
-  // before interpreting coverage/persistent format variations so a missing
-  // HEAD still fails closed by exception while benign variations with a
-  // known HEAD safely run improve (skip:false).
+  // The exact reviewed HEAD is mandatory for any skip decision: without it
+  // the orchestrator must still safely run improve for repair value instead
+  // of crashing, so a missing HEAD fails closed to skip:false (never to an
+  // exception) while benign variations with a known HEAD do the same.
   const reviewedHeadSha = String(
     opts.reviewedHeadSha || opts.reviewed_head_sha || opts.headSha || opts.head_sha || ''
   ).trim().toLowerCase();
   if (!reviewedHeadSha) {
-    throw new Error('Cannot decide improve skip without the exact reviewed HEAD.');
+    return { skip: false, reason: 'cannot decide improve skip without the exact reviewed HEAD: failing closed' };
   }
   // Fail closed on the explicit opt-in plus positive coverage evidence
   // in the review payload. An omitted flag never skips, and absent

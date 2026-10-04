@@ -137,6 +137,7 @@ jobs:
               "unwrapReview",
               "qualifyingImproveSuggestions",
               "reviewDisposition",
+              "isCleanReviewForImproveSkip",
               "isSkippedCleanImprovePayload",
               "hasToolErrorSignal",
               "hasIncompleteCoverageSignal",
@@ -180,10 +181,12 @@ jobs:
             //   - no tool error (config.propagate_tool_errors,
             //     github_action_config.fail_on_tool_errors)
             //   - complete review and improve coverage (upstream chunking
-            //     coverage footers; incomplete coverage never greens), except
-            //     that a marked skipped-clean improve payload
+            //     coverage footers; truncated/invalid improve payloads never
+            //     green), except that a marked skipped-clean improve payload
             //     (continuum.improve_skipped_clean) satisfies the improve leg
-            //     with zero suggestions and no improve run
+            //     with zero suggestions and no improve run, and an empty
+            //     improve payload parses to zero suggestions judged via
+            //     `disposition` so a clean HEAD cannot deadlock
             //   - green CI on the exact HEAD, revalidated immediately before
             //     merge, plus draft/conflict revalidation
             //   - matching HEAD (results for SHA A never merge SHA B;
@@ -344,22 +347,20 @@ jobs:
               return;
             }
             // Improve-coverage leg wired to the skipped-clean flag
-            // (mirrors GateInputs.improve_skipped_clean): an empty improve
-            // payload only greens when improve ran for this HEAD (non-empty
-            // payload) or the payload carries the skipped-clean marker. An
-            // empty payload without the marker means improve never produced
-            // coverage here, so the gate fails closed instead of merging on
-            // missing evidence. Producer: continuum-pr-agent.yml
-            // `improve_gate` (skip_improve decision) plus the
-            // `improve_skipped` step, which writes the marked empty payload
+            // (mirrors GateInputs.improve_skipped_clean): a skipped-clean
+            // HEAD carries the marked empty payload
             // `{"payload": {"code_suggestions": []}, "continuum":
-            // {"improve_skipped_clean": true}}` for the exact clean HEAD and
+            // {"improve_skipped_clean": true}}` for the exact clean HEAD
+            // (producer: continuum-pr-agent.yml `improve_gate`
+            // skip_improve decision plus the `improve_skipped` step, which
             // forwards it here as `improve_jsonl`; the `improve` step runs
-            // only when `skip_improve != 'true'`.
-            if (!raw.trim() && !improveSkippedClean) {
-              fail('incomplete improve coverage: failing closed');
-              return;
-            }
+            // only when `skip_improve != 'true'`). An empty improve payload
+            // without the marker parses to zero suggestions and proceeds
+            // via `disposition` below, so an improve run for the exact HEAD
+            // that emitted no suggestions (or a missing/miswired
+            // `improve_skipped` step) cannot deadlock a clean HEAD.
+            // Truncated/invalid payloads still fail closed on the
+            // improve-coverage leg above.
             if (recommendation !== policy.REVIEW_MERGE_SAFE) {
               fail(`merge recommendation blocks: ${recommendation}`);
               return;
