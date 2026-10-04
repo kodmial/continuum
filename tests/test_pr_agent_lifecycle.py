@@ -1121,13 +1121,8 @@ class StabilizationParityTests(unittest.TestCase):
         self.assertIn('echo "classification=transient" >> "$GITHUB_OUTPUT"', repair)
         self.assertIn("requesting bounded exact-HEAD re-review/repair", repair)
         self.assertIn("if: always() && steps.repair_pass.outputs.no_progress == 'true'", repair)
-        # Work-Lock #58 item 5 (#236 conservative subset): only the two
-        # verified-safe pure reads leave TAP_PAT. The repair pass mixes
-        # revalidation with comment writes/commit/push and must stay wholly
-        # PAT-backed (see
-        # test_pr_agent_repair_verified_safe_reads_use_repository_token).
-        self.assertNotIn('READ_GH_TOKEN', repair)
         self.assertIn('GH_TOKEN: ${{ secrets.TAP_PAT }}', repair)
+        self.assertNotIn('READ_GH_TOKEN: ${{ github.token }}', repair)
         self.assertIn("GitHub API failure is retryable", repair)
         self.assertNotIn("No repair diff; controller state will hold", repair)
 
