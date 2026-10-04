@@ -328,14 +328,20 @@ jobs:
             let surviving = [];
             const transitionRe =
               /<!-- continuum-pr-agent-convergence from=([0-9a-f]{40}) to=([0-9a-f]{40}) findings=([0-9a-f]{64}(?:,[0-9a-f]{64})*) -->/gi;
+            let transitionCount = 0;
+            const MAX_TRANSITIONS = 50;
+            const MAX_IDS_PER_MARKER = 500;
             for (const comment of comments) {
+              if (transitionCount >= MAX_TRANSITIONS) break;
               const body = String(comment.body || '');
               for (const match of body.matchAll(transitionRe)) {
+                if (transitionCount >= MAX_TRANSITIONS) break;
+                transitionCount++;
                 const fromHead = String(match[1] || '').toLowerCase();
                 const toHead = String(match[2] || '').toLowerCase();
                 if (fromHead === toHead) continue;
                 if (toHead !== headSha) continue;
-                const prior = new Set(String(match[3] || '').toLowerCase().split(',').filter(Boolean));
+                const prior = new Set(String(match[3] || '').toLowerCase().split(',').filter(Boolean).slice(0, MAX_IDS_PER_MARKER));
                 for (const id of findingIds) {
                   if (prior.has(id)) surviving.push(id);
                 }
@@ -369,6 +375,7 @@ jobs:
             core.setOutput('surviving_findings', surviving.join(','));
             core.setOutput('eligible_count', String(eligible.length));
             core.setOutput('eligible_batch', JSON.stringify(eligible.map(entry => entry.item)));
+            core.setOutput('eligible_findings', eligible.map(entry => String(entry.id || '').toLowerCase()).sort().join(','));
             core.setOutput('held', held ? 'true' : 'false');
             if (held) {
               core.notice(

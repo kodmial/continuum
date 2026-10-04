@@ -167,8 +167,27 @@ class ConvergenceStateTests(unittest.TestCase):
             current_finding_ids=ids,
             comment_bodies=[marker],
         )
-        self.assertTrue(decision.same_head_hold)
+        self.assertFalse(decision.same_head_hold)
         self.assertTrue(decision.held)
+        self.assertEqual(decision.surviving, frozenset(ids))
+        self.assertFalse(decision.eligible)
+
+    def test_same_head_partial_overlap_keeps_new_finding_eligible(self):
+        from continuum.pr_agent_convergence import no_progress_marker
+
+        old_ids = finding_fingerprints([item("bug")])
+        marker = no_progress_marker(A, "2" * 64, old_ids)
+        current = finding_fingerprints([item("bug"), item("totally different")])
+        decision = decide(
+            head_sha=A,
+            batch_fp="3" * 64,
+            current_finding_ids=current,
+            comment_bodies=[marker],
+        )
+        self.assertFalse(decision.same_head_hold)
+        self.assertFalse(decision.held)
+        self.assertEqual(decision.surviving, frozenset(old_ids))
+        self.assertEqual(decision.eligible, frozenset(current) - frozenset(old_ids))
 
     def test_same_head_new_logical_finding_stays_eligible(self):
         from continuum.pr_agent_convergence import no_progress_marker

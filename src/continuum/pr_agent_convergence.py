@@ -186,9 +186,11 @@ def decide(
     genuine user/new-work commits invalidate stale convergence state. Findings
     that survived a workflow-generated repair stay held, while new/materially
     changed findings on the same generated HEAD remain eligible. The same HEAD
-    holds when its batch fingerprint recurs exactly (#33 contract) or when a
-    same-HEAD no-progress marker carries any of the current logical finding
-    IDs, so volatile-only variants cannot trigger a second automatic repair.
+    holds globally only when its batch fingerprint recurs exactly (#33
+    contract); a same-HEAD no-progress marker otherwise holds only the
+    overlapping logical finding IDs via surviving, so a re-run on the same HEAD
+    with one old plus one new logical finding keeps the new finding eligible
+    and volatile-only variants cannot trigger a second automatic repair.
     """
     head = (head_sha or "").lower()
     fp = (batch_fp or "").lower()
@@ -212,13 +214,15 @@ def decide(
                 same_head_findings.update(
                     list(marker_findings.split(","))[:500]
                 )
-    if not same_head_hold and same_head_findings & current:
-        same_head_hold = True
-
+    same_head_exact = same_head_hold
+    same_head_surviving = frozenset(same_head_findings & current)
     prior: set[str] = set()
     for transition in parse_transitions(comment_bodies):
         if transition.to_head == head and transition.from_head != head:
             prior.update(transition.findings)
-    surviving = frozenset(prior & current)
-    eligible = frozenset() if same_head_hold else frozenset(current - surviving)
-    return ConvergenceDecision(same_head_hold, surviving, eligible)
+    surviving = frozenset((prior & current) | same_head_surviving)
+    if same_head_exact:
+        eligible: frozenset[str] = frozenset()
+    else:
+        eligible = frozenset(current - surviving)
+    return ConvergenceDecision(same_head_exact, surviving, eligible)
