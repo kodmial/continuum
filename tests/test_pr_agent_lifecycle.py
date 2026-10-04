@@ -237,7 +237,7 @@ APPROVED_260_OPENCODE_PROVENANCE_ADDED_LINES = (
     '            git commit -m "chore: recover OpenCode issue changes" -m "Continuum-Component: opencode"',
     '            git commit -m "fix: address CodeRabbit review findings for PR #${PR_NUMBER}" -m "Continuum-Component: opencode"',
     '            git commit -m "fix: repair blocking workflow for PR #${PR_NUMBER}" -m "Continuum-Component: opencode"',
-    '            git commit -m "fix: resolve merge conflict with main for PR #${PR_NUMBER}" -m "Continuum-Component: opencode" || true',
+    '            git commit -m "fix: resolve merge conflict with main for PR #${PR_NUMBER}" -m "Continuum-Component: opencode"',
     '            git push origin "HEAD:${HEAD_REF}"',
     '            git push origin "HEAD:${HEAD_REF}"',
     '            git push origin "HEAD:${HEAD_REF}"',
