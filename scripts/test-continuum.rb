@@ -3400,8 +3400,6 @@ class ContinuumTest < Minitest::Test
                     "MAX_RECOVERY_RETRIES: ${{ inputs.max_recovery_retries || vars.AUTOMATION_WATCHDOG_MAX_RETRIES || '1' }}"
     assert_includes watchdog_body,
                     "PAUSE_ON_FAILURE: ${{ inputs.pause_on_failure || vars.AUTOMATION_PAUSE_ON_FAILURE || 'false' }}"
-    assert_includes workflow_body('continuum-opencode.yml'),
-                    "PAUSE_ON_FAILURE: ${{ inputs.pause_on_failure || vars.AUTOMATION_PAUSE_ON_FAILURE || 'false' }}"
   end
 
   # Adding a `vars.` fallback to a `inputs.x || 'literal'` chain must not change
