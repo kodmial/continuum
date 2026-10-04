@@ -39,6 +39,9 @@ SRC = os.path.join(ROOT, "src")
 # kodmial/continuum#179 owns the prepared agent runtime and never touches
 # PAUSE_ON_FAILURE, so this advance does not narrow #179. Any other
 # protected-file drift beyond the #179 probe still fails.
+# Merged with origin/main: main restores the same 'true' PAUSE_ON_FAILURE
+# baseline at 3df3b1e (identical protected-file content to 197bafd); it is
+# retained here as OLDEST_BASELINE_SHA so neither baseline reference is lost.
 BASELINE_SHA = "197bafdb6b157ad7d4e77888a1fed5a921a3f125"
 
 # Previous protected baseline before the PAUSE_ON_FAILURE advance above.

@@ -2,6 +2,13 @@ name: PR-Agent recovery
 
 on:
   workflow_dispatch:
+    inputs:
+      max_executions:
+        description: >-
+          Total transient executions per exact PR/HEAD/operation (1..10,
+          default 10). Empty falls back to vars.PR_AGENT_RECOVERY_MAX_EXECUTIONS.
+        required: false
+        type: string
   schedule:
     - cron: "*/10 * * * *"
   pull_request_target:
@@ -25,3 +32,4 @@ jobs:
     secrets: inherit
     with:
       continuum_ref: main
+      max_executions: "${{ inputs.max_executions }}"
