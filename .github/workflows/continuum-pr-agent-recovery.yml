@@ -45,7 +45,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: pr-agent-recovery-${{ (inputs.target_child_id || vars.CONTINUUM_PR_AGENT_TARGET_CHILD_ID) && format('child-{0}', inputs.target_child_id || vars.CONTINUUM_PR_AGENT_TARGET_CHILD_ID) || 'local' }}-${{ github.repository }}
+  group: ${{ (inputs.target_child_id || vars.CONTINUUM_PR_AGENT_TARGET_CHILD_ID) && format('pr-agent-recovery-child-{0}-{1}', inputs.target_child_id || vars.CONTINUUM_PR_AGENT_TARGET_CHILD_ID, github.repository) || format('pr-agent-recovery-{0}', github.repository) }}
   cancel-in-progress: false
 
 jobs:
@@ -734,19 +734,27 @@ jobs:
               }
               try {
                 const ref = await defaultBranch();
+                // Local runs dispatch bare: a custom reviewWorkflow without
+                // the target_child_id workflow_dispatch input would reject
+                // an empty value, breaking local recovery. Delegated runs
+                // preserve the opaque child selection.
+                const recoveryInputs = {
+                  pr_number: String(pr.number),
+                  expected_head_sha: head,
+                  retry_attempt: String(attempt),
+                  retry_workflow: reviewWorkflow,
+                  recovery_kind: kind,
+                };
+                const recoveryChildId = String(process.env.TARGET_CHILD_ID || '');
+                if (recoveryChildId) {
+                  recoveryInputs.target_child_id = recoveryChildId;
+                }
                 await github.rest.actions.createWorkflowDispatch({
                   owner: executionOwner,
                   repo: executionRepo,
                   workflow_id: reviewWorkflow,
                   ref,
-                  inputs: {
-                    pr_number: String(pr.number),
-                    expected_head_sha: head,
-                    retry_attempt: String(attempt),
-                    retry_workflow: reviewWorkflow,
-                    recovery_kind: kind,
-                    target_child_id: String(process.env.TARGET_CHILD_ID || ''),
-                  },
+                  inputs: recoveryInputs,
                 });
                 core.notice(
                   'PR #' + pr.number + ' HEAD ' + head + ': dispatched ' +

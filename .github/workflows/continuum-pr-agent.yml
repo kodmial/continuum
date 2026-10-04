@@ -1172,6 +1172,10 @@ jobs:
         if: always() && steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
         run: |
           set -euo pipefail
+          if [[ -z "${CONTINUUM_PR_AGENT_WORKTREE:-}" ]]; then
+            echo "::error::PR-Agent worktree is unavailable; the manual checkout failed before exporting the worktree."
+            exit 1
+          fi
           cd "$CONTINUUM_PR_AGENT_WORKTREE"
           DIRTY="$(git status --porcelain -- . ':(exclude)pr-agent-outputs')"
           if [[ -n "$DIRTY" ]]; then

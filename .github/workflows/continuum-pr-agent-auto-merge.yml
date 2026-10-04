@@ -75,7 +75,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: pr-agent-merge-${{ inputs.target_child_id && format('child-{0}', inputs.target_child_id) || 'local' }}-${{ inputs.pr_number || github.run_id }}
+  group: ${{ inputs.target_child_id && format('pr-agent-merge-child-{0}-{1}', inputs.target_child_id, inputs.pr_number || github.run_id) || format('pr-agent-merge-{0}', inputs.pr_number || github.run_id) }}
   cancel-in-progress: false
 
 jobs:
