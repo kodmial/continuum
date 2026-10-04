@@ -789,13 +789,24 @@ jobs:
               # window.
               override_first_page=1
               override_last_page=5
+              override_failed=0
               for override_page in $(seq "$override_first_page" "$override_last_page"); do
-                override_json="$(gh api "repos/$child_repo/issues/$task_number/comments?per_page=100&page=$override_page&since=$grace_since" 2>/dev/null || true)"
-                override_count="$(jq 'length' <<<"$override_json" 2>/dev/null || echo 0)"
-                [[ "$override_count" =~ ^[0-9]+$ ]] || continue
-                override_seen+="$(jq -r '.[] | select(.user.login == "'"$child_owner"'") | select((.body // "") | test("(^|[[:space:]])/(oc|opencode)([[:space:]]|$)")) | .created_at' <<<"$override_json" 2>/dev/null || true)"$'\n'
+                # Fail closed: a fetch or parse failure leaves the window
+                # unknown, so report active instead of reading an empty
+                # window as idle and double-dispatching.
+                if ! override_json="$(gh api "repos/$child_repo/issues/$task_number/comments?per_page=100&page=$override_page&since=$grace_since" 2>/dev/null)"; then
+                  override_failed=1
+                  break
+                fi
+                if ! override_count="$(jq 'length' <<<"$override_json" 2>/dev/null)"; then
+                  override_failed=1
+                  break
+                fi
+                [[ "$override_count" =~ ^[0-9]+$ ]] || { override_failed=1; break; }
+                override_seen+="$(jq -r --arg owner "$child_owner" '.[] | select(.user.login == $owner) | select((.body // "") | test("(^|[[:space:]])/(oc|opencode)([[:space:]]|$)")) | .created_at' <<<"$override_json" 2>/dev/null || true)"$'\n'
                 [[ "$override_count" -ge 100 ]] || break
               done
+              [[ "$override_failed" -eq 0 ]] || return 0
               recent_command="$(grep -v '^$' <<<"$override_seen" | tail -n 1 | tr -d '[:space:]' || true)"
               [[ -n "$recent_command" ]] || return 1
               command_epoch="$(date -d "$recent_command" +%s 2>/dev/null || echo 0)"

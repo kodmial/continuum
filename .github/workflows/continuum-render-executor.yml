@@ -520,8 +520,18 @@ jobs:
           continuum_newest_comments_slurp() {
             local repo="$1" issue="$2"
             local total last first page page_json count pages_out=""
-            total="$(continuum_api_get "repos/$repo/issues/$issue" --jq '.comments // 0' 2>/dev/null || echo 0)"
-            [[ "$total" =~ ^[0-9]+$ ]] || total=0
+            # Fail closed: an unknown comment total cannot anchor the
+            # newest window, so return failure instead of scanning only
+            # the oldest page and missing a recent repair marker (which
+            # would undercount the budget and permit an extra repair).
+            if ! total="$(continuum_api_get "repos/$repo/issues/$issue" --jq '.comments // 0' 2>/dev/null)"; then
+              echo "::error::Could not determine the newest comment page; failing closed without repair." >&2
+              return 1
+            fi
+            [[ "$total" =~ ^[0-9]+$ ]] || {
+              echo "::error::Could not parse the newest comment page; failing closed without repair." >&2
+              return 1
+            }
             last=$(( (total + 99) / 100 ))
             [[ "$last" -ge 1 ]] || last=1
             first=$(( last - CONTINUUM_MAX_PAGES + 1 ))
@@ -539,9 +549,16 @@ jobs:
               page=$((page + 1))
             done
             if [[ -z "$pages_out" ]]; then
+              # Empty is authoritative only when the issue truly has no
+              # comments; otherwise the window is unretrieved, so fail
+              # closed instead of reporting a zero budget count.
+              if [[ "$total" -gt 0 ]]; then
+                echo "::error::Newest comment window could not be retrieved; failing closed without repair." >&2
+                return 1
+              fi
               echo "[]"
             else
-              jq -s '.' <<<"$(grep -v '^$' <<<"$pages_out" || true)"
+              jq -s '.' <<<"$(grep -v '^$' <<<"$pages_out" || true)" || return 1
             fi
           }
 
@@ -609,9 +626,17 @@ jobs:
           # `.[][]?`, capped at CONTINUUM_MAX_PAGES instead of full-history
           # pagination. Comments list oldest-first, so the oldest pages
           # would miss a recent repair marker and undercount the budget.
-          COMMENTS_JSON="$(continuum_newest_comments_slurp "$GITHUB_REPOSITORY" "$ISSUE_NUMBER" 2>/dev/null || echo "[]")"
+          COMMENTS_UNKNOWN=0
+          if ! COMMENTS_JSON="$(continuum_newest_comments_slurp "$GITHUB_REPOSITORY" "$ISSUE_NUMBER" 2>/dev/null)"; then
+            echo "::warning::Comment scan could not anchor the newest window; failing closed with an exhausted repair budget." >&2
+            COMMENTS_UNKNOWN=1
+            COMMENTS_JSON="[]"
+          fi
 
           fingerprint_seen() {
+            # Fail closed: unknown comment state may hide a marker, so
+            # report it as seen and coalesce instead of duplicating work.
+            [[ "$COMMENTS_UNKNOWN" -eq 1 ]] && return 0
             local marker="$1"
             local count
             count="$(jq --arg marker "$marker" \
@@ -673,8 +698,14 @@ jobs:
               # Bounded automatic infrastructure recovery without a
               # repository repair issue. The source stays eligible for an
               # automatic retry; the marker budget stops an endless loop.
-              TRANSIENT_COUNT="$(jq '[.[][]? | select((.body // "") | contains("<!-- continuum-render-transient-attempt -->"))] | length' \
-                <<<"$COMMENTS_JSON" 2>/dev/null || echo "$MAX_RENDER_REPAIR_ATTEMPTS")"
+              # Fail closed: unknown comment state may hide markers, so
+              # treat the budget as exhausted instead of retrying blindly.
+              if [[ "$COMMENTS_UNKNOWN" -eq 1 ]]; then
+                TRANSIENT_COUNT="$MAX_RENDER_REPAIR_ATTEMPTS"
+              else
+                TRANSIENT_COUNT="$(jq '[.[][]? | select((.body // "") | contains("<!-- continuum-render-transient-attempt -->"))] | length' \
+                  <<<"$COMMENTS_JSON" 2>/dev/null || echo "$MAX_RENDER_REPAIR_ATTEMPTS")"
+              fi
               if [[ "${TRANSIENT_COUNT:-0}" -ge "$MAX_RENDER_REPAIR_ATTEMPTS" ]]; then
                 gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
                   --add-label "$PAUSE_LABEL" >/dev/null 2>&1 || true
@@ -708,8 +739,15 @@ jobs:
                 gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
                   --body "$(printf '%s\n%s' "$FAILURE_MARKER" "<!-- continuum-origin role=continuum component=render-executor -->")"
               fi
-              REPAIR_COUNT="$(jq '[.[][]? | select((.body // "") | contains("<!-- continuum-render-repair-attempt -->"))] | length' \
-                <<<"$COMMENTS_JSON" 2>/dev/null || echo 0)"
+              # Fail closed: unknown comment state may hide repair markers,
+              # so treat the budget as exhausted instead of permitting an
+              # extra repair behind an undercount.
+              if [[ "$COMMENTS_UNKNOWN" -eq 1 ]]; then
+                REPAIR_COUNT="$MAX_RENDER_REPAIR_ATTEMPTS"
+              else
+                REPAIR_COUNT="$(jq '[.[][]? | select((.body // "") | contains("<!-- continuum-render-repair-attempt -->"))] | length' \
+                  <<<"$COMMENTS_JSON" 2>/dev/null || echo "$MAX_RENDER_REPAIR_ATTEMPTS")"
+              fi
               if [[ "${REPAIR_COUNT:-0}" -lt "$MAX_RENDER_REPAIR_ATTEMPTS" ]]; then
                 SOURCE_MARKER="<!-- continuum-render-repair source=$ISSUE_NUMBER -->"
                 # Bounded open-issue scan (#254): repair issues are recent, so
