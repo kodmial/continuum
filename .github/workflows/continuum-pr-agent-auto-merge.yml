@@ -136,6 +136,7 @@ jobs:
             for (const key of [
               "unwrapReview",
               "qualifyingImproveSuggestions",
+              "reviewDisposition",
               "isSkippedCleanImprovePayload",
               "hasToolErrorSignal",
               "hasIncompleteCoverageSignal",
@@ -220,6 +221,13 @@ jobs:
             let qualifying;
             try {
               qualifying = policy.qualifyingImproveSuggestions(raw);
+            } catch (err) {
+              core.setFailed(err.message);
+              return;
+            }
+            let disposition;
+            try {
+              disposition = policy.reviewDisposition(review, raw);
             } catch (err) {
               core.setFailed(err.message);
               return;
@@ -358,6 +366,10 @@ jobs:
             }
             if (qualifying.length > 0) {
               fail(`${qualifying.length} qualifying suggestion(s) remain`);
+              return;
+            }
+            if (disposition.action !== 'merge') {
+              fail(disposition.reason);
               return;
             }
             if (hasActive) {

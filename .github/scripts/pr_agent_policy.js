@@ -762,6 +762,52 @@ function isSkippedCleanImprovePayload(raw) {
   return sawLine && foundMarker;
 }
 
+function reviewDisposition(reviewPayload, improveJsonl, threshold = IMPROVE_REPAIR_THRESHOLD) {
+  // Split envelopes carry signals on both sides: merge fail-closed via the
+  // centralized unwrapReview so no finding is lost from the disposition.
+  const review = unwrapReview(reviewPayload);
+  if (!review || typeof review !== 'object' || Array.isArray(review)) {
+    throw new Error('PR-Agent review payload must be an object.');
+  }
+  if (!Array.isArray(review.key_issues_to_review)) {
+    throw new Error('PR-Agent review JSON has no key_issues_to_review list.');
+  }
+  const recommendation = String(review.merge_recommendation || '').trim();
+  if (!['safe_to_merge', 'merge_with_caution', 'changes_required'].includes(recommendation)) {
+    throw new Error(
+      'PR-Agent review has invalid merge_recommendation: ' + (recommendation || '<empty>')
+    );
+  }
+  const qualifying = qualifyingImproveSuggestions(improveJsonl, threshold);
+  const reviewCount = review.key_issues_to_review.length;
+  const common = {
+    recommendation,
+    reviewCount,
+    qualifyingSuggestionCount: qualifying.length,
+  };
+  if (reviewCount > 0 || qualifying.length > 0) {
+    return {
+      ...common,
+      action: 'repair',
+      reason:
+        reviewCount + ' review finding(s), ' +
+        qualifying.length + ' qualifying improve suggestion(s)',
+    };
+  }
+  if (recommendation === 'safe_to_merge') {
+    return {
+      ...common,
+      action: 'merge',
+      reason: 'safe_to_merge with no actionable review/improve items',
+    };
+  }
+  return {
+    ...common,
+    action: 'rereview',
+    reason: 'blocking merge recommendation without actionable payload: ' + recommendation,
+  };
+}
+
 function controllerStateBody(stateMarker, summary) {
   return [
     CONTROLLER_STATE_MARKER,
@@ -794,6 +840,7 @@ module.exports = {
   parseImproveJsonl,
   persistentHasActive,
   qualifyingImproveSuggestions,
+  reviewDisposition,
   sameLogicalDefect,
   unwrapReview,
 };

@@ -143,13 +143,23 @@ def derive_fallback_state(
         raise FallbackStateError(
             "fallback persistent state requires the exact reviewed HEAD"
         )
-    if isinstance(review, dict) and isinstance(review.get("review"), dict):
-        inner = review["review"]
-    elif isinstance(review, dict):
-        inner = review
-    else:
+    if not isinstance(review, dict):
         raise FallbackStateError("fallback persistent state requires a review object")
-    key_issues = inner.get("key_issues_to_review")
+    # Split envelopes carry findings on both sides: merge fail-closed (union)
+    # so no actionable finding is dropped from the derived fallback state.
+    outer_issues = review.get("key_issues_to_review")
+    nested = review.get("review")
+    nested_issues = nested.get("key_issues_to_review") if isinstance(nested, dict) else None
+    if outer_issues is None:
+        key_issues = nested_issues
+    elif nested_issues is None:
+        key_issues = outer_issues
+    elif isinstance(outer_issues, list) and isinstance(nested_issues, list):
+        key_issues = [*outer_issues, *nested_issues]
+    elif isinstance(outer_issues, list):
+        key_issues = nested_issues
+    else:
+        key_issues = outer_issues
     if key_issues is None:
         raise FallbackStateError(
             "fallback persistent state requires key_issues_to_review"

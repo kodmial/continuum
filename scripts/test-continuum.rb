@@ -1703,19 +1703,25 @@ class ContinuumTest < Minitest::Test
     refute_includes pr_agent, 'Stale admission: caller observed'
 
     assert_includes pr_agent, 'REVIEW_JSON: ${{ steps.pragent.outputs.review }}'
-    assert_includes pr_agent, '"findings": []'
-    assert_includes pr_agent, '"complete": True'
-    assert_includes pr_agent, '"kind": "full"'
+    # The runtime loads the canonical fallback helper from Continuum itself,
+    # so old PR heads cannot keep the broken inline implementation alive.
+    assert_includes pr_agent, 'contents/src/continuum/pr_agent_fallback_state.py'
+    assert_includes pr_agent, 'fallback_pythonpath'
+    assert_includes pr_agent, 'derive_fallback_state'
+    assert_includes pr_agent, 'FallbackStateError'
     # Native state wins when present; otherwise the validated structured
     # review derives an ACTIVE fallback instead of blocking repair.
     assert_includes pr_agent, 'parse_review_state'
-    assert_includes pr_agent, 'reconcile_review_findings'
-    assert_includes pr_agent, 'normalize_finding'
+    refute_includes pr_agent, 'state = reconciled.state'
     refute_includes pr_agent, 'Upstream review has key findings but published no persistent finding state.'
     # Only an unrepresentable finding fails closed; nothing is invented and
     # nothing is marked resolved by the fallback.
-    assert_includes pr_agent, 'represented as persistent finding state; failing closed'
-    assert_includes pr_agent, 'cannot derive fallback state.'
+    assert_includes pr_agent, 'Cannot derive fallback persistent state'
+
+    fallback = File.read(File.join(ROOT, 'src/continuum/pr_agent_fallback_state.py'))
+    assert_includes fallback, '"findings": findings'
+    assert_includes fallback, '"complete": True'
+    assert_includes fallback, '"kind": "full"'
 
     repair = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent-repair.yml'))
     assert_includes repair, 'git clean -fdX',
@@ -2819,10 +2825,14 @@ class ContinuumTest < Minitest::Test
       assert_equal "\${{ inputs.#{key} }}", with.fetch(key), "#{key} must be a bare passthrough"
     end
 
-    # The lock the dispatch path writes is the same configured lock the
-    # synchronize reset clears, or a new head could not repair.
+    # Both per-HEAD locks are reset on synchronize/reopen. A stale conflict
+    # label from an older HEAD must never suppress repair of the new HEAD.
     assert_includes body, '"repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/$CI_REPAIR_LABEL"',
-                    'the per-head reset must clear the configured lock, not a hardcoded one'
+                    'the per-head reset must clear the configured CI lock'
+    assert_includes body, '"repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/opencode-conflict-repair"',
+                    'the per-head reset must clear the stale conflict lock'
+    assert_includes body, 'Reset per-head CI/conflict repair locks',
+                    'synchronize/reopen must start a fresh conflict-repair episode'
     # The workflow_run path keeps its looser `opencode/*` guard: tightening it
     # would stop repairing heads this controller repaired before.
     assert_includes body, '"$head_ref" != opencode/*'
@@ -3369,7 +3379,7 @@ class ContinuumTest < Minitest::Test
       'QUALIFYING_LABEL' => ['qualifying_label', 'AUTOMATION_QUALIFYING_LABEL', 'automation:qualifying'],
       'BLOCKED_LABEL' => ['blocked_label', 'AUTOMATION_BLOCKED_LABEL', 'automation:blocked'],
       'COUNT_OPEN_PRS_AS_WIP' => ['count_open_prs_as_wip', 'AUTOMATION_COUNT_OPEN_PRS_AS_WIP', 'true'],
-      'PAUSE_ON_FAILURE' => ['pause_on_failure', 'AUTOMATION_PAUSE_ON_FAILURE', 'true']
+      'PAUSE_ON_FAILURE' => ['pause_on_failure', 'AUTOMATION_PAUSE_ON_FAILURE', 'false']
     }.each do |env_key, (input, variable, literal)|
       assert_includes scheduler,
                       "#{env_key}: \${{ inputs.#{input} || vars.#{variable} || '#{literal}' }}",
@@ -3380,6 +3390,10 @@ class ContinuumTest < Minitest::Test
                     "REVIEW_PROVIDER: ${{ inputs.review_provider || vars.CONTINUUM_REVIEW_PROVIDER || 'none' }}"
     assert_includes watchdog_body,
                     "MAX_RECOVERY_RETRIES: ${{ inputs.max_recovery_retries || vars.AUTOMATION_WATCHDOG_MAX_RETRIES || '1' }}"
+    assert_includes watchdog_body,
+                    "PAUSE_ON_FAILURE: ${{ inputs.pause_on_failure || vars.AUTOMATION_PAUSE_ON_FAILURE || 'false' }}"
+    assert_includes workflow_body('continuum-opencode.yml'),
+                    "PAUSE_ON_FAILURE: ${{ inputs.pause_on_failure || vars.AUTOMATION_PAUSE_ON_FAILURE || 'false' }}"
   end
 
   # Adding a `vars.` fallback to a `inputs.x || 'literal'` chain must not change
