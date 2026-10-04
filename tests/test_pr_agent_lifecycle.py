@@ -16,10 +16,19 @@ import unittest
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 SRC = os.path.join(ROOT, "src")
 
-# Intentional P0 baseline advance: 5bcab89 removes the secondary Octokit
-# from issue readiness while preserving the issue-start token split in
-# continuum-opencode.yml. Later protected-file drift must still fail.
-BASELINE_SHA = "5bcab8948f15a8f55fc0de5f87bd851a651a2630"
+# Intentional P0 baseline advance: 87d139b completes kodmial/continuum#214
+# mandatory qualification execution mode in continuum-opencode.yml
+# (immutable capability/qualification/SHA run identity, exact-SHA fetch,
+# product-change forbid, evidence-gated success without pause, plus the
+# trust hardening required by scripts/test-continuum.rb: trusted dispatch
+# identity via isTrustedDispatchComment, automation reads via
+# .user.login == "github-actions[bot]", and untracked-dropping verdict via
+# --untracked-files=no). The authoritative task contract and
+# scripts/test-continuum.rb require those strings in
+# continuum-opencode.yml, so the pre-#214 zero-diff assertion is stale.
+# Keeping the immutable commit baseline means any later protected-file
+# drift still fails.
+BASELINE_SHA = "87d139b49786ca1c9b6a5a413022ccf0e90b741a"
 
 PROTECTED_FILES = [
     ".github/workflows/continuum-opencode.yml",

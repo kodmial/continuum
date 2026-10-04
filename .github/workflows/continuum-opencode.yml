@@ -120,6 +120,27 @@ on:
         required: false
         type: string
         default: ''
+      capability_number:
+        description: >-
+          Capability issue number for qualification mode. Empty unless the
+          scheduler dispatched a mandatory qualification run.
+        required: false
+        type: string
+        default: ''
+      qualification_number:
+        description: >-
+          Qualification issue number for qualification mode. Empty unless the
+          scheduler dispatched a mandatory qualification run.
+        required: false
+        type: string
+        default: ''
+      required_sha:
+        description: >-
+          Exact main SHA a qualification run must checkout and test.
+          Empty unless the scheduler dispatched a mandatory qualification run.
+        required: false
+        type: string
+        default: ''
       conflict_strategy:
         description: >-
           How resolve-conflict settles a conflict: `merge` merges the default
@@ -294,9 +315,14 @@ jobs:
   opencode:
     # Manual invocations remain owner-only. Automated repair modes arrive via
     # internal workflow_dispatch events from trusted workflows on main.
+    # Qualification mode is dispatched by the scheduler with the immutable
+    # run identity (capability, qualification, exact required SHA); an
+    # issue_comment carrying a trusted qualification-dispatch marker is also
+    # recognized as qualification mode and bound to that marker's triple, so
+    # a later main advance can never retarget an already-started run.
     if: >-
       (github.event_name == 'workflow_dispatch' &&
-       contains(fromJSON('["coderabbit-fix","resolve-conflict","ci-fix","issue"]'), inputs.mode)) ||
+       contains(fromJSON('["coderabbit-fix","resolve-conflict","ci-fix","issue","qualification"]'), inputs.mode)) ||
       ((github.event_name == 'issue_comment' ||
         github.event_name == 'pull_request_review_comment') &&
        github.actor == github.repository_owner &&
@@ -1150,6 +1176,174 @@ jobs:
           fi
           echo "Created/updated PR #$PR_NUMBER for issue #$ISSUE_NUMBER."
 
+      - name: Resolve qualification run identity
+        id: qualification_identity
+        if: >-
+          (github.event_name == 'workflow_dispatch' && inputs.mode == 'qualification') ||
+          (github.event_name == 'issue_comment' &&
+           contains(github.event.comment.body, 'continuum-qualification-dispatch'))
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const dispatchMode = '${{ inputs.mode }}' === 'qualification';
+            let capability = '${{ inputs.capability_number }}';
+            let qualification = '${{ inputs.qualification_number }}';
+            let sha = '${{ inputs.required_sha }}';
+            if (!dispatchMode) {
+              const body = context.payload.comment?.body || '';
+              const marker = body.match(
+                /<!--\s*continuum-qualification-dispatch\s+capability\s*=\s*(\d+)\s+qualification\s*=\s*(\d+)\s+sha\s*=\s*([0-9a-f]{40})\s*-->/i
+              );
+              if (!marker) {
+                core.setOutput('active', 'false');
+                return;
+              }
+              // Bind to the triggering dispatch comment's triple, never to
+              // the latest marker currently visible on the issue: a later
+              // SHA-B dispatch must not retarget an already-started SHA-A run.
+              capability = marker[1];
+              qualification = marker[2];
+              sha = marker[3].toLowerCase();
+              const association = String(
+                context.payload.comment?.author_association || ''
+              ).toUpperCase();
+              const trusted = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']).has(association) ||
+                context.payload.comment?.user?.login === context.repo.owner;
+              if (!trusted) {
+                core.setFailed('Untrusted qualification dispatch marker; refusing to run.');
+                return;
+              }
+            }
+            if (!/^[0-9]+$/.test(capability) || !/^[0-9]+$/.test(qualification) || !/^[0-9a-f]{40}$/i.test(sha)) {
+              core.setFailed('Invalid immutable qualification run identity.');
+              return;
+            }
+            core.setOutput('active', 'true');
+            core.setOutput('capability_number', capability);
+            core.setOutput('qualification_number', qualification);
+            core.setOutput('required_sha', sha.toLowerCase());
+            core.notice(
+              'Qualification run bound to capability #' + capability +
+              ' qualification #' + qualification + ' sha ' + sha.toLowerCase() + '.'
+            );
+
+      - name: Run mandatory qualification at the exact required SHA
+        if: >-
+          steps.qualification_identity.outputs.active == 'true' &&
+          (github.event_name == 'workflow_dispatch' && inputs.mode == 'qualification' ||
+           github.event_name == 'issue_comment')
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
+          OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
+          CAPABILITY_NUMBER: ${{ steps.qualification_identity.outputs.capability_number || inputs.capability_number }}
+          QUALIFICATION_NUMBER: ${{ steps.qualification_identity.outputs.qualification_number || inputs.qualification_number || inputs.issue_number || github.event.issue.number }}
+          REQUIRED_SHA: ${{ steps.qualification_identity.outputs.required_sha || inputs.required_sha }}
+          IN_PROGRESS_LABEL: ${{ inputs.in_progress_label || vars.AUTOMATION_IN_PROGRESS_LABEL || 'automation:in-progress' }}
+        run: |
+          set -euo pipefail
+          [[ "$QUALIFICATION_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::Missing qualification issue number."; exit 2; }
+          [[ "$REQUIRED_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::Missing exact required SHA for qualification."; exit 2; }
+          [[ "$CAPABILITY_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::Missing capability number for qualification run identity."; exit 2; }
+
+          # Fetch the exact required SHA explicitly with depth 1 before
+          # checkout. Fetching current main is insufficient when main has
+          # advanced past the required SHA.
+          git fetch origin "$REQUIRED_SHA" --depth 1
+          git switch --detach FETCH_HEAD
+          ACTUAL_SHA="$(git rev-parse HEAD)"
+          [[ "${ACTUAL_SHA,,}" == "${REQUIRED_SHA,,}" ]] || {
+            echo "::error::Checked out $ACTUAL_SHA instead of required $REQUIRED_SHA."
+            exit 2
+          }
+          echo "Qualification testing exact required SHA $REQUIRED_SHA for capability #$CAPABILITY_NUMBER (qualification #$QUALIFICATION_NUMBER)."
+
+          ISSUE_BODY="$(gh issue view "$QUALIFICATION_NUMBER" --repo "$GITHUB_REPOSITORY" --json body --jq '.body // ""')"
+          ISSUE_TITLE="$(gh issue view "$QUALIFICATION_NUMBER" --repo "$GITHUB_REPOSITORY" --json title --jq '.title // ""')"
+          PROMPT="$(cat <<EOF
+          Mandatory live qualification for capability #${CAPABILITY_NUMBER} at exact main SHA ${REQUIRED_SHA}.
+
+          Qualification issue: #${QUALIFICATION_NUMBER}
+          Title:
+          ${ISSUE_TITLE}
+
+          Specification / Definition of Done:
+          ${ISSUE_BODY}
+
+          Immutable run identity: capability=${CAPABILITY_NUMBER} qualification=${QUALIFICATION_NUMBER} sha=${REQUIRED_SHA}.
+          A later main advance or a later dispatch marker must never retarget this run; test exactly ${REQUIRED_SHA}.
+
+          Requirements:
+          - This is qualification mode, not implementation mode: validate the issue Definition of Done against the exact required SHA. Do NOT implement product code.
+          - Checkout and test exactly ${REQUIRED_SHA} (already checked out). Do not test whatever main has advanced to later.
+          - Product and repository changes are forbidden in qualification mode. Do not edit, commit, push, or open a pull request. Leave the working tree clean.
+          - Never close the qualification issue itself. Pass/fail is reported as evidence, not as issue closure. Repair is a separate task.
+          - Publish exactly one canonical result marker as a comment on qualification issue #${QUALIFICATION_NUMBER} for the exact SHA, either result=pass or result=fail. Do not publish markers for any other SHA.
+          - A fail verdict is a lifecycle signal for the scheduler to create the repair issue; it is not an infrastructure failure.
+          - No-code plus valid pass/fail evidence is a successful qualification execution. No-code without evidence fails closed and will be retried automatically.
+          - Do not perform git commits, pushes, branch switches, rebases, resets, merges, or PR creation; the workflow owns Git state.
+          EOF
+          )"
+          opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
+
+          # Qualification mode cannot push product changes: untracked tool
+          # droppings are discarded silently, and only tracked working-tree
+          # diffs are forbidden. Discard untracked files first so a leftover
+          # log/tmp file next to valid evidence does not fail the run.
+          git clean -fd >/dev/null 2>&1 || true
+          if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
+            echo "::error::Qualification mode produced repository changes, which are forbidden. Discarding them."
+            git status --porcelain --untracked-files=no
+            git reset --hard HEAD >/dev/null 2>&1 || true
+            git clean -fd >/dev/null 2>&1 || true
+            gh issue comment "$QUALIFICATION_NUMBER" --repo "$GITHUB_REPOSITORY" \
+              --body "Qualification attempted product changes in qualification mode, which is forbidden. The run is recorded as failed without evidence; it will be retried automatically." >/dev/null 2>&1 || true
+            exit 1
+          fi
+
+          # Verify trusted evidence for the exact SHA exists. Dispatch bodies
+          # never count, public forgeries are rejected, and stale SHAs are
+          # rejected. Docker/Render automation payloads count where allowed.
+          EVIDENCE_STATE="$(gh api "repos/$GITHUB_REPOSITORY/issues/$QUALIFICATION_NUMBER/comments?per_page=100" --jq '
+            [ .[] |
+              select(
+                ( .author_association == "OWNER" or .author_association == "MEMBER" or
+                  .author_association == "COLLABORATOR" or .user.login == "github-actions[bot]" or .author.login == "github-actions[bot]" )
+                and ( (.body // "") | contains("continuum-qualification-dispatch") | not )
+                and (
+                  ((.body // "") | test("<!--[ \\t]*continuum-qualification-result[ \\t>]")) or
+                  ((.body // "") | contains("<!-- continuum-docker-qualification-result -->")) or
+                  ((.body // "") | contains("<!-- continuum-render-qualification-result -->"))
+                )
+              ) | .body
+            ] | join("\n---\n")
+          ')"
+          if grep -Eqi "<!--[[:space:]]*continuum-qualification-result[^>]*sha[[:space:]]*=[[:space:]]*${REQUIRED_SHA}[^>]*result[[:space:]]*=[[:space:]]*pass" <<<"$EVIDENCE_STATE"; then
+            echo "Qualification pass evidence recorded for exact SHA $REQUIRED_SHA."
+          elif grep -Eqi "<!--[[:space:]]*continuum-qualification-result[^>]*sha[[:space:]]*=[[:space:]]*${REQUIRED_SHA}[^>]*result[[:space:]]*=[[:space:]]*fail" <<<"$EVIDENCE_STATE"; then
+            echo "Qualification fail evidence recorded for exact SHA $REQUIRED_SHA; scheduler will route repair."
+          else
+            echo "Docker/Render payload or canonical marker check: looking for exact-SHA evidence."
+            if grep -Eq "${REQUIRED_SHA}" <<<"$EVIDENCE_STATE" && grep -Eqi "pass|fail|classification|result|verdict" <<<"$EVIDENCE_STATE"; then
+              echo "Specialized controller evidence present for exact SHA $REQUIRED_SHA."
+            else
+              echo "::error::No trusted pass/fail evidence for exact SHA $REQUIRED_SHA; failing closed for automatic retry."
+              gh issue comment "$QUALIFICATION_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                --body "Qualification run for exact SHA \`$REQUIRED_SHA\` produced no trusted pass/fail evidence; it will be retried automatically with the same run identity (capability #$CAPABILITY_NUMBER, qualification #$QUALIFICATION_NUMBER, sha \`$REQUIRED_SHA\`)." >/dev/null 2>&1 || true
+              gh issue edit "$QUALIFICATION_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                --remove-label "$IN_PROGRESS_LABEL" >/dev/null 2>&1 || true
+              exit 1
+            fi
+          fi
+
+          # Success in both verdicts: never pause, never close. Pass completes
+          # the capability; fail routes to the existing repair issue. The
+          # scheduler wakes from the result comment (cron remains the backstop).
+          gh issue edit "$QUALIFICATION_NUMBER" --repo "$GITHUB_REPOSITORY" \
+            --remove-label "$IN_PROGRESS_LABEL" >/dev/null 2>&1 || true
+          echo "Qualification execution succeeded with valid evidence; leaving the qualification issue open for the scheduler."
+
       - name: Fix CodeRabbit review findings
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'coderabbit-fix'
         env:
@@ -1653,6 +1847,28 @@ jobs:
               (comment.body || '').includes(marker)
             ).length;
 
+            // Mandatory qualification must never strand behind a terminal
+            // human-gated pause: exhausted immediate retries fall back to a
+            // bounded lease/backoff and resume automatically with the same
+            // immutable run identity (capability + qualification + SHA).
+            // A dispatch marker counts only from a trusted author
+            // (OWNER/MEMBER/COLLABORATOR or repository automation); a public
+            // forgery must never switch a normal failure into the
+            // qualification unpause-and-retry path.
+            const isTrustedDispatchComment = comment => {
+              const association = String(comment?.author_association || '').toUpperCase();
+              if (['OWNER', 'MEMBER', 'COLLABORATOR'].includes(association)) return true;
+              const login = String(comment?.user?.login || comment?.author?.login || '');
+              return login === 'github-actions[bot]';
+            };
+            const isQualificationRun =
+              (context.payload.inputs?.mode === 'qualification') ||
+              '${{ inputs.mode }}' === 'qualification' ||
+              comments.some(comment =>
+                isTrustedDispatchComment(comment) &&
+                (comment.body || '').includes('continuum-qualification-dispatch')
+              );
+
             try {
               await github.rest.issues.removeLabel({
                 owner,
@@ -1662,6 +1878,23 @@ jobs:
               });
             } catch (err) {
               if (err.status !== 404) throw err;
+            }
+
+            if (isQualificationRun) {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                  name: paused,
+                });
+              } catch (err) {
+                if (err.status !== 404) throw err;
+              }
+              core.warning(
+                `Qualification issue #${issueNumber} failed without trusted evidence; released for automatic retry with bounded backoff (never terminally paused).`
+              );
+              return;
             }
 
             if (attempts >= maxAttempts && pauseOnFailure) {
