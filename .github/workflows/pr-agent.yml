@@ -16,7 +16,6 @@ on:
         description: Opaque verified child id for delegated PR-Agent execution
         required: false
         type: string
-        type: string
       expected_head_sha:
         description: Exact PR HEAD the retry is allowed to review
         required: false
