@@ -137,7 +137,7 @@ class AgentRuntimeContractTest(unittest.TestCase):
                                 "{}: prepared-runtime probe with pinned versions + image digest required".format(name))
             checked += 1
         if checked == 0:
-            self.skipTest("no workflow files present; hermetic fixtures above carry the contract")
+            self.fail("no workflow files present; checked-in warm-path workflows must exist")
 
     def test_04_queued_demand_creates_fresh_instance(self):
         controller = _controller()

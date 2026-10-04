@@ -429,7 +429,7 @@ jobs:
             exit 0
           fi
           python3 -m pip install --quiet "pr-agent==${PR_AGENT_VERSION}"
-          pr-agent --version 2>&1 | grep -E -q "(^|[^0-9.])0\.46\.0([^0-9.]|$)"
+          pr-agent --version 2>&1 | grep -E -q "(^|[^0-9.])0\.46\.0([^0-9.]|$)" || exit 1
 
       - name: Install pinned OpenCode CLI for the PR-Agent backend
         id: install_opencode

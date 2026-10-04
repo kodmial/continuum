@@ -46,7 +46,7 @@ BASELINE_SHA = "197bafdb6b157ad7d4e77888a1fed5a921a3f125"
 # carries only the approved #179 probe plus this PAUSE change, so a new
 # baseline bundling unrelated protected-file drift cannot pass via the
 # worktree contract alone.
-PREVIOUS_BASELINE_SHA = "1a93faa"
+PREVIOUS_BASELINE_SHA = "1a93faa10739ca104be871093908b5d15cad1d4a"
 
 # PAUSE_ON_FAILURE baseline lines claimed by BASELINE_SHA (kodmial/continuum
 # #248 follow-up): the only non-#179 protected-file drift permitted in the
@@ -89,8 +89,8 @@ PROTECTED_FILES = [
 # CONTINUUM_IMAGE_DIGEST shape gate is required for identity enforcement: a
 # set, well-formed digest is required to take the hit path with zero
 # downloads, so an empty/unresolved digest falls through to deterministic
-# reconstruction instead of skipping install; a malformed set digest fails
-# explicitly. The post-install `opencode --version | grep -E` line fails the
+# reconstruction instead of skipping install; a malformed set digest warns
+# and falls back to deterministic reconstruction. The post-install `opencode --version | grep -E` line fails the
 # step when deterministic reconstruction did not produce the pinned runtime.
 #
 # The digest-gated hit plus `vars.` env wiring repair (see
@@ -124,38 +124,41 @@ APPROVED_179_OPENCODE_PROBE_LINES = (
     '              opencode --version 2>&1 | grep -E -q "(^|[^0-9.])1\\.18\\.34([^0-9.]|$)" || exit 1',
 )
 
-# Worktree repair layer for the #179 probe, now landed in HEAD: the warm hit
-# is keyed by the image digest (a set, well-formed CONTINUUM_IMAGE_DIGEST is
-# required to take the hit path; an empty digest falls through to
-# deterministic reconstruction), the digest reaches the shell via an explicit
-# step-level `env:` wired from the repository variable, and the duplicate
-# PATH export on the consumer-child warm path is removed. The tuples below
-# record the landed transition (old format-only probe -> digest-gated probe)
-# for the worktree-drift check; a clean worktree passes without using them.
+# Worktree repair layer for the #179 probe digest binding: the warm hit is
+# keyed by the image digest plus the image-digest stamp
+# ($HOME/.opencode/image-digest), a malformed digest warns and falls back
+# to deterministic reconstruction (never failing closed), and a successful
+# reconstruction records the stamp. The tuples below record the landed
+# transition (digest-gated probe -> stamp-bound digest-gated probe) for the
+# worktree-drift check; a clean worktree passes without using them.
 # Each tuple lists the unique worktree-vs-HEAD lines for one install site
 # (both opencode sites carry them, so worktree diff counts are doubled).
 APPROVED_179_WORKTREE_ADDED_LINES = (
-    "        env:",
-    "          CONTINUUM_IMAGE_DIGEST: ${{ vars.CONTINUUM_IMAGE_DIGEST }}",
-    "          # (or its provider-native cache equivalent) already carries pinned",
-    "          # OpenCode 1.18.34. The warm hit below is keyed by the image digest",
-    "          # in CONTINUUM_IMAGE_DIGEST (wired from the repository variable):",
-    "          # only a set, well-formed digest plus `command -v opencode` and the",
-    "          # exact version takes the hit path with zero downloads; an empty",
-    "          # digest falls through to deterministic reconstruction below.",
-    '          if [[ "${CONTINUUM_IMAGE_DIGEST:-}" =~ ^[0-9a-f]{64}$ ]] && command -v opencode >/dev/null 2>&1 && opencode --version 2>&1 | grep -E -q "(^|[^0-9.])1\\.18\\.34([^0-9.]|$)"; then',
-    '            echo "prepared-runtime hit: opencode 1.18.34 already present (image digest ${CONTINUUM_IMAGE_DIGEST})."',
+    "          # exact version takes the hit path with zero downloads. A cache",
+    "          # failure (empty or malformed digest) falls back to deterministic",
+    "          # reconstruction below, never failing closed. The digest is bound",
+    "          # to the runtime by the image-digest stamp",
+    "          # ($HOME/.opencode/image-digest) recorded by the validated image",
+    "          # build (or a prior reconstruction): a stale or unrelated",
+    "          # opencode 1.18.34 binary whose stamp does not match the digest",
+    "          # cannot take the hit path.",
+    '          STAMP_FILE="$HOME/.opencode/image-digest"',
+    '            echo "::warning::CONTINUUM_IMAGE_DIGEST is malformed; falling back to deterministic reconstruction."',
+    '            CONTINUUM_IMAGE_DIGEST=""',
+    '          if [[ "${CONTINUUM_IMAGE_DIGEST:-}" =~ ^[0-9a-f]{64}$ ]] && [[ -f "$STAMP_FILE" ]] && [[ "$(cat "$STAMP_FILE")" == "$CONTINUUM_IMAGE_DIGEST" ]] && command -v opencode >/dev/null 2>&1 && opencode --version 2>&1 | grep -E -q "(^|[^0-9.])1\\.18\\.34([^0-9.]|$)"; then',
+    '            echo "prepared-runtime hit: opencode 1.18.34 already present (image digest ${CONTINUUM_IMAGE_DIGEST} validated against ${STAMP_FILE})."',
+    '              if [[ "${CONTINUUM_IMAGE_DIGEST:-}" =~ ^[0-9a-f]{64}$ ]]; then',
+    '                echo "$CONTINUUM_IMAGE_DIGEST" > "$STAMP_FILE"',
+    "              fi",
 )
 
 APPROVED_179_WORKTREE_REMOVED_LINES = (
-    "          # (or its provider-native cache equivalent keyed by the image digest",
-    "          # in CONTINUUM_IMAGE_DIGEST) already carries pinned OpenCode 1.18.34,",
-    "          # so warm jobs perform zero downloads. Probe the prepared agent",
-    "          # runtime first via `command -v opencode` and the exact version;",
-    "          # only a validated cache miss falls through to deterministic",
-    "          # reconstruction below.",
-    '          if command -v opencode >/dev/null 2>&1 && opencode --version 2>&1 | grep -E -q "(^|[^0-9.])1\\.18\\.34([^0-9.]|$)"; then',
-    '            echo "prepared-runtime hit: opencode 1.18.34 already present (image digest ${CONTINUUM_IMAGE_DIGEST:-unresolved})."',
+    "          # exact version takes the hit path with zero downloads; an empty",
+    "          # digest falls through to deterministic reconstruction below.",
+    '            echo "::error::CONTINUUM_IMAGE_DIGEST must be a 64-char sha256 hex digest when set."',
+    "            exit 1",
+    '          if [[ "${CONTINUUM_IMAGE_DIGEST:-}" =~ ^[0-9a-f]{64}$ ]] && command -v opencode >/dev/null 2>&1 && opencode --version 2>&1 | grep -E -q "(^|[^0-9.])1\\.18\\.34([^0-9.]|$)"; then',
+    '            echo "prepared-runtime hit: opencode 1.18.34 already present (image digest ${CONTINUUM_IMAGE_DIGEST})."',
 )
 
 PR_AGENT_WORKFLOWS = [

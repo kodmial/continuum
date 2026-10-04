@@ -120,6 +120,36 @@ FORBIDDEN_PROVIDER_KEYS = (
     "GROQ.KEY",
 )
 
+
+def _declares_forbidden_provider_key(value: Any) -> Optional[str]:
+    """Return the offending paid-provider key found anywhere in a declaration.
+
+    Scans mapping keys recursively (so ``{"env": {"OPENCODE_API_KEY": ...}}``
+    and nested cache/toolchain blocks cannot smuggle a paid key past the
+    top level) as well as bare string entries in sequences. Key comparison
+    is case-insensitive via ``upper()`` to match the resolver contract.
+    """
+
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if isinstance(key, str) and key.upper() in FORBIDDEN_PROVIDER_KEYS:
+                return key
+            found = _declares_forbidden_provider_key(item)
+            if found is not None:
+                return found
+        return None
+    if isinstance(value, (list, tuple, set, frozenset)):
+        for item in value:
+            if isinstance(item, str) and item.upper() in FORBIDDEN_PROVIDER_KEYS:
+                return item
+            found = _declares_forbidden_provider_key(item)
+            if found is not None:
+                return found
+        return None
+    if isinstance(value, str) and value.upper() in FORBIDDEN_PROVIDER_KEYS:
+        return value
+    return None
+
 #: Lease/timeout defaults (section 7). Exact defaults may be refined, but no
 #: state may mean "wait indefinitely": every bound is finite.
 DEFAULT_PROVISIONING_TIMEOUT_SECONDS = 600
@@ -355,11 +385,11 @@ def resolve_profile(declaration: Mapping[str, Any]) -> RuntimeProfile:
     if not isinstance(declaration, Mapping):
         raise AgentRuntimeError("runtime profile must be a mapping, got {!r}".format(type(declaration).__name__))
     decl = dict(declaration)
-    for key in tuple(decl):
-        if isinstance(key, str) and key.upper() in FORBIDDEN_PROVIDER_KEYS:
-            raise AgentRuntimeError(
-                "core profiles must never require, read, or forward paid provider key {!r}".format(key)
-            )
+    offending = _declares_forbidden_provider_key(decl)
+    if offending is not None:
+        raise AgentRuntimeError(
+            "core profiles must never require, read, or forward paid provider key {!r}".format(offending)
+        )
     preset = decl.get("preset")
     base: Dict[str, Any] = {}
     name = str(decl.get("name") or preset or "custom")
@@ -406,6 +436,11 @@ def resolve_profile(declaration: Mapping[str, Any]) -> RuntimeProfile:
     network_block = base.get("network", {})
     if isinstance(network_block, Mapping):
         network_lifecycle = str(network_block.get("lifecycle", STRICT_NETWORK_LIFECYCLE))
+    elif isinstance(network_block, str):
+        # A scalar network declaration is a lifecycle intent (e.g.
+        # {"network": "persistent"}): validate it as the lifecycle instead
+        # of falling through to the per-job default and accepting it.
+        network_lifecycle = str(network_block)
     else:
         network_lifecycle = str(base.get("network_lifecycle", STRICT_NETWORK_LIFECYCLE))
     if network_lifecycle not in SUPPORTED_NETWORK_LIFECYCLES:
@@ -1144,11 +1179,13 @@ class EphemeralController:
             self.leases[instance.id] = lease
             if fail_jit or outcome == OUTCOME_JIT_FAILURE:
                 events.append("jit-registration-failed {}".format(instance.id))
-                self._teardown(instance, now=now, retries=teardown_retries)
+                destroyed = self._teardown(instance, now=now, retries=teardown_retries)
                 self.leases.pop(instance.id, None)
+                if not destroyed:
+                    events.append("teardown-deferred-to-reconciler {}".format(instance.id))
                 assert network is not None and instance is not None
                 return JobResult(job_id, OUTCOME_JIT_FAILURE, instance.id, network.id,
-                                 instance.public_ip, digest, instance.destroyed_at is not None, events)
+                                 instance.public_ip, digest, destroyed, events)
             jit_id = self.provider.jit_register(instance)
             events.append("jit-registered {}".format(jit_id))
         except Exception:
@@ -1170,10 +1207,12 @@ class EphemeralController:
         assert network is not None and instance is not None
         if fail_startup or outcome == OUTCOME_STARTUP_FAILURE:
             events.append("job-startup-failed {}".format(instance.id))
-            self._teardown(instance, now=now, retries=teardown_retries)
+            destroyed = self._teardown(instance, now=now, retries=teardown_retries)
             self.leases.pop(instance.id, None)
+            if not destroyed:
+                events.append("teardown-deferred-to-reconciler {}".format(instance.id))
             return JobResult(job_id, OUTCOME_STARTUP_FAILURE, instance.id, network.id,
-                             instance.public_ip, digest, instance.destroyed_at is not None, events)
+                             instance.public_ip, digest, destroyed, events)
 
         self._execute_one_job(instance, lease, now=now)
         events.append("executed-one-job {} uses={}".format(instance.id, instance.uses))
@@ -1331,6 +1370,7 @@ class EphemeralController:
         restarted.leases = deepcopy(self.leases)
         restarted.queued = deepcopy(self.queued)
         restarted.diagnostics = list(self.diagnostics)
+        restarted._job_counter = self._job_counter
         restarted.diagnostics.append("controller-restarted")
         return restarted
 
@@ -1564,18 +1604,46 @@ def workflow_step_has_prepared_runtime_probe(workflow_text: str) -> bool:
     if not (probe and pinned and digest):
         return False
     # The warm hit must be keyed by the image digest, not just mention it:
-    # require a digest-gated probe line (a code line carrying both the
-    # CONTINUUM_IMAGE_DIGEST gate and a real executable probe) so an empty
-    # or unresolved digest cannot take the hit path and skip install.
+    # require a digest-gated probe (a code line carrying both the
+    # CONTINUUM_IMAGE_DIGEST gate and a real executable probe, or a
+    # multi-line gate where a digest conditional within a short window of
+    # the probe guards the hit path) so an empty or unresolved digest
+    # cannot take the hit path and skip install.
     # Comment portions are stripped so a trailing-comment probe cannot fake
     # a digest-gated hit.
-    gated = any(
-        "CONTINUUM_IMAGE_DIGEST" in code and any(pattern in code for pattern in _PROBE_PATTERNS)
+    code_lines = [
+        _code_without_comment(line)
         for line in workflow_text.splitlines()
         if line.strip() and not line.strip().startswith("#")
-        for code in (_code_without_comment(line),)
-        if code.strip()
+    ]
+    code_lines = [code for code in code_lines if code.strip()]
+    gated = any(
+        "CONTINUUM_IMAGE_DIGEST" in code and any(pattern in code for pattern in _PROBE_PATTERNS)
+        for code in code_lines
     )
+    if not gated:
+        # Multi-line gate: `if [ -n "$CONTINUUM_IMAGE_DIGEST" ]; then` on
+        # one line and `command -v opencode` on a nearby line is the same
+        # digest keying as the single-line `&&` form. Accept a digest
+        # conditional (if/test/bracket/shape check) within a short window
+        # of an executable probe so valid split gates are not reported as
+        # missing. A bare digest assignment without a conditional gate
+        # never counts.
+        _gate_markers = ("if", "[[", "[ ", "[\"", "test ", "&&", "||", "-n", "-z", "=~", "case ")
+        digest_gates = [
+            index for index, code in enumerate(code_lines)
+            if "CONTINUUM_IMAGE_DIGEST" in code
+            and any(marker in code for marker in _gate_markers)
+        ]
+        probe_lines = [
+            index for index, code in enumerate(code_lines)
+            if any(pattern in code for pattern in _PROBE_PATTERNS)
+        ]
+        gated = any(
+            abs(digest_index - probe_index) <= 20
+            for digest_index in digest_gates
+            for probe_index in probe_lines
+        )
     if not gated:
         return False
     if "pr-agent==" in workflow_text:
@@ -1689,9 +1757,40 @@ def live_qualification_evidence(
         "live_networks_final": sum(1 for item in provider.networks.values() if item.destroyed_at is None),
     })
     networks = list(provider.networks.values())
+    first_created_event = any(
+        "created-instance" in item and "after demand" in item for item in first.events
+    )
+    first_instance = provider.instances.get(first.instance_id)
+    first_created_at_ok = (
+        first_instance is not None and first_instance.created_at >= now
+    )
+    # Negative control: the no-persistent-egress check is only meaningful
+    # because a deliberately persistent attachment populates
+    # persistent_egress_objects (see FakeProvider.create_network and
+    # test_persistent_attachment_is_recorded_as_persistent_egress). Prove
+    # the detector can fail on a scratch provider so an empty list on the
+    # real provider reflects real per-job lifecycle work, not a detector
+    # that can never trigger.
+    _control_provider = FakeProvider()
+    _control_net = _control_provider.create_network(
+        profile_digest=profile_digest(profile), job_id="negative-control",
+        now=now, persistent=True,
+    )
+    persistent_detector_works = (
+        _control_net.persistent
+        and _control_provider.persistent_egress_objects == [_control_net.id]
+    )
     checks = {
         "started_at_zero": evidence["start_live_instances"] == 0,
-        "created_after_demand": first.instance_id not in ("", None),
+        # Non-vacuous creation-after-demand: a non-empty id alone is always
+        # true once created, so also require the created-after-demand event,
+        # a provider timestamp at/after demand, zero live instances at start
+        # (no pre-created pool), and a distinct second instance below (no
+        # pool reuse).
+        "created_after_demand": bool(first.instance_id)
+        and first_created_event
+        and first_created_at_ok
+        and evidence["start_live_instances"] == 0,
         "validated_before_work": any(item.startswith("validated-identity") for item in first.events),
         "exactly_one_job": provider.instances[first.instance_id].uses == 1,
         "destroyed_after_job": first.destroyed and second.destroyed,
@@ -1703,9 +1802,12 @@ def live_qualification_evidence(
         # this harness is non-persistent and destroyed, and the harness
         # exercises at least the two job networks plus the orphan network,
         # so an empty list alone cannot pass without real lifecycle work.
+        # The scratch-provider negative control above proves the detector
+        # itself can fail.
         "no_persistent_egress": (
             provider.persistent_egress_objects == []
             and all(not item.persistent for item in networks)
+            and persistent_detector_works
         ),
         "all_networks_destroyed": all(item.destroyed_at is not None for item in networks),
         "egress_lifecycle_exercised": len(networks) >= 3,
