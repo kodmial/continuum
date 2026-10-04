@@ -54,7 +54,12 @@ race conditions, unsafe GitHub Actions behavior, security issues, error handling
 resource leaks, performance regressions, macOS compatibility, packaging/release
 correctness, and test gaps. Verify findings against the actual diff and repository
 context. Do not report cosmetic style preferences or speculative issues without a
-concrete failure scenario.
+concrete failure scenario. Large-PR reviews may be chunked: never infer that
+implementation, tests, workflow wiring, or ticket requirements are missing merely
+because a file or symbol is absent from the current review chunk. Report an actionable
+finding or lower the merge recommendation only for a concrete defect evidenced by
+code visible in the current chunk or repository context. If confirmation depends on
+files outside the current chunk, place it under human verification instead.
 """
 enable_large_pr_chunking = true
 max_number_of_calls = 3
