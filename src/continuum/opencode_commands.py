@@ -40,9 +40,11 @@ What this module does not decide
 * Authorship. The parser is body-only. Callers must still require the
   repository owner as the comment author (``github.actor ==
   github.repository_owner``); see :func:`is_owner_command`.
-* The pull-request interactive path. PR and review comments stay permissive
-  on purpose: any owner PR comment may drive the interactive agent, and only
-  :func:`is_cancel_command` guards that path.
+* The pull-request interactive path. PR issue comments additionally require
+  the PR to still be open and the command token at the start of the comment
+  (``startsWith`` in the workflow expression, not ``contains``), so
+  agent-generated prose that mentions ``/oc`` later can never chain a
+  self-triggered run. Review comments keep their existing owner gate.
 * Cancellation of running work. ``/oc-cancel`` is a launch guard only:
   Continuum has no mechanism that cancels an already-running run.
 
