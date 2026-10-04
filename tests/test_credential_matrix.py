@@ -78,9 +78,16 @@ def step_window(text, step, span=6000):
             break
     block = "\n".join(lines[start:end])
     if len(block) < 200:
-        # Tiny anchor (e.g. a job name): widen symmetrically so evidence that
-        # sits just above the anchor is still visible.
-        block = "\n".join(lines[max(0, start - 60): end])
+        # Job-name anchor (e.g. a job-level site): the step-boundary scan
+        # above stops at the first `- uses:` line and would exclude the step
+        # bodies that carry the evidence. Extend to the enclosing job
+        # boundary instead so the whole job is visible.
+        job_end = len(lines)
+        for i in range(start + 1, len(lines)):
+            if re.match(r"^  [A-Za-z0-9_-]+:\s*$", lines[i]) or re.match(r"^jobs:\s*$", lines[i]):
+                job_end = i
+                break
+        block = "\n".join(lines[max(0, start - 60): job_end])
     if len(block) > span * 2:
         block = block[: span * 2]
     return block
@@ -126,15 +133,16 @@ class MigratedActorTests(unittest.TestCase):
         for entry in matrix.migrated_entries():
             with self.subTest(workflow=entry["workflow"], step=entry["step"]):
                 text = read_workflow(entry["workflow"])
-                # Step locality: the marker must exist (step_window asserts).
-                step_window(text, entry["step"])
-                # Evidence may sit anywhere in the owning workflow (e.g. a
-                # dispatch helper at the end of a long script); the step
-                # assertion above already pins the site.
+                # Step locality: every evidence literal must sit inside the
+                # owning step block, not merely anywhere in the file where an
+                # unrelated `github.token` could satisfy the check. The span
+                # covers the largest migrated step end to end so tail evidence
+                # (e.g. a dispatch helper) is not truncated away.
+                window = step_window(text, entry["step"], span=20000)
                 for evidence in entry["evidence"]:
                     self.assertIn(
-                        evidence, text,
-                        f"{entry['workflow']}::{entry['step']}: missing {evidence!r}",
+                        evidence, window,
+                        f"{entry['workflow']}::{entry['step']}: missing {evidence!r} in owning step",
                     )
 
     def test_migrated_steps_do_not_use_tap_pat_for_the_migrated_call(self):
@@ -145,9 +153,27 @@ class MigratedActorTests(unittest.TestCase):
         for entry in matrix.migrated_entries():
             with self.subTest(workflow=entry["workflow"], step=entry["step"]):
                 text = read_workflow(entry["workflow"])
-                window = step_window(text, entry["step"])
+                window = step_window(text, entry["step"], span=20000)
                 if entry["workflow"] == "continuum-add-review-label.yml":
                     self.assertIn("patClient()", window)
+                    # Split-actor step: label mutations must stay on the
+                    # GITHUB_TOKEN client while workflow dispatches stay
+                    # PAT-backed. Checking only `patClient()` presence would
+                    # let label writes regress to PAT (or dispatches regress
+                    # to GITHUB_TOKEN) without failing.
+                    self.assertIn("github.rest.issues", window)
+                    self.assertNotIn(
+                        "patClient().rest.issues", window,
+                        f"{entry['workflow']}::{entry['step']}: label writes must use github.rest.issues, not patClient()",
+                    )
+                    self.assertIn(
+                        "patClient().rest.actions.createWorkflowDispatch", window,
+                        f"{entry['workflow']}::{entry['step']}: dispatches must use patClient()",
+                    )
+                    self.assertNotIn(
+                        "github.rest.actions.createWorkflowDispatch", window,
+                        f"{entry['workflow']}::{entry['step']}: dispatches must not use the GITHUB_TOKEN client",
+                    )
                     continue
                 if "TARGET_IS_DELEGATED" in window or "target-aware" in window.lower():
                     # Conditional target-aware token: TAP_PAT appears only on
