@@ -16,10 +16,10 @@ import unittest
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 SRC = os.path.join(ROOT, "src")
 
-# Intentional P0 baseline advance: b651314 hardens the complete issue-start
-# control-plane credential routing in continuum-opencode.yml. Keeping the
-# immutable commit baseline means any later protected-file drift still fails.
-BASELINE_SHA = "b651314df3d730cfbf385d86a272507882301643"
+# Intentional P0 baseline advance: 5bcab89 removes the secondary Octokit
+# from issue readiness while preserving the issue-start token split in
+# continuum-opencode.yml. Later protected-file drift must still fail.
+BASELINE_SHA = "5bcab8948f15a8f55fc0de5f87bd851a651a2630"
 
 PROTECTED_FILES = [
     ".github/workflows/continuum-opencode.yml",
