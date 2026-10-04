@@ -16,10 +16,19 @@ import unittest
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 SRC = os.path.join(ROOT, "src")
 
-# Intentional P0 baseline advance: 5bcab89 removes the secondary Octokit
-# from issue readiness while preserving the issue-start token split in
-# continuum-opencode.yml. Later protected-file drift must still fail.
-BASELINE_SHA = "5bcab8948f15a8f55fc0de5f87bd851a651a2630"
+# Intentional P0 baseline advance: 87d139b completes kodmial/continuum#214
+# mandatory qualification execution mode in continuum-opencode.yml
+# (immutable capability/qualification/SHA run identity, exact-SHA fetch,
+# product-change forbid, evidence-gated success without pause, plus the
+# trust hardening required by scripts/test-continuum.rb: trusted dispatch
+# identity via isTrustedDispatchComment, automation reads via
+# .user.login == "github-actions[bot]", and untracked-dropping verdict via
+# --untracked-files=no). The authoritative task contract and
+# scripts/test-continuum.rb require those strings in
+# continuum-opencode.yml, so the pre-#214 zero-diff assertion is stale.
+# Keeping the immutable commit baseline means any later protected-file
+# drift still fails.
+BASELINE_SHA = "87d139b49786ca1c9b6a5a413022ccf0e90b741a"
 
 PROTECTED_FILES = [
     ".github/workflows/continuum-opencode.yml",
@@ -1481,15 +1490,80 @@ class RepairWiringRegressionTests(unittest.TestCase):
         self.assertIn("Publish failed PR-Agent repair state", repair)
         self.assertIn("continuum/pr-agent-repair", repair)
 
-    def test_caller_level_concurrency_serializes_duplicate_wakeups(self):
+    def test_no_caller_level_per_pr_serialization(self):
+        # Issue #227: the caller must not serialize per PR. A caller-level
+        # lock is acquired before admission, so no-op comment runs would
+        # queue ahead of useful exact-HEAD reviews. Heavy callers are
+        # dispatch-only by design (issue #229): ordinary comments must not
+        # create heavy workflow runs at all. Filtering and coalescing live
+        # in the thin router, so the heavy YAML carries no comment gate.
+        # Every atomic condition of caller_review_event_is_actionable stays
+        # mirrored in the router, not in the heavy caller.
         for path in (
             ".github/workflows/pr-agent.yml",
             ".github/caller-stubs/continuum-pr-agent.yml",
         ):
             with self.subTest(path=path):
                 caller = read_repo(path)
-                self.assertIn("group: pr-agent-caller-", caller)
-                self.assertIn("cancel-in-progress: false", caller)
+                self.assertNotIn("pr-agent-caller-", caller)
+                self.assertNotIn("concurrency:", caller)
+                self.assertNotIn("cancel-in-progress", caller)
+                self.assertIn("workflow_dispatch:", caller)
+                self.assertIn("github.event_name == 'workflow_dispatch'", caller)
+                self.assertNotIn("issue_comment", caller)
+                self.assertNotIn(
+                    "contains(github.event.comment.body, '/review')", caller
+                )
+        router_stub = read_repo(
+            ".github/caller-stubs/continuum-pr-agent-router.yml"
+        )
+        self.assertIn("issue_comment", router_stub)
+        self.assertIn(
+            "contains(github.event.comment.body, '/review')", router_stub
+        )
+
+    def test_authoritative_review_serialization_is_cancellable_per_pr(self):
+        # Issue #227: the reusable operation layer owns the only per-PR
+        # serialization, and it covers the whole run at workflow level so
+        # downstream repair/merge wrappers can never run in parallel with
+        # a newer run. Preemption is HEAD-guarded, never unconditional:
+        # an out-of-order old-HEAD event must not cancel newer
+        # exact-HEAD work and same-HEAD duplicates coalesce.
+        body = read_repo(".github/workflows/continuum-pr-agent.yml")
+        self.assertIn("group: pr-agent-${{", body)
+        self.assertIn("cancel-in-progress: false", body)
+        self.assertNotIn("group: pr-agent-caller-", body)
+        self.assertNotIn("cancel-in-progress: true", body)
+        workflow_block, _, jobs_block = body.partition("\njobs:\n")
+        self.assertIn("concurrency:", workflow_block)
+        self.assertNotIn("\n    concurrency:", jobs_block)
+        # HEAD-guarded supersession markers implement
+        # stale_review_may_be_cancelled instead of native preemption.
+        self.assertIn("Stale admission ignored:", body)
+        self.assertIn("PR head moved during review", body)
+        self.assertIn("stale_review_may_be_cancelled", body)
+
+    def test_repair_serialization_is_non_interruptible_per_head(self):
+        # Issue #227: repair publication keeps its own non-cancellable
+        # per-PR-HEAD group and is never interrupted by serialized review
+        # work, so a newer event cannot interrupt a mutating publish.
+        # The parent run is also non-preemptive at workflow level, so an
+        # old-HEAD duplicate can never cancel newer exact-HEAD work.
+        repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
+        self.assertIn(
+            "group: pr-agent-repair-${{ inputs.pr_number || github.run_id }}-"
+            "${{ inputs.head_sha || github.sha }}",
+            repair,
+        )
+        self.assertIn("cancel-in-progress: false", repair)
+        review = read_repo(".github/workflows/continuum-pr-agent.yml")
+        self.assertIn("cancel-in-progress: false", review)
+        self.assertNotIn("cancel-in-progress: true", review)
+        # The whole-run group is per PR; the repair group is
+        # per PR plus exact HEAD, so same-HEAD repairs serialize while
+        # HEAD-guarded supersession (not native cancellation) retires
+        # stale reviews.
+        self.assertIn("inputs.pr_number || github.run_id", review)
 
     def test_no_progress_marker_trust_does_not_depend_on_login(self):
         repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
@@ -1556,6 +1630,434 @@ class RepairWiringRegressionTests(unittest.TestCase):
         )
         self.assertIn('retry_attempt: "${{ inputs.retry_attempt }}"', caller)
 
+
+class FallbackPersistentStateTests(unittest.TestCase):
+    """kodmial/continuum#241: route validated findings to repair when native
+    persistent finding state is absent.
+
+    Native upstream state remains authoritative when present and valid. Only
+    after exact-HEAD and PRReview-schema validation may a fallback be
+    derived, preserving every actionable finding as ACTIVE and failing
+    closed on anything unrepresentable.
+    """
+
+    def _fallback(self):
+        import sys
+
+        sys.path.insert(0, SRC)
+        try:
+            from continuum import pr_agent_fallback_state as fallback
+        finally:
+            sys.path.remove(SRC)
+        return fallback
+
+    def _life(self):
+        import sys
+
+        sys.path.insert(0, SRC)
+        try:
+            from continuum import pr_agent_lifecycle as life
+        finally:
+            sys.path.remove(SRC)
+        return life
+
+    def test_clean_validated_review_derives_empty_fallback(self):
+        fallback = self._fallback()
+        state = fallback.derive_fallback_state(
+            make_review([]), "AbC123", run_id="run-1"
+        )
+        self.assertEqual(state["schema_version"], 1)
+        self.assertEqual(state["findings"], [])
+        self.assertTrue(state["last_run"]["complete"])
+        self.assertEqual(state["last_run"]["kind"], "full")
+        self.assertEqual(state["last_run"]["head_sha"], "abc123")
+        self.assertEqual(state["last_run"]["run_id"], "run-1")
+
+    def test_validated_findings_derive_active_fallback(self):
+        fallback = self._fallback()
+        findings = [issue_entry(n=0), issue_entry(n=1)]
+        state = fallback.derive_fallback_state(
+            {"review": make_review(findings)}, "HEAD1", run_id="run-9"
+        )
+        self.assertEqual(len(state["findings"]), 2)
+        bodies = {entry["body"] for entry in state["findings"]}
+        self.assertEqual(
+            bodies,
+            {"concrete failure scenario 0", "concrete failure scenario 1"},
+        )
+        for entry in state["findings"]:
+            with self.subTest(entry=entry):
+                self.assertEqual(entry["state"], "ACTIVE")
+                self.assertEqual(entry["path"], "src/app.py")
+                self.assertTrue(entry["finding_id"])
+        self.assertEqual(state["last_run"]["head_sha"], "head1")
+        self.assertTrue(state["last_run"]["complete"])
+        self.assertEqual(state["last_run"]["kind"], "full")
+
+    def test_fallback_preserves_every_actionable_finding(self):
+        fallback = self._fallback()
+        findings = [issue_entry(n=i) for i in range(5)]
+        state = fallback.derive_fallback_state(
+            make_review(findings), "head", run_id="run"
+        )
+        self.assertEqual(len(state["findings"]), len(findings))
+
+    def test_fallback_never_marks_resolved(self):
+        fallback = self._fallback()
+        life = self._life()
+        state = fallback.derive_fallback_state(
+            make_review([issue_entry(n=0)]), "head", run_id="run"
+        )
+        states = {entry["state"] for entry in state["findings"]}
+        self.assertEqual(states, {"ACTIVE"})
+        self.assertFalse(
+            life.upstream_state_has_active(
+                {"findings": [{"state": "RESOLVED"}]}
+            )
+        )
+        self.assertTrue(life.upstream_state_has_active(state))
+
+    def test_fallback_fingerprint_is_stable(self):
+        fallback = self._fallback()
+        first = fallback.normalize_finding(issue_entry(n=3))
+        second = fallback.normalize_finding(issue_entry(n=3))
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        assert first is not None and second is not None
+        self.assertEqual(first["finding_id"], second["finding_id"])
+        self.assertEqual(len(first["finding_id"]), 12)
+
+    def test_mirror_matches_upstream_v0460_contract(self):
+        try:
+            from pr_agent.algo import review_finding_state as upstream
+        except ImportError:
+            self.skipTest("pinned upstream pr-agent is not installed")
+        fallback = self._fallback()
+        findings = [issue_entry(n=i) for i in range(3)]
+        mine = fallback.derive_fallback_state(
+            make_review(findings), "abc123", run_id="run"
+        )
+        reconciled = upstream.reconcile_review_findings(
+            None, findings, allow_resolution=True,
+            head_sha="abc123", run_id="run",
+        )
+        self.assertEqual(
+            sorted(entry["finding_id"] for entry in mine["findings"]),
+            sorted(entry["finding_id"] for entry in reconciled.state["findings"]),
+        )
+        marker = upstream.serialize_review_state(mine)
+        parsed = upstream.parse_review_state("presentation\n" + marker + "\n")
+        self.assertTrue(parsed.present)
+        self.assertTrue(parsed.valid)
+
+    def test_malformed_review_fails_closed(self):
+        fallback = self._fallback()
+        for bad in (
+            None,
+            "not-a-review",
+            ["key_issues_to_review"],
+            {"review": "not-an-object"},
+            {},
+            {"key_issues_to_review": None},
+            {"key_issues_to_review": "not-a-list"},
+            {"key_issues_to_review": ["not-an-object"]},
+            {"key_issues_to_review": [None]},
+        ):
+            with self.subTest(bad=bad):
+                with self.assertRaises(fallback.FallbackStateError):
+                    fallback.derive_fallback_state(bad, "head")
+
+    def test_unrepresentable_finding_fails_closed(self):
+        fallback = self._fallback()
+        for bad in (
+            {"relevant_file": "", "issue_content": "real body",
+             "start_line": 1, "end_line": 1},
+            {"relevant_file": "src/app.py", "issue_content": "  ",
+             "start_line": 1, "end_line": 1},
+            {"relevant_file": "src/app.py", "issue_header": "no body",
+             "start_line": 1, "end_line": 1},
+            {"issue_content": "no path", "start_line": 1, "end_line": 1},
+        ):
+            with self.subTest(bad=bad):
+                with self.assertRaises(fallback.FallbackStateError):
+                    fallback.derive_fallback_state(
+                        make_review([bad]), "head"
+                    )
+
+    def test_fallback_requires_the_exact_reviewed_head(self):
+        fallback = self._fallback()
+        life = self._life()
+        with self.assertRaises(fallback.FallbackStateError):
+            fallback.derive_fallback_state(make_review([]), "")
+        state = fallback.derive_fallback_state(
+            make_review([issue_entry(n=0)]), "AbC", run_id="run"
+        )
+        self.assertTrue(life.is_same_head(state["last_run"]["head_sha"], "abc"))
+        self.assertFalse(life.is_same_head(state["last_run"]["head_sha"], "def"))
+
+    def test_native_state_remains_authoritative(self):
+        body = read_repo(".github/workflows/continuum-pr-agent.yml")
+        # The fallback exists only in the native-absent branch; a published
+        # native marker is parsed and used verbatim instead.
+        self.assertIn("parse_review_state", body)
+        absent = body.index("if not candidates:")
+        self.assertLess(absent, body.index("reconcile_review_findings("))
+        self.assertLess(
+            body.index("reconcile_review_findings("),
+            body.index("parsed = parse_review_state"),
+        )
+
+    def test_validated_findings_route_reaches_repair(self):
+        body = read_repo(".github/workflows/continuum-pr-agent.yml")
+        # The persistent export (now with fallback) precedes routing, and
+        # routing still decides from the current structured review plus
+        # qualifying improve suggestions.
+        self.assertLess(
+            body.index("Export native persistent finding state"),
+            body.index("Route the current PR-Agent result"),
+        )
+        route = body[body.index("Route the current PR-Agent result"):]
+        self.assertIn("key_issues_to_review", route)
+        self.assertIn("qualifyingImproveSuggestions", route)
+        self.assertIn("needs_repair", route)
+        # Actionable results reach repair; only a clean HEAD reaches merge.
+        self.assertIn("needs.pr_agent.outputs.needs_repair == 'true'", body)
+        repair_use = body.index(
+            "continuum-pr-agent-repair.yml",
+            body.index("needs.pr_agent.outputs.needs_repair == 'true'"),
+        )
+        self.assertLess(
+            body.index("needs.pr_agent.outputs.needs_repair == 'true'"), repair_use
+        )
+
+    def test_workflow_fails_closed_on_unrepresentable_finding(self):
+        body = read_repo(".github/workflows/continuum-pr-agent.yml")
+        self.assertIn("normalize_finding", body)
+        self.assertIn(
+            "represented as persistent finding state; failing closed",
+            body,
+        )
+        self.assertIn("cannot derive fallback state", body)
+        self.assertIn("No validated reviewed HEAD", body)
+
+    def test_stale_head_is_rejected(self):
+        body = read_repo(".github/workflows/continuum-pr-agent.yml")
+        self.assertIn("Persistent state is stale", body)
+        self.assertIn("PR head moved during review", body)
+        self.assertIn("the review is stale", body)
+
+    def test_improve_only_repair_path_remains_functional(self):
+        suggestion = {
+            "relevant_file": "src/app.py",
+            "one_sentence_summary": "Unclosed resource handle leaks on error",
+            "suggestion_content": "Use a context manager so the handle closes on error.",
+            "relevant_lines_start": 30,
+            "relevant_lines_end": 34,
+            "score": 8,
+        }
+        batch = run_policy(
+            "build",
+            {
+                "review": make_review([]),
+                "improve_jsonl": json.dumps(
+                    {"payload": {"code_suggestions": [suggestion]}}
+                ),
+            },
+        )
+        self.assertEqual(len(batch["items"]), 1)
+        self.assertEqual(batch["items"][0]["source"], "improve")
+
+    def test_review_repair_rereview_progression(self):
+        review = read_repo(".github/workflows/continuum-pr-agent.yml")
+        repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
+        merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
+        # Repair consumes the canonical review/improve outputs and publishes
+        # a new HEAD when changes are required.
+        self.assertIn("review_json: ${{ needs.pr_agent.outputs.review_json }}", review)
+        self.assertIn("REVIEW_JSON: ${{ inputs.review_json }}", repair)
+        self.assertIn("git push", repair)
+        # The merge gate still requires persistent state for the exact HEAD
+        # and stays closed until a clean exact-HEAD review.
+        self.assertIn(
+            "persistent_state_json: ${{ needs.pr_agent.outputs.persistent_state_json }}",
+            review,
+        )
+        self.assertIn("PR-Agent gate requires native persistent finding state", merge)
+        self.assertIn("safe_to_merge", merge)
+
+class SchedulingSemanticsTests(unittest.TestCase):
+    """Issue #227: latest-useful-work scheduling without double-queueing.
+
+    No-op issue_comment events must never hold a per-PR lock, superseded
+    reviews may be cancelled/coalesced, and in-flight repair publication
+    must never be interrupted by a newer review event.
+    """
+
+    def _life(self):
+        import sys
+
+        sys.path.insert(0, SRC)
+        try:
+            from continuum import pr_agent_lifecycle as life
+        finally:
+            sys.path.remove(SRC)
+        return life
+
+    def test_noop_comment_events_are_not_actionable(self):
+        life = self._life()
+        # Owner /review on a PR and workflow_dispatch carry useful work.
+        self.assertTrue(
+            life.caller_review_event_is_actionable(
+                "workflow_dispatch",
+            )
+        )
+        self.assertTrue(
+            life.caller_review_event_is_actionable(
+                "issue_comment",
+                is_pull_request_comment=True,
+                actor_is_owner=True,
+                comment_body="/review please",
+            )
+        )
+        # Everything else is a no-op: plain comments, non-owner actors,
+        # non-PR issues, and unrelated events must not invoke the operation
+        # layer, so they can never delay a useful exact-HEAD review.
+        self.assertFalse(
+            life.caller_review_event_is_actionable(
+                "issue_comment",
+                is_pull_request_comment=True,
+                actor_is_owner=True,
+                comment_body="looks good, thanks!",
+            )
+        )
+        self.assertFalse(
+            life.caller_review_event_is_actionable(
+                "issue_comment",
+                is_pull_request_comment=True,
+                actor_is_owner=False,
+                comment_body="/review",
+            )
+        )
+        self.assertFalse(
+            life.caller_review_event_is_actionable(
+                "issue_comment",
+                is_pull_request_comment=False,
+                actor_is_owner=True,
+                comment_body="/review",
+            )
+        )
+        self.assertFalse(
+            life.caller_review_event_is_actionable(
+                "issue_comment",
+                is_pull_request_comment=True,
+                actor_is_owner=True,
+                comment_body="",
+            )
+        )
+        self.assertFalse(life.caller_review_event_is_actionable("schedule"))
+        self.assertFalse(life.caller_review_event_is_actionable(""))
+
+    def test_superseded_review_may_be_cancelled_same_head_coalesces(self):
+        life = self._life()
+        old = "a" * 40
+        new = "b" * 40
+        # A moved HEAD supersedes older review work: cancel/coalesce it.
+        self.assertTrue(life.stale_review_may_be_cancelled(old, new))
+        self.assertTrue(life.needs_fresh_review(old, new))
+        # Same HEAD duplicates coalesce: exact-HEAD work is idempotent.
+        self.assertFalse(life.stale_review_may_be_cancelled(old, old.upper()))
+        self.assertFalse(life.needs_fresh_review(old, old.upper()))
+        # Missing SHAs never cancel: fail closed, never discard blindly.
+        self.assertFalse(life.stale_review_may_be_cancelled("", new))
+        self.assertFalse(life.stale_review_may_be_cancelled(old, ""))
+        self.assertFalse(life.stale_review_may_be_cancelled(None, new))
+
+    def test_repair_publication_is_non_interruptible(self):
+        life = self._life()
+        # Repair mutates/publishes under exact-HEAD revalidation plus
+        # force-with-lease; an active same-HEAD repair blocks review
+        # preemption, while no repair (or a different HEAD) does not.
+        self.assertTrue(
+            life.repair_is_protected_from_review_preemption(
+                repair_active=True, repair_head_sha="a" * 40, review_head_sha="a" * 40
+            )
+        )
+        self.assertTrue(
+            life.repair_is_protected_from_review_preemption(repair_active=True)
+        )
+        self.assertFalse(
+            life.repair_is_protected_from_review_preemption(repair_active=False)
+        )
+        self.assertFalse(
+            life.repair_is_protected_from_review_preemption(
+                repair_active=True,
+                repair_head_sha="a" * 40,
+                review_head_sha="b" * 40,
+            )
+        )
+        # The scheduling decision wires all three predicates so none is
+        # dead code: non-actionable events ignore, active repair waits,
+        # moved HEAD supersedes, same HEAD coalesces, and a current HEAD
+        # with no running review proceeds.
+        old, new = "a" * 40, "b" * 40
+        self.assertEqual(
+            life.review_supersession_decision(
+                old, new, event_name="schedule"
+            )["action"],
+            "ignore",
+        )
+        self.assertEqual(
+            life.review_supersession_decision(
+                old,
+                new,
+                repair_active=True,
+                repair_head_sha=new,
+                review_head_sha=new,
+            )["action"],
+            "wait",
+        )
+        self.assertEqual(
+            life.review_supersession_decision(old, new)["action"], "supersede"
+        )
+        self.assertEqual(
+            life.review_supersession_decision(old, old)["action"], "coalesce"
+        )
+        # First-ever review with no running SHA proceeds to admission;
+        # a missing current HEAD still fails closed to wait.
+        self.assertEqual(
+            life.review_supersession_decision("", new)["action"], "proceed"
+        )
+        self.assertEqual(
+            life.review_supersession_decision(None, new)["action"], "proceed"
+        )
+        self.assertEqual(
+            life.review_supersession_decision(old, "")["action"], "wait"
+        )
+        # Python wiring is a real call site, not documentation-only.
+        source = lifecycle_source()
+        decision = source.split("def review_supersession_decision", 1)[1]
+        self.assertIn("caller_review_event_is_actionable(", decision)
+        self.assertIn("stale_review_may_be_cancelled(", decision)
+        self.assertIn("repair_is_protected_from_review_preemption(", decision)
+        repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
+        self.assertIn("force-with-lease", repair)
+        self.assertIn("PR branch moved before publish", repair)
+
+    def test_router_holds_no_per_pr_lock(self):
+        # Issue #227: the thin router filters before any delay. A
+        # workflow-level lock is acquired before the job `if` / early-exit
+        # filter, so a plain non-`/review` comment run would queue ahead of
+        # a useful dispatch for the same PR. Duplicates coalesce via the
+        # operation-key active-run check instead.
+        for path in (
+            ".github/caller-stubs/continuum-pr-agent-router.yml",
+            ".github/workflows/continuum-pr-agent-router.yml",
+            ".github/workflows/pr-agent-router.yml",
+        ):
+            with self.subTest(path=path):
+                body = read_repo(path)
+                self.assertNotIn("concurrency:", body)
+                self.assertNotIn("cancel-in-progress", body)
 
 if __name__ == "__main__":
     unittest.main()

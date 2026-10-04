@@ -29,9 +29,14 @@ on:
 
 permissions: {}
 
-concurrency:
-  group: pr-agent-router-${{ github.event.issue.number || inputs.pr_number || github.run_id }}
-  cancel-in-progress: false
+# No workflow-level concurrency by design (issue #227): the actionable
+# /review filter and the operation-key active-run coalescing run inside the
+# `route` step, which executes only after a workflow-level lock would already
+# have queued this run. A per-PR router lock would let a plain non-`/review`
+# comment run queue ahead of a useful exact-HEAD dispatch for the same PR.
+# The heavy operation layer owns the only per-PR serialization
+# (continuum-pr-agent.yml); the router itself never holds a per-PR lock and
+# never preempts (native cancellation cannot compare HEADs).
 
 jobs:
   route:
