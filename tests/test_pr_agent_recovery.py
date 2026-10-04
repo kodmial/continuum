@@ -162,7 +162,11 @@ class RecoveryDecisionTests(unittest.TestCase):
         self.assertIsNone(decision.attempt)
 
     def test_shipped_recovery_defines_operation_liveness_recheck(self):
-        body = self.read(".github/workflows/continuum-pr-agent-recovery.yml")
+        with open(
+            os.path.join(ROOT, ".github/workflows/continuum-pr-agent-recovery.yml"),
+            encoding="utf-8",
+        ) as handle:
+            body = handle.read()
         definition = "async function operationIsActive(prNumber, head, kind)"
         call = "await operationIsActive(pr.number, head, kind)"
         self.assertIn(definition, body)
