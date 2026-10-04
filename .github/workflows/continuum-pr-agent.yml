@@ -1109,10 +1109,31 @@ jobs:
               EXPORT_FIRST_PAGE=$(( EXPORT_LAST_PAGE - 9 ))
               [[ "$EXPORT_FIRST_PAGE" -ge 1 ]] || EXPORT_FIRST_PAGE=1
             else
-              # Issue-total lookup failed; keep the previous oldest-first
-              # 10-page bound rather than narrowing to a single page.
-              EXPORT_FIRST_PAGE=1
-              EXPORT_LAST_PAGE=10
+              # Issue-total lookup failed; oldest-first pages 1-10 would
+              # scan the wrong end on a PR with >1000 comments because the
+              # comments list is oldest-first, missing the recent
+              # reviewed-HEAD marker. Anchor at the newest end instead: the
+              # paginated Link header advertises the last page in one read.
+              # Fail closed when the newest page cannot be determined
+              # rather than exporting state from the wrong window.
+              if ! EXPORT_INCLUDE="$(gh api --include "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100&page=1" 2>/dev/null)"; then
+                echo "::error::Could not determine the newest PR comment page for persistent-state export."
+                exit 1
+              fi
+              EXPORT_HEADERS="$(tr -d '\r' <<<"$EXPORT_INCLUDE" | sed -n '1,/^$/p')"
+              EXPORT_LINK_LAST="$(grep -i '^link:' <<<"$EXPORT_HEADERS" | tr '[:upper:]' '[:lower:]' | sed -nE 's/.*<[^>]*[?&]page=([0-9]+)[^>]*>[[:space:]]*;[[:space:]]*rel="last".*/\1/p' | tail -n 1)"
+              if [[ "$EXPORT_LINK_LAST" =~ ^[0-9]+$ ]] && [[ "$EXPORT_LINK_LAST" -ge 1 ]]; then
+                EXPORT_LAST_PAGE="$EXPORT_LINK_LAST"
+                EXPORT_FIRST_PAGE=$(( EXPORT_LAST_PAGE - 9 ))
+                [[ "$EXPORT_FIRST_PAGE" -ge 1 ]] || EXPORT_FIRST_PAGE=1
+              elif grep -qi '^link:' <<<"$EXPORT_HEADERS"; then
+                echo "::error::Could not parse the newest PR comment page for persistent-state export."
+                exit 1
+              else
+                # No Link header means the thread fits in a single page.
+                EXPORT_FIRST_PAGE=1
+                EXPORT_LAST_PAGE=1
+              fi
             fi
             for comment_page in $(seq "$EXPORT_FIRST_PAGE" "$EXPORT_LAST_PAGE"); do
               if ! gh api "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100&page=$comment_page" \
