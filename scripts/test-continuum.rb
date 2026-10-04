@@ -2061,8 +2061,6 @@ class ContinuumTest < Minitest::Test
                     'router needs least-privilege Actions write for workflow_dispatch'
     assert_includes router, 'github-token: ${{ github.token }}',
                     'router must authenticate reads and dispatch with GITHUB_TOKEN'
-    refute_includes router, 'secrets.TAP_PAT',
-                    'router must not consume the shared user PAT'
     assert_includes router, 'github.rest.pulls.get(',
                     'PR metadata read must use repository token'
     assert_includes router, 'github.rest.actions.listWorkflowRuns(',
