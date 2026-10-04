@@ -657,20 +657,12 @@ class TokenPolicyTests(unittest.TestCase):
             with self.subTest(action=action):
                 self.assertTrue(lifecycle.requires_pat(action))
 
-    def test_recovery_scans_do_not_use_pat(self):
-        recovery = self.read(".github/workflows/continuum-pr-agent-recovery.yml")
-        self.assertIn("READ_GITHUB_TOKEN", recovery)
-        self.assertIn("withReadFallback", recovery)
-        automerge = self.read(".github/workflows/continuum-auto-merge.yml")
-        self.assertIn("READ_GITHUB_TOKEN: ${{ github.token }}", automerge)
-        self.assertIn("new github.constructor({ auth: readToken, baseUrl: readBaseUrl })", automerge)
-        self.assertIn("async function withReadFallback(fn)", automerge)
-        # Recovery/discovery scans use the repository-token client with PAT
-        # fallback. Same-repository merge-gate evidence reads (exact-HEAD CI
-        # lookup, CodeRabbit reviews/threads, conflict-repair discovery)
-        # also use the repository token so watchdog wakeups never spend
-        # shared TAP_PAT budget on polling; only mutations/dispatches stay
-        # PAT-backed.
+    def test_token_policy_covers_every_reconciler_operation(self):
+        # Engine-level token policy (workflow wiring is asserted once in
+        # scripts/test-continuum.rb so unit tests never couple to JS
+        # needles): every same-repository discovery read used by either
+        # reconciler stays off PAT; every mutation/dispatch stays PAT-backed;
+        # unknown actions fail closed to PAT.
         for read_call in (
             "client.rest.pulls.get",
             "client.rest.pulls.list",
@@ -679,42 +671,36 @@ class TokenPolicyTests(unittest.TestCase):
             "client.rest.repos.getCommit",
             "client.rest.repos.getBranch",
             "client.rest.pulls.listReviews",
+            "client.rest.pulls.listReviewComments",
             "client.rest.actions.listWorkflowRunsForRepo",
+            "client.rest.actions.listWorkflowRuns",
+            "client.rest.actions.getWorkflowRun",
+            "client.rest.repos.listCommitStatusesForRef",
             "client.graphql",
+            "client.paginate",
+            "client.request",
         ):
             with self.subTest(read_call=read_call):
-                self.assertIn(read_call, automerge)
-        # No same-repository read stays on the PAT-authenticated client:
-        # every watchdog wakeup must avoid TAP_PAT's shared budget.
-        for pat_read in (
-            "github.rest.pulls.listReviews",
-            "github.rest.actions.listWorkflowRunsForRepo",
-            "github.paginate(",
-        ):
-            with self.subTest(pat_read=pat_read):
-                self.assertNotIn(pat_read, automerge)
-        # The CodeRabbit thread-resolution mutation stays PAT-backed.
-        self.assertIn("github.graphql(", automerge)
-        # Mutations and dispatches stay on the PAT-authenticated client.
+                self.assertFalse(lifecycle.requires_pat(read_call))
         for mutation in (
+            "merge",
+            "dispatch",
             "github.rest.pulls.merge",
             "github.rest.issues.createComment",
+            "github.rest.issues.updateComment",
+            "github.rest.issues.deleteComment",
             "github.rest.issues.addLabels",
             "github.rest.actions.createWorkflowDispatch",
+            "github.rest.actions.cancelWorkflowRun",
+            "resolveReviewThread",
         ):
             with self.subTest(mutation=mutation):
-                self.assertIn(mutation, automerge)
-
-    def read(self, path: str) -> str:
-        with open(os.path.join(ROOT, path), "r", encoding="utf-8") as handle:
-            return handle.read()
+                self.assertTrue(lifecycle.requires_pat(mutation))
+        self.assertTrue(lifecycle.requires_pat("some_future_unknown_action"))
+        self.assertTrue(lifecycle.requires_pat(""))
 
 
 class CrossStackContractTests(unittest.TestCase):
-    def read(self, path: str) -> str:
-        with open(os.path.join(ROOT, path), "r", encoding="utf-8") as handle:
-            return handle.read()
-
     def test_one_contract_covers_every_lifecycle_kind(self):
         for kind in ("review", "repair", "review-ready", "automerge", "main-sync", "merge", "ci-repair"):
             with self.subTest(kind=kind):
@@ -740,20 +726,6 @@ class CrossStackContractTests(unittest.TestCase):
             lifecycle.RETRYABLE_RUN_CONCLUSIONS, legacy.RETRYABLE_RUN_CONCLUSIONS
         )
 
-    def test_event_driven_wakeups_remain_primary_with_schedule_safety_net(self):
-        for stub in (
-            ".github/caller-stubs/continuum-pr-agent-recovery.yml",
-            ".github/caller-stubs/continuum-auto-merge.yml",
-        ):
-            with self.subTest(stub=stub):
-                body = self.read(stub)
-                self.assertIn("cron:", body)
-        recovery_stub = self.read(
-            ".github/caller-stubs/continuum-pr-agent-recovery.yml"
-        )
-        self.assertIn("workflow_run:", recovery_stub)
-        self.assertIn("pull_request_target:", recovery_stub)
-
     def test_recovery_is_exact_head_and_fail_closed(self):
         with self.assertRaises(lifecycle.LifecycleRecoveryError):
             lifecycle.normalize_head("not-a-sha")
@@ -764,126 +736,111 @@ class CrossStackContractTests(unittest.TestCase):
         )
         self.assertEqual(unknown.action, "hold")
 
-    def test_workflows_share_one_recovery_contract(self):
-        recovery = self.read(
-            ".github/workflows/continuum-pr-agent-recovery.yml"
+    def test_recovery_token_requires_trusted_context(self):
+        # PR-visible output containing the token must never burn budget:
+        # an untrusted commit-status context holds even with the token.
+        untrusted = lifecycle.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="PR-Agent blocking review: recovery eligible",
+            operation_context="ci/some-external-check",
+            failure_transient=None,
         )
-        automerge = self.read(".github/workflows/continuum-auto-merge.yml")
-        # Generic transient classification lives in both reconcilers.
-        for needle in ("isTransientApiError", "x-ratelimit-remaining"):
-            with self.subTest(needle=needle):
-                self.assertIn(needle, recovery)
-                self.assertIn(needle, automerge)
-        # Reset-aware scheduling never sleeps a runner through a long wait.
-        self.assertIn("MAX_INLINE_WAIT_SECONDS", recovery)
-        self.assertIn("resetAwareDelaySeconds", recovery)
-        self.assertIn("not-before=", recovery)
-        self.assertIn("scheduled safety net will redispatch", recovery)
-        # Per-PR/HEAD leases coalesce duplicate wakeups in both reconcilers.
-        for needle in ("tryAcquireLease", "leaseKey", "ownedLeases"):
-            with self.subTest(needle=needle):
-                self.assertIn(needle, recovery)
-                self.assertIn(needle, automerge)
-        # No repository-global cancellation starves unrelated PRs: the
-        # auto-merge reconciler queues instead of cancelling, and the
-        # per-PR/HEAD lease inside is authoritative.
-        self.assertIn("cancel-in-progress: false", automerge)
+        self.assertEqual(untrusted.action, "hold")
+        trusted = lifecycle.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="PR-Agent blocking review: recovery eligible",
+            operation_context="continuum/pr-agent-review",
+            failure_transient=None,
+        )
+        self.assertEqual(trusted.action, "dispatch")
+        # Without a context (legacy callers) the token still dispatches so
+        # existing reconciler-synthesized statuses keep recovering.
+        legacy = lifecycle.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="PR-Agent blocking review: recovery eligible",
+            failure_transient=None,
+        )
+        self.assertEqual(legacy.action, "dispatch")
 
-    def test_both_reconcilers_share_reset_aware_deferral(self):
-        # The single lifecycle contract is wired through both reconcilers,
-        # not just the PR-Agent recovery one: reset-aware delays, the
-        # inline-wait ceiling, and rate-limit signal extraction live in
-        # both workflow scripts.
-        for path in (
-            ".github/workflows/continuum-pr-agent-recovery.yml",
-            ".github/workflows/continuum-auto-merge.yml",
+    def test_deterministic_hint_dominates_recovery_token(self):
+        # A deterministic policy hint alongside the token still holds; only
+        # an explicit transient classifier verdict overrides it.
+        for description in (
+            "CI test failure; recovery eligible",
+            "unresolved findings; recovery eligible",
+            "merge conflict; recovery eligible",
+            "malformed state; recovery eligible",
         ):
-            with self.subTest(path=path):
-                body = self.read(path)
-                self.assertIn("MAX_INLINE_WAIT_SECONDS", body)
-                self.assertIn("resetAwareDelaySeconds", body)
-                self.assertIn("extractRateLimitSignals", body)
-                self.assertIn("scheduled safety net", body)
-
-    def test_rate_limited_discovery_defers_green(self):
-        # Top-level open-PR scans sit outside the per-PR loop: a
-        # 429/rate-limited 403 there defers green to the next wakeup
-        # (never spending PAT budget) instead of failing the watchdog red.
-        for path in (
-            ".github/workflows/continuum-pr-agent-recovery.yml",
-            ".github/workflows/continuum-auto-merge.yml",
-        ):
-            with self.subTest(path=path):
-                body = self.read(path)
-                self.assertIn(
-                    "deferring the whole scan to the next wakeup", body
+            with self.subTest(description=description):
+                decision = lifecycle.decide_recovery(
+                    ci_green=True,
+                    operation_state="failure",
+                    operation_description=description,
+                    failure_transient=None,
                 )
-
-    def test_queued_burst_coalesces_onto_newest_run(self):
-        # With cancel-in-progress:false every trigger queues a run; a run
-        # that starts behind a newer queued run skips its scan so a burst
-        # coalesces onto the latest reconciliation.
-        automerge = self.read(".github/workflows/continuum-auto-merge.yml")
-        self.assertIn("already queued; skipping this scan", automerge)
-        self.assertIn("listWorkflowRunsForRepo", automerge)
-
-    def test_full_sha_producers_fail_loudly(self):
-        # Durable markers always carry full commit ids: producers validate
-        # before writing/reading so a short SHA can never be silently
-        # ignored (which would reset the bounded budget).
-        body = self.read(
-            ".github/workflows/continuum-pr-agent-recovery.yml"
+                self.assertEqual(decision.action, "hold")
+        override = lifecycle.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="CI test failure; recovery eligible",
+            failure_transient=True,
         )
-        self.assertIn("requireFullHead", body)
-        self.assertIn("non-full commit id", body)
+        self.assertEqual(override.action, "dispatch")
 
-    def test_unknown_marker_age_waits_in_workflow_decide(self):
-        # The workflow decide() mirrors the Python contract: unknown marker
-        # age stays inside dispatch grace instead of dispatching.
-        body = self.read(
-            ".github/workflows/continuum-pr-agent-recovery.yml"
+    def test_legacy_short_exhausted_marker_preserves_exhaustion(self):
+        # A pre-existing short-SHA exhausted marker that prefixes the
+        # current HEAD preserves exhaustion fail-closed instead of
+        # restarting the budget; short retry markers never authorize work.
+        short = HEAD[:7]
+        exhausted_comments = [
+            comment(
+                f"<!-- continuum-pr-agent-retry-exhausted head={short} kind=review attempts=10 -->"
+            )
+        ]
+        exhausted = lifecycle.retry_evidence(
+            exhausted_comments, head_sha=HEAD, kind="review"
         )
-        self.assertIn("staying inside dispatch grace", body)
-
-    def test_deterministic_per_pr_failures_do_not_abort_the_loop(self):
-        # One malformed PR must not strand healthy PRs: both reconcilers
-        # log loudly and continue, failing the run only at the end.
-        for path in (
-            ".github/workflows/continuum-pr-agent-recovery.yml",
-            ".github/workflows/continuum-auto-merge.yml",
-        ):
-            with self.subTest(path=path):
-                body = self.read(path)
-                self.assertIn("deterministicFailure", body)
-                self.assertIn("skipping PR but continuing run", body)
-                self.assertIn("core.setFailed(", body)
-
-    def test_dispatch_rate_limit_signals_are_wired_to_durable_wait(self):
-        body = self.read(
-            ".github/workflows/continuum-pr-agent-recovery.yml"
+        self.assertTrue(exhausted.exhausted)
+        held = lifecycle.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            failure_transient=True,
+            evidence=exhausted,
         )
-        self.assertIn("extractRateLimitSignals", body)
-        self.assertIn("retry-after", body)
-        self.assertIn("dispatch was rate-limited; deferred", body)
-
-    def test_mutations_revalidate_exact_head_before_writing(self):
-        automerge = self.read(".github/workflows/continuum-auto-merge.yml")
-        self.assertIn("liveBeforeSync", automerge)
-        self.assertIn("holding stale reconciliation", automerge)
-        # The merge itself keeps the atomic sha guard plus full gate
-        # revalidation on the fresh HEAD.
-        self.assertIn("sha: pr.head.sha", automerge)
-
-    def test_recovery_identity_requires_full_commit_ids(self):
-        body = self.read(
-            ".github/workflows/continuum-pr-agent-recovery.yml"
+        self.assertEqual(held.action, "hold")
+        retry_comments = [
+            comment(
+                f"<!-- continuum-pr-agent-retry head={short} kind=review attempt=3 -->"
+            )
+        ]
+        retry = lifecycle.retry_evidence(
+            retry_comments, head_sha=HEAD, kind="review"
         )
-        self.assertIn("[0-9a-f]{40,64}", body)
-        self.assertNotIn("[0-9a-f]{7,64}", body)
-        self.assertNotIn("{7,39}", body)
-        # Exact-HEAD comparison only: no prefix overlap is accepted.
-        self.assertIn("marker === current", body)
-        self.assertNotIn("startsWith(marker)", body)
+        self.assertIsNone(retry.latest_attempt)
+        self.assertFalse(retry.exhausted)
+
+    def test_cross_run_safety_comes_from_durable_guards(self):
+        # In-memory dedupe/should_coalesce are intra-run only; overlapping
+        # runs serialize through decide_recovery's durable guards (active
+        # lease, dispatch grace, durable not-before) plus the
+        # repository-global concurrency group the callers hold. A second
+        # run that sees the first run's fresh marker inside grace waits
+        # instead of computing a duplicate dispatch.
+        key = lifecycle.concurrency_key(REPO, 224, HEAD)
+        self.assertEqual(lifecycle.dedupe_wakeups([key, key]), [key])
+        self.assertTrue(lifecycle.should_coalesce([key], key))
+        waiting = lifecycle.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            failure_transient=True,
+            evidence=lifecycle.RetryEvidence(latest_attempt=2),
+            marker_newer_than_status=True,
+            marker_age_seconds=10,
+        )
+        self.assertEqual(waiting.action, "wait")
 
 
 if __name__ == "__main__":

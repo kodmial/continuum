@@ -142,13 +142,21 @@ jobs:
             // deterministic and fail the whole run obscurely.
             if (
               typeof readGithub.paginate !== 'function' ||
+              typeof readGithub.graphql !== 'function' ||
+              typeof readGithub.request !== 'function' ||
               typeof readGithub.rest?.issues?.listComments !== 'function' ||
               typeof readGithub.rest?.pulls?.get !== 'function' ||
               typeof readGithub.rest?.pulls?.list !== 'function' ||
-              typeof readGithub.rest?.actions?.listWorkflowRunsForRepo !== 'function'
+              typeof readGithub.rest?.pulls?.listReviews !== 'function' ||
+              typeof readGithub.rest?.pulls?.listReviewComments !== 'function' ||
+              typeof readGithub.rest?.repos?.getBranch !== 'function' ||
+              typeof readGithub.rest?.repos?.getCommit !== 'function' ||
+              typeof readGithub.rest?.repos?.getCombinedStatusForRef !== 'function' ||
+              typeof readGithub.rest?.actions?.listWorkflowRunsForRepo !== 'function' ||
+              typeof readGithub.rest?.actions?.listWorkflowRuns !== 'function'
             ) {
               throw new Error(
-                'readGithub client lacks the paginate/rest plugins; ' +
+                'readGithub client lacks the paginate/rest/graphql plugins; ' +
                 'cannot perform same-repository housekeeping reads.'
               );
             }
@@ -2248,7 +2256,39 @@ jobs:
             let deterministicFailure = null;
 
             for (const listed of pulls) {
-              // Guarded per-PR fetch: one transient or deterministic fetch
+              // Single live re-read per PR (#224 read budget): the open-PR
+              // listing already carries number/draft/head identity for the
+              // pre-lease filter, so only one authoritative pulls.get follows
+              // lease acquisition. A second pulls.get per PR would double
+              // read load (~2N) on every wakeup during quota exhaustion.
+              const listedHead = listed.head && listed.head.sha;
+              const listedFork = listed.head && listed.head.repo && listed.head.repo.full_name;
+              if (
+                (listed.state && listed.state !== 'open') ||
+                listed.draft ||
+                (listedFork && listedFork !== repoFullName)
+              ) {
+                continue;
+              }
+
+              // Per-PR/HEAD coalescing (#224): duplicate wakeups for the same
+              // transition collapse onto one lease; unrelated PRs proceed
+              // independently instead of queuing behind a repository lock.
+              // The lease pins the HEAD observed at acquisition: if the HEAD
+              // moves mid-reconciliation, the reconciler re-reads and refuses
+              // to merge the stale result.
+              const leaseHead = listedHead;
+              if (!leaseHead) {
+                continue;
+              }
+              if (!tryAcquireLease(listed.number, leaseHead)) {
+                core.info(
+                  `PR #${listed.number}: HEAD ${leaseHead} is already owned by this reconciliation; coalescing duplicate wakeup.`
+                );
+                continue;
+              }
+              try {
+              // Guarded live fetch: one transient or deterministic fetch
               // failure must not abort the repository loop and strand
               // healthy PRs behind a single bad PR.
               let pr;
@@ -2263,7 +2303,10 @@ jobs:
                 }
                 continue;
               }
-
+              if (pr.head.sha !== leaseHead) {
+                core.info(`PR #${pr.number}: HEAD moved ${leaseHead} -> ${pr.head.sha}; holding stale reconciliation.`);
+                continue;
+              }
               if (
                 pr.state !== 'open' ||
                 pr.draft ||
@@ -2271,27 +2314,6 @@ jobs:
               ) {
                 continue;
               }
-
-              // Per-PR/HEAD coalescing (#224): duplicate wakeups for the same
-              // transition collapse onto one lease; unrelated PRs proceed
-              // independently instead of queuing behind a repository lock.
-              // The lease pins the HEAD observed at acquisition: if the HEAD
-              // moves mid-reconciliation, the reconciler re-reads and refuses
-              // to merge the stale result.
-              const leaseHead = pr.head.sha;
-              if (!tryAcquireLease(pr.number, leaseHead)) {
-                core.info(
-                  `PR #${pr.number}: HEAD ${leaseHead} is already owned by this reconciliation; coalescing duplicate wakeup.`
-                );
-                continue;
-              }
-              try {
-              const livePr = await getPull(pr.number);
-              if (livePr.head.sha !== leaseHead) {
-                core.info(`PR #${pr.number}: HEAD moved ${leaseHead} -> ${livePr.head.sha}; holding stale reconciliation.`);
-                continue;
-              }
-              pr = livePr;
 
               if (hasLabel(pr, AUTO_MERGE_BLOCK_LABEL)) {
                 core.info(

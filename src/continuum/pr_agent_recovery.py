@@ -73,6 +73,15 @@ _EXHAUSTED_RE = re.compile(
     r"kind=(review|repair)\s+"
     r"attempts=(\d+)\s*-->"
 )
+# Pre-existing short-SHA exhausted markers (7-39 hex): never authorize a
+# retry attempt, but a prefix-matching exhausted marker preserves exhaustion
+# fail-closed so the budget never restarts.
+_LEGACY_SHORT_EXHAUSTED_RE = re.compile(
+    r"<!--\s*continuum-pr-agent-retry-exhausted\s+"
+    r"head=([0-9a-fA-F]{7,39})\s+"
+    r"kind=(review|repair)\s+"
+    r"attempts=(\d+)\s*-->"
+)
 _LIFECYCLE_EXHAUSTED_RE = re.compile(
     r"<!--\s*continuum-lifecycle-retry-exhausted\s+"
     r"head=([0-9a-fA-F]{40,64})\s+"
@@ -133,6 +142,27 @@ def operation_key(pr_number: object, head_sha: object, kind: object) -> str:
 _RECOVERY_ELIGIBLE_RE = re.compile(r"\brecovery eligible\b")
 _NEGATED_RECOVERY_ELIGIBLE_RE = re.compile(
     r"\b(?:not|no|non|never)[\s\-_]*recovery[\s\-_]+eligible\b"
+)
+# Deterministic policy hints dominate the recovery token: a description that
+# carries both (e.g. "CI test failure; recovery eligible" synthesized from
+# PR-visible output) must hold, never burn transient budget. Only an
+# explicit failure_transient=True classifier verdict overrides this.
+_DETERMINISTIC_HINTS = (
+    "test failure",
+    "tests failed",
+    "unresolved",
+    "merge conflict",
+    "conflict",
+    "malformed",
+    "stale head",
+    "moved head",
+    "invalid state",
+)
+TRUSTED_OPERATION_CONTEXTS = frozenset(
+    {
+        "continuum/pr-agent-review",
+        "continuum/pr-agent-repair",
+    }
 )
 
 
@@ -264,6 +294,16 @@ def retry_evidence(
                 continue
             if int(attempts_text) >= budget:
                 exhausted = True
+        # Legacy short-SHA exhaustion is fail-closed only: a short marker
+        # that prefixes the current full HEAD preserves exhaustion so the
+        # budget never restarts. Short retry markers never advance
+        # latest_attempt (no prefix authorization).
+        for match in _LEGACY_SHORT_EXHAUSTED_RE.finditer(body):
+            marker_head, marker_kind, attempts_text = match.groups()
+            if marker_kind != normalized_kind:
+                continue
+            if head.startswith(marker_head.lower()) and int(attempts_text) >= budget:
+                exhausted = True
 
     return RetryEvidence(
         latest_attempt=latest_attempt,
@@ -323,6 +363,8 @@ def decide_recovery(
     ci_green: bool,
     operation_state: Optional[str],
     operation_description: str = "",
+    operation_context: Optional[str] = None,
+    failure_transient: Optional[bool] = None,
     active_exact_run: bool = False,
     run_conclusion: Optional[str] = None,
     status_age_seconds: Optional[int] = None,
@@ -341,6 +383,14 @@ def decide_recovery(
     success or a new HEAD resets the episode.  A durable reset-aware
     not-before (canonical marker, redispatch via the scheduled safety net)
     waits instead of dispatching early.
+
+    ``failure_transient`` carries the caller's explicit classifier verdict:
+    True dispatches even without the token (so classifier-proven transient
+    infrastructure gaps never strand for lack of a token), False holds even
+    with the token. When None, only the explicit reconciler-synthesized
+    ``recovery eligible`` token from a trusted commit-status context
+    authorizes a retry; a bare ``transient`` substring never suffices, and
+    a deterministic policy hint alongside the token still holds.
     """
 
     state = str(operation_state or "").strip().lower() or None
@@ -394,14 +444,38 @@ def decide_recovery(
     elif state == "success":
         return RecoveryDecision("settled", None, "operation already settled")
     elif state == "failure":
-        if _is_explicit_recovery_eligible(description):
+        if failure_transient is True:
+            recoverable = True
+        elif failure_transient is False:
+            return RecoveryDecision(
+                "hold", None, "deterministic failure is not automatically retried"
+            )
+        elif _is_explicit_recovery_eligible(description):
+            if operation_context is not None and str(operation_context or "").strip().lower() not in TRUSTED_OPERATION_CONTEXTS:
+                return RecoveryDecision(
+                    "hold", None, "recovery token from untrusted context is not automatically retried"
+                )
+            lowered = description.lower()
+            if any(hint in lowered for hint in _DETERMINISTIC_HINTS):
+                return RecoveryDecision(
+                    "hold", None, "deterministic failure is not automatically retried"
+                )
             recoverable = True
         else:
             return RecoveryDecision(
                 "hold", None, "deterministic failure is not automatically retried"
             )
     elif state == "pending":
-        if conclusion in RETRYABLE_RUN_CONCLUSIONS:
+        # An explicit deterministic verdict dominates staleness, mirroring
+        # the single lifecycle contract; an explicit transient verdict
+        # dispatches immediately without waiting for staleness.
+        if failure_transient is False:
+            return RecoveryDecision(
+                "hold", None, "deterministic failure is not automatically retried"
+            )
+        if failure_transient is True:
+            recoverable = True
+        elif conclusion in RETRYABLE_RUN_CONCLUSIONS:
             recoverable = True
         elif (
             status_age_seconds is not None
@@ -439,6 +513,7 @@ __all__ = [
     "STALE_AFTER_SECONDS",
     "DISPATCH_GRACE_SECONDS",
     "TRUSTED_ASSOCIATIONS",
+    "TRUSTED_OPERATION_CONTEXTS",
     "RETRYABLE_RUN_CONCLUSIONS",
     "KINDS",
     "RecoveryError",

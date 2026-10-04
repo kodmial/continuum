@@ -304,6 +304,86 @@ class RecoveryDecisionTests(unittest.TestCase):
         self.assertEqual(decision.action, "hold")
         self.assertIsNone(decision.attempt)
 
+    def test_explicit_transient_verdict_dispatches_without_token(self):
+        # Classifier-proven transient infrastructure gaps never strand for
+        # lack of a token; an explicit deterministic verdict holds even
+        # with the token.
+        dispatched = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="runner evicted by the provider",
+            failure_transient=True,
+        )
+        self.assertEqual(dispatched.action, "dispatch")
+        held = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="transient; recovery eligible",
+            failure_transient=False,
+        )
+        self.assertEqual(held.action, "hold")
+        self.assertIsNone(held.attempt)
+
+    def test_bare_transient_substring_holds_without_token(self):
+        # The narrowed predicate holds on a bare "transient" substring: all
+        # producers emit the explicit token for retryable failures, so a
+        # status with only "transient" is deterministic until proven so.
+        decision = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="PR-Agent review failed: transient",
+        )
+        self.assertEqual(decision.action, "hold")
+
+    def test_deterministic_hint_dominates_recovery_token(self):
+        decision = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="CI test failure; recovery eligible",
+        )
+        self.assertEqual(decision.action, "hold")
+        override = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="CI test failure; recovery eligible",
+            failure_transient=True,
+        )
+        self.assertEqual(override.action, "dispatch")
+
+    def test_recovery_token_from_untrusted_context_holds(self):
+        held = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="transient; recovery eligible",
+            operation_context="ci/external-check",
+        )
+        self.assertEqual(held.action, "hold")
+        dispatched = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="transient; recovery eligible",
+            operation_context="continuum/pr-agent-review",
+        )
+        self.assertEqual(dispatched.action, "dispatch")
+
+    def test_legacy_short_exhausted_marker_preserves_exhaustion(self):
+        short = HEAD[:7]
+        evidence = recovery.retry_evidence(
+            [comment(
+                f"<!-- continuum-pr-agent-retry-exhausted head={short} kind=review attempts=10 -->"
+            )],
+            head_sha=HEAD,
+            kind="review",
+        )
+        self.assertTrue(evidence.exhausted)
+        held = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="transient; recovery eligible",
+            evidence=evidence,
+        )
+        self.assertEqual(held.action, "hold")
+
     def test_non_green_ci_never_dispatches(self):
         decision = recovery.decide_recovery(
             ci_green=False,

@@ -107,6 +107,24 @@ _LEGACY_EXHAUSTED_RE = re.compile(
     r"kind=(review|repair)\s+"
     r"attempts=(\d+)\s*-->"
 )
+# Pre-existing short-SHA exhausted markers (7-39 hex) from before exact-HEAD
+# safety: they can never authorize a retry attempt (no prefix matching for
+# budget), but an exhausted marker that prefix-matches the current HEAD must
+# preserve exhaustion instead of restarting the budget. Fail-closed: holding
+# on a prefix collision is safe; restarting the budget to dispatch extra
+# executions is not.
+_LEGACY_SHORT_EXHAUSTED_RE = re.compile(
+    r"<!--\s*continuum-pr-agent-retry-exhausted\s+"
+    r"head=([0-9a-fA-F]{7,39})\s+"
+    r"kind=(review|repair)\s+"
+    r"attempts=(\d+)\s*-->"
+)
+_LEGACY_SHORT_RETRY_RE = re.compile(
+    r"<!--\s*continuum-pr-agent-retry\s+"
+    r"head=([0-9a-fA-F]{7,39})\s+"
+    r"kind=(review|repair)\s+"
+    r"attempt=(\d+)\s*-->"
+)
 
 _TRANSIENT_ERROR_PATTERNS = (
     "timeout",
@@ -646,6 +664,16 @@ def retry_evidence(
                 if _same_head(marker_head, head) and marker_kind.lower() == normalized_kind:
                     if int(attempts_text) >= budget:
                         exhausted = True
+            # Legacy short-SHA exhaustion is fail-closed only: a short
+            # marker that is a prefix of the current full HEAD preserves
+            # exhaustion so the budget never restarts. Short retry markers
+            # never advance latest_attempt (no prefix authorization).
+            for match in _LEGACY_SHORT_EXHAUSTED_RE.finditer(body):
+                marker_head, marker_kind, attempts_text = match.groups()
+                if marker_kind.lower() != normalized_kind:
+                    continue
+                if head.startswith(marker_head.lower()) and int(attempts_text) >= budget:
+                    exhausted = True
 
     return RetryEvidence(
         latest_attempt=latest_attempt,
@@ -676,6 +704,7 @@ def decide_recovery(
     ci_green: bool,
     operation_state: Optional[str] = None,
     operation_description: str = "",
+    operation_context: Optional[str] = None,
     failure_transient: Optional[bool] = None,
     head_moved: bool = False,
     malformed_state: bool = False,
@@ -708,6 +737,16 @@ def decide_recovery(
     (``exhaust`` once, then ``hold`` while the durable marker exists).
     ``main_sync_required`` gates merge-kind callers: when True the decision
     waits for the outstanding main sync instead of dispatching a merge.
+
+    The ``recovery eligible`` token is honored only for reconciler-
+    synthesized descriptions from trusted commit-status contexts
+    (``TRUSTED_OPERATION_CONTEXTS``). When ``operation_context`` is
+    supplied and untrusted, the token is ignored and the failure holds,
+    so PR-visible check output or review text containing the token can
+    never burn transient budget. A deterministic policy hint in the
+    description (CI failure, unresolved findings, merge conflict,
+    malformed state) also holds even when the token is present: only an
+    explicit ``failure_transient=True`` classifier verdict overrides it.
     """
 
     budget = resolve_max_executions(max_executions)
@@ -791,6 +830,14 @@ def decide_recovery(
         elif failure_transient is False:
             return RecoveryDecision("hold", None, "deterministic failure is not automatically retried")
         elif _is_explicit_recovery_eligible(description):
+            # Trust gate: the token alone never authorizes a retry unless
+            # it comes from a reconciler-synthesized status in a trusted
+            # context and carries no deterministic policy hint.
+            if operation_context is not None and str(operation_context or "").strip().lower() not in TRUSTED_OPERATION_CONTEXTS:
+                return RecoveryDecision("hold", None, "recovery token from untrusted context is not automatically retried")
+            lowered_description = description.lower()
+            if any(hint in lowered_description for hint in _DETERMINISTIC_HINTS):
+                return RecoveryDecision("hold", None, "deterministic failure is not automatically retried")
             recoverable = True
             transient_failure = True
         else:
@@ -932,21 +979,82 @@ def should_coalesce(active_leases: Sequence[str], key: str) -> bool:
     return normalized in {str(item or "").strip() for item in active_leases}
 
 
-def requires_pat(action: object) -> bool:
-    """Token policy: reads use GITHUB_TOKEN; only mutations require PAT."""
+TRUSTED_OPERATION_CONTEXTS = frozenset(
+    {
+        "continuum/pr-agent-review",
+        "continuum/pr-agent-repair",
+    }
+)
 
-    name = str(action or "").strip().lower().replace("-", "_")
-    pat_actions = {
+# Every same-repository read the reconcilers perform through the
+# repository-token client. ``requires_pat`` returns False for all of these
+# (including dotted ``client.rest.*`` paths); only mutations/dispatches stay
+# PAT-backed. Unknown actions fail closed to True. Note: ``graphql`` alone
+# defaults to read (query); a mutation is identified by its operation
+# content (``resolve``/``mutation``), and the workflow wiring keeps queries
+# on the read client and mutations on the PAT client.
+_READ_TOKENS = (
+    "read", "list", "get", "discover", "scan", "reconcile_read",
+    "status", "check", "poll", "paginate", "graphql", "graphql_query",
+    "request", "request_get", "compare", "reviewthreads",
+)
+_PAT_TOKENS = (
+    "merge", "dispatch", "comment", "label", "review_submit",
+    "update_branch", "push", "release", "mutate", "write", "cancel",
+    "resolve_thread", "mutation",
+)
+
+
+def requires_pat(action: object) -> bool:
+    """Token policy: reads use GITHUB_TOKEN; only mutations require PAT.
+
+    Accepts both bare action names (``"list"``) and dotted client paths
+    (``"client.rest.pulls.listReviews"``, ``"client.graphql"``,
+    ``"client.request"``, ``"client.paginate"``). Any path naming a
+    mutation/dispatch (merge, dispatch, comment/label writes, push,
+    cancel, thread resolution, graphql mutations) returns True. Pure
+    same-repository discovery reads return False. Unknown actions fail
+    closed to True rather than silently widening GITHUB_TOKEN use.
+    """
+
+    name = str(action or "").strip().lower().replace("-", "_").replace(" ", "_")
+    # Dotted client paths are judged by the leaf operation so
+    # "client.rest.pulls.listreviewcomments" (a read) is not confused with
+    # "github.rest.issues.createcomment" (a mutation): the leaf carries the
+    # verb. Mutation evidence wins over read naming.
+    leaf = [segment for segment in name.replace(".", "_").split("_") if segment]
+    leaf_word = leaf[-1] if leaf else ""
+    full = "_".join(leaf)
+    mutation_markers = (
+        "create", "update", "delete", "addlabel", "removelabel",
+        "createlabel", "merge", "dispatch", "push", "cancel",
+        "resolve", "mutation", "mutate", "write", "submit",
+    )
+    if any(marker in leaf_word or marker in full.split("client_")[-1].split("github_")[-1] for marker in ("create", "update", "delete", "merge", "dispatch", "push", "cancel", "resolve", "mutation", "mutate")):
+        # Exclude pure read leaves that merely embed those substrings as
+        # part of a longer read noun: none of the read verbs below contain
+        # them, so any hit here is a real mutation/dispatch.
+        if leaf_word not in {"listreviewcomments", "listcomments", "listreviews"}:
+            return True
+    # Explicit write verbs as whole segments (covers bare names like
+    # "comment", "label", "release" used as shorthand for writes).
+    if leaf_word in {"comment", "label", "release", "write", "submit", "push", "merge", "dispatch", "mutate", "mutation"}:
+        return True
+    for token in _READ_TOKENS:
+        if token in leaf_word or token in full:
+            # A leaf already classified as a mutation above never reaches
+            # here; remaining hits are pure discovery reads.
+            return False
+    # Bare known names keep their exact meaning.
+    if name in {
         "merge", "dispatch", "comment", "label", "review_submit",
         "update_branch", "push", "release", "mutate", "write",
-    }
-    read_actions = {
+    }:
+        return True
+    if name in {
         "read", "list", "get", "discover", "scan", "reconcile_read",
         "status", "check", "poll",
-    }
-    if name in pat_actions:
-        return True
-    if name in read_actions:
+    }:
         return False
     # Fail closed: unknown actions keep PAT semantics rather than silently
     # widening GITHUB_TOKEN use.
@@ -964,6 +1072,7 @@ __all__ = [
     "DISPATCH_GRACE_SECONDS",
     "MAX_INLINE_WAIT_SECONDS",
     "TRUSTED_ASSOCIATIONS",
+    "TRUSTED_OPERATION_CONTEXTS",
     "RETRYABLE_RUN_CONCLUSIONS",
     "KINDS",
     "PR_AGENT_KINDS",
