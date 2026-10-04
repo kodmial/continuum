@@ -1004,8 +1004,16 @@ jobs:
                 } catch (dispatchErr) {
                   const dispatchMessage = String(dispatchErr.message || dispatchErr);
                   const dispatchStatus = Number(dispatchErr.status || 0);
+                  // Narrow input-rejection detection: only a 422 whose
+                  // message names the opaque input (or GitHub's
+                  // unexpected/unknown-input wording) means the wakeup
+                  // target does not accept target_child_id. Any other
+                  // 422 (invalid ref, payload validation) or any message
+                  // merely containing the word "input" is rethrown
+                  // verbatim so reviewers get the true remediation path.
                   const isInputRejection =
-                    dispatchStatus === 422 || /input/i.test(dispatchMessage);
+                    dispatchStatus === 422 &&
+                    /(target_child_id|unexpected\s+inputs?|unknown\s+inputs?|unrecognized\s+inputs?|invalid\s+inputs?|inputs?\s+not\s+(accepted|recognized|allowed|supported))/i.test(dispatchMessage);
                   if (dispatchParams.inputs && isInputRejection) {
                     // A delegated wakeup must never retry bare: a bare
                     // dispatch would wake the execution repository instead of

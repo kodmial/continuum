@@ -331,6 +331,21 @@ jobs:
               `${deduplicatedCount} overlapping suggestion(s) deduplicated.`
             );
 
+      - name: Fail closed when delegated no-progress check lacks PAT
+        if: steps.batch.outputs.empty != 'true'
+        env:
+          TAP_PAT: ${{ secrets.TAP_PAT }}
+        run: |
+          set -euo pipefail
+          # actions/github-script authenticates before the embedded script
+          # runs, so an empty token would surface as a generic octokit auth
+          # error instead of the explicit delegated message. Fail here with
+          # the explicit message before the no-progress read step starts.
+          if [[ "${CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED:-false}" == "true" && -z "${TAP_PAT:-}" ]]; then
+            echo "::error::Delegated PR-Agent execution requires TAP_PAT; refusing to fall back to github.token."
+            exit 1
+          fi
+
       - name: Check durable PR-Agent no-progress state
         if: steps.batch.outputs.empty != 'true'
         id: convergence
@@ -349,8 +364,10 @@ jobs:
           # parsing only against the resolved target). Local same-repository
           # reads use github.token; delegated cross-repository reads require
           # TAP_PAT. The fallback is gated on non-delegated runs so a
-          # delegated run without PAT yields an empty token and fails
-          # explicitly instead of silently reading as github.token.
+          # delegated run without PAT yields an empty token instead of
+          # silently reading as github.token. The guard step above fails
+          # first with the explicit delegated message, before
+          # actions/github-script authenticates with that empty token.
           github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           script: |
             if (process.env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED === 'true' &&
