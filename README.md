@@ -311,9 +311,11 @@ The `core` install supplies the one ordinary `Issue scheduler`; the
 - Every open issue is parent-routed automatically; priority labels are optional
   ordering hints, not admission requirements, and issue-body ownership markers
   are not required.
-- The local issue scheduler remains installed but is fail-safe skipped while
-  `CONTINUUM_ROLE=child`. Manual owner `/oc` and `/opencode` commands still
-  use the existing local OpenCode workflow.
+- The local Issue scheduler remains installed. With `CONTINUUM_ROLE=child`, it
+  never schedules local work: event-driven runs verify the bidirectional
+  relationship and immediately wake the parent scheduler, while child cron runs
+  stay skipped so private runner minutes are not used for polling. Manual owner
+  `/oc` and `/opencode` commands still use the existing local OpenCode workflow.
 - A trusted validation script on the **base** branch is executed against the
   candidate worktree with a minimal `env -i` environment.
 - Discovery is fail-closed: zero or multiple repositories matching the
