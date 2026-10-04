@@ -1935,6 +1935,12 @@ class FallbackPersistentStateTests(unittest.TestCase):
         self.assertIn("safe_to_merge", merge)
 
 class SchedulingSemanticsTests(unittest.TestCase):
+    def test_common_auto_merge_running_pass_is_not_cancelled_by_status_storms(self):
+        body = read_repo(".github/workflows/continuum-auto-merge.yml")
+        self.assertIn("group: ${{ github.workflow }}-auto-merge", body)
+        self.assertIn("cancel-in-progress: false", body)
+        self.assertNotIn("cancel-in-progress: true", body)
+
     """Issue #227: latest-useful-work scheduling without double-queueing.
 
     No-op issue_comment events must never hold a per-PR lock, superseded

@@ -72,12 +72,16 @@ concurrency:
   # same pure latest-state reconciler. It revalidates every gate immediately
   # before each write. Runs are never cancelled: the repository-global group
   # below serializes runs so at most one reconciler executes at a time and a
-  # queued run re-reconciles from latest state when it starts. The in-memory
-  # per-PR/HEAD lease inside the reconciler only coalesces duplicate wakeups
-  # within a single run; cross-run safety comes from that serialization plus
-  # the exact-HEAD re-read and the atomic `sha:` guard on the merge call, so
-  # a stale queued run becomes a safe no-op instead of a concurrent writer.
-  # Repository-global cancellation would let a busy PR starve unrelated PRs
+  # queued run re-reconciles from latest state when it starts. With GitHub's
+  # default single pending slot, newer wake-ups replace older pending work
+  # without cancelling the in-flight scan. The in-memory per-PR/HEAD lease
+  # inside the reconciler only coalesces duplicate wakeups within a single
+  # run; cross-run safety comes from that serialization plus the exact-HEAD
+  # re-read and the atomic `sha:` guard on the merge call, so a stale queued
+  # run becomes a safe no-op instead of a concurrent writer. Cancelling the
+  # running pass let status storms repeatedly abort before later PRs were
+  # reconciled, starving conflict repair and merge progress, and
+  # repository-global cancellation would let a busy PR starve unrelated PRs
   # via repeated cancel/requeue livelock.
   group: ${{ github.workflow }}-auto-merge
   cancel-in-progress: false
