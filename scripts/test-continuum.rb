@@ -1703,19 +1703,25 @@ class ContinuumTest < Minitest::Test
     refute_includes pr_agent, 'Stale admission: caller observed'
 
     assert_includes pr_agent, 'REVIEW_JSON: ${{ steps.pragent.outputs.review }}'
-    assert_includes pr_agent, '"findings": []'
-    assert_includes pr_agent, '"complete": True'
-    assert_includes pr_agent, '"kind": "full"'
+    # The runtime loads the canonical fallback helper from Continuum itself,
+    # so old PR heads cannot keep the broken inline implementation alive.
+    assert_includes pr_agent, 'contents/src/continuum/pr_agent_fallback_state.py'
+    assert_includes pr_agent, 'fallback_pythonpath'
+    assert_includes pr_agent, 'derive_fallback_state'
+    assert_includes pr_agent, 'FallbackStateError'
     # Native state wins when present; otherwise the validated structured
     # review derives an ACTIVE fallback instead of blocking repair.
     assert_includes pr_agent, 'parse_review_state'
-    assert_includes pr_agent, 'reconcile_review_findings'
-    assert_includes pr_agent, 'normalize_finding'
+    refute_includes pr_agent, 'state = reconciled.state'
     refute_includes pr_agent, 'Upstream review has key findings but published no persistent finding state.'
     # Only an unrepresentable finding fails closed; nothing is invented and
     # nothing is marked resolved by the fallback.
-    assert_includes pr_agent, 'represented as persistent finding state; failing closed'
-    assert_includes pr_agent, 'cannot derive fallback state.'
+    assert_includes pr_agent, 'Cannot derive fallback persistent state'
+
+    fallback = File.read(File.join(ROOT, 'src/continuum/pr_agent_fallback_state.py'))
+    assert_includes fallback, '"findings": findings'
+    assert_includes fallback, '"complete": True'
+    assert_includes fallback, '"kind": "full"'
 
     repair = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent-repair.yml'))
     assert_includes repair, 'git clean -fdX',
