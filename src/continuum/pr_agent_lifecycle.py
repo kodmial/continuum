@@ -758,11 +758,11 @@ def caller_review_event_is_actionable(
 ) -> bool:
     """Whether a caller event may invoke the reusable PR-Agent operation layer.
 
-    Mirrors the `jobs.call.if` gate in `pr-agent.yml` and
-    `.github/caller-stubs/continuum-pr-agent.yml`: workflow_dispatch
-    (bounded retries/recovery) is always actionable, while issue_comment is
-    actionable only for an owner `/review` comment on a pull request.
-    Every other event is a no-op that must never hold a per-PR lock.
+    Mirrors the thin-router gate in `continuum-pr-agent-router.yml` (heavy
+    callers are dispatch-only): workflow_dispatch (bounded retries/recovery)
+    is always actionable, while issue_comment is actionable only for an
+    owner `/review` comment on a pull request. Every other event is a no-op
+    that must never create a heavy run or hold a per-PR lock.
     """
 
     name = str(event_name or "").strip()

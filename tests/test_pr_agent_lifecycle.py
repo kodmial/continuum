@@ -1483,8 +1483,13 @@ class RepairWiringRegressionTests(unittest.TestCase):
 
     def test_no_caller_level_per_pr_serialization(self):
         # Issue #227: the caller must not serialize per PR. A caller-level
-        # lock is acquired before admission, so no-op issue_comment runs
-        # would queue ahead of useful exact-HEAD reviews.
+        # lock is acquired before admission, so no-op comment runs would
+        # queue ahead of useful exact-HEAD reviews. Heavy callers are
+        # dispatch-only by design (issue #229): ordinary comments must not
+        # create heavy workflow runs at all. Filtering and coalescing live
+        # in the thin router, so the heavy YAML carries no comment gate.
+        # Every atomic condition of caller_review_event_is_actionable stays
+        # mirrored in the router, not in the heavy caller.
         for path in (
             ".github/workflows/pr-agent.yml",
             ".github/caller-stubs/continuum-pr-agent.yml",
@@ -1494,16 +1499,19 @@ class RepairWiringRegressionTests(unittest.TestCase):
                 self.assertNotIn("pr-agent-caller-", caller)
                 self.assertNotIn("concurrency:", caller)
                 self.assertNotIn("cancel-in-progress", caller)
-                # The /review gate stays: non-actionable comments skip
-                # without ever holding a lock. Every atomic condition of
-                # caller_review_event_is_actionable must stay mirrored in
-                # the YAML gate or the two drift silently.
-                self.assertIn("contains(github.event.comment.body, '/review')", caller)
                 self.assertIn("workflow_dispatch:", caller)
                 self.assertIn("github.event_name == 'workflow_dispatch'", caller)
-                self.assertIn("github.event_name == 'issue_comment'", caller)
-                self.assertIn("github.event.issue.pull_request", caller)
-                self.assertIn("github.actor == github.repository_owner", caller)
+                self.assertNotIn("issue_comment", caller)
+                self.assertNotIn(
+                    "contains(github.event.comment.body, '/review')", caller
+                )
+        router_stub = read_repo(
+            ".github/caller-stubs/continuum-pr-agent-router.yml"
+        )
+        self.assertIn("issue_comment", router_stub)
+        self.assertIn(
+            "contains(github.event.comment.body, '/review')", router_stub
+        )
 
     def test_authoritative_review_serialization_is_cancellable_per_pr(self):
         # Issue #227: the reusable operation layer owns the only per-PR
