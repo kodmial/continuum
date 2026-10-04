@@ -2912,6 +2912,209 @@ class ReviewDispositionIntegrationTests(unittest.TestCase):
         self.assertNotIn("state = reconciled.state", review)
 
 
+class ImproveSkipFailClosedRegressionTests(unittest.TestCase):
+    """Bounded repair for review findings: whole-word tool markers,
+    fail-closed empty coverage, and JS/Python parity for clean-skip,
+    actionable-improve, and exact-HEAD safety."""
+
+    def _life(self):
+        import sys
+
+        sys.path.insert(0, SRC)
+        try:
+            from continuum import pr_agent_lifecycle as life
+        finally:
+            sys.path.remove(SRC)
+        return life
+
+    def _js(self, expression, review=None, state=None, options=None, raw=None):
+        env = os.environ.copy()
+        env["POLICY_MODULE"] = POLICY_MODULE
+        env["POLICY_REVIEW"] = json.dumps(review) if review is not None else ""
+        env["POLICY_STATE"] = json.dumps(state) if state is not None else ""
+        env["POLICY_OPTIONS"] = json.dumps(options or {})
+        env["POLICY_RAW"] = raw if raw is not None else ""
+        env["POLICY_EXPR"] = expression
+        code = r"""
+const policy = require(process.env.POLICY_MODULE);
+const review = process.env.POLICY_REVIEW ? JSON.parse(process.env.POLICY_REVIEW) : null;
+const state = process.env.POLICY_STATE ? JSON.parse(process.env.POLICY_STATE) : null;
+const options = JSON.parse(process.env.POLICY_OPTIONS || '{}');
+const raw = process.env.POLICY_RAW || '';
+let result;
+const expr = process.env.POLICY_EXPR;
+if (expr === 'tool') result = policy.hasToolErrorSignal(review);
+else if (expr === 'coverage') result = policy.hasIncompleteCoverageSignal(review);
+else if (expr === 'security') result = policy.hasBlockingSecuritySignal(review);
+else if (expr === 'unwrap') result = policy.unwrapReview(review);
+else if (expr === 'skipped') result = policy.isSkippedCleanImprovePayload(raw);
+else if (expr === 'skip') result = policy.isCleanReviewForImproveSkip(review, state, options);
+else throw new Error('unknown expr');
+process.stdout.write(JSON.stringify(result === undefined ? null : result));
+"""
+        completed = subprocess.run(
+            ["node", "-e", code],
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        return json.loads(completed.stdout)
+
+    def test_tool_substring_prose_does_not_force_improve(self):
+        life = self._life()
+        clean_extras = (
+            {"errors": "tooling notes in diff"},
+            {"error": "tooling notes in diff"},
+            {"errors": "retold errors"},
+            {"errors": "exceptional handling noted in diff"},
+        )
+        for extra in clean_extras:
+            with self.subTest(extra=extra):
+                review = make_review([], extra=extra)
+                self.assertFalse(life.has_tool_error_signal(review))
+                self.assertFalse(self._js("tool", review=review))
+                decision = life.should_skip_improve(
+                    review,
+                    make_persistent([], head_sha="abc"),
+                    head_matches=True,
+                    review_coverage_complete=True,
+                    reviewed_head_sha="abc",
+                )
+                self.assertTrue(decision["skip"])
+                js = run_skip_policy(
+                    review,
+                    make_persistent([], head_sha="abc"),
+                    {"headMatches": True, "reviewCoverageComplete": True, "reviewedHeadSha": "abc"},
+                )
+                self.assertTrue(js["skip"])
+        explicit_extras = (
+            {"errors": "upstream tool failed"},
+            {"error": "upstream tools failed"},
+            {"errors": "tool timeout contacting model"},
+        )
+        for extra in explicit_extras:
+            with self.subTest(extra=extra):
+                review = make_review([], extra=extra)
+                self.assertTrue(life.has_tool_error_signal(review))
+                self.assertTrue(self._js("tool", review=review))
+
+    def test_empty_explicit_coverage_fails_closed(self):
+        life = self._life()
+        for key in ("review_coverage_complete", "coverage_complete", "coverage_completed"):
+            for empty in ("", "   "):
+                with self.subTest(key=key, empty=repr(empty)):
+                    review = make_review([], extra={key: empty})
+                    self.assertTrue(life.has_incomplete_coverage_signal(review))
+                    self.assertTrue(self._js("coverage", review=review))
+                    decision = life.should_skip_improve(
+                        review,
+                        make_persistent([], head_sha="abc"),
+                        head_matches=True,
+                        review_coverage_complete=True,
+                        reviewed_head_sha="abc",
+                    )
+                    self.assertFalse(decision["skip"])
+                    js = run_skip_policy(
+                        review,
+                        make_persistent([], head_sha="abc"),
+                        {"headMatches": True, "reviewCoverageComplete": True, "reviewedHeadSha": "abc"},
+                    )
+                    self.assertFalse(js["skip"])
+        # None stays fail-closed as before.
+        review = make_review([], extra={"coverage_complete": None})
+        self.assertTrue(life.has_incomplete_coverage_signal(review))
+        self.assertTrue(self._js("coverage", review=review))
+
+    def test_clean_skip_actionable_improve_and_exact_head_parity(self):
+        life = self._life()
+        state = make_persistent([], head_sha="abc")
+        opts = {"headMatches": True, "reviewCoverageComplete": True, "reviewedHeadSha": "abc"}
+        clean = make_review([])
+        self.assertTrue(
+            life.should_skip_improve(
+                clean, state, head_matches=True,
+                review_coverage_complete=True, reviewed_head_sha="abc",
+            )["skip"]
+        )
+        self.assertTrue(self._js("skip", review=clean, state=state, options=opts)["skip"])
+        # Actionable reviews must run improve in both stacks.
+        actionable = [
+            make_review([issue_entry(n=0)]),
+            make_review([], recommendation="merge_with_caution"),
+            make_review([], recommendation="changes_required"),
+            make_review([issue_entry(n=i) for i in range(6)]),
+            make_review([], extra={"security_concerns": ["hardcoded credential"]}),
+        ]
+        for review in actionable:
+            with self.subTest(review=review):
+                self.assertFalse(
+                    life.should_skip_improve(
+                        review, state, head_matches=True,
+                        review_coverage_complete=True, reviewed_head_sha="abc",
+                    )["skip"]
+                )
+                self.assertFalse(
+                    self._js("skip", review=review, state=state, options=opts)["skip"]
+                )
+        # Exact-HEAD safety: stale head, placeholder heads, and missing
+        # reviewed HEAD never skip in either stack.
+        stale = life.should_skip_improve(
+            clean, state, head_matches=False,
+            review_coverage_complete=True, reviewed_head_sha="abc",
+        )
+        self.assertFalse(stale["skip"])
+        self.assertFalse(
+            self._js(
+                "skip", review=clean, state=state,
+                options={"headMatches": False, "reviewCoverageComplete": True, "reviewedHeadSha": "abc"},
+            )["skip"]
+        )
+        for bad_head in ("unknown", "HEAD", ""):
+            with self.subTest(bad_head=bad_head):
+                bad_state = make_persistent([], head_sha=bad_head or "unknown")
+                decision = life.should_skip_improve(
+                    clean, bad_state, head_matches=True,
+                    review_coverage_complete=True, reviewed_head_sha=bad_head or "unknown",
+                )
+                self.assertFalse(decision["skip"])
+        with self.assertRaises(life.LifecycleError):
+            life.should_skip_improve(
+                clean, state, head_matches=True, review_coverage_complete=True,
+            )
+        missing = run_skip_policy_raw(
+            json.dumps(clean), json.dumps(state),
+            {"headMatches": True, "reviewCoverageComplete": True},
+        )
+        self.assertIn("threw", missing)
+
+    def test_split_envelope_merges_fail_closed_in_both_stacks(self):
+        life = self._life()
+        nested_findings = {"review": make_review([issue_entry(n=0)])}
+        nested_findings["coverage_complete"] = True
+        merged = life._unwrap_review(nested_findings)
+        self.assertEqual(len(merged["key_issues_to_review"]), 1)
+        js_merged = self._js("unwrap", review=nested_findings)
+        self.assertEqual(len(js_merged["key_issues_to_review"]), 1)
+        # Nested blocking security must block the merged view.
+        split_security = {"review": make_review([], extra={"security_concerns": ["leak"]})}
+        self.assertTrue(life.has_blocking_security_signal(split_security))
+        self.assertTrue(self._js("security", review=split_security))
+        # Nested tool failure must block the merged view.
+        split_tool = {"review": make_review([], extra={"errors": "upstream tool failed"})}
+        self.assertTrue(life.has_tool_error_signal(split_tool))
+        self.assertTrue(self._js("tool", review=split_tool))
+        # Nested incomplete coverage must read as incomplete.
+        split_coverage = {"review": make_review([], extra={"coverage_complete": ""})}
+        self.assertTrue(life.has_incomplete_coverage_signal(split_coverage))
+        self.assertTrue(self._js("coverage", review=split_coverage))
+        # Skipped-clean marker payload stays machine-readable.
+        skipped = '{"payload": {"code_suggestions": []}, "continuum": {"improve_skipped_clean": true}}'
+        self.assertTrue(self._js("skipped", raw=skipped))
+        self.assertFalse(self._js("skipped", raw='{"payload": {"code_suggestions": []}}'))
+
 class IncompleteNativePersistentStateContractTests(unittest.TestCase):
     """Issue #252: an incomplete native marker cannot dead-end routing."""
 

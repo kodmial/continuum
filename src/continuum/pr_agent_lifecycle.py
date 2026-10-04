@@ -375,12 +375,16 @@ _GENERIC_TOOL_ERROR_KEYS = (
     "error",
 )
 
-# Substrings marking explicit tool-failure prose inside a generic
-# `errors`/`error` value. Matched case-insensitively against the raw text;
-# negation/empty prose is already excluded by _security_value_is_blocking
-# before this check runs.
+# Tool-failure words marking explicit tool-failure prose inside a generic
+# `errors`/`error` value. Matched as whole words (case-insensitive) against
+# the raw text; negation/empty prose is already excluded by
+# _security_value_is_blocking before this check runs. Whole-word matching
+# keeps ordinary summaries containing `tool` as a substring (e.g. "tooling
+# notes in diff") clean while still catching explicit prose such as
+# "upstream tool failed".
 _GENERIC_TOOL_FAILURE_MARKERS = (
     "tool",
+    "tools",
     "failed",
     "failure",
     "timeout",
@@ -388,6 +392,10 @@ _GENERIC_TOOL_FAILURE_MARKERS = (
     "traceback",
     "exception",
     "unavailable",
+)
+
+_GENERIC_TOOL_FAILURE_PATTERNS = tuple(
+    re.compile(r"\b" + re.escape(marker) + r"\b") for marker in _GENERIC_TOOL_FAILURE_MARKERS
 )
 
 # Review-payload keys that carry an explicit coverage signal. Explicit
@@ -436,8 +444,9 @@ def _is_generic_tool_failure_text(value: object) -> bool:
     """Whether a generic `errors`/`error` value reports a tool failure.
 
     Negation/empty prose is clean (no signal). Any other value must
-    explicitly mention a tool-failure marker to count: ordinary code-error
-    summaries such as "2 lint errors noted in diff" stay clean.
+    explicitly mention a tool-failure word (whole-word match) to count:
+    ordinary code-error summaries such as "2 lint errors noted in diff"
+    or "tooling notes in diff" stay clean.
     """
 
     if isinstance(value, Mapping):
@@ -451,7 +460,7 @@ def _is_generic_tool_failure_text(value: object) -> bool:
     if not _security_value_is_blocking(value):
         return False
     lowered = value.strip().lower()
-    return any(marker in lowered for marker in _GENERIC_TOOL_FAILURE_MARKERS)
+    return any(pattern.search(lowered) is not None for pattern in _GENERIC_TOOL_FAILURE_PATTERNS)
 
 
 def has_tool_error_signal(review: Mapping[str, Any]) -> bool:
@@ -547,7 +556,9 @@ def _coverage_flag_value_is_incomplete(key: str, value: object) -> bool:
     if isinstance(value, str):
         lowered = value.strip().lower()
         if not lowered:
-            return False
+            # An explicit coverage key with an empty value is not evidence
+            # of complete coverage: fail closed like None.
+            return True
         if lowered in ("0", "false", "no"):
             return True
         if lowered in ("1", "true", "yes"):

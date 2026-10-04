@@ -357,11 +357,15 @@ const TOOL_ERROR_SIGNAL_KEYS = [
 // skip when otherwise clean.
 const GENERIC_TOOL_ERROR_KEYS = ['errors', 'error'];
 
-// Substrings marking explicit tool-failure prose inside a generic
-// `errors`/`error` value (case-insensitive). Negation/empty prose is
-// already excluded by securityValueIsBlocking before this check runs.
+// Words marking explicit tool-failure prose inside a generic
+// `errors`/`error` value (whole-word, case-insensitive). Negation/empty
+// prose is already excluded by securityValueIsBlocking before this check
+// runs. Whole-word matching keeps ordinary summaries containing `tool` as
+// a substring (e.g. "tooling notes in diff") clean while still catching
+// explicit prose such as "upstream tool failed".
 const GENERIC_TOOL_FAILURE_MARKERS = [
   'tool',
+  'tools',
   'failed',
   'failure',
   'timeout',
@@ -370,6 +374,14 @@ const GENERIC_TOOL_FAILURE_MARKERS = [
   'exception',
   'unavailable',
 ];
+
+function escapeRegExp(text) {
+  return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+const GENERIC_TOOL_FAILURE_PATTERNS = GENERIC_TOOL_FAILURE_MARKERS.map(
+  (marker) => new RegExp(`\\b${escapeRegExp(marker)}\\b`, 'i')
+);
 
 function isGenericToolFailureText(value) {
   if (Array.isArray(value)) {
@@ -383,8 +395,8 @@ function isGenericToolFailureText(value) {
   }
   if (typeof value !== 'string') return false;
   if (!securityValueIsBlocking(value)) return false;
-  const lowered = value.trim().toLowerCase();
-  return GENERIC_TOOL_FAILURE_MARKERS.some((marker) => lowered.includes(marker));
+  const text = value.trim();
+  return GENERIC_TOOL_FAILURE_PATTERNS.some((pattern) => pattern.test(text));
 }
 
 const COVERAGE_FLAG_KEYS = [
@@ -478,7 +490,9 @@ function coverageFlagValueIsIncomplete(key, value) {
   if (value === null || value === undefined) return true;
   if (typeof value === 'string') {
     const lowered = value.trim().toLowerCase();
-    if (!lowered) return false;
+    // An explicit coverage key with an empty value is not evidence of
+    // complete coverage: fail closed like null/undefined.
+    if (!lowered) return true;
     if (['0', 'false', 'no'].includes(lowered)) return true;
     if (['1', 'true', 'yes'].includes(lowered)) return false;
     const numeric = Number(lowered);
