@@ -3061,7 +3061,7 @@ class ContinuumTest < Minitest::Test
       readGithub.rest.actions.listWorkflowRunsForRepo
     ].each { |call| assert_includes scheduler, call }
 
-    child = scheduler[/if \(candidate\.source === 'child'\).*?continue;\n              \}/m]
+    child = scheduler[/const \[childOwner, childRepo\] = parts;.*?await dispatchWorkflow\(childWorkerWorkflow/m]
     refute_nil child
     assert_includes child, 'const freshResponse = await github.rest.issues.get({'
     assert_includes child, 'const childNativeBlockers = await github.paginate('
