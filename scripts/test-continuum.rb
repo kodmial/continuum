@@ -1862,11 +1862,10 @@ class ContinuumTest < Minitest::Test
     assert_includes after, 'PR head moved during review'
     assert_includes moved, 'the review is stale'
 
-    # Mixed read/write/dispatch and cross-repo paths remain PAT-backed.
-    # kodmial/continuum#231 splits the former combined review+improve tool
-    # step: review stays unconditional on the admitted HEAD while automatic
-    # improve runs only when the authoritative review still carries repair
-    # value. Both native tool executions remain PAT-backed.
+    # Review-side same-repository control-plane work is repository-token
+    # backed. Repair/push remains in the separate repair workflow and keeps
+    # its stronger credential contract. The review workflow must not consume
+    # the shared user PAT even for bounded workflow_dispatch recovery.
     runtime = step_body(body, 'Resolve the Continuum-owned PR-Agent runtime bundle')
     retry_step = step_body(body, 'Schedule bounded retry for retryable PR-Agent review failure')
     review_tool = step_body(body, 'Run upstream full review on the exact HEAD')
@@ -1877,29 +1876,29 @@ class ContinuumTest < Minitest::Test
     [runtime, retry_step, review_tool, improve_tool, in_flight, normalize, publish].each { |step| refute_nil step }
     refute_includes body, 'Run upstream full review and full improve on the exact HEAD',
                       'issue #231 splits review and conditional improve; the combined step must stay removed'
-    assert_includes runtime, 'GH_TOKEN: ${{ secrets.TAP_PAT }}',
-                    'runtime-bundle fetch can be cross-repository; it must stay PAT-backed'
+    assert_includes runtime, 'GH_TOKEN: ${{ github.token }}',
+                    'public Continuum runtime-bundle fetch must not consume shared PAT quota'
     assert_includes runtime, 'repos/kodmial/continuum/contents'
-    assert_includes retry_step, 'GH_TOKEN: ${{ secrets.TAP_PAT }}',
-                    'the retry step mixes reads with workflow dispatch; it must stay wholly PAT-backed'
+    assert_includes retry_step, 'GH_TOKEN: ${{ github.token }}',
+                    'bounded same-repo workflow_dispatch must use repository token'
     assert_includes retry_step, 'gh workflow run'
-    refute_includes retry_step, 'github.token',
-                      'the retry step must not be partially migrated to github.token'
     refute_includes before, 'gh workflow run',
                       'the pre-review revalidation must stay read-only'
     refute_includes moved, 'gh workflow run',
                       'the moved-head check must stay read-only'
-    assert_includes review_tool, 'GITHUB__USER_TOKEN: ${{ secrets.TAP_PAT }}',
-                     'PR-Agent review tool execution credentials must stay PAT-backed'
-    assert_includes improve_tool, 'GITHUB__USER_TOKEN: ${{ secrets.TAP_PAT }}',
-                     'PR-Agent improve tool execution credentials must stay PAT-backed'
-    assert_includes in_flight, 'github-token: ${{ secrets.TAP_PAT }}',
-                    'commit-status publishing must stay PAT-backed'
-    assert_includes normalize, 'github-token: ${{ secrets.TAP_PAT }}',
-                    'comment deletion steps must stay PAT-backed'
+    assert_includes review_tool, 'GITHUB__USER_TOKEN: ${{ github.token }}',
+                     'PR-Agent review tool execution must use repository token'
+    assert_includes improve_tool, 'GITHUB__USER_TOKEN: ${{ github.token }}',
+                     'PR-Agent improve tool execution must use repository token'
+    assert_includes in_flight, 'github-token: ${{ github.token }}',
+                    'commit-status publishing must use repository token'
+    assert_includes normalize, 'github-token: ${{ github.token }}',
+                    'comment maintenance must use repository token'
     assert_includes normalize, 'deleteComment'
-    assert_includes publish, 'github-token: ${{ secrets.TAP_PAT }}',
-                    'commit-status publishing must stay PAT-backed'
+    assert_includes publish, 'github-token: ${{ github.token }}',
+                    'commit-status publishing must use repository token'
+    refute_includes body, 'secrets.TAP_PAT',
+                    'review workflow must be completely isolated from shared user PAT quota'
   end
 
   # Work-Lock #58 item 5 (conservative subset, kodmial/continuum#236): only
