@@ -871,23 +871,35 @@ jobs:
                 return;
               }
               const attemptMarker = conflictAttemptMarker(fresh.head.sha);
-              // Bounded idempotency scan (#254): the attempt marker for
-              // this HEAD is written by this flow's own prior run, so the
-              // newest ten pages preserve the one-attempt-per-HEAD budget
-              // without walking full history (`listComments` ignores
-              // `sort`/`direction`, so count down from the last page via
-              // the total instead).
+              // Bounded idempotency scan (#254): newest ten pages via the
+              // total. Fail closed: truncated (>10) or unreadable window
+              // may hide the HEAD marker, so treat it as seen.
               const priorComments = [];
               const total = (await github.rest.issues.get({ owner, repo, issue_number: prNumber })).data.comments || 0;
               const lastPage = Math.max(1, Math.ceil(total / 100));
+              if (lastPage > 10) {
+                await releaseConflictLock();
+                core.warning('PR #' + prNumber + ' HEAD ' + fresh.head.sha + ': marker window truncated; assuming attempted.');
+                return;
+              }
+              let unknown = false;
               for (let page = 1; page <= 10; page += 1) {
                 const targetPage = lastPage - (page - 1);
                 if (targetPage < 1) break;
-                const { data } = await github.rest.issues.listComments(
-                  { owner, repo, issue_number: prNumber, per_page: 100, page: targetPage }
-                );
-                if (!Array.isArray(data) || data.length === 0) continue;
-                priorComments.push(...data);
+                let d;
+                try {
+                  ({ data: d } = await github.rest.issues.listComments(
+                    { owner, repo, issue_number: prNumber, per_page: 100, page: targetPage }
+                  ));
+                } catch (err) { unknown = true; break; }
+                if (!Array.isArray(d)) { unknown = true; break; }
+                if (d.length === 0) continue;
+                priorComments.push(...d);
+              }
+              if (unknown) {
+                await releaseConflictLock();
+                core.warning('PR #' + prNumber + ' HEAD ' + fresh.head.sha + ': marker window unknown; assuming attempted.');
+                return;
               }
               if (priorComments.some(comment =>
                 String(comment.body || '').includes(attemptMarker)

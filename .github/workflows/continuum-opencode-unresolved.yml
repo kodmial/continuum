@@ -89,6 +89,16 @@ jobs:
           fi
           FIRST_PAGE=$(( LAST_PAGE - MAX_PAGES + 1 ))
           [[ "$FIRST_PAGE" -ge 1 ]] || FIRST_PAGE=1
+          # The page-1 probe above costs one request even when the newest
+          # window starts after page 1 (its body is then never reused).
+          # Keep the worst case at MAX_PAGES total requests by shrinking
+          # the window one page (dropping the oldest, keeping the newest)
+          # when the probe falls outside it.
+          PROBE_EXTRA=0
+          if [[ "$FIRST_PAGE" -gt 1 ]]; then
+            PROBE_EXTRA=1
+            FIRST_PAGE=$(( FIRST_PAGE + 1 ))
+          fi
           COMMENT_PAGES=""
           page="$FIRST_PAGE"
           while [[ "$page" -le "$LAST_PAGE" ]]; do
@@ -147,7 +157,7 @@ jobs:
           echo "dispatch=true" >> "$GITHUB_OUTPUT"
           echo "review_id=$REVIEW_ID" >> "$GITHUB_OUTPUT"
           echo "Matched UNRESOLVED comment $UNRESOLVED_COMMENT_ID to finding $FINDING_ID, review $REVIEW_ID, HEAD $HEAD_SHA."
-          echo "continuum-api-budget: comment_pages=$(( LAST_PAGE - FIRST_PAGE + 1 )) max_pages=${MAX_PAGES} raw_CONTINUUM_MAX_COMMENT_PAGES=${CONTINUUM_MAX_COMMENT_PAGES:-5}"
+          echo "continuum-api-budget: comment_pages=$(( LAST_PAGE - FIRST_PAGE + 1 + PROBE_EXTRA )) max_pages=${MAX_PAGES} raw_CONTINUUM_MAX_COMMENT_PAGES=${CONTINUUM_MAX_COMMENT_PAGES:-5}"
 
       - name: Dispatch OpenCode retry
         if: steps.context.outputs.dispatch == 'true'

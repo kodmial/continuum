@@ -538,13 +538,30 @@ jobs:
             [[ "$first" -ge 1 ]] || first=1
             page="$first"
             while [[ "$page" -le "$last" ]]; do
+              # Fail closed: a missed page may hold a repair/transient
+              # marker, so a fetch/parse gap must exhaust the budget
+              # instead of returning the remaining pages as authoritative
+              # (which would undercount and permit an extra repair/retry).
               if ! page_json="$(continuum_api_get "repos/$repo/issues/$issue/comments?per_page=100&page=${page}" 2>/dev/null)"; then
+                echo "::error::Newest comment page ${page} could not be retrieved; failing closed without repair." >&2
+                return 1
+              fi
+              if ! count="$(jq 'length' <<<"$page_json" 2>/dev/null)"; then
+                echo "::error::Newest comment page ${page} could not be parsed; failing closed without repair." >&2
+                return 1
+              fi
+              [[ "$count" =~ ^[0-9]+$ ]] || {
+                echo "::error::Newest comment page ${page} could not be parsed; failing closed without repair." >&2
+                return 1
+              }
+              if [[ "$count" -eq 0 ]]; then
+                if [[ "$total" -gt 0 ]]; then
+                  echo "::error::Newest comment page ${page} is unexpectedly empty; failing closed without repair." >&2
+                  return 1
+                fi
                 page=$((page + 1))
                 continue
               fi
-              count="$(jq 'length' <<<"$page_json" 2>/dev/null || echo 0)"
-              [[ "$count" =~ ^[0-9]+$ ]] || { page=$((page + 1)); continue; }
-              [[ "$count" -gt 0 ]] || { page=$((page + 1)); continue; }
               pages_out+="$page_json"$'\n'
               page=$((page + 1))
             done
