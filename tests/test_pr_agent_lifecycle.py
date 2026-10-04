@@ -28,7 +28,18 @@ SRC = os.path.join(ROOT, "src")
 # continuum-opencode.yml, so the pre-#248 zero-diff assertion from 87d139b is
 # stale. Keeping the immutable commit baseline means any later
 # protected-file drift still fails.
-BASELINE_SHA = "3df3b1e231c395d425385107e9dea03a8911274d"
+# Intentional baseline advance to 1a93faa (main): 1a93faa keeps OpenCode
+# recovery automatic across stale locks and exhaustion and deliberately
+# changes the PAUSE_ON_FAILURE default from 'true' to 'false' in
+# continuum-opencode.yml (env default plus the JS
+# `(process.env.PAUSE_ON_FAILURE || 'false') !== 'false'` fallback).
+# scripts/test-continuum.rb on current main requires the 'false' default, so
+# a zero-diff assertion pinned at 3df3b1e (which expects 'true') is stale and
+# contradicts the current implementation contract. Authoritative task
+# kodmial/continuum#179 owns the prepared agent runtime and never touches
+# PAUSE_ON_FAILURE, so this advance does not narrow #179. Any other
+# protected-file drift beyond the #179 probe still fails.
+BASELINE_SHA = "1a93faa10739ca104be871093908b5d15cad1d4a"
 
 PROTECTED_FILES = [
     ".github/workflows/continuum-opencode.yml",
