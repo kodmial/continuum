@@ -2036,26 +2036,27 @@ class ContinuumTest < Minitest::Test
                     'router must coalesce duplicate exact-HEAD dispatches'
     assert_includes router, 'coalesced a duplicate dispatch',
                     'router must log coalesced duplicates instead of dispatching'
-    # Same-repo discovery/coalescing is read-only and must not consume the
-    # shared PAT quota. The PAT-backed client is reserved for workflow dispatch.
-    assert_includes router, 'READ_GITHUB_TOKEN: ${{ github.token }}',
-                    'router same-repo reads must use the repository token'
-    assert_includes router, 'new github.constructor(',
-                    'router must build a dedicated repository-token read client'
-    assert_includes router, 'readGithub.rest.pulls.get(',
+    # The same-repo router uses only the repository-scoped token. GitHub
+    # explicitly permits workflow_dispatch events created with GITHUB_TOKEN,
+    # so the shared user PAT is unnecessary here.
+    assert_includes router, 'actions: write',
+                    'router needs least-privilege Actions write for workflow_dispatch'
+    assert_includes router, 'github-token: ${{ github.token }}',
+                    'router must authenticate reads and dispatch with GITHUB_TOKEN'
+    refute_includes router, 'secrets.TAP_PAT',
+                    'router must not consume the shared user PAT'
+    assert_includes router, 'github.rest.pulls.get(',
                     'PR metadata read must use repository token'
-    assert_includes router, 'readGithub.rest.actions.listWorkflowRuns(',
+    assert_includes router, 'github.rest.actions.listWorkflowRuns(',
                     'active-run coalescing read must use repository token'
     refute_includes router, 'github.paginate(',
                     'router must not scan unbounded workflow history'
-    refute_includes router, 'github.rest.actions.listWorkflowRuns(',
-                    'PAT-backed client must not perform coalescing reads'
     assert_includes router, "event: 'workflow_dispatch'",
                     'router active-run lookup must stay scoped to dispatch runs'
     assert_includes router, 'page: 1',
                     'router active-run lookup must remain bounded to one page'
     assert_includes router, 'github.rest.actions.createWorkflowDispatch(',
-                    'dispatch mutation must remain PAT-backed'
+                    'same-repo workflow dispatch must use repository token'
     # The router never holds a per-PR lock: the actionable filter and the
     # operation-key coalescing run inside the route step, so a plain
     # non-/review comment run can never queue ahead of a useful dispatch.
