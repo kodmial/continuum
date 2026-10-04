@@ -600,6 +600,240 @@ class PrAgentWorkflowContractTests(unittest.TestCase):
         self.assertIn("truncated/invalid improve payload", merge)
         self.assertIn("incomplete improve coverage", merge)
 
+    def test_gated_improve_steps_and_policy_sync_are_wired(self):
+        body = self._read(".github", "workflows", "continuum-pr-agent.yml")
+        self.assertIn("improve_gate", body)
+        self.assertIn("improve_skipped", body)
+        self.assertIn("isCleanReviewForImproveSkip", body)
+        self.assertIn("policy bundle is missing export", body)
+        merge = self._read(
+            ".github", "workflows", "continuum-pr-agent-auto-merge.yml"
+        )
+        self.assertIn("hasToolErrorSignal", merge)
+        self.assertIn("hasIncompleteCoverageSignal", merge)
+        self.assertIn("hasBlockingSecuritySignal", merge)
+        self.assertIn("tool error: failing closed", merge)
+        self.assertIn("incomplete review coverage: failing closed", merge)
+        self.assertIn("blocking security signal remains", merge)
+
+
+class SecurityNormalizationRegressionTests(unittest.TestCase):
+    """Regression cover for security-text normalization fail-closed behavior.
+
+    A change to CLEAN_SECURITY_TEXTS, suffix handling, punctuation folding,
+    or nested/typed security values must not silently let a dirty review
+    skip improve or block a clean review.
+    """
+
+    def test_negation_prose_variants_stay_clean(self):
+        for text in (
+            "No",
+            "NONE",
+            "n/a",
+            "N/A.",
+            "None",
+            "No security concerns found",
+            "No security concerns detected",
+            "No security concerns identified",
+            "No security concerns observed",
+            "none found",
+            "no findings",
+            "  No   Issues  ",
+            "no tool errors",
+            "",
+            "null",
+            "false",
+            "OK",
+        ):
+            with self.subTest(text=text):
+                review = make_review([], extra={"security_concerns": text})
+                self.assertFalse(run_js("security", review=review))
+                result = run_js(
+                    "skip",
+                    review=review,
+                    state=make_persistent([], head_sha="abc1234"),
+                    options=dict(CLEAN_OPTS),
+                )
+                self.assertTrue(result["skip"], result["reason"])
+
+    def test_non_negation_prose_blocks_fail_closed(self):
+        for text in (
+            "hardcoded credential",
+            "No security concerns, but hardcoded credential present",
+            "No major issues but review needed",
+            "all clear!",
+            "no security concerns at all?? see details",
+        ):
+            with self.subTest(text=text):
+                review = make_review([], extra={"security_concerns": text})
+                self.assertTrue(run_js("security", review=review))
+                result = run_js(
+                    "skip",
+                    review=review,
+                    state=make_persistent([], head_sha="abc1234"),
+                    options=dict(CLEAN_OPTS),
+                )
+                self.assertFalse(result["skip"])
+
+    def test_typed_and_nested_security_values(self):
+        blocking = (
+            True,
+            1,
+            ["hardcoded credential"],
+            {"detail": "leak"},
+            ["No concerns", "leak"],
+        )
+        for value in blocking:
+            with self.subTest(value=value):
+                review = make_review([], extra={"security_concerns": value})
+                self.assertTrue(run_js("security", review=review))
+        clean = (False, 0, [], {}, ["No concerns", "none found"], "")
+        for value in clean:
+            with self.subTest(value=value):
+                review = make_review([], extra={"security_concerns": value})
+                self.assertFalse(run_js("security", review=review))
+
+
+class CoverageFlagRegressionTests(unittest.TestCase):
+    """Regression cover for coverage-flag handling fail-closed behavior.
+
+    Unknown strings, unparseable counts, and unrecognized shapes must read
+    as incomplete; generic prose keys must not block clean reviews.
+    """
+
+    def test_explicit_and_generic_flags(self):
+        incomplete = [
+            {"coverage_complete": False},
+            {"coverage_complete": "false"},
+            {"coverage_complete": "no"},
+            {"coverage_complete": "maybe"},
+            {"coverage_complete": ""},
+            {"coverage_complete": 0},
+            {"truncated": ""},
+            {"truncated": True},
+            {"truncated": "yes"},
+            {"complete": False},
+            {"coverage": {}},
+            {"coverage": "full"},
+            {"coverage": {"reviewed": 3, "total": 5}},
+            {"coverage": {"reviewed": "n/a", "total": 5}},
+        ]
+        for extra in incomplete:
+            with self.subTest(extra=extra):
+                review = make_review([], extra=extra)
+                self.assertTrue(run_js("coverage", review=review))
+                result = run_js(
+                    "skip",
+                    review=review,
+                    state=make_persistent([], head_sha="abc1234"),
+                    options=dict(CLEAN_OPTS),
+                )
+                self.assertFalse(result["skip"])
+
+    def test_complete_and_prose_shapes_stay_clean(self):
+        clean = [
+            {"coverage_complete": True},
+            {"coverage_complete": "yes"},
+            {"coverage_complete": "1"},
+            {"coverage_complete": 1},
+            {"truncated": False},
+            {"truncated": "false"},
+            # Generic keys carry prose as often as coverage state.
+            {"complete": "completed review summary"},
+            {"complete": "yes"},
+            {"coverage": {"reviewed": 5, "total": 5}},
+        ]
+        for extra in clean:
+            with self.subTest(extra=extra):
+                review = make_review([], extra=extra)
+                self.assertFalse(run_js("coverage", review=review))
+        # Absent coverage keys carry no incomplete signal; the explicit
+        # reviewCoverageComplete flag still gates the skip separately.
+        self.assertFalse(run_js("coverage", review=make_review([])))
+        without_flag = dict(CLEAN_OPTS)
+        without_flag["reviewCoverageComplete"] = False
+        result = run_js(
+            "skip",
+            review=make_review([]),
+            state=make_persistent([], head_sha="abc1234"),
+            options=without_flag,
+        )
+        self.assertFalse(result["skip"])
+
+
+class SplitEnvelopeMergeRegressionTests(unittest.TestCase):
+    """Regression cover for split-envelope merge fail-closed behavior."""
+
+    def test_unknown_recommendation_prose_wins_most_restrictive(self):
+        split = {
+            "merge_recommendation": "safe_to_merge",
+            "key_issues_to_review": [],
+            "review": make_review([], recommendation="needs_work"),
+        }
+        merged = run_js("unwrap", review=split)
+        self.assertEqual(merged["merge_recommendation"], "needs_work")
+        split2 = {
+            "merge_recommendation": "merge_with_caution",
+            "key_issues_to_review": [],
+            "review": make_review([], recommendation="needs_work"),
+        }
+        self.assertEqual(
+            run_js("unwrap", review=split2)["merge_recommendation"],
+            "needs_work",
+        )
+
+    def test_non_list_findings_shape_surfaces_fail_closed(self):
+        split = {
+            "merge_recommendation": "safe_to_merge",
+            "key_issues_to_review": "bad",
+            "review": make_review([issue_entry(n=0)]),
+        }
+        merged = run_js("unwrap", review=split)
+        self.assertEqual(merged["key_issues_to_review"], "bad")
+        result = run_js(
+            "skip",
+            review=split,
+            state=make_persistent([], head_sha="abc1234"),
+            options=dict(CLEAN_OPTS),
+        )
+        self.assertFalse(result["skip"])
+
+    def test_either_side_blocking_security_tool_coverage_blocks(self):
+        outer_blocking = make_review([], extra={"security_concerns": "leak"})
+        outer_blocking["review"] = make_review(
+            [], extra={"security_concerns": "No concerns"}
+        )
+        self.assertTrue(run_js("security", review=outer_blocking))
+        outer_clean = {"coverage_complete": True}
+        outer_clean.update(
+            {"review": make_review([], extra={"coverage_complete": ""})}
+        )
+        self.assertTrue(run_js("coverage", review=outer_clean))
+        merged = run_js("unwrap", review=outer_clean)
+        self.assertEqual(merged["coverage_complete"], "")
+
+    def test_skipped_marker_edge_shapes(self):
+        multi = (
+            '{"payload": {"code_suggestions": []}, '
+            '"continuum": {"improve_skipped_clean": true}}\n'
+            '{"payload": {"code_suggestions": []}}'
+        )
+        self.assertTrue(run_js("skipped", raw=multi))
+        self.assertFalse(
+            run_js(
+                "skipped",
+                raw='{"payload": {"code_suggestions": []}, '
+                '"continuum": {"improve_skipped_clean": false}}',
+            )
+        )
+        with self.assertRaises(Exception):
+            run_js(
+                "disposition",
+                review=make_review([]),
+                raw='{"payload": {"code_suggestions": []}, '
+                '"continuum": {"improve_skipped_clean": true},',
+            )
+
 
 class PythonDirectPolicyTests(unittest.TestCase):
     """Direct Python coverage for the parity helpers (no node subprocess).
