@@ -107,6 +107,18 @@ jobs:
             -f ref="$CONTINUUM_REF" --jq .content \
             | tr -d '\n' | base64 --decode > "$POLICY_SCRIPT"
           node --check "$POLICY_SCRIPT"
+          # Policy-bundle sync: the repair batch requires buildRepairBatch
+          # (which merges split review envelopes fail-closed). Validate now
+          # so a stale bundle fails closed here instead of in the batch.
+          POLICY_SCRIPT="$POLICY_SCRIPT" node -e '
+            const p = require(process.env.POLICY_SCRIPT);
+            for (const key of ["buildRepairBatch", "unwrapReview"]) {
+              if (typeof p[key] !== "function") {
+                console.error("::error::Continuum PR-Agent policy bundle is missing export: " + key);
+                process.exit(1);
+              }
+            }
+          '
           echo "policy_script=$POLICY_SCRIPT" >> "$GITHUB_OUTPUT"
 
       - name: Build one bounded repair batch from native outputs
@@ -141,12 +153,6 @@ jobs:
               review = JSON.parse(String(process.env.REVIEW_JSON || ''));
             } catch (err) {
               core.setFailed(`Invalid PR-Agent review JSON: ${err.message}`);
-              return;
-            }
-            const inner = review.review || review;
-            const keyIssues = inner.key_issues_to_review;
-            if (!Array.isArray(keyIssues)) {
-              core.setFailed('PR-Agent review JSON has no key_issues_to_review list.');
               return;
             }
             // Centralized Work Lock #37 policy owns the autonomous /improve
@@ -205,7 +211,7 @@ jobs:
             core.setOutput('batch', JSON.stringify(items));
             core.setOutput('deduplicated_suggestions', String(deduplicatedCount));
             core.notice(
-              `PR #${prNumber} HEAD ${headSha}: batching ${keyIssues.length} review finding(s) ` +
+              `PR #${prNumber} HEAD ${headSha}: batching ${batch.reviewCount} review finding(s) ` +
               `and ${qualifyingCount - deduplicatedCount} unique high-signal improve suggestion(s); ` +
               `${deduplicatedCount} overlapping suggestion(s) deduplicated.`
             );

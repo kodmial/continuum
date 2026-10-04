@@ -1934,13 +1934,20 @@ class ContinuumTest < Minitest::Test
     assert_includes moved, 'the review is stale'
 
     # Mixed read/write/dispatch and cross-repo paths remain PAT-backed.
+    # kodmial/continuum#231 splits the former combined review+improve tool
+    # step: review stays unconditional on the admitted HEAD while automatic
+    # improve runs only when the authoritative review still carries repair
+    # value. Both native tool executions remain PAT-backed.
     runtime = step_body(body, 'Resolve the Continuum-owned PR-Agent runtime bundle')
     retry_step = step_body(body, 'Schedule bounded retry for retryable PR-Agent review failure')
-    tool = step_body(body, 'Run upstream full review and full improve on the exact HEAD')
+    review_tool = step_body(body, 'Run upstream full review on the exact HEAD')
+    improve_tool = step_body(body, 'Run upstream improve on the exact HEAD when repair value remains')
     in_flight = step_body(body, 'Mark PR-Agent review in flight')
     normalize = step_body(body, 'Normalize persistent improve presentation')
     publish = step_body(body, 'Publish durable PR-Agent review state')
-    [runtime, retry_step, tool, in_flight, normalize, publish].each { |step| refute_nil step }
+    [runtime, retry_step, review_tool, improve_tool, in_flight, normalize, publish].each { |step| refute_nil step }
+    refute_includes body, 'Run upstream full review and full improve on the exact HEAD',
+                      'issue #231 splits review and conditional improve; the combined step must stay removed'
     assert_includes runtime, 'GH_TOKEN: ${{ secrets.TAP_PAT }}',
                     'runtime-bundle fetch can be cross-repository; it must stay PAT-backed'
     assert_includes runtime, 'repos/kodmial/continuum/contents'
@@ -1953,8 +1960,10 @@ class ContinuumTest < Minitest::Test
                       'the pre-review revalidation must stay read-only'
     refute_includes moved, 'gh workflow run',
                       'the moved-head check must stay read-only'
-    assert_includes tool, 'GITHUB__USER_TOKEN: ${{ secrets.TAP_PAT }}',
-                    'PR-Agent tool execution credentials must stay PAT-backed'
+    assert_includes review_tool, 'GITHUB__USER_TOKEN: ${{ secrets.TAP_PAT }}',
+                     'PR-Agent review tool execution credentials must stay PAT-backed'
+    assert_includes improve_tool, 'GITHUB__USER_TOKEN: ${{ secrets.TAP_PAT }}',
+                     'PR-Agent improve tool execution credentials must stay PAT-backed'
     assert_includes in_flight, 'github-token: ${{ secrets.TAP_PAT }}',
                     'commit-status publishing must stay PAT-backed'
     assert_includes normalize, 'github-token: ${{ secrets.TAP_PAT }}',

@@ -555,6 +555,40 @@ jobs:
           PYTHONPATH="$RUNTIME_ROOT/src" python3 -m py_compile \
             "$BRIDGE_SCRIPT" "$RUNTIME_ROOT/src/continuum/pr_agent.py" "$FALLBACK_SCRIPT"
           node --check "$POLICY_SCRIPT"
+          # Policy-bundle sync: the gate/route/threshold steps below require
+          # these exports with fail-closed semantics. Validate immediately so
+          # a stale bundle (CONTINUUM_REF predating the improve-skip policy)
+          # fails closed here with a clear message instead of throwing in the
+          # gate and blocking all admitted HEADs.
+          POLICY_SCRIPT="$POLICY_SCRIPT" node -e '
+            const p = require(process.env.POLICY_SCRIPT);
+            for (const key of [
+              "isCleanReviewForImproveSkip",
+              "hasIncompleteCoverageSignal",
+              "hasToolErrorSignal",
+              "hasBlockingSecuritySignal",
+              "isSkippedCleanImprovePayload",
+              "qualifyingImproveSuggestions",
+              "unwrapReview"
+            ]) {
+              if (typeof p[key] !== "function") {
+                console.error("::error::Continuum PR-Agent policy bundle is missing export: " + key);
+                process.exit(1);
+              }
+            }
+            if (!/^[0-9]+$/.test(String(p.IMPROVE_REPAIR_THRESHOLD))) {
+              console.error("::error::Invalid centralized PR-Agent improve threshold in policy bundle.");
+              process.exit(1);
+            }
+            if (!/^[0-9]+$/.test(String(p.REVIEW_MAX_FINDINGS))) {
+              console.error("::error::Invalid centralized PR-Agent review findings cap in policy bundle.");
+              process.exit(1);
+            }
+            if (typeof p.REVIEW_MERGE_SAFE !== "string" || !p.REVIEW_MERGE_SAFE.trim()) {
+              console.error("::error::Invalid centralized PR-Agent merge-safe recommendation in policy bundle.");
+              process.exit(1);
+            }
+          '
           echo "bridge_script=$BRIDGE_SCRIPT" >> "$GITHUB_OUTPUT"
           echo "policy_script=$POLICY_SCRIPT" >> "$GITHUB_OUTPUT"
           echo "fallback_pythonpath=$RUNTIME_ROOT/src" >> "$GITHUB_OUTPUT"
@@ -625,7 +659,7 @@ jobs:
           echo "sha=$ADMITTED_SHA" >> "$GITHUB_OUTPUT"
           echo "Exact CI-qualified HEAD $ADMITTED_SHA is still current."
 
-      - name: Run upstream full review and full improve on the exact HEAD
+      - name: Run upstream full review on the exact HEAD
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
         id: pragent
         env:
@@ -684,17 +718,21 @@ jobs:
           : > pr-agent-outputs/continuum.jsonl
           # The authoritative re-review is CI-gated by this controller: after
           # OpenCode pushes a repair, a new HEAD waits for CI success and then
-          # receives a complete upstream review plus a complete upstream
-          # improve on that exact HEAD. Push-command handling is disabled
+          # receives a complete upstream review on that exact HEAD. An
+          # automatic improve pass runs only when the authoritative review
+          # still carries actionable repair value (see the improve-gate step
+          # below); a clean review reaches the merge gate without paying a
+          # second LLM pass. Push-command handling is disabled
           # (handle_push_trigger=false), so the default bot-commit push filter
           # cannot skip OpenCode-authored repair commits.
           #
-          # Upstream reviewer is PR-Agent v0.46.0 (pinned above). Both native
-          # tools run in full on the admitted HEAD:
+          # Upstream reviewer is PR-Agent v0.46.0 (pinned above). The native
+          # tools run on the admitted HEAD:
           #   review  -> structured review output (steps.pragent.outputs.review)
           #   improve -> native code suggestions via the runner-local
           #             push_outputs file channel
           #            (pr-agent-outputs/continuum.jsonl payload.code_suggestions)
+          #             only when the improve-gate step allows it.
           # Check-run publishing stays disabled so persistent finding state
           # remains active (github.publish_as_check_run=false).
           pr-agent --pr_url "$PR_URL" review \
@@ -708,43 +746,17 @@ jobs:
             --github.publish_as_check_run=false \
             --github_action_config.enable_output=true \
             --github_action_config.fail_on_tool_errors=true
-          pr-agent --pr_url "$PR_URL" improve \
-            --config.propagate_tool_errors=true \
-            --pr_code_suggestions.focus_only_on_problems=true \
-            --pr_code_suggestions.publish_output_no_suggestions=false \
-            --pr_code_suggestions.suggestions_score_threshold="$IMPROVE_REPAIR_THRESHOLD" \
-            --github.publish_as_check_run=false
           # Canonical machine source: the structured review JSON is exported
           # as the step output `review` (steps.pragent.outputs.review) for
           # the repair and merge workflows. Prose comments are presentation
           # only and are never the primary protocol.
-          if [[ ! -s pr-agent-outputs/continuum.jsonl ]]; then
-            echo "No improve suggestions were published; recording an empty payload."
-            echo '{"payload": {"code_suggestions": []}}' > pr-agent-outputs/continuum.jsonl
-          fi
           echo "review_head=$REVIEWED_SHA" >> "$GITHUB_OUTPUT"
           echo "improve_repair_threshold=$IMPROVE_REPAIR_THRESHOLD" >> "$GITHUB_OUTPUT"
           # Persist the push_outputs file payload for the repair workflow.
           # The improve payload is consumed only from this runner-local file
           # channel, never by scraping comments.
           echo "improve_file=pr-agent-outputs/continuum.jsonl" >> "$GITHUB_OUTPUT"
-          echo "Upstream review and improve completed for $REVIEWED_SHA."
-
-      - name: Export native improve output
-        if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
-        id: improve_output
-        run: |
-          set -euo pipefail
-          [[ -s pr-agent-outputs/continuum.jsonl ]] || {
-            echo "::error::Native PR-Agent improve output file is missing."
-            exit 1
-          }
-          DELIMITER="__CONTINUUM_PR_AGENT_IMPROVE_EOF__"
-          {
-            echo "improve_jsonl<<$DELIMITER"
-            cat pr-agent-outputs/continuum.jsonl
-            echo "$DELIMITER"
-          } >> "$GITHUB_OUTPUT"
+          echo "Upstream review completed for $REVIEWED_SHA; improve is gated below."
 
       - name: Revalidate the PR head and native review output after review
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
@@ -754,6 +766,7 @@ jobs:
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           REVIEWED_SHA: ${{ steps.before.outputs.sha }}
           REVIEW_JSON: ${{ steps.pragent.outputs.review }}
+          POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
         with:
           # Pure same-repository read-only revalidation (pulls.get for the
           # current PR head only). Repository token is sufficient.
@@ -766,9 +779,10 @@ jobs:
             });
             const currentSha = String(pr.head.sha || '').toLowerCase();
             if (currentSha !== reviewedSha) {
+              core.setOutput('stale_head', 'true');
               core.setFailed(
                 `PR head moved during review (${reviewedSha} -> ${currentSha}); ` +
-                'discarding both results and waiting for fresh CI on the new HEAD.'
+                'discarding the review result and waiting for fresh CI on the new HEAD.'
               );
               return;
             }
@@ -784,17 +798,441 @@ jobs:
               core.setFailed(`Upstream PR-Agent review output is invalid JSON: ${err.message}`);
               return;
             }
-            if (!review || typeof review !== 'object' || !Array.isArray(review.key_issues_to_review)) {
+            // Split envelopes carry signals on both sides: merge fail-closed
+            // via the centralized policy so no finding is lost.
+            let inner;
+            try {
+              inner = require(process.env.POLICY_SCRIPT).unwrapReview(review);
+            } catch (err) {
+              core.setFailed(err.message);
+              return;
+            }
+            if (!inner || typeof inner !== 'object' || !Array.isArray(inner.key_issues_to_review)) {
               core.setFailed('Upstream PR-Agent review output does not match the expected PRReview schema.');
               return;
             }
             core.setOutput('head_sha', currentSha);
             core.notice(`Native PR-Agent review output for ${reviewedSha} is current and machine-readable.`);
 
+      - name: Export native persistent finding state for the reviewed HEAD
+        if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
+        id: persistent
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
+          REVIEWED_SHA: ${{ steps.result.outputs.head_sha }}
+          REVIEW_JSON: ${{ steps.pragent.outputs.review }}
+          FALLBACK_PYTHONPATH: ${{ steps.runtime.outputs.fallback_pythonpath }}
+        run: |
+          set -euo pipefail
+          COMMENTS_JSON="$RUNNER_TEMP/pr-agent-comments.json"
+          gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100" \
+            > "$COMMENTS_JSON"
+          PYTHONPATH="$FALLBACK_PYTHONPATH" python3 - "$COMMENTS_JSON" <<'PY'
+          import json
+          import os
+          import sys
+          from continuum.pr_agent_fallback_state import (
+              FallbackStateError,
+              derive_fallback_state,
+          )
+          from pr_agent.algo.review_finding_state import parse_review_state
+
+          path = sys.argv[1]
+          reviewed = os.environ["REVIEWED_SHA"].strip().lower()
+          if not reviewed:
+              raise SystemExit(
+                  "No validated reviewed HEAD; refusing to export persistent finding state."
+              )
+          with open(path, "r", encoding="utf-8") as handle:
+              pages = json.load(handle)
+          comments = []
+          for page in pages:
+              if isinstance(page, list):
+                  comments.extend(page)
+          candidates = [
+              c for c in comments
+              if "<!-- pr-agent-review-state:" in str(c.get("body") or "")
+          ]
+          def derive_current_fallback():
+              try:
+                  review = json.loads(os.environ.get("REVIEW_JSON", ""))
+              except json.JSONDecodeError as exc:
+                  raise SystemExit(f"Cannot validate review for persistent-state fallback: {exc}")
+              # Split-envelope union is handled inside derive_fallback_state (union + fail-closed on invalid shapes). Do not pre-merge here to avoid duplicating findings.
+              try:
+                  return derive_fallback_state(
+                      review,
+                      reviewed,
+                      run_id=f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/commit/{reviewed}",
+                  )
+              except FallbackStateError as exc:
+                  raise SystemExit(f"Cannot derive fallback persistent state: {exc}")
+
+          state = None
+          if candidates:
+              latest = max(candidates, key=lambda c: str(c.get("updated_at") or c.get("created_at") or ""))
+              parsed = parse_review_state(str(latest.get("body") or ""))
+              if parsed.present and parsed.valid and isinstance(parsed.state, dict):
+                  candidate = parsed.state
+                  last = candidate.get("last_run")
+                  findings = candidate.get("findings")
+                  native_usable = (
+                      isinstance(last, dict)
+                      and str(last.get("head_sha") or "").strip().lower() == reviewed
+                      and last.get("complete") is True
+                      and str(last.get("kind") or "") == "full"
+                      and isinstance(findings, list)
+                      and all(
+                          isinstance(finding, dict)
+                          and str(finding.get("state") or "").upper() in {"ACTIVE", "RESOLVED"}
+                          for finding in findings
+                      )
+                  )
+                  if native_usable:
+                      state = candidate
+          if state is None:
+              # Upstream may publish a marker before its full-review last_run
+              # is complete. That incomplete marker is not authoritative.
+              # The exact-HEAD structured review has already passed schema and
+              # stale-HEAD validation, so derive the canonical fallback rather
+              # than dead-ending before repair routing.
+              state = derive_current_fallback()
+          last = state.get("last_run")
+          if not isinstance(last, dict):
+              raise SystemExit("Upstream PR-Agent persistent state has no last_run.")
+          state_head = str(last.get("head_sha") or "").strip().lower()
+          if state_head != reviewed:
+              # Expected stale-head discard, not a retryable tool error: flag
+              # it so the bounded-retry controller does not reschedule the
+              # already-superseded admitted SHA and simply waits for fresh CI.
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+                  out.write("stale_head=true\n")
+              raise SystemExit(
+                  f"Persistent state is stale: last_run.head_sha={state_head or '<empty>'}, reviewed={reviewed}."
+              )
+          if last.get("complete") is not True or str(last.get("kind") or "") != "full":
+              raise SystemExit("Persistent state does not represent a complete full review.")
+          findings = state.get("findings")
+          if not isinstance(findings, list):
+              raise SystemExit("Upstream PR-Agent persistent state findings is not a list.")
+          valid_states = {"ACTIVE", "RESOLVED"}
+          current_findings = []
+          stale_active = 0
+          for finding in findings:
+              if not isinstance(finding, dict):
+                  raise SystemExit("Upstream PR-Agent persistent state contains a non-object finding.")
+              finding_state = str(finding.get("state") or "").upper()
+              if finding_state not in valid_states:
+                  raise SystemExit("Upstream PR-Agent persistent state contains an unknown finding state.")
+              if finding_state == "ACTIVE":
+                  last_seen_head = str(finding.get("last_seen_head_sha") or "").strip().lower()
+                  if not last_seen_head:
+                      raise SystemExit(
+                          "ACTIVE PR-Agent persistent finding has no last_seen_head_sha; failing closed."
+                      )
+                  if last_seen_head != reviewed:
+                      stale_active += 1
+                      continue
+              current_findings.append(finding)
+          if stale_active:
+              # Persistent state spans review history. The merge contract is
+              # exact-HEAD: after a complete full review for this HEAD, an
+              # ACTIVE finding last seen only on an older HEAD is historical
+              # evidence, not a current-head veto. Current findings are still
+              # represented by structured review output and by ACTIVE entries
+              # whose last_seen_head_sha equals the reviewed HEAD.
+              state = dict(state)
+              state["findings"] = current_findings
+              print(
+                  f"Ignored {stale_active} stale ACTIVE persistent finding(s) "
+                  f"not seen on exact reviewed HEAD {reviewed}."
+              )
+          compact = json.dumps(state, separators=(",", ":"), ensure_ascii=False)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"persistent_state_json={compact}\n")
+          PY
+
+      - name: Decide whether automatic improve can be skipped
+        if: >-
+          steps.stack.outputs.enabled == 'true' &&
+          steps.admit.outputs.admitted == 'true' &&
+          steps.result.outcome == 'success' &&
+          steps.persistent.outcome == 'success'
+        id: improve_gate
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          REVIEW_JSON: ${{ steps.pragent.outputs.review }}
+          PERSISTENT_STATE_JSON: ${{ steps.persistent.outputs.persistent_state_json }}
+          HEAD_SHA: ${{ steps.result.outputs.head_sha }}
+          REVIEWED_SHA: ${{ steps.before.outputs.sha }}
+          PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
+          PRAGENT_OUTCOME: ${{ steps.pragent.outcome }}
+          POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
+        with:
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            // Automatic-improve gate: review is the authoritative merge gate.
+            // A clean authoritative review (safe_to_merge, zero
+            // key_issues_to_review, complete full persistent state for the
+            // exact HEAD, no blocking security/tool/coverage signal) skips the
+            // second LLM pass and routes directly to the merge gate. A review
+            // with actionable findings still runs improve for repair
+            // suggestions. Exact-HEAD mismatch or invalid state fails closed
+            // and never skips. Explicit manual improve remains available by
+            // invoking the improve tool directly; this gate only governs the
+            // automatic pass.
+            const policy = require(process.env.POLICY_SCRIPT);
+            const headSha = String(process.env.HEAD_SHA || '').trim().toLowerCase();
+            const reviewedSha = String(process.env.REVIEWED_SHA || '').trim().toLowerCase();
+            if (!headSha || !reviewedSha) {
+              core.setFailed('Improve gate requires the exact reviewed HEAD.');
+              return;
+            }
+            if (headSha !== reviewedSha) {
+              core.setOutput('stale_head', 'true');
+              core.setFailed(
+                `PR head moved before the improve gate (${reviewedSha} -> ${headSha}); ` +
+                'discarding the review result and waiting for fresh CI on the new HEAD.'
+              );
+              return;
+            }
+            // Stored step outputs alone cannot prove the HEAD is still
+            // current: a push after `result`/`persistent` leaves old==old.
+            // Revalidate against the live PR head before deciding.
+            const prNumber = Number(process.env.PR_NUMBER);
+            if (!Number.isInteger(prNumber) || prNumber <= 0) {
+              core.setFailed('Improve gate requires a pull request number for live HEAD validation.');
+              return;
+            }
+            let liveSha = '';
+            try {
+              const { data: pr } = await github.rest.pulls.get({
+                owner: context.repo.owner, repo: context.repo.repo, pull_number: prNumber,
+              });
+              liveSha = String((pr && pr.head && pr.head.sha) || '').trim().toLowerCase();
+            } catch (err) {
+              core.setFailed(`Improve gate could not revalidate the live PR head: ${err.message}`);
+              return;
+            }
+            if (!liveSha) {
+              core.setFailed('Improve gate requires the exact reviewed HEAD.');
+              return;
+            }
+            if (liveSha !== reviewedSha || liveSha !== headSha) {
+              core.setOutput('stale_head', 'true');
+              core.setFailed(
+                `PR head moved before the improve gate (${reviewedSha} -> ${liveSha}); ` +
+                'discarding the review result and waiting for fresh CI on the new HEAD.'
+              );
+              return;
+            }
+            let review;
+            try {
+              review = JSON.parse(String(process.env.REVIEW_JSON || ''));
+            } catch (err) {
+              core.setFailed(`Invalid PR-Agent review JSON: ${err.message}`);
+              return;
+            }
+            let persistentState;
+            try {
+              persistentState = JSON.parse(String(process.env.PERSISTENT_STATE_JSON || ''));
+            } catch (err) {
+              core.setFailed(`Invalid PR-Agent persistent state JSON: ${err.message}`);
+              return;
+            }
+            const stateHead = String(
+              (persistentState && persistentState.last_run && persistentState.last_run.head_sha) || ''
+            ).trim().toLowerCase();
+            if (!stateHead || stateHead !== reviewedSha) {
+              core.setOutput('stale_head', 'true');
+              core.setFailed(
+                `PR-Agent persistent state is stale: last_run.head_sha=${stateHead || '<empty>'}, reviewed=${reviewedSha}.`
+              );
+              return;
+            }
+            // Wire the real tool-error and review-coverage signals instead
+            // of assuming a clean run: with
+            // github_action_config.fail_on_tool_errors=true a failed
+            // review tool surfaces as steps.pragent.outcome == 'failure',
+            // and partial large-PR coverage surfaces as an explicit
+            // coverage signal inside the review payload. Either must keep
+            // the automatic improve pass (fail closed, never skip).
+            const pragentOutcome = String(process.env.PRAGENT_OUTCOME || '').trim().toLowerCase();
+            let reviewCoverageComplete = true;
+            try {
+              reviewCoverageComplete = !policy.hasIncompleteCoverageSignal(review);
+            } catch (err) {
+              core.setFailed(`Invalid PR-Agent review coverage signal: ${err.message}`);
+              return;
+            }
+            let decision;
+            try {
+              decision = policy.isCleanReviewForImproveSkip(
+                review,
+                persistentState,
+                {
+                  headMatches: true,
+                  toolError: pragentOutcome === 'failure',
+                  reviewCoverageComplete,
+                  reviewedHeadSha: reviewedSha,
+                }
+              );
+            } catch (err) {
+              core.setFailed(err.message);
+              return;
+            }
+            core.setOutput('skip_improve', decision.skip ? 'true' : 'false');
+            core.setOutput('reason', String(decision.reason || ''));
+            core.notice(
+              decision.skip
+                ? `Clean authoritative review at ${reviewedSha}; skipping automatic improve: ${decision.reason}`
+                : `Automatic improve still required at ${reviewedSha}: ${decision.reason}`
+            );
+
+      - name: Run upstream improve on the exact HEAD when repair value remains
+        if: >-
+          steps.stack.outputs.enabled == 'true' &&
+          steps.admit.outputs.admitted == 'true' &&
+          steps.improve_gate.outcome == 'success' &&
+          steps.improve_gate.outputs.skip_improve != 'true'
+        id: improve
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          GITHUB__USER_TOKEN: ${{ secrets.TAP_PAT }}
+          CONFIG__GIT_PROVIDER: github
+          CONFIG__MODEL: ${{ steps.stack.outputs.model }}
+          CONFIG__CUSTOM_MODEL_MAX_TOKENS: ${{ steps.stack.outputs.max_tokens }}
+          CONFIG__PROPAGATE_TOOL_ERRORS: 'true'
+          OPENAI__API_BASE: ${{ steps.stack.outputs.api_base }}
+          OPENAI__KEY: continuum-loopback
+          GITHUB__PUBLISH_AS_CHECK_RUN: 'false'
+          GITHUB_ACTION_CONFIG__FAIL_ON_TOOL_ERRORS: 'true'
+          PR_CODE_SUGGESTIONS__FOCUS_ONLY_ON_PROBLEMS: 'true'
+          PR_CODE_SUGGESTIONS__PERSISTENT_COMMENT: 'true'
+          PR_CODE_SUGGESTIONS__PUBLISH_OUTPUT_NO_SUGGESTIONS: 'false'
+          PR_CODE_SUGGESTIONS__MAX_SUGGESTIONS_PER_FILE: '0'
+          PR_CODE_SUGGESTIONS__MAX_NUMBER_OF_CALLS: '3'
+          PR_CODE_SUGGESTIONS__ENABLE_SUGGESTIONS_COVERAGE_FOOTER: 'true'
+          PUSH_OUTPUTS__ENABLE: 'true'
+          PUSH_OUTPUTS__CHANNELS: '["file"]'
+          PUSH_OUTPUTS__FILE_PATH: 'pr-agent-outputs/continuum.jsonl'
+          PR_URL: https://github.com/${{ github.repository }}/pull/${{ steps.stack.outputs.pr_number }}
+          PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
+          REVIEWED_SHA: ${{ steps.before.outputs.sha }}
+          POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
+        run: |
+          set -euo pipefail
+          CURRENT_SHA="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)"
+          if [[ "${CURRENT_SHA,,}" != "${REVIEWED_SHA,,}" ]]; then
+            echo "::error::PR head moved before improve ($REVIEWED_SHA -> $CURRENT_SHA); discarding stale gate decision."
+            echo "stale_head=true" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          IMPROVE_REPAIR_THRESHOLD="$(node -e 'const p=require(process.env.POLICY_SCRIPT); process.stdout.write(String(p.IMPROVE_REPAIR_THRESHOLD));')"
+          [[ "$IMPROVE_REPAIR_THRESHOLD" =~ ^[0-9]+$ ]] || { echo "::error::Invalid centralized PR-Agent improve threshold."; exit 1; }
+          mkdir -p pr-agent-outputs
+          : > pr-agent-outputs/continuum.jsonl
+          # The authoritative review carried actionable findings, so run one
+          # bounded upstream improve pass for additional repair suggestions.
+          # The improve payload is consumed only from the runner-local file
+          # channel, never by scraping comments.
+          pr-agent --pr_url "$PR_URL" improve \
+            --config.propagate_tool_errors=true \
+            --pr_code_suggestions.focus_only_on_problems=true \
+            --pr_code_suggestions.publish_output_no_suggestions=false \
+            --pr_code_suggestions.suggestions_score_threshold="$IMPROVE_REPAIR_THRESHOLD" \
+            --github.publish_as_check_run=false
+          if [[ ! -s pr-agent-outputs/continuum.jsonl ]]; then
+            echo "No improve suggestions were published; recording an empty payload."
+            echo '{"payload": {"code_suggestions": []}}' > pr-agent-outputs/continuum.jsonl
+          fi
+          echo "improve_repair_threshold=$IMPROVE_REPAIR_THRESHOLD" >> "$GITHUB_OUTPUT"
+          echo "improve_file=pr-agent-outputs/continuum.jsonl" >> "$GITHUB_OUTPUT"
+          echo "Upstream improve completed for $REVIEWED_SHA."
+
+      - name: Record skipped automatic improve for the clean HEAD
+        if: >-
+          steps.stack.outputs.enabled == 'true' &&
+          steps.admit.outputs.admitted == 'true' &&
+          steps.improve_gate.outcome == 'success' &&
+          steps.improve_gate.outputs.skip_improve == 'true'
+        id: improve_skipped
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
+          REVIEWED_SHA: ${{ steps.before.outputs.sha }}
+          POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
+        run: |
+          set -euo pipefail
+          CURRENT_SHA="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)"
+          if [[ "${CURRENT_SHA,,}" != "${REVIEWED_SHA,,}" ]]; then
+            echo "::error::PR head moved before recording skipped improve ($REVIEWED_SHA -> $CURRENT_SHA); refusing empty payload for the wrong HEAD."
+            echo "stale_head=true" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          IMPROVE_REPAIR_THRESHOLD="$(node -e 'const p=require(process.env.POLICY_SCRIPT); process.stdout.write(String(p.IMPROVE_REPAIR_THRESHOLD));')"
+          [[ "$IMPROVE_REPAIR_THRESHOLD" =~ ^[0-9]+$ ]] || { echo "::error::Invalid centralized PR-Agent improve threshold."; exit 1; }
+          mkdir -p pr-agent-outputs
+          # The skipped-clean marker lets downstream repair/merge gating tell
+          # "improve skipped for a clean HEAD" apart from "improve never
+          # ran": only the marked empty payload satisfies the
+          # improve-coverage leg without an improve run (mirrors
+          # GateInputs.improve_skipped_clean). Suggestion parsing ignores
+          # the extra key.
+          echo '{"payload": {"code_suggestions": []}, "continuum": {"improve_skipped_clean": true}}' > pr-agent-outputs/continuum.jsonl
+          echo "improve_repair_threshold=$IMPROVE_REPAIR_THRESHOLD" >> "$GITHUB_OUTPUT"
+          echo "improve_file=pr-agent-outputs/continuum.jsonl" >> "$GITHUB_OUTPUT"
+          echo "Automatic improve skipped for clean HEAD $REVIEWED_SHA; empty payload recorded."
+
+      - name: Revalidate the PR head after improve
+        if: >-
+          steps.stack.outputs.enabled == 'true' &&
+          steps.admit.outputs.admitted == 'true' &&
+          (steps.improve.outcome == 'success' || steps.improve_skipped.outcome == 'success')
+        id: post_improve
+        env:
+          # Pure same-repository read-only check (gh pr view for the current
+          # PR head only). Repository token is sufficient.
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
+          REVIEWED_SHA: ${{ steps.before.outputs.sha }}
+        run: |
+          set -euo pipefail
+          CURRENT_SHA="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)"
+          if [[ "${CURRENT_SHA,,}" != "${REVIEWED_SHA,,}" ]]; then
+            echo "::error::PR head moved during improve ($REVIEWED_SHA -> $CURRENT_SHA); discarding stale improve output."
+            echo "stale_head=true" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          echo "Improve output for $REVIEWED_SHA is still current."
+
+      - name: Export native improve output
+        if: >-
+          steps.stack.outputs.enabled == 'true' &&
+          steps.admit.outputs.admitted == 'true' &&
+          (steps.improve.outcome == 'success' || steps.improve_skipped.outcome == 'success') &&
+          steps.post_improve.outcome == 'success'
+        id: improve_output
+        run: |
+          set -euo pipefail
+          [[ -s pr-agent-outputs/continuum.jsonl ]] || {
+            echo "::error::Native PR-Agent improve output file is missing."
+            exit 1
+          }
+          DELIMITER="__CONTINUUM_PR_AGENT_IMPROVE_EOF__"
+          {
+            echo "improve_jsonl<<$DELIMITER"
+            cat pr-agent-outputs/continuum.jsonl
+            echo "$DELIMITER"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Normalize persistent improve presentation
         if: >-
           steps.result.outcome == 'success' &&
-          steps.result.outputs.head_sha
+          steps.result.outputs.head_sha &&
+          steps.improve_output.outcome == 'success'
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
@@ -843,154 +1281,60 @@ jobs:
               );
             }
 
-      - name: Export native persistent finding state for the reviewed HEAD
-        if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
-        id: persistent
-        env:
-          GH_TOKEN: ${{ secrets.TAP_PAT }}
-          PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
-          REVIEWED_SHA: ${{ steps.result.outputs.head_sha }}
-          REVIEW_JSON: ${{ steps.pragent.outputs.review }}
-          FALLBACK_PYTHONPATH: ${{ steps.runtime.outputs.fallback_pythonpath }}
-        run: |
-          set -euo pipefail
-          COMMENTS_JSON="$RUNNER_TEMP/pr-agent-comments.json"
-          gh api --paginate --slurp \
-            "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100" \
-            > "$COMMENTS_JSON"
-          PYTHONPATH="$FALLBACK_PYTHONPATH" python3 - "$COMMENTS_JSON" <<'PY'
-          import json
-          import os
-          import sys
-          from continuum.pr_agent_fallback_state import (
-              FallbackStateError,
-              derive_fallback_state,
-          )
-          from pr_agent.algo.review_finding_state import parse_review_state
-
-          path = sys.argv[1]
-          reviewed = os.environ["REVIEWED_SHA"].strip().lower()
-          if not reviewed:
-              raise SystemExit(
-                  "No validated reviewed HEAD; refusing to export persistent finding state."
-              )
-          with open(path, "r", encoding="utf-8") as handle:
-              pages = json.load(handle)
-          comments = []
-          for page in pages:
-              if isinstance(page, list):
-                  comments.extend(page)
-          candidates = [
-              c for c in comments
-              if "<!-- pr-agent-review-state:" in str(c.get("body") or "")
-          ]
-          def derive_current_fallback():
-              try:
-                  review = json.loads(os.environ.get("REVIEW_JSON", ""))
-              except json.JSONDecodeError as exc:
-                  raise SystemExit(f"Cannot validate review for persistent-state fallback: {exc}")
-              try:
-                  return derive_fallback_state(
-                      review,
-                      reviewed,
-                      run_id=f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/commit/{reviewed}",
-                  )
-              except FallbackStateError as exc:
-                  raise SystemExit(f"Cannot derive fallback persistent state: {exc}")
-
-          state = None
-          if candidates:
-              latest = max(candidates, key=lambda c: str(c.get("updated_at") or c.get("created_at") or ""))
-              parsed = parse_review_state(str(latest.get("body") or ""))
-              if parsed.present and parsed.valid and isinstance(parsed.state, dict):
-                  candidate = parsed.state
-                  last = candidate.get("last_run")
-                  findings = candidate.get("findings")
-                  native_usable = (
-                      isinstance(last, dict)
-                      and str(last.get("head_sha") or "").strip().lower() == reviewed
-                      and last.get("complete") is True
-                      and str(last.get("kind") or "") == "full"
-                      and isinstance(findings, list)
-                      and all(
-                          isinstance(finding, dict)
-                          and str(finding.get("state") or "").upper() in {"ACTIVE", "RESOLVED"}
-                          for finding in findings
-                      )
-                  )
-                  if native_usable:
-                      state = candidate
-          if state is None:
-              # Upstream may publish a marker before its full-review last_run
-              # is complete. That incomplete marker is not authoritative.
-              # The exact-HEAD structured review has already passed schema and
-              # stale-HEAD validation, so derive the canonical fallback rather
-              # than dead-ending before repair routing.
-              state = derive_current_fallback()
-
-          last = state.get("last_run")
-          if not isinstance(last, dict):
-              raise SystemExit("Upstream PR-Agent persistent state has no last_run.")
-          state_head = str(last.get("head_sha") or "").strip().lower()
-          if state_head != reviewed:
-              raise SystemExit(
-                  f"Persistent state is stale: last_run.head_sha={state_head or '<empty>'}, reviewed={reviewed}."
-              )
-          if last.get("complete") is not True or str(last.get("kind") or "") != "full":
-              raise SystemExit("Persistent state does not represent a complete full review.")
-          findings = state.get("findings")
-          if not isinstance(findings, list):
-              raise SystemExit("Upstream PR-Agent persistent state findings is not a list.")
-          valid_states = {"ACTIVE", "RESOLVED"}
-          current_findings = []
-          stale_active = 0
-          for finding in findings:
-              if not isinstance(finding, dict):
-                  raise SystemExit("Upstream PR-Agent persistent state contains a non-object finding.")
-              finding_state = str(finding.get("state") or "").upper()
-              if finding_state not in valid_states:
-                  raise SystemExit("Upstream PR-Agent persistent state contains an unknown finding state.")
-              if finding_state == "ACTIVE":
-                  last_seen_head = str(finding.get("last_seen_head_sha") or "").strip().lower()
-                  if not last_seen_head:
-                      raise SystemExit(
-                          "ACTIVE PR-Agent persistent finding has no last_seen_head_sha; failing closed."
-                      )
-                  if last_seen_head != reviewed:
-                      stale_active += 1
-                      continue
-              current_findings.append(finding)
-          if stale_active:
-              # Persistent state spans review history. The merge contract is
-              # exact-HEAD: after a complete full review for this HEAD, an
-              # ACTIVE finding last seen only on an older HEAD is historical
-              # evidence, not a current-head veto. Current findings are still
-              # represented by structured review output and by ACTIVE entries
-              # whose last_seen_head_sha equals the reviewed HEAD.
-              state = dict(state)
-              state["findings"] = current_findings
-              print(
-                  f"Ignored {stale_active} stale ACTIVE persistent finding(s) "
-                  f"not seen on exact reviewed HEAD {reviewed}."
-              )
-          compact = json.dumps(state, separators=(",", ":"), ensure_ascii=False)
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
-              out.write(f"persistent_state_json={compact}\n")
-          PY
-
       - name: Route the current PR-Agent result
-        if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
+        if: >-
+          steps.stack.outputs.enabled == 'true' &&
+          steps.admit.outputs.admitted == 'true' &&
+          steps.post_improve.outcome == 'success'
         id: route
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           REVIEW_JSON: ${{ steps.pragent.outputs.review }}
           IMPROVE_JSONL: ${{ steps.improve_output.outputs.improve_jsonl }}
+          IMPROVE_SKIPPED: ${{ steps.improve_skipped.outcome == 'success' }}
           POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
             const policy = require(process.env.POLICY_SCRIPT);
             const review = JSON.parse(String(process.env.REVIEW_JSON || ''));
+            // Split envelopes share the merged helper: checking only one
+            // side would miss nested findings or nested blocking security.
+            let inner;
+            try {
+              inner = policy.unwrapReview(review);
+            } catch (err) {
+              core.setFailed(err.message);
+              return;
+            }
+            const keyIssues = Array.isArray(inner.key_issues_to_review)
+              ? inner.key_issues_to_review
+              : [];
+            const suggestions = policy.qualifyingImproveSuggestions(
+              String(process.env.IMPROVE_JSONL || '')
+            );
+            // Wire the skipped-clean flag into repair/merge gating (mirrors
+            // GateInputs.improve_skipped_clean): a skipped-clean HEAD
+            // carries an empty improve payload with incomplete improve
+            // coverage, so only this flag routes it to the merge gate.
+            // A skipped HEAD with remaining qualifying suggestions never
+            // greens: it routes to repair instead.
+            const improveSkippedClean =
+              String(process.env.IMPROVE_SKIPPED || '').trim().toLowerCase() === 'true';
+            if (improveSkippedClean && suggestions.length > 0) {
+              core.setOutput('needs_repair', 'true');
+              core.setOutput('ready_to_merge', 'false');
+              core.setOutput('needs_rereview', 'false');
+              core.setOutput('review_disposition', 'repair');
+              core.setOutput('review_findings', String(keyIssues.length));
+              core.setOutput('improve_suggestions', String(suggestions.length));
+              core.notice(
+                'Improve was skipped but qualifying suggestions remain; ' +
+                `routing ${keyIssues.length} review finding(s) and ${suggestions.length} improve suggestion(s) to PR-Agent repair.`
+              );
+              return;
+            }
+            // One canonical policy owns repair/merge/re-review routing.
             const disposition = policy.reviewDisposition(
               review,
               String(process.env.IMPROVE_JSONL || '')
@@ -1076,10 +1420,29 @@ jobs:
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           HEAD_SHA: ${{ steps.admit.outputs.head_sha }}
-          RETRYABLE_FAILURE: ${{ (steps.install_pragent.outcome == 'failure' || steps.install_opencode.outcome == 'failure' || steps.start_opencode.outcome == 'failure' || steps.runtime.outcome == 'failure' || steps.start_bridge.outcome == 'failure' || steps.pragent.outcome == 'failure') && 'true' || 'false' }}
+          PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
+          RETRYABLE_FAILURE: ${{ (steps.install_pragent.outcome == 'failure' || steps.install_opencode.outcome == 'failure' || steps.start_opencode.outcome == 'failure' || steps.runtime.outcome == 'failure' || steps.start_bridge.outcome == 'failure' || steps.pragent.outcome == 'failure' || steps.result.outcome == 'failure' || steps.persistent.outcome == 'failure' || steps.improve_gate.outcome == 'failure' || steps.improve.outcome == 'failure' || steps.improve_skipped.outcome == 'failure' || steps.post_improve.outcome == 'failure' || steps.improve_output.outcome == 'failure') && steps.result.outputs.stale_head != 'true' && steps.persistent.outputs.stale_head != 'true' && steps.improve_gate.outputs.stale_head != 'true' && steps.improve.outputs.stale_head != 'true' && steps.improve_skipped.outputs.stale_head != 'true' && steps.post_improve.outputs.stale_head != 'true' && 'true' || 'false' }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
+            // Defense in depth: every stale-head discard above carries its
+            // own flag, but revalidate the live PR head anyway so a
+            // superseded SHA is never reported as recovery-eligible.
+            let retryable = process.env.RETRYABLE_FAILURE === 'true';
+            if (retryable) {
+              try {
+                const { data: pr } = await github.rest.pulls.get({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  pull_number: Number(process.env.PR_NUMBER),
+                });
+                const liveSha = String((pr && pr.head && pr.head.sha) || '').trim().toLowerCase();
+                if (liveSha && liveSha !== String(process.env.HEAD_SHA || '').trim().toLowerCase()) {
+                  retryable = false;
+                }
+              } catch (err) {
+                core.warning(`Could not revalidate the live PR head: ${err.message}`);
+              }
+            }
             await github.rest.repos.createCommitStatus({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -1087,7 +1450,7 @@ jobs:
               state: 'failure',
               context: 'continuum/pr-agent-review',
               description:
-                process.env.RETRYABLE_FAILURE === 'true'
+                retryable
                   ? 'PR-Agent review failed: transient; recovery eligible'
                   : 'PR-Agent review failed: deterministic; recovery held',
               target_url:
@@ -1146,7 +1509,20 @@ jobs:
            steps.start_opencode.outcome == 'failure' ||
            steps.runtime.outcome == 'failure' ||
            steps.start_bridge.outcome == 'failure' ||
-           steps.pragent.outcome == 'failure')
+           steps.pragent.outcome == 'failure' ||
+           steps.result.outcome == 'failure' ||
+           steps.persistent.outcome == 'failure' ||
+           steps.improve_gate.outcome == 'failure' ||
+           steps.improve.outcome == 'failure' ||
+           steps.improve_skipped.outcome == 'failure' ||
+           steps.post_improve.outcome == 'failure' ||
+           steps.improve_output.outcome == 'failure') &&
+           steps.result.outputs.stale_head != 'true' &&
+           steps.persistent.outputs.stale_head != 'true' &&
+           steps.improve_gate.outputs.stale_head != 'true' &&
+           steps.improve.outputs.stale_head != 'true' &&
+           steps.improve_skipped.outputs.stale_head != 'true' &&
+           steps.post_improve.outputs.stale_head != 'true'
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
@@ -1160,6 +1536,25 @@ jobs:
             const policy = require(process.env.POLICY_SCRIPT);
             const prNumber = Number(process.env.PR_NUMBER);
             const head = String(process.env.HEAD_SHA || '').toLowerCase();
+            // Defense in depth: every stale-head discard above carries its
+            // own flag, but revalidate the live PR head first so a
+            // bounded retry is never scheduled for an already-superseded
+            // admitted SHA. Fresh CI on the new HEAD recovers on its own.
+            try {
+              const { data: pr } = await github.rest.pulls.get({
+                owner: context.repo.owner, repo: context.repo.repo, pull_number: prNumber,
+              });
+              const liveSha = String((pr && pr.head && pr.head.sha) || '').trim().toLowerCase();
+              if (liveSha && liveSha !== head) {
+                core.notice(
+                  'PR head moved during review (' + head + ' -> ' + liveSha + '); ' +
+                  'stale retry cancelled, waiting for fresh CI on the new HEAD.'
+                );
+                return;
+              }
+            } catch (err) {
+              core.warning(`Could not revalidate the live PR head: ${err.message}`);
+            }
             const kind = String(process.env.RECOVERY_KIND || 'review').toLowerCase();
             const attempt = Number(process.env.RETRY_ATTEMPT || '0');
             const exhausted = Number.isInteger(attempt) && attempt >= 2;
@@ -1215,7 +1610,20 @@ jobs:
            steps.start_opencode.outcome == 'failure' ||
            steps.runtime.outcome == 'failure' ||
            steps.start_bridge.outcome == 'failure' ||
-           steps.pragent.outcome == 'failure')
+           steps.pragent.outcome == 'failure' ||
+           steps.result.outcome == 'failure' ||
+           steps.persistent.outcome == 'failure' ||
+           steps.improve_gate.outcome == 'failure' ||
+           steps.improve.outcome == 'failure' ||
+           steps.improve_skipped.outcome == 'failure' ||
+           steps.post_improve.outcome == 'failure' ||
+           steps.improve_output.outcome == 'failure') &&
+           steps.result.outputs.stale_head != 'true' &&
+           steps.persistent.outputs.stale_head != 'true' &&
+           steps.improve_gate.outputs.stale_head != 'true' &&
+           steps.improve.outputs.stale_head != 'true' &&
+           steps.improve_skipped.outputs.stale_head != 'true' &&
+           steps.post_improve.outputs.stale_head != 'true'
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
@@ -1238,6 +1646,17 @@ jobs:
           if (( attempt >= 2 )); then
             echo "Retry budget exhausted for PR #$PR_NUMBER HEAD $HEAD_SHA."
             exit 0
+          fi
+
+          # Defense in depth: every stale-head discard above carries its own
+          # flag, but cancel before the backoff anyway so a superseded SHA
+          # never sleeps toward a dispatch. The post-backoff revalidation
+          # below remains as further defense in depth.
+          if live_head="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid 2>/dev/null)"; then
+            if [[ -n "$live_head" && "$live_head" != "$HEAD_SHA" ]]; then
+              echo "PR head moved ($HEAD_SHA -> $live_head); stale retry cancelled."
+              exit 0
+            fi
           fi
 
           next=$((attempt + 1))
