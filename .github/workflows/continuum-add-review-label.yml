@@ -211,8 +211,6 @@ jobs:
                   repo,
                   issue_number: pr.number,
                   per_page: 100,
-                  sort: 'created',
-                  direction: 'desc',
                 }
               );
 
