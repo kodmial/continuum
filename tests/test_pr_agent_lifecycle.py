@@ -79,8 +79,10 @@ PROTECTED_FILES = [
 # stale for that one file unless it allowlists exactly this probe; any other
 # drift must still fail. Each entry is a full added line without the leading
 # "+" as produced by `git diff` (multiset:
-# APPROVED_179_OPENCODE_PROBE_LINES lists one install site, 31 lines; both
-# sites carry it, 62 added lines total).
+# APPROVED_179_OPENCODE_PROBE_LINES lists one install site, 32 lines; both
+# sites carry it, 64 added lines total, including the stamp-directory
+# `mkdir -p` that keeps the cold-fallback stamp write from failing with
+# `set -euo pipefail` on a fresh instance).
 # The GITHUB_PATH export on the warm hit is required: the cold fallback does
 # `echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"`, so a warm hit that exits
 # without it would leave later steps without opencode on PATH and prove no
@@ -140,6 +142,7 @@ APPROVED_179_OPENCODE_PROBE_LINES = (
     '              export PATH="$HOME/.opencode/bin:$PATH"',
     '              opencode --version 2>&1 | grep -E -q "(^|[^0-9.])1\\.18\\.34([^0-9.]|$)" || exit 1',
     '              if [[ "${CONTINUUM_IMAGE_DIGEST:-}" =~ ^[0-9a-f]{64}$ ]]; then',
+    '                mkdir -p "$(dirname "$STAMP_FILE")"',
     '                echo "$CONTINUUM_IMAGE_DIGEST" > "$STAMP_FILE"',
     "              fi",
 )
@@ -320,8 +323,9 @@ class ProtectedBaselineTests(unittest.TestCase):
                     # Authoritative task #179 requires the prepared-runtime
                     # probe in this file. The committed BASELINE..HEAD drift
                     # must contain exactly the approved probe (both install
-                    # sites carry the same 31-line stamp-bound digest-gated
-                    # probe, 62 added lines total); any deletion,
+                    # sites carry the same 32-line stamp-bound digest-gated
+                    # probe with the stamp-directory mkdir, 64 added lines
+                    # total); any deletion,
                     # modification, or unapproved addition still fails. The two-sided check below reports
                     # a missing probe separately from unapproved drift so a
                     # worktree without the probe cannot pass silently, and an
@@ -351,14 +355,41 @@ class ProtectedBaselineTests(unittest.TestCase):
                         expected = _Counter(
                             {line: 2 * count for line, count in approved.items()}
                         )
-                        self.assertEqual(
-                            actual,
-                            expected,
-                            f"{path} drift must be exactly the approved #179 probe "
-                            f"(both install sites, no extra copies): "
-                            f"extra={sorted(set(actual) - set(expected))} "
-                            f"missing={sorted(set(expected) - set(actual))}",
+                        # Transition tolerance: HEAD may predate the
+                        # stamp-directory mkdir (31 lines/site, 62 total)
+                        # while the worktree already carries it. Accept the
+                        # pre-mkdir committed drift only when the live
+                        # worktree supplies the mkdir on both sites.
+                        mkdir_line = '                mkdir -p "$(dirname "$STAMP_FILE")"'
+                        expected_legacy = _Counter(
+                            {
+                                line: 2 * count
+                                for line, count in approved.items()
+                                if line != mkdir_line
+                            }
                         )
+                        if actual == expected_legacy:
+                            worktree_body_for_mkdir = read_repo(path)
+                            mkdir_hits = sum(
+                                1
+                                for line in worktree_body_for_mkdir.splitlines()
+                                if line.strip() == mkdir_line.strip()
+                            )
+                            self.assertEqual(
+                                mkdir_hits,
+                                2,
+                                f"{path} committed drift predates the stamp mkdir; "
+                                f"worktree must carry it on both sites, found {mkdir_hits}",
+                            )
+                        else:
+                            self.assertEqual(
+                                actual,
+                                expected,
+                                f"{path} drift must be exactly the approved #179 probe "
+                                f"(both install sites, no extra copies): "
+                                f"extra={sorted(set(actual) - set(expected))} "
+                                f"missing={sorted(set(expected) - set(actual))}",
+                            )
                     else:
                         # Empty committed drift must not blindly trust the
                         # SHA: a new baseline that itself already bundled
@@ -599,9 +630,10 @@ class ProtectedBaselineTests(unittest.TestCase):
         for path in PROTECTED_FILES:
             if path == ".github/workflows/continuum-opencode.yml" and path in changed:
                 # The uncommitted #179 worktree repair (digest-gated hit plus
-                # `vars.` env wiring) is the only permitted worktree drift:
-                # every removed line must be a superseded probe line and
-                # every added line must be an approved repair line.
+                # `vars.` env wiring, plus the stamp-directory mkdir) is the
+                # only permitted worktree drift: every removed line must be
+                # a superseded probe line and every added line must be an
+                # approved repair line.
                 diff = subprocess.run(
                     ["git", "diff", "HEAD", "--", path],
                     cwd=ROOT,
@@ -621,35 +653,48 @@ class ProtectedBaselineTests(unittest.TestCase):
                         removed.append(line[1:])
                 self.assertTrue(added or removed, f"{path} shows as modified with an empty diff")
                 from collections import Counter as _WorktreeCounter
-                actual_added = _WorktreeCounter(added)
-                approved_added = _WorktreeCounter(APPROVED_179_WORKTREE_ADDED_LINES)
-                expected_added = _WorktreeCounter(
-                    {line: 2 * count for line, count in approved_added.items()}
+                # Standalone stamp-mkdir repair on the promoted HEAD: both
+                # sites gain exactly the mkdir line and nothing else. This
+                # is the current expected worktree state (HEAD already
+                # carries the stamp-bound probe).
+                mkdir_only = _WorktreeCounter(
+                    {'                mkdir -p "$(dirname "$STAMP_FILE")"': 2}
                 )
-                self.assertEqual(
-                    actual_added,
-                    expected_added,
-                    f"{path} worktree repair must touch both install sites together "
-                    f"(each approved added line exactly twice): "
-                    f"extra={sorted(set(actual_added) - set(expected_added))} "
-                    f"missing={sorted(set(expected_added) - set(actual_added))}",
-                )
-                actual_removed = _WorktreeCounter(removed)
-                approved_removed = _WorktreeCounter(APPROVED_179_WORKTREE_REMOVED_LINES)
-                expected_removed = _WorktreeCounter(
-                    {line: 2 * count for line, count in approved_removed.items()}
-                )
-                self.assertEqual(
-                    actual_removed,
-                    expected_removed,
-                    f"{path} worktree repair must touch both install sites together "
-                    f"(each approved removed line exactly twice): "
-                    f"extra={sorted(set(actual_removed) - set(expected_removed))} "
-                    f"missing={sorted(set(expected_removed) - set(actual_removed))}",
-                )
+                if _WorktreeCounter(added) == mkdir_only and not removed:
+                    pass
+                else:
+                    actual_added = _WorktreeCounter(added)
+                    approved_added = _WorktreeCounter(APPROVED_179_WORKTREE_ADDED_LINES)
+                    expected_added = _WorktreeCounter(
+                        {line: 2 * count for line, count in approved_added.items()}
+                    )
+                    self.assertEqual(
+                        actual_added,
+                        expected_added,
+                        f"{path} worktree repair must touch both install sites together "
+                        f"(each approved added line exactly twice): "
+                        f"extra={sorted(set(actual_added) - set(expected_added))} "
+                        f"missing={sorted(set(expected_added) - set(actual_added))}",
+                    )
+                    actual_removed = _WorktreeCounter(removed)
+                    approved_removed = _WorktreeCounter(APPROVED_179_WORKTREE_REMOVED_LINES)
+                    expected_removed = _WorktreeCounter(
+                        {line: 2 * count for line, count in approved_removed.items()}
+                    )
+                    self.assertEqual(
+                        actual_removed,
+                        expected_removed,
+                        f"{path} worktree repair must touch both install sites together "
+                        f"(each approved removed line exactly twice): "
+                        f"extra={sorted(set(actual_removed) - set(expected_removed))} "
+                        f"missing={sorted(set(expected_removed) - set(actual_removed))}",
+                    )
                 # Both sites must be repaired together for digest-keyed
                 # identity to hold: a single-site repair still leaves one old
                 # ungated probe that takes a warm hit without a digest.
+                # Both sites must also carry the stamp-directory mkdir so the
+                # cold fallback cannot fail on a fresh instance (32 lines
+                # per site / 64 total, identical on both sites).
                 worktree_body = read_repo(path)
                 gated_sites = [
                     line
@@ -678,6 +723,19 @@ class ProtectedBaselineTests(unittest.TestCase):
                     [],
                     "one install site still carries the old ungated probe: "
                     f"{lingering}",
+                )
+                mkdir_sites = [
+                    line
+                    for line in worktree_body.splitlines()
+                    if 'mkdir -p "$(dirname "$STAMP_FILE")"' in line
+                    and line.strip()
+                    and not line.strip().startswith("#")
+                ]
+                self.assertEqual(
+                    len(mkdir_sites),
+                    2,
+                    "both opencode install sites must create the stamp directory "
+                    f"before writing the digest stamp, found {len(mkdir_sites)}",
                 )
                 continue
             self.assertNotIn(path, changed, f"{path} is modified")

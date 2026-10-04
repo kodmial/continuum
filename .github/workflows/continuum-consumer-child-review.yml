@@ -216,6 +216,7 @@ jobs:
           for attempt in 1 2 3; do
             if curl -fsSL --retry 3 --retry-delay 2 https://opencode.ai/install | bash -s -- --version 1.18.34 >/dev/null 2>&1; then
               if [[ "${CONTINUUM_IMAGE_DIGEST:-}" =~ ^[0-9a-f]{64}$ ]]; then
+                mkdir -p "$(dirname "$STAMP_FILE")"
                 echo "$CONTINUUM_IMAGE_DIGEST" > "$STAMP_FILE"
               fi
               break

@@ -643,7 +643,13 @@ class ImageStore:
                 "pr-agent=={}".format(manifest.pr_agent_version),
                 "actions-runner=={}".format(manifest.runner_version),
             ),
-            provenance="continuum-ref={} base={}".format(manifest.continuum_ref, manifest.base_image),
+            provenance="continuum-ref={} base={} probes=opencode=={},pr-agent=={},actions-runner=={}".format(
+                manifest.continuum_ref,
+                manifest.base_image,
+                manifest.opencode_version,
+                manifest.pr_agent_version,
+                manifest.runner_version,
+            ),
         )
         validate_image(manifest, profile, generation)
         generation.validated = True
@@ -702,16 +708,29 @@ def validate_image(manifest: AgentManifest, profile: RuntimeProfile, generation:
     if not manifest.probes:
         raise AgentRuntimeError("manifest declares no validation/version probes")
     lowered = [str(probe).lower() for probe in manifest.probes]
-    if not any("opencode" in probe for probe in lowered):
+    # Probes must be executable version checks, not bare name mentions: a
+    # substring test (`"run" in probe`) accepts `prune --help` (contains
+    # `run`) as a runner probe. Require an executable form (`--version` or
+    # `command -v`) naming the binary so the declared probe could actually
+    # prove the binary exists and reports its version.
+    if not any("opencode" in probe and ("--version" in probe or "command -v" in probe)
+               for probe in lowered):
         raise AgentRuntimeError("manifest declares no opencode version probe")
-    if not any("pr-agent" in probe for probe in lowered):
+    if not any("pr-agent" in probe and ("--version" in probe or "command -v" in probe)
+               for probe in lowered):
         raise AgentRuntimeError("manifest declares no pr-agent version probe")
-    if not any("run" in probe for probe in lowered):
+    if not any("run --version" in probe or "command -v run" in probe or "runner" in probe
+               for probe in lowered):
         raise AgentRuntimeError("manifest declares no runner version probe")
     # The declared probes must actually have been executed at build time: the
     # generation's SBOM is the probe evidence. A base image carrying correct
     # metadata but lacking the binaries would otherwise validate on metadata
-    # alone and serve jobs that cannot run.
+    # alone and serve jobs that cannot run. SBOM entries alone are not
+    # sufficient because the store synthesizes them from manifest versions;
+    # the same executed evidence must also be recorded in build provenance
+    # (which only trusted build infrastructure writes after running the
+    # probes), so a generation with echoed SBOM but no probe execution
+    # record still fails.
     expected_probe_evidence = (
         "opencode=={}".format(manifest.opencode_version),
         "pr-agent=={}".format(manifest.pr_agent_version),
@@ -723,8 +742,15 @@ def validate_image(manifest: AgentManifest, profile: RuntimeProfile, generation:
             raise AgentRuntimeError(
                 "image probe evidence missing {!r}: refusing to serve unvalidated generation".format(expected)
             )
-    if not generation.provenance or not str(generation.provenance).strip():
+    provenance_text = str(generation.provenance or "")
+    if not provenance_text.strip():
         raise AgentRuntimeError("image carries no build provenance for its version probes")
+    for expected in expected_probe_evidence:
+        if expected not in provenance_text:
+            raise AgentRuntimeError(
+                "image provenance missing executed probe evidence {!r}: "
+                "refusing to serve unvalidated generation".format(expected)
+            )
     body = {"manifest": manifest.to_canonical(), "profile": profile.describe()}
     offender = image_contains_secret(body)
     if offender is not None:
@@ -1060,11 +1086,31 @@ class EphemeralController:
         self.diagnostics.append("queued {} for {}".format(job_id, repository))
         return job_id
 
-    def live_idle_count(self) -> int:
-        """Live instances not bound to a live job lease (idle/orphan compute)."""
+    def live_idle_count(self, now: Optional[float] = None) -> int:
+        """Live instances not bound to a live job lease (idle/orphan compute).
 
-        leased = set(self.leases)
-        return sum(1 for item in self.provider.live_instances() if item.id not in leased)
+        A lease past ``lease_expires_at``/``max_age_at`` (or past the
+        provisioning timeout while still provisioning) is awaiting the
+        orphan sweep, not actively serving a job: its compute is idle
+        leaked compute and must count as idle so the metric cannot report
+        zero idle while live compute leaks until reconciliation runs. When
+        ``now`` is omitted the legacy membership check applies (every lease
+        entry counts as bound) so callers without a clock keep working.
+        """
+
+        if now is None:
+            leased = set(self.leases)
+            return sum(1 for item in self.provider.live_instances() if item.id not in leased)
+        live_leased = set()
+        for instance_id, lease in self.leases.items():
+            expired = False
+            if now >= lease.max_age_at or now >= lease.lease_expires_at:
+                expired = True
+            elif lease.state == "provisioning" and now - lease.created_at >= self.provisioning_timeout:
+                expired = True
+            if not expired:
+                live_leased.add(instance_id)
+        return sum(1 for item in self.provider.live_instances() if item.id not in live_leased)
 
     def live_instance_count(self) -> int:
         return len(self.provider.live_instances())
@@ -1086,6 +1132,8 @@ class EphemeralController:
 
         if not self.queued:
             raise AgentRuntimeError("no queued demand: the controller never provisions without demand")
+        if outcome not in TERMINAL_OUTCOMES:
+            raise AgentRuntimeError("unknown job outcome {!r}: refusing to record success".format(outcome))
         # Peek first: image build/validation failures must not drop queued
         # demand. The entry is popped only after validation succeeds.
         queued = self.queued[0]
@@ -1217,7 +1265,12 @@ class EphemeralController:
         self._execute_one_job(instance, lease, now=now)
         events.append("executed-one-job {} uses={}".format(instance.id, instance.uses))
 
-        terminal = outcome if outcome in TERMINAL_OUTCOMES else OUTCOME_SUCCESS
+        # Unknown outcomes must never coerce to success: a typo (`succes`)
+        # or a new caller outcome (`timeout`) recorded as success would
+        # publish dependency cache and mask the failure. Fail closed.
+        if outcome not in TERMINAL_OUTCOMES:
+            raise AgentRuntimeError("unknown job outcome {!r}: refusing to record success".format(outcome))
+        terminal = outcome
         events.append("terminal {}".format(terminal))
         destroyed = self._teardown(instance, now=now, retries=teardown_retries)
         self.leases.pop(instance.id, None)
@@ -1624,12 +1677,13 @@ def workflow_step_has_prepared_runtime_probe(workflow_text: str) -> bool:
     if not gated:
         # Multi-line gate: `if [ -n "$CONTINUUM_IMAGE_DIGEST" ]; then` on
         # one line and `command -v opencode` on a nearby line is the same
-        # digest keying as the single-line `&&` form. Accept a digest
-        # conditional (if/test/bracket/shape check) within a short window
-        # of an executable probe so valid split gates are not reported as
-        # missing. A bare digest assignment without a conditional gate
-        # never counts.
-        _gate_markers = ("if", "[[", "[ ", "[\"", "test ", "&&", "||", "-n", "-z", "=~", "case ")
+        # digest keying as the single-line `&&` form. The gate must precede
+        # the probe in the same workflow step within a tight window so an
+        # unrelated digest `if` and a distant `command -v opencode` cannot
+        # pair up across steps (or in either order) and fake a digest-keyed
+        # hit without actually guarding the warm path. A bare digest
+        # assignment without a conditional gate never counts.
+        _gate_markers = ("=~", "-n", "-z", "==", "!=", "&&", "||", "case ")
         digest_gates = [
             index for index, code in enumerate(code_lines)
             if "CONTINUUM_IMAGE_DIGEST" in code
@@ -1639,8 +1693,19 @@ def workflow_step_has_prepared_runtime_probe(workflow_text: str) -> bool:
             index for index, code in enumerate(code_lines)
             if any(pattern in code for pattern in _PROBE_PATTERNS)
         ]
+        step_breaks = [
+            index for index, code in enumerate(code_lines)
+            if code.strip().startswith("- name") or code.strip().startswith("-name")
+        ]
+
+        def _same_step(first: int, second: int) -> bool:
+            low, high = (first, second) if first <= second else (second, first)
+            return not any(low < boundary <= high for boundary in step_breaks)
+
         gated = any(
-            abs(digest_index - probe_index) <= 20
+            digest_index <= probe_index
+            and (probe_index - digest_index) <= 10
+            and _same_step(digest_index, probe_index)
             for digest_index in digest_gates
             for probe_index in probe_lines
         )
