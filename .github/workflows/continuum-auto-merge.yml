@@ -101,6 +101,10 @@ jobs:
           POST_MERGE_WAKEUP_REF: ${{ inputs.post_merge_wakeup_ref || vars.CONTINUUM_POST_MERGE_WAKEUP_REF || github.event.repository.default_branch || 'main' }}
           REQUIRED_WORKFLOW_GATE_LABEL: ${{ inputs.required_workflow_gate_label || vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_LABEL || '' }}
           REQUIRED_WORKFLOW_GATE_NAME: ${{ inputs.required_workflow_gate_name || vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_NAME || '' }}
+          # Same-repository housekeeping reads (main SHA, active run listing,
+          # obsolete-run metadata) run on the repository token so they never
+          # draw from the shared TAP_PAT budget. Mutations stay PAT-backed.
+          READ_GITHUB_TOKEN: ${{ github.token }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
@@ -160,6 +164,101 @@ jobs:
               String(process.env.REQUIRED_WORKFLOW_GATE_LABEL || '').trim();
             const requiredWorkflowGateName =
               String(process.env.REQUIRED_WORKFLOW_GATE_NAME || '').trim();
+
+            // Same-repository housekeeping reads use the repository token so
+            // they never draw from the shared TAP_PAT budget. The github-script
+            // action client (`github`) stays PAT-authenticated for every
+            // mutation below (merge, cancel, label, comment, dispatch). Reuse
+            // the injected constructor so the paginate/rest plugins are kept;
+            // dynamically requiring `@actions/github` is not resolvable here.
+            const readToken = String(process.env.READ_GITHUB_TOKEN || '').trim();
+            if (!readToken) {
+              throw new Error(
+                'READ_GITHUB_TOKEN is required for same-repository auto-merge housekeeping reads.'
+              );
+            }
+            const readBaseUrl = (
+              (github && github.request && github.request.endpoint &&
+                github.request.endpoint.DEFAULTS && github.request.endpoint.DEFAULTS.baseUrl) ||
+              process.env.GITHUB_API_URL || 'https://api.github.com'
+            );
+            const readGithub = new github.constructor({
+              auth: readToken,
+              baseUrl: readBaseUrl,
+            });
+            if (
+              typeof readGithub.paginate !== 'function' ||
+              typeof readGithub.rest?.repos?.getBranch !== 'function' ||
+              typeof readGithub.rest?.repos?.getContent !== 'function' ||
+              typeof readGithub.rest?.repos?.getReleaseByTag !== 'function' ||
+              typeof readGithub.rest?.actions?.listWorkflowRunsForRepo !== 'function'
+            ) {
+              throw new Error(
+                'readGithub client lacks the paginate/rest plugins; ' +
+                'cannot perform same-repository auto-merge housekeeping reads.'
+              );
+            }
+
+            // Bounded Actions housekeeping budget (kodmial/continuum#253).
+            // The obsolete-run scan must never grow with repository age: only
+            // active/non-terminal states are listed, one status value per
+            // request (the API accepts a single status), with an explicit page
+            // cap per status. Completed history is never walked to discover
+            // active runs. With 5 statuses x 2 pages x 100 rows the list phase
+            // costs at most 10 REST calls and never requests page 10+.
+            const HOUSEKEEPING_ACTIVE_STATUSES = [
+              'queued', 'in_progress', 'waiting', 'requested', 'pending',
+            ];
+            const HOUSEKEEPING_PER_PAGE = 100;
+            const HOUSEKEEPING_MAX_PAGES_PER_STATUS = 2;
+            const HOUSEKEEPING_MAX_RELEASE_PROBES = 10;
+
+            function housekeepingStatus(err) {
+              return err?.status ?? err?.response?.status;
+            }
+
+            // Best-effort housekeeping: a rate-limit/transient read or cancel
+            // skips cleanup and lets core reconciliation continue. Any other
+            // deterministic error (programming/config bug) still fails loudly.
+            // A 403 is transient only with rate-limit evidence: GitHub also
+            // uses 403 for deterministic permission/config denials (missing
+            // scope, private-repo denial, SSO enforcement), which must fail
+            // loudly instead of hiding as skipped cleanup.
+            function isHousekeepingRateLimit403(err) {
+              const message = [
+                err?.message,
+                err?.response?.data?.message,
+                typeof err?.response?.data === 'string'
+                  ? err.response.data
+                  : '',
+              ]
+                .filter(value => typeof value === 'string' && value.length > 0)
+                .join('\n')
+                .toLowerCase();
+              if (/rate[\s_-]*limit|secondary|abuse/.test(message)) {
+                return true;
+              }
+              const rawHeaders =
+                err?.response?.headers ?? err?.headers ?? null;
+              if (rawHeaders && typeof rawHeaders === 'object') {
+                const headers = {};
+                for (const [key, value] of Object.entries(rawHeaders)) {
+                  headers[String(key).toLowerCase()] =
+                    String(value).toLowerCase().trim();
+                }
+                if ('retry-after' in headers) return true;
+                if (headers['x-ratelimit-remaining'] === '0') return true;
+              }
+              return false;
+            }
+
+            function isHousekeepingTransientError(err) {
+              const status = housekeepingStatus(err);
+              if (status === 429) return true;
+              if (status === 403) return isHousekeepingRateLimit403(err);
+              if ([500, 502, 503, 504].includes(status)) return true;
+              return false;
+            }
 
             // Downstream wake-ups after a merge are consumer-owned. The fork
             // auto-merger woke `knowledge-sync.yml` (which has no core
@@ -986,7 +1085,27 @@ jobs:
             }
 
             async function cancelObsoleteRuns(openPulls) {
-              const { data: mainBranch } = await github.rest.repos.getBranch({
+              // Best-effort housekeeping wrapper: a transient/rate-limit read
+              // skips this cleanup pass and lets core PR synchronization,
+              // review, and merge reconciliation continue. Deterministic
+              // programming/config errors still fail loudly.
+              try {
+                return await cancelObsoleteRunsInner(openPulls);
+              } catch (err) {
+                if (isHousekeepingTransientError(err)) {
+                  core.warning(
+                    `Skipping obsolete-run cleanup: housekeeping read failed with transient status ${housekeepingStatus(err)}: ${err.message}`
+                  );
+                  return { ci: 0, noopRelease: 0, skipped: true };
+                }
+                throw err;
+              }
+            }
+
+            async function cancelObsoleteRunsInner(openPulls) {
+              // Same-repository housekeeping reads stay on the repository
+              // token; only the cancellation mutation below uses TAP_PAT.
+              const { data: mainBranch } = await readGithub.rest.repos.getBranch({
                 owner,
                 repo,
                 branch: 'main',
@@ -998,22 +1117,37 @@ jobs:
                 ...openPulls.map(pr => pr.head.sha),
               ]);
 
-              const runs = await github.paginate(
-                github.rest.actions.listWorkflowRunsForRepo,
-                {
-                  owner,
-                  repo,
-                  per_page: 100,
+              // Bounded status-filtered listing: one status per request (the
+              // API accepts a single status value) with an explicit page cap.
+              // Completed history is never walked to discover active runs, so
+              // the list phase costs at most
+              // HOUSEKEEPING_ACTIVE_STATUSES.length *
+              // HOUSEKEEPING_MAX_PAGES_PER_STATUS REST calls regardless of
+              // repository history size, and never requests page 10+.
+              const runs = [];
+              for (const status of HOUSEKEEPING_ACTIVE_STATUSES) {
+                for (let page = 1; page <= HOUSEKEEPING_MAX_PAGES_PER_STATUS; page += 1) {
+                  const { data } = await readGithub.rest.actions.listWorkflowRunsForRepo({
+                    owner,
+                    repo,
+                    per_page: HOUSEKEEPING_PER_PAGE,
+                    page,
+                    status,
+                  });
+                  const batch = data.workflow_runs || [];
+                  for (const run of batch) runs.push(run);
+                  if (batch.length < HOUSEKEEPING_PER_PAGE) break;
                 }
-              );
+              }
 
-              const activeStates =
-                ['queued', 'in_progress', 'waiting', 'pending', 'requested'];
               let ci = 0;
               let noopRelease = 0;
+              let releaseProbes = 0;
 
               async function cancelRun(run, reason) {
                 try {
+                  // Cancellation is a mutation: it stays PAT-backed so the
+                  // actor identity and downstream fan-out are unchanged.
                   await github.rest.actions.cancelWorkflowRun({
                     owner,
                     repo,
@@ -1026,16 +1160,27 @@ jobs:
                 } catch (err) {
                   // A run may finish or be cancelled by concurrency between the
                   // list and the write; that race is harmless.
-                  if (![409, 422].includes(err.status)) throw err;
-                  core.info(
-                    `Run ${run.id} changed state before cancellation: ${err.message}`
-                  );
-                  return false;
+                  if ([409, 422].includes(housekeepingStatus(err))) {
+                    core.info(
+                      `Run ${run.id} changed state before cancellation: ${err.message}`
+                    );
+                    return false;
+                  }
+                  // A rate-limit/transient cancel is best-effort housekeeping:
+                  // skip this run and let reconciliation continue instead of
+                  // turning the controller red. No retry storm: no retry here.
+                  if (isHousekeepingTransientError(err)) {
+                    core.warning(
+                      `Skipping cancellation of ${reason} run ${run.id}: transient status ${housekeepingStatus(err)}: ${err.message}`
+                    );
+                    return false;
+                  }
+                  throw err;
                 }
               }
 
               for (const run of runs) {
-                if (!activeStates.includes(run.status)) continue;
+                if (!HOUSEKEEPING_ACTIVE_STATUSES.includes(run.status)) continue;
 
                 if (
                   run.name === 'CI' &&
@@ -1056,9 +1201,16 @@ jobs:
                   run.head_branch === 'main' &&
                   run.head_sha !== mainSha
                 ) {
+                  if (releaseProbes >= HOUSEKEEPING_MAX_RELEASE_PROBES) {
+                    core.info(
+                      `Housekeeping release-probe budget exhausted; skipping Release run ${run.id}.`
+                    );
+                    continue;
+                  }
+                  releaseProbes += 1;
                   try {
                     const { data: versionFile } =
-                      await github.rest.repos.getContent({
+                      await readGithub.rest.repos.getContent({
                         owner,
                         repo,
                         path: process.env.CONTINUUM_VERSION_FILE,
@@ -1076,7 +1228,7 @@ jobs:
                     if (!match) continue;
 
                     const { data: release } =
-                      await github.rest.repos.getReleaseByTag({
+                      await readGithub.rest.repos.getReleaseByTag({
                         owner,
                         repo,
                         tag: `v${match[0]}`,
@@ -1097,13 +1249,24 @@ jobs:
                       }
                     }
                   } catch (err) {
-                    if (err.status !== 404) throw err;
-                    // No matching release existed: this may be a real release.
+                    if (housekeepingStatus(err) === 404) {
+                      // No matching release existed: this may be a real release.
+                      continue;
+                    }
+                    // A transient metadata read skips this Release candidate
+                    // only; deterministic errors still fail loudly.
+                    if (isHousekeepingTransientError(err)) {
+                      core.warning(
+                        `Skipping Release housekeeping for run ${run.id}: transient status ${housekeepingStatus(err)}: ${err.message}`
+                      );
+                      continue;
+                    }
+                    throw err;
                   }
                 }
               }
 
-              return { ci, noopRelease };
+              return { ci, noopRelease, skipped: false };
             }
 
             function resolveOpencodeWorkflow() {

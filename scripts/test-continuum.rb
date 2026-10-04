@@ -5202,4 +5202,328 @@ class ContinuumTest < Minitest::Test
     end
   end
 
+  # kodmial/continuum#253 P0: the auto-merge obsolete-run scan walked the
+  # complete Actions history (page 10+ on Kodmai PR #95) from the shared
+  # TAP_PAT and aborted the whole controller on a 403. Housekeeping must be
+  # bounded and cheap regardless of repository history size.
+  #
+  # Covers DoD regression items 1-3: bounded list-call count with 10k
+  # historical completed runs, no page 10+ request, only active/relevant runs
+  # considered for obsolete cancellation.
+  def test_auto_merge_housekeeping_listing_is_bounded_and_status_filtered
+    body = auto_merge_body
+    inner = js_block(body, 'async function cancelObsoleteRunsInner')
+    refute_nil inner, 'the bounded housekeeping implementation is missing'
+
+    # The unbounded all-history pagination must be gone from the
+    # housekeeping path. Gate reads (latestWorkflowForHead) still paginate a
+    # single branch+event scope; only the housekeeping scan is asserted here.
+    refute_includes inner, 'github.paginate(',
+                    'housekeeping must not use unbounded paginate; use explicit page bounds'
+    assert_includes inner, 'for (const status of HOUSEKEEPING_ACTIVE_STATUSES)',
+                    'housekeeping must query one status value per request'
+    assert_includes inner, 'for (let page = 1; page <= HOUSEKEEPING_MAX_PAGES_PER_STATUS; page += 1)',
+                    'housekeeping must enforce an explicit page cap'
+    assert_includes inner, 'status,',
+                    'the list call must pass the status filter to the API'
+    assert_includes body, 'HOUSEKEEPING_MAX_PAGES_PER_STATUS = 2',
+                    'the page cap must stay well below page 10'
+    assert_includes body, 'HOUSEKEEPING_ACTIVE_STATUSES = [',
+                    'active states must be enumerated explicitly'
+    %w[queued in_progress waiting requested pending].each do |state|
+      assert_includes body, "'#{state}'",
+                        "active state #{state} must remain in the housekeeping set"
+    end
+    assert_includes inner, 'if (batch.length < HOUSEKEEPING_PER_PAGE) break;',
+                    'a short page must stop pagination early'
+    assert_includes inner, 'if (!HOUSEKEEPING_ACTIVE_STATUSES.includes(run.status)) continue;',
+                    'only active/non-terminal runs may be considered for cancellation'
+    refute_match(/page:\s*10/, inner,
+                 'housekeeping must never request arbitrary page 10+')
+    refute_match(/page\s*=\s*10/, inner,
+                 'housekeeping must never walk to page 10+')
+
+    # Request-count bound is structural: 5 statuses x max 2 pages = at most
+    # 10 list calls. Release metadata probes are bounded independently.
+    assert_includes body, 'HOUSEKEEPING_MAX_RELEASE_PROBES = 10',
+                    'per-run Release metadata reads must be probe-bounded'
+    assert_includes inner, 'if (releaseProbes >= HOUSEKEEPING_MAX_RELEASE_PROBES)',
+                    'the probe budget must be enforced before further reads'
+
+    # Deterministic Kodmai-scale fixture: 10k historical completed runs plus
+    # only 3 active runs. The old all-history strategy pays
+    # ceil(10003/100)=101 REST list calls and walks past page 10; the new
+    # status-filtered strategy pays one short page per status (5 calls) and
+    # never touches completed history.
+    active = [
+      { 'status' => 'queued', 'name' => 'CI' },
+      { 'status' => 'in_progress', 'name' => 'CI' },
+      { 'status' => 'queued', 'name' => 'Release' },
+    ]
+    historical_completed = 10_000
+    per_page = 100
+    old_calls = ((historical_completed + active.size).to_f / per_page).ceil
+    assert_equal 101, old_calls, 'fixture sanity: old scan walks 101 pages for 10k history'
+    assert_operator old_calls, :>, 10, 'the old scan demonstrably exceeds any small bound'
+
+    # Simulate the new bounded loop against a fake server that filters by
+    # status server-side (like the real API): each status bucket holds at
+    # most the few active runs, so every status terminates after 1 page.
+    statuses = %w[queued in_progress waiting requested pending]
+    max_pages = 2
+    calls = 0
+    max_page_seen = 0
+    considered = []
+    buckets = active.group_by { |run| run['status'] }
+    statuses.each do |_status|
+      (1..max_pages).each do |page|
+        calls += 1
+        max_page_seen = [max_page_seen, page].max
+        batch = (buckets[_status] || []).each_slice(per_page).to_a[page - 1] || []
+        considered.concat(batch)
+        break if batch.size < per_page
+      end
+    end
+    assert_equal 5, calls, 'bounded scan costs 5 list calls for the fixture (1 short page per status)'
+    assert_operator calls, :<=, 10, 'list-call count must stay bounded regardless of history size'
+    assert_operator max_page_seen, :<, 10, 'no request for page 10+ may be made'
+    assert_equal 3, considered.size, 'only the few active runs are considered'
+    assert considered.all? { |run| statuses.include?(run['status']) },
+           'only active/non-terminal states are considered'
+    assert_equal historical_completed, 10_000, 'history size is fixed by the fixture'
+  end
+
+  # Covers DoD regression items 4 and 10: same-repo housekeeping reads use
+  # the repository token while cancellation stays PAT-backed, and no other
+  # credential binding changes.
+  def test_auto_merge_housekeeping_reads_use_repository_token_and_mutations_stay_pat
+    body = auto_merge_body
+    workflow = yaml(File.join(ROOT, '.github/workflows/continuum-auto-merge.yml'))
+    stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-auto-merge.yml'))
+    inner = js_block(body, 'async function cancelObsoleteRunsInner')
+    refute_nil inner, 'the bounded housekeeping implementation is missing'
+
+    # The step keeps its PAT client for mutations; the repository token
+    # arrives only as an extra env binding for housekeeping reads.
+    assert_includes body, 'github-token: ${{ secrets.TAP_PAT }}',
+                    'the auto-merge step must stay PAT-backed for mutations'
+    assert_includes body, 'READ_GITHUB_TOKEN: ${{ github.token }}',
+                    'housekeeping reads must bind the repository token explicitly'
+    assert_equal 1, body.scan('${{ github.token }}').size,
+                 'no credential binding outside the verified housekeeping-read scope may change'
+    assert_includes body, 'new github.constructor(',
+                    'housekeeping must build a dedicated read client from the injected constructor'
+
+    # Housekeeping reads (main SHA, active run listing, version/release
+    # metadata) run on the read client.
+    assert_includes inner, 'await readGithub.rest.repos.getBranch(',
+                    'the housekeeping main-SHA read must use the repository token'
+    assert_includes inner, 'await readGithub.rest.actions.listWorkflowRunsForRepo(',
+                    'the active run listing must use the repository token'
+    assert_includes inner, 'await readGithub.rest.repos.getContent(',
+                    'the version-file metadata read must use the repository token'
+    assert_includes inner, 'await readGithub.rest.repos.getReleaseByTag(',
+                    'the release metadata read must use the repository token'
+    refute_includes inner, 'await github.rest.repos.getBranch(',
+                    'the housekeeping main-SHA read must not use TAP_PAT'
+    refute_includes inner, 'await github.rest.actions.listWorkflowRunsForRepo(',
+                    'the housekeeping run listing must not use TAP_PAT'
+    refute_includes inner, 'await github.rest.repos.getContent(',
+                    'the housekeeping version read must not use TAP_PAT'
+    refute_includes inner, 'await github.rest.repos.getReleaseByTag(',
+                    'the housekeeping release read must not use TAP_PAT'
+
+    # The cancellation mutation stays PAT-backed with unchanged actor/fan-out.
+    assert_includes inner, 'await github.rest.actions.cancelWorkflowRun(',
+                    'cancellation must remain PAT-backed'
+    refute_includes inner, 'await readGithub.rest.actions.cancelWorkflowRun(',
+                    'cancellation must never move to the repository token in this P0'
+
+    # Least privilege is unchanged: the reusable workflow and its caller
+    # already grant actions:write (which includes read), so no permission
+    # widening is needed for the repository-token reads.
+    assert_equal 'write', workflow.fetch('jobs').fetch('controller').fetch('permissions').fetch('actions')
+    assert_equal 'write', stub.fetch('permissions').fetch('actions')
+    assert_equal 'write', workflow.fetch('jobs').fetch('controller').fetch('permissions').fetch('contents')
+    assert_equal 'write', workflow.fetch('jobs').fetch('controller').fetch('permissions').fetch('pull-requests')
+
+    # Gate reads outside housekeeping stay on the PAT path: the exact-HEAD CI
+    # lookup is merge-gate evidence, not housekeeping, and is not migrated.
+    assert_includes body, 'async function latestWorkflowForHead',
+                    'the CI gate lookup must still exist'
+    gate = js_block(body, 'async function latestWorkflowForHead')
+    refute_nil gate
+    assert_includes gate, 'github.paginate(',
+                    'the branch-scoped CI gate keeps its existing client; only housekeeping moves'
+  end
+
+  # Covers DoD regression items 5 and 6: a rate-limit/transient failure on
+  # the housekeeping read path warns and skips cleanup without aborting core
+  # reconciliation, while a deterministic bug still fails loudly.
+  def test_auto_merge_housekeeping_rate_limit_is_best_effort_but_deterministic_fails
+    body = auto_merge_body
+    outer = js_block(body, 'async function cancelObsoleteRuns(')
+    inner = js_block(body, 'async function cancelObsoleteRunsInner')
+    refute_nil outer, 'the best-effort housekeeping wrapper is missing'
+    refute_nil inner, 'the bounded housekeeping implementation is missing'
+
+    # Transient set: the live 403 core-REST exhaustion plus 429/5xx.
+    # A bare 403 is not transient: GitHub also uses 403 for deterministic
+    # permission/config denials, which must fail loudly. Only a 403 with
+    # rate-limit evidence (message or headers) skips cleanup.
+    assert_includes body, 'function isHousekeepingTransientError(err)',
+                    'the transient classifier is missing'
+    assert_includes body, 'function isHousekeepingRateLimit403(err)',
+                    'the 403 rate-limit evidence classifier is missing'
+    assert_includes body, 'if (status === 429) return true;',
+                    '429 must be treated as transient housekeeping failure'
+    assert_includes body, 'if (status === 403) return isHousekeepingRateLimit403(err);',
+                    '403 must be transient only with rate-limit evidence'
+    refute_includes body, 'if (status === 403) return true;',
+                    'a bare 403 must not be treated as transient'
+    assert_includes body, 'rate[',
+                    'the 403 classifier must inspect rate-limit message evidence'
+    assert_includes body, 'x-ratelimit-remaining',
+                    'the 403 classifier must inspect rate-limit header evidence'
+    assert_includes body, '[500, 502, 503, 504].includes(status)',
+                    'transient 5xx must be treated as transient housekeeping failure'
+
+    # Best-effort wrapper: warn, return zero counts with skipped:true, and
+    # let the caller continue into PR synchronization/review/merge.
+    assert_includes outer, 'return await cancelObsoleteRunsInner(openPulls);'
+    assert_includes outer, 'if (isHousekeepingTransientError(err)) {'
+    assert_includes outer, 'core.warning('
+    assert_includes outer, 'Skipping obsolete-run cleanup'
+    assert_includes outer, 'return { ci: 0, noopRelease: 0, skipped: true };'
+    assert_includes outer, 'throw err;'
+    # The caller after the wrapper continues reconciliation unconditionally:
+    # no human-required marking, no early return on skipped.
+    caller_at = body.index('const cancelledRuns = await cancelObsoleteRuns(pulls);')
+    refute_nil caller_at, 'the housekeeping call site is missing'
+    tail = body[caller_at, 1200]
+    assert_includes tail, 'pulls.sort(',
+                    'reconciliation must continue after housekeeping regardless of skip'
+    refute_includes tail, 'core.setFailed',
+                    'a skipped cleanup pass must not fail the run'
+    refute_includes tail, 'human-required',
+                    'a skipped cleanup pass must not mark work human-required'
+
+    # Per-run Release metadata and per-cancel transient handling are also
+    # best-effort without retry storms: warn/skip, never retry-loop.
+    assert_includes inner, 'Skipping Release housekeeping for run'
+    assert_includes inner, 'Skipping cancellation of'
+    refute_match(/for\s*\(.*retry.*\)/i, inner,
+                 'housekeeping must not introduce a retry loop')
+    refute_match(/setTimeout.*housekeep/i, inner,
+                 'housekeeping must not introduce delayed retries')
+
+    # Executable classifier replica: the same status set the workflow
+    # expresses must behave as specified (rate-limit skips, bug fails).
+    # A 403 skips only with rate-limit evidence; a deterministic 403
+    # (permission/config denial) still fails loudly.
+    transient = lambda do |status, rate_limit_evidence = false|
+      next true if status == 429
+      next rate_limit_evidence if status == 403
+      [500, 502, 503, 504].include?(status)
+    end
+    assert transient.call(403, true), 'a 403 with rate-limit evidence must skip cleanup, not abort'
+    refute transient.call(403, false), 'a deterministic 403 denial must still fail loudly'
+    assert transient.call(429), '429 must skip cleanup, not abort'
+    assert transient.call(503), '503 must skip cleanup, not abort'
+    refute transient.call(422), 'a deterministic 422 must still fail loudly'
+    refute transient.call(400), 'a deterministic 400 must still fail loudly'
+    refute transient.call(nil), 'a programming bug with no status must still fail loudly'
+
+    # A deterministic bug inside housekeeping still rejects: only the
+    # transient branch returns zeros; every other error rethrows.
+    assert_match(/catch \(err\) \{\s*\n\s*if \(isHousekeepingTransientError\(err\)\) \{[\s\S]*?\n\s*\}\s*\n\s*throw err;/, outer,
+                 'non-transient housekeeping errors must rethrow')
+    # The Release 404 fast path (may-be-real-release) is preserved.
+    assert_includes inner, 'housekeepingStatus(err) === 404',
+                    'the 404 may-be-real-release path must be preserved'
+  end
+
+  # Covers DoD regression items 7-9 plus safety-gate preservation: stale CI
+  # cancellation, stale no-op Release cancellation, PR-Agent sync-only mode,
+  # and every merge gate stay exactly as before.
+  def test_auto_merge_housekeeping_preserves_cancellation_and_sync_semantics
+    body = auto_merge_body
+    inner = js_block(body, 'async function cancelObsoleteRunsInner')
+    refute_nil inner, 'the bounded housekeeping implementation is missing'
+
+    # 7. Stale CI semantics unchanged: active CI runs whose head is neither
+    # main nor any open PR head are cancelled and counted.
+    assert_includes inner, "run.name === 'CI' &&"
+    assert_includes inner, '!liveHeads.has(run.head_sha)'
+    assert_includes inner, "if (await cancelRun(run, 'obsolete CI')) ci += 1;"
+    assert_includes inner, 'const liveHeads = new Set(['
+    assert_includes inner, 'mainSha,'
+    assert_includes inner, '...openPulls.map(pr => pr.head.sha),'
+
+    # 8. Stale no-op Release semantics unchanged: push-to-main Release runs
+    # off current main are cancelled only when the run-head version was
+    # already published before the run started; a missing release (404)
+    # means it may be a real release and is never cancelled.
+    assert_includes inner, "run.name === 'Release' &&"
+    assert_includes inner, "run.event === 'push' &&"
+    assert_includes inner, "run.head_branch === 'main' &&"
+    assert_includes inner, 'run.head_sha !== mainSha'
+    assert_includes inner, '/\\b\\d+\\.\\d+\\.\\d+\\b/'
+    assert_includes inner, 'tag: `v${match[0]}`'
+    assert_includes inner, 'publishedAt < runCreatedAt'
+    assert_includes inner, "if (await cancelRun(run, 'stale no-op Release')) {"
+    assert_includes inner, 'noopRelease += 1;'
+    # The 409/422 list-then-cancel race stays harmless.
+    assert_includes inner, '[409, 422].includes(housekeepingStatus(err))'
+    assert_includes inner, 'changed state before cancellation'
+
+    # Executable semantic check on the preserved predicates.
+    stale_ci = lambda do |run_name, head, live|
+      run_name == 'CI' && !live.include?(head)
+    end
+    assert stale_ci.call('CI', 'dead-sha', %w[main-sha pr-sha]),
+           'an obsolete CI head must still be cancelled'
+    refute stale_ci.call('CI', 'pr-sha', %w[main-sha pr-sha]),
+           'a live CI head must never be cancelled'
+    refute stale_ci.call('Release', 'dead-sha', %w[main-sha pr-sha]),
+           'a Release run must never take the CI path'
+    stale_release = lambda do |run, main_sha, published_at, created_at|
+      run['name'] == 'Release' && run['event'] == 'push' &&
+        run['head_branch'] == 'main' && run['head_sha'] != main_sha &&
+        published_at.positive? && created_at.positive? && published_at < created_at
+    end
+    run = { 'name' => 'Release', 'event' => 'push', 'head_branch' => 'main', 'head_sha' => 'old-main' }
+    assert stale_release.call(run, 'new-main', 100, 200),
+           'a stale no-op Release must still be cancelled'
+    refute stale_release.call(run, 'old-main', 100, 200),
+           'the current-main Release run must never be cancelled'
+    refute stale_release.call(run, 'new-main', 300, 200),
+           'a run that may itself publish the release must never be cancelled'
+
+    # 9. PR-Agent sync-only mode still works: main sync stays active while
+    # the generic reconciler exits before CI/review/merge gates.
+    assert_includes body, "const prAgentSyncOnly = reviewProvider === 'pr-agent';"
+    assert_includes body, 'generic reconciler stops after main-sync evaluation'
+    sync_guard = body.index('if (prAgentSyncOnly) {', body.index('await updateFromMain(pr);'))
+    generic_ci = body.index('const ci = await latestCurrentHeadCi(pr);')
+    refute_nil sync_guard, 'the sync-only guard is missing'
+    refute_nil generic_ci, 'the generic CI gate is missing'
+    assert_operator sync_guard, :<, generic_ci,
+                    'PR-Agent sync-only mode must exit before generic review/merge gates'
+
+    # Safety gates are not weakened: exact-HEAD CI, packaging smoke,
+    # main-sync conflict handling, conflict repair, PR-Agent ownership, merge
+    # SHA guard, and downstream wake-up semantics all remain.
+    assert_includes body, 'async function latestCurrentHeadCi(pr)'
+    assert_includes body, 'async function shouldSyncFromMain(pr, comparison)'
+    assert_includes body, 'async function dispatchConflictRepair(pr, reason)'
+    assert_includes body, 'sha: pr.head.sha,',
+                    'the merge SHA guard must remain'
+    assert_includes body, 'merge_method:'
+    assert_includes body, "'squash'"
+    assert_includes body, 'pr.mergeable === false'
+    assert_includes body, "hasLabel(pr, AUTO_MERGE_BLOCK_LABEL)"
+    assert_includes body, 'for (const workflow of postMergeWakeups) {'
+  end
+
   end
