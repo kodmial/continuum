@@ -473,7 +473,6 @@ jobs:
         if: steps.batch.outputs.empty != 'true' && steps.convergence.outcome == 'success' && steps.convergence.outputs.held != 'true'
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
-          READ_GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ inputs.pr_number }}
           HEAD_SHA: ${{ inputs.head_sha }}
           HEAD_REF: ${{ steps.target.outputs.head_ref }}
@@ -549,7 +548,7 @@ jobs:
           fi
           # Revalidate immediately before publication so a long repair run can
           # never publish against a PR branch that moved after repair started.
-          if ! CURRENT_STATE="$(GH_TOKEN="$READ_GH_TOKEN" gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid,state,isDraft --jq '[.headRefOid,.state,(.isDraft|tostring)]|@tsv')"; then
+          if ! CURRENT_STATE="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid,state,isDraft --jq '[.headRefOid,.state,(.isDraft|tostring)]|@tsv')"; then
             echo "classification=transient" >> "$GITHUB_OUTPUT"
             echo "::error::Unable to revalidate PR branch before publish; GitHub API read failed and recovery may retry."
             exit 1
@@ -600,7 +599,7 @@ jobs:
             "Repair prepared ${HEAD_SHA_LOWER} -> ${NEW_HEAD_LOWER}; a fresh exact-HEAD review will hold only surviving logical findings."
 
           CONTROLLER_JSON="$RUNNER_TEMP/pr-agent-controller-comments.json"
-          if ! GH_TOKEN="$READ_GH_TOKEN" gh api --paginate \
+          if ! gh api --paginate \
             "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100" > "$CONTROLLER_JSON"; then
             echo "classification=transient" >> "$GITHUB_OUTPUT"
             echo "::error::Could not read controller comments; GitHub API failure is retryable."
@@ -637,7 +636,7 @@ jobs:
           fi
 
           if ! git push --force-with-lease="refs/heads/$HEAD_REF:$HEAD_SHA" origin "HEAD:refs/heads/$HEAD_REF"; then
-            if ! CURRENT_AFTER="$(GH_TOKEN="$READ_GH_TOKEN" gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)"; then
+            if ! CURRENT_AFTER="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)"; then
               echo "classification=transient" >> "$GITHUB_OUTPUT"
               echo "::error::Repair push failed and GitHub API could not revalidate the PR; recovery may retry."
               exit 1
