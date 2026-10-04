@@ -344,6 +344,15 @@ class RecoveryWiringTests(unittest.TestCase):
         self.assertIn("rollbackControllerState", body)
         self.assertIn("comment.updated_at || comment.created_at", body)
 
+    def test_recovery_controller_touch_changes_comment_body_per_dispatch_run(self):
+        body = self.read(".github/workflows/continuum-pr-agent-recovery.yml")
+        self.assertIn("Controller dispatch run:", body)
+        self.assertIn("String(context.runId)", body)
+        self.assertLess(
+            body.index("Controller dispatch run:"),
+            body.index("github.rest.actions.createWorkflowDispatch"),
+        )
+
     def test_recovered_review_uses_ci_workflow_not_combined_status(self):
         review = self.read(".github/workflows/continuum-pr-agent.yml")
         self.assertIn("listWorkflowRunsForRepo", review)
