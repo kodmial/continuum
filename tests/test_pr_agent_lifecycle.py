@@ -1111,6 +1111,24 @@ class StabilizationParityTests(unittest.TestCase):
         self.assertIn("identical structured PR-Agent finding state", repair)
         self.assertIn("steps.convergence.outputs.held != 'true'", repair)
 
+    def test_no_progress_and_github_api_failures_are_bounded_retryable(self):
+        repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
+        self.assertIn("explicitRepairRetry", repair)
+        self.assertIn("sameHeadFindings.clear()", repair)
+        self.assertIn('echo "classification=transient" >> "$GITHUB_OUTPUT"', repair)
+        self.assertIn("requesting bounded exact-HEAD re-review/repair", repair)
+        self.assertIn("if: always() && steps.repair_pass.outputs.no_progress == 'true'", repair)
+        # Target-aware merge: the repair pass stays wholly PAT-backed
+        # (GH_TOKEN is TAP_PAT) so delegated cross-repository reads succeed;
+        # a same-repository github.token read cannot target the child. The
+        # bounded-retry contract is preserved via transient classification
+        # and retryable API-failure handling against the resolved target.
+        self.assertIn('GH_TOKEN: ${{ secrets.TAP_PAT }}', repair)
+        self.assertIn('repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/issues/$PR_NUMBER/comments', repair)
+        self.assertIn('gh pr view "$PR_NUMBER" --repo "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY"', repair)
+        self.assertIn("GitHub API failure is retryable", repair)
+        self.assertNotIn("No repair diff; controller state will hold", repair)
+
     def test_main_sync_classification_predicate_is_not_inverted(self):
         merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
         # The exact negation is the contract: only a fully non-critical
