@@ -546,6 +546,7 @@ jobs:
           ISSUE_NUMBER: ${{ inputs.issue_number || github.event.issue.number }}
           IN_PROGRESS_LABEL: ${{ inputs.in_progress_label || vars.AUTOMATION_IN_PROGRESS_LABEL || 'automation:in-progress' }}
           READ_GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_API_URL: ${{ github.api_url }}
         with:
           # Preserve PAT identity for readiness mutations while moving the
           # same-repository readiness reads off the shared PAT core budget.
@@ -557,12 +558,19 @@ jobs:
             const inProgressLabel =
               process.env.IN_PROGRESS_LABEL || 'automation:in-progress';
             const readToken = String(process.env.READ_GITHUB_TOKEN || '').trim();
-            const readGithub = readToken
-              ? new github.constructor({ auth: readToken })
-              : github;
+            const apiBase = String(process.env.GITHUB_API_URL || 'https://api.github.com')
+              .replace(/\/+$/, '');
+            if (!readToken) {
+              core.setFailed('READ_GITHUB_TOKEN is required for readiness reads.');
+              return;
+            }
+            const readGithub = new github.constructor({
+              auth: readToken,
+              baseUrl: apiBase,
+            });
             let readTokenUnavailable = false;
             async function withReadFallback(fn) {
-              if (readTokenUnavailable || readGithub === github) {
+              if (readTokenUnavailable) {
                 return await fn(github);
               }
               try {
@@ -709,25 +717,84 @@ jobs:
           steps.issue_readiness.outputs.ready != 'false' &&
           ((github.event_name == 'workflow_dispatch' && inputs.mode == 'issue') ||
            (github.event_name == 'issue_comment' && !github.event.issue.pull_request))
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
-          GH_TOKEN: ${{ github.token }}
           ISSUE_NUMBER: ${{ inputs.issue_number || github.event.issue.number }}
-        run: |
-          set -euo pipefail
-          [[ -n "$ISSUE_NUMBER" ]] || { echo "skip=false" >> "$GITHUB_OUTPUT"; exit 0; }
+          TAP_PAT: ${{ secrets.TAP_PAT }}
+          GITHUB_API_URL: ${{ github.api_url }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const issueNumber = Number(process.env.ISSUE_NUMBER || 0);
+            const tapPat = String(process.env.TAP_PAT || '').trim();
+            const apiBase = String(process.env.GITHUB_API_URL || 'https://api.github.com')
+              .replace(/\/+$/, '');
 
-          # Read-only same-repository duplicate detection must not depend on TAP_PAT.\n          EXISTING_PR="$(gh pr list \
-            --repo "$GITHUB_REPOSITORY" \
-            --state open \
-            --json number,headRefName \
-            --jq '[.[] | select(.headRefName | startswith("opencode/issue'"$ISSUE_NUMBER"'-"))][0].number // empty')"
-          if [[ -n "$EXISTING_PR" ]]; then
-            echo "Open PR #$EXISTING_PR already implements issue #$ISSUE_NUMBER; skipping duplicate OpenCode run."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
+            if (!Number.isInteger(issueNumber) || issueNumber <= 0) {
+              core.setOutput('skip', 'false');
+              return;
+            }
 
+            async function listOpenPrsWithPat() {
+              if (!tapPat) throw new Error('TAP_PAT is unavailable for duplicate-guard fallback.');
+              const all = [];
+              for (let page = 1; ; page += 1) {
+                const response = await fetch(
+                  `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls?state=open&per_page=100&page=${page}`,
+                  {
+                    headers: {
+                      accept: 'application/vnd.github+json',
+                      authorization: `Bearer ${tapPat}`,
+                      'x-github-api-version': '2022-11-28',
+                    },
+                  }
+                );
+                if (!response.ok) {
+                  const details = (await response.text()).slice(0, 500);
+                  throw new Error(
+                    `Duplicate-guard PAT fallback failed with HTTP ${response.status}` +
+                    (details ? `: ${details}` : '')
+                  );
+                }
+                const pageItems = await response.json();
+                if (!Array.isArray(pageItems)) throw new Error('Unexpected duplicate-guard response.');
+                all.push(...pageItems);
+                if (pageItems.length < 100) break;
+              }
+              return all;
+            }
+
+            let openPrs;
+            try {
+              openPrs = await github.paginate(
+                github.rest.pulls.list,
+                { owner, repo, state: 'open', per_page: 100 }
+              );
+            } catch (err) {
+              const status = err ? (err.status ?? err.response?.status) : undefined;
+              if (![401, 403, 429].includes(status)) throw err;
+              core.warning(
+                `Repository-token duplicate read failed (${status}); ` +
+                'retrying with TAP_PAT for liveness.'
+              );
+              openPrs = await listOpenPrsWithPat();
+            }
+
+            const prefix = `opencode/issue${issueNumber}-`;
+            const existing = openPrs.find(pr =>
+              String(pr.head?.ref || '').startsWith(prefix)
+            );
+            if (existing) {
+              core.info(
+                `Open PR #${existing.number} already implements issue #${issueNumber}; ` +
+                'skipping duplicate OpenCode run.'
+              );
+              core.setOutput('skip', 'true');
+            } else {
+              core.setOutput('skip', 'false');
+            }
       # workflow_dispatch repair modes must NOT use "opencode github run":
       # that integration owns a branch/PR lifecycle and can open a new PR even
       # when the prompt says not to. Plain "opencode run" works in this already
