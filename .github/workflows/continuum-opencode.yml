@@ -355,8 +355,13 @@ jobs:
           MODE: ${{ inputs.mode }}
           ISSUE_NUMBER: ${{ inputs.issue_number || github.event.issue.number || '' }}
           PR_NUMBER: ${{ inputs.pr_number }}
+          TAP_PAT: ${{ secrets.TAP_PAT }}
+          GITHUB_API_URL: ${{ github.api_url }}
         with:
-          github-token: ${{ secrets.TAP_PAT }}
+          # Same-repository task-context reads must not consume the shared
+          # user PAT core budget. TAP_PAT is reserved for true cross-repo
+          # task fetches and as a bounded liveness fallback.
+          github-token: ${{ github.token }}
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
@@ -370,6 +375,30 @@ jobs:
             let source = '';
             let prTitle = '';
             let prBody = '';
+            const tapPat = String(process.env.TAP_PAT || '').trim();
+            const apiBase = String(process.env.GITHUB_API_URL || 'https://api.github.com')
+              .replace(/\/+$/, '');
+
+            async function fetchWithTapPat(path, description) {
+              if (!tapPat) {
+                throw new Error(`${description} requires TAP_PAT.`);
+              }
+              const response = await fetch(`${apiBase}${path}`, {
+                headers: {
+                  accept: 'application/vnd.github+json',
+                  authorization: `Bearer ${tapPat}`,
+                  'x-github-api-version': '2022-11-28',
+                },
+              });
+              if (!response.ok) {
+                const details = (await response.text()).slice(0, 500);
+                throw new Error(
+                  `${description} failed with HTTP ${response.status}` +
+                  (details ? `: ${details}` : '')
+                );
+              }
+              return await response.json();
+            }
 
             if (mode === 'issue' || (!mode && issueEventNumber > 0)) {
               if (!Number.isInteger(issueEventNumber) || issueEventNumber <= 0) {
@@ -455,11 +484,33 @@ jobs:
             }
 
             let issue;
+            const sameRepository =
+              taskRepository.toLowerCase() === repository.toLowerCase();
             try {
-              const response = await github.rest.issues.get({
-                owner: parts[0], repo: parts[1], issue_number: taskNumber,
-              });
-              issue = response.data;
+              if (sameRepository) {
+                try {
+                  const response = await github.rest.issues.get({
+                    owner: parts[0], repo: parts[1], issue_number: taskNumber,
+                  });
+                  issue = response.data;
+                } catch (err) {
+                  const status = err ? (err.status ?? err.response?.status) : undefined;
+                  if (![401, 403, 429].includes(status) || !tapPat) throw err;
+                  core.warning(
+                    `Repository-token task read failed (${status}); ` +
+                    'falling back to TAP_PAT for liveness.'
+                  );
+                  issue = await fetchWithTapPat(
+                    `/repos/${encodeURIComponent(parts[0])}/${encodeURIComponent(parts[1])}/issues/${taskNumber}`,
+                    `Authoritative task ${taskRepository}#${taskNumber}`
+                  );
+                }
+              } else {
+                issue = await fetchWithTapPat(
+                  `/repos/${encodeURIComponent(parts[0])}/${encodeURIComponent(parts[1])}/issues/${taskNumber}`,
+                  `Cross-repository authoritative task ${taskRepository}#${taskNumber}`
+                );
+              }
             } catch (err) {
               core.setFailed(
                 `Authoritative task ${taskRepository}#${taskNumber} could not be fetched: ${err.message || err}`
@@ -494,25 +545,103 @@ jobs:
         env:
           ISSUE_NUMBER: ${{ inputs.issue_number || github.event.issue.number }}
           IN_PROGRESS_LABEL: ${{ inputs.in_progress_label || vars.AUTOMATION_IN_PROGRESS_LABEL || 'automation:in-progress' }}
+          TAP_PAT: ${{ secrets.TAP_PAT }}
+          GITHUB_API_URL: ${{ github.api_url }}
         with:
-          github-token: ${{ secrets.TAP_PAT }}
+          # Same-repository readiness reads use the repository installation
+          # token. PAT is explicit only for event-producing mutations and
+          # bounded permission/rate-limit fallback.
+          github-token: ${{ github.token }}
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const issueNumber = Number(process.env.ISSUE_NUMBER);
             const inProgressLabel =
               process.env.IN_PROGRESS_LABEL || 'automation:in-progress';
+            const tapPat = String(process.env.TAP_PAT || '').trim();
+            const apiBase = String(process.env.GITHUB_API_URL || 'https://api.github.com')
+              .replace(/\/+$/, '');
+            const repoPath =
+              `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+
+            async function patRequest(path, options = {}) {
+              if (!tapPat) {
+                throw new Error('TAP_PAT is required for readiness mutation/fallback.');
+              }
+              const method = options.method || 'GET';
+              const apiVersion = options.apiVersion || '2022-11-28';
+              const response = await fetch(`${apiBase}${path}`, {
+                method,
+                headers: {
+                  accept: 'application/vnd.github+json',
+                  authorization: `Bearer ${tapPat}`,
+                  'content-type': 'application/json',
+                  'x-github-api-version': apiVersion,
+                },
+                body: options.body === undefined
+                  ? undefined
+                  : JSON.stringify(options.body),
+              });
+              if (options.allow404 && response.status === 404) return null;
+              if (!response.ok) {
+                const details = (await response.text()).slice(0, 500);
+                throw new Error(
+                  `Readiness PAT request ${method} ${path} failed with HTTP ${response.status}` +
+                  (details ? `: ${details}` : '')
+                );
+              }
+              if (response.status === 204) return null;
+              const text = await response.text();
+              return text ? JSON.parse(text) : null;
+            }
+
+            async function patPaginate(path, apiVersion = '2022-11-28') {
+              const all = [];
+              for (let page = 1; ; page += 1) {
+                const separator = path.includes('?') ? '&' : '?';
+                const pageItems = await patRequest(
+                  `${path}${separator}per_page=100&page=${page}`,
+                  { apiVersion }
+                );
+                if (!Array.isArray(pageItems)) {
+                  throw new Error(`Unexpected paginated readiness response for ${path}.`);
+                }
+                all.push(...pageItems);
+                if (pageItems.length < 100) break;
+              }
+              return all;
+            }
+
+            async function readWithFallback(fn, patPath, options = {}) {
+              try {
+                return await fn();
+              } catch (err) {
+                const status = err ? (err.status ?? err.response?.status) : undefined;
+                if (![401, 403, 429].includes(status)) throw err;
+                core.warning(
+                  `Repository-token readiness read failed (${status}); ` +
+                  'retrying with TAP_PAT for liveness.'
+                );
+                return options.paginate
+                  ? await patPaginate(patPath, options.apiVersion)
+                  : await patRequest(patPath, { apiVersion: options.apiVersion });
+              }
+            }
 
             if (!Number.isInteger(issueNumber) || issueNumber <= 0) {
               core.setFailed('Invalid issue number for readiness check.');
               return;
             }
 
-            const { data: issue } = await github.rest.issues.get({
-              owner,
-              repo,
-              issue_number: issueNumber,
-            });
+            const issue = await readWithFallback(
+              async () => {
+                const { data } = await github.rest.issues.get({
+                  owner, repo, issue_number: issueNumber,
+                });
+                return data;
+              },
+              `${repoPath}/issues/${issueNumber}`
+            );
             if (issue.state !== 'open') {
               core.setOutput('ready', 'false');
               core.notice(`Issue #${issueNumber} is not open; implementation will not start.`);
@@ -527,26 +656,31 @@ jobs:
               for (const match of declared[1].matchAll(/\d+/g)) {
                 const blockerNumber = Number(match[0]);
                 if (blockerNumber === issueNumber) continue;
-                const { data: blocker } = await github.rest.issues.get({
-                  owner,
-                  repo,
-                  issue_number: blockerNumber,
-                });
+                const blocker = await readWithFallback(
+                  async () => {
+                    const { data } = await github.rest.issues.get({
+                      owner, repo, issue_number: blockerNumber,
+                    });
+                    return data;
+                  },
+                  `${repoPath}/issues/${blockerNumber}`
+                );
                 if (blocker.state === 'open') blockerNumbers.add(blockerNumber);
               }
             }
 
-            const nativeBlockers = await github.paginate(
-              'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
-              {
-                owner,
-                repo,
-                issue_number: issueNumber,
-                per_page: 100,
-                headers: {
-                  'X-GitHub-Api-Version': '2026-03-10',
-                },
-              }
+            const nativeBlockersPath =
+              `${repoPath}/issues/${issueNumber}/dependencies/blocked_by`;
+            const nativeBlockers = await readWithFallback(
+              () => github.paginate(
+                'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
+                {
+                  owner, repo, issue_number: issueNumber, per_page: 100,
+                  headers: { 'X-GitHub-Api-Version': '2026-03-10' },
+                }
+              ),
+              nativeBlockersPath,
+              { paginate: true, apiVersion: '2026-03-10' }
             );
             for (const blocker of nativeBlockers) {
               if (blocker.state === 'open') blockerNumbers.add(blocker.number);
@@ -558,41 +692,35 @@ jobs:
               return;
             }
 
-            try {
-              await github.rest.issues.removeLabel({
-                owner,
-                repo,
-                issue_number: issueNumber,
-                name: inProgressLabel,
-              });
-            } catch (err) {
-              if (err.status !== 404) throw err;
-            }
+            await patRequest(
+              `${repoPath}/issues/${issueNumber}/labels/${encodeURIComponent(inProgressLabel)}`,
+              { method: 'DELETE', allow404: true }
+            );
 
             const blockerText = openBlockers.map(number => `#${number}`).join(', ');
             const marker =
               `<!-- continuum-issue-readiness-blocked issue=${issueNumber} blockers=${openBlockers.join(',')} -->`;
-            const comments = await github.paginate(
-              github.rest.issues.listComments,
-              {
-                owner,
-                repo,
-                issue_number: issueNumber,
-                per_page: 100,
-              }
+            const comments = await readWithFallback(
+              () => github.paginate(
+                github.rest.issues.listComments,
+                { owner, repo, issue_number: issueNumber, per_page: 100 }
+              ),
+              `${repoPath}/issues/${issueNumber}/comments`,
+              { paginate: true }
             );
             if (!comments.some(comment => (comment.body || '').includes(marker))) {
-              await github.rest.issues.createComment({
-                owner,
-                repo,
-                issue_number: issueNumber,
-                body: [
+              await patRequest(
+                `${repoPath}/issues/${issueNumber}/comments`,
+                {
+                  method: 'POST',
+                  body: { body: [
                   marker,
                   `Automation did not start: the issue Definition of Ready is not satisfied because these dependencies are still open: ${blockerText}.`,
                   '',
                   'Continuum will not create a partial PR for a blocked/umbrella task. Complete the blockers first; the scheduler can then pick this issue up normally.',
-                ].join('\n'),
-              });
+                ].join('\n') },
+                }
+              );
             }
 
             core.setOutput('ready', 'false');
@@ -623,25 +751,84 @@ jobs:
           steps.issue_readiness.outputs.ready != 'false' &&
           ((github.event_name == 'workflow_dispatch' && inputs.mode == 'issue') ||
            (github.event_name == 'issue_comment' && !github.event.issue.pull_request))
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
-          GH_TOKEN: ${{ secrets.TAP_PAT }}
           ISSUE_NUMBER: ${{ inputs.issue_number || github.event.issue.number }}
-        run: |
-          set -euo pipefail
-          [[ -n "$ISSUE_NUMBER" ]] || { echo "skip=false" >> "$GITHUB_OUTPUT"; exit 0; }
+          TAP_PAT: ${{ secrets.TAP_PAT }}
+          GITHUB_API_URL: ${{ github.api_url }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const issueNumber = Number(process.env.ISSUE_NUMBER || 0);
+            const tapPat = String(process.env.TAP_PAT || '').trim();
+            const apiBase = String(process.env.GITHUB_API_URL || 'https://api.github.com')
+              .replace(/\/+$/, '');
 
-          EXISTING_PR="$(gh pr list \
-            --repo "$GITHUB_REPOSITORY" \
-            --state open \
-            --json number,headRefName \
-            --jq '[.[] | select(.headRefName | startswith("opencode/issue'"$ISSUE_NUMBER"'-"))][0].number // empty')"
-          if [[ -n "$EXISTING_PR" ]]; then
-            echo "Open PR #$EXISTING_PR already implements issue #$ISSUE_NUMBER; skipping duplicate OpenCode run."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
+            if (!Number.isInteger(issueNumber) || issueNumber <= 0) {
+              core.setOutput('skip', 'false');
+              return;
+            }
 
+            async function listOpenPrsWithPat() {
+              if (!tapPat) throw new Error('TAP_PAT is unavailable for duplicate-guard fallback.');
+              const all = [];
+              for (let page = 1; ; page += 1) {
+                const response = await fetch(
+                  `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls?state=open&per_page=100&page=${page}`,
+                  {
+                    headers: {
+                      accept: 'application/vnd.github+json',
+                      authorization: `Bearer ${tapPat}`,
+                      'x-github-api-version': '2022-11-28',
+                    },
+                  }
+                );
+                if (!response.ok) {
+                  const details = (await response.text()).slice(0, 500);
+                  throw new Error(
+                    `Duplicate-guard PAT fallback failed with HTTP ${response.status}` +
+                    (details ? `: ${details}` : '')
+                  );
+                }
+                const pageItems = await response.json();
+                if (!Array.isArray(pageItems)) throw new Error('Unexpected duplicate-guard response.');
+                all.push(...pageItems);
+                if (pageItems.length < 100) break;
+              }
+              return all;
+            }
+
+            let openPrs;
+            try {
+              openPrs = await github.paginate(
+                github.rest.pulls.list,
+                { owner, repo, state: 'open', per_page: 100 }
+              );
+            } catch (err) {
+              const status = err ? (err.status ?? err.response?.status) : undefined;
+              if (![401, 403, 429].includes(status)) throw err;
+              core.warning(
+                `Repository-token duplicate read failed (${status}); ` +
+                'retrying with TAP_PAT for liveness.'
+              );
+              openPrs = await listOpenPrsWithPat();
+            }
+
+            const prefix = `opencode/issue${issueNumber}-`;
+            const existing = openPrs.find(pr =>
+              String(pr.head?.ref || '').startsWith(prefix)
+            );
+            if (existing) {
+              core.info(
+                `Open PR #${existing.number} already implements issue #${issueNumber}; ` +
+                'skipping duplicate OpenCode run.'
+              );
+              core.setOutput('skip', 'true');
+            } else {
+              core.setOutput('skip', 'false');
+            }
       # workflow_dispatch repair modes must NOT use "opencode github run":
       # that integration owns a branch/PR lifecycle and can open a new PR even
       # when the prompt says not to. Plain "opencode run" works in this already

@@ -4168,11 +4168,14 @@ class ContinuumTest < Minitest::Test
 
     guard = step_body(body, 'Skip duplicate issue implementation')
     assert_includes guard, 'id: duplicate_guard'
-    assert_includes guard, "--state open"
-    assert_includes guard, 'select(.headRefName | startswith("opencode/issue'
-    assert_includes guard, '[0].number // empty'
-    assert_includes guard, 'echo "skip=true" >> "$GITHUB_OUTPUT"'
-    assert_includes guard, 'echo "skip=false" >> "$GITHUB_OUTPUT"'
+    assert_includes guard, 'github-token: ${{ github.token }}'
+    assert_includes guard, 'TAP_PAT: ${{ secrets.TAP_PAT }}'
+    assert_includes guard, "github.rest.pulls.list"
+    assert_includes guard, "state: 'open'"
+    assert_includes guard, '[401, 403, 429].includes(status)'
+    assert_includes guard, 'const prefix = `opencode/issue${issueNumber}-`'
+    assert_includes guard, "core.setOutput('skip', 'true')"
+    assert_includes guard, "core.setOutput('skip', 'false')"
 
     # Both launch sites must consult it.
     assert_includes body[run_at, issue_at], "steps.duplicate_guard.outputs.skip != 'true'"
