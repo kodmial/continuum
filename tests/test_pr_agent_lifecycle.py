@@ -1220,7 +1220,8 @@ class StabilizationParityTests(unittest.TestCase):
             merge,
         )
         self.assertIn("required workflow ", merge)
-        self.assertIn("combined status is ", merge)
+        self.assertNotIn("getCombinedStatusForRef", merge)
+        self.assertNotIn("combined status is ", merge)
 
     def test_finding_fingerprint_is_order_independent(self):
         first = issue_entry(n=0)
@@ -2763,7 +2764,9 @@ class FallbackPersistentStateTests(unittest.TestCase):
             body,
         )
         self.assertIn("last_seen_head != reviewed", body)
-        self.assertIn("Ignored {stale_active} stale ACTIVE persistent finding(s)", body)
+        self.assertIn("current_structured_clean", body)
+        self.assertIn("same_head_stale_active", body)
+        self.assertIn("stale same-HEAD ACTIVE persistent", body)
 
     def test_improve_only_repair_path_remains_functional(self):
         suggestion = {
