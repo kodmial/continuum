@@ -581,6 +581,23 @@ def should_skip_improve(
     }
 
 
+def is_improve_skipped_clean(improve_skipped_success: object) -> bool:
+    """Whether the automatic-improve skip counts as clean coverage.
+
+    Repair/merge gating must derive ``GateInputs.improve_skipped_clean``
+    through this helper from the ``improve_skipped`` step outcome instead
+    of relying on the ``False`` default: a skipped-clean HEAD carries an
+    empty improve payload, so ``improve_coverage_complete`` stays
+    ``False`` and only this flag lets :func:`evaluate_gate` green it.
+    Accepts the workflow step outcome in either boolean or
+    ``'true'``/``'false'`` string form.
+    """
+
+    if isinstance(improve_skipped_success, bool):
+        return improve_skipped_success
+    return str(improve_skipped_success or "").strip().lower() == "true"
+
+
 def parse_improve_push_outputs(text: object) -> List[Dict[str, Any]]:
     """Capture native improve suggestions via the runner-local file channel.
 
@@ -896,6 +913,14 @@ def evaluate_gate(decision: GateInputs) -> Dict[str, Any]:
     HEAD, safe_to_merge, empty current key issues, no qualifying improve
     suggestions, no ACTIVE finding in native persistent state, and no
     potentially truncated batch. Anything else blocks with a reason.
+
+    A clean HEAD whose automatic improve was skipped carries an empty
+    improve payload with ``improve_coverage_complete=False``: callers must
+    set ``improve_skipped_clean`` via :func:`is_improve_skipped_clean`
+    from the ``improve_skipped`` step outcome, otherwise the gate fails
+    closed on incomplete improve coverage and negates the skip's latency
+    win. A skipped HEAD with remaining qualifying suggestions never
+    greens.
     """
 
     if decision.tool_error:
@@ -1317,6 +1342,7 @@ __all__ = [
     "has_tool_error_signal",
     "has_incomplete_coverage_signal",
     "should_skip_improve",
+    "is_improve_skipped_clean",
     "parse_improve_push_outputs",
     "qualifying_suggestions",
     "build_repair_batch",

@@ -562,6 +562,35 @@ function isCleanReviewForImproveSkip(reviewPayload, persistentState, options = {
   };
 }
 
+function isSkippedCleanImprovePayload(raw) {
+  // Whether the improve payload carries the `improve_skipped` step's clean
+  // marker. The skipped step records an empty suggestion payload marked
+  // with `continuum.improve_skipped_clean` so downstream repair/merge gating
+  // can tell "improve skipped for a clean HEAD" apart from "improve never
+  // ran": only the former satisfies the improve-coverage leg with an empty
+  // payload (mirrors GateInputs.improve_skipped_clean). Extra keys never
+  // affect suggestion parsing. Unparseable lines are not clean.
+  for (const line of String(raw || '').split('\n')) {
+    if (!line.trim()) continue;
+    let record;
+    try {
+      record = JSON.parse(line);
+    } catch (err) {
+      return false;
+    }
+    if (record && typeof record === 'object' && !Array.isArray(record)) {
+      const marker = record.continuum;
+      if (
+        marker && typeof marker === 'object' && !Array.isArray(marker) &&
+        marker.improve_skipped_clean === true
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 function controllerStateBody(stateMarker, summary) {
   return [
     CONTROLLER_STATE_MARKER,
@@ -587,6 +616,7 @@ module.exports = {
   hasIncompleteCoverageSignal,
   hasToolErrorSignal,
   isCleanReviewForImproveSkip,
+  isSkippedCleanImprovePayload,
   logicalFingerprint,
   normalizeProblem,
   overlappingLocation,

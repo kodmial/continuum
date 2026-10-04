@@ -2096,7 +2096,9 @@ class ImproveSkipWorkflowTests(unittest.TestCase):
     def test_improve_gate_revalidates_the_live_head(self):
         body = read_repo(".github/workflows/continuum-pr-agent.yml")
         gate = body.index("Decide whether automatic improve can be skipped")
-        window = body[gate:gate + 6000]
+        # The window must cover the whole gate step: the three stale-head
+        # discards each carry their own flag before the live-head decision.
+        window = body[gate:gate + 6200]
         self.assertIn("pulls.get", window)
         self.assertIn("liveSha", window)
         self.assertIn("reviewedHeadSha", window)
@@ -2106,6 +2108,132 @@ class ImproveSkipWorkflowTests(unittest.TestCase):
         self.assertGreaterEqual(
             body.count("steps.improve_skipped.outcome == 'failure'"), 3
         )
+
+
+class ImproveSkipGateRepairTests(unittest.TestCase):
+    """The skipped-clean flag must be wired into repair/merge gating.
+
+    A clean HEAD that skips automatic improve carries an empty improve
+    payload with incomplete improve coverage: gating that calls the gate
+    with defaults fails closed on improve coverage and negates the skip.
+    """
+
+    def _life(self):
+        import sys
+
+        sys.path.insert(0, SRC)
+        try:
+            from continuum import pr_agent_lifecycle as life
+        finally:
+            sys.path.remove(SRC)
+        return life
+
+    def test_skipped_flag_helper_coerces_step_outcomes(self):
+        life = self._life()
+        for value in (True, "true", "True", " TRUE "):
+            with self.subTest(value=value):
+                self.assertTrue(life.is_improve_skipped_clean(value))
+        for value in (False, "false", "", "  ", None, "yes", 0):
+            with self.subTest(value=value):
+                self.assertFalse(life.is_improve_skipped_clean(value))
+
+    def test_gate_greens_for_wired_skipped_clean_head(self):
+        # Concrete scenario: clean review skips improve, so gating derives
+        # the flag from the improve_skipped step outcome instead of the
+        # False default and greens with empty qualifying improve.
+        life = self._life()
+        gate = life.evaluate_gate(life.GateInputs(
+            review=make_review([]),
+            qualifying_improve=[],
+            persistent_state=make_persistent([], head_sha="abc"),
+            ci_green_on_exact_head=True,
+            head_matches=True,
+            review_coverage_complete=True,
+            improve_coverage_complete=False,
+            improve_skipped_clean=life.is_improve_skipped_clean("true"),
+        ))
+        self.assertTrue(gate["green"])
+
+    def test_skipped_marker_payload_is_machine_readable(self):
+        skipped = '{"payload": {"code_suggestions": []}, "continuum": {"improve_skipped_clean": true}}'
+        plain = '{"payload": {"code_suggestions": []}}'
+        env = os.environ.copy()
+        env["POLICY_MODULE"] = POLICY_MODULE
+        env["POLICY_SKIPPED"] = skipped
+        env["POLICY_PLAIN"] = plain
+        code = r"""
+const policy = require(process.env.POLICY_MODULE);
+const result = {
+  skipped: policy.isSkippedCleanImprovePayload(process.env.POLICY_SKIPPED || ''),
+  plain: policy.isSkippedCleanImprovePayload(process.env.POLICY_PLAIN || ''),
+  invalid: policy.isSkippedCleanImprovePayload('not json'),
+  qualifying: policy.qualifyingImproveSuggestions(process.env.POLICY_SKIPPED || '').length,
+};
+process.stdout.write(JSON.stringify(result));
+"""
+        completed = subprocess.run(
+            ["node", "-e", code],
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        result = json.loads(completed.stdout)
+        self.assertTrue(result["skipped"])
+        self.assertFalse(result["plain"])
+        self.assertFalse(result["invalid"])
+        # The marker never affects suggestion parsing.
+        self.assertEqual(result["qualifying"], 0)
+
+    def test_route_wires_the_skipped_flag(self):
+        body = read_repo(".github/workflows/continuum-pr-agent.yml")
+        route = body.index("Route the current PR-Agent result")
+        window = body[route:route + 4000]
+        self.assertIn("IMPROVE_SKIPPED", window)
+        self.assertIn("steps.improve_skipped.outcome", body)
+        self.assertIn(
+            "but qualifying suggestions remain", body
+        )
+        self.assertIn("improveSkippedClean", window)
+
+    def test_merge_gate_wires_the_skipped_flag(self):
+        merge = read_repo(
+            ".github/workflows/continuum-pr-agent-auto-merge.yml"
+        )
+        self.assertIn("isSkippedCleanImprovePayload", merge)
+        self.assertIn(
+            "but qualifying suggestions remain", merge
+        )
+        self.assertIn("improveSkippedClean", merge)
+
+    def test_improve_gate_stale_discards_flag_stale_head(self):
+        body = read_repo(".github/workflows/continuum-pr-agent.yml")
+        gate = body.index("Decide whether automatic improve can be skipped")
+        improve = body.index(
+            "Run upstream improve on the exact HEAD when repair value remains"
+        )
+        window = body[gate:improve]
+        self.assertEqual(
+            window.count("core.setOutput('stale_head', 'true')"), 3,
+            "each improve-gate stale-head discard must flag stale_head",
+        )
+
+    def test_improve_gate_excluded_from_retry_gates(self):
+        body = read_repo(".github/workflows/continuum-pr-agent.yml")
+        self.assertGreaterEqual(
+            body.count("steps.improve_gate.outputs.stale_head != 'true'"), 3,
+            "retry classification and both retry schedulers must ignore "
+            "improve-gate stale-head discards",
+        )
+
+    def test_export_runs_only_after_a_successful_improve_branch(self):
+        body = read_repo(".github/workflows/continuum-pr-agent.yml")
+        export = body.index("Export native improve output")
+        window = body[export:export + 800]
+        self.assertIn("steps.improve.outcome == 'success'", window)
+        self.assertIn("steps.improve_skipped.outcome == 'success'", window)
 
 
 class FallbackPersistentStateTests(unittest.TestCase):

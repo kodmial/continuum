@@ -853,6 +853,7 @@ jobs:
               return;
             }
             if (headSha !== reviewedSha) {
+              core.setOutput('stale_head', 'true');
               core.setFailed(
                 `PR head moved before the improve gate (${reviewedSha} -> ${headSha}); ` +
                 'discarding the review result and waiting for fresh CI on the new HEAD.'
@@ -882,6 +883,7 @@ jobs:
               return;
             }
             if (liveSha !== reviewedSha || liveSha !== headSha) {
+              core.setOutput('stale_head', 'true');
               core.setFailed(
                 `PR head moved before the improve gate (${reviewedSha} -> ${liveSha}); ` +
                 'discarding the review result and waiting for fresh CI on the new HEAD.'
@@ -906,6 +908,7 @@ jobs:
               (persistentState && persistentState.last_run && persistentState.last_run.head_sha) || ''
             ).trim().toLowerCase();
             if (!stateHead || stateHead !== reviewedSha) {
+              core.setOutput('stale_head', 'true');
               core.setFailed(
                 `PR-Agent persistent state is stale: last_run.head_sha=${stateHead || '<empty>'}, reviewed=${reviewedSha}.`
               );
@@ -1034,13 +1037,22 @@ jobs:
           IMPROVE_REPAIR_THRESHOLD="$(node -e 'const p=require(process.env.POLICY_SCRIPT); process.stdout.write(String(p.IMPROVE_REPAIR_THRESHOLD));')"
           [[ "$IMPROVE_REPAIR_THRESHOLD" =~ ^[0-9]+$ ]] || { echo "::error::Invalid centralized PR-Agent improve threshold."; exit 1; }
           mkdir -p pr-agent-outputs
-          echo '{"payload": {"code_suggestions": []}}' > pr-agent-outputs/continuum.jsonl
+          # The skipped-clean marker lets downstream repair/merge gating tell
+          # "improve skipped for a clean HEAD" apart from "improve never
+          # ran": only the marked empty payload satisfies the
+          # improve-coverage leg without an improve run (mirrors
+          # GateInputs.improve_skipped_clean). Suggestion parsing ignores
+          # the extra key.
+          echo '{"payload": {"code_suggestions": []}, "continuum": {"improve_skipped_clean": true}}' > pr-agent-outputs/continuum.jsonl
           echo "improve_repair_threshold=$IMPROVE_REPAIR_THRESHOLD" >> "$GITHUB_OUTPUT"
           echo "improve_file=pr-agent-outputs/continuum.jsonl" >> "$GITHUB_OUTPUT"
           echo "Automatic improve skipped for clean HEAD $REVIEWED_SHA; empty payload recorded."
 
       - name: Export native improve output
-        if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
+        if: >-
+          steps.stack.outputs.enabled == 'true' &&
+          steps.admit.outputs.admitted == 'true' &&
+          (steps.improve.outcome == 'success' || steps.improve_skipped.outcome == 'success')
         id: improve_output
         run: |
           set -euo pipefail
@@ -1114,6 +1126,7 @@ jobs:
         env:
           REVIEW_JSON: ${{ steps.pragent.outputs.review }}
           IMPROVE_JSONL: ${{ steps.improve_output.outputs.improve_jsonl }}
+          IMPROVE_SKIPPED: ${{ steps.improve_skipped.outcome == 'success' }}
           POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
@@ -1127,6 +1140,24 @@ jobs:
             const suggestions = policy.qualifyingImproveSuggestions(
               String(process.env.IMPROVE_JSONL || '')
             );
+            // Wire the skipped-clean flag into repair/merge gating (mirrors
+            // GateInputs.improve_skipped_clean): a skipped-clean HEAD
+            // carries an empty improve payload with incomplete improve
+            // coverage, so only this flag routes it to the merge gate.
+            // A skipped HEAD with remaining qualifying suggestions never
+            // greens: it routes to repair instead.
+            const improveSkippedClean =
+              String(process.env.IMPROVE_SKIPPED || '').trim().toLowerCase() === 'true';
+            if (improveSkippedClean && suggestions.length > 0) {
+              core.setOutput('needs_repair', 'true');
+              core.setOutput('review_findings', String(keyIssues.length));
+              core.setOutput('improve_suggestions', String(suggestions.length));
+              core.notice(
+                'Improve was skipped but qualifying suggestions remain; ' +
+                `routing ${keyIssues.length} review finding(s) and ${suggestions.length} improve suggestion(s) to PR-Agent repair.`
+              );
+              return;
+            }
             const needsRepair = keyIssues.length > 0 || suggestions.length > 0;
             core.setOutput('needs_repair', needsRepair ? 'true' : 'false');
             core.setOutput('review_findings', String(keyIssues.length));
@@ -1199,13 +1230,12 @@ jobs:
         env:
           HEAD_SHA: ${{ steps.admit.outputs.head_sha }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
-          RETRYABLE_FAILURE: ${{ (steps.install_pragent.outcome == 'failure' || steps.install_opencode.outcome == 'failure' || steps.start_opencode.outcome == 'failure' || steps.runtime.outcome == 'failure' || steps.start_bridge.outcome == 'failure' || steps.pragent.outcome == 'failure' || steps.result.outcome == 'failure' || steps.persistent.outcome == 'failure' || steps.improve_gate.outcome == 'failure' || steps.improve.outcome == 'failure' || steps.improve_skipped.outcome == 'failure' || steps.improve_output.outcome == 'failure') && steps.result.outputs.stale_head != 'true' && steps.persistent.outputs.stale_head != 'true' && steps.improve.outputs.stale_head != 'true' && steps.improve_skipped.outputs.stale_head != 'true' && 'true' || 'false' }}
+          RETRYABLE_FAILURE: ${{ (steps.install_pragent.outcome == 'failure' || steps.install_opencode.outcome == 'failure' || steps.start_opencode.outcome == 'failure' || steps.runtime.outcome == 'failure' || steps.start_bridge.outcome == 'failure' || steps.pragent.outcome == 'failure' || steps.result.outcome == 'failure' || steps.persistent.outcome == 'failure' || steps.improve_gate.outcome == 'failure' || steps.improve.outcome == 'failure' || steps.improve_skipped.outcome == 'failure' || steps.improve_output.outcome == 'failure') && steps.result.outputs.stale_head != 'true' && steps.persistent.outputs.stale_head != 'true' && steps.improve_gate.outputs.stale_head != 'true' && steps.improve.outputs.stale_head != 'true' && steps.improve_skipped.outputs.stale_head != 'true' && 'true' || 'false' }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
-            // A stale-head discard without its own flag (e.g. the improve
-            // gate's live-head revalidation) still reports through the
-            // outcome list above: revalidate the live PR head so a
+            // Defense in depth: every stale-head discard above carries its
+            // own flag, but revalidate the live PR head anyway so a
             // superseded SHA is never reported as recovery-eligible.
             let retryable = process.env.RETRYABLE_FAILURE === 'true';
             if (retryable) {
@@ -1295,10 +1325,11 @@ jobs:
            steps.improve.outcome == 'failure' ||
            steps.improve_skipped.outcome == 'failure' ||
            steps.improve_output.outcome == 'failure') &&
-          steps.result.outputs.stale_head != 'true' &&
-          steps.persistent.outputs.stale_head != 'true' &&
-          steps.improve.outputs.stale_head != 'true' &&
-          steps.improve_skipped.outputs.stale_head != 'true'
+           steps.result.outputs.stale_head != 'true' &&
+           steps.persistent.outputs.stale_head != 'true' &&
+           steps.improve_gate.outputs.stale_head != 'true' &&
+           steps.improve.outputs.stale_head != 'true' &&
+           steps.improve_skipped.outputs.stale_head != 'true'
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
@@ -1312,9 +1343,8 @@ jobs:
             const policy = require(process.env.POLICY_SCRIPT);
             const prNumber = Number(process.env.PR_NUMBER);
             const head = String(process.env.HEAD_SHA || '').toLowerCase();
-            // Stale-head discards without their own flag (e.g. the improve
-            // gate's live-head revalidation) reach this step through the
-            // outcome list above: revalidate the live PR head first so a
+            // Defense in depth: every stale-head discard above carries its
+            // own flag, but revalidate the live PR head first so a
             // bounded retry is never scheduled for an already-superseded
             // admitted SHA. Fresh CI on the new HEAD recovers on its own.
             try {
@@ -1394,10 +1424,11 @@ jobs:
            steps.improve.outcome == 'failure' ||
            steps.improve_skipped.outcome == 'failure' ||
            steps.improve_output.outcome == 'failure') &&
-          steps.result.outputs.stale_head != 'true' &&
-          steps.persistent.outputs.stale_head != 'true' &&
-          steps.improve.outputs.stale_head != 'true' &&
-          steps.improve_skipped.outputs.stale_head != 'true'
+           steps.result.outputs.stale_head != 'true' &&
+           steps.persistent.outputs.stale_head != 'true' &&
+           steps.improve_gate.outputs.stale_head != 'true' &&
+           steps.improve.outputs.stale_head != 'true' &&
+           steps.improve_skipped.outputs.stale_head != 'true'
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
@@ -1422,11 +1453,10 @@ jobs:
             exit 0
           fi
 
-          # Stale-head discards without their own flag (e.g. the improve
-          # gate's live-head revalidation) still satisfy the outcome list
-          # above: cancel before the backoff so a superseded SHA never
-          # sleeps toward a dispatch. The post-backoff revalidation below
-          # remains as defense in depth.
+          # Defense in depth: every stale-head discard above carries its own
+          # flag, but cancel before the backoff anyway so a superseded SHA
+          # never sleeps toward a dispatch. The post-backoff revalidation
+          # below remains as further defense in depth.
           if live_head="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid 2>/dev/null)"; then
             if [[ -n "$live_head" && "$live_head" != "$HEAD_SHA" ]]; then
               echo "PR head moved ($HEAD_SHA -> $live_head); stale retry cancelled."

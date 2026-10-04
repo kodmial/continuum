@@ -147,7 +147,10 @@ jobs:
             //   - no tool error (config.propagate_tool_errors,
             //     github_action_config.fail_on_tool_errors)
             //   - complete review and improve coverage (upstream chunking
-            //     coverage footers; incomplete coverage never greens)
+            //     coverage footers; incomplete coverage never greens), except
+            //     that a marked skipped-clean improve payload
+            //     (continuum.improve_skipped_clean) satisfies the improve leg
+            //     with zero suggestions and no improve run
             //   - green CI on the exact HEAD, revalidated immediately before
             //     merge, plus draft/conflict revalidation
             //   - matching HEAD (results for SHA A never merge SHA B;
@@ -191,6 +194,19 @@ jobs:
             let qualifying;
             try {
               qualifying = policy.qualifyingImproveSuggestions(raw);
+            } catch (err) {
+              core.setFailed(err.message);
+              return;
+            }
+            // Wire the skipped-clean flag into the merge gate (mirrors
+            // GateInputs.improve_skipped_clean): a skipped-clean HEAD
+            // carries an empty improve payload with incomplete improve
+            // coverage, so only the marked payload greens here without an
+            // improve run. A skipped HEAD with remaining qualifying
+            // suggestions never greens.
+            let improveSkippedClean = false;
+            try {
+              improveSkippedClean = policy.isSkippedCleanImprovePayload(raw);
             } catch (err) {
               core.setFailed(err.message);
               return;
@@ -259,6 +275,10 @@ jobs:
               } else {
                 fail(`${keyIssues.length} current key issue(s) remain`);
               }
+              return;
+            }
+            if (improveSkippedClean && qualifying.length > 0) {
+              fail('improve was skipped but qualifying suggestions remain');
               return;
             }
             if (qualifying.length > 0) {
