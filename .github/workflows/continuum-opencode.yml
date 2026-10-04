@@ -355,8 +355,13 @@ jobs:
           MODE: ${{ inputs.mode }}
           ISSUE_NUMBER: ${{ inputs.issue_number || github.event.issue.number || '' }}
           PR_NUMBER: ${{ inputs.pr_number }}
+          TAP_PAT: ${{ secrets.TAP_PAT }}
+          GITHUB_API_URL: ${{ github.api_url }}
         with:
-          github-token: ${{ secrets.TAP_PAT }}
+          # Same-repository task-context reads must not consume the shared
+          # user PAT core budget. TAP_PAT is reserved for true cross-repo
+          # task fetches and as a bounded liveness fallback.
+          github-token: ${{ github.token }}
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
@@ -370,6 +375,30 @@ jobs:
             let source = '';
             let prTitle = '';
             let prBody = '';
+            const tapPat = String(process.env.TAP_PAT || '').trim();
+            const apiBase = String(process.env.GITHUB_API_URL || 'https://api.github.com')
+              .replace(/\/+$/, '');
+
+            async function fetchWithTapPat(path, description) {
+              if (!tapPat) {
+                throw new Error(`${description} requires TAP_PAT.`);
+              }
+              const response = await fetch(`${apiBase}${path}`, {
+                headers: {
+                  accept: 'application/vnd.github+json',
+                  authorization: `Bearer ${tapPat}`,
+                  'x-github-api-version': '2022-11-28',
+                },
+              });
+              if (!response.ok) {
+                const details = (await response.text()).slice(0, 500);
+                throw new Error(
+                  `${description} failed with HTTP ${response.status}` +
+                  (details ? `: ${details}` : '')
+                );
+              }
+              return await response.json();
+            }
 
             if (mode === 'issue' || (!mode && issueEventNumber > 0)) {
               if (!Number.isInteger(issueEventNumber) || issueEventNumber <= 0) {
@@ -455,11 +484,33 @@ jobs:
             }
 
             let issue;
+            const sameRepository =
+              taskRepository.toLowerCase() === repository.toLowerCase();
             try {
-              const response = await github.rest.issues.get({
-                owner: parts[0], repo: parts[1], issue_number: taskNumber,
-              });
-              issue = response.data;
+              if (sameRepository) {
+                try {
+                  const response = await github.rest.issues.get({
+                    owner: parts[0], repo: parts[1], issue_number: taskNumber,
+                  });
+                  issue = response.data;
+                } catch (err) {
+                  const status = err ? (err.status ?? err.response?.status) : undefined;
+                  if (![401, 403, 429].includes(status) || !tapPat) throw err;
+                  core.warning(
+                    `Repository-token task read failed (${status}); ` +
+                    'falling back to TAP_PAT for liveness.'
+                  );
+                  issue = await fetchWithTapPat(
+                    `/repos/${encodeURIComponent(parts[0])}/${encodeURIComponent(parts[1])}/issues/${taskNumber}`,
+                    `Authoritative task ${taskRepository}#${taskNumber}`
+                  );
+                }
+              } else {
+                issue = await fetchWithTapPat(
+                  `/repos/${encodeURIComponent(parts[0])}/${encodeURIComponent(parts[1])}/issues/${taskNumber}`,
+                  `Cross-repository authoritative task ${taskRepository}#${taskNumber}`
+                );
+              }
             } catch (err) {
               core.setFailed(
                 `Authoritative task ${taskRepository}#${taskNumber} could not be fetched: ${err.message || err}`
