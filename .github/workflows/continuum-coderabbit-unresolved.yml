@@ -58,15 +58,27 @@ jobs:
             const verificationPattern =
               /<!-- opencode-coderabbit-verification review=(\d+) finding=(\d+) head=([0-9a-f]{40}) -->/;
 
-            const comments = await github.paginate(
-              github.rest.pulls.listReviewComments,
-              {
+            // Bounded newest-first scan (#254): batching only needs the
+            // latest verification per finding and replies newer than it,
+            // so ten newest-first pages bound the cost. Thread-parent
+            // misses outside the window fall back to the immediate parent
+            // id via getRootId, and any stranded finding is re-batched by
+            // its own UNRESOLVED event.
+            const comments = [];
+            for (let page = 1; page <= 10; page += 1) {
+              const { data } = await github.rest.pulls.listReviewComments({
                 owner,
                 repo,
                 pull_number: pullNumber,
                 per_page: 100,
-              }
-            );
+                page,
+                sort: 'created',
+                direction: 'desc',
+              });
+              if (!Array.isArray(data) || data.length === 0) break;
+              comments.push(...data);
+              if (data.length < 100) break;
+            }
 
             const byId = new Map(comments.map((comment) => [comment.id, comment]));
 
@@ -293,15 +305,24 @@ jobs:
             });
             const headSha = pr.data.head.sha;
 
-            const comments = await github.paginate(
-              github.rest.pulls.listReviewComments,
-              {
+            // Bounded newest-first duplicate check (#254): the marker being
+            // checked carries the just-pushed HEAD, so three pages bound
+            // the cost; a missed marker only duplicates a visible reply.
+            const comments = [];
+            for (let page = 1; page <= 3; page += 1) {
+              const { data } = await github.rest.pulls.listReviewComments({
                 owner,
                 repo,
                 pull_number: pullNumber,
                 per_page: 100,
-              }
-            );
+                page,
+                sort: 'created',
+                direction: 'desc',
+              });
+              if (!Array.isArray(data) || data.length === 0) break;
+              comments.push(...data);
+              if (data.length < 100) break;
+            }
 
             let requested = 0;
             for (const item of items) {

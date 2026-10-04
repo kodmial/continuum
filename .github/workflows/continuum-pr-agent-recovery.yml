@@ -182,11 +182,32 @@ jobs:
               ].join('\n');
             }
 
+            // Bounded collection (#254): caps every list scan at maxPages
+            // instead of walking full history. Read evidence and controller
+            // markers accumulate in recent windows, so capped scans preserve
+            // decisions while bounding requests under scale.
+            const MAX_COMMENT_PAGES = 10;
+            const MAX_QUEUE_PAGES = 5;
+            const MAX_GATE_PAGES = 2;
+            async function boundedCollect(client, request, params, maxPages) {
+              const items = [];
+              for (let page = 1; page <= maxPages; page += 1) {
+                const { data } = await request({ ...params, page });
+                const batch = Array.isArray(data) ? data : (data.workflow_runs || []);
+                if (batch.length === 0) break;
+                items.push(...batch);
+                if (batch.length < (params.per_page || 100)) break;
+              }
+              return items;
+            }
+
             async function upsertControllerState(prNumber, stateMarker, summary) {
               const comments = await withReadFallback(client =>
-                client.paginate(
-                  client.rest.issues.listComments,
-                  { owner, repo, issue_number: prNumber, per_page: 100 }
+                boundedCollect(
+                  client,
+                  (params) => client.rest.issues.listComments(params),
+                  { owner, repo, issue_number: prNumber, per_page: 100 },
+                  MAX_COMMENT_PAGES
                 )
               );
               const controller = comments
@@ -315,19 +336,23 @@ jobs:
                 )[0] || null;
             }
 
-            async function listReviewRuns() {
-              try {
-                return await withReadFallback(client =>
-                  client.paginate(
-                    client.rest.actions.listWorkflowRuns,
-                    {
-                      owner,
-                      repo,
-                      workflow_id: reviewWorkflow,
-                      per_page: 100,
-                    }
-                  )
-                );
+                async function listReviewRuns() {
+                  try {
+                    // Workflow-filtered server-side; recovery only needs
+                    // recent active/stale runs, so two pages bound the cost.
+                    return await withReadFallback(client =>
+                      boundedCollect(
+                        client,
+                        (params) => client.rest.actions.listWorkflowRuns(params),
+                        {
+                          owner,
+                          repo,
+                          workflow_id: reviewWorkflow,
+                          per_page: 100,
+                        },
+                        MAX_GATE_PAGES
+                      )
+                    );
               } catch (err) {
                 core.setFailed(
                   'Could not inspect PR-Agent caller runs for ' + reviewWorkflow +
@@ -391,19 +416,23 @@ jobs:
               }
             }
 
-            async function exactHeadCiGreen(head) {
-              const runs = await withReadFallback(client =>
-                client.paginate(
-                  client.rest.actions.listWorkflowRunsForRepo,
-                  {
-                    owner,
-                    repo,
-                    event: 'pull_request',
-                    head_sha: head,
-                    per_page: 100,
-                  }
-                )
-              );
+                async function exactHeadCiGreen(head) {
+                  // Head-filtered server-side; only the newest matching run
+                  // decides, so two pages bound the cost.
+                  const runs = await withReadFallback(client =>
+                    boundedCollect(
+                      client,
+                      (params) => client.rest.actions.listWorkflowRunsForRepo(params),
+                      {
+                        owner,
+                        repo,
+                        event: 'pull_request',
+                        head_sha: head,
+                        per_page: 100,
+                      },
+                      MAX_GATE_PAGES
+                    )
+                  );
               const latest = runs
                 .filter(run => run.name === ciWorkflowName && run.head_sha === head)
                 .sort((a, b) =>
@@ -572,12 +601,14 @@ jobs:
                 return false;
               }
 
-              const refreshedComments = await withReadFallback(client =>
-                client.paginate(
-                  client.rest.issues.listComments,
-                  { owner, repo, issue_number: pr.number, per_page: 100 }
-                )
-              );
+                  const refreshedComments = await withReadFallback(client =>
+                    boundedCollect(
+                      client,
+                      (params) => client.rest.issues.listComments(params),
+                      { owner, repo, issue_number: pr.number, per_page: 100 },
+                      MAX_COMMENT_PAGES
+                    )
+                  );
               const refreshedEvidence = parseEvidence(refreshedComments, head, kind);
               if (refreshedEvidence.exhausted) {
                 core.info('PR #' + pr.number + ' ' + kind + ': retry budget is already exhausted.');
@@ -610,13 +641,15 @@ jobs:
                 // marker alone cannot distinguish another head/kind. Keeping
                 // the fresh latest preserves a concurrent writer's state;
                 // the next successful upsert finishes coalescing.
-                try {
-                  const graceComments = await withReadFallback(client =>
-                    client.paginate(
-                      client.rest.issues.listComments,
-                      { owner, repo, issue_number: pr.number, per_page: 100 }
-                    )
-                  );
+                    try {
+                      const graceComments = await withReadFallback(client =>
+                        boundedCollect(
+                          client,
+                          (params) => client.rest.issues.listComments(params),
+                          { owner, repo, issue_number: pr.number, per_page: 100 },
+                          MAX_COMMENT_PAGES
+                        )
+                      );
                   const controllerDupes = graceComments
                     .filter(comment => String(comment.body || '').includes(CONTROLLER_STATE_MARKER))
                     .sort((a, b) => Number(a.id) - Number(b.id));
@@ -739,14 +772,16 @@ jobs:
                   }
                 }
               }
-              if (stateError) {
-                try {
-                  const freshController = await withReadFallback(client =>
-                    client.paginate(
-                      client.rest.issues.listComments,
-                      { owner, repo, issue_number: pr.number, per_page: 100 }
-                    )
-                  );
+                  if (stateError) {
+                    try {
+                      const freshController = await withReadFallback(client =>
+                        boundedCollect(
+                          client,
+                          (params) => client.rest.issues.listComments(params),
+                          { owner, repo, issue_number: pr.number, per_page: 100 },
+                          MAX_COMMENT_PAGES
+                        )
+                      );
                   const snapshotIds = new Set(
                     refreshedComments.map(comment => Number(comment.id))
                   );
@@ -803,12 +838,14 @@ jobs:
               );
             }
 
-            const openPrs = await withReadFallback(client =>
-              client.paginate(
-                client.rest.pulls.list,
-                { owner, repo, state: 'open', per_page: 100 }
-              )
-            );
+                const openPrs = await withReadFallback(client =>
+                  boundedCollect(
+                    client,
+                    (params) => client.rest.pulls.list(params),
+                    { owner, repo, state: 'open', per_page: 100 },
+                    MAX_QUEUE_PAGES
+                  )
+                );
             let reviewRuns = await listReviewRuns();
 
             for (const pr of openPrs) {
@@ -828,19 +865,23 @@ jobs:
                 continue;
               }
 
-              const [statuses, comments] = await Promise.all([
-                withReadFallback(client =>
-                  client.paginate(
-                    client.rest.repos.listCommitStatusesForRef,
-                    { owner, repo, ref: head, per_page: 100 }
-                  )
-                ),
-                withReadFallback(client =>
-                  client.paginate(
-                    client.rest.issues.listComments,
-                    { owner, repo, issue_number: pr.number, per_page: 100 }
-                  )
-                ),
+                  const [statuses, comments] = await Promise.all([
+                    withReadFallback(client =>
+                      boundedCollect(
+                        client,
+                        (params) => client.rest.repos.listCommitStatusesForRef(params),
+                        { owner, repo, ref: head, per_page: 100 },
+                        MAX_GATE_PAGES
+                      )
+                    ),
+                    withReadFallback(client =>
+                      boundedCollect(
+                        client,
+                        (params) => client.rest.issues.listComments(params),
+                        { owner, repo, issue_number: pr.number, per_page: 100 },
+                        MAX_COMMENT_PAGES
+                      )
+                    ),
               ]);
 
               const reviewStatus = latestContext(statuses, REVIEW_CONTEXT);

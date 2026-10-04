@@ -64,12 +64,78 @@ jobs:
         env:
           REQUIRED_WORKFLOW_GATE_LABEL: ${{ vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_LABEL || '' }}
           REQUIRED_WORKFLOW_GATE_NAME: ${{ vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_NAME || '' }}
+          READ_GITHUB_TOKEN: ${{ github.token }}
         with:
+          # TAP_PAT stays for the label/comment mutations below (their PAT
+          # actor fans events out to downstream automation). Same-repo
+          # reads move to READ_GITHUB_TOKEN via readGithub (#254).
           github-token: ${{ secrets.TAP_PAT }}
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const repoFullName = `${owner}/${repo}`;
+
+            // Request-budget observability (#254): counts only, no secrets.
+            const apiBudget = { reads: 0, patReads: 0, mutations: 0, pages: 0, event: 0 };
+            function noteRead(pages = 1) {
+              apiBudget.reads += 1;
+              apiBudget.pages += pages;
+            }
+            function reportBudget() {
+              core.notice(
+                `continuum-api-budget: total_calls=${apiBudget.reads + apiBudget.mutations} ` +
+                `reads=${apiBudget.reads} (repository-token) ` +
+                `mutations=${apiBudget.mutations} (shared-PAT) ` +
+                `pages=${apiBudget.pages} event_substitutions=${apiBudget.event}`
+              );
+            }
+            // Same-repository reads run on the repository token, keeping
+            // them off the shared TAP_PAT budget.
+            const readToken = String(process.env.READ_GITHUB_TOKEN || '').trim();
+            if (!readToken) {
+              throw new Error(
+                'READ_GITHUB_TOKEN is required for same-repository CodeRabbit reads.'
+              );
+            }
+            const readGithub = new github.constructor({
+              auth: readToken,
+              baseUrl: github.request.endpoint.DEFAULTS.baseUrl,
+            });
+            if (
+              typeof readGithub.paginate !== 'function' ||
+              typeof readGithub.rest?.pulls?.list !== 'function' ||
+              typeof readGithub.rest?.issues?.get !== 'function' ||
+              typeof readGithub.rest?.actions?.listWorkflowRunsForRepo !== 'function' ||
+              typeof readGithub.graphql !== 'function'
+            ) {
+              throw new Error(
+                'readGithub client lacks the paginate/rest/graphql plugins; ' +
+                'cannot perform same-repository CodeRabbit reads.'
+              );
+            }
+            // Bounded page caps (#254): no scan scales with repository
+            // lifetime/history. Gate checks only need recent branch runs;
+            // queue/comment/review/thread scans are capped windows.
+            const MAX_QUEUE_PAGES = 5;
+            const MAX_THREAD_PAGES = 5;
+            const MAX_GATE_PAGES = 2;
+            async function boundedList(request, params, maxPages) {
+              const items = [];
+              for (let page = 1; page <= maxPages; page += 1) {
+                const { data } = await request({ ...params, page });
+                noteRead();
+                const batch = Array.isArray(data) ? data : (data.workflow_runs || []);
+                if (batch.length === 0) break;
+                items.push(...batch);
+                if (batch.length < (params.per_page || 100)) break;
+              }
+              return items;
+            }
+            // Single-pass memoization (#254): gate listings are shared per
+            // branch/event/workflow and issue priority per issue number, so
+            // repeated checks in one reconciliation never re-fetch.
+            const gateCache = new Map();
+            const issueCache = new Map();
 
             const RATE_LIMIT_RE =
               /Review rate limited|Review limit reached/i;
@@ -186,18 +252,23 @@ jobs:
             }
 
             async function latestWorkflowForHead(pr, workflowName) {
-              const runs = await github.paginate(
-                github.rest.actions.listWorkflowRunsForRepo,
+              const cacheKey = `${pr.head.ref}|pull_request|${workflowName}`;
+              if (gateCache.has(cacheKey)) return gateCache.get(cacheKey);
+              // Branch/event-filtered server-side; only the newest runs can
+              // decide the gate, so two pages bound the cost.
+              const runs = await boundedList(
+                (params) => readGithub.rest.actions.listWorkflowRunsForRepo(params),
                 {
                   owner,
                   repo,
                   branch: pr.head.ref,
                   event: 'pull_request',
                   per_page: 100,
-                }
+                },
+                MAX_GATE_PAGES
               );
 
-              return runs
+              const latest = runs
                 .filter(run =>
                   run.name === workflowName &&
                   run.head_sha === pr.head.sha
@@ -205,10 +276,12 @@ jobs:
                 .sort(
                   (a, b) =>
                     (new Date(b.updated_at || b.created_at).getTime() -
-                     new Date(a.updated_at || a.created_at).getTime()) ||
+                      new Date(a.updated_at || a.created_at).getTime()) ||
                     (Number(b.run_attempt || 0) -
-                     Number(a.run_attempt || 0))
+                      Number(a.run_attempt || 0))
                 )[0] || null;
+              gateCache.set(cacheKey, latest);
+              return latest;
             }
 
             async function currentHeadReviewGate(pr) {
@@ -315,11 +388,17 @@ jobs:
               }
 
               try {
-                const { data: issue } = await github.rest.issues.get({
-                  owner,
-                  repo,
-                  issue_number: issueNumber,
-                });
+                let issue = issueCache.get(issueNumber);
+                if (!issue) {
+                  const { data } = await readGithub.rest.issues.get({
+                    owner,
+                    repo,
+                    issue_number: issueNumber,
+                  });
+                  noteRead();
+                  issue = data;
+                  issueCache.set(issueNumber, issue);
+                }
                 const labels = new Set(
                   (issue.labels || []).map(label =>
                     typeof label === 'string' ? label : label.name
@@ -347,11 +426,12 @@ jobs:
 
             async function latestCodeRabbitStatus(pr) {
               const { data: combined } =
-                await github.rest.repos.getCombinedStatusForRef({
+                await readGithub.rest.repos.getCombinedStatusForRef({
                   owner,
                   repo,
                   ref: pr.head.sha,
                 });
+              noteRead();
 
               return (combined.statuses || [])
                 .filter(status => status.context === 'CodeRabbit')
@@ -376,10 +456,22 @@ jobs:
             async function unresolvedCodeRabbitThreads(pr) {
               const unresolved = [];
               let cursor = null;
+              // Bounded thread walk (#254): cap GraphQL pages so one PR
+              // with deep thread history cannot scale the pass. Truncation
+              // fails closed for this PR (skipped this pass, retried on the
+              // next wake-up) and never blocks the rest of the queue.
+              let threadPages = 0;
 
               try {
                 do {
-                  const data = await github.graphql(
+                  threadPages += 1;
+                  if (threadPages > MAX_THREAD_PAGES) {
+                    core.warning(
+                      `PR #${pr.number}: review-thread scan hit the ${MAX_THREAD_PAGES}-page budget; skipping this PR for this pass.`
+                    );
+                    return null;
+                  }
+                  const data = await readGithub.graphql(
                     `query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
                       repository(owner: $owner, name: $repo) {
                         pullRequest(number: $number) {
@@ -407,6 +499,7 @@ jobs:
                       cursor,
                     }
                   );
+                  noteRead();
 
                   const connection =
                     data.repository?.pullRequest?.reviewThreads;
@@ -479,13 +572,19 @@ jobs:
 
 
             async function collectState() {
-              const pulls = await github.paginate(github.rest.pulls.list, {
-                owner,
-                repo,
-                state: 'open',
-                base: 'main',
-                per_page: 100,
-              });
+              // Bounded queue scan (#254): the priority queue only needs
+              // currently open PRs against main, capped at MAX_QUEUE_PAGES.
+              const pulls = await boundedList(
+                (params) => readGithub.rest.pulls.list(params),
+                {
+                  owner,
+                  repo,
+                  state: 'open',
+                  base: 'main',
+                  per_page: 100,
+                },
+                MAX_QUEUE_PAGES
+              );
 
               let latestCompletedReviewAt = 0;
               let latestInFlightCommand = null;
@@ -493,11 +592,10 @@ jobs:
 
               for (const listed of pulls) {
                 try {
-                  const { data: pr } = await github.rest.pulls.get({
-                  owner,
-                  repo,
-                  pull_number: listed.number,
-                });
+                // The listing already carries the full PR representation
+                // (state, draft, head, labels, body): reusing it removes
+                // one pulls.get per queued PR per pass (#254).
+                const pr = listed;
 
                 if (
                   pr.state !== 'open' ||
@@ -507,24 +605,30 @@ jobs:
                   continue;
                 }
 
-                const reviews = await github.paginate(
-                  github.rest.pulls.listReviews,
+                // Bounded per-PR scans (#254): review/comment state that
+                // decides queue eligibility lives on recent records; a
+                // truncated window only defers a PR to the next wake-up,
+                // never admits it incorrectly.
+                const reviews = await boundedList(
+                  (params) => readGithub.rest.pulls.listReviews(params),
                   {
                     owner,
                     repo,
                     pull_number: pr.number,
                     per_page: 100,
-                  }
+                  },
+                  MAX_THREAD_PAGES
                 );
 
-                const comments = await github.paginate(
-                  github.rest.issues.listComments,
+                const comments = await boundedList(
+                  (params) => readGithub.rest.issues.listComments(params),
                   {
                     owner,
                     repo,
                     issue_number: pr.number,
                     per_page: 100,
-                  }
+                  },
+                  MAX_THREAD_PAGES
                 );
 
                 const carriedApprovalMarker = comments.some(comment =>
@@ -888,6 +992,7 @@ jobs:
                 core.notice(
                   `CodeRabbit slot is already in flight for PR #${state.latestInFlightCommand.prNumber} at head ${state.latestInFlightCommand.headSha}; no second review command will be emitted.`
                 );
+                reportBudget();
                 return;
               }
               core.warning(
@@ -898,7 +1003,10 @@ jobs:
             let selected = await chooseDueCandidate(state);
 
             if (!selected) {
-              if (!deferUntilNextCandidate(state)) return;
+              if (!deferUntilNextCandidate(state)) {
+                reportBudget();
+                return;
+              }
               state = await collectState();
 
               if (state.latestInFlightCommand) {
@@ -908,6 +1016,7 @@ jobs:
                   core.notice(
                     `CodeRabbit slot became occupied by PR #${state.latestInFlightCommand.prNumber} while this controller was waiting; no second command will be emitted.`
                   );
+                  reportBudget();
                   return;
                 }
               }
@@ -919,6 +1028,7 @@ jobs:
               core.notice(
                 'Queue changed during final revalidation; a newer event will reconcile it.'
               );
+              reportBudget();
               return;
             }
 
@@ -933,6 +1043,7 @@ jobs:
                 issue_number: selected.prNumber,
                 labels: [REQUESTED_LABEL],
               });
+              apiBudget.mutations += 1;
               acquiredInitialLock = true;
             }
 
@@ -943,6 +1054,7 @@ jobs:
                 issue_number: selected.prNumber,
                 body: '@coderabbitai full review',
               });
+              apiBudget.mutations += 1;
             } catch (err) {
               if (acquiredInitialLock) {
                 try {
@@ -952,6 +1064,7 @@ jobs:
                     issue_number: selected.prNumber,
                     name: REQUESTED_LABEL,
                   });
+                  apiBudget.mutations += 1;
                 } catch (_) {}
               }
               throw err;
@@ -960,3 +1073,4 @@ jobs:
             core.notice(
               `Selected PR #${selected.prNumber} from issue #${selected.issueNumber === Number.MAX_SAFE_INTEGER ? '?' : selected.issueNumber} (${selected.priority}, ${selected.stage}, ${selected.kind}) for the next CodeRabbit slot at head ${selected.headSha}.`
             );
+            reportBudget();

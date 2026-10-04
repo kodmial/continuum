@@ -343,6 +343,9 @@ jobs:
           set -euo pipefail
           ISSUE_JSON="$(gh issue view "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --json body,labels)"
           IS_QUALIFICATION="$(jq -r --arg label "$QUALIFICATION_LABEL" '[.labels[].name] | index($label) != null' <<<"$ISSUE_JSON")"
+          # Coalesce the follow-up label read: the finalize step reuses this
+          # output instead of re-fetching the same issue (#254).
+          echo "issue_labels=$(jq -c '[.labels[].name]' <<<"$ISSUE_JSON")" >> "$GITHUB_OUTPUT"
 
           if [[ "$IS_QUALIFICATION" == "true" ]]; then
             ISSUE_BODY="$(jq -r '.body // ""' <<<"$ISSUE_JSON")"
@@ -402,9 +405,42 @@ jobs:
           QUALIFICATION_CLASSIFICATION: ${{ steps.qualification.outputs.classification }}
           QUALIFICATION_SUBTYPE: ${{ steps.qualification.outputs.subtype }}
           QUALIFICATION_FINGERPRINT: ${{ steps.qualification.outputs.fingerprint }}
+          ISSUE_LABELS_JSON: ${{ steps.qualification.outputs.issue_labels }}
         shell: bash
         run: |
           set -euo pipefail
+
+          # Request budget (#254): no listing below walks more than
+          # CONTINUUM_MAX_PAGES pages; counts are reported at the end.
+          CONTINUUM_MAX_PAGES=5
+          CONTINUUM_API_CALLS=0
+          continuum_api_get() {
+            CONTINUUM_API_CALLS=$((CONTINUUM_API_CALLS + 1))
+            gh api "$@"
+          }
+          # Bounded slurp-compatible page walk: keeps the array-of-pages
+          # shape callers already parse with `.[][]?`, capped at
+          # CONTINUUM_MAX_PAGES instead of full-history pagination.
+          continuum_bounded_slurp() {
+            local url="$1" page=1 pages_out=""
+            while [[ "$page" -le "$CONTINUUM_MAX_PAGES" ]]; do
+              local page_json count
+              if ! page_json="$(continuum_api_get "${url}?per_page=100&page=${page}" 2>/dev/null)"; then
+                break
+              fi
+              count="$(jq 'length' <<<"$page_json" 2>/dev/null || echo 0)"
+              [[ "$count" =~ ^[0-9]+$ ]] || break
+              [[ "$count" -gt 0 ]] || break
+              pages_out+="$page_json"$'\n'
+              [[ "$count" -lt 100 ]] && break
+              page=$((page + 1))
+            done
+            if [[ -z "$pages_out" ]]; then
+              echo "[]"
+            else
+              jq -s '.' <<<"$(grep -v '^$' <<<"$pages_out" || true)"
+            fi
+          }
 
           # A follow-up chain is optional: without one the controller still
           # classifies and still fails, it simply does not dispatch a workflow
@@ -420,7 +456,14 @@ jobs:
           gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
             --remove-label "$IN_PROGRESS_LABEL" >/dev/null 2>&1 || true
 
-          ISSUE_LABELS="$(gh issue view "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --json labels --jq '[.labels[].name]')"
+          # Reuse the qualification step's label snapshot when present
+          # instead of re-reading the same issue (#254).
+          if [[ -n "${ISSUE_LABELS_JSON:-}" ]]; then
+            ISSUE_LABELS="$ISSUE_LABELS_JSON"
+          else
+            ISSUE_LABELS="$(gh issue view "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --json labels --jq '[.labels[].name]')"
+            CONTINUUM_API_CALLS=$((CONTINUUM_API_CALLS + 1))
+          fi
           if jq -e --arg label "$QUALIFICATION_LABEL" 'index($label) != null' <<<"$ISSUE_LABELS" >/dev/null; then
             CHAIN_QUALIFICATION="yes"
           else
@@ -444,8 +487,8 @@ jobs:
               exit 1
             fi
 
-            COMMENTS_JSON="$(gh api --paginate --slurp \
-              "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER/comments?per_page=100" 2>/dev/null || echo "[]")"
+            COMMENTS_JSON="$(continuum_bounded_slurp \
+              "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER/comments" 2>/dev/null || echo "[]")"
             REPAIR_COUNT="$(jq '[.[][]? | select((.body // "") | contains("<!-- continuum-render-repair-attempt -->"))] | length' \
               <<<"$COMMENTS_JSON" 2>/dev/null || echo 0)"
 
@@ -469,8 +512,11 @@ jobs:
 
             if [[ "$REPAIR_COUNT" -lt "$MAX_RENDER_REPAIR_ATTEMPTS" ]]; then
               SOURCE_MARKER="<!-- continuum-render-repair source=$ISSUE_NUMBER -->"
-              ALL_ISSUES_JSON="$(gh api --paginate --slurp \
-                "repos/$GITHUB_REPOSITORY/issues?state=open&per_page=100" 2>/dev/null || echo "[]")"
+              # Bounded open-issue scan (#254): repair issues are recent, so
+              # a capped newest-first window finds them without walking
+              # full history.
+              ALL_ISSUES_JSON="$(continuum_bounded_slurp \
+                "repos/$GITHUB_REPOSITORY/issues?state=open" 2>/dev/null || echo "[]")"
               EXISTING_REPAIR="$(jq -r --arg marker "$SOURCE_MARKER" \
                 '.[][]? | select((.body // "") | contains($marker)) | .number' \
                 <<<"$ALL_ISSUES_JSON" | head -n 1)"
@@ -556,3 +602,5 @@ jobs:
             gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
               --body "Render E2E execution and cleanup succeeded in workflow run $GITHUB_RUN_ID; PR #$PR_NUMBER is now in the CI/merge chain."
           fi
+
+          echo "continuum-api-budget: bounded_list_calls=$CONTINUUM_API_CALLS max_pages=$CONTINUUM_MAX_PAGES"

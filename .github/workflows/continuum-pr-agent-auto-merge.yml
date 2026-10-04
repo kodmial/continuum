@@ -519,23 +519,39 @@ jobs:
               }
             }
 
+            // Single-pass gate memo (#254): CI/packaging/required checks
+            // share one branch listing per workflow name.
+            const gateCache = new Map();
             async function latestWorkflowForHead(pr, headSha, workflowName) {
-              const runs = await github.paginate(
-                github.rest.actions.listWorkflowRunsForRepo,
-                {
-                  owner,
-                  repo,
-                  branch: pr.head.ref,
-                  event: 'pull_request',
-                  per_page: 100,
-                }
-              );
-              return runs
+              const cacheKey = `${pr.head.ref}|${headSha}|${workflowName}`;
+              if (gateCache.has(cacheKey)) return gateCache.get(cacheKey);
+              // Branch/event-filtered server-side; only the newest runs can
+              // decide the gate, so two pages bound the cost (#254).
+              const runs = [];
+              for (let page = 1; page <= 2; page += 1) {
+                const { data } = await github.rest.actions.listWorkflowRunsForRepo(
+                  {
+                    owner,
+                    repo,
+                    branch: pr.head.ref,
+                    event: 'pull_request',
+                    per_page: 100,
+                    page,
+                  }
+                );
+                const batch = data.workflow_runs || [];
+                if (batch.length === 0) break;
+                runs.push(...batch);
+                if (batch.length < 100) break;
+              }
+              const latest = runs
                 .filter(run => run.name === workflowName && run.head_sha === headSha)
                 .sort((a, b) =>
                   new Date(b.created_at || 0).getTime() -
                   new Date(a.created_at || 0).getTime()
                 )[0] || null;
+              gateCache.set(cacheKey, latest);
+              return latest;
             }
 
             async function currentHeadGates(pr) {
@@ -726,10 +742,19 @@ jobs:
                 return;
               }
               const attemptMarker = conflictAttemptMarker(fresh.head.sha);
-              const priorComments = await github.paginate(
-                github.rest.issues.listComments,
-                { owner, repo, issue_number: prNumber, per_page: 100 }
-              );
+              // Bounded idempotency scan (#254): the attempt marker for
+              // this HEAD is written by this flow's own prior run, so ten
+              // pages preserve the one-attempt-per-HEAD budget without
+              // walking full history.
+              const priorComments = [];
+              for (let page = 1; page <= 10; page += 1) {
+                const { data } = await github.rest.issues.listComments(
+                  { owner, repo, issue_number: prNumber, per_page: 100, page }
+                );
+                if (!Array.isArray(data) || data.length === 0) break;
+                priorComments.push(...data);
+                if (data.length < 100) break;
+              }
               if (priorComments.some(comment =>
                 String(comment.body || '').includes(attemptMarker)
               )) {

@@ -246,15 +246,27 @@ jobs:
               return;
             }
 
-            const reviewComments = await github.paginate(
-              github.rest.pulls.listReviewComments,
-              {
+            // Bounded newest-first scan (#254): the triggering review was
+            // just submitted, so its inline findings are the newest review
+            // comments. Three pages bound the cost without walking full
+            // history; a truncated window only risks treating an extreme
+            // (>300-comment) review as non-code, which records a visible
+            // marker instead of dispatching repair.
+            const reviewComments = [];
+            for (let page = 1; page <= 3; page += 1) {
+              const { data } = await github.rest.pulls.listReviewComments({
                 owner,
                 repo,
                 pull_number: pullNumber,
                 per_page: 100,
-              }
-            );
+                page,
+                sort: 'created',
+                direction: 'desc',
+              });
+              if (!Array.isArray(data) || data.length === 0) break;
+              reviewComments.push(...data);
+              if (data.length < 100) break;
+            }
             const findings = reviewComments.filter(comment =>
               comment.pull_request_review_id === reviewId &&
               comment.user?.login === 'coderabbitai[bot]' &&
@@ -268,15 +280,22 @@ jobs:
             if (reviewState === 'changes_requested' && findings.length === 0) {
               const marker =
                 `<!-- continuum-coderabbit-no-progress head=${expectedHead} review=${reviewId} kind=non-code -->`;
-              const issueComments = await github.paginate(
-                github.rest.issues.listComments,
-                {
+              // Bounded idempotency check (#254): five pages instead of
+              // full history; a missed marker only duplicates a visible
+              // notice comment, never a repair dispatch.
+              const issueComments = [];
+              for (let page = 1; page <= 5; page += 1) {
+                const { data } = await github.rest.issues.listComments({
                   owner,
                   repo,
                   issue_number: pullNumber,
                   per_page: 100,
-                }
-              );
+                  page,
+                });
+                if (!Array.isArray(data) || data.length === 0) break;
+                issueComments.push(...data);
+                if (data.length < 100) break;
+              }
               if (!issueComments.some(comment => (comment.body || '').includes(marker))) {
                 await github.rest.issues.createComment({
                   owner,
@@ -743,10 +762,21 @@ jobs:
             const marker =
               `<!-- continuum-issue-readiness-blocked issue=${issueNumber} blockers=${openBlockers.join(',')} -->`;
             const comments = await readWithFallback(
-              () => github.paginate(
-                github.rest.issues.listComments,
-                { owner, repo, issue_number: issueNumber, per_page: 100 }
-              ),
+              async () => {
+                // Bounded idempotency window (#254): ten pages instead of
+                // full history; a missed marker only duplicates a visible
+                // blocked notice, never a partial-PR dispatch.
+                const collected = [];
+                for (let page = 1; page <= 10; page += 1) {
+                  const { data } = await github.rest.issues.listComments(
+                    { owner, repo, issue_number: issueNumber, per_page: 100, page }
+                  );
+                  if (!Array.isArray(data) || data.length === 0) break;
+                  collected.push(...data);
+                  if (data.length < 100) break;
+                }
+                return collected;
+              },
               `${repoPath}/issues/${issueNumber}/comments`,
               { paginate: true }
             );
@@ -816,7 +846,9 @@ jobs:
             async function listOpenPrsWithPat() {
               if (!tapPat) throw new Error('TAP_PAT is unavailable for duplicate-guard fallback.');
               const all = [];
-              for (let page = 1; ; page += 1) {
+              // Bounded to five pages like the primary scan below: the
+              // guard only needs currently open PRs, never full history.
+              for (let page = 1; page <= 5; page += 1) {
                 const response = await fetch(
                   `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls?state=open&per_page=100&page=${page}`,
                   {
@@ -844,10 +876,17 @@ jobs:
 
             let openPrs;
             try {
-              openPrs = await github.paginate(
-                github.rest.pulls.list,
-                { owner, repo, state: 'open', per_page: 100 }
-              );
+              // Bounded queue scan (#254): five pages cover any realistic
+              // open-PR backlog; open PRs do not grow with repo history.
+              openPrs = [];
+              for (let page = 1; page <= 5; page += 1) {
+                const { data } = await github.rest.pulls.list({
+                  owner, repo, state: 'open', per_page: 100, page,
+                });
+                if (!Array.isArray(data) || data.length === 0) break;
+                openPrs.push(...data);
+                if (data.length < 100) break;
+              }
             } catch (err) {
               const status = err ? (err.status ?? err.response?.status) : undefined;
               if (![401, 403, 429].includes(status)) throw err;
@@ -1419,15 +1458,25 @@ jobs:
             });
             const headSha = pr.data.head.sha;
 
-            const comments = await github.paginate(
-              github.rest.pulls.listReviewComments,
-              {
+            // Bounded newest-first scan (#254): the source review's inline
+            // findings are the newest review comments. Three pages bound
+            // the cost; replies for the same findings are newest too, so
+            // the duplicate check below stays exact within the window.
+            const comments = [];
+            for (let page = 1; page <= 3; page += 1) {
+              const { data } = await github.rest.pulls.listReviewComments({
                 owner,
                 repo,
                 pull_number: pullNumber,
                 per_page: 100,
-              }
-            );
+                page,
+                sort: 'created',
+                direction: 'desc',
+              });
+              if (!Array.isArray(data) || data.length === 0) break;
+              comments.push(...data);
+              if (data.length < 100) break;
+            }
 
             const findings = comments.filter(
               (comment) =>
@@ -1497,15 +1546,22 @@ jobs:
             if (findings.length === 0 && reviewedSha && headSha === reviewedSha) {
               const marker =
                 `<!-- opencode-coderabbit-full-rereview review=${reviewId} head=${headSha} -->`;
-              const issueComments = await github.paginate(
-                github.rest.issues.listComments,
-                {
+              // Bounded idempotency check (#254): five pages instead of
+              // full history; a missed marker only duplicates a visible
+              // re-review request, never a repair.
+              const issueComments = [];
+              for (let page = 1; page <= 5; page += 1) {
+                const { data } = await github.rest.issues.listComments({
                   owner,
                   repo,
                   issue_number: pullNumber,
                   per_page: 100,
-                }
-              );
+                  page,
+                });
+                if (!Array.isArray(data) || data.length === 0) break;
+                issueComments.push(...data);
+                if (data.length < 100) break;
+              }
               const duplicate = issueComments.some(comment =>
                 comment.body?.includes(marker)
               );
@@ -1819,13 +1875,23 @@ jobs:
               return;
             }
 
-            const pulls = await github.paginate(github.rest.pulls.list, {
-              owner,
-              repo,
-              state: 'open',
-              base: 'main',
-              per_page: 100,
-            });
+            // Bounded open-PR scan (#254): five pages cover any realistic
+            // backlog; the branch-prefix match is newest-biased by run
+            // recency, and open PRs never scale with repo history.
+            const pulls = [];
+            for (let page = 1; page <= 5; page += 1) {
+              const { data } = await github.rest.pulls.list({
+                owner,
+                repo,
+                state: 'open',
+                base: 'main',
+                per_page: 100,
+                page,
+              });
+              if (!Array.isArray(data) || data.length === 0) break;
+              pulls.push(...data);
+              if (data.length < 100) break;
+            }
             const openPr = pulls.find(pr =>
               pr.head?.repo?.full_name === `${owner}/${repo}` &&
               (pr.head.ref || '').startsWith(`opencode/issue${issueNumber}-`)
@@ -1837,15 +1903,22 @@ jobs:
               return;
             }
 
-            const comments = await github.paginate(
-              github.rest.issues.listComments,
-              {
+            // Bounded comment scan (#254): dispatch/qualification markers
+            // accumulate in the newest window with every retry, so ten
+            // pages preserve the attempt budget without walking history.
+            const comments = [];
+            for (let page = 1; page <= 10; page += 1) {
+              const { data } = await github.rest.issues.listComments({
                 owner,
                 repo,
                 issue_number: issueNumber,
                 per_page: 100,
-              }
-            );
+                page,
+              });
+              if (!Array.isArray(data) || data.length === 0) break;
+              comments.push(...data);
+              if (data.length < 100) break;
+            }
             const attempts = comments.filter(comment =>
               (comment.body || '').includes(marker)
             ).length;

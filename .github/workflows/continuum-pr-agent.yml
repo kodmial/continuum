@@ -337,16 +337,26 @@ jobs:
             // not the combined Statuses API. PR-Agent's own failure/pending
             // statuses must never make a recovered CI-green HEAD inadmissible.
             const ciWorkflowName = String(process.env.CI_WORKFLOW_NAME || 'CI').trim();
-            const runs = await github.paginate(
-              github.rest.actions.listWorkflowRunsForRepo,
-              {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                event: 'pull_request',
-                head_sha: headSha,
-                per_page: 100,
-              }
-            );
+            // Bounded gate read (#254): the head_sha filter is server-side
+            // and only the newest matching run decides admission, so two
+            // pages bound the cost without walking run history.
+            const runs = [];
+            for (let page = 1; page <= 2; page += 1) {
+              const { data } = await github.rest.actions.listWorkflowRunsForRepo(
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  event: 'pull_request',
+                  head_sha: headSha,
+                  per_page: 100,
+                  page,
+                }
+              );
+              const batch = data.workflow_runs || [];
+              if (batch.length === 0) break;
+              runs.push(...batch);
+              if (batch.length < 100) break;
+            }
             const latestCi = runs
               .filter(run => run.name === ciWorkflowName && run.head_sha === headSha)
               .sort(
@@ -757,9 +767,37 @@ jobs:
         run: |
           set -euo pipefail
           COMMENTS_JSON="$RUNNER_TEMP/pr-agent-comments.json"
-          gh api --paginate --slurp \
-            "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100" \
-            > "$COMMENTS_JSON"
+          # Bounded persistent-state lookup (#254): state markers for the
+          # reviewed HEAD are written by recent reviews, so a server-side
+          # `since` window answers in one request and keeps the
+          # array-of-pages shape below. Only a full window falls back to a
+          # capped 10-page walk instead of full-history pagination.
+          SINCE_TS="$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")"
+          WINDOW_JSON=""
+          if [[ -n "$SINCE_TS" ]]; then
+            WINDOW_JSON="$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100&since=$SINCE_TS" 2>/dev/null || true)"
+          fi
+          WINDOW_LEN="$(jq 'length' <<<"$WINDOW_JSON" 2>/dev/null || echo 100)"
+          if [[ "$WINDOW_LEN" =~ ^[0-9]+$ ]] && [[ "$WINDOW_LEN" -lt 100 ]]; then
+            jq -s '.' <<<"$WINDOW_JSON" > "$COMMENTS_JSON"
+          else
+            rm -f "$RUNNER_TEMP/pr-agent-comment-pages.jsonl"
+            for comment_page in 1 2 3 4 5 6 7 8 9 10; do
+              if ! gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100&page=$comment_page" \
+                > "$RUNNER_TEMP/pr-agent-comment-page.json" 2>/dev/null; then
+                echo "::error::Could not read PR comments for persistent-state export."
+                exit 1
+              fi
+              PAGE_LEN="$(jq 'length' "$RUNNER_TEMP/pr-agent-comment-page.json" 2>/dev/null || echo 0)"
+              [[ "$PAGE_LEN" =~ ^[0-9]+$ ]] || { echo "::error::Could not parse PR comments page."; exit 1; }
+              cat "$RUNNER_TEMP/pr-agent-comment-page.json" >> "$RUNNER_TEMP/pr-agent-comment-pages.jsonl"
+              echo >> "$RUNNER_TEMP/pr-agent-comment-pages.jsonl"
+              rm -f "$RUNNER_TEMP/pr-agent-comment-page.json"
+              [[ "$PAGE_LEN" -lt 100 ]] && break
+            done
+            jq -s '.' "$RUNNER_TEMP/pr-agent-comment-pages.jsonl" > "$COMMENTS_JSON"
+            rm -f "$RUNNER_TEMP/pr-agent-comment-pages.jsonl"
+          fi
           PYTHONPATH="$FALLBACK_PYTHONPATH" python3 - "$COMMENTS_JSON" <<'PY'
           import json
           import os
@@ -1203,15 +1241,24 @@ jobs:
             const qualifying = policy.qualifyingImproveSuggestions(
               String(process.env.IMPROVE_JSONL || '')
             );
-            const comments = await github.paginate(
-              github.rest.issues.listComments,
-              {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: prNumber,
-                per_page: 100,
-              }
-            );
+            // Bounded scan (#254): improve presentation is rewritten every
+            // run, so five pages cover live state; older leftovers are
+            // cosmetic and pruned once visible again.
+            const comments = [];
+            for (let page = 1; page <= 5; page += 1) {
+              const { data } = await github.rest.issues.listComments(
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prNumber,
+                  per_page: 100,
+                  page,
+                }
+              );
+              if (!Array.isArray(data) || data.length === 0) break;
+              comments.push(...data);
+              if (data.length < 100) break;
+            }
             const improveComments = comments
               .filter(comment => String(comment.body || '').includes('<!-- pr-agent:improve:'))
               .sort((a, b) => Number(a.id) - Number(b.id));
@@ -1319,15 +1366,23 @@ jobs:
           github-token: ${{ github.token }}
           script: |
             const policy = require(process.env.POLICY_SCRIPT);
-            const comments = await github.paginate(
-              github.rest.issues.listComments,
-              {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: Number(process.env.PR_NUMBER),
-                per_page: 100,
-              }
-            );
+            // Bounded cleanup scan (#254): five pages; older leftovers are
+            // cosmetic and pruned once visible again.
+            const comments = [];
+            for (let page = 1; page <= 5; page += 1) {
+              const { data } = await github.rest.issues.listComments(
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: Number(process.env.PR_NUMBER),
+                  per_page: 100,
+                  page,
+                }
+              );
+              if (!Array.isArray(data) || data.length === 0) break;
+              comments.push(...data);
+              if (data.length < 100) break;
+            }
             for (const comment of comments) {
               if (!String(comment.body || '').includes(policy.CONTROLLER_STATE_MARKER)) continue;
               await github.rest.issues.deleteComment({
@@ -1525,10 +1580,18 @@ jobs:
               ? 'Retry budget exhausted for ' + kind + ' on exact HEAD ' + head + '.'
               : 'Transient ' + kind + ' failure; bounded retry ' + next + '/3 is scheduled for exact HEAD ' + head + '.';
             const body = policy.controllerStateBody(stateMarker, summary);
-            const comments = await github.paginate(
-              github.rest.issues.listComments,
-              { owner: context.repo.owner, repo: context.repo.repo, issue_number: prNumber, per_page: 100 }
-            );
+            // Bounded scan (#254): ten pages cover any realistic controller
+            // history; a truncated window only risks one duplicate state
+            // comment, which the prune loop below removes once visible.
+            const comments = [];
+            for (let page = 1; page <= 10; page += 1) {
+              const { data } = await github.rest.issues.listComments(
+                { owner: context.repo.owner, repo: context.repo.repo, issue_number: prNumber, per_page: 100, page }
+              );
+              if (!Array.isArray(data) || data.length === 0) break;
+              comments.push(...data);
+              if (data.length < 100) break;
+            }
             const controller = comments
               .filter(comment => String(comment.body || '').includes(policy.CONTROLLER_STATE_MARKER))
               .sort((a, b) => Number(a.id) - Number(b.id));

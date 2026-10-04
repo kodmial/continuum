@@ -267,10 +267,24 @@ jobs:
               failClosed('PR-Agent no-progress check requires PR, HEAD, batch fingerprint, and identified logical findings.');
               return;
             }
-            const comments = await github.paginate(
-              github.rest.issues.listComments,
-              { owner, repo, issue_number: prNumber, per_page: 100 }
-            );
+            // Bounded comment scan (#254): marker state decides whether the
+            // same HEAD/state may be repaired again, so a truncated window
+            // fails closed (held) instead of deciding on partial data.
+            const comments = [];
+            let commentsTruncated = false;
+            for (let page = 1; page <= 10; page += 1) {
+              const { data } = await github.rest.issues.listComments(
+                { owner, repo, issue_number: prNumber, per_page: 100, page }
+              );
+              if (!Array.isArray(data) || data.length === 0) break;
+              comments.push(...data);
+              if (data.length < 100) break;
+              if (page === 10) commentsTruncated = true;
+            }
+            if (commentsTruncated) {
+              failClosed('PR-Agent comment scan hit the 10-page budget; holding repair instead of deciding on a truncated window.');
+              return;
+            }
             // The marker carries the exact HEAD plus the structured finding
             // state token. It is written only by this workflow through the
             // single persistent controller-state API path, so the marker body is the trust anchor:
@@ -605,11 +619,45 @@ jobs:
             "Repair prepared ${HEAD_SHA_LOWER} -> ${NEW_HEAD_LOWER}; a fresh exact-HEAD review will hold only surviving logical findings."
 
           CONTROLLER_JSON="$RUNNER_TEMP/pr-agent-controller-comments.json"
-          if ! gh api --paginate \
-            "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100" > "$CONTROLLER_JSON"; then
-            echo "classification=transient" >> "$GITHUB_OUTPUT"
-            echo "::error::Could not read controller comments; GitHub API failure is retryable."
-            exit 1
+          # Bounded controller-state lookup (#254): controller state is
+          # written by recent repairs, so a server-side `since` window
+          # answers in one request; only a quiet-but-chatty PR falls back
+          # to a capped 5-page scan instead of full-history pagination.
+          SINCE_TS="$(date -u -d '30 days ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")"
+          if [[ -n "$SINCE_TS" ]] && gh api \
+            "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100&since=$SINCE_TS" > "$CONTROLLER_JSON"; then
+            if [[ "$(jq 'length' <"$CONTROLLER_JSON" 2>/dev/null || echo 0)" -lt 100 ]]; then
+              CONTROLLER_WINDOW_COMPLETE=true
+            else
+              CONTROLLER_WINDOW_COMPLETE=false
+            fi
+          else
+            CONTROLLER_WINDOW_COMPLETE=false
+          fi
+          if [[ "$CONTROLLER_WINDOW_COMPLETE" != "true" ]]; then
+            rm -f "$CONTROLLER_JSON.pages"
+            for controller_page in 1 2 3 4 5; do
+              controller_page_file="$RUNNER_TEMP/pr-agent-controller-page-$controller_page.json"
+              if ! gh api \
+                "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100&page=$controller_page" > "$controller_page_file" 2>/dev/null; then
+                rm -f "$controller_page_file"
+                break
+              fi
+              controller_page_len="$(jq 'length' "$controller_page_file" 2>/dev/null || echo 0)"
+              [[ "$controller_page_len" =~ ^[0-9]+$ ]] || { rm -f "$controller_page_file"; break; }
+              cat "$controller_page_file" >> "$CONTROLLER_JSON.pages"
+              echo >> "$CONTROLLER_JSON.pages"
+              rm -f "$controller_page_file"
+              [[ "$controller_page_len" -lt 100 ]] && break
+            done
+            if [[ -f "$CONTROLLER_JSON.pages" ]]; then
+              jq -s 'add // []' "$CONTROLLER_JSON.pages" > "$CONTROLLER_JSON" 2>/dev/null || echo "[]" > "$CONTROLLER_JSON"
+              rm -f "$CONTROLLER_JSON.pages"
+            else
+              echo "classification=transient" >> "$GITHUB_OUTPUT"
+              echo "::error::Could not read controller comments; GitHub API failure is retryable."
+              exit 1
+            fi
           fi
           mapfile -t CONTROLLER_IDS < <(
             jq -r '.[] | select(.body | contains("<!-- continuum-pr-agent-controller-state:v1 -->")) | .id' "$CONTROLLER_JSON"
@@ -689,10 +737,18 @@ jobs:
               ' (' + String(process.env.REASON || 'no-effective-change') +
               '); automatic same-state repair is held until the HEAD or logical finding state changes.';
             const body = policy.controllerStateBody(stateMarker, summary);
-            const comments = await github.paginate(
-              github.rest.issues.listComments,
-              { owner: context.repo.owner, repo: context.repo.repo, issue_number: prNumber, per_page: 100 }
-            );
+            // Bounded scan (#254): ten pages cover any realistic controller
+            // history; a truncated window only risks one duplicate state
+            // comment, which the prune loop below removes once visible.
+            const comments = [];
+            for (let page = 1; page <= 10; page += 1) {
+              const { data } = await github.rest.issues.listComments(
+                { owner: context.repo.owner, repo: context.repo.repo, issue_number: prNumber, per_page: 100, page }
+              );
+              if (!Array.isArray(data) || data.length === 0) break;
+              comments.push(...data);
+              if (data.length < 100) break;
+            }
             const controller = comments
               .filter(comment => String(comment.body || '').includes(policy.CONTROLLER_STATE_MARKER))
               .sort((a, b) => Number(a.id) - Number(b.id));
@@ -797,10 +853,18 @@ jobs:
               ? 'Retry budget exhausted for repair on exact HEAD ' + head + '.'
               : 'Transient repair failure; bounded retry ' + next + '/3 is scheduled for exact HEAD ' + head + '.';
             const body = policy.controllerStateBody(stateMarker, summary);
-            const comments = await github.paginate(
-              github.rest.issues.listComments,
-              { owner: context.repo.owner, repo: context.repo.repo, issue_number: prNumber, per_page: 100 }
-            );
+            // Bounded scan (#254): ten pages cover any realistic controller
+            // history; a truncated window only risks one duplicate state
+            // comment, which the prune loop below removes once visible.
+            const comments = [];
+            for (let page = 1; page <= 10; page += 1) {
+              const { data } = await github.rest.issues.listComments(
+                { owner: context.repo.owner, repo: context.repo.repo, issue_number: prNumber, per_page: 100, page }
+              );
+              if (!Array.isArray(data) || data.length === 0) break;
+              comments.push(...data);
+              if (data.length < 100) break;
+            }
             const controller = comments
               .filter(comment => String(comment.body || '').includes(policy.CONTROLLER_STATE_MARKER))
               .sort((a, b) => Number(a.id) - Number(b.id));
@@ -856,12 +920,10 @@ jobs:
               ;;
           esac
 
-          current_sha="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid || true)"
-          if [[ -z "$current_sha" || "$current_sha" != "$HEAD_SHA" ]]; then
-            echo "PR HEAD changed during failed repair; stale retry cancelled."
-            exit 0
-          fi
-
+          # No pre-backoff PR read here (#254): the post-backoff exact-HEAD
+          # revalidation below is the authoritative stale-retry gate, so a
+          # second read before sleeping would only duplicate it. A stale
+          # retry sleeps once, then cancels without dispatching.
           if (( attempt >= 2 )); then
             echo "Repair retry budget exhausted for PR #$PR_NUMBER HEAD $HEAD_SHA."
             exit 0

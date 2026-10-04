@@ -5677,4 +5677,233 @@ class ContinuumTest < Minitest::Test
     assert_includes body, 'for (const workflow of postMergeWakeups) {'
   end
 
+  # kodmial/continuum#254: audit and minimize GitHub API/PAT usage outside
+  # the #253 auto-merge housekeeping scope. The contracts below pin the
+  # optimized shapes so a later change cannot silently reintroduce unbounded
+  # scans, duplicate same-resource reads, or shared-PAT reads where the
+  # repository token suffices. Safety gates and mutation identities stay
+  # pinned by the existing tests above; these tests only pin budgets.
+  def test_api_budget_review_label_reads_use_repository_token_and_bounded_scans
+    body = workflow_body('continuum-add-review-label.yml')
+
+    # Same-repo reads leave the shared PAT budget; mutations keep PAT actor
+    # semantics so label/dispatch events still fan out.
+    assert_includes body, 'READ_GITHUB_TOKEN: ${{ github.token }}'
+    assert_includes body, 'github-token: ${{ secrets.TAP_PAT }}'
+    assert_includes body, 'const readGithub = new github.constructor({'
+    assert_includes body, 'readGithub.rest.repos.listPullRequestsAssociatedWithCommit'
+    assert_includes body, 'readGithub.rest.pulls.listFiles'
+    assert_includes body, 'readGithub.rest.repos.getCommit'
+    assert_includes body, 'readGithub.rest.issues.listComments'
+    assert_includes body, 'readGithub.rest.pulls.listReviews'
+    assert_includes body, 'readGithub.rest.repos.getCombinedStatusForRef'
+    assert_includes body, 'readGithub.rest.issues.listLabelsOnIssue'
+
+    # The unbounded open-PR listing is replaced by the exact-commit
+    # endpoint; no scan scales with history anymore.
+    refute_includes body, 'github.paginate(',
+                    'review-label reconciliation must not paginate unbounded history'
+    assert_includes body, 'commit_sha: run.head_sha'
+    assert_includes body, 'MAX_FILES_PAGES'
+    assert_includes body, 'continuum-api-budget:'
+
+    # Mutations stay PAT-backed.
+    assert_includes body, 'await github.rest.issues.addLabels({'
+    assert_includes body, 'await github.rest.actions.createWorkflowDispatch({'
+  end
+
+  def test_api_budget_coderabbit_retry_reads_use_repository_token_and_bounded_scans
+    body = workflow_body('continuum-coderabbit-retry.yml')
+
+    assert_includes body, 'READ_GITHUB_TOKEN: ${{ github.token }}'
+    assert_includes body, 'const readGithub = new github.constructor({'
+    assert_includes body, 'readGithub.rest.pulls.list'
+    assert_includes body, 'readGithub.rest.issues.get'
+    assert_includes body, 'readGithub.rest.actions.listWorkflowRunsForRepo'
+    assert_includes body, 'readGithub.graphql'
+    refute_includes body, 'github.paginate(',
+                    'the retry queue must not paginate unbounded history'
+    assert_includes body, 'MAX_QUEUE_PAGES'
+    assert_includes body, 'MAX_GATE_PAGES'
+    assert_includes body, 'gateCache'
+    assert_includes body, 'issueCache'
+    # The per-PR pulls.get is coalesced into the queue listing itself.
+    refute_includes body, 'await github.rest.pulls.get({',
+                    'per-PR pulls.get must reuse the queue listing'
+    refute_includes body, 'await readGithub.rest.pulls.get({',
+                    'per-PR pulls.get must reuse the queue listing'
+    # Review-thread walk is capped and fails closed per PR.
+    assert_includes body, 'MAX_THREAD_PAGES'
+    assert_includes body, 'continuum-api-budget:'
+  end
+
+  def test_api_budget_recovery_scans_are_bounded_but_keep_read_fallback
+    body = workflow_body('continuum-pr-agent-recovery.yml')
+
+    assert_includes body, 'READ_GITHUB_TOKEN: ${{ github.token }}'
+    assert_includes body, 'withReadFallback'
+    assert_includes body, 'boundedCollect'
+    assert_includes body, 'MAX_COMMENT_PAGES'
+    assert_includes body, 'MAX_QUEUE_PAGES'
+    assert_includes body, 'MAX_GATE_PAGES'
+    refute_includes body, 'client.paginate(',
+                    'recovery scans must be bounded instead of paginating full history'
+  end
+
+  def test_api_budget_repair_marker_scans_are_bounded_and_truncation_is_safe
+    body = workflow_body('continuum-pr-agent-repair.yml')
+
+    # The no-progress gate fails closed on a truncated window instead of
+    # deciding on partial data.
+    convergence = step_body(body, 'Check durable PR-Agent no-progress state')
+    refute_nil convergence, 'the no-progress check step is missing'
+    assert_includes convergence, 'github.rest.issues.listComments'
+    assert_includes convergence, 'commentsTruncated'
+    assert_includes convergence, 'holding repair instead of deciding on a truncated window'
+
+    # The repair retry keeps one authoritative post-backoff revalidation
+    # instead of two spaced reads of the same HEAD.
+    retry_step = step_body(body, 'Schedule bounded retry for retryable PR-Agent repair failure')
+    refute_nil retry_step, 'the repair retry step is missing'
+    assert_equal 1, retry_step.scan('gh pr view').size,
+                 'the retry step must revalidate the PR exactly once (post-backoff)'
+    assert_includes retry_step, 'actions/runs?event=pull_request&head_sha='
+  end
+
+  def test_api_budget_opencode_repair_coalesces_pr_and_label_reads
+    body = workflow_body('continuum-opencode-repair.yml')
+
+    dispatch_job = body[/^  ci-repair-dispatch:\n(.*?)(?=^  \S|\z)/m, 1]
+    refute_nil dispatch_job, 'the dispatch job is missing'
+    assert_includes dispatch_job, 'PR_JSON="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")"'
+    assert_includes dispatch_job, 'grep -Fxq "$CI_REPAIR_LABEL" <<<"$PR_LABELS"'
+    refute_includes dispatch_job, 'gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels"',
+                    'the lock check must reuse the pulls.get labels instead of a second read'
+
+    repair_job = body[/^  ci-repair:\n(.*?)(?=^  \S|\z)/m, 1]
+    refute_nil repair_job, 'the ci-repair job is missing'
+    assert_includes repair_job, 'PR_JSON="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr")"'
+    assert_includes repair_job, 'grep -Fxq "$lock_label" <<<"$PR_LABELS"'
+    refute_includes repair_job, 'gh api "repos/$GITHUB_REPOSITORY/issues/$pr/labels"',
+                    'the lock check must reuse the pulls.get labels instead of a second read'
+  end
+
+  def test_api_budget_shell_pagination_is_bounded_everywhere
+    {
+      'continuum-opencode-unresolved.yml' => ['CONTINUUM_MAX_COMMENT_PAGES', 'continuum-api-budget:'],
+      'continuum-render-executor.yml' => ['continuum_bounded_slurp', 'CONTINUUM_MAX_PAGES', 'continuum-api-budget:'],
+      'continuum-pr-agent.yml' => ['pr-agent-comment-page', 'SINCE_TS'],
+      'continuum-pr-agent-repair.yml' => ['CONTROLLER_WINDOW_COMPLETE', 'SINCE_TS'],
+      'continuum-issue-scheduler.yml' => ['CONTINUUM_DEP_STATE', 'dep_state state', 'override_page in 1 2 3 4 5'],
+      'continuum-consumer-child-dispatcher.yml' => ['CONTINUUM_DEP_STATE', 'dep_state state', 'override_page in 1 2 3 4 5'],
+    }.each do |name, markers|
+      body = workflow_body(name)
+      markers.each do |marker|
+        assert_includes body, marker,
+                        "#{name}: expected bounded-scan marker #{marker.inspect}"
+      end
+    end
+
+    # No unbounded history pagination may remain in the touched shells.
+    %w[
+      continuum-opencode-unresolved.yml
+      continuum-render-executor.yml
+      continuum-pr-agent.yml
+      continuum-pr-agent-repair.yml
+      continuum-consumer-child-dispatcher.yml
+    ].each do |name|
+      body = workflow_body(name)
+      refute_includes body, 'gh api --paginate --slurp',
+                      "#{name}: unbounded slurp pagination must be bounded"
+    end
+    dispatcher = workflow_body('continuum-consumer-child-dispatcher.yml')
+    refute_includes dispatcher, 'gh api --paginate "repos/$child_repo/actions/runs',
+                    'child run lookup must be page-bounded like the scheduler'
+  end
+
+  def test_api_budget_canary_polls_are_single_page_and_reuse_create_state
+    body = workflow_body('continuum-pr-agent-canary.yml')
+
+    assert_includes body, 'per_page: 50, page: 1',
+                    'canary run polls must read one recent page, not full history'
+    refute_includes body, 'github.paginate(',
+                    'canary polls must not paginate unbounded history'
+    assert_includes body, 'let head = pr.data.head.sha;',
+                    'the create response already carries the HEAD'
+    assert_includes body, 'for (let page = 1; page <= 2; page += 1)',
+                    'canary finding polls must be page-bounded'
+  end
+
+  def test_api_budget_opencode_scans_are_bounded_but_keep_guard_semantics
+    body = workflow_body('continuum-opencode.yml')
+
+    assert_includes body, "direction: 'desc'",
+                    'finding scans must read newest-first within their window'
+    assert_includes body, 'for (let page = 1; page <= 5; page += 1)',
+                    'open-PR and marker scans must be page-bounded'
+    assert_includes body, 'for (let page = 1; page <= 10; page += 1)',
+                    'attempt-budget scans must be page-bounded'
+    # The duplicate-guard PAT fallback loop is bounded too.
+    assert_includes body, 'for (let page = 1; page <= 5; page += 1) {',
+                    'the duplicate-guard PAT fallback must be page-bounded'
+    # Guard semantics stay intact.
+    assert_includes body, "github.rest.pulls.list"
+    assert_includes body, "state: 'open'"
+    assert_includes body, 'TAP_PAT is unavailable for duplicate-guard fallback.'
+  end
+
+  def test_api_budget_pr_agent_review_scans_are_bounded
+    body = workflow_body('continuum-pr-agent.yml')
+
+    assert_includes body, 'for (let page = 1; page <= 2; page += 1)',
+                    'exact-HEAD gate reads must be page-bounded'
+    assert_includes body, 'for (let page = 1; page <= 5; page += 1)',
+                    'presentation cleanup scans must be page-bounded'
+    assert_includes body, 'for (let page = 1; page <= 10; page += 1)',
+                    'controller-state scans must be page-bounded'
+    # Spaced exact-HEAD revalidations before/after agent work stay: each
+    # guards a later mutation and collapsing them would widen TOCTOU.
+    assert_includes body, 'gh pr view'
+  end
+
+  def test_api_budget_pr_agent_auto_merge_gates_are_bounded_and_memoized
+    body = workflow_body('continuum-pr-agent-auto-merge.yml')
+
+    assert_includes body, 'gateCache'
+    assert_includes body, 'for (let page = 1; page <= 2; page += 1)',
+                    'workflow-gate reads must be page-bounded'
+    assert_includes body, 'for (let page = 1; page <= 10; page += 1)',
+                    'attempt-marker scans must be page-bounded'
+    refute_includes body, 'github.paginate(',
+                    'auto-merge gate scans must not paginate unbounded history'
+  end
+
+  def test_api_budget_child_and_qualification_reads_are_coalesced
+    worker = workflow_body('continuum-consumer-child-worker.yml')
+    assert_includes worker, 'CHILD_ISSUE_JSON'
+    assert_includes worker, 'jq -r \'.title\' <"$CHILD_ISSUE_JSON"'
+
+    review = workflow_body('continuum-consumer-child-review.yml')
+    assert_includes review, '--json state,mergedAt,headRefName,baseRefName'
+    refute_includes review, '--json headRefName,baseRefName',
+                    'branch identity must reuse the combined PR read'
+
+    qualification = workflow_body('continuum-docker-qualification.yml')
+    assert_includes qualification, 'issue.md'
+    assert_includes qualification, 'only re-read when it never ran'
+  end
+
+  def test_api_budget_coderabbit_unresolved_scans_newest_first_and_bounded
+    body = workflow_body('continuum-coderabbit-unresolved.yml')
+
+    assert_includes body, "direction: 'desc'",
+                    'unresolved batching must read newest-first within its window'
+    assert_includes body, 'for (let page = 1; page <= 10; page += 1)',
+                    'batch collection must be page-bounded'
+    assert_includes body, 'for (let page = 1; page <= 3; page += 1)',
+                    'verification duplicate checks must be page-bounded'
+    refute_includes body, 'github.paginate(',
+                    'unresolved scans must not paginate unbounded history'
+  end
+
   end

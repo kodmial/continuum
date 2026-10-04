@@ -105,8 +105,10 @@ jobs:
               bash "$resolver" validation "$child_repo"
           )"
 
+          # One PR read serves the merged/open gate plus the branch
+          # identity check below (#254).
           pr_state_json="$(
-            gh pr view "$PR_NUMBER" --repo "$child_repo" --json state,mergedAt 2>/dev/null || true
+            gh pr view "$PR_NUMBER" --repo "$child_repo" --json state,mergedAt,headRefName,baseRefName 2>/dev/null || true
           )"
           [[ -n "$pr_state_json" ]] || exit 0
           if [[ "$(jq -r '.mergedAt // ""' <<<"$pr_state_json")" != "" ]]; then
@@ -133,9 +135,8 @@ jobs:
           review_started="<!-- continuum-child-review-started --> Independent delegated review/repair for child task #$TASK_NUMBER started on PR #$PR_NUMBER."
           gh issue comment "$TASK_NUMBER" --repo "$child_repo" --body "$review_started" >/dev/null 2>&1 || true
 
-          pr_json="$(gh pr view "$PR_NUMBER" --repo "$child_repo" --json headRefName,baseRefName 2>/dev/null)"
-          head_ref="$(jq -r '.headRefName' <<<"$pr_json")"
-          base_ref="$(jq -r '.baseRefName' <<<"$pr_json")"
+          head_ref="$(jq -r '.headRefName' <<<"$pr_state_json")"
+          base_ref="$(jq -r '.baseRefName' <<<"$pr_state_json")"
           if [[ "$head_ref" != continuum-child/task-"$TASK_NUMBER"-* &&
                 "$head_ref" != runtime-worker/task-"$TASK_NUMBER"-* ]]; then
             echo "::error::PR does not belong to the delegated child worker."

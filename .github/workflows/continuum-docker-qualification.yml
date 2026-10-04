@@ -485,7 +485,14 @@ jobs:
           # recorded, and recorded as infrastructure rather than as a verdict
           # about the binary.
           if [[ ! -s "$RESULT_FILE" ]]; then
-            ISSUE_BODY="$(gh issue view "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --json body --jq '.body // ""')"
+            # Reuse the issue snapshot the evidence step already fetched
+            # (#254); only re-read when it never ran. The artifact fields
+            # are immutable once dispatched.
+            if [[ -s "${EVIDENCE_DIR:-/tmp/continuum-docker-qualification-evidence}/issue.md" ]]; then
+              ISSUE_BODY="$(cat "${EVIDENCE_DIR:-/tmp/continuum-docker-qualification-evidence}/issue.md")"
+            else
+              ISSUE_BODY="$(gh issue view "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --json body --jq '.body // ""')"
+            fi
             ARTIFACT_ID="$(sed -n 's/^- Artifact ID: //p' <<<"$ISSUE_BODY" | tail -n1 | tr -d '\`')"
             BINARY_SHA="$(sed -n 's/^- Expected binary SHA-256: //p' <<<"$ISSUE_BODY" | tail -n1 | tr -d '\`')"
             [[ "$ARTIFACT_ID" =~ ^[0-9]+$ ]] || ARTIFACT_ID=0
