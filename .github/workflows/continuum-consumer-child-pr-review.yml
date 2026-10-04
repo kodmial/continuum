@@ -168,8 +168,9 @@ jobs:
           # only a validated cache miss falls through to deterministic
           # reconstruction below.
           export PATH="$HOME/.opencode/bin:$PATH"
-          if command -v opencode >/dev/null 2>&1 && opencode --version 2>/dev/null | grep -q "1.18.34"; then
+          if command -v opencode >/dev/null 2>&1 && opencode --version 2>/dev/null | grep -F -q "1.18.34"; then
             echo "prepared-runtime hit: opencode 1.18.34 already present (image digest ${CONTINUUM_IMAGE_DIGEST:-unresolved})."
+            echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
           else
           for attempt in 1 2 3; do
             if curl -fsSL --retry 3 --retry-delay 2 https://opencode.ai/install | bash -s -- --version 1.18.34 >/dev/null 2>&1; then
@@ -183,7 +184,8 @@ jobs:
           done
           fi
           export PATH="$HOME/.opencode/bin:$PATH"
-          test -x "$HOME/.opencode/bin/opencode"
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+          command -v opencode >/dev/null 2>&1
 
           python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/opencode_instructions.py" install             --source "$CONTINUUM_ENGINE_ROOT/.github/agents/AGENTS.md"
 

@@ -390,7 +390,7 @@ jobs:
             echo "::error::Isolated PR-Agent stack pins upstream v0.46.0, got $PR_AGENT_VERSION."
             exit 1
           fi
-          if command -v pr-agent >/dev/null 2>&1 && pr-agent --version 2>/dev/null | grep -q "0.46.0"; then
+          if command -v pr-agent >/dev/null 2>&1 && pr-agent --version 2>/dev/null | grep -F -q "0.46.0"; then
             echo "prepared-runtime hit: pr-agent 0.46.0 already present (image digest ${CONTINUUM_IMAGE_DIGEST:-unresolved})."
             exit 0
           fi
@@ -410,8 +410,9 @@ jobs:
           # only a validated cache miss falls through to deterministic
           # reconstruction below.
           export PATH="$HOME/.opencode/bin:$PATH"
-          if command -v opencode >/dev/null 2>&1 && opencode --version 2>/dev/null | grep -q "1.18.34"; then
+          if command -v opencode >/dev/null 2>&1 && opencode --version 2>/dev/null | grep -F -q "1.18.34"; then
             echo "prepared-runtime hit: opencode 1.18.34 already present (image digest ${CONTINUUM_IMAGE_DIGEST:-unresolved})."
+            echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
             exit 0
           fi
           for attempt in 1 2 3; do

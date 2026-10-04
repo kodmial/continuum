@@ -962,9 +962,10 @@ class EphemeralController:
         return job_id
 
     def live_idle_count(self) -> int:
-        """Live execution instances exist only while bound to a live job lease."""
+        """Live instances not bound to a live job lease (idle/orphan compute)."""
 
-        return 0
+        leased = set(self.leases)
+        return sum(1 for item in self.provider.live_instances() if item.id not in leased)
 
     def live_instance_count(self) -> int:
         return len(self.provider.live_instances())
@@ -984,7 +985,9 @@ class EphemeralController:
 
         if not self.queued:
             raise AgentRuntimeError("no queued demand: the controller never provisions without demand")
-        queued = self.queued.pop(0)
+        # Peek first: image build/validation failures must not drop queued
+        # demand. The entry is popped only after validation succeeds.
+        queued = self.queued[0]
         profile: RuntimeProfile = queued["profile"]
         job_id: str = queued["job_id"]
         repository: str = queued["repository"]
@@ -998,6 +1001,7 @@ class EphemeralController:
             self.images.promote(generation.digest, now=now)
         validate_image(manifest, profile, generation)
         events.append("validated-identity {}".format(digest))
+        self.queued.pop(0)
 
         network = self.provider.create_network(profile_digest=profile_digest(profile), job_id=job_id, now=now)
         if network.persistent:
@@ -1076,8 +1080,17 @@ class EphemeralController:
         raise AgentRuntimeError("one instance cannot accept a second job")
 
     def _teardown(self, instance: RunnerInstance, now: float, retries: Optional[int] = None) -> bool:
-        attempts = self.retry_limit if retries is None else int(retries)
-        for _ in range(max(1, attempts)):
+        requested = self.retry_limit if retries is None else int(retries)
+        # Bound teardown work by teardown_timeout_seconds: each retry costs
+        # one DEFAULT_TEARDOWN_RETRY_BASE_SECONDS slot. Explicit retry
+        # requests are still capped by the timeout so no teardown waits
+        # indefinitely.
+        budget = max(1, int(self.teardown_timeout // DEFAULT_TEARDOWN_RETRY_BASE_SECONDS))
+        attempts = max(1, min(int(requested), budget))
+        deadline = float(now) + float(self.teardown_timeout)
+        for _ in range(attempts):
+            if float(now) > deadline:
+                break
             if self.provider.destroy(instance, now=now):
                 self.diagnostics.append("destroyed {}".format(instance.id))
                 return True
@@ -1124,12 +1137,21 @@ class EphemeralController:
                 self.diagnostics.append("removed-stale-registration {}".format(jit_id))
         return sorted(removed)
 
+    def discover_via_tags(self) -> List[Dict[str, str]]:
+        """Discover owned live resources from provider tags, without memory.
+
+        Uses only provider-side state (live instances + their tags), so
+        orphan discovery does not depend on in-process leases or queues.
+        """
+
+        return [self.provider.provider_tags(item) for item in self.provider.live_instances()]
+
     def restart(self) -> "EphemeralController":
         """Simulate a controller restart: leases survive, memory does not.
 
-        The returned controller shares the same durable stores (images,
-        provider, cache, leases) so a missed completion event still produces
-        delayed cleanup via the scheduled sweep, not a hanging VM.
+        Leases/queue entries are durably copied (not shared by reference),
+        so the restarted controller proves cleanup works from durable state
+        plus provider-tag discovery, not from shared process memory.
         """
 
         restarted = EphemeralController(
@@ -1144,8 +1166,8 @@ class EphemeralController:
             global_max_age_seconds=self.global_max_age,
             retry_limit=self.retry_limit,
         )
-        restarted.leases = self.leases
-        restarted.queued = self.queued
+        restarted.leases = dict(self.leases)
+        restarted.queued = [dict(item) for item in self.queued]
         restarted.diagnostics = list(self.diagnostics)
         restarted.diagnostics.append("controller-restarted")
         return restarted
@@ -1301,7 +1323,7 @@ def normal_execution_uses_bootstrap_install(workflow_text: str) -> bool:
         for pattern in _BOOTSTRAP_PATTERNS:
             if pattern in line:
                 return True
-    return True
+    return False
 
 
 def workflow_step_has_prepared_runtime_probe(workflow_text: str) -> bool:
