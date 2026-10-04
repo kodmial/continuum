@@ -111,6 +111,41 @@ def order_key(state: QueueState):
     )
 
 
+# Safety-net tick model. Mirrors the controller's chooseDueCandidate plus the
+# in-flight slot guard: rank only candidates with effectiveDueAt <= now, emit
+# at most one command per active slot, and never sleep the runner.
+SAFETY_NET_INTERVAL_MS = 10 * 60_000
+IN_FLIGHT_TIMEOUT_MS = 30 * 60_000
+
+
+def effective_due_at(due_at_ms: int, global_not_before_ms: int = 0) -> int:
+    return max(due_at_ms, global_not_before_ms)
+
+
+def slot_occupied(in_flight_at_ms: int | None, now_ms: int) -> bool:
+    if in_flight_at_ms is None:
+        return False
+    return (now_ms - in_flight_at_ms) < IN_FLIGHT_TIMEOUT_MS
+
+
+def tick_select(
+    due_candidates: list[tuple[QueueState, int]],
+    now_ms: int,
+    in_flight_at_ms: int | None = None,
+    global_not_before_ms: int = 0,
+) -> QueueState | None:
+    """Return the candidate a safety-net tick would command, or None."""
+    if slot_occupied(in_flight_at_ms, now_ms):
+        return None
+    due = [
+        state
+        for state, due_at in due_candidates
+        if effective_due_at(due_at, global_not_before_ms) <= now_ms
+        and may_emit_command(state)
+    ]
+    return sorted(due, key=order_key)[0] if due else None
+
+
 class CodeRabbitQueueLifecycleTests(unittest.TestCase):
     def test_changes_requested_waits_for_finding_verification_then_final_review(self):
         repairing = QueueState(
@@ -287,6 +322,124 @@ class CodeRabbitQueueLifecycleTests(unittest.TestCase):
         self.assertTrue(may_emit_command(QueueState(rate_limited=False)))
 
 
+class CodeRabbitSafetyNetTickTests(unittest.TestCase):
+    """Deferred-queue liveness without any external event (issue #267)."""
+
+    def test_deferred_queue_reconsidered_by_first_tick_after_due(self):
+        due_at = 1_000_000
+        candidate = QueueState(priority="priority:p1", pr_number=7)
+        # Ticks every 10 minutes with no review/comment/status event in between.
+        self.assertIsNone(
+            tick_select([(candidate, due_at)], due_at - 1),
+        )
+        self.assertEqual(
+            candidate,
+            tick_select([(candidate, due_at)], due_at),
+        )
+        self.assertEqual(
+            candidate,
+            tick_select(
+                [(candidate, due_at)], due_at + SAFETY_NET_INTERVAL_MS
+            ),
+        )
+
+    def test_tick_before_due_emits_no_command(self):
+        due_at = 2_000_000
+        candidate = QueueState(priority="priority:p0", pr_number=8)
+        self.assertIsNone(tick_select([(candidate, due_at)], due_at - 60_000))
+        self.assertIsNone(
+            tick_select(
+                [(candidate, due_at)],
+                due_at - 1,
+                global_not_before_ms=due_at + 60_000,
+            )
+        )
+
+    def test_repeated_overlapping_ticks_emit_no_duplicate(self):
+        due_at = 3_000_000
+        candidate = QueueState(priority="priority:p1", pr_number=9)
+        first = tick_select([(candidate, due_at)], due_at)
+        self.assertEqual(candidate, first)
+        # The first tick's command occupies the shared slot; overlapping and
+        # repeated ticks must not emit a second command for the same slot.
+        in_flight_at = due_at
+        self.assertIsNone(
+            tick_select([(candidate, due_at)], due_at + 1, in_flight_at)
+        )
+        self.assertIsNone(
+            tick_select(
+                [(candidate, due_at)],
+                due_at + SAFETY_NET_INTERVAL_MS,
+                in_flight_at,
+            )
+        )
+        # Once the in-flight timeout lapses without a review or rate-limit
+        # response, the slot lock is stale and the queue may retry.
+        self.assertEqual(
+            candidate,
+            tick_select(
+                [(candidate, due_at)],
+                in_flight_at + IN_FLIGHT_TIMEOUT_MS,
+                in_flight_at,
+            ),
+        )
+
+    def test_safety_net_preserves_priority_and_final_review_ordering(self):
+        now = 4_000_000
+        p0_initial = QueueState(
+            priority="priority:p0", prior_full_reviews=0, pr_number=10
+        )
+        p1_final = QueueState(
+            priority="priority:p1",
+            prior_full_reviews=1,
+            prior_changes_requested=True,
+            pr_number=11,
+        )
+        self.assertEqual(
+            p0_initial,
+            tick_select([(p1_final, now), (p0_initial, now)], now),
+        )
+        p2_initial = QueueState(
+            priority="priority:p2",
+            prior_full_reviews=0,
+            created_at=1,
+            pr_number=12,
+        )
+        p2_final = QueueState(
+            priority="priority:p2",
+            prior_full_reviews=1,
+            prior_changes_requested=True,
+            created_at=100,
+            pr_number=13,
+        )
+        self.assertEqual(
+            p2_final,
+            tick_select([(p2_initial, now), (p2_final, now)], now),
+        )
+        # A not-yet-due P0 must not outrank a due P1: only due candidates rank.
+        self.assertEqual(
+            p1_final,
+            tick_select([(p0_initial, now + 60_000), (p1_final, now)], now),
+        )
+
+    def test_global_quota_serialization_holds_on_safety_net_ticks(self):
+        now = 5_000_000
+        candidate = QueueState(priority="priority:p0", pr_number=14)
+        self.assertIsNone(
+            tick_select(
+                [(candidate, now - 1)], now, global_not_before_ms=now + 1
+            )
+        )
+        self.assertEqual(
+            candidate,
+            tick_select(
+                [(candidate, now - 1)],
+                now + 1,
+                global_not_before_ms=now + 1,
+            ),
+        )
+
+
 class WorkflowBindingTests(unittest.TestCase):
     """Bind the executable model to the production workflow contract."""
 
@@ -299,6 +452,10 @@ class WorkflowBindingTests(unittest.TestCase):
         cls.auto_merge = (
             Path(__file__).resolve().parents[1]
             / ".github/workflows/continuum-auto-merge.yml"
+        ).read_text(encoding="utf-8")
+        cls.stub = (
+            Path(__file__).resolve().parents[1]
+            / ".github/caller-stubs/continuum-coderabbit-retry.yml"
         ).read_text(encoding="utf-8")
 
     def test_model_is_bound_to_review_queue_source(self):
@@ -342,6 +499,55 @@ class WorkflowBindingTests(unittest.TestCase):
             "sha: pr.head.sha",
             self.auto_merge,
         )
+
+    def test_safety_net_tick_is_non_blocking_and_never_sleeps(self):
+        for contract in (
+            "function deferUntilNextCandidate(state)",
+            "function chooseDueCandidate(state)",
+            "no runner sleep",
+            "timeout-minutes: 15",
+            "cancel-in-progress: true",
+            "latestInFlightCommand",
+            "no second review command will be emitted",
+        ):
+            self.assertIn(contract, self.workflow)
+        for forbidden in (
+            "MAX_WAIT_MS",
+            "Sleeping until",
+            "setTimeout(resolve, waitMs)",
+            "await new Promise",
+        ):
+            self.assertNotIn(forbidden, self.workflow)
+        # Queue liveness is repository-local; it must not depend on a
+        # separate auto-merge cron.
+        self.assertNotIn("auto-merge safety-net", self.workflow)
+        self.assertIn("scheduled safety-net", self.workflow)
+
+    def test_disabled_consumers_stay_noop_on_safety_net_ticks(self):
+        # The schedule event must sit inside the coderabbit provider gate, so
+        # a tick in a disabled/non-CodeRabbit repository still exits as no-op.
+        self.assertIn("github.event_name == 'schedule'", self.workflow)
+        gate = self.workflow.index("== 'coderabbit'")
+        schedule = self.workflow.index("github.event_name == 'schedule'")
+        self.assertLess(gate, schedule)
+        self.assertIn("workflow_dispatch", self.workflow)
+
+    def test_caller_stub_trigger_parity_for_safety_net(self):
+        # The managed caller must carry the bounded periodic trigger; the
+        # controller must accept the event it produces.
+        self.assertIn("schedule:", self.stub)
+        self.assertIn("3,13,23,33,43,53 * * * *", self.stub)
+        self.assertIn("github.event_name == 'schedule'", self.workflow)
+        # No new credential and no consumer repository literal may ride along.
+        for secret in (
+            "OPENCODE_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GROQ_API_KEY",
+        ):
+            self.assertNotIn(secret, self.stub)
+            self.assertNotIn(secret, self.workflow)
+        self.assertNotIn("kodmial/nanodictate", self.stub)
+        self.assertNotIn("kodmial/nanodictate", self.workflow)
 
 
 if __name__ == "__main__":
