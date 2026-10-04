@@ -178,10 +178,12 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertIn("identified.filter(entry => !survivingSet.has", self.workflow)
 
     def test_transition_is_durable_before_branch_move(self):
-        marker = self.workflow.index('gh pr comment "$PR_NUMBER"')
+        transition = self.workflow.index('continuum-pr-agent-convergence from=')
+        marker = self.workflow.index('gh pr comment "$PR_NUMBER"', transition)
         push = self.workflow.index(
             'git push --force-with-lease="refs/heads/$HEAD_REF:$HEAD_SHA"'
         )
+        self.assertLess(transition, marker)
         self.assertLess(marker, push)
 
     def test_same_head_marker_format_from_33_is_preserved(self):

@@ -284,19 +284,22 @@ jobs:
             // and a login allow-list would miss them, leaving `held` false
             // forever and repairing the same HEAD/state repeatedly.
             const sameHeadHeld = comments.some(comment =>
-              String(comment.body || '').includes(marker)
+              String(comment.body || '').toLowerCase().includes(marker)
             );
             // Cross-HEAD state is per logical finding, not per whole batch.
             // This catches F surviving A->B even if some other findings were
             // resolved or new findings appeared on B.
             let surviving = [];
             const transitionRe =
-              /<!-- continuum-pr-agent-convergence from=([0-9a-f]{40}) to=([0-9a-f]{40}) findings=([0-9a-f,]+) -->/g;
+              /<!-- continuum-pr-agent-convergence from=([0-9a-f]{40}) to=([0-9a-f]{40}) findings=([0-9a-f,]+) -->/gi;
             for (const comment of comments) {
               const body = String(comment.body || '');
               for (const match of body.matchAll(transitionRe)) {
-                if (match[2] !== headSha) continue;
-                const prior = new Set(match[3].split(',').filter(Boolean));
+                const fromHead = String(match[1] || '').toLowerCase();
+                const toHead = String(match[2] || '').toLowerCase();
+                if (fromHead === toHead) continue;
+                if (toHead !== headSha) continue;
+                const prior = new Set(String(match[3] || '').toLowerCase().split(',').filter(Boolean));
                 for (const id of findingIds) {
                   if (prior.has(id)) surviving.push(id);
                 }
@@ -304,6 +307,14 @@ jobs:
             }
             surviving = [...new Set(surviving)].sort();
             const survivingSet = new Set(surviving);
+            const idRe = /^[0-9a-f]{64}$/;
+            for (const entry of identified) {
+              const id = String(entry?.id || '').toLowerCase();
+              if (!idRe.test(id) || typeof entry?.item !== 'object' || entry?.item === null) {
+                core.setFailed('PR-Agent identified batch contains an invalid logical finding entry.');
+                return;
+              }
+            }
             const eligible = sameHeadHeld
               ? []
               : identified.filter(entry => !survivingSet.has(String(entry.id || '').toLowerCase()));
@@ -530,6 +541,16 @@ jobs:
             echo "::error::Repair produced no new HEAD; refusing self-transition marker."
             exit 1
           fi
+          [[ "$HEAD_SHA_LOWER" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "classification=deterministic" >> "$GITHUB_OUTPUT"
+            echo "::error::HEAD_SHA is missing or invalid; refusing publication."
+            exit 1
+          }
+          [[ "$NEW_HEAD_LOWER" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "classification=deterministic" >> "$GITHUB_OUTPUT"
+            echo "::error::New HEAD is missing or invalid; refusing publication."
+            exit 1
+          }
           [[ "$FINDING_IDS_LOWER" =~ ^[0-9a-f]{64}(,[0-9a-f]{64})*$ ]] || {
             echo "classification=deterministic" >> "$GITHUB_OUTPUT"
             echo "::error::Logical finding IDs are missing or invalid; refusing publication."

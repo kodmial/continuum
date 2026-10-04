@@ -159,7 +159,7 @@ def decide(
     same_marker = (
         f"<!-- continuum-pr-agent-no-progress head={head} fingerprint={fp} -->"
     )
-    same_head_hold = any(same_marker in (body or "") for body in comment_bodies)
+    same_head_hold = any(same_marker in (body or "").lower() for body in comment_bodies)
 
     prior: set[str] = set()
     for transition in parse_transitions(comment_bodies):
