@@ -545,47 +545,86 @@ jobs:
         env:
           ISSUE_NUMBER: ${{ inputs.issue_number || github.event.issue.number }}
           IN_PROGRESS_LABEL: ${{ inputs.in_progress_label || vars.AUTOMATION_IN_PROGRESS_LABEL || 'automation:in-progress' }}
-          READ_GITHUB_TOKEN: ${{ github.token }}
+          TAP_PAT: ${{ secrets.TAP_PAT }}
           GITHUB_API_URL: ${{ github.api_url }}
         with:
-          # Preserve PAT identity for readiness mutations while moving the
-          # same-repository readiness reads off the shared PAT core budget.
-          github-token: ${{ secrets.TAP_PAT }}
+          # Same-repository readiness reads use the repository installation
+          # token. PAT is explicit only for event-producing mutations and
+          # bounded permission/rate-limit fallback.
+          github-token: ${{ github.token }}
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const issueNumber = Number(process.env.ISSUE_NUMBER);
             const inProgressLabel =
               process.env.IN_PROGRESS_LABEL || 'automation:in-progress';
-            const readToken = String(process.env.READ_GITHUB_TOKEN || '').trim();
+            const tapPat = String(process.env.TAP_PAT || '').trim();
             const apiBase = String(process.env.GITHUB_API_URL || 'https://api.github.com')
               .replace(/\/+$/, '');
-            if (!readToken) {
-              core.setFailed('READ_GITHUB_TOKEN is required for readiness reads.');
-              return;
-            }
-            const readGithub = new github.constructor({
-              auth: readToken,
-              baseUrl: apiBase,
-            });
-            let readTokenUnavailable = false;
-            async function withReadFallback(fn) {
-              if (readTokenUnavailable) {
-                return await fn(github);
+            const repoPath =
+              `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+
+            async function patRequest(path, options = {}) {
+              if (!tapPat) {
+                throw new Error('TAP_PAT is required for readiness mutation/fallback.');
               }
+              const method = options.method || 'GET';
+              const apiVersion = options.apiVersion || '2022-11-28';
+              const response = await fetch(`${apiBase}${path}`, {
+                method,
+                headers: {
+                  accept: 'application/vnd.github+json',
+                  authorization: `Bearer ${tapPat}`,
+                  'content-type': 'application/json',
+                  'x-github-api-version': apiVersion,
+                },
+                body: options.body === undefined
+                  ? undefined
+                  : JSON.stringify(options.body),
+              });
+              if (options.allow404 && response.status === 404) return null;
+              if (!response.ok) {
+                const details = (await response.text()).slice(0, 500);
+                throw new Error(
+                  `Readiness PAT request ${method} ${path} failed with HTTP ${response.status}` +
+                  (details ? `: ${details}` : '')
+                );
+              }
+              if (response.status === 204) return null;
+              const text = await response.text();
+              return text ? JSON.parse(text) : null;
+            }
+
+            async function patPaginate(path, apiVersion = '2022-11-28') {
+              const all = [];
+              for (let page = 1; ; page += 1) {
+                const separator = path.includes('?') ? '&' : '?';
+                const pageItems = await patRequest(
+                  `${path}${separator}per_page=100&page=${page}`,
+                  { apiVersion }
+                );
+                if (!Array.isArray(pageItems)) {
+                  throw new Error(`Unexpected paginated readiness response for ${path}.`);
+                }
+                all.push(...pageItems);
+                if (pageItems.length < 100) break;
+              }
+              return all;
+            }
+
+            async function readWithFallback(fn, patPath, options = {}) {
               try {
-                return await fn(readGithub);
+                return await fn();
               } catch (err) {
                 const status = err ? (err.status ?? err.response?.status) : undefined;
-                if (status === 401 || status === 403 || status === 429) {
-                  readTokenUnavailable = true;
-                  core.warning(
-                    'Repository-token readiness read failed (' + status + '); ' +
-                    'retrying with TAP_PAT for liveness.'
-                  );
-                  return await fn(github);
-                }
-                throw err;
+                if (![401, 403, 429].includes(status)) throw err;
+                core.warning(
+                  `Repository-token readiness read failed (${status}); ` +
+                  'retrying with TAP_PAT for liveness.'
+                );
+                return options.paginate
+                  ? await patPaginate(patPath, options.apiVersion)
+                  : await patRequest(patPath, { apiVersion: options.apiVersion });
               }
             }
 
@@ -594,12 +633,14 @@ jobs:
               return;
             }
 
-            const { data: issue } = await withReadFallback(client =>
-              client.rest.issues.get({
-                owner,
-                repo,
-                issue_number: issueNumber,
-              })
+            const issue = await readWithFallback(
+              async () => {
+                const { data } = await github.rest.issues.get({
+                  owner, repo, issue_number: issueNumber,
+                });
+                return data;
+              },
+              `${repoPath}/issues/${issueNumber}`
             );
             if (issue.state !== 'open') {
               core.setOutput('ready', 'false');
@@ -615,30 +656,31 @@ jobs:
               for (const match of declared[1].matchAll(/\d+/g)) {
                 const blockerNumber = Number(match[0]);
                 if (blockerNumber === issueNumber) continue;
-                const { data: blocker } = await withReadFallback(client =>
-                  client.rest.issues.get({
-                    owner,
-                    repo,
-                    issue_number: blockerNumber,
-                  })
+                const blocker = await readWithFallback(
+                  async () => {
+                    const { data } = await github.rest.issues.get({
+                      owner, repo, issue_number: blockerNumber,
+                    });
+                    return data;
+                  },
+                  `${repoPath}/issues/${blockerNumber}`
                 );
                 if (blocker.state === 'open') blockerNumbers.add(blockerNumber);
               }
             }
 
-            const nativeBlockers = await withReadFallback(client =>
-              client.paginate(
+            const nativeBlockersPath =
+              `${repoPath}/issues/${issueNumber}/dependencies/blocked_by`;
+            const nativeBlockers = await readWithFallback(
+              () => github.paginate(
                 'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
                 {
-                  owner,
-                  repo,
-                  issue_number: issueNumber,
-                  per_page: 100,
-                  headers: {
-                    'X-GitHub-Api-Version': '2026-03-10',
-                  },
+                  owner, repo, issue_number: issueNumber, per_page: 100,
+                  headers: { 'X-GitHub-Api-Version': '2026-03-10' },
                 }
-              )
+              ),
+              nativeBlockersPath,
+              { paginate: true, apiVersion: '2026-03-10' }
             );
             for (const blocker of nativeBlockers) {
               if (blocker.state === 'open') blockerNumbers.add(blocker.number);
@@ -650,43 +692,35 @@ jobs:
               return;
             }
 
-            try {
-              await github.rest.issues.removeLabel({
-                owner,
-                repo,
-                issue_number: issueNumber,
-                name: inProgressLabel,
-              });
-            } catch (err) {
-              if (err.status !== 404) throw err;
-            }
+            await patRequest(
+              `${repoPath}/issues/${issueNumber}/labels/${encodeURIComponent(inProgressLabel)}`,
+              { method: 'DELETE', allow404: true }
+            );
 
             const blockerText = openBlockers.map(number => `#${number}`).join(', ');
             const marker =
               `<!-- continuum-issue-readiness-blocked issue=${issueNumber} blockers=${openBlockers.join(',')} -->`;
-            const comments = await withReadFallback(client =>
-              client.paginate(
-                client.rest.issues.listComments,
-                {
-                  owner,
-                  repo,
-                  issue_number: issueNumber,
-                  per_page: 100,
-                }
-              )
+            const comments = await readWithFallback(
+              () => github.paginate(
+                github.rest.issues.listComments,
+                { owner, repo, issue_number: issueNumber, per_page: 100 }
+              ),
+              `${repoPath}/issues/${issueNumber}/comments`,
+              { paginate: true }
             );
             if (!comments.some(comment => (comment.body || '').includes(marker))) {
-              await github.rest.issues.createComment({
-                owner,
-                repo,
-                issue_number: issueNumber,
-                body: [
+              await patRequest(
+                `${repoPath}/issues/${issueNumber}/comments`,
+                {
+                  method: 'POST',
+                  body: { body: [
                   marker,
                   `Automation did not start: the issue Definition of Ready is not satisfied because these dependencies are still open: ${blockerText}.`,
                   '',
                   'Continuum will not create a partial PR for a blocked/umbrella task. Complete the blockers first; the scheduler can then pick this issue up normally.',
-                ].join('\n'),
-              });
+                ].join('\n') },
+                }
+              );
             }
 
             core.setOutput('ready', 'false');
