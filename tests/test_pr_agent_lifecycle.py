@@ -16,19 +16,19 @@ import unittest
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 SRC = os.path.join(ROOT, "src")
 
-# Intentional P0 baseline advance: 87d139b completes kodmial/continuum#214
-# mandatory qualification execution mode in continuum-opencode.yml
-# (immutable capability/qualification/SHA run identity, exact-SHA fetch,
-# product-change forbid, evidence-gated success without pause, plus the
-# trust hardening required by scripts/test-continuum.rb: trusted dispatch
-# identity via isTrustedDispatchComment, automation reads via
-# .user.login == "github-actions[bot]", and untracked-dropping verdict via
-# --untracked-files=no). The authoritative task contract and
-# scripts/test-continuum.rb require those strings in
-# continuum-opencode.yml, so the pre-#214 zero-diff assertion is stale.
-# Keeping the immutable commit baseline means any later protected-file
-# drift still fails.
-BASELINE_SHA = "87d139b49786ca1c9b6a5a413022ccf0e90b741a"
+# Intentional P0 baseline advance: 3df3b1e implements kodmial/continuum#248
+# (stop recursive OpenCode runs from arbitrary PR issue comments) in
+# continuum-opencode.yml: the interactive PR issue_comment route now requires
+# a still-open PR, the repository owner, an explicit command at the start of
+# the comment (startsWith /oc or /opencode, never a later-prose substring),
+# and the /oc-cancel exclusion, in both the opencode job gate and the Run
+# OpenCode step gate. The plain-issue, qualification, workflow_dispatch, and
+# review-comment routes keep their existing behavior. The authoritative task
+# contract and scripts/test-continuum.rb require those gate strings in
+# continuum-opencode.yml, so the pre-#248 zero-diff assertion from 87d139b is
+# stale. Keeping the immutable commit baseline means any later
+# protected-file drift still fails.
+BASELINE_SHA = "3df3b1e231c395d425385107e9dea03a8911274d"
 
 PROTECTED_FILES = [
     ".github/workflows/continuum-opencode.yml",

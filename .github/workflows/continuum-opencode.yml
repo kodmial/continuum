@@ -320,11 +320,27 @@ jobs:
     # issue_comment carrying a trusted qualification-dispatch marker is also
     # recognized as qualification mode and bound to that marker's triple, so
     # a later main advance can never retarget an already-started run.
+    # Interactive PR comments are gated narrowly: an issue_comment on a PR
+    # runs only for an explicit owner command at the start of the comment on
+    # a still-open PR. Substring matching is forbidden on that route because
+    # OpenCode-generated prose itself can mention /oc while documenting the
+    # contract, which chained one run per minute on a closed PR.
     if: >-
       (github.event_name == 'workflow_dispatch' &&
        contains(fromJSON('["coderabbit-fix","resolve-conflict","ci-fix","issue","qualification"]'), inputs.mode)) ||
-      ((github.event_name == 'issue_comment' ||
-        github.event_name == 'pull_request_review_comment') &&
+      ((github.event_name == 'issue_comment' &&
+        !github.event.issue.pull_request) &&
+       github.actor == github.repository_owner &&
+       (contains(github.event.comment.body, '/oc') ||
+        contains(github.event.comment.body, '/opencode'))) ||
+      ((github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request) &&
+       github.actor == github.repository_owner &&
+       github.event.issue.state == 'open' &&
+       (startsWith(github.event.comment.body, '/oc') ||
+        startsWith(github.event.comment.body, '/opencode')) &&
+       !contains(github.event.comment.body, '/oc-cancel')) ||
+      ((github.event_name == 'pull_request_review_comment') &&
        github.actor == github.repository_owner &&
        (contains(github.event.comment.body, '/oc') ||
         contains(github.event.comment.body, '/opencode')))
@@ -898,11 +914,22 @@ jobs:
       # comment on a plain issue is an implementation command and is routed
       # through the deterministic issue-mode contract below instead of letting
       # `opencode github run` infer intent from a bare slash command.
+      # On PR issue comments the gate is deliberately narrow: the PR must
+      # still be open, the author must be the repository owner, and the body
+      # must start with /oc or /opencode. startsWith (not contains) is used
+      # because agent-generated prose can mention /oc later in the comment,
+      # which previously chained one self-triggered run per verification
+      # comment. Review comments keep their existing owner + contains gate.
       - name: Run OpenCode
         if: >-
           github.event_name != 'workflow_dispatch' &&
-          (github.event_name == 'pull_request_review_comment' ||
-           github.event.issue.pull_request) &&
+          ((github.event_name == 'pull_request_review_comment') ||
+           (github.event_name == 'issue_comment' &&
+            github.event.issue.pull_request &&
+            github.actor == github.repository_owner &&
+            github.event.issue.state == 'open' &&
+            (startsWith(github.event.comment.body, '/oc') ||
+             startsWith(github.event.comment.body, '/opencode')))) &&
           steps.duplicate_guard.outputs.skip != 'true' &&
           !contains(github.event.comment.body, '/oc-cancel')
         env:
