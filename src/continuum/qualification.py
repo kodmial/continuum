@@ -72,6 +72,31 @@ that shape so the publisher can use a non-closing body, and
 qualifications are not all satisfied for the required SHA reports
 ``must-reopen``, never ``complete``.
 
+Qualification DAG semantics (kodmial/continuum#278)
+--------------------------------------------------
+The qualification relation is first-class, not a normal implementation
+dependency:
+
+* A capability that declares ``automation-qualification: #Q`` must never treat
+  ``#Q`` as a normal blocker: during qualification the capability
+  intentionally remains open/``automation:qualifying``, so waiting on ``#Q``
+  as ordinary work strands the lifecycle. Such an edge is a direct
+  capability<->qualification back-edge and is deterministically ignored for
+  qualification readiness with a clear diagnostic, never honored as a blocker.
+* A qualification tracker ``#Q`` that declares ``automation-blocked-by: #C``
+  (where ``#C`` is the capability it validates) must still be dispatched for
+  that exact ``#C`` run: qualification dispatch bypasses normal
+  implementation-readiness admission for the declared capability relation
+  while still honoring the immutable required SHA and every
+  qualification-specific safety rule.
+* Qualification/validation trackers are never auto-admitted to generic
+  implementation: an issue that is declared as a qualification of another
+  issue needs explicit qualification dispatch and stays independent of
+  ``automation:ready``.
+* Reusable trackers stay open across revisions; consumers gate on the trusted
+  exact revision/fingerprint PASS tuple (:func:`qualification_result_tuple`),
+  never on tracker closure.
+
 Standard library only.
 """
 
@@ -79,11 +104,20 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Tuple
 
 #: Marker a capability issue carries to declare mandatory qualifications.
 QUALIFICATION_DECLARATION_RE = re.compile(
     r"<!--\s*automation-qualification\s*:\s*([0-9#\s,]+?)\s*-->",
+    re.IGNORECASE,
+)
+
+#: Marker an issue carries to declare normal implementation blockers. A
+#: qualification tracker that lists its own capability here creates the
+#: capability<->qualification back-edge described above; the qualification
+#: relation itself is never expressed with this marker.
+BLOCKED_BY_RE = re.compile(
+    r"<!--\s*automation-blocked-by\s*:\s*([0-9#\s,]+?)\s*-->",
     re.IGNORECASE,
 )
 
@@ -362,6 +396,257 @@ def parse_qualification_refs(body: object, self_number: object = None) -> Tuple[
     return tuple(sorted(found))
 
 
+def parse_blocked_by_refs(body: object, self_number: object = None) -> Tuple[int, ...]:
+    """Normal implementation blocker numbers declared in a body.
+
+    Only the machine-readable ``automation-blocked-by`` marker counts;
+    prose never does. The result is sorted, deduplicated, and never contains
+    the issue itself. This is the normal implementation dependency relation;
+    the qualification relation is declared separately with
+    ``automation-qualification`` and must never be modeled through it.
+    """
+
+    if not isinstance(body, str):
+        return ()
+    try:
+        own = int(self_number) if self_number is not None else None
+    except (TypeError, ValueError):
+        own = None
+    found = set()
+    for match in BLOCKED_BY_RE.finditer(body):
+        for item in re.findall(r"\d+", match.group(1)):
+            try:
+                number = int(item)
+            except ValueError:
+                continue
+            if number <= 0:
+                continue
+            if own is not None and number == own:
+                continue
+            found.add(number)
+    return tuple(sorted(found))
+
+
+def collect_qualification_trackers(
+    bodies_by_issue: Mapping[object, object],
+) -> Tuple[int, ...]:
+    """Every issue number declared as a qualification by any mapped body.
+
+    The input maps capability issue number to body text. The result is the
+    sorted, deduplicated union of :func:`parse_qualification_refs` across all
+    bodies. Schedulers consult this set to keep qualification/validation
+    trackers out of generic implementation admission: a tracker needs
+    explicit qualification dispatch and is independent of
+    ``automation:ready``.
+    """
+
+    found: set = set()
+    if not bodies_by_issue:
+        return ()
+    try:
+        items = list(bodies_by_issue.items())
+    except AttributeError:
+        return ()
+    for self_number, body in items:
+        try:
+            own = int(self_number)
+        except (TypeError, ValueError):
+            own = None
+        for ref in parse_qualification_refs(body, own):
+            found.add(int(ref))
+    return tuple(sorted(found))
+
+
+def is_qualification_tracker(
+    issue_number: object, bodies_by_issue: Mapping[object, object]
+) -> bool:
+    """Whether an issue is declared as a qualification tracker elsewhere."""
+
+    try:
+        wanted = int(issue_number)
+    except (TypeError, ValueError):
+        return False
+    return wanted in set(collect_qualification_trackers(bodies_by_issue or {}))
+
+
+def should_admit_to_implementation(
+    issue_number: object, bodies_by_issue: Mapping[object, object]
+) -> Tuple[bool, str]:
+    """Whether generic implementation scheduling may admit an issue.
+
+    Qualification/validation trackers must not be auto-admitted to generic
+    implementation simply because they are open and unblocked: they need
+    explicit qualification dispatch, which remains independent of
+    ``automation:ready``. Returns ``(False,
+    "qualification-tracker-needs-explicit-dispatch")`` for a declared
+    tracker and ``(True, "ready")`` otherwise. Repair issues (which carry
+    the ``continuum-qualification-repair`` marker, not a qualification
+    declaration) are ordinary implementation work and stay admissible.
+    """
+
+    if is_qualification_tracker(issue_number, bodies_by_issue or {}):
+        return False, "qualification-tracker-needs-explicit-dispatch"
+    return True, "ready"
+
+
+def qualification_cycle_edges(
+    capability_number: object,
+    qualification_refs: Iterable[int],
+    capability_blocked_by: Iterable[object] = (),
+    qualification_blocked_by: Optional[Mapping[object, Iterable[object]]] = None,
+) -> Dict[str, Tuple[int, ...]]:
+    """The direct capability<->qualification back-edges for one capability.
+
+    Returns ``{"capability_blocked_by_qualification": (...),
+    "qualifications_blocked_by_capability": (...)}`` where the first tuple
+    holds declared qualifications that the capability also lists as normal
+    blockers, and the second holds declared qualifications whose own
+    ``automation-blocked-by`` lists the capability. Either tuple being
+    non-empty is the directly impossible topology (for example AA ``#6``
+    declaring qualification ``#7`` while ``#7`` declares
+    ``automation-blocked-by: #6``): the validator must never be modeled as
+    a normal downstream implementation dependency.
+    """
+
+    try:
+        capability = int(capability_number)
+    except (TypeError, ValueError):
+        return {
+            "capability_blocked_by_qualification": (),
+            "qualifications_blocked_by_capability": (),
+        }
+    refs = tuple(sorted({int(item) for item in (qualification_refs or ())}))
+    try:
+        blockers = {int(item) for item in (capability_blocked_by or [])}
+    except (TypeError, ValueError):
+        blockers = set()
+    forward = tuple(sorted(set(refs) & blockers))
+    reverse: List[int] = []
+    mapping = qualification_blocked_by or {}
+    try:
+        pairs = list(mapping.items())
+    except AttributeError:
+        pairs = []
+    blocked_sets: Dict[int, set] = {}
+    for key, values in pairs:
+        try:
+            qualification = int(key)
+        except (TypeError, ValueError):
+            continue
+        try:
+            blocked_sets[qualification] = {int(item) for item in (values or [])}
+        except (TypeError, ValueError):
+            continue
+    for ref in refs:
+        if capability in blocked_sets.get(ref, set()):
+            reverse.append(int(ref))
+    return {
+        "capability_blocked_by_qualification": forward,
+        "qualifications_blocked_by_capability": tuple(sorted(reverse)),
+    }
+
+
+def has_qualification_blocker_cycle(
+    capability_number: object,
+    qualification_refs: Iterable[int],
+    capability_blocked_by: Iterable[object] = (),
+    qualification_blocked_by: Optional[Mapping[object, Iterable[object]]] = None,
+) -> bool:
+    """Whether the direct capability<->qualification topology is cyclic."""
+
+    edges = qualification_cycle_edges(
+        capability_number,
+        qualification_refs,
+        capability_blocked_by,
+        qualification_blocked_by,
+    )
+    return bool(
+        edges["capability_blocked_by_qualification"]
+        or edges["qualifications_blocked_by_capability"]
+    )
+
+
+def effective_qualification_blockers(
+    qualification_refs: Iterable[int],
+    open_blockers: Iterable[object] = (),
+) -> Tuple[List[int], Tuple[int, ...]]:
+    """Capability blockers with qualification back-edges deterministically ignored.
+
+    Returns ``(effective_blockers, ignored_back_edges)`` where ``ignored``
+    holds open blockers that are also declared qualifications of this
+    capability. An open capability intentionally remains open while it
+    qualifies, so waiting on its own validator as ordinary work would strand
+    the lifecycle; the back-edge is ignored with a diagnostic instead of
+    being honored. Any remaining effective blocker still blocks.
+    """
+
+    refs = {int(item) for item in (qualification_refs or ())}
+    blockers: List[int] = []
+    for item in open_blockers or []:
+        try:
+            blockers.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    ignored = tuple(sorted(set(blockers) & refs))
+    effective = [item for item in blockers if item not in refs]
+    return effective, ignored
+
+
+def qualification_dispatch_bypass(
+    qualification_number: object,
+    capability_number: object,
+    qualification_open_blockers: Iterable[object] = (),
+) -> Tuple[List[int], Tuple[int, ...], str]:
+    """Reverse-edge bypass for dispatching one qualification tracker.
+
+    A qualification tracker commonly declares ``automation-blocked-by`` on
+    the capability it validates (AA ``#7`` blocked by ``#6``). Normal
+    implementation readiness would then wait for the capability to close,
+    while the capability waits for qualification evidence to close: a
+    deadlock. Qualification dispatch bypasses exactly that declared
+    capability relation and still honors every other open blocker and all
+    qualification-specific safety rules (immutable required SHA, trusted
+    evidence, idempotent dispatch). Returns ``(effective_blockers,
+    bypassed, reason)`` with reason ``"dispatch"`` when nothing was
+    bypassed, ``"dispatch-ignoring-capability-back-edge"`` when only the
+    capability edge was bypassed, and ``"blocked"`` when other blockers
+    remain.
+    """
+
+    try:
+        qualification = int(qualification_number)
+    except (TypeError, ValueError):
+        return [], (), "blocked"
+    try:
+        capability = int(capability_number)
+    except (TypeError, ValueError):
+        blockers: List[int] = []
+        for item in qualification_open_blockers or []:
+            try:
+                blockers.append(int(item))
+            except (TypeError, ValueError):
+                continue
+        if blockers:
+            return blockers, (), "blocked"
+        return [], (), "dispatch"
+    blockers = []
+    for item in qualification_open_blockers or []:
+        try:
+            number = int(item)
+        except (TypeError, ValueError):
+            continue
+        if number == qualification:
+            continue
+        blockers.append(number)
+    bypassed = tuple(sorted({item for item in blockers if item == capability}))
+    effective = [item for item in blockers if item != capability]
+    if effective:
+        return effective, bypassed, "blocked"
+    if bypassed:
+        return [], bypassed, "dispatch-ignoring-capability-back-edge"
+    return [], (), "dispatch"
+
+
 def latest_required_sha(body: object, capability_number: object = None) -> Optional[str]:
     """The most recently recorded required main SHA, or None.
 
@@ -524,12 +809,30 @@ def _verdict_from_aliases(attrs: Dict[str, str]) -> Optional[str]:
     return None
 
 
+def _fingerprint_from_attrs(attrs: Dict[str, str]) -> Optional[str]:
+    for key in ("fingerprint", "fp", "digest"):
+        value = attrs.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _fingerprint_from_payload(payload: dict) -> Optional[str]:
+    for key in ("fingerprint", "fp", "digest"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
 def parse_evidence_entries(comment_body: object) -> List[Dict[str, object]]:
     """Every machine-readable evidence entry in one comment body.
 
     Canonical markers and Docker/Render controller payloads are accepted.
     Prose verdicts never count. Each entry is a mapping with ``sha`` and
-    ``result`` (``pass``/``fail``), plus ``source`` and ``issue`` when known.
+    ``result`` (``pass``/``fail``), plus ``source`` and ``issue`` when known
+    and ``fingerprint`` when the payload carries one (controller results;
+    the canonical marker carries none).
     """
 
     if not isinstance(comment_body, str) or not comment_body:
@@ -548,7 +851,13 @@ def parse_evidence_entries(comment_body: object) -> List[Dict[str, object]]:
             except ValueError:
                 continue
         entries.append(
-            {"source": "canonical", "issue": issue, "sha": sha, "result": verdict}
+            {
+                "source": "canonical",
+                "issue": issue,
+                "sha": sha,
+                "result": verdict,
+                "fingerprint": _fingerprint_from_attrs(attrs),
+            }
         )
     for marker, source in (
         (DOCKER_RESULT_MARKER, "docker"),
@@ -583,6 +892,7 @@ def parse_evidence_entries(comment_body: object) -> List[Dict[str, object]]:
                                 if classification in ("pass", "passed", "success", "approved")
                                 else EVIDENCE_FAIL
                             ),
+                            "fingerprint": _fingerprint_from_payload(payload),
                         }
                     )
                     break
@@ -676,6 +986,88 @@ def latest_trusted_evidence_body(
         if matched:
             latest = body
     return latest
+
+
+def qualification_result_tuple(
+    comments: Iterable[object],
+    qualification_number: int,
+    required_sha: object,
+) -> Optional[Dict[str, object]]:
+    """The trusted reusable result tuple for one qualification at one SHA.
+
+    Returns ``{"issue": int, "sha": str, "result": "pass"/"fail",
+    "fingerprint": Optional[str], "source": str}`` for the latest trusted
+    evidence entry matching the exact required SHA, or ``None`` when there
+    is no such entry. The tuple is the reusable contract consumers gate on:
+    it is consumable without closing the qualification tracker, so a
+    reusable validation issue stays open across revisions while each
+    revision carries its own pass/fail evidence. Trust, dispatch-exclusion,
+    and exact-SHA rules are identical to
+    :func:`qualification_evidence_state`; only the shape differs.
+    """
+
+    sha = _normalize_sha(required_sha)
+    if sha is None:
+        return None
+    try:
+        wanted = int(qualification_number)
+    except (TypeError, ValueError):
+        return None
+    latest: Optional[Dict[str, object]] = None
+    for comment in comments or []:
+        if not is_trusted_comment(comment, allow_automation=True):
+            continue
+        body = _comment_body(comment)
+        if not isinstance(body, str) or not body:
+            continue
+        if contains_dispatch_marker(body):
+            continue
+        for entry in parse_evidence_entries(body):
+            issue = entry.get("issue")
+            if issue is not None and int(issue) != wanted:
+                continue
+            if entry.get("sha") != sha:
+                continue
+            latest = {
+                "issue": wanted,
+                "sha": sha,
+                "result": str(entry.get("result")),
+                "fingerprint": entry.get("fingerprint"),
+                "source": str(entry.get("source")),
+            }
+    return latest
+
+
+def has_trusted_pass_for_sha(
+    comments: Iterable[object],
+    qualification_number: int,
+    required_sha: object,
+) -> bool:
+    """Whether trusted exact-SHA PASS evidence exists, without closure.
+
+    Reusable qualification trackers are never required to close: a ``True``
+    result means the exact revision is proven good even while the tracker
+    stays open for the next revision.
+    """
+
+    result = qualification_result_tuple(comments, qualification_number, required_sha)
+    return result is not None and result.get("result") == EVIDENCE_PASS
+
+
+def trusted_pass_fingerprint(
+    comments: Iterable[object],
+    qualification_number: int,
+    required_sha: object,
+) -> Optional[str]:
+    """The fingerprint of the trusted exact-SHA PASS, if any carries one."""
+
+    result = qualification_result_tuple(comments, qualification_number, required_sha)
+    if result is None or result.get("result") != EVIDENCE_PASS:
+        return None
+    fingerprint = result.get("fingerprint")
+    if isinstance(fingerprint, str) and fingerprint.strip():
+        return fingerprint.strip()
+    return None
 
 
 def capability_status(
@@ -777,8 +1169,12 @@ def should_start_qualification(
     starts qualification by itself and never synthesizes a required SHA from
     current main. Only a trusted implementation-merge transition recording
     the first ``continuum-qualification-required`` SHA may start it. Open
-    blockers/unimplemented capability work remain blockers; qualification
-    cannot leapfrog them.
+    blockers/unimplemented capability work remain blockers, except for a
+    direct capability<->qualification back-edge: an open blocker that is
+    itself a declared qualification of this capability is deterministically
+    ignored with the ``ready-ignoring-qualification-back-edge`` reason,
+    because the capability intentionally remains open while it qualifies.
+    Qualification cannot otherwise leapfrog blockers.
     """
 
     refs = tuple(int(item) for item in (qualification_refs or ()))
@@ -786,9 +1182,11 @@ def should_start_qualification(
         return False, "no-qualification"
     if _normalize_sha(required_sha) is None:
         return False, "no-required-sha"
-    blockers = [item for item in (open_blockers or [])]
-    if blockers:
+    effective, ignored = effective_qualification_blockers(refs, open_blockers)
+    if effective:
         return False, "blocked"
+    if ignored:
+        return True, "ready-ignoring-qualification-back-edge"
     return True, "ready"
 
 

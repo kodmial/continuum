@@ -932,6 +932,16 @@ jobs:
               CONTINUUM_DEP_STATE[$open_number]="open"
             done < <(jq -r '.[].number' <<<"$issues_json" 2>/dev/null || true)
 
+            # Qualification/validation trackers are never generic
+            # implementation work (kodmial/continuum#278): they need explicit
+            # qualification dispatch, independent of automation:ready. The set
+            # is derived from the fetched inventory without extra API reads.
+            qualification_trackers="$(
+              jq -r '.[] | select(.pull_request == null) | .body // ""' <<<"$issues_json" \
+                | grep -oiE '<!--[[:space:]]*automation-qualification:[^>]*-->' \
+                | grep -oE '[0-9]+' | sort -n -u | tr '\n' ' ' || true
+            )"
+
             while IFS= read -r encoded; do
               [[ -n "$encoded" ]] || continue
               decoded="$(base64 -d <<<"$encoded")"
@@ -963,7 +973,18 @@ jobs:
               grep -Fxq "$task_number" <<<"$open_pr_tasks" && continue
               local_override_active "$task_number" && continue
 
+              # A declared qualification tracker never enters generic
+              # implementation scheduling, even when open and unblocked.
+              if [[ " $qualification_trackers " == *" $task_number "* ]]; then
+                echo "Skipping delegated task #$task_number: qualification tracker needs explicit dispatch, not generic implementation."
+                continue
+              fi
+
               ready=true
+              task_refs="$(
+                sed -nE 's/.*<!-- *automation-qualification: *([^>]*) *-->.*/\1/p' \
+                  <<<"$body" | head -1 | tr ',' ' ' || true
+              )"
               deps="$(
                 sed -nE 's/.*<!-- *automation-blocked-by: *([^>]*) *-->.*/\1/p' \
                   <<<"$body" | head -1 | tr ',' ' '
@@ -972,6 +993,14 @@ jobs:
                 dep="${dep//#/}"
                 dep="${dep//[[:space:]]/}"
                 [[ "$dep" =~ ^[0-9]+$ ]] || continue
+                # A direct capability<->qualification back-edge is ignored
+                # with a diagnostic (kodmial/continuum#278): the capability
+                # stays open while it qualifies, so its own validator is
+                # never an implementation blocker.
+                if grep -qw "$dep" <<<"$task_refs" 2>/dev/null; then
+                  echo "Delegated task #$task_number: ignoring qualification back-edge blocker #$dep."
+                  continue
+                fi
                 dep_state state "$dep"
                 if [[ "$state" != "closed" ]]; then ready=false; break; fi
               done
@@ -1391,6 +1420,149 @@ jobs:
               return [...found].sort((a, b) => a - b);
             }
 
+            // Normal implementation blockers. Mirrors
+            // src/continuum/qualification.py parse_blocked_by_refs: only the
+            // machine-readable marker counts, prose never does.
+            function blockedByRefs(body, selfNumber) {
+              if (typeof body !== 'string' || !body) return [];
+              const found = new Set();
+              const pattern = /<!--\s*automation-blocked-by:\s*([0-9#\s,]+?)\s*-->/gi;
+              for (const match of body.matchAll(pattern)) {
+                for (const item of match[1].matchAll(/\d+/g)) {
+                  const number = Number.parseInt(item[0], 10);
+                  if (!Number.isInteger(number) || number <= 0) continue;
+                  if (number === selfNumber) continue;
+                  found.add(number);
+                }
+              }
+              return [...found].sort((a, b) => a - b);
+            }
+
+            // Qualification DAG semantics (kodmial/continuum#278). Mirrors
+            // src/continuum/qualification.py: the validator is never a normal
+            // downstream implementation dependency. A direct
+            // capability<->qualification back-edge is detected and
+            // deterministically ignored for qualification readiness with a
+            // clear diagnostic, never honored as a blocker.
+            function qualificationCycleEdges(
+              capabilityNumber, refs, capabilityBlockedBy, qualificationBlockedBy
+            ) {
+              const refSet = new Set(refs || []);
+              const blockerSet = new Set(capabilityBlockedBy || []);
+              const forward = [...refSet].filter(number => blockerSet.has(number)).sort((a, b) => a - b);
+              const reverse = (refs || []).filter(ref =>
+                ((qualificationBlockedBy || {})[ref] || []).includes(capabilityNumber)
+              ).sort((a, b) => a - b);
+              return {
+                capabilityBlockedByQualification: forward,
+                qualificationsBlockedByCapability: reverse,
+              };
+            }
+
+            function hasQualificationBlockerCycle(
+              capabilityNumber, refs, capabilityBlockedBy, qualificationBlockedBy
+            ) {
+              const edges = qualificationCycleEdges(
+                capabilityNumber, refs, capabilityBlockedBy, qualificationBlockedBy
+              );
+              return edges.capabilityBlockedByQualification.length > 0 ||
+                edges.qualificationsBlockedByCapability.length > 0;
+            }
+
+            // Capability blockers with qualification back-edges ignored.
+            // Mirrors effective_qualification_blockers: an open blocker that
+            // is itself a declared qualification stays reported in `ignored`
+            // for the diagnostic while `effective` drives the decision.
+            function effectiveQualificationBlockers(refs, openBlockers) {
+              const refSet = new Set(refs || []);
+              const blockers = (openBlockers || []).map(blocker =>
+                typeof blocker === 'object' && blocker !== null && typeof blocker.number === 'number'
+                  ? blocker.number
+                  : blocker
+              );
+              return {
+                effective: blockers.filter(number => !refSet.has(number)),
+                ignored: blockers.filter(number => refSet.has(number)),
+              };
+            }
+
+            // Reverse-edge bypass for one qualification tracker. Mirrors
+            // qualification_dispatch_bypass: a tracker blocked only by the
+            // capability it validates still dispatches for that exact run.
+            function qualificationDispatchBypass(
+              qualificationNumber, capabilityNumber, openBlockers
+            ) {
+              const blockers = (openBlockers || []).map(blocker =>
+                typeof blocker === 'object' && blocker !== null && typeof blocker.number === 'number'
+                  ? blocker.number
+                  : blocker
+              ).filter(number => number !== qualificationNumber);
+              const bypassed = blockers.filter(number => number === capabilityNumber);
+              const effective = blockers.filter(number => number !== capabilityNumber);
+              if (effective.length > 0) return { effective, bypassed, reason: 'blocked' };
+              if (bypassed.length > 0) {
+                return { effective, bypassed, reason: 'dispatch-ignoring-capability-back-edge' };
+              }
+              return { effective, bypassed, reason: 'dispatch' };
+            }
+
+            // Every issue number declared as a qualification anywhere in the
+            // open inventory. Trackers need explicit qualification dispatch
+            // and are never auto-admitted to generic implementation,
+            // independent of automation:ready. Mirrors
+            // collect_qualification_trackers.
+            function collectQualificationTrackers(issues) {
+              const found = new Set();
+              for (const issue of issues || []) {
+                for (const ref of qualificationRefs(issue.body || '', issue.number)) {
+                  found.add(ref);
+                }
+              }
+              return [...found].sort((a, b) => a - b);
+            }
+
+            function shouldAdmitToImplementation(issueNumber, trackerNumbers) {
+              if ((trackerNumbers || []).includes(issueNumber)) {
+                return { admit: false, reason: 'qualification-tracker-needs-explicit-dispatch' };
+              }
+              return { admit: true, reason: 'ready' };
+            }
+
+            // Trusted reusable result tuple for one qualification at one SHA.
+            // Mirrors qualification_result_tuple: consumable without tracker
+            // closure, so a reusable validation issue stays open across
+            // revisions while each revision carries its own evidence.
+            function qualificationResultTuple(commentBodies, qualificationNumber, requiredSha) {
+              const sha = normalizeSha(requiredSha);
+              if (!sha) return null;
+              let latest = null;
+              for (const comment of commentBodies || []) {
+                if (!isTrustedQualificationComment(comment, true)) continue;
+                const body = commentBodyOf(comment);
+                if (typeof body !== 'string' || !body) continue;
+                if (commentHasDispatchMarker(body)) continue;
+                for (const entry of parseQualificationEvidenceEntries(body)) {
+                  if (entry.issue != null && entry.issue !== qualificationNumber) continue;
+                  if (entry.sha !== sha) continue;
+                  latest = {
+                    issue: qualificationNumber,
+                    sha,
+                    result: entry.result,
+                    fingerprint: entry.fingerprint || null,
+                    source: entry.source,
+                  };
+                }
+              }
+              return latest;
+            }
+
+            function hasTrustedPassForSha(commentBodies, qualificationNumber, requiredSha) {
+              const tuple = qualificationResultTuple(
+                commentBodies, qualificationNumber, requiredSha
+              );
+              return !!tuple && tuple.result === 'pass';
+            }
+
             function isValidSha(value) {
               return typeof value === 'string' && /^[0-9a-f]{40}$/i.test(value.trim());
             }
@@ -1524,7 +1696,12 @@ jobs:
                   issue = Number.parseInt(String(attrs.issue), 10);
                   if (!Number.isInteger(issue)) continue;
                 }
-                entries.push({ issue, sha, result: verdict });
+                entries.push({
+                  issue,
+                  sha,
+                  result: verdict,
+                  fingerprint: attrs.fingerprint || attrs.fp || attrs.digest || null,
+                });
               }
               for (const marker of [
                 '<!-- continuum-docker-qualification-result -->',
@@ -1553,6 +1730,7 @@ jobs:
                       result: ['pass', 'passed', 'success', 'approved'].includes(classification)
                         ? 'pass'
                         : 'fail',
+                      fingerprint: (payload.fingerprint || payload.fp || payload.digest || null),
                     });
                   }
                 }
@@ -1629,6 +1807,13 @@ jobs:
             // unpaused here, not skipped. Idempotent per SHA so duplicate
             // merge events cannot start qualification storms; a closed
             // qualification is never dispatched (it must be reopened first).
+            // Explicit qualification dispatch is independent of the optional
+            // automation:ready admission gate and bypasses normal
+            // implementation-readiness admission for the declared capability
+            // relation (kodmial/continuum#278): a tracker blocked only by its
+            // own capability still dispatches for that exact run. The
+            // immutable required SHA and every qualification-specific safety
+            // rule still apply.
             async function dispatchQualificationIssue(
               capabilityNumber,
               qualificationNumber,
@@ -1746,12 +1931,27 @@ jobs:
                 return 'no-required-sha';
               }
               // Qualification cannot leapfrog open blockers/unimplemented
-              // capability work: they remain blockers until closed.
+              // capability work: they remain blockers until closed. A direct
+              // capability<->qualification back-edge is the one exception
+              // (kodmial/continuum#278): the capability intentionally stays
+              // open while it qualifies, so its own validator is ignored
+              // with a diagnostic instead of stranding qualification.
               const declaredBlockers = await openDeclaredBlockers(capabilityIssue);
-              if (declaredBlockers.length > 0) {
+              const qualifierSplit = effectiveQualificationBlockers(
+                refs, declaredBlockers.map(blocker => blocker.number)
+              );
+              if (qualifierSplit.ignored.length > 0) {
+                core.notice(
+                  'Capability #' + capabilityNumber +
+                  ': ignoring qualification back-edge blocker(s) ' +
+                  qualifierSplit.ignored.map(number => '#' + number).join(', ') +
+                  ' for qualification readiness.'
+                );
+              }
+              if (qualifierSplit.effective.length > 0) {
                 core.info(
                   'Capability #' + capabilityNumber + ': blocked by ' +
-                  declaredBlockers.map(blocker => '#' + blocker.number).join(', ') +
+                  qualifierSplit.effective.map(number => '#' + number).join(', ') +
                   '; qualification waits.'
                 );
                 return 'blocked-waiting';
@@ -2010,12 +2210,25 @@ jobs:
               const refs = qualificationRefs(fresh.body || '', issueNumber);
               if (refs.length === 0) return refs;
               // Qualification cannot leapfrog open blockers: the merge still
-              // records nothing and dispatches nothing until they close.
+              // records nothing and dispatches nothing until they close. A
+              // direct back-edge on the capability's own validator is
+              // ignored with a diagnostic (kodmial/continuum#278).
               const mergeDeclaredBlockers = await openDeclaredBlockers(fresh);
-              if (mergeDeclaredBlockers.length > 0) {
+              const mergeSplit = effectiveQualificationBlockers(
+                refs, mergeDeclaredBlockers.map(blocker => blocker.number)
+              );
+              if (mergeSplit.ignored.length > 0) {
+                core.notice(
+                  'Capability #' + issueNumber +
+                  ': ignoring qualification back-edge blocker(s) ' +
+                  mergeSplit.ignored.map(number => '#' + number).join(', ') +
+                  ' at the merge transition.'
+                );
+              }
+              if (mergeSplit.effective.length > 0) {
                 core.info(
                   'Capability #' + issueNumber + ': implementation merged but blocked by ' +
-                  mergeDeclaredBlockers.map(blocker => '#' + blocker.number).join(', ') +
+                  mergeSplit.effective.map(number => '#' + number).join(', ') +
                   '; qualification waits for blockers.'
                 );
                 return 'blocked-waiting';
@@ -2847,12 +3060,29 @@ jobs:
               return;
             }
 
+            // Qualification/validation trackers are never generic
+            // implementation work (kodmial/continuum#278): they need explicit
+            // qualification dispatch, independent of automation:ready. The set
+            // is derived from the open inventory without extra API reads.
+            const qualificationTrackers = collectQualificationTrackers(issues);
+
             const candidates = [];
             for (const issue of issues) {
               if (activeIssueNumbers.has(issue.number)) continue;
               // An existing implementation PR must never be duplicated even
               // when it is configured not to consume a WIP slot.
               if (openPrIssues.has(issue.number)) continue;
+
+              const admission = shouldAdmitToImplementation(
+                issue.number, qualificationTrackers
+              );
+              if (!admission.admit) {
+                core.info(
+                  'Skipping #' + issue.number +
+                  ': qualification tracker needs explicit dispatch, not generic implementation.'
+                );
+                continue;
+              }
 
               const labels = labelsByIssue.get(issue.number);
               if (pauseOnFailure && labels.has(pausedLabel)) {
@@ -2957,10 +3187,23 @@ jobs:
               }
 
               const declaredOpenBlockers = await openDeclaredBlockers(issue);
-              if (declaredOpenBlockers.length > 0) {
+              const candidateRefs = qualificationRefs(issue.body || '', issue.number);
+              const candidateSplit = effectiveQualificationBlockers(
+                candidateRefs,
+                declaredOpenBlockers.map(blocker => blocker.number)
+              );
+              if (candidateSplit.ignored.length > 0) {
+                core.notice(
+                  'Issue #' + issue.number +
+                  ': ignoring qualification back-edge blocker(s) ' +
+                  candidateSplit.ignored.map(number => '#' + number).join(', ') +
+                  ' for implementation readiness.'
+                );
+              }
+              if (candidateSplit.effective.length > 0) {
                 core.info(
                   'Skipping #' + issue.number + ': declared blocked by ' +
-                  declaredOpenBlockers.map(blocker => '#' + blocker.number).join(', ') + '.'
+                  candidateSplit.effective.map(number => '#' + number).join(', ') + '.'
                 );
                 continue;
               }
@@ -3132,11 +3375,28 @@ jobs:
                 continue;
               }
 
+              // A qualification tracker re-verified here is still never
+              // generic implementation work, even if it appeared after
+              // selection.
+              const freshAdmission = shouldAdmitToImplementation(
+                freshIssue.number, qualificationTrackers
+              );
+              if (!freshAdmission.admit) {
+                core.info(
+                  'Skipping #' + issue.number +
+                  ': qualification tracker needs explicit dispatch, not generic implementation.'
+                );
+                continue;
+              }
               const freshDeclaredBlockers = await openDeclaredBlockers(freshIssue);
-              if (freshDeclaredBlockers.length > 0) {
+              const freshSplit = effectiveQualificationBlockers(
+                qualificationRefs(freshIssue.body || '', freshIssue.number),
+                freshDeclaredBlockers.map(blocker => blocker.number)
+              );
+              if (freshSplit.effective.length > 0) {
                 core.info(
                   'Skipping #' + issue.number + ': declared blocker appeared before dispatch: ' +
-                  freshDeclaredBlockers.map(blocker => '#' + blocker.number).join(', ') + '.'
+                  freshSplit.effective.map(number => '#' + number).join(', ') + '.'
                 );
                 continue;
               }

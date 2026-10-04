@@ -605,5 +605,277 @@ class EventCompletenessTests(unittest.TestCase):
         )
 
 
+class QualificationDagSemanticsTests(unittest.TestCase):
+    """kodmial/continuum#278: the validator is never a normal dependency.
+
+    Reproduces the live AA topology: capability #6 declares qualification
+    #7 while #7 declares ``automation-blocked-by: #6`` (and likewise #9 /
+    #40). Both directions are direct back-edges and must be detected
+    deterministically.
+    """
+
+    def test_aa_topology_both_pairs_are_cycles(self):
+        for capability, qualification in ((6, 7), (9, 40)):
+            capability_body = "<!-- automation-qualification: #%d -->" % qualification
+            qualification_body = (
+                "<!-- automation-blocked-by: #%d -->" % capability
+            )
+            refs = gate.parse_qualification_refs(capability_body, capability)
+            qual_blockers = gate.parse_blocked_by_refs(
+                qualification_body, qualification
+            )
+            self.assertEqual(refs, (qualification,))
+            self.assertEqual(qual_blockers, (capability,))
+            edges = gate.qualification_cycle_edges(
+                capability,
+                refs,
+                (),
+                {qualification: qual_blockers},
+            )
+            self.assertEqual(
+                edges["qualifications_blocked_by_capability"], (qualification,)
+            )
+            self.assertTrue(
+                gate.has_qualification_blocker_cycle(
+                    capability, refs, (), {qualification: qual_blockers}
+                )
+            )
+
+    def test_forward_edge_capability_blocked_by_own_qualification_is_cycle(self):
+        edges = gate.qualification_cycle_edges(6, (7,), (7,), {7: ()})
+        self.assertEqual(edges["capability_blocked_by_qualification"], (7,))
+        self.assertTrue(
+            gate.has_qualification_blocker_cycle(6, (7,), (7,), {7: ()})
+        )
+
+    def test_unrelated_blockers_are_not_cycles(self):
+        self.assertFalse(
+            gate.has_qualification_blocker_cycle(6, (7,), (5,), {7: (5,)})
+        )
+        edges = gate.qualification_cycle_edges(6, (7,), (5,), {7: (5,)})
+        self.assertEqual(edges["capability_blocked_by_qualification"], ())
+        self.assertEqual(edges["qualifications_blocked_by_capability"], ())
+
+    def test_blocked_by_parsing_ignores_prose_and_self(self):
+        self.assertEqual(
+            gate.parse_blocked_by_refs("See #6 for context."), ()
+        )
+        self.assertEqual(
+            gate.parse_blocked_by_refs(
+                "<!-- automation-blocked-by: #6, #6 -->", self_number=7
+            ),
+            (6,),
+        )
+        self.assertEqual(
+            gate.parse_blocked_by_refs(
+                "<!-- automation-blocked-by: #7 -->", self_number=7
+            ),
+            (),
+        )
+
+
+class QualificationBackEdgeBypassTests(unittest.TestCase):
+    def test_open_capability_cannot_block_its_own_qualification(self):
+        ok, reason = gate.should_start_qualification((7,), SHA_A, [7])
+        self.assertTrue(ok)
+        self.assertEqual(reason, "ready-ignoring-qualification-back-edge")
+        effective, ignored = gate.effective_qualification_blockers((7,), [7])
+        self.assertEqual(effective, [])
+        self.assertEqual(ignored, (7,))
+
+    def test_real_blockers_still_block_despite_back_edge(self):
+        ok, reason = gate.should_start_qualification((7,), SHA_A, [5, 7])
+        self.assertFalse(ok)
+        self.assertEqual(reason, "blocked")
+        effective, ignored = gate.effective_qualification_blockers((7,), [5, 7])
+        self.assertEqual(effective, [5])
+        self.assertEqual(ignored, (7,))
+
+    def test_qualification_dispatch_bypasses_only_the_capability_edge(self):
+        effective, bypassed, reason = gate.qualification_dispatch_bypass(7, 6, [6])
+        self.assertEqual(effective, [])
+        self.assertEqual(bypassed, (6,))
+        self.assertEqual(reason, "dispatch-ignoring-capability-back-edge")
+
+    def test_qualification_dispatch_still_honors_other_blockers(self):
+        effective, bypassed, reason = gate.qualification_dispatch_bypass(
+            7, 6, [5, 6]
+        )
+        self.assertEqual(effective, [5])
+        self.assertEqual(reason, "blocked")
+
+    def test_qualification_dispatch_without_blockers_dispatches(self):
+        effective, bypassed, reason = gate.qualification_dispatch_bypass(7, 6, [])
+        self.assertEqual(effective, [])
+        self.assertEqual(reason, "dispatch")
+
+
+class QualificationTrackerAdmissionTests(unittest.TestCase):
+    def test_trackers_are_collected_across_capabilities(self):
+        bodies = {
+            6: "<!-- automation-qualification: #7 -->",
+            9: "<!-- automation-qualification: #40 -->",
+            11: "plain work",
+        }
+        self.assertEqual(
+            gate.collect_qualification_trackers(bodies), (7, 40)
+        )
+        self.assertTrue(gate.is_qualification_tracker(7, bodies))
+        self.assertTrue(gate.is_qualification_tracker(40, bodies))
+        self.assertFalse(gate.is_qualification_tracker(6, bodies))
+
+    def test_trackers_are_not_auto_admitted_to_implementation(self):
+        bodies = {
+            6: "<!-- automation-qualification: #7 -->",
+            7: "<!-- automation-blocked-by: #6 -->",
+        }
+        admit, reason = gate.should_admit_to_implementation(7, bodies)
+        self.assertFalse(admit)
+        self.assertEqual(reason, "qualification-tracker-needs-explicit-dispatch")
+        admit, _ = gate.should_admit_to_implementation(6, bodies)
+        self.assertTrue(admit)
+
+    def test_repair_issues_stay_admissible_implementation_work(self):
+        bodies = {
+            6: "<!-- automation-qualification: #7 -->",
+            99: gate.repair_marker_text(7, 6),
+        }
+        admit, _ = gate.should_admit_to_implementation(99, bodies)
+        self.assertTrue(admit)
+
+
+class ReusableResultTupleTests(unittest.TestCase):
+    def test_pass_tuple_is_consumable_without_tracker_closure(self):
+        comments = [trusted_comment(evidence_comment(7, SHA_A, "pass"))]
+        result = gate.qualification_result_tuple(comments, 7, SHA_A)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["issue"], 7)
+        self.assertEqual(result["sha"], SHA_A)
+        self.assertEqual(result["result"], "pass")
+        # Closure is not a readiness primitive: the tracker stays open.
+        self.assertTrue(gate.has_trusted_pass_for_sha(comments, 7, SHA_A))
+
+    def test_controller_fingerprint_is_carried_in_the_tuple(self):
+        import json
+
+        payload = json.dumps(
+            {
+                "head_sha": SHA_A,
+                "classification": "pass",
+                "fingerprint": "fp-123",
+            }
+        )
+        comments = [
+            trusted_comment(gate.DOCKER_RESULT_MARKER + "\n" + payload)
+        ]
+        result = gate.qualification_result_tuple(comments, 7, SHA_A)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["fingerprint"], "fp-123")
+        self.assertEqual(
+            gate.trusted_pass_fingerprint(comments, 7, SHA_A), "fp-123"
+        )
+
+    def test_stale_sha_has_no_tuple_and_untrusted_is_rejected(self):
+        comments = [trusted_comment(evidence_comment(7, SHA_A, "pass"))]
+        self.assertIsNone(gate.qualification_result_tuple(comments, 7, SHA_B))
+        self.assertFalse(gate.has_trusted_pass_for_sha(comments, 7, SHA_B))
+        forged = [untrusted_comment(evidence_comment(7, SHA_A, "pass"))]
+        self.assertIsNone(gate.qualification_result_tuple(forged, 7, SHA_A))
+        self.assertFalse(gate.has_trusted_pass_for_sha(forged, 7, SHA_A))
+
+
+class AaLifecycleAutonomyTests(unittest.TestCase):
+    """AA-style consumer: implementation -> qualification -> repair ->
+    requalification -> completion with no manual action."""
+
+    def test_full_cycle_runs_autonomously_for_aa_pair(self):
+        for capability, qualification in ((6, 7), (9, 40)):
+            capability_body = (
+                "<!-- automation-qualification: #%d -->" % qualification
+            )
+            refs = gate.parse_qualification_refs(capability_body, capability)
+            self.assertEqual(refs, (qualification,))
+            # The qualification tracker points back at the open capability.
+            qual_blockers = gate.parse_blocked_by_refs(
+                "<!-- automation-blocked-by: #%d -->" % capability,
+                qualification,
+            )
+            self.assertTrue(
+                gate.has_qualification_blocker_cycle(
+                    capability, refs, (), {qualification: qual_blockers}
+                )
+            )
+            # The tracker is never generic implementation work...
+            bodies = {capability: capability_body}
+            self.assertFalse(
+                gate.should_admit_to_implementation(qualification, bodies)[0]
+            )
+            # ...but its dispatch bypasses exactly the capability back-edge.
+            _, _, reason = gate.qualification_dispatch_bypass(
+                qualification, capability, [capability]
+            )
+            self.assertEqual(reason, "dispatch-ignoring-capability-back-edge")
+            # Implementation merges at SHA-A: qualification starts and dispatches.
+            ok, _ = gate.should_start_qualification(refs, SHA_A, [])
+            self.assertTrue(ok)
+            dispatch, _ = gate.should_dispatch_qualification(
+                True, False, gate.STAY_QUALIFYING, False, SHA_A
+            )
+            self.assertTrue(dispatch)
+            # Qualification fails at SHA-A: capability blocks, repair routes.
+            fail_comments = [
+                trusted_comment(evidence_comment(qualification, SHA_A, "fail"))
+            ]
+            state = gate.qualification_evidence_state(
+                fail_comments, qualification, SHA_A
+            )
+            self.assertEqual(state, gate.EVIDENCE_FAIL)
+            status = gate.capability_status(
+                True, refs, {qualification: state}, SHA_A
+            )
+            self.assertEqual(status, gate.STAY_BLOCKED)
+            self.assertEqual(
+                gate.repair_targets({qualification: state}), (qualification,)
+            )
+            retry, _ = gate.qualification_needs_retry(
+                state, True, status
+            )
+            self.assertTrue(retry)
+            # Repair merges at SHA-B: stale evidence no longer matches, the
+            # gate reruns qualification for the new exact SHA autonomously.
+            self.assertTrue(gate.sha_superseded(SHA_A, SHA_B))
+            rerun_state = gate.qualification_evidence_state(
+                fail_comments, qualification, SHA_B
+            )
+            self.assertEqual(rerun_state, gate.EVIDENCE_UNKNOWN)
+            dispatch, _ = gate.should_dispatch_qualification(
+                True,
+                False,
+                gate.capability_status(
+                    True, refs, {qualification: rerun_state}, SHA_B
+                ),
+                False,
+                SHA_B,
+            )
+            self.assertTrue(dispatch)
+            # Requalification passes at SHA-B without closing the tracker.
+            pass_comments = fail_comments + [
+                trusted_comment(evidence_comment(qualification, SHA_B, "pass"))
+            ]
+            final = gate.qualification_evidence_state(
+                pass_comments, qualification, SHA_B
+            )
+            self.assertEqual(final, gate.EVIDENCE_PASS)
+            self.assertTrue(
+                gate.has_trusted_pass_for_sha(
+                    pass_comments, qualification, SHA_B
+                )
+            )
+            self.assertEqual(
+                gate.capability_status(True, refs, {qualification: final}, SHA_B),
+                gate.MAY_COMPLETE,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
