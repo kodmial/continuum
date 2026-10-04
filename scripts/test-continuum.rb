@@ -2064,7 +2064,17 @@ class ContinuumTest < Minitest::Test
     assert_includes router, 'page: 1',
                     'router active-run lookup must remain bounded to one page'
     assert_includes router, 'github.rest.actions.createWorkflowDispatch(',
-                    'same-repo workflow dispatch must use repository token'
+                    'same-repo workflow dispatch must use repository token first'
+    assert_includes router, 'FALLBACK_DISPATCH_TOKEN: ${{ secrets.TAP_PAT }}',
+                    'router may inherit PAT only as a dispatch-only fallback'
+    assert_includes router, 'permissionDenied',
+                    'fallback must be restricted to permission-denied 403 responses'
+    assert_includes router, 'rateLimited',
+                    'rate-limit 403 must never trigger PAT fallback'
+    assert_includes router, 'single dispatch mutation only',
+                    'fallback scope must stay one workflow_dispatch mutation'
+    assert_includes router, 'fallbackGithub.rest.actions.createWorkflowDispatch',
+                    'fallback client must only perform the dispatch mutation'
     # The router never holds a per-PR lock: the actionable filter and the
     # operation-key coalescing run inside the route step, so a plain
     # non-/review comment run can never queue ahead of a useful dispatch.
