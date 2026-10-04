@@ -1758,23 +1758,29 @@ jobs:
           github-token: ${{ github.token }}
           script: |
             const policy = require(process.env.POLICY_SCRIPT);
-            // Bounded cleanup scan (#254): five pages; older leftovers are
-            // cosmetic and pruned once visible again.
+            // Bounded cleanup scan (#254): controller markers gate the next
+            // run, so the newest five pages cover live state; older leftovers are
+            // cosmetic and pruned once visible again. `listComments` is
+            // oldest-first and ignores sort/direction, so count down from
+            // the issue total to scan newest-first.
             // Target-aware: delegated reads use the resolved child.
             const comments = [];
+            const total = (await github.rest.issues.get({ owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER, repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO, issue_number: Number(process.env.PR_NUMBER) })).data.comments || 0;
+            const lastPage = Math.max(1, Math.ceil(total / 100));
             for (let page = 1; page <= 5; page += 1) {
+              const targetPage = lastPage - (page - 1);
+              if (targetPage < 1) break;
               const { data } = await github.rest.issues.listComments(
                 {
                   owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
                   repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
                   issue_number: Number(process.env.PR_NUMBER),
                   per_page: 100,
-                  page,
+                  page: targetPage,
                 }
               );
-              if (!Array.isArray(data) || data.length === 0) break;
+              if (!Array.isArray(data) || data.length === 0) continue;
               comments.push(...data);
-              if (data.length < 100) break;
             }
             for (const comment of comments) {
               if (!String(comment.body || '').includes(policy.CONTROLLER_STATE_MARKER)) continue;

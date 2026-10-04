@@ -668,8 +668,12 @@ jobs:
                     noteRead();
                     if (Array.isArray(newest)) {
                       for (const c of newest) { if (!comments.some(e => e.id === c.id)) comments.push(c); }
-                      comments.truncated = false;
                     }
+                    if (total > comments.length) {
+                      core.warning(`PR #${pr.number}: comment scan hit budget with incomplete middle window; skipping this pass.`);
+                      continue;
+                    }
+                    comments.truncated = false;
                   } catch {
                     core.warning(`PR #${pr.number}: comment/review scan hit budget and newest-page confirm failed; skipping this pass.`);
                     continue;
