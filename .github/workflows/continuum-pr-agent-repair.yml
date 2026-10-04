@@ -861,6 +861,12 @@ jobs:
                 echo "::error::Could not read controller comments; GitHub API failure is retryable."
                 exit 1
               fi
+              if ! jq -e 'type == "array"' "$controller_page_file" >/dev/null 2>&1; then
+                rm -f "$controller_page_file"
+                echo "classification=transient" >> "$GITHUB_OUTPUT"
+                echo "::error::Could not parse controller comments; GitHub API failure is retryable."
+                exit 1
+              fi
               if ! controller_page_len="$(jq 'length' "$controller_page_file" 2>/dev/null)"; then
                 rm -f "$controller_page_file"
                 echo "classification=transient" >> "$GITHUB_OUTPUT"
