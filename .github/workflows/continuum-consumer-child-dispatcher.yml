@@ -79,7 +79,10 @@ jobs:
           plan="$(PARENT_CONFIG=.continuum.yml CHILD_REPOSITORIES="$CHILD_REPOSITORIES" bash "$resolver" plan)"
 
           active_titles="$(
-            gh run list --repo "$GITHUB_REPOSITORY" --limit 100               --json status,displayTitle               --jq '.[] | select(.status == "queued" or .status == "in_progress" or .status == "waiting" or .status == "pending") | .displayTitle'               2>/dev/null || true
+            # Non-completed run statuses only: `pending` is not a workflow-run
+            # status, while `action_required` (e.g. waiting for approval) is
+            # and must read as active so it never dispatches twice.
+            gh run list --repo "$GITHUB_REPOSITORY" --limit 100               --json status,displayTitle               --jq '.[] | select(.status == "queued" or .status == "in_progress" or .status == "waiting" or .status == "action_required") | .displayTitle'               2>/dev/null || true
           )"
 
           task_active() {
@@ -107,6 +110,26 @@ jobs:
             [[ -n "$row" ]] || continue
             child_id="$(jq -r '.id' <<<"$row")"
             child_repo="$(jq -r '.repository' <<<"$row")"
+
+            # Single-pass dependency-state memo (#254): repeated lookups of
+            # the same blocking issue across tasks in this child cost one
+            # API read. Callers pass an output variable name (no command
+            # substitution) so the cache survives in this shell.
+            declare -A CONTINUUM_DEP_STATE=()
+            dep_state() {
+              local __out="$1" __dep="$2" __cached="__missing__"
+              if [[ -v CONTINUUM_DEP_STATE[$__dep] ]]; then
+                __cached="${CONTINUUM_DEP_STATE[$__dep]}"
+              fi
+              if [[ "$__cached" == "__missing__" ]]; then
+                if __cached="$(gh api "repos/$child_repo/issues/$__dep" --jq '.state' 2>/dev/null)" && [[ "$__cached" == "open" || "$__cached" == "closed" ]]; then
+                  CONTINUUM_DEP_STATE[$__dep]="$__cached"
+                else
+                  __cached="open"
+                fi
+              fi
+              printf -v "$__out" '%s' "$__cached"
+            }
 
             if ! PARENT_CONFIG=.continuum.yml CHILD_REPOSITORIES="$CHILD_REPOSITORIES" \
               bash "$resolver" verify "$child_id" "$child_repo" >/dev/null 2>&1; then
@@ -144,9 +167,7 @@ jobs:
                 stale_dep="${stale_dep//#/}"
                 stale_dep="${stale_dep//[[:space:]]/}"
                 [[ "$stale_dep" =~ ^[0-9]+$ ]] || continue
-                stale_dep_state="$(
-                  gh api "repos/$child_repo/issues/$stale_dep" --jq '.state' 2>/dev/null || echo open
-                )"
+                dep_state stale_dep_state "$stale_dep"
                 if [[ "$stale_dep_state" != "closed" ]]; then
                   stale_ready=false
                   break
@@ -185,32 +206,88 @@ jobs:
                 | sed -nE 's#^opencode/issue([0-9]+)-.*#\1#p'
             )"
             local_opencode_run_tasks="$(
-              gh api --paginate "repos/$child_repo/actions/runs?per_page=100" \
-                --jq '.workflow_runs[]
-                  | select(.status != "completed")
-                  | .display_title
-                  | select(test("^OpenCode issue #[0-9]+$"))
-                  | capture("^OpenCode issue #(?<task>[0-9]+)$").task' \
-                2>/dev/null || true
+              # Single unfiltered list with client-side active filtering:
+              # one request answers the idle no-op case; pages 2-3 are
+              # read only when the previous page is full. A fetch or parse
+              # failure must fail closed as active (sentinel __unknown__) so
+              # a transient error never reads as idle and double-dispatches.
+              for page in 1 2 3; do
+                if ! run_json="$(gh api "repos/$child_repo/actions/runs?per_page=100&page=$page" 2>/dev/null)"; then
+                  echo "::warning::run lookup failed for page=$page; assuming active to avoid double-dispatch." >&2
+                  echo "__unknown__"
+                  break
+                fi
+                run_count="$(jq '.workflow_runs | length' <<<"$run_json" 2>/dev/null || echo -1)"
+                [[ "$run_count" =~ ^[0-9]+$ ]] || { echo "__unknown__"; break; }
+                if ! run_tasks="$(jq -r '.workflow_runs[]
+                    | select(.status != "completed")
+                    | .display_title
+                    | select(test("^OpenCode issue #[0-9]+$"))
+                    | capture("^OpenCode issue #(?<task>[0-9]+)$").task' \
+                  <<<"$run_json" 2>/dev/null)"; then
+                  echo "__unknown__"
+                  break
+                fi
+                [[ -n "$run_tasks" ]] && echo "$run_tasks"
+                [[ "$run_count" -lt 100 ]] && break
+                if [[ "$page" -eq 3 ]]; then
+                  echo "::warning::run window truncated at 3 pages; assuming active to avoid double-dispatch." >&2
+                  echo "__unknown__"
+                  break
+                fi
+              done
             )"
             child_owner="$(gh api "repos/$child_repo" --jq '.owner.login' 2>/dev/null || true)"
             command_grace_seconds=$(( COMMAND_GRACE_MINUTES * 60 ))
 
             local_override_active() {
               local task_number="$1"
-              local recent_command command_epoch now_epoch
+              local recent_command command_epoch now_epoch grace_since
 
+              # Fail closed: an unknown run-lookup state means active work
+              # cannot be ruled out, so never dispatch behind it.
+              if grep -Fxq "__unknown__" <<<"$local_opencode_run_tasks"; then
+                return 0
+              fi
               if grep -Fxq "$task_number" <<<"$local_opencode_pr_tasks" ||
                  grep -Fxq "$task_number" <<<"$local_opencode_run_tasks"; then
                 return 0
               fi
 
               [[ -n "$child_owner" ]] || return 1
-              recent_command="$(
-                gh api --paginate "repos/$child_repo/issues/$task_number/comments?per_page=100" \
-                  --jq '.[] | select(.user.login == "'"$child_owner"'") | select((.body // "") | test("(^|[[:space:]])/(oc|opencode)([[:space:]]|$)")) | .created_at' \
-                  2>/dev/null | tail -1 || true
-              )"
+              # Width (#254) caps the since scan.
+              grace_since="$(date -u -d "@$(( $(date +%s) - command_grace_seconds - 120 ))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)"
+              recent_command=""; override_seen=""
+              # Since-filtered pagination starts at page 1: the filtered set
+              # is already only recent comments, so pages 1..5 cover it
+              # without the extra issue-total read. Keep the first/last
+              # names so the bounded-scan contract still identifies the
+              # window.
+              override_first_page=1
+              override_last_page=5
+              override_failed=0
+              for override_page in $(seq "$override_first_page" "$override_last_page"); do
+                # Fail closed: a fetch or parse failure leaves the window
+                # unknown, so report active instead of reading an empty
+                # window as idle and double-dispatching.
+                if ! override_json="$(gh api "repos/$child_repo/issues/$task_number/comments?per_page=100&page=$override_page&since=$grace_since" 2>/dev/null)"; then
+                  override_failed=1
+                  break
+                fi
+                if ! override_count="$(jq 'length' <<<"$override_json" 2>/dev/null)"; then
+                  override_failed=1
+                  break
+                fi
+                [[ "$override_count" =~ ^[0-9]+$ ]] || { override_failed=1; break; }
+                if ! override_cmds="$(jq -r --arg owner "$child_owner" '.[] | select(.user.login == $owner) | select((.body // "") | test("(^|[[:space:]])/(oc|opencode)([[:space:]]|$)")) | .created_at' <<<"$override_json" 2>/dev/null)"; then
+                  override_failed=1
+                  break
+                fi
+                override_seen+="${override_cmds}"$'\n'
+                [[ "$override_count" -ge 100 ]] || break
+              done
+              [[ "$override_failed" -eq 0 ]] || return 0
+              recent_command="$(grep -v '^$' <<<"$override_seen" | tail -n 1 | tr -d '[:space:]' || true)"
               [[ -n "$recent_command" ]] || return 1
 
               command_epoch="$(date -d "$recent_command" +%s 2>/dev/null || echo 0)"
@@ -321,6 +398,12 @@ jobs:
                 )
               ' <<<"$issues_json"
             )"
+            # Preload known-open states from the snapshot just fetched so
+            # steady-state passes skip re-reading them below.
+            while IFS= read -r open_number; do
+              [[ -n "$open_number" && "$open_number" =~ ^[0-9]+$ ]] || continue
+              CONTINUUM_DEP_STATE[$open_number]="open"
+            done < <(jq -r '.[].number' <<<"$issues_json" 2>/dev/null || true)
 
             while IFS= read -r encoded; do
               [[ -n "$encoded" ]] || continue
@@ -359,9 +442,7 @@ jobs:
                 dep="${dep//#/}"
                 dep="${dep//[[:space:]]/}"
                 [[ "$dep" =~ ^[0-9]+$ ]] || continue
-                state="$(
-                  gh api "repos/$child_repo/issues/$dep" --jq '.state' 2>/dev/null || echo open
-                )"
+                dep_state state "$dep"
                 if [[ "$state" != "closed" ]]; then
                   ready=false
                   break

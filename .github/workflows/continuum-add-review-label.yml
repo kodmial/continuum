@@ -39,11 +39,14 @@ jobs:
           CONTINUUM_RELEASE_MANIFEST_FILES: ${{ vars.CONTINUUM_RELEASE_MANIFEST_FILES || '[]' }}
           REVIEW_PROVIDER: ${{ inputs.review_provider || vars.CONTINUUM_REVIEW_PROVIDER || 'none' }}
           TAP_PAT: ${{ secrets.TAP_PAT }}
+          READ_GITHUB_TOKEN: ${{ github.token }}
         with:
           # kodmial/continuum#259: same-repository label mutations use the
           # repository-scoped GITHUB_TOKEN (github-actions[bot] actor). The two
           # workflow dispatches below intentionally stay PAT-backed via a
           # dedicated PAT client so downstream event chaining is preserved.
+          # Same-repository reads use READ_GITHUB_TOKEN via readGithub so they
+          # stay off the shared PAT budget (#254).
           github-token: ${{ github.token }}
           script: |
             const owner = context.repo.owner;
@@ -51,6 +54,80 @@ jobs:
             const repoFullName = `${owner}/${repo}`;
             const run = context.payload.workflow_run;
             const REQUESTED_LABEL = 'coderabbit-review-requested';
+            // Request-budget observability (#254): counts only, no secrets.
+            // Mutations use the default GITHUB_TOKEN client
+            // (github-actions[bot] actor, #259); dispatches stay PAT-backed
+            // via patClient below; every read moves to the repository token
+            // via readGithub.
+            const apiBudget = { reads: 0, patReads: 0, mutations: 0, pages: 0, git: 0, event: 1 };
+            function noteRead(pages = 1) {
+              apiBudget.reads += 1;
+              apiBudget.pages += pages;
+            }
+            function noteMutation() {
+              apiBudget.mutations += 1;
+            }
+            function reportBudget() {
+              core.notice(
+                `continuum-api-budget: total_calls=${apiBudget.reads + apiBudget.mutations} ` +
+                `reads=${apiBudget.reads} (repository-token) ` +
+                `mutations=${apiBudget.mutations} (github-token) ` +
+                `pages=${apiBudget.pages} event_substitutions=${apiBudget.event}`
+              );
+            }
+            // Same-repository reads run on the repository token, keeping
+            // them off the shared TAP_PAT budget. The github-script action
+            // client is GITHUB_TOKEN-authenticated (github-actions[bot]
+            // actor) for label mutations; workflow dispatches that must fan
+            // out into downstream runs use the dedicated PAT client below.
+            const readToken = String(process.env.READ_GITHUB_TOKEN || '').trim();
+            if (!readToken) {
+              throw new Error(
+                'READ_GITHUB_TOKEN is required for same-repository review-label reads.'
+              );
+            }
+            const readGithub = new github.constructor({
+              auth: readToken,
+              baseUrl: github.request.endpoint.DEFAULTS.baseUrl,
+            });
+            if (
+              typeof readGithub.rest?.repos?.listPullRequestsAssociatedWithCommit !== 'function' ||
+              typeof readGithub.rest?.pulls?.listFiles !== 'function' ||
+              typeof readGithub.rest?.repos?.getCommit !== 'function' ||
+              typeof readGithub.rest?.issues?.listComments !== 'function' ||
+              typeof readGithub.rest?.pulls?.listReviews !== 'function' ||
+              typeof readGithub.rest?.repos?.getCombinedStatusForRef !== 'function' ||
+              typeof readGithub.rest?.issues?.listLabelsOnIssue !== 'function'
+            ) {
+              throw new Error(
+                'readGithub client lacks the rest plugins; ' +
+                'cannot perform same-repository review-label reads.'
+              );
+            }
+            // Bounded page cap for any single list scan (#254): request
+            // count never scales with repository lifetime/history.
+            // Issue comments and pull reviews paginate oldest-first with no
+            // newest-first sort, so a full final page at the cap may hide
+            // newer records. The collected array carries a `truncated` flag;
+            // approval-carry readers must fail closed (no carry) when it is
+            // true instead of deciding on partial oldest data.
+            const MAX_SCAN_PAGES = 5;
+            const MAX_FILES_PAGES = 10;
+            async function boundedPages(request, params) {
+              const perPage = params.per_page || 100;
+              const items = [];
+              let truncated = false;
+              for (let page = 1; page <= MAX_SCAN_PAGES; page += 1) {
+                const { data } = await request({ ...params, per_page: perPage, page });
+                noteRead();
+                if (!Array.isArray(data) || data.length === 0) break;
+                items.push(...data);
+                if (data.length < perPage) break;
+                if (page === MAX_SCAN_PAGES) truncated = true;
+              }
+              items.truncated = truncated;
+              return items;
+            }
             // PAT client for workflow dispatches only. Label/comment/state
             // mutations above use the default GITHUB_TOKEN client (`github`)
             // so GitHub attributes them to github-actions[bot]; dispatches
@@ -127,38 +204,67 @@ jobs:
                 return false;
               }
 
-              const files = await github.paginate(github.rest.pulls.listFiles, {
-                owner,
-                repo,
-                pull_number: pr.number,
-                per_page: 100,
-              });
-              const names = files.map(file => file.filename);
-              const onlyAllowed = allowed =>
-                names.length > 0 && names.every(name => allowed.has(name));
-
+              // Release-automation PRs are small; cap the file scan at
+              // MAX_FILES_PAGES and fail closed (not trusted) past the cap
+              // rather than walking unbounded history. Stop at the first
+              // disallowed file so large non-release PRs cost one page.
+              let allowed = null;
               if (pr.head.ref === 'release-please--branches--main') {
                 const labels = new Set((pr.labels || []).map(label => label.name));
-                return labels.has('autorelease: pending') && onlyAllowed(RELEASE_FILES);
+                if (!labels.has('autorelease: pending')) return false;
+                allowed = RELEASE_FILES;
+              } else if (pr.head.ref.startsWith('chore/release-manifests-v')) {
+                allowed = MANIFEST_FILES;
+              } else {
+                return false;
               }
-
-              return (
-                pr.head.ref.startsWith('chore/release-manifests-v') &&
-                onlyAllowed(MANIFEST_FILES)
-              );
+              let seen = 0;
+              let complete = false;
+              for (let page = 1; page <= MAX_FILES_PAGES; page += 1) {
+                const { data: files } = await readGithub.rest.pulls.listFiles({
+                  owner,
+                  repo,
+                  pull_number: pr.number,
+                  per_page: 100,
+                  page,
+                });
+                noteRead();
+                if (!Array.isArray(files) || files.length === 0) {
+                  complete = true;
+                  break;
+                }
+                for (const file of files) {
+                  seen += 1;
+                  if (!allowed.has(file.filename)) return false;
+                }
+                if (files.length < 100) {
+                  complete = true;
+                  break;
+                }
+              }
+              // A full page cap without a short/empty page means the
+              // listing may be truncated: fail closed (not trusted).
+              return seen > 0 && complete;
             }
 
             async function carriedApprovalSource(pr) {
-              const { data: commit } = await github.rest.repos.getCommit({
+              const { data: commit } = await readGithub.rest.repos.getCommit({
                 owner,
                 repo,
                 ref: pr.head.sha,
               });
+              noteRead();
               const parents = (commit.parents || []).map(parent => parent.sha);
               if (parents.length !== 2) return null;
 
-              const comments = await github.paginate(
-                github.rest.issues.listComments,
+              // Bounded comment/review scans (#254): both endpoints paginate
+              // oldest-first with no newest-first sort, so the capped window
+              // holds the oldest records. A truncated window fails closed (no
+              // carry) and only costs a fresh review, never a skipped one:
+              // a missed recent carry marker must not carry, and a missed
+              // recent nitpick-gating review must not be treated as absent.
+              const comments = await boundedPages(
+                (params) => readGithub.rest.issues.listComments(params),
                 {
                   owner,
                   repo,
@@ -166,6 +272,7 @@ jobs:
                   per_page: 100,
                 }
               );
+              if (comments.truncated) return null;
 
               const markerPattern =
                 /<!-- auto-main-sync head=([0-9a-f]{40}) from=([0-9a-f]{40}) main=([0-9a-f]{40}) carry=([0-9a-f]{40}) -->/i;
@@ -197,8 +304,8 @@ jobs:
                 return null;
               }
 
-              const reviews = await github.paginate(
-                github.rest.pulls.listReviews,
+              const reviews = await boundedPages(
+                (params) => readGithub.rest.pulls.listReviews(params),
                 {
                   owner,
                   repo,
@@ -206,6 +313,10 @@ jobs:
                   per_page: 100,
                 }
               );
+              // Fail closed: a truncated oldest-first review window may hide
+              // the newest decision or a nitpick-gating COMMENTED review, so
+              // it must not carry.
+              if (reviews.truncated) return null;
 
               const sourceReviews = reviews
                 .filter(review =>
@@ -233,11 +344,12 @@ jobs:
               if (nitpicks.length > 0) return null;
 
               const { data: combined } =
-                await github.rest.repos.getCombinedStatusForRef({
+                await readGithub.rest.repos.getCombinedStatusForRef({
                   owner,
                   repo,
                   ref: marker.carry,
                 });
+              noteRead();
               const completed = (combined.statuses || []).some(status =>
                 status.context === 'CodeRabbit' &&
                 status.state === 'success' &&
@@ -248,16 +360,34 @@ jobs:
               return marker.carry;
             }
 
-            const prs = await github.paginate(github.rest.pulls.list, {
-              owner,
-              repo,
-              state: 'open',
-              per_page: 100,
-            });
+            // Resolve candidate PRs through the narrowest endpoint: PRs
+            // associated with the exact CI head commit (#254). Bounded
+            // pagination (per_page 100) replaces the unbounded open-PR
+            // listing, and the exact-head/same-repo/non-draft match below
+            // keeps the admission semantics identical.
+            const associated = [];
+            for (let page = 1; page <= MAX_SCAN_PAGES; page += 1) {
+              const { data: batch } =
+                await readGithub.rest.repos.listPullRequestsAssociatedWithCommit({
+                  owner,
+                  repo,
+                  commit_sha: run.head_sha,
+                  per_page: 100,
+                  page,
+                });
+              noteRead();
+              if (!Array.isArray(batch) || batch.length === 0) break;
+              associated.push(...batch);
+              if (batch.length < 100) break;
+            }
 
-            // Match only a non-draft same-repository PR whose current head is
-            // exactly the commit tested by this completed CI run.
-            const matched = prs.filter((pr) =>
+            // Match only an open non-draft same-repository PR whose current
+            // head is exactly the commit tested by this completed CI run.
+            // listPullRequestsAssociatedWithCommit can return closed PRs,
+            // so the open-state check restores the prior pulls.list
+            // state:open semantics.
+            const matched = (associated || []).filter((pr) =>
+              pr.state === 'open' &&
               !pr.draft &&
               pr.head.sha === run.head_sha &&
               pr.head.repo.full_name === repoFullName
@@ -287,11 +417,13 @@ jobs:
                       issue_number: pr.number,
                       name,
                     });
+                    noteMutation();
                   } catch (err) {
                     if (err.status !== 404) throw err;
                   }
                 }
               }
+              reportBudget();
               return;
             }
 
@@ -319,6 +451,7 @@ jobs:
                   color: 'C5DEF5',
                   description: 'CodeRabbit review requested or safely carried for the current PR head.',
                 });
+                noteMutation();
               } catch (err) {
                 if (err.status !== 422) throw err; // already exists
               }
@@ -332,9 +465,12 @@ jobs:
                   issue_number: pr.number,
                   labels: ['review-ready'],
                 });
+                noteMutation();
 
-                const labels = await github.paginate(
-                  github.rest.issues.listLabelsOnIssue,
+                // Label state is GitHub-only; the read stays API-backed
+                // but moves to the repository token and a bounded scan.
+                const labels = await boundedPages(
+                  (params) => readGithub.rest.issues.listLabelsOnIssue(params),
                   {
                     owner,
                     repo,
@@ -363,6 +499,7 @@ jobs:
                     issue_number: pr.number,
                     labels: [REQUESTED_LABEL],
                   });
+                  noteMutation();
                   core.notice(
                     `PR #${pr.number}: carried CodeRabbit approval from ${carriedSource} across clean main sync to ${pr.head.sha}; no duplicate full review requested.`
                   );
@@ -389,6 +526,7 @@ jobs:
                   workflow_id: 'continuum-coderabbit-retry.yml',
                   ref: 'main',
                 });
+                noteMutation();
                 core.notice(
                   `Dispatched the global CodeRabbit priority controller after CI run ${run.id}.`
                 );
@@ -407,7 +545,10 @@ jobs:
                 workflow_id: 'continuum-auto-merge.yml',
                 ref: 'main',
               });
+              noteMutation();
               core.notice(
                 `Dispatched auto-merge reconciliation after successful CI run ${run.id} for head ${run.head_sha}.`
               );
             }
+
+            reportBudget();

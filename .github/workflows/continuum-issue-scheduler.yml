@@ -665,6 +665,26 @@ jobs:
             child_id="$(jq -r '.id' <<<"$row")"
             child_repo="$(jq -r '.repository' <<<"$row")"
 
+            # Single-pass dependency-state memo (#254): repeated lookups of
+            # the same blocking issue across tasks in this child cost one
+            # API read. Callers pass an output variable name (no command
+            # substitution) so the cache survives in this shell.
+            declare -A CONTINUUM_DEP_STATE=()
+            dep_state() {
+              local __out="$1" __dep="$2" __cached="__missing__"
+              if [[ -v CONTINUUM_DEP_STATE[$__dep] ]]; then
+                __cached="${CONTINUUM_DEP_STATE[$__dep]}"
+              fi
+              if [[ "$__cached" == "__missing__" ]]; then
+                if __cached="$(gh api "repos/$child_repo/issues/$__dep" --jq '.state' 2>/dev/null)" && [[ "$__cached" == "open" || "$__cached" == "closed" ]]; then
+                  CONTINUUM_DEP_STATE[$__dep]="$__cached"
+                else
+                  __cached="open"
+                fi
+              fi
+              printf -v "$__out" '%s' "$__cached"
+            }
+
             if ! PARENT_CONFIG=.continuum.yml CHILD_REPOSITORIES="" \
               bash "$resolver" verify "$child_id" "$child_repo" >/dev/null 2>&1; then
               echo "::error::Delegated relationship verification failed."
@@ -691,9 +711,7 @@ jobs:
                 stale_dep="${stale_dep//#/}"
                 stale_dep="${stale_dep//[[:space:]]/}"
                 [[ "$stale_dep" =~ ^[0-9]+$ ]] || continue
-                stale_dep_state="$(
-                  gh api "repos/$child_repo/issues/$stale_dep" --jq '.state' 2>/dev/null || echo open
-                )"
+                dep_state stale_dep_state "$stale_dep"
                 if [[ "$stale_dep_state" != "closed" ]]; then
                   stale_ready=false
                   break
@@ -761,16 +779,39 @@ jobs:
                 return 0
               fi
               [[ -n "$child_owner" ]] || return 1
-              # Bounded grace-window read (Work-Lock #58 item 6 A4): only
-              # comments since grace plus a small clock-skew margin are
-              # fetched. Cross-repository PAT credential, owner identity,
-              # both command spellings and the grace comparison are unchanged.
+              # Width (#254) caps the since scan (A4).
               grace_since="$(date -u -d "@$(( $(date +%s) - command_grace_seconds - 120 ))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)"
-              recent_command="$(
-                gh api --paginate "repos/$child_repo/issues/$task_number/comments?per_page=100&since=$grace_since" \
-                  --jq '.[] | select(.user.login == "'"$child_owner"'") | select((.body // "") | test("(^|[[:space:]])/(oc|opencode)([[:space:]]|$)")) | .created_at' \
-                  2>/dev/null | tail -1 || true
-              )"
+              recent_command=""; override_seen=""
+              # Since-filtered pagination starts at page 1: the filtered set
+              # is already only recent comments, so pages 1..5 cover it
+              # without the extra issue-total read. Keep the first/last
+              # names so the bounded-scan contract still identifies the
+              # window.
+              override_first_page=1
+              override_last_page=5
+              override_failed=0
+              for override_page in $(seq "$override_first_page" "$override_last_page"); do
+                # Fail closed: a fetch or parse failure leaves the window
+                # unknown, so report active instead of reading an empty
+                # window as idle and double-dispatching.
+                if ! override_json="$(gh api "repos/$child_repo/issues/$task_number/comments?per_page=100&page=$override_page&since=$grace_since" 2>/dev/null)"; then
+                  override_failed=1
+                  break
+                fi
+                if ! override_count="$(jq 'length' <<<"$override_json" 2>/dev/null)"; then
+                  override_failed=1
+                  break
+                fi
+                [[ "$override_count" =~ ^[0-9]+$ ]] || { override_failed=1; break; }
+                if ! override_cmds="$(jq -r --arg owner "$child_owner" '.[] | select(.user.login == $owner) | select((.body // "") | test("(^|[[:space:]])/(oc|opencode)([[:space:]]|$)")) | .created_at' <<<"$override_json" 2>/dev/null)"; then
+                  override_failed=1
+                  break
+                fi
+                override_seen+="${override_cmds}"$'\n'
+                [[ "$override_count" -ge 100 ]] || break
+              done
+              [[ "$override_failed" -eq 0 ]] || return 0
+              recent_command="$(grep -v '^$' <<<"$override_seen" | tail -n 1 | tr -d '[:space:]' || true)"
               [[ -n "$recent_command" ]] || return 1
               command_epoch="$(date -d "$recent_command" +%s 2>/dev/null || echo 0)"
               now_epoch="$(date +%s)"
@@ -882,6 +923,14 @@ jobs:
                     else . end)
               ' <<<"$issues_json"
             )"
+            # Preload known-open states from the snapshot just fetched: any
+            # dependency number present here is open without another read.
+            # Absent numbers still resolve through dep_state (one live read
+            # each, memoized for the rest of this child).
+            while IFS= read -r open_number; do
+              [[ -n "$open_number" && "$open_number" =~ ^[0-9]+$ ]] || continue
+              CONTINUUM_DEP_STATE[$open_number]="open"
+            done < <(jq -r '.[].number' <<<"$issues_json" 2>/dev/null || true)
 
             while IFS= read -r encoded; do
               [[ -n "$encoded" ]] || continue
@@ -923,7 +972,7 @@ jobs:
                 dep="${dep//#/}"
                 dep="${dep//[[:space:]]/}"
                 [[ "$dep" =~ ^[0-9]+$ ]] || continue
-                state="$(gh api "repos/$child_repo/issues/$dep" --jq '.state' 2>/dev/null || echo open)"
+                dep_state state "$dep"
                 if [[ "$state" != "closed" ]]; then ready=false; break; fi
               done
               [[ "$ready" == true ]] || continue

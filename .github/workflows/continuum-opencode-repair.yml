@@ -203,10 +203,15 @@ jobs:
           # its head must still be an OpenCode branch. Everything after a guard
           # is skipped rather than failed, because a stale report is a normal
           # outcome of a CI run racing a push, not an error.
+          #
+          # One pulls.get serves every guard plus the lock check below: the
+          # PR representation already carries labels, so no second
+          # labels-list read is needed (#254).
+          PR_JSON="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")" || PR_JSON='{}'
           read -r pr_state head_ref head_sha head_repo < <(
-            gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" \
-              --jq '[.state, .head.ref, .head.sha, .head.repo.full_name] | @tsv'
+            jq -r '[.state, .head.ref, .head.sha, .head.repo.full_name] | @tsv' <<<"$PR_JSON"
           )
+          PR_LABELS="$(jq -r '[.labels[]?.name? // empty][]?' <<<"$PR_JSON" 2>/dev/null || true)"
 
           if [[ "$pr_state" != "open" || "$head_repo" != "$GITHUB_REPOSITORY" ]]; then
             echo "PR #$PR_NUMBER is not an open same-repository PR; ignoring the reported CI result."
@@ -252,8 +257,7 @@ jobs:
             exit 0
           fi
 
-          if gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels" \
-            --jq '.[].name' | grep -Fxq "$CI_REPAIR_LABEL"; then
+          if grep -Fxq "$CI_REPAIR_LABEL" <<<"$PR_LABELS"; then
             echo "An automatic CI repair was already attempted for this exact PR head; waiting for a new head or a successful rerun."
             exit 0
           fi
@@ -314,10 +318,13 @@ jobs:
             exit 0
           }
 
+          # One pulls.get serves the guards plus the lock check below: the
+          # PR representation already carries labels (#254).
+          PR_JSON="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr")" || PR_JSON='{}'
           read -r head_ref head_sha head_repo < <(
-            gh api "repos/$GITHUB_REPOSITORY/pulls/$pr" \
-              --jq '[.head.ref, .head.sha, .head.repo.full_name] | @tsv'
+            jq -r '[.head.ref, .head.sha, .head.repo.full_name] | @tsv' <<<"$PR_JSON"
           )
+          PR_LABELS="$(jq -r '[.labels[]?.name? // empty][]?' <<<"$PR_JSON" 2>/dev/null || true)"
 
           # Unchanged on purpose: the workflow_run path has always accepted any
           # `opencode/*` branch. The stricter OpenCode issue-branch pattern is
@@ -345,8 +352,7 @@ jobs:
             exit 0
           fi
 
-          if gh api "repos/$GITHUB_REPOSITORY/issues/$pr/labels" \
-            --jq '.[].name' | grep -Fxq "$lock_label"; then
+          if grep -Fxq "$lock_label" <<<"$PR_LABELS"; then
             echo "An automatic $RUN_NAME repair was already attempted for this exact PR head; waiting for a new head or a successful rerun."
             exit 0
           fi

@@ -420,10 +420,61 @@ jobs:
               failClosed('PR-Agent no-progress check requires PR, HEAD, batch fingerprint, and identified logical findings.');
               return;
             }
-            const comments = await github.paginate(
-              github.rest.issues.listComments,
-              { owner, repo, issue_number: prNumber, per_page: 100 }
-            );
+            // Bounded comment scan (#254): marker state decides whether the
+            // same HEAD/state may be repaired again. `listComments` is
+            // oldest-first and ignores sort/direction, so a truncated
+            // oldest-first window would hide the recent no-progress marker;
+            // recover the bounded newest window (derived from the issue
+            // total) and decide on the merged oldest+newest window. Only
+            // a newest-recovery failure or an unseen middle window holds
+            // repair instead of deciding on a gapped window.
+            const comments = [];
+            let commentsTruncated = false;
+            for (let page = 1; page <= 10; page += 1) {
+              const { data } = await github.rest.issues.listComments(
+                { owner, repo, issue_number: prNumber, per_page: 100, page }
+              );
+              if (!Array.isArray(data) || data.length === 0) break;
+              comments.push(...data);
+              if (data.length < 100) break;
+              if (page === 10) commentsTruncated = true;
+            }
+            if (commentsTruncated) {
+              try {
+                const noProgressTotal = (await github.rest.issues.get({ owner, repo, issue_number: prNumber })).data.comments || 0;
+                const noProgressLastPage = Math.max(1, Math.ceil(noProgressTotal / 100));
+                if (!noProgressLastPage) throw new Error('cannot anchor newest comments window');
+                // Oldest 10 pages cover 1-10 and newest 10 cover
+                // last-9..last. When the thread spans more than 20 pages
+                // (2000 comments) the merged window leaves an unseen middle
+                // where a no-progress marker would be missed, so hold repair
+                // instead of retrying on gapped data.
+                if (noProgressLastPage > 20) {
+                  failClosed('PR-Agent comment scan spans more than the bounded oldest+newest window; holding repair instead of deciding with an unseen middle window.');
+                  return;
+                }
+                const seen = new Set(comments.map(entry => entry && entry.id));
+                for (let page = 1; page <= 10; page += 1) {
+                  const targetPage = noProgressLastPage - (page - 1);
+                  if (targetPage < 1) break;
+                  const { data } = await github.rest.issues.listComments(
+                    { owner, repo, issue_number: prNumber, per_page: 100, page: targetPage }
+                  );
+                  if (!Array.isArray(data) || data.length === 0) continue;
+                  for (const entry of data) {
+                    if (!entry || seen.has(entry.id)) continue;
+                    seen.add(entry.id);
+                    comments.push(entry);
+                  }
+                }
+                core.warning(
+                  'PR-Agent comment scan hit the 10-page budget; deciding on the merged oldest+newest window.'
+                );
+              } catch (recoveryErr) {
+                failClosed('PR-Agent comment scan hit the 10-page budget and newest-window recovery failed; holding repair instead of deciding on a truncated window: ' + recoveryErr.message);
+                return;
+              }
+            }
             // The marker carries the exact HEAD plus the structured finding
             // state token. It is written only by this workflow through the
             // single persistent controller-state API path, so the marker body is the trust anchor:
@@ -806,22 +857,118 @@ jobs:
           fi
           MARKER="<!-- continuum-pr-agent-convergence from=${HEAD_SHA_LOWER} to=${NEW_HEAD_LOWER} findings=${FINDING_IDS_LOWER} -->"
           CONTROLLER_MARKER='<!-- continuum-pr-agent-controller-state:v1 -->'
+
+          CONTROLLER_JSON="$RUNNER_TEMP/pr-agent-controller-comments.json"
+          # Bounded controller-state lookup (#254): controller state is
+          # written by recent repairs, so a server-side `since` window
+          # answers in one request; only a quiet-but-chatty PR falls back
+          # to a capped 5-page scan instead of full-history pagination.
+          # Target-aware: delegated reads use the resolved child repository.
+          SINCE_TS="$(date -u -d '30 days ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")"
+          if [[ -n "$SINCE_TS" ]] && gh api \
+            "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100&since=$SINCE_TS" > "$CONTROLLER_JSON"; then
+            if [[ "$(jq 'length' <"$CONTROLLER_JSON" 2>/dev/null || echo 0)" -lt 100 ]]; then
+              CONTROLLER_WINDOW_COMPLETE=true
+            else
+              CONTROLLER_WINDOW_COMPLETE=false
+            fi
+          else
+            CONTROLLER_WINDOW_COMPLETE=false
+          fi
+          # A `<100` since-window is complete only for the last 30 days: a
+          # live controller marker older than the window would be missed and
+          # reported as complete, risking a duplicate state comment. When
+          # the window holds no controller marker, fall back to the capped
+          # 5-page scan so older history is checked before creating.
+          if [[ "$CONTROLLER_WINDOW_COMPLETE" == "true" ]]; then
+            if ! jq -e --arg marker '<!-- continuum-pr-agent-controller-state:v1 -->' \
+              'map(select((.body // "") | contains($marker))) | length > 0' \
+              "$CONTROLLER_JSON" >/dev/null 2>&1; then
+              CONTROLLER_WINDOW_COMPLETE=false
+            fi
+          fi
+          if [[ "$CONTROLLER_WINDOW_COMPLETE" != "true" ]]; then
+            rm -f "$CONTROLLER_JSON.pages"
+            # Newest-first window: comments list oldest-first, so pages
+            # 1-5 would miss a recent controller marker on a PR with >500
+            # comments. Derive the last page from the issue total and scan
+            # the newest 5 pages instead.
+            CONTROLLER_TOTAL_RAW="$(gh api "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/issues/$PR_NUMBER" --jq '.comments // 0' 2>/dev/null || echo unknown)"
+            if [[ "$CONTROLLER_TOTAL_RAW" =~ ^[0-9]+$ ]]; then
+              CONTROLLER_LAST_PAGE=$(( (CONTROLLER_TOTAL_RAW + 99) / 100 ))
+              [[ "$CONTROLLER_LAST_PAGE" -ge 1 ]] || CONTROLLER_LAST_PAGE=1
+              CONTROLLER_FIRST_PAGE=$(( CONTROLLER_LAST_PAGE - 4 ))
+              [[ "$CONTROLLER_FIRST_PAGE" -ge 1 ]] || CONTROLLER_FIRST_PAGE=1
+            else
+              # Issue-total lookup failed: the newest window cannot be
+              # anchored, so fail closed (transient) rather than scanning
+              # oldest-first pages 1-5 and missing a recent marker.
+              echo "classification=transient" >> "$GITHUB_OUTPUT"
+              echo "::error::Could not determine controller comment window; GitHub API failure is retryable."
+              exit 1
+            fi
+            for controller_page in $(seq "$CONTROLLER_FIRST_PAGE" "$CONTROLLER_LAST_PAGE"); do
+              controller_page_file="$RUNNER_TEMP/pr-agent-controller-page-$controller_page.json"
+              if ! gh api \
+                "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100&page=$controller_page" > "$controller_page_file" 2>/dev/null; then
+                rm -f "$controller_page_file"
+                echo "classification=transient" >> "$GITHUB_OUTPUT"
+                echo "::error::Could not read controller comments; GitHub API failure is retryable."
+                exit 1
+              fi
+              if ! jq -e 'type == "array"' "$controller_page_file" >/dev/null 2>&1; then
+                rm -f "$controller_page_file"
+                echo "classification=transient" >> "$GITHUB_OUTPUT"
+                echo "::error::Could not parse controller comments; GitHub API failure is retryable."
+                exit 1
+              fi
+              if ! controller_page_len="$(jq 'length' "$controller_page_file" 2>/dev/null)"; then
+                rm -f "$controller_page_file"
+                echo "classification=transient" >> "$GITHUB_OUTPUT"
+                echo "::error::Could not parse controller comments; GitHub API failure is retryable."
+                exit 1
+              fi
+              if ! [[ "$controller_page_len" =~ ^[0-9]+$ ]]; then
+                rm -f "$controller_page_file"
+                echo "classification=transient" >> "$GITHUB_OUTPUT"
+                echo "::error::Could not parse controller comments; GitHub API failure is retryable."
+                exit 1
+              fi
+              cat "$controller_page_file" >> "$CONTROLLER_JSON.pages"
+              echo >> "$CONTROLLER_JSON.pages"
+              rm -f "$controller_page_file"
+            done
+            if [[ -f "$CONTROLLER_JSON.pages" ]]; then
+              if ! jq -s 'add // []' "$CONTROLLER_JSON.pages" > "$CONTROLLER_JSON" 2>/dev/null; then
+                echo "classification=transient" >> "$GITHUB_OUTPUT"
+                echo "::error::Could not merge controller comments; GitHub API failure is retryable."
+                exit 1
+              fi
+              rm -f "$CONTROLLER_JSON.pages"
+            else
+              echo "classification=transient" >> "$GITHUB_OUTPUT"
+              echo "::error::Could not read controller comments; GitHub API failure is retryable."
+              exit 1
+            fi
+          fi
+          # Normalize to a flat comment array: the `since` fast-path and the
+          # 5-page fallback must share one shape for the `.[]` scan below.
+          # Flatten an accidental array-of-pages so markers are never missed.
+          if jq -e 'type == "array" and length > 0 and (.[0] | type) == "array"' "$CONTROLLER_JSON" >/dev/null 2>&1; then
+            jq 'add // []' "$CONTROLLER_JSON" > "$CONTROLLER_JSON.flat" 2>/dev/null \
+              && mv "$CONTROLLER_JSON.flat" "$CONTROLLER_JSON" \
+              || echo "[]" > "$CONTROLLER_JSON"
+          fi
           # Continuum comment attribution (kodmial/continuum#258): the legacy
           # hidden marker lines stay first so positional upsert matching is
           # unchanged; the attribution header is the first rendered line.
+          # Assembled here (after the bounded #254 lookup) so the attributed
+          # body stays adjacent to the PATCH/POST mutation calls below.
           printf -v BODY '%s\n%s\n%s\n%s\n<details>\n<summary>Continuum PR-Agent controller state</summary>\n\n%s\n\n</details>' \
             "$CONTROLLER_MARKER" "$MARKER" \
             "⚡ **Continuum · pr-agent-repair**" \
             "<!-- continuum-origin role=continuum component=pr-agent-repair -->" \
             "Repair prepared ${HEAD_SHA_LOWER} -> ${NEW_HEAD_LOWER}; a fresh exact-HEAD review will hold only surviving logical findings."
-
-          CONTROLLER_JSON="$RUNNER_TEMP/pr-agent-controller-comments.json"
-          if ! gh api --paginate \
-            "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100" > "$CONTROLLER_JSON"; then
-            echo "classification=transient" >> "$GITHUB_OUTPUT"
-            echo "::error::Could not read controller comments; GitHub API failure is retryable."
-            exit 1
-          fi
           mapfile -t CONTROLLER_IDS < <(
             jq -r '.[] | select(.body | contains("<!-- continuum-pr-agent-controller-state:v1 -->")) | .id' "$CONTROLLER_JSON"
           )
@@ -900,10 +1047,25 @@ jobs:
               ' (' + String(process.env.REASON || 'no-effective-change') +
               '); automatic same-state repair is held until the HEAD or logical finding state changes.';
             const body = policy.controllerStateBody(stateMarker, summary);
-            const comments = await github.paginate(
-              github.rest.issues.listComments,
-              { owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER, repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO, issue_number: prNumber, per_page: 100 }
-            );
+            // Bounded scan (#254): controller markers are written by recent
+            // activity, so the newest window preserves live state.
+            // `listComments` is oldest-first and ignores sort/direction, so
+            // count down from the issue total to scan newest-first. A
+            // truncated newest window only risks one duplicate state
+            // comment, which the prune loop below removes once visible.
+            // Target-aware: delegated reads use the resolved child.
+            const comments = [];
+            const noProgressTotal = (await github.rest.issues.get({ owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER, repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO, issue_number: prNumber })).data.comments || 0;
+            const noProgressLastPage = Math.max(1, Math.ceil(noProgressTotal / 100));
+            for (let page = 1; page <= 10; page += 1) {
+              const targetPage = noProgressLastPage - (page - 1);
+              if (targetPage < 1) break;
+              const { data } = await github.rest.issues.listComments(
+                { owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER, repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO, issue_number: prNumber, per_page: 100, page: targetPage }
+              );
+              if (!Array.isArray(data) || data.length === 0) continue;
+              comments.push(...data);
+            }
             const controller = comments
               .filter(comment => String(comment.body || '').includes(policy.CONTROLLER_STATE_MARKER))
               .sort((a, b) => Number(a.id) - Number(b.id));
@@ -1008,10 +1170,25 @@ jobs:
               ? 'Retry budget exhausted for repair on exact HEAD ' + head + '.'
               : 'Transient repair failure; bounded retry ' + next + '/3 is scheduled for exact HEAD ' + head + '.';
             const body = policy.controllerStateBody(stateMarker, summary);
-            const comments = await github.paginate(
-              github.rest.issues.listComments,
-              { owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER, repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO, issue_number: prNumber, per_page: 100 }
-            );
+            // Bounded scan (#254): controller markers are written by recent
+            // activity, so the newest window preserves live state.
+            // `listComments` is oldest-first and ignores sort/direction, so
+            // count down from the issue total to scan newest-first. A
+            // truncated newest window only risks one duplicate state
+            // comment, which the prune loop below removes once visible.
+            // Target-aware: delegated reads use the resolved child.
+            const comments = [];
+            const retryTotal = (await github.rest.issues.get({ owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER, repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO, issue_number: prNumber })).data.comments || 0;
+            const retryLastPage = Math.max(1, Math.ceil(retryTotal / 100));
+            for (let page = 1; page <= 10; page += 1) {
+              const targetPage = retryLastPage - (page - 1);
+              if (targetPage < 1) break;
+              const { data } = await github.rest.issues.listComments(
+                { owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER, repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO, issue_number: prNumber, per_page: 100, page: targetPage }
+              );
+              if (!Array.isArray(data) || data.length === 0) continue;
+              comments.push(...data);
+            }
             const controller = comments
               .filter(comment => String(comment.body || '').includes(policy.CONTROLLER_STATE_MARKER))
               .sort((a, b) => Number(a.id) - Number(b.id));
@@ -1078,12 +1255,12 @@ jobs:
               ;;
           esac
 
-          current_sha="$(gh pr view "$PR_NUMBER" --repo "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" --json headRefOid --jq .headRefOid || true)"
-          if [[ -z "$current_sha" || "$current_sha" != "$HEAD_SHA" ]]; then
-            echo "PR HEAD changed during failed repair; stale retry cancelled."
-            exit 0
-          fi
-
+          # No pre-backoff PR read here (#254): the post-backoff exact-HEAD
+          # revalidation below is the authoritative stale-retry gate, so a
+          # second read before sleeping would only duplicate it. A stale
+          # retry sleeps once, then cancels without dispatching.
+          # Target-aware post-backoff revalidation below still uses
+          # CONTINUUM_PR_AGENT_TARGET_REPOSITORY for delegated correctness.
           if (( attempt >= 2 )); then
             echo "Repair retry budget exhausted for PR #$PR_NUMBER HEAD $HEAD_SHA."
             exit 0

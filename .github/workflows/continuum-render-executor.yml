@@ -354,6 +354,9 @@ jobs:
           set -euo pipefail
           ISSUE_JSON="$(gh issue view "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --json body,labels)"
           IS_QUALIFICATION="$(jq -r --arg label "$QUALIFICATION_LABEL" '[.labels[].name] | index($label) != null' <<<"$ISSUE_JSON")"
+          # Coalesce the follow-up label read: the finalize step reuses this
+          # output instead of re-fetching the same issue (#254).
+          echo "issue_labels=$(jq -c '[.labels[].name]' <<<"$ISSUE_JSON")" >> "$GITHUB_OUTPUT"
 
           if [[ "$IS_QUALIFICATION" == "true" ]]; then
             ISSUE_BODY="$(jq -r '.body // ""' <<<"$ISSUE_JSON")"
@@ -453,6 +456,7 @@ jobs:
           QUALIFICATION_CLASSIFICATION: ${{ steps.qualification.outputs.classification }}
           QUALIFICATION_SUBTYPE: ${{ steps.qualification.outputs.subtype }}
           QUALIFICATION_FINGERPRINT: ${{ steps.qualification.outputs.fingerprint }}
+          ISSUE_LABELS_JSON: ${{ steps.qualification.outputs.issue_labels }}
           ENGINE_CLASSIFICATION: ${{ steps.engine.outputs.classification }}
           ENGINE_SUBTYPE: ${{ steps.engine.outputs.subtype }}
           ENGINE_FINGERPRINT: ${{ steps.engine.outputs.fingerprint }}
@@ -460,6 +464,120 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
+          # Request budget (#254): no listing below walks more than
+          # CONTINUUM_MAX_PAGES pages; counts are reported at the end.
+          CONTINUUM_MAX_PAGES=5
+          CONTINUUM_API_CALLS=0
+          # File-backed counter: continuum_api_get runs inside command
+          # substitution (a subshell), so a shell variable increment would
+          # be lost to the parent. A temp file survives subshells.
+          CONTINUUM_API_COUNT_FILE="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/continuum-api-calls.$$"
+          echo 0 > "$CONTINUUM_API_COUNT_FILE"
+          continuum_api_count_bump() {
+            local cur=0
+            cur="$(cat "$CONTINUUM_API_COUNT_FILE" 2>/dev/null || echo 0)"
+            [[ "$cur" =~ ^[0-9]+$ ]] || cur=0
+            echo $((cur + 1)) > "$CONTINUUM_API_COUNT_FILE"
+          }
+          continuum_api_get() {
+            local rc=0
+            gh api "$@" || rc=$?
+            continuum_api_count_bump
+            return $rc
+          }
+          # Bounded slurp-compatible page walk: keeps the array-of-pages
+          # shape callers already parse with `.[][]?`, capped at
+          # CONTINUUM_MAX_PAGES instead of full-history pagination.
+          continuum_bounded_slurp() {
+            local url="$1" page=1 pages_out="" sep="?"
+            [[ "$url" == *"?"* ]] && sep="&"
+            while [[ "$page" -le "$CONTINUUM_MAX_PAGES" ]]; do
+              local page_json count
+              if ! page_json="$(continuum_api_get "${url}${sep}per_page=100&page=${page}" 2>/dev/null)"; then
+                break
+              fi
+              count="$(jq 'length' <<<"$page_json" 2>/dev/null || echo 0)"
+              [[ "$count" =~ ^[0-9]+$ ]] || break
+              [[ "$count" -gt 0 ]] || break
+              pages_out+="$page_json"$'\n'
+              [[ "$count" -lt 100 ]] && break
+              page=$((page + 1))
+            done
+            if [[ -z "$pages_out" ]]; then
+              echo "[]"
+            else
+              jq -s '.' <<<"$(grep -v '^$' <<<"$pages_out" || true)"
+            fi
+          }
+
+          # Newest-first comment window: issue comments list oldest-first
+          # and ignore sort/direction, so pages 1..N would miss a recent
+          # repair marker on a long thread. Derive the last page from the
+          # issue total (like child-dispatcher) and walk the newest
+          # CONTINUUM_MAX_PAGES pages instead, keeping the array-of-pages
+          # shape callers parse with `.[][]?`.
+          continuum_newest_comments_slurp() {
+            local repo="$1" issue="$2"
+            local total last first page page_json count pages_out=""
+            # Fail closed: an unknown comment total cannot anchor the
+            # newest window, so return failure instead of scanning only
+            # the oldest page and missing a recent repair marker (which
+            # would undercount the budget and permit an extra repair).
+            if ! total="$(continuum_api_get "repos/$repo/issues/$issue" --jq '.comments // 0' 2>/dev/null)"; then
+              echo "::error::Could not determine the newest comment page; failing closed without repair." >&2
+              return 1
+            fi
+            [[ "$total" =~ ^[0-9]+$ ]] || {
+              echo "::error::Could not parse the newest comment page; failing closed without repair." >&2
+              return 1
+            }
+            last=$(( (total + 99) / 100 ))
+            [[ "$last" -ge 1 ]] || last=1
+            first=$(( last - CONTINUUM_MAX_PAGES + 1 ))
+            [[ "$first" -ge 1 ]] || first=1
+            page="$first"
+            while [[ "$page" -le "$last" ]]; do
+              # Fail closed: a missed page may hold a repair/transient
+              # marker, so a fetch/parse gap must exhaust the budget
+              # instead of returning the remaining pages as authoritative
+              # (which would undercount and permit an extra repair/retry).
+              if ! page_json="$(continuum_api_get "repos/$repo/issues/$issue/comments?per_page=100&page=${page}" 2>/dev/null)"; then
+                echo "::error::Newest comment page ${page} could not be retrieved; failing closed without repair." >&2
+                return 1
+              fi
+              if ! count="$(jq 'length' <<<"$page_json" 2>/dev/null)"; then
+                echo "::error::Newest comment page ${page} could not be parsed; failing closed without repair." >&2
+                return 1
+              fi
+              [[ "$count" =~ ^[0-9]+$ ]] || {
+                echo "::error::Newest comment page ${page} could not be parsed; failing closed without repair." >&2
+                return 1
+              }
+              if [[ "$count" -eq 0 ]]; then
+                if [[ "$total" -gt 0 ]]; then
+                  echo "::error::Newest comment page ${page} is unexpectedly empty; failing closed without repair." >&2
+                  return 1
+                fi
+                page=$((page + 1))
+                continue
+              fi
+              pages_out+="$page_json"$'\n'
+              page=$((page + 1))
+            done
+            if [[ -z "$pages_out" ]]; then
+              # Empty is authoritative only when the issue truly has no
+              # comments; otherwise the window is unretrieved, so fail
+              # closed instead of reporting a zero budget count.
+              if [[ "$total" -gt 0 ]]; then
+                echo "::error::Newest comment window could not be retrieved; failing closed without repair." >&2
+                return 1
+              fi
+              echo "[]"
+            else
+              jq -s '.' <<<"$(grep -v '^$' <<<"$pages_out" || true)" || return 1
+            fi
+          }
 
           # A follow-up chain is optional: without one the controller still
           # classifies and still fails, it simply does not dispatch a workflow
@@ -489,7 +607,14 @@ jobs:
           gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
             --remove-label "$IN_PROGRESS_LABEL" >/dev/null 2>&1 || true
 
-          ISSUE_LABELS="$(gh issue view "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --json labels --jq '[.labels[].name]')"
+          # Reuse the qualification step's label snapshot when present
+          # instead of re-reading the same issue (#254).
+          if [[ -n "${ISSUE_LABELS_JSON:-}" ]]; then
+            ISSUE_LABELS="$ISSUE_LABELS_JSON"
+          else
+            ISSUE_LABELS="$(gh issue view "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --json labels --jq '[.labels[].name]')"
+            continuum_api_count_bump
+          fi
           if jq -e --arg label "$QUALIFICATION_LABEL" 'index($label) != null' <<<"$ISSUE_LABELS" >/dev/null; then
             CHAIN_QUALIFICATION="yes"
           else
@@ -513,10 +638,22 @@ jobs:
           ENGINE_FINGERPRINT="${ENGINE_FINGERPRINT:-}"
           ENGINE_REASON="${ENGINE_REASON:-no engine reason recorded}"
 
-          COMMENTS_JSON="$(gh api --paginate --slurp \
-            "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER/comments?per_page=100" 2>/dev/null || echo "[]")"
+          # Bounded comment scan (#254): newest-first window keeping the
+          # array-of-pages shape the fingerprint helpers parse with
+          # `.[][]?`, capped at CONTINUUM_MAX_PAGES instead of full-history
+          # pagination. Comments list oldest-first, so the oldest pages
+          # would miss a recent repair marker and undercount the budget.
+          COMMENTS_UNKNOWN=0
+          if ! COMMENTS_JSON="$(continuum_newest_comments_slurp "$GITHUB_REPOSITORY" "$ISSUE_NUMBER" 2>/dev/null)"; then
+            echo "::warning::Comment scan could not anchor the newest window; failing closed with an exhausted repair budget." >&2
+            COMMENTS_UNKNOWN=1
+            COMMENTS_JSON="[]"
+          fi
 
           fingerprint_seen() {
+            # Fail closed: unknown comment state may hide a marker, so
+            # report it as seen and coalesce instead of duplicating work.
+            [[ "$COMMENTS_UNKNOWN" -eq 1 ]] && return 0
             local marker="$1"
             local count
             count="$(jq --arg marker "$marker" \
@@ -537,6 +674,13 @@ jobs:
             exit 1
           fi
 
+          # Authoritative routing (kodmial/continuum#263): the engine
+          # classified the run from durable machine evidence before any
+          # recovery route is chosen below. The legacy qualification-only
+          # repair path from #254 is superseded here: qualification verdicts
+          # still gate success via QUALIFICATION_FAILED, while the engine
+          # decides between terminal hold, bounded retry, and
+          # evidence-driven repair.
           case "$ENGINE_CLASSIFICATION" in
             capacity|provider|timeout_unknown|unknown)
               # Terminal hold: no repository repair, no blind rerun, WIP
@@ -571,8 +715,14 @@ jobs:
               # Bounded automatic infrastructure recovery without a
               # repository repair issue. The source stays eligible for an
               # automatic retry; the marker budget stops an endless loop.
-              TRANSIENT_COUNT="$(jq '[.[][]? | select((.body // "") | contains("<!-- continuum-render-transient-attempt -->"))] | length' \
-                <<<"$COMMENTS_JSON" 2>/dev/null || echo "$MAX_RENDER_REPAIR_ATTEMPTS")"
+              # Fail closed: unknown comment state may hide markers, so
+              # treat the budget as exhausted instead of retrying blindly.
+              if [[ "$COMMENTS_UNKNOWN" -eq 1 ]]; then
+                TRANSIENT_COUNT="$MAX_RENDER_REPAIR_ATTEMPTS"
+              else
+                TRANSIENT_COUNT="$(jq '[.[][]? | select((.body // "") | contains("<!-- continuum-render-transient-attempt -->"))] | length' \
+                  <<<"$COMMENTS_JSON" 2>/dev/null || echo "$MAX_RENDER_REPAIR_ATTEMPTS")"
+              fi
               if [[ "${TRANSIENT_COUNT:-0}" -ge "$MAX_RENDER_REPAIR_ATTEMPTS" ]]; then
                 gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
                   --add-label "$PAUSE_LABEL" >/dev/null 2>&1 || true
@@ -606,12 +756,24 @@ jobs:
                 gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
                   --body "$(printf '%s\n%s' "$FAILURE_MARKER" "<!-- continuum-origin role=continuum component=render-executor -->")"
               fi
-              REPAIR_COUNT="$(jq '[.[][]? | select((.body // "") | contains("<!-- continuum-render-repair-attempt -->"))] | length' \
-                <<<"$COMMENTS_JSON" 2>/dev/null || echo 0)"
+              # Fail closed: unknown comment state may hide repair markers,
+              # so treat the budget as exhausted instead of permitting an
+              # extra repair behind an undercount.
+              if [[ "$COMMENTS_UNKNOWN" -eq 1 ]]; then
+                REPAIR_COUNT="$MAX_RENDER_REPAIR_ATTEMPTS"
+              else
+                REPAIR_COUNT="$(jq '[.[][]? | select((.body // "") | contains("<!-- continuum-render-repair-attempt -->"))] | length' \
+                  <<<"$COMMENTS_JSON" 2>/dev/null || echo "$MAX_RENDER_REPAIR_ATTEMPTS")"
+              fi
               if [[ "${REPAIR_COUNT:-0}" -lt "$MAX_RENDER_REPAIR_ATTEMPTS" ]]; then
                 SOURCE_MARKER="<!-- continuum-render-repair source=$ISSUE_NUMBER -->"
-                ALL_ISSUES_JSON="$(gh api --paginate --slurp \
-                  "repos/$GITHUB_REPOSITORY/issues?state=open&per_page=100" 2>/dev/null || echo "[]")"
+                # Bounded open-issue scan (#254): repair issues are recent, so
+                # a capped newest-first window finds them without walking
+                # full history. sort/direction are explicit: the default
+                # issue ordering keeps the oldest-first pages, which would
+                # miss a recent repair beyond the first ~500 open issues.
+                ALL_ISSUES_JSON="$(continuum_bounded_slurp \
+                  "repos/$GITHUB_REPOSITORY/issues?state=open&sort=created&direction=desc" 2>/dev/null || echo "[]")"
                 EXISTING_REPAIR="$(jq -r --arg marker "$SOURCE_MARKER" \
                   '.[][]? | select((.body // "") | contains($marker)) | .number' \
                   <<<"$ALL_ISSUES_JSON" | head -n 1)"
@@ -729,3 +891,10 @@ jobs:
             gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
                 --body "$(printf '%s\n%s\n%s' '⚡ **Continuum · render-executor**' '<!-- continuum-origin role=continuum component=render-executor -->' "Render E2E execution and cleanup succeeded in workflow run $GITHUB_RUN_ID; PR #$PR_NUMBER is now in the CI/merge chain.")"
           fi
+
+          # Drain the file-backed counter (bounded reads ran in subshells)
+          # so the budget line reflects every bounded-list call.
+          CONTINUUM_API_CALLS="$(cat "$CONTINUUM_API_COUNT_FILE" 2>/dev/null || echo 0)"
+          [[ "$CONTINUUM_API_CALLS" =~ ^[0-9]+$ ]] || CONTINUUM_API_CALLS=0
+          rm -f "$CONTINUUM_API_COUNT_FILE"
+          echo "continuum-api-budget: bounded_list_calls=$CONTINUUM_API_CALLS max_pages=$CONTINUUM_MAX_PAGES"

@@ -284,10 +284,14 @@ jobs:
             const workflowRunIds = [];
             let bridgeEvidence = '';
             let opencodeEvidence = '';
-            const prAgentRuns = async () => (await github.paginate(
-              github.rest.actions.listWorkflowRunsForRepo,
-              { owner, repo, per_page: 100 }
-            )).filter((run) => run.name === 'PR Agent (OpenCode backend)');
+            // Bounded run lookup (#254): the canary watches for its own
+            // freshly-dispatched runs, which are always the most recent, so
+            // one page (no full-history pagination) answers every poll.
+            // Each waitFor poll below therefore costs one request instead
+            // of a history-sized scan.
+            const prAgentRuns = async () => (await github.rest.actions.listWorkflowRunsForRepo({
+              owner, repo, per_page: 50, page: 1, branch,
+            })).data.workflow_runs.filter((run) => run.name === 'PR Agent (OpenCode backend)');
 
             try {
               sh(`git checkout -b "${branch}"`);
@@ -313,7 +317,9 @@ jobs:
               });
               prNumber = pr.data.number;
               core.setOutput('canary_pr', String(prNumber));
-              let head = (await github.rest.pulls.get({ owner, repo, pull_number: prNumber })).data.head.sha;
+              // The create response already carries the fresh HEAD (#254):
+              // no extra pulls.get is needed here.
+              let head = pr.data.head.sha;
               core.setOutput('blocking_sha', head);
 
               const reviewComment = await github.rest.issues.createComment({
@@ -363,15 +369,30 @@ jobs:
                 `via request model ${process.env.REQUEST_MODEL}`;
 
               const blocking = await waitFor(async () => {
-                const reviews = await github.paginate(github.rest.pulls.listReviews, {
-                  owner, repo, pull_number: prNumber, per_page: 100,
-                });
+                // Bounded poll reads (#254): the disposable canary PR holds
+                // only canary interactions, so two pages per poll bound the
+                // cost without walking history.
+                const reviews = [];
+                for (let page = 1; page <= 2; page += 1) {
+                  const { data } = await github.rest.pulls.listReviews({
+                    owner, repo, pull_number: prNumber, per_page: 100, page,
+                  });
+                  if (!Array.isArray(data) || data.length === 0) break;
+                  reviews.push(...data);
+                  if (data.length < 100) break;
+                }
                 const mine = reviews.filter((review) =>
                   review.state === 'CHANGES_REQUESTED' && review.commit_id === head);
                 if (mine.length === 0) return null;
-                const comments = await github.paginate(github.rest.pulls.listReviewComments, {
-                  owner, repo, pull_number: prNumber, per_page: 100,
-                });
+                const comments = [];
+                for (let page = 1; page <= 2; page += 1) {
+                  const { data } = await github.rest.pulls.listReviewComments({
+                    owner, repo, pull_number: prNumber, per_page: 100, page,
+                  });
+                  if (!Array.isArray(data) || data.length === 0) break;
+                  comments.push(...data);
+                  if (data.length < 100) break;
+                }
                 const inline = comments.filter((comment) =>
                   comment.pull_request_review_id === mine[0].id && !comment.in_reply_to_id);
                 if (inline.length === 0) return null;
@@ -410,9 +431,16 @@ jobs:
               core.setOutput('verify_command_id', String(verifyCommandId));
 
               const verified = await waitFor(async () => {
-                const comments = await github.paginate(github.rest.pulls.listReviewComments, {
-                  owner, repo, pull_number: prNumber, per_page: 100,
-                });
+                // Bounded poll read (#254): two pages on the disposable PR.
+                const comments = [];
+                for (let page = 1; page <= 2; page += 1) {
+                  const { data } = await github.rest.pulls.listReviewComments({
+                    owner, repo, pull_number: prNumber, per_page: 100, page,
+                  });
+                  if (!Array.isArray(data) || data.length === 0) break;
+                  comments.push(...data);
+                  if (data.length < 100) break;
+                }
                 return comments.find((comment) =>
                   comment.in_reply_to_id === findingId &&
                   (comment.body || '').includes(`finding=${findingId}`)) || null;
@@ -444,9 +472,16 @@ jobs:
               core.setOutput('clean_review_command_id', String(cleanComment.data.id));
               const cleanHead = head;
               const clean = await waitFor(async () => {
-                const reviews = await github.paginate(github.rest.pulls.listReviews, {
-                  owner, repo, pull_number: prNumber, per_page: 100,
-                });
+                // Bounded poll read (#254): two pages on the disposable PR.
+                const reviews = [];
+                for (let page = 1; page <= 2; page += 1) {
+                  const { data } = await github.rest.pulls.listReviews({
+                    owner, repo, pull_number: prNumber, per_page: 100, page,
+                  });
+                  if (!Array.isArray(data) || data.length === 0) break;
+                  reviews.push(...data);
+                  if (data.length < 100) break;
+                }
                 return reviews.find((review) =>
                   review.state === 'APPROVED' && review.commit_id === cleanHead) || null;
               }, { timeoutMs: 25 * 60 * 1000, intervalMs: 30000, what: 'the clean-HEAD approval' });

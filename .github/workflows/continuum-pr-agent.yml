@@ -455,16 +455,27 @@ jobs:
             // not the combined Statuses API. PR-Agent's own failure/pending
             // statuses must never make a recovered CI-green HEAD inadmissible.
             const ciWorkflowName = String(process.env.CI_WORKFLOW_NAME || 'CI').trim();
-            const runs = await github.paginate(
-              github.rest.actions.listWorkflowRunsForRepo,
-              {
-                owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
-                repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
-                event: 'pull_request',
-                head_sha: headSha,
-                per_page: 100,
-              }
-            );
+            // Bounded gate read (#254): the head_sha filter is server-side
+            // and only the newest matching run decides admission, so two
+            // pages bound the cost without walking run history.
+            // Target-aware: delegated admission reads the resolved child.
+            const runs = [];
+            for (let page = 1; page <= 2; page += 1) {
+              const { data } = await github.rest.actions.listWorkflowRunsForRepo(
+                {
+                  owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+                  repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
+                  event: 'pull_request',
+                  head_sha: headSha,
+                  per_page: 100,
+                  page,
+                }
+              );
+              const batch = data.workflow_runs || [];
+              if (batch.length === 0) break;
+              runs.push(...batch);
+              if (batch.length < 100) break;
+            }
             const latestCi = runs
               .filter(run => run.name === ciWorkflowName && run.head_sha === headSha)
               .sort(
@@ -1070,9 +1081,77 @@ jobs:
         run: |
           set -euo pipefail
           COMMENTS_JSON="$RUNNER_TEMP/pr-agent-comments.json"
-          gh api --paginate --slurp \
-            "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100" \
-            > "$COMMENTS_JSON"
+          # Bounded persistent-state lookup (#254): state markers for the
+          # reviewed HEAD are written by recent reviews, so a server-side
+          # `since` window answers in one request and keeps the
+          # array-of-pages shape below. A short window is trusted only when
+          # it contains the reviewed-HEAD marker; otherwise a capped 10-page
+          # walk runs instead of full-history pagination.
+          # Target-aware: delegated reads use the resolved child repository.
+          SINCE_TS="$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")"
+          WINDOW_JSON=""
+          if [[ -n "$SINCE_TS" ]]; then
+            WINDOW_JSON="$(gh api "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100&since=$SINCE_TS" 2>/dev/null || true)"
+          fi
+          WINDOW_LEN="$(jq 'length' <<<"$WINDOW_JSON" 2>/dev/null || echo 100)"
+          if [[ "$WINDOW_LEN" =~ ^[0-9]+$ ]] && [[ "$WINDOW_LEN" -lt 100 ]] && [[ -n "${REVIEWED_SHA:-}" ]] && jq -e --arg head "$REVIEWED_SHA" 'any(.[]; ((.body // "") | contains($head)))' <<<"$WINDOW_JSON" >/dev/null 2>&1; then
+            jq -s '.' <<<"$WINDOW_JSON" > "$COMMENTS_JSON"
+          else
+            rm -f "$RUNNER_TEMP/pr-agent-comment-pages.jsonl"
+            # Newest-first window: comments list oldest-first, so pages
+            # 1-10 would miss a recent reviewed-HEAD marker on a PR with
+            # >1000 comments. Derive the last page from the issue total
+            # and scan the newest 10 pages instead.
+            EXPORT_TOTAL_RAW="$(gh api "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/issues/$PR_NUMBER" --jq '.comments // 0' 2>/dev/null || echo unknown)"
+            if [[ "$EXPORT_TOTAL_RAW" =~ ^[0-9]+$ ]]; then
+              EXPORT_LAST_PAGE=$(( (EXPORT_TOTAL_RAW + 99) / 100 ))
+              [[ "$EXPORT_LAST_PAGE" -ge 1 ]] || EXPORT_LAST_PAGE=1
+              EXPORT_FIRST_PAGE=$(( EXPORT_LAST_PAGE - 9 ))
+              [[ "$EXPORT_FIRST_PAGE" -ge 1 ]] || EXPORT_FIRST_PAGE=1
+            else
+              # Issue-total lookup failed; oldest-first pages 1-10 would
+              # scan the wrong end on a PR with >1000 comments because the
+              # comments list is oldest-first, missing the recent
+              # reviewed-HEAD marker. Anchor at the newest end instead: the
+              # paginated Link header advertises the last page in one read.
+              # Fail closed when the newest page cannot be determined
+              # rather than exporting state from the wrong window.
+              if ! EXPORT_INCLUDE="$(gh api --include "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100&page=1" 2>/dev/null)"; then
+                echo "::error::Could not determine the newest PR comment page for persistent-state export."
+                exit 1
+              fi
+              EXPORT_HEADERS="$(tr -d '\r' <<<"$EXPORT_INCLUDE" | sed -n '1,/^$/p')"
+              EXPORT_LINK_LAST="$(grep -i '^link:' <<<"$EXPORT_HEADERS" | tr '[:upper:]' '[:lower:]' | sed -nE 's/.*<[^>]*[?&]page=([0-9]+)[^>]*>[[:space:]]*;[[:space:]]*rel="last".*/\1/p' | tail -n 1)"
+              if [[ "$EXPORT_LINK_LAST" =~ ^[0-9]+$ ]] && [[ "$EXPORT_LINK_LAST" -ge 1 ]]; then
+                EXPORT_LAST_PAGE="$EXPORT_LINK_LAST"
+                EXPORT_FIRST_PAGE=$(( EXPORT_LAST_PAGE - 9 ))
+                [[ "$EXPORT_FIRST_PAGE" -ge 1 ]] || EXPORT_FIRST_PAGE=1
+              elif grep -qi '^link:' <<<"$EXPORT_HEADERS"; then
+                echo "::error::Could not parse the newest PR comment page for persistent-state export."
+                exit 1
+              else
+                # No Link header means the thread fits in a single page.
+                EXPORT_FIRST_PAGE=1
+                EXPORT_LAST_PAGE=1
+              fi
+            fi
+            for comment_page in $(seq "$EXPORT_FIRST_PAGE" "$EXPORT_LAST_PAGE"); do
+              if ! gh api "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100&page=$comment_page" \
+                > "$RUNNER_TEMP/pr-agent-comment-page.json" 2>/dev/null; then
+                echo "::error::Could not read PR comments for persistent-state export."
+                exit 1
+              fi
+              if ! PAGE_LEN="$(jq 'length' "$RUNNER_TEMP/pr-agent-comment-page.json" 2>/dev/null)"; then
+                echo "::error::Could not parse PR comments page."; exit 1
+              fi
+              [[ "$PAGE_LEN" =~ ^[0-9]+$ ]] || { echo "::error::Could not parse PR comments page."; exit 1; }
+              cat "$RUNNER_TEMP/pr-agent-comment-page.json" >> "$RUNNER_TEMP/pr-agent-comment-pages.jsonl"
+              echo >> "$RUNNER_TEMP/pr-agent-comment-pages.jsonl"
+              rm -f "$RUNNER_TEMP/pr-agent-comment-page.json"
+            done
+            jq -s '.' "$RUNNER_TEMP/pr-agent-comment-pages.jsonl" > "$COMMENTS_JSON"
+            rm -f "$RUNNER_TEMP/pr-agent-comment-pages.jsonl"
+          fi
           PYTHONPATH="$FALLBACK_PYTHONPATH" python3 - "$COMMENTS_JSON" <<'PY'
           import json
           import os
@@ -1569,15 +1648,60 @@ jobs:
             const qualifying = policy.qualifyingImproveSuggestions(
               String(process.env.IMPROVE_JSONL || '')
             );
-            const comments = await github.paginate(
-              github.rest.issues.listComments,
+            // Bounded scan (#254): improve presentation is rewritten every
+            // run, so the newest five pages cover live state; older leftovers are
+            // cosmetic and pruned once visible again. `listComments` is
+            // oldest-first and ignores sort/direction, so count down from
+            // the issue total to scan newest-first. The issue total is
+            // only fetched after a full first window so small threads cost
+            // a single list request.
+            // Target-aware: delegated reads use the resolved child.
+            const comments = [];
+            const firstResp = await github.rest.issues.listComments(
               {
                 owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
                 repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
                 issue_number: prNumber,
                 per_page: 100,
+                page: 1,
               }
             );
+            const firstPage = firstResp && firstResp.data;
+            if (Array.isArray(firstPage)) comments.push(...firstPage);
+            if (Array.isArray(firstPage) && firstPage.length === 100) {
+              let lastPage = 0;
+              const link = firstResp && firstResp.headers && firstResp.headers.link;
+              if (typeof link === 'string') {
+                const match = link.match(/[?&]page=(\d+)[^>]*>;\s*rel="last"/);
+                if (match) lastPage = Math.max(lastPage, Number(match[1]));
+              }
+              if (!lastPage) {
+                const total = (await github.rest.issues.get({ owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER, repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO, issue_number: prNumber })).data.comments || 0;
+                if (total > 0) lastPage = Math.max(1, Math.ceil(total / 100));
+              }
+              if (!lastPage) lastPage = 1;
+              const seen = new Set(comments.map(entry => entry && entry.id));
+              for (let page = 1; page <= 5; page += 1) {
+                const targetPage = lastPage - (page - 1);
+                if (targetPage < 1) break;
+                if (targetPage === 1) continue;
+                const { data } = await github.rest.issues.listComments(
+                  {
+                    owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+                    repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
+                    issue_number: prNumber,
+                    per_page: 100,
+                    page: targetPage,
+                  }
+                );
+                if (!Array.isArray(data) || data.length === 0) continue;
+                for (const entry of data) {
+                  if (!entry || seen.has(entry.id)) continue;
+                  seen.add(entry.id);
+                  comments.push(entry);
+                }
+              }
+            }
             const improveComments = comments
               .filter(comment => String(comment.body || '').includes('<!-- pr-agent:improve:'))
               .sort((a, b) => Number(a.id) - Number(b.id));
@@ -1685,15 +1809,30 @@ jobs:
           github-token: ${{ github.token }}
           script: |
             const policy = require(process.env.POLICY_SCRIPT);
-            const comments = await github.paginate(
-              github.rest.issues.listComments,
-              {
-                owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
-                repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
-                issue_number: Number(process.env.PR_NUMBER),
-                per_page: 100,
-              }
-            );
+            // Bounded cleanup scan (#254): controller markers gate the next
+            // run, so the newest five pages cover live state; older leftovers are
+            // cosmetic and pruned once visible again. `listComments` is
+            // oldest-first and ignores sort/direction, so count down from
+            // the issue total to scan newest-first.
+            // Target-aware: delegated reads use the resolved child.
+            const comments = [];
+            const total = (await github.rest.issues.get({ owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER, repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO, issue_number: Number(process.env.PR_NUMBER) })).data.comments || 0;
+            const lastPage = Math.max(1, Math.ceil(total / 100));
+            for (let page = 1; page <= 5; page += 1) {
+              const targetPage = lastPage - (page - 1);
+              if (targetPage < 1) break;
+              const { data } = await github.rest.issues.listComments(
+                {
+                  owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+                  repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
+                  issue_number: Number(process.env.PR_NUMBER),
+                  per_page: 100,
+                  page: targetPage,
+                }
+              );
+              if (!Array.isArray(data) || data.length === 0) continue;
+              comments.push(...data);
+            }
             for (const comment of comments) {
               if (!String(comment.body || '').includes(policy.CONTROLLER_STATE_MARKER)) continue;
               await github.rest.issues.deleteComment({
@@ -1907,10 +2046,24 @@ jobs:
               ? 'Retry budget exhausted for ' + kind + ' on exact HEAD ' + head + '.'
               : 'Transient ' + kind + ' failure; bounded retry ' + next + '/3 is scheduled for exact HEAD ' + head + '.';
             const body = policy.controllerStateBody(stateMarker, summary);
-            const comments = await github.paginate(
-              github.rest.issues.listComments,
-              { owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER, repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO, issue_number: prNumber, per_page: 100 }
-            );
+            // Bounded scan (#254): ten pages cover any realistic controller
+            // history; a truncated window only drops old history, which the
+            // prune loop below removes once visible. `listComments` is
+            // oldest-first and ignores sort/direction, so count down from
+            // the issue total to scan newest-first.
+            // Target-aware: delegated reads use the resolved child.
+            const comments = [];
+            const total = (await github.rest.issues.get({ owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER, repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO, issue_number: prNumber })).data.comments || 0;
+            const lastPage = Math.max(1, Math.ceil(total / 100));
+            for (let page = 1; page <= 10; page += 1) {
+              const targetPage = lastPage - (page - 1);
+              if (targetPage < 1) break;
+              const { data } = await github.rest.issues.listComments(
+                { owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER, repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO, issue_number: prNumber, per_page: 100, page: targetPage }
+              );
+              if (!Array.isArray(data) || data.length === 0) continue;
+              comments.push(...data);
+            }
             const controller = comments
               .filter(comment => String(comment.body || '').includes(policy.CONTROLLER_STATE_MARKER))
               .sort((a, b) => Number(a.id) - Number(b.id));

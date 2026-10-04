@@ -99,7 +99,12 @@ jobs:
           PARENT_CONFIG=.continuum.yml CHILD_REPOSITORIES="$CHILD_REPOSITORIES" \
             bash "$resolver" verify "$CHILD_ID" "$child_repo" >/dev/null
 
-          issue_state="$(gh api "repos/$child_repo/issues/$TASK_NUMBER" --jq '.state' 2>/dev/null || true)"
+          # One issue fetch serves the open-gate below and the prompt
+          # context later (#254): title/body are prompt context only, while
+          # the open gate is re-checked by the dispatcher/review passes.
+          CHILD_ISSUE_JSON="$RUNNER_TEMP/continuum-child-issue.json"
+          gh api "repos/$child_repo/issues/$TASK_NUMBER" > "$CHILD_ISSUE_JSON" 2>/dev/null || true
+          issue_state="$(jq -r '.state // ""' <"$CHILD_ISSUE_JSON" 2>/dev/null || echo "")"
           [[ "$issue_state" == "open" ]] || exit 0
 
           workdir="$RUNNER_TEMP/continuum-child-target"
@@ -188,9 +193,8 @@ jobs:
           python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/opencode_instructions.py" install \
             --source "$CONTINUUM_ENGINE_ROOT/.github/agents/AGENTS.md"
 
-          issue_json="$(gh issue view "$TASK_NUMBER" --repo "$child_repo" --json title,body 2>/dev/null)"
-          issue_title="$(jq -r '.title' <<<"$issue_json")"
-          issue_body="$(jq -r '.body // ""' <<<"$issue_json")"
+          issue_title="$(jq -r '.title // ""' <"$CHILD_ISSUE_JSON" 2>/dev/null || echo "")"
+          issue_body="$(jq -r '.body // ""' <"$CHILD_ISSUE_JSON" 2>/dev/null || echo "")"
 
           mkdir -p "$(dirname "$result_file")"
           prompt="$RUNNER_TEMP/continuum-child-task.txt"
