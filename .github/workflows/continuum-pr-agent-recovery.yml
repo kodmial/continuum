@@ -665,7 +665,8 @@ jobs:
               if (
                 refreshedEvidence.latestAttempt === attempt &&
                 refreshedEvidence.latestMarkerAt !== null &&
-                nowMs() - refreshedEvidence.latestMarkerAt < dispatchGraceMs
+                nowMs() - refreshedEvidence.latestMarkerAt < dispatchGraceMs &&
+                await operationIsActive(pr.number, head, kind)
               ) {
                 // The claim from the successful dispatch is already durable
                 // evidence, but a prior coalescing failure can leave it plus
