@@ -57,6 +57,7 @@ jobs:
           INPUT_REVIEW_PROVIDER: ${{ inputs.review_provider }}
           CFG_REVIEW_PROVIDER: ${{ vars.CONTINUUM_REVIEW_PROVIDER }}
           INPUT_PR_NUMBER: ${{ inputs.pr_number }}
+          FALLBACK_DISPATCH_TOKEN: ${{ secrets.TAP_PAT }}
         with:
           github-token: ${{ github.token }}
           script: |
@@ -168,7 +169,7 @@ jobs:
             }
 
             const ref = String(context.payload.repository?.default_branch || 'main');
-            await github.rest.actions.createWorkflowDispatch({
+            const dispatchArgs = {
               owner, repo, workflow_id: reviewWorkflow, ref,
               inputs: {
                 pr_number: String(prNumber),
@@ -177,7 +178,31 @@ jobs:
                 retry_workflow: reviewWorkflow,
                 recovery_kind: 'review',
               },
-            });
+            };
+            try {
+              await github.rest.actions.createWorkflowDispatch(dispatchArgs);
+            } catch (err) {
+              const message = String(err?.message || '');
+              const rateLimited =
+                err?.status === 403 &&
+                /rate limit|secondary rate limit/i.test(message);
+              const permissionDenied =
+                err?.status === 403 &&
+                /resource not accessible|integration|permission/i.test(message);
+              const fallbackToken =
+                String(process.env.FALLBACK_DISPATCH_TOKEN || '').trim();
+              if (!permissionDenied || rateLimited || !fallbackToken) {
+                throw err;
+              }
+              core.warning(
+                'Repository token cannot dispatch this same-repo workflow; ' +
+                'using the inherited PAT for this single dispatch mutation only.'
+              );
+              const fallbackGithub = new github.constructor({
+                auth: fallbackToken,
+              });
+              await fallbackGithub.rest.actions.createWorkflowDispatch(dispatchArgs);
+            }
             core.notice(
               'PR-Agent review router dispatched ' + operationKey +
               ' to ' + reviewWorkflow + ' with exact HEAD ' + head + '.'

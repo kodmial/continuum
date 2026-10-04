@@ -7,6 +7,12 @@ on:
         description: Opaque verified child id for delegated PR-Agent recovery
         required: false
         type: string
+      max_executions:
+        description: >-
+          Total transient executions per exact PR/HEAD/operation (1..10,
+          default 10). Empty falls back to vars.PR_AGENT_RECOVERY_MAX_EXECUTIONS.
+        required: false
+        type: string
   schedule:
     - cron: "*/10 * * * *"
   pull_request_target:
@@ -35,3 +41,4 @@ jobs:
       # reusable falls through to vars.CONTINUUM_PR_AGENT_TARGET_CHILD_ID
       # (then to the execution repository).
       target_child_id: "${{ inputs.target_child_id }}"
+      max_executions: "${{ inputs.max_executions }}"
