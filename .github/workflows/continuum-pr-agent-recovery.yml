@@ -158,8 +158,13 @@ jobs:
               if (status === 429) return true;
               if (status !== 403) return false;
               const headers = (err && ((err.response && err.response.headers) || err.headers)) || {};
-              const remaining = headers['x-ratelimit-remaining'] ?? headers['X-RateLimit-Remaining'];
-              if (String(remaining) === '0') return true;
+              const lowered = {};
+              for (const [key, value] of Object.entries(headers)) {
+                lowered[String(key).toLowerCase()] = value;
+              }
+              if (lowered['retry-after'] !== undefined && String(lowered['retry-after']).trim() !== '') return true;
+              if (lowered['x-ratelimit-reset'] !== undefined && String(lowered['x-ratelimit-reset']).trim() !== '') return true;
+              if (lowered['x-ratelimit-remaining'] !== undefined && String(lowered['x-ratelimit-remaining']).trim() === '0') return true;
               return /rate limit|rate-limit|ratelimit|quota exhaustion|secondary rate limit|retry after/i.test(
                 String((err && err.message) || '')
               );
