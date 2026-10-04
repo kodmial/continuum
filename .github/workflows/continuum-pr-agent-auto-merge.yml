@@ -345,6 +345,7 @@ jobs:
           POST_MERGE_WAKEUP_REF: ${{ inputs.post_merge_wakeup_ref || vars.CONTINUUM_POST_MERGE_WAKEUP_REF || github.event.repository.default_branch || 'main' }}
           REQUIRED_WORKFLOW_GATE_LABEL: ${{ inputs.required_workflow_gate_label || vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_LABEL || '' }}
           REQUIRED_WORKFLOW_GATE_NAME: ${{ inputs.required_workflow_gate_name || vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_NAME || '' }}
+          TARGET_CHILD_ID: ${{ inputs.target_child_id }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
@@ -361,6 +362,15 @@ jobs:
             const repoFullName = process.env.CONTINUUM_PR_AGENT_TARGET_REPOSITORY;
             const delegated =
               process.env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED === 'true';
+            if (!owner || !repo || !repoFullName) {
+              core.setFailed(
+                delegated
+                  ? 'PR-Agent target relationship is missing: delegated execution requires non-empty CONTINUUM_PR_AGENT_TARGET_OWNER/REPO/REPOSITORY.'
+                  : 'PR-Agent target context is missing: CONTINUUM_PR_AGENT_TARGET_OWNER/REPO/REPOSITORY must be non-empty.'
+              );
+              return;
+            }
+            const targetChildId = String(process.env.TARGET_CHILD_ID || '').trim();
             const prNumber = Number(process.env.PR_NUMBER);
             const reviewedHead = String(process.env.REVIEWED_HEAD || '').trim().toLowerCase();
             const AUTO_MERGE_BLOCK_LABEL = 'no-auto-merge';
@@ -969,15 +979,44 @@ jobs:
                 continue;
               }
               try {
-                await github.request(
-                  'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
-                  {
-                    owner: executionOwner,
-                    repo: executionRepo,
-                    workflow_id: workflow,
-                    ref: postMergeWakeupRef,
+                const dispatchParams = {
+                  owner: executionOwner,
+                  repo: executionRepo,
+                  workflow_id: workflow,
+                  ref: postMergeWakeupRef,
+                };
+                // Preserve the opaque delegated selection for the follow-up
+                // run, mirroring the recovery dispatch. Local runs dispatch
+                // bare to preserve the existing best-effort contract.
+                if (targetChildId) {
+                  dispatchParams.inputs = { target_child_id: targetChildId };
+                }
+                try {
+                  await github.request(
+                    'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
+                    dispatchParams
+                  );
+                } catch (dispatchErr) {
+                  const dispatchMessage = String(dispatchErr.message || dispatchErr);
+                  if (dispatchParams.inputs && /input/i.test(dispatchMessage)) {
+                    core.warning(
+                      'PR #' + prNumber +
+                      ': wakeup ' + workflow + ' rejected target_child_id inputs; retrying bare: ' +
+                      dispatchMessage
+                    );
+                    await github.request(
+                      'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
+                      {
+                        owner: executionOwner,
+                        repo: executionRepo,
+                        workflow_id: workflow,
+                        ref: postMergeWakeupRef,
+                      }
+                    );
+                  } else {
+                    throw dispatchErr;
                   }
-                );
+                }
                 core.notice('Woke ' + workflow + ' at ' + postMergeWakeupRef + '.');
               } catch (err) {
                 core.warning(
