@@ -588,6 +588,29 @@ jobs:
                 refreshedEvidence.latestMarkerAt !== null &&
                 nowMs() - refreshedEvidence.latestMarkerAt < dispatchGraceMs
               ) {
+                // The claim from the successful dispatch is already durable
+                // evidence, but a prior coalescing failure can leave it plus
+                // an older controller comment behind. Prune to one comment
+                // before coalescing so the bounded-at-one invariant holds
+                // even when an earlier upsert never succeeded.
+                try {
+                  const controllerDupes = refreshedComments
+                    .filter(comment => String(comment.body || '').includes(CONTROLLER_STATE_MARKER))
+                    .sort((a, b) => Number(a.id) - Number(b.id));
+                  for (const stale of controllerDupes.slice(0, -1)) {
+                    await github.rest.issues.deleteComment({
+                      owner,
+                      repo,
+                      comment_id: stale.id,
+                    });
+                  }
+                } catch (pruneErr) {
+                  core.warning(
+                    'PR #' + pr.number + ' ' + kind +
+                    ': dispatch-grace duplicate prune failed: ' +
+                    (pruneErr.message || pruneErr)
+                  );
+                }
                 core.info(
                   'PR #' + pr.number + ' ' + kind +
                   ': matching retry marker is inside dispatch grace; duplicate wakeup coalesced.'
@@ -661,10 +684,12 @@ jobs:
                 throw err;
               }
               // Coalesce the pre-dispatch claim (plus any stale controller
-              // comments) into the single controller comment. The claim
-              // already provides durable evidence, so a coalescing failure
-              // only warns: the next wakeup still sees the claim inside
-              // grace and coalesces instead of duplicating the same attempt.
+              // comments) into the single controller comment. The claim is a
+              // fresh controller-state comment, so on persistent upsert
+              // failure delete every prior controller comment and keep only
+              // the claim: exactly one controller comment remains. The
+              // failure is then thrown instead of a silent warn-and-true so
+              // the run goes red instead of claiming a clean coalesce.
               let stateError = null;
               for (let stateAttempt = 1; stateAttempt <= 3; stateAttempt++) {
                 try {
@@ -684,13 +709,32 @@ jobs:
                 }
               }
               if (stateError) {
+                try {
+                  const priorController = refreshedComments
+                    .filter(comment => String(comment.body || '').includes(CONTROLLER_STATE_MARKER))
+                    .sort((a, b) => Number(a.id) - Number(b.id));
+                  for (const stale of priorController) {
+                    await github.rest.issues.deleteComment({
+                      owner,
+                      repo,
+                      comment_id: stale.id,
+                    });
+                  }
+                } catch (pruneErr) {
+                  core.warning(
+                    'PR #' + pr.number + ' ' + kind +
+                    ': post-dispatch duplicate prune failed: ' +
+                    (pruneErr.message || pruneErr)
+                  );
+                }
                 core.warning(
                   'PR #' + pr.number + ' ' + kind +
                   ': dispatched recovery execution ' + (attempt + 1) + '/' + maxExecutions +
                   ' but coalescing into one controller comment failed; ' +
-                  'the pre-dispatch claim still guards against duplicate dispatch. ' +
+                  'prior controller comments pruned, keeping only the pre-dispatch claim. ' +
                   (stateError.message || stateError)
                 );
+                throw stateError;
               }
               return true;
             }

@@ -736,6 +736,35 @@ class CodeRabbitDeadlockWiringTests(unittest.TestCase):
         gate = self.read(".github/workflows/continuum-auto-merge.yml")
         self.assertIn("Review skipped", gate)
         self.assertIn("Review completed", gate)
+        # The Review-completed wait must stay conditional on a missing
+        # review basis. An unconditional `description contains Review
+        # completed` merge-authorization check would erase a durable
+        # exact-head APPROVED basis whenever an auto-review-disabled event
+        # overwrote the status with "Review skipped".
+        self.assertRegex(gate, r"!reviewBasis[\s\S]{0,400}Review completed")
+        # Exactly two mentions exist: the status-independence comment and
+        # the single guarded wait. A reintroduced hard Review-completed
+        # authorization check adds a third and fails here.
+        self.assertEqual(gate.count("Review completed"), 2)
+        basis_src = self._extract_js_function(gate, "directCodeRabbitReviewBasis")
+        # The basis is review+CI+nitpick only: it must never read a commit
+        # status description. (Its explanatory comment mentions the status
+        # names, so pin on status plumbing instead of bare substrings.)
+        self.assertNotIn(
+            "rabbitStatus",
+            basis_src,
+            "review basis must stay status-independent; a skipped status never erases it",
+        )
+        self.assertNotIn(
+            "latestCodeRabbitStatus",
+            basis_src,
+            "review basis must stay status-independent; completed status is not merge evidence",
+        )
+        self.assertNotIn(
+            ".description",
+            basis_src,
+            "review basis must not authorize on a status description",
+        )
 
     def test_nitpick_supersession(self):
         gate = self.read(".github/workflows/continuum-auto-merge.yml")
@@ -950,14 +979,30 @@ REVIEWS = [
   review({{ state: 'CHANGES_REQUESTED', submitted_at: '2026-01-02T00:00:00Z', id: 2 }}),
 ];
 RUNS = ciRun();
-const skippedStatus = {{ context: 'CodeRabbit', description: 'Review skipped' }};
+const skippedStatus = {{ context: 'CodeRabbit', state: 'success', description: 'Review skipped' }};
+const completedStatus = {{ context: 'CodeRabbit', state: 'success', description: 'Review completed' }};
+function waitingForCompletedReview(reviewBasis, rabbitStatus) {{
+  return (
+    !reviewBasis &&
+    (
+      !rabbitStatus ||
+      rabbitStatus.state !== 'success' ||
+      !/Review completed/i.test(rabbitStatus.description || '')
+    )
+  );
+}}
+const changesBasis = await directCodeRabbitReviewBasis(pr, HEAD);
 results.changes_requested_blocked =
-  (await directCodeRabbitReviewBasis(pr, HEAD)) === null &&
-  /skipped/i.test(skippedStatus.description);
+  changesBasis === null &&
+  waitingForCompletedReview(changesBasis, skippedStatus);
 // 4. "Review skipped" must not erase a durable exact-head approval.
 REVIEWS = [review({{ state: 'APPROVED' }})];
 RUNS = ciRun();
-results.skipped_keeps_approval = !!(await directCodeRabbitReviewBasis(pr, HEAD));
+const keptBasis = await directCodeRabbitReviewBasis(pr, HEAD);
+results.skipped_keeps_approval =
+  keptBasis !== null &&
+  !waitingForCompletedReview(keptBasis, skippedStatus) &&
+  !waitingForCompletedReview(keptBasis, completedStatus);
 // 5. A nitpick newer than the decision blocks the merge.
 REVIEWS = [
   review({{ state: 'APPROVED', submitted_at: '2026-01-01T00:00:00Z', id: 1 }}),
