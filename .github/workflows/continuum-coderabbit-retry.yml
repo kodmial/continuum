@@ -269,6 +269,7 @@ jobs:
                   repo,
                   branch: pr.head.ref,
                   event: 'pull_request',
+                  head_sha: pr.head.sha,
                   per_page: 100,
                 },
                 MAX_GATE_PAGES
