@@ -671,12 +671,16 @@ class RecoveryWiringTests(unittest.TestCase):
         self.assertIn("let readTokenUnavailable = false", body)
         self.assertIn("async function withReadFallback(fn)", body)
         self.assertIn("err.status ?? err.response?.status", body)
-        # Rate-limit retries must never burn TAP_PAT's shared budget: only
-        # authentication/permission gaps fall back; 429 and rate-limited 403
-        # surface so the caller defers to the next wakeup.
+        # Delegated cross-repository reads surface as 404 under the
+        # repository-scoped token, so the PAT fallback must cover 404 as
+        # well. Rate-limit retries must never burn TAP_PAT's shared budget:
+        # only authentication/permission gaps (plus delegated 404) fall back;
+        # 429 and rate-limited 403 surface so the caller defers to the next
+        # wakeup.
         self.assertIn("isRateLimitError", body)
         self.assertIn("status === 401", body)
         self.assertIn("!isRateLimitError(err, status)", body)
+        self.assertIn("status === 404", body)
         self.assertIn("if (readTokenUnavailable || readGithub === github)", body)
 
         for read_call in (
@@ -687,10 +691,15 @@ class RecoveryWiringTests(unittest.TestCase):
             "client.rest.pulls.get",
             "client.rest.repos.listCommitStatusesForRef",
             "client.rest.issues.listComments",
-            "client.rest.repos.get({ owner, repo })",
         ):
             with self.subTest(read_call=read_call):
                 self.assertIn(read_call, body)
+        # Target-aware recovery: target PR/CI/status/comment reads use the
+        # resolved target (owner/repo), while execution-run inspection and the
+        # dispatch-ref lookup stay in the parent execution repository.
+        self.assertIn("const executionOwner = context.repo.owner;", body)
+        self.assertIn("const owner = process.env.CONTINUUM_PR_AGENT_TARGET_OWNER;", body)
+        self.assertIn("client.rest.repos.get({ owner: executionOwner, repo: executionRepo })", body)
 
         # One helper definition plus twelve guarded read sites. Controller-state
         # upsert also reads comments through the repository-scoped token, and

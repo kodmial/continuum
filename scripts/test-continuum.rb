@@ -1777,28 +1777,87 @@ class ContinuumTest < Minitest::Test
     moved = step_body(body, 'Fail closed on a moved head')
     [admit, before, after, moved].each { |step| refute_nil step, 'a verified-safe read step is missing' }
 
-    # 1. Admission: pulls.get plus exact-HEAD CI evidence under github.token.
-    assert_includes admit, 'github-token: ${{ github.token }}'
-    refute_includes admit, 'secrets.TAP_PAT'
+    # 1. Admission: pulls.get plus exact-HEAD CI evidence against the
+    # resolved target. Local same-repository reads use github.token;
+    # delegated cross-repository reads require TAP_PAT via the conditional.
+    # Presence-only checks would pass a step that reads cross-repo with an
+    # unconditional github.token while mentioning TAP_PAT elsewhere, so each
+    # step must carry the conditional token expression and the fail-closed
+    # guard, and must never set an unconditional github.token credential.
+    conditional_token = "CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '')"
+    empty_token_tail = "&& github.token || '')"
+    assert_includes admit, 'github.token'
+    assert_includes admit, 'secrets.TAP_PAT'
+    assert_includes admit, 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED'
+    assert_includes admit, conditional_token,
+                    'admission must select TAP_PAT for delegated reads instead of an unconditional github.token'
+    assert_includes admit, empty_token_tail,
+                    'admission must yield an empty token for delegated runs without PAT so auth itself fails closed'
+    refute_includes admit, 'secrets.TAP_PAT || github.token }}',
+                    'admission must not fall back to github.token for delegated runs without PAT'
+    assert_includes admit, 'refusing to fall back to github.token',
+                    'admission must fail closed for delegated reads without TAP_PAT'
+    refute_includes admit, 'github-token: ${{ github.token }}',
+                    'admission must not set an unconditional github.token credential'
     assert_includes admit, 'github.rest.pulls.get'
     assert_includes admit, 'github.rest.actions.listWorkflowRunsForRepo'
+    assert_includes admit, 'CONTINUUM_PR_AGENT_TARGET_OWNER'
+    refute_includes admit, 'owner: context.repo.owner'
 
     # 2. Immediately-before-review revalidation: gh pr view plus exact-HEAD
-    # CI evidence under github.token.
-    assert_includes before, 'GH_TOKEN: ${{ github.token }}'
-    refute_includes before, 'secrets.TAP_PAT'
+    # CI evidence against the resolved target (conditional token as above).
+    assert_includes before, 'github.token'
+    assert_includes before, 'secrets.TAP_PAT'
+    assert_includes before, 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED'
+    assert_includes before, conditional_token,
+                    'pre-review revalidation must select TAP_PAT for delegated reads instead of an unconditional github.token'
+    assert_includes before, empty_token_tail,
+                    'pre-review revalidation must yield an empty token for delegated runs without PAT so auth itself fails closed'
+    refute_includes before, 'secrets.TAP_PAT || github.token }}',
+                    'pre-review revalidation must not fall back to github.token for delegated runs without PAT'
+    assert_includes before, 'refusing to fall back to github.token',
+                    'pre-review revalidation must fail closed for delegated reads without TAP_PAT'
+    refute_includes before, 'GH_TOKEN: ${{ github.token }}',
+                    'pre-review revalidation must not set an unconditional github.token credential'
     assert_includes before, 'gh pr view'
     assert_includes before, 'actions/runs?event=pull_request&head_sha='
+    assert_includes before, 'CONTINUUM_PR_AGENT_TARGET_REPOSITORY'
 
-    # 3. Immediately-after-review revalidation: pulls.get for current PR/head only.
-    assert_includes after, 'github-token: ${{ github.token }}'
-    refute_includes after, 'secrets.TAP_PAT'
+    # 3. Immediately-after-review revalidation: pulls.get for current PR/head
+    # only against the resolved target.
+    assert_includes after, 'github.token'
+    assert_includes after, 'secrets.TAP_PAT'
+    assert_includes after, 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED'
+    assert_includes after, conditional_token,
+                    'post-review revalidation must select TAP_PAT for delegated reads instead of an unconditional github.token'
+    assert_includes after, empty_token_tail,
+                    'post-review revalidation must yield an empty token for delegated runs without PAT so auth itself fails closed'
+    refute_includes after, 'secrets.TAP_PAT || github.token }}',
+                    'post-review revalidation must not fall back to github.token for delegated runs without PAT'
+    assert_includes after, 'refusing to fall back to github.token',
+                    'post-review revalidation must fail closed for delegated reads without TAP_PAT'
+    refute_includes after, 'github-token: ${{ github.token }}',
+                    'post-review revalidation must not set an unconditional github.token credential'
     assert_includes after, 'github.rest.pulls.get'
+    assert_includes after, 'CONTINUUM_PR_AGENT_TARGET_OWNER'
 
-    # 4. Final fail-closed moved-head check: gh pr view for current PR/head only.
-    assert_includes moved, 'GH_TOKEN: ${{ github.token }}'
-    refute_includes moved, 'secrets.TAP_PAT'
+    # 4. Final fail-closed moved-head check: gh pr view for current PR/head
+    # only against the resolved target.
+    assert_includes moved, 'github.token'
+    assert_includes moved, 'secrets.TAP_PAT'
+    assert_includes moved, 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED'
+    assert_includes moved, conditional_token,
+                    'moved-head check must select TAP_PAT for delegated reads instead of an unconditional github.token'
+    assert_includes moved, empty_token_tail,
+                    'moved-head check must yield an empty token for delegated runs without PAT so auth itself fails closed'
+    refute_includes moved, 'secrets.TAP_PAT || github.token }}',
+                    'moved-head check must not fall back to github.token for delegated runs without PAT'
+    assert_includes moved, 'refusing to fall back to github.token',
+                    'moved-head check must fail closed for delegated reads without TAP_PAT'
+    refute_includes moved, 'GH_TOKEN: ${{ github.token }}',
+                    'moved-head check must not set an unconditional github.token credential'
     assert_includes moved, 'gh pr view'
+    assert_includes moved, 'CONTINUUM_PR_AGENT_TARGET_REPOSITORY'
 
     # github-script pure reads use the injected client directly: no dynamic
     # require of @actions/github and no secondary Octokit client to audit.
@@ -1830,26 +1889,89 @@ class ContinuumTest < Minitest::Test
     assert_includes runtime, 'GH_TOKEN: ${{ github.token }}',
                     'public Continuum runtime-bundle fetch must not consume shared PAT quota'
     assert_includes runtime, 'repos/kodmial/continuum/contents'
-    assert_includes retry_step, 'GH_TOKEN: ${{ github.token }}',
-                    'bounded same-repo workflow_dispatch must use repository token'
+    # Target-aware (#243) retry revalidation reads the resolved target:
+    # local same-repository reads use github.token while delegated
+    # cross-repository reads require TAP_PAT with a fail-closed empty token
+    # (delegated runs without PAT yield '' so auth itself fails closed
+    # instead of silently reading the parent with github.token).
+    assert_includes retry_step, conditional_token,
+                    'bounded retry revalidation must select TAP_PAT for delegated reads instead of an unconditional github.token'
+    assert_includes retry_step, empty_token_tail,
+                    'bounded retry revalidation must yield an empty token for delegated runs without PAT so auth itself fails closed'
+    refute_includes retry_step, 'secrets.TAP_PAT || github.token }}',
+                    'bounded retry revalidation must not fall back to github.token for delegated runs without PAT'
+    assert_includes retry_step, 'Delegated PR-Agent retry requires TAP_PAT',
+                    'bounded retry revalidation must fail closed for delegated reads without TAP_PAT'
+    assert_includes retry_step, 'CONTINUUM_PR_AGENT_TARGET_REPOSITORY',
+                    'bounded retry revalidation must read the resolved target, never the parent by default'
     assert_includes retry_step, 'gh workflow run'
     refute_includes before, 'gh workflow run',
                       'the pre-review revalidation must stay read-only'
     refute_includes moved, 'gh workflow run',
                       'the moved-head check must stay read-only'
-    assert_includes review_tool, 'GITHUB__USER_TOKEN: ${{ github.token }}',
-                     'PR-Agent review tool execution must use repository token'
-    assert_includes improve_tool, 'GITHUB__USER_TOKEN: ${{ github.token }}',
-                     'PR-Agent improve tool execution must use repository token'
-    assert_includes in_flight, 'github-token: ${{ github.token }}',
-                    'commit-status publishing must use repository token'
+    assert_includes review_tool, 'GITHUB__USER_TOKEN:',
+                     'PR-Agent review tool execution must set a user token'
+    assert_includes review_tool, conditional_token,
+                    'PR-Agent review tool execution must select TAP_PAT for delegated runs instead of an unconditional github.token'
+    assert_includes review_tool, empty_token_tail,
+                    'PR-Agent review tool execution must yield an empty token for delegated runs without PAT so auth itself fails closed'
+    refute_includes review_tool, 'secrets.TAP_PAT || github.token }}',
+                    'PR-Agent review tool execution must not fall back to github.token for delegated runs without PAT'
+    assert_includes review_tool, 'Delegated PR-Agent execution requires TAP_PAT',
+                    'PR-Agent review tool execution must fail closed for delegated runs without TAP_PAT'
+    assert_includes improve_tool, 'GITHUB__USER_TOKEN:',
+                     'PR-Agent improve tool execution must set a user token'
+    assert_includes improve_tool, conditional_token,
+                    'PR-Agent improve tool execution must select TAP_PAT for delegated runs instead of an unconditional github.token'
+    assert_includes improve_tool, empty_token_tail,
+                    'PR-Agent improve tool execution must yield an empty token for delegated runs without PAT so auth itself fails closed'
+    refute_includes improve_tool, 'secrets.TAP_PAT || github.token }}',
+                    'PR-Agent improve tool execution must not fall back to github.token for delegated runs without PAT'
+    assert_includes improve_tool, 'Delegated PR-Agent execution requires TAP_PAT',
+                    'PR-Agent improve tool execution must fail closed for delegated runs without TAP_PAT'
+    assert_includes in_flight, conditional_token,
+                    'in-flight commit-status publishing must select TAP_PAT for delegated writes instead of an unconditional github.token'
+    assert_includes in_flight, empty_token_tail,
+                    'in-flight commit-status publishing must yield an empty token for delegated runs without PAT so auth itself fails closed'
+    refute_includes in_flight, 'secrets.TAP_PAT || github.token }}',
+                    'in-flight commit-status publishing must not fall back to github.token for delegated runs without PAT'
+    assert_includes in_flight, 'Delegated PR-Agent execution requires TAP_PAT',
+                    'in-flight commit-status publishing must fail closed for delegated writes without TAP_PAT'
+    refute_includes in_flight, 'github-token: ${{ github.token }}',
+                    'in-flight commit-status publishing must not set an unconditional github.token credential'
     assert_includes normalize, 'github-token: ${{ github.token }}',
                     'comment maintenance must use repository token'
     assert_includes normalize, 'deleteComment'
     assert_includes publish, 'github-token: ${{ github.token }}',
-                    'commit-status publishing must use repository token'
-    refute_includes body, 'secrets.TAP_PAT',
-                    'review workflow must be completely isolated from shared user PAT quota'
+                     'commit-status publishing must use repository token'
+    # Target-aware (#243) delegated reads/writes require TAP_PAT, so the review
+    # workflow is no longer entirely PAT-free: the admission/revalidation
+    # steps above plus the in-flight commit-status step and the PR-Agent
+    # review/improve tool steps legitimately carry
+    # the fail-closed conditional. The
+    # PAT-quota isolation contract is preserved in scoped form: local
+    # control-plane steps stay repository-token backed (asserted per step
+    # above), tool execution consumes the shared PAT only through the
+    # fail-closed conditional for delegated runs, there is no
+    # unconditional fallback to github.token for delegated runs, and the
+    # only bare TAP_PAT credential is the target-resolution fetch itself.
+    refute_includes body, 'secrets.TAP_PAT || github.token }}',
+                    'review workflow must never fall back to github.token for delegated runs without PAT'
+    refute_includes body, 'GITHUB__USER_TOKEN: ${{ secrets.TAP_PAT }}',
+                    'review tool execution must never consume the shared user PAT unconditionally'
+    resolve = step_body(body, 'Resolve PR-Agent target context')
+    refute_nil resolve, 'the target-context resolution step is missing'
+    assert_includes resolve, 'GH_TOKEN: ${{ secrets.TAP_PAT }}',
+                    'target resolution fetches cross-repo child config with TAP_PAT'
+    assert_equal 1, body.scan('GH_TOKEN: ${{ secrets.TAP_PAT }}').size,
+                 'only target resolution may use a bare TAP_PAT credential; every read must use the fail-closed conditional'
+    body.each_line.with_index(1) do |line, lineno|
+      next unless line.include?('secrets.TAP_PAT')
+      allowed = line.include?('CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED') ||
+                line.include?('TAP_PAT: ${{ secrets.TAP_PAT }}') ||
+                resolve.include?(line.strip)
+      assert allowed, "line #{lineno} consumes TAP_PAT outside the gated target-aware contract: #{line.strip}"
+    end
   end
 
   # Work-Lock #58 item 5 (conservative subset, kodmial/continuum#236): only
@@ -1873,11 +1995,20 @@ class ContinuumTest < Minitest::Test
     refute_nil convergence, 'the no-progress read step is missing'
     refute_nil target, 'the writable-branch resolution read step is missing'
 
-    # 1. No-progress check: pure issues.listComments read plus
-    # workflow-owned marker parsing under github.token.
-    assert_includes convergence, 'github-token: ${{ github.token }}'
-    refute_includes convergence, 'secrets.TAP_PAT',
-                      'the no-progress read must leave the shared TAP_PAT budget'
+    # 1. No-progress check: issues.listComments read plus workflow-owned
+    # marker parsing against the resolved target. Local reads use
+    # github.token; delegated cross-repository reads require TAP_PAT via the
+    # empty-token conditional (delegated runs without PAT yield '' so auth
+    # itself fails closed before the embedded guard runs).
+    fail_closed_token = "CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '')"
+    assert_includes convergence, 'github.token'
+    assert_includes convergence, 'secrets.TAP_PAT'
+    assert_includes convergence, 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED'
+    assert_includes convergence, fail_closed_token,
+                    'the no-progress read must yield an empty token for delegated runs without PAT'
+    refute_includes convergence, 'secrets.TAP_PAT || github.token }}',
+                    'the no-progress read must not fall back to github.token for delegated runs without PAT'
+    assert_includes convergence, 'CONTINUUM_PR_AGENT_TARGET_OWNER'
     assert_includes convergence, 'github.rest.issues.listComments'
     assert_includes convergence, 'continuum-pr-agent-no-progress head='
     assert_includes convergence, 'continuum-pr-agent-convergence from='
@@ -1891,17 +2022,22 @@ class ContinuumTest < Minitest::Test
     refute_includes convergence, 'gh workflow run'
     refute_includes convergence, 'git push'
 
-    # 2. Writable-branch resolution: GET the current pull only, under
-    # github.token. Every GitHub operation in the step is read-only.
-    assert_includes target, 'GH_TOKEN: ${{ github.token }}'
-    refute_includes target, 'secrets.TAP_PAT',
-                      'the target-resolution read must leave the shared TAP_PAT budget'
-    assert_includes target, 'repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER'
+    # 2. Writable-branch resolution: GET the current pull only against the
+    # resolved target (empty-token conditional as above). Every GitHub
+    # operation in this step is read-only and fails closed on mismatch.
+    assert_includes target, 'github.token'
+    assert_includes target, 'secrets.TAP_PAT'
+    assert_includes target, 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED'
+    assert_includes target, fail_closed_token,
+                    'writable-branch resolution must yield an empty token for delegated runs without PAT'
+    refute_includes target, 'secrets.TAP_PAT || github.token }}',
+                    'writable-branch resolution must not fall back to github.token for delegated runs without PAT'
+    assert_includes target, 'repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/pulls/$PR_NUMBER'
     assert_includes target, "CURRENT_SHA=\"$(jq -r '.head.sha'"
     assert_includes target, 'PR_STATE="$(jq -r'
     assert_includes target, 'PR_DRAFT="$(jq -r'
     assert_includes target, '"$CURRENT_SHA" != "$HEAD_SHA"'
-    assert_includes target, '"$HEAD_REPO" != "$GITHUB_REPOSITORY"'
+    assert_includes target, '"$HEAD_REPO" != "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY"'
     refute_includes target, 'gh pr view'
     refute_includes target, 'gh workflow run'
     refute_includes target, 'git push'
@@ -2014,10 +2150,24 @@ class ContinuumTest < Minitest::Test
 
   def test_pr_agent_review_workflow_uses_repository_token_not_shared_pat
     body = workflow_body('continuum-pr-agent.yml')
-    refute_includes body, 'secrets.TAP_PAT',
-                    'review workflow must not consume the shared user PAT'
-    assert_includes body, 'GITHUB__USER_TOKEN: ${{ github.token }}'
+    # Target-aware (#243) delegated cross-repository reads require TAP_PAT
+    # through the fail-closed conditional, so the review workflow is no
+    # longer entirely PAT-free. The repository-token contract is preserved
+    # in scoped form: local control-plane runs stay
+    # repository-token backed, the shared PAT is never consumed
+    # unconditionally, and delegated runs without PAT fail closed instead
+    # of silently falling back to github.token. PR-Agent tool execution
+    # (pr-agent --pr_url against the resolved target) follows the same
+    # target-aware contract: TAP_PAT when delegated, github.token locally.
+    refute_includes body, 'secrets.TAP_PAT || github.token }}',
+                    'review workflow must never fall back to github.token for delegated runs without PAT'
+    refute_includes body, 'GITHUB__USER_TOKEN: ${{ secrets.TAP_PAT }}',
+                    'review workflow must not consume the shared user PAT unconditionally for tool execution'
+    assert_includes body, 'GITHUB__USER_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED',
+                    'PR-Agent tool execution must select its user token through the target-aware conditional'
     assert_includes body, 'GH_TOKEN: ${{ github.token }}'
+    assert_includes body, "CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT",
+                    'delegated target-aware reads must select TAP_PAT through the fail-closed conditional'
     workflow = yaml(File.join(ROOT, '.github/caller-stubs/continuum-pr-agent.yml'))
     permissions = workflow.fetch('permissions')
     assert_equal 'write', permissions.fetch('actions')
@@ -3527,23 +3677,23 @@ class ContinuumTest < Minitest::Test
       head_ref_pattern auto_merge_workflow opencode_workflow
     ],
     'continuum-opencode-unresolved.yml' => %w[continuum_ref],
-    'continuum-pr-agent-recovery.yml' => %w[continuum_ref max_executions],
+    'continuum-pr-agent-recovery.yml' => %w[continuum_ref target_child_id max_executions],
     'continuum-pr-agent-canary.yml' => %w[
       continuum_ref canary_enabled base_ref opencode_model model max_tokens
       api_base bridge_port server_port pr_agent_version
     ],
     'continuum-pr-agent.yml' => %w[
-      continuum_ref pr_number expected_head_sha retry_attempt retry_workflow recovery_kind
+      continuum_ref pr_number target_child_id expected_head_sha retry_attempt retry_workflow recovery_kind
     ],
     'continuum-pr-agent-router.yml' => %w[
       continuum_ref review_workflow review_provider pr_number
     ],
     'continuum-pr-agent-repair.yml' => %w[
-      continuum_ref pr_number head_sha review_json improve_jsonl
+      continuum_ref pr_number target_child_id head_sha review_json improve_jsonl
       retry_attempt retry_workflow
     ],
     'continuum-pr-agent-auto-merge.yml' => %w[
-      continuum_ref pr_number head_sha review_json improve_jsonl persistent_state_json
+      continuum_ref pr_number target_child_id head_sha review_json improve_jsonl persistent_state_json
       post_merge_wakeups post_merge_wakeup_ref
       required_workflow_gate_label required_workflow_gate_name
     ],
@@ -6044,6 +6194,393 @@ class ContinuumTest < Minitest::Test
     assert_includes body, 'pr.mergeable_state'
     assert_includes body, "hasLabel(pr, AUTO_MERGE_BLOCK_LABEL)"
     assert_includes body, 'for (const workflow of postMergeWakeups) {'
+  end
+
+  # PR-Agent delegated-execution contract: the opaque `target_child_id`
+  # input is the only delegated selector, local runs resolve without
+  # CONTINUUM_REF, and every delegated read targets the resolved child.
+  def test_pr_agent_target_child_id_passthrough_and_local_resolution
+    %w[continuum-pr-agent.yml continuum-pr-agent-repair.yml continuum-pr-agent-auto-merge.yml].each do |base|
+      workflow = yaml(File.join(ROOT, '.github/workflows', base))
+      stub = yaml(File.join(ROOT, '.github/caller-stubs', base))
+      body = File.read(File.join(ROOT, '.github/workflows', base))
+
+      call_inputs = events(workflow).fetch('workflow_call').fetch('inputs')
+      assert call_inputs.key?('target_child_id'), "#{base}: workflow_call must declare target_child_id"
+      assert_equal '', call_inputs.fetch('target_child_id').fetch('default'), "#{base}: target_child_id must default empty (local)"
+      assert_equal false, call_inputs.fetch('target_child_id').fetch('required'), "#{base}: target_child_id must not gate the call"
+      assert_equal 'string', call_inputs.fetch('target_child_id').fetch('type'), "#{base}: target_child_id must stay a string input"
+
+      dispatch_inputs = events(stub).fetch('workflow_dispatch').fetch('inputs')
+      assert dispatch_inputs.key?('target_child_id'), "#{base}: caller stub must expose target_child_id"
+      assert_equal 'string', dispatch_inputs.fetch('target_child_id').fetch('type'), "#{base}: caller stub target_child_id must stay a string input"
+      assert_equal false, dispatch_inputs.fetch('target_child_id').fetch('required'), "#{base}: caller stub target_child_id must not gate dispatch"
+      assert_equal '${{ inputs.target_child_id }}', stub.fetch('jobs').fetch('call').fetch('with').fetch('target_child_id'),
+                   "#{base}: caller stub must forward the opaque child id verbatim"
+      refute_includes body, 'target_repository:',
+                        "#{base}: concrete repository identity must never be an input"
+
+      assert_includes body, 'inputs.target_child_id',
+                        "#{base}: concurrency must scope delegated runs by the opaque id"
+      resolve = step_body(body, 'Resolve PR-Agent target context')
+      refute_nil resolve, "#{base}: target-context resolution step is missing"
+      local_guard = resolve.index('if [[ -z "${TARGET_CHILD_ID:-}" ]]; then')
+      ref_require = resolve.index('CONTINUUM_REF is required for pinned target resolution')
+      refute_nil local_guard, "#{base}: local fast path is missing"
+      refute_nil ref_require, "#{base}: delegated CONTINUUM_REF requirement is missing"
+      assert_operator local_guard, :<, ref_require,
+                      "#{base}: local runs must exit before CONTINUUM_REF is required"
+      assert_includes resolve, 'CONTINUUM_PR_AGENT_TARGET_REPOSITORY'
+      assert_includes resolve, 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED'
+      assert_includes resolve, 'PR-Agent target context resolved locally.'
+      assert_includes resolve, 'exit 0'
+      assert_includes resolve, 'contents/.continuum.yml" --jq',
+                        "#{base}: parent config must resolve from the execution repository default branch, not the engine pin"
+      refute_includes resolve, 'contents/.continuum.yml" -f ref="$CONTINUUM_REF"',
+                        "#{base}: the engine pin may not exist in the execution repository"
+    end
+  end
+
+  # The pr-agent.yml retry entry forwards `target_child_id` to the reusable
+  # review workflow, which must declare it and resolve the delegated target
+  # from it: otherwise delegated runs would plumb the opaque id nowhere and
+  # review against the parent repository.
+  def test_pr_agent_retry_caller_target_child_id_reaches_reusable_resolver
+    caller = yaml(File.join(ROOT, '.github/workflows/pr-agent.yml'))
+    caller_body = File.read(File.join(ROOT, '.github/workflows/pr-agent.yml'))
+    reusable = yaml(File.join(ROOT, '.github/workflows/continuum-pr-agent.yml'))
+    reusable_body = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent.yml'))
+
+    dispatch_inputs = events(caller).fetch('workflow_dispatch').fetch('inputs')
+    assert dispatch_inputs.key?('target_child_id'), 'pr-agent.yml must expose target_child_id'
+    assert_equal 'string', dispatch_inputs.fetch('target_child_id').fetch('type'),
+                 'pr-agent.yml target_child_id must stay a string input'
+    assert_equal false, dispatch_inputs.fetch('target_child_id').fetch('required'),
+                 'pr-agent.yml target_child_id must not gate dispatch'
+    assert_equal '${{ inputs.target_child_id }}',
+                 caller.fetch('jobs').fetch('call').fetch('with').fetch('target_child_id'),
+                 'pr-agent.yml must forward the opaque child id verbatim'
+
+    call_inputs = events(reusable).fetch('workflow_call').fetch('inputs')
+    assert call_inputs.key?('target_child_id'), 'continuum-pr-agent.yml must declare target_child_id'
+    resolve = step_body(reusable_body, 'Resolve PR-Agent target context')
+    refute_nil resolve, 'the reusable target-context resolution step is missing'
+    assert_includes resolve, 'TARGET_CHILD_ID: ${{ inputs.target_child_id }}',
+                    'the reusable resolver must consume the forwarded opaque child id'
+    assert_includes caller_body, 'Resolve PR-Agent target context',
+                    'the forwarding comment must name the consuming resolver step'
+  end
+
+  # Delegated PR-Agent repair/merge reads must fail closed without TAP_PAT
+  # and must operate on the resolved target, never the parent execution
+  # repository. The conditional token alone would silently fall back to
+  # github.token and surface as 404/permission errors.
+  def test_pr_agent_delegated_reads_fail_closed_and_use_target
+    repair = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent-repair.yml'))
+    resolve = step_body(repair, 'Resolve PR-Agent target context')
+    validate = step_body(repair, 'Validate PR-Agent target context')
+    convergence = step_body(repair, 'Check durable PR-Agent no-progress state')
+    target = step_body(repair, 'Resolve the writable PR source branch')
+    checkout = step_body(repair, 'Checkout the writable PR source branch')
+    refute_nil resolve, 'the target-context resolution step is missing'
+    refute_nil validate, 'the target-context validation step is missing'
+    refute_nil convergence
+    refute_nil target
+    refute_nil checkout, 'the target checkout step is missing'
+    # The validation must run immediately after resolution and before any
+    # checkout/push/comment so an empty target can never fall back to the
+    # execution repository.
+    resolve_at = repair.index('Resolve PR-Agent target context')
+    validate_at = repair.index('Validate PR-Agent target context')
+    checkout_at = repair.index('Checkout the writable PR source branch')
+    refute_nil resolve_at
+    refute_nil validate_at
+    refute_nil checkout_at
+    assert_operator resolve_at, :<, validate_at,
+                    'target validation must run after target resolution'
+    assert_operator validate_at, :<, checkout_at,
+                    'target validation must run before checkout'
+    assert_includes validate, 'CONTINUUM_PR_AGENT_TARGET_REPOSITORY:?'
+    assert_includes validate, 'CONTINUUM_PR_AGENT_TARGET_OWNER:?'
+    assert_includes validate, 'CONTINUUM_PR_AGENT_TARGET_REPO:?'
+    assert_includes validate, 'PR-Agent target repository identity is invalid'
+    assert_includes validate, 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED'
+    assert_includes validate, 'TAP_PAT: ${{ secrets.TAP_PAT }}'
+    assert_includes validate, 'Delegated PR-Agent execution requires TAP_PAT'
+    assert_includes validate, 'refusing to fall back to github.token'
+    assert_includes checkout, 'repository: ${{ env.CONTINUUM_PR_AGENT_TARGET_REPOSITORY }}',
+                    'checkout must target the validated resolved repository, never the parent by default'
+    [convergence, target].each do |step|
+      assert_includes step, 'github.token'
+      assert_includes step, 'secrets.TAP_PAT'
+      assert_includes step, 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED'
+      assert_includes step, 'TAP_PAT: ${{ secrets.TAP_PAT }}',
+                        'delegated guard needs the PAT value to test emptiness'
+      assert_includes step, 'Delegated PR-Agent execution requires TAP_PAT',
+                        'delegated runs without PAT must fail closed, not fall back to github.token'
+      assert_includes step, 'refusing to fall back to github.token'
+    end
+    assert_includes convergence, 'github.rest.issues.listComments'
+    assert_includes convergence, 'CONTINUUM_PR_AGENT_TARGET_OWNER'
+    assert_includes target, 'repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/pulls/$PR_NUMBER'
+    assert_includes target, '"$HEAD_REPO" != "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY"'
+    refute_includes target, 'repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER',
+                    'PR resolution must read the target, never the parent execution repository'
+
+    [
+      'Mark PR-Agent repair in flight',
+      'Publish durable PR-Agent repair state',
+      'Publish failed PR-Agent repair state'
+    ].each do |name|
+      step = step_body(repair, name)
+      refute_nil step, "#{name} step is missing"
+      assert_includes step, 'CONTINUUM_PR_AGENT_TARGET_OWNER', "#{name}: commit status must target the child"
+      assert_includes step, 'createCommitStatus', "#{name}: commit status must be published"
+      assert_includes step, 'continuum/pr-agent-repair', "#{name}: repair status context must be preserved"
+    end
+
+    merge = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent-auto-merge.yml'))
+    reconcile = step_body(merge, 'Reconcile current PR state and merge only the exact reviewed HEAD')
+    refute_nil reconcile, 'auto-merge reconciliation step is missing'
+    assert_includes reconcile, 'process.env.CONTINUUM_PR_AGENT_TARGET_OWNER'
+    assert_includes reconcile, 'process.env.CONTINUUM_PR_AGENT_TARGET_REPOSITORY'
+    assert_includes reconcile, 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED'
+    assert_includes reconcile, 'pr.head.sha.toLowerCase() !== reviewedHead',
+                    'merge must refuse a moved HEAD'
+    assert_includes reconcile, 'sha: reviewedHead',
+                    'only the exact reviewed SHA may merge'
+    assert_includes merge, 'refusing bare retry to preserve the delegated target',
+                     'delegated wakeups must never retry bare against the parent execution repository'
+    assert_includes merge, 'if (targetChildId)',
+                     'delegated wakeups must still carry the opaque child id while warning best-effort on failure'
+    refute_includes merge, 'skipping bare retry to preserve the delegated target',
+                    'a delegated wakeup must never silently skip the child post-merge chain'
+  end
+
+  # PR-Agent recovery delegated-execution contract: the opaque
+  # `target_child_id` input (or vars.CONTINUUM_PR_AGENT_TARGET_CHILD_ID for
+  # schedule/workflow_run wakeups) is the only delegated selector. Local runs
+  # resolve without CONTINUUM_REF, target reads use the resolved child while
+  # execution-run inspection and dispatch stay in the parent, local dispatches
+  # stay bare, and only the exact HEAD is ever recovered.
+  def test_pr_agent_recovery_target_resolution_and_execution_split
+    base = 'continuum-pr-agent-recovery.yml'
+    workflow = yaml(File.join(ROOT, '.github/workflows', base))
+    stub = yaml(File.join(ROOT, '.github/caller-stubs', base))
+    body = File.read(File.join(ROOT, '.github/workflows', base))
+
+    call_inputs = events(workflow).fetch('workflow_call').fetch('inputs')
+    assert call_inputs.key?('target_child_id'), "#{base}: workflow_call must declare target_child_id"
+    assert_equal '', call_inputs.fetch('target_child_id').fetch('default'), "#{base}: target_child_id must default empty (local)"
+    assert_equal false, call_inputs.fetch('target_child_id').fetch('required'), "#{base}: target_child_id must not gate the call"
+    assert_equal 'string', call_inputs.fetch('target_child_id').fetch('type'), "#{base}: target_child_id must stay a string input"
+
+    dispatch_inputs = events(stub).fetch('workflow_dispatch').fetch('inputs')
+    assert dispatch_inputs.key?('target_child_id'), "#{base}: caller stub must expose target_child_id"
+    assert_equal 'string', dispatch_inputs.fetch('target_child_id').fetch('type'), "#{base}: caller stub target_child_id must stay a string input"
+    assert_equal false, dispatch_inputs.fetch('target_child_id').fetch('required'), "#{base}: caller stub target_child_id must not gate dispatch"
+    assert_equal '${{ inputs.target_child_id }}', stub.fetch('jobs').fetch('call').fetch('with').fetch('target_child_id'),
+                 "#{base}: caller stub must forward the opaque child id verbatim"
+    refute_includes body, 'target_repository:',
+                      "#{base}: concrete repository identity must never be an input"
+
+    # Schedule/pull_request_target/workflow_run carry no dispatch inputs, so
+    # the reusable falls through to the repository variable before local.
+    assert_includes body, 'inputs.target_child_id || vars.CONTINUUM_PR_AGENT_TARGET_CHILD_ID',
+                      "#{base}: schedule/workflow_run wakeups must fall through to the repository variable"
+    assert_includes body, "format('pr-agent-recovery-child-",
+                      "#{base}: concurrency must scope delegated runs by the opaque id"
+    assert_includes body, "format('pr-agent-recovery-",
+                      "#{base}: concurrency must preserve the exact local group when empty"
+
+    resolve = step_body(body, 'Resolve PR-Agent target context')
+    refute_nil resolve, "#{base}: target-context resolution step is missing"
+    assert_includes resolve, 'TARGET_CHILD_ID: ${{ inputs.target_child_id || vars.CONTINUUM_PR_AGENT_TARGET_CHILD_ID }}',
+                      "#{base}: resolution must honour the input-then-variable fallback"
+    local_guard = resolve.index('if [[ -z "${TARGET_CHILD_ID:-}" ]]; then')
+    ref_require = resolve.index('CONTINUUM_REF is required for pinned target resolution')
+    refute_nil local_guard, "#{base}: local fast path is missing"
+    refute_nil ref_require, "#{base}: delegated CONTINUUM_REF requirement is missing"
+    assert_operator local_guard, :<, ref_require,
+                    "#{base}: local runs must exit before CONTINUUM_REF is required"
+      assert_includes resolve, 'CONTINUUM_PR_AGENT_TARGET_REPOSITORY'
+      assert_includes resolve, 'CONTINUUM_PR_AGENT_TARGET_OWNER'
+      assert_includes resolve, 'CONTINUUM_PR_AGENT_TARGET_REPO'
+      assert_includes resolve, 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED'
+      assert_includes resolve, 'PR-Agent target context resolved locally.'
+      assert_includes resolve, 'exit 0'
+      assert_includes resolve, 'contents/.continuum.yml" --jq',
+                        "#{base}: parent config must resolve from the execution repository default branch, not the engine pin"
+      refute_includes resolve, 'contents/.continuum.yml" -f ref="$CONTINUUM_REF"',
+                        "#{base}: the engine pin may not exist in the execution repository"
+
+    reconcile = step_body(body, 'Reconcile PR-Agent latest state')
+    refute_nil reconcile, "#{base}: reconciliation step is missing"
+    assert_includes reconcile, 'const executionOwner = context.repo.owner;',
+                      "#{base}: execution identity must stay the parent repository"
+    assert_includes reconcile, 'const owner = process.env.CONTINUUM_PR_AGENT_TARGET_OWNER;',
+                      "#{base}: target reads must use the resolved child"
+    assert_includes reconcile, 'const repoFullName = process.env.CONTINUUM_PR_AGENT_TARGET_REPOSITORY;',
+                      "#{base}: same-repository filter must use the resolved child"
+    assert_includes reconcile, 'owner: executionOwner',
+                      "#{base}: execution-run inspection must stay in the parent"
+    assert_includes reconcile, 'repo: executionRepo',
+                      "#{base}: execution-run inspection must stay in the parent"
+    assert_includes reconcile, 'client.rest.pulls.list',
+                      "#{base}: open-PR enumeration must go through the guarded read client"
+    assert_includes reconcile, 'client.rest.pulls.get',
+                      "#{base}: PR revalidation must go through the guarded read client"
+    assert_includes reconcile, 'client.rest.actions.listWorkflowRunsForRepo',
+                      "#{base}: exact-HEAD CI evidence must go through the guarded read client"
+    assert_includes reconcile, 'head_sha: head',
+                      "#{base}: CI evidence must be for the exact HEAD only"
+    assert_includes reconcile, 'run.head_sha === head',
+                      "#{base}: CI match must be for the exact HEAD only"
+    assert_includes reconcile, 'pr.head.repo.full_name !== repoFullName',
+                      "#{base}: fork/same-repo filter must compare against the resolved target"
+    assert_includes reconcile, 'const recoveryChildId',
+                      "#{base}: dispatch must read the opaque child selection"
+    assert_includes reconcile, 'if (recoveryChildId)',
+                      "#{base}: local runs must dispatch bare so custom review workflows stay compatible"
+    assert_includes reconcile, 'recoveryInputs.target_child_id = recoveryChildId',
+                      "#{base}: delegated runs must preserve the opaque child selection"
+    assert_includes reconcile, 'dispatchStatus === 422',
+                      "#{base}: delegated input rejection must be detected via HTTP 422"
+    assert_includes reconcile, '/target_child_id/i',
+                      "#{base}: only a 422 naming target_child_id means the review workflow lacks the delegated input; other 422s must rethrow verbatim"
+    refute_includes reconcile, '/input/i.test(dispatchMessage)',
+                      "#{base}: a bare /input/ match misclassifies unrelated input validation as a missing target_child_id input"
+    assert_includes reconcile, 'refusing bare retry to preserve the delegated target',
+                      "#{base}: a review workflow without the target_child_id input must fail closed explicitly"
+    assert_includes reconcile, 'status === 404',
+                      "#{base}: cross-repository target reads surface as 404 under a repository-scoped token, so the PAT read fallback must cover it"
+  end
+
+  # Fail-closed guards around the delegated retry path: the manual checkout
+  # must reject a non-numeric PR number before it reaches the pull/ refspec,
+  # and both shell retry dispatches must detect a 422 unknown-input
+  # rejection naming target_child_id explicitly (mirroring the merge-wakeup
+  # and recovery 422 detection) instead of failing generically.
+  def test_pr_agent_retry_and_checkout_fail_closed_on_delegated_inputs
+    review_body = workflow_body('continuum-pr-agent.yml')
+    checkout = step_body(review_body, 'Checkout the pull request head without exposing delegated repository metadata')
+    refute_nil checkout, 'the manual review checkout step is missing'
+    assert_includes checkout, '^[0-9]+$',
+                    'the checkout must gate PR_NUMBER numerically before the pull/ refspec, mirroring HEAD_SHA validation'
+    assert_includes checkout, 'PR number is malformed',
+                    'a non-numeric PR number must fail closed with an explicit message'
+    assert_includes checkout, 'pull/$PR_NUMBER/head'
+
+    {
+      'continuum-pr-agent.yml' => 'Schedule bounded retry for retryable PR-Agent review failure',
+      'continuum-pr-agent-repair.yml' => 'Schedule bounded retry for retryable PR-Agent repair failure'
+    }.each do |base, step_name|
+      step = step_body(workflow_body(base), step_name)
+      refute_nil step, "#{base}: #{step_name} is missing"
+      assert_includes step, 'dispatch_isolated_retry',
+                      "#{base}: retry dispatch must go through the 422-detecting helper"
+      assert_includes step, '422',
+                      "#{base}: a delegated retry rejected as an unknown input must be detected via HTTP 422"
+      assert_includes step, 'target_child_id',
+                      "#{base}: the 422 detection must name the opaque target_child_id input"
+      assert_includes step, 'refusing bare retry to preserve the delegated target',
+                      "#{base}: a retry workflow without the target_child_id input must fail closed explicitly, never dispatch bare"
+      assert_includes step, 'set +e',
+                      "#{base}: the retry dispatch must disable errexit around the expected 422 failure so the explicit detection runs"
+    end
+  end
+
+  # Delegated conflict-repair dispatch and post-merge wakeup share the
+  # narrow 422 contract: only a 422 naming the opaque target_child_id
+  # input (wakeup additionally accepts GitHub's unexpected/unknown-input
+  # wording) is an input-rejection; any other 422 rethrows verbatim so a
+  # ref or payload validation failure keeps its true remediation path.
+  # The repair reusable must declare the input, otherwise the delegated
+  # dispatch is unreachable.
+  def test_pr_agent_repair_dispatch_and_wakeup_narrow_422
+    repair_inputs = events(yaml(File.join(ROOT, '.github/workflows/continuum-pr-agent-repair.yml')))
+      .fetch('workflow_call').fetch('inputs')
+    assert repair_inputs.key?('target_child_id'),
+           'continuum-pr-agent-repair.yml must declare target_child_id or delegated repair dispatch is unreachable'
+
+    merge = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent-auto-merge.yml'))
+    repair_window = merge[merge.index('async function dispatchConflictRepair')..]
+    assert_includes repair_window, "workflow_id: 'continuum-pr-agent-repair.yml'",
+                    'delegated conflict repair must dispatch the repair reusable'
+    assert_includes repair_window, 'target_child_id: targetChildId',
+                    'delegated conflict repair must forward the opaque child id'
+    assert_includes repair_window, 'isMissingTargetInput',
+                    'delegated conflict-repair dispatch must detect 422 input rejection like recovery/wakeup'
+    assert_includes repair_window, '/target_child_id/i.test(dispatchMessage)',
+                    'conflict-repair 422 detection must name the opaque input explicitly'
+    assert_includes repair_window, 'dispatchStatus === 422',
+                    'conflict-repair input rejection must be gated on HTTP 422'
+    assert_includes repair_window, 'refusing bare retry to preserve the delegated target',
+                    'conflict-repair without the repair input must fail closed explicitly, never dispatch bare'
+    assert_includes repair_window, 'recovery per #224',
+                    'a transient repair dispatch must be reconciled by recovery'
+
+    wakeup_window = merge[merge.index('for (const workflow of postMergeWakeups)')..]
+    assert_includes wakeup_window, '/(target_child_id|unexpected',
+                    'wakeup 422 detection must name the opaque input plus unexpected/unknown-input wording'
+    assert_includes wakeup_window, 'unknown\\s+inputs?',
+                    'wakeup 422 detection must accept unknown-input wording'
+    refute_includes wakeup_window, 'invalid\\s+inputs?',
+                    'wakeup 422 detection must not match generic invalid-inputs messages'
+    refute_includes wakeup_window, 'unrecognized',
+                    'wakeup 422 detection must not match unrecognized-input wording'
+    refute_includes wakeup_window, 'inputs?\\s+not\\s+(accepted',
+                    'wakeup 422 detection must not match inputs-not-accepted wording'
+  end
+
+  # The pr-agent-recovery.yml dogfood entry forwards `target_child_id` to the
+  # reusable recovery workflow: otherwise delegated schedule/workflow_run
+  # wakeups would plumb the opaque id nowhere and reconcile the parent.
+  def test_pr_agent_recovery_dogfood_forwards_target_child_id
+    caller = yaml(File.join(ROOT, '.github/workflows/pr-agent-recovery.yml'))
+    dispatch_inputs = events(caller).fetch('workflow_dispatch').fetch('inputs')
+    assert dispatch_inputs.key?('target_child_id'), 'pr-agent-recovery.yml must expose target_child_id'
+    assert_equal 'string', dispatch_inputs.fetch('target_child_id').fetch('type'),
+                 'pr-agent-recovery.yml target_child_id must stay a string input'
+    assert_equal false, dispatch_inputs.fetch('target_child_id').fetch('required'),
+                 'pr-agent-recovery.yml target_child_id must not gate dispatch'
+    assert_equal '${{ inputs.target_child_id }}',
+                 caller.fetch('jobs').fetch('call').fetch('with').fetch('target_child_id'),
+                 'pr-agent-recovery.yml must forward the opaque child id verbatim'
+
+    reusable_inputs = events(yaml(File.join(ROOT, '.github/workflows/continuum-pr-agent-recovery.yml')))
+      .fetch('workflow_call').fetch('inputs')
+    assert reusable_inputs.key?('target_child_id'),
+           'continuum-pr-agent-recovery.yml must declare target_child_id or the dogfood forward is unreachable'
+  end
+
+  # Repository identity must fail closed on dot-only components (`owner/..`,
+  # `owner/.`): the charset class alone accepts them and they would otherwise
+  # flow into `gh`, `git remote`, and checkout steps as the resolved target.
+  def test_pr_agent_target_identity_rejects_dot_only_components
+    helper = File.read(File.join(ROOT, '.github/scripts/pr_agent_target.sh'))
+    assert_includes helper, 'pr_agent_valid_target_repository',
+                    'target resolution must go through the strict identity validator'
+    assert_includes helper, '^\\.+$',
+                    'the strict validator must reject dot-only owner/repo components'
+
+    %w[
+      continuum-pr-agent.yml
+      continuum-pr-agent-repair.yml
+      continuum-pr-agent-auto-merge.yml
+      continuum-pr-agent-recovery.yml
+    ].each do |base|
+      body = File.read(File.join(ROOT, '.github/workflows', base))
+      assert_includes body, '^\\.+$',
+                      "#{base}: workflow identity guards must reject dot-only components like the helper"
+    end
+
+    runtime = File.read(File.join(ROOT, '.github/scripts/delegation_runtime.py'))
+    assert_includes runtime, '\\.+',
+                    'the delegation resolver must reject dot-only repository components'
+    config = File.read(File.join(ROOT, 'src/continuum/config.py'))
+    assert_includes config, 'strip(".")',
+                    'child parent configuration must reject dot-only repository components'
   end
 
   end
