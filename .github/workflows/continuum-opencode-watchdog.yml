@@ -518,6 +518,9 @@ jobs:
                 repo,
                 issue_number: issueNumber,
                 body: [
+                  '⚡ **Continuum · opencode-watchdog**',
+                  '<!-- continuum-origin role=continuum component=opencode-watchdog -->',
+                  '',
                   'OpenCode automation paused after ' + previousRetries +
                     ' automatic recovery retries.',
                   '',
@@ -546,6 +549,8 @@ jobs:
                 '/oc',
                 '',
                 retryMarker,
+                '⚡ **Continuum · opencode-watchdog**',
+                '<!-- continuum-origin role=continuum component=opencode-watchdog -->',
                 'Automatic recovery retry ' + (previousRetries + 1) +
                   '/' + maxRetries + ' after OpenCode run ' + run.id +
                   ' ended with ' + run.conclusion +

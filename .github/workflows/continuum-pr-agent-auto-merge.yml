@@ -874,6 +874,8 @@ jobs:
                 issue_number: prNumber,
                 body: [
                   attemptMarker,
+                  '⚡ **Continuum · pr-agent-auto-merge**',
+                  '<!-- continuum-origin role=continuum component=pr-agent-auto-merge -->',
                   'Automatic OpenCode conflict repair, attempt 1/1 for HEAD `' +
                     fresh.head.sha + '` (base `' + defaultBranch + '`, reason: ' +
                     reason + '). Scope is merge-conflict resolution only; ' +

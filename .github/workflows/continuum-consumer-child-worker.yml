@@ -163,7 +163,7 @@ jobs:
               break
             fi
             if [[ "$attempt" -eq 3 ]]; then
-              gh issue comment "$TASK_NUMBER" --repo "$child_repo"                 --body "<!-- continuum-child-infra --> Child task #$TASK_NUMBER could not install the agent runtime."                 >/dev/null 2>&1 || true
+              gh issue comment "$TASK_NUMBER" --repo "$child_repo"                 --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-infra -->' '⚡ **Continuum · delegation-worker**' '<!-- continuum-origin role=continuum component=delegation-worker -->' "Child task #$TASK_NUMBER could not install the agent runtime.")"                 >/dev/null 2>&1 || true
               exit 3
             fi
             sleep $((attempt * 5))
@@ -248,12 +248,12 @@ jobs:
           done
 
           if [[ "$accepted" != true ]]; then
-            gh issue comment "$TASK_NUMBER" --repo "$child_repo"               --body "<!-- continuum-child-needs-retry --> Child task #$TASK_NUMBER exhausted this runner cycle without verified acceptance."               >/dev/null 2>&1 || true
+            gh issue comment "$TASK_NUMBER" --repo "$child_repo"               --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-needs-retry -->' '⚡ **Continuum · delegation-worker**' '<!-- continuum-origin role=continuum component=delegation-worker -->' "Child task #$TASK_NUMBER exhausted this runner cycle without verified acceptance.")"               >/dev/null 2>&1 || true
             exit 30
           fi
 
           if git diff --no-ext-diff -- . | grep -Eiq '(github_pat_[A-Za-z0-9_]+|ghp_[A-Za-z0-9]+|rnd_[A-Za-z0-9]+)'; then
-            gh issue comment "$TASK_NUMBER" --repo "$child_repo"               --body "<!-- continuum-child-security --> Child task #$TASK_NUMBER produced token-like material; publication was blocked."               >/dev/null 2>&1 || true
+            gh issue comment "$TASK_NUMBER" --repo "$child_repo"               --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-security -->' '⚡ **Continuum · delegation-worker**' '<!-- continuum-origin role=continuum component=delegation-worker -->' "Child task #$TASK_NUMBER produced token-like material; publication was blocked.")"               >/dev/null 2>&1 || true
             exit 31
           fi
 
@@ -276,5 +276,5 @@ jobs:
           pr_url="$(
             gh pr create --repo "$child_repo" --base main --head "$branch"               --title "$issue_title" --body "$pr_body" 2>/dev/null
           )"
-          gh issue comment "$TASK_NUMBER" --repo "$child_repo"             --body "<!-- continuum-child-pr --> Child task #$TASK_NUMBER produced an accepted implementation PR: $pr_url"             >/dev/null 2>&1 || true
+          gh issue comment "$TASK_NUMBER" --repo "$child_repo"             --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-pr -->' '🦾 **Agent Coder · delegation-worker**' '<!-- continuum-origin role=agent-coder component=delegation-worker -->' "Child task #$TASK_NUMBER produced an accepted implementation PR: $pr_url")"             >/dev/null 2>&1 || true
           echo "SubTask #$TASK_NUMBER produced an implementation PR."
