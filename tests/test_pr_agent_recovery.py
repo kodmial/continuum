@@ -202,6 +202,7 @@ class DurableEvidenceTests(unittest.TestCase):
             evidence=recovery.RetryEvidence(latest_attempt=2),
             marker_newer_than_status=True,
             marker_age_seconds=None,
+            now_epoch=1000,
         )
         self.assertEqual(expired.action, "dispatch")
         self.assertEqual(expired.attempt, 3)
@@ -260,6 +261,7 @@ class RecoveryDecisionTests(unittest.TestCase):
             operation_state="pending",
             run_conclusion="timed_out",
             evidence=recovery.RetryEvidence(latest_attempt=1),
+            now_epoch=1000,
         )
         self.assertEqual(decision.action, "dispatch")
         self.assertEqual(decision.attempt, 2)
@@ -331,6 +333,7 @@ class RecoveryDecisionTests(unittest.TestCase):
             evidence=evidence,
             marker_newer_than_status=True,
             marker_age_seconds=recovery.DISPATCH_GRACE_SECONDS + 1,
+            now_epoch=1000,
         )
         self.assertEqual(decision.action, "dispatch")
         self.assertEqual(decision.attempt, 2)
@@ -556,9 +559,20 @@ class RecoveryDecisionTests(unittest.TestCase):
             operation_description="transient; recovery eligible",
             operation_context="continuum/pr-agent-review",
             evidence=recovery.RetryEvidence(latest_attempt=2),
+            now_epoch=1000,
         )
         self.assertEqual(decision.action, "dispatch")
         self.assertEqual(decision.attempt, 3)
+        clockless = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="transient; recovery eligible",
+            operation_context="continuum/pr-agent-review",
+            evidence=recovery.RetryEvidence(latest_attempt=2),
+            now_epoch=None,
+        )
+        self.assertEqual(clockless.action, "wait")
+        self.assertIsNone(clockless.attempt)
 
     def test_durable_exhausted_marker_holds_future_wakeups(self):
         decision = recovery.decide_recovery(

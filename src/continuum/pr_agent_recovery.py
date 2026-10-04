@@ -749,6 +749,16 @@ def decide_recovery(
         # Return the budget count so callers can persist it in the durable
         # exhaustion marker instead of receiving None with no count.
         return RecoveryDecision("exhaust", budget, "automatic execution budget exhausted")
+    if now_epoch is None and attempt > 0:
+        # Fail closed without a clock: a retry cannot persist a durable
+        # not-before without now, so dispatching it would let the next
+        # watchdog retry immediately and compress the canonical backoff,
+        # burning the bounded budget faster than specified. Defer to a
+        # clocked wakeup instead. Attempt 0 still runs immediately below;
+        # only retries carry backoff.
+        return RecoveryDecision(
+            "wait", None, "retry backoff requires a clock; deferring"
+        )
     return RecoveryDecision(
         "dispatch",
         attempt,

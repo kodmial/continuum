@@ -611,11 +611,16 @@ jobs:
               if (status === 429) return true;
               if (typeof status === 'number' && status >= 500 && status <= 599) return true;
               if (status === 403) {
-                const headers = (err.response && err.response.headers) || err.headers || {};
-                const remaining = headers['x-ratelimit-remaining'] ?? headers['X-RateLimit-Remaining'];
+                const headers = (err && ((err.response && err.response.headers) || err.headers)) || {};
+                const lowered = {};
+                for (const [key, value] of Object.entries(headers)) {
+                  lowered[String(key).toLowerCase()] = value;
+                }
+                if (lowered['retry-after'] !== undefined && String(lowered['retry-after']).trim() !== '') return true;
+                if (lowered['x-ratelimit-reset'] !== undefined && String(lowered['x-ratelimit-reset']).trim() !== '') return true;
+                if (lowered['x-ratelimit-remaining'] !== undefined && String(lowered['x-ratelimit-remaining']).trim() === '0') return true;
                 const message = String(err.message || '');
-                if (String(remaining) === '0') return true;
-                if (/rate limit|rate-limit|ratelimit|quota exhaustion|secondary rate limit/i.test(message)) return true;
+                if (/rate limit|rate-limit|ratelimit|quota exhaustion|secondary rate limit|retry after/i.test(message)) return true;
                 return false;
               }
               // A cancelled/evicted-run error without runner/run phrasing is
@@ -1333,7 +1338,9 @@ jobs:
                 /<!--\s*continuum-pr-agent-retry-exhausted\s+head=([0-9a-f]{40,64})\s+kind=(review|repair)\s+attempts=(\d+)\s*-->/gi,
               ];
               const already = comments.some(comment => {
-                if (!trustedAssociations.has(String(comment.author_association || '').toUpperCase())) {
+                const rawUser = (comment.user && typeof comment.user === 'object') ? comment.user : {};
+                const login = String(rawUser.login || comment.user_login || comment.author || '').trim().toLowerCase();
+                if (!trustedAssociations.has(String(comment.author_association || '').toUpperCase()) && login !== 'github-actions[bot]') {
                   return false;
                 }
                 const body = String(comment.body || '');
