@@ -256,7 +256,8 @@ class WorkflowWiringTests(unittest.TestCase):
             "continuum-pr-agent-no-progress head=' + headSha +",
             self.workflow,
         )
-        self.assertIn(".update(JSON.stringify(canonical))", self.workflow)
+        self.assertIn("const fingerprint = batch.fingerprint;", self.workflow)
+        self.assertIn("policy.buildRepairBatch(review, raw)", self.workflow)
 
     def test_no_upstream_resolution_is_written(self):
         self.assertNotIn("state=RESOLVED", self.workflow)
@@ -282,7 +283,8 @@ class WorkflowWiringTests(unittest.TestCase):
 
     def test_js_same_head_holds_logical_finding(self):
         self.assertIn("sameHeadFindings", self.workflow)
-        self.assertIn("findings=${FINDING_IDS_LOWER_EARLY}", self.workflow)
+        self.assertIn("findings=${FINDING_IDS_LOWER}", self.workflow)
+        self.assertIn("FINDING_IDS: ${{ steps.convergence.outputs.eligible_findings }}", self.workflow)
 
 
 if __name__ == "__main__":

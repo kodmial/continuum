@@ -3494,6 +3494,47 @@ class ContinuumTest < Minitest::Test
     end
   end
 
+  # Initial implementation and later CI repair must share one authoritative
+  # task-context resolver. Without this contract a repair can optimize for a
+  # red CI log while silently violating the original issue/Definition of Done.
+  def test_opencode_issue_and_ci_repair_share_authoritative_task_context
+    body = workflow_body('continuum-opencode.yml')
+
+    resolver = step_body(body, 'Resolve authoritative task context')
+    refute_nil resolver, 'the shared task-context resolver step is missing'
+    assert_includes resolver, 'continuum-task-context'
+    assert_includes resolver, "source = 'canonical-marker'"
+    assert_includes resolver, "source = 'legacy-cross-repo-reference'"
+    assert_includes resolver, "source = 'legacy-same-repo-reference'"
+    assert_includes resolver, "source = 'legacy-branch-identity'"
+    assert_includes resolver, 'github.rest.issues.get',
+                    'resolved task context must fetch the authoritative issue itself'
+    assert_includes resolver, "core.setOutput('task_body'"
+    assert_includes resolver, "core.setOutput('task_title'"
+
+    issue = step_body(body, 'Implement issue')
+    refute_nil issue
+    assert_includes issue, 'TASK_CONTEXT_PRESENT: ${{ steps.task_context.outputs.present }}'
+    assert_includes issue, 'ISSUE_TITLE: ${{ steps.task_context.outputs.task_title }}'
+    assert_includes issue, 'ISSUE_BODY: ${{ steps.task_context.outputs.task_body }}'
+    refute_includes issue, 'ISSUE_JSON="$(gh issue view',
+                    'issue mode must not bypass the shared resolver with a second fetch path'
+    assert_includes issue, 'TASK_MARKER="<!-- continuum-task-context repo=${GITHUB_REPOSITORY} issue=${ISSUE_NUMBER} -->"'
+
+    recover = step_body(body, 'Recover agent-managed issue branch')
+    refute_nil recover
+    assert_includes recover, 'continuum-task-context repo=${GITHUB_REPOSITORY} issue=${ISSUE_NUMBER}',
+                    'recovered task PRs must preserve the same canonical marker'
+
+    repair = step_body(body, 'Fix failed blocking workflow')
+    refute_nil repair
+    assert_includes repair, 'TASK_BODY: ${{ steps.task_context.outputs.task_body }}'
+    assert_includes repair, 'PR_BODY: ${{ steps.task_context.outputs.pr_body }}'
+    assert_includes repair, 'Task specification / Definition of Done:'
+    assert_includes repair, 'treat its specification and Definition of Done as authoritative'
+    assert_includes repair, 'Never weaken, delete, skip, or special-case a validation merely to make CI green.'
+    assert_includes repair, 'No authoritative task issue was resolved for this legacy PR. Do not fabricate one'
+  end
   # A task implementation command must obey the same dependency/DoR gate as
   # the scheduler. Manual /oc is not an escape hatch that may turn a blocked
   # tracking issue into a partial PR.
@@ -4162,7 +4203,7 @@ class ContinuumTest < Minitest::Test
     refute_nil step, 'the `issue` mode step is missing'
 
     assert_includes step, "inputs.mode == 'issue'"
-    assert_includes step, '[[ -n "$ISSUE_NUMBER" ]]'
+    assert_includes step, '[[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]]'
     assert_includes step, 'BRANCH="opencode/issue${ISSUE_NUMBER}-${GITHUB_RUN_ID}"'
     assert_includes step, 'opencode run --auto --model "$OPENCODE_MODEL"'
     assert_includes step, "if [[ \"\$CURRENT_BRANCH\" != \"\$BRANCH\" ]]; then"

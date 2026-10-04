@@ -114,6 +114,21 @@ jobs:
             }
             core.setOutput('stack', 'pr-agent');
 
+      - name: Resolve PR-Agent signal policy
+        id: policy
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          CONTINUUM_REF: ${{ inputs.continuum_ref }}
+        run: |
+          set -euo pipefail
+          POLICY_SCRIPT="$RUNNER_TEMP/pr_agent_policy.js"
+          gh api --method GET \
+            "repos/kodmial/continuum/contents/.github/scripts/pr_agent_policy.js" \
+            -f ref="$CONTINUUM_REF" --jq .content \
+            | tr -d '\n' | base64 --decode > "$POLICY_SCRIPT"
+          node --check "$POLICY_SCRIPT"
+          echo "policy_script=$POLICY_SCRIPT" >> "$GITHUB_OUTPUT"
+
       - name: Evaluate the exact-head PR-Agent gate
         id: gate
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
@@ -123,6 +138,7 @@ jobs:
           REVIEW_JSON: ${{ inputs.review_json }}
           IMPROVE_JSONL: ${{ inputs.improve_jsonl }}
           PERSISTENT_STATE_JSON: ${{ inputs.persistent_state_json }}
+          POLICY_SCRIPT: ${{ steps.policy.outputs.policy_script }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
@@ -140,8 +156,8 @@ jobs:
             //     changes_required block)
             //   - empty current key_issues_to_review (a batch at the findings
             //     cap is potentially truncated and never clean)
-            //   - no qualifying improve code_suggestions
-            //     (suggestions_score_threshold=1)
+            //   - no high-signal improve code_suggestions according to the
+            //     centralized PR-Agent provider policy (threshold 7)
             //   - native persistent review state has no ACTIVE finding
             // Inline presentation (inline_key_issues) never decides the gate:
             // absence of inline comments cannot produce green while summary
@@ -170,21 +186,15 @@ jobs:
               core.setFailed('PR-Agent review has no merge_recommendation (require_merge_recommendation).');
               return;
             }
-            let suggestions = [];
+            const policy = require(process.env.POLICY_SCRIPT);
             const raw = String(process.env.IMPROVE_JSONL || '').trim();
-            if (raw) {
-              for (const line of raw.split('\n')) {
-                if (!line.trim()) continue;
-                const record = JSON.parse(line);
-                const payload = record.payload || record;
-                for (const entry of payload.code_suggestions || []) suggestions.push(entry);
-              }
+            let qualifying;
+            try {
+              qualifying = policy.qualifyingImproveSuggestions(raw);
+            } catch (err) {
+              core.setFailed(err.message);
+              return;
             }
-            const qualifying = suggestions.filter((entry) => {
-              if (entry.score === undefined || entry.score === null) return true;
-              const numeric = Number(entry.score);
-              return Number.isNaN(numeric) ? true : numeric >= 1;
-            });
             const stateRaw = String(process.env.PERSISTENT_STATE_JSON || '').trim();
             if (!stateRaw) {
               core.setFailed('PR-Agent gate requires native persistent finding state for the exact reviewed HEAD.');

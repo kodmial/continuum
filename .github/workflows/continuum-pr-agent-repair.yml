@@ -94,6 +94,21 @@ jobs:
             }
             core.setOutput('stack', 'pr-agent');
 
+      - name: Resolve PR-Agent signal policy
+        id: policy
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          CONTINUUM_REF: ${{ inputs.continuum_ref }}
+        run: |
+          set -euo pipefail
+          POLICY_SCRIPT="$RUNNER_TEMP/pr_agent_policy.js"
+          gh api --method GET \
+            "repos/kodmial/continuum/contents/.github/scripts/pr_agent_policy.js" \
+            -f ref="$CONTINUUM_REF" --jq .content \
+            | tr -d '\n' | base64 --decode > "$POLICY_SCRIPT"
+          node --check "$POLICY_SCRIPT"
+          echo "policy_script=$POLICY_SCRIPT" >> "$GITHUB_OUTPUT"
+
       - name: Build one bounded repair batch from native outputs
         id: batch
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
@@ -102,6 +117,7 @@ jobs:
           HEAD_SHA: ${{ inputs.head_sha }}
           REVIEW_JSON: ${{ inputs.review_json }}
           IMPROVE_JSONL: ${{ inputs.improve_jsonl }}
+          POLICY_SCRIPT: ${{ steps.policy.outputs.policy_script }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
@@ -110,10 +126,10 @@ jobs:
             //   improve: runner-local push_outputs file payload
             //            (pr-agent-outputs/continuum.jsonl payload.code_suggestions)
             // Comment prose is never scraped. Every current review finding and
-            // every qualifying improve suggestion enters ONE bounded OpenCode
-            // pass together, each preserving its native source (review or
-            // improve). The pass never stops after the first finding and never
-            // fans out one agent per finding.
+            // every high-signal improve suggestion enters one bounded OpenCode
+            // pass. Overlap emitted by both upstream tools is conservatively
+            // deduplicated by the centralized provider policy, preferring the
+            // review finding while preserving native source data for diagnostics.
             const prNumber = String(process.env.PR_NUMBER || '').trim();
             const headSha = String(process.env.HEAD_SHA || '').trim();
             if (!prNumber || !headSha) {
@@ -133,72 +149,24 @@ jobs:
               core.setFailed('PR-Agent review JSON has no key_issues_to_review list.');
               return;
             }
-            // Improve suggestions come only from the file channel payload.
-            let suggestions = [];
+            // Centralized Work Lock #37 policy owns the autonomous /improve
+            // threshold, conservative review/improve deduplication, and the
+            // logical fingerprint used by no-progress suppression.
+            const policy = require(process.env.POLICY_SCRIPT);
             const raw = String(process.env.IMPROVE_JSONL || '').trim();
-            if (raw) {
-              for (const line of raw.split('\n')) {
-                if (!line.trim()) continue;
-                let record;
-                try {
-                  record = JSON.parse(line);
-                } catch (err) {
-                  core.setFailed(`Invalid improve push_outputs line: ${err.message}`);
-                  return;
-                }
-                const payload = record.payload || record;
-                for (const entry of payload.code_suggestions || []) {
-                  suggestions.push(entry);
-                }
-              }
-            }
-            // suggestions_score_threshold=1: only a score below 1 is dropped.
-            // A missing score is conservatively qualifying.
-            const qualifying = suggestions.filter((entry) => {
-              const score = entry.score;
-              if (score === undefined || score === null) return true;
-              const numeric = Number(score);
-              if (Number.isNaN(numeric)) return true;
-              return numeric >= 1;
-            });
-            // A batch at the findings cap is potentially truncated: it still
-            // repairs the visible batch and re-reviews, but never declares
-            // the HEAD clean from this batch alone.
-            const truncated = keyIssues.length === 6;
-            const items = [
-              ...keyIssues.map((finding, index) => ({ source: 'review', index, finding })),
-              ...qualifying.map((suggestion, index) => ({ source: 'improve', index, suggestion })),
-            ];
-            if (items.length === 0) {
-              core.setOutput('empty', 'true');
-              core.notice(`PR #${prNumber} HEAD ${headSha}: no current findings; no repair to dispatch.`);
+            let batch;
+            try {
+              batch = policy.buildRepairBatch(review, raw);
+            } catch (err) {
+              core.setFailed(err.message);
               return;
             }
-            // At most one OpenCode repair per review result: the per-head
-            // marker below makes a second dispatch for the same HEAD a no-op,
-            // so a repeated run cannot storm the same HEAD.
+            const items = batch.items;
+            const fingerprint = batch.fingerprint;
+            const truncated = batch.truncated;
+            const qualifyingCount = batch.qualifyingSuggestionCount;
+            const deduplicatedCount = batch.deduplicatedSuggestions;
             const crypto = require('crypto');
-            // #33 compatibility: same-HEAD no-progress identity is the
-            // original full structured batch fingerprint. Do not weaken or
-            // migrate this marker implicitly.
-            const stable = (value) => {
-              if (Array.isArray(value)) return value.map(stable);
-              if (value && typeof value === 'object') {
-                return Object.fromEntries(
-                  Object.keys(value).sort().map(key => [key, stable(value[key])])
-                );
-              }
-              return value;
-            };
-            // Preserve the #33 same-HEAD fingerprint contract verbatim for
-            // existing no-progress markers. Cross-HEAD identity is separate
-            // and per logical finding.
-            const canonical = stable(items).map(entry => JSON.stringify(entry)).sort();
-            const fingerprint = crypto
-              .createHash('sha256')
-              .update(JSON.stringify(canonical))
-              .digest('hex');
-
             const logicalVolatileKeys = new Set([
               'index', 'line', 'line_number', 'start_line', 'end_line',
               'position', 'start_position', 'end_position', 'rank', 'score',
@@ -223,6 +191,11 @@ jobs:
               item,
             }));
             const findingIds = [...new Set(identified.map(entry => entry.id))].sort();
+            if (items.length === 0) {
+              core.setOutput('empty', 'true');
+              core.notice(`PR #${prNumber} HEAD ${headSha}: no current high-signal findings; no repair to dispatch.`);
+              return;
+            }
             core.setOutput('empty', 'false');
             core.setOutput('count', String(items.length));
             core.setOutput('truncated', truncated ? 'true' : 'false');
@@ -230,9 +203,11 @@ jobs:
             core.setOutput('finding_ids', findingIds.join(','));
             core.setOutput('identified_batch', JSON.stringify(identified));
             core.setOutput('batch', JSON.stringify(items));
+            core.setOutput('deduplicated_suggestions', String(deduplicatedCount));
             core.notice(
               `PR #${prNumber} HEAD ${headSha}: batching ${keyIssues.length} review finding(s) ` +
-              `and ${qualifying.length} qualifying suggestion(s) into one bounded repair pass.`
+              `and ${qualifyingCount - deduplicatedCount} unique high-signal improve suggestion(s); ` +
+              `${deduplicatedCount} overlapping suggestion(s) deduplicated.`
             );
 
       - name: Check durable PR-Agent no-progress state
@@ -488,7 +463,7 @@ jobs:
           HEAD_REF: ${{ steps.target.outputs.head_ref }}
           BATCH_JSON: ${{ steps.convergence.outputs.eligible_batch }}
           BATCH_FINGERPRINT: ${{ steps.batch.outputs.fingerprint }}
-          FINDING_IDS: ${{ steps.batch.outputs.finding_ids }}
+          FINDING_IDS: ${{ steps.convergence.outputs.eligible_findings }}
           OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
         run: |
           set -euo pipefail
@@ -541,23 +516,19 @@ jobs:
             git restore --source="$START_HEAD" --worktree --staged -- "${TRACKED_IGNORED[@]}"
           fi
 
-          FINDING_IDS_LOWER_EARLY="${FINDING_IDS,,}"
-          if [[ "$FINDING_IDS_LOWER_EARLY" =~ ^[0-9a-f]{64}(,[0-9a-f]{64})*$ ]]; then
-            NO_PROGRESS_MARKER="<!-- continuum-pr-agent-no-progress head=${HEAD_SHA,,} fingerprint=${BATCH_FINGERPRINT,,} findings=${FINDING_IDS_LOWER_EARLY} -->"
-          else
-            NO_PROGRESS_MARKER="<!-- continuum-pr-agent-no-progress head=${HEAD_SHA,,} fingerprint=${BATCH_FINGERPRINT,,} -->"
-          fi
           if [[ -z "$(git status --porcelain)" ]]; then
-            printf -v BODY '%s\n%s' "$NO_PROGRESS_MARKER" "PR-Agent reported actionable structured findings, but the bounded OpenCode repair produced no code change for this exact HEAD/finding state. Automatic same-state repair is held until the HEAD or structured finding state changes."
-            gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$BODY"
-            echo "No repair diff; recorded durable no-progress state for PR #$PR_NUMBER HEAD $HEAD_SHA."
+            echo "classification=settled" >> "$GITHUB_OUTPUT"
+            echo "no_progress=true" >> "$GITHUB_OUTPUT"
+            echo "no_progress_reason=no-code-change" >> "$GITHUB_OUTPUT"
+            echo "No repair diff; controller state will hold PR #$PR_NUMBER HEAD $HEAD_SHA."
             exit 0
           fi
           git add -A
           if git diff --cached --quiet; then
-            printf -v BODY '%s\n%s' "$NO_PROGRESS_MARKER" "PR-Agent repair staged no effective change for this exact HEAD/finding state. Automatic same-state repair is held until the HEAD or structured finding state changes."
-            gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$BODY"
-            echo "No staged repair diff; recorded durable no-progress state."
+            echo "classification=settled" >> "$GITHUB_OUTPUT"
+            echo "no_progress=true" >> "$GITHUB_OUTPUT"
+            echo "no_progress_reason=no-staged-change" >> "$GITHUB_OUTPUT"
+            echo "No staged repair diff; controller state will hold this exact finding state."
             exit 0
           fi
           # Revalidate immediately before publication so a long repair run can
@@ -594,32 +565,16 @@ jobs:
           FINDING_IDS_LOWER="${FINDING_IDS,,}"
           HEAD_SHA_LOWER="${HEAD_SHA,,}"
           NEW_HEAD_LOWER="${NEW_HEAD,,}"
+          [[ "$HEAD_SHA_LOWER" =~ ^[0-9a-f]{40}$ ]] || { echo "classification=deterministic" >> "$GITHUB_OUTPUT"; echo "::error::Invalid reviewed HEAD."; exit 1; }
+          [[ "$NEW_HEAD_LOWER" =~ ^[0-9a-f]{40}$ ]] || { echo "classification=deterministic" >> "$GITHUB_OUTPUT"; echo "::error::Invalid repair HEAD."; exit 1; }
+          [[ "$FINDING_IDS_LOWER" =~ ^[0-9a-f]{64}(,[0-9a-f]{64})*$ ]] || { echo "classification=deterministic" >> "$GITHUB_OUTPUT"; echo "::error::Invalid eligible finding IDs."; exit 1; }
           if [[ "$HEAD_SHA_LOWER" == "$NEW_HEAD_LOWER" ]]; then
             echo "classification=deterministic" >> "$GITHUB_OUTPUT"
-            echo "::error::Repair produced no new HEAD; refusing self-transition marker."
+            echo "::error::Repair produced no new HEAD; refusing convergence transition."
             exit 1
           fi
-          [[ "$HEAD_SHA_LOWER" =~ ^[0-9a-f]{40}$ ]] || {
-            echo "classification=deterministic" >> "$GITHUB_OUTPUT"
-            echo "::error::HEAD_SHA is missing or invalid; refusing publication."
-            exit 1
-          }
-          [[ "$NEW_HEAD_LOWER" =~ ^[0-9a-f]{40}$ ]] || {
-            echo "classification=deterministic" >> "$GITHUB_OUTPUT"
-            echo "::error::New HEAD is missing or invalid; refusing publication."
-            exit 1
-          }
-          [[ "$FINDING_IDS_LOWER" =~ ^[0-9a-f]{64}(,[0-9a-f]{64})*$ ]] || {
-            echo "classification=deterministic" >> "$GITHUB_OUTPUT"
-            echo "::error::Logical finding IDs are missing or invalid; refusing publication."
-            exit 1
-          }
-          # Persist the workflow-owned transition before moving the branch.
-          # If marker publication fails, no repair commit is pushed. If the
-          # subsequent push fails, the marker targets an unreachable SHA and
-          # therefore cannot block the still-current PR HEAD.
           MARKER="<!-- continuum-pr-agent-convergence from=${HEAD_SHA_LOWER} to=${NEW_HEAD_LOWER} findings=${FINDING_IDS_LOWER} -->"
-          printf -v BODY '%s\n%s' "$MARKER" "PR-Agent bounded repair prepared a workflow-generated HEAD transition. A fresh full review on that exact HEAD will hold only logical findings that survived this repair; materially changed findings and genuine new work remain eligible."
+          printf -v BODY '%s\n%s' "$MARKER" "PR-Agent bounded repair prepared a workflow-generated HEAD transition. A fresh exact-HEAD review will hold surviving logical findings while allowing genuinely new or changed findings."
           gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$BODY"
 
           if ! git push --force-with-lease="refs/heads/$HEAD_REF:$HEAD_SHA" origin "HEAD:refs/heads/$HEAD_REF"; then
@@ -635,7 +590,95 @@ jobs:
             exit 1
           fi
           echo "classification=settled" >> "$GITHUB_OUTPUT"
-          echo "Pushed one bounded repair to refs/heads/$HEAD_REF for PR #$PR_NUMBER ($HEAD_SHA -> $NEW_HEAD)."
+          echo "published=true" >> "$GITHUB_OUTPUT"
+          echo "Pushed one bounded repair to refs/heads/$HEAD_REF for PR #$PR_NUMBER."
+
+      - name: Persist PR-Agent no-progress controller state
+        if: steps.repair_pass.outputs.no_progress == 'true'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          FINGERPRINT: ${{ steps.batch.outputs.fingerprint }}
+          FINDING_IDS: ${{ steps.convergence.outputs.eligible_findings }}
+          REASON: ${{ steps.repair_pass.outputs.no_progress_reason }}
+          POLICY_SCRIPT: ${{ steps.policy.outputs.policy_script }}
+        with:
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            const policy = require(process.env.POLICY_SCRIPT);
+            const prNumber = Number(process.env.PR_NUMBER);
+            const head = String(process.env.HEAD_SHA || '').toLowerCase();
+            const fingerprint = String(process.env.FINGERPRINT || '').toLowerCase();
+            const findingIds = String(process.env.FINDING_IDS || '').toLowerCase();
+            const validFindingIds = /^[0-9a-f]{64}(,[0-9a-f]{64})*$/.test(findingIds);
+            const stateMarker =
+              '<!-- continuum-pr-agent-no-progress head=' + head +
+              ' fingerprint=' + fingerprint +
+              (validFindingIds ? ' findings=' + findingIds : '') + ' -->';
+            const summary =
+              'No progress for exact HEAD ' + head +
+              ' (' + String(process.env.REASON || 'no-effective-change') +
+              '); automatic same-state repair is held until the HEAD or logical finding state changes.';
+            const body = policy.controllerStateBody(stateMarker, summary);
+            const comments = await github.paginate(
+              github.rest.issues.listComments,
+              { owner: context.repo.owner, repo: context.repo.repo, issue_number: prNumber, per_page: 100 }
+            );
+            const controller = comments
+              .filter(comment => String(comment.body || '').includes(policy.CONTROLLER_STATE_MARKER))
+              .sort((a, b) => Number(a.id) - Number(b.id));
+            const latest = controller.at(-1);
+            if (latest) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: latest.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body,
+              });
+            }
+            for (const stale of controller.slice(0, -1)) {
+              await github.rest.issues.deleteComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: stale.id,
+              });
+            }
+
+      - name: Clear settled PR-Agent controller state after repair publication
+        if: steps.repair_pass.outputs.published == 'true'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+          POLICY_SCRIPT: ${{ steps.policy.outputs.policy_script }}
+        with:
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            const policy = require(process.env.POLICY_SCRIPT);
+            const comments = await github.paginate(
+              github.rest.issues.listComments,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: Number(process.env.PR_NUMBER),
+                per_page: 100,
+              }
+            );
+            for (const comment of comments) {
+              if (!String(comment.body || '').includes(policy.CONTROLLER_STATE_MARKER)) continue;
+              await github.rest.issues.deleteComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: comment.id,
+              });
+            }
 
       - name: Publish durable PR-Agent repair state
         if: steps.repair_status.outcome == 'success' && steps.repair_pass.outcome == 'success'
@@ -681,11 +724,75 @@ jobs:
                 context.repo.repo + '/actions/runs/' + context.runId,
             });
 
+      - name: Update persistent PR-Agent repair retry controller state
+        if: >-
+          always() &&
+          steps.batch.outputs.empty != 'true' &&
+          steps.convergence.outcome == 'success' && steps.convergence.outputs.held != 'true' &&
+          failure() &&
+          (steps.install_opencode.outcome == 'failure' ||
+           (steps.repair_pass.outcome == 'failure' &&
+            steps.repair_pass.outputs.classification == 'transient'))
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          RETRY_ATTEMPT: ${{ inputs.retry_attempt || '0' }}
+          POLICY_SCRIPT: ${{ steps.policy.outputs.policy_script }}
+        with:
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            const policy = require(process.env.POLICY_SCRIPT);
+            const prNumber = Number(process.env.PR_NUMBER);
+            const head = String(process.env.HEAD_SHA || '').toLowerCase();
+            const attempt = Number(process.env.RETRY_ATTEMPT || '0');
+            const exhausted = Number.isInteger(attempt) && attempt >= 2;
+            const next = Number.isInteger(attempt) ? attempt + 1 : 1;
+            const stateMarker = exhausted
+              ? '<!-- continuum-pr-agent-retry-exhausted head=' + head +
+                ' kind=repair attempts=' + next + ' -->'
+              : '<!-- continuum-pr-agent-retry head=' + head +
+                ' kind=repair attempt=' + next + ' -->';
+            const summary = exhausted
+              ? 'Retry budget exhausted for repair on exact HEAD ' + head + '.'
+              : 'Transient repair failure; bounded retry ' + next + '/3 is scheduled for exact HEAD ' + head + '.';
+            const body = policy.controllerStateBody(stateMarker, summary);
+            const comments = await github.paginate(
+              github.rest.issues.listComments,
+              { owner: context.repo.owner, repo: context.repo.repo, issue_number: prNumber, per_page: 100 }
+            );
+            const controller = comments
+              .filter(comment => String(comment.body || '').includes(policy.CONTROLLER_STATE_MARKER))
+              .sort((a, b) => Number(a.id) - Number(b.id));
+            const latest = controller.at(-1);
+            if (latest) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: latest.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body,
+              });
+            }
+            for (const stale of controller.slice(0, -1)) {
+              await github.rest.issues.deleteComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: stale.id,
+              });
+            }
+
       - name: Schedule bounded retry for retryable PR-Agent repair failure
         if: >-
           always() &&
           steps.batch.outputs.empty != 'true' &&
-          steps.convergence.outputs.held != 'true' &&
+          steps.convergence.outcome == 'success' && steps.convergence.outputs.held != 'true' &&
           failure() &&
           (steps.install_opencode.outcome == 'failure' ||
            (steps.repair_pass.outcome == 'failure' &&
@@ -716,18 +823,12 @@ jobs:
           fi
 
           if (( attempt >= 2 )); then
-            MARKER="<!-- continuum-pr-agent-retry-exhausted head=${HEAD_SHA,,} kind=repair attempts=$((attempt + 1)) -->"
-            printf -v BODY '%s\n%s' "$MARKER" "PR-Agent repair exhausted the bounded retry budget for this exact HEAD. A changed HEAD/finding state or explicit owner /review starts a fresh evaluation."
-            gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$BODY"
             echo "Repair retry budget exhausted for PR #$PR_NUMBER HEAD $HEAD_SHA."
             exit 0
           fi
 
           next=$((attempt + 1))
           delay=$((15 * (1 << attempt)))
-          MARKER="<!-- continuum-pr-agent-retry head=${HEAD_SHA,,} kind=repair attempt=$next -->"
-          printf -v BODY '%s\n%s' "$MARKER" "Retrying a transient PR-Agent repair/runtime failure through a fresh exact-HEAD review (attempt $next/3, backoff ${delay}s)."
-          gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$BODY"
           sleep "$delay"
 
           if ! current="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid,state,isDraft --jq '[.headRefOid,.state,(.isDraft|tostring)]|@tsv')"; then

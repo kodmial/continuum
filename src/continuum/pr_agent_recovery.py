@@ -123,7 +123,7 @@ def retry_evidence(
         if association not in TRUSTED_ASSOCIATIONS:
             continue
         body = str(comment.get("body") or "")
-        created_at = _parse_time(comment.get("created_at") or comment.get("updated_at"))
+        created_at = _parse_time(comment.get("updated_at") or comment.get("created_at"))
 
         for match in _RETRY_RE.finditer(body):
             marker_head, marker_kind, attempt_text = match.groups()

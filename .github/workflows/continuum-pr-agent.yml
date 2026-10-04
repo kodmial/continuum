@@ -431,6 +431,7 @@ jobs:
           set -euo pipefail
           RUNTIME_ROOT="$RUNNER_TEMP/continuum-pr-agent-runtime"
           BRIDGE_SCRIPT="$RUNTIME_ROOT/.github/scripts/pr_agent_bridge.py"
+          POLICY_SCRIPT="$RUNTIME_ROOT/.github/scripts/pr_agent_policy.js"
           mkdir -p "$RUNTIME_ROOT/.github/scripts" "$RUNTIME_ROOT/src/continuum"
           gh api --method GET \
             "repos/kodmial/continuum/contents/.github/scripts/pr_agent_bridge.py" \
@@ -440,10 +441,16 @@ jobs:
             "repos/kodmial/continuum/contents/src/continuum/pr_agent.py" \
             -f ref="$CONTINUUM_REF" --jq .content \
             | tr -d '\n' | base64 --decode > "$RUNTIME_ROOT/src/continuum/pr_agent.py"
+          gh api --method GET \
+            "repos/kodmial/continuum/contents/.github/scripts/pr_agent_policy.js" \
+            -f ref="$CONTINUUM_REF" --jq .content \
+            | tr -d '\n' | base64 --decode > "$POLICY_SCRIPT"
           : > "$RUNTIME_ROOT/src/continuum/__init__.py"
           PYTHONPATH="$RUNTIME_ROOT/src" python3 -m py_compile \
             "$BRIDGE_SCRIPT" "$RUNTIME_ROOT/src/continuum/pr_agent.py"
+          node --check "$POLICY_SCRIPT"
           echo "bridge_script=$BRIDGE_SCRIPT" >> "$GITHUB_OUTPUT"
+          echo "policy_script=$POLICY_SCRIPT" >> "$GITHUB_OUTPUT"
 
       - name: Start the OpenAI-compatibility bridge on loopback
         id: start_bridge
@@ -528,6 +535,7 @@ jobs:
           GITHUB_ACTION_CONFIG__HANDLE_PUSH_TRIGGER: 'false'
           GITHUB_ACTION_CONFIG__PUSH_TRIGGER_IGNORE_BOT_COMMITS: 'true'
           PR_REVIEWER__PERSISTENT_COMMENT: 'true'
+          PR_REVIEWER__FINAL_UPDATE_MESSAGE: 'false'
           PR_REVIEWER__PERSISTENT_FINDING_STATE: 'true'
           PR_REVIEWER__INLINE_KEY_ISSUES: 'true'
           PR_REVIEWER__ENABLE_LARGE_PR_CHUNKING: 'true'
@@ -541,8 +549,7 @@ jobs:
           PR_REVIEWER__NUM_MAX_FINDINGS: '6'
           PR_CODE_SUGGESTIONS__FOCUS_ONLY_ON_PROBLEMS: 'true'
           PR_CODE_SUGGESTIONS__PERSISTENT_COMMENT: 'true'
-          PR_CODE_SUGGESTIONS__PUBLISH_OUTPUT_NO_SUGGESTIONS: 'true'
-          PR_CODE_SUGGESTIONS__SUGGESTIONS_SCORE_THRESHOLD: '1'
+          PR_CODE_SUGGESTIONS__PUBLISH_OUTPUT_NO_SUGGESTIONS: 'false'
           PR_CODE_SUGGESTIONS__MAX_SUGGESTIONS_PER_FILE: '0'
           PR_CODE_SUGGESTIONS__MAX_NUMBER_OF_CALLS: '3'
           PR_CODE_SUGGESTIONS__ENABLE_SUGGESTIONS_COVERAGE_FOOTER: 'true'
@@ -551,8 +558,11 @@ jobs:
           PUSH_OUTPUTS__FILE_PATH: 'pr-agent-outputs/continuum.jsonl'
           PR_URL: https://github.com/${{ github.repository }}/pull/${{ steps.stack.outputs.pr_number }}
           REVIEWED_SHA: ${{ steps.before.outputs.sha }}
+          POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
         run: |
           set -euo pipefail
+          IMPROVE_REPAIR_THRESHOLD="$(node -e 'const p=require(process.env.POLICY_SCRIPT); process.stdout.write(String(p.IMPROVE_REPAIR_THRESHOLD));')"
+          [[ "$IMPROVE_REPAIR_THRESHOLD" =~ ^[0-9]+$ ]] || { echo "::error::Invalid centralized PR-Agent improve threshold."; exit 1; }
           mkdir -p pr-agent-outputs
           : > pr-agent-outputs/continuum.jsonl
           # The authoritative re-review is CI-gated by this controller: after
@@ -574,6 +584,7 @@ jobs:
             --config.propagate_tool_errors=true \
             --config.persistent_inline_comments=true \
             --pr_reviewer.persistent_finding_state=true \
+            --pr_reviewer.final_update_message=false \
             --pr_reviewer.inline_key_issues=true \
             --pr_reviewer.require_merge_recommendation=true \
             --pr_reviewer.require_ticket_analysis_review=true \
@@ -583,7 +594,8 @@ jobs:
           pr-agent --pr_url "$PR_URL" improve \
             --config.propagate_tool_errors=true \
             --pr_code_suggestions.focus_only_on_problems=true \
-            --pr_code_suggestions.suggestions_score_threshold=1 \
+            --pr_code_suggestions.publish_output_no_suggestions=false \
+            --pr_code_suggestions.suggestions_score_threshold="$IMPROVE_REPAIR_THRESHOLD" \
             --github.publish_as_check_run=false
           # Canonical machine source: the structured review JSON is exported
           # as the step output `review` (steps.pragent.outputs.review) for
@@ -594,6 +606,7 @@ jobs:
             echo '{"payload": {"code_suggestions": []}}' > pr-agent-outputs/continuum.jsonl
           fi
           echo "review_head=$REVIEWED_SHA" >> "$GITHUB_OUTPUT"
+          echo "improve_repair_threshold=$IMPROVE_REPAIR_THRESHOLD" >> "$GITHUB_OUTPUT"
           # Persist the push_outputs file payload for the repair workflow.
           # The improve payload is consumed only from this runner-local file
           # channel, never by scraping comments.
@@ -658,6 +671,58 @@ jobs:
             }
             core.setOutput('head_sha', currentSha);
             core.notice(`Native PR-Agent review output for ${reviewedSha} is current and machine-readable.`);
+
+      - name: Normalize persistent improve presentation
+        if: >-
+          steps.result.outcome == 'success' &&
+          steps.result.outputs.head_sha
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
+          POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
+          IMPROVE_JSONL: ${{ steps.improve_output.outputs.improve_jsonl }}
+        with:
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            const policy = require(process.env.POLICY_SCRIPT);
+            const prNumber = Number(process.env.PR_NUMBER);
+            const qualifying = policy.qualifyingImproveSuggestions(
+              String(process.env.IMPROVE_JSONL || '')
+            );
+            const comments = await github.paginate(
+              github.rest.issues.listComments,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                per_page: 100,
+              }
+            );
+            const improveComments = comments
+              .filter(comment => String(comment.body || '').includes('<!-- pr-agent:improve:'))
+              .sort((a, b) => Number(a.id) - Number(b.id));
+            if (qualifying.length === 0) {
+              for (const comment of improveComments) {
+                await github.rest.issues.deleteComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: comment.id,
+                });
+              }
+              core.notice('No high-signal /improve suggestions; stale improve presentation removed.');
+            } else {
+              for (const comment of improveComments.slice(0, -1)) {
+                await github.rest.issues.deleteComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: comment.id,
+                });
+              }
+              core.notice(
+                'Kept one persistent /improve comment for ' +
+                qualifying.length + ' high-signal suggestion(s).'
+              );
+            }
 
       - name: Export native persistent finding state for the reviewed HEAD
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
@@ -759,25 +824,19 @@ jobs:
         env:
           REVIEW_JSON: ${{ steps.pragent.outputs.review }}
           IMPROVE_JSONL: ${{ steps.improve_output.outputs.improve_jsonl }}
+          POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
+            const policy = require(process.env.POLICY_SCRIPT);
             const review = JSON.parse(String(process.env.REVIEW_JSON || ''));
-            const keyIssues = Array.isArray(review.key_issues_to_review)
-              ? review.key_issues_to_review
+            const inner = review.review || review;
+            const keyIssues = Array.isArray(inner.key_issues_to_review)
+              ? inner.key_issues_to_review
               : [];
-            const suggestions = [];
-            for (const line of String(process.env.IMPROVE_JSONL || '').split('\n')) {
-              if (!line.trim()) continue;
-              const record = JSON.parse(line);
-              const payload = record.payload || record;
-              for (const entry of payload.code_suggestions || []) {
-                const score = entry?.score;
-                if (score === undefined || score === null || Number.isNaN(Number(score)) || Number(score) >= 1) {
-                  suggestions.push(entry);
-                }
-              }
-            }
+            const suggestions = policy.qualifyingImproveSuggestions(
+              String(process.env.IMPROVE_JSONL || '')
+            );
             const needsRepair = keyIssues.length > 0 || suggestions.length > 0;
             core.setOutput('needs_repair', needsRepair ? 'true' : 'false');
             core.setOutput('review_findings', String(keyIssues.length));
@@ -787,6 +846,34 @@ jobs:
                 ? `Routing ${keyIssues.length} review finding(s) and ${suggestions.length} improve suggestion(s) to PR-Agent repair.`
                 : 'No current actionable review/improve items; routing this exact HEAD to the PR-Agent merge gate.'
             );
+
+      - name: Clear settled PR-Agent controller state
+        if: steps.route.outcome == 'success' && steps.route.outputs.needs_repair == 'false'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
+          POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
+        with:
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            const policy = require(process.env.POLICY_SCRIPT);
+            const comments = await github.paginate(
+              github.rest.issues.listComments,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: Number(process.env.PR_NUMBER),
+                per_page: 100,
+              }
+            );
+            for (const comment of comments) {
+              if (!String(comment.body || '').includes(policy.CONTROLLER_STATE_MARKER)) continue;
+              await github.rest.issues.deleteComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: comment.id,
+              });
+            }
 
       - name: Publish durable PR-Agent review state
         if: steps.route.outcome == 'success' && steps.result.outputs.head_sha
@@ -878,6 +965,75 @@ jobs:
           pkill -f "continuum-pr-agent-bridge.p[y]" || true
           pkill -f "pr_agent_bridge.p[y]" || true
 
+      - name: Update persistent PR-Agent retry controller state
+        if: >-
+          always() &&
+          steps.stack.outputs.enabled == 'true' &&
+          steps.admit.outputs.admitted == 'true' &&
+          failure() &&
+          (steps.install_pragent.outcome == 'failure' ||
+           steps.install_opencode.outcome == 'failure' ||
+           steps.start_opencode.outcome == 'failure' ||
+           steps.runtime.outcome == 'failure' ||
+           steps.start_bridge.outcome == 'failure' ||
+           steps.pragent.outcome == 'failure')
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.admit.outputs.head_sha }}
+          RETRY_ATTEMPT: ${{ steps.stack.outputs.retry_attempt }}
+          RECOVERY_KIND: ${{ steps.stack.outputs.recovery_kind }}
+          POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
+        with:
+          github-token: ${{ secrets.TAP_PAT }}
+          script: |
+            const policy = require(process.env.POLICY_SCRIPT);
+            const prNumber = Number(process.env.PR_NUMBER);
+            const head = String(process.env.HEAD_SHA || '').toLowerCase();
+            const kind = String(process.env.RECOVERY_KIND || 'review').toLowerCase();
+            const attempt = Number(process.env.RETRY_ATTEMPT || '0');
+            const exhausted = Number.isInteger(attempt) && attempt >= 2;
+            const next = Number.isInteger(attempt) ? attempt + 1 : 1;
+            const stateMarker = exhausted
+              ? '<!-- continuum-pr-agent-retry-exhausted head=' + head +
+                ' kind=' + kind + ' attempts=' + next + ' -->'
+              : '<!-- continuum-pr-agent-retry head=' + head +
+                ' kind=' + kind + ' attempt=' + next + ' -->';
+            const summary = exhausted
+              ? 'Retry budget exhausted for ' + kind + ' on exact HEAD ' + head + '.'
+              : 'Transient ' + kind + ' failure; bounded retry ' + next + '/3 is scheduled for exact HEAD ' + head + '.';
+            const body = policy.controllerStateBody(stateMarker, summary);
+            const comments = await github.paginate(
+              github.rest.issues.listComments,
+              { owner: context.repo.owner, repo: context.repo.repo, issue_number: prNumber, per_page: 100 }
+            );
+            const controller = comments
+              .filter(comment => String(comment.body || '').includes(policy.CONTROLLER_STATE_MARKER))
+              .sort((a, b) => Number(a.id) - Number(b.id));
+            const latest = controller.at(-1);
+            if (latest) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: latest.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body,
+              });
+            }
+            for (const stale of controller.slice(0, -1)) {
+              await github.rest.issues.deleteComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: stale.id,
+              });
+            }
+
       - name: Schedule bounded retry for retryable PR-Agent review failure
         if: >-
           always() &&
@@ -910,18 +1066,12 @@ jobs:
               ;;
           esac
           if (( attempt >= 2 )); then
-            MARKER="<!-- continuum-pr-agent-retry-exhausted head=${HEAD_SHA,,} kind=${CURRENT_RECOVERY_KIND:-review} attempts=$((attempt + 1)) -->"
-            printf -v BODY '%s\n%s' "$MARKER" "PR-Agent ${CURRENT_RECOVERY_KIND:-review} recovery exhausted the bounded retry budget for this exact HEAD. A new HEAD or an explicit owner /review starts a fresh evaluation."
-            gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$BODY"
             echo "Retry budget exhausted for PR #$PR_NUMBER HEAD $HEAD_SHA."
             exit 0
           fi
 
           next=$((attempt + 1))
           delay=$((15 * (1 << attempt)))
-          MARKER="<!-- continuum-pr-agent-retry head=${HEAD_SHA,,} kind=${CURRENT_RECOVERY_KIND:-review} attempt=$next -->"
-          printf -v BODY '%s\n%s' "$MARKER" "Retrying a transient PR-Agent ${CURRENT_RECOVERY_KIND:-review} recovery/runtime failure for this exact HEAD (attempt $next/3, backoff ${delay}s)."
-          gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$BODY"
           sleep "$delay"
 
           if ! current="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid,state,isDraft --jq '[.headRefOid,.state,(.isDraft|tostring)]|@tsv')"; then

@@ -58,6 +58,23 @@ class DurableEvidenceTests(unittest.TestCase):
         self.assertEqual(evidence.latest_attempt, 2)
         self.assertFalse(evidence.exhausted)
 
+    def test_edited_controller_marker_uses_updated_timestamp(self):
+        old = datetime.now(timezone.utc) - timedelta(minutes=10)
+        fresh = datetime.now(timezone.utc)
+        comments = [{
+            "body": (
+                "<!-- continuum-pr-agent-controller-state:v1 -->\n"
+                f"<!-- continuum-pr-agent-retry head={HEAD} kind=review attempt=1 -->"
+            ),
+            "author_association": "OWNER",
+            "created_at": old.isoformat(),
+            "updated_at": fresh.isoformat(),
+        }]
+        evidence = recovery.retry_evidence(comments, head_sha=HEAD, kind="review")
+        self.assertEqual(evidence.latest_attempt, 1)
+        self.assertIsNotNone(evidence.latest_marker_at)
+        self.assertLess(abs((evidence.latest_marker_at - fresh).total_seconds()), 1)
+
     def test_external_comment_cannot_forge_retry_budget(self):
         comments = [
             comment(
@@ -274,8 +291,8 @@ class RecoveryWiringTests(unittest.TestCase):
         body = self.read(".github/workflows/continuum-pr-agent-recovery.yml")
         self.assertIn("READ_GITHUB_TOKEN: ${{ github.token }}", body)
         self.assertIn("github-token: ${{ secrets.TAP_PAT }}", body)
-        self.assertIn("const { getOctokit } = require('@actions/github')", body)
-        self.assertIn("const readGithub = readToken ? getOctokit(readToken) : github", body)
+        self.assertNotIn("require('@actions/github')", body)
+        self.assertIn("new github.constructor({ auth: readToken })", body)
         self.assertIn("using PAT client for PR-Agent recovery reads", body)
         self.assertIn("let readTokenUnavailable = false", body)
         self.assertIn("async function withReadFallback(fn)", body)
@@ -296,14 +313,15 @@ class RecoveryWiringTests(unittest.TestCase):
             with self.subTest(read_call=read_call):
                 self.assertIn(read_call, body)
 
-        # One helper definition plus nine guarded read sites. This prevents a
-        # future direct repository-token read from bypassing the liveness fallback.
-        self.assertEqual(body.count("withReadFallback("), 10)
+        # One helper definition plus ten guarded read sites. Controller-state
+        # upsert also reads comments through the repository-scoped token.
+        self.assertEqual(body.count("withReadFallback("), 11)
 
         # Item 1 keeps all mutation/dispatch calls on the PAT-authenticated
         # action client, preserving actor and event fan-out semantics.
         for mutation in (
             "github.rest.issues.createComment",
+            "github.rest.issues.updateComment",
             "github.rest.issues.deleteComment",
             "github.rest.actions.createWorkflowDispatch",
         ):
@@ -313,9 +331,18 @@ class RecoveryWiringTests(unittest.TestCase):
         self.assertNotIn("github.paginate(", body)
         self.assertNotRegex(
             body,
-            r"github\.rest\.(?!issues\.createComment\b|issues\.deleteComment\b|actions\.createWorkflowDispatch\b)",
+            r"github\.rest\.(?!issues\.createComment\b|issues\.updateComment\b|issues\.deleteComment\b|actions\.createWorkflowDispatch\b)",
             "PAT client must only be used for mutations/dispatch",
         )
+
+    def test_recovery_coalesces_retry_state_into_one_controller_comment(self):
+        body = self.read(".github/workflows/continuum-pr-agent-recovery.yml")
+        self.assertIn("continuum-pr-agent-controller-state:v1", body)
+        self.assertIn("async function upsertControllerState", body)
+        self.assertIn("github.rest.issues.updateComment", body)
+        self.assertIn("controller.slice(0, -1)", body)
+        self.assertIn("rollbackControllerState", body)
+        self.assertIn("comment.updated_at || comment.created_at", body)
 
     def test_recovered_review_uses_ci_workflow_not_combined_status(self):
         review = self.read(".github/workflows/continuum-pr-agent.yml")
