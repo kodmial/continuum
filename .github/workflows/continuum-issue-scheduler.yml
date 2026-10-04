@@ -225,10 +225,17 @@ concurrency:
 
 jobs:
   wake_parent:
-    # Child repositories never schedule work locally. Event-driven caller runs
-    # only verify the bidirectional relationship and wake the parent's public
-    # scheduler; the caller keeps child cron events skipped to avoid consuming
-    # private child runner minutes as a polling mechanism.
+    # Best-effort acceleration only (kodmial/continuum#261), retained for
+    # already-installed child callers that still forward issue events. It is
+    # never required for eventual dispatch: the public parent's scheduled
+    # reconciler below independently discovers verified child repositories
+    # and their open eligible tasks, so a failed or missing wake-up — for
+    # example a private child with zero Actions minutes that cannot start
+    # this job at all — cannot strand work and needs no manual rerun.
+    # New caller stubs skip child events at the caller level and never reach
+    # this job, allocating zero private child runner minutes. Duplicate wakes
+    # coalesce per issue via the concurrency group; the parent dispatch is
+    # idempotent and cron stays the missed-event backstop.
     # The gate reads inputs.caller_event_name (not github.event_name, which is
     # always workflow_call inside a called workflow) and groups by
     # inputs.caller_issue_number (not github.event.issue, which is empty in a
@@ -489,6 +496,13 @@ jobs:
   schedule:
     # Repository role is the routing authority. A child keeps this workflow
     # installed, but local automatic scheduling is fail-safe disabled.
+    # The parent scheduled reconciler is authoritative for delegated work
+    # (kodmial/continuum#261): child task discovery, dependency checks,
+    # priority ordering, WIP accounting and dispatch all happen here, in the
+    # public parent, without any successful Actions job in the child
+    # repository. A new eligible child issue is therefore dispatched by cron
+    # reconciliation alone; no child wake-up, workflow_dispatch, comment,
+    # label toggle or human rerun is ever required.
     if: vars.CONTINUUM_ROLE != 'child'
     runs-on: ubuntu-latest
     timeout-minutes: ${{ fromJSON(vars.AUTOMATION_SCHEDULER_TIMEOUT_MINUTES || '5') }}
