@@ -20,6 +20,11 @@ on:
         type: string
         default: ''
         required: false
+      target_child_id:
+        description: Opaque verified child id for delegated execution. Empty targets the caller repository.
+        type: string
+        default: ''
+        required: false
       head_sha:
         description: Exact HEAD SHA the review evaluated.
         type: string
@@ -70,7 +75,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: pr-agent-merge-${{ inputs.pr_number || github.run_id }}
+  group: ${{ inputs.target_child_id && format('pr-agent-merge-child-{0}-{1}', inputs.target_child_id, inputs.pr_number || github.run_id) || format('pr-agent-merge-{0}', inputs.pr_number || github.run_id) }}
   cancel-in-progress: false
 
 jobs:
@@ -114,6 +119,77 @@ jobs:
             }
             core.setOutput('stack', 'pr-agent');
 
+      - name: Resolve PR-Agent target context
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          TARGET_CHILD_ID: ${{ inputs.target_child_id }}
+          CONTINUUM_REF: ${{ inputs.continuum_ref }}
+        run: |
+          set -euo pipefail
+          continuum_b64_decode() {
+            if printf '' | base64 --decode >/dev/null 2>&1; then
+              base64 --decode
+            elif printf '' | base64 -d >/dev/null 2>&1; then
+              base64 -d
+            elif printf '' | base64 -D >/dev/null 2>&1; then
+              base64 -D
+            elif command -v python3 >/dev/null 2>&1; then
+              python3 -c 'import sys,base64; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))'
+            else
+              openssl base64 -d
+            fi
+          }
+          CONTINUUM_SOURCE_REPO="${GITHUB_WORKFLOW_REF:-}"
+          CONTINUUM_SOURCE_REPO="${CONTINUUM_SOURCE_REPO%%/.github/workflows/*}"
+          if ! [[ "$CONTINUUM_SOURCE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || [[ "${CONTINUUM_SOURCE_REPO%%/*}" =~ ^\.+$ ]] || [[ "${CONTINUUM_SOURCE_REPO#*/}" =~ ^\.+$ ]]; then
+            CONTINUUM_SOURCE_REPO="kodmial/continuum"
+          fi
+          if [[ -z "${TARGET_CHILD_ID:-}" ]]; then
+            # Local fast path: no delegated resolver is needed and
+            # CONTINUUM_REF is not required for local-only merge.
+            if ! [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || [[ "${GITHUB_REPOSITORY%%/*}" =~ ^\.+$ ]] || [[ "${GITHUB_REPOSITORY#*/}" =~ ^\.+$ ]]; then
+              echo "::error::PR-Agent target repository identity is invalid."
+              exit 2
+            fi
+            {
+              printf 'CONTINUUM_PR_AGENT_TARGET_REPOSITORY=%s\n' "$GITHUB_REPOSITORY"
+              printf 'CONTINUUM_PR_AGENT_TARGET_OWNER=%s\n' "${GITHUB_REPOSITORY%%/*}"
+              printf 'CONTINUUM_PR_AGENT_TARGET_REPO=%s\n' "${GITHUB_REPOSITORY#*/}"
+              printf 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED=%s\n' "false"
+            } >> "$GITHUB_ENV"
+            echo "PR-Agent target context resolved locally."
+            exit 0
+          fi
+          : "${CONTINUUM_REF:?CONTINUUM_REF is required for pinned target resolution}"
+          RUNTIME_ROOT="$RUNNER_TEMP/continuum-pr-agent-target-runtime"
+          mkdir -p "$RUNTIME_ROOT/.github/scripts"
+          fetch_runtime_file() {
+            local path="$1" dest="$2"
+            if ! gh api --method GET "repos/$CONTINUUM_SOURCE_REPO/contents/$path" -f ref="$CONTINUUM_REF" --jq .content 2>/dev/null \
+              | tr -d '\n' | continuum_b64_decode > "$dest" 2>/dev/null; then
+              echo "::error::Unable to load the Continuum PR-Agent target resolver."
+              exit 1
+            fi
+            if [[ ! -s "$dest" ]]; then
+              echo "::error::Unable to load the Continuum PR-Agent target resolver."
+              exit 1
+            fi
+          }
+          fetch_runtime_file ".github/scripts/pr_agent_target.sh" "$RUNTIME_ROOT/.github/scripts/pr_agent_target.sh"
+          fetch_runtime_file ".github/scripts/delegation_repository.sh" "$RUNTIME_ROOT/.github/scripts/delegation_repository.sh"
+          fetch_runtime_file ".github/scripts/delegation_runtime.py" "$RUNTIME_ROOT/.github/scripts/delegation_runtime.py"
+          PARENT_CONFIG_FILE="$RUNTIME_ROOT/parent.continuum.yml"
+          # The parent config lives in the execution repository: fetch its
+          # default branch, never the Continuum engine pin (which may not
+          # exist in the execution repository).
+          if ! gh api --method GET "repos/$GITHUB_REPOSITORY/contents/.continuum.yml" --jq .content 2>/dev/null \
+            | tr -d '\n' | continuum_b64_decode > "$PARENT_CONFIG_FILE" 2>/dev/null || [[ ! -s "$PARENT_CONFIG_FILE" ]]; then
+            echo "::error::Unable to load the parent Continuum configuration for delegated target resolution; refusing to guess."
+            exit 1
+          fi
+          CONTINUUM_ENGINE_ROOT="$RUNTIME_ROOT" PARENT_CONFIG="$PARENT_CONFIG_FILE" \
+            bash "$RUNTIME_ROOT/.github/scripts/pr_agent_target.sh" "$TARGET_CHILD_ID"
+
       - name: Resolve PR-Agent signal policy
         id: policy
         env:
@@ -121,11 +197,24 @@ jobs:
           CONTINUUM_REF: ${{ inputs.continuum_ref }}
         run: |
           set -euo pipefail
+          continuum_b64_decode() {
+            if printf '' | base64 --decode >/dev/null 2>&1; then
+              base64 --decode
+            elif printf '' | base64 -d >/dev/null 2>&1; then
+              base64 -d
+            elif printf '' | base64 -D >/dev/null 2>&1; then
+              base64 -D
+            elif command -v python3 >/dev/null 2>&1; then
+              python3 -c 'import sys,base64; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))'
+            else
+              openssl base64 -d
+            fi
+          }
           POLICY_SCRIPT="$RUNNER_TEMP/pr_agent_policy.js"
           gh api --method GET \
             "repos/kodmial/continuum/contents/.github/scripts/pr_agent_policy.js" \
             -f ref="$CONTINUUM_REF" --jq .content \
-            | tr -d '\n' | base64 --decode > "$POLICY_SCRIPT"
+            | tr -d '\n' | continuum_b64_decode > "$POLICY_SCRIPT"
           node --check "$POLICY_SCRIPT"
           # Policy-bundle sync: the merge gate requires these exports with
           # fail-closed semantics (mirrors GateInputs.improve_skipped_clean).
@@ -468,14 +557,32 @@ jobs:
           POST_MERGE_WAKEUP_REF: ${{ inputs.post_merge_wakeup_ref || vars.CONTINUUM_POST_MERGE_WAKEUP_REF || github.event.repository.default_branch || 'main' }}
           REQUIRED_WORKFLOW_GATE_LABEL: ${{ inputs.required_workflow_gate_label || vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_LABEL || '' }}
           REQUIRED_WORKFLOW_GATE_NAME: ${{ inputs.required_workflow_gate_name || vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_NAME || '' }}
+          TARGET_CHILD_ID: ${{ inputs.target_child_id }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
             // Work Lock #33 mirrors the mature provider-neutral mechanics from
             // continuum-auto-merge.yml while keeping CodeRabbit untouched.
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const repoFullName = owner + '/' + repo;
+            // Target-aware: review, repair, recovery, merge and exact-HEAD
+            // validation operate against the resolved target repository while
+            // execution remains in the parent. Only the opaque child id ever
+            // selects the target; concrete identity stays runner-local.
+            const executionOwner = context.repo.owner;
+            const executionRepo = context.repo.repo;
+            const owner = process.env.CONTINUUM_PR_AGENT_TARGET_OWNER;
+            const repo = process.env.CONTINUUM_PR_AGENT_TARGET_REPO;
+            const repoFullName = process.env.CONTINUUM_PR_AGENT_TARGET_REPOSITORY;
+            const delegated =
+              process.env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED === 'true';
+            if (!owner || !repo || !repoFullName) {
+              core.setFailed(
+                delegated
+                  ? 'PR-Agent target relationship is missing: delegated execution requires non-empty CONTINUUM_PR_AGENT_TARGET_OWNER/REPO/REPOSITORY.'
+                  : 'PR-Agent target context is missing: CONTINUUM_PR_AGENT_TARGET_OWNER/REPO/REPOSITORY must be non-empty.'
+              );
+              return;
+            }
+            const targetChildId = String(process.env.TARGET_CHILD_ID || '').trim();
             const prNumber = Number(process.env.PR_NUMBER);
             const reviewedHead = String(process.env.REVIEWED_HEAD || '').trim().toLowerCase();
             const AUTO_MERGE_BLOCK_LABEL = 'no-auto-merge';
@@ -771,6 +878,64 @@ jobs:
                 ].join('\n'),
               });
               try {
+                if (delegated) {
+                  // Delegated: execution stays in the parent, so dispatch
+                  // target-aware repair in the execution repository with the
+                  // opaque child id (the repair workflow resolves the target
+                  // via target_child_id). The exact-HEAD attempt marker and
+                  // lock are preserved as this HEAD's single bounded attempt.
+                  if (!targetChildId) {
+                    core.setFailed(
+                      'PR #' + prNumber +
+                      ': delegated conflict repair requires target_child_id; ' +
+                      'no target-aware dispatch was made for HEAD ' + fresh.head.sha +
+                      ' (' + reason + ').'
+                    );
+                    return;
+                  }
+                  try {
+                    await github.request(
+                      'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
+                      {
+                        owner: executionOwner,
+                        repo: executionRepo,
+                        workflow_id: 'continuum-pr-agent-repair.yml',
+                        ref: defaultBranch,
+                        inputs: {
+                          pr_number: String(prNumber),
+                          head_sha: fresh.head.sha,
+                          target_child_id: targetChildId,
+                        },
+                      }
+                    );
+                  } catch (dispatchErr) {
+                    const dispatchMessage = String(dispatchErr.message || dispatchErr);
+                    const dispatchStatus = Number(dispatchErr.status || 0);
+                    // Narrow input-rejection detection (mirrors recovery/wakeup):
+                    // only a 422 naming the opaque target_child_id input means
+                    // the repair workflow lacks the delegated selector. Any
+                    // other 422 or message is a transient/payload failure and
+                    // is rethrown for the outer cleanup; the marker/lock are
+                    // removed there so recovery per #224 can reconcile a
+                    // transient dispatch on its next wakeup.
+                    const isMissingTargetInput =
+                      dispatchStatus === 422 &&
+                      /target_child_id/i.test(dispatchMessage);
+                    if (isMissingTargetInput) {
+                      throw new Error(
+                        'PR #' + prNumber +
+                        ': delegated conflict repair requires continuum-pr-agent-repair.yml ' +
+                        'to declare a target_child_id input; refusing bare retry to preserve the delegated target: ' +
+                        dispatchMessage
+                      );
+                    }
+                    throw dispatchErr;
+                  }
+                  core.notice(
+                    'PR #' + prNumber + ': dispatched delegated conflict repair via parent (' + reason + ').'
+                  );
+                  return;
+                }
                 await github.request(
                   'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
                   {
@@ -1043,17 +1208,58 @@ jobs:
                 continue;
               }
               try {
-                await github.request(
-                  'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
-                  {
-                    owner,
-                    repo,
-                    workflow_id: workflow,
-                    ref: postMergeWakeupRef,
+                const dispatchParams = {
+                  owner: executionOwner,
+                  repo: executionRepo,
+                  workflow_id: workflow,
+                  ref: postMergeWakeupRef,
+                };
+                // Preserve the opaque delegated selection for the follow-up
+                // run, mirroring the recovery dispatch. Local runs dispatch
+                // bare to preserve the existing best-effort contract.
+                if (targetChildId) {
+                  dispatchParams.inputs = { target_child_id: targetChildId };
+                }
+                try {
+                  await github.request(
+                    'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
+                    dispatchParams
+                  );
+                } catch (dispatchErr) {
+                  const dispatchMessage = String(dispatchErr.message || dispatchErr);
+                  const dispatchStatus = Number(dispatchErr.status || 0);
+                  // Narrow input-rejection detection: only a 422 whose
+                  // message names the opaque input (or GitHub's
+                  // unexpected/unknown-input wording) means the wakeup
+                  // target does not accept target_child_id. Any other
+                  // 422 (invalid ref, payload validation, or a message
+                  // merely mentioning inputs) is rethrown verbatim so
+                  // reviewers get the true remediation path.
+                  const isInputRejection =
+                    dispatchStatus === 422 &&
+                    /(target_child_id|unexpected\s+inputs?|unknown\s+inputs?)/i.test(dispatchMessage);
+                  if (dispatchParams.inputs && isInputRejection) {
+                    // A delegated wakeup must never retry bare: a bare
+                    // dispatch would wake the execution repository instead of
+                    // the delegated child target. Fail closed so the missing
+                    // post-merge chain is visible instead of a silent success.
+                    throw new Error(
+                      'PR #' + prNumber +
+                      ': wakeup ' + workflow + ' does not accept target_child_id inputs; ' +
+                      'refusing bare retry to preserve the delegated target: ' +
+                      dispatchMessage
+                    );
+                  } else {
+                    throw dispatchErr;
                   }
-                );
+                }
                 core.notice('Woke ' + workflow + ' at ' + postMergeWakeupRef + '.');
               } catch (err) {
+                // Post-merge wakeup is best-effort: the merge already
+                // succeeded, so a wakeup failure warns without failing the
+                // merge run. A delegated wakeup is never retried bare: the
+                // explicit refusal above surfaces here as a warning, never
+                // as a parent-targeted dispatch.
                 core.warning(
                   'PR #' + prNumber +
                   ': could not wake ' + workflow + ': ' + err.message
