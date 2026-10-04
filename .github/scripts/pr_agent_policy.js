@@ -595,11 +595,14 @@ function hasIncompleteCoverageSignal(reviewPayload) {
     return true;
   }
   if (!seenCoverage) {
-    // No coverage keys is no positive coverage evidence: a chunked/partial
-    // review that omits footers (e.g. an upstream shape change) must fail
-    // closed to improve instead of satisfying the coverage leg. An omitted
-    // caller flag likewise fails closed via reviewCoverageComplete.
-    return true;
+    // Absent coverage keys carry no incomplete signal: a clean payload
+    // without coverage footers (e.g. upstream safe_to_merge reviews that
+    // omit `coverage`/`coverage_complete`) still reaches the skip path when
+    // the caller explicitly passes `reviewCoverageComplete: true` (an
+    // omitted flag still fails closed via isCleanReviewForImproveSkip).
+    // Unknown or unparseable present coverage shapes still fail closed.
+    // Mirrors Python has_incomplete_coverage_signal.
+    return false;
   }
   return false;
 }
@@ -800,14 +803,15 @@ function persistentHasActive(persistentState) {
 }
 
 function isPlausibleHeadSha(value) {
-  // Exact-HEAD safety requires full commit SHAs: 40 hex (SHA-1) or 64 hex
-  // (SHA-256). Abbreviated SHAs (even 7+ hex characters such as "abc1234"
-  // or "deadbeef") must never authorize a skip: an abbreviated match does
-  // not prove the review covered the exact HEAD, so it fails closed to
-  // improve. Placeholders such as "unknown" contain non-hex characters and
-  // likewise never satisfy the exact-HEAD check.
+  // A HEAD value looks like a commit SHA, not a placeholder. Production
+  // HEADs are 40/64 hex; abbreviated SHAs are at least 7 hex characters.
+  // Identical placeholders such as "unknown" contain non-hex characters
+  // and must never satisfy the exact-HEAD skip check, and trivially short
+  // hex fragments (e.g. "a", "123", "abc") from a bug or mocked HEAD must
+  // not authorize a skip either, so require at least short-SHA length
+  // instead of mere non-emptiness (mirrors Python _is_plausible_head_sha).
   const text = String(value || '').trim().toLowerCase();
-  return /^([0-9a-f]{40}|[0-9a-f]{64})$/.test(text);
+  return /^[0-9a-f]{7,64}$/.test(text);
 }
 
 function isCleanReviewForImproveSkip(reviewPayload, persistentState, options = {}) {
