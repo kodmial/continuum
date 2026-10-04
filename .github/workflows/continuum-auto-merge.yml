@@ -68,11 +68,21 @@ on:
 permissions: {}
 
 concurrency:
-  # Every trigger enters one latest-state reconciler. Let the running pass
-  # finish: with GitHub's default single pending slot, newer wake-ups replace
-  # older pending work without cancelling the in-flight scan. Cancelling the
+  # Every trigger (CI dispatch, CodeRabbit, push, manual, or cron) enters the
+  # same pure latest-state reconciler. It revalidates every gate immediately
+  # before each write. Runs are never cancelled: the repository-global group
+  # below serializes runs so at most one reconciler executes at a time and a
+  # queued run re-reconciles from latest state when it starts. With GitHub's
+  # default single pending slot, newer wake-ups replace older pending work
+  # without cancelling the in-flight scan. The in-memory per-PR/HEAD lease
+  # inside the reconciler only coalesces duplicate wakeups within a single
+  # run; cross-run safety comes from that serialization plus the exact-HEAD
+  # re-read and the atomic `sha:` guard on the merge call, so a stale queued
+  # run becomes a safe no-op instead of a concurrent writer. Cancelling the
   # running pass let status storms repeatedly abort before later PRs were
-  # reconciled, starving conflict repair and merge progress.
+  # reconciled, starving conflict repair and merge progress, and
+  # repository-global cancellation would let a busy PR starve unrelated PRs
+  # via repeated cancel/requeue livelock.
   group: ${{ github.workflow }}-auto-merge
   cancel-in-progress: false
 
@@ -102,9 +112,10 @@ jobs:
           POST_MERGE_WAKEUP_REF: ${{ inputs.post_merge_wakeup_ref || vars.CONTINUUM_POST_MERGE_WAKEUP_REF || github.event.repository.default_branch || 'main' }}
           REQUIRED_WORKFLOW_GATE_LABEL: ${{ inputs.required_workflow_gate_label || vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_LABEL || '' }}
           REQUIRED_WORKFLOW_GATE_NAME: ${{ inputs.required_workflow_gate_name || vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_NAME || '' }}
-          # Same-repository housekeeping reads (main SHA, active run listing,
-          # obsolete-run metadata) run on the repository token so they never
-          # draw from the shared TAP_PAT budget. Mutations stay PAT-backed.
+          # Same-repository read-only discovery and housekeeping reads
+          # (main SHA, active run listing, obsolete-run metadata) use the
+          # run-scoped installation token so they never draw from the shared
+          # TAP_PAT budget. Mutations stay PAT-backed.
           READ_GITHUB_TOKEN: ${{ github.token }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
@@ -112,6 +123,233 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const repoFullName = `${owner}/${repo}`;
+            // Lifecycle self-healing (#224): same-repository read-only
+            // discovery uses the run-scoped GITHUB_TOKEN so recovery scans
+            // never consume TAP_PAT's shared budget. Mutations and dispatches
+            // below stay on the PAT-authenticated action client, preserving
+            // actor and event fan-out semantics.
+            const readToken = String(process.env.READ_GITHUB_TOKEN || '').trim();
+            const readBaseUrl = (
+              (github && github.request && github.request.endpoint &&
+                github.request.endpoint.DEFAULTS && github.request.endpoint.DEFAULTS.baseUrl) ||
+              process.env.GITHUB_API_URL || 'https://api.github.com'
+            );
+            if (!readToken) {
+              core.setFailed('READ_GITHUB_TOKEN is empty; same-repository reads require GITHUB_TOKEN and must not fall back to TAP_PAT.');
+              return;
+            }
+            const readGithub = new github.constructor({ auth: readToken, baseUrl: readBaseUrl });
+            // Fail fast when the injected constructor lacks the composed
+            // paginate/rest plugins. Without this, per-PR housekeeping reads
+            // fail later with `client.paginate is not a function`, which the
+            // per-PR isTransientApiError catch would misclassify as
+            // deterministic and fail the whole run obscurely.
+            if (
+              typeof readGithub.paginate !== 'function' ||
+              typeof readGithub.graphql !== 'function' ||
+              typeof readGithub.request !== 'function' ||
+              typeof readGithub.rest?.issues?.listComments !== 'function' ||
+              typeof readGithub.rest?.pulls?.get !== 'function' ||
+              typeof readGithub.rest?.pulls?.list !== 'function' ||
+              typeof readGithub.rest?.pulls?.listReviews !== 'function' ||
+              typeof readGithub.rest?.pulls?.listReviewComments !== 'function' ||
+              typeof readGithub.rest?.repos?.getBranch !== 'function' ||
+              typeof readGithub.rest?.repos?.getCommit !== 'function' ||
+              typeof readGithub.rest?.repos?.getCombinedStatusForRef !== 'function' ||
+              typeof readGithub.rest?.actions?.listWorkflowRunsForRepo !== 'function' ||
+              typeof readGithub.rest?.actions?.listWorkflowRuns !== 'function'
+            ) {
+              throw new Error(
+                'readGithub client lacks the paginate/rest/graphql plugins; ' +
+                'cannot perform same-repository housekeeping reads.'
+              );
+            }
+            let readTokenUnavailable = false;
+            function isRateLimitError(err, status) {
+              if (status === 429) return true;
+              if (status !== 403) return false;
+              const headers = (err && ((err.response && err.response.headers) || err.headers)) || {};
+              const lowered = {};
+              for (const [key, value] of Object.entries(headers)) {
+                lowered[String(key).toLowerCase()] = value;
+              }
+              if (lowered['retry-after'] !== undefined && String(lowered['retry-after']).trim() !== '') return true;
+              if (lowered['x-ratelimit-reset'] !== undefined && String(lowered['x-ratelimit-reset']).trim() !== '') return true;
+              if (lowered['x-ratelimit-remaining'] !== undefined && String(lowered['x-ratelimit-remaining']).trim() === '0') return true;
+              return /rate limit|rate-limit|ratelimit|quota exhaustion|secondary rate limit|retry after/i.test(
+                String((err && err.message) || '')
+              );
+            }
+            async function withReadFallback(fn) {
+              // Per-call fallback only: a single per-PR 401/non-rate-limit
+              // 403 falls back for that call alone and never flips the rest
+              // of the watchdog scan to PAT-heavy polling. (readTokenUnavailable
+              // is retained only so the repository-token health check above
+              // keeps its shape; it is never set sticky here.)
+              if (readTokenUnavailable || readGithub === github) {
+                return await fn(github);
+              }
+              try {
+                return await fn(readGithub);
+              } catch (err) {
+                const status = err ? (err.status ?? err.response?.status) : undefined;
+                // Never spend TAP_PAT's shared budget on rate-limit retries:
+                // a 429 or a rate-limited 403 (empty budget) must surface so
+                // the caller warns and defers to the next wakeup instead of
+                // re-issuing the same scan on the PAT client. Only
+                // authentication/permission gaps (401, non-rate-limit 403)
+                // fall back to the PAT client, one call at a time.
+                if (status === 401 || (status === 403 && !isRateLimitError(err, status))) {
+                  core.warning('Repository-token read failed (' + status + '); retrying with PAT client: ' + err.message);
+                  return await fn(github);
+                }
+                throw err;
+              }
+            }
+            // Generic transient-failure classification (#224): infrastructure
+            // gaps (rate limit with an empty budget, 429/Retry-After, 5xx,
+            // network timeout/reset, runner cancellation/eviction, temporary
+            // provider outage) are retryable via the next event/scheduled
+            // wakeup. Deterministic policy outcomes (red CI, unresolved
+            // findings, merge conflict, malformed state, moved HEAD) never
+            // consume the transient budget and hold instead.
+            function isTransientApiError(err) {
+              const status = err ? (err.status ?? err.response?.status) : undefined;
+              if (status === 429) return true;
+              if (typeof status === 'number' && status >= 500 && status <= 599) return true;
+              if (status === 403) {
+                const headers = (err.response && err.response.headers) || err.headers || {};
+                const lowered = {};
+                for (const [key, value] of Object.entries(headers)) {
+                  lowered[String(key).toLowerCase()] = value;
+                }
+                if (lowered['retry-after'] !== undefined && String(lowered['retry-after']).trim() !== '') return true;
+                if (lowered['x-ratelimit-reset'] !== undefined && String(lowered['x-ratelimit-reset']).trim() !== '') return true;
+                if (lowered['x-ratelimit-remaining'] !== undefined && String(lowered['x-ratelimit-remaining']).trim() === '0') return true;
+                const message = String(err.message || '');
+                if (/rate limit|rate-limit|ratelimit|quota exhaustion|secondary rate limit|retry after/i.test(message)) return true;
+                return false;
+              }
+              const retryable = new Set(['cancelled', 'timed_out', 'stale', 'startup_failure']);
+              if (err && retryable.has(String(err.conclusion || '').toLowerCase())) return true;
+              // Bare timeout alone never proves infrastructure: deterministic
+              // current-head CI text such as `tests timed out: assertion
+              // failed` must hold. Only qualified infrastructure timeouts
+              // retry. Infrastructure evidence wins over an incidental
+              // `assert` substring (e.g. a bootstrap/runner/TLS message
+              // mentioning an assertion); only when no infrastructure
+              // token matches does an assertion mention hold.
+              if (/econnreset|econnrefused|eai_again|epipe|socket hang up|network error|network failure|network timeout|network unreachable|dns error|dns failure|dns resolution|tls handshake|tls error|ssl error|connection reset|connection refused|connection aborted|temporarily unavailable|service unavailable|bad gateway|gateway timeout|bootstrap failed|bootstrap error|runner evicted|runner cancelled|runner timeout|runner lost|run evicted|run cancelled/i.test(
+                String((err && err.message) || '')
+              )) {
+                return true;
+              }
+              const _msg = String((err && err.message) || '');
+              if (/timed out|timeout/i.test(_msg)) {
+                if (/read|connection|network|runner|socket|dns|tls|ssl|gateway|http|request|operation|bootstrap|provider/i.test(_msg)) return true;
+                return false;
+              }
+              if (_msg.toLowerCase().includes('assert')) return false;
+              return false;
+            }
+            // Reset-aware scheduling (#224, single lifecycle contract): the
+            // canonical retry schedule plus bounded jitter is the floor and
+            // any Retry-After / X-RateLimit-Reset / provider reset wait that
+            // is longer wins. A runner never sleeps through a long wait:
+            // delays beyond the inline threshold defer to the scheduled
+            // safety net (the cron caller stub), which redispatches when the
+            // window expires. Mirrors continuum-pr-agent-recovery.yml.
+            const MAX_INLINE_WAIT_SECONDS = 60;
+            const LIFECYCLE_RETRY_DELAY_SCHEDULE = [0, 10, 30, 60, 180, 300, 600, 1200, 2400, 3600];
+            const JITTER_CAP_SECONDS = 5;
+            // Deterministic bounded jitter so concurrent PRs hitting the same
+            // reset window do not redispatch in lockstep and re-hammer the
+            // limit. Mirrors continuum-pr-agent-recovery.yml.
+            function jitterSeconds(key, attempt, cap = JITTER_CAP_SECONDS) {
+              let hash = 2166136261;
+              const text = String(key || 'lifecycle') + ':' + String(attempt);
+              for (let i = 0; i < text.length; i += 1) {
+                hash ^= text.charCodeAt(i);
+                hash = Math.imul(hash, 16777619);
+              }
+              return cap > 0 ? (hash >>> 0) % (cap + 1) : 0;
+            }
+            function resetAwareDelaySeconds({ attempt, retryAfterSeconds, ratelimitResetEpoch, providerResetEpoch, nowEpoch, operationKey }) {
+              // Clamp to the last schedule entry: an attempt at or beyond
+              // the schedule end still defers the full 60m tail instead of
+              // returning 0 and hot-retrying through quota exhaustion.
+              let delay = attempt <= 0
+                ? 0
+                : LIFECYCLE_RETRY_DELAY_SCHEDULE[
+                  Math.min(attempt, LIFECYCLE_RETRY_DELAY_SCHEDULE.length - 1)
+                ] + jitterSeconds(operationKey || 'lifecycle', attempt);
+              if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds >= 0) {
+                delay = Math.max(delay, retryAfterSeconds);
+              }
+              for (const resetEpoch of [ratelimitResetEpoch, providerResetEpoch]) {
+                if (Number.isFinite(resetEpoch) && Number.isFinite(nowEpoch)) {
+                  delay = Math.max(delay, Math.max(0, resetEpoch - nowEpoch));
+                }
+              }
+              return delay;
+            }
+
+            // Reset-signal extraction (#224): server-provided Retry-After /
+            // X-RateLimit-Reset / provider reset minimums are read from the
+            // failed call's headers so a 429/403 does not fall back to an
+            // immediate retry that hammers the limit. Callers always pass
+            // the live clock, so a reset epoch is never silently dropped.
+            function extractRateLimitSignals(err) {
+              const headers = (err && ((err.response && err.response.headers) || err.headers)) || {};
+              const lowered = {};
+              for (const [key, value] of Object.entries(headers)) {
+                lowered[String(key).toLowerCase()] = value;
+              }
+              const retryAfterRaw = lowered['retry-after'];
+              let retryAfterSeconds;
+              if (retryAfterRaw !== undefined && retryAfterRaw !== null && String(retryAfterRaw).trim() !== '') {
+                const text = String(retryAfterRaw).trim();
+                const parsed = Number.parseInt(text, 10);
+                if (Number.isFinite(parsed) && parsed >= 0 && /^\d+/.test(text)) {
+                  retryAfterSeconds = parsed;
+                } else {
+                  const when = Date.parse(text);
+                  if (Number.isFinite(when)) {
+                    retryAfterSeconds = Math.max(0, Math.ceil((when - Date.now()) / 1000));
+                  }
+                }
+              }
+              const resetRaw = lowered['x-ratelimit-reset'] ?? lowered['ratelimit-reset'];
+              let ratelimitResetEpoch;
+              if (resetRaw !== undefined && resetRaw !== null && String(resetRaw).trim() !== '') {
+                const parsed = Number.parseInt(String(resetRaw).trim(), 10);
+                if (Number.isFinite(parsed) && parsed > 0) ratelimitResetEpoch = parsed;
+              }
+              const providerRaw = lowered['x-provider-reset'] ?? lowered['provider-reset'];
+              let providerResetEpoch;
+              if (providerRaw !== undefined && providerRaw !== null && String(providerRaw).trim() !== '') {
+                const parsed = Number.parseInt(String(providerRaw).trim(), 10);
+                if (Number.isFinite(parsed) && parsed > 0) providerResetEpoch = parsed;
+              }
+              return { retryAfterSeconds, ratelimitResetEpoch, providerResetEpoch };
+            }
+            // Per-PR/HEAD lease (#224): at most one authoritative
+            // reconciliation owns a PR/HEAD transition at a time. Duplicate
+            // wakeups for the same key coalesce; independent PRs never block
+            // each other behind a repository-global lock.
+            const ownedLeases = new Set();
+            function leaseKey(prNumber, headSha) {
+              return String(prNumber) + ':' + String(headSha || '').toLowerCase();
+            }
+            function tryAcquireLease(prNumber, headSha) {
+              const key = leaseKey(prNumber, headSha);
+              if (ownedLeases.has(key)) return false;
+              ownedLeases.add(key);
+              return true;
+            }
+            function releaseLease(prNumber, headSha) {
+              ownedLeases.delete(leaseKey(prNumber, headSha));
+            }
             const AUTO_MERGE_BLOCK_LABEL = 'no-auto-merge';
             const CONFLICT_LOCK_LABEL = 'opencode-conflict-repair';
             // Self-healing conflict recovery (issue #246). Every
@@ -137,6 +375,42 @@ jobs:
             ]);
             const CONFLICT_MARKER_RE =
               /<!--\s*continuum-conflict-repair\s+head=([0-9a-f]{7,64})\s+attempt=(\d+)\s*-->/gi;
+            // Durable rate-limit wait (#224): a conflict-repair dispatch that
+            // fails rate-limited persists a deferred not-before so the next
+            // wakeup waits for the reset window instead of retrying
+            // immediately against an unexpired limit. Deferred waits never
+            // consume the bounded per-HEAD dispatch budget.
+            const CONFLICT_DEFER_RE =
+              /<!--\s*continuum-conflict-repair-deferred\s+head=([0-9a-f]{7,64})\s+not-before=(\d+)\s*-->/gi;
+            function conflictRepairNotBefore(comments, headSha, nowEpoch) {
+              const exactHead = String(headSha || '').toLowerCase();
+              let notBefore = null;
+              for (const comment of comments || []) {
+                const association = String(
+                  comment.author_association || ''
+                ).toUpperCase();
+                const login = String(
+                  comment.user?.login || ''
+                ).toLowerCase();
+                const trusted =
+                  TRUSTED_COMMENT_ASSOCIATIONS.has(association) ||
+                  login === 'github-actions[bot]' ||
+                  login === owner.toLowerCase();
+                if (!trusted) continue;
+                const body = String(comment.body || '');
+                CONFLICT_DEFER_RE.lastIndex = 0;
+                for (const match of body.matchAll(CONFLICT_DEFER_RE)) {
+                  if (String(match[1] || '').toLowerCase() !== exactHead) continue;
+                  const epoch = Number.parseInt(match[2], 10);
+                  if (!Number.isFinite(epoch) || epoch <= 0) continue;
+                  if (notBefore === null || epoch > notBefore) notBefore = epoch;
+                }
+              }
+              if (notBefore !== null && Number.isFinite(nowEpoch) && nowEpoch < notBefore) {
+                return notBefore;
+              }
+              return null;
+            }
             // CodeRabbit is an optional integration. When this project did not
             // ask for it, every CodeRabbit gate below is skipped and no
             // CodeRabbit workflow is ever dispatched: requiring an approval
@@ -166,39 +440,12 @@ jobs:
             const requiredWorkflowGateName =
               String(process.env.REQUIRED_WORKFLOW_GATE_NAME || '').trim();
 
-            // Same-repository housekeeping reads use the repository token so
-            // they never draw from the shared TAP_PAT budget. The github-script
-            // action client (`github`) stays PAT-authenticated for every
-            // mutation below (merge, cancel, label, comment, dispatch). Reuse
-            // the injected constructor so the paginate/rest plugins are kept;
-            // dynamically requiring `@actions/github` is not resolvable here.
-            const readToken = String(process.env.READ_GITHUB_TOKEN || '').trim();
-            if (!readToken) {
-              throw new Error(
-                'READ_GITHUB_TOKEN is required for same-repository auto-merge housekeeping reads.'
-              );
-            }
-            const readBaseUrl = (
-              (github && github.request && github.request.endpoint &&
-                github.request.endpoint.DEFAULTS && github.request.endpoint.DEFAULTS.baseUrl) ||
-              process.env.GITHUB_API_URL || 'https://api.github.com'
-            );
-            const readGithub = new github.constructor({
-              auth: readToken,
-              baseUrl: readBaseUrl,
-            });
-            if (
-              typeof readGithub.paginate !== 'function' ||
-              typeof readGithub.rest?.repos?.getBranch !== 'function' ||
-              typeof readGithub.rest?.repos?.getContent !== 'function' ||
-              typeof readGithub.rest?.repos?.getReleaseByTag !== 'function' ||
-              typeof readGithub.rest?.actions?.listWorkflowRunsForRepo !== 'function'
-            ) {
-              throw new Error(
-                'readGithub client lacks the paginate/rest plugins; ' +
-                'cannot perform same-repository auto-merge housekeeping reads.'
-              );
-            }
+            // Housekeeping below reuses the repository-token read client
+            // defined above (`readGithub`, built from the injected
+            // constructor so paginate/rest plugins are kept). The
+            // github-script action client (`github`) stays PAT-authenticated
+            // for every mutation below (merge, cancel, label, comment,
+            // dispatch).
 
             // Bounded Actions housekeeping budget (kodmial/continuum#253).
             // The obsolete-run scan must never grow with repository age: only
@@ -309,20 +556,24 @@ jobs:
             }
 
             async function getPull(pullNumber) {
-              const { data } = await github.rest.pulls.get({
-                owner, repo, pull_number: pullNumber,
-              });
+              const { data } = await withReadFallback(client =>
+                client.rest.pulls.get({
+                  owner, repo, pull_number: pullNumber,
+                })
+              );
               return data;
             }
 
             async function compareWithMain(headSha) {
-              const { data } = await github.request(
-                'GET /repos/{owner}/{repo}/compare/{basehead}',
-                {
-                  owner,
-                  repo,
-                  basehead: `main...${headSha}`,
-                }
+              const { data } = await withReadFallback(client =>
+                client.request(
+                  'GET /repos/{owner}/{repo}/compare/{basehead}',
+                  {
+                    owner,
+                    repo,
+                    basehead: `main...${headSha}`,
+                  }
+                )
               );
               return data;
             }
@@ -347,16 +598,18 @@ jobs:
             }
 
             async function mainDeltaSincePrHead(headSha) {
-              const { data } = await github.request(
-                'GET /repos/{owner}/{repo}/compare/{basehead}',
-                {
-                  owner,
-                  repo,
-                  // Reverse the normal PR comparison on purpose. GitHub uses
-                  // the merge base, so this side contains only commits/files
-                  // that advanced main since the PR diverged.
-                  basehead: `${headSha}...main`,
-                }
+              const { data } = await withReadFallback(client =>
+                client.request(
+                  'GET /repos/{owner}/{repo}/compare/{basehead}',
+                  {
+                    owner,
+                    repo,
+                    // Reverse the normal PR comparison on purpose. GitHub uses
+                    // the merge base, so this side contains only commits/files
+                    // that advanced main since the PR diverged.
+                    basehead: `${headSha}...main`,
+                  }
+                )
               );
 
               const files = (data.files || []).map(file => file.filename);
@@ -405,15 +658,21 @@ jobs:
             }
 
             async function latestWorkflowForHead(pr, headSha, workflowName) {
-              const runs = await github.paginate(
-                github.rest.actions.listWorkflowRunsForRepo,
-                {
-                  owner,
-                  repo,
-                  branch: pr.head.ref,
-                  event: 'pull_request',
-                  per_page: 100,
-                }
+              // Same-repository merge-gate evidence reads use the
+              // repository token via withReadFallback so watchdog wakeups
+              // never spend shared TAP_PAT budget on polling. Mutations
+              // below stay PAT-backed.
+              const runs = await withReadFallback(client =>
+                client.paginate(
+                  client.rest.actions.listWorkflowRunsForRepo,
+                  {
+                    owner,
+                    repo,
+                    branch: pr.head.ref,
+                    event: 'pull_request',
+                    per_page: 100,
+                  }
+                )
               );
 
               return runs
@@ -456,9 +715,11 @@ jobs:
             }
 
             async function latestCodeRabbitStatus(headSha) {
-              const { data } = await github.rest.repos.getCombinedStatusForRef({
-                owner, repo, ref: headSha,
-              });
+              const { data } = await withReadFallback(client =>
+                client.rest.repos.getCombinedStatusForRef({
+                  owner, repo, ref: headSha,
+                })
+              );
 
               return (data.statuses || [])
                 .filter(status => status.context === 'CodeRabbit')
@@ -470,14 +731,16 @@ jobs:
             }
 
             async function codeRabbitNoProgressBlocked(pr, headSha) {
-              const comments = await github.paginate(
-                github.rest.issues.listComments,
-                {
-                  owner,
-                  repo,
-                  issue_number: pr.number,
-                  per_page: 100,
-                }
+              const comments = await withReadFallback(client =>
+                client.paginate(
+                  client.rest.issues.listComments,
+                  {
+                    owner,
+                    repo,
+                    issue_number: pr.number,
+                    per_page: 100,
+                  }
+                )
               );
               const markerPrefix =
                 `<!-- continuum-coderabbit-no-progress head=${headSha} `;
@@ -618,14 +881,16 @@ jobs:
                 return false;
               }
 
-              let comments = await github.paginate(
-                github.rest.issues.listComments,
-                {
-                  owner,
-                  repo,
-                  issue_number: pr.number,
-                  per_page: 100,
-                }
+              let comments = await withReadFallback(client =>
+                client.paginate(
+                  client.rest.issues.listComments,
+                  {
+                    owner,
+                    repo,
+                    issue_number: pr.number,
+                    per_page: 100,
+                  }
+                )
               );
 
               const limited = latestCodeRabbitRateLimit(comments);
@@ -692,14 +957,16 @@ jobs:
                 return false;
               }
 
-              comments = await github.paginate(
-                github.rest.issues.listComments,
-                {
-                  owner,
-                  repo,
-                  issue_number: fresh.number,
-                  per_page: 100,
-                }
+              comments = await withReadFallback(client =>
+                client.paginate(
+                  client.rest.issues.listComments,
+                  {
+                    owner,
+                    repo,
+                    issue_number: fresh.number,
+                    per_page: 100,
+                  }
+                )
               );
 
               const freshLimited = latestCodeRabbitRateLimit(comments);
@@ -728,14 +995,18 @@ jobs:
             }
 
             async function latestCodeRabbitDecision(pr, headSha = pr.head.sha) {
-              const reviews = await github.paginate(
-                github.rest.pulls.listReviews,
-                {
-                  owner,
-                  repo,
-                  pull_number: pr.number,
-                  per_page: 100,
-                }
+              // Same-repository review reads use the repository token so
+              // watchdog wakeups never spend shared TAP_PAT budget.
+              const reviews = await withReadFallback(client =>
+                client.paginate(
+                  client.rest.pulls.listReviews,
+                  {
+                    owner,
+                    repo,
+                    pull_number: pr.number,
+                    per_page: 100,
+                  }
+                )
               );
 
               return reviews
@@ -755,14 +1026,18 @@ jobs:
             }
 
             async function codeRabbitNitpickReviews(pr, headSha = pr.head.sha) {
-              const reviews = await github.paginate(
-                github.rest.pulls.listReviews,
-                {
-                  owner,
-                  repo,
-                  pull_number: pr.number,
-                  per_page: 100,
-                }
+              // Same-repository review reads use the repository token so
+              // watchdog wakeups never spend shared TAP_PAT budget.
+              const reviews = await withReadFallback(client =>
+                client.paginate(
+                  client.rest.pulls.listReviews,
+                  {
+                    owner,
+                    repo,
+                    pull_number: pr.number,
+                    per_page: 100,
+                  }
+                )
               );
 
               const headReviews = reviews.filter(review =>
@@ -851,24 +1126,28 @@ jobs:
             }
 
             async function carriedCodeRabbitReviewBasis(pr, headSha) {
-              const { data: commit } = await github.rest.repos.getCommit({
-                owner,
-                repo,
-                ref: headSha,
-              });
+              const { data: commit } = await withReadFallback(client =>
+                client.rest.repos.getCommit({
+                  owner,
+                  repo,
+                  ref: headSha,
+                })
+              );
               const parents = (commit.parents || []).map(parent =>
                 parent.sha.toLowerCase()
               );
               if (parents.length !== 2) return null;
 
-              const comments = await github.paginate(
-                github.rest.issues.listComments,
-                {
-                  owner,
-                  repo,
-                  issue_number: pr.number,
-                  per_page: 100,
-                }
+              const comments = await withReadFallback(client =>
+                client.paginate(
+                  client.rest.issues.listComments,
+                  {
+                    owner,
+                    repo,
+                    issue_number: pr.number,
+                    per_page: 100,
+                  }
+                )
               );
 
               const markerPattern =
@@ -935,8 +1214,13 @@ jobs:
               let cursor = null;
 
               do {
-                const data = await github.graphql(
-                  `query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+                // Same-repository review-thread reads use the repository
+                // token so watchdog wakeups never spend shared TAP_PAT
+                // budget. The resolveReviewThread mutation below stays
+                // PAT-backed.
+                const data = await withReadFallback(client =>
+                  client.graphql(
+                    `query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
                     repository(owner: $owner, name: $repo) {
                       pullRequest(number: $number) {
                         reviewThreads(first: 100, after: $cursor) {
@@ -961,12 +1245,13 @@ jobs:
                       }
                     }
                   }`,
-                  {
-                    owner,
-                    repo,
-                    number: pr.number,
-                    cursor,
-                  }
+                    {
+                      owner,
+                      repo,
+                      number: pr.number,
+                      cursor,
+                    }
+                  )
                 );
 
                 const connection =
@@ -1035,14 +1320,16 @@ jobs:
             async function requestCodeRabbitThreadVerification(pr, threads) {
               if (!threads.length) return 0;
 
-              const comments = await github.paginate(
-                github.rest.pulls.listReviewComments,
-                {
-                  owner,
-                  repo,
-                  pull_number: pr.number,
-                  per_page: 100,
-                }
+              const comments = await withReadFallback(client =>
+                client.paginate(
+                  client.rest.pulls.listReviewComments,
+                  {
+                    owner,
+                    repo,
+                    pull_number: pr.number,
+                    per_page: 100,
+                  }
+                )
               );
 
               let requested = 0;
@@ -1381,14 +1668,18 @@ jobs:
               const opencodeWorkflow = resolveOpencodeWorkflow();
               let runs;
               try {
-                runs = await github.paginate(
-                  github.rest.actions.listWorkflowRuns,
-                  {
-                    owner,
-                    repo,
-                    workflow_id: opencodeWorkflow,
-                    per_page: 100,
-                  }
+                // Same-repository run discovery uses the repository token
+                // so watchdog wakeups never spend shared TAP_PAT budget.
+                runs = await withReadFallback(client =>
+                  client.paginate(
+                    client.rest.actions.listWorkflowRuns,
+                    {
+                      owner,
+                      repo,
+                      workflow_id: opencodeWorkflow,
+                      per_page: 100,
+                    }
+                  )
                 );
               } catch (err) {
                 // A missing caller file surfaces loudly at dispatch time;
@@ -1488,16 +1779,29 @@ jobs:
                 return;
               }
 
-              const comments = await github.paginate(
-                github.rest.issues.listComments,
-                {
-                  owner,
-                  repo,
-                  issue_number: pr.number,
-                  per_page: 100,
-                }
+              const comments = await withReadFallback(client =>
+                client.paginate(
+                  client.rest.issues.listComments,
+                  {
+                    owner,
+                    repo,
+                    issue_number: pr.number,
+                    per_page: 100,
+                  }
+                )
               );
               const markers = conflictRepairMarkers(comments, headSha);
+              // Durable rate-limit wait: a deferred not-before from a prior
+              // rate-limited dispatch wins over a fresh dispatch.
+              const deferredNotBefore = conflictRepairNotBefore(
+                comments, headSha, Math.floor(Date.now() / 1000)
+              );
+              if (deferredNotBefore !== null) {
+                core.info(
+                  `PR #${pr.number}: conflict-repair deferred until ${new Date(deferredNotBefore * 1000).toISOString()}; waiting for the scheduled safety net.`
+                );
+                return;
+              }
               const latest = markers.at(-1) || null;
               const markerAgeMs =
                 latest && Number.isFinite(latest.createdAt)
@@ -1565,14 +1869,16 @@ jobs:
                   );
                   return;
                 }
-                const confirmComments = await github.paginate(
-                  github.rest.issues.listComments,
-                  {
-                    owner,
-                    repo,
-                    issue_number: pr.number,
-                    per_page: 100,
-                  }
+                const confirmComments = await withReadFallback(client =>
+                  client.paginate(
+                    client.rest.issues.listComments,
+                    {
+                      owner,
+                      repo,
+                      issue_number: pr.number,
+                      per_page: 100,
+                    }
+                  )
                 );
                 const confirmMarkers = conflictRepairMarkers(
                   confirmComments,
@@ -1635,14 +1941,16 @@ jobs:
                 throw markerErr;
               }
               {
-                const electionComments = await github.paginate(
-                  github.rest.issues.listComments,
-                  {
-                    owner,
-                    repo,
-                    issue_number: pr.number,
-                    per_page: 100,
-                  }
+                const electionComments = await withReadFallback(client =>
+                  client.paginate(
+                    client.rest.issues.listComments,
+                    {
+                      owner,
+                      repo,
+                      issue_number: pr.number,
+                      per_page: 100,
+                    }
+                  )
                 );
                 let winnerId = claimCommentId;
                 for (const comment of electionComments) {
@@ -1732,6 +2040,67 @@ jobs:
                 // next retry). Best-effort cleanup must never mask the
                 // original dispatch error needed to diagnose a bad caller
                 // name or a missing workflow_dispatch trigger.
+                //
+                // Reset-aware deferral (#224, single lifecycle contract):
+                // honor the server-provided reset wait instead of retrying
+                // immediately on the next wakeup and hammering the limit.
+                // Short waits sleep inline; long waits defer to the
+                // scheduled safety net (the cron caller stub redispatches
+                // when the window expires) and no runner sleeps. The claim
+                // is still deleted so a deferred wait never consumes the
+                // bounded per-HEAD budget for work that never executed.
+                // Deferral is transient-only: a deterministic dispatch
+                // error (404/422) must surface immediately, never persist
+                // a schedule-derived wait that hides the real failure.
+                const isDispatchTransient = isTransientApiError(err);
+                const signals = isDispatchTransient ? extractRateLimitSignals(err) : {};
+                const resetDelay = isDispatchTransient ? resetAwareDelaySeconds({
+                  attempt,
+                  retryAfterSeconds: signals.retryAfterSeconds,
+                  ratelimitResetEpoch: signals.ratelimitResetEpoch,
+                  providerResetEpoch: signals.providerResetEpoch,
+                  nowEpoch: Math.floor(Date.now() / 1000),
+                  operationKey: `${repoFullName}#${pr.number}:${headSha}`,
+                }) : 0;
+                // Never sleep inline: a rate-limited PR must not hold the
+                // single run/loop slot while healthy independent PRs wait
+                // behind it. Short and long waits alike defer to the next
+                // wakeup/scheduled safety net without blocking the loop.
+                if (resetDelay > 0) {
+                  core.notice(
+                    `PR #${pr.number}: conflict-repair dispatch hit a rate limit; ` +
+                    `deferring execution for ~${resetDelay}s to the scheduled safety net ` +
+                    `without sleeping the runner: ` + (err.message || err)
+                  );
+                }
+                // Durable not-before: persist the reset-aware wait so the
+                // next wakeup honors it instead of retrying immediately
+                // against an unexpired limit. The schedule-based backoff is
+                // durable even without a server reset signal: a generic
+                // 5xx/network failure with no Retry-After/Reset headers must
+                // still defer instead of hot-retrying. Deferred waits never
+                // consume the per-HEAD dispatch budget (no conflict-repair
+                // marker is written for work that never executed).
+                {
+                  if (resetDelay > 0) {
+                    const notBefore = Math.floor(Date.now() / 1000) + resetDelay;
+                    try {
+                      await github.rest.issues.createComment({
+                        owner,
+                        repo,
+                        issue_number: pr.number,
+                        body:
+                          `<!-- continuum-conflict-repair-deferred head=${headSha} not-before=${notBefore} -->\n` +
+                          `Continuum deferred automatic OpenCode conflict repair for this exact HEAD until ` +
+                          `${new Date(notBefore * 1000).toISOString()} (rate-limited dispatch; reset-aware backoff ${resetDelay}s).`,
+                      });
+                    } catch (deferErr) {
+                      core.warning(
+                        `PR #${pr.number}: could not persist conflict-repair deferral: ${deferErr.message}`
+                      );
+                    }
+                  }
+                }
                 try {
                   await github.rest.issues.deleteComment({
                     owner,
@@ -1790,11 +2159,27 @@ jobs:
 
             async function updateFromMain(pr) {
               const oldHead = pr.head.sha;
-              const { data: mainBranch } = await github.rest.repos.getBranch({
-                owner,
-                repo,
-                branch: 'main',
-              });
+              // Exact-HEAD revalidation immediately before mutation (#224):
+              // the caller reconciles from a snapshot taken earlier in a long
+              // loop. If the HEAD moved since, hold instead of syncing stale
+              // state: the next wakeup reconciles the new HEAD from latest.
+              const liveBeforeSync = await getPull(pr.number);
+              if (
+                liveBeforeSync.state !== 'open' ||
+                liveBeforeSync.head.sha !== oldHead
+              ) {
+                core.info(
+                  `PR #${pr.number}: HEAD moved ${oldHead} -> ${liveBeforeSync.head.sha} before main sync; holding stale reconciliation.`
+                );
+                return false;
+              }
+              const { data: mainBranch } = await withReadFallback(client =>
+                client.rest.repos.getBranch({
+                  owner,
+                  repo,
+                  branch: 'main',
+                })
+              );
               const mainHead = mainBranch.commit.sha;
 
               // Carry is allowed only from a fully valid review basis and only
@@ -1834,11 +2219,13 @@ jobs:
 
                 let carried = false;
                 if (reviewBasis && fresh && fresh.head.sha !== oldHead) {
-                  const { data: newCommit } = await github.rest.repos.getCommit({
-                    owner,
-                    repo,
-                    ref: fresh.head.sha,
-                  });
+                  const { data: newCommit } = await withReadFallback(client =>
+                    client.rest.repos.getCommit({
+                      owner,
+                      repo,
+                      ref: fresh.head.sha,
+                    })
+                  );
                   const parents = (newCommit.parents || []).map(parent =>
                     parent.sha.toLowerCase()
                   );
@@ -1905,13 +2292,88 @@ jobs:
               }
             }
 
-            const pulls = await github.paginate(github.rest.pulls.list, {
-              owner,
-              repo,
-              state: 'open',
-              base: 'main',
-              per_page: 100,
-            });
+            // Storm coalescing (#224): cancel-in-progress:false serializes
+            // runs, so a burst of triggers queues full-scan runs back to
+            // back. A run that starts while a NEWER run of this workflow is
+            // already queued skips its scan entirely: the newer run
+            // re-reconciles from latest state when it starts, so this run
+            // would only duplicate its work and its read API load. The probe
+            // pages repo-wide runs (up to 3 pages, newest first) so a newer
+            // queued reconciler is not missed when a busy repository pushes
+            // it outside the first page; if it fails deterministically the
+            // run scans anyway (fail-open: a broken probe must never strand
+            // reconciliation), and a transient probe failure defers green to
+            // the next wakeup.
+            try {
+              const queuedStatuses = new Set(['queued', 'waiting', 'requested', 'pending']);
+              let newerQueued = false;
+              for (let page = 1; page <= 3 && !newerQueued; page += 1) {
+                const { data: recentRuns } = await withReadFallback(client =>
+                  client.rest.actions.listWorkflowRunsForRepo({
+                    owner,
+                    repo,
+                    per_page: 100,
+                    page,
+                  })
+                );
+                const runs = recentRuns.workflow_runs || [];
+                newerQueued = runs.some(run =>
+                  run.name === context.workflow &&
+                  typeof run.id === 'number' &&
+                  run.id > context.runId &&
+                  queuedStatuses.has(String(run.status || '').toLowerCase())
+                );
+                if (runs.length < 100) break;
+              }
+              if (newerQueued) {
+                core.info(
+                  'A newer run of this workflow is already queued; skipping this scan ' +
+                  'so the burst coalesces onto the latest reconciliation.'
+                );
+                return;
+              }
+            } catch (err) {
+              if (isTransientApiError(err)) {
+                core.warning(
+                  'Storm-coalescing probe hit a transient/rate-limit read; ' +
+                  'deferring the whole scan to the next wakeup: ' +
+                  (err.message || err)
+                );
+                return;
+              }
+              core.warning(
+                'Storm-coalescing probe failed; scanning anyway: ' +
+                (err.message || err)
+              );
+            }
+
+            let pulls;
+            try {
+              pulls = await withReadFallback(client =>
+                client.paginate(client.rest.pulls.list, {
+                  owner,
+                  repo,
+                  state: 'open',
+                  base: 'main',
+                  per_page: 100,
+                })
+              );
+            } catch (err) {
+              // Top-level discovery sits outside the per-PR loop, so a
+              // 429/rate-limited 403 here must defer green to the next
+              // wakeup (PAT budget is never spent on the retry) instead of
+              // failing the whole watchdog run red. Deterministic errors
+              // still throw and fail loudly.
+              if (isTransientApiError(err)) {
+                core.warning(
+                  'Open-PR discovery hit a transient/rate-limit read; ' +
+                  'deferring the whole scan to the next wakeup: ' +
+                  (err.message || err)
+                );
+                return;
+              }
+              throw err;
+            }
 
             const cancelledRuns = await cancelObsoleteRuns(pulls);
             if (cancelledRuns.ci > 0 || cancelledRuns.noopRelease > 0) {
@@ -1928,10 +2390,62 @@ jobs:
             );
 
             let codeRabbitRetryControllerDispatched = false;
+            // Deterministic per-PR failures must not strand healthy PRs
+            // behind one bad PR: record loudly and continue the loop.
+            let deterministicFailure = null;
 
             for (const listed of pulls) {
-              let pr = await getPull(listed.number);
+              // Single live re-read per PR (#224 read budget): the open-PR
+              // listing already carries number/draft/head identity for the
+              // pre-lease filter, so only one authoritative pulls.get follows
+              // lease acquisition. A second pulls.get per PR would double
+              // read load (~2N) on every wakeup during quota exhaustion.
+              const listedHead = listed.head && listed.head.sha;
+              const listedFork = listed.head && listed.head.repo && listed.head.repo.full_name;
+              if (
+                (listed.state && listed.state !== 'open') ||
+                listed.draft ||
+                (listedFork && listedFork !== repoFullName)
+              ) {
+                continue;
+              }
 
+              // Per-PR/HEAD coalescing (#224): duplicate wakeups for the same
+              // transition collapse onto one lease; unrelated PRs proceed
+              // independently instead of queuing behind a repository lock.
+              // The lease pins the HEAD observed at acquisition: if the HEAD
+              // moves mid-reconciliation, the reconciler re-reads and refuses
+              // to merge the stale result.
+              const leaseHead = listedHead;
+              if (!leaseHead) {
+                continue;
+              }
+              if (!tryAcquireLease(listed.number, leaseHead)) {
+                core.info(
+                  `PR #${listed.number}: HEAD ${leaseHead} is already owned by this reconciliation; coalescing duplicate wakeup.`
+                );
+                continue;
+              }
+              try {
+              // Guarded live fetch: one transient or deterministic fetch
+              // failure must not abort the repository loop and strand
+              // healthy PRs behind a single bad PR.
+              let pr;
+              try {
+                pr = await getPull(listed.number);
+              } catch (err) {
+                if (isTransientApiError(err)) {
+                  core.warning(`PR #${listed.number}: transient fetch error; deferred to next wakeup: ` + (err.message || err));
+                } else {
+                  core.error(`PR #${listed.number}: deterministic fetch error; skipping PR: ` + (err.stack || err.message || err));
+                  if (!deterministicFailure) deterministicFailure = err;
+                }
+                continue;
+              }
+              if (pr.head.sha !== leaseHead) {
+                core.info(`PR #${pr.number}: HEAD moved ${leaseHead} -> ${pr.head.sha}; holding stale reconciliation.`);
+                continue;
+              }
               if (
                 pr.state !== 'open' ||
                 pr.draft ||
@@ -2309,4 +2823,37 @@ jobs:
               // new main. Clean controller-generated syncs keep an already valid
               // CodeRabbit approval; all other new commits require a fresh review.
               break;
+              } catch (err) {
+                // Transient infrastructure gaps warn and defer to the next
+                // event/scheduled wakeup from latest state. A deterministic
+                // per-PR failure is loud but never aborts the loop: one
+                // malformed PR, red CI fetcher error, or permission failure
+                // must not strand healthy PRs behind it. `listed.number` is
+                // loop-stable; `pr` is let-scoped inside the try above and
+                // is not visible here.
+                if (isTransientApiError(err)) {
+                  core.warning(
+                    `PR #${listed.number}: transient reconciliation error; a later wakeup retries from latest state: ` +
+                    (err.message || err)
+                  );
+                } else {
+                  core.error(
+                    `PR #${listed.number}: deterministic reconciliation error; skipping PR but continuing run: ` +
+                    (err.stack || err.message || err)
+                  );
+                  if (!deterministicFailure) deterministicFailure = err;
+                }
+              } finally {
+                // Release by the listed identity: `pr` stays undefined when
+                // the guarded getPull above fails, and dereferencing it here
+                // would throw in `finally` and abort the whole open-PR loop
+                // behind one bad fetch. The number never changes mid-loop.
+                releaseLease(listed.number, leaseHead);
+              }
+            }
+            if (deterministicFailure) {
+              core.setFailed(
+                'Deterministic auto-merge reconciliation failure(s) held loudly: ' +
+                (deterministicFailure.message || deterministicFailure)
+              );
             }
