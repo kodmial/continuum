@@ -387,9 +387,12 @@ class RecoveryWiringTests(unittest.TestCase):
             with self.subTest(read_call=read_call):
                 self.assertIn(read_call, body)
 
-        # One helper definition plus ten guarded read sites. Controller-state
-        # upsert also reads comments through the repository-scoped token.
-        self.assertEqual(body.count("withReadFallback("), 11)
+        # One helper definition plus twelve guarded read sites. Controller-state
+        # upsert also reads comments through the repository-scoped token, and
+        # both post-dispatch prune paths re-read fresh (grace-coalesce and
+        # coalesce-failure) so an interleaved controller write is never pruned
+        # from a stale pre-dispatch snapshot.
+        self.assertEqual(body.count("withReadFallback("), 13)
 
         # Item 1 keeps all mutation/dispatch calls on the PAT-authenticated
         # action client, preserving actor and event fan-out semantics.
@@ -516,6 +519,222 @@ console.log('sandbox construction OK');
         self.assertIn("rollbackControllerState", body)
         self.assertIn("comment.updated_at || comment.created_at", body)
 
+    def test_recovery_controller_touch_changes_comment_body_per_dispatch_run(self):
+        body = self.read(".github/workflows/continuum-pr-agent-recovery.yml")
+        self.assertIn("Controller dispatch run:", body)
+        self.assertIn("String(context.runId)", body)
+        self.assertLess(
+            body.index("Controller dispatch run:"),
+            body.index("github.rest.actions.createWorkflowDispatch"),
+        )
+        # The touch is presentation-only: durable retry identity is the
+        # stateMarker line alone, and the touch prefix cannot match the
+        # retry/exhausted marker regexes.
+        self.assertIn("durable retry identity", body)
+        self.assertIn("is the stateMarker line alone", body)
+        self.assertIn("continuum-pr-agent-retry markers", body)
+
+    def test_controller_touch_body_differs_per_run_but_keeps_retry_identity(self):
+        """Exercise the real shipped JS, not a Python reimplementation.
+
+        The static pins fail if the workflow touch is reverted; the Node
+        harness below extracts the real `controllerStateBody` plus the real
+        touch expression from the workflow text and executes them, so this
+        test cannot stay green while the shipped code regresses.
+        """
+        import json
+        import re
+        import shutil
+        import subprocess
+        import tempfile
+
+        body = self.read(".github/workflows/continuum-pr-agent-recovery.yml")
+        # Static pins against revert: the unsafe bare concatenation must be
+        # gone and the null-safe coercion must be present.
+        self.assertNotIn("summary + '\\n\\nController dispatch run:'", body)
+        self.assertIn(
+            "String(summary || '').trim() + '\\n\\nController dispatch run: '"
+            " + String(context.runId)",
+            body,
+        )
+
+        node = shutil.which("node")
+        self.assertIsNotNone(
+            node,
+            "node is required to execute the shipped JS; failing closed instead of silently skipping",
+        )
+
+        marker_match = re.search(
+            r"const CONTROLLER_STATE_MARKER = '([^']*)';", body
+        )
+        self.assertIsNotNone(marker_match, "controller state marker const is missing")
+        marker_const = marker_match.group(1)
+
+        fn_start = body.index("function controllerStateBody(stateMarker, summary)")
+        brace = body.index("{", fn_start)
+        depth = 0
+        fn_end = None
+        for pos in range(brace, len(body)):
+            if body[pos] == "{":
+                depth += 1
+            elif body[pos] == "}":
+                depth -= 1
+                if depth == 0:
+                    fn_end = pos + 1
+                    break
+        self.assertIsNotNone(fn_end, "could not extract controllerStateBody")
+        fn_source = body[fn_start:fn_end]
+
+        touch_match = re.search(
+            r"const body = controllerStateBody\(\s*stateMarker,\s*([\s\S]*?)\n\s*\);",
+            body,
+        )
+        self.assertIsNotNone(touch_match, "could not extract the touch expression")
+        touch_expr = touch_match.group(1).strip()
+        self.assertIn("Controller dispatch run:", touch_expr)
+
+        harness = (
+            "const assert = require('assert');\n"
+            f"const CONTROLLER_STATE_MARKER = {json.dumps(marker_const)};\n"
+            + fn_source
+            + "\n"
+            "function touchedSummary(summary, runId) {\n"
+            "  const context = { runId };\n"
+            f"  return ({touch_expr});\n"
+            "}\n"
+            f"const marker = {json.dumps(f'<!-- continuum-pr-agent-retry head={HEAD} kind=review attempt=1 -->')};\n"
+            "const base = 'Automatic PR-Agent review recovery for exact HEAD.';\n"
+            "const a = controllerStateBody(marker, touchedSummary(base, 111));\n"
+            "const b = controllerStateBody(marker, touchedSummary(base, 222));\n"
+            "assert.notStrictEqual(a, b, 'different runs must produce different bodies');\n"
+            "assert.ok(a.includes('Controller dispatch run: 111'));\n"
+            "assert.ok(b.includes('Controller dispatch run: 222'));\n"
+            "assert.strictEqual(a.split('\\n')[1], marker);\n"
+            "assert.strictEqual(b.split('\\n')[1], marker);\n"
+            "for (const summary of [undefined, null, 0, 12345, '']) {\n"
+            "  const touched = controllerStateBody(marker, touchedSummary(summary, 999));\n"
+            "  assert.ok(!/\\bundefined\\b/.test(touched), 'summary must never render undefined: ' + touched);\n"
+            "  assert.ok(!/\\bnull\\b/.test(touched), 'summary must never render null: ' + touched);\n"
+            "  assert.ok(touched.includes(marker), 'retry identity must survive nullish summary');\n"
+            "  assert.ok(touched.includes('Controller dispatch run: 999'));\n"
+            "}\n"
+            "console.log('TOUCH_OK');\n"
+        )
+        tmpdir = os.path.join(ROOT, ".opencode-tmp")
+        os.makedirs(tmpdir, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".js", delete=False, dir=tmpdir
+        ) as handle:
+            handle.write(harness)
+            script = handle.name
+        try:
+            completed = subprocess.run(
+                [node, script],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        finally:
+            os.unlink(script)
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        self.assertIn("TOUCH_OK", completed.stdout)
+
+    def test_failed_dispatch_leaves_controller_state_untouched(self):
+        """A dispatch that throws must not advance existing comment timestamps.
+
+        Dispatch records a pre-dispatch claim via a fresh createComment
+        before createWorkflowDispatch (so a crash after a successful
+        dispatch can never leave the next wakeup without marker evidence
+        inside grace, which would duplicate the same attempt), never via
+        updateComment (which would bump updated_at even on failure), and
+        deletes that claim when the dispatch throws, so a retry that never
+        dispatched is never coalesced as fresh. The success path then
+        coalesces the claim via upsertControllerState.
+        """
+        body = self.read(".github/workflows/continuum-pr-agent-recovery.yml")
+        window = body[
+            body.index("async function dispatch("): body.index("async function exhaust(")
+        ]
+        dispatch_at = window.index("github.rest.actions.createWorkflowDispatch")
+        self.assertLess(
+            window.index("github.rest.issues.createComment"),
+            dispatch_at,
+            "pre-dispatch claim must be recorded before dispatch",
+        )
+        self.assertNotIn(
+            "github.rest.issues.updateComment",
+            window[:dispatch_at],
+            "pre-dispatch claim must be a fresh create, never an update that bumps updated_at on failure",
+        )
+        self.assertIn(
+            "rollbackControllerState",
+            window,
+            "a failed dispatch must delete the pre-dispatch claim",
+        )
+        # The success-path coalescing write must come after the dispatch
+        # call. Scope the search to the post-dispatch text: dispatch() also
+        # holds an early reset-aware deferral upsert (no dispatch attempted
+        # on that path) before createWorkflowDispatch, which a window-wide
+        # index would mistake for the success-path coalescing write.
+        self.assertIn(
+            "await upsertControllerState(",
+            window[dispatch_at:],
+            "success path must coalesce the claim into one controller comment",
+        )
+
+    def test_controller_touch_line_never_consumes_retry_budget(self):
+        marker = f"<!-- continuum-pr-agent-retry head={HEAD} kind=review attempt=1 -->"
+        touched = (
+            "<!-- continuum-pr-agent-controller-state:v1 -->\n"
+            f"{marker}\n"
+            "<details>\n"
+            "<summary>Continuum PR-Agent controller state</summary>\n"
+            "\n"
+            "Automatic recovery.\n"
+            "\n"
+            "Controller dispatch run: 999\n"
+            "\n"
+            "</details>"
+        )
+        plain = (
+            "<!-- continuum-pr-agent-controller-state:v1 -->\n"
+            f"{marker}\n"
+            "<details>\n"
+            "<summary>Continuum PR-Agent controller state</summary>\n"
+            "\n"
+            "Automatic recovery.\n"
+            "\n"
+            "</details>"
+        )
+        touched_evidence = recovery.retry_evidence(
+            [comment(touched)], head_sha=HEAD, kind="review"
+        )
+        plain_evidence = recovery.retry_evidence(
+            [comment(plain)], head_sha=HEAD, kind="review"
+        )
+        self.assertEqual(touched_evidence.latest_attempt, 1)
+        self.assertEqual(
+            touched_evidence.latest_attempt, plain_evidence.latest_attempt
+        )
+        self.assertFalse(touched_evidence.exhausted)
+        # The touch prefix itself carries no retry marker.
+        self.assertNotRegex(
+            "Controller dispatch run: 999",
+            r"continuum-pr-agent-retry",
+        )
+
+    def test_controller_state_stays_in_one_comment_with_rollback(self):
+        body = self.read(".github/workflows/continuum-pr-agent-recovery.yml")
+        # Single-comment coalescing: update the latest controller comment,
+        # delete every older one, and roll back on dispatch failure.
+        self.assertIn("github.rest.issues.updateComment", body)
+        self.assertIn("github.rest.issues.createComment", body)
+        self.assertIn("controller.slice(0, -1)", body)
+        self.assertIn("rollbackControllerState", body)
+        self.assertIn("previousBody", body)
+        # Grace/coalescing reads the bumped timestamp.
+        self.assertIn("comment.updated_at || comment.created_at", body)
+
     def test_recovered_review_uses_ci_workflow_not_combined_status(self):
         review = self.read(".github/workflows/continuum-pr-agent.yml")
         self.assertIn("listWorkflowRunsForRepo", review)
@@ -568,6 +787,368 @@ console.log('sandbox construction OK');
             "it still belongs to the durable repair",
             recovery_workflow,
         )
+
+
+class CodeRabbitDeadlockWiringTests(unittest.TestCase):
+    """Lock the issue-37 P0 merge-gate deadlock semantics in place.
+
+    The controller-touch follow-up above must never regress or silently
+    substitute for these CodeRabbit adapter guarantees: exact-head
+    APPROVED identity, Review-skipped tolerance, nitpick supersession,
+    RESOLVED/UNRESOLVED normalization with fail-closed behavior, and
+    quota serialization.
+    """
+
+    def read(self, path: str) -> str:
+        with open(os.path.join(ROOT, path), "r", encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_exact_head_approved_identity(self):
+        gate = self.read(".github/workflows/continuum-auto-merge.yml")
+        self.assertIn("review.commit_id === headSha", gate)
+        self.assertIn("decision.state !== 'APPROVED'", gate)
+        self.assertIn("CHANGES_REQUESTED", gate)
+        self.assertIn("relative timestamps do not add safety", gate)
+        self.assertIn("sha: pr.head.sha", gate)
+
+    def test_review_skipped_does_not_erase_durable_approval(self):
+        gate = self.read(".github/workflows/continuum-auto-merge.yml")
+        self.assertIn("Review skipped", gate)
+        self.assertIn("Review completed", gate)
+        # The Review-completed wait must stay conditional on a missing
+        # review basis. An unconditional `description contains Review
+        # completed` merge-authorization check would erase a durable
+        # exact-head APPROVED basis whenever an auto-review-disabled event
+        # overwrote the status with "Review skipped".
+        self.assertRegex(gate, r"!reviewBasis[\s\S]{0,400}Review completed")
+        # Exactly two mentions exist: the status-independence comment and
+        # the single guarded wait. A reintroduced hard Review-completed
+        # authorization check adds a third and fails here.
+        self.assertEqual(gate.count("Review completed"), 2)
+        basis_src = self._extract_js_function(gate, "directCodeRabbitReviewBasis")
+        # The basis is review+CI+nitpick only: it must never read a commit
+        # status description. (Its explanatory comment mentions the status
+        # names, so pin on status plumbing instead of bare substrings.)
+        self.assertNotIn(
+            "rabbitStatus",
+            basis_src,
+            "review basis must stay status-independent; a skipped status never erases it",
+        )
+        self.assertNotIn(
+            "latestCodeRabbitStatus",
+            basis_src,
+            "review basis must stay status-independent; completed status is not merge evidence",
+        )
+        self.assertNotIn(
+            ".description",
+            basis_src,
+            "review basis must not authorize on a status description",
+        )
+
+    def test_nitpick_supersession(self):
+        gate = self.read(".github/workflows/continuum-auto-merge.yml")
+        self.assertIn("supersedes earlier advisory", gate)
+        self.assertIn("codeRabbitNitpickReviews", gate)
+        self.assertIn("> decisionAt", gate)
+
+    def test_thread_normalization_is_fail_closed(self):
+        gate = self.read(".github/workflows/continuum-auto-merge.yml")
+        self.assertIn("resolveReviewThread", gate)
+        self.assertIn("UNRESOLVED always wins", gate)
+        self.assertIn("unresolved.push", gate)
+        self.assertIn("unresolvedCodeRabbitThreads", gate)
+
+    def test_verification_requests_are_serialized_and_deduplicated(self):
+        gate = self.read(".github/workflows/continuum-auto-merge.yml")
+        self.assertIn("auto-merge-coderabbit-verification", gate)
+        self.assertIn("if (duplicate) continue", gate)
+
+    @staticmethod
+    def _extract_js_function(source: str, name: str) -> str:
+        """Extract one top-level JS function, skipping braces in strings.
+
+        A naive brace counter miscounts the GraphQL template literals in the
+        auto-merge gate, so this scanner tracks line/block comments,
+        single/double-quoted strings, and template literals with ${}
+        interpolation.
+        """
+        import re
+
+        match = re.search(
+            r"(?:async\s+)?function\s+" + re.escape(name) + r"\s*\(", source
+        )
+        assert match is not None, f"JS function {name} not found"
+        brace = source.index("{", match.end() - 1)
+        depth = 1
+        mode = ["code"]
+        i = brace + 1
+        total = len(source)
+        while i < total:
+            char = source[i]
+            nxt = source[i + 1] if i + 1 < total else ""
+            top = mode[-1]
+            if top == "line":
+                if char == "\n":
+                    mode.pop()
+            elif top == "block":
+                if char == "*" and nxt == "/":
+                    mode.pop()
+                    i += 1
+            elif top == "str1":
+                if char == "\\":
+                    i += 1
+                elif char == "'":
+                    mode.pop()
+            elif top == "str2":
+                if char == "\\":
+                    i += 1
+                elif char == '"':
+                    mode.pop()
+            elif top == "tpl":
+                if char == "\\":
+                    i += 1
+                elif char == "`":
+                    mode.pop()
+                elif char == "$" and nxt == "{":
+                    mode.append("{tpl}")
+                    depth += 1
+                    i += 1
+            else:  # code or {tpl}
+                if char == "/" and nxt == "/" and top == "code":
+                    mode.append("line")
+                    i += 1
+                elif char == "/" and nxt == "*" and top == "code":
+                    mode.append("block")
+                    i += 1
+                elif char == "'" and top == "code":
+                    mode.append("str1")
+                elif char == '"' and top == "code":
+                    mode.append("str2")
+                elif char == "`" and top == "code":
+                    mode.append("tpl")
+                elif char == "{":
+                    depth += 1
+                elif char == "}":
+                    depth -= 1
+                    if top == "{tpl}":
+                        mode.pop()
+                    if depth == 0:
+                        return source[match.start() : i + 1]
+            i += 1
+        raise AssertionError(f"unterminated JS function {name}")
+
+    def test_deadlock_ticket_cases_distinguish_green_from_blocked(self):
+        """Execute the real gate logic against fixtures for the deadlock cases.
+
+        Substring presence cannot tell a green gate from a blocked one, so
+        this test extracts the real decision functions from
+        continuum-auto-merge.yml and runs green-vs-blocked fixtures under
+        Node: stale-head approval, CHANGES_REQUESTED over a skipped status,
+        skipped status preserving a durable approval, newer vs superseded
+        nitpicks, RESOLVED normalization, UNRESOLVED blocking, and fail-closed
+        normalization failure.
+        """
+        import json
+        import shutil
+        import subprocess
+        import tempfile
+
+        gate = self.read(".github/workflows/continuum-auto-merge.yml")
+        needed = (
+            "latestWorkflowForHead",
+            "latestCiForHead",
+            "latestCodeRabbitDecision",
+            "codeRabbitNitpickReviews",
+            "directCodeRabbitReviewBasis",
+            "waitingForCompletedCodeRabbitReview",
+            "codeRabbitExplicitlyResolved",
+            "unresolvedCodeRabbitThreads",
+        )
+        extracted = [self._extract_js_function(gate, name) for name in needed]
+        self.assertIn("Review completed", extracted[5])
+        self.assertIn("isResolved", extracted[-1])
+
+        node = shutil.which("node")
+        self.assertIsNotNone(
+            node,
+            "node is required to execute the shipped JS; failing closed instead of silently skipping",
+        )
+
+        head = "a" * 40
+        old_head = "b" * 40
+        driver = """
+const assert = require('assert');
+const owner = 'acme';
+const repo = 'demo';
+let REVIEWS = [];
+let RUNS = [];
+let THREAD_NODES = [];
+let MUTATION_SHOULD_FAIL = false;
+let MUTATIONS = 0;
+const LIST_REVIEWS = { kind: 'listReviews' };
+const LIST_RUNS = { kind: 'listRuns' };
+const github = {
+  rest: {
+    pulls: { listReviews: LIST_REVIEWS },
+    actions: { listWorkflowRunsForRepo: LIST_RUNS },
+  },
+  paginate: async (endpoint, params) => {
+    if (endpoint === LIST_REVIEWS) return REVIEWS;
+    if (endpoint === LIST_RUNS) return RUNS;
+    throw new Error('unexpected paginate endpoint');
+  },
+  graphql: async (query, vars) => {
+    if (query.includes('mutation')) {
+      MUTATIONS += 1;
+      if (MUTATION_SHOULD_FAIL) throw new Error('resolution failed');
+      return { resolveReviewThread: { thread: { id: vars.threadId, isResolved: true } } };
+    }
+    return {
+      repository: {
+        pullRequest: {
+          reviewThreads: { nodes: THREAD_NODES, pageInfo: { hasNextPage: false, endCursor: null } },
+        },
+      },
+    };
+  },
+};
+const core = { info() {}, notice() {}, warning() {} };
+""" + "\n".join(extracted) + """
+async function main() {
+""" + f"""
+const HEAD = {json.dumps(head)};
+const OLD_HEAD = {json.dumps(old_head)};
+const review = (over = {{}}) => Object.assign(
+  {{
+    user: {{ login: 'coderabbitai[bot]' }},
+    commit_id: HEAD,
+    state: 'APPROVED',
+    submitted_at: '2026-01-01T00:00:00Z',
+    id: 1,
+    body: '',
+  }},
+  over,
+);
+const pr = {{ number: 7, head: {{ sha: HEAD, ref: 'feature' }} }};
+const ciRun = () => [{{
+  name: 'CI', head_sha: HEAD, status: 'completed',
+  conclusion: 'success', id: 10, created_at: '2026-01-01T00:00:00Z',
+}}];
+function threadWith(id, replyBodies) {{
+  const nodes = [{{ databaseId: 1, body: 'finding', author: {{ login: 'coderabbitai[bot]' }} }}];
+  replyBodies.forEach((reply, index) => {{
+    nodes.push({{ databaseId: 10 + index, body: reply, author: {{ login: 'coderabbitai[bot]' }} }});
+  }});
+  return [{{
+    id, isResolved: false, isOutdated: false, path: 'a.ts',
+    comments: {{ nodes }},
+  }}];
+}}
+const results = {{}};
+// 1. Exact-head approval with green CI and no findings merges.
+REVIEWS = [review()];
+RUNS = ciRun();
+results.green_direct = !!(await directCodeRabbitReviewBasis(pr, HEAD));
+// 2. Approval for a stale head must not merge the new head.
+REVIEWS = [review({{ commit_id: OLD_HEAD }})];
+RUNS = ciRun();
+results.stale_head_blocked = (await directCodeRabbitReviewBasis(pr, HEAD)) === null;
+// 3. A newer CHANGES_REQUESTED verdict blocks even when the status was
+// overwritten with "Review skipped" by an auto-review-disabled event.
+REVIEWS = [
+  review({{ state: 'APPROVED', submitted_at: '2026-01-01T00:00:00Z', id: 1 }}),
+  review({{ state: 'CHANGES_REQUESTED', submitted_at: '2026-01-02T00:00:00Z', id: 2 }}),
+];
+RUNS = ciRun();
+const skippedStatus = {{ context: 'CodeRabbit', state: 'success', description: 'Review skipped' }};
+const completedStatus = {{ context: 'CodeRabbit', state: 'success', description: 'Review completed' }};
+const changesBasis = await directCodeRabbitReviewBasis(pr, HEAD);
+results.changes_requested_blocked =
+  changesBasis === null &&
+  waitingForCompletedCodeRabbitReview(changesBasis, skippedStatus);
+// 4. "Review skipped" must not erase a durable exact-head approval.
+REVIEWS = [review({{ state: 'APPROVED' }})];
+RUNS = ciRun();
+const keptBasis = await directCodeRabbitReviewBasis(pr, HEAD);
+results.skipped_keeps_approval =
+  keptBasis !== null &&
+  !waitingForCompletedCodeRabbitReview(keptBasis, skippedStatus) &&
+  !waitingForCompletedCodeRabbitReview(keptBasis, completedStatus);
+// 5. A nitpick newer than the decision blocks the merge.
+REVIEWS = [
+  review({{ state: 'APPROVED', submitted_at: '2026-01-01T00:00:00Z', id: 1 }}),
+  review({{
+    state: 'COMMENTED', submitted_at: '2026-01-02T00:00:00Z', id: 2,
+    body: 'Nitpick comments (2): check bounds',
+  }}),
+];
+RUNS = ciRun();
+results.newer_nitpick_blocks =
+  (await directCodeRabbitReviewBasis(pr, HEAD)) === null &&
+  (await codeRabbitNitpickReviews(pr, HEAD)).length === 1;
+// 6. A nitpick older than the latest decision is superseded and merges.
+REVIEWS = [
+  review({{
+    state: 'COMMENTED', submitted_at: '2026-01-01T00:00:00Z', id: 1,
+    body: 'Nitpick comments (3): stale advice',
+  }}),
+  review({{ state: 'APPROVED', submitted_at: '2026-01-02T00:00:00Z', id: 2 }}),
+];
+RUNS = ciRun();
+results.superseded_nitpick_green =
+  !!(await directCodeRabbitReviewBasis(pr, HEAD)) &&
+  (await codeRabbitNitpickReviews(pr, HEAD)).length === 0;
+// 7. A RESOLVED bot reply normalizes the thread and merges.
+THREAD_NODES = threadWith('T1', ['**RESOLVED** fixed in latest push']);
+MUTATIONS = 0;
+MUTATION_SHOULD_FAIL = false;
+results.resolved_normalized =
+  (await unresolvedCodeRabbitThreads(pr)).length === 0 && MUTATIONS === 1;
+// 8. UNRESOLVED always wins and blocks without a resolution attempt.
+THREAD_NODES = threadWith('T2', ['UNRESOLVED: still broken on current HEAD']);
+MUTATIONS = 0;
+const stillOpen = await unresolvedCodeRabbitThreads(pr);
+results.unresolved_blocks = stillOpen.length === 1 && MUTATIONS === 0;
+// 9. A failed GitHub thread resolution stays fail-closed and blocks.
+THREAD_NODES = threadWith('T3', ['✅ Review thread resolved.']);
+MUTATIONS = 0;
+MUTATION_SHOULD_FAIL = true;
+results.normalization_failure_blocks =
+  (await unresolvedCodeRabbitThreads(pr)).length === 1 && MUTATIONS === 1;
+console.log('CASES:' + JSON.stringify(results));
+}}
+""" + """main().then(
+  () => {},
+  (err) => {
+    console.error((err && err.stack) || err);
+    process.exit(1);
+  },
+);
+"""
+        tmpdir = os.path.join(ROOT, ".opencode-tmp")
+        os.makedirs(tmpdir, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".js", delete=False, dir=tmpdir
+        ) as handle:
+            handle.write(driver)
+            script = handle.name
+        try:
+            completed = subprocess.run(
+                [node, script],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        finally:
+            os.unlink(script)
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        line = next(
+            entry for entry in completed.stdout.splitlines() if entry.startswith("CASES:")
+        )
+        results = json.loads(line[len("CASES:"):])
+        for case, green in results.items():
+            with self.subTest(case=case):
+                self.assertTrue(green, f"deadlock fixture {case} regressed")
 
 
 if __name__ == "__main__":

@@ -487,18 +487,31 @@ class TokenPolicyTests(unittest.TestCase):
         self.assertIn("READ_GITHUB_TOKEN: ${{ github.token }}", automerge)
         self.assertIn("new github.constructor({ auth: readToken, baseUrl: readBaseUrl })", automerge)
         self.assertIn("async function withReadFallback(fn)", automerge)
+        # Recovery/discovery scans use the repository-token client with PAT
+        # fallback. Merge-gate evidence reads (exact-HEAD CI lookup,
+        # CodeRabbit reviews/threads) intentionally stay PAT-backed per the
+        # main-branch housekeeping contract: they are merge evidence, not
+        # housekeeping, so they are asserted PAT-backed below instead.
         for read_call in (
             "client.rest.pulls.get",
             "client.rest.pulls.list",
-            "client.rest.actions.listWorkflowRunsForRepo",
             "client.rest.repos.getCombinedStatusForRef",
             "client.rest.issues.listComments",
-            "client.rest.pulls.listReviews",
             "client.rest.repos.getCommit",
             "client.rest.repos.getBranch",
         ):
             with self.subTest(read_call=read_call):
                 self.assertIn(read_call, automerge)
+        # Merge-gate evidence stays on the PAT-authenticated client; only
+        # housekeeping and recovery/discovery scans move to the token.
+        for gate_call in (
+            "github.paginate(",
+            "github.rest.pulls.listReviews",
+            "github.rest.actions.listWorkflowRunsForRepo",
+            "github.graphql(",
+        ):
+            with self.subTest(gate_call=gate_call):
+                self.assertIn(gate_call, automerge)
         # Mutations and dispatches stay on the PAT-authenticated client.
         for mutation in (
             "github.rest.pulls.merge",
