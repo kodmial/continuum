@@ -409,8 +409,6 @@ jobs:
                   // same-attempt marker without not-before lifts the older
                   // reset-aware wait instead of waiting past the clearing.
                   notBeforeEpoch = markerNotBeforeEpoch;
-                } else if (attempt === latestAttempt && markerNotBeforeEpoch !== null && notBeforeEpoch === null) {
-                  notBeforeEpoch = markerNotBeforeEpoch;
                 }
               };
               for (const comment of comments) {

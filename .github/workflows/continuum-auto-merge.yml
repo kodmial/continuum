@@ -226,12 +226,12 @@ jobs:
               )) {
                 return true;
               }
-              if (String((err && err.message) || '').toLowerCase().includes('assert')) return false;
-              if (/timed out|timeout/i.test(String((err && err.message) || ''))) {
-                return /read|connection|network|runner|socket|dns|tls|ssl|gateway|http|request|operation|bootstrap|provider/i.test(
-                  String((err && err.message) || '')
-                );
+              const _msg = String((err && err.message) || '');
+              if (/timed out|timeout/i.test(_msg)) {
+                if (/read|connection|network|runner|socket|dns|tls|ssl|gateway|http|request|operation|bootstrap|provider/i.test(_msg)) return true;
+                return false;
               }
+              if (_msg.toLowerCase().includes('assert')) return false;
               return false;
             }
             // Reset-aware scheduling (#224, single lifecycle contract): the
@@ -2053,15 +2053,14 @@ jobs:
                 }
                 // Durable not-before: persist the reset-aware wait so the
                 // next wakeup honors it instead of retrying immediately
-                // against an unexpired limit. Deferred waits never consume
-                // the per-HEAD dispatch budget (no conflict-repair marker is
-                // written for work that never executed).
+                // against an unexpired limit. The schedule-based backoff is
+                // durable even without a server reset signal: a generic
+                // 5xx/network failure with no Retry-After/Reset headers must
+                // still defer instead of hot-retrying. Deferred waits never
+                // consume the per-HEAD dispatch budget (no conflict-repair
+                // marker is written for work that never executed).
                 {
-                  const hasResetSignal =
-                    signals.retryAfterSeconds !== undefined ||
-                    signals.ratelimitResetEpoch !== undefined ||
-                    signals.providerResetEpoch !== undefined;
-                  if (hasResetSignal && resetDelay > 0) {
+                  if (resetDelay > 0) {
                     const notBefore = Math.floor(Date.now() / 1000) + resetDelay;
                     try {
                       await github.rest.issues.createComment({
