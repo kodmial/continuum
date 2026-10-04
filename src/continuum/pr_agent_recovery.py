@@ -255,6 +255,40 @@ def _parse_time(value: object) -> Optional[datetime]:
     return parsed.astimezone(timezone.utc)
 
 
+def safe_retry_evidence(
+    comments: Sequence[Mapping[str, Any]],
+    *,
+    head_sha: object,
+    kind: object,
+    max_executions: int = MAX_EXECUTIONS,
+) -> Optional[RetryEvidence]:
+    """Batch-safe evidence read: ``None`` for one bad HEAD/kind, no abort.
+
+    Repository-global open-PR loops must never let one truncated/malformed
+    HEAD strand independent healthy PRs behind it. Guard with
+    :func:`is_full_head` (``continue`` on False) or use this helper, which
+    isolates the per-PR failure and lets the loop continue::
+
+        for pr, head_sha, comments in open_prs:
+            evidence = safe_retry_evidence(
+                comments, head_sha=head_sha, kind=kind,
+                max_executions=max_executions,
+            )
+            if evidence is None:
+                continue  # loud skip; healthy PRs behind it still reconcile
+    """
+
+    try:
+        return retry_evidence(
+            comments,
+            head_sha=head_sha,  # type: ignore[arg-type]
+            kind=kind,  # type: ignore[arg-type]
+            max_executions=max_executions,
+        )
+    except RecoveryError:
+        return None
+
+
 def retry_evidence(
     comments: Sequence[Mapping[str, Any]],
     *,
@@ -268,9 +302,15 @@ def retry_evidence(
     member/collaborator remains usable, while arbitrary external commenters
     cannot forge retry/exhaustion state. Like :func:`operation_key`, the
     ``head_sha`` must be a full commit id: batch callers must isolate
-    per-PR failures (catch per PR and continue, or pre-check with
-    :func:`is_full_head`) so one short/truncated SHA never aborts a
-    repository-global open-PR scan.
+    per-PR failures (catch per PR and continue, pre-check with
+    :func:`is_full_head`, or use :func:`safe_retry_evidence`) so one
+    short/truncated SHA never aborts a repository-global open-PR scan.
+
+    Budget pairing: ``max_executions`` must be the same resolved value
+    passed to :func:`decide_recovery` for the same reconciliation. Resolve
+    once with :func:`resolve_max_executions` and pass it to both: the
+    exhaustion flag here and the dispatch/exhaust decision there share one
+    budget, so mismatched values would disagree about exhaustion.
     """
 
     head = str(head_sha or "").strip().lower()
@@ -448,6 +488,12 @@ def decide_recovery(
     ``operation_context`` (the reconciler-synthesized commit-status
     context) or an explicit ``failure_transient`` verdict; a token-bearing
     description without either holds.
+
+    Budget pairing: ``max_executions`` must be the same resolved value
+    passed to :func:`retry_evidence` for the same reconciliation. Resolve
+    once with :func:`resolve_max_executions` and pass it to both: the
+    exhaustion flag on ``evidence`` and the dispatch/exhaust decision here
+    share one budget, so mismatched values would disagree about exhaustion.
     """
 
     state = str(operation_state or "").strip().lower() or None
@@ -633,6 +679,7 @@ __all__ = [
     "operation_key",
     "is_full_head",
     "safe_operation_key",
+    "safe_retry_evidence",
     "retry_evidence",
     "resolve_max_executions",
     "retry_delay_schedule",

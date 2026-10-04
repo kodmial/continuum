@@ -531,6 +531,12 @@ def classify_infrastructure_failure(
         return None
 
     if conclusion in RETRYABLE_RUN_CONCLUSIONS:
+        if message and not _has_transient_signature(message):
+            return FailureClassification(
+                False, f"deterministic run conclusion: {conclusion}",
+                retry_after_seconds=None,
+                ratelimit_reset_epoch=None,
+            )
         return FailureClassification(
             True, f"retryable run conclusion: {conclusion}",
             retry_after_seconds=retry_after(),

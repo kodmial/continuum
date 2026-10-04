@@ -4387,6 +4387,39 @@ class ContinuumTest < Minitest::Test
     refute_includes recovery, 'exactHead.startsWith(shortHead)'
     refute_includes recovery, 'legacyShortRetryRe'
     refute_includes recovery, 'startsWith(marker)'
+
+    # Behavioral wiring: the strings above must feed the decisions below.
+    # Dead or unwired helpers containing those names still fail here.
+    # Reset-aware minimums: extracted signals flow into the delay computer,
+    # and the computer enforces the server reset floor over schedule+jitter.
+    assert_includes recovery, 'const signals = extractRateLimitSignals(err);'
+    assert_includes recovery, 'retryAfterSeconds: signals.retryAfterSeconds,'
+    assert_includes recovery, 'ratelimitResetEpoch: signals.ratelimitResetEpoch,'
+    assert_includes recovery, 'delay = Math.max(delay, retryAfterSeconds);'
+    assert_includes recovery, 'delay = Math.max(delay, Math.max(0, resetEpoch - nowEpoch));'
+    assert_includes recovery, 'resetFloor = Math.max(resetFloor, signals.retryAfterSeconds);'
+    # No-sleeping-runner deferral: a long reset-aware wait defers to the
+    # scheduled safety net instead of sleeping the runner inline.
+    assert_includes recovery, 'if (remaining > MAX_INLINE_WAIT_SECONDS) {'
+    assert_match(/remaining > MAX_INLINE_WAIT_SECONDS[\s\S]{0,3000}scheduled safety net will redispatch/m, recovery)
+    # Lease coalescing: the per-PR lease key feeds the acquire gate, and the
+    # repository-global scan coalesces through that gate.
+    assert_includes recovery, 'const key = leaseKey(prNumber, head, kind);'
+    assert_includes recovery, "if (!tryAcquireLease(pr.number, head, 'reconciler')) {"
+    assert_match(/function tryAcquireLease[\s\S]{0,300}leaseKey\(/m, recovery)
+    # Old-HEAD isolation: evidence filters on exact identity and every
+    # dispatch/evidence entry point requires a full commit id.
+    assert_includes recovery, 'if (markerKind !== kind || !sameHead(markerHead, exactHead)) return;'
+    assert_includes recovery, "const exactHead = requireFullHead(head, 'retry evidence read');"
+    assert_includes recovery, "requireFullHead(head, 'recovery dispatch');"
+    # Dispatch-grace / active-run coalescing: the pre-mutation re-read checks
+    # the exact run and the refreshed not-before before mutating.
+    assert_includes recovery, 'const refreshedRuns = await listReviewRuns();'
+    assert_includes recovery, 'if (exactActiveRun(refreshedRuns, pr.number, kind, head)) {'
+    assert_includes recovery, 'const activeRun = exactActiveRun(reviewRuns, pr.number, kind, head);'
+    assert_includes recovery, 'const refreshedEvidence = parseEvidence(refreshedComments, head, kind);'
+    assert_includes recovery, 'Number.isFinite(refreshedEvidence.notBeforeEpoch)'
+    assert_includes recovery, 'await operationIsActive(pr.number, head, kind)'
   end
 
   # Both branches of the flag, checked in the body that acts on them. Asserting
