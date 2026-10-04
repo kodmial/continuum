@@ -4172,6 +4172,22 @@ class ContinuumTest < Minitest::Test
     assert_equal 1, body.scan("body: '@coderabbitai full review'").size
   end
 
+  # Hour-scale CodeRabbit quota waits must never pin a GitHub runner. The
+  # controller keeps the due time in durable review/comment timestamps and
+  # exits; existing event-driven and auto-merge safety-net wake-ups reconcile
+  # the queue later.
+  def test_coderabbit_review_queue_defers_without_sleeping_runner
+    body = workflow_body('continuum-coderabbit-retry.yml')
+
+    assert_includes body, 'function deferUntilNextCandidate(state)'
+    assert_includes body, 'no runner sleep'
+    assert_includes body, 'auto-merge safety-net reconciliation will wake the controller again'
+    assert_includes body, 'timeout-minutes: 15'
+    refute_includes body, 'MAX_WAIT_MS'
+    refute_includes body, 'Sleeping until'
+    refute_includes body, 'setTimeout(resolve, waitMs)'
+  end
+
   # RESOLVED/UNRESOLVED replies are lifecycle events. They must wake the queue
   # without relying on cron. A PR lacking a source issue gets an explicit P2
   # fallback instead of an infinite rank that can starve forever.
