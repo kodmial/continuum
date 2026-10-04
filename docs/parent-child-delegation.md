@@ -133,6 +133,52 @@ does not start a delegated worker for the same issue while it observes an active
 local OpenCode run, an open `opencode/issue<NUMBER>-...` pull request, or a
 recent owner command inside the configured command-grace window.
 
+## Child PR-Agent routing through the parent
+
+When `CONTINUUM_REVIEW_PROVIDER=pr-agent`, the parent is the only automatic
+execution plane for child PR-Agent, and exactly one authoritative review path
+exists per parent:
+
+- `pr-agent` provider => parent-side PR-Agent lifecycle. The parent Issue
+  scheduler dispatches one `continuum-pr-agent-recovery.yml` run per verified
+  child carrying only the opaque child id; the recovery reconciler
+  discovers/admits every eligible child PR in that target and dispatches
+  parent-side review/repair work with PR number + exact HEAD. Review ->
+  repair -> re-review -> recovery continues in the parent as child HEADs
+  change. Owner-created and automation-created child PRs share this single
+  deterministic route: the reconciler admits every open same-repo non-draft
+  target PR with green exact-HEAD CI.
+- any other provider value => legacy independent child review only
+  (`continuum-child-review.yml` / `continuum-child-pr-review.yml`). The
+  scheduler never dispatches legacy child review beside PR-Agent, so there
+  is no double review, double repair, or competing merge path.
+
+Child-local automatic PR-Agent execution is suppressed in verified child
+mode: the `continuum-pr-agent.yml`, `continuum-pr-agent-repair.yml`,
+`continuum-pr-agent-auto-merge.yml`, `continuum-pr-agent-recovery.yml`, and
+`continuum-pr-agent-router.yml` reusable workflows never execute when the
+executing repository has `CONTINUUM_ROLE=child`, and the automatic recovery
+callers (`continuum-pr-agent-recovery.yml`, `pr-agent-recovery.yml`) skip
+schedule, `pull_request_target`, and `workflow_run` events there. An explicit
+owner `workflow_dispatch` in a child still reaches the reusable, which
+fail-safes to the same deterministic skip, so manual behavior is mutually
+exclusive with parent execution instead of racing it. Repositories without a
+child role are unaffected.
+
+Dedup and concurrency identity is stable across scheduler, event, and
+recovery wakeups: review, repair, merge, and recovery groups scope delegated
+runs by the opaque child id (preserving the exact local group string when
+empty), the router operation key is `review:<child>:<pr>:<head>` when
+delegated, and recovery leases plus durable retry markers coalesce duplicate
+wakeups so duplicates create at most one logical operation per exact
+PR/HEAD/operation. Dispatches carry only the opaque child id plus PR number
+plus exact HEAD; concrete child repository identity is resolved and
+re-verified only inside the trusted parent runner, masked in logs, and never
+appears in public run names, workflow inputs, artifacts, or committed
+config. Stale dispatches cannot repair or merge a newer HEAD: admission,
+revalidation, repair publication, and the merge gate all re-check the exact
+HEAD. CodeRabbit remains separate and unchanged.
+
 The historical `<!-- continuum-child-owned -->` and
 `<!-- runtime-worker-owned -->` strings may remain in old issue bodies, but
 they are no longer routing inputs.

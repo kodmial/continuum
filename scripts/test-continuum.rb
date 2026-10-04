@@ -3822,7 +3822,8 @@ class ContinuumTest < Minitest::Test
       continuum_ref pr_number target_child_id expected_head_sha retry_attempt retry_workflow recovery_kind
     ],
     'continuum-pr-agent-router.yml' => %w[
-      continuum_ref review_workflow review_provider pr_number
+      continuum_ref review_workflow review_provider pr_number target_child_id
+      expected_head_sha
     ],
     'continuum-pr-agent-repair.yml' => %w[
       continuum_ref pr_number target_child_id head_sha review_json improve_jsonl
@@ -7078,6 +7079,73 @@ class ContinuumTest < Minitest::Test
       .fetch('workflow_call').fetch('inputs')
     assert reusable_inputs.key?('target_child_id'),
            'continuum-pr-agent-recovery.yml must declare target_child_id or the dogfood forward is unreachable'
+  end
+
+  # Issue #244: the parent is the only automatic execution plane for child
+  # PR-Agent. Reusable PR-Agent jobs never execute in verified child mode,
+  # automatic recovery callers skip child events while keeping an explicit
+  # owner dispatch, the parent scheduler fans out one recovery per verified
+  # child with the opaque id only, and legacy child review never runs beside
+  # PR-Agent. The router accepts and forwards the opaque child id with a
+  # child-scoped operation key.
+  def test_pr_agent_child_routing_through_parent_with_suppression
+    %w[
+      continuum-pr-agent.yml
+      continuum-pr-agent-repair.yml
+      continuum-pr-agent-auto-merge.yml
+      continuum-pr-agent-recovery.yml
+      continuum-pr-agent-router.yml
+    ].each do |base|
+      body = File.read(File.join(ROOT, '.github/workflows', base))
+      assert_includes body, "vars.CONTINUUM_ROLE != 'child'",
+                      "#{base}: PR-Agent execution must be suppressed in verified child mode"
+    end
+
+    recovery = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent-recovery.yml'))
+    assert_includes recovery, "(inputs.review_provider || vars.CONTINUUM_REVIEW_PROVIDER || 'none') == 'pr-agent'",
+                    'recovery must keep the provider gate beside child suppression'
+
+    %w[
+      .github/caller-stubs/continuum-pr-agent-recovery.yml
+      .github/workflows/pr-agent-recovery.yml
+    ].each do |path|
+      body = File.read(File.join(ROOT, path))
+      assert_includes body, "vars.CONTINUUM_ROLE != 'child'",
+                      "#{path}: automatic PR-Agent callers must skip in verified child mode"
+      assert_includes body, "github.event_name == 'workflow_dispatch'",
+                      "#{path}: an explicit owner dispatch must still reach the fail-safe reusable"
+    end
+
+    scheduler = workflow_body('continuum-issue-scheduler.yml')
+    assert_includes scheduler, 'REVIEW_PROVIDER',
+                    'the scheduler must read the authoritative review provider for child PR routing'
+    assert_includes scheduler, 'pr_agent_authoritative',
+                    'the scheduler must branch on the authoritative review path'
+    assert_includes scheduler, 'gh workflow run "continuum-pr-agent-recovery.yml" --repo "$GITHUB_REPOSITORY"',
+                    'the parent must dispatch per-child PR-Agent recovery'
+    assert_includes scheduler, '-f target_child_id="$child_id"',
+                    'the parent fan-out must carry only the opaque child id'
+    assert_includes scheduler, 'if [[ "$pr_agent_authoritative" != true ]]; then',
+                    'legacy child review must be fenced off while PR-Agent is authoritative'
+
+    router = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent-router.yml'))
+    router_inputs = events(yaml(File.join(ROOT, '.github/workflows/continuum-pr-agent-router.yml')))
+      .fetch('workflow_call').fetch('inputs')
+    assert router_inputs.key?('target_child_id'),
+           'continuum-pr-agent-router.yml must declare target_child_id for delegated routing'
+    assert_includes router, 'dispatchArgs.inputs.target_child_id = targetChildId',
+                    'the router must forward the opaque child id to the heavy workflow'
+    assert_includes router, 'requires an exact expected_head_sha for delegated routing',
+                    'delegated routing must fail closed without an exact HEAD'
+    assert_includes router, "'review:' + targetChildId + ':' + prNumber + ':' + head",
+                    'the router operation key must stay stable per child/PR/HEAD across wakeups'
+    refute_includes router, 'target_repository:',
+                    'concrete repository identity must never be a router input'
+
+    router_stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-pr-agent-router.yml'))
+    assert_equal '${{ inputs.target_child_id }}',
+                 router_stub.fetch('jobs').fetch('call').fetch('with').fetch('target_child_id'),
+                 'the router caller must forward the opaque child id verbatim'
   end
 
   # Repository identity must fail closed on dot-only components (`owner/..`,

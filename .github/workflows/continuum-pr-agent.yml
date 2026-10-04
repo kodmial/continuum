@@ -164,6 +164,12 @@ concurrency:
 
 jobs:
   pr_agent:
+    # Verified child repositories never execute PR-Agent locally: the parent
+    # control plane is the only automatic execution plane for child PR-Agent
+    # (issue #244). Delegated runs execute in the parent (role=parent), so
+    # this gate only suppresses child-local execution while local/non-child
+    # behavior is unchanged.
+    if: vars.CONTINUUM_ROLE != 'child'
     runs-on: ubuntu-latest
     timeout-minutes: ${{ fromJSON(vars.AUTOMATION_PR_AGENT_TIMEOUT_MINUTES || '60') }}
     outputs:

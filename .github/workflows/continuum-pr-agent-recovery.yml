@@ -59,8 +59,12 @@ concurrency:
 
 jobs:
   reconcile:
+    # Child-local automatic recovery is suppressed in verified child mode
+    # (issue #244): the parent is the only automatic execution plane for
+    # child PR-Agent. Local/non-child behavior is unchanged.
     if: >-
-      (inputs.review_provider || vars.CONTINUUM_REVIEW_PROVIDER || 'none') == 'pr-agent'
+      (inputs.review_provider || vars.CONTINUUM_REVIEW_PROVIDER || 'none') == 'pr-agent' &&
+      vars.CONTINUUM_ROLE != 'child'
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
