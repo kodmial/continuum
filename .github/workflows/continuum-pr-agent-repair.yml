@@ -798,8 +798,13 @@ jobs:
           fi
           MARKER="<!-- continuum-pr-agent-convergence from=${HEAD_SHA_LOWER} to=${NEW_HEAD_LOWER} findings=${FINDING_IDS_LOWER} -->"
           CONTROLLER_MARKER='<!-- continuum-pr-agent-controller-state:v1 -->'
-          printf -v BODY '%s\n%s\n<details>\n<summary>Continuum PR-Agent controller state</summary>\n\n%s\n\n</details>' \
+          # Continuum comment attribution (kodmial/continuum#258): the legacy
+          # hidden marker lines stay first so positional upsert matching is
+          # unchanged; the attribution header is the first rendered line.
+          printf -v BODY '%s\n%s\n%s\n%s\n<details>\n<summary>Continuum PR-Agent controller state</summary>\n\n%s\n\n</details>' \
             "$CONTROLLER_MARKER" "$MARKER" \
+            "⚡ **Continuum · pr-agent-repair**" \
+            "<!-- continuum-origin role=continuum component=pr-agent-repair -->" \
             "Repair prepared ${HEAD_SHA_LOWER} -> ${NEW_HEAD_LOWER}; a fresh exact-HEAD review will hold only surviving logical findings."
 
           CONTROLLER_JSON="$RUNNER_TEMP/pr-agent-controller-comments.json"

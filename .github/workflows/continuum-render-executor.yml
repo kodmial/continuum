@@ -381,7 +381,7 @@ jobs:
 
             BODY="$(jq -c . "$RENDER_QUAL_RESULT_FILE")"
             gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
-              --body "$(printf '%s\n%s' "$QUALIFICATION_MARKER" "$BODY")"
+              --body "$(printf '%s\n%s\n%s\n%s' "🛰️ **Project · ${GITHUB_REPOSITORY##*/}**" "<!-- continuum-origin role=project component=qualification -->" "$QUALIFICATION_MARKER" "$BODY")"
             echo "classification=$(jq -r .classification "$RENDER_QUAL_RESULT_FILE")" >> "$GITHUB_OUTPUT"
             echo "subtype=$(jq -r .subtype "$RENDER_QUAL_RESULT_FILE")" >> "$GITHUB_OUTPUT"
             echo "fingerprint=$(jq -r .fingerprint "$RENDER_QUAL_RESULT_FILE")" >> "$GITHUB_OUTPUT"
@@ -532,7 +532,7 @@ jobs:
             gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
               --add-label "$PAUSE_LABEL" >/dev/null 2>&1 || true
             gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
-              --body "Mandatory Render cleanup failed in run $GITHUB_RUN_ID (execute=$EXECUTE_OUTCOME, cleanup=$CLEANUP_OUTCOME). Cleanup is verified independently on every path; the source is held paused for inspection and no repository repair was created."
+                --body "$(printf '%s\n%s\n%s' '⚡ **Continuum · render-executor**' '<!-- continuum-origin role=continuum component=render-executor -->' "Mandatory Render cleanup failed in run $GITHUB_RUN_ID (execute=$EXECUTE_OUTCOME, cleanup=$CLEANUP_OUTCOME). Cleanup is verified independently on every path; the source is held paused for inspection and no repository repair was created.")"
             echo "::error::Mandatory Render cleanup failed"
             exit 1
           fi
@@ -549,15 +549,15 @@ jobs:
               FAILURE_MARKER="<!-- continuum-render-failure-fingerprint=$ENGINE_FINGERPRINT -->"
               if [[ -n "$ENGINE_FINGERPRINT" ]] && fingerprint_seen "$FAILURE_MARKER"; then
                 gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
-                  --body "Identical Render $ENGINE_CLASSIFICATION failure fingerprint repeated ($ENGINE_FINGERPRINT). Automation remains paused instead of creating another identical task; a materially changed runtime artifact/profile or memory configuration may explicitly re-arm the source."
+                    --body "$(printf '%s\n%s\n%s' '⚡ **Continuum · render-executor**' '<!-- continuum-origin role=continuum component=render-executor -->' "Identical Render $ENGINE_CLASSIFICATION failure fingerprint repeated ($ENGINE_FINGERPRINT). Automation remains paused instead of creating another identical task; a materially changed runtime artifact/profile or memory configuration may explicitly re-arm the source.")"
                 echo "::error::Repeated identical Render failure fingerprint: $ENGINE_FINGERPRINT"
                 exit 1
               fi
               HOLD_MARKER="<!-- continuum-render-capacity-hold fingerprint=$ENGINE_FINGERPRINT -->"
               gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
-                --body "$FAILURE_MARKER"
+                --body "$(printf '%s\n%s' "$FAILURE_MARKER" "<!-- continuum-origin role=continuum component=render-executor -->")"
               gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
-                --body "$HOLD_MARKER Render $ENGINE_CLASSIFICATION failure in run $GITHUB_RUN_ID ($ENGINE_SUBTYPE): $ENGINE_REASON. No repository repair was created and the workload was not blindly rerun."
+                  --body "$(printf '%s\n%s\n%s\n%s' "$HOLD_MARKER" '⚡ **Continuum · render-executor**' '<!-- continuum-origin role=continuum component=render-executor -->' "Render $ENGINE_CLASSIFICATION failure in run $GITHUB_RUN_ID ($ENGINE_SUBTYPE): $ENGINE_REASON. No repository repair was created and the workload was not blindly rerun.")"
               if [[ "$ENGINE_CLASSIFICATION" == "capacity" && "$CHAIN_QUALIFICATION" == "yes" ]]; then
                 wake_chain
               fi
@@ -577,12 +577,12 @@ jobs:
                 gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
                   --add-label "$PAUSE_LABEL" >/dev/null 2>&1 || true
                 gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
-                  --body "Render transient infrastructure failures repeated $TRANSIENT_COUNT time(s); automatic recovery limit ($MAX_RENDER_REPAIR_ATTEMPTS) is exhausted. Issue remains paused for inspection and no repository repair was created."
+                    --body "$(printf '%s\n%s\n%s' '⚡ **Continuum · render-executor**' '<!-- continuum-origin role=continuum component=render-executor -->' "Render transient infrastructure failures repeated $TRANSIENT_COUNT time(s); automatic recovery limit ($MAX_RENDER_REPAIR_ATTEMPTS) is exhausted. Issue remains paused for inspection and no repository repair was created.")"
                 echo "::error::Transient Render recovery budget exhausted"
                 exit 1
               fi
               gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
-                --body "<!-- continuum-render-transient-attempt --> Transient Render infrastructure failure in run $GITHUB_RUN_ID ($ENGINE_SUBTYPE): $ENGINE_REASON. Bounded automatic recovery attempt $((TRANSIENT_COUNT + 1))/$MAX_RENDER_REPAIR_ATTEMPTS; no repository repair was created."
+                  --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-render-transient-attempt -->' '⚡ **Continuum · render-executor**' '<!-- continuum-origin role=continuum component=render-executor -->' "Transient Render infrastructure failure in run $GITHUB_RUN_ID ($ENGINE_SUBTYPE): $ENGINE_REASON. Bounded automatic recovery attempt $((TRANSIENT_COUNT + 1))/$MAX_RENDER_REPAIR_ATTEMPTS; no repository repair was created.")"
               gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
                 --remove-label "$PAUSE_LABEL" >/dev/null 2>&1 || true
               gh workflow run "$SCHEDULER_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DISPATCH_REF"
@@ -598,13 +598,13 @@ jobs:
               FAILURE_MARKER="<!-- continuum-render-failure-fingerprint=$ENGINE_FINGERPRINT -->"
               if [[ -n "$ENGINE_FINGERPRINT" ]] && fingerprint_seen "$FAILURE_MARKER"; then
                 gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
-                  --body "Identical Render repository failure fingerprint repeated ($ENGINE_FINGERPRINT). Automation remains paused instead of creating another identical repair; a materially changed runtime artifact/profile may explicitly re-arm the source."
+                    --body "$(printf '%s\n%s\n%s' '⚡ **Continuum · render-executor**' '<!-- continuum-origin role=continuum component=render-executor -->' "Identical Render repository failure fingerprint repeated ($ENGINE_FINGERPRINT). Automation remains paused instead of creating another identical repair; a materially changed runtime artifact/profile may explicitly re-arm the source.")"
                 echo "::error::Repeated identical Render repository failure fingerprint: $ENGINE_FINGERPRINT"
                 exit 1
               fi
               if [[ -n "$ENGINE_FINGERPRINT" ]]; then
                 gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
-                  --body "$FAILURE_MARKER"
+                  --body "$(printf '%s\n%s' "$FAILURE_MARKER" "<!-- continuum-origin role=continuum component=render-executor -->")"
               fi
               REPAIR_COUNT="$(jq '[.[][]? | select((.body // "") | contains("<!-- continuum-render-repair-attempt -->"))] | length' \
                 <<<"$COMMENTS_JSON" 2>/dev/null || echo 0)"
@@ -652,6 +652,8 @@ jobs:
                     --label "$REPAIR_LABEL" --body "$REPAIR_BODY")"
                   gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$(cat <<EOF
           <!-- continuum-render-repair-attempt -->
+          ⚡ **Continuum · render-executor**
+          <!-- continuum-origin role=continuum component=render-executor -->
           Render execution failed with engine classification $ENGINE_CLASSIFICATION ($ENGINE_SUBTYPE, run=$GITHUB_RUN_ID).
           Created automatic recovery issue: $REPAIR_URL
           The source issue remains paused until the recovery PR merges.
@@ -660,11 +662,11 @@ jobs:
                   gh workflow run "$SCHEDULER_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DISPATCH_REF"
                 else
                   gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
-                    --body "Render execution failed in run $GITHUB_RUN_ID; recovery issue #$EXISTING_REPAIR is already open, so no duplicate repair was created."
+                      --body "$(printf '%s\n%s\n%s' '⚡ **Continuum · render-executor**' '<!-- continuum-origin role=continuum component=render-executor -->' "Render execution failed in run $GITHUB_RUN_ID; recovery issue #$EXISTING_REPAIR is already open, so no duplicate repair was created.")"
                 fi
               else
                 gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
-                  --body "Render execution failed in run $GITHUB_RUN_ID. Automatic recovery limit ($MAX_RENDER_REPAIR_ATTEMPTS) is exhausted; issue remains paused for inspection."
+                      --body "$(printf '%s\n%s\n%s' '⚡ **Continuum · render-executor**' '<!-- continuum-origin role=continuum component=render-executor -->' "Render execution failed in run $GITHUB_RUN_ID. Automatic recovery limit ($MAX_RENDER_REPAIR_ATTEMPTS) is exhausted; issue remains paused for inspection.")"
               fi
 
               echo "::error::Render execution failed with repository classification"
@@ -679,7 +681,7 @@ jobs:
               gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
                 --add-label "$PAUSE_LABEL" >/dev/null 2>&1 || true
               gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
-                --body "Render execution produced an unrecognized engine classification ($ENGINE_CLASSIFICATION) in run $GITHUB_RUN_ID. Failing closed: the source is held paused and no repository repair was created."
+                  --body "$(printf '%s\n%s\n%s' '⚡ **Continuum · render-executor**' '<!-- continuum-origin role=continuum component=render-executor -->' "Render execution produced an unrecognized engine classification ($ENGINE_CLASSIFICATION) in run $GITHUB_RUN_ID. Failing closed: the source is held paused and no repository repair was created.")"
               echo "::error::Unrecognized Render engine classification: $ENGINE_CLASSIFICATION"
               exit 1
               ;;
@@ -693,7 +695,7 @@ jobs:
             gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
               --add-label "$PAUSE_LABEL" >/dev/null 2>&1 || true
             gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
-              --body "Render execution failed in run $GITHUB_RUN_ID (execute=$EXECUTE_OUTCOME, engine=$ENGINE_CLASSIFICATION) without a matching recovery route. Failing closed: the source is held paused and no repository repair was created."
+                --body "$(printf '%s\n%s\n%s' '⚡ **Continuum · render-executor**' '<!-- continuum-origin role=continuum component=render-executor -->' "Render execution failed in run $GITHUB_RUN_ID (execute=$EXECUTE_OUTCOME, engine=$ENGINE_CLASSIFICATION) without a matching recovery route. Failing closed: the source is held paused and no repository repair was created.")"
             echo "::error::Render execution failed without a matching recovery route"
             exit 1
           fi
@@ -701,7 +703,7 @@ jobs:
           if [[ "$EXECUTION_MODE" == "smoke" ]]; then
             gh issue close "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
               --reason completed \
-              --comment "Real Render smoke execution and mandatory cleanup completed successfully in workflow run $GITHUB_RUN_ID."
+                --comment "$(printf '%s\n%s\n%s' '⚡ **Continuum · render-executor**' '<!-- continuum-origin role=continuum component=render-executor -->' "Real Render smoke execution and mandatory cleanup completed successfully in workflow run $GITHUB_RUN_ID.")"
             if [[ "$CHAIN_QUALIFICATION" == "yes" ]]; then
               wake_chain
             fi
@@ -717,7 +719,7 @@ jobs:
               gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
                 --add-label "$PAUSE_LABEL" >/dev/null 2>&1 || true
               gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
-                --body "Render E2E execution and cleanup succeeded in workflow run $GITHUB_RUN_ID, but no compatible ${E2E_BRANCH_PREFIX}${ISSUE_NUMBER}-... PR was found."
+                  --body "$(printf '%s\n%s\n%s' '⚡ **Continuum · render-executor**' '<!-- continuum-origin role=continuum component=render-executor -->' "Render E2E execution and cleanup succeeded in workflow run $GITHUB_RUN_ID, but no compatible ${E2E_BRANCH_PREFIX}${ISSUE_NUMBER}-... PR was found.")"
               echo "::error::E2E mode completed without the required PR"
               exit 1
             fi
@@ -725,5 +727,5 @@ jobs:
             gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
               --add-label "$IN_PROGRESS_LABEL" >/dev/null 2>&1 || true
             gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
-              --body "Render E2E execution and cleanup succeeded in workflow run $GITHUB_RUN_ID; PR #$PR_NUMBER is now in the CI/merge chain."
+                --body "$(printf '%s\n%s\n%s' '⚡ **Continuum · render-executor**' '<!-- continuum-origin role=continuum component=render-executor -->' "Render E2E execution and cleanup succeeded in workflow run $GITHUB_RUN_ID; PR #$PR_NUMBER is now in the CI/merge chain.")"
           fi

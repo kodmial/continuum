@@ -117,7 +117,7 @@ jobs:
             exit 0
           fi
 
-          gh pr comment "$PR_NUMBER" --repo "$child_repo"             --body "<!-- continuum-child-pr-review-started --> Independent external review/repair started for owner-created PR #$PR_NUMBER."             >/dev/null 2>&1 || true
+          gh pr comment "$PR_NUMBER" --repo "$child_repo"             --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-pr-review-started -->' '⚡ **Continuum · delegation-pr-review**' '<!-- continuum-origin role=continuum component=delegation-pr-review -->' "Independent external review/repair started for owner-created PR #$PR_NUMBER.")"             >/dev/null 2>&1 || true
 
           workdir="$RUNNER_TEMP/continuum-child-pr-review"
           transcript="$RUNNER_TEMP/continuum-child-pr-review.log"
@@ -150,7 +150,7 @@ jobs:
           initial_validation="not configured"
           if [[ -n "$validation_script" ]]; then
             if ! git cat-file -e "origin/$base_ref:$validation_script" 2>/dev/null; then
-              gh pr comment "$PR_NUMBER" --repo "$child_repo"                 --body "<!-- continuum-child-pr-validation-missing --> Configured delegated validation gate is missing from the base branch."                 >/dev/null 2>&1 || true
+              gh pr comment "$PR_NUMBER" --repo "$child_repo"                 --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-pr-validation-missing -->' '⚡ **Continuum · delegation-pr-review**' '<!-- continuum-origin role=continuum component=delegation-pr-review -->' 'Configured delegated validation gate is missing from the base branch.')"                 >/dev/null 2>&1 || true
               exit 5
             fi
             trusted_validation="$RUNNER_TEMP/continuum-child-pr-validation.sh"
@@ -208,7 +208,7 @@ jobs:
               break
             fi
             if [[ "$attempt" -eq 3 ]]; then
-              gh pr comment "$PR_NUMBER" --repo "$child_repo"                 --body "<!-- continuum-child-pr-review-infra --> Review could not install the agent runtime; dispatcher may retry."                 >/dev/null 2>&1 || true
+              gh pr comment "$PR_NUMBER" --repo "$child_repo"                 --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-pr-review-infra -->' '⚡ **Continuum · delegation-pr-review**' '<!-- continuum-origin role=continuum component=delegation-pr-review -->' 'Review could not install the agent runtime; dispatcher may retry.')"                 >/dev/null 2>&1 || true
               exit 4
             fi
             sleep $((attempt * 5))
@@ -285,12 +285,12 @@ jobs:
           done
 
           if [[ "$accepted" != true ]]; then
-            gh pr comment "$PR_NUMBER" --repo "$child_repo"               --body "<!-- continuum-child-pr-review-needs-retry --> Independent review did not reach verified acceptance; the PR remains open for automatic retry."               >/dev/null 2>&1 || true
+            gh pr comment "$PR_NUMBER" --repo "$child_repo"               --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-pr-review-needs-retry -->' '⚡ **Continuum · delegation-pr-review**' '<!-- continuum-origin role=continuum component=delegation-pr-review -->' 'Independent review did not reach verified acceptance; the PR remains open for automatic retry.')"               >/dev/null 2>&1 || true
             exit 30
           fi
 
           if git diff --no-ext-diff "origin/$base_ref"...HEAD -- . |              grep -Eiq '(github_pat_[A-Za-z0-9_]+|ghp_[A-Za-z0-9]+|rnd_[A-Za-z0-9]+)'; then
-            gh pr comment "$PR_NUMBER" --repo "$child_repo"               --body "<!-- continuum-child-pr-review-security --> Token-like material detected; merge blocked."               >/dev/null 2>&1 || true
+            gh pr comment "$PR_NUMBER" --repo "$child_repo"               --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-pr-review-security -->' '⚡ **Continuum · delegation-pr-review**' '<!-- continuum-origin role=continuum component=delegation-pr-review -->' 'Token-like material detected; merge blocked.')"               >/dev/null 2>&1 || true
             exit 31
           fi
 
@@ -335,9 +335,9 @@ jobs:
           done
 
           if [[ "$merge_ok" != true ]]; then
-            gh pr comment "$PR_NUMBER" --repo "$child_repo"               --body "<!-- continuum-child-pr-review-merge-retry --> Review passed, but merge was deferred; dispatcher will retry."               >/dev/null 2>&1 || true
+            gh pr comment "$PR_NUMBER" --repo "$child_repo"               --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-pr-review-merge-retry -->' '⚡ **Continuum · delegation-pr-review**' '<!-- continuum-origin role=continuum component=delegation-pr-review -->' 'Review passed, but merge was deferred; dispatcher will retry.')"               >/dev/null 2>&1 || true
             exit 0
           fi
 
-          gh pr comment "$PR_NUMBER" --repo "$child_repo"             --body "<!-- continuum-child-pr-review-merged --> Independent review passed and this owner-created PR was merged."             >/dev/null 2>&1 || true
+          gh pr comment "$PR_NUMBER" --repo "$child_repo"             --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-pr-review-merged -->' '⚡ **Continuum · delegation-pr-review**' '<!-- continuum-origin role=continuum component=delegation-pr-review -->' "Independent review passed and this owner-created PR was merged.")"             >/dev/null 2>&1 || true
           echo "SubTask PR review #$PR_NUMBER reviewed and merged."

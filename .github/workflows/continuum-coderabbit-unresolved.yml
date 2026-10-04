@@ -369,6 +369,8 @@ jobs:
 
               const body = [
                 marker,
+                '⚡ **Continuum · coderabbit-unresolved**',
+                '<!-- continuum-origin role=continuum component=coderabbit-unresolved -->',
                 '@coderabbitai Re-check this exact original finding after the batched OpenCode retry.',
                 '',
                 `Latest UNRESOLVED reply processed: ${unresolvedId}`,

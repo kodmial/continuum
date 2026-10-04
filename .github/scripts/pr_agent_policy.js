@@ -5,6 +5,45 @@ const crypto = require('crypto');
 const IMPROVE_REPAIR_THRESHOLD = 7;
 const CONTROLLER_STATE_MARKER = '<!-- continuum-pr-agent-controller-state:v1 -->';
 
+// Continuum comment attribution (kodmial/continuum#258). Every
+// human-visible comment created or updated by Continuum must make machine
+// authorship unambiguous even when the GitHub actor renders as the
+// repository owner. The canonical contract lives in
+// src/continuum/comment_attribution.py; these JS mirrors must stay
+// byte-identical to it. Attribution is inserted into the existing body --
+// a second "signature" comment is never posted and single-comment
+// coalescing semantics are unchanged.
+const COMMENT_ATTRIBUTION_CONTINUUM_PREFIX = '⚡ **Continuum · ';
+const COMMENT_ATTRIBUTION_AGENT_CODER_PREFIX = '🦾 **Agent Coder · ';
+const COMMENT_ATTRIBUTION_PROJECT_PREFIX = '🛰️ **Project · ';
+
+function attributionHeader(role, component) {
+  if (role === 'continuum') {
+    return COMMENT_ATTRIBUTION_CONTINUUM_PREFIX + component + '**';
+  }
+  if (role === 'agent-coder') {
+    return COMMENT_ATTRIBUTION_AGENT_CODER_PREFIX + component + '**';
+  }
+  throw new Error('unknown attribution role: ' + String(role));
+}
+
+function originMarker(role, component) {
+  return '<!-- continuum-origin role=' + role + ' component=' + component + ' -->';
+}
+
+// The shared controllerStateBody serves the review controller
+// (kind=review) and the repair controller (kind=repair, no-progress
+// markers). The component is derived from the state marker itself so the
+// long-standing two-argument call shape -- and every existing caller --
+// keeps working unchanged.
+function controllerAttributionComponent(stateMarker) {
+  const text = String(stateMarker || '');
+  const kindMatch = /\bkind=(review|repair)\b/.exec(text);
+  if (kindMatch) return 'pr-agent-' + kindMatch[1];
+  if (text.indexOf('continuum-pr-agent-no-progress') !== -1) return 'pr-agent-repair';
+  return 'pr-agent';
+}
+
 const PATH_KEYS = ['relevant_file', 'path', 'file', 'filename'];
 const START_KEYS = ['relevant_lines_start', 'line_start', 'start_line', 'line'];
 const END_KEYS = ['relevant_lines_end', 'line_end', 'end_line', 'line'];
@@ -1047,9 +1086,15 @@ function reviewDisposition(reviewPayload, improveJsonl, threshold = IMPROVE_REPA
 }
 
 function controllerStateBody(stateMarker, summary) {
+  // Layout: the legacy hidden marker lines stay first so positional
+  // upsert/election matching is unchanged (HTML comments do not render,
+  // so the attribution header is still the first rendered line).
+  const component = controllerAttributionComponent(stateMarker);
   return [
     CONTROLLER_STATE_MARKER,
     String(stateMarker || '').trim(),
+    attributionHeader('continuum', component),
+    originMarker('continuum', component),
     '<details>',
     '<summary>Continuum PR-Agent controller state</summary>',
     '',
@@ -1061,11 +1106,16 @@ function controllerStateBody(stateMarker, summary) {
 
 module.exports = {
   BLOCKING_SECURITY_SIGNAL_KEYS,
+  COMMENT_ATTRIBUTION_AGENT_CODER_PREFIX,
+  COMMENT_ATTRIBUTION_CONTINUUM_PREFIX,
+  COMMENT_ATTRIBUTION_PROJECT_PREFIX,
   CONTROLLER_STATE_MARKER,
   IMPROVE_REPAIR_THRESHOLD,
   REVIEW_MAX_FINDINGS,
   REVIEW_MERGE_SAFE,
+  attributionHeader,
   buildRepairBatch,
+  controllerAttributionComponent,
   controllerStateBody,
   hasBlockingSecuritySignal,
   hasIncompleteCoverageSignal,
@@ -1074,6 +1124,7 @@ module.exports = {
   isSkippedCleanImprovePayload,
   logicalFingerprint,
   normalizeProblem,
+  originMarker,
   overlappingLocation,
   parseImproveJsonl,
   persistentHasActive,

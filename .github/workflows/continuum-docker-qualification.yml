@@ -501,8 +501,13 @@ jobs:
           fi
 
           BODY="$(jq -c . "$RESULT_FILE")"
+          # Continuum comment attribution (kodmial/continuum#258): the result
+          # comment reports facts produced by the consumer repository itself,
+          # so it speaks as 🛰️ Project with the repository display name
+          # derived from context (never hard-coded). The hidden origin marker
+          # carries no repository identity.
           gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
-            --body "$(printf '%s\n%s' "$RESULT_MARKER" "$BODY")"
+            --body "$(printf '%s\n%s\n%s\n%s' "🛰️ **Project · ${GITHUB_REPOSITORY##*/}**" "<!-- continuum-origin role=project component=qualification -->" "$RESULT_MARKER" "$BODY")"
           gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
             --add-label "$PAUSE_LABEL" --remove-label "$IN_PROGRESS_LABEL" >/dev/null 2>&1 || true
 
