@@ -511,6 +511,40 @@ jobs:
             fi
           }
 
+          # Newest-first comment window: issue comments list oldest-first
+          # and ignore sort/direction, so pages 1..N would miss a recent
+          # repair marker on a long thread. Derive the last page from the
+          # issue total (like child-dispatcher) and walk the newest
+          # CONTINUUM_MAX_PAGES pages instead, keeping the array-of-pages
+          # shape callers parse with `.[][]?`.
+          continuum_newest_comments_slurp() {
+            local repo="$1" issue="$2"
+            local total last first page page_json count pages_out=""
+            total="$(continuum_api_get "repos/$repo/issues/$issue" --jq '.comments // 0' 2>/dev/null || echo 0)"
+            [[ "$total" =~ ^[0-9]+$ ]] || total=0
+            last=$(( (total + 99) / 100 ))
+            [[ "$last" -ge 1 ]] || last=1
+            first=$(( last - CONTINUUM_MAX_PAGES + 1 ))
+            [[ "$first" -ge 1 ]] || first=1
+            page="$first"
+            while [[ "$page" -le "$last" ]]; do
+              if ! page_json="$(continuum_api_get "repos/$repo/issues/$issue/comments?per_page=100&page=${page}" 2>/dev/null)"; then
+                page=$((page + 1))
+                continue
+              fi
+              count="$(jq 'length' <<<"$page_json" 2>/dev/null || echo 0)"
+              [[ "$count" =~ ^[0-9]+$ ]] || { page=$((page + 1)); continue; }
+              [[ "$count" -gt 0 ]] || { page=$((page + 1)); continue; }
+              pages_out+="$page_json"$'\n'
+              page=$((page + 1))
+            done
+            if [[ -z "$pages_out" ]]; then
+              echo "[]"
+            else
+              jq -s '.' <<<"$(grep -v '^$' <<<"$pages_out" || true)"
+            fi
+          }
+
           # A follow-up chain is optional: without one the controller still
           # classifies and still fails, it simply does not dispatch a workflow
           # the consumer may not have installed.
@@ -570,11 +604,12 @@ jobs:
           ENGINE_FINGERPRINT="${ENGINE_FINGERPRINT:-}"
           ENGINE_REASON="${ENGINE_REASON:-no engine reason recorded}"
 
-          # Bounded comment scan (#254): keeps the array-of-pages shape the
-          # fingerprint helpers parse with `.[][]?`, capped at
-          # CONTINUUM_MAX_PAGES instead of full-history pagination.
-          COMMENTS_JSON="$(continuum_bounded_slurp \
-            "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER/comments" 2>/dev/null || echo "[]")"
+          # Bounded comment scan (#254): newest-first window keeping the
+          # array-of-pages shape the fingerprint helpers parse with
+          # `.[][]?`, capped at CONTINUUM_MAX_PAGES instead of full-history
+          # pagination. Comments list oldest-first, so the oldest pages
+          # would miss a recent repair marker and undercount the budget.
+          COMMENTS_JSON="$(continuum_newest_comments_slurp "$GITHUB_REPOSITORY" "$ISSUE_NUMBER" 2>/dev/null || echo "[]")"
 
           fingerprint_seen() {
             local marker="$1"

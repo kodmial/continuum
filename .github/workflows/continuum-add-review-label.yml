@@ -91,7 +91,6 @@ jobs:
               baseUrl: github.request.endpoint.DEFAULTS.baseUrl,
             });
             if (
-              typeof readGithub.paginate !== 'function' ||
               typeof readGithub.rest?.repos?.listPullRequestsAssociatedWithCommit !== 'function' ||
               typeof readGithub.rest?.pulls?.listFiles !== 'function' ||
               typeof readGithub.rest?.repos?.getCommit !== 'function' ||
@@ -101,7 +100,7 @@ jobs:
               typeof readGithub.rest?.issues?.listLabelsOnIssue !== 'function'
             ) {
               throw new Error(
-                'readGithub client lacks the paginate/rest plugins; ' +
+                'readGithub client lacks the rest plugins; ' +
                 'cannot perform same-repository review-label reads.'
               );
             }
