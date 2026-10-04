@@ -63,6 +63,10 @@ concurrency:
 
 jobs:
   repair:
+    # Child-local suppression (issue #244): delegated repair executes in the
+    # parent; a verified child never repairs locally so no child-local repair
+    # can race the parent. Local/non-child behavior is unchanged.
+    if: vars.CONTINUUM_ROLE != 'child'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 

@@ -80,6 +80,10 @@ concurrency:
 
 jobs:
   gate:
+    # Child-local suppression (issue #244): delegated merges execute in the
+    # parent; a verified child never merges locally so no competing merge
+    # path can race the parent. Local/non-child behavior is unchanged.
+    if: vars.CONTINUUM_ROLE != 'child'
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
