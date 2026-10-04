@@ -2150,6 +2150,37 @@ class ContinuumTest < Minitest::Test
     end
   end
 
+  def test_watchdog_same_repo_reads_use_repository_token_but_writes_keep_pat
+    body = watchdog_body
+
+    assert_includes body, 'READ_GITHUB_TOKEN: ${{ github.token }}'
+    assert_includes body, 'github-token: ${{ secrets.TAP_PAT }}'
+    assert_includes body, 'const readGithub = new github.constructor({'
+    assert_includes body, 'baseUrl: github.request.endpoint.DEFAULTS.baseUrl'
+
+    %w[
+      readGithub.rest.issues.listForRepo
+      readGithub.rest.issues.get
+      readGithub.rest.pulls.list
+      readGithub.rest.actions.listWorkflowRunsForRepo
+      readGithub.rest.issues.listComments
+    ].each do |read_call|
+      assert_includes body, read_call
+    end
+    assert_includes body, 'const blockers = await readGithub.paginate('
+
+    refute_includes body, 'await github.rest.issues.get({'
+    refute_includes body, 'github.rest.issues.listForRepo'
+    refute_includes body, 'github.rest.pulls.list'
+    refute_includes body, 'github.rest.actions.listWorkflowRunsForRepo'
+    refute_includes body, 'github.rest.issues.listComments'
+
+    # Mutations stay on the PAT-authenticated action client so their
+    # issue_comment / label events continue to wake downstream automation.
+    assert_includes body, 'await github.rest.issues.createComment({'
+    assert_includes body, 'await github.rest.issues.addLabels({'
+    assert_includes body, 'await github.rest.issues.removeLabel({'
+  end
   # Every knob that used to be hardcoded in kodmai's full fork must be a
   # `workflow_call` input with a `vars.` fallback carrying the fork's own
   # default, so a consumer with empty repository variables still behaves.
