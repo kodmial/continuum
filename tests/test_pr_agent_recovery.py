@@ -701,12 +701,14 @@ class RecoveryWiringTests(unittest.TestCase):
         self.assertIn("const owner = process.env.CONTINUUM_PR_AGENT_TARGET_OWNER;", body)
         self.assertIn("client.rest.repos.get({ owner: executionOwner, repo: executionRepo })", body)
 
-        # One helper definition plus twelve guarded read sites. Controller-state
-        # upsert also reads comments through the repository-scoped token, and
-        # both post-dispatch prune paths re-read fresh (grace-coalesce and
-        # coalesce-failure) so an interleaved controller write is never pruned
-        # from a stale pre-dispatch snapshot.
-        self.assertEqual(body.count("withReadFallback("), 13)
+        # One helper definition plus thirteen guarded read sites.
+        # Controller-state upsert also reads comments through the
+        # repository-scoped token, both post-dispatch prune paths re-read
+        # fresh (grace-coalesce and coalesce-failure) so an interleaved
+        # controller write is never pruned from a stale pre-dispatch
+        # snapshot, and the bounded CI snapshot (Work-Lock #58 item 6 B3)
+        # reads through the same guarded client with per-PR exact fallback.
+        self.assertEqual(body.count("withReadFallback("), 14)
 
         # Item 1 keeps all mutation/dispatch calls on the PAT-authenticated
         # action client, preserving actor and event fan-out semantics.
