@@ -214,9 +214,12 @@ jobs:
             // Canonical durable marker contract (#224): exactly one marker
             // shape carries retry state, with not-before INSIDE the trailing
             // --> so a single parseable comment holds the whole record.
-            // Legacy continuum-pr-agent-retry markers remain readable so
-            // existing durable state survives; all new writes use the
-            // continuum-lifecycle-retry prefix.
+            // Legacy full-SHA continuum-pr-agent-retry markers remain
+            // readable so existing durable state survives; all new writes
+            // use the continuum-lifecycle-retry prefix. Pre-existing
+            // short-SHA exhausted markers never authorize a retry attempt,
+            // but a prefix-matching one preserves exhaustion fail-closed
+            // (see parseEvidence) so the bounded budget never restarts.
             const LIFECYCLE_RETRY_PREFIX = 'continuum-lifecycle-retry';
             const LIFECYCLE_EXHAUSTED_PREFIX = 'continuum-lifecycle-retry-exhausted';
             // Exact-HEAD producer contract (#224): every durable marker
@@ -356,9 +359,13 @@ jobs:
             function parseEvidence(comments, head, kind) {
               // Fail closed on short SHAs: every producer writes the full
               // HEAD, so a short identity here is a programming error, not
-              // a legacy marker worth prefix-matching (two commits can share
+              // a retry marker worth prefix-matching (two commits can share
               // a 7-char prefix, which would let old-HEAD evidence authorize
-              // a new HEAD and silently reset the budget).
+              // a new HEAD and silently reset the budget). The single
+              // exception is fail-closed exhaustion below: a pre-existing
+              // short-SHA exhausted marker that prefixes the current HEAD
+              // preserves exhaustion so the budget never restarts. Short
+              // retry markers never advance latestAttempt.
               const exactHead = requireFullHead(head, 'retry evidence read');
               // Exact-HEAD identity only: prefix matching is rejected
               // because two distinct commits can share a 7-char prefix,
@@ -377,6 +384,13 @@ jobs:
                 /<!--\s*continuum-lifecycle-retry-exhausted\s+head=([0-9a-f]{40,64})\s+kind=(review|repair)\s+attempts=(\d+)\s*-->/ig;
               const legacyExhaustedRe =
                 /<!--\s*continuum-pr-agent-retry-exhausted\s+head=([0-9a-f]{40,64})\s+kind=(review|repair)\s+attempts=(\d+)\s*-->/ig;
+              // Pre-existing short-SHA exhausted markers (7-39 hex) from
+              // before exact-HEAD safety: fail-closed only. A prefix-matching
+              // one preserves exhaustion so the budget never restarts; short
+              // retry markers never authorize work, so there is deliberately
+              // no short retry regex feeding latestAttempt.
+              const legacyShortExhaustedRe =
+                /<!--\s*continuum-pr-agent-retry-exhausted\s+head=([0-9a-f]{7,39})\s+kind=(review|repair)\s+attempts=(\d+)\s*-->/ig;
               let latestAttempt = null;
               let latestMarkerAt = null;
               let notBeforeEpoch = null;
@@ -414,6 +428,7 @@ jobs:
                 legacyRetryRe.lastIndex = 0;
                 exhaustedRe.lastIndex = 0;
                 legacyExhaustedRe.lastIndex = 0;
+                legacyShortExhaustedRe.lastIndex = 0;
                 for (const match of body.matchAll(retryRe)) {
                   consider(match[1], match[2], match[3], markerNotBefore(match), createdAt);
                 }
@@ -433,6 +448,21 @@ jobs:
                   if (
                     sameHead(match[1], exactHead) &&
                     match[2] === kind &&
+                    Number.parseInt(match[3], 10) >= maxExecutions
+                  ) {
+                    exhausted = true;
+                  }
+                }
+                // Fail-closed short-SHA exhaustion only: a short marker that
+                // prefixes the current full HEAD preserves exhaustion so the
+                // budget never restarts. It never touches latestAttempt (no
+                // prefix authorization for retry attempts).
+                for (const match of body.matchAll(legacyShortExhaustedRe)) {
+                  if (match[2] !== kind) continue;
+                  const shortHead = String(match[1] || '').toLowerCase();
+                  if (
+                    shortHead &&
+                    exactHead.startsWith(shortHead) &&
                     Number.parseInt(match[3], 10) >= maxExecutions
                   ) {
                     exhausted = true;

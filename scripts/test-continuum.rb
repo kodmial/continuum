@@ -4379,7 +4379,13 @@ class ContinuumTest < Minitest::Test
     assert_includes automerge, 'liveBeforeSync'
     assert_includes automerge, 'holding stale reconciliation'
     assert_includes automerge, 'sha: pr.head.sha'
-    refute_includes recovery, '{7,39}'
+    # Fail-closed legacy short-SHA exhaustion only: a pre-existing short
+    # exhausted marker that prefixes the current HEAD preserves exhaustion
+    # so the bounded budget never restarts. Short SHAs must never authorize
+    # retry attempts, so no short retry regex may feed latestAttempt.
+    assert_includes recovery, 'legacyShortExhaustedRe'
+    assert_includes recovery, 'never touches latestAttempt'
+    refute_includes recovery, 'legacyShortRetryRe'
     refute_includes recovery, 'startsWith(marker)'
   end
 

@@ -146,18 +146,22 @@ _NEGATED_RECOVERY_ELIGIBLE_RE = re.compile(
 # Deterministic policy hints dominate the recovery token: a description that
 # carries both (e.g. "CI test failure; recovery eligible" synthesized from
 # PR-visible output) must hold, never burn transient budget. Only an
-# explicit failure_transient=True classifier verdict overrides this.
+# explicit failure_transient=True classifier verdict overrides this. Bare
+# ``conflict`` is matched word-initially (``[^a-z]conflict``, mirroring the
+# reconciler workflow) so incidental mentions such as ``conflict-free`` or
+# ``conflicting`` do not strand genuinely transient failures; a real merge
+# conflict still holds via ``merge conflict``.
 _DETERMINISTIC_HINTS = (
     "test failure",
     "tests failed",
     "unresolved",
     "merge conflict",
-    "conflict",
     "malformed",
     "stale head",
     "moved head",
     "invalid state",
 )
+_BARE_CONFLICT_RE = re.compile(r"[^a-z]conflict")
 TRUSTED_OPERATION_CONTEXTS = frozenset(
     {
         "continuum/pr-agent-review",
@@ -408,6 +412,13 @@ def decide_recovery(
         return RecoveryDecision("hold", None, "retry budget already exhausted")
     if active_exact_run:
         return RecoveryDecision("wait", None, "exact operation already active")
+    if evidence.not_before_epoch is not None and now_epoch is None:
+        # Fail closed without a clock: a durable reset-aware wait the marker
+        # already committed must defer to the scheduled safety net, never
+        # dispatch straight through it and burn transient budget on 403/429.
+        return RecoveryDecision(
+            "wait", None, "durable reset-aware not-before requires a clock; deferring"
+        )
     if (
         evidence.not_before_epoch is not None
         and now_epoch is not None
@@ -425,13 +436,13 @@ def decide_recovery(
     if (
         marker_newer_than_status
         and evidence.latest_attempt is not None
-        and (
-            marker_age_seconds is None
-            or marker_age_seconds < dispatch_grace_seconds
-        )
+        and marker_age_seconds is not None
+        and marker_age_seconds < dispatch_grace_seconds
     ):
-        # Fail closed like the single lifecycle contract: unknown marker
-        # age cannot prove grace expired, so it stays inside grace.
+        # Only a known age inside grace coalesces: an unknown marker age
+        # (missing/unparsable timestamp) cannot prove a dispatch is still
+        # in flight, so waiting on it would never expire and would strand
+        # a healthy PR with neither event nor watchdog wakeups advancing.
         return RecoveryDecision(
             "wait", None, "newer retry dispatch marker is still inside dispatch grace"
         )
@@ -456,7 +467,10 @@ def decide_recovery(
                     "hold", None, "recovery token from untrusted context is not automatically retried"
                 )
             lowered = description.lower()
-            if any(hint in lowered for hint in _DETERMINISTIC_HINTS):
+            if (
+                any(hint in lowered for hint in _DETERMINISTIC_HINTS)
+                or _BARE_CONFLICT_RE.search(lowered)
+            ):
                 return RecoveryDecision(
                     "hold", None, "deterministic failure is not automatically retried"
                 )

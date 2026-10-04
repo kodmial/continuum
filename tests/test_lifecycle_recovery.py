@@ -474,14 +474,35 @@ class LatestStateReconciliationTests(unittest.TestCase):
                 )
                 self.assertEqual(decision.action, "hold")
 
-    def test_explicit_recovery_eligible_still_dispatches(self):
-        decision = lifecycle.decide_recovery(
+    def test_explicit_recovery_eligible_requires_trusted_context(self):
+        # The token alone never authorizes a retry: a missing or untrusted
+        # commit-status context holds, so PR-visible check output or review
+        # text containing the token can never burn transient budget. Only a
+        # trusted reconciler-synthesized context dispatches, and an explicit
+        # transient classifier verdict overrides the gate.
+        missing = lifecycle.decide_recovery(
             ci_green=True,
             operation_state="failure",
             operation_description="PR-Agent blocking review: recovery eligible",
             failure_transient=None,
         )
-        self.assertEqual(decision.action, "dispatch")
+        self.assertEqual(missing.action, "hold")
+        self.assertIsNone(missing.attempt)
+        trusted = lifecycle.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="PR-Agent blocking review: recovery eligible",
+            operation_context="continuum/pr-agent-review",
+            failure_transient=None,
+        )
+        self.assertEqual(trusted.action, "dispatch")
+        override = lifecycle.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="PR-Agent blocking review: recovery eligible",
+            failure_transient=True,
+        )
+        self.assertEqual(override.action, "dispatch")
 
     def test_success_clears_recovery_state(self):
         self.assertTrue(lifecycle.forward_progress_clears("success"))
@@ -603,6 +624,17 @@ class DurableEvidenceTests(unittest.TestCase):
             [comment(marker)], head_sha=HEAD, kind="review"
         )
         self.assertEqual(evidence.not_before_epoch, 2000)
+
+    def test_retry_marker_preserves_epoch_zero_not_before(self):
+        # Epoch zero is a real scheduling commitment, not a missing value:
+        # the marker must carry it and the reader must return it instead
+        # of treating it as no wait.
+        marker = lifecycle.retry_marker(HEAD, "review", 1, not_before_epoch=0)
+        self.assertIn("not-before=0 -->", marker)
+        evidence = lifecycle.retry_evidence(
+            [comment(marker)], head_sha=HEAD, kind="review"
+        )
+        self.assertEqual(evidence.not_before_epoch, 0)
 
     def test_stray_not_before_outside_any_marker_is_ignored(self):
         evidence = lifecycle.retry_evidence(
@@ -755,15 +787,24 @@ class CrossStackContractTests(unittest.TestCase):
             failure_transient=None,
         )
         self.assertEqual(trusted.action, "dispatch")
-        # Without a context (legacy callers) the token still dispatches so
-        # existing reconciler-synthesized statuses keep recovering.
+        # Without a context the token holds: PR-visible text is not a
+        # reconciler-synthesized status, so it can never burn transient
+        # budget on its own. Only an explicit transient classifier
+        # verdict overrides the gate.
         legacy = lifecycle.decide_recovery(
             ci_green=True,
             operation_state="failure",
             operation_description="PR-Agent blocking review: recovery eligible",
             failure_transient=None,
         )
-        self.assertEqual(legacy.action, "dispatch")
+        self.assertEqual(legacy.action, "hold")
+        override = lifecycle.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="PR-Agent blocking review: recovery eligible",
+            failure_transient=True,
+        )
+        self.assertEqual(override.action, "dispatch")
 
     def test_deterministic_hint_dominates_recovery_token(self):
         # A deterministic policy hint alongside the token still holds; only
@@ -824,11 +865,11 @@ class CrossStackContractTests(unittest.TestCase):
 
     def test_cross_run_safety_comes_from_durable_guards(self):
         # In-memory dedupe/should_coalesce are intra-run only; overlapping
-        # runs serialize through decide_recovery's durable guards (active
-        # lease, dispatch grace, durable not-before) plus the
-        # repository-global concurrency group the callers hold. A second
-        # run that sees the first run's fresh marker inside grace waits
-        # instead of computing a duplicate dispatch.
+        # runs serialize per PR/HEAD through decide_recovery's durable guards
+        # (per-PR/HEAD lease via concurrency_key, dispatch grace, durable
+        # not-before) so unrelated PRs never queue behind or starve each
+        # other. A second run that sees the first run's fresh marker inside
+        # grace waits instead of computing a duplicate dispatch.
         key = lifecycle.concurrency_key(REPO, 224, HEAD)
         self.assertEqual(lifecycle.dedupe_wakeups([key, key]), [key])
         self.assertTrue(lifecycle.should_coalesce([key], key))

@@ -574,7 +574,11 @@ def retry_marker(head_sha: str, kind: str, attempt: int, *, not_before_epoch: Op
     normalized_kind = normalize_kind(kind)
     if attempt < 0:
         raise LifecycleRecoveryError("attempt must be non-negative")
-    suffix = f" not-before={int(not_before_epoch)}" if not_before_epoch else ""
+    suffix = (
+        f" not-before={int(not_before_epoch)}"
+        if not_before_epoch is not None
+        else ""
+    )
     return (
         f"<!-- continuum-lifecycle-retry head={head} "
         f"kind={normalized_kind} attempt={int(attempt)}{suffix} -->"
@@ -741,9 +745,11 @@ def decide_recovery(
     The ``recovery eligible`` token is honored only for reconciler-
     synthesized descriptions from trusted commit-status contexts
     (``TRUSTED_OPERATION_CONTEXTS``). When ``operation_context`` is
-    supplied and untrusted, the token is ignored and the failure holds,
+    missing or untrusted, the token is ignored and the failure holds,
     so PR-visible check output or review text containing the token can
-    never burn transient budget. A deterministic policy hint in the
+    never burn transient budget. Only an explicit
+    ``failure_transient=True`` classifier verdict overrides the gate.
+    A deterministic policy hint in the
     description (CI failure, unresolved findings, merge conflict,
     malformed state) also holds even when the token is present: only an
     explicit ``failure_transient=True`` classifier verdict overrides it.
@@ -832,8 +838,10 @@ def decide_recovery(
         elif _is_explicit_recovery_eligible(description):
             # Trust gate: the token alone never authorizes a retry unless
             # it comes from a reconciler-synthesized status in a trusted
-            # context and carries no deterministic policy hint.
-            if operation_context is not None and str(operation_context or "").strip().lower() not in TRUSTED_OPERATION_CONTEXTS:
+            # context and carries no deterministic policy hint. A missing
+            # context is untrusted: PR-visible text is not a reconciler
+            # status, so it can never burn transient budget on its own.
+            if str(operation_context or "").strip().lower() not in TRUSTED_OPERATION_CONTEXTS:
                 return RecoveryDecision("hold", None, "recovery token from untrusted context is not automatically retried")
             lowered_description = description.lower()
             if any(hint in lowered_description for hint in _DETERMINISTIC_HINTS):
@@ -950,11 +958,13 @@ def dedupe_wakeups(keys: Sequence[str]) -> list[str]:
     In-memory only: this coalesces duplicate wakeups WITHIN a single
     process/run. Cross-run safety (cron plus an event wakeup overlapping)
     never comes from this helper; it comes from the durable mechanisms the
-    callers combine it with: the repository-global concurrency group that
-    serializes reconciler runs, the durable dispatch marker inside its
-    dispatch-grace window, and an exact-HEAD/CI/active-run re-read
-    immediately before every mutation. A stale queued run therefore becomes
-    a safe no-op instead of a concurrent writer.
+    callers combine it with: the per-PR/HEAD lease keyed by
+    :func:`concurrency_key` (at most one authoritative reconciliation per
+    PR/HEAD, so unrelated PRs never queue behind each other or starve),
+    the durable dispatch marker inside its dispatch-grace window, and an
+    exact-HEAD/CI/active-run re-read immediately before every mutation.
+    A stale queued run therefore becomes a safe no-op instead of a
+    concurrent writer.
     """
 
     seen: dict[str, None] = {}
@@ -969,9 +979,10 @@ def should_coalesce(active_leases: Sequence[str], key: str) -> bool:
     """Whether a wakeup must stand down because its lease is already owned.
 
     In-memory only: ``active_leases`` is the per-process owned-lease set for
-    the current run. Two independent runs do not share it, so this alone
-    cannot guarantee at-most-one-operation across runs; callers must combine
-    it with the repository-global concurrency group, the durable dispatch
+    the current run, keyed per PR/HEAD via :func:`concurrency_key` so
+    unrelated PRs proceed independently. Two independent runs do not share
+    it, so this alone cannot guarantee at-most-one-operation across runs;
+    callers must combine it with the per-PR/HEAD lease, the durable dispatch
     marker grace window, and the pre-mutation latest-state re-read.
     """
 

@@ -228,9 +228,14 @@ jobs:
             const MAX_INLINE_WAIT_SECONDS = 60;
             const LIFECYCLE_RETRY_DELAY_SCHEDULE = [0, 10, 30, 60, 180, 300, 600, 1200, 2400, 3600];
             function resetAwareDelaySeconds({ attempt, retryAfterSeconds, ratelimitResetEpoch, providerResetEpoch, nowEpoch }) {
-              let delay = attempt > 0 && attempt < LIFECYCLE_RETRY_DELAY_SCHEDULE.length
-                ? LIFECYCLE_RETRY_DELAY_SCHEDULE[attempt]
-                : 0;
+              // Clamp to the last schedule entry: an attempt at or beyond
+              // the schedule end still defers the full 60m tail instead of
+              // returning 0 and hot-retrying through quota exhaustion.
+              let delay = attempt <= 0
+                ? 0
+                : LIFECYCLE_RETRY_DELAY_SCHEDULE[
+                  Math.min(attempt, LIFECYCLE_RETRY_DELAY_SCHEDULE.length - 1)
+                ];
               if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds >= 0) {
                 delay = Math.max(delay, retryAfterSeconds);
               }
@@ -2703,7 +2708,11 @@ jobs:
                   if (!deterministicFailure) deterministicFailure = err;
                 }
               } finally {
-                releaseLease(pr.number, leaseHead);
+                // Release by the listed identity: `pr` stays undefined when
+                // the guarded getPull above fails, and dereferencing it here
+                // would throw in `finally` and abort the whole open-PR loop
+                // behind one bad fetch. The number never changes mid-loop.
+                releaseLease(listed.number, leaseHead);
               }
             }
             if (deterministicFailure) {

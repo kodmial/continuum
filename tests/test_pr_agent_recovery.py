@@ -175,10 +175,12 @@ class DurableEvidenceTests(unittest.TestCase):
                 now_epoch=1000,
             )
 
-    def test_unknown_marker_age_stays_inside_dispatch_grace(self):
-        # Fail closed like the single lifecycle contract: a marker newer
-        # than status whose age is unknown cannot prove grace expired.
-        decision = recovery.decide_recovery(
+    def test_unknown_marker_age_dispatches_instead_of_waiting_forever(self):
+        # Only a known age inside grace coalesces: an unknown marker age
+        # (missing/unparsable timestamp) cannot prove a dispatch is still
+        # in flight, so waiting on it would never expire and would strand
+        # a healthy PR with no wakeup able to advance.
+        dispatch = recovery.decide_recovery(
             ci_green=True,
             operation_state="failure",
             operation_description="transient; recovery eligible",
@@ -186,7 +188,33 @@ class DurableEvidenceTests(unittest.TestCase):
             marker_newer_than_status=True,
             marker_age_seconds=None,
         )
-        self.assertEqual(decision.action, "wait")
+        self.assertEqual(dispatch.action, "dispatch")
+        self.assertEqual(dispatch.attempt, 3)
+        # A known age inside grace still coalesces the duplicate wakeup.
+        waiting = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="transient; recovery eligible",
+            evidence=recovery.RetryEvidence(latest_attempt=2),
+            marker_newer_than_status=True,
+            marker_age_seconds=10,
+        )
+        self.assertEqual(waiting.action, "wait")
+
+    def test_not_before_without_clock_waits_fail_closed(self):
+        # A durable reset-aware wait the marker already committed must
+        # defer to the scheduled safety net when no clock is supplied,
+        # never dispatch straight through it and burn budget on 403/429.
+        evidence = recovery.RetryEvidence(latest_attempt=1, not_before_epoch=2000)
+        deferred = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="transient; recovery eligible",
+            evidence=evidence,
+            now_epoch=None,
+        )
+        self.assertEqual(deferred.action, "wait")
+        self.assertIsNone(deferred.attempt)
 
 
 class RecoveryDecisionTests(unittest.TestCase):
@@ -342,6 +370,29 @@ class RecoveryDecisionTests(unittest.TestCase):
             operation_description="CI test failure; recovery eligible",
         )
         self.assertEqual(decision.action, "hold")
+
+    def test_incidental_conflict_mention_does_not_hold_transient_retry(self):
+        # A bare "conflict" substring (conflict-free, conflicting) alongside
+        # the token must not hold: only a real merge conflict does, so
+        # classifier-unproven but genuinely transient failures that mention
+        # the word incidentally still retry.
+        for description in (
+            "conflict-free run; recovery eligible",
+            "conflicting signals resolved; recovery eligible",
+        ):
+            with self.subTest(description=description):
+                decision = recovery.decide_recovery(
+                    ci_green=True,
+                    operation_state="failure",
+                    operation_description=description,
+                )
+                self.assertEqual(decision.action, "dispatch")
+        held = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="merge conflict; recovery eligible",
+        )
+        self.assertEqual(held.action, "hold")
         override = recovery.decide_recovery(
             ci_green=True,
             operation_state="failure",
@@ -659,6 +710,17 @@ console.log('sandbox construction OK');
         self.assertIn("rollbackControllerState", body)
         self.assertIn("comment.updated_at || comment.created_at", body)
 
+    def test_short_sha_exhaustion_is_preserved_fail_closed(self):
+        # Pre-existing short-SHA exhausted markers must preserve exhaustion
+        # fail-closed so the bounded budget never restarts, while short SHAs
+        # must never authorize a retry attempt (no prefix budget sharing).
+        body = self.read(".github/workflows/continuum-pr-agent-recovery.yml")
+        self.assertIn("legacyShortExhaustedRe", body)
+        self.assertIn("never touches latestAttempt", body)
+        self.assertNotIn("legacyShortRetryRe", body)
+        # Exact-HEAD identity still governs the retry budget itself.
+        self.assertIn("marker === current", body)
+
     def test_recovery_controller_touch_changes_comment_body_per_dispatch_run(self):
         body = self.read(".github/workflows/continuum-pr-agent-recovery.yml")
         self.assertIn("Controller dispatch run:", body)
@@ -927,6 +989,107 @@ console.log('sandbox construction OK');
             "it still belongs to the durable repair",
             recovery_workflow,
         )
+
+
+class AutoMergeLoopSafetyTests(unittest.TestCase):
+    """Lock the open-PR loop self-healing guarantees in place.
+
+    One bad PR fetch must never abort the whole loop behind it, and an
+    attempt at or beyond the schedule end must still defer the full tail
+    instead of hot-retrying through quota exhaustion.
+    """
+
+    def read(self, path: str) -> str:
+        with open(os.path.join(ROOT, path), "r", encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_pr_fetch_failure_cannot_abort_open_pr_loop(self):
+        body = self.read(".github/workflows/continuum-auto-merge.yml")
+        # The finally block must release by the listed identity: `pr` stays
+        # undefined when the guarded getPull fails, and dereferencing it in
+        # `finally` would throw and strand healthy PRs behind one bad fetch.
+        self.assertIn("releaseLease(listed.number, leaseHead)", body)
+        self.assertNotIn("releaseLease(pr.number, leaseHead)", body)
+
+    def test_conflict_repair_backoff_clamps_past_schedule_end(self):
+        """Execute the real shipped delay function, not a reimplementation.
+
+        Static pins fail if the clamp is reverted; the Node harness below
+        extracts the real `resetAwareDelaySeconds` plus the real schedule
+        from the workflow text and executes the boundary cases, so this
+        test cannot stay green while the shipped code regresses to 0.
+        """
+        import re
+        import shutil
+        import subprocess
+        import tempfile
+
+        body = self.read(".github/workflows/continuum-auto-merge.yml")
+        self.assertIn(
+            "Math.min(attempt, LIFECYCLE_RETRY_DELAY_SCHEDULE.length - 1)",
+            body,
+        )
+
+        node = shutil.which("node")
+        self.assertIsNotNone(
+            node,
+            "node is required to execute the shipped JS; failing closed instead of silently skipping",
+        )
+
+        schedule_match = re.search(
+            r"const LIFECYCLE_RETRY_DELAY_SCHEDULE = (\[[^\]]*\]);", body
+        )
+        self.assertIsNotNone(schedule_match, "retry schedule const is missing")
+        fn_start = body.index("function resetAwareDelaySeconds(")
+        # Start brace counting at the function body, not the destructured
+        # parameter list (which itself contains braces).
+        brace = body.index(") {", fn_start) + 1
+        depth = 0
+        fn_end = None
+        for pos in range(brace, len(body)):
+            if body[pos] == "{":
+                depth += 1
+            elif body[pos] == "}":
+                depth -= 1
+                if depth == 0:
+                    fn_end = pos + 1
+                    break
+        self.assertIsNotNone(fn_end, "could not extract resetAwareDelaySeconds")
+        fn_source = body[fn_start:fn_end]
+
+        harness = (
+            f"const LIFECYCLE_RETRY_DELAY_SCHEDULE = {schedule_match.group(1)};\n"
+            + fn_source
+            + "\n"
+            "const assert = require('assert');\n"
+            "const base = {};\n"
+            "assert.strictEqual(resetAwareDelaySeconds({ ...base, attempt: 0 }), 0);\n"
+            "assert.strictEqual(resetAwareDelaySeconds({ ...base, attempt: 1 }), 10);\n"
+            "assert.strictEqual(resetAwareDelaySeconds({ ...base, attempt: 9 }), 3600);\n"
+            "assert.strictEqual(resetAwareDelaySeconds({ ...base, attempt: 10 }), 3600);\n"
+            "assert.strictEqual(resetAwareDelaySeconds({ ...base, attempt: 99 }), 3600);\n"
+            "assert.strictEqual(resetAwareDelaySeconds({ ...base, attempt: 9, retryAfterSeconds: 4000 }), 4000);\n"
+            "assert.strictEqual(resetAwareDelaySeconds({ ...base, attempt: 5, ratelimitResetEpoch: 1900, nowEpoch: 1000 }), 900);\n"
+            "console.log('CLAMP_OK');\n"
+        )
+        tmpdir = os.path.join(ROOT, ".opencode-tmp")
+        os.makedirs(tmpdir, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".js", delete=False, dir=tmpdir
+        ) as handle:
+            handle.write(harness)
+            script = handle.name
+        try:
+            completed = subprocess.run(
+                [node, script],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        finally:
+            os.unlink(script)
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        self.assertIn("CLAMP_OK", completed.stdout)
 
 
 class CodeRabbitDeadlockWiringTests(unittest.TestCase):
