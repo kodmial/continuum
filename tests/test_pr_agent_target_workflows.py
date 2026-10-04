@@ -413,6 +413,69 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
         self.assertIn("target_child_id: targetChildId", body)
         self.assertIn("dispatched delegated conflict repair via parent", body)
 
+    def test_review_resolves_locally_before_pinned_ref(self):
+        body = read(".github/workflows/continuum-pr-agent.yml")
+        # Local-unchanged path: empty id resolves from the execution
+        # repository and exits before CONTINUUM_REF is required, so a
+        # previously local-only review never depends on resolver fetches.
+        resolve_at = body.index("Resolve PR-Agent target context")
+        resolve = body[resolve_at:resolve_at + 6000]
+        self.assertIn('if [[ -z "${TARGET_CHILD_ID:-}" ]]; then', resolve)
+        self.assertIn("CONTINUUM_REF is required for pinned target resolution", resolve)
+        self.assertLess(
+            resolve.index('if [[ -z "${TARGET_CHILD_ID:-}" ]]; then'),
+            resolve.index("CONTINUUM_REF is required for pinned target resolution"),
+        )
+        self.assertIn("CONTINUUM_PR_AGENT_TARGET_REPOSITORY", resolve)
+        self.assertIn("CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED", resolve)
+        self.assertIn("PR-Agent target context resolved locally.", resolve)
+        self.assertIn("exit 0", resolve)
+        # Delegated-must-use-target: the parent config is fetched from the
+        # execution repository default branch, never the engine pin.
+        self.assertIn('contents/.continuum.yml" --jq', resolve)
+        self.assertNotIn('contents/.continuum.yml" -f ref="$CONTINUUM_REF"', resolve)
+
+    def test_auto_merge_resolves_locally_before_pinned_ref(self):
+        body = read(".github/workflows/continuum-pr-agent-auto-merge.yml")
+        resolve_at = body.index("Resolve PR-Agent target context")
+        resolve = body[resolve_at:resolve_at + 6000]
+        self.assertIn('if [[ -z "${TARGET_CHILD_ID:-}" ]]; then', resolve)
+        self.assertIn("CONTINUUM_REF is required for pinned target resolution", resolve)
+        self.assertLess(
+            resolve.index('if [[ -z "${TARGET_CHILD_ID:-}" ]]; then'),
+            resolve.index("CONTINUUM_REF is required for pinned target resolution"),
+        )
+        self.assertIn("CONTINUUM_PR_AGENT_TARGET_REPOSITORY", resolve)
+        self.assertIn("CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED", resolve)
+        self.assertIn("PR-Agent target context resolved locally.", resolve)
+        self.assertIn("exit 0", resolve)
+        self.assertIn('contents/.continuum.yml" --jq', resolve)
+        self.assertNotIn('contents/.continuum.yml" -f ref="$CONTINUUM_REF"', resolve)
+
+    def test_target_identity_rejects_dot_only_components(self):
+        helper = read(".github/scripts/pr_agent_target.sh")
+        self.assertIn("pr_agent_valid_target_repository", helper)
+        self.assertIn(r"^\.+$", helper)
+        for path in (
+            ".github/workflows/continuum-pr-agent.yml",
+            ".github/workflows/continuum-pr-agent-repair.yml",
+            ".github/workflows/continuum-pr-agent-auto-merge.yml",
+            ".github/workflows/continuum-pr-agent-recovery.yml",
+        ):
+            with self.subTest(path=path):
+                body = read(path)
+                self.assertIn(r"^\.+$", body)
+        runtime = read(".github/scripts/delegation_runtime.py")
+        self.assertIn(r"\.+", runtime)
+        config = read("src/continuum/config.py")
+        self.assertIn('strip(".")', config)
+
+    def test_recovery_dogfood_forwards_opaque_child_id(self):
+        body = read(".github/workflows/pr-agent-recovery.yml")
+        self.assertIn("target_child_id:", body)
+        self.assertIn("target_child_id: \"${{ inputs.target_child_id }}\"", body)
+        self.assertNotIn("target_repository", body)
+
 
 if __name__ == "__main__":
     unittest.main()

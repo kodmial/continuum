@@ -1052,7 +1052,19 @@ def _require_repository(value: Any, where: str) -> str:
         raise ConfigError(
             f"{where} must be an owner/repository name; got {value!r}"
         )
-    return value.strip()
+    cleaned = value.strip()
+    owner, _, name = cleaned.partition("/")
+    # The charset class alone accepts dot-only components (`owner/..`,
+    # `owner/.`); fail closed because they are never valid GitHub identities.
+    if not owner or not name or owner.strip(".") == "" or name.strip(".") == "":
+        raise ConfigError(
+            f"{where} must be an owner/repository name; got {value!r}"
+        )
+    if owner.startswith(".") or owner.endswith(".") or name.startswith(".") or name.endswith("."):
+        raise ConfigError(
+            f"{where} must be an owner/repository name; got {value!r}"
+        )
+    return cleaned
 
 
 def _parse_delegation(value: Any) -> DelegationSettings:

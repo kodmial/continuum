@@ -141,13 +141,13 @@ jobs:
           }
           CONTINUUM_SOURCE_REPO="${GITHUB_WORKFLOW_REF:-}"
           CONTINUUM_SOURCE_REPO="${CONTINUUM_SOURCE_REPO%%/.github/workflows/*}"
-          if ! [[ "$CONTINUUM_SOURCE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+          if ! [[ "$CONTINUUM_SOURCE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || [[ "${CONTINUUM_SOURCE_REPO%%/*}" =~ ^\.+$ ]] || [[ "${CONTINUUM_SOURCE_REPO#*/}" =~ ^\.+$ ]]; then
             CONTINUUM_SOURCE_REPO="kodmial/continuum"
           fi
           if [[ -z "${TARGET_CHILD_ID:-}" ]]; then
             # Local fast path: no delegated resolver is needed and
             # CONTINUUM_REF is not required for local-only merge.
-            if ! [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            if ! [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || [[ "${GITHUB_REPOSITORY%%/*}" =~ ^\.+$ ]] || [[ "${GITHUB_REPOSITORY#*/}" =~ ^\.+$ ]]; then
               echo "::error::PR-Agent target repository identity is invalid."
               exit 2
             fi

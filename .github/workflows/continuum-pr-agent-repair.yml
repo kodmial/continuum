@@ -121,13 +121,13 @@ jobs:
           }
           CONTINUUM_SOURCE_REPO="${GITHUB_WORKFLOW_REF:-}"
           CONTINUUM_SOURCE_REPO="${CONTINUUM_SOURCE_REPO%%/.github/workflows/*}"
-          if ! [[ "$CONTINUUM_SOURCE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+          if ! [[ "$CONTINUUM_SOURCE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || [[ "${CONTINUUM_SOURCE_REPO%%/*}" =~ ^\.+$ ]] || [[ "${CONTINUUM_SOURCE_REPO#*/}" =~ ^\.+$ ]]; then
             CONTINUUM_SOURCE_REPO="kodmial/continuum"
           fi
           if [[ -z "${TARGET_CHILD_ID:-}" ]]; then
             # Local fast path: no delegated resolver is needed and
             # CONTINUUM_REF is not required for local-only repair.
-            if ! [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            if ! [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || [[ "${GITHUB_REPOSITORY%%/*}" =~ ^\.+$ ]] || [[ "${GITHUB_REPOSITORY#*/}" =~ ^\.+$ ]]; then
               echo "::error::PR-Agent target repository identity is invalid."
               exit 2
             fi
@@ -181,7 +181,7 @@ jobs:
           : "${CONTINUUM_PR_AGENT_TARGET_REPOSITORY:?PR-Agent target repository is unset; refusing to fall back to the execution repository.}"
           : "${CONTINUUM_PR_AGENT_TARGET_OWNER:?PR-Agent target owner is unset.}"
           : "${CONTINUUM_PR_AGENT_TARGET_REPO:?PR-Agent target repository name is unset.}"
-          if ! [[ "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+          if ! [[ "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || [[ "${CONTINUUM_PR_AGENT_TARGET_REPOSITORY%%/*}" =~ ^\.+$ ]] || [[ "${CONTINUUM_PR_AGENT_TARGET_REPOSITORY#*/}" =~ ^\.+$ ]]; then
             echo "::error::PR-Agent target repository identity is invalid."
             exit 2
           fi

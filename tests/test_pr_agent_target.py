@@ -172,6 +172,34 @@ class PrAgentTargetContextTests(unittest.TestCase):
         self.assertEqual(values, {})
         self.assertIn("invalid", proc.stderr.lower())
 
+    def test_dot_only_resolved_components_are_rejected_fail_closed(self):
+        for identity in ("owner/..", "owner/.", "owner/...", "../child", "./child"):
+            with self.subTest(identity=identity):
+                proc, values, _ = self.run_target(
+                    "opaque-a",
+                    f"""
+                    #!/usr/bin/env bash
+                    set -euo pipefail
+                    if [[ "$1" == resolve ]]; then
+                      printf '{identity}\\n'
+                    else
+                      exit 0
+                    fi
+                    """,
+                )
+                self.assertNotEqual(proc.returncode, 0, identity)
+                self.assertEqual(values, {}, identity)
+                self.assertIn("invalid", proc.stderr.lower(), identity)
+                self.assertNotIn(identity, proc.stdout)
+                self.assertNotIn(identity, proc.stderr)
+
+    def test_dot_only_owner_and_repo_are_rejected_in_local_context(self):
+        helper = (ROOT / ".github" / "scripts" / "pr_agent_target.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("pr_agent_valid_target_repository", helper)
+        self.assertIn(r"^\.+$", helper)
+
     def test_delegated_resolver_stderr_is_suppressed_before_masking(self):
         proc, values, _ = self.run_target(
             "opaque-a",

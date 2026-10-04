@@ -39,7 +39,15 @@ class DelegationError(ValueError):
 def _repository(value: object, where: str) -> str:
     if not isinstance(value, str) or not _REPOSITORY_RE.match(value.strip()):
         raise DelegationError(f"{where} must be an owner/repository name")
-    return value.strip()
+    cleaned = value.strip()
+    owner, _, name = cleaned.partition("/")
+    # The charset class alone accepts dot-only components (`owner/..`,
+    # `owner/.`) which are never valid GitHub identities. Fail closed.
+    if not owner or not name or re.fullmatch(r"\.+", owner) or re.fullmatch(r"\.+", name):
+        raise DelegationError(f"{where} must be an owner/repository name")
+    if owner.startswith(".") or owner.endswith(".") or name.startswith(".") or name.endswith("."):
+        raise DelegationError(f"{where} must be an owner/repository name")
+    return cleaned
 
 
 def _slug(value: object, where: str) -> str:

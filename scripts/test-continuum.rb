@@ -6047,4 +6047,54 @@ class ContinuumTest < Minitest::Test
                     'wakeup 422 detection must not match inputs-not-accepted wording'
   end
 
+  # The pr-agent-recovery.yml dogfood entry forwards `target_child_id` to the
+  # reusable recovery workflow: otherwise delegated schedule/workflow_run
+  # wakeups would plumb the opaque id nowhere and reconcile the parent.
+  def test_pr_agent_recovery_dogfood_forwards_target_child_id
+    caller = yaml(File.join(ROOT, '.github/workflows/pr-agent-recovery.yml'))
+    dispatch_inputs = events(caller).fetch('workflow_dispatch').fetch('inputs')
+    assert dispatch_inputs.key?('target_child_id'), 'pr-agent-recovery.yml must expose target_child_id'
+    assert_equal 'string', dispatch_inputs.fetch('target_child_id').fetch('type'),
+                 'pr-agent-recovery.yml target_child_id must stay a string input'
+    assert_equal false, dispatch_inputs.fetch('target_child_id').fetch('required'),
+                 'pr-agent-recovery.yml target_child_id must not gate dispatch'
+    assert_equal '${{ inputs.target_child_id }}',
+                 caller.fetch('jobs').fetch('call').fetch('with').fetch('target_child_id'),
+                 'pr-agent-recovery.yml must forward the opaque child id verbatim'
+
+    reusable_inputs = events(yaml(File.join(ROOT, '.github/workflows/continuum-pr-agent-recovery.yml')))
+      .fetch('workflow_call').fetch('inputs')
+    assert reusable_inputs.key?('target_child_id'),
+           'continuum-pr-agent-recovery.yml must declare target_child_id or the dogfood forward is unreachable'
+  end
+
+  # Repository identity must fail closed on dot-only components (`owner/..`,
+  # `owner/.`): the charset class alone accepts them and they would otherwise
+  # flow into `gh`, `git remote`, and checkout steps as the resolved target.
+  def test_pr_agent_target_identity_rejects_dot_only_components
+    helper = File.read(File.join(ROOT, '.github/scripts/pr_agent_target.sh'))
+    assert_includes helper, 'pr_agent_valid_target_repository',
+                    'target resolution must go through the strict identity validator'
+    assert_includes helper, '^\\.+$',
+                    'the strict validator must reject dot-only owner/repo components'
+
+    %w[
+      continuum-pr-agent.yml
+      continuum-pr-agent-repair.yml
+      continuum-pr-agent-auto-merge.yml
+      continuum-pr-agent-recovery.yml
+    ].each do |base|
+      body = File.read(File.join(ROOT, '.github/workflows', base))
+      assert_includes body, '^\\.+$',
+                      "#{base}: workflow identity guards must reject dot-only components like the helper"
+    end
+
+    runtime = File.read(File.join(ROOT, '.github/scripts/delegation_runtime.py'))
+    assert_includes runtime, '\\.+',
+                    'the delegation resolver must reject dot-only repository components'
+    config = File.read(File.join(ROOT, 'src/continuum/config.py'))
+    assert_includes config, 'strip(".")',
+                    'child parent configuration must reject dot-only repository components'
+  end
+
   end

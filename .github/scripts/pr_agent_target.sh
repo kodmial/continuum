@@ -10,6 +10,22 @@ if [[ -n "$child_id" ]] && ! [[ "$child_id" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$
   echo "::error::PR-Agent delegated target identity is invalid." >&2
   exit 2
 fi
+
+# Strict repository identity: the charset class alone still accepts
+# dot-only components (`owner/..`, `owner/.`) which are never valid GitHub
+# identities and would otherwise flow into `gh`, `git remote`, and checkout
+# steps. Reject dot-only components plus leading/trailing dots fail-closed.
+pr_agent_valid_target_repository() {
+  local candidate="${1:-}"
+  [[ "$candidate" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 1
+  local candidate_owner="${candidate%%/*}"
+  local candidate_name="${candidate#*/}"
+  [[ "$candidate_owner" =~ ^\.+$ ]] && return 1
+  [[ "$candidate_name" =~ ^\.+$ ]] && return 1
+  [[ "$candidate_owner" == .* || "$candidate_owner" == *. ]] && return 1
+  [[ "$candidate_name" == .* || "$candidate_name" == *. ]] && return 1
+  return 0
+}
 target_repository="$GITHUB_REPOSITORY"
 delegated=false
 
@@ -39,7 +55,7 @@ if [[ -n "$child_id" ]]; then
     exit "$resolve_rc"
   fi
 
-  if ! [[ "$target_repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+  if ! pr_agent_valid_target_repository "$target_repository"; then
     echo "::error::PR-Agent target repository identity is invalid." >&2
     exit 2
   fi
@@ -52,7 +68,7 @@ if [[ -n "$child_id" ]]; then
   delegated=true
 fi
 
-if ! [[ "$target_repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+if ! pr_agent_valid_target_repository "$target_repository"; then
   echo "::error::PR-Agent target repository identity is invalid." >&2
   exit 2
 fi
