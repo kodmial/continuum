@@ -257,8 +257,8 @@ jobs:
               { owner, repo, issue_number: prNumber, per_page: 100 }
             );
             // The marker carries the exact HEAD plus the structured finding
-            // state token. It is written only by this workflow (gh pr comment
-            // with TAP_PAT), so the marker body itself is the trust anchor:
+            // state token. It is written only by this workflow through the
+            // single persistent controller-state API path, so the marker body is the trust anchor:
             // the comment author's login must not be consulted. Markers land
             // under whichever identity owns TAP_PAT (often a machine user that
             // is neither the repository owner nor the actions bot identity),
@@ -289,14 +289,8 @@ jobs:
                 }
               }
             }
-            if (!sameHeadHeld) {
-              for (const id of findingIds) {
-                if (sameHeadFindings.has(id)) {
-                  sameHeadHeld = true;
-                  break;
-                }
-              }
-            }
+            const sameHeadSurviving = [...findingIds]
+              .filter(id => sameHeadFindings.has(id));
             // Cross-HEAD state is per logical finding, not per whole batch.
             // This catches F surviving A->B even if some other findings were
             // resolved or new findings appeared on B.
@@ -341,7 +335,7 @@ jobs:
               failClosed('PR-Agent finding IDs do not match identified batch.');
               return;
             }
-            surviving = [...new Set(surviving)].sort();
+            surviving = [...new Set([...surviving, ...sameHeadSurviving])].sort();
             const survivingSet = new Set(surviving);
             const eligible = sameHeadHeld
               ? []
@@ -574,8 +568,29 @@ jobs:
             exit 1
           fi
           MARKER="<!-- continuum-pr-agent-convergence from=${HEAD_SHA_LOWER} to=${NEW_HEAD_LOWER} findings=${FINDING_IDS_LOWER} -->"
-          printf -v BODY '%s\n%s' "$MARKER" "PR-Agent bounded repair prepared a workflow-generated HEAD transition. A fresh exact-HEAD review will hold surviving logical findings while allowing genuinely new or changed findings."
-          gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$BODY"
+          CONTROLLER_MARKER='<!-- continuum-pr-agent-controller-state:v1 -->'
+          printf -v BODY '%s\n%s\n<details>\n<summary>Continuum PR-Agent controller state</summary>\n\n%s\n\n</details>' \
+            "$CONTROLLER_MARKER" "$MARKER" \
+            "Repair prepared ${HEAD_SHA_LOWER} -> ${NEW_HEAD_LOWER}; a fresh exact-HEAD review will hold only surviving logical findings."
+
+          mapfile -t CONTROLLER_IDS < <(
+            gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100" \
+              --jq '.[] | select(.body | contains("<!-- continuum-pr-agent-controller-state:v1 -->")) | .id'
+          )
+          if (( ${#CONTROLLER_IDS[@]} > 0 )); then
+            LAST_INDEX=$((${#CONTROLLER_IDS[@]} - 1))
+            CONTROLLER_ID="${CONTROLLER_IDS[$LAST_INDEX]}"
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$CONTROLLER_ID" \
+              -f body="$BODY" >/dev/null
+            if (( LAST_INDEX > 0 )); then
+              for STALE_ID in "${CONTROLLER_IDS[@]:0:$LAST_INDEX}"; do
+                gh api --method DELETE "repos/$GITHUB_REPOSITORY/issues/comments/$STALE_ID" >/dev/null
+              done
+            fi
+          else
+            gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
+              -f body="$BODY" >/dev/null
+          fi
 
           if ! git push --force-with-lease="refs/heads/$HEAD_REF:$HEAD_SHA" origin "HEAD:refs/heads/$HEAD_REF"; then
             CURRENT_AFTER="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid || true)"
@@ -649,34 +664,6 @@ jobs:
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 comment_id: stale.id,
-              });
-            }
-
-      - name: Clear settled PR-Agent controller state after repair publication
-        if: steps.repair_pass.outputs.published == 'true'
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
-        env:
-          PR_NUMBER: ${{ inputs.pr_number }}
-          POLICY_SCRIPT: ${{ steps.policy.outputs.policy_script }}
-        with:
-          github-token: ${{ secrets.TAP_PAT }}
-          script: |
-            const policy = require(process.env.POLICY_SCRIPT);
-            const comments = await github.paginate(
-              github.rest.issues.listComments,
-              {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: Number(process.env.PR_NUMBER),
-                per_page: 100,
-              }
-            );
-            for (const comment of comments) {
-              if (!String(comment.body || '').includes(policy.CONTROLLER_STATE_MARKER)) continue;
-              await github.rest.issues.deleteComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                comment_id: comment.id,
               });
             }
 
