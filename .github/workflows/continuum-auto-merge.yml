@@ -1332,13 +1332,17 @@ jobs:
                 labels: [CONFLICT_LOCK_LABEL],
               });
 
-              // Double-checked locking: two overlapping reconciler jobs can
-              // both pass the pre-lock checks before either dispatches. The
-              // lock itself is not atomic, so revalidate after acquiring it
-              // and before dispatching. An overlapping job that won the race
-              // leaves either a visible run or a fresh marker; seeing either
-              // here means waiting instead of dispatching a duplicate. The
-              // acquired lock is shared and left in place on these waits.
+              // Overlap guard (best-effort): two overlapping reconciler jobs
+              // can both pass the pre-lock checks before either dispatches,
+              // and the lock label itself is not atomic, so revalidate after
+              // acquiring it and before dispatching. An overlapping job that
+              // already dispatched leaves either a visible run or a fresh
+              // marker; seeing either here means waiting instead of
+              // dispatching a duplicate. This recheck cannot see an
+              // overlapping job that has not dispatched yet, so the claim
+              // comment written below is the authoritative linearization
+              // point. The acquired lock is shared and left in place on
+              // these waits.
               {
                 const confirmRun =
                   await findActiveConflictRepairRun(pr.number);
@@ -1388,6 +1392,95 @@ jobs:
                 attempt = confirmMarkers.length;
               }
 
+              // Claim-before-dispatch: the label is not atomic, and neither a
+              // run nor a post-dispatch marker is visible until after
+              // dispatch, so two overlapping jobs can both pass every check
+              // above and both dispatch. The claim comment IS visible before
+              // dispatch, so it is the linearization point: write it first,
+              // then elect the smallest comment id among fresh markers for
+              // this HEAD as the single winner. Only the winner dispatches;
+              // the loser deletes its own claim (best-effort) and waits,
+              // leaving the shared lock in place for the winner's run.
+              let claimCommentId = null;
+              try {
+                const { data: claimComment } =
+                  await github.rest.issues.createComment({
+                    owner,
+                    repo,
+                    issue_number: pr.number,
+                    body: conflictRepairMarker(headSha, attempt),
+                  });
+                claimCommentId = claimComment.id;
+              } catch (markerErr) {
+                try {
+                  await removeConflictLock(pr.number);
+                } catch (unlockErr) {
+                  core.warning(
+                    `PR #${pr.number}: could not remove ${CONFLICT_LOCK_LABEL} after marker failure: ${unlockErr.message}`
+                  );
+                }
+                throw markerErr;
+              }
+              {
+                const electionComments = await github.paginate(
+                  github.rest.issues.listComments,
+                  {
+                    owner,
+                    repo,
+                    issue_number: pr.number,
+                    per_page: 100,
+                  }
+                );
+                let winnerId = claimCommentId;
+                for (const comment of electionComments) {
+                  const body = String(comment.body || '');
+                  CONFLICT_MARKER_RE.lastIndex = 0;
+                  let matchedHead = false;
+                  for (const match of body.matchAll(CONFLICT_MARKER_RE)) {
+                    if (
+                      String(match[1] || '').toLowerCase() ===
+                      String(headSha || '').toLowerCase()
+                    ) {
+                      matchedHead = true;
+                      break;
+                    }
+                  }
+                  if (!matchedHead) continue;
+                  const createdAt = Date.parse(
+                    String(comment.updated_at || comment.created_at || '')
+                  );
+                  if (
+                    !Number.isFinite(createdAt) ||
+                    Date.now() - createdAt >= CONFLICT_DISPATCH_GRACE_MS
+                  ) {
+                    continue;
+                  }
+                  if (
+                    typeof comment.id === 'number' &&
+                    comment.id < winnerId
+                  ) {
+                    winnerId = comment.id;
+                  }
+                }
+                if (winnerId !== claimCommentId) {
+                  try {
+                    await github.rest.issues.deleteComment({
+                      owner,
+                      repo,
+                      comment_id: claimCommentId,
+                    });
+                  } catch (cleanupErr) {
+                    core.warning(
+                      `PR #${pr.number}: lost conflict-repair race for head ${headSha}; could not delete duplicate claim comment: ${cleanupErr.message}`
+                    );
+                  }
+                  core.info(
+                    `PR #${pr.number}: another reconciler claimed conflict repair for head ${headSha} first; waiting.`
+                  );
+                  return;
+                }
+              }
+
               try {
                 await github.request(
                   'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
@@ -1403,26 +1496,33 @@ jobs:
                     },
                   }
                 );
-                // A successful dispatch owns the lock even if the marker
-                // write fails, so marker failures must never un-lock an
-                // active run (that would invite a duplicate dispatch).
-                try {
-                  await github.rest.issues.createComment({
-                    owner,
-                    repo,
-                    issue_number: pr.number,
-                    body: conflictRepairMarker(headSha, attempt),
-                  });
-                } catch (markerErr) {
-                  core.warning(
-                    `PR #${pr.number}: repair dispatched but marker comment failed: ${markerErr.message}`
-                  );
-                }
                 core.notice(
                   `PR #${pr.number}: dispatched OpenCode conflict repair via ${opencodeWorkflow} for head ${headSha} (attempt ${attempt + 1}/${MAX_CONFLICT_DISPATCHES_PER_HEAD}, ${reason}).`
                 );
               } catch (err) {
-                await removeConflictLock(pr.number);
+                // A failed dispatch leaves no run behind, so its claim must
+                // not linger inside the grace window (that would stall the
+                // next retry). Best-effort cleanup must never mask the
+                // original dispatch error needed to diagnose a bad caller
+                // name or a missing workflow_dispatch trigger.
+                try {
+                  await github.rest.issues.deleteComment({
+                    owner,
+                    repo,
+                    comment_id: claimCommentId,
+                  });
+                } catch (cleanupErr) {
+                  core.warning(
+                    `PR #${pr.number}: repair dispatch failed and claim cleanup failed: ${cleanupErr.message}`
+                  );
+                }
+                try {
+                  await removeConflictLock(pr.number);
+                } catch (unlockErr) {
+                  core.warning(
+                    `PR #${pr.number}: repair dispatch failed and lock removal failed: ${unlockErr.message}`
+                  );
+                }
                 throw err;
               }
             }
