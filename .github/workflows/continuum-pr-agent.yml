@@ -119,6 +119,7 @@ on:
         required: false
 
 permissions:
+  actions: read
   contents: write
   issues: write
   pull-requests: write
@@ -146,6 +147,7 @@ jobs:
       recovery_kind: ${{ steps.stack.outputs.recovery_kind }}
 
     permissions:
+      actions: read
       contents: read
       issues: write
       pull-requests: write
@@ -178,7 +180,9 @@ jobs:
           CFG_SERVER_PORT: ${{ vars.PR_AGENT_OPENCODE_PORT }}
           CFG_PR_AGENT_VERSION: ${{ vars.PR_AGENT_VERSION }}
         with:
-          github-token: ${{ secrets.TAP_PAT }}
+          # No API calls: the repository token is sufficient and spends no
+          # TAP_PAT budget.
+          github-token: ${{ github.token }}
           script: |
             // A single selector owns the whole review stack.
             const pick = (input, vars, fallback) =>
@@ -264,15 +268,54 @@ jobs:
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           EXPECTED_HEAD: ${{ steps.stack.outputs.expected_head }}
           CI_WORKFLOW_NAME: ${{ inputs.ci_workflow_name || vars.CONTINUUM_CI_WORKFLOW_NAME || 'CI' }}
+          # Work-Lock #58 item 4: same-repository admission reads use the
+          # repository-scoped token. The action client stays PAT-authenticated
+          # for the fallback path only; writes keep PAT identity elsewhere.
+          READ_GITHUB_TOKEN: ${{ github.token }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
             // Admission: open, non-draft, same-repo PR whose exact current HEAD
             // has green CI. Anything else is skipped, never reviewed.
             const prNumber = Number(process.env.PR_NUMBER);
-            const { data: pr } = await github.rest.pulls.get({
-              owner: context.repo.owner, repo: context.repo.repo, pull_number: prNumber,
-            });
+            // github-script already supplies the plugin-composed Octokit class.
+            // Reuse its constructor instead of dynamically requiring
+            // @actions/github, which is not resolvable from the script sandbox.
+            // Preserve the enterprise base URL so GitHub Enterprise reads keep working.
+            const readToken = String(process.env.READ_GITHUB_TOKEN || '').trim();
+            const readBaseUrl = (
+              (github && github.request && github.request.endpoint &&
+                github.request.endpoint.DEFAULTS && github.request.endpoint.DEFAULTS.baseUrl) ||
+              process.env.GITHUB_API_URL || 'https://api.github.com'
+            );
+            const readGithub = readToken
+              ? new github.constructor({ auth: readToken, baseUrl: readBaseUrl })
+              : github;
+            if (!readToken) {
+              core.warning('READ_GITHUB_TOKEN is empty; using PAT client for PR-Agent admission reads.');
+            }
+            let readTokenUnavailable = false;
+            async function withReadFallback(fn) {
+              if (readTokenUnavailable || readGithub === github) {
+                return await fn(github);
+              }
+              try {
+                return await fn(readGithub);
+              } catch (err) {
+                const status = err ? (err.status ?? err.response?.status) : undefined;
+                if (status === 401 || status === 403 || status === 429) {
+                  readTokenUnavailable = true;
+                  core.warning('Repository-token read failed (' + status + '); retrying with PAT client: ' + err.message);
+                  return await fn(github);
+                }
+                throw err;
+              }
+            }
+            const { data: pr } = await withReadFallback(client =>
+              client.rest.pulls.get({
+                owner: context.repo.owner, repo: context.repo.repo, pull_number: prNumber,
+              })
+            );
             if (pr.state !== 'open') {
               core.setOutput('admitted', 'false');
               core.notice(`PR #${prNumber} is not open; skipping PR-Agent review.`);
@@ -305,15 +348,17 @@ jobs:
             // not the combined Statuses API. PR-Agent's own failure/pending
             // statuses must never make a recovered CI-green HEAD inadmissible.
             const ciWorkflowName = String(process.env.CI_WORKFLOW_NAME || 'CI').trim();
-            const runs = await github.paginate(
-              github.rest.actions.listWorkflowRunsForRepo,
-              {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                event: 'pull_request',
-                head_sha: headSha,
-                per_page: 100,
-              }
+            const runs = await withReadFallback(client =>
+              client.paginate(
+                client.rest.actions.listWorkflowRunsForRepo,
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  event: 'pull_request',
+                  head_sha: headSha,
+                  per_page: 100,
+                }
+              )
             );
             const latestCi = runs
               .filter(run => run.name === ciWorkflowName && run.head_sha === headSha)
@@ -481,7 +526,9 @@ jobs:
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
         id: before
         env:
-          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          # Work-Lock #58 item 4: same-repository current-head/CI reads use
+          # the repository-scoped token; tool execution below keeps PAT.
+          GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           ADMITTED_SHA: ${{ steps.admit.outputs.head_sha }}
           CI_WORKFLOW_NAME: ${{ inputs.ci_workflow_name || vars.CONTINUUM_CI_WORKFLOW_NAME || 'CI' }}
@@ -637,14 +684,53 @@ jobs:
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           REVIEWED_SHA: ${{ steps.before.outputs.sha }}
           REVIEW_JSON: ${{ steps.pragent.outputs.review }}
+          # Work-Lock #58 item 4: same-repository current-head read uses the
+          # repository-scoped token; the action client stays PAT-authenticated
+          # for the fallback path only.
+          READ_GITHUB_TOKEN: ${{ github.token }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
             const prNumber = Number(process.env.PR_NUMBER);
             const reviewedSha = String(process.env.REVIEWED_SHA || '').toLowerCase();
-            const { data: pr } = await github.rest.pulls.get({
-              owner: context.repo.owner, repo: context.repo.repo, pull_number: prNumber,
-            });
+            // github-script already supplies the plugin-composed Octokit class.
+            // Reuse its constructor instead of dynamically requiring
+            // @actions/github, which is not resolvable from the script sandbox.
+            // Preserve the enterprise base URL so GitHub Enterprise reads keep working.
+            const readToken = String(process.env.READ_GITHUB_TOKEN || '').trim();
+            const readBaseUrl = (
+              (github && github.request && github.request.endpoint &&
+                github.request.endpoint.DEFAULTS && github.request.endpoint.DEFAULTS.baseUrl) ||
+              process.env.GITHUB_API_URL || 'https://api.github.com'
+            );
+            const readGithub = readToken
+              ? new github.constructor({ auth: readToken, baseUrl: readBaseUrl })
+              : github;
+            if (!readToken) {
+              core.warning('READ_GITHUB_TOKEN is empty; using PAT client for PR-Agent post-review reads.');
+            }
+            let readTokenUnavailable = false;
+            async function withReadFallback(fn) {
+              if (readTokenUnavailable || readGithub === github) {
+                return await fn(github);
+              }
+              try {
+                return await fn(readGithub);
+              } catch (err) {
+                const status = err ? (err.status ?? err.response?.status) : undefined;
+                if (status === 401 || status === 403 || status === 429) {
+                  readTokenUnavailable = true;
+                  core.warning('Repository-token read failed (' + status + '); retrying with PAT client: ' + err.message);
+                  return await fn(github);
+                }
+                throw err;
+              }
+            }
+            const { data: pr } = await withReadFallback(client =>
+              client.rest.pulls.get({
+                owner: context.repo.owner, repo: context.repo.repo, pull_number: prNumber,
+              })
+            );
             const currentSha = String(pr.head.sha || '').toLowerCase();
             if (currentSha !== reviewedSha) {
               core.setFailed(
@@ -728,7 +814,9 @@ jobs:
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
         id: persistent
         env:
-          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          # Work-Lock #58 item 4: same-repository comment reads use the
+          # repository-scoped token.
+          GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           REVIEWED_SHA: ${{ steps.result.outputs.head_sha }}
           REVIEW_JSON: ${{ steps.pragent.outputs.review }}
@@ -826,7 +914,9 @@ jobs:
           IMPROVE_JSONL: ${{ steps.improve_output.outputs.improve_jsonl }}
           POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
         with:
-          github-token: ${{ secrets.TAP_PAT }}
+          # No API calls: local policy routing only, so the repository token
+          # is sufficient and spends no TAP_PAT budget.
+          github-token: ${{ github.token }}
           script: |
             const policy = require(process.env.POLICY_SCRIPT);
             const review = JSON.parse(String(process.env.REVIEW_JSON || ''));
@@ -930,7 +1020,9 @@ jobs:
       - name: Fail closed on a moved head
         if: steps.stack.outputs.enabled == 'true' && always()
         env:
-          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          # Work-Lock #58 item 4: same-repository head read uses the
+          # repository-scoped token.
+          GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           REVIEWED_SHA: ${{ steps.before.outputs.sha }}
         run: |
@@ -1047,7 +1139,12 @@ jobs:
            steps.start_bridge.outcome == 'failure' ||
            steps.pragent.outcome == 'failure')
         env:
-          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          # Work-Lock #58 item 4: same-repository retry revalidation reads
+          # (gh pr view, actions runs, repo view) use the repository-scoped
+          # token. Only the workflow dispatch below uses PAT, which alone
+          # fans the retry out into downstream event triggers.
+          GH_TOKEN: ${{ github.token }}
+          RETRY_DISPATCH_TOKEN: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           HEAD_SHA: ${{ steps.admit.outputs.head_sha }}
           RETRY_ATTEMPT: ${{ steps.stack.outputs.retry_attempt }}
@@ -1117,7 +1214,10 @@ jobs:
           esac
           if ! [[ "$DEFAULT_BRANCH" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]]; then DEFAULT_BRANCH="main"; fi
           if [[ "$DEFAULT_BRANCH" == */.*/* || "$DEFAULT_BRANCH" == .*/ || "$DEFAULT_BRANCH" == */. ]] || [[ "$DEFAULT_BRANCH" =~ (^|/)\. ]] || [[ "$DEFAULT_BRANCH" =~ \.lock($|/) ]]; then DEFAULT_BRANCH="main"; fi
-          gh workflow run "$RETRY_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH"             -f pr_number="$PR_NUMBER"             -f expected_head_sha="$HEAD_SHA"             -f retry_attempt="$next"             -f retry_workflow="$RETRY_WORKFLOW"             -f recovery_kind="${CURRENT_RECOVERY_KIND:-review}"
+          # The isolated retry dispatch must keep PAT identity so the new run
+          # is created with the same actor/event fan-out as before; the
+          # same-repository revalidation reads above already used github.token.
+          GH_TOKEN="$RETRY_DISPATCH_TOKEN" gh workflow run "$RETRY_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH"             -f pr_number="$PR_NUMBER"             -f expected_head_sha="$HEAD_SHA"             -f retry_attempt="$next"             -f retry_workflow="$RETRY_WORKFLOW"             -f recovery_kind="${CURRENT_RECOVERY_KIND:-review}"
           echo "Dispatched isolated PR-Agent retry attempt $next/3 for PR #$PR_NUMBER HEAD $HEAD_SHA."
 
   repair:

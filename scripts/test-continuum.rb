@@ -1719,6 +1719,83 @@ class ContinuumTest < Minitest::Test
                     'a mid-repair draft transition must discard local repair changes'
   end
 
+  # Work-Lock #58 item 4: same-repository, read-only PR-Agent admission and
+  # revalidation calls run on the repository-scoped token instead of the
+  # shared TAP_PAT budget. Writes, dispatches, and external tool credentials
+  # keep PAT identity so actor and event fan-out semantics do not change.
+  def test_pr_agent_admission_reads_use_repository_token_but_writes_keep_pat
+    pr_agent = workflow_body('continuum-pr-agent.yml')
+    workflow = yaml(File.join(ROOT, '.github/workflows/continuum-pr-agent.yml'))
+    stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-pr-agent.yml'))
+
+    # The repository token needs explicit read scopes for the migrated
+    # exact-HEAD CI and PR reads; the generic caller-permissions test also
+    # enforces that the stub covers the job contract.
+    assert_equal 'read', workflow.fetch('permissions').fetch('actions')
+    assert_equal 'read', workflow.fetch('jobs').fetch('pr_agent').fetch('permissions').fetch('actions')
+    assert_equal 'read', stub.fetch('permissions').fetch('actions')
+
+    admit = step_body(pr_agent, 'Admit only a review-ready PR with green CI on the exact HEAD')
+    refute_nil admit, 'admission step is missing'
+    assert_includes admit, 'READ_GITHUB_TOKEN: ${{ github.token }}'
+    assert_includes admit, 'new github.constructor({ auth: readToken, baseUrl: readBaseUrl })'
+    assert_includes admit, 'github.request.endpoint.DEFAULTS.baseUrl'
+    assert_includes admit, 'async function withReadFallback(fn)'
+    assert_includes admit, 'client.rest.pulls.get'
+    assert_includes admit, 'client.rest.actions.listWorkflowRunsForRepo'
+    assert_includes admit, 'client.paginate('
+    refute_includes admit, "require('@actions/github')"
+    refute_includes admit, 'require("@actions/github")'
+    # Exact-HEAD admission and CI-gating semantics are unchanged.
+    assert_includes admit, 'expected !== headSha.toLowerCase()'
+    assert_includes admit, 'run.name === ciWorkflowName && run.head_sha === headSha'
+    assert_includes admit, "latestCi.status !== 'completed'"
+    assert_includes admit, "latestCi.conclusion !== 'success'"
+    assert_includes admit, 'Stale admission ignored:'
+    refute_includes admit, 'await github.rest.pulls.get({'
+    refute_includes admit, 'await github.paginate('
+
+    result = step_body(pr_agent, 'Revalidate the PR head and native review output after review')
+    refute_nil result, 'post-review revalidation step is missing'
+    assert_includes result, 'READ_GITHUB_TOKEN: ${{ github.token }}'
+    assert_includes result, 'new github.constructor({ auth: readToken, baseUrl: readBaseUrl })'
+    assert_includes result, 'async function withReadFallback(fn)'
+    assert_includes result, 'client.rest.pulls.get'
+    assert_includes result, 'PR head moved during review'
+    refute_includes result, 'await github.rest.pulls.get({'
+
+    # Shell revalidation reads use the repository token ...
+    before = step_body(pr_agent, 'Revalidate the admitted exact HEAD immediately before review')
+    refute_nil before, 'pre-review revalidation step is missing'
+    assert_includes before, 'GH_TOKEN: ${{ github.token }}'
+    assert_includes before, 'actions/runs?event=pull_request&head_sha=$ADMITTED_SHA'
+
+    persistent = step_body(pr_agent, 'Export native persistent finding state for the reviewed HEAD')
+    refute_nil persistent, 'persistent-state export step is missing'
+    assert_includes persistent, 'GH_TOKEN: ${{ github.token }}'
+
+    fail_closed = step_body(pr_agent, 'Fail closed on a moved head')
+    refute_nil fail_closed, 'fail-closed step is missing'
+    assert_includes fail_closed, 'GH_TOKEN: ${{ github.token }}'
+
+    # ... while the retry dispatch keeps PAT identity; only the dispatch
+    # command itself may spend it.
+    retry_step = step_body(pr_agent, 'Schedule bounded retry for retryable PR-Agent review failure')
+    refute_nil retry_step, 'retry scheduling step is missing'
+    assert_includes retry_step, 'GH_TOKEN: ${{ github.token }}'
+    assert_includes retry_step, 'RETRY_DISPATCH_TOKEN: ${{ secrets.TAP_PAT }}'
+    assert_includes retry_step, 'GH_TOKEN="$RETRY_DISPATCH_TOKEN" gh workflow run'
+
+    # Tool execution credentials and every write/dispatch path stay PAT-backed.
+    tool = step_body(pr_agent, 'Run upstream full review and full improve on the exact HEAD')
+    refute_nil tool, 'upstream tool step is missing'
+    assert_includes tool, 'GITHUB__USER_TOKEN: ${{ secrets.TAP_PAT }}'
+    assert_includes tool, 'GH_TOKEN: ${{ secrets.TAP_PAT }}'
+
+    assert_includes pr_agent, 'await github.rest.repos.createCommitStatus({'
+    assert_includes pr_agent, 'github-token: ${{ secrets.TAP_PAT }}'
+  end
+
   # The free default model must be the single documented fallback everywhere an
   # OpenCode model is named, otherwise a consumer without OPENCODE_MODEL
   # silently runs a paid model.
