@@ -376,21 +376,28 @@ jobs:
             }
 
             // Bounded collection (#254): caps every list scan at maxPages
-            // instead of walking full history. Read evidence and controller
-            // markers accumulate in recent windows, so capped scans preserve
-            // decisions while bounding requests under scale.
+            // instead of walking full history. Workflow-run and status
+            // listings are newest-first, so a capped window preserves the
+            // deciding records. Issue comments and pull reviews are
+            // oldest-first, so a capped window may hide the newest markers:
+            // the collected array carries a `truncated` flag and comment
+            // readers deciding retry budgets must defer when it is true
+            // instead of deciding on partial oldest data.
             const MAX_COMMENT_PAGES = 10;
             const MAX_QUEUE_PAGES = 5;
             const MAX_GATE_PAGES = 2;
             async function boundedCollect(client, request, params, maxPages) {
               const items = [];
+              let truncated = false;
               for (let page = 1; page <= maxPages; page += 1) {
                 const { data } = await request({ ...params, page });
                 const batch = Array.isArray(data) ? data : (data.workflow_runs || []);
                 if (batch.length === 0) break;
                 items.push(...batch);
                 if (batch.length < (params.per_page || 100)) break;
+                if (page === maxPages) truncated = true;
               }
+              items.truncated = truncated;
               return items;
             }
 
@@ -403,6 +410,16 @@ jobs:
                   MAX_COMMENT_PAGES
                 )
               );
+              // Fail closed on truncation: the listing is oldest-first, so a
+              // truncated window may hide the newest controller marker. Never
+              // update-or-prune from partial oldest data; defer to the next
+              // wakeup instead.
+              if (comments.truncated) {
+                throw new Error(
+                  'CONTINUUM_COMMENT_BUDGET_EXCEEDED pr=' + prNumber +
+                  ': comment scan hit the ' + MAX_COMMENT_PAGES + '-page budget; holding controller write instead of deciding on a truncated window.'
+                );
+              }
               const controller = comments
                 .filter(comment => String(comment.body || '').includes(CONTROLLER_STATE_MARKER))
                 .sort((a, b) => Number(a.id) - Number(b.id));
@@ -847,6 +864,10 @@ jobs:
             // findings, merge conflict, malformed state, moved HEAD) never
             // consume it and hold instead.
             function isTransientApiError(err) {
+              // A truncated oldest-first comment window is a deferral, not a
+              // deterministic failure: the next wakeup retries from latest
+              // state instead of failing the run.
+              if (/CONTINUUM_COMMENT_BUDGET_EXCEEDED|CONTINUUM_THREAD_BUDGET_EXCEEDED/i.test(String((err && err.message) || ''))) return true;
               const status = err ? (err.status ?? err.response?.status) : undefined;
               if (status === 429) return true;
               if (typeof status === 'number' && status >= 500 && status <= 599) return true;
@@ -1293,6 +1314,16 @@ jobs:
                       MAX_COMMENT_PAGES
                     )
                   );
+              // Fail closed on truncation: the listing is oldest-first, so a
+              // truncated window hides the newest retry/exhausted markers.
+              // Hold the dispatch instead of deciding from partial data.
+              if (refreshedComments.truncated) {
+                core.warning(
+                  'PR #' + pr.number + ' ' + kind +
+                  ': comment scan hit the ' + MAX_COMMENT_PAGES + '-page budget; holding dispatch instead of deciding on a truncated window.'
+                );
+                return false;
+              }
               const refreshedEvidence = parseEvidence(refreshedComments, head, kind);
               if (refreshedEvidence.exhausted) {
                 core.info('PR #' + pr.number + ' ' + kind + ': retry budget is already exhausted.');
@@ -1347,6 +1378,16 @@ jobs:
                           MAX_COMMENT_PAGES
                         )
                       );
+                  // Fail closed on truncation: the listing is oldest-first,
+                  // so a truncated window may hide a concurrent controller
+                  // write. Never prune from partial data; coalescing still
+                  // defers this wakeup and the next upsert finishes cleanup.
+                  if (graceComments.truncated) {
+                    core.warning(
+                      'PR #' + pr.number + ' ' + kind +
+                      ': comment scan hit the ' + MAX_COMMENT_PAGES + '-page budget; skipping dispatch-grace prune on a truncated window.'
+                    );
+                  } else {
                   const controllerDupes = graceComments
                     .filter(comment => String(comment.body || '').includes(CONTROLLER_STATE_MARKER))
                     .sort((a, b) => Number(a.id) - Number(b.id));
@@ -1360,6 +1401,7 @@ jobs:
                     } catch (deleteErr) {
                       if (deleteErr.status !== 404) throw deleteErr;
                     }
+                  }
                   }
                 } catch (pruneErr) {
                   core.warning(
@@ -1563,6 +1605,16 @@ jobs:
                           MAX_COMMENT_PAGES
                         )
                       );
+                  // Fail closed on truncation: the listing is oldest-first,
+                  // so a truncated window may hide controller comments.
+                  // Never prune from partial data; the next wakeup coalesces
+                  // via dispatch grace instead.
+                  if (freshController.truncated) {
+                    core.warning(
+                      'PR #' + pr.number + ' ' + kind +
+                      ': comment scan hit the ' + MAX_COMMENT_PAGES + '-page budget; skipping post-dispatch prune on a truncated window.'
+                    );
+                  } else {
                   const snapshotIds = new Set(
                     refreshedComments.map(comment => Number(comment.id))
                   );
@@ -1582,6 +1634,7 @@ jobs:
                     } catch (deleteErr) {
                       if (deleteErr.status !== 404) throw deleteErr;
                     }
+                  }
                   }
                 } catch (pruneErr) {
                   core.warning(
@@ -1791,6 +1844,17 @@ jobs:
                   MAX_COMMENT_PAGES
                 )
               );
+              // Fail closed on truncation: the listing is oldest-first, so a
+              // truncated window hides the newest retry/exhausted markers.
+              // Defer this PR instead of deriving a retry budget from partial
+              // oldest data.
+              if (comments.truncated) {
+                core.warning(
+                  'PR #' + pr.number + ' HEAD ' + head +
+                  ': comment scan hit the ' + MAX_COMMENT_PAGES + '-page budget; deferring recovery instead of deciding on a truncated window.'
+                );
+                continue;
+              }
               const reviewRun = reviewStatus
                 ? await statusRunMetadata(reviewStatus)
                 : { conclusion: null, recoveryKind: null };

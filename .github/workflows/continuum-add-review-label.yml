@@ -106,18 +106,26 @@ jobs:
             }
             // Bounded page cap for any single list scan (#254): request
             // count never scales with repository lifetime/history.
+            // Issue comments and pull reviews paginate oldest-first with no
+            // newest-first sort, so a full final page at the cap may hide
+            // newer records. The collected array carries a `truncated` flag;
+            // approval-carry readers must fail closed (no carry) when it is
+            // true instead of deciding on partial oldest data.
             const MAX_SCAN_PAGES = 5;
             const MAX_FILES_PAGES = 10;
             async function boundedPages(request, params) {
               const perPage = params.per_page || 100;
               const items = [];
+              let truncated = false;
               for (let page = 1; page <= MAX_SCAN_PAGES; page += 1) {
                 const { data } = await request({ ...params, per_page: perPage, page });
                 noteRead();
                 if (!Array.isArray(data) || data.length === 0) break;
                 items.push(...data);
                 if (data.length < perPage) break;
+                if (page === MAX_SCAN_PAGES) truncated = true;
               }
+              items.truncated = truncated;
               return items;
             }
             // PAT client for workflow dispatches only. Label/comment/state
@@ -249,11 +257,12 @@ jobs:
               const parents = (commit.parents || []).map(parent => parent.sha);
               if (parents.length !== 2) return null;
 
-              // Bounded comment/review scans (#254): marker and decision
-              // state live on recent records, so a capped newest-first
-              // window preserves the gate while bounding requests.
-              // A truncated window fails closed (no carry) and only costs
-              // a fresh review, never a skipped one.
+              // Bounded comment/review scans (#254): both endpoints paginate
+              // oldest-first with no newest-first sort, so the capped window
+              // holds the oldest records. A truncated window fails closed (no
+              // carry) and only costs a fresh review, never a skipped one:
+              // a missed recent carry marker must not carry, and a missed
+              // recent nitpick-gating review must not be treated as absent.
               const comments = await boundedPages(
                 (params) => readGithub.rest.issues.listComments(params),
                 {
@@ -263,6 +272,7 @@ jobs:
                   per_page: 100,
                 }
               );
+              if (comments.truncated) return null;
 
               const markerPattern =
                 /<!-- auto-main-sync head=([0-9a-f]{40}) from=([0-9a-f]{40}) main=([0-9a-f]{40}) carry=([0-9a-f]{40}) -->/i;
@@ -303,6 +313,10 @@ jobs:
                   per_page: 100,
                 }
               );
+              // Fail closed: a truncated oldest-first review window may hide
+              // the newest decision or a nitpick-gating COMMENTED review, so
+              // it must not carry.
+              if (reviews.truncated) return null;
 
               const sourceReviews = reviews
                 .filter(review =>

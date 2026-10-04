@@ -127,6 +127,12 @@ jobs:
             const MAX_GATE_PAGES = 2;
             async function boundedList(request, params, maxPages) {
               const items = [];
+              // Fail-closed truncation flag: issue comments and pull reviews
+              // are oldest-first, so a full final page at the cap may hide
+              // newer records. Callers deciding per-PR eligibility must skip
+              // the PR when truncated is true instead of deciding on partial
+              // oldest data.
+              let truncated = false;
               for (let page = 1; page <= maxPages; page += 1) {
                 const { data } = await request({ ...params, page });
                 noteRead();
@@ -134,7 +140,9 @@ jobs:
                 if (batch.length === 0) break;
                 items.push(...batch);
                 if (batch.length < (params.per_page || 100)) break;
+                if (page === maxPages) truncated = true;
               }
+              items.truncated = truncated;
               return items;
             }
             // Single-pass memoization (#254): gate listings are shared per
@@ -644,6 +652,17 @@ jobs:
                   },
                   MAX_THREAD_PAGES
                 );
+
+                // Fail closed on truncation: both listings are oldest-first,
+                // so a truncated window hides the newest records that decide
+                // eligibility. Defer the PR to the next wake-up instead of
+                // deciding on partial oldest data.
+                if (reviews.truncated || comments.truncated) {
+                  core.warning(
+                    `PR #${pr.number}: comment/review scan hit the ${MAX_THREAD_PAGES}-page budget; skipping this PR for this pass.`
+                  );
+                  continue;
+                }
 
                 const carriedApprovalMarker = comments.some(comment =>
                   comment.user?.login === owner &&
