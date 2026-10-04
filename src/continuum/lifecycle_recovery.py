@@ -160,19 +160,27 @@ _TIMEOUT_INFRA_QUALIFIERS = (
 def _has_transient_signature(message: str) -> bool:
     """Whether a lowercased message carries transient infrastructure evidence.
 
-    Deterministic test assertions dominate: any `assert` mention holds even
-    when a timeout substring is present.
+    Infrastructure evidence wins over an incidental ``assert`` substring
+    (e.g. a bootstrap/runner/TLS message that mentions an assertion):
+    only when no infrastructure token matches does an ``assert`` mention
+    hold as deterministic. Bare ``timeout``/``timed out`` still requires
+    an infrastructure qualifier, so deterministic current-head CI text
+    such as ``tests timed out: assertion failed`` (no qualifier) holds.
     """
 
     if not message:
-        return False
-    if "assert" in message:
         return False
     for token in _TRANSIENT_ERROR_PATTERNS:
         if token in ("timeout", "timed out"):
             continue
         if token in message:
             return True
+    if "assert" in message:
+        # No infrastructure token matched above; a bare timeout with an
+        # assert mention stays deterministic even when qualified below.
+        # Fall through to the qualified-timeout check would let
+        # "operation timeout ... assertion failed" retry, so hold here.
+        return False
     if "timed out" in message or "timeout" in message:
         return any(qual in message for qual in _TIMEOUT_INFRA_QUALIFIERS)
     return False
@@ -406,12 +414,20 @@ def _parse_int(value: object) -> Optional[int]:
     return number
 
 
-def _parse_retry_after_seconds(value: object) -> Optional[int]:
+def _parse_retry_after_seconds(
+    value: object, now: Optional[datetime] = None
+) -> Optional[int]:
     """Parse a Retry-After header in seconds or HTTP-date form.
 
     Numeric form returns seconds directly. HTTP-date form returns the
     non-negative delay until that time so reset-aware scheduling honors the
     server-requested time instead of falling back to schedule+jitter.
+
+    ``now`` is the reference clock for HTTP-date conversion (defaults to
+    the current UTC time). Callers that already hold a scheduling clock
+    pass it explicitly so classification and ``decide_recovery``
+    scheduling share one instant instead of sampling the clock twice on
+    different runners.
     """
 
     text = str(value or "").strip()
@@ -428,8 +444,10 @@ def _parse_retry_after_seconds(value: object) -> Optional[int]:
         return None
     if when.tzinfo is None:
         when = when.replace(tzinfo=timezone.utc)
-    now = datetime.now(timezone.utc)
-    return max(0, int(math.ceil((when - now).total_seconds())))
+    reference = now if now is not None else datetime.now(timezone.utc)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=timezone.utc)
+    return max(0, int(math.ceil((when - reference).total_seconds())))
 
 
 def _parse_time(value: object) -> Optional[datetime]:
@@ -454,6 +472,7 @@ def classify_infrastructure_failure(
     headers: Optional[Mapping[str, object]] = None,
     error: object = "",
     run_conclusion: object = None,
+    now: Optional[datetime] = None,
 ) -> FailureClassification:
     """Classify a failure as transient infrastructure or deterministic.
 
@@ -461,6 +480,10 @@ def classify_infrastructure_failure(
     Retry-After, any 5xx, network timeout/reset, runner cancellation/eviction,
     temporary provider/bootstrap outage.  Everything else fails closed to
     deterministic so it never consumes the transient budget.
+
+    ``now`` is the reference clock forwarded to HTTP-date Retry-After
+    parsing so classification shares one instant with later
+    ``decide_recovery`` scheduling instead of sampling the clock twice.
     """
 
     norm_headers: dict[str, str] = {}
@@ -479,7 +502,7 @@ def classify_infrastructure_failure(
 
     def retry_after() -> Optional[int]:
         for key in ("retry-after", "retry_after"):
-            seconds = _parse_retry_after_seconds(norm_headers.get(key, ""))
+            seconds = _parse_retry_after_seconds(norm_headers.get(key, ""), now=now)
             if seconds is not None and seconds >= 0:
                 return seconds
         return None
@@ -796,6 +819,38 @@ def _next_attempt(
     return evidence.latest_attempt + 1
 
 
+def dispatch_grace_active(
+    *,
+    marker_newer_than_status: bool,
+    latest_attempt: Optional[int],
+    marker_age_seconds: Optional[int] = None,
+    status_age_seconds: Optional[int] = None,
+    dispatch_grace_seconds: int = DISPATCH_GRACE_SECONDS,
+    stale_after_seconds: int = STALE_AFTER_SECONDS,
+) -> bool:
+    """Whether the durable dispatch-grace window still coalesces a wakeup.
+
+    Cross-run helper shared by :func:`decide_recovery`: a marker newer
+    than status coalesces while its age is inside grace. An unknown marker
+    age stays inside grace while status is fresh but expires once the
+    status itself is stale, so a timestamp-less marker can never strand a
+    PR forever. Callers implement cross-run at-most-one by combining this
+    durable check with the repository-global concurrency lease and a
+    pre-mutation latest-state re-read.
+    """
+
+    if not marker_newer_than_status or latest_attempt is None:
+        return False
+    if marker_age_seconds is None:
+        if (
+            status_age_seconds is not None
+            and status_age_seconds >= stale_after_seconds
+        ):
+            return False
+        return True
+    return marker_age_seconds < dispatch_grace_seconds
+
+
 def decide_recovery(
     *,
     ci_green: bool,
@@ -879,18 +934,20 @@ def decide_recovery(
     if active_exact_lease or active_operation:
         return RecoveryDecision("wait", None, "exact PR/HEAD operation already owns the lease")
 
-    if (
-        marker_newer_than_status
-        and evidence.latest_attempt is not None
-        and (
-            marker_age_seconds is None
-            or marker_age_seconds < dispatch_grace_seconds
-        )
+    if dispatch_grace_active(
+        marker_newer_than_status=marker_newer_than_status,
+        latest_attempt=evidence.latest_attempt,
+        marker_age_seconds=marker_age_seconds,
+        status_age_seconds=status_age_seconds,
+        dispatch_grace_seconds=dispatch_grace_seconds,
+        stale_after_seconds=stale_after_seconds,
     ):
-        # Fail closed: a marker that is newer than status but whose age is
-        # unknown (missing/unparsable timestamp) cannot prove grace
-        # expired, so it stays inside grace instead of dispatching a
-        # likely duplicate.
+        # Dispatch grace with a staleness expiry: an unknown-age marker
+        # (missing/unparsable timestamp) cannot prove grace expired, so it
+        # stays inside grace while status is fresh. Once the status itself
+        # is stale (>= STALE_AFTER) the wait expires and reconciliation
+        # proceeds instead of stranding a healthy PR forever on a marker
+        # that never ages.
         return RecoveryDecision(
             "wait", None, "newer retry dispatch marker is still inside dispatch grace"
         )
@@ -1026,10 +1083,13 @@ def decide_recovery(
         # inline ceiling (the 10m/20m/40m/60m tail, or a long Retry-After)
         # cannot persist a durable not-before without now, so dispatching
         # it with defer=true and not_before=None would let the next
-        # watchdog retry immediately and burn the budget. Bounded jitter
-        # around the 60s inline threshold is runner-local noise, not a
-        # scheduling commitment, so mid-budget attempts still dispatch.
-        floor = exponential_backoff_seconds(attempt)
+        # watchdog retry immediately and burn the budget. The floor
+        # includes bounded jitter (the same delay the dispatcher would
+        # sleep) so a 60s schedule plus jitter dispatches as a durable
+        # wait instead of compressing the canonical backoff.
+        floor = exponential_backoff_seconds(attempt) + jitter_seconds(
+            operation_key_value or "lifecycle", attempt
+        )
         if retry_after_seconds is not None and retry_after_seconds >= 0:
             floor = max(floor, int(retry_after_seconds))
         if floor > MAX_INLINE_WAIT_SECONDS:
@@ -1072,15 +1132,24 @@ def dedupe_wakeups(keys: Sequence[str]) -> list[str]:
     """Coalesce multiple wakeups for the same PR/HEAD into one operation.
 
     In-memory only: this coalesces duplicate wakeups WITHIN a single
-    process/run. Cross-run safety (cron plus an event wakeup overlapping)
-    never comes from this helper; it comes from the durable mechanisms the
-    callers combine it with: the per-PR/HEAD lease keyed by
-    :func:`concurrency_key` (at most one authoritative reconciliation per
-    PR/HEAD, so unrelated PRs never queue behind each other or starve),
-    the durable dispatch marker inside its dispatch-grace window, and an
-    exact-HEAD/CI/active-run re-read immediately before every mutation.
-    A stale queued run therefore becomes a safe no-op instead of a
-    concurrent writer.
+    process/run and provides NO cross-run at-most-one guarantee. Two
+    overlapping runs (event plus watchdog) that both read before either
+    marker is visible would both pass this helper. Cross-run safety
+    requires the durable combination that every caller MUST wire together
+    with this helper:
+
+    1. the repository-global ``concurrency`` group
+       (``cancel-in-progress:false``) plus the per-PR/HEAD lease keyed by
+       :func:`concurrency_key` (at most one authoritative reconciliation
+       per PR/HEAD);
+    2. the durable dispatch/exhaustion markers (:func:`retry_marker`,
+       :func:`exhausted_marker`) honored through the dispatch-grace
+       window in :func:`decide_recovery` (see :func:`dispatch_grace_active`);
+    3. an exact-HEAD/CI/active-run latest-state re-read immediately
+       before every mutation, so a stale queued run becomes a safe no-op.
+
+    Callers that use this helper without (1)-(3) can dispatch duplicate
+    full scans/mutations across runs.
     """
 
     seen: dict[str, None] = {}
@@ -1098,8 +1167,11 @@ def should_coalesce(active_leases: Sequence[str], key: str) -> bool:
     the current run, keyed per PR/HEAD via :func:`concurrency_key` so
     unrelated PRs proceed independently. Two independent runs do not share
     it, so this alone cannot guarantee at-most-one-operation across runs;
-    callers must combine it with the per-PR/HEAD lease, the durable dispatch
-    marker grace window, and the pre-mutation latest-state re-read.
+    callers MUST combine it with the repository-global concurrency group,
+    the durable dispatch-marker grace window
+    (:func:`dispatch_grace_active` / :func:`decide_recovery`), and the
+    pre-mutation latest-state re-read. Without that combination two
+    overlapping runs can both dispatch duplicate mutations.
     """
 
     normalized = str(key or "").strip()
@@ -1285,6 +1357,7 @@ __all__ = [
     "exhausted_marker",
     "retry_evidence",
     "decide_recovery",
+    "dispatch_grace_active",
     "forward_progress_clears",
     "dedupe_wakeups",
     "should_coalesce",

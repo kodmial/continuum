@@ -531,15 +531,27 @@ class LatestStateReconciliationTests(unittest.TestCase):
             evidence=lifecycle.RetryEvidence(latest_attempt=9, exhausted=True),
         )
         self.assertEqual(held.action, "hold")
-        # Mid-budget work still dispatches.
-        mid = lifecycle.decide_recovery(
+        # Mid-budget work still dispatches. Attempt 3 waits 60s plus bounded
+        # jitter, which exceeds the inline ceiling without a clock, so the
+        # clockless path correctly defers to a clocked wakeup; with a clock
+        # the same attempt dispatches with a durable not-before.
+        clockless_mid = lifecycle.decide_recovery(
             ci_green=True,
             operation_state="failure",
             failure_transient=True,
             evidence=lifecycle.RetryEvidence(latest_attempt=2),
         )
+        self.assertEqual(clockless_mid.action, "wait")
+        mid = lifecycle.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            failure_transient=True,
+            evidence=lifecycle.RetryEvidence(latest_attempt=2),
+            now_epoch=1000,
+        )
         self.assertEqual(mid.action, "dispatch")
         self.assertEqual(mid.attempt, 3)
+        self.assertIsNotNone(mid.not_before_epoch)
 
     def test_two_prs_recover_without_global_starvation(self):
         first = lifecycle.concurrency_key(REPO, 1, HEAD)

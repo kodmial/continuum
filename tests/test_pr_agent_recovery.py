@@ -707,8 +707,10 @@ class RecoveryWiringTests(unittest.TestCase):
         self.assertNotIn("require('@actions/github')", body)
 
         node = shutil.which("node")
-        if node is None:
-            self.skipTest("node is required for the github-script sandbox check")
+        self.assertIsNotNone(
+            node,
+            "node is required for the github-script sandbox check; failing closed instead of silently skipping",
+        )
 
         harness = r"""
 const assert = require('assert');
@@ -845,8 +847,10 @@ console.log('sandbox construction OK');
         )
 
         node = shutil.which("node")
-        if node is None:
-            self.skipTest("node is unavailable; skipping shipped-JS execution")
+        self.assertIsNotNone(
+            node,
+            "node is required to execute the shipped JS; failing closed instead of silently skipping",
+        )
 
         marker_match = re.search(
             r"const CONTROLLER_STATE_MARKER = '([^']*)';", body
@@ -1113,8 +1117,10 @@ class AutoMergeLoopSafetyTests(unittest.TestCase):
         )
 
         node = shutil.which("node")
-        if node is None:
-            self.skipTest("node is unavailable; skipping shipped-JS execution")
+        self.assertIsNotNone(
+            node,
+            "node is required to execute the shipped JS; failing closed instead of silently skipping",
+        )
 
         schedule_match = re.search(
             r"const LIFECYCLE_RETRY_DELAY_SCHEDULE = (\[[^\]]*\]);", body

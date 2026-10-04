@@ -217,13 +217,16 @@ jobs:
               // Bare timeout alone never proves infrastructure: deterministic
               // current-head CI text such as `tests timed out: assertion
               // failed` must hold. Only qualified infrastructure timeouts
-              // retry; any assertion mention holds.
-              if (String((err && err.message) || '').toLowerCase().includes('assert')) return false;
+              // retry. Infrastructure evidence wins over an incidental
+              // `assert` substring (e.g. a bootstrap/runner/TLS message
+              // mentioning an assertion); only when no infrastructure
+              // token matches does an assertion mention hold.
               if (/econnreset|econnrefused|eai_again|epipe|socket hang up|network error|network failure|network timeout|network unreachable|dns error|dns failure|dns resolution|tls handshake|tls error|ssl error|connection reset|connection refused|connection aborted|temporarily unavailable|service unavailable|bad gateway|gateway timeout|bootstrap failed|bootstrap error|runner evicted|runner cancelled|runner timeout|runner lost|run evicted|run cancelled/i.test(
                 String((err && err.message) || '')
               )) {
                 return true;
               }
+              if (String((err && err.message) || '').toLowerCase().includes('assert')) return false;
               if (/timed out|timeout/i.test(String((err && err.message) || ''))) {
                 return /read|connection|network|runner|socket|dns|tls|ssl|gateway|http|request|operation|bootstrap|provider/i.test(
                   String((err && err.message) || '')

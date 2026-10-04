@@ -620,14 +620,16 @@ jobs:
               // Bare timeout alone never proves infrastructure: deterministic
               // current-head CI text such as `tests timed out: assertion
               // failed` must hold. Only qualified infrastructure timeouts
-              // retry; any assertion mention holds.
+              // retry. Infrastructure evidence wins over an incidental
+              // `assert` substring; only when no infrastructure token
+              // matches does an assertion mention hold.
               const message = String((err && err.message) || '').toLowerCase();
-              if (message.includes('assert')) return false;
               if (/econnreset|econnrefused|eai_again|epipe|socket hang up|network error|network failure|network timeout|network unreachable|dns error|dns failure|dns resolution|tls handshake|tls error|ssl error|connection reset|connection refused|connection aborted|temporarily unavailable|service unavailable|bad gateway|gateway timeout|bootstrap failed|bootstrap error|runner evicted|runner cancelled|runner timeout|runner lost|run evicted|run cancelled/i.test(
                 String((err && err.message) || '')
               )) {
                 return true;
               }
+              if (message.includes('assert')) return false;
               if (/timed out|timeout/i.test(String((err && err.message) || ''))) {
                 return /read|connection|network|runner|socket|dns|tls|ssl|gateway|http|request|operation|bootstrap|provider/i.test(
                   String((err && err.message) || '')
@@ -729,6 +731,7 @@ jobs:
               runConclusion,
               evidence,
               failureTransient,
+              operationContext,
             }) {
               const state = String(operationStatus?.state || '').toLowerCase() || null;
               const description = String(operationStatus?.description || '');
@@ -765,11 +768,19 @@ jobs:
                 (!Number.isFinite(statusAt) || evidence.latestMarkerAt > statusAt);
               const markerAge =
                 evidence.latestMarkerAt === null ? null : Math.max(0, nowMs() - evidence.latestMarkerAt);
-
+              // Dispatch grace with a staleness expiry: an unknown-age
+              // marker stays inside grace while status is fresh, but once
+              // the status itself is stale the wait expires instead of
+              // stranding a healthy PR forever on a marker that never ages.
+              const statusAgeMs = operationStatus
+                ? ageMs(operationStatus.updated_at || operationStatus.created_at)
+                : Number.MAX_SAFE_INTEGER;
+              const statusStale = statusAgeMs >= staleMs;
               if (
                 markerNewer &&
                 evidence.latestAttempt !== null &&
-                (markerAge === null || markerAge < dispatchGraceMs)
+                (markerAge === null || markerAge < dispatchGraceMs) &&
+                !(markerAge === null && statusStale)
               ) {
                 return {
                   action: 'wait',
@@ -778,16 +789,18 @@ jobs:
               }
               // Fail closed on unknown marker age (#224, single lifecycle
               // contract): a durable marker without a parseable timestamp
-              // cannot prove grace expired, so an in-flight dispatch
-              // (marker newer than status) stays inside grace instead of
-              // dispatching a likely duplicate immediately. Gated on
-              // markerNewer so a stale timestamp-less marker never strands
-              // the PR forever: once status catches up, reconciliation
-              // proceeds.
+              // cannot prove grace expired, so it stays inside grace while
+              // status is fresh instead of dispatching a likely duplicate
+              // immediately. The status-staleness expiry bounds the wait:
+              // once status goes stale, reconciliation proceeds instead of
+              // stranding the PR forever. This check does not require
+              // markerNewer (which is false without a marker timestamp) so
+              // timestamp-less markers match the Python contract.
               if (
-                markerNewer &&
                 evidence.latestAttempt !== null &&
-                evidence.latestMarkerAt === null
+                evidence.latestMarkerAt === null &&
+                operationStatus &&
+                !statusStale
               ) {
                 return {
                   action: 'wait',
@@ -815,8 +828,13 @@ jobs:
                     reason: 'deterministic failure is not automatically retried',
                   };
                 } else {
-                // Only the explicit reconciler-synthesized token authorizes
-                // a retry without classifier input. A bare "transient"
+                // Only the explicit reconciler-synthesized token from a
+                // trusted commit-status context authorizes a retry without
+                // classifier input (parity with decide_recovery in
+                // src/continuum/pr_agent_recovery.py). Every shipped
+                // producer emits the token from continuum/pr-agent-review
+                // or continuum/pr-agent-repair, so PR-visible text carrying
+                // the token can never spend the budget. A bare "transient"
                 // substring is never sufficient: deterministic messages such
                 // as "non-transient policy failure" contain it and must never
                 // burn the transient budget. Negated forms (not/no/non/never
@@ -827,6 +845,8 @@ jobs:
                 // transient classifier verdict overrides it, so PR-visible
                 // output containing the token can never spend the budget.
                 const lowered = description.toLowerCase();
+                const trustedContexts = new Set([REVIEW_CONTEXT, REPAIR_CONTEXT]);
+                const contextValue = String(operationContext || operationStatus?.context || '').trim();
                 // Narrowed deterministic hints, mirroring
                 // src/continuum/pr_agent_recovery.py: bare "unresolved"
                 // alone never holds (transient "unresolved host"/DNS text
@@ -836,13 +856,16 @@ jobs:
                 if (
                   /\brecovery eligible\b/.test(lowered) &&
                   !/\b(?:not|no|non|never)[\s\-_]*recovery[\s\-_]+eligible\b/.test(lowered) &&
-                  !hasDeterministicHint
+                  !hasDeterministicHint &&
+                  trustedContexts.has(contextValue)
                 ) {
                   recoverable = true;
                 } else {
                   return {
                     action: 'hold',
-                    reason: 'deterministic failure is not automatically retried',
+                    reason: contextValue && !trustedContexts.has(contextValue)
+                      ? 'recovery token from untrusted context is not automatically retried'
+                      : 'deterministic failure is not automatically retried',
                   };
                 }
                 }
@@ -919,10 +942,22 @@ jobs:
               const statusTime = status
                 ? Date.parse(String(status.updated_at || status.created_at || ''))
                 : null;
+              // Schedule discount applies only to the schedule+jitter
+              // portion: an old status must never discount the absolute
+              // server reset floor (Retry-After / rate-limit / provider
+              // reset), otherwise quota is re-hammered.
               const elapsedSeconds = Number.isFinite(statusTime)
                 ? Math.floor(Math.max(0, nowMs() - statusTime) / 1000)
-                : delaySeconds;
-              const remaining = Math.max(0, delaySeconds - elapsedSeconds);
+                : 0;
+              const nowEpoch = Math.floor(nowMs() / 1000);
+              const scheduleDelay = backoffSeconds(attempt) + jitterSeconds(repoFullName + '#' + pr.number + ':' + head + ':' + kind, attempt);
+              const scheduleRemaining = Math.max(0, scheduleDelay - elapsedSeconds);
+              let resetFloor = 0;
+              if (Number.isFinite(signals.retryAfterSeconds)) resetFloor = Math.max(resetFloor, signals.retryAfterSeconds);
+              for (const resetEpoch of [signals.ratelimitResetEpoch, signals.providerResetEpoch]) {
+                if (Number.isFinite(resetEpoch)) resetFloor = Math.max(resetFloor, Math.max(0, resetEpoch - nowEpoch));
+              }
+              const remaining = Math.max(scheduleRemaining, resetFloor);
               if (remaining > MAX_INLINE_WAIT_SECONDS) {
                 // Never keep a runner sleeping through a long rate-limit or
                 // quota wait. Record the reset-aware not-before time so the
@@ -1460,12 +1495,18 @@ jobs:
 
               const evidence = parseEvidence(comments, head, kind);
               const activeRun = exactActiveRun(reviewRuns, pr.number, kind, head);
+              // Trusted-context parity with the Python contract: every
+              // shipped producer emits the token from
+              // continuum/pr-agent-review or continuum/pr-agent-repair, and
+              // the synthesized blocking-review status below reuses the
+              // review status object (already scoped to REVIEW_CONTEXT).
               const decision = decide({
                 ciGreen,
                 operationStatus,
                 activeRun,
                 runConclusion: operationRun.conclusion,
                 evidence,
+                operationContext: String(operationStatus?.context || ''),
               });
 
               core.info(

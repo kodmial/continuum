@@ -463,16 +463,18 @@ def decide_recovery(
             or marker_age_seconds < dispatch_grace_seconds
         )
     ):
-        # Fail closed on unknown marker age, mirroring the reconciler: a
-        # durable marker without a parseable timestamp cannot prove grace
-        # expired, so it stays inside grace instead of dispatching a
-        # likely duplicate. This wait is gated on marker_newer_than_status,
-        # so it cannot strand a PR forever: the scheduled safety net keeps
-        # waking (caller stub cron), and once status activity catches up
-        # the marker is no longer newer and reconciliation proceeds.
-        return RecoveryDecision(
-            "wait", None, "newer retry dispatch marker is still inside dispatch grace"
+        # Dispatch grace with a staleness expiry, mirroring the single
+        # lifecycle contract: an unknown-age marker stays inside grace
+        # while status is fresh, but once the status itself is stale the
+        # wait expires and the retry fires instead of recurring forever.
+        status_stale = (
+            status_age_seconds is not None
+            and status_age_seconds >= stale_after_seconds
         )
+        if not (marker_age_seconds is None and status_stale):
+            return RecoveryDecision(
+                "wait", None, "newer retry dispatch marker is still inside dispatch grace"
+            )
 
     recoverable = False
     operation_seen = state is not None
