@@ -1490,15 +1490,80 @@ class RepairWiringRegressionTests(unittest.TestCase):
         self.assertIn("Publish failed PR-Agent repair state", repair)
         self.assertIn("continuum/pr-agent-repair", repair)
 
-    def test_caller_level_concurrency_serializes_duplicate_wakeups(self):
+    def test_no_caller_level_per_pr_serialization(self):
+        # Issue #227: the caller must not serialize per PR. A caller-level
+        # lock is acquired before admission, so no-op comment runs would
+        # queue ahead of useful exact-HEAD reviews. Heavy callers are
+        # dispatch-only by design (issue #229): ordinary comments must not
+        # create heavy workflow runs at all. Filtering and coalescing live
+        # in the thin router, so the heavy YAML carries no comment gate.
+        # Every atomic condition of caller_review_event_is_actionable stays
+        # mirrored in the router, not in the heavy caller.
         for path in (
             ".github/workflows/pr-agent.yml",
             ".github/caller-stubs/continuum-pr-agent.yml",
         ):
             with self.subTest(path=path):
                 caller = read_repo(path)
-                self.assertIn("group: pr-agent-caller-", caller)
-                self.assertIn("cancel-in-progress: false", caller)
+                self.assertNotIn("pr-agent-caller-", caller)
+                self.assertNotIn("concurrency:", caller)
+                self.assertNotIn("cancel-in-progress", caller)
+                self.assertIn("workflow_dispatch:", caller)
+                self.assertIn("github.event_name == 'workflow_dispatch'", caller)
+                self.assertNotIn("issue_comment", caller)
+                self.assertNotIn(
+                    "contains(github.event.comment.body, '/review')", caller
+                )
+        router_stub = read_repo(
+            ".github/caller-stubs/continuum-pr-agent-router.yml"
+        )
+        self.assertIn("issue_comment", router_stub)
+        self.assertIn(
+            "contains(github.event.comment.body, '/review')", router_stub
+        )
+
+    def test_authoritative_review_serialization_is_cancellable_per_pr(self):
+        # Issue #227: the reusable operation layer owns the only per-PR
+        # serialization, and it covers the whole run at workflow level so
+        # downstream repair/merge wrappers can never run in parallel with
+        # a newer run. Preemption is HEAD-guarded, never unconditional:
+        # an out-of-order old-HEAD event must not cancel newer
+        # exact-HEAD work and same-HEAD duplicates coalesce.
+        body = read_repo(".github/workflows/continuum-pr-agent.yml")
+        self.assertIn("group: pr-agent-${{", body)
+        self.assertIn("cancel-in-progress: false", body)
+        self.assertNotIn("group: pr-agent-caller-", body)
+        self.assertNotIn("cancel-in-progress: true", body)
+        workflow_block, _, jobs_block = body.partition("\njobs:\n")
+        self.assertIn("concurrency:", workflow_block)
+        self.assertNotIn("\n    concurrency:", jobs_block)
+        # HEAD-guarded supersession markers implement
+        # stale_review_may_be_cancelled instead of native preemption.
+        self.assertIn("Stale admission ignored:", body)
+        self.assertIn("PR head moved during review", body)
+        self.assertIn("stale_review_may_be_cancelled", body)
+
+    def test_repair_serialization_is_non_interruptible_per_head(self):
+        # Issue #227: repair publication keeps its own non-cancellable
+        # per-PR-HEAD group and is never interrupted by serialized review
+        # work, so a newer event cannot interrupt a mutating publish.
+        # The parent run is also non-preemptive at workflow level, so an
+        # old-HEAD duplicate can never cancel newer exact-HEAD work.
+        repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
+        self.assertIn(
+            "group: pr-agent-repair-${{ inputs.pr_number || github.run_id }}-"
+            "${{ inputs.head_sha || github.sha }}",
+            repair,
+        )
+        self.assertIn("cancel-in-progress: false", repair)
+        review = read_repo(".github/workflows/continuum-pr-agent.yml")
+        self.assertIn("cancel-in-progress: false", review)
+        self.assertNotIn("cancel-in-progress: true", review)
+        # The whole-run group is per PR; the repair group is
+        # per PR plus exact HEAD, so same-HEAD repairs serialize while
+        # HEAD-guarded supersession (not native cancellation) retires
+        # stale reviews.
+        self.assertIn("inputs.pr_number || github.run_id", review)
 
     def test_no_progress_marker_trust_does_not_depend_on_login(self):
         repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
@@ -1948,6 +2013,183 @@ class ImproveSkipWorkflowTests(unittest.TestCase):
         self.assertGreaterEqual(
             body.count("steps.improve_skipped.outcome == 'failure'"), 3
         )
+
+
+class SchedulingSemanticsTests(unittest.TestCase):
+    """Issue #227: latest-useful-work scheduling without double-queueing.
+
+    No-op issue_comment events must never hold a per-PR lock, superseded
+    reviews may be cancelled/coalesced, and in-flight repair publication
+    must never be interrupted by a newer review event.
+    """
+
+    def _life(self):
+        import sys
+
+        sys.path.insert(0, SRC)
+        try:
+            from continuum import pr_agent_lifecycle as life
+        finally:
+            sys.path.remove(SRC)
+        return life
+
+    def test_noop_comment_events_are_not_actionable(self):
+        life = self._life()
+        # Owner /review on a PR and workflow_dispatch carry useful work.
+        self.assertTrue(
+            life.caller_review_event_is_actionable(
+                "workflow_dispatch",
+            )
+        )
+        self.assertTrue(
+            life.caller_review_event_is_actionable(
+                "issue_comment",
+                is_pull_request_comment=True,
+                actor_is_owner=True,
+                comment_body="/review please",
+            )
+        )
+        # Everything else is a no-op: plain comments, non-owner actors,
+        # non-PR issues, and unrelated events must not invoke the operation
+        # layer, so they can never delay a useful exact-HEAD review.
+        self.assertFalse(
+            life.caller_review_event_is_actionable(
+                "issue_comment",
+                is_pull_request_comment=True,
+                actor_is_owner=True,
+                comment_body="looks good, thanks!",
+            )
+        )
+        self.assertFalse(
+            life.caller_review_event_is_actionable(
+                "issue_comment",
+                is_pull_request_comment=True,
+                actor_is_owner=False,
+                comment_body="/review",
+            )
+        )
+        self.assertFalse(
+            life.caller_review_event_is_actionable(
+                "issue_comment",
+                is_pull_request_comment=False,
+                actor_is_owner=True,
+                comment_body="/review",
+            )
+        )
+        self.assertFalse(
+            life.caller_review_event_is_actionable(
+                "issue_comment",
+                is_pull_request_comment=True,
+                actor_is_owner=True,
+                comment_body="",
+            )
+        )
+        self.assertFalse(life.caller_review_event_is_actionable("schedule"))
+        self.assertFalse(life.caller_review_event_is_actionable(""))
+
+    def test_superseded_review_may_be_cancelled_same_head_coalesces(self):
+        life = self._life()
+        old = "a" * 40
+        new = "b" * 40
+        # A moved HEAD supersedes older review work: cancel/coalesce it.
+        self.assertTrue(life.stale_review_may_be_cancelled(old, new))
+        self.assertTrue(life.needs_fresh_review(old, new))
+        # Same HEAD duplicates coalesce: exact-HEAD work is idempotent.
+        self.assertFalse(life.stale_review_may_be_cancelled(old, old.upper()))
+        self.assertFalse(life.needs_fresh_review(old, old.upper()))
+        # Missing SHAs never cancel: fail closed, never discard blindly.
+        self.assertFalse(life.stale_review_may_be_cancelled("", new))
+        self.assertFalse(life.stale_review_may_be_cancelled(old, ""))
+        self.assertFalse(life.stale_review_may_be_cancelled(None, new))
+
+    def test_repair_publication_is_non_interruptible(self):
+        life = self._life()
+        # Repair mutates/publishes under exact-HEAD revalidation plus
+        # force-with-lease; an active same-HEAD repair blocks review
+        # preemption, while no repair (or a different HEAD) does not.
+        self.assertTrue(
+            life.repair_is_protected_from_review_preemption(
+                repair_active=True, repair_head_sha="a" * 40, review_head_sha="a" * 40
+            )
+        )
+        self.assertTrue(
+            life.repair_is_protected_from_review_preemption(repair_active=True)
+        )
+        self.assertFalse(
+            life.repair_is_protected_from_review_preemption(repair_active=False)
+        )
+        self.assertFalse(
+            life.repair_is_protected_from_review_preemption(
+                repair_active=True,
+                repair_head_sha="a" * 40,
+                review_head_sha="b" * 40,
+            )
+        )
+        # The scheduling decision wires all three predicates so none is
+        # dead code: non-actionable events ignore, active repair waits,
+        # moved HEAD supersedes, same HEAD coalesces, and a current HEAD
+        # with no running review proceeds.
+        old, new = "a" * 40, "b" * 40
+        self.assertEqual(
+            life.review_supersession_decision(
+                old, new, event_name="schedule"
+            )["action"],
+            "ignore",
+        )
+        self.assertEqual(
+            life.review_supersession_decision(
+                old,
+                new,
+                repair_active=True,
+                repair_head_sha=new,
+                review_head_sha=new,
+            )["action"],
+            "wait",
+        )
+        self.assertEqual(
+            life.review_supersession_decision(old, new)["action"], "supersede"
+        )
+        self.assertEqual(
+            life.review_supersession_decision(old, old)["action"], "coalesce"
+        )
+        # First-ever review with no running SHA proceeds to admission;
+        # a missing current HEAD still fails closed to wait.
+        self.assertEqual(
+            life.review_supersession_decision("", new)["action"], "proceed"
+        )
+        self.assertEqual(
+            life.review_supersession_decision(None, new)["action"], "proceed"
+        )
+        self.assertEqual(
+            life.review_supersession_decision(old, "")["action"], "wait"
+        )
+        # Python wiring is a real call site, not documentation-only.
+        source = lifecycle_source()
+        decision = source.split("def review_supersession_decision", 1)[1]
+        self.assertIn("caller_review_event_is_actionable(", decision)
+        self.assertIn("stale_review_may_be_cancelled(", decision)
+        self.assertIn("repair_is_protected_from_review_preemption(", decision)
+        repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
+        self.assertIn("force-with-lease", repair)
+        self.assertIn("PR branch moved before publish", repair)
+
+    def test_router_holds_no_per_pr_lock(self):
+        # Issue #227: the thin router filters before any delay. A
+        # workflow-level lock is acquired before the job `if` / early-exit
+        # filter, so a plain non-`/review` comment run would queue ahead of
+        # a useful dispatch for the same PR. Duplicates coalesce via the
+        # operation-key active-run check instead.
+        for path in (
+            ".github/caller-stubs/continuum-pr-agent-router.yml",
+            ".github/workflows/continuum-pr-agent-router.yml",
+            ".github/workflows/pr-agent-router.yml",
+        ):
+            with self.subTest(path=path):
+                body = read_repo(path)
+                self.assertNotIn("concurrency:", body)
+                self.assertNotIn("cancel-in-progress", body)
+
+
 
 
 if __name__ == "__main__":
