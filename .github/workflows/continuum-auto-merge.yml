@@ -810,6 +810,22 @@ jobs:
               };
             }
 
+            // Shipped CodeRabbit gate wait condition. A missing review basis
+            // waits unless the commit status proves a finished review; the
+            // status is operational state only, never merge evidence, because
+            // auto-review-disabled events can overwrite a finished status
+            // with a skipped one without changing any review record.
+            function waitingForCompletedCodeRabbitReview(reviewBasis, rabbitStatus) {
+              return (
+                !reviewBasis &&
+                (
+                  !rabbitStatus ||
+                  rabbitStatus.state !== 'success' ||
+                  !/Review completed/i.test(rabbitStatus.description || '')
+                )
+              );
+            }
+
             async function carriedCodeRabbitReviewBasis(pr, headSha) {
               const { data: commit } = await github.rest.repos.getCommit({
                 owner,
@@ -1592,12 +1608,7 @@ jobs:
 
               if (
                 requireCodeRabbit &&
-                !reviewBasis &&
-                (
-                  !rabbitStatus ||
-                  rabbitStatus.state !== 'success' ||
-                  !/Review completed/i.test(rabbitStatus.description || '')
-                )
+                waitingForCompletedCodeRabbitReview(reviewBasis, rabbitStatus)
               ) {
                 core.info(
                   `PR #${pr.number}: waiting for completed CodeRabbit review on current head.`
