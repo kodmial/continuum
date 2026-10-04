@@ -1287,6 +1287,11 @@ class RunnerInstance:
     network_id: Optional[str] = None
     public_ip: Optional[str] = None
     log_forwarded: bool = False
+    # Durable cloud identity (e.g. EC2 InstanceId or GCE/Azure resource
+    # name). Stored on the instance so teardown survives a process restart
+    # that clears the in-memory local-id -> provider-id map; provider_tags
+    # also carries it for tag-based discovery without process memory.
+    provider_resource_id: Optional[str] = None
 
 
 @dataclass
@@ -1421,6 +1426,29 @@ class FakeProvider:
         instance.log_forwarded = True
         instance.destroyed_at = now
         self.prune_destroyed_resources()
+        return True
+
+    def delete_network(self, network: NetworkAttachment, now: float) -> bool:
+        """Idempotent per-job network teardown (local bookkeeping).
+
+        Cloud-backed subclasses override this to delete the remote
+        firewall/security-group/NSG first, then delegate here for the
+        local mark. Keeping the local mark in one place lets the
+        provisioning failure path and the orphan sweep reclaim remote
+        attachments through the same entry point instead of setting
+        ``destroyed_at`` directly and leaking the remote rule.
+        """
+
+        stored = self.networks.get(network.id)
+        target = stored if stored is not None else network
+        if target.destroyed_at is not None:
+            return True
+        target.destroyed_at = now
+        if stored is not None and stored is not network:
+            try:
+                network.destroyed_at = now
+            except Exception:
+                pass
         return True
 
     def prune_destroyed_resources(self, max_retained_destroyed: int = 256) -> int:
@@ -1762,9 +1790,18 @@ class CustomProvider(FakeProvider):
         if self._destroy_fn is None:
             return super().destroy(instance, now)
         destroyed = bool(self._destroy_fn(instance, now))
-        if destroyed:
-            return super().destroy(instance, now)
-        return False
+        if not destroyed:
+            return False
+        if instance.destroyed_at is not None:
+            return True
+        FakeProvider.jit_deregister(self, instance)
+        network = self.networks.get(instance.network_id or "")
+        if network is not None and network.destroyed_at is None:
+            network.destroyed_at = now
+        instance.log_forwarded = True
+        instance.destroyed_at = now
+        self.prune_destroyed_resources()
+        return True
 
 
 def _sanitize_cloud_resource_token(value: str, fallback: str = "job") -> str:
@@ -1930,7 +1967,73 @@ class CloudCliProvider(FakeProvider):
             digest=digest, job_id=job_id, network_id=network_id, now=now,
         )
         self._provider_instance_ids[instance.id] = real_id
+        # Persist the real cloud identity on the durable instance record
+        # (and therefore in provider_tags) so teardown after a process
+        # restart with a fresh in-memory map can still address real
+        # compute instead of raising with no InstanceId.
+        try:
+            instance.provider_resource_id = real_id
+        except Exception:
+            pass
         return instance
+
+    def provider_tags(self, instance: RunnerInstance) -> Dict[str, str]:
+        tags = super().provider_tags(instance)
+        durable = getattr(instance, "provider_resource_id", None) or self._provider_instance_ids.get(instance.id, "")
+        if durable:
+            tags["continuum-provider-id"] = str(durable)
+        return tags
+
+    def _resolve_ec2_instance_id(self, cli: str, name: str, instance: RunnerInstance) -> str:
+        """Resolve the real EC2 InstanceId from durable state, then the cloud.
+
+        Preference order: in-memory map (fast path), durable instance
+        record (survives restarts), live cloud discovery by the
+        ``continuum-job`` tag (reclaims instances created before the
+        durable record existed). An empty string means the cloud reports
+        no such instance, which the caller treats as already gone.
+        """
+
+        real_id = self._provider_instance_ids.get(instance.id, "")
+        if real_id:
+            return real_id
+        durable = str(getattr(instance, "provider_resource_id", "") or "")
+        if durable:
+            self._provider_instance_ids[instance.id] = durable
+            return durable
+        try:
+            output = self._run_cli([cli, "ec2", "describe-instances", "--filters",
+                                    "Name=tag:continuum-job,Values={}".format(name)])
+        except AgentRuntimeError as exc:
+            text = str(exc).lower()
+            if "not found" in text or "does not exist" in text or "invalidinstanceid" in text:
+                return ""
+            raise
+        try:
+            parsed = json.loads(output or "{}")
+        except Exception:
+            parsed = None
+        found = ""
+        if isinstance(parsed, dict):
+            for reservation in parsed.get("Reservations") or []:
+                if not isinstance(reservation, dict):
+                    continue
+                for entry in reservation.get("Instances") or []:
+                    if isinstance(entry, dict) and entry.get("InstanceId"):
+                        found = str(entry.get("InstanceId"))
+                        break
+                if found:
+                    break
+        if not found:
+            match = re.search(r"\bi-[0-9a-fA-F]{8,17}\b", output or "")
+            found = match.group(0) if match else ""
+        if found:
+            self._provider_instance_ids[instance.id] = found
+            try:
+                instance.provider_resource_id = found
+            except Exception:
+                pass
+        return found
 
     def _delete_remote_network_rule(self, cli: str, name: str) -> None:
         if self._backend == "gce":
@@ -1941,6 +2044,23 @@ class CloudCliProvider(FakeProvider):
             self._run_cli([cli, "network", "nsg", "delete", "--name", name,
                             "--resource-group", self.project, "--yes"])
 
+    def delete_network(self, network: NetworkAttachment, now: float) -> bool:
+        """Delete the remote per-job firewall/SG/NSG, then mark it locally."""
+
+        stored = self.networks.get(network.id)
+        target = stored if stored is not None else network
+        if target.destroyed_at is not None:
+            return True
+        cli = self._require_cli()
+        name = _cloud_resource_name(target.job_id or "", target.profile_digest or "")
+        try:
+            self._delete_remote_network_rule(cli, name)
+        except AgentRuntimeError as exc:
+            text = str(exc).lower()
+            if "not found" not in text and "does not exist" not in text:
+                raise
+        return FakeProvider.delete_network(self, target, now)
+
     def destroy(self, instance: RunnerInstance, now: float) -> bool:
         if instance.destroyed_at is not None:
             return True
@@ -1950,12 +2070,9 @@ class CloudCliProvider(FakeProvider):
             if self._backend == "gce":
                 self._run_cli([cli, "compute", "instances", "delete", name, "--quiet"])
             elif self._backend == "ec2":
-                real_id = self._provider_instance_ids.get(instance.id, "")
-                if not real_id:
-                    raise AgentRuntimeError(
-                        "ec2 teardown has no recorded provider InstanceId for {}: "
-                        "refusing to terminate local id as real compute".format(instance.id))
-                self._run_cli([cli, "ec2", "terminate-instances", "--instance-ids", real_id])
+                real_id = self._resolve_ec2_instance_id(cli, name, instance)
+                if real_id:
+                    self._run_cli([cli, "ec2", "terminate-instances", "--instance-ids", real_id])
             else:
                 self._run_cli([cli, "vm", "delete", "--name", name, "--yes"])
         except AgentRuntimeError as exc:
@@ -2063,11 +2180,15 @@ class EphemeralController:
         self.queued: List[Dict[str, Any]] = []
         self.diagnostics: List[str] = []
         self._job_counter = 0
-        # Serializes provisioning so concurrent callers cannot both pass
-        # the concurrency-limit check and over-provision beyond the
-        # consumer cost cap. The public run_next_job holds this across
-        # the whole check-then-provision path.
+        # Serializes queue/lease bookkeeping so concurrent callers cannot
+        # both claim the same demand or both pass the concurrency-limit
+        # check and over-provision beyond the consumer cost cap. Only the
+        # short claim/bookkeeping sections hold this lock: image
+        # ensure/validate, cloud CLI calls, and JIT registration run
+        # outside it, with an in-flight reservation covering the gap so
+        # queue operations never block for a full provisioning duration.
         self._provisioning_lock = threading.Lock()
+        self._provisioning_inflight = 0
 
     # -- demand ------------------------------------------------------
     def queue_job(self, repository: str, profile: RuntimeProfile, run_id: str = "") -> str:
@@ -2126,16 +2247,39 @@ class EphemeralController:
     ) -> JobResult:
         """Execute steps 2-13 of the required provisioning path for one job.
 
-        Serialized on the provisioning lock so the concurrency-limit
-        check and the subsequent network/instance creation are atomic:
-        concurrent callers cannot both observe the same live count and
-        both provision beyond the limit. ``probe_executor`` overrides the
-        image-probe runner for this job (falling back to the
-        controller-level and store-level defaults).
+        Only short queue/limit-claim and bookkeeping sections hold the
+        provisioning lock: image ensure/validate, cloud CLI calls, and JIT
+        registration run outside it. An in-flight reservation covers the
+        gap so concurrent callers cannot both pass the concurrency-limit
+        check and over-provision, without serializing slow provisioning
+        across workers. ``probe_executor`` overrides the image-probe
+        runner for this job (falling back to the controller-level and
+        store-level defaults).
         """
 
         with self._provisioning_lock:
-            return self._run_next_job_impl(
+            if not self.queued:
+                raise AgentRuntimeError("no queued demand: the controller never provisions without demand")
+            if outcome not in TERMINAL_OUTCOMES:
+                raise AgentRuntimeError("unknown job outcome {!r}: refusing to record success".format(outcome))
+            peeked = self.queued[0]
+            peek_profile: RuntimeProfile = peeked["profile"]
+            try:
+                concurrency_limit = int(peek_profile.concurrency_limit)
+            except (TypeError, ValueError):
+                raise AgentRuntimeError("concurrency_limit must be an integer between 1 and 256")
+            live = len(self.provider.live_instances())
+            if live + self._provisioning_inflight >= concurrency_limit:
+                raise AgentRuntimeError(
+                    "concurrency limit {} reached ({} live instances): refusing to provision {}".format(
+                        concurrency_limit, live, peeked.get("job_id", "?")
+                    )
+                )
+            pending = self.queued.pop(0)
+            self._provisioning_inflight += 1
+        try:
+            return self._run_claimed_job(
+                pending,
                 manifest,
                 now=now,
                 outcome=outcome,
@@ -2146,6 +2290,9 @@ class EphemeralController:
                 trusted_context=trusted_context,
                 probe_executor=probe_executor,
             )
+        finally:
+            with self._provisioning_lock:
+                self._provisioning_inflight = max(0, self._provisioning_inflight - 1)
 
     def _run_next_job_impl(
         self,
@@ -2162,29 +2309,72 @@ class EphemeralController:
     ) -> JobResult:
         """Execute steps 2-13 of the required provisioning path for one job."""
 
-        if not self.queued:
-            raise AgentRuntimeError("no queued demand: the controller never provisions without demand")
+        with self._provisioning_lock:
+            if not self.queued:
+                raise AgentRuntimeError("no queued demand: the controller never provisions without demand")
+            pending_claim = self.queued.pop(0)
+            self._provisioning_inflight += 1
+        try:
+            return self._run_claimed_job(
+                pending_claim,
+                manifest,
+                now=now,
+                outcome=outcome,
+                fail_jit=fail_jit,
+                fail_startup=fail_startup,
+                teardown_retries=teardown_retries,
+                is_fork=is_fork,
+                trusted_context=trusted_context,
+                probe_executor=probe_executor,
+            )
+        finally:
+            with self._provisioning_lock:
+                self._provisioning_inflight = max(0, self._provisioning_inflight - 1)
+
+    def _run_claimed_job(
+        self,
+        pending: Dict[str, Any],
+        manifest: AgentManifest,
+        *,
+        now: float,
+        outcome: str = OUTCOME_SUCCESS,
+        fail_jit: bool = False,
+        fail_startup: bool = False,
+        teardown_retries: Optional[int] = None,
+        is_fork: bool = False,
+        trusted_context: bool = True,
+        probe_executor: Any = None,
+    ) -> JobResult:
+        """Run one already-claimed queued entry (lock held only for bookkeeping)."""
+
+        def _requeue_claim() -> None:
+            with self._provisioning_lock:
+                if pending not in self.queued:
+                    self.queued.insert(0, pending)
+
         if outcome not in TERMINAL_OUTCOMES:
+            _requeue_claim()
             raise AgentRuntimeError("unknown job outcome {!r}: refusing to record success".format(outcome))
-        # Peek first: image build/validation failures must not drop queued
-        # demand. The entry is popped only after validation succeeds.
-        queued = self.queued[0]
-        profile: RuntimeProfile = queued["profile"]
-        job_id: str = queued["job_id"]
-        repository: str = queued["repository"]
-        run_id: str = queued["run_id"]
+        profile: RuntimeProfile = pending["profile"]
+        job_id: str = pending["job_id"]
+        repository: str = pending["repository"]
+        run_id: str = pending["run_id"]
         events: List[str] = ["queued {}".format(job_id)]
 
-        # Consumer-owned concurrency/cost limit: never provision beyond the
-        # profile's concurrency_limit live instances. The queued demand is
-        # kept (not popped) so a refused job is retried later instead of
-        # being silently dropped.
+        # Consumer-owned concurrency/cost limit: re-checked here from the
+        # claimed entry so a direct _run_claimed_job/_run_next_job_impl
+        # caller (and the pre-claim check in run_next_job) never
+        # provisions beyond the profile's concurrency_limit live
+        # instances. Refused demand is requeued at the front so it is
+        # retried later instead of being silently dropped.
         try:
             concurrency_limit = int(profile.concurrency_limit)
         except (TypeError, ValueError):
+            _requeue_claim()
             raise AgentRuntimeError("concurrency_limit must be an integer between 1 and 256")
         live = len(self.provider.live_instances())
         if live >= concurrency_limit:
+            _requeue_claim()
             raise AgentRuntimeError(
                 "concurrency limit {} reached ({} live instances): refusing to provision {}".format(
                     concurrency_limit, live, job_id
@@ -2195,11 +2385,13 @@ class EphemeralController:
         # Promotion/rollback gate execution: each runtime profile keeps its
         # own active digest. A queued job requesting any other digest for
         # its profile must wait for an explicit promotion instead of
-        # building/validating and running unpromoted. Demand is kept (not
-        # popped) so the refused job is retried after promotion. Profiles
-        # are independent: promoting linux-x64 never blocks macos-arm64.
+        # building/validating and running unpromoted. The claimed demand
+        # is requeued at the front so the refused job is retried after
+        # promotion. Profiles are independent: promoting linux-x64 never
+        # blocks macos-arm64.
         active = self.images.active_digest_for(profile)
         if active is not None and digest != active:
+            _requeue_claim()
             raise AgentRuntimeError(
                 "image digest {} is not the active image {} for profile {!r}: "
                 "promote it before serving jobs".format(
@@ -2224,20 +2416,28 @@ class EphemeralController:
         # Probe runner precedence for this job: per-call override, then
         # the controller default, then the store default, then the real
         # subprocess executor. Without an injection path a host missing
-        # the binaries on PATH fails here before any compute is created
-        # and the demand stays queued for retry.
+        # the binaries on PATH fails here before any compute is created;
+        # the claimed demand is requeued for retry. This slow
+        # ensure/validate path runs outside the provisioning lock.
         effective_probe_executor = (
             probe_executor if probe_executor is not None else self.probe_executor
         )
-        generation = self.images.ensure_image(
-            manifest, profile, now=now, executor=effective_probe_executor
-        )
+        try:
+            generation = self.images.ensure_image(
+                manifest, profile, now=now, executor=effective_probe_executor
+            )
+        except Exception:
+            _requeue_claim()
+            raise
         events.append("ensured-image {}".format(digest))
         if self.images.active_digest_for(profile) is None:
             self.images.promote(generation.digest, now=now, profile=profile)
-        validate_image(manifest, profile, generation)
+        try:
+            validate_image(manifest, profile, generation)
+        except Exception:
+            _requeue_claim()
+            raise
         events.append("validated-identity {}".format(digest))
-        pending = self.queued.pop(0)
 
         network: Optional[NetworkAttachment] = None
         instance: Optional[RunnerInstance] = None
@@ -2289,12 +2489,14 @@ class EphemeralController:
                 state="provisioning",
                 provisioning_timeout_seconds=profile_provisioning_timeout,
             )
-            self.leases[instance.id] = lease
+            with self._provisioning_lock:
+                self.leases[instance.id] = lease
             if fail_jit or outcome == OUTCOME_JIT_FAILURE:
                 events.append("jit-registration-failed {}".format(instance.id))
                 destroyed = self._teardown(instance, now=now, retries=teardown_retries)
                 if destroyed:
-                    self.leases.pop(instance.id, None)
+                    with self._provisioning_lock:
+                        self.leases.pop(instance.id, None)
                 else:
                     events.append("teardown-deferred-to-reconciler {}".format(instance.id))
                 assert network is not None and instance is not None
@@ -2314,23 +2516,44 @@ class EphemeralController:
                     destroyed = self._teardown(instance, now=now, retries=teardown_retries)
                     if not destroyed:
                         events.append("teardown-deferred-to-reconciler {}".format(instance.id))
-                        self.diagnostics.append(
-                            "teardown-deferred-to-reconciler {}".format(instance.id)
-                        )
+                        with self._provisioning_lock:
+                            self.diagnostics.append(
+                                "teardown-deferred-to-reconciler {}".format(instance.id)
+                            )
                 finally:
-                    self.leases.pop(instance.id, None)
+                    with self._provisioning_lock:
+                        self.leases.pop(instance.id, None)
             elif network is not None:
-                stored = self.provider.networks.get(network.id)
-                if stored is not None and stored.destroyed_at is None:
-                    stored.destroyed_at = now
-            self.queued.insert(0, pending)
+                # Network-only failure (create_instance raised after
+                # create_network succeeded): tear down the remote
+                # firewall/SG/NSG through the provider instead of only
+                # marking local state, or the real per-job network leaks.
+                deleter = getattr(self.provider, "delete_network", None)
+                if callable(deleter):
+                    try:
+                        deleter(network, now)
+                    except Exception as cleanup_exc:
+                        with self._provisioning_lock:
+                            self.diagnostics.append(
+                                "network-cleanup-failed {}: {}".format(network.id, cleanup_exc)
+                            )
+                else:
+                    try:
+                        networks = getattr(self.provider, "networks", {})
+                        stored = networks.get(network.id)
+                    except Exception:
+                        stored = None
+                    if stored is not None and stored.destroyed_at is None:
+                        stored.destroyed_at = now
+            _requeue_claim()
             raise
 
         assert network is not None and instance is not None
         if fail_startup or outcome == OUTCOME_STARTUP_FAILURE:
             events.append("job-startup-failed {}".format(instance.id))
             destroyed = self._teardown(instance, now=now, retries=teardown_retries)
-            self.leases.pop(instance.id, None)
+            with self._provisioning_lock:
+                self.leases.pop(instance.id, None)
             if not destroyed:
                 events.append("teardown-deferred-to-reconciler {}".format(instance.id))
             return JobResult(job_id, OUTCOME_STARTUP_FAILURE, instance.id, network.id,
@@ -2347,7 +2570,8 @@ class EphemeralController:
         terminal = outcome
         events.append("terminal {}".format(terminal))
         destroyed = self._teardown(instance, now=now, retries=teardown_retries)
-        self.leases.pop(instance.id, None)
+        with self._provisioning_lock:
+            self.leases.pop(instance.id, None)
         if not destroyed:
             events.append("teardown-deferred-to-reconciler {}".format(instance.id))
         if cache_key is not None and terminal == OUTCOME_SUCCESS:
@@ -2400,7 +2624,8 @@ class EphemeralController:
         # requests are still capped by the timeout so no teardown waits
         # indefinitely. The effective clock advances one slot per attempt
         # so the deadline actually bounds retry work instead of being dead
-        # code on a frozen timestamp.
+        # code on a frozen timestamp. Runs outside the provisioning lock
+        # so slow cloud CLI teardown never blocks queue operations.
         budget = max(1, int(self.teardown_timeout // DEFAULT_TEARDOWN_RETRY_BASE_SECONDS))
         attempts = max(1, min(int(requested), budget))
         deadline = float(now) + float(self.teardown_timeout)
@@ -2413,15 +2638,115 @@ class EphemeralController:
             except Exception:
                 destroyed = False
             if destroyed:
-                self.diagnostics.append("destroyed {}".format(instance.id))
+                with self._provisioning_lock:
+                    self.diagnostics.append("destroyed {}".format(instance.id))
                 return True
-        self.diagnostics.append("teardown-retry-exhausted {}".format(instance.id))
+        with self._provisioning_lock:
+            self.diagnostics.append("teardown-retry-exhausted {}".format(instance.id))
         return False
 
     # -- reconciliation (section 7) ------------------------------------
     def sweep_orphans(self, now: float) -> List[str]:
+        """Scheduled orphan sweep without holding the lock across teardown.
+
+        Candidate selection and bookkeeping hold the provisioning lock
+        only briefly; provider destroy/delete calls (cloud CLI, JIT
+        deregistration) run outside it so queue operations never block
+        for a full sweep duration.
+        """
+
         with self._provisioning_lock:
-            return self._sweep_orphans_impl(now)
+            try:
+                live_snapshot = list(self.provider.live_instances())
+            except Exception:
+                live_snapshot = []
+            try:
+                networks_snapshot = list(self.provider.networks.items())
+            except Exception:
+                networks_snapshot = []
+            leases_snapshot = dict(self.leases)
+        live_network_ids = {item.network_id for item in live_snapshot if getattr(item, "network_id", None)}
+        orphan_networks = [
+            (network_id, network)
+            for network_id, network in networks_snapshot
+            if getattr(network, "destroyed_at", None) is None
+            and network_id not in live_network_ids
+            and now - getattr(network, "created_at", now) >= self.orphan_grace
+        ]
+        orphan_instances: List[Tuple[Any, str]] = []
+        for instance in live_snapshot:
+            lease = leases_snapshot.get(instance.id)
+            orphan = False
+            reason = ""
+            if lease is None:
+                if getattr(instance, "jit_registered", False):
+                    orphan, reason = True, "stale-jit-without-lease"
+                elif now - getattr(instance, "created_at", now) >= self.orphan_grace:
+                    orphan, reason = True, "no-lease-past-grace"
+            else:
+                if now >= lease.max_age_at:
+                    orphan, reason = True, "global-max-age"
+                elif lease.state == "provisioning" and now - lease.created_at >= _lease_provisioning_timeout(lease, self.provisioning_timeout):
+                    orphan, reason = True, "provisioning-timeout"
+                elif lease.state == "running" and now >= lease.lease_expires_at:
+                    orphan, reason = True, "job-lifetime-exceeded"
+            if orphan:
+                orphan_instances.append((instance, reason))
+        removed: List[str] = []
+        # Network-only sweep first: a per-job attachment created before a
+        # crash between `create_network` and `create_instance` has no
+        # owning instance, so the live-instance loop below would never
+        # reclaim it. Route through provider network teardown so real
+        # cloud firewall/SG/NSG rules are deleted, not just local state.
+        for network_id, network in orphan_networks:
+            deleter = getattr(self.provider, "delete_network", None)
+            try:
+                if callable(deleter):
+                    deleter(network, now)
+                else:
+                    if getattr(network, "destroyed_at", None) is None:
+                        network.destroyed_at = now
+            except Exception as exc:
+                with self._provisioning_lock:
+                    self.diagnostics.append(
+                        "reconciled-orphan-network-destroy-failed {}: {}".format(network_id, exc))
+                continue
+            removed.append(network_id)
+            with self._provisioning_lock:
+                self.diagnostics.append("reconciled-orphan-network {} ({})".format(network_id, network.job_id))
+        for instance, reason in orphan_instances:
+            try:
+                destroyed = bool(self.provider.destroy(instance, now=now))
+            except Exception as exc:
+                with self._provisioning_lock:
+                    self.diagnostics.append(
+                        "reconciled-orphan-destroy-failed {} ({}): {}".format(instance.id, reason, exc))
+                continue
+            if destroyed:
+                with self._provisioning_lock:
+                    self.leases.pop(instance.id, None)
+                removed.append(instance.id)
+                with self._provisioning_lock:
+                    self.diagnostics.append("reconciled-orphan {} ({})".format(instance.id, reason))
+        with self._provisioning_lock:
+            try:
+                registrations_snapshot = list(self.provider.registrations.items())
+            except Exception:
+                registrations_snapshot = []
+        for jit_id, instance_id in registrations_snapshot:
+            with self._provisioning_lock:
+                try:
+                    instance = self.provider.instances.get(instance_id)
+                except Exception:
+                    instance = None
+                if instance is None or getattr(instance, "destroyed_at", None) is not None:
+                    try:
+                        self.provider.registrations.pop(jit_id, None)
+                    except Exception:
+                        pass
+                    removed.append(jit_id)
+                    self.diagnostics.append("removed-stale-registration {}".format(jit_id))
+        return sorted(removed)
 
     def _sweep_orphans_impl(self, now: float) -> List[str]:
         """Scheduled orphan sweep: destroy expired/over-age/stale resources.
@@ -2432,52 +2757,7 @@ class EphemeralController:
         and provider tags allow discovery without process memory).
         """
 
-        removed: List[str] = []
-        # Network-only sweep: a per-job attachment created before a crash
-        # between `create_network` and `create_instance` has no owning
-        # instance, so the live-instance loop below would never reclaim it.
-        # Reclaim attachments past grace with no live owner.
-        live_network_ids = {item.network_id for item in self.provider.live_instances() if item.network_id}
-        for network_id, network in list(self.provider.networks.items()):
-            if network.destroyed_at is None and network_id not in live_network_ids:
-                if now - network.created_at >= self.orphan_grace:
-                    network.destroyed_at = now
-                    removed.append(network_id)
-                    self.diagnostics.append("reconciled-orphan-network {} ({})".format(network_id, network.job_id))
-        for instance in list(self.provider.live_instances()):
-            lease = self.leases.get(instance.id)
-            orphan = False
-            reason = ""
-            if lease is None:
-                if instance.jit_registered:
-                    orphan, reason = True, "stale-jit-without-lease"
-                elif now - instance.created_at >= self.orphan_grace:
-                    orphan, reason = True, "no-lease-past-grace"
-            else:
-                if now >= lease.max_age_at:
-                    orphan, reason = True, "global-max-age"
-                elif lease.state == "provisioning" and now - lease.created_at >= _lease_provisioning_timeout(lease, self.provisioning_timeout):
-                    orphan, reason = True, "provisioning-timeout"
-                elif lease.state == "running" and now >= lease.lease_expires_at:
-                    orphan, reason = True, "job-lifetime-exceeded"
-            if orphan:
-                try:
-                    destroyed = bool(self.provider.destroy(instance, now=now))
-                except Exception as exc:
-                    self.diagnostics.append(
-                        "reconciled-orphan-destroy-failed {} ({}): {}".format(instance.id, reason, exc))
-                    continue
-                if destroyed:
-                    self.leases.pop(instance.id, None)
-                    removed.append(instance.id)
-                    self.diagnostics.append("reconciled-orphan {} ({})".format(instance.id, reason))
-        for jit_id, instance_id in list(self.provider.registrations.items()):
-            instance = self.provider.instances.get(instance_id)
-            if instance is None or instance.destroyed_at is not None:
-                self.provider.registrations.pop(jit_id, None)
-                removed.append(jit_id)
-                self.diagnostics.append("removed-stale-registration {}".format(jit_id))
-        return sorted(removed)
+        return self.sweep_orphans(now)
 
     def discover_via_tags(self) -> List[Dict[str, str]]:
         """Discover owned live resources from provider tags, without memory.
