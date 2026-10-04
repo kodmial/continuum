@@ -141,6 +141,29 @@ EVIDENCE_PASS = "pass"
 EVIDENCE_FAIL = "fail"
 EVIDENCE_UNKNOWN = "unknown"
 
+#: Comment authors whose lifecycle markers are trusted. Public/untrusted
+#: commenters can forge syntactically valid markers, so only these GitHub
+#: author associations may satisfy the gate or drive dispatch.
+TRUSTED_AUTHOR_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
+
+#: Automation logins trusted for lifecycle control and result evidence where
+#: explicitly intended (Docker/Render controllers and the scheduler post
+#: through this identity).
+TRUSTED_AUTOMATION_LOGINS = frozenset({"github-actions[bot]"})
+
+#: Bounded automatic-retry backoff for mandatory qualification (seconds).
+#: Exhausted immediate retries fall back to this lease instead of a terminal
+#: human-gated pause, so qualification resumes without label removal.
+QUALIFICATION_RETRY_BACKOFF_SECONDS = (60, 300, 900, 3600)
+
+#: Marker recording a repair handoff for a failed qualification.
+REPAIR_MARKER_RE = re.compile(
+    r"<!--\s*continuum-qualification-repair\s+"
+    r"source\s*=\s*(?P<source>\d+)\s+"
+    r"capability\s*=\s*(?P<capability>\d+)\s*-->",
+    re.IGNORECASE,
+)
+
 #: Capability lifecycle outcomes of :func:`capability_status`.
 MAY_COMPLETE = "complete"
 MUST_REOPEN = "must-reopen"
@@ -158,6 +181,152 @@ def _normalize_sha(value: object) -> Optional[str]:
     if _SHA_RE.match(text):
         return text
     return None
+
+
+def _comment_body(comment: object) -> Optional[str]:
+    if isinstance(comment, str):
+        return comment
+    if isinstance(comment, dict):
+        body = comment.get("body")
+        return body if isinstance(body, str) else None
+    body = getattr(comment, "body", None)
+    return body if isinstance(body, str) else None
+
+
+def _comment_association(comment: object) -> Optional[str]:
+    if isinstance(comment, str):
+        return None
+    if isinstance(comment, dict):
+        for key in ("author_association", "association", "authorAssociation"):
+            value = comment.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip().upper()
+        author = comment.get("author") or comment.get("user") or {}
+        if isinstance(author, dict):
+            for key in ("association", "author_association"):
+                value = author.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip().upper()
+        return None
+    for attr in ("author_association", "association"):
+        value = getattr(comment, attr, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip().upper()
+    return None
+
+
+def _comment_login(comment: object) -> Optional[str]:
+    if isinstance(comment, str):
+        return None
+    if isinstance(comment, dict):
+        for key in ("author_login", "login"):
+            value = comment.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        for key in ("author", "user"):
+            author = comment.get(key)
+            if isinstance(author, dict):
+                login = author.get("login")
+                if isinstance(login, str) and login.strip():
+                    return login.strip()
+            elif isinstance(author, str) and author.strip():
+                return author.strip()
+        return None
+    for attr in ("author_login", "login"):
+        value = getattr(comment, attr, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def is_trusted_comment(comment: object, allow_automation: bool = False) -> bool:
+    """Whether a comment author may drive the qualification lifecycle.
+
+    ``OWNER``/``MEMBER``/``COLLABORATOR`` are always trusted. Repository
+    automation (``github-actions[bot]``) is trusted only where the caller
+    explicitly allows it (dispatch control and controller result payloads).
+    Plain string bodies predate author metadata and are treated as trusted
+    for backward compatibility; structured callers must pass mappings so
+    public forgeries are rejected.
+    """
+
+    if isinstance(comment, str):
+        return True
+    association = _comment_association(comment)
+    if association in TRUSTED_AUTHOR_ASSOCIATIONS:
+        return True
+    if allow_automation:
+        login = (_comment_login(comment) or "").lower()
+        if login in {name.lower() for name in TRUSTED_AUTOMATION_LOGINS}:
+            return True
+        if association == "BOT" and login in {
+            name.lower() for name in TRUSTED_AUTOMATION_LOGINS
+        }:
+            return True
+    return False
+
+
+def contains_dispatch_marker(body: object) -> bool:
+    """Whether a body carries a qualification dispatch marker."""
+
+    if not isinstance(body, str) or not body:
+        return False
+    return DISPATCH_RE.search(body) is not None
+
+
+def is_qualification_result_comment(body: object) -> bool:
+    """Whether a body carries any supported qualification result marker."""
+
+    if not isinstance(body, str) or not body:
+        return False
+    if EVIDENCE_RE.search(body) is not None:
+        return True
+    return (
+        DOCKER_RESULT_MARKER in body or RENDER_RESULT_MARKER in body
+    )
+
+
+def qualification_run_identity(
+    capability_number: int, qualification_number: int, sha: str
+) -> Tuple[int, int, str]:
+    """The immutable identity of one qualification run.
+
+    A new SHA is a distinct run identity; a retry without evidence preserves
+    the same triple so recovery never retargets the run.
+    """
+
+    normalized = _normalize_sha(sha)
+    if normalized is None:
+        raise ValueError("sha must be a 40-character hex revision, got {!r}".format(sha))
+    return (int(capability_number), int(qualification_number), normalized)
+
+
+def qualification_run_key(
+    capability_number: int, qualification_number: int, sha: str
+) -> str:
+    triple = qualification_run_identity(capability_number, qualification_number, sha)
+    return "capability={} qualification={} sha={}".format(*triple)
+
+
+def dispatch_matches_run(
+    capability_number: int,
+    qualification_number: int,
+    sha: str,
+    run: Tuple[int, int, str],
+) -> bool:
+    """Whether a dispatch marker triple binds exactly to a running run."""
+
+    normalized = _normalize_sha(sha)
+    if normalized is None:
+        return False
+    try:
+        return (
+            int(capability_number) == int(run[0])
+            and int(qualification_number) == int(run[1])
+            and normalized == _normalize_sha(run[2])
+        )
+    except (TypeError, ValueError, IndexError):
+        return False
 
 
 def parse_qualification_refs(body: object, self_number: object = None) -> Tuple[int, ...]:
@@ -256,12 +425,48 @@ def has_dispatch_marker(
     qualification_number: int,
     sha: str,
 ) -> bool:
-    """Whether a dispatch was already recorded for this exact triple."""
+    """Whether a trusted dispatch was already recorded for this exact triple.
+
+    Only markers authored by trusted repository actors/automation count;
+    public/untrusted forged markers must not suppress, redirect, or
+    manufacture qualification dispatch. Plain string bodies predate author
+    metadata and are treated as trusted for backward compatibility.
+    """
 
     normalized = _normalize_sha(sha)
     if normalized is None:
         return False
-    for body in bodies:
+    for comment in bodies or []:
+        if not is_trusted_comment(comment, allow_automation=True):
+            continue
+        body = _comment_body(comment)
+        if not isinstance(body, str):
+            continue
+        for match in DISPATCH_RE.finditer(body):
+            if (
+                int(match.group("capability")) == int(capability_number)
+                and int(match.group("qualification")) == int(qualification_number)
+                and (_normalize_sha(match.group("sha")) == normalized)
+            ):
+                return True
+    return False
+
+
+def has_untrusted_dispatch_forgery(
+    bodies: Iterable[object],
+    capability_number: int,
+    qualification_number: int,
+    sha: str,
+) -> bool:
+    """Whether an untrusted comment forges a dispatch for this triple."""
+
+    normalized = _normalize_sha(sha)
+    if normalized is None:
+        return False
+    for comment in bodies or []:
+        if is_trusted_comment(comment, allow_automation=True):
+            continue
+        body = _comment_body(comment)
         if not isinstance(body, str):
             continue
         for match in DISPATCH_RE.finditer(body):
@@ -388,10 +593,13 @@ def qualification_evidence_state(
     qualification_number: int,
     required_sha: object,
 ) -> str:
-    """The evidence verdict for one qualification at the required SHA.
+    """The trusted evidence verdict for one qualification at the required SHA.
 
-    Returns ``pass`` only when the latest evidence entry for the exact
-    required SHA is a pass. A fail for the required SHA returns ``fail``.
+    Returns ``pass`` only when the latest *trusted* evidence entry for the
+    exact required SHA is a pass. A dispatch/instruction comment never counts
+    as evidence, public/untrusted forged markers are rejected, and only
+    ``OWNER``/``MEMBER``/``COLLABORATOR`` plus explicitly allowed repository
+    automation are accepted. A fail for the required SHA returns ``fail``.
     Anything else — no entries, entries only for older SHAs, malformed
     markers, prose — returns ``unknown``. A merely closed qualification
     issue without evidence is ``unknown`` by construction.
@@ -406,7 +614,16 @@ def qualification_evidence_state(
         return EVIDENCE_UNKNOWN
     latest: Optional[str] = None
     for comment in comments or []:
-        for entry in parse_evidence_entries(comment):
+        if not is_trusted_comment(comment, allow_automation=True):
+            continue
+        body = _comment_body(comment)
+        if not isinstance(body, str) or not body:
+            continue
+        if contains_dispatch_marker(body):
+            # A qualification dispatch/instruction comment must never count
+            # as result evidence, even if its prose quotes a marker shape.
+            continue
+        for entry in parse_evidence_entries(body):
             issue = entry.get("issue")
             if issue is not None and int(issue) != wanted:
                 continue
@@ -420,6 +637,41 @@ def qualification_evidence_state(
     if latest == EVIDENCE_FAIL:
         return EVIDENCE_FAIL
     return EVIDENCE_UNKNOWN
+
+
+def latest_trusted_evidence_body(
+    comments: Iterable[object],
+    qualification_number: int,
+    required_sha: object,
+) -> Optional[str]:
+    """The latest trusted comment body carrying evidence for the exact SHA."""
+
+    sha = _normalize_sha(required_sha)
+    if sha is None:
+        return None
+    try:
+        wanted = int(qualification_number)
+    except (TypeError, ValueError):
+        return None
+    latest: Optional[str] = None
+    for comment in comments or []:
+        if not is_trusted_comment(comment, allow_automation=True):
+            continue
+        body = _comment_body(comment)
+        if not isinstance(body, str) or not body:
+            continue
+        if contains_dispatch_marker(body):
+            continue
+        matched = False
+        for entry in parse_evidence_entries(body):
+            issue = entry.get("issue")
+            if issue is not None and int(issue) != wanted:
+                continue
+            if entry.get("sha") == sha:
+                matched = True
+        if matched:
+            latest = body
+    return latest
 
 
 def capability_status(
@@ -508,3 +760,169 @@ def sha_superseded(old_required_sha: object, current_main_sha: object) -> bool:
     if old is None or current is None:
         return False
     return old != current
+
+
+def should_start_qualification(
+    qualification_refs: Iterable[int],
+    required_sha: object,
+    open_blockers: Iterable[object] = (),
+) -> Tuple[bool, str]:
+    """Whether qualification may start for a capability.
+
+    Declaring ``automation-qualification`` is only a relationship: it never
+    starts qualification by itself and never synthesizes a required SHA from
+    current main. Only a trusted implementation-merge transition recording
+    the first ``continuum-qualification-required`` SHA may start it. Open
+    blockers/unimplemented capability work remain blockers; qualification
+    cannot leapfrog them.
+    """
+
+    refs = tuple(int(item) for item in (qualification_refs or ()))
+    if not refs:
+        return False, "no-qualification"
+    if _normalize_sha(required_sha) is None:
+        return False, "no-required-sha"
+    blockers = [item for item in (open_blockers or [])]
+    if blockers:
+        return False, "blocked"
+    return True, "ready"
+
+
+def can_enter_qualifying_state(
+    required_sha: object,
+    open_blockers: Iterable[object] = (),
+) -> Tuple[bool, str]:
+    """Whether a merge event may record the qualifying SHA and dispatch."""
+
+    return should_start_qualification((1,), required_sha, open_blockers)
+
+
+def repair_marker_text(source_number: int, capability_number: int) -> str:
+    return "<!-- continuum-qualification-repair source={} capability={} -->".format(
+        int(source_number), int(capability_number)
+    )
+
+
+def repair_issue_body(
+    capability_number: int,
+    qualification_number: int,
+    required_sha: str,
+    failure_evidence: Optional[str] = None,
+) -> str:
+    """The body for the automatically created/reused repair issue.
+
+    The repair worker must read the failure matrix before editing code, so
+    the body always points at the exact qualification issue, required SHA,
+    and latest trusted failure evidence for that SHA.
+    """
+
+    normalized = _normalize_sha(required_sha)
+    if normalized is None:
+        raise ValueError("sha must be a 40-character hex revision, got {!r}".format(required_sha))
+    lines = [
+        repair_marker_text(int(qualification_number), int(capability_number)),
+        "",
+        "Mandatory qualification #{} for capability #{} failed at main `{}`.".format(
+            int(qualification_number), int(capability_number), normalized
+        ),
+        "",
+        "Failure handoff (read before editing code):",
+        "- qualification issue: #{}".format(int(qualification_number)),
+        "- capability issue: #{}".format(int(capability_number)),
+        "- required SHA: `{}`".format(normalized),
+    ]
+    if failure_evidence and failure_evidence.strip():
+        lines += [
+            "",
+            "Latest trusted failure evidence for this exact SHA:",
+            "",
+            failure_evidence.strip(),
+        ]
+    lines += [
+        "",
+        "Fix the concrete failing scenarios from the evidence above; do not",
+        "guess from the generic title alone. Merge the fix and the",
+        "qualification gate automatically reruns qualification #{} against".format(
+            int(qualification_number)
+        ),
+        "the new exact main SHA. Do not close capability #{} manually:".format(
+            int(capability_number)
+        ),
+        "only exact-SHA pass evidence may complete it.",
+    ]
+    return "\n".join(lines)
+
+
+def repair_body_needs_refresh(
+    existing_body: object, required_sha: object, failure_evidence: Optional[str]
+) -> bool:
+    """Whether an existing open repair issue keeps stale evidence."""
+
+    sha = _normalize_sha(required_sha)
+    if sha is None or not isinstance(existing_body, str):
+        return True
+    if sha not in existing_body:
+        return True
+    evidence = (failure_evidence or "").strip()
+    if evidence and evidence not in existing_body:
+        return True
+    return False
+
+
+def next_qualification_retry_delay_seconds(attempt: int) -> int:
+    """Bounded lease/backoff delay before the next automatic qualification try."""
+
+    try:
+        index = int(attempt)
+    except (TypeError, ValueError):
+        index = 0
+    if index < 0:
+        index = 0
+    if index >= len(QUALIFICATION_RETRY_BACKOFF_SECONDS):
+        return QUALIFICATION_RETRY_BACKOFF_SECONDS[-1]
+    return QUALIFICATION_RETRY_BACKOFF_SECONDS[index]
+
+
+def qualification_needs_retry(
+    evidence_state: str,
+    qualification_open: bool,
+    capability_state: str,
+) -> Tuple[bool, str]:
+    """Whether mandatory qualification must retry without human intervention.
+
+    A failed/missing-evidence qualification must never become permanently
+    stranded behind ``automation:paused``. Deliberate owner pauses are
+    represented by the same label, so the scheduler treats pause as a reason
+    to unpause-and-retry with bounded backoff rather than as terminal state.
+    """
+
+    if capability_state not in (STAY_QUALIFYING, STAY_BLOCKED):
+        return False, "capability-complete"
+    if not qualification_open:
+        return False, "qualification-closed"
+    if evidence_state == EVIDENCE_PASS:
+        return False, "already-passing"
+    return True, "retry-with-backoff"
+
+
+def evaluate_qualification_run(
+    has_code_diff: bool,
+    evidence_state: str,
+    pushed_product_changes: bool = False,
+) -> Tuple[str, str]:
+    """The outcome of one qualification-mode execution.
+
+    Pure validation work with no code diff is a successful execution when it
+    leaves valid pass/fail evidence; without evidence it fails closed but
+    remains automatically recoverable. A fail verdict is a lifecycle signal
+    that routes to repair, not an infrastructure failure. Pushing product
+    changes from qualification mode is forbidden.
+    """
+
+    if pushed_product_changes or has_code_diff:
+        return "forbidden", "qualification-mode-cannot-push-product-changes"
+    if evidence_state == EVIDENCE_PASS:
+        return "success", "pass-evidence-recorded"
+    if evidence_state == EVIDENCE_FAIL:
+        return "success", "fail-evidence-routes-to-repair"
+    return "fail-closed", "missing-evidence-retry"

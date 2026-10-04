@@ -830,11 +830,64 @@ jobs:
                 ' sha=' + sha + ' -->';
             }
 
+            const TRUSTED_AUTHOR_ASSOCIATIONS = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
+            const TRUSTED_AUTOMATION_LOGINS = new Set(['github-actions[bot]']);
+
+            function commentBodyOf(comment) {
+              if (typeof comment === 'string') return comment;
+              if (comment && typeof comment.body === 'string') return comment.body;
+              return null;
+            }
+
+            function commentAssociationOf(comment) {
+              if (typeof comment === 'string') return null;
+              const direct = comment?.author_association;
+              if (typeof direct === 'string' && direct) return direct.toUpperCase();
+              const nested = comment?.author?.association || comment?.user?.association;
+              if (typeof nested === 'string' && nested) return nested.toUpperCase();
+              return null;
+            }
+
+            function commentLoginOf(comment) {
+              if (typeof comment === 'string') return null;
+              const login = comment?.author?.login || comment?.user?.login ||
+                comment?.author_login || comment?.login;
+              return typeof login === 'string' && login ? login : null;
+            }
+
+            // Only trusted repository actors/automation may drive the
+            // lifecycle. Public/untrusted forged markers are rejected.
+            // Plain strings predate author metadata and stay trusted.
+            function isTrustedQualificationComment(comment, allowAutomation) {
+              if (typeof comment === 'string') return true;
+              const association = commentAssociationOf(comment);
+              if (TRUSTED_AUTHOR_ASSOCIATIONS.has(association)) return true;
+              if (allowAutomation) {
+                const login = (commentLoginOf(comment) || '').toLowerCase();
+                if (TRUSTED_AUTOMATION_LOGINS.has(login)) return true;
+              }
+              return false;
+            }
+
+            function commentHasDispatchMarker(body) {
+              if (typeof body !== 'string' || !body) return false;
+              return /<!--\s*continuum-qualification-dispatch\s+capability\s*=\s*(\d+)\s+qualification\s*=\s*(\d+)\s+sha\s*=\s*([0-9a-f]{40})\s*-->/i.test(body);
+            }
+
+            function isQualificationResultCommentBody(body) {
+              if (typeof body !== 'string' || !body) return false;
+              if (/<!--\s*continuum-qualification-result\b/i.test(body)) return true;
+              return body.includes('<!-- continuum-docker-qualification-result -->') ||
+                body.includes('<!-- continuum-render-qualification-result -->');
+            }
+
             function hasQualificationDispatch(bodies, capabilityNumber, qualificationNumber, sha) {
               const wanted = normalizeSha(sha);
               if (!wanted) return false;
               const pattern = /<!--\s*continuum-qualification-dispatch\s+capability\s*=\s*(\d+)\s+qualification\s*=\s*(\d+)\s+sha\s*=\s*([0-9a-f]{40})\s*-->/gi;
-              for (const body of bodies || []) {
+              for (const comment of bodies || []) {
+                if (!isTrustedQualificationComment(comment, true)) continue;
+                const body = commentBodyOf(comment);
                 if (typeof body !== 'string') continue;
                 for (const match of body.matchAll(pattern)) {
                   if (
@@ -852,6 +905,8 @@ jobs:
             // Machine-readable evidence only: the canonical marker, or a
             // Docker/Render controller payload whose head SHA matches. Prose
             // verdicts never count, and entries for any other SHA are stale.
+            // A dispatch/instruction comment never counts as evidence, even
+            // when its prose quotes a marker shape.
             function parseQualificationEvidenceEntries(commentBody) {
               if (typeof commentBody !== 'string' || !commentBody) return [];
               const entries = [];
@@ -917,7 +972,11 @@ jobs:
               const sha = normalizeSha(requiredSha);
               if (!sha) return 'unknown';
               let latest = null;
-              for (const body of commentBodies || []) {
+              for (const comment of commentBodies || []) {
+                if (!isTrustedQualificationComment(comment, true)) continue;
+                const body = commentBodyOf(comment);
+                if (typeof body !== 'string' || !body) continue;
+                if (commentHasDispatchMarker(body)) continue;
                 for (const entry of parseQualificationEvidenceEntries(body)) {
                   if (entry.issue != null && entry.issue !== qualificationNumber) continue;
                   if (entry.sha !== sha) continue;
@@ -927,6 +986,25 @@ jobs:
               if (latest === 'pass') return 'pass';
               if (latest === 'fail') return 'fail';
               return 'unknown';
+            }
+
+            function latestTrustedEvidenceBody(commentBodies, qualificationNumber, requiredSha) {
+              const sha = normalizeSha(requiredSha);
+              if (!sha) return null;
+              let latest = null;
+              for (const comment of commentBodies || []) {
+                if (!isTrustedQualificationComment(comment, true)) continue;
+                const body = commentBodyOf(comment);
+                if (typeof body !== 'string' || !body) continue;
+                if (commentHasDispatchMarker(body)) continue;
+                let matched = false;
+                for (const entry of parseQualificationEvidenceEntries(body)) {
+                  if (entry.issue != null && entry.issue !== qualificationNumber) continue;
+                  if (entry.sha === sha) matched = true;
+                }
+                if (matched) latest = body;
+              }
+              return latest;
             }
 
             let cachedMainSha = null;
@@ -946,7 +1024,12 @@ jobs:
                 github.rest.issues.listComments,
                 { owner, repo, issue_number: issueNumber, per_page: 100 }
               );
-              return comments.map(comment => comment.body || '');
+              return comments.map(comment => ({
+                body: comment.body || '',
+                author_association: comment.author_association || '',
+                author: { login: comment.user?.login || '' },
+                user: { login: comment.user?.login || '' },
+              }));
             }
 
             // Dispatch one mandatory qualification for an exact main SHA.
@@ -989,13 +1072,21 @@ jobs:
               const marker = qualificationDispatchMarker(
                 capabilityNumber, qualificationNumber, sha
               );
+              // Instructional prose must never embed a parseable result
+              // marker: the evidence parser scans comment bodies, so a
+              // literal canonical marker here would self-satisfy the gate
+              // for the exact SHA. Describe the marker without its
+              // HTML-comment brackets.
               const note =
                 'Mandatory live qualification for capability #' + capabilityNumber +
                 ' at main `' + sha +
                 '`: automatically dispatched after implementation merge. ' +
-                'Qualification must publish `<!-- continuum-qualification-result' +
-                ' issue=' + qualificationNumber + ' sha=' + sha + ' result=pass -->`' +
-                ' evidence for this exact SHA.';
+                'Qualification must publish one canonical pass/fail result marker ' +
+                'for issue ' + qualificationNumber + ' at this exact SHA ' +
+                '(continuum-qualification-result with issue, sha, and result pass/fail). ' +
+                'Prose verdicts never count; stale SHAs never satisfy the gate. ' +
+                'Run identity is immutable: capability=' + capabilityNumber +
+                ' qualification=' + qualificationNumber + ' sha=' + sha + '.';
               if (opencodeDispatch === 'workflow') {
                 await github.rest.issues.createComment({
                   owner,
@@ -1014,8 +1105,11 @@ jobs:
                     ),
                     ref: dispatchRef,
                     inputs: {
-                      mode: 'issue',
+                      mode: 'qualification',
                       issue_number: String(qualificationNumber),
+                      capability_number: String(capabilityNumber),
+                      qualification_number: String(qualificationNumber),
+                      required_sha: sha,
                     },
                   }
                 );
@@ -1047,21 +1141,49 @@ jobs:
                 capabilityIssue.body || '', capabilityNumber
               );
               if (!requiredSha) {
-                requiredSha = await currentMainSha();
-                await github.rest.issues.update({
-                  owner,
-                  repo,
-                  issue_number: capabilityNumber,
-                  body: (capabilityIssue.body || '') +
-                    '\n' + requiredShaMarker(capabilityNumber, requiredSha),
-                });
-                capabilityIssue.body =
-                  (capabilityIssue.body || '') +
-                  '\n' + requiredShaMarker(capabilityNumber, requiredSha);
+                // A bare qualification relation never starts qualification
+                // and never synthesizes a required SHA from current main.
+                // Only the trusted implementation-merge transition records
+                // the first SHA. Repair/qualification issues are never
+                // created before that transition, and open blockers keep
+                // the capability in its normal pre-merge state.
                 core.notice(
                   'Capability #' + capabilityNumber +
-                  ': recorded missing required SHA ' + requiredSha + '.'
+                  ': qualification declared but implementation has not merged; waiting for the merge transition.'
                 );
+                return 'no-required-sha';
+              }
+              // Qualification cannot leapfrog open blockers/unimplemented
+              // capability work: they remain blockers until closed.
+              const declaredBlockers = await openDeclaredBlockers(capabilityIssue);
+              if (declaredBlockers.length > 0) {
+                core.info(
+                  'Capability #' + capabilityNumber + ': blocked by ' +
+                  declaredBlockers.map(blocker => '#' + blocker.number).join(', ') +
+                  '; qualification waits.'
+                );
+                return 'blocked-waiting';
+              }
+              try {
+                const nativeBlockers = await github.paginate(
+                  'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
+                  {
+                    owner,
+                    repo,
+                    issue_number: capabilityNumber,
+                    per_page: 100,
+                    headers: { 'X-GitHub-Api-Version': '2022-11-28' },
+                  }
+                );
+                if (nativeBlockers.some(blocker => blocker.state === 'open')) {
+                  core.info(
+                    'Capability #' + capabilityNumber +
+                    ': native blocker open; qualification waits.'
+                  );
+                  return 'blocked-waiting';
+                }
+              } catch (err) {
+                if (err.status !== 404) throw err;
               }
               const mainSha = await currentMainSha();
               if (normalizeSha(mainSha) !== requiredSha) {
@@ -1084,6 +1206,7 @@ jobs:
                 );
               }
               const evidence = {};
+              const evidenceBodies = {};
               for (const ref of refs) {
                 let bodies = [];
                 try {
@@ -1091,6 +1214,7 @@ jobs:
                 } catch (err) {
                   if (err.status !== 404) throw err;
                 }
+                evidenceBodies[ref] = bodies;
                 evidence[ref] = qualificationEvidenceState(
                   bodies, ref, requiredSha
                 );
@@ -1130,7 +1254,7 @@ jobs:
               await addLabel(capabilityNumber, qualifyingLabel);
               if (failures.length > 0) {
                 await addLabel(capabilityNumber, blockedLabel);
-                await ensureRepairIssue(capabilityNumber, failures, requiredSha);
+                await ensureRepairIssue(capabilityNumber, failures, requiredSha, evidenceBodies);
                 for (const ref of refs) {
                   await dispatchQualificationIssue(
                     capabilityNumber, ref, requiredSha
@@ -1162,13 +1286,46 @@ jobs:
             async function ensureRepairIssue(
               capabilityNumber,
               failures,
-              requiredSha
+              requiredSha,
+              evidenceBodiesByRef
             ) {
               const openIssues = await github.paginate(
                 github.rest.issues.listForRepo,
                 { owner, repo, state: 'open', per_page: 100 }
               );
               for (const failure of failures) {
+                const bodies = (evidenceBodiesByRef && evidenceBodiesByRef[failure]) || [];
+                const latestEvidence = latestTrustedEvidenceBody(bodies, failure, requiredSha) || '';
+                const handoffLines = [
+                  '<!-- continuum-qualification-repair source=' + failure +
+                  ' capability=' + capabilityNumber + ' -->',
+                  '',
+                  'Mandatory qualification #' + failure + ' for capability #' +
+                    capabilityNumber + ' failed at main `' + requiredSha + '`.',
+                  '',
+                  'Failure handoff (read before editing code):',
+                  '- qualification issue: #' + failure,
+                  '- capability issue: #' + capabilityNumber,
+                  '- required SHA: `' + requiredSha + '`',
+                ];
+                if (latestEvidence) {
+                  handoffLines.push(
+                    '',
+                    'Latest trusted failure evidence for this exact SHA:',
+                    '',
+                    latestEvidence
+                  );
+                }
+                handoffLines.push(
+                  '',
+                  'Fix the concrete failing scenarios from the evidence above; do not',
+                  'guess from the generic title alone. Merge the fix and the',
+                  'qualification gate automatically reruns qualification #' +
+                    failure + ' against the new exact main SHA.',
+                  'Do not close capability #' + capabilityNumber +
+                    ' manually: only exact-SHA pass evidence may complete it.'
+                );
+                const handoffBody = handoffLines.join('\n');
                 const existing = openIssues.find(
                   item =>
                     !item.pull_request &&
@@ -1177,32 +1334,34 @@ jobs:
                     Number((item.body || '').match(repairMarkerPattern)[2]) === capabilityNumber
                 );
                 if (existing) {
-                  core.info(
-                    'Repair for qualification #' + failure +
-                    ' already tracked in #' + existing.number + '.'
-                  );
+                  const current = existing.body || '';
+                  const stale = current.indexOf(requiredSha) === -1 ||
+                    (latestEvidence && current.indexOf(latestEvidence) === -1);
+                  if (stale) {
+                    await github.rest.issues.update({
+                      owner,
+                      repo,
+                      issue_number: existing.number,
+                      body: handoffBody,
+                    });
+                    core.warning(
+                      'Refreshed repair issue #' + existing.number +
+                      ' with latest exact-SHA failure evidence for qualification #' + failure + '.'
+                    );
+                  } else {
+                    core.info(
+                      'Repair for qualification #' + failure +
+                      ' already tracked in #' + existing.number + '.'
+                    );
+                  }
                   continue;
                 }
-                const marker =
-                  '<!-- continuum-qualification-repair source=' + failure +
-                  ' capability=' + capabilityNumber + ' -->';
                 const created = await github.rest.issues.create({
                   owner,
                   repo,
                   title: 'Repair qualification failure for #' + capabilityNumber +
                     ' (qualification #' + failure + ')',
-                  body: [
-                    marker,
-                    '',
-                    'Mandatory qualification #' + failure + ' for capability #' +
-                      capabilityNumber + ' failed at main `' + requiredSha + '`.',
-                    '',
-                    'Repair the concrete defect, merge the fix, and the',
-                    'qualification gate automatically reruns qualification #' +
-                      failure + ' against the new exact main SHA.',
-                    'Do not close capability #' + capabilityNumber +
-                      ' manually: only exact-SHA pass evidence may complete it.',
-                  ].join('\n'),
+                  body: handoffBody,
                   labels: ['priority:p0'],
                 });
                 await github.rest.issues.createComment({
@@ -1243,6 +1402,17 @@ jobs:
               rememberIssue(fresh);
               const refs = qualificationRefs(fresh.body || '', issueNumber);
               if (refs.length === 0) return refs;
+              // Qualification cannot leapfrog open blockers: the merge still
+              // records nothing and dispatches nothing until they close.
+              const mergeDeclaredBlockers = await openDeclaredBlockers(fresh);
+              if (mergeDeclaredBlockers.length > 0) {
+                core.info(
+                  'Capability #' + issueNumber + ': implementation merged but blocked by ' +
+                  mergeDeclaredBlockers.map(blocker => '#' + blocker.number).join(', ') +
+                  '; qualification waits for blockers.'
+                );
+                return 'blocked-waiting';
+              }
               const sha = normalizeSha(mergedSha) || (await currentMainSha());
               const knownSha = latestRequiredSha(fresh.body || '', issueNumber);
               if (knownSha !== sha) {
@@ -1462,7 +1632,13 @@ jobs:
                         pr.merge_commit_sha,
                         'merged PR #' + pr.number
                       );
-                      if (entered === 'missing' || entered.length === 0) {
+                      if (entered === 'blocked-waiting') {
+                        core.notice(
+                          'Merged OpenCode PR #' + pr.number +
+                          ': capability #' + issueNumber +
+                          ' stays blocked; qualification waits for blockers.'
+                        );
+                      } else if (entered === 'missing' || entered.length === 0) {
                         await removeLabel(issueNumber, inProgressLabel);
                         await removeLabel(issueNumber, pausedLabel);
                         if (response.data.state !== 'closed') {
@@ -1929,7 +2105,13 @@ jobs:
                       mergeSha,
                       'reconciled PR #' + latestPr.number
                     );
-                    if (entered === 'missing' || entered.length === 0) {
+                    if (entered === 'blocked-waiting') {
+                      core.notice(
+                        'Reconciled merged PR #' + latestPr.number +
+                        ' -> capability #' + issueNumber +
+                        ' stays blocked; qualification waits for blockers.'
+                      );
+                    } else if (entered === 'missing' || entered.length === 0) {
                       await removeLabel(issueNumber, inProgressLabel);
                       await removeLabel(issueNumber, pausedLabel);
                       await github.rest.issues.update({
