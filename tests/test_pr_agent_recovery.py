@@ -270,6 +270,47 @@ class RecoveryWiringTests(unittest.TestCase):
         self.assertNotIn("continuum-coderabbit-retry.yml", body)
         self.assertNotIn("continuum-coderabbit-unresolved.yml", body)
 
+    def test_recovery_reads_use_repository_token_but_mutations_keep_pat(self):
+        body = self.read(".github/workflows/continuum-pr-agent-recovery.yml")
+        self.assertIn("READ_GITHUB_TOKEN: ${{ github.token }}", body)
+        self.assertIn("github-token: ${{ secrets.TAP_PAT }}", body)
+        self.assertIn("const readRequest = github.request.defaults", body)
+        for route in (
+            "GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs",
+            "GET /repos/{owner}/{repo}/actions/runs/{run_id}",
+            "GET /repos/{owner}/{repo}/actions/runs",
+            "GET /repos/{owner}/{repo}",
+            "GET /repos/{owner}/{repo}/pulls/{pull_number}",
+            "GET /repos/{owner}/{repo}/pulls",
+            "GET /repos/{owner}/{repo}/issues/{issue_number}/comments",
+            "GET /repos/{owner}/{repo}/commits/{ref}/statuses",
+        ):
+            with self.subTest(route=route):
+                self.assertIn(route, body)
+
+        # Item 1 keeps all mutation/dispatch calls on the PAT-authenticated
+        # action client, preserving actor and event fan-out semantics.
+        for mutation in (
+            "github.rest.issues.createComment",
+            "github.rest.issues.deleteComment",
+            "github.rest.actions.createWorkflowDispatch",
+        ):
+            with self.subTest(mutation=mutation):
+                self.assertIn(mutation, body)
+
+        for old_pat_read in (
+            "github.rest.actions.listWorkflowRuns",
+            "github.rest.actions.getWorkflowRun",
+            "github.rest.actions.listWorkflowRunsForRepo",
+            "github.rest.pulls.list",
+            "github.rest.pulls.get",
+            "github.rest.repos.listCommitStatusesForRef",
+            "github.rest.issues.listComments",
+            "github.rest.repos.get({ owner, repo })",
+        ):
+            with self.subTest(old_pat_read=old_pat_read):
+                self.assertNotIn(old_pat_read, body)
+
     def test_recovered_review_uses_ci_workflow_not_combined_status(self):
         review = self.read(".github/workflows/continuum-pr-agent.yml")
         self.assertIn("listWorkflowRunsForRepo", review)
