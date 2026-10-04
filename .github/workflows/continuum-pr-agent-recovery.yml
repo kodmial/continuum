@@ -461,6 +461,49 @@ jobs:
               items.truncated = false;
             }
 
+            // Bounded newest-window recovery for the open-PR queue: the
+            // 5-page queue cap silently drops overflow PRs past ~500 open
+            // PRs on every pass. Merge up to MAX_QUEUE_PAGES newest
+            // records (anchored at lastPage) so overflow PRs are still
+            // serviced on this pass. Beyond twice the budget the middle
+            // stays unseen, so recovery throws and the caller warns
+            // loudly and decides on the partial oldest window instead of
+            // silently ignoring overflow. Runs on the caller's
+            // already-resolved read client so the per-scan auth fallback
+            // is resolved once, not once per recovery page.
+            async function recoverNewestQueue(client, items) {
+              const lastPage = Number(items.lastPage || 0);
+              if (!lastPage) {
+                throw new Error('cannot anchor newest queue window');
+              }
+              // Oldest MAX_QUEUE_PAGES cover 1..MAX and newest MAX cover
+              // lastPage-(MAX-1)..lastPage. Beyond twice the budget the
+              // middle stays unseen.
+              if (lastPage > MAX_QUEUE_PAGES * 2) {
+                throw new Error(
+                  'open-PR scan spans more than the bounded oldest+newest window (pages=' + lastPage + '); deciding on a partial window with an unseen middle'
+                );
+              }
+              const seen = new Set(items.map(pr => pr && (pr.id ?? pr.number)));
+              for (let page = 1; page <= MAX_QUEUE_PAGES; page += 1) {
+                const targetPage = lastPage - (page - 1);
+                if (targetPage <= MAX_QUEUE_PAGES) break;
+                const response = await client.rest.pulls.list(
+                  { owner, repo, state: 'open', per_page: 100, page: targetPage }
+                );
+                const batch = response && response.data;
+                if (!Array.isArray(batch) || batch.length === 0) continue;
+                for (const entry of batch) {
+                  if (!entry) continue;
+                  const key = entry.id ?? entry.number;
+                  if (seen.has(key)) continue;
+                  seen.add(key);
+                  items.push(entry);
+                }
+              }
+              items.truncated = false;
+            }
+
             async function upsertControllerState(prNumber, stateMarker, summary) {
               const comments = await withReadFallback(async (client) => {
                 const items = await boundedCollect(
@@ -1811,14 +1854,33 @@ jobs:
             // PAT budget; deterministic errors fail loudly.
             let openPrs;
             try {
-              openPrs = await withReadFallback(client =>
-                boundedCollect(
+              openPrs = await withReadFallback(async (client) => {
+                const items = await boundedCollect(
                   client,
                   (params) => client.rest.pulls.list(params),
                   { owner, repo, state: 'open', per_page: 100 },
                   MAX_QUEUE_PAGES
-                )
-              );
+                );
+                // Queue truncation hides overflow PRs past ~500 open PRs
+                // on every pass. Merge the bounded newest window so
+                // overflow PRs are still serviced; only a
+                // newest-recovery failure falls back to the partial
+                // oldest window with a loud warning instead of silence.
+                if (items.truncated) {
+                  try {
+                    await recoverNewestQueue(client, items);
+                    core.warning(
+                      'CONTINUUM_QUEUE_BUDGET_EXCEEDED: open-PR scan hit the ' + MAX_QUEUE_PAGES + '-page budget; deciding on the merged oldest+newest window.'
+                    );
+                  } catch (recoveryErr) {
+                    core.warning(
+                      'CONTINUUM_QUEUE_BUDGET_EXCEEDED: open-PR scan hit the ' + MAX_QUEUE_PAGES + '-page budget and newest-window recovery failed; deciding on a partial oldest window with unseen overflow: ' +
+                      (recoveryErr.message || recoveryErr)
+                    );
+                  }
+                }
+                return items;
+              });
             } catch (err) {
               // Top-level discovery sits outside the per-PR loop, so a
               // 429/rate-limited 403 here must defer green to the next
