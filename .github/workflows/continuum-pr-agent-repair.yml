@@ -426,8 +426,8 @@ jobs:
             // oldest-first window would hide the recent no-progress marker;
             // recover the bounded newest window (derived from the issue
             // total) and decide on the merged oldest+newest window. Only
-            // a newest-recovery failure holds repair instead of deciding
-            // on a truncated window.
+            // a newest-recovery failure or an unseen middle window holds
+            // repair instead of deciding on a gapped window.
             const comments = [];
             let commentsTruncated = false;
             for (let page = 1; page <= 10; page += 1) {
@@ -444,6 +444,15 @@ jobs:
                 const noProgressTotal = (await github.rest.issues.get({ owner, repo, issue_number: prNumber })).data.comments || 0;
                 const noProgressLastPage = Math.max(1, Math.ceil(noProgressTotal / 100));
                 if (!noProgressLastPage) throw new Error('cannot anchor newest comments window');
+                // Oldest 10 pages cover 1-10 and newest 10 cover
+                // last-9..last. When the thread spans more than 20 pages
+                // (2000 comments) the merged window leaves an unseen middle
+                // where a no-progress marker would be missed, so hold repair
+                // instead of retrying on gapped data.
+                if (noProgressLastPage > 20) {
+                  failClosed('PR-Agent comment scan spans more than the bounded oldest+newest window; holding repair instead of deciding with an unseen middle window.');
+                  return;
+                }
                 const seen = new Set(comments.map(entry => entry && entry.id));
                 for (let page = 1; page <= 10; page += 1) {
                   const targetPage = noProgressLastPage - (page - 1);

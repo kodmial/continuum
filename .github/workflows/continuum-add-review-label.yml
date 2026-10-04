@@ -361,17 +361,25 @@ jobs:
             }
 
             // Resolve candidate PRs through the narrowest endpoint: PRs
-            // associated with the exact CI head commit (#254). One
-            // repository-token request replaces the unbounded open-PR
+            // associated with the exact CI head commit (#254). Bounded
+            // pagination (per_page 100) replaces the unbounded open-PR
             // listing, and the exact-head/same-repo/non-draft match below
             // keeps the admission semantics identical.
-            const { data: associated } =
-              await readGithub.rest.repos.listPullRequestsAssociatedWithCommit({
-                owner,
-                repo,
-                commit_sha: run.head_sha,
-              });
-            noteRead();
+            const associated = [];
+            for (let page = 1; page <= MAX_SCAN_PAGES; page += 1) {
+              const { data: batch } =
+                await readGithub.rest.repos.listPullRequestsAssociatedWithCommit({
+                  owner,
+                  repo,
+                  commit_sha: run.head_sha,
+                  per_page: 100,
+                  page,
+                });
+              noteRead();
+              if (!Array.isArray(batch) || batch.length === 0) break;
+              associated.push(...batch);
+              if (batch.length < 100) break;
+            }
 
             // Match only an open non-draft same-repository PR whose current
             // head is exactly the commit tested by this completed CI run.
