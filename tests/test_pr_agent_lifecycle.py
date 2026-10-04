@@ -74,15 +74,15 @@ PROTECTED_FILES = [
 # the image digest from `vars.CONTINUUM_IMAGE_DIGEST` + boundary-anchored
 # `grep -E` exact version + CONTINUUM_IMAGE_DIGEST 64-char sha256 shape
 # enforcement + image-digest stamp binding + GITHUB_PATH export +
-# post-install exact-version verification and stamp record) ahead of the
-# deterministic reconstruction fallback. The zero-diff assertion below is
-# stale for that one file unless it allowlists exactly this probe; any other
-# drift must still fail. Each entry is a full added line without the leading
-# "+" as produced by `git diff` (multiset:
-# APPROVED_179_OPENCODE_PROBE_LINES lists one install site, 32 lines; both
-# sites carry it, 64 added lines total, including the stamp-directory
-# `mkdir -p` that keeps the cold-fallback stamp write from failing with
-# `set -euo pipefail` on a fresh instance).
+# post-install exact-version verification) ahead of the deterministic
+# reconstruction fallback. The zero-diff assertion below is stale for that
+# one file unless it allowlists exactly this probe; any other drift must
+# still fail. Each entry is a full added line without the leading "+" as
+# produced by `git diff` (multiset: APPROVED_179_OPENCODE_PROBE_LINES lists
+# one install site, 30 lines; both sites carry it, 60 added lines total).
+# Deterministic reconstruction never records the stamp: only the validated
+# image build (or a provider cache restore of it) proves golden-image
+# provenance, so the tuple below carries no stamp-write lines.
 # The GITHUB_PATH export on the warm hit is required: the cold fallback does
 # `echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"`, so a warm hit that exits
 # without it would leave later steps without opencode on PATH and prove no
@@ -103,8 +103,7 @@ PROTECTED_FILES = [
 # stale or unrelated opencode binary whose stamp does not match the digest
 # cannot take the hit path. The post-install `opencode --version | grep -E`
 # line fails the step when deterministic reconstruction did not produce the
-# pinned runtime, and a successful reconstruction records the stamp for the
-# next warm hit.
+# pinned runtime.
 #
 # The stamp-bound digest-gated hit plus `vars.` env wiring has landed in
 # HEAD, so the committed BASELINE..HEAD drift below already carries it. The
@@ -113,6 +112,45 @@ PROTECTED_FILES = [
 # separately; an empty committed diff with a conforming worktree (probe
 # landed before the baseline) passes via the worktree contract alone.
 APPROVED_179_OPENCODE_PROBE_LINES = (
+    "        env:",
+    "          CONTINUUM_IMAGE_DIGEST: ${{ vars.CONTINUUM_IMAGE_DIGEST }}",
+    "          # Continuum #179 prepared agent runtime: the immutable golden image",
+    "          # (or its provider-native cache equivalent) already carries pinned",
+    "          # OpenCode 1.18.34. The warm hit below is keyed by the image digest",
+    "          # in CONTINUUM_IMAGE_DIGEST (wired from the repository variable):",
+    "          # only a set, well-formed digest plus `command -v opencode` and the",
+    "          # exact version takes the hit path with zero downloads. A cache",
+    "          # failure (empty or malformed digest) falls back to deterministic",
+    "          # reconstruction below, never failing closed. The digest is bound",
+    "          # to the runtime by the image-digest stamp",
+    "          # ($HOME/.opencode/image-digest) recorded by the validated image",
+    "          # build: a stale or unrelated",
+    "          # opencode 1.18.34 binary whose stamp does not match the digest",
+    "          # cannot take the hit path. Deterministic reconstruction below",
+    "          # never records the stamp: only the validated image build (or a",
+    "          # provider cache restore of it) proves golden-image provenance.",
+    '          export PATH="$HOME/.opencode/bin:$PATH"',
+    '          STAMP_FILE="$HOME/.opencode/image-digest"',
+    '          if [[ -n "${CONTINUUM_IMAGE_DIGEST:-}" ]] && ! [[ "$CONTINUUM_IMAGE_DIGEST" =~ ^[0-9a-f]{64}$ ]]; then',
+    '            echo "::warning::CONTINUUM_IMAGE_DIGEST is malformed; falling back to deterministic reconstruction."',
+    '            CONTINUUM_IMAGE_DIGEST=""',
+    "          fi",
+    '          if [[ "${CONTINUUM_IMAGE_DIGEST:-}" =~ ^[0-9a-f]{64}$ ]] && [[ -f "$STAMP_FILE" ]] && [[ "$(cat "$STAMP_FILE")" == "$CONTINUUM_IMAGE_DIGEST" ]] && command -v opencode >/dev/null 2>&1 && opencode --version 2>&1 | grep -E -q "(^|[^0-9.])1\\.18\\.34([^0-9.]|$)"; then',
+    '            echo "prepared-runtime hit: opencode 1.18.34 already present (image digest ${CONTINUUM_IMAGE_DIGEST} validated against ${STAMP_FILE})."',
+    '            echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"',
+    "            exit 0",
+    "          fi",
+    '              export PATH="$HOME/.opencode/bin:$PATH"',
+    '              opencode --version 2>&1 | grep -E -q "(^|[^0-9.])1\\.18\\.34([^0-9.]|$)" || exit 1',
+)
+
+# Fixed-history pin for the old-to-new baseline range check below
+# (PREVIOUS_BASELINE_SHA..BASELINE_SHA): that range landed before the
+# reconstruction self-stamp was removed, so it still carries the four
+# stamp-write lines per site. New drift must match
+# APPROVED_179_OPENCODE_PROBE_LINES above; history keeps this pin and the
+# two are never mixed.
+APPROVED_179_BASELINE_RANGE_PROBE_LINES = (
     "        env:",
     "          CONTINUUM_IMAGE_DIGEST: ${{ vars.CONTINUUM_IMAGE_DIGEST }}",
     "          # Continuum #179 prepared agent runtime: the immutable golden image",
@@ -145,45 +183,6 @@ APPROVED_179_OPENCODE_PROBE_LINES = (
     '                mkdir -p "$(dirname "$STAMP_FILE")"',
     '                echo "$CONTINUUM_IMAGE_DIGEST" > "$STAMP_FILE"',
     "              fi",
-)
-
-# Historical worktree repair layer for the #179 probe digest binding (now
-# promoted to the committed APPROVED_179_OPENCODE_PROBE_LINES above): the
-# warm hit is keyed by the image digest plus the image-digest stamp
-# ($HOME/.opencode/image-digest), a malformed digest warns and falls back
-# to deterministic reconstruction (never failing closed), and a successful
-# reconstruction records the stamp. The tuples below record the historical
-# transition (fail-closed digest-gated probe -> stamp-bound digest-gated
-# probe) for the worktree-drift check during transition; a clean worktree
-# on the promoted HEAD passes without using them.
-# Each tuple lists the unique worktree-vs-HEAD lines for one install site
-# (both opencode sites carry them, so worktree diff counts are doubled).
-APPROVED_179_WORKTREE_ADDED_LINES = (
-    "          # exact version takes the hit path with zero downloads. A cache",
-    "          # failure (empty or malformed digest) falls back to deterministic",
-    "          # reconstruction below, never failing closed. The digest is bound",
-    "          # to the runtime by the image-digest stamp",
-    "          # ($HOME/.opencode/image-digest) recorded by the validated image",
-    "          # build (or a prior reconstruction): a stale or unrelated",
-    "          # opencode 1.18.34 binary whose stamp does not match the digest",
-    "          # cannot take the hit path.",
-    '          STAMP_FILE="$HOME/.opencode/image-digest"',
-    '            echo "::warning::CONTINUUM_IMAGE_DIGEST is malformed; falling back to deterministic reconstruction."',
-    '            CONTINUUM_IMAGE_DIGEST=""',
-    '          if [[ "${CONTINUUM_IMAGE_DIGEST:-}" =~ ^[0-9a-f]{64}$ ]] && [[ -f "$STAMP_FILE" ]] && [[ "$(cat "$STAMP_FILE")" == "$CONTINUUM_IMAGE_DIGEST" ]] && command -v opencode >/dev/null 2>&1 && opencode --version 2>&1 | grep -E -q "(^|[^0-9.])1\\.18\\.34([^0-9.]|$)"; then',
-    '            echo "prepared-runtime hit: opencode 1.18.34 already present (image digest ${CONTINUUM_IMAGE_DIGEST} validated against ${STAMP_FILE})."',
-    '              if [[ "${CONTINUUM_IMAGE_DIGEST:-}" =~ ^[0-9a-f]{64}$ ]]; then',
-    '                echo "$CONTINUUM_IMAGE_DIGEST" > "$STAMP_FILE"',
-    "              fi",
-)
-
-APPROVED_179_WORKTREE_REMOVED_LINES = (
-    "          # exact version takes the hit path with zero downloads; an empty",
-    "          # digest falls through to deterministic reconstruction below.",
-    '            echo "::error::CONTINUUM_IMAGE_DIGEST must be a 64-char sha256 hex digest when set."',
-    "            exit 1",
-    '          if [[ "${CONTINUUM_IMAGE_DIGEST:-}" =~ ^[0-9a-f]{64}$ ]] && command -v opencode >/dev/null 2>&1 && opencode --version 2>&1 | grep -E -q "(^|[^0-9.])1\\.18\\.34([^0-9.]|$)"; then',
-    '            echo "prepared-runtime hit: opencode 1.18.34 already present (image digest ${CONTINUUM_IMAGE_DIGEST})."',
 )
 
 PR_AGENT_WORKFLOWS = [
@@ -355,41 +354,70 @@ class ProtectedBaselineTests(unittest.TestCase):
                         expected = _Counter(
                             {line: 2 * count for line, count in approved.items()}
                         )
-                        # Transition tolerance: HEAD may predate the
-                        # stamp-directory mkdir (31 lines/site, 62 total)
-                        # while the worktree already carries it. Accept the
-                        # pre-mkdir committed drift only when the live
-                        # worktree supplies the mkdir on both sites.
-                        mkdir_line = '                mkdir -p "$(dirname "$STAMP_FILE")"'
-                        expected_legacy = _Counter(
-                            {
-                                line: 2 * count
-                                for line, count in approved.items()
-                                if line != mkdir_line
-                            }
+                        self.assertEqual(
+                            actual,
+                            expected,
+                            f"{path} drift must be exactly the approved #179 probe "
+                            f"(both install sites, no extra copies): "
+                            f"extra={sorted(set(actual) - set(expected))} "
+                            f"missing={sorted(set(expected) - set(actual))}",
                         )
-                        if actual == expected_legacy:
-                            worktree_body_for_mkdir = read_repo(path)
-                            mkdir_hits = sum(
-                                1
-                                for line in worktree_body_for_mkdir.splitlines()
-                                if line.strip() == mkdir_line.strip()
-                            )
-                            self.assertEqual(
-                                mkdir_hits,
-                                2,
-                                f"{path} committed drift predates the stamp mkdir; "
-                                f"worktree must carry it on both sites, found {mkdir_hits}",
-                            )
-                        else:
-                            self.assertEqual(
-                                actual,
-                                expected,
-                                f"{path} drift must be exactly the approved #179 probe "
-                                f"(both install sites, no extra copies): "
-                                f"extra={sorted(set(actual) - set(expected))} "
-                                f"missing={sorted(set(expected) - set(actual))}",
-                            )
+                        # Per-site ordering on the committed HEAD blob: the
+                        # multiset above cannot tell whether both probe
+                        # copies landed on one site or after the installer.
+                        # Both install sites carry an identical probe
+                        # string, so line numbers (not str.index) separate
+                        # them: each site's probe must precede its own
+                        # installer and the second probe must follow the
+                        # first installer.
+                        head_blob = subprocess.run(
+                            ["git", "show", f"HEAD:{path}"],
+                            cwd=ROOT,
+                            capture_output=True,
+                            text=True,
+                            timeout=30,
+                        )
+                        self.assertEqual(head_blob.returncode, 0, head_blob.stderr)
+                        head_lines = head_blob.stdout.splitlines()
+                        head_probe_nos = [
+                            i
+                            for i, line in enumerate(head_lines)
+                            if "CONTINUUM_IMAGE_DIGEST" in line and "command -v opencode" in line
+                            and line.strip() and not line.strip().startswith("#")
+                        ]
+                        head_installer_nos = [
+                            i
+                            for i, line in enumerate(head_lines)
+                            if "https://opencode.ai/install" in line
+                        ]
+                        self.assertEqual(
+                            len(head_probe_nos),
+                            2,
+                            f"{path} committed HEAD must carry two digest-gated probes, "
+                            f"found {len(head_probe_nos)}",
+                        )
+                        self.assertEqual(
+                            len(head_installer_nos),
+                            2,
+                            f"{path} committed HEAD must carry two installers, "
+                            f"found {len(head_installer_nos)}",
+                        )
+                        self.assertLess(
+                            head_probe_nos[0],
+                            head_installer_nos[0],
+                            f"{path} committed first probe must precede the first installer",
+                        )
+                        self.assertLess(
+                            head_probe_nos[1],
+                            head_installer_nos[1],
+                            f"{path} committed second probe must precede the second installer",
+                        )
+                        self.assertLess(
+                            head_installer_nos[0],
+                            head_probe_nos[1],
+                            f"{path} committed probes must be per-site: second probe must be "
+                            "after first installer",
+                        )
                     else:
                         # Empty committed drift must not blindly trust the
                         # SHA: a new baseline that itself already bundled
@@ -515,7 +543,7 @@ class ProtectedBaselineTests(unittest.TestCase):
                                 range_added.append(line[1:])
                             elif line.startswith("-"):
                                 range_removed.append(line[1:])
-                        approved_probe = _RangeCounter(APPROVED_179_OPENCODE_PROBE_LINES)
+                        approved_probe = _RangeCounter(APPROVED_179_BASELINE_RANGE_PROBE_LINES)
                         expected_added = _RangeCounter(
                             {line: 2 * count for line, count in approved_probe.items()}
                         )
@@ -611,6 +639,19 @@ class ProtectedBaselineTests(unittest.TestCase):
                         probe_nos[1],
                         "probes must be per-site: second probe must be after first installer",
                     )
+                    stamp_writes = [
+                        line
+                        for line in body.splitlines()
+                        if '> "$STAMP_FILE"' in line
+                        and line.strip()
+                        and not line.strip().startswith("#")
+                    ]
+                    self.assertEqual(
+                        stamp_writes,
+                        [],
+                        "deterministic reconstruction must never record the stamp: "
+                        f"{stamp_writes}",
+                    )
                     continue
                 self.assertEqual(
                     out.stdout.strip(),
@@ -628,73 +669,16 @@ class ProtectedBaselineTests(unittest.TestCase):
         )
         changed = out.stdout
         for path in PROTECTED_FILES:
-            if path == ".github/workflows/continuum-opencode.yml" and path in changed:
-                # The uncommitted #179 worktree repair (digest-gated hit plus
-                # `vars.` env wiring, plus the stamp-directory mkdir) is the
-                # only permitted worktree drift: every removed line must be
-                # a superseded probe line and every added line must be an
-                # approved repair line.
-                diff = subprocess.run(
-                    ["git", "diff", "HEAD", "--", path],
-                    cwd=ROOT,
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                )
-                self.assertEqual(diff.returncode, 0, diff.stderr)
-                added = []
-                removed = []
-                for line in diff.stdout.splitlines():
-                    if line.startswith("+++ ") or line.startswith("--- "):
-                        continue
-                    if line.startswith("+"):
-                        added.append(line[1:])
-                    elif line.startswith("-"):
-                        removed.append(line[1:])
-                self.assertTrue(added or removed, f"{path} shows as modified with an empty diff")
-                from collections import Counter as _WorktreeCounter
-                # Standalone stamp-mkdir repair on the promoted HEAD: both
-                # sites gain exactly the mkdir line and nothing else. This
-                # is the current expected worktree state (HEAD already
-                # carries the stamp-bound probe).
-                mkdir_only = _WorktreeCounter(
-                    {'                mkdir -p "$(dirname "$STAMP_FILE")"': 2}
-                )
-                if _WorktreeCounter(added) == mkdir_only and not removed:
-                    pass
-                else:
-                    actual_added = _WorktreeCounter(added)
-                    approved_added = _WorktreeCounter(APPROVED_179_WORKTREE_ADDED_LINES)
-                    expected_added = _WorktreeCounter(
-                        {line: 2 * count for line, count in approved_added.items()}
-                    )
-                    self.assertEqual(
-                        actual_added,
-                        expected_added,
-                        f"{path} worktree repair must touch both install sites together "
-                        f"(each approved added line exactly twice): "
-                        f"extra={sorted(set(actual_added) - set(expected_added))} "
-                        f"missing={sorted(set(expected_added) - set(actual_added))}",
-                    )
-                    actual_removed = _WorktreeCounter(removed)
-                    approved_removed = _WorktreeCounter(APPROVED_179_WORKTREE_REMOVED_LINES)
-                    expected_removed = _WorktreeCounter(
-                        {line: 2 * count for line, count in approved_removed.items()}
-                    )
-                    self.assertEqual(
-                        actual_removed,
-                        expected_removed,
-                        f"{path} worktree repair must touch both install sites together "
-                        f"(each approved removed line exactly twice): "
-                        f"extra={sorted(set(actual_removed) - set(expected_removed))} "
-                        f"missing={sorted(set(expected_removed) - set(actual_removed))}",
-                    )
-                # Both sites must be repaired together for digest-keyed
-                # identity to hold: a single-site repair still leaves one old
-                # ungated probe that takes a warm hit without a digest.
-                # Both sites must also carry the stamp-directory mkdir so the
-                # cold fallback cannot fail on a fresh instance (32 lines
-                # per site / 64 total, identical on both sites).
+            if path == ".github/workflows/continuum-opencode.yml":
+                # HEAD already carries the approved probe (see the committed
+                # drift check above), so no uncommitted worktree drift is
+                # permitted: the transition tolerances (pre-mkdir committed
+                # drift, mkdir-only worktree drift, staged repair tuples)
+                # were removed once HEAD was promoted. A single-site repair
+                # or partial state can no longer pass one tolerance branch
+                # while the strict two-site assertions below are the only
+                # backstop; both sites must satisfy the full contract
+                # together for digest-keyed identity to hold.
                 worktree_body = read_repo(path)
                 gated_sites = [
                     line
@@ -724,19 +708,43 @@ class ProtectedBaselineTests(unittest.TestCase):
                     "one install site still carries the old ungated probe: "
                     f"{lingering}",
                 )
-                mkdir_sites = [
+                # Reconstruction must never self-stamp: only the validated
+                # image build (or a provider cache restore of it) may
+                # create the image-digest stamp.
+                stamp_writes = [
                     line
                     for line in worktree_body.splitlines()
-                    if 'mkdir -p "$(dirname "$STAMP_FILE")"' in line
+                    if '> "$STAMP_FILE"' in line
                     and line.strip()
                     and not line.strip().startswith("#")
                 ]
                 self.assertEqual(
-                    len(mkdir_sites),
-                    2,
-                    "both opencode install sites must create the stamp directory "
-                    f"before writing the digest stamp, found {len(mkdir_sites)}",
+                    stamp_writes,
+                    [],
+                    "deterministic reconstruction must never record the stamp: "
+                    f"{stamp_writes}",
                 )
+                # Per-site ordering by line number: both install sites
+                # carry an identical probe string, so str.index() would
+                # return the first occurrence for both.
+                worktree_lines = worktree_body.splitlines()
+                worktree_probe_nos = [
+                    i
+                    for i, line in enumerate(worktree_lines)
+                    if "CONTINUUM_IMAGE_DIGEST" in line and "command -v opencode" in line
+                    and line.strip() and not line.strip().startswith("#")
+                ]
+                worktree_installer_nos = [
+                    i
+                    for i, line in enumerate(worktree_lines)
+                    if "https://opencode.ai/install" in line
+                ]
+                self.assertEqual(len(worktree_probe_nos), 2)
+                self.assertEqual(len(worktree_installer_nos), 2)
+                self.assertLess(worktree_probe_nos[0], worktree_installer_nos[0])
+                self.assertLess(worktree_probe_nos[1], worktree_installer_nos[1])
+                self.assertLess(worktree_installer_nos[0], worktree_probe_nos[1])
+                self.assertNotIn(path, changed, f"{path} is modified")
                 continue
             self.assertNotIn(path, changed, f"{path} is modified")
 

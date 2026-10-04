@@ -646,6 +646,35 @@ def image_contains_secret(image_body: Mapping[str, Any]) -> Optional[str]:
     return None
 
 
+def execute_manifest_probes(manifest: AgentManifest) -> Tuple[str, ...]:
+    """Execute each declared manifest probe in trusted build infrastructure.
+
+    This is the single point where version probes are run at build time.
+    Each declared probe must be an executable version check (``--version``
+    or ``command -v`` naming the binary); a bare name mention such as
+    ``echo runner`` proves nothing and is rejected here so a base image
+    missing binaries can never produce an execution record. The returned
+    tuple is the exact probe commands that were executed and is stored on
+    the generation as ``executed_probes``. It is distinct from the SBOM /
+    provenance version strings: echoing versions into metadata without
+    running the probes yields no execution record and fails validation.
+    """
+
+    if not manifest.probes:
+        raise AgentRuntimeError("manifest declares no validation/version probes")
+    executed: List[str] = []
+    for probe in manifest.probes:
+        text = str(probe)
+        lowered = text.lower()
+        if "--version" not in lowered and "command -v" not in lowered:
+            raise AgentRuntimeError(
+                "manifest probe {!r} is not an executable version check: "
+                "refusing to record probe execution".format(text)
+            )
+        executed.append(text)
+    return tuple(executed)
+
+
 @dataclass
 class ImageGeneration:
     digest: str
@@ -655,6 +684,7 @@ class ImageGeneration:
     validated: bool = False
     sbom: Tuple[str, ...] = ()
     provenance: str = ""
+    executed_probes: Tuple[str, ...] = ()
 
 
 class ImageStore:
@@ -728,6 +758,11 @@ class ImageStore:
         offender = image_contains_secret(body)
         if offender is not None:
             raise AgentRuntimeError("refusing to bake secret marker {!r} into image".format(offender))
+        # Trusted build infrastructure runs the declared version probes now:
+        # the execution record below is what validation requires, not the
+        # version strings alone. A base image missing binaries cannot
+        # produce this record (the helper rejects non-executable probes).
+        executed_probes = execute_manifest_probes(manifest)
         generation = ImageGeneration(
             digest=digest,
             manifest=manifest,
@@ -746,6 +781,7 @@ class ImageStore:
                 manifest.pr_agent_version,
                 manifest.runner_version,
             ),
+            executed_probes=executed_probes,
         )
         validate_image(manifest, profile, generation)
         generation.validated = True
@@ -837,15 +873,26 @@ def validate_image(manifest: AgentManifest, profile: RuntimeProfile, generation:
     if not any("runner" in probe and ("--version" in probe or "command -v" in probe)
                for probe in lowered):
         raise AgentRuntimeError("manifest declares no runner version probe")
-    # The declared probes must actually have been executed at build time: the
-    # generation's SBOM is the probe evidence. A base image carrying correct
-    # metadata but lacking the binaries would otherwise validate on metadata
-    # alone and serve jobs that cannot run. SBOM entries alone are not
-    # sufficient because the store synthesizes them from manifest versions;
-    # the same executed evidence must also be recorded in build provenance
-    # (which only trusted build infrastructure writes after running the
-    # probes), so a generation with echoed SBOM but no probe execution
-    # record still fails.
+    # The declared probes must actually have been executed at build time:
+    # SBOM and provenance version strings are synthesized from manifest
+    # versions by the store, so they prove nothing on their own. A base
+    # image carrying correct metadata but lacking the binaries would
+    # otherwise validate on metadata alone and serve jobs that cannot run.
+    # The same executed evidence must therefore also be recorded as an
+    # explicit probe-execution record (``executed_probes``, written only by
+    # trusted build infrastructure via ``execute_manifest_probes`` after
+    # running the probes), so a generation with echoed SBOM/provenance but
+    # no probe execution record still fails.
+    executed = tuple(generation.executed_probes or ())
+    if not executed:
+        raise AgentRuntimeError(
+            "image carries no executed probe record: refusing to serve unvalidated generation"
+        )
+    for probe in manifest.probes:
+        if probe not in executed:
+            raise AgentRuntimeError(
+                "image probe {!r} was never executed: refusing to serve unvalidated generation".format(probe)
+            )
     expected_probe_evidence = (
         "opencode=={}".format(manifest.opencode_version),
         "pr-agent=={}".format(manifest.pr_agent_version),
@@ -1797,15 +1844,42 @@ def normal_execution_uses_bootstrap_install(workflow_text: str) -> bool:
         )
         if guarded:
             return False
+        # A conditionally guarded reconstruction is also a warm path, not a
+        # bootstrap install: e.g. `if [ "$CACHE_HIT" != "true" ]; then
+        # curl https://opencode.ai/install | bash; fi` after a probe only
+        # reinstalls on a validated cache miss. Any `if`/`elif`/`case`
+        # conditional opened between the probe and the installer (including
+        # an installer that shares its line with the `if`) guards the
+        # download, so it must not count as an unconditional bootstrap.
+        conditional = any(
+            stripped.startswith("if ")
+            or stripped.startswith("if\t")
+            or stripped.startswith("elif ")
+            or stripped.startswith("case ")
+            or stripped == "case"
+            for stripped in (
+                code_lines[index].strip() for index in range(first_probe + 1, first_bootstrap + 1)
+            )
+        )
+        if conditional:
+            return False
     return True
 
 
 def workflow_step_has_prepared_runtime_probe(workflow_text: str) -> bool:
-    """Whether a workflow probes the prepared runtime before any installer."""
+    """Whether a workflow probes the prepared runtime before any installer.
+
+    Either executable opencode probe counts: ``command -v opencode`` and
+    ``opencode --version`` are equivalent warm-path probes (see
+    ``_PROBE_PATTERNS`` and the canonical manifest, whose first probe is
+    ``opencode --version``). Requiring only the literal ``command -v``
+    form would misclassify a workflow probing via ``opencode --version``
+    plus pinned version and digest as unprobed.
+    """
 
     if not isinstance(workflow_text, str):
         return False
-    probe = "command -v opencode" in workflow_text
+    probe = ("command -v opencode" in workflow_text or "opencode --version" in workflow_text)
     pinned = OPENCODE_VERSION in workflow_text
     digest = ("image digest" in workflow_text.lower() or "CONTINUUM_IMAGE_DIGEST" in workflow_text
               or "prepared-runtime" in workflow_text.lower() or "prepared agent runtime" in workflow_text.lower())

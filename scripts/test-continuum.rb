@@ -5271,7 +5271,13 @@ class ContinuumTest < Minitest::Test
                    "#{name}: one instance may execute exactly one job")
     end
 
-    engine = File.read(File.join(ROOT, 'src/continuum/agent_runtime.py'))
+    engine_path = File.join(ROOT, 'src/continuum/agent_runtime.py')
+    assert File.exist?(engine_path),
+           'src/continuum/agent_runtime.py must exist: the engine is the asserted strict-profile and live-qualification source of truth'
+    harness_path = File.join(ROOT, 'tests/test_agent_runtime.py')
+    assert File.exist?(harness_path),
+           'tests/test_agent_runtime.py must exist: docs claim it as the deterministic qualification harness'
+    engine = File.read(engine_path)
     assert_includes engine, 'STRICT_MAX_USES_PER_INSTANCE = 1'
     assert_includes engine, 'STRICT_IDLE_INSTANCES = 0'
     # Positive proof: the refutes above pass vacuously when neither key is
@@ -5303,7 +5309,10 @@ class ContinuumTest < Minitest::Test
   # in agreement.
   def test_agent_runtime_variables_are_documented
     docs = File.read(File.join(ROOT, 'docs/consumer-variables.md'))
-    engine = File.read(File.join(ROOT, 'src/continuum/agent_runtime.py'))
+    engine_path = File.join(ROOT, 'src/continuum/agent_runtime.py')
+    assert File.exist?(engine_path),
+           'src/continuum/agent_runtime.py must exist: the preset/provider contract is asserted on it'
+    engine = File.read(engine_path)
     %w[CONTINUUM_IMAGE_DIGEST CONTINUUM_RUNTIME_PRESET CONTINUUM_RUNTIME_PROVIDER].each do |name|
       assert_includes docs, name, "docs/consumer-variables.md must document #{name}"
     end
@@ -5312,6 +5321,53 @@ class ContinuumTest < Minitest::Test
     body = workflow_body('continuum-opencode.yml')
     assert_includes body, 'CONTINUUM_IMAGE_DIGEST',
                     'continuum-opencode.yml: the probe must key on the immutable image digest'
+  end
+
+  # kodmial/continuum#179: golden-image provenance and per-profile digests.
+  # Only a validated image build (or a provider cache restore of it) may
+  # create the image-digest stamp, so deterministic reconstruction never
+  # self-stamps; and the content-addressed digest is per profile, so the
+  # child worker takes one digest per profile job instead of a single
+  # global variable that a second promotion would evict.
+  def test_prepared_runtime_provenance_and_per_profile_digest
+    opencode = workflow_body('continuum-opencode.yml')
+    opencode_code = opencode.lines.map { |line| code_without_comment(line) }.join
+    refute_match(/>\s*"\$STAMP_FILE"/, opencode_code,
+                 'continuum-opencode.yml: deterministic reconstruction must never record the stamp')
+    assert_includes opencode, 'never records the stamp',
+                    'continuum-opencode.yml: the no-self-stamp provenance rule must be documented at the install sites'
+
+    worker = workflow_body('continuum-consumer-child-worker.yml')
+    worker_inputs = events(yaml(File.join(ROOT, '.github/workflows/continuum-consumer-child-worker.yml')))
+                        .fetch('workflow_call').fetch('inputs')
+    digest_input = worker_inputs.fetch('image_digest')
+    assert_equal 'string', digest_input.fetch('type')
+    assert_equal false, digest_input.fetch('required')
+    assert_equal '', digest_input.fetch('default'),
+                 'image_digest must default to empty so vars.CONTINUUM_IMAGE_DIGEST remains the fallback'
+    assert_includes digest_input.fetch('description').to_s, 'vars.CONTINUUM_IMAGE_DIGEST'
+    assert_includes worker, 'inputs.image_digest || vars.CONTINUUM_IMAGE_DIGEST',
+                    'continuum-consumer-child-worker.yml: the per-profile input must fall back to the repository variable'
+    worker_code = worker.lines.map { |line| code_without_comment(line) }.join
+    refute_match(/>\s*"\$STAMP_FILE"/, worker_code,
+                 'continuum-consumer-child-worker.yml: deterministic reconstruction must never record the stamp')
+
+    parent_stub = yaml(File.join(ROOT, '.github/caller-stubs/parent/continuum-child-worker.yml'))
+    parent_with = nil
+    parent_stub.fetch('jobs').each_value do |job|
+      parent_with = job['with'] if job['uses']
+    end
+    refute_nil parent_with, 'the parent child-worker stub must call the reusable workflow'
+    assert_equal '${{ inputs.image_digest }}', parent_with['image_digest'],
+                 'the parent stub must pass the per-profile digest through to the reusable worker'
+
+    engine = File.read(File.join(ROOT, 'src/continuum/agent_runtime.py'))
+    assert_includes engine, 'def execute_manifest_probes',
+                    'engine must execute (not synthesize) the declared version probes at build time'
+    assert_includes engine, 'executed_probes',
+                    'engine must record an explicit probe-execution record distinct from SBOM/provenance version strings'
+    assert_includes engine, 'image carries no executed probe record',
+                    'engine must refuse to serve a generation with echoed metadata but no probe execution'
   end
 
   # kodmial/continuum#214: mandatory qualification evidence must be

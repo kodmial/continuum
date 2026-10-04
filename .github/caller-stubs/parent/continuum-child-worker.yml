@@ -12,6 +12,10 @@ on:
         description: Child task number
         required: true
         type: string
+      image_digest:
+        description: Per-profile prepared-image digest for this worker's runtime profile (falls back to vars.CONTINUUM_IMAGE_DIGEST when empty)
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -24,6 +28,7 @@ jobs:
       task_number: ${{ inputs.task_number }}
       model: ${{ vars.OPENCODE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
       max_agent_passes: 4
+      image_digest: ${{ inputs.image_digest }}
       engine_ref: main
     secrets:
       CHILD_RUNTIME_TOKEN: ${{ secrets.TAP_PAT }}

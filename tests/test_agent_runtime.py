@@ -686,6 +686,77 @@ class AgentRuntimeContractTest(unittest.TestCase):
         strong_generation = store.ensure_image(strong, profile, now=2000.0)
         runtime.validate_image(strong, profile, strong_generation)
 
+    def test_synthesized_metadata_without_probe_execution_does_not_validate(self):
+        # SBOM/provenance version strings are synthesized from manifest
+        # versions, so they prove nothing on their own: a hand-built
+        # generation echoing the right versions but carrying no executed
+        # probe record (a base image missing the binaries) must fail.
+        profile = runtime.resolve_profile({"preset": "agent-linux"})
+        manifest = runtime.canonical_manifest("linux", "x64", "main")
+        forged = runtime.ImageGeneration(
+            digest=runtime.image_digest(manifest, profile),
+            manifest=manifest,
+            profile=profile,
+            built_at=1000.0,
+            validated=False,
+            sbom=(
+                "opencode=={}".format(manifest.opencode_version),
+                "pr-agent=={}".format(manifest.pr_agent_version),
+                "actions-runner=={}".format(manifest.runner_version),
+            ),
+            provenance="continuum-ref={} base={} probes=opencode=={},pr-agent=={},actions-runner=={}".format(
+                manifest.continuum_ref,
+                manifest.base_image,
+                manifest.opencode_version,
+                manifest.pr_agent_version,
+                manifest.runner_version,
+            ),
+        )
+        with self.assertRaises(runtime.AgentRuntimeError):
+            runtime.validate_image(manifest, profile, forged)
+        # The trusted build path records execution: ensure_image runs the
+        # declared probes and the result validates.
+        genuine = runtime.ImageStore(project_id="proj-probe-exec").ensure_image(
+            manifest, profile, now=1000.0)
+        self.assertEqual(tuple(genuine.executed_probes), tuple(manifest.probes))
+        runtime.validate_image(manifest, profile, genuine)
+        # A non-executable probe can never produce an execution record.
+        with self.assertRaises(runtime.AgentRuntimeError):
+            runtime.execute_manifest_probes(
+                runtime.AgentManifest(**{**manifest.to_canonical(), "probes": ("echo runner",)}))
+
+    def test_opencode_version_probe_is_equivalent_to_command_v(self):
+        # `opencode --version` (the canonical manifest probe) plus pinned
+        # version and digest counts as a prepared-runtime probe, exactly
+        # like `command -v opencode`.
+        workflow = (
+            "run: |\n"
+            "  if [[ \"${CONTINUUM_IMAGE_DIGEST:-}\" =~ ^[0-9a-f]{64}$ ]] && "
+            "opencode --version 2>&1 | grep -E -q \"1.18.34\"; then\n"
+            "    echo prepared-runtime hit 1.18.34\n"
+            "  fi\n"
+        )
+        self.assertTrue(runtime.workflow_step_has_prepared_runtime_probe(workflow))
+
+    def test_guarded_cache_miss_reconstruction_is_not_a_bootstrap_install(self):
+        # A correctly guarded cache-miss branch after a probe only
+        # reconstructs on a validated miss; it must not count as a
+        # bootstrap install.
+        guarded = (
+            "run: |\n"
+            "  command -v opencode >/dev/null 2>&1\n"
+            "  opencode --version 2>&1 | grep -E -q \"1.18.34\"\n"
+            "  if [ \"$CACHE_HIT\" != \"true\" ]; then curl -fsSL https://opencode.ai/install | bash; fi\n"
+        )
+        self.assertFalse(runtime.normal_execution_uses_bootstrap_install(guarded))
+        # An unconditional installer after a bare probe still counts.
+        bare = (
+            "run: |\n"
+            "  command -v opencode >/dev/null 2>&1\n"
+            "  curl -fsSL https://opencode.ai/install | bash\n"
+        )
+        self.assertTrue(runtime.normal_execution_uses_bootstrap_install(bare))
+
     def test_live_idle_count_without_clock_exposes_expired_lease(self):
         controller = _controller()
         profile = runtime.resolve_profile({"preset": "agent-linux"})
