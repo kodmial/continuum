@@ -45,7 +45,7 @@ permissions:
 # serialize per PR before the reusable operation layer admits exact-HEAD
 # work. A per-PR caller lock would queue no-op comment runs ahead of
 # useful reviews. The single authoritative serialization lives in
-# continuum-pr-agent.yml (cancellable review) and
+# continuum-pr-agent.yml (serialized review without preemption) and
 # continuum-pr-agent-repair.yml (non-cancellable repair publication).
 
 jobs:

@@ -846,11 +846,17 @@ def review_supersession_decision(
     the HEAD under review blocks preemption
     (repair_is_protected_from_review_preemption), and only a moved HEAD
     supersedes older review work (stale_review_may_be_cancelled).
-    Same-HEAD duplicates coalesce; missing SHAs fail closed to wait
-    rather than discard blindly. The reusable workflow implements this
-    decision with workflow-level serialization (no native preemption)
-    plus exact-HEAD admission, before/after revalidation, and
-    retry-backoff HEAD rechecks.
+    Same-HEAD duplicates coalesce; a current HEAD with no running review
+    proceeds; missing SHAs fail closed to wait rather than discard
+    blindly. The reusable workflow implements this decision with
+    workflow-level serialization (no native preemption) plus exact-HEAD
+    admission, before/after revalidation, and retry-backoff HEAD rechecks:
+    `proceed` enters the admission path, `supersede` means the stale
+    run's results are discarded by those exact-HEAD checks and the newer
+    HEAD is reviewed fresh once the lock frees (a stale running review is
+    never interrupted mid-flight), `coalesce` skips duplicate same-HEAD
+    work, and `wait` holds while a same-HEAD repair publishes or a HEAD
+    is still unknown.
     """
 
     if not caller_review_event_is_actionable(
@@ -873,6 +879,8 @@ def review_supersession_decision(
     current = str(current_head_sha or "").strip().lower()
     if running and current and running == current:
         return {"action": "coalesce", "reason": "same HEAD: exact-HEAD work is idempotent"}
+    if current and not running:
+        return {"action": "proceed", "reason": "no active review: admit fresh HEAD"}
     return {"action": "wait", "reason": "missing HEAD: fail closed"}
 
 

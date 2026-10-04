@@ -24,9 +24,11 @@ permissions:
   issues: read
   pull-requests: read
 
-concurrency:
-  group: pr-agent-router-entry-${{ github.event.issue.number || inputs.pr_number || github.run_id }}
-  cancel-in-progress: false
+# No entry-level concurrency by design (issue #227): the actionable /review
+# filter lives in the job `if` gate below, which is evaluated only after a
+# workflow-level lock would already have queued this run. A per-PR entry lock
+# would let a plain non-`/review` comment run queue ahead of an immediately
+# following owner `/review` dispatch for the same PR.
 
 jobs:
   call:

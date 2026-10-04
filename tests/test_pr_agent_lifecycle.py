@@ -1536,8 +1536,8 @@ class RepairWiringRegressionTests(unittest.TestCase):
 
     def test_repair_serialization_is_non_interruptible_per_head(self):
         # Issue #227: repair publication keeps its own non-cancellable
-        # per-PR-HEAD group and is never part of any cancellable review
-        # group, so a newer event cannot interrupt a mutating publish.
+        # per-PR-HEAD group and is never interrupted by serialized review
+        # work, so a newer event cannot interrupt a mutating publish.
         # The parent run is also non-preemptive at workflow level, so an
         # old-HEAD duplicate can never cancel newer exact-HEAD work.
         repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
@@ -1734,7 +1734,8 @@ class SchedulingSemanticsTests(unittest.TestCase):
         )
         # The scheduling decision wires all three predicates so none is
         # dead code: non-actionable events ignore, active repair waits,
-        # moved HEAD supersedes, same HEAD coalesces.
+        # moved HEAD supersedes, same HEAD coalesces, and a current HEAD
+        # with no running review proceeds.
         old, new = "a" * 40, "b" * 40
         self.assertEqual(
             life.review_supersession_decision(
@@ -1758,6 +1759,17 @@ class SchedulingSemanticsTests(unittest.TestCase):
         self.assertEqual(
             life.review_supersession_decision(old, old)["action"], "coalesce"
         )
+        # First-ever review with no running SHA proceeds to admission;
+        # a missing current HEAD still fails closed to wait.
+        self.assertEqual(
+            life.review_supersession_decision("", new)["action"], "proceed"
+        )
+        self.assertEqual(
+            life.review_supersession_decision(None, new)["action"], "proceed"
+        )
+        self.assertEqual(
+            life.review_supersession_decision(old, "")["action"], "wait"
+        )
         # Python wiring is a real call site, not documentation-only.
         source = lifecycle_source()
         decision = source.split("def review_supersession_decision", 1)[1]
@@ -1767,6 +1779,22 @@ class SchedulingSemanticsTests(unittest.TestCase):
         repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
         self.assertIn("force-with-lease", repair)
         self.assertIn("PR branch moved before publish", repair)
+
+    def test_router_holds_no_per_pr_lock(self):
+        # Issue #227: the thin router filters before any delay. A
+        # workflow-level lock is acquired before the job `if` / early-exit
+        # filter, so a plain non-`/review` comment run would queue ahead of
+        # a useful dispatch for the same PR. Duplicates coalesce via the
+        # operation-key active-run check instead.
+        for path in (
+            ".github/caller-stubs/continuum-pr-agent-router.yml",
+            ".github/workflows/continuum-pr-agent-router.yml",
+            ".github/workflows/pr-agent-router.yml",
+        ):
+            with self.subTest(path=path):
+                body = read_repo(path)
+                self.assertNotIn("concurrency:", body)
+                self.assertNotIn("cancel-in-progress", body)
 
 
 if __name__ == "__main__":

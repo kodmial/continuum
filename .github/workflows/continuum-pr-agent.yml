@@ -140,8 +140,9 @@ permissions:
 # before/after review revalidation, and the retry-backoff HEAD recheck below
 # implement that predicate. Repair publication keeps its own
 # non-cancellable per-PR-HEAD group in continuum-pr-agent-repair.yml and is
-# never part of any cancellable review group
-# (repair_is_protected_from_review_preemption).
+# never interrupted by serialized review work
+# (repair_is_protected_from_review_preemption): the review group itself
+# is non-preemptive (cancel-in-progress: false).
 
 concurrency:
   group: pr-agent-${{ github.event.issue.number || github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || inputs.pr_number || github.run_id }}
