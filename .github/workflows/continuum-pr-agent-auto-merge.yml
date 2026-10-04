@@ -368,8 +368,12 @@ jobs:
             // additionally re-validated through
             // policy.isCleanReviewForImproveSkip below, so the marker alone
             // never greens a dirty review.
-            if (recommendation !== policy.REVIEW_MERGE_SAFE) {
-              fail(`merge recommendation blocks: ${recommendation}`);
+            if (!disposition || disposition.action !== 'merge') {
+              fail(
+                'central review disposition blocks merge: ' +
+                  String(disposition?.action || 'unknown') + ': ' +
+                  String(disposition?.reason || recommendation)
+              );
               return;
             }
             if (keyIssues.length > 0) {
