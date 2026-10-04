@@ -99,8 +99,12 @@ jobs:
             // A distinct Octokit instance handles read-only same-repository calls
             // with github.token, keeping those requests off TAP_PAT's shared budget.
             const readToken = String(process.env.READ_GITHUB_TOKEN || '').trim();
-            const { getOctokit } = require('@actions/github');
-            const readGithub = readToken ? getOctokit(readToken) : github;
+            // github-script already supplies the plugin-composed Octokit class.
+            // Reuse its constructor instead of dynamically requiring
+            // @actions/github, which is not resolvable from the script sandbox.
+            const readGithub = readToken
+              ? new github.constructor({ auth: readToken })
+              : github;
             if (!readToken) {
               core.warning('READ_GITHUB_TOKEN is empty; using PAT client for PR-Agent recovery reads.');
             }
