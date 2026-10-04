@@ -1720,6 +1720,105 @@ class ContinuumTest < Minitest::Test
                     'a mid-repair draft transition must discard local repair changes'
   end
 
+  # Work-Lock #58 item 4 (conservative subset): only the four verified-safe
+  # pure same-repository read-only PR-Agent paths leave the shared TAP_PAT
+  # budget. Mixed read/write/dispatch and cross-repo paths stay PAT-backed so
+  # downstream triggers and actor identity are unchanged.
+  def test_pr_agent_admission_and_revalidation_reads_use_repository_token
+    body = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent.yml'))
+    workflow = yaml(File.join(ROOT, '.github/workflows/continuum-pr-agent.yml'))
+    stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-pr-agent.yml'))
+
+    # The exact-HEAD workflow-run lookup runs under github.token, so both the
+    # reusable workflow and its caller must grant actions:read (least
+    # privilege: never write). Reusable workflows cannot elevate GITHUB_TOKEN
+    # beyond the caller grant.
+    assert_equal 'read', workflow.fetch('permissions').fetch('actions'),
+                 'reusable workflow must grant actions:read for exact-HEAD CI evidence'
+    assert_equal 'read', workflow.fetch('jobs').fetch('pr_agent').fetch('permissions').fetch('actions'),
+                 'pr_agent job must grant actions:read for exact-HEAD CI evidence'
+    assert_equal 'read', stub.fetch('permissions').fetch('actions'),
+                 'caller stub must grant actions:read because reusable workflows cannot elevate GITHUB_TOKEN'
+    refute_equal 'write', workflow.fetch('permissions').fetch('actions')
+    refute_equal 'write', stub.fetch('permissions').fetch('actions')
+    # pull-requests read capability is preserved (write implies read; the
+    # contract keeps write for the mutating steps below).
+    assert_equal 'write', workflow.fetch('jobs').fetch('pr_agent').fetch('permissions').fetch('pull-requests')
+    assert_equal 'write', stub.fetch('permissions').fetch('pull-requests')
+
+    admit = step_body(body, 'Admit only a review-ready PR with green CI on the exact HEAD')
+    before = step_body(body, 'Revalidate the admitted exact HEAD immediately before review')
+    after = step_body(body, 'Revalidate the PR head and native review output after review')
+    moved = step_body(body, 'Fail closed on a moved head')
+    [admit, before, after, moved].each { |step| refute_nil step, 'a verified-safe read step is missing' }
+
+    # 1. Admission: pulls.get plus exact-HEAD CI evidence under github.token.
+    assert_includes admit, 'github-token: ${{ github.token }}'
+    refute_includes admit, 'secrets.TAP_PAT'
+    assert_includes admit, 'github.rest.pulls.get'
+    assert_includes admit, 'github.rest.actions.listWorkflowRunsForRepo'
+
+    # 2. Immediately-before-review revalidation: gh pr view plus exact-HEAD
+    # CI evidence under github.token.
+    assert_includes before, 'GH_TOKEN: ${{ github.token }}'
+    refute_includes before, 'secrets.TAP_PAT'
+    assert_includes before, 'gh pr view'
+    assert_includes before, 'actions/runs?event=pull_request&head_sha='
+
+    # 3. Immediately-after-review revalidation: pulls.get for current PR/head only.
+    assert_includes after, 'github-token: ${{ github.token }}'
+    refute_includes after, 'secrets.TAP_PAT'
+    assert_includes after, 'github.rest.pulls.get'
+
+    # 4. Final fail-closed moved-head check: gh pr view for current PR/head only.
+    assert_includes moved, 'GH_TOKEN: ${{ github.token }}'
+    refute_includes moved, 'secrets.TAP_PAT'
+    assert_includes moved, 'gh pr view'
+
+    # github-script pure reads use the injected client directly: no dynamic
+    # require of @actions/github and no secondary Octokit client to audit.
+    refute_includes body, "require('@actions/github')"
+    refute_includes body, 'require("@actions/github")'
+
+    # Exact-HEAD admission, CI name matching, stale-HEAD rejection and
+    # fail-closed behavior are unchanged.
+    assert_includes admit, 'run.head_sha === headSha'
+    assert_includes admit, 'Stale admission ignored:'
+    assert_includes before, 'refusing to review an unqualified HEAD'
+    assert_includes after, 'PR head moved during review'
+    assert_includes moved, 'the review is stale'
+
+    # Mixed read/write/dispatch and cross-repo paths remain PAT-backed.
+    runtime = step_body(body, 'Resolve the Continuum-owned PR-Agent runtime bundle')
+    retry_step = step_body(body, 'Schedule bounded retry for retryable PR-Agent review failure')
+    tool = step_body(body, 'Run upstream full review and full improve on the exact HEAD')
+    in_flight = step_body(body, 'Mark PR-Agent review in flight')
+    normalize = step_body(body, 'Normalize persistent improve presentation')
+    publish = step_body(body, 'Publish durable PR-Agent review state')
+    [runtime, retry_step, tool, in_flight, normalize, publish].each { |step| refute_nil step }
+    assert_includes runtime, 'GH_TOKEN: ${{ secrets.TAP_PAT }}',
+                    'runtime-bundle fetch can be cross-repository; it must stay PAT-backed'
+    assert_includes runtime, 'repos/kodmial/continuum/contents'
+    assert_includes retry_step, 'GH_TOKEN: ${{ secrets.TAP_PAT }}',
+                    'the retry step mixes reads with workflow dispatch; it must stay wholly PAT-backed'
+    assert_includes retry_step, 'gh workflow run'
+    refute_includes retry_step, 'github.token',
+                      'the retry step must not be partially migrated to github.token'
+    refute_includes before, 'gh workflow run',
+                      'the pre-review revalidation must stay read-only'
+    refute_includes moved, 'gh workflow run',
+                      'the moved-head check must stay read-only'
+    assert_includes tool, 'GITHUB__USER_TOKEN: ${{ secrets.TAP_PAT }}',
+                    'PR-Agent tool execution credentials must stay PAT-backed'
+    assert_includes in_flight, 'github-token: ${{ secrets.TAP_PAT }}',
+                    'commit-status publishing must stay PAT-backed'
+    assert_includes normalize, 'github-token: ${{ secrets.TAP_PAT }}',
+                    'comment deletion steps must stay PAT-backed'
+    assert_includes normalize, 'deleteComment'
+    assert_includes publish, 'github-token: ${{ secrets.TAP_PAT }}',
+                    'commit-status publishing must stay PAT-backed'
+  end
+
   # kodmial/continuum#229: ordinary PR comments must not create heavy
   # PR-Agent workflow runs. The heavy entry workflows are dispatch-only;
   # explicit `/review` is routed through a thin router that validates the
