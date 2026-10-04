@@ -126,13 +126,14 @@ jobs:
           CONTINUUM_REF: ${{ inputs.continuum_ref }}
         run: |
           set -euo pipefail
-          : "${CONTINUUM_REF:?CONTINUUM_REF is required for pinned target resolution}"
           CONTINUUM_SOURCE_REPO="${GITHUB_WORKFLOW_REF:-}"
           CONTINUUM_SOURCE_REPO="${CONTINUUM_SOURCE_REPO%%/.github/workflows/*}"
           if ! [[ "$CONTINUUM_SOURCE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
             CONTINUUM_SOURCE_REPO="kodmial/continuum"
           fi
           if [[ -z "${TARGET_CHILD_ID:-}" ]]; then
+            # Local fast path: no delegated resolver is needed and
+            # CONTINUUM_REF is not required for local-only merge.
             if ! [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
               echo "::error::PR-Agent target repository identity is invalid."
               exit 2
@@ -146,6 +147,7 @@ jobs:
             echo "PR-Agent target context resolved locally."
             exit 0
           fi
+          : "${CONTINUUM_REF:?CONTINUUM_REF is required for pinned target resolution}"
           RUNTIME_ROOT="$RUNNER_TEMP/continuum-pr-agent-target-runtime"
           mkdir -p "$RUNTIME_ROOT/.github/scripts"
           fetch_runtime_file() {

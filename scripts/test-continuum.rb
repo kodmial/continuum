@@ -5555,4 +5555,95 @@ class ContinuumTest < Minitest::Test
     assert_includes body, 'for (const workflow of postMergeWakeups) {'
   end
 
+  # PR-Agent delegated-execution contract: the opaque `target_child_id`
+  # input is the only delegated selector, local runs resolve without
+  # CONTINUUM_REF, and every delegated read targets the resolved child.
+  def test_pr_agent_target_child_id_passthrough_and_local_resolution
+    %w[continuum-pr-agent.yml continuum-pr-agent-repair.yml continuum-pr-agent-auto-merge.yml].each do |base|
+      workflow = yaml(File.join(ROOT, '.github/workflows', base))
+      stub = yaml(File.join(ROOT, '.github/caller-stubs', base))
+      body = File.read(File.join(ROOT, '.github/workflows', base))
+
+      call_inputs = events(workflow).fetch('workflow_call').fetch('inputs')
+      assert call_inputs.key?('target_child_id'), "#{base}: workflow_call must declare target_child_id"
+      assert_equal '', call_inputs.fetch('target_child_id').fetch('default'), "#{base}: target_child_id must default empty (local)"
+      assert_equal false, call_inputs.fetch('target_child_id').fetch('required'), "#{base}: target_child_id must not gate the call"
+
+      dispatch_inputs = events(stub).fetch('workflow_dispatch').fetch('inputs')
+      assert dispatch_inputs.key?('target_child_id'), "#{base}: caller stub must expose target_child_id"
+      assert_equal '${{ inputs.target_child_id }}', stub.fetch('jobs').fetch('call').fetch('with').fetch('target_child_id'),
+                   "#{base}: caller stub must forward the opaque child id verbatim"
+      refute_includes body, 'target_repository:',
+                        "#{base}: concrete repository identity must never be an input"
+
+      assert_includes body, 'inputs.target_child_id',
+                        "#{base}: concurrency must scope delegated runs by the opaque id"
+      resolve = step_body(body, 'Resolve PR-Agent target context')
+      refute_nil resolve, "#{base}: target-context resolution step is missing"
+      local_guard = resolve.index('if [[ -z "${TARGET_CHILD_ID:-}" ]]; then')
+      ref_require = resolve.index('CONTINUUM_REF is required for pinned target resolution')
+      refute_nil local_guard, "#{base}: local fast path is missing"
+      refute_nil ref_require, "#{base}: delegated CONTINUUM_REF requirement is missing"
+      assert_operator local_guard, :<, ref_require,
+                      "#{base}: local runs must exit before CONTINUUM_REF is required"
+      assert_includes resolve, 'CONTINUUM_PR_AGENT_TARGET_REPOSITORY'
+      assert_includes resolve, 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED'
+      assert_includes resolve, 'PR-Agent target context resolved locally.'
+      assert_includes resolve, 'exit 0'
+    end
+  end
+
+  # Delegated PR-Agent repair/merge reads must fail closed without TAP_PAT
+  # and must operate on the resolved target, never the parent execution
+  # repository. The conditional token alone would silently fall back to
+  # github.token and surface as 404/permission errors.
+  def test_pr_agent_delegated_reads_fail_closed_and_use_target
+    repair = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent-repair.yml'))
+    convergence = step_body(repair, 'Check durable PR-Agent no-progress state')
+    target = step_body(repair, 'Resolve the writable PR source branch')
+    refute_nil convergence
+    refute_nil target
+    [convergence, target].each do |step|
+      assert_includes step, 'github.token'
+      assert_includes step, 'secrets.TAP_PAT'
+      assert_includes step, 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED'
+      assert_includes step, 'TAP_PAT: ${{ secrets.TAP_PAT }}',
+                        'delegated guard needs the PAT value to test emptiness'
+      assert_includes step, 'Delegated PR-Agent execution requires TAP_PAT',
+                        'delegated runs without PAT must fail closed, not fall back to github.token'
+      assert_includes step, 'refusing to fall back to github.token'
+    end
+    assert_includes convergence, 'github.rest.issues.listComments'
+    assert_includes convergence, 'CONTINUUM_PR_AGENT_TARGET_OWNER'
+    assert_includes target, 'repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/pulls/$PR_NUMBER'
+    assert_includes target, '"$HEAD_REPO" != "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY"'
+    refute_includes target, 'repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER',
+                    'PR resolution must read the target, never the parent execution repository'
+
+    [
+      'Mark PR-Agent repair in flight',
+      'Publish durable PR-Agent repair state',
+      'Publish failed PR-Agent repair state'
+    ].each do |name|
+      step = step_body(repair, name)
+      refute_nil step, "#{name} step is missing"
+      assert_includes step, 'CONTINUUM_PR_AGENT_TARGET_OWNER', "#{name}: commit status must target the child"
+      assert_includes step, 'createCommitStatus', "#{name}: commit status must be published"
+      assert_includes step, 'continuum/pr-agent-repair', "#{name}: repair status context must be preserved"
+    end
+
+    merge = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent-auto-merge.yml'))
+    reconcile = step_body(merge, 'Reconcile current PR state and merge only the exact reviewed HEAD')
+    refute_nil reconcile, 'auto-merge reconciliation step is missing'
+    assert_includes reconcile, 'process.env.CONTINUUM_PR_AGENT_TARGET_OWNER'
+    assert_includes reconcile, 'process.env.CONTINUUM_PR_AGENT_TARGET_REPOSITORY'
+    assert_includes reconcile, 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED'
+    assert_includes reconcile, 'pr.head.sha.toLowerCase() !== reviewedHead',
+                    'merge must refuse a moved HEAD'
+    assert_includes reconcile, 'sha: reviewedHead',
+                    'only the exact reviewed SHA may merge'
+    assert_includes merge, 'skipping bare retry to preserve the delegated target',
+                    'delegated wakeups must never retry bare against the parent'
+  end
+
   end
