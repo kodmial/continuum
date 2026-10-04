@@ -5521,7 +5521,19 @@ class ContinuumTest < Minitest::Test
                     'the merge SHA guard must remain'
     assert_includes body, 'merge_method:'
     assert_includes body, "'squash'"
-    assert_includes body, 'pr.mergeable === false'
+    # Issue #246 canonical dirty detection: every mergeability read is routed
+    # through isConflictedMergeability(pr.mergeable, pr.mergeable_state),
+    # which returns true for mergeable=false and mergeable_state=dirty (plus
+    # GraphQL CONFLICTING etc.) and null while GitHub recomputes. The pre-#246
+    # inline `pr.mergeable === false` literal covered only the REST boolean
+    # and is superseded by this strictly broader helper; assert the helper
+    # and its call sites instead so REST and GraphQL dirty shapes stay gated.
+    assert_includes body, 'function isConflictedMergeability('
+    assert_includes body, "if (state === 'dirty') return true;"
+    assert_includes body, "if (typeof mergeable === 'boolean') return !mergeable;"
+    assert_includes body, 'isConflictedMergeability('
+    assert_includes body, 'pr.mergeable,'
+    assert_includes body, 'pr.mergeable_state'
     assert_includes body, "hasLabel(pr, AUTO_MERGE_BLOCK_LABEL)"
     assert_includes body, 'for (const workflow of postMergeWakeups) {'
   end
