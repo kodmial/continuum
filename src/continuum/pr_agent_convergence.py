@@ -117,8 +117,8 @@ def transition_marker(
     if not ids or any(not re.fullmatch(_FP, fp) for fp in ids):
         raise ValueError("transition requires valid logical finding fingerprints")
     return (
-        f"<!-- continuum-pr-agent-convergence from={from_head.lower()} "
-        f"to={to_head.lower()} findings={','.join(ids)} -->"
+        f"<!-- continuum-pr-agent-convergence from={source} "
+        f"to={target} findings={','.join(ids)} -->"
     )
 
 
