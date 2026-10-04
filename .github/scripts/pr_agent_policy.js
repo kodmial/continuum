@@ -381,14 +381,21 @@ function hasToolErrorSignal(reviewPayload) {
 function coverageFlagValueIsIncomplete(key, value) {
   if (key === 'truncated' || key === 'partial' || key === 'incomplete') {
     if (value === true) return true;
+    if (typeof value === 'boolean') return false;
     if (typeof value === 'string' && ['1', 'true', 'yes'].includes(value.trim().toLowerCase())) {
       return true;
     }
+    if (typeof value === 'number' && value !== 0) return true;
     return false;
   }
   if (value === false) return true;
+  if (typeof value === 'boolean') return false;
   if (typeof value === 'string' && ['0', 'false', 'no'].includes(value.trim().toLowerCase())) {
     return true;
+  }
+  if (typeof value === 'number') {
+    if (value === 0) return true;
+    if (Number.isNaN(value)) return true; // fail closed
   }
   return false;
 }
@@ -398,17 +405,7 @@ function hasIncompleteCoverageSignal(reviewPayload) {
   for (const key of COVERAGE_FLAG_KEYS) {
     if (!(key in review)) continue;
     const value = review[key];
-    if (key === 'truncated' || key === 'partial' || key === 'incomplete') {
-      if (value === true) return true;
-      if (typeof value === 'string' && ['1', 'true', 'yes'].includes(value.trim().toLowerCase())) {
-        return true;
-      }
-      continue;
-    }
-    if (value === false) return true;
-    if (typeof value === 'string' && ['0', 'false', 'no'].includes(value.trim().toLowerCase())) {
-      return true;
-    }
+    if (coverageFlagValueIsIncomplete(key, value)) return true;
   }
   for (const key of COVERAGE_OBJECT_KEYS) {
     if (!(key in review)) continue;

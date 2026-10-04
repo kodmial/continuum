@@ -385,13 +385,24 @@ def _coverage_flag_value_is_incomplete(key: str, value: object) -> bool:
     if key in ("truncated", "partial", "incomplete"):
         if value is True:
             return True
+        if isinstance(value, bool):
+            return False
         if isinstance(value, str) and value.strip().lower() in ("1", "true", "yes"):
+            return True
+        if isinstance(value, (int, float)) and value != 0:
             return True
         return False
     if value is False:
         return True
+    if isinstance(value, bool):
+        return False
     if isinstance(value, str) and value.strip().lower() in ("0", "false", "no"):
         return True
+    if isinstance(value, (int, float)):
+        if value == 0:
+            return True
+        if isinstance(value, float) and value != value:  # NaN: fail closed
+            return True
     return False
 
 
@@ -403,15 +414,7 @@ def has_incomplete_coverage_signal(review: Mapping[str, Any]) -> bool:
         if key not in inner:
             continue
         value = inner.get(key)
-        if key in ("truncated", "partial", "incomplete"):
-            if value is True:
-                return True
-            if isinstance(value, str) and value.strip().lower() in ("1", "true", "yes"):
-                return True
-            continue
-        if value is False:
-            return True
-        if isinstance(value, str) and value.strip().lower() in ("0", "false", "no"):
+        if _coverage_flag_value_is_incomplete(key, value):
             return True
     for key in _COVERAGE_OBJECT_KEYS:
         if key not in inner:
