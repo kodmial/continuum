@@ -3064,6 +3064,44 @@ class ContinuumTest < Minitest::Test
     assert_includes scheduler, "': declared blocked by '"
   end
 
+  def test_scheduler_local_reads_use_repository_token_but_pat_keeps_privileged_paths
+    scheduler = workflow_body('continuum-issue-scheduler.yml')
+    workflow = yaml(File.join(ROOT, '.github/workflows/continuum-issue-scheduler.yml'))
+    stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-issue-scheduler.yml'))
+
+    expected_read_permissions = {
+      'actions' => 'read',
+      'contents' => 'read',
+      'issues' => 'read',
+      'pull-requests' => 'read',
+    }
+    assert_equal expected_read_permissions, workflow.fetch('permissions')
+    assert_equal expected_read_permissions, stub.fetch('permissions')
+
+    assert_includes scheduler, 'READ_GITHUB_TOKEN: ${{ github.token }}'
+    assert_includes scheduler, 'github-token: ${{ secrets.TAP_PAT }}'
+    assert_includes scheduler, 'const readGithub = new github.constructor({'
+    assert_includes scheduler, 'baseUrl: readBaseUrl'
+
+    %w[
+      readGithub.rest.repos.getBranch
+      readGithub.rest.issues.listForRepo
+      readGithub.rest.issues.listComments
+      readGithub.rest.pulls.list
+      readGithub.rest.pulls.get
+      readGithub.rest.actions.listWorkflowRunsForRepo
+    ].each { |call| assert_includes scheduler, call }
+
+    child = scheduler[/const \[childOwner, childRepo\] = parts;.*?await dispatchWorkflow\(childWorkerWorkflow/m]
+    refute_nil child
+    assert_includes child, 'const freshResponse = await github.rest.issues.get({'
+    assert_includes child, 'const childNativeBlockers = await github.paginate('
+
+    assert_includes scheduler, 'await github.rest.issues.createComment({'
+    assert_includes scheduler, 'await github.rest.issues.addLabels({'
+    assert_includes scheduler, 'await github.rest.issues.removeLabel({'
+    assert_includes scheduler, 'await github.request('
+  end
   # Child routing is repository-level. The installed caller and reusable
   # scheduler both fail safe when CONTINUUM_ROLE=child, while legacy marker
   # inputs stay accepted only for caller compatibility and have no routing role.
@@ -3168,7 +3206,7 @@ class ContinuumTest < Minitest::Test
     refute_nil dispatch, 'the just-in-time re-check block is gone'
 
     [
-      'const freshIssueResponse = await github.rest.issues.get({',
+      'const freshIssueResponse = await readGithub.rest.issues.get({',
       "freshIssue.state !== 'open'",
       '(pauseOnFailure && freshLabels.has(pausedLabel))',
       'freshLabels.has(inProgressLabel)',
@@ -3188,9 +3226,9 @@ class ContinuumTest < Minitest::Test
   def test_scheduler_releases_stale_leases_from_closed_issues
     scheduler = workflow_body('continuum-issue-scheduler.yml')
 
-    reconciliation = scheduler[/const closedLeasedIssues = await github\.paginate\(.*?\n\s*let issues = await github\.paginate/m]
+    reconciliation = scheduler[/const closedLeasedIssues = await readGithub\.paginate\(.*?\n\s*let issues = await readGithub\.paginate/m]
     refute_nil reconciliation, 'closed-issue lease reconciliation is missing from the shared scheduler'
-    assert_includes reconciliation, 'github.rest.issues.listForRepo'
+    assert_includes reconciliation, 'readGithub.rest.issues.listForRepo'
     assert_includes reconciliation, "state: 'closed'"
     assert_includes reconciliation, 'labels: inProgressLabel'
     assert_includes reconciliation, 'if (issue.pull_request) continue;'
@@ -3202,11 +3240,11 @@ class ContinuumTest < Minitest::Test
     # The admission is located by its own statement, not by the first
     # `state: 'open'` string in the file: helpers elsewhere in the script
     # legitimately reopen issues and would otherwise move that match.
-    admission_at = scheduler.index('let issues = await github.paginate(')
+    admission_at = scheduler.index('let issues = await readGithub.paginate(')
     refute_nil admission_at, 'the open-backlog admission is missing from the shared scheduler'
     assert_includes scheduler[admission_at, 400], "state: 'open'",
                     'the backlog admission must list open issues'
-    assert_operator scheduler.index('const closedLeasedIssues = await github.paginate'),
+    assert_operator scheduler.index('const closedLeasedIssues = await readGithub.paginate'),
                     :<,
                     admission_at
   end
@@ -3236,9 +3274,9 @@ class ContinuumTest < Minitest::Test
     # An active OpenCode run is authoritative too, or the lease would release
     # an issue GitHub is still implementing.
     assert_includes scheduler, 'for (let page = 1; page <= 3; page += 1) {'
-    assert_includes scheduler, 'github.rest.actions.listWorkflowRunsForRepo({'
+    assert_includes scheduler, 'readGithub.rest.actions.listWorkflowRunsForRepo({'
     assert_includes scheduler, 'if (data.workflow_runs.length < 100) break;'
-    refute_includes scheduler, "github.paginate(\n              github.rest.actions.listWorkflowRunsForRepo"
+    refute_includes scheduler, "readGithub.paginate(\n              readGithub.rest.actions.listWorkflowRunsForRepo"
     refute_includes scheduler, 'gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs?per_page=100"'
     refute_includes scheduler, 'gh api --paginate "repos/$child_repo/actions/runs?per_page=100"'
     assert_includes scheduler, "run.event !== 'issue_comment'"
