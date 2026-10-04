@@ -45,6 +45,7 @@ jobs:
     secrets: inherit
     with:
       continuum_ref: main
+      wip_limit: '4'
       opencode_workflow_name: 'OpenCode agent'
       opencode_workflow_path: '.github/workflows/opencode.yml'
 
@@ -82,3 +83,4 @@ jobs:
     secrets: inherit
     with:
       continuum_ref: main
+      opencode_workflow: 'opencode.yml'
