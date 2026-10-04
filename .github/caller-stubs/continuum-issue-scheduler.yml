@@ -121,15 +121,18 @@ permissions:
 
 jobs:
   call:
-    # A child keeps local scheduling disabled, but repository events must reach
+    # A child keeps local scheduling disabled, but issue events must reach
     # the reusable scheduler so it can wake the verified parent immediately.
-    # Child cron stays skipped: polling belongs to the parent and must not burn
-    # private child runner minutes. Unrelated issue comments remain cheap skips.
+    # Only issues and issue_comment are admitted for a child, matching the
+    # reusable wake-up job: child cron stays skipped so polling never burns
+    # private child runner minutes, and child push, pull_request_target,
+    # workflow_run, and workflow_dispatch stay cheap caller skips instead of
+    # empty reusable runs. Unrelated issue comments remain cheap skips.
     # A manual owner `/oc` is in-flight work the scheduler must reserve, and
     # trusted qualification result comments wake the scheduler immediately;
     # cron remains the missed-event backstop.
     if: >-
-      (vars.CONTINUUM_ROLE != 'child' || github.event_name != 'schedule') &&
+      (vars.CONTINUUM_ROLE != 'child' || github.event_name == 'issues' || github.event_name == 'issue_comment') &&
       (github.event_name != 'issue_comment' ||
        (github.actor == github.repository_owner &&
         (contains(github.event.comment.body, '/oc') ||

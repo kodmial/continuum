@@ -3464,7 +3464,9 @@ class ContinuumTest < Minitest::Test
 
     stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-issue-scheduler.yml'))
     caller_gate = stub.fetch('jobs').fetch('call').fetch('if')
-    assert_includes caller_gate, "vars.CONTINUUM_ROLE != 'child' || github.event_name != 'schedule'"
+    assert_includes caller_gate, "vars.CONTINUUM_ROLE != 'child' || github.event_name == 'issues'"
+    assert_includes caller_gate, "github.event_name == 'issue_comment'",
+                    'a child admits only issue events matching the reusable wake-up job; child push, pull_request_target, workflow_run, and workflow_dispatch stay cheap caller skips'
     assert_includes caller_gate, "github.event_name != 'issue_comment'"
     assert_includes caller_gate, 'github.actor == github.repository_owner',
                     'the parent wake gate must stay owner-only or any comment wakes a TAP_PAT dispatch'
@@ -3494,8 +3496,14 @@ class ContinuumTest < Minitest::Test
                     'relationship lookups must fetch the named variable directly instead of paginating the collection'
     refute_includes scheduler, 'actions/variables?per_page=100',
                     'paginated variable listings truncate past 100 entries and over-expose values'
-    assert_includes scheduler, 'grep -Fxq -- "$child_id"',
-                    'the child-id match must terminate option parsing before the attacker-influenced pattern'
+    assert_includes scheduler, '--child-id "$candidate_id"',
+                    'the expected child id must come from the verified parent allow-list, never from the child declaration itself'
+    assert_includes scheduler, '--parent-repository "$parent_identity"',
+                    'the expected parent must be the independently verified parent identity, never the child declaration itself'
+    refute_includes scheduler, '--child-id "$child_id"',
+                    'comparing the child declaration against itself proves no cross-party agreement'
+    refute_includes scheduler, 'CURRENT_REPO="$GITHUB_REPOSITORY"',
+                    'CONTINUUM_CHILDREN holds opaque id slugs, never owner/repo names, so no wake-up can require both at once'
     refute_includes scheduler, 'GITHUB_TOKEN: ${{ secrets.TAP_PAT }}',
                     'gh already uses GH_TOKEN; overriding GITHUB_TOKEN elevates every consumer to PAT privileges'
 

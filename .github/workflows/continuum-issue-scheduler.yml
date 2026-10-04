@@ -301,8 +301,11 @@ jobs:
             exit 4
           fi
 
-          # Validate the child declaration with the same authoritative parser
-          # used by parent-side delegated discovery. Values are never echoed.
+          # Fail fast on visibly malformed declarations without echoing
+          # values. Authoritative format validation and the bidirectional
+          # agreement proof both happen below, where the child declaration
+          # is matched against the verified parent allow-list with the same
+          # parser parent-side delegated discovery uses.
           if [[ "$parent" == *$'\n'* || "$child_id" == *$'\n'* || "$parent" == *$'\r'* || "$child_id" == *$'\r'* ]]; then
             echo "::error::Child relationship declaration is invalid; parent wake-up refused."
             exit 2
@@ -312,15 +315,6 @@ jobs:
           if [ ! -f "$runtime" ]; then
             echo "::error::Parent verification lookup is unavailable; parent wake-up refused."
             exit 4
-          fi
-          if ! python3 "$runtime" verify-child-variables \
-            --role "$child_role" \
-            --declared-id "$child_id" \
-            --declared-parent "$parent" \
-            --child-id "$child_id" \
-            --parent-repository "$parent" >/dev/null; then
-            echo "::error::Child relationship declaration is invalid; parent wake-up refused."
-            exit 2
           fi
 
           parent_owner="${parent%%/*}"
@@ -373,17 +367,52 @@ jobs:
             exit 4
           fi
           rm -f "$parent_ids_err"
-          if ! grep -Fxq -- "$child_id" "$parent_ids_file"; then
+          # Read the parent repository's canonical identity back from the API
+          # instead of reusing the child's spelling: exact agreement with this
+          # independently verified value is part of the bidirectional proof
+          # below. Casing follows the parent's canonical full_name, matching
+          # the exact-match semantics parent-side discovery already enforces.
+          if [ -z "${RUNNER_TEMP:-}" ]; then
+            echo "::error::Parent verification lookup is unavailable; parent wake-up refused."
             rm -f "$parent_ids_file"
-            echo "::error::Bidirectional parent/child verification failed; parent wake-up refused."
-            exit 2
+            exit 4
           fi
+          if ! parent_identity_err="$(mktemp -p "$RUNNER_TEMP" continuum-parent-identity-err.XXXXXX)"; then
+            echo "::error::Parent verification lookup is unavailable; parent wake-up refused."
+            rm -f "$parent_ids_file"
+            exit 4
+          fi
+          if ! parent_identity="$(gh api "repos/$parent" --jq '.full_name // ""' 2>"$parent_identity_err")" || \
+             [ -z "$parent_identity" ]; then
+            cat "$parent_identity_err" >&2 || true
+            rm -f "$parent_ids_file" "$parent_identity_err"
+            echo "::error::Parent verification lookup is unavailable; parent wake-up refused."
+            exit 4
+          fi
+          rm -f "$parent_identity_err"
+          printf '::add-mask::%s\n' "$parent_identity"
+          # Bidirectional agreement in one authoritative step. Each candidate
+          # id comes from the verified parent allow-list while the declared
+          # values come from the child, so equality here proves cross-party
+          # agreement instead of comparing the child declaration against
+          # itself. The allow-list holds opaque id slugs (never
+          # `owner/repo` names), so repository-name membership is never
+          # tested against it.
+          verified_child_id=""
+          while IFS= read -r candidate_id; do
+            [ -n "$candidate_id" ] || continue
+            if python3 "$runtime" verify-child-variables \
+              --role "$child_role" \
+              --declared-id "$child_id" \
+              --declared-parent "$parent" \
+              --child-id "$candidate_id" \
+              --parent-repository "$parent_identity" >/dev/null 2>&1; then
+              verified_child_id="$candidate_id"
+              break
+            fi
+          done < "$parent_ids_file"
           rm -f "$parent_ids_file"
-          # Exact repository allow-list membership. A substring test would let
-          # `owner/child` match `owner/child2`, so parse CONTINUUM_CHILDREN as
-          # JSON and require exact equality instead. Malformed JSON stays a
-          # verification failure and refuses the wake-up.
-          if ! CHILDREN_JSON="$parent_children" CURRENT_REPO="$GITHUB_REPOSITORY" python3 -c $'import json, os, sys\nraw = os.environ.get("CHILDREN_JSON", "")\nrepo = os.environ.get("CURRENT_REPO", "")\ntry:\n    data = json.loads(raw) if raw else []\nexcept Exception:\n    sys.exit(1)\nrepos = set()\nitems = data if isinstance(data, list) else []\nfor x in items:\n    if isinstance(x, str):\n        repos.add(x)\n    elif isinstance(x, dict):\n        for k in ("repo", "repository", "name"):\n            v = x.get(k, "")\n            if v:\n                repos.add(v)\nsys.exit(0 if repo and repo in repos else 1)'; then
+          if [ -z "$verified_child_id" ]; then
             echo "::error::Bidirectional parent/child verification failed; parent wake-up refused."
             exit 2
           fi
