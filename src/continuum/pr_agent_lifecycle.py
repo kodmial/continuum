@@ -65,6 +65,19 @@ REVIEW_MERGE_SAFE = "safe_to_merge"
 REVIEW_MERGE_CAUTION = "merge_with_caution"
 REVIEW_MERGE_CHANGES = "changes_required"
 
+# Severity ranking for conflicting split-envelope merge recommendations.
+# Higher wins so the merged view never understates severity: an unknown
+# non-empty recommendation fails closed as most restrictive.
+_MERGE_RECOMMENDATION_SEVERITY = {
+    REVIEW_MERGE_SAFE: 0,
+    REVIEW_MERGE_CAUTION: 1,
+    REVIEW_MERGE_CHANGES: 2,
+}
+
+
+def _merge_recommendation_severity(text: object) -> int:
+    return _MERGE_RECOMMENDATION_SEVERITY.get(str(text or "").strip(), 3)
+
 STATE_ACTIVE = "ACTIVE"
 STATE_RESOLVED = "RESOLVED"
 
@@ -148,6 +161,34 @@ def is_same_head(expected_sha: str, actual_sha: str) -> bool:
     return expected_sha.strip().lower() == actual_sha.strip().lower()
 
 
+def _is_plausible_head_sha(value: object) -> bool:
+    """Whether a HEAD value looks like a commit SHA, not a placeholder.
+
+    Production HEADs are 40/64 lowercase hex; abbreviated SHAs are at
+    least 7 hex characters. Identical placeholders such as "unknown"
+    contain non-hex characters and must never satisfy the exact-HEAD
+    skip check, and trivially short hex fragments (e.g. "a", "123",
+    "abc") from a bug or mocked HEAD must not authorize a skip either,
+    so require at least short-SHA length instead of mere non-emptiness.
+    Git additionally reserves the all-zero object id ("0000000...") for
+    "no object": matching zero placeholders on both sides must never
+    pass the exact-HEAD check even though both sides are hex of
+    plausible length. Production always compares full HEADs from the
+    GitHub API, so abbreviated prefixes never occur there; the length
+    floor screens mocked fragments while genuine abbreviations stay
+    valid for the parity suite.
+    """
+
+    text = str(value or "").strip().lower()
+    if not text:
+        return False
+    if re.fullmatch(r"[0-9a-f]{7,64}", text) is None:
+        return False
+    if set(text) == {"0"}:
+        return False
+    return True
+
+
 def admission_allowed(
     *,
     pr_state: str,
@@ -190,7 +231,9 @@ def parse_review_json(payload: object) -> Dict[str, Any]:
             raise LifecycleError(f"PR-Agent review JSON is invalid: {exc}") from None
     if not isinstance(payload, dict):
         raise LifecycleError("PR-Agent review JSON must be an object")
-    review = payload.get("review", payload)
+    # Merge split envelopes fail-closed so outer and nested findings are
+    # both preserved (see _unwrap_review).
+    review = _unwrap_review(payload)
     if not isinstance(review, dict):
         raise LifecycleError("PR-Agent review JSON has no review object")
     if "key_issues_to_review" not in review:
@@ -235,6 +278,779 @@ def is_potentially_truncated(review: Mapping[str, Any], cap: int = NUM_MAX_FINDI
     """
 
     return len(current_key_issues(review)) == cap
+
+
+# Explicit security-concern fields that block the automatic-improve skip.
+# The upstream merge recommendation already aggregates security posture, but
+# an explicit non-empty concern list must never be skipped over: a clean
+# skip requires both `safe_to_merge` and no listed security concern.
+BLOCKING_SECURITY_SIGNAL_KEYS = (
+    "security_concerns",
+    "security_issues",
+    "security_vulnerabilities",
+    "critical_security_issues",
+)
+
+# Upstream clean reviews commonly report security fields as negation prose
+# ("No", "None", "N/A", "No security concerns found"). Such prose must not
+# block the clean-PR fast path; anything else fails closed and blocks.
+_CLEAN_SECURITY_TEXTS = frozenset(
+    {
+        "no",
+        "none",
+        "n/a",
+        "na",
+        "nil",
+        "null",
+        "nope",
+        "0",
+        "false",
+        "ok",
+        "clear",
+        "clean",
+        "pass",
+        "passed",
+        "not applicable",
+        "none found",
+        "no findings",
+        "no finding",
+        "no issues",
+        "no issue",
+        "no errors",
+        "no error",
+        "no tool errors",
+        "no tool error",
+        "no concerns",
+        "no concern",
+        "no risks",
+        "no risk",
+        "no vulnerabilities",
+        "no vulnerability",
+        "no problems",
+        "no problem",
+        "no threats",
+        "no threat",
+        "no security concerns",
+        "no security issues",
+        "no security vulnerabilities",
+        "no critical issues",
+        "no critical security issues",
+    }
+)
+
+_CLEAN_SECURITY_SUFFIXES = (" found", " detected", " identified", " observed")
+
+
+def _is_clean_security_text(value: str) -> bool:
+    """Whether a security-field string is negation/empty prose, not a concern."""
+
+    norm = re.sub(r"[^a-z0-9/ ]+", " ", value.strip().lower())
+    norm = re.sub(r"\s+", " ", norm).strip()
+    if not norm:
+        return True
+    if norm in _CLEAN_SECURITY_TEXTS:
+        return True
+    for suffix in _CLEAN_SECURITY_SUFFIXES:
+        if norm.endswith(suffix) and norm[: -len(suffix)].strip() in _CLEAN_SECURITY_TEXTS:
+            return True
+    return False
+
+
+def _security_value_is_blocking(value: object) -> bool:
+    """Whether a security-field value carries a real concern (fail closed)."""
+
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return not _is_clean_security_text(value)
+    if isinstance(value, Mapping):
+        if len(value) == 0:
+            return False
+        return any(_security_value_is_blocking(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        if len(value) == 0:
+            return False
+        return any(_security_value_is_blocking(item) for item in value)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return bool(value)
+
+
+# Review-payload keys that carry an explicit tool-error signal when
+# `config.propagate_tool_errors` surfaces a failed tool. Any non-clean
+# entry on a tool-specific key fails closed; absent keys mean no signal.
+# Generic `errors`/`error` routinely carry ordinary review content
+# (e.g. "2 lint errors noted in diff") rather than a failed tool, so they
+# force automatic improve only when they carry explicit tool-failure prose
+# (see _is_generic_tool_failure_text), never on ordinary counts/summaries.
+_TOOL_ERROR_SIGNAL_KEYS = (
+    "tool_errors",
+    "tool_error",
+    "tool_failures",
+    "failed_tools",
+)
+
+# Generic review-payload keys that only signal a tool error when their
+# content explicitly describes a tool failure (e.g.
+# "upstream tool failed"). Ordinary code-error summaries
+# (e.g. "2 lint errors noted in diff") must still skip when otherwise clean.
+_GENERIC_TOOL_ERROR_KEYS = (
+    "errors",
+    "error",
+)
+
+# Tool words and failure words marking explicit tool-failure prose inside a
+# generic `errors`/`error` value. Both groups are matched as whole words
+# (case-insensitive) against the raw text; negation/empty prose is already
+# excluded by _security_value_is_blocking before this check runs. A generic
+# summary counts as a tool failure only when it names the failing
+# infrastructure (`tool`/`tools`, or an infrastructure noun such as `api`,
+# `model`, `llm`, `provider`, `server`, or `upstream` for reports like
+# "API timeout contacting model" that never use the literal word `tool`)
+# AND reports a failure (`failed`, `failure`, `timeout`, `timed out`,
+# `traceback`, `exception`, `unavailable`, `error`/`errors`). Requiring the
+# conjunction keeps ordinary code summaries such as `errors: 2 checks failed
+# in diff` or `errors: missing timeout handling` (failure word without an
+# infrastructure mention) clean, while still catching explicit prose such as
+# "upstream tool failed" or "API timeout contacting model". Whole-word
+# matching additionally keeps substrings such as "tooling" or "exceptional"
+# clean.
+_GENERIC_TOOL_WORDS = (
+    "tool",
+    "tools",
+    "api",
+    "model",
+    "llm",
+    "provider",
+    "server",
+    "upstream",
+)
+
+_GENERIC_TOOL_FAILURE_WORDS = (
+    "failed",
+    "failure",
+    "timeout",
+    "timed out",
+    "traceback",
+    "exception",
+    "unavailable",
+    "error",
+    "errors",
+)
+
+_GENERIC_TOOL_WORD_PATTERNS = tuple(
+    re.compile(r"\b" + re.escape(marker) + r"\b") for marker in _GENERIC_TOOL_WORDS
+)
+
+_GENERIC_TOOL_FAILURE_PATTERNS = tuple(
+    re.compile(r"\b" + re.escape(marker) + r"\b") for marker in _GENERIC_TOOL_FAILURE_WORDS
+)
+
+# Review-payload keys that carry an explicit coverage signal. Explicit
+# coverage keys (`review_coverage_complete`, `coverage_complete`,
+# `coverage_completed`, `truncated`, `partial`, `incomplete`) fail closed
+# on unparseable values. Generic keys (`is_complete`, `is_completed`,
+# `complete`) routinely carry ordinary prose (e.g.
+# `"complete": "completed review summary"`), so only explicit false-like
+# values on those keys count as incomplete; unparseable strings and other
+# shapes are ignored. Absent coverage keys carry no incomplete signal (see
+# has_incomplete_coverage_signal): a clean payload without coverage footers
+# still reaches the skip path when the caller explicitly passes
+# review_coverage_complete=True (an omitted flag still fails closed via
+# should_skip_improve); the findings-cap truncation check still
+# applies separately below.
+_COVERAGE_FLAG_KEYS = (
+    "review_coverage_complete",
+    "coverage_complete",
+    "coverage_completed",
+    "is_complete",
+    "is_completed",
+    "complete",
+    "truncated",
+    "partial",
+    "incomplete",
+)
+
+# Generic coverage keys that must not fail closed on prose: only explicit
+# false-like values signal incomplete coverage.
+_GENERIC_COVERAGE_KEYS = (
+    "is_complete",
+    "is_completed",
+    "complete",
+)
+
+_COVERAGE_OBJECT_KEYS = (
+    "coverage",
+    "review_coverage",
+    "chunk_coverage",
+    "review_coverage_footer",
+    "coverage_footer",
+)
+
+
+def _is_generic_tool_failure_text(value: object) -> bool:
+    """Whether a generic `errors`/`error` value reports a tool failure.
+
+    Negation/empty prose is clean (no signal). Any other value must name
+    the failing infrastructure AND report a failure (whole-word
+    conjunction): ordinary code-error summaries such as
+    "2 checks failed in diff" or "missing timeout handling" (failure word
+    without an infrastructure mention) and "tooling notes in diff"
+    (substring, not a tool word) stay clean, while infrastructure reports
+    such as "API timeout contacting model" fail closed.
+    """
+
+    if isinstance(value, Mapping):
+        return any(_is_generic_tool_failure_text(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        if len(value) == 0:
+            return False
+        return any(_is_generic_tool_failure_text(item) for item in value)
+    if not isinstance(value, str):
+        # Explicit non-string error evidence (e.g. `errors: True` or
+        # `errors: 1`) must force improve instead of authorizing a clean
+        # skip: fail closed via the blocking check. Clean values
+        # (False, 0, None) stay clean.
+        return _security_value_is_blocking(value)
+    if not _security_value_is_blocking(value):
+        return False
+    lowered = value.strip().lower()
+    has_tool = any(pattern.search(lowered) is not None for pattern in _GENERIC_TOOL_WORD_PATTERNS)
+    if not has_tool:
+        return False
+    return any(pattern.search(lowered) is not None for pattern in _GENERIC_TOOL_FAILURE_PATTERNS)
+
+
+def has_tool_error_signal(review: Mapping[str, Any]) -> bool:
+    """Whether the review payload itself reports a tool error (fail closed)."""
+
+    inner = _unwrap_review(review)
+    for key in _TOOL_ERROR_SIGNAL_KEYS:
+        if key not in inner:
+            continue
+        if _security_value_is_blocking(inner.get(key)):
+            return True
+    for key in _GENERIC_TOOL_ERROR_KEYS:
+        if key not in inner:
+            continue
+        if _is_generic_tool_failure_text(inner.get(key)):
+            return True
+    return False
+
+
+def _coverage_flag_value_is_incomplete(key: str, value: object) -> bool:
+    """Whether one coverage flag entry reports incomplete coverage (fail closed)."""
+
+    if key in ("truncated", "partial", "incomplete"):
+        if value is True:
+            return True
+        if isinstance(value, bool):
+            return False
+        if value is None:
+            return True
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if not lowered:
+                # An explicit truncation key with an empty value is not
+                # evidence of complete coverage: fail closed like
+                # null/undefined so `{"truncated": ""}` never authorizes
+                # an improve skip.
+                return True
+            if lowered in ("1", "true", "yes"):
+                return True
+            if lowered in ("0", "false", "no"):
+                return False
+            try:
+                numeric = float(lowered)
+            except (TypeError, ValueError):
+                return True
+            if numeric != numeric:  # NaN: fail closed
+                return True
+            if numeric in (float("inf"), float("-inf")):
+                return True
+            return numeric != 0
+        if isinstance(value, (int, float)):
+            if isinstance(value, float) and value != value:  # NaN: fail closed
+                return True
+            if isinstance(value, float) and value in (
+                float("inf"),
+                float("-inf"),
+            ):
+                return True
+            return value != 0
+        return True
+    if key in _GENERIC_COVERAGE_KEYS:
+        # Generic keys carry ordinary prose as often as coverage state, so
+        # only explicit false-like values block the clean fast path.
+        # Unparseable strings and other shapes are ignored (no signal).
+        if isinstance(value, bool):
+            return value is False
+        if value is None:
+            return False
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if not lowered:
+                return False
+            if lowered in ("0", "false", "no"):
+                return True
+            if lowered in ("1", "true", "yes"):
+                return False
+            try:
+                numeric = float(lowered)
+            except (TypeError, ValueError):
+                return False
+            if numeric != numeric:  # NaN: ignore for generic keys
+                return False
+            if numeric in (float("inf"), float("-inf")):
+                return False
+            return numeric == 0
+        if isinstance(value, (int, float)):
+            if isinstance(value, float) and value != value:
+                return False
+            if isinstance(value, float) and value in (float("inf"), float("-inf")):
+                return False
+            return value == 0
+        return False
+    if isinstance(value, bool):
+        return value is False
+    if value is None:
+        return True
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if not lowered:
+            # An explicit coverage key with an empty value is not evidence
+            # of complete coverage: fail closed like None.
+            return True
+        if lowered in ("0", "false", "no"):
+            return True
+        if lowered in ("1", "true", "yes"):
+            return False
+        try:
+            numeric = float(lowered)
+        except (TypeError, ValueError):
+            return True
+        if numeric != numeric:  # NaN: fail closed
+            return True
+        if numeric in (float("inf"), float("-inf")):
+            return True
+        return numeric == 0
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and value != value:  # NaN: fail closed
+            return True
+        if isinstance(value, float) and value in (float("inf"), float("-inf")):
+            return True
+        return value == 0
+    return True
+
+
+def has_incomplete_coverage_signal(review: Mapping[str, Any]) -> bool:
+    """Whether the review payload itself reports incomplete coverage.
+
+    Absent coverage keys carry no incomplete signal: a clean payload
+    without coverage footers (e.g. upstream safe_to_merge reviews that
+    omit `coverage`/`coverage_complete`) still reaches the skip path when
+    the caller explicitly passes `review_coverage_complete=True` (an
+    omitted flag still fails closed via should_skip_improve). Unknown or
+    unparseable present coverage shapes still fail closed.
+    """
+
+    inner = _unwrap_review(review)
+    seen_coverage = False
+    for key in _COVERAGE_FLAG_KEYS:
+        if key not in inner:
+            continue
+        seen_coverage = True
+        value = inner.get(key)
+        if _coverage_flag_value_is_incomplete(key, value):
+            return True
+    for key in _COVERAGE_OBJECT_KEYS:
+        if key not in inner:
+            continue
+        seen_coverage = True
+        value = inner.get(key)
+        if isinstance(value, Mapping):
+            has_reviewed_key = "reviewed" in value or "reviewed_chunks" in value
+            has_total_key = "total" in value or "total_chunks" in value
+            reviewed = value.get("reviewed", value.get("reviewed_chunks"))
+            total = value.get("total", value.get("total_chunks"))
+            try:
+                reviewed_num: float | None = (
+                    float(reviewed) if reviewed is not None else None
+                )
+            except (TypeError, ValueError):
+                reviewed_num = None
+            try:
+                total_num: float | None = float(total) if total is not None else None
+            except (TypeError, ValueError):
+                total_num = None
+            has_count_signal = has_reviewed_key or has_total_key
+            has_flag_signal = any(flag_key in value for flag_key in _COVERAGE_FLAG_KEYS)
+            if has_count_signal:
+                # Fail closed on unparseable counts: a present-but-unrecognized
+                # count never reads as complete coverage.
+                if reviewed_num is None or total_num is None:
+                    return True
+                if (
+                    reviewed_num != reviewed_num
+                    or total_num != total_num
+                    or reviewed_num in (float("inf"), float("-inf"))
+                    or total_num in (float("inf"), float("-inf"))
+                ):
+                    return True
+                if total_num <= 0 or reviewed_num < total_num:
+                    return True
+            # Flags are independent of counts: a full count never masks an
+            # explicit incomplete flag (fail closed).
+            for flag_key in _COVERAGE_FLAG_KEYS:
+                if flag_key in value and _coverage_flag_value_is_incomplete(
+                    flag_key, value.get(flag_key)
+                ):
+                    return True
+            # A coverage object with no recognized counts or flags (e.g. {}
+            # or only unknown fields) is not evidence of complete coverage:
+            # fail closed so unknown coverage never permits an improve skip.
+            if not has_count_signal and not has_flag_signal:
+                return True
+            continue
+        if isinstance(value, str):
+            # A coverage-object key expects a mapping with counts/flags;
+            # any string value is an unrecognized shape: fail closed so
+            # unknown coverage never permits an improve skip.
+            return True
+        # Any other non-mapping value (bool, number, None, list, ...) is
+        # an unrecognized coverage shape: fail closed.
+        return True
+    if not seen_coverage:
+        # Absent coverage keys carry no incomplete signal: a clean payload
+        # without coverage footers must still reach the skip path (the
+        # findings-cap truncation check still applies separately). An
+        # omitted caller flag still fails closed via
+        # review_coverage_complete.
+        return False
+    return False
+
+
+def _coverage_single_value_is_incomplete(key: str, value: object) -> bool:
+    """Whether one coverage key/value pair alone reports incomplete coverage."""
+
+    if key in _COVERAGE_FLAG_KEYS:
+        return _coverage_flag_value_is_incomplete(key, value)
+    if key in _COVERAGE_OBJECT_KEYS:
+        if isinstance(value, Mapping):
+            has_reviewed_key = "reviewed" in value or "reviewed_chunks" in value
+            has_total_key = "total" in value or "total_chunks" in value
+            reviewed = value.get("reviewed", value.get("reviewed_chunks"))
+            total = value.get("total", value.get("total_chunks"))
+            try:
+                reviewed_num = float(reviewed) if reviewed is not None else None
+            except (TypeError, ValueError):
+                reviewed_num = None
+            try:
+                total_num = float(total) if total is not None else None
+            except (TypeError, ValueError):
+                total_num = None
+            has_count_signal = has_reviewed_key or has_total_key
+            has_flag_signal = any(flag_key in value for flag_key in _COVERAGE_FLAG_KEYS)
+            if has_count_signal:
+                if reviewed_num is None or total_num is None:
+                    return True
+                if (
+                    reviewed_num != reviewed_num
+                    or total_num != total_num
+                    or reviewed_num in (float("inf"), float("-inf"))
+                    or total_num in (float("inf"), float("-inf"))
+                ):
+                    return True
+                if total_num <= 0 or reviewed_num < total_num:
+                    return True
+            for flag_key in _COVERAGE_FLAG_KEYS:
+                if flag_key in value and _coverage_flag_value_is_incomplete(
+                    flag_key, value.get(flag_key)
+                ):
+                    return True
+            if not has_count_signal and not has_flag_signal:
+                return True
+            return False
+        if isinstance(value, str):
+            # A coverage-object key expects a mapping with counts/flags;
+            # any string value is an unrecognized shape: fail closed.
+            return True
+        # Any other non-mapping value (bool, number, None, list, ...) is
+        # an unrecognized coverage shape: fail closed.
+        return True
+    return False
+
+
+def _unwrap_review(review: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Accept the canonical review payload in either envelope shape.
+
+    The GitHub Action output may be the flat PRReview object or
+    `{"review": <PRReview>}`; both are canonical machine sources.
+    Split envelopes carry signals on both sides, so both sides are
+    merged fail-closed: returning only the outer object would discard
+    nested findings (breaking the clean fast path) or miss nested
+    blocking security (failing open).
+    """
+
+    if not isinstance(review, Mapping):
+        raise LifecycleError("PR-Agent review JSON must be an object")
+    inner = review.get("review", None)
+    if not isinstance(inner, dict):
+        return review
+    outer_has_signal = (
+        "key_issues_to_review" in review
+        or "merge_recommendation" in review
+        or any(key in review for key in BLOCKING_SECURITY_SIGNAL_KEYS)
+        or any(key in review for key in _TOOL_ERROR_SIGNAL_KEYS)
+        or any(key in review for key in _GENERIC_TOOL_ERROR_KEYS)
+        or any(key in review for key in _COVERAGE_FLAG_KEYS)
+        or any(key in review for key in _COVERAGE_OBJECT_KEYS)
+    )
+    if not outer_has_signal:
+        return inner
+    merged: Dict[str, Any] = {
+        key: value for key, value in inner.items() if key != "review"
+    }
+    for key, value in review.items():
+        if key == "review":
+            continue
+        if key not in merged:
+            merged[key] = value
+            continue
+        current = merged[key]
+        if key == "key_issues_to_review":
+            current_is_list = isinstance(current, list)
+            outer_is_list = isinstance(value, list)
+            if current_is_list and outer_is_list:
+                merged[key] = [*value, *current]
+            elif not current_is_list:
+                # Keep the non-list so callers fail closed on invalid
+                # shape instead of silently reading the clean side.
+                pass
+            else:
+                # Outer is non-list while nested is a list: surface the
+                # invalid shape so validation throws (fail closed).
+                merged[key] = value
+            continue
+        if key == "merge_recommendation":
+            current_text = str(current or "").strip()
+            outer_text = str(value or "").strip()
+            if not current_text:
+                merged[key] = value
+            elif not outer_text:
+                pass
+            elif current_text != outer_text:
+                # Most restrictive wins so split envelopes never understate
+                # severity: changes_required > merge_with_caution >
+                # safe_to_merge, with unknown non-empty prose failing closed
+                # as most restrictive.
+                if _merge_recommendation_severity(outer_text) > _merge_recommendation_severity(
+                    current_text
+                ):
+                    merged[key] = value
+            continue
+        if key in BLOCKING_SECURITY_SIGNAL_KEYS or key in _TOOL_ERROR_SIGNAL_KEYS:
+            # Either side blocking must block the merged view.
+            if not _security_value_is_blocking(current) and _security_value_is_blocking(value):
+                merged[key] = value
+            continue
+        if key in _GENERIC_TOOL_ERROR_KEYS:
+            # Either side reporting an explicit generic tool failure must
+            # block the merged view; ordinary summaries stay clean.
+            if not _is_generic_tool_failure_text(current) and _is_generic_tool_failure_text(value):
+                merged[key] = value
+            continue
+        if key in _COVERAGE_FLAG_KEYS or key in _COVERAGE_OBJECT_KEYS:
+            # Either side incomplete must read as incomplete.
+            current_incomplete = _coverage_single_value_is_incomplete(key, current)
+            outer_incomplete = _coverage_single_value_is_incomplete(key, value)
+            if outer_incomplete and not current_incomplete:
+                merged[key] = value
+            elif not current_incomplete and not outer_incomplete:
+                if isinstance(current, Mapping) and isinstance(value, Mapping):
+                    combined = {**current, **value}
+                    merged[key] = combined
+                else:
+                    merged[key] = value
+            # Else keep the incomplete current value (fail closed).
+            continue
+        merged[key] = value
+    return merged
+
+
+def has_blocking_security_signal(review: Mapping[str, Any]) -> bool:
+    """Whether the review lists an explicit blocking security concern.
+
+    Negation/empty prose ("No", "None", "N/A",
+    "No security concerns found") is normalized to clean and does not
+    block; any other non-empty signal fails closed and blocks.
+    """
+
+    inner = _unwrap_review(review)
+    for key in BLOCKING_SECURITY_SIGNAL_KEYS:
+        value = inner.get(key, None)
+        if value is None:
+            continue
+        if _security_value_is_blocking(value):
+            return True
+    return False
+
+
+def should_skip_improve(
+    review: Mapping[str, Any],
+    persistent_state: object,
+    *,
+    head_matches: bool,
+    tool_error: bool = False,
+    review_coverage_complete: bool = False,
+    reviewed_head_sha: object = None,
+) -> Dict[str, Any]:
+    """Decide whether the automatic `improve` pass can be skipped.
+
+    `review` remains the authoritative merge gate. A skip is allowed only
+    when the review is provably clean for the exact HEAD: no tool error
+    (caller flag or an explicit tool-error signal in the review payload),
+    complete review coverage (explicit caller `review_coverage_complete=True`
+    and no incomplete-coverage signal in the review payload; the flag
+    defaults to False so an omitted flag never skips), matching HEAD, `safe_to_merge`, zero
+    current key issues (a batch at the findings cap is never clean), no
+    explicit blocking security signal, and native persistent state that
+    is a complete full review for the exact reviewed HEAD with no ACTIVE
+    finding.
+
+    `reviewed_head_sha` is mandatory for any `skip=True`: it is compared
+    against `persistent_state.last_run.head_sha` and a missing value returns
+    `skip=False` (fail closed, never raises) so a stale persistent state
+    from a prior HEAD can never authorize a skip and the orchestrator still
+    runs `improve` for repair value instead of crashing (parity with the JS
+    `isCleanReviewForImproveSkip` contract). Callers must pass the exact
+    reviewed HEAD. A missing `last_run.head_sha` (or an unrecognized HEAD
+    shape such as a placeholder) likewise returns `skip=False`; only a
+    plausible hex HEAD that exactly matches the reviewed HEAD can allow a
+    skip.
+
+    Anything else returns `skip=False` so `improve` may still run to
+    generate additional repair suggestions. An invalid review payload
+    (unparseable envelope, missing/non-list `key_issues_to_review`, or
+    missing `merge_recommendation`) returns `skip=False` so `improve`
+    still runs for repair value, as does a missing reviewed HEAD. A benign
+    persistent format variation (non-object state, non-list findings,
+    missing `last_run`, non-full run, missing or placeholder `head_sha`)
+    with a known HEAD returns `skip=False` so `improve` still runs.
+    """
+
+    try:
+        inner = _unwrap_review(review)
+    except LifecycleError:
+        # An upstream review-shape variation must safely run improve for
+        # repair value instead of crashing the orchestrator: fail closed
+        # to skip=False, never to an exception.
+        return {"skip": False, "reason": "invalid review payload: failing closed"}
+    if tool_error or has_tool_error_signal(inner):
+        return {"skip": False, "reason": "tool error: failing closed"}
+    if head_matches is not True:
+        return {"skip": False, "reason": "stale head: result is not for the current HEAD"}
+    if "key_issues_to_review" not in inner or not isinstance(
+        inner.get("key_issues_to_review"), list
+    ):
+        return {
+            "skip": False,
+            "reason": "review has no key_issues_to_review list: failing closed",
+        }
+    try:
+        recommendation = merge_recommendation(inner)
+    except LifecycleError:
+        return {
+            "skip": False,
+            "reason": "review has no merge_recommendation: failing closed",
+        }
+    # The exact reviewed HEAD is mandatory for any skip decision: validate
+    # it before interpreting coverage/persistent format variations so a
+    # missing HEAD fails closed to skip=False (never to an exception,
+    # mirroring the JS contract) while benign variations with a known HEAD
+    # likewise safely run improve (skip=False).
+    expected_head = str(reviewed_head_sha or "").strip()
+    if not expected_head:
+        return {
+            "skip": False,
+            "reason": "cannot decide improve skip without the exact reviewed HEAD: failing closed",
+        }
+    if (review_coverage_complete is not True) or has_incomplete_coverage_signal(inner):
+        return {"skip": False, "reason": "incomplete review coverage: failing closed"}
+    if recommendation != REVIEW_MERGE_SAFE:
+        return {"skip": False, "reason": f"merge recommendation blocks: {recommendation}"}
+    issues = current_key_issues(inner)
+    if issues:
+        if is_potentially_truncated(inner):
+            return {
+                "skip": False,
+                "reason": "review batch reached the findings cap: potentially truncated",
+            }
+        return {"skip": False, "reason": f"{len(issues)} current key issue(s) remain"}
+    if has_blocking_security_signal(inner):
+        return {"skip": False, "reason": "blocking security signal remains"}
+    if not isinstance(persistent_state, dict):
+        return {"skip": False, "reason": "persistent state is not an object: failing closed"}
+    raw_findings = persistent_state.get("findings")
+    if not isinstance(raw_findings, list):
+        # A benign upstream format variation must still run improve for
+        # repair value instead of crashing the orchestrator: fail closed
+        # to skip=False, never to an exception.
+        return {"skip": False, "reason": "persistent state findings is not a list: failing closed"}
+    last_run = persistent_state.get("last_run")
+    if not isinstance(last_run, dict):
+        return {"skip": False, "reason": "persistent state has no last_run: failing closed"}
+    if last_run.get("complete") is not True or str(last_run.get("kind") or "") != "full":
+        return {"skip": False, "reason": "persistent state is not from a complete full review: failing closed"}
+    state_head = str(last_run.get("head_sha") or last_run.get("headSha") or "").strip()
+    if not state_head:
+        # Benign schema variation (e.g. an upstream field omission): run
+        # improve for repair value instead of crashing the orchestrator.
+        return {"skip": False, "reason": "persistent state has no last_run.head_sha: failing closed"}
+    if not _is_plausible_head_sha(state_head) or not _is_plausible_head_sha(expected_head):
+        # Identical placeholders (e.g. "unknown" on both sides) must never
+        # pass the exact-HEAD check: only a real commit SHA shape can allow
+        # a skip. Fail closed to improve, never to an exception.
+        return {"skip": False, "reason": "unrecognized HEAD shape: failing closed"}
+    if not is_same_head(state_head, expected_head):
+        return {"skip": False, "reason": "stale persistent state: not for the reviewed HEAD"}
+    try:
+        has_active = upstream_state_has_active(persistent_state)
+    except Exception:
+        return {"skip": False, "reason": "persistent state has an unrecognized finding state: failing closed"}
+    if has_active:
+        return {"skip": False, "reason": "native persistent state has an ACTIVE finding"}
+    return {
+        "skip": True,
+        "reason": (
+            "clean exact HEAD: safe_to_merge with zero findings and complete "
+            "state; automatic improve skipped"
+        ),
+    }
+
+
+def is_improve_skipped_clean(improve_skipped_success: object) -> bool:
+    """Whether the automatic-improve skip counts as clean coverage.
+
+    Repair/merge gating must derive ``GateInputs.improve_skipped_clean``
+    through this helper from the ``improve_skipped`` step outcome instead
+    of relying on the ``False`` default: a skipped-clean HEAD carries an
+    empty improve payload, so ``improve_coverage_complete`` stays
+    ``False`` and only this flag lets :func:`evaluate_gate` green it.
+    Accepts the workflow step outcome in boolean form, as
+    ``'true'``/``'success'`` strings (case-insensitive, trimmed), or as
+    the ``${{ steps.improve_skipped.outcome == 'success' }}`` mapping
+    (``'true'``). GitHub step outcomes are ``'success'``/``'failure'``/
+    ``'skipped'``/``'cancelled'``, so the raw ``'success'`` outcome of the
+    ``improve_skipped`` marker step counts as clean; any other outcome
+    (including ``'skipped'`` when the marker step never ran) is not clean.
+    """
+
+    if isinstance(improve_skipped_success, bool):
+        return improve_skipped_success
+    return str(improve_skipped_success or "").strip().lower() in ("true", "success")
 
 
 def parse_improve_push_outputs(text: object) -> List[Dict[str, Any]]:
@@ -541,6 +1357,7 @@ class GateInputs:
     review_coverage_complete: bool
     improve_coverage_complete: bool
     tool_error: bool = False
+    improve_skipped_clean: bool = False
 
 
 def evaluate_gate(decision: GateInputs) -> Dict[str, Any]:
@@ -551,14 +1368,44 @@ def evaluate_gate(decision: GateInputs) -> Dict[str, Any]:
     HEAD, safe_to_merge, empty current key issues, no qualifying improve
     suggestions, no ACTIVE finding in native persistent state, and no
     potentially truncated batch. Anything else blocks with a reason.
+
+    A clean HEAD whose automatic improve was skipped carries an empty
+    improve payload with ``improve_coverage_complete=False``: callers must
+    set ``improve_skipped_clean`` via :func:`is_improve_skipped_clean`
+    from the ``improve_skipped`` step outcome, otherwise the gate fails
+    closed on incomplete improve coverage and negates the skip's latency
+    win.     A skipped HEAD with remaining qualifying suggestions never
+    greens. The skip waives improve coverage, never review cleanliness:
+    when ``improve_skipped_clean`` is set the gate re-validates the
+    review payload's own tool-error, coverage, and security signals
+    fail-closed, so a stale or miswired skip flag for a dirty review
+    still blocks.
     """
 
     if decision.tool_error:
         return {"green": False, "reason": "tool error: failing closed"}
     if not decision.review_coverage_complete:
         return {"green": False, "reason": "incomplete review coverage: failing closed"}
-    if not decision.improve_coverage_complete:
+    if not decision.improve_coverage_complete and not decision.improve_skipped_clean:
         return {"green": False, "reason": "incomplete improve coverage: failing closed"}
+    if decision.improve_skipped_clean and decision.qualifying_improve:
+        return {
+            "green": False,
+            "reason": "improve was skipped but qualifying suggestions remain",
+        }
+    if decision.improve_skipped_clean:
+        try:
+            skipped_tool_error = has_tool_error_signal(decision.review)
+            skipped_coverage_gap = has_incomplete_coverage_signal(decision.review)
+            skipped_security = has_blocking_security_signal(decision.review)
+        except LifecycleError as exc:
+            return {"green": False, "reason": f"invalid review JSON: {exc}"}
+        if skipped_tool_error:
+            return {"green": False, "reason": "tool error: failing closed"}
+        if skipped_coverage_gap:
+            return {"green": False, "reason": "incomplete review coverage: failing closed"}
+        if skipped_security:
+            return {"green": False, "reason": "blocking security signal remains"}
     if not decision.ci_green_on_exact_head:
         return {"green": False, "reason": "current-head CI is not green"}
     if not decision.head_matches:
@@ -962,6 +1809,12 @@ __all__ = [
     "current_key_issues",
     "merge_recommendation",
     "is_potentially_truncated",
+    "BLOCKING_SECURITY_SIGNAL_KEYS",
+    "has_blocking_security_signal",
+    "has_tool_error_signal",
+    "has_incomplete_coverage_signal",
+    "should_skip_improve",
+    "is_improve_skipped_clean",
     "parse_improve_push_outputs",
     "qualifying_suggestions",
     "build_repair_batch",
