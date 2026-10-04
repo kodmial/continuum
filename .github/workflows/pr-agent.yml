@@ -16,6 +16,7 @@ on:
         description: Opaque verified child id for delegated PR-Agent execution
         required: false
         type: string
+        type: string
       expected_head_sha:
         description: Exact PR HEAD the retry is allowed to review
         required: false
@@ -61,6 +62,9 @@ jobs:
     with:
       continuum_ref: main
       pr_number: "${{ inputs.pr_number }}"
+      # Consumed by the reusable workflow's Resolve PR-Agent target context
+      # step (TARGET_CHILD_ID): the opaque id selects the delegated child
+      # target runner-local; empty targets the caller repository.
       target_child_id: "${{ inputs.target_child_id }}"
       expected_head_sha: "${{ inputs.expected_head_sha }}"
       retry_attempt: "${{ inputs.retry_attempt }}"

@@ -179,7 +179,7 @@ jobs:
           fetch_runtime_file ".github/scripts/delegation_repository.sh" "$RUNTIME_ROOT/.github/scripts/delegation_repository.sh"
           fetch_runtime_file ".github/scripts/delegation_runtime.py" "$RUNTIME_ROOT/.github/scripts/delegation_runtime.py"
           PARENT_CONFIG_FILE="$RUNTIME_ROOT/parent.continuum.yml"
-          if ! gh api --method GET "repos/$GITHUB_REPOSITORY/contents/.continuum.yml" --jq .content 2>/dev/null \
+          if ! gh api --method GET "repos/$GITHUB_REPOSITORY/contents/.continuum.yml" -f ref="$CONTINUUM_REF" --jq .content 2>/dev/null \
             | tr -d '\n' | continuum_b64_decode > "$PARENT_CONFIG_FILE" 2>/dev/null || [[ ! -s "$PARENT_CONFIG_FILE" ]]; then
             echo "::error::Unable to load the parent Continuum configuration for delegated target resolution; refusing to guess."
             exit 1
@@ -1000,23 +1000,32 @@ jobs:
                   );
                 } catch (dispatchErr) {
                   const dispatchMessage = String(dispatchErr.message || dispatchErr);
-                  if (dispatchParams.inputs && /unknown inputs?|invalid inputs?|unexpected inputs?|unrecognized inputs?/i.test(dispatchMessage)) {
+                  const dispatchStatus = Number(dispatchErr.status || 0);
+                  const isInputRejection =
+                    dispatchStatus === 422 || /input/i.test(dispatchMessage);
+                  if (dispatchParams.inputs && isInputRejection) {
                     // A delegated wakeup must never retry bare: a bare
                     // dispatch would wake the execution repository instead of
-                    // the delegated child target. Skip and stay visible.
-                    core.warning(
+                    // the delegated child target. Fail closed so the missing
+                    // post-merge chain is visible instead of a silent success.
+                    throw new Error(
                       'PR #' + prNumber +
                       ': wakeup ' + workflow + ' does not accept target_child_id inputs; ' +
-                      'skipping bare retry to preserve the delegated target: ' +
+                      'refusing bare retry to preserve the delegated target: ' +
                       dispatchMessage
                     );
-                    continue;
                   } else {
                     throw dispatchErr;
                   }
                 }
                 core.notice('Woke ' + workflow + ' at ' + postMergeWakeupRef + '.');
               } catch (err) {
+                if (targetChildId) {
+                  // Delegated post-merge work must not be silently skipped:
+                  // rethrow so the merge run fails closed instead of
+                  // reporting success without the child post-merge chain.
+                  throw err;
+                }
                 core.warning(
                   'PR #' + prNumber +
                   ': could not wake ' + workflow + ': ' + err.message

@@ -121,7 +121,7 @@ jobs:
           fetch_runtime_file ".github/scripts/delegation_repository.sh" "$RUNTIME_ROOT/.github/scripts/delegation_repository.sh"
           fetch_runtime_file ".github/scripts/delegation_runtime.py" "$RUNTIME_ROOT/.github/scripts/delegation_runtime.py"
           PARENT_CONFIG_FILE="$RUNTIME_ROOT/parent.continuum.yml"
-          if ! gh api --method GET "repos/$GITHUB_REPOSITORY/contents/.continuum.yml" --jq .content 2>/dev/null \
+          if ! gh api --method GET "repos/$GITHUB_REPOSITORY/contents/.continuum.yml" -f ref="$CONTINUUM_REF" --jq .content 2>/dev/null \
             | tr -d '\n' | continuum_b64_decode > "$PARENT_CONFIG_FILE" 2>/dev/null || [[ ! -s "$PARENT_CONFIG_FILE" ]]; then
             echo "::error::Unable to load the parent Continuum configuration for delegated target resolution; refusing to guess."
             exit 1
@@ -774,7 +774,13 @@ jobs:
                   });
                 } catch (dispatchErr) {
                   const dispatchMessage = String(dispatchErr.message || dispatchErr);
-                  if (recoveryChildId && /unknown inputs?|invalid inputs?|unexpected inputs?|unrecognized inputs?/i.test(dispatchMessage)) {
+                  const dispatchStatus = Number(dispatchErr.status || 0);
+                  // Any input rejection (HTTP 422 or any input-mentioning
+                  // error, regardless of GitHub's exact wording) on a
+                  // delegated dispatch means the review workflow lacks the
+                  // target_child_id input: refuse the bare retry explicitly
+                  // instead of surfacing a raw API error.
+                  if (recoveryChildId && (dispatchStatus === 422 || /input/i.test(dispatchMessage))) {
                     throw new Error(
                       'Delegated recovery requires reviewWorkflow ' + reviewWorkflow +
                       ' to declare a target_child_id workflow_dispatch input; ' +

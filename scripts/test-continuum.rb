@@ -1773,9 +1773,20 @@ class ContinuumTest < Minitest::Test
     # 1. Admission: pulls.get plus exact-HEAD CI evidence against the
     # resolved target. Local same-repository reads use github.token;
     # delegated cross-repository reads require TAP_PAT via the conditional.
+    # Presence-only checks would pass a step that reads cross-repo with an
+    # unconditional github.token while mentioning TAP_PAT elsewhere, so each
+    # step must carry the conditional token expression and the fail-closed
+    # guard, and must never set an unconditional github.token credential.
+    conditional_token = "CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || github.token"
     assert_includes admit, 'github.token'
     assert_includes admit, 'secrets.TAP_PAT'
     assert_includes admit, 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED'
+    assert_includes admit, conditional_token,
+                    'admission must select TAP_PAT for delegated reads instead of an unconditional github.token'
+    assert_includes admit, 'refusing to fall back to github.token',
+                    'admission must fail closed for delegated reads without TAP_PAT'
+    refute_includes admit, 'github-token: ${{ github.token }}',
+                    'admission must not set an unconditional github.token credential'
     assert_includes admit, 'github.rest.pulls.get'
     assert_includes admit, 'github.rest.actions.listWorkflowRunsForRepo'
     assert_includes admit, 'CONTINUUM_PR_AGENT_TARGET_OWNER'
@@ -1786,6 +1797,12 @@ class ContinuumTest < Minitest::Test
     assert_includes before, 'github.token'
     assert_includes before, 'secrets.TAP_PAT'
     assert_includes before, 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED'
+    assert_includes before, conditional_token,
+                    'pre-review revalidation must select TAP_PAT for delegated reads instead of an unconditional github.token'
+    assert_includes before, 'refusing to fall back to github.token',
+                    'pre-review revalidation must fail closed for delegated reads without TAP_PAT'
+    refute_includes before, 'GH_TOKEN: ${{ github.token }}',
+                    'pre-review revalidation must not set an unconditional github.token credential'
     assert_includes before, 'gh pr view'
     assert_includes before, 'actions/runs?event=pull_request&head_sha='
     assert_includes before, 'CONTINUUM_PR_AGENT_TARGET_REPOSITORY'
@@ -1795,6 +1812,12 @@ class ContinuumTest < Minitest::Test
     assert_includes after, 'github.token'
     assert_includes after, 'secrets.TAP_PAT'
     assert_includes after, 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED'
+    assert_includes after, conditional_token,
+                    'post-review revalidation must select TAP_PAT for delegated reads instead of an unconditional github.token'
+    assert_includes after, 'refusing to fall back to github.token',
+                    'post-review revalidation must fail closed for delegated reads without TAP_PAT'
+    refute_includes after, 'github-token: ${{ github.token }}',
+                    'post-review revalidation must not set an unconditional github.token credential'
     assert_includes after, 'github.rest.pulls.get'
     assert_includes after, 'CONTINUUM_PR_AGENT_TARGET_OWNER'
 
@@ -1803,6 +1826,12 @@ class ContinuumTest < Minitest::Test
     assert_includes moved, 'github.token'
     assert_includes moved, 'secrets.TAP_PAT'
     assert_includes moved, 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED'
+    assert_includes moved, conditional_token,
+                    'moved-head check must select TAP_PAT for delegated reads instead of an unconditional github.token'
+    assert_includes moved, 'refusing to fall back to github.token',
+                    'moved-head check must fail closed for delegated reads without TAP_PAT'
+    refute_includes moved, 'GH_TOKEN: ${{ github.token }}',
+                    'moved-head check must not set an unconditional github.token credential'
     assert_includes moved, 'gh pr view'
     assert_includes moved, 'CONTINUUM_PR_AGENT_TARGET_REPOSITORY'
 
@@ -5694,7 +5723,39 @@ class ContinuumTest < Minitest::Test
       assert_includes resolve, 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED'
       assert_includes resolve, 'PR-Agent target context resolved locally.'
       assert_includes resolve, 'exit 0'
+      assert_includes resolve, 'contents/.continuum.yml" -f ref="$CONTINUUM_REF"',
+                        "#{base}: parent config must resolve from the pinned revision, not the moving default branch"
     end
+  end
+
+  # The pr-agent.yml retry entry forwards `target_child_id` to the reusable
+  # review workflow, which must declare it and resolve the delegated target
+  # from it: otherwise delegated runs would plumb the opaque id nowhere and
+  # review against the parent repository.
+  def test_pr_agent_retry_caller_target_child_id_reaches_reusable_resolver
+    caller = yaml(File.join(ROOT, '.github/workflows/pr-agent.yml'))
+    caller_body = File.read(File.join(ROOT, '.github/workflows/pr-agent.yml'))
+    reusable = yaml(File.join(ROOT, '.github/workflows/continuum-pr-agent.yml'))
+    reusable_body = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent.yml'))
+
+    dispatch_inputs = events(caller).fetch('workflow_dispatch').fetch('inputs')
+    assert dispatch_inputs.key?('target_child_id'), 'pr-agent.yml must expose target_child_id'
+    assert_equal 'string', dispatch_inputs.fetch('target_child_id').fetch('type'),
+                 'pr-agent.yml target_child_id must stay a string input'
+    assert_equal false, dispatch_inputs.fetch('target_child_id').fetch('required'),
+                 'pr-agent.yml target_child_id must not gate dispatch'
+    assert_equal '${{ inputs.target_child_id }}',
+                 caller.fetch('jobs').fetch('call').fetch('with').fetch('target_child_id'),
+                 'pr-agent.yml must forward the opaque child id verbatim'
+
+    call_inputs = events(reusable).fetch('workflow_call').fetch('inputs')
+    assert call_inputs.key?('target_child_id'), 'continuum-pr-agent.yml must declare target_child_id'
+    resolve = step_body(reusable_body, 'Resolve PR-Agent target context')
+    refute_nil resolve, 'the reusable target-context resolution step is missing'
+    assert_includes resolve, 'TARGET_CHILD_ID: ${{ inputs.target_child_id }}',
+                    'the reusable resolver must consume the forwarded opaque child id'
+    assert_includes caller_body, 'Resolve PR-Agent target context',
+                    'the forwarding comment must name the consuming resolver step'
   end
 
   # Delegated PR-Agent repair/merge reads must fail closed without TAP_PAT
@@ -5775,8 +5836,12 @@ class ContinuumTest < Minitest::Test
                     'merge must refuse a moved HEAD'
     assert_includes reconcile, 'sha: reviewedHead',
                     'only the exact reviewed SHA may merge'
-    assert_includes merge, 'skipping bare retry to preserve the delegated target',
-                    'delegated wakeups must never retry bare against the parent'
+    assert_includes merge, 'refusing bare retry to preserve the delegated target',
+                    'delegated wakeups must fail closed instead of skipping the child post-merge chain'
+    assert_includes merge, 'if (targetChildId)',
+                    'delegated wakeup failures must propagate instead of warning-and-continuing'
+    refute_includes merge, 'skipping bare retry to preserve the delegated target',
+                    'a delegated wakeup must never silently skip the child post-merge chain'
   end
 
   # PR-Agent recovery delegated-execution contract: the opaque
@@ -5831,6 +5896,8 @@ class ContinuumTest < Minitest::Test
     assert_includes resolve, 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED'
     assert_includes resolve, 'PR-Agent target context resolved locally.'
     assert_includes resolve, 'exit 0'
+    assert_includes resolve, 'contents/.continuum.yml" -f ref="$CONTINUUM_REF"',
+                      "#{base}: parent config must resolve from the pinned revision, not the moving default branch"
 
     reconcile = step_body(body, 'Reconcile PR-Agent latest state')
     refute_nil reconcile, "#{base}: reconciliation step is missing"
@@ -5862,6 +5929,10 @@ class ContinuumTest < Minitest::Test
                       "#{base}: local runs must dispatch bare so custom review workflows stay compatible"
     assert_includes reconcile, 'recoveryInputs.target_child_id = recoveryChildId',
                       "#{base}: delegated runs must preserve the opaque child selection"
+    assert_includes reconcile, 'dispatchStatus === 422',
+                      "#{base}: any 422 on a delegated dispatch must raise the explicit delegated-target refusal, not a raw API error"
+    assert_includes reconcile, 'refusing bare retry to preserve the delegated target',
+                      "#{base}: a review workflow without the target_child_id input must fail closed explicitly"
   end
 
   end
