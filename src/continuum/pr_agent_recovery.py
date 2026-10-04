@@ -73,15 +73,13 @@ _EXHAUSTED_RE = re.compile(
     r"kind=(review|repair)\s+"
     r"attempts=(\d+)\s*-->"
 )
-# Pre-existing short-SHA exhausted markers (7-39 hex): never authorize a
-# retry attempt, but a prefix-matching exhausted marker preserves exhaustion
-# fail-closed so the budget never restarts.
-_LEGACY_SHORT_EXHAUSTED_RE = re.compile(
-    r"<!--\s*continuum-pr-agent-retry-exhausted\s+"
-    r"head=([0-9a-fA-F]{7,39})\s+"
-    r"kind=(review|repair)\s+"
-    r"attempts=(\d+)\s*-->"
-)
+# Short-SHA markers (7-39 hex) predate exact-HEAD safety and are ignored
+# entirely: no short marker -- retry or exhausted -- ever authorizes an
+# attempt or preserves exhaustion. Two distinct commits can share a 7-char
+# prefix, so prefix matching would let old-HEAD evidence strand an
+# unrelated healthy HEAD with no expiry path. Exact-HEAD isolation
+# requires full-commit identity only; there is deliberately no short-SHA
+# regex feeding any evidence.
 _LIFECYCLE_EXHAUSTED_RE = re.compile(
     r"<!--\s*continuum-lifecycle-retry-exhausted\s+"
     r"head=([0-9a-fA-F]{40,64})\s+"
@@ -248,7 +246,11 @@ def retry_evidence(
 
     Association rather than login is used so a PAT owned by an organization
     member/collaborator remains usable, while arbitrary external commenters
-    cannot forge retry/exhaustion state.
+    cannot forge retry/exhaustion state. Like :func:`operation_key`, the
+    ``head_sha`` must be a full commit id: batch callers must isolate
+    per-PR failures (catch per PR and continue, or pre-check with
+    :func:`is_full_head`) so one short/truncated SHA never aborts a
+    repository-global open-PR scan.
     """
 
     head = str(head_sha or "").strip().lower()
@@ -320,7 +322,7 @@ def retry_evidence(
                 continue
             if int(attempts_text) >= budget:
                 exhausted = True
-        # Legacy short-SHA markers are ignored: two distinct commits can
+        # Short-SHA markers are ignored entirely: two distinct commits can
         # share a 7-char prefix, so prefix matching would let old-HEAD
         # evidence strand an unrelated healthy HEAD with no expiry path.
         # Exact-HEAD isolation requires full-commit identity only.
@@ -410,7 +412,11 @@ def decide_recovery(
     with the token. When None, only the explicit reconciler-synthesized
     ``recovery eligible`` token from a trusted commit-status context
     authorizes a retry; a bare ``transient`` substring never suffices, and
-    a deterministic policy hint alongside the token still holds.
+    a deterministic policy hint alongside the token still holds. Callers
+    that previously relied on the token alone must pass
+    ``operation_context`` (the reconciler-synthesized commit-status
+    context) or an explicit ``failure_transient`` verdict; a token-bearing
+    description without either holds.
     """
 
     state = str(operation_state or "").strip().lower() or None
@@ -460,9 +466,10 @@ def decide_recovery(
         # Fail closed on unknown marker age, mirroring the reconciler: a
         # durable marker without a parseable timestamp cannot prove grace
         # expired, so it stays inside grace instead of dispatching a
-        # likely duplicate. The scheduled safety net keeps waking (caller
-        # stub cron), and newer status activity clears marker_newer, so
-        # this wait always has an expiry path.
+        # likely duplicate. This wait is gated on marker_newer_than_status,
+        # so it cannot strand a PR forever: the scheduled safety net keeps
+        # waking (caller stub cron), and once status activity catches up
+        # the marker is no longer newer and reconciliation proceeds.
         return RecoveryDecision(
             "wait", None, "newer retry dispatch marker is still inside dispatch grace"
         )

@@ -25,19 +25,17 @@ token-policy semantics without changing any provider-specific review policy:
 - same-repository read-only discovery uses the run-scoped ``GITHUB_TOKEN``;
   PAT/TAP_PAT is reserved for mutations/dispatches.
 
-Required caller wiring (shipped alongside the pure decisions below, so a
-stranded PR has an automatic rediscovery/redispatch path): every reconciler
-built on this contract combines the pure decisions with
+Required caller wiring (every reconciler built on the pure decisions
+below must combine them with the following, so a stranded PR has an
+automatic rediscovery/redispatch path):
 
-- event triggers plus a scheduled watchdog (the ``continuum-*.yml``
-  caller stubs provide ``pull_request_target``/``workflow_run`` events
-  and a cron schedule, so every pass rediscovers already-stranded PRs;
-  implemented for PR-Agent review/repair by
-  ``.github/workflows/continuum-pr-agent-recovery.yml`` and
-  ``.github/caller-stubs/continuum-pr-agent-recovery.yml``);
+- event triggers plus a scheduled watchdog (for PR-Agent review/repair
+  provided by ``.github/workflows/continuum-pr-agent-recovery.yml`` and
+  ``.github/caller-stubs/continuum-pr-agent-recovery.yml``; every other
+  operation kind provides its own equivalent triggers);
 - a repository-global ``concurrency`` group (``cancel-in-progress:false``,
   so a queued run re-reconciles from latest state instead of racing)
-  plus the per-PR/HEAD in-memory lease (:func:`concurrency_key`,
+  plus the per-PR/HEAD lease key (:func:`concurrency_key`,
   :func:`should_coalesce`) so unrelated PRs never queue behind or
   starve each other;
 - durable dispatch/exhaustion marker writes (:func:`retry_marker`,
@@ -45,6 +43,14 @@ built on this contract combines the pure decisions with
   dispatch replays the same bounded attempt instead of duplicating;
 - an exact-HEAD/CI/active-run latest-state re-read immediately before
   every mutation, so a stale queued run becomes a safe no-op.
+
+Cross-run at-most-one is enforced only by that combination of durable
+guards (the per-PR/HEAD lease key, the dispatch-grace window, and the
+pre-mutation latest-state re-read). The in-memory helpers
+(:func:`dedupe_wakeups`, :func:`should_coalesce`) coalesce duplicate
+wakeups within a single run only: two overlapping runs that both read
+before either marker is visible serialize on the lease, and the loser
+becomes a safe no-op after its pre-mutation re-read.
 """
 
 from __future__ import annotations
@@ -172,24 +178,13 @@ def _has_transient_signature(message: str) -> bool:
     return False
 
 
-# Pre-existing short-SHA exhausted markers (7-39 hex) from before exact-HEAD
-# safety: they can never authorize a retry attempt (no prefix matching for
-# budget), but an exhausted marker that prefix-matches the current HEAD must
-# preserve exhaustion instead of restarting the budget. Fail-closed: holding
-# on a prefix collision is safe; restarting the budget to dispatch extra
-# executions is not.
-_LEGACY_SHORT_EXHAUSTED_RE = re.compile(
-    r"<!--\s*continuum-pr-agent-retry-exhausted\s+"
-    r"head=([0-9a-fA-F]{7,39})\s+"
-    r"kind=(review|repair)\s+"
-    r"attempts=(\d+)\s*-->"
-)
-_LEGACY_SHORT_RETRY_RE = re.compile(
-    r"<!--\s*continuum-pr-agent-retry\s+"
-    r"head=([0-9a-fA-F]{7,39})\s+"
-    r"kind=(review|repair)\s+"
-    r"attempt=(\d+)\s*-->"
-)
+# Short-SHA markers (7-39 hex) predate exact-HEAD safety and are ignored
+# entirely: no short marker -- retry or exhausted -- ever authorizes an
+# attempt or preserves exhaustion. Two distinct commits can share a 7-char
+# prefix, so prefix matching would let old-HEAD evidence authorize a new
+# HEAD (restarting a bounded budget) or strand an unrelated healthy HEAD
+# with no expiry path. Exact-HEAD isolation requires full-commit identity
+# only; there is deliberately no short-SHA regex feeding any evidence.
 
 _TRANSIENT_ERROR_PATTERNS = (
     "timeout",
@@ -771,10 +766,11 @@ def retry_evidence(
                 if _same_head(marker_head, head) and marker_kind.lower() == normalized_kind:
                     if int(attempts_text) >= budget:
                         exhausted = True
-            # Legacy short-SHA markers are ignored: two distinct commits can
-            # share a 7-char prefix, so prefix matching would let old-HEAD
-            # evidence strand an unrelated healthy HEAD with no expiry path.
-            # Exact-HEAD isolation requires full-commit identity only.
+            # Short-SHA markers are ignored entirely: two distinct commits
+            # can share a 7-char prefix, so prefix matching would let
+            # old-HEAD evidence strand an unrelated healthy HEAD with no
+            # expiry path. Exact-HEAD isolation requires full-commit
+            # identity only.
 
     return RetryEvidence(
         latest_attempt=latest_attempt,
@@ -841,7 +837,8 @@ def decide_recovery(
 
     The ``recovery eligible`` token is honored only for reconciler-
     synthesized descriptions from trusted commit-status contexts
-    (``TRUSTED_OPERATION_CONTEXTS``). When ``operation_context`` is
+    (``TRUSTED_OPERATION_CONTEXTS``, which covers one context per
+    operation kind). When ``operation_context`` is
     missing or untrusted, the token is ignored and the failure holds,
     so PR-visible check output or review text containing the token can
     never burn transient budget. Only an explicit
@@ -1113,6 +1110,11 @@ TRUSTED_OPERATION_CONTEXTS = frozenset(
     {
         "continuum/pr-agent-review",
         "continuum/pr-agent-repair",
+        "continuum/review-ready",
+        "continuum/automerge",
+        "continuum/main-sync",
+        "continuum/merge",
+        "continuum/ci-repair",
     }
 )
 
