@@ -300,7 +300,12 @@ class RecoveryWiringTests(unittest.TestCase):
         self.assertIn("let readTokenUnavailable = false", body)
         self.assertIn("async function withReadFallback(fn)", body)
         self.assertIn("err.status ?? err.response?.status", body)
-        self.assertIn("status === 401 || status === 403 || status === 429", body)
+        # Rate-limit retries must never burn TAP_PAT's shared budget: only
+        # authentication/permission gaps fall back; 429 and rate-limited 403
+        # surface so the caller defers to the next wakeup.
+        self.assertIn("isRateLimitError", body)
+        self.assertIn("status === 401", body)
+        self.assertIn("!isRateLimitError(err, status)", body)
         self.assertIn("if (readTokenUnavailable || readGithub === github)", body)
 
         for read_call in (

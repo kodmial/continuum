@@ -115,6 +115,16 @@ jobs:
               core.warning('READ_GITHUB_TOKEN is empty; using PAT client for PR-Agent recovery reads.');
             }
             let readTokenUnavailable = false;
+            function isRateLimitError(err, status) {
+              if (status === 429) return true;
+              if (status !== 403) return false;
+              const headers = (err && ((err.response && err.response.headers) || err.headers)) || {};
+              const remaining = headers['x-ratelimit-remaining'] ?? headers['X-RateLimit-Remaining'];
+              if (String(remaining) === '0') return true;
+              return /rate limit|rate-limit|ratelimit|quota exhaustion|secondary rate limit|retry after/i.test(
+                String((err && err.message) || '')
+              );
+            }
             async function withReadFallback(fn) {
               if (readTokenUnavailable || readGithub === github) {
                 return await fn(github);
@@ -123,7 +133,12 @@ jobs:
                 return await fn(readGithub);
               } catch (err) {
                 const status = err ? (err.status ?? err.response?.status) : undefined;
-                if (status === 401 || status === 403 || status === 429) {
+                // Never spend TAP_PAT's shared budget on rate-limit retries:
+                // a 429 or a rate-limited 403 must surface so the caller
+                // defers to the next wakeup instead of re-issuing the scan
+                // on the PAT client. Only authentication/permission gaps
+                // (401, non-rate-limit 403) fall back.
+                if (status === 401 || (status === 403 && !isRateLimitError(err, status))) {
                   readTokenUnavailable = true;
                   core.warning('Repository-token read failed (' + status + '); retrying with PAT client: ' + err.message);
                   return await fn(github);
@@ -157,10 +172,13 @@ jobs:
               return Number.isFinite(parsed) ? Math.max(0, nowMs() - parsed) : Number.MAX_SAFE_INTEGER;
             }
 
-            function retryMarker(head, kind, attempt) {
+            function retryMarker(head, kind, attempt, notBefore) {
+              const suffix = Number.isFinite(Number(notBefore)) && Number(notBefore) > 0
+                ? ' not-before=' + Number(notBefore)
+                : '';
               return '<!-- continuum-pr-agent-retry head=' +
                 String(head).toLowerCase() + ' kind=' + kind +
-                ' attempt=' + String(attempt) + ' -->';
+                ' attempt=' + String(attempt) + suffix + ' -->';
             }
 
             function exhaustedMarker(head, kind) {
@@ -247,7 +265,7 @@ jobs:
             function parseEvidence(comments, head, kind) {
               const exactHead = String(head).toLowerCase();
               const retryRe =
-                /<!--\s*continuum-pr-agent-retry\s+head=([0-9a-f]{7,64})\s+kind=(review|repair)\s+attempt=(\d+)\s*-->/ig;
+                /<!--\s*continuum-pr-agent-retry\s+head=([0-9a-f]{7,64})\s+kind=(review|repair)\s+attempt=(\d+)[^>]*-->/ig;
               const exhaustedRe =
                 /<!--\s*continuum-pr-agent-retry-exhausted\s+head=([0-9a-f]{7,64})\s+kind=(review|repair)\s+attempts=(\d+)\s*-->/ig;
               let latestAttempt = null;
@@ -413,7 +431,7 @@ jobs:
                 if (/rate limit|rate-limit|ratelimit|quota exhaustion|secondary rate limit/i.test(message)) return true;
                 return false;
               }
-              return /timeout|timed out|econnreset|econnrefused|eai_again|epipe|socket hang up|network|dns|tls|ssl|connection reset|connection refused|temporarily unavailable|service unavailable|bad gateway|gateway timeout|bootstrap|evicted|cancelled/i.test(
+              return /timeout|timed out|econnreset|econnrefused|eai_again|epipe|socket hang up|network error|network failure|network timeout|network unreachable|dns error|dns failure|dns resolution|tls handshake|tls error|ssl error|connection reset|connection refused|connection aborted|temporarily unavailable|service unavailable|bad gateway|gateway timeout|bootstrap failed|bootstrap error|runner evicted|runner cancelled|runner timeout|runner lost|evicted|cancelled/i.test(
                 String((err && err.message) || '')
               );
             }
@@ -570,7 +588,7 @@ jobs:
                 const notBefore = Math.floor(nowMs() / 1000) + remaining;
                 await upsertControllerState(
                   pr.number,
-                  retryMarker(head, kind, attempt) + ' not-before=' + notBefore,
+                  retryMarker(head, kind, attempt, notBefore),
                   'Deferred PR-Agent ' + kind + ' recovery for exact HEAD ' + head +
                     ' until ' + new Date(notBefore * 1000).toISOString() +
                     ' (reset-aware backoff ' + remaining + 's).'

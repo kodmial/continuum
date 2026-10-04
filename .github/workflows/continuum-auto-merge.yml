@@ -62,10 +62,15 @@ permissions: {}
 concurrency:
   # Every trigger (CI dispatch, CodeRabbit, push, manual, or cron) enters the
   # same pure latest-state reconciler. It revalidates every gate immediately
-  # before each write. Runs are never cancelled: a per-PR/HEAD lease inside
-  # the reconciler owns each PR/HEAD transition, so a queued run simply
-  # coalesces with the in-flight one. Repository-global cancellation would
-  # let a busy PR starve unrelated PRs via repeated cancel/requeue livelock.
+  # before each write. Runs are never cancelled: the repository-global group
+  # below serializes runs so at most one reconciler executes at a time and a
+  # queued run re-reconciles from latest state when it starts. The in-memory
+  # per-PR/HEAD lease inside the reconciler only coalesces duplicate wakeups
+  # within a single run; cross-run safety comes from that serialization plus
+  # the exact-HEAD re-read and the atomic `sha:` guard on the merge call, so
+  # a stale queued run becomes a safe no-op instead of a concurrent writer.
+  # Repository-global cancellation would let a busy PR starve unrelated PRs
+  # via repeated cancel/requeue livelock.
   group: ${{ github.workflow }}-auto-merge
   cancel-in-progress: false
 
@@ -121,6 +126,16 @@ jobs:
               core.warning('READ_GITHUB_TOKEN is empty; using PAT client for auto-merge reads.');
             }
             let readTokenUnavailable = false;
+            function isRateLimitError(err, status) {
+              if (status === 429) return true;
+              if (status !== 403) return false;
+              const headers = (err && ((err.response && err.response.headers) || err.headers)) || {};
+              const remaining = headers['x-ratelimit-remaining'] ?? headers['X-RateLimit-Remaining'];
+              if (String(remaining) === '0') return true;
+              return /rate limit|rate-limit|ratelimit|quota exhaustion|secondary rate limit|retry after/i.test(
+                String((err && err.message) || '')
+              );
+            }
             async function withReadFallback(fn) {
               if (readTokenUnavailable || readGithub === github) {
                 return await fn(github);
@@ -129,7 +144,13 @@ jobs:
                 return await fn(readGithub);
               } catch (err) {
                 const status = err ? (err.status ?? err.response?.status) : undefined;
-                if (status === 401 || status === 403 || status === 429) {
+                // Never spend TAP_PAT's shared budget on rate-limit retries:
+                // a 429 or a rate-limited 403 (empty budget) must surface so
+                // the caller warns and defers to the next wakeup instead of
+                // re-issuing the same scan on the PAT client. Only
+                // authentication/permission gaps (401, non-rate-limit 403)
+                // fall back to the PAT client.
+                if (status === 401 || (status === 403 && !isRateLimitError(err, status))) {
                   readTokenUnavailable = true;
                   core.warning('Repository-token read failed (' + status + '); retrying with PAT client: ' + err.message);
                   return await fn(github);
@@ -158,7 +179,7 @@ jobs:
               }
               const retryable = new Set(['cancelled', 'timed_out', 'stale', 'startup_failure']);
               if (err && retryable.has(String(err.conclusion || '').toLowerCase())) return true;
-              return /timeout|timed out|econnreset|econnrefused|eai_again|epipe|socket hang up|network|dns|tls|ssl|connection reset|connection refused|temporarily unavailable|service unavailable|bad gateway|gateway timeout|bootstrap|evicted/i.test(
+              return /timeout|timed out|econnreset|econnrefused|eai_again|epipe|socket hang up|network error|network failure|network timeout|network unreachable|dns error|dns failure|dns resolution|tls handshake|tls error|ssl error|connection reset|connection refused|connection aborted|temporarily unavailable|service unavailable|bad gateway|gateway timeout|bootstrap failed|bootstrap error|runner evicted|runner cancelled|runner timeout|runner lost|evicted|cancelled/i.test(
                 String((err && err.message) || '')
               );
             }
@@ -1393,6 +1414,12 @@ jobs:
                 continue;
               }
               try {
+              const livePr = await getPull(pr.number);
+              if (livePr.head.sha !== leaseHead) {
+                core.info(`PR #${pr.number}: HEAD moved ${leaseHead} -> ${livePr.head.sha}; holding stale reconciliation.`);
+                continue;
+              }
+              pr = livePr;
 
               if (hasLabel(pr, AUTO_MERGE_BLOCK_LABEL)) {
                 core.info(
@@ -1752,6 +1779,18 @@ jobs:
               // new main. Clean controller-generated syncs keep an already valid
               // CodeRabbit approval; all other new commits require a fresh review.
               break;
+              } catch (err) {
+                // Transient infrastructure gaps warn and defer to the next
+                // event/scheduled wakeup from latest state; deterministic
+                // reconciliation failures stay loud.
+                if (isTransientApiError(err)) {
+                  core.warning(
+                    `PR #${pr.number}: transient reconciliation error; a later wakeup retries from latest state: ` +
+                    (err.message || err)
+                  );
+                } else {
+                  throw err;
+                }
               } finally {
                 releaseLease(pr.number, leaseHead);
               }
