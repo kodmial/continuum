@@ -1936,18 +1936,28 @@ class CloudCliProvider(FakeProvider):
             return True
         cli = self._require_cli()
         name = _cloud_resource_name(instance.job_id or instance.id, instance.profile_digest)
-        if self._backend == "gce":
-            self._run_cli([cli, "compute", "instances", "delete", name, "--quiet"])
-        elif self._backend == "ec2":
-            real_id = self._provider_instance_ids.get(instance.id, "")
-            if not real_id:
-                raise AgentRuntimeError(
-                    "ec2 teardown has no recorded provider InstanceId for {}: "
-                    "refusing to terminate local id as real compute".format(instance.id))
-            self._run_cli([cli, "ec2", "terminate-instances", "--instance-ids", real_id])
-        else:
-            self._run_cli([cli, "vm", "delete", "--name", name, "--yes"])
-        self._delete_remote_network_rule(cli, name)
+        try:
+            if self._backend == "gce":
+                self._run_cli([cli, "compute", "instances", "delete", name, "--quiet"])
+            elif self._backend == "ec2":
+                real_id = self._provider_instance_ids.get(instance.id, "")
+                if not real_id:
+                    raise AgentRuntimeError(
+                        "ec2 teardown has no recorded provider InstanceId for {}: "
+                        "refusing to terminate local id as real compute".format(instance.id))
+                self._run_cli([cli, "ec2", "terminate-instances", "--instance-ids", real_id])
+            else:
+                self._run_cli([cli, "vm", "delete", "--name", name, "--yes"])
+        except AgentRuntimeError as exc:
+            text = str(exc).lower()
+            if "not found" not in text and "does not exist" not in text and "invalidinstanceid" not in text:
+                raise
+        try:
+            self._delete_remote_network_rule(cli, name)
+        except AgentRuntimeError as exc:
+            text = str(exc).lower()
+            if "not found" not in text and "does not exist" not in text:
+                raise
         destroyed = super().destroy(instance, now)
         if destroyed:
             self._provider_instance_ids.pop(instance.id, None)
