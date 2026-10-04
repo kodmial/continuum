@@ -457,18 +457,26 @@ function hasIncompleteCoverageSignal(reviewPayload) {
 }
 
 function unwrapReview(reviewPayload) {
-  if (
-    reviewPayload &&
-    typeof reviewPayload === 'object' &&
-    !Array.isArray(reviewPayload) &&
-    reviewPayload.review &&
-    typeof reviewPayload.review === 'object' &&
-    !Array.isArray(reviewPayload.review)
-  ) {
-    return reviewPayload.review;
-  }
   if (!reviewPayload || typeof reviewPayload !== 'object' || Array.isArray(reviewPayload)) {
     throw new Error('PR-Agent review JSON must be an object.');
+  }
+  const nested = reviewPayload.review;
+  const nestedIsObject =
+    nested && typeof nested === 'object' && !Array.isArray(nested);
+  if (nestedIsObject) {
+    // A top-level review payload may itself contain a `review` object
+    // field: only unwrap the envelope when the top level does not already
+    // carry review fields. Otherwise unwrapping would discard
+    // `key_issues_to_review`/`merge_recommendation`/security signals and
+    // decide skip on the nested object.
+    if (
+      'key_issues_to_review' in reviewPayload ||
+      'merge_recommendation' in reviewPayload ||
+      BLOCKING_SECURITY_SIGNAL_KEYS.some((key) => key in reviewPayload)
+    ) {
+      return reviewPayload;
+    }
+    return nested;
   }
   return reviewPayload;
 }
@@ -573,7 +581,16 @@ function isCleanReviewForImproveSkip(reviewPayload, persistentState, options = {
   if (stateHead !== reviewedHeadSha) {
     return { skip: false, reason: 'stale persistent state: not for the reviewed HEAD' };
   }
-  if (persistentHasActive(persistentState)) {
+  let hasActive;
+  try {
+    hasActive = persistentHasActive(persistentState);
+  } catch (err) {
+    // A benign upstream format variation (e.g. a new finding state) must
+    // safely run improve for repair value instead of crashing the
+    // orchestrator: fail closed to skip:false, never to an exception.
+    return { skip: false, reason: 'persistent state has an unrecognized finding state: failing closed' };
+  }
+  if (hasActive) {
     return { skip: false, reason: 'native persistent state has an ACTIVE finding' };
   }
   return {

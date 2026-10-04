@@ -296,7 +296,7 @@ jobs:
             // empty payload without the marker means improve never produced
             // coverage here, so the gate fails closed instead of merging on
             // missing evidence.
-            if (!raw && !improveSkippedClean) {
+            if (!raw.trim() && !improveSkippedClean) {
               fail('incomplete improve coverage: failing closed');
               return;
             }
