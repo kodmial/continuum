@@ -68,12 +68,13 @@ on:
 permissions: {}
 
 concurrency:
-  # Every trigger (CI dispatch, CodeRabbit, push, manual, or cron) enters the
-  # same pure latest-state reconciler. It revalidates every gate immediately
-  # before each write. A newer wake-up makes an older queued/in-flight run
-  # obsolete, so at most one reconciliation owns side effects at a time.
+  # Every trigger enters one latest-state reconciler. Let the running pass
+  # finish: with GitHub's default single pending slot, newer wake-ups replace
+  # older pending work without cancelling the in-flight scan. Cancelling the
+  # running pass let status storms repeatedly abort before later PRs were
+  # reconciled, starving conflict repair and merge progress.
   group: ${{ github.workflow }}-auto-merge
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   controller:
