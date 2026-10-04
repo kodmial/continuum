@@ -1133,6 +1133,43 @@ jobs:
               return configured;
             }
 
+            // Mirrors src/continuum/conflict_repair.py:is_conflicted. Keep the
+            // two in sync: mergeable may be a REST boolean (or null) or a
+            // GraphQL-style string such as CONFLICTING; mergeable_state is
+            // the REST dirty/clean style string. Returns true (dirty),
+            // false (clean), or null (still computing).
+            function isConflictedMergeability(mergeable, mergeableState) {
+              const state = String(mergeableState || '').trim().toLowerCase();
+              if (state === 'dirty') return true;
+              if (typeof mergeable === 'boolean') return !mergeable;
+              if (mergeable === null || mergeable === undefined) {
+                return state === '' || state === 'unknown' ? null : false;
+              }
+              const text = String(mergeable).trim().toLowerCase();
+              if (
+                text === 'false' ||
+                text === 'conflicting' ||
+                text === 'conflicted' ||
+                text === 'dirty'
+              ) {
+                return true;
+              }
+              if (
+                text === 'true' ||
+                text === 'mergeable' ||
+                text === 'clean' ||
+                text === 'stable' ||
+                text === 'blocked' ||
+                text === 'behind'
+              ) {
+                return false;
+              }
+              if (text === '' || text === 'null' || text === 'unknown') {
+                return null;
+              }
+              return null;
+            }
+
             function conflictRepairMarkers(comments, headSha) {
               const exactHead = String(headSha || '').toLowerCase();
               const markers = [];
@@ -1249,19 +1286,15 @@ jobs:
               // Dirty recheck: the PR may have turned clean (or GitHub may
               // still be recomputing mergeability) between the scan read and
               // this dispatch. Never dispatch repair for a clean HEAD.
+              // Uses isConflictedMergeability so REST booleans and
+              // GraphQL-style strings match src/continuum/conflict_repair.py.
               {
-                const mergeState = String(
-                  pr.mergeable_state || ''
-                ).toLowerCase();
-                const isDirty =
-                  pr.mergeable === false || mergeState === 'dirty';
-                if (!isDirty) {
-                  const computing =
-                    pr.mergeable == null &&
-                    (mergeState === '' ||
-                      mergeState === 'unknown' ||
-                      mergeState === 'null');
-                  if (computing) {
+                const conflicted = isConflictedMergeability(
+                  pr.mergeable,
+                  pr.mergeable_state
+                );
+                if (conflicted !== true) {
+                  if (conflicted === null) {
                     core.info(
                       `PR #${pr.number}: mergeability is still being computed for head ${headSha}; waiting.`
                     );
@@ -1449,6 +1482,20 @@ jobs:
                 );
                 let winnerId = claimCommentId;
                 for (const comment of electionComments) {
+                  // Same trust as conflictRepairMarkers: an untrusted forged
+                  // marker must never win the smallest-id election and
+                  // suppress the legitimate repair.
+                  const association = String(
+                    comment.author_association || ''
+                  ).toUpperCase();
+                  const login = String(
+                    comment.user?.login || ''
+                  ).toLowerCase();
+                  const trusted =
+                    TRUSTED_COMMENT_ASSOCIATIONS.has(association) ||
+                    login === 'github-actions[bot]' ||
+                    login === owner.toLowerCase();
+                  if (!trusted) continue;
                   const body = String(comment.body || '');
                   CONFLICT_MARKER_RE.lastIndex = 0;
                   let matchedHead = false;
@@ -1552,13 +1599,15 @@ jobs:
             // GitHub mergeability of null means "still computing": the normal
             // sync path (update-branch) remains authoritative for that case.
             async function reconcileDirtyPr(pr) {
-              const dirty =
-                pr.mergeable === false ||
-                String(pr.mergeable_state || '').toLowerCase() === 'dirty';
-              if (!dirty) {
+              // Matches src/continuum/conflict_repair.py:is_conflicted so
+              // REST booleans and GraphQL-style strings agree on dirty.
+              const conflicted = isConflictedMergeability(
+                pr.mergeable,
+                pr.mergeable_state
+              );
+              if (conflicted !== true) {
                 if (
-                  pr.mergeable !== null &&
-                  pr.mergeable !== undefined &&
+                  conflicted === false &&
                   hasLabel(pr, CONFLICT_LOCK_LABEL)
                 ) {
                   await removeConflictLock(pr.number);
@@ -2021,14 +2070,20 @@ jobs:
                 continue;
               }
 
-              if (pr.mergeable === false || pr.mergeable_state === 'dirty') {
+              // Dirty check matches src/continuum/conflict_repair.py:is_conflicted:
+              // REST booleans and GraphQL-style mergeable strings agree.
+              const mergeConflicted = isConflictedMergeability(
+                pr.mergeable,
+                pr.mergeable_state
+              );
+              if (mergeConflicted === true) {
                 await dispatchConflictRepair(
                   pr,
                   `mergeable_state=${pr.mergeable_state}`
                 );
                 continue;
               }
-              if (pr.mergeable === null) {
+              if (mergeConflicted === null) {
                 core.info(
                   `PR #${pr.number}: GitHub mergeability is still being computed; waiting.`
                 );
