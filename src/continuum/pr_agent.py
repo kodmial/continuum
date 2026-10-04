@@ -484,6 +484,84 @@ def disabled_report(reason: str = "PR-Agent is not enabled") -> Dict[str, Any]:
 
 VERIFY_COMMAND_RE = re.compile(r"(?m)^\s*/verify\s+(?P<id>\S+)\s*$")
 
+REVIEW_COMMAND_RE = re.compile(r"/review\b")
+
+
+def is_review_command(body: str) -> bool:
+    """Whether a comment carries an actionable manual `/review` request.
+
+    Mirrors the caller-level `/review` gate: a plain substring would also
+    match prose such as `/reviewer`, so require a word boundary after
+    `/review`. Matching stays case-sensitive like `contains(..., '/review')`.
+    """
+
+    return bool(REVIEW_COMMAND_RE.search(body or ""))
+
+
+def is_allowed_review_actor(actor: str, owner: str) -> bool:
+    """Whether the comment actor may trigger a manual PR-Agent review.
+
+    Manual `/review` stays owner-gated, mirroring the
+    `github.actor == github.repository_owner` caller guard. An empty actor
+    or owner never qualifies.
+    """
+
+    if not actor or not owner:
+        return False
+    return str(actor) == str(owner)
+
+
+def pr_agent_operation_key(pr_number: object, head_sha: str, kind: str = "review") -> str:
+    """Logical coalescing key for one PR-Agent operation.
+
+    Duplicate CI/recovery/manual signals for the same key must not create
+    duplicate exact-HEAD heavy runs; the router coalesces on this key.
+    """
+
+    pr = str(pr_number or "").strip()
+    head = str(head_sha or "").strip().lower()
+    operation = str(kind or "review").strip().lower() or "review"
+    return f"{operation}:{pr}:{head}"
+
+
+def classify_pr_agent_comment(
+    *,
+    is_pull_request: bool,
+    actor: str,
+    owner: str,
+    body: str,
+    provider: str,
+) -> Dict[str, Any]:
+    """Classify an issue_comment event for the thin PR-Agent router.
+
+    Returns a mapping with `actionable` (bool) and `reason` (str). Only an
+    actionable classification may dispatch the heavy workflow; every other
+    comment must exit without dispatching.
+    """
+
+    if not is_pull_request:
+        return {"actionable": False, "reason": "not a pull request"}
+    if not is_allowed_review_actor(actor, owner):
+        return {"actionable": False, "reason": "actor not allowed"}
+    configured = str(provider or "none").strip().lower()
+    if configured != "pr-agent":
+        return {"actionable": False, "reason": "review provider is not pr-agent"}
+    if not is_review_command(body):
+        return {"actionable": False, "reason": "no actionable /review command"}
+    return {"actionable": True, "reason": "actionable /review request"}
+
+
+def is_duplicate_operation(
+    active_operation_keys: Sequence[str], operation_key: str
+) -> bool:
+    """Whether the logical operation already has an active heavy run."""
+
+    wanted = str(operation_key or "").strip().lower()
+    if not wanted:
+        return False
+    seen = {str(key or "").strip().lower() for key in active_operation_keys}
+    return wanted in seen
+
 
 def parse_verify_command(body: str) -> Optional[str]:
     """Extract the finding id from a `/verify <finding-id>` comment."""
