@@ -510,11 +510,11 @@ function hasIncompleteCoverageSignal(reviewPayload) {
     return true;
   }
   if (!seenCoverage) {
-    // Absent coverage keys are not evidence of complete coverage: fail
-    // closed so a payload that omits coverage footers can never qualify
-    // for an improve skip on missing evidence (the findings-cap
-    // truncation check still applies separately).
-    return true;
+    // Absent coverage keys carry no incomplete signal: a clean payload
+    // without coverage footers must still reach the skip path (the
+    // findings-cap truncation check still applies separately). An omitted
+    // caller flag still fails closed via reviewCoverageComplete.
+    return false;
   }
   return false;
 }
@@ -740,10 +740,10 @@ function isCleanReviewForImproveSkip(reviewPayload, persistentState, options = {
   if (!reviewedHeadSha) {
     throw new Error('Cannot decide improve skip without the exact reviewed HEAD.');
   }
-  // Fail closed: coverage must be proven complete with an explicit opt-in
-  // plus no incomplete signal in the review payload. An omitted flag never
-  // skips; absent coverage keys fail closed as incomplete (with the
-  // findings-cap truncation check applying separately).
+  // Fail closed on the explicit opt-in plus any explicit incomplete signal
+  // in the review payload. An omitted flag never skips; absent coverage
+  // keys carry no incomplete signal (with the findings-cap truncation
+  // check applying separately).
   const reviewCoverageComplete =
     opts.reviewCoverageComplete === true && !hasIncompleteCoverageSignal(review);
   if (!reviewCoverageComplete) {
