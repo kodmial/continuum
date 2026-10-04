@@ -2017,36 +2017,18 @@ jobs:
             // Bounded comment scan (#254): dispatch/qualification markers
             // accumulate in the newest window with every retry, so ten
             // pages preserve the attempt budget without walking history.
-            // `listComments` is oldest-first and ignores sort/direction,
-            // so count down from the issue total to scan newest-first and
-            // fall back to pages 1-10 only when the total read fails.
             const comments = [];
-            let lastPage = 0;
-            try {
-              const total = (await github.rest.issues.get({ owner, repo, issue_number: issueNumber })).data.comments || 0;
-              lastPage = Math.max(1, Math.ceil(total / 100));
-            } catch { lastPage = 0; }
-            if (lastPage > 0) {
-              for (let page = 1; page <= 10; page += 1) {
-                const targetPage = lastPage - (page - 1);
-                if (targetPage < 1) break;
-                const { data } = await github.rest.issues.listComments({ owner, repo, issue_number: issueNumber, per_page: 100, page: targetPage });
-                if (!Array.isArray(data) || data.length === 0) continue;
-                comments.push(...data);
-              }
-            } else {
-              for (let page = 1; page <= 10; page += 1) {
-                const { data } = await github.rest.issues.listComments({
-                  owner,
-                  repo,
-                  issue_number: issueNumber,
-                  per_page: 100,
-                  page,
-                });
-                if (!Array.isArray(data) || data.length === 0) break;
-                comments.push(...data);
-                if (data.length < 100) break;
-              }
+            for (let page = 1; page <= 10; page += 1) {
+              const { data } = await github.rest.issues.listComments({
+                owner,
+                repo,
+                issue_number: issueNumber,
+                per_page: 100,
+                page,
+              });
+              if (!Array.isArray(data) || data.length === 0) break;
+              comments.push(...data);
+              if (data.length < 100) break;
             }
             const attempts = comments.filter(comment =>
               (comment.body || '').includes(marker)
