@@ -244,12 +244,21 @@ class WorkflowWiringTests(unittest.TestCase):
 
     def test_transition_is_durable_before_branch_move(self):
         transition = self.workflow.index('continuum-pr-agent-convergence from=')
-        marker = self.workflow.index('gh pr comment "$PR_NUMBER"', transition)
+        controller = self.workflow.index(
+            "CONTROLLER_MARKER='<!-- continuum-pr-agent-controller-state:v1 -->'",
+            transition,
+        )
+        upsert = self.workflow.index('gh api --method PATCH', controller)
+        create = self.workflow.index('gh api --method POST', controller)
         push = self.workflow.index(
             'git push --force-with-lease="refs/heads/$HEAD_REF:$HEAD_SHA"'
         )
-        self.assertLess(transition, marker)
-        self.assertLess(marker, push)
+        self.assertLess(transition, controller)
+        self.assertLess(controller, upsert)
+        self.assertLess(controller, create)
+        self.assertLess(upsert, push)
+        self.assertLess(create, push)
+        self.assertNotIn("gh pr comment", self.workflow)
 
     def test_same_head_marker_format_from_33_is_preserved(self):
         self.assertIn(
