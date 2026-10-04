@@ -414,9 +414,22 @@ jobs:
           # CONTINUUM_MAX_PAGES pages; counts are reported at the end.
           CONTINUUM_MAX_PAGES=5
           CONTINUUM_API_CALLS=0
+          # File-backed counter: continuum_api_get runs inside command
+          # substitution (a subshell), so a shell variable increment would
+          # be lost to the parent. A temp file survives subshells.
+          CONTINUUM_API_COUNT_FILE="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/continuum-api-calls.$$"
+          echo 0 > "$CONTINUUM_API_COUNT_FILE"
+          continuum_api_count_bump() {
+            local cur=0
+            cur="$(cat "$CONTINUUM_API_COUNT_FILE" 2>/dev/null || echo 0)"
+            [[ "$cur" =~ ^[0-9]+$ ]] || cur=0
+            echo $((cur + 1)) > "$CONTINUUM_API_COUNT_FILE"
+          }
           continuum_api_get() {
-            CONTINUUM_API_CALLS=$((CONTINUUM_API_CALLS + 1))
-            gh api "$@"
+            local rc=0
+            gh api "$@" || rc=$?
+            continuum_api_count_bump
+            return $rc
           }
           # Bounded slurp-compatible page walk: keeps the array-of-pages
           # shape callers already parse with `.[][]?`, capped at
@@ -463,7 +476,7 @@ jobs:
             ISSUE_LABELS="$ISSUE_LABELS_JSON"
           else
             ISSUE_LABELS="$(gh issue view "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --json labels --jq '[.labels[].name]')"
-            CONTINUUM_API_CALLS=$((CONTINUUM_API_CALLS + 1))
+            continuum_api_count_bump
           fi
           if jq -e --arg label "$QUALIFICATION_LABEL" 'index($label) != null' <<<"$ISSUE_LABELS" >/dev/null; then
             CHAIN_QUALIFICATION="yes"
@@ -604,4 +617,9 @@ jobs:
               --body "Render E2E execution and cleanup succeeded in workflow run $GITHUB_RUN_ID; PR #$PR_NUMBER is now in the CI/merge chain."
           fi
 
+          # Drain the file-backed counter (bounded reads ran in subshells)
+          # so the budget line reflects every bounded-list call.
+          CONTINUUM_API_CALLS="$(cat "$CONTINUUM_API_COUNT_FILE" 2>/dev/null || echo 0)"
+          [[ "$CONTINUUM_API_CALLS" =~ ^[0-9]+$ ]] || CONTINUUM_API_CALLS=0
+          rm -f "$CONTINUUM_API_COUNT_FILE"
           echo "continuum-api-budget: bounded_list_calls=$CONTINUUM_API_CALLS max_pages=$CONTINUUM_MAX_PAGES"

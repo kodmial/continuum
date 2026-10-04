@@ -634,6 +634,18 @@ jobs:
           else
             CONTROLLER_WINDOW_COMPLETE=false
           fi
+          # A `<100` since-window is complete only for the last 30 days: a
+          # live controller marker older than the window would be missed and
+          # reported as complete, risking a duplicate state comment. When
+          # the window holds no controller marker, fall back to the capped
+          # 5-page scan so older history is checked before creating.
+          if [[ "$CONTROLLER_WINDOW_COMPLETE" == "true" ]]; then
+            if ! jq -e --arg marker '<!-- continuum-pr-agent-controller-state:v1 -->' \
+              'map(select((.body // "") | contains($marker))) | length > 0' \
+              "$CONTROLLER_JSON" >/dev/null 2>&1; then
+              CONTROLLER_WINDOW_COMPLETE=false
+            fi
+          fi
           if [[ "$CONTROLLER_WINDOW_COMPLETE" != "true" ]]; then
             rm -f "$CONTROLLER_JSON.pages"
             for controller_page in 1 2 3 4 5; do
