@@ -62,7 +62,7 @@ code visible in the current chunk or repository context. If confirmation depends
 files outside the current chunk, place it under human verification instead.
 """
 enable_large_pr_chunking = true
-max_number_of_calls = 3
+max_number_of_calls = 10
 
 [pr_code_suggestions]
 focus_only_on_problems = true

@@ -767,7 +767,7 @@ jobs:
           PR_REVIEWER__PERSISTENT_FINDING_STATE: 'true'
           PR_REVIEWER__INLINE_KEY_ISSUES: 'true'
           PR_REVIEWER__ENABLE_LARGE_PR_CHUNKING: 'true'
-          PR_REVIEWER__MAX_NUMBER_OF_CALLS: '3'
+          PR_REVIEWER__MAX_NUMBER_OF_CALLS: '10'
           PR_REVIEWER__REQUIRE_TESTS_REVIEW: 'true'
           PR_REVIEWER__REQUIRE_SECURITY_REVIEW: 'true'
           PR_REVIEWER__REQUIRE_RISK_ASSESSMENT: 'true'
@@ -787,7 +787,7 @@ jobs:
           PR_CODE_SUGGESTIONS__PERSISTENT_COMMENT: 'true'
           PR_CODE_SUGGESTIONS__PUBLISH_OUTPUT_NO_SUGGESTIONS: 'false'
           PR_CODE_SUGGESTIONS__MAX_SUGGESTIONS_PER_FILE: '0'
-          PR_CODE_SUGGESTIONS__MAX_NUMBER_OF_CALLS: '3'
+          PR_CODE_SUGGESTIONS__MAX_NUMBER_OF_CALLS: '10'
           PR_CODE_SUGGESTIONS__ENABLE_SUGGESTIONS_COVERAGE_FOOTER: 'true'
           PUSH_OUTPUTS__ENABLE: 'true'
           PUSH_OUTPUTS__CHANNELS: '["file"]'
@@ -1090,11 +1090,37 @@ jobs:
           if not isinstance(findings, list):
               raise SystemExit("Upstream PR-Agent persistent state findings is not a list.")
           valid_states = {"ACTIVE", "RESOLVED"}
+          current_findings = []
+          stale_active = 0
           for finding in findings:
               if not isinstance(finding, dict):
                   raise SystemExit("Upstream PR-Agent persistent state contains a non-object finding.")
-              if str(finding.get("state") or "").upper() not in valid_states:
+              finding_state = str(finding.get("state") or "").upper()
+              if finding_state not in valid_states:
                   raise SystemExit("Upstream PR-Agent persistent state contains an unknown finding state.")
+              if finding_state == "ACTIVE":
+                  last_seen_head = str(finding.get("last_seen_head_sha") or "").strip().lower()
+                  if not last_seen_head:
+                      raise SystemExit(
+                          "ACTIVE PR-Agent persistent finding has no last_seen_head_sha; failing closed."
+                      )
+                  if last_seen_head != reviewed:
+                      stale_active += 1
+                      continue
+              current_findings.append(finding)
+          if stale_active:
+              # Persistent state spans review history. The merge contract is
+              # exact-HEAD: after a complete full review for this HEAD, an
+              # ACTIVE finding last seen only on an older HEAD is historical
+              # evidence, not a current-head veto. Current findings are still
+              # represented by structured review output and by ACTIVE entries
+              # whose last_seen_head_sha equals the reviewed HEAD.
+              state = dict(state)
+              state["findings"] = current_findings
+              print(
+                  f"Ignored {stale_active} stale ACTIVE persistent finding(s) "
+                  f"not seen on exact reviewed HEAD {reviewed}."
+              )
           compact = json.dumps(state, separators=(",", ":"), ensure_ascii=False)
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
               out.write(f"persistent_state_json={compact}\n")

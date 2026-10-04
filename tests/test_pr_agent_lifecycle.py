@@ -551,6 +551,8 @@ class NoCustomProtocolTests(unittest.TestCase):
         self.assertIn("enable_large_pr_chunking = true", toml)
         body = read_repo(".github/workflows/continuum-pr-agent.yml")
         self.assertIn("PR_REVIEWER__ENABLE_LARGE_PR_CHUNKING", body)
+        self.assertIn("PR_REVIEWER__MAX_NUMBER_OF_CALLS: '10'", body)
+        self.assertIn("PR_CODE_SUGGESTIONS__MAX_NUMBER_OF_CALLS: '10'", body)
         self.assertIn("PR_REVIEWER__EXTRA_INSTRUCTIONS", body)
         self.assertIn("Never infer that implementation, tests,", body)
         self.assertIn("absent from the current review chunk", body)
@@ -572,7 +574,7 @@ class ConfigurationTests(unittest.TestCase):
             "persistent_finding_state = true",
             "inline_key_issues = true",
             "enable_large_pr_chunking = true",
-            "max_number_of_calls = 3",
+            "max_number_of_calls = 10",
             "require_tests_review = true",
             "require_security_review = true",
             "require_risk_assessment = true",
@@ -1897,6 +1899,16 @@ class FallbackPersistentStateTests(unittest.TestCase):
         self.assertIn("Persistent state is stale", body)
         self.assertIn("PR head moved during review", body)
         self.assertIn("the review is stale", body)
+
+    def test_persistent_active_findings_are_scoped_to_exact_reviewed_head(self):
+        body = read_repo(".github/workflows/continuum-pr-agent.yml")
+        self.assertIn('finding.get("last_seen_head_sha")', body)
+        self.assertIn(
+            "ACTIVE PR-Agent persistent finding has no last_seen_head_sha; failing closed.",
+            body,
+        )
+        self.assertIn("last_seen_head != reviewed", body)
+        self.assertIn("Ignored {stale_active} stale ACTIVE persistent finding(s)", body)
 
     def test_improve_only_repair_path_remains_functional(self):
         suggestion = {
