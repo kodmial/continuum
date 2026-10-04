@@ -213,6 +213,29 @@ jobs:
             }
             const AUTO_MERGE_BLOCK_LABEL = 'no-auto-merge';
             const CONFLICT_LOCK_LABEL = 'opencode-conflict-repair';
+            // Self-healing conflict recovery (issue #246). Every
+            // reconciliation pass rediscovers every open dirty PR, including
+            // PRs that turned dirty before the current wake. Dispatch is
+            // idempotent per PR + exact HEAD and bounded per HEAD; a stale
+            // lock with no active repair run is reconciled and redispatched,
+            // never left to strand the PR. Retry never applies
+            // `automation:paused` and never requires manual label removal.
+            const MAX_CONFLICT_DISPATCHES_PER_HEAD = 3;
+            const CONFLICT_DISPATCH_GRACE_MS = 10 * 60_000;
+            const ACTIVE_REPAIR_STATUSES = new Set([
+              'queued',
+              'in_progress',
+              'waiting',
+              'pending',
+              'requested',
+            ]);
+            const TRUSTED_COMMENT_ASSOCIATIONS = new Set([
+              'OWNER',
+              'MEMBER',
+              'COLLABORATOR',
+            ]);
+            const CONFLICT_MARKER_RE =
+              /<!--\s*continuum-conflict-repair\s+head=([0-9a-f]{7,64})\s+attempt=(\d+)\s*-->/gi;
             // CodeRabbit is an optional integration. When this project did not
             // ask for it, every CodeRabbit gate below is skipped and no
             // CodeRabbit workflow is ever dispatched: requiring an approval
@@ -1347,12 +1370,272 @@ jobs:
               return { ci, noopRelease, skipped: false };
             }
 
+            function resolveOpencodeWorkflow() {
+              // Conflict repair always dispatches the configured consumer
+              // OpenCode caller (Continuum dogfood: opencode.yml). The
+              // reusable engine file owns no workflow_dispatch trigger, so a
+              // hardcoded engine dispatch can never start a repair run.
+              const configured = String(
+                process.env.OPENCODE_WORKFLOW || 'continuum-opencode.yml'
+              ).trim();
+              if (!configured) {
+                throw new Error(
+                  'Conflict repair has no configured OpenCode caller workflow.'
+                );
+              }
+              if (
+                !configured.endsWith('.yml') ||
+                configured.includes('/') ||
+                configured.includes('\\') ||
+                configured.includes('..')
+              ) {
+                throw new Error(
+                  `Invalid OpenCode caller workflow: ${configured}. ` +
+                  'Expected a bare workflow file name such as opencode.yml.'
+                );
+              }
+              return configured;
+            }
+
+            // Mirrors src/continuum/conflict_repair.py:is_conflicted. Keep the
+            // two in sync: mergeable may be a REST boolean (or null) or a
+            // GraphQL-style string such as CONFLICTING; mergeable_state is
+            // the REST dirty/clean style string. Returns true (dirty),
+            // false (clean), or null (still computing).
+            function isConflictedMergeability(mergeable, mergeableState) {
+              const state = String(mergeableState || '').trim().toLowerCase();
+              if (state === 'dirty') return true;
+              if (typeof mergeable === 'boolean') return !mergeable;
+              if (mergeable === null || mergeable === undefined) {
+                return state === '' || state === 'unknown' ? null : false;
+              }
+              const text = String(mergeable).trim().toLowerCase();
+              if (
+                text === 'false' ||
+                text === 'conflicting' ||
+                text === 'conflicted' ||
+                text === 'dirty'
+              ) {
+                return true;
+              }
+              if (
+                text === 'true' ||
+                text === 'mergeable' ||
+                text === 'clean' ||
+                text === 'stable' ||
+                text === 'blocked' ||
+                text === 'behind'
+              ) {
+                return false;
+              }
+              if (text === '' || text === 'null' || text === 'unknown') {
+                return null;
+              }
+              return null;
+            }
+
+            function conflictRepairMarkers(comments, headSha) {
+              const exactHead = String(headSha || '').toLowerCase();
+              const markers = [];
+              for (const comment of comments || []) {
+                const association = String(
+                  comment.author_association || ''
+                ).toUpperCase();
+                const login = String(
+                  comment.user?.login || ''
+                ).toLowerCase();
+                const trusted =
+                  TRUSTED_COMMENT_ASSOCIATIONS.has(association) ||
+                  login === 'github-actions[bot]' ||
+                  login === owner.toLowerCase();
+                if (!trusted) continue;
+                const body = String(comment.body || '');
+                CONFLICT_MARKER_RE.lastIndex = 0;
+                for (const match of body.matchAll(CONFLICT_MARKER_RE)) {
+                  if (String(match[1] || '').toLowerCase() !== exactHead) {
+                    continue;
+                  }
+                  markers.push({
+                    attempt: Number.parseInt(match[2], 10),
+                    createdAt: Date.parse(
+                      String(
+                        comment.updated_at || comment.created_at || ''
+                      )
+                    ),
+                  });
+                }
+              }
+              markers.sort((a, b) => a.attempt - b.attempt);
+              return markers;
+            }
+
+            function conflictRepairMarker(headSha, attempt) {
+              return (
+                `<!-- continuum-conflict-repair head=${headSha} attempt=${attempt} -->\n` +
+                'Continuum dispatched automatic OpenCode conflict repair ' +
+                'for this exact HEAD.'
+              );
+            }
+
+            async function findActiveConflictRepairRun(prNumber) {
+              const opencodeWorkflow = resolveOpencodeWorkflow();
+              let runs;
+              try {
+                runs = await github.paginate(
+                  github.rest.actions.listWorkflowRuns,
+                  {
+                    owner,
+                    repo,
+                    workflow_id: opencodeWorkflow,
+                    per_page: 100,
+                  }
+                );
+              } catch (err) {
+                // A missing caller file surfaces loudly at dispatch time;
+                // the liveness probe itself must not fail the pass.
+                core.warning(
+                  `PR #${prNumber}: could not list ${opencodeWorkflow} runs: ${err.message}`
+                );
+                return null;
+              }
+              // Word-boundary match: `PR #23` must not match the live run
+              // for `PR #237`.
+              const titlePattern = new RegExp(`PR #${prNumber}(?!\\d)`);
+              return runs.find(run =>
+                ACTIVE_REPAIR_STATUSES.has(
+                  String(run.status || '').toLowerCase()
+                ) &&
+                titlePattern.test(String(run.display_title || ''))
+              ) || null;
+            }
+
+            async function removeConflictLock(prNumber) {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner,
+                  repo,
+                  issue_number: prNumber,
+                  name: CONFLICT_LOCK_LABEL,
+                });
+              } catch (err) {
+                if (err.status !== 404) throw err;
+              }
+            }
+
             async function dispatchConflictRepair(pr, reason) {
-              if (hasLabel(pr, CONFLICT_LOCK_LABEL)) {
+              const opencodeWorkflow = resolveOpencodeWorkflow();
+
+              // Exact-HEAD revalidation: the PR may have advanced between the
+              // scan read and this dispatch.
+              const fresh = await getPull(pr.number);
+              if (
+                fresh.state !== 'open' ||
+                fresh.draft ||
+                fresh.head.repo?.full_name !== repoFullName
+              ) {
                 core.info(
-                  `PR #${pr.number}: conflict repair already active; waiting.`
+                  `PR #${pr.number}: no longer an open same-repository PR; cancelling conflict dispatch.`
                 );
                 return;
+              }
+              if (fresh.head.sha !== pr.head.sha) {
+                core.info(
+                  `PR #${pr.number}: head advanced from ${pr.head.sha} to ${fresh.head.sha} before conflict dispatch; re-evaluating.`
+                );
+                return;
+              }
+              pr = fresh;
+              const headSha = pr.head.sha;
+
+              // Dirty recheck: the PR may have turned clean (or GitHub may
+              // still be recomputing mergeability) between the scan read and
+              // this dispatch. Never dispatch repair for a clean HEAD.
+              // Uses isConflictedMergeability so REST booleans and
+              // GraphQL-style strings match src/continuum/conflict_repair.py.
+              {
+                const conflicted = isConflictedMergeability(
+                  pr.mergeable,
+                  pr.mergeable_state
+                );
+                if (conflicted !== true) {
+                  if (conflicted === null) {
+                    core.info(
+                      `PR #${pr.number}: mergeability is still being computed for head ${headSha}; waiting.`
+                    );
+                    return;
+                  }
+                  if (hasLabel(pr, CONFLICT_LOCK_LABEL)) {
+                    await removeConflictLock(pr.number);
+                    core.notice(
+                      `PR #${pr.number}: head ${headSha} is no longer dirty; reconciled ${CONFLICT_LOCK_LABEL} and resuming CI/review lifecycle.`
+                    );
+                  } else {
+                    core.info(
+                      `PR #${pr.number}: head ${headSha} is no longer dirty; cancelling conflict dispatch.`
+                    );
+                  }
+                  return;
+                }
+              }
+
+              // A live repair run for this PR owns the lock: wait instead of
+              // dispatching a duplicate.
+              const activeRun = await findActiveConflictRepairRun(pr.number);
+              if (activeRun) {
+                core.info(
+                  `PR #${pr.number}: conflict repair run ${activeRun.id} (${activeRun.status}) is already active for this PR; waiting.`
+                );
+                return;
+              }
+
+              const comments = await github.paginate(
+                github.rest.issues.listComments,
+                {
+                  owner,
+                  repo,
+                  issue_number: pr.number,
+                  per_page: 100,
+                }
+              );
+              const markers = conflictRepairMarkers(comments, headSha);
+              const latest = markers.at(-1) || null;
+              const markerAgeMs =
+                latest && Number.isFinite(latest.createdAt)
+                  ? Date.now() - latest.createdAt
+                  : null;
+
+              // Idempotency per PR/current HEAD: a dispatch that just happened
+              // has a fresh marker even before its run becomes visible.
+              if (
+                markers.length > 0 &&
+                markerAgeMs !== null &&
+                markerAgeMs < CONFLICT_DISPATCH_GRACE_MS
+              ) {
+                core.info(
+                  `PR #${pr.number}: conflict-repair dispatch for head ${headSha} is inside its grace window; waiting.`
+                );
+                return;
+              }
+
+              // Bounded autonomy: stop redispatching one unchanged HEAD after
+              // the per-HEAD budget is spent. No pause label is applied and no
+              // manual label removal is required; a new HEAD starts a fresh
+              // budget.
+              if (markers.length >= MAX_CONFLICT_DISPATCHES_PER_HEAD) {
+                core.warning(
+                  `PR #${pr.number}: bounded conflict-repair budget exhausted for head ${headSha} (${markers.length}/${MAX_CONFLICT_DISPATCHES_PER_HEAD}); waiting for a new HEAD.`
+                );
+                return;
+              }
+              let attempt = markers.length;
+
+              // A stale lock with no active run and no fresh marker must not
+              // strand the PR: reconcile it, then redispatch safely.
+              if (hasLabel(pr, CONFLICT_LOCK_LABEL)) {
+                await removeConflictLock(pr.number);
+                core.notice(
+                  `PR #${pr.number}: reconciled stale ${CONFLICT_LOCK_LABEL} lock with no active repair run; redispatching.`
+                );
               }
 
               await github.rest.issues.addLabels({
@@ -1362,15 +1645,176 @@ jobs:
                 labels: [CONFLICT_LOCK_LABEL],
               });
 
+              // Overlap guard (best-effort): two overlapping reconciler jobs
+              // can both pass the pre-lock checks before either dispatches,
+              // and the lock label itself is not atomic, so revalidate after
+              // acquiring it and before dispatching. An overlapping job that
+              // already dispatched leaves either a visible run or a fresh
+              // marker; seeing either here means waiting instead of
+              // dispatching a duplicate. This recheck cannot see an
+              // overlapping job that has not dispatched yet, so the claim
+              // comment written below is the authoritative linearization
+              // point. The acquired lock is shared and left in place on
+              // these waits.
+              {
+                const confirmRun =
+                  await findActiveConflictRepairRun(pr.number);
+                if (confirmRun) {
+                  core.info(
+                    `PR #${pr.number}: conflict repair run ${confirmRun.id} (${confirmRun.status}) appeared while acquiring the lock; waiting.`
+                  );
+                  return;
+                }
+                const confirmComments = await github.paginate(
+                  github.rest.issues.listComments,
+                  {
+                    owner,
+                    repo,
+                    issue_number: pr.number,
+                    per_page: 100,
+                  }
+                );
+                const confirmMarkers = conflictRepairMarkers(
+                  confirmComments,
+                  headSha
+                );
+                const confirmLatest = confirmMarkers.at(-1) || null;
+                const confirmAgeMs =
+                  confirmLatest &&
+                  Number.isFinite(confirmLatest.createdAt)
+                    ? Date.now() - confirmLatest.createdAt
+                    : null;
+                if (
+                  confirmMarkers.length > 0 &&
+                  confirmAgeMs !== null &&
+                  confirmAgeMs < CONFLICT_DISPATCH_GRACE_MS
+                ) {
+                  core.info(
+                    `PR #${pr.number}: conflict-repair dispatch for head ${headSha} appeared while acquiring the lock; waiting.`
+                  );
+                  return;
+                }
+                if (
+                  confirmMarkers.length >= MAX_CONFLICT_DISPATCHES_PER_HEAD
+                ) {
+                  core.warning(
+                    `PR #${pr.number}: bounded conflict-repair budget exhausted for head ${headSha} (${confirmMarkers.length}/${MAX_CONFLICT_DISPATCHES_PER_HEAD}); waiting for a new HEAD.`
+                  );
+                  return;
+                }
+                attempt = confirmMarkers.length;
+              }
+
+              // Claim-before-dispatch: the label is not atomic, and neither a
+              // run nor a post-dispatch marker is visible until after
+              // dispatch, so two overlapping jobs can both pass every check
+              // above and both dispatch. The claim comment IS visible before
+              // dispatch, so it is the linearization point: write it first,
+              // then elect the smallest comment id among fresh markers for
+              // this HEAD as the single winner. Only the winner dispatches;
+              // the loser deletes its own claim (best-effort) and waits,
+              // leaving the shared lock in place for the winner's run.
+              let claimCommentId = null;
+              try {
+                const { data: claimComment } =
+                  await github.rest.issues.createComment({
+                    owner,
+                    repo,
+                    issue_number: pr.number,
+                    body: conflictRepairMarker(headSha, attempt),
+                  });
+                claimCommentId = claimComment.id;
+              } catch (markerErr) {
+                try {
+                  await removeConflictLock(pr.number);
+                } catch (unlockErr) {
+                  core.warning(
+                    `PR #${pr.number}: could not remove ${CONFLICT_LOCK_LABEL} after marker failure: ${unlockErr.message}`
+                  );
+                }
+                throw markerErr;
+              }
+              {
+                const electionComments = await github.paginate(
+                  github.rest.issues.listComments,
+                  {
+                    owner,
+                    repo,
+                    issue_number: pr.number,
+                    per_page: 100,
+                  }
+                );
+                let winnerId = claimCommentId;
+                for (const comment of electionComments) {
+                  // Same trust as conflictRepairMarkers: an untrusted forged
+                  // marker must never win the smallest-id election and
+                  // suppress the legitimate repair.
+                  const association = String(
+                    comment.author_association || ''
+                  ).toUpperCase();
+                  const login = String(
+                    comment.user?.login || ''
+                  ).toLowerCase();
+                  const trusted =
+                    TRUSTED_COMMENT_ASSOCIATIONS.has(association) ||
+                    login === 'github-actions[bot]' ||
+                    login === owner.toLowerCase();
+                  if (!trusted) continue;
+                  const body = String(comment.body || '');
+                  CONFLICT_MARKER_RE.lastIndex = 0;
+                  let matchedHead = false;
+                  for (const match of body.matchAll(CONFLICT_MARKER_RE)) {
+                    if (
+                      String(match[1] || '').toLowerCase() ===
+                      String(headSha || '').toLowerCase()
+                    ) {
+                      matchedHead = true;
+                      break;
+                    }
+                  }
+                  if (!matchedHead) continue;
+                  const createdAt = Date.parse(
+                    String(comment.updated_at || comment.created_at || '')
+                  );
+                  if (
+                    !Number.isFinite(createdAt) ||
+                    Date.now() - createdAt >= CONFLICT_DISPATCH_GRACE_MS
+                  ) {
+                    continue;
+                  }
+                  if (
+                    typeof comment.id === 'number' &&
+                    comment.id < winnerId
+                  ) {
+                    winnerId = comment.id;
+                  }
+                }
+                if (winnerId !== claimCommentId) {
+                  try {
+                    await github.rest.issues.deleteComment({
+                      owner,
+                      repo,
+                      comment_id: claimCommentId,
+                    });
+                  } catch (cleanupErr) {
+                    core.warning(
+                      `PR #${pr.number}: lost conflict-repair race for head ${headSha}; could not delete duplicate claim comment: ${cleanupErr.message}`
+                    );
+                  }
+                  core.info(
+                    `PR #${pr.number}: another reconciler claimed conflict repair for head ${headSha} first; waiting.`
+                  );
+                  return;
+                }
+              }
+
               try {
                 await github.request(
                   'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
                   {
                     owner,
                     repo,
-                    workflow_id: String(
-                      process.env.OPENCODE_WORKFLOW || 'continuum-opencode.yml'
-                    ).trim(),
+                    workflow_id: opencodeWorkflow,
                     ref: 'main',
                     inputs: {
                       mode: 'resolve-conflict',
@@ -1380,19 +1824,68 @@ jobs:
                   }
                 );
                 core.notice(
-                  `PR #${pr.number}: dispatched OpenCode conflict repair (${reason}).`
+                  `PR #${pr.number}: dispatched OpenCode conflict repair via ${opencodeWorkflow} for head ${headSha} (attempt ${attempt + 1}/${MAX_CONFLICT_DISPATCHES_PER_HEAD}, ${reason}).`
                 );
               } catch (err) {
+                // A failed dispatch leaves no run behind, so its claim must
+                // not linger inside the grace window (that would stall the
+                // next retry). Best-effort cleanup must never mask the
+                // original dispatch error needed to diagnose a bad caller
+                // name or a missing workflow_dispatch trigger.
                 try {
-                  await github.rest.issues.removeLabel({
+                  await github.rest.issues.deleteComment({
                     owner,
                     repo,
-                    issue_number: pr.number,
-                    name: CONFLICT_LOCK_LABEL,
+                    comment_id: claimCommentId,
                   });
-                } catch (_) {}
+                } catch (cleanupErr) {
+                  core.warning(
+                    `PR #${pr.number}: repair dispatch failed and claim cleanup failed: ${cleanupErr.message}`
+                  );
+                }
+                try {
+                  await removeConflictLock(pr.number);
+                } catch (unlockErr) {
+                  core.warning(
+                    `PR #${pr.number}: repair dispatch failed and lock removal failed: ${unlockErr.message}`
+                  );
+                }
                 throw err;
               }
+            }
+
+            // Early self-healing scan for one PR. Returns true when the PR was
+            // handled here (dirty: dispatched, waiting, or bounded hold) and
+            // the caller must continue to the next PR. Returns false when the
+            // PR is clean so the normal CI/review/merge gates evaluate this
+            // same pass; a leftover lock on a clean PR is reconciled first so
+            // CI runs on the repaired HEAD and the lifecycle resumes.
+            // GitHub mergeability of null means "still computing": the normal
+            // sync path (update-branch) remains authoritative for that case.
+            async function reconcileDirtyPr(pr) {
+              // Matches src/continuum/conflict_repair.py:is_conflicted so
+              // REST booleans and GraphQL-style strings agree on dirty.
+              const conflicted = isConflictedMergeability(
+                pr.mergeable,
+                pr.mergeable_state
+              );
+              if (conflicted !== true) {
+                if (
+                  conflicted === false &&
+                  hasLabel(pr, CONFLICT_LOCK_LABEL)
+                ) {
+                  await removeConflictLock(pr.number);
+                  core.notice(
+                    `PR #${pr.number}: repaired HEAD ${pr.head.sha} is no longer dirty; reconciled ${CONFLICT_LOCK_LABEL} and resuming CI/review lifecycle.`
+                  );
+                }
+                return false;
+              }
+              await dispatchConflictRepair(
+                pr,
+                `mergeable_state=${pr.mergeable_state}`
+              );
+              return true;
             }
 
             async function updateFromMain(pr) {
@@ -1595,6 +2088,16 @@ jobs:
                 core.info(
                   `PR #${pr.number}: ${AUTO_MERGE_BLOCK_LABEL} is set; skipping.`
                 );
+                continue;
+              }
+
+              // Self-healing conflict scan runs on every pass, before the
+              // CI/review gates, so an already-dirty PR is never stranded
+              // behind a red CI check and a PR that predates this controller
+              // revision is rediscovered without any new PR event or manual
+              // command. Clean PRs (including freshly repaired HEADs) fall
+              // through to the normal gates below.
+              if (await reconcileDirtyPr(pr)) {
                 continue;
               }
 
@@ -1875,14 +2378,20 @@ jobs:
                 continue;
               }
 
-              if (pr.mergeable === false || pr.mergeable_state === 'dirty') {
+              // Dirty check matches src/continuum/conflict_repair.py:is_conflicted:
+              // REST booleans and GraphQL-style mergeable strings agree.
+              const mergeConflicted = isConflictedMergeability(
+                pr.mergeable,
+                pr.mergeable_state
+              );
+              if (mergeConflicted === true) {
                 await dispatchConflictRepair(
                   pr,
                   `mergeable_state=${pr.mergeable_state}`
                 );
                 continue;
               }
-              if (pr.mergeable === null) {
+              if (mergeConflicted === null) {
                 core.info(
                   `PR #${pr.number}: GitHub mergeability is still being computed; waiting.`
                 );
