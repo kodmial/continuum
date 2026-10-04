@@ -393,6 +393,64 @@ jobs:
               return 15 * (1 << (attempt - 1));
             }
 
+            // Generic transient-failure classification for lifecycle
+            // self-healing (#224). Infrastructure gaps (GitHub 403 rate limit
+            // with an empty budget, 429/Retry-After, 5xx, network
+            // timeout/reset, runner cancellation/eviction, temporary
+            // provider/bootstrap outage) are retryable through the bounded
+            // budget. Deterministic policy outcomes (red CI, unresolved
+            // findings, merge conflict, malformed state, moved HEAD) never
+            // consume it and hold instead.
+            function isTransientApiError(err) {
+              const status = err ? (err.status ?? err.response?.status) : undefined;
+              if (status === 429) return true;
+              if (typeof status === 'number' && status >= 500 && status <= 599) return true;
+              if (status === 403) {
+                const headers = (err.response && err.response.headers) || err.headers || {};
+                const remaining = headers['x-ratelimit-remaining'] ?? headers['X-RateLimit-Remaining'];
+                const message = String(err.message || '');
+                if (String(remaining) === '0') return true;
+                if (/rate limit|rate-limit|ratelimit|quota exhaustion|secondary rate limit/i.test(message)) return true;
+                return false;
+              }
+              return /timeout|timed out|econnreset|econnrefused|eai_again|epipe|socket hang up|network|dns|tls|ssl|connection reset|connection refused|temporarily unavailable|service unavailable|bad gateway|gateway timeout|bootstrap|evicted|cancelled/i.test(
+                String((err && err.message) || '')
+              );
+            }
+
+            // Reset-aware scheduling (#224): Retry-After and
+            // X-RateLimit-Reset are a minimum next-attempt time. A runner
+            // never sleeps through a long wait: delays beyond the inline
+            // threshold defer to the scheduled safety net, which redispatches
+            // when the window expires. Short backoffs are awaited inline.
+            const MAX_INLINE_WAIT_SECONDS = 60;
+            function resetAwareDelaySeconds({ attempt, retryAfterSeconds, ratelimitResetEpoch, nowEpoch }) {
+              let delay = backoffSeconds(attempt);
+              if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds >= 0) {
+                delay = Math.max(delay, retryAfterSeconds);
+              }
+              if (Number.isFinite(ratelimitResetEpoch) && Number.isFinite(nowEpoch)) {
+                delay = Math.max(delay, Math.max(0, ratelimitResetEpoch - nowEpoch));
+              }
+              return delay;
+            }
+
+            // Per-PR/HEAD lease (#224): at most one authoritative
+            // reconciliation owns a PR/HEAD transition at a time. Duplicate
+            // review comments, status events and workflow completions for the
+            // same key coalesce; independent PRs never starve each other
+            // behind a repository-global lock.
+            const ownedLeases = new Set();
+            function leaseKey(prNumber, head, kind) {
+              return String(prNumber) + ':' + String(head || '').toLowerCase() + ':' + String(kind || '');
+            }
+            function tryAcquireLease(prNumber, head, kind) {
+              const key = leaseKey(prNumber, head, kind);
+              if (ownedLeases.has(key)) return false;
+              ownedLeases.add(key);
+              return true;
+            }
+
             function decide({
               ciGreen,
               operationStatus,
@@ -491,8 +549,13 @@ jobs:
               return String(data.default_branch || 'main');
             }
 
-            async function dispatch(pr, kind, head, attempt, status) {
-              const delaySeconds = backoffSeconds(attempt);
+            async function dispatch(pr, kind, head, attempt, status, signals = {}) {
+              const delaySeconds = resetAwareDelaySeconds({
+                attempt,
+                retryAfterSeconds: signals.retryAfterSeconds,
+                ratelimitResetEpoch: signals.ratelimitResetEpoch,
+                nowEpoch: Math.floor(nowMs() / 1000),
+              });
               const statusTime = status
                 ? Date.parse(String(status.updated_at || status.created_at || ''))
                 : null;
@@ -500,6 +563,25 @@ jobs:
                 ? Math.floor(Math.max(0, nowMs() - statusTime) / 1000)
                 : delaySeconds;
               const remaining = Math.max(0, delaySeconds - elapsedSeconds);
+              if (remaining > MAX_INLINE_WAIT_SECONDS) {
+                // Never keep a runner sleeping through a long rate-limit or
+                // quota wait. Record the reset-aware not-before time so the
+                // scheduled safety net redispatches when the window expires.
+                const notBefore = Math.floor(nowMs() / 1000) + remaining;
+                await upsertControllerState(
+                  pr.number,
+                  retryMarker(head, kind, attempt) + ' not-before=' + notBefore,
+                  'Deferred PR-Agent ' + kind + ' recovery for exact HEAD ' + head +
+                    ' until ' + new Date(notBefore * 1000).toISOString() +
+                    ' (reset-aware backoff ' + remaining + 's).'
+                );
+                core.notice(
+                  'PR #' + pr.number + ' ' + kind +
+                  ': deferring execution index ' + attempt + ' for ' + remaining +
+                  's; the scheduled safety net will redispatch. No runner sleeps.'
+                );
+                return false;
+              }
               if (remaining > 0) {
                 core.info(
                   'PR #' + pr.number + ' ' + kind +
@@ -653,7 +735,20 @@ jobs:
               const head = String(pr.head.sha || '').toLowerCase();
               if (!head) continue;
 
-              const ciGreen = await exactHeadCiGreen(head);
+              // Per-PR/HEAD/operation lease (#224): duplicate wakeups for the
+              // same transition coalesce; independent PRs never starve each
+              // other behind a repository-global lock.
+              if (!tryAcquireLease(pr.number, head, 'reconciler')) {
+                core.info(
+                  'PR #' + pr.number + ' HEAD ' + head +
+                  ': already owned by this reconciliation; coalescing duplicate wakeup.'
+                );
+                continue;
+              }
+              try {
+                // Latest-state reconciliation body (flat inside the loop so
+                // per-PR skip stays a plain `continue`).
+                const ciGreen = await exactHeadCiGreen(head);
               if (!ciGreen) {
                 core.info('PR #' + pr.number + ' HEAD ' + head + ': exact-head CI not green; skip.');
                 continue;
@@ -741,5 +836,19 @@ jobs:
               );
               if (dispatched) {
                 reviewRuns = await listReviewRuns();
+              }
+              } catch (err) {
+                // Generic transient classification (#224): infrastructure
+                // gaps retry via the next event/scheduled wakeup from latest
+                // state; deterministic reconciliation bugs hold loudly.
+                if (isTransientApiError(err)) {
+                  core.warning(
+                    'PR #' + pr.number + ' HEAD ' + head +
+                    ': transient reconciliation error; a later wakeup retries from latest state: ' +
+                    (err.message || err)
+                  );
+                } else {
+                  throw err;
+                }
               }
             }

@@ -62,10 +62,12 @@ permissions: {}
 concurrency:
   # Every trigger (CI dispatch, CodeRabbit, push, manual, or cron) enters the
   # same pure latest-state reconciler. It revalidates every gate immediately
-  # before each write. A newer wake-up makes an older queued/in-flight run
-  # obsolete, so at most one reconciliation owns side effects at a time.
+  # before each write. Runs are never cancelled: a per-PR/HEAD lease inside
+  # the reconciler owns each PR/HEAD transition, so a queued run simply
+  # coalesces with the in-flight one. Repository-global cancellation would
+  # let a busy PR starve unrelated PRs via repeated cancel/requeue livelock.
   group: ${{ github.workflow }}-auto-merge
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   controller:
@@ -92,12 +94,91 @@ jobs:
           POST_MERGE_WAKEUP_REF: ${{ inputs.post_merge_wakeup_ref || vars.CONTINUUM_POST_MERGE_WAKEUP_REF || github.event.repository.default_branch || 'main' }}
           REQUIRED_WORKFLOW_GATE_LABEL: ${{ inputs.required_workflow_gate_label || vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_LABEL || '' }}
           REQUIRED_WORKFLOW_GATE_NAME: ${{ inputs.required_workflow_gate_name || vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_NAME || '' }}
+          # Same-repository read-only discovery uses the run-scoped
+          # installation token. PAT remains the mutation/dispatch identity.
+          READ_GITHUB_TOKEN: ${{ github.token }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const repoFullName = `${owner}/${repo}`;
+            // Lifecycle self-healing (#224): same-repository read-only
+            // discovery uses the run-scoped GITHUB_TOKEN so recovery scans
+            // never consume TAP_PAT's shared budget. Mutations and dispatches
+            // below stay on the PAT-authenticated action client, preserving
+            // actor and event fan-out semantics.
+            const readToken = String(process.env.READ_GITHUB_TOKEN || '').trim();
+            const readBaseUrl = (
+              (github && github.request && github.request.endpoint &&
+                github.request.endpoint.DEFAULTS && github.request.endpoint.DEFAULTS.baseUrl) ||
+              process.env.GITHUB_API_URL || 'https://api.github.com'
+            );
+            const readGithub = readToken
+              ? new github.constructor({ auth: readToken, baseUrl: readBaseUrl })
+              : github;
+            if (!readToken) {
+              core.warning('READ_GITHUB_TOKEN is empty; using PAT client for auto-merge reads.');
+            }
+            let readTokenUnavailable = false;
+            async function withReadFallback(fn) {
+              if (readTokenUnavailable || readGithub === github) {
+                return await fn(github);
+              }
+              try {
+                return await fn(readGithub);
+              } catch (err) {
+                const status = err ? (err.status ?? err.response?.status) : undefined;
+                if (status === 401 || status === 403 || status === 429) {
+                  readTokenUnavailable = true;
+                  core.warning('Repository-token read failed (' + status + '); retrying with PAT client: ' + err.message);
+                  return await fn(github);
+                }
+                throw err;
+              }
+            }
+            // Generic transient-failure classification (#224): infrastructure
+            // gaps (rate limit with an empty budget, 429/Retry-After, 5xx,
+            // network timeout/reset, runner cancellation/eviction, temporary
+            // provider outage) are retryable via the next event/scheduled
+            // wakeup. Deterministic policy outcomes (red CI, unresolved
+            // findings, merge conflict, malformed state, moved HEAD) never
+            // consume the transient budget and hold instead.
+            function isTransientApiError(err) {
+              const status = err ? (err.status ?? err.response?.status) : undefined;
+              if (status === 429) return true;
+              if (typeof status === 'number' && status >= 500 && status <= 599) return true;
+              if (status === 403) {
+                const headers = (err.response && err.response.headers) || err.headers || {};
+                const remaining = headers['x-ratelimit-remaining'] ?? headers['X-RateLimit-Remaining'];
+                const message = String(err.message || '');
+                if (String(remaining) === '0') return true;
+                if (/rate limit|rate-limit|ratelimit|quota exhaustion|secondary rate limit/i.test(message)) return true;
+                return false;
+              }
+              const retryable = new Set(['cancelled', 'timed_out', 'stale', 'startup_failure']);
+              if (err && retryable.has(String(err.conclusion || '').toLowerCase())) return true;
+              return /timeout|timed out|econnreset|econnrefused|eai_again|epipe|socket hang up|network|dns|tls|ssl|connection reset|connection refused|temporarily unavailable|service unavailable|bad gateway|gateway timeout|bootstrap|evicted/i.test(
+                String((err && err.message) || '')
+              );
+            }
+            // Per-PR/HEAD lease (#224): at most one authoritative
+            // reconciliation owns a PR/HEAD transition at a time. Duplicate
+            // wakeups for the same key coalesce; independent PRs never block
+            // each other behind a repository-global lock.
+            const ownedLeases = new Set();
+            function leaseKey(prNumber, headSha) {
+              return String(prNumber) + ':' + String(headSha || '').toLowerCase();
+            }
+            function tryAcquireLease(prNumber, headSha) {
+              const key = leaseKey(prNumber, headSha);
+              if (ownedLeases.has(key)) return false;
+              ownedLeases.add(key);
+              return true;
+            }
+            function releaseLease(prNumber, headSha) {
+              ownedLeases.delete(leaseKey(prNumber, headSha));
+            }
             const AUTO_MERGE_BLOCK_LABEL = 'no-auto-merge';
             const CONFLICT_LOCK_LABEL = 'opencode-conflict-repair';
             // CodeRabbit is an optional integration. When this project did not
@@ -177,20 +258,24 @@ jobs:
             }
 
             async function getPull(pullNumber) {
-              const { data } = await github.rest.pulls.get({
-                owner, repo, pull_number: pullNumber,
-              });
+              const { data } = await withReadFallback(client =>
+                client.rest.pulls.get({
+                  owner, repo, pull_number: pullNumber,
+                })
+              );
               return data;
             }
 
             async function compareWithMain(headSha) {
-              const { data } = await github.request(
-                'GET /repos/{owner}/{repo}/compare/{basehead}',
-                {
-                  owner,
-                  repo,
-                  basehead: `main...${headSha}`,
-                }
+              const { data } = await withReadFallback(client =>
+                client.request(
+                  'GET /repos/{owner}/{repo}/compare/{basehead}',
+                  {
+                    owner,
+                    repo,
+                    basehead: `main...${headSha}`,
+                  }
+                )
               );
               return data;
             }
@@ -215,16 +300,18 @@ jobs:
             }
 
             async function mainDeltaSincePrHead(headSha) {
-              const { data } = await github.request(
-                'GET /repos/{owner}/{repo}/compare/{basehead}',
-                {
-                  owner,
-                  repo,
-                  // Reverse the normal PR comparison on purpose. GitHub uses
-                  // the merge base, so this side contains only commits/files
-                  // that advanced main since the PR diverged.
-                  basehead: `${headSha}...main`,
-                }
+              const { data } = await withReadFallback(client =>
+                client.request(
+                  'GET /repos/{owner}/{repo}/compare/{basehead}',
+                  {
+                    owner,
+                    repo,
+                    // Reverse the normal PR comparison on purpose. GitHub uses
+                    // the merge base, so this side contains only commits/files
+                    // that advanced main since the PR diverged.
+                    basehead: `${headSha}...main`,
+                  }
+                )
               );
 
               const files = (data.files || []).map(file => file.filename);
@@ -273,15 +360,17 @@ jobs:
             }
 
             async function latestWorkflowForHead(pr, headSha, workflowName) {
-              const runs = await github.paginate(
-                github.rest.actions.listWorkflowRunsForRepo,
-                {
-                  owner,
-                  repo,
-                  branch: pr.head.ref,
-                  event: 'pull_request',
-                  per_page: 100,
-                }
+              const runs = await withReadFallback(client =>
+                client.paginate(
+                  client.rest.actions.listWorkflowRunsForRepo,
+                  {
+                    owner,
+                    repo,
+                    branch: pr.head.ref,
+                    event: 'pull_request',
+                    per_page: 100,
+                  }
+                )
               );
 
               return runs
@@ -324,9 +413,11 @@ jobs:
             }
 
             async function latestCodeRabbitStatus(headSha) {
-              const { data } = await github.rest.repos.getCombinedStatusForRef({
-                owner, repo, ref: headSha,
-              });
+              const { data } = await withReadFallback(client =>
+                client.rest.repos.getCombinedStatusForRef({
+                  owner, repo, ref: headSha,
+                })
+              );
 
               return (data.statuses || [])
                 .filter(status => status.context === 'CodeRabbit')
@@ -338,14 +429,16 @@ jobs:
             }
 
             async function codeRabbitNoProgressBlocked(pr, headSha) {
-              const comments = await github.paginate(
-                github.rest.issues.listComments,
-                {
-                  owner,
-                  repo,
-                  issue_number: pr.number,
-                  per_page: 100,
-                }
+              const comments = await withReadFallback(client =>
+                client.paginate(
+                  client.rest.issues.listComments,
+                  {
+                    owner,
+                    repo,
+                    issue_number: pr.number,
+                    per_page: 100,
+                  }
+                )
               );
               const markerPrefix =
                 `<!-- continuum-coderabbit-no-progress head=${headSha} `;
@@ -486,14 +579,16 @@ jobs:
                 return false;
               }
 
-              let comments = await github.paginate(
-                github.rest.issues.listComments,
-                {
-                  owner,
-                  repo,
-                  issue_number: pr.number,
-                  per_page: 100,
-                }
+              let comments = await withReadFallback(client =>
+                client.paginate(
+                  client.rest.issues.listComments,
+                  {
+                    owner,
+                    repo,
+                    issue_number: pr.number,
+                    per_page: 100,
+                  }
+                )
               );
 
               const limited = latestCodeRabbitRateLimit(comments);
@@ -560,14 +655,16 @@ jobs:
                 return false;
               }
 
-              comments = await github.paginate(
-                github.rest.issues.listComments,
-                {
-                  owner,
-                  repo,
-                  issue_number: fresh.number,
-                  per_page: 100,
-                }
+              comments = await withReadFallback(client =>
+                client.paginate(
+                  client.rest.issues.listComments,
+                  {
+                    owner,
+                    repo,
+                    issue_number: fresh.number,
+                    per_page: 100,
+                  }
+                )
               );
 
               const freshLimited = latestCodeRabbitRateLimit(comments);
@@ -596,14 +693,16 @@ jobs:
             }
 
             async function latestCodeRabbitDecision(pr, headSha = pr.head.sha) {
-              const reviews = await github.paginate(
-                github.rest.pulls.listReviews,
-                {
-                  owner,
-                  repo,
-                  pull_number: pr.number,
-                  per_page: 100,
-                }
+              const reviews = await withReadFallback(client =>
+                client.paginate(
+                  client.rest.pulls.listReviews,
+                  {
+                    owner,
+                    repo,
+                    pull_number: pr.number,
+                    per_page: 100,
+                  }
+                )
               );
 
               return reviews
@@ -623,14 +722,16 @@ jobs:
             }
 
             async function codeRabbitNitpickReviews(pr, headSha = pr.head.sha) {
-              const reviews = await github.paginate(
-                github.rest.pulls.listReviews,
-                {
-                  owner,
-                  repo,
-                  pull_number: pr.number,
-                  per_page: 100,
-                }
+              const reviews = await withReadFallback(client =>
+                client.paginate(
+                  client.rest.pulls.listReviews,
+                  {
+                    owner,
+                    repo,
+                    pull_number: pr.number,
+                    per_page: 100,
+                  }
+                )
               );
 
               const headReviews = reviews.filter(review =>
@@ -703,24 +804,28 @@ jobs:
             }
 
             async function carriedCodeRabbitReviewBasis(pr, headSha) {
-              const { data: commit } = await github.rest.repos.getCommit({
-                owner,
-                repo,
-                ref: headSha,
-              });
+              const { data: commit } = await withReadFallback(client =>
+                client.rest.repos.getCommit({
+                  owner,
+                  repo,
+                  ref: headSha,
+                })
+              );
               const parents = (commit.parents || []).map(parent =>
                 parent.sha.toLowerCase()
               );
               if (parents.length !== 2) return null;
 
-              const comments = await github.paginate(
-                github.rest.issues.listComments,
-                {
-                  owner,
-                  repo,
-                  issue_number: pr.number,
-                  per_page: 100,
-                }
+              const comments = await withReadFallback(client =>
+                client.paginate(
+                  client.rest.issues.listComments,
+                  {
+                    owner,
+                    repo,
+                    issue_number: pr.number,
+                    per_page: 100,
+                  }
+                )
               );
 
               const markerPattern =
@@ -787,8 +892,9 @@ jobs:
               let cursor = null;
 
               do {
-                const data = await github.graphql(
-                  `query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+                const data = await withReadFallback(client =>
+                  client.graphql(
+                    `query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
                     repository(owner: $owner, name: $repo) {
                       pullRequest(number: $number) {
                         reviewThreads(first: 100, after: $cursor) {
@@ -813,12 +919,13 @@ jobs:
                       }
                     }
                   }`,
-                  {
-                    owner,
-                    repo,
-                    number: pr.number,
-                    cursor,
-                  }
+                    {
+                      owner,
+                      repo,
+                      number: pr.number,
+                      cursor,
+                    }
+                  )
                 );
 
                 const connection =
@@ -887,14 +994,16 @@ jobs:
             async function requestCodeRabbitThreadVerification(pr, threads) {
               if (!threads.length) return 0;
 
-              const comments = await github.paginate(
-                github.rest.pulls.listReviewComments,
-                {
-                  owner,
-                  repo,
-                  pull_number: pr.number,
-                  per_page: 100,
-                }
+              const comments = await withReadFallback(client =>
+                client.paginate(
+                  client.rest.pulls.listReviewComments,
+                  {
+                    owner,
+                    repo,
+                    pull_number: pr.number,
+                    per_page: 100,
+                  }
+                )
               );
 
               let requested = 0;
@@ -938,11 +1047,13 @@ jobs:
             }
 
             async function cancelObsoleteRuns(openPulls) {
-              const { data: mainBranch } = await github.rest.repos.getBranch({
-                owner,
-                repo,
-                branch: 'main',
-              });
+              const { data: mainBranch } = await withReadFallback(client =>
+                client.rest.repos.getBranch({
+                  owner,
+                  repo,
+                  branch: 'main',
+                })
+              );
               const mainSha = mainBranch.commit.sha;
 
               const liveHeads = new Set([
@@ -950,13 +1061,15 @@ jobs:
                 ...openPulls.map(pr => pr.head.sha),
               ]);
 
-              const runs = await github.paginate(
-                github.rest.actions.listWorkflowRunsForRepo,
-                {
-                  owner,
-                  repo,
-                  per_page: 100,
-                }
+              const runs = await withReadFallback(client =>
+                client.paginate(
+                  client.rest.actions.listWorkflowRunsForRepo,
+                  {
+                    owner,
+                    repo,
+                    per_page: 100,
+                  }
+                )
               );
 
               const activeStates =
@@ -1010,12 +1123,14 @@ jobs:
                 ) {
                   try {
                     const { data: versionFile } =
-                      await github.rest.repos.getContent({
-                        owner,
-                        repo,
-                        path: process.env.CONTINUUM_VERSION_FILE,
-                        ref: run.head_sha,
-                      });
+                      await withReadFallback(client =>
+                        client.rest.repos.getContent({
+                          owner,
+                          repo,
+                          path: process.env.CONTINUUM_VERSION_FILE,
+                          ref: run.head_sha,
+                        })
+                      );
                     if (Array.isArray(versionFile) || !versionFile.content) {
                       continue;
                     }
@@ -1028,11 +1143,13 @@ jobs:
                     if (!match) continue;
 
                     const { data: release } =
-                      await github.rest.repos.getReleaseByTag({
-                        owner,
-                        repo,
-                        tag: `v${match[0]}`,
-                      });
+                      await withReadFallback(client =>
+                        client.rest.repos.getReleaseByTag({
+                          owner,
+                          repo,
+                          tag: `v${match[0]}`,
+                        })
+                      );
 
                     const publishedAt = new Date(
                       release.published_at || release.created_at || 0
@@ -1106,11 +1223,13 @@ jobs:
 
             async function updateFromMain(pr) {
               const oldHead = pr.head.sha;
-              const { data: mainBranch } = await github.rest.repos.getBranch({
-                owner,
-                repo,
-                branch: 'main',
-              });
+              const { data: mainBranch } = await withReadFallback(client =>
+                client.rest.repos.getBranch({
+                  owner,
+                  repo,
+                  branch: 'main',
+                })
+              );
               const mainHead = mainBranch.commit.sha;
 
               // Carry is allowed only from a fully valid review basis and only
@@ -1150,11 +1269,13 @@ jobs:
 
                 let carried = false;
                 if (reviewBasis && fresh && fresh.head.sha !== oldHead) {
-                  const { data: newCommit } = await github.rest.repos.getCommit({
-                    owner,
-                    repo,
-                    ref: fresh.head.sha,
-                  });
+                  const { data: newCommit } = await withReadFallback(client =>
+                    client.rest.repos.getCommit({
+                      owner,
+                      repo,
+                      ref: fresh.head.sha,
+                    })
+                  );
                   const parents = (newCommit.parents || []).map(parent =>
                     parent.sha.toLowerCase()
                   );
@@ -1221,13 +1342,15 @@ jobs:
               }
             }
 
-            const pulls = await github.paginate(github.rest.pulls.list, {
-              owner,
-              repo,
-              state: 'open',
-              base: 'main',
-              per_page: 100,
-            });
+            const pulls = await withReadFallback(client =>
+              client.paginate(client.rest.pulls.list, {
+                owner,
+                repo,
+                state: 'open',
+                base: 'main',
+                per_page: 100,
+              })
+            );
 
             const cancelledRuns = await cancelObsoleteRuns(pulls);
             if (cancelledRuns.ci > 0 || cancelledRuns.noopRelease > 0) {
@@ -1255,6 +1378,21 @@ jobs:
               ) {
                 continue;
               }
+
+              // Per-PR/HEAD coalescing (#224): duplicate wakeups for the same
+              // transition collapse onto one lease; unrelated PRs proceed
+              // independently instead of queuing behind a repository lock.
+              // The lease pins the HEAD observed at acquisition: if the HEAD
+              // moves mid-reconciliation, the reconciler re-reads and refuses
+              // to merge the stale result.
+              const leaseHead = pr.head.sha;
+              if (!tryAcquireLease(pr.number, leaseHead)) {
+                core.info(
+                  `PR #${pr.number}: HEAD ${leaseHead} is already owned by this reconciliation; coalescing duplicate wakeup.`
+                );
+                continue;
+              }
+              try {
 
               if (hasLabel(pr, AUTO_MERGE_BLOCK_LABEL)) {
                 core.info(
@@ -1614,4 +1752,7 @@ jobs:
               // new main. Clean controller-generated syncs keep an already valid
               // CodeRabbit approval; all other new commits require a fresh review.
               break;
+              } finally {
+                releaseLease(pr.number, leaseHead);
+              }
             }
