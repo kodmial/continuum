@@ -348,11 +348,6 @@ jobs:
             }
 
             async function operationIsActive(prNumber, head, kind) {
-              const runs = await listReviewRuns();
-              return Boolean(exactActiveRun(runs, prNumber, kind, head));
-            }
-
-            async function operationIsActive(prNumber, head, kind) {
               // Re-read immediately before dispatch-grace coalescing. A fresh
               // controller marker is only proof of a live dispatch while the
               // exact PR/HEAD/operation run is still active; if that run was
