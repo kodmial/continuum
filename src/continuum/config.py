@@ -1053,6 +1053,10 @@ def _require_repository(value: Any, where: str) -> str:
             f"{where} must be an owner/repository name; got {value!r}"
         )
     cleaned = value.strip()
+    if cleaned.count("/") != 1:
+        raise ConfigError(
+            f"{where} must be an owner/repository name; got {value!r}"
+        )
     owner, _, name = cleaned.partition("/")
     # The charset class alone accepts dot-only components (`owner/..`,
     # `owner/.`); fail closed because they are never valid GitHub identities.
