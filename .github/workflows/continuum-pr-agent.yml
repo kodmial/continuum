@@ -494,7 +494,6 @@ jobs:
           POLICY_SCRIPT="$POLICY_SCRIPT" node -e '
             const p = require(process.env.POLICY_SCRIPT);
             for (const key of [
-              "IMPROVE_REPAIR_THRESHOLD",
               "isCleanReviewForImproveSkip",
               "hasIncompleteCoverageSignal",
               "hasToolErrorSignal",
@@ -503,7 +502,7 @@ jobs:
               "qualifyingImproveSuggestions",
               "unwrapReview"
             ]) {
-              if (p[key] === undefined) {
+              if (typeof p[key] !== "function") {
                 console.error("::error::Continuum PR-Agent policy bundle is missing export: " + key);
                 process.exit(1);
               }
@@ -776,19 +775,7 @@ jobs:
                   review = json.loads(os.environ.get("REVIEW_JSON", ""))
               except json.JSONDecodeError as exc:
                   raise SystemExit(f"Cannot validate review for persistent-state fallback: {exc}")
-              # Split envelopes carry findings on both sides: merge
-              # fail-closed (union) so no actionable finding is dropped from
-              # the derived fallback state.
-              if isinstance(review, dict) and isinstance(review.get("review"), dict):
-                  outer_findings = review.get("key_issues_to_review")
-                  nested_findings = review.get("review", {}).get("key_issues_to_review")
-                  if isinstance(outer_findings, list) and isinstance(nested_findings, list):
-                      merged_findings = [*outer_findings, *nested_findings]
-                      review = {
-                          **review,
-                          "key_issues_to_review": merged_findings,
-                          "review": {**review["review"], "key_issues_to_review": merged_findings},
-                      }
+              # Split-envelope union is handled inside derive_fallback_state (union + fail-closed on invalid shapes). Do not pre-merge here to avoid duplicating findings.
               try:
                   return derive_fallback_state(
                       review,

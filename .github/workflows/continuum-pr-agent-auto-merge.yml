@@ -339,7 +339,7 @@ jobs:
               return;
             }
             if (keyIssues.length > 0) {
-              if (keyIssues.length === 6) {
+              if (keyIssues.length === policy.REVIEW_MAX_FINDINGS) {
                 fail('review batch reached the findings cap: potentially truncated');
               } else {
                 fail(`${keyIssues.length} current key issue(s) remain`);

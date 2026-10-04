@@ -244,7 +244,7 @@ function buildRepairBatch(reviewPayload, improveJsonl, threshold = IMPROVE_REPAI
     reviewCount: keyIssues.length,
     qualifyingSuggestionCount: qualifying.length,
     deduplicatedSuggestions,
-    truncated: keyIssues.length === 6,
+    truncated: keyIssues.length === REVIEW_MAX_FINDINGS,
   };
 }
 
@@ -363,6 +363,12 @@ const COVERAGE_FLAG_KEYS = [
   'incomplete',
 ];
 
+// Generic keys routinely carry ordinary prose (e.g.
+// `"complete": "completed review summary"`), so only explicit false-like
+// values on those keys signal incomplete coverage; unparseable strings
+// and other shapes are ignored.
+const GENERIC_COVERAGE_KEYS = new Set(['is_complete', 'is_completed', 'complete']);
+
 const COVERAGE_OBJECT_KEYS = [
   'coverage',
   'review_coverage',
@@ -403,6 +409,30 @@ function coverageFlagValueIsIncomplete(key, value) {
       return value !== 0;
     }
     return true;
+  }
+  if (GENERIC_COVERAGE_KEYS.has(key)) {
+    // Generic keys carry prose as often as coverage state: only explicit
+    // false-like values block the clean fast path. Unparseable strings
+    // and other shapes are ignored (no signal).
+    if (typeof value === 'boolean') return value === false;
+    if (value === null || value === undefined) return false;
+    if (typeof value === 'string') {
+      const lowered = value.trim().toLowerCase();
+      if (!lowered) return false;
+      if (['0', 'false', 'no'].includes(lowered)) return true;
+      if (['1', 'true', 'yes'].includes(lowered)) return false;
+      const numeric = Number(lowered);
+      if (lowered !== '' && Number.isFinite(numeric)) {
+        return numeric === 0;
+      }
+      return false;
+    }
+    if (typeof value === 'number') {
+      if (Number.isNaN(value)) return false;
+      if (!Number.isFinite(value)) return false;
+      return value === 0;
+    }
+    return false;
   }
   if (typeof value === 'boolean') return value === false;
   if (value === null || value === undefined) return true;
@@ -480,9 +510,11 @@ function hasIncompleteCoverageSignal(reviewPayload) {
     return true;
   }
   if (!seenCoverage) {
-    // Absent coverage keys mean no signal (coverage is assumed complete
-    // here; the findings-cap truncation check still applies separately).
-    return false;
+    // Absent coverage keys are not evidence of complete coverage: fail
+    // closed so a payload that omits coverage footers can never qualify
+    // for an improve skip on missing evidence (the findings-cap
+    // truncation check still applies separately).
+    return true;
   }
   return false;
 }
@@ -671,6 +703,14 @@ function persistentHasActive(persistentState) {
   return false;
 }
 
+function isPlausibleHeadSha(value) {
+  // Production HEADs are 40/64 hex; fixtures use short hex (e.g. "abc").
+  // Placeholders such as "unknown" contain non-hex characters and must
+  // never satisfy the exact-HEAD skip check.
+  const text = String(value || '').trim().toLowerCase();
+  return /^[0-9a-f]+$/.test(text);
+}
+
 function isCleanReviewForImproveSkip(reviewPayload, persistentState, options = {}) {
   const opts = options && typeof options === 'object' ? options : {};
   const headMatches = opts.headMatches === true;
@@ -702,7 +742,7 @@ function isCleanReviewForImproveSkip(reviewPayload, persistentState, options = {
   }
   // Fail closed: coverage must be proven complete with an explicit opt-in
   // plus no incomplete signal in the review payload. An omitted flag never
-  // skips; absent coverage keys mean no signal (assumed complete, with the
+  // skips; absent coverage keys fail closed as incomplete (with the
   // findings-cap truncation check applying separately).
   const reviewCoverageComplete =
     opts.reviewCoverageComplete === true && !hasIncompleteCoverageSignal(review);
@@ -739,7 +779,15 @@ function isCleanReviewForImproveSkip(reviewPayload, persistentState, options = {
   }
   const stateHead = String(lastRun.head_sha || lastRun.headSha || '').trim().toLowerCase();
   if (!stateHead) {
-    throw new Error('Upstream PR-Agent persistent state has no last_run.head_sha.');
+    // Benign schema variation (e.g. an upstream field omission): run
+    // improve for repair value instead of crashing the orchestrator.
+    return { skip: false, reason: 'persistent state has no last_run.head_sha: failing closed' };
+  }
+  if (!isPlausibleHeadSha(stateHead) || !isPlausibleHeadSha(reviewedHeadSha)) {
+    // Identical placeholders (e.g. "unknown" on both sides) must never
+    // pass the exact-HEAD check: only a real commit SHA shape can allow a
+    // skip. Fail closed to improve, never to an exception.
+    return { skip: false, reason: 'unrecognized HEAD shape: failing closed' };
   }
   if (stateHead !== reviewedHeadSha) {
     return { skip: false, reason: 'stale persistent state: not for the reviewed HEAD' };

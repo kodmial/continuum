@@ -148,6 +148,21 @@ def is_same_head(expected_sha: str, actual_sha: str) -> bool:
     return expected_sha.strip().lower() == actual_sha.strip().lower()
 
 
+def _is_plausible_head_sha(value: object) -> bool:
+    """Whether a HEAD value looks like a commit SHA, not a placeholder.
+
+    Production HEADs are 40/64 lowercase hex; unit fixtures use short hex
+    (e.g. "abc"). Identical placeholders such as "unknown" contain
+    non-hex characters and must never satisfy the exact-HEAD skip check,
+    so require a non-empty hex string instead of mere non-emptiness.
+    """
+
+    text = str(value or "").strip().lower()
+    if not text:
+        return False
+    return re.fullmatch(r"[0-9a-f]+", text) is not None
+
+
 def admission_allowed(
     *,
     pr_state: str,
@@ -350,9 +365,16 @@ _TOOL_ERROR_SIGNAL_KEYS = (
     "failed_tools",
 )
 
-# Review-payload keys that carry an explicit coverage signal. Absent keys
-# mean no signal (coverage is assumed complete here; the findings-cap
-# truncation check still applies separately below).
+# Review-payload keys that carry an explicit coverage signal. Explicit
+# coverage keys (`review_coverage_complete`, `coverage_complete`,
+# `coverage_completed`, `truncated`, `partial`, `incomplete`) fail closed
+# on unparseable values. Generic keys (`is_complete`, `is_completed`,
+# `complete`) routinely carry ordinary prose (e.g.
+# `"complete": "completed review summary"`), so only explicit false-like
+# values on those keys count as incomplete; unparseable strings and other
+# shapes are ignored. Absent coverage keys fail closed (see
+# has_incomplete_coverage_signal); the findings-cap truncation check still
+# applies separately below.
 _COVERAGE_FLAG_KEYS = (
     "review_coverage_complete",
     "coverage_complete",
@@ -363,6 +385,14 @@ _COVERAGE_FLAG_KEYS = (
     "truncated",
     "partial",
     "incomplete",
+)
+
+# Generic coverage keys that must not fail closed on prose: only explicit
+# false-like values signal incomplete coverage.
+_GENERIC_COVERAGE_KEYS = (
+    "is_complete",
+    "is_completed",
+    "complete",
 )
 
 _COVERAGE_OBJECT_KEYS = (
@@ -423,6 +453,38 @@ def _coverage_flag_value_is_incomplete(key: str, value: object) -> bool:
                 return True
             return value != 0
         return True
+    if key in _GENERIC_COVERAGE_KEYS:
+        # Generic keys carry ordinary prose as often as coverage state, so
+        # only explicit false-like values block the clean fast path.
+        # Unparseable strings and other shapes are ignored (no signal).
+        if isinstance(value, bool):
+            return value is False
+        if value is None:
+            return False
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if not lowered:
+                return False
+            if lowered in ("0", "false", "no"):
+                return True
+            if lowered in ("1", "true", "yes"):
+                return False
+            try:
+                numeric = float(lowered)
+            except (TypeError, ValueError):
+                return False
+            if numeric != numeric:  # NaN: ignore for generic keys
+                return False
+            if numeric in (float("inf"), float("-inf")):
+                return False
+            return numeric == 0
+        if isinstance(value, (int, float)):
+            if isinstance(value, float) and value != value:
+                return False
+            if isinstance(value, float) and value in (float("inf"), float("-inf")):
+                return False
+            return value == 0
+        return False
     if isinstance(value, bool):
         return value is False
     if value is None:
@@ -454,7 +516,12 @@ def _coverage_flag_value_is_incomplete(key: str, value: object) -> bool:
 
 
 def has_incomplete_coverage_signal(review: Mapping[str, Any]) -> bool:
-    """Whether the review payload itself reports incomplete coverage."""
+    """Whether the review payload itself reports incomplete coverage.
+
+    Fail closed: a payload with no recognized coverage keys reports
+    incomplete so a truncated/omitted coverage footer can never qualify
+    for an improve skip on missing evidence.
+    """
 
     inner = _unwrap_review(review)
     seen_coverage = False
@@ -523,10 +590,11 @@ def has_incomplete_coverage_signal(review: Mapping[str, Any]) -> bool:
         # an unrecognized coverage shape: fail closed.
         return True
     if not seen_coverage:
-        # Absent coverage keys mean no signal (coverage is assumed
-        # complete here; the findings-cap truncation check still applies
-        # separately below).
-        return False
+        # Absent coverage keys are not evidence of complete coverage: fail
+        # closed so a payload that omits coverage footers can never qualify
+        # for an improve skip on missing evidence (the findings-cap
+        # truncation check still applies separately below).
+        return True
     return False
 
 
@@ -710,14 +778,18 @@ def should_skip_improve(
     against `persistent_state.last_run.head_sha` and a missing value raises
     `LifecycleError` (fail closed) so a stale persistent state from a prior
     HEAD can never authorize a skip. Callers must pass the exact reviewed
-    HEAD; a missing `last_run.head_sha` always raises `LifecycleError`.
+    HEAD. A missing `last_run.head_sha` (or an unrecognized HEAD shape such
+    as a placeholder) returns `skip=False` so `improve` still runs for
+    repair value instead of crashing the orchestrator; only a plausible
+    hex HEAD that exactly matches the reviewed HEAD can allow a skip.
 
     Anything else returns `skip=False` so `improve` may still run to
     generate additional repair suggestions. Invalid review payloads and a
     missing reviewed HEAD raise `LifecycleError` and fail closed instead
     of skipping; a benign persistent format variation (non-object state,
-    non-list findings, missing `last_run`, non-full run) with a known HEAD
-    returns `skip=False` so `improve` still runs.
+    non-list findings, missing `last_run`, non-full run, missing or
+    placeholder `head_sha`) with a known HEAD returns `skip=False` so
+    `improve` still runs.
     """
 
     inner = _unwrap_review(review)
@@ -767,9 +839,16 @@ def should_skip_improve(
         return {"skip": False, "reason": "persistent state has no last_run: failing closed"}
     if last_run.get("complete") is not True or str(last_run.get("kind") or "") != "full":
         return {"skip": False, "reason": "persistent state is not from a complete full review: failing closed"}
-    state_head = str(last_run.get("head_sha") or "").strip()
+    state_head = str(last_run.get("head_sha") or last_run.get("headSha") or "").strip()
     if not state_head:
-        raise LifecycleError("upstream PR-Agent persistent state has no last_run.head_sha.")
+        # Benign schema variation (e.g. an upstream field omission): run
+        # improve for repair value instead of crashing the orchestrator.
+        return {"skip": False, "reason": "persistent state has no last_run.head_sha: failing closed"}
+    if not _is_plausible_head_sha(state_head) or not _is_plausible_head_sha(expected_head):
+        # Identical placeholders (e.g. "unknown" on both sides) must never
+        # pass the exact-HEAD check: only a real commit SHA shape can allow
+        # a skip. Fail closed to improve, never to an exception.
+        return {"skip": False, "reason": "unrecognized HEAD shape: failing closed"}
     if not is_same_head(state_head, expected_head):
         return {"skip": False, "reason": "stale persistent state: not for the reviewed HEAD"}
     try:
