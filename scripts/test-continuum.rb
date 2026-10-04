@@ -1903,16 +1903,25 @@ class ContinuumTest < Minitest::Test
                      'PR-Agent review tool execution must use repository token'
     assert_includes improve_tool, 'GITHUB__USER_TOKEN: ${{ github.token }}',
                      'PR-Agent improve tool execution must use repository token'
-    assert_includes in_flight, 'github-token: ${{ github.token }}',
-                    'commit-status publishing must use repository token'
+    assert_includes in_flight, conditional_token,
+                    'in-flight commit-status publishing must select TAP_PAT for delegated writes instead of an unconditional github.token'
+    assert_includes in_flight, empty_token_tail,
+                    'in-flight commit-status publishing must yield an empty token for delegated runs without PAT so auth itself fails closed'
+    refute_includes in_flight, 'secrets.TAP_PAT || github.token }}',
+                    'in-flight commit-status publishing must not fall back to github.token for delegated runs without PAT'
+    assert_includes in_flight, 'Delegated PR-Agent execution requires TAP_PAT',
+                    'in-flight commit-status publishing must fail closed for delegated writes without TAP_PAT'
+    refute_includes in_flight, 'github-token: ${{ github.token }}',
+                    'in-flight commit-status publishing must not set an unconditional github.token credential'
     assert_includes normalize, 'github-token: ${{ github.token }}',
                     'comment maintenance must use repository token'
     assert_includes normalize, 'deleteComment'
     assert_includes publish, 'github-token: ${{ github.token }}',
                      'commit-status publishing must use repository token'
-    # Target-aware (#243) delegated reads require TAP_PAT, so the review
+    # Target-aware (#243) delegated reads/writes require TAP_PAT, so the review
     # workflow is no longer entirely PAT-free: the admission/revalidation
-    # steps above legitimately carry the fail-closed conditional. The
+    # steps above plus the in-flight commit-status step legitimately carry
+    # the fail-closed conditional. The
     # PAT-quota isolation contract is preserved in scoped form: local
     # control-plane steps stay repository-token backed (asserted per step
     # above), tool execution never consumes the shared PAT, there is no
@@ -6086,6 +6095,8 @@ class ContinuumTest < Minitest::Test
                       "#{base}: the 422 detection must name the opaque target_child_id input"
       assert_includes step, 'refusing bare retry to preserve the delegated target',
                       "#{base}: a retry workflow without the target_child_id input must fail closed explicitly, never dispatch bare"
+      assert_includes step, 'set +e',
+                      "#{base}: the retry dispatch must disable errexit around the expected 422 failure so the explicit detection runs"
     end
   end
 

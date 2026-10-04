@@ -487,9 +487,22 @@ jobs:
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           HEAD_SHA: ${{ steps.admit.outputs.head_sha }}
+          TAP_PAT: ${{ secrets.TAP_PAT }}
         with:
-          github-token: ${{ github.token }}
+          # Target-aware status (createCommitStatus against the resolved
+          # target). Local same-repository writes use github.token;
+          # delegated cross-repository writes require TAP_PAT. The fallback
+          # is gated on non-delegated runs so a delegated run without PAT
+          # yields an empty token (auth itself fails closed).
+          github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           script: |
+            if (process.env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED === 'true' &&
+                !String(process.env.TAP_PAT || '').trim()) {
+              core.setFailed(
+                'Delegated PR-Agent execution requires TAP_PAT; refusing to fall back to github.token.'
+              );
+              return;
+            }
             await github.rest.repos.createCommitStatus({
               owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
               repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
@@ -1947,8 +1960,10 @@ jobs:
           # (mirrors the merge-wakeup 422 detection).
           dispatch_isolated_retry() {
             local dispatch_output dispatch_status
+            set +e
             dispatch_output="$(gh workflow run "$RETRY_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" "$@" 2>&1)"
             dispatch_status=$?
+            set -e
             if (( dispatch_status == 0 )); then
               printf '%s\n' "$dispatch_output"
               return 0

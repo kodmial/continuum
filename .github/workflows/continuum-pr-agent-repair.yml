@@ -1094,8 +1094,10 @@ jobs:
           # (mirrors the merge-wakeup 422 detection).
           dispatch_isolated_retry() {
             local dispatch_output dispatch_status
+            set +e
             dispatch_output="$(gh workflow run "$RETRY_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" "$@" 2>&1)"
             dispatch_status=$?
+            set -e
             if (( dispatch_status == 0 )); then
               printf '%s\n' "$dispatch_output"
               return 0
