@@ -357,5 +357,296 @@ class DispatchStormTests(unittest.TestCase):
                 self.assertRaises(ValueError, builder)
 
 
+def trusted_comment(body, association="OWNER", login="some-owner"):
+    return {
+        "body": body,
+        "author_association": association,
+        "user": {"login": login},
+    }
+
+
+class DispatchInstructionExclusionTests(unittest.TestCase):
+    def test_dispatch_comment_with_quoted_result_marker_is_not_evidence(self):
+        dispatch = gate.dispatch_marker(182, 184, SHA_A)
+        instructional = (
+            dispatch
+            + "\nMandatory live qualification for capability #182 at main `"
+            + SHA_A
+            + "`: publish "
+            + gate.evidence_marker(184, SHA_A, "pass")
+            + " evidence for this exact SHA."
+        )
+        self.assertEqual(gate.parse_evidence_entries(instructional), [])
+        self.assertEqual(
+            gate.qualification_evidence_state([instructional], 184, SHA_A),
+            gate.EVIDENCE_UNKNOWN,
+        )
+
+    def test_dispatch_prose_without_marker_shape_is_detected(self):
+        self.assertTrue(
+            gate.is_dispatch_instruction(
+                gate.dispatch_marker(182, 184, SHA_A) + "\nvalidate this SHA"
+            )
+        )
+        self.assertFalse(
+            gate.is_dispatch_instruction(
+                "validate this SHA\n" + gate.evidence_marker(184, SHA_A, "pass")
+            )
+        )
+        self.assertFalse(gate.is_dispatch_instruction(None))
+
+    def test_result_comment_without_dispatch_marker_still_counts(self):
+        comments = [evidence_comment(184, SHA_A, "pass")]
+        self.assertEqual(
+            gate.qualification_evidence_state(comments, 184, SHA_A),
+            gate.EVIDENCE_PASS,
+        )
+
+
+class TrustedAuthorTests(unittest.TestCase):
+    def test_untrusted_public_marker_is_rejected(self):
+        forged = trusted_comment(
+            evidence_comment(184, SHA_A, "pass"),
+            association="NONE",
+            login="random-forger",
+        )
+        self.assertFalse(gate.is_trusted_evidence_author("NONE", "random-forger"))
+        self.assertEqual(
+            gate.qualification_evidence_state([forged], 184, SHA_A),
+            gate.EVIDENCE_UNKNOWN,
+        )
+
+    def test_contributor_and_first_timer_markers_are_rejected(self):
+        for association in ("CONTRIBUTOR", "FIRST_TIMER", "FIRST_TIME_CONTRIBUTOR", ""):
+            with self.subTest(association=association):
+                comment = trusted_comment(
+                    evidence_comment(184, SHA_A, "pass"),
+                    association=association,
+                    login="outsider",
+                )
+                self.assertEqual(
+                    gate.qualification_evidence_state([comment], 184, SHA_A),
+                    gate.EVIDENCE_UNKNOWN,
+                )
+
+    def test_owner_member_collaborator_markers_are_accepted(self):
+        for association in ("OWNER", "MEMBER", "COLLABORATOR", "owner", "Member"):
+            with self.subTest(association=association):
+                self.assertTrue(
+                    gate.is_trusted_evidence_author(association, "someone")
+                )
+                comment = trusted_comment(
+                    evidence_comment(184, SHA_A, "pass"),
+                    association=association,
+                )
+                self.assertEqual(
+                    gate.qualification_evidence_state([comment], 184, SHA_A),
+                    gate.EVIDENCE_PASS,
+                )
+
+    def test_trusted_github_actions_result_is_accepted_where_allowed(self):
+        import json
+
+        self.assertTrue(
+            gate.is_trusted_evidence_author("NONE", "github-actions[bot]")
+        )
+        canonical = trusted_comment(
+            evidence_comment(184, SHA_A, "pass"),
+            association="NONE",
+            login="github-actions[bot]",
+        )
+        self.assertEqual(
+            gate.qualification_evidence_state([canonical], 184, SHA_A),
+            gate.EVIDENCE_PASS,
+        )
+        payload = json.dumps({"head_sha": SHA_A, "classification": "pass"})
+        docker = trusted_comment(
+            gate.DOCKER_RESULT_MARKER + "\n" + payload,
+            association="NONE",
+            login="github-actions[bot]",
+        )
+        self.assertEqual(
+            gate.qualification_evidence_state([docker], 184, SHA_A),
+            gate.EVIDENCE_PASS,
+        )
+
+    def test_exact_sha_stale_evidence_is_rejected_even_when_trusted(self):
+        comment = trusted_comment(evidence_comment(184, SHA_A, "pass"))
+        self.assertEqual(
+            gate.qualification_evidence_state([comment], 184, SHA_B),
+            gate.EVIDENCE_UNKNOWN,
+        )
+
+    def test_untrusted_forgery_cannot_override_trusted_evidence(self):
+        comments = [
+            trusted_comment(evidence_comment(184, SHA_A, "pass")),
+            trusted_comment(
+                evidence_comment(184, SHA_A, "fail"),
+                association="NONE",
+                login="random-forger",
+            ),
+        ]
+        self.assertEqual(
+            gate.qualification_evidence_state(comments, 184, SHA_A),
+            gate.EVIDENCE_PASS,
+        )
+
+    def test_latest_trusted_verdict_wins(self):
+        comments = [
+            trusted_comment(evidence_comment(184, SHA_A, "pass")),
+            trusted_comment(
+                evidence_comment(184, SHA_A, "fail"), association="MEMBER"
+            ),
+        ]
+        self.assertEqual(
+            gate.qualification_evidence_state(comments, 184, SHA_A),
+            gate.EVIDENCE_FAIL,
+        )
+
+    def test_comment_without_author_metadata_fails_closed(self):
+        self.assertEqual(
+            gate.qualification_evidence_state(
+                [{"body": evidence_comment(184, SHA_A, "pass")}], 184, SHA_A
+            ),
+            gate.EVIDENCE_UNKNOWN,
+        )
+        self.assertEqual(
+            gate.qualification_evidence_state([None, 123], 184, SHA_A),
+            gate.EVIDENCE_UNKNOWN,
+        )
+
+    def test_plain_string_bodies_keep_their_historical_meaning(self):
+        self.assertEqual(
+            gate.qualification_evidence_state(
+                [evidence_comment(184, SHA_A, "pass")], 184, SHA_A
+            ),
+            gate.EVIDENCE_PASS,
+        )
+
+
+class QualificationDispatchLookupTests(unittest.TestCase):
+    def test_latest_dispatch_for_the_issue_wins(self):
+        bodies = [
+            gate.dispatch_marker(182, 184, SHA_A),
+            gate.dispatch_marker(182, 184, SHA_B),
+        ]
+        self.assertEqual(
+            gate.qualification_dispatch_for(bodies, 184),
+            {"capability": 182, "sha": SHA_B},
+        )
+
+    def test_dispatch_for_another_issue_is_ignored(self):
+        bodies = [gate.dispatch_marker(182, 999, SHA_A)]
+        self.assertIsNone(gate.qualification_dispatch_for(bodies, 184))
+
+    def test_prose_and_malformed_markers_match_nothing(self):
+        self.assertIsNone(
+            gate.qualification_dispatch_for(["qualify #184 at " + SHA_A], 184)
+        )
+        self.assertIsNone(gate.qualification_dispatch_for([None], 184))
+        self.assertIsNone(gate.qualification_dispatch_for([], "nope"))
+
+
+class QualificationRunClassificationTests(unittest.TestCase):
+    def test_non_qualification_run_uses_the_normal_path(self):
+        disposition, _ = gate.classify_qualification_run(False, False, "pass")
+        self.assertEqual(disposition, gate.QUAL_RUN_NOT_QUALIFICATION)
+        self.assertTrue(gate.qualification_permits_product_changes(False))
+
+    def test_no_code_with_pass_evidence_succeeds_without_pause(self):
+        disposition, _ = gate.classify_qualification_run(
+            True, False, gate.EVIDENCE_PASS
+        )
+        self.assertEqual(disposition, gate.QUAL_RUN_PASS)
+        self.assertFalse(gate.qualification_permits_product_changes(True))
+
+    def test_no_code_with_fail_evidence_succeeds_and_routes_repair(self):
+        disposition, reason = gate.classify_qualification_run(
+            True, False, gate.EVIDENCE_FAIL
+        )
+        self.assertEqual(disposition, gate.QUAL_RUN_RECORDED_FAIL)
+        # A fail verdict is recorded, never an infrastructure failure, so
+        # the scheduler can create the existing P0 repair issue.
+        self.assertEqual(gate.repair_targets({184: gate.EVIDENCE_FAIL}), (184,))
+        self.assertIn("repair", reason)
+
+    def test_no_code_without_evidence_fails_closed(self):
+        disposition, _ = gate.classify_qualification_run(
+            True, False, gate.EVIDENCE_UNKNOWN
+        )
+        self.assertEqual(disposition, gate.QUAL_RUN_MISSING_EVIDENCE)
+
+    def test_qualification_mode_cannot_push_product_changes(self):
+        for evidence in (
+            gate.EVIDENCE_PASS,
+            gate.EVIDENCE_FAIL,
+            gate.EVIDENCE_UNKNOWN,
+        ):
+            with self.subTest(evidence=evidence):
+                disposition, _ = gate.classify_qualification_run(True, True, evidence)
+                self.assertEqual(disposition, gate.QUAL_RUN_REJECT_CHANGES)
+        self.assertFalse(gate.qualification_permits_product_changes(True))
+
+
+class RedispatchTests(unittest.TestCase):
+    def _redispatch(self, **overrides):
+        params = {
+            "qualification_open": True,
+            "qualification_paused": False,
+            "capability_state": gate.STAY_QUALIFYING,
+            "already_dispatched_for_sha": True,
+            "required_sha": SHA_A,
+            "evidence_state": gate.EVIDENCE_UNKNOWN,
+            "run_in_flight": False,
+        }
+        params.update(overrides)
+        return gate.should_redispatch_qualification(**params)
+
+    def test_missing_evidence_without_in_flight_run_redispatches(self):
+        dispatch, reason = self._redispatch()
+        self.assertTrue(dispatch)
+        self.assertEqual(reason, "redispatch-after-failure")
+
+    def test_decided_evidence_never_redispatches(self):
+        for evidence in (gate.EVIDENCE_PASS, gate.EVIDENCE_FAIL):
+            with self.subTest(evidence=evidence):
+                dispatch, reason = self._redispatch(evidence_state=evidence)
+                self.assertFalse(dispatch)
+                self.assertEqual(reason, "already-decided")
+
+    def test_in_flight_run_is_not_duplicated(self):
+        dispatch, reason = self._redispatch(run_in_flight=True)
+        self.assertFalse(dispatch)
+        self.assertEqual(reason, "already-dispatched")
+
+    def test_paused_qualification_stays_paused(self):
+        dispatch, reason = self._redispatch(qualification_paused=True)
+        self.assertFalse(dispatch)
+        self.assertEqual(reason, "dispatch-paused")
+
+    def test_undispatched_sha_uses_the_first_dispatch_path(self):
+        dispatch, reason = self._redispatch(already_dispatched_for_sha=False)
+        self.assertFalse(dispatch)
+        self.assertEqual(reason, "not-yet-dispatched")
+
+    def test_closed_qualification_and_complete_capability_dispatch_nothing(self):
+        dispatch, _ = self._redispatch(qualification_open=False)
+        self.assertFalse(dispatch)
+        dispatch, reason = self._redispatch(capability_state=gate.MAY_COMPLETE)
+        self.assertFalse(dispatch)
+        self.assertEqual(reason, "capability-complete")
+        dispatch, _ = self._redispatch(required_sha="short")
+        self.assertFalse(dispatch)
+
+    def test_duplicate_results_do_not_multiply_repair_targets(self):
+        comments = [
+            trusted_comment(evidence_comment(184, SHA_A, "fail")),
+            trusted_comment(evidence_comment(184, SHA_A, "fail")),
+        ]
+        state = gate.qualification_evidence_state(comments, 184, SHA_A)
+        self.assertEqual(state, gate.EVIDENCE_FAIL)
+        self.assertEqual(gate.repair_targets({184: state}), (184,))
+
+
 if __name__ == "__main__":
     unittest.main()

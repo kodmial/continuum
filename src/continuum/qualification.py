@@ -48,6 +48,37 @@ document whose ``head_sha`` equals the required SHA and whose
 ``classification`` equals ``pass`` counts as a pass for that SHA. Evidence
 for any other SHA is stale and never satisfies the gate.
 
+Evidence integrity
+------------------
+Two rules keep the gate trustworthy:
+
+* A dispatch/instruction comment never counts as result evidence. Any comment
+  carrying a ``continuum-qualification-dispatch`` marker is instructional by
+  definition, so :func:`parse_evidence_entries` ignores it even when its
+  prose quotes a result-looking marker. Scheduler instructional prose must
+  additionally never embed a parseable result marker.
+* Only trusted repository actors may publish evidence. Plain comment bodies
+  keep their historical meaning, but whenever author metadata is present the
+  entry counts only for ``OWNER``/``MEMBER``/``COLLABORATOR`` associations or
+  for repository Actions automation (``github-actions[bot]``), so a public
+  commenter cannot forge completion. See :func:`is_trusted_evidence_author`.
+
+Qualification execution
+-----------------------
+An OpenCode run dispatched from a ``continuum-qualification-dispatch``
+marker is a qualification run, not an implementation run: it checks out and
+tests the exact required main SHA, validates the issue Definition of Done
+instead of implementing product code, publishes exactly one canonical
+pass/fail marker for the exact SHA, never closes the qualification issue,
+and never pushes product changes. :func:`classify_qualification_run`
+encodes the outcome table (no-code plus pass evidence succeeds without a
+pause; no-code plus fail evidence succeeds as an execution so the
+scheduler can route the existing P0 repair issue; no-code without evidence
+fails closed and stays automatically recoverable; product changes are
+rejected), and :func:`should_redispatch_qualification` lets the scheduler
+retry a dispatch that died without evidence while refusing duplicate
+result/reconcile storms.
+
 Merge bookkeeping
 -----------------
 When the implementation PR merges, the controller records the exact merged
@@ -140,6 +171,17 @@ PAUSED_LABEL = "automation:paused"
 EVIDENCE_PASS = "pass"
 EVIDENCE_FAIL = "fail"
 EVIDENCE_UNKNOWN = "unknown"
+
+#: Issue-comment author associations trusted to publish qualification
+#: evidence. Anything else (public commenters, bots other than repository
+#: automation) is untrusted and its markers are rejected.
+TRUSTED_EVIDENCE_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
+
+#: Automation logins trusted like a repository actor where the result path
+#: is explicitly automation-driven: the Docker/Render controllers and
+#: workflow-posted canonical results run as this actor when they
+#: authenticate with ``GITHUB_TOKEN``.
+TRUSTED_EVIDENCE_AUTOMATION_LOGINS = frozenset({"github-actions[bot]"})
 
 #: Capability lifecycle outcomes of :func:`capability_status`.
 MAY_COMPLETE = "complete"
@@ -298,6 +340,96 @@ def contains_closing_keyword(text: object, issue_number: object = None) -> bool:
     return pattern.search(text) is not None
 
 
+def is_trusted_evidence_author(
+    author_association: object = None,
+    author_login: object = None,
+) -> bool:
+    """Whether an evidence comment author is trusted to publish results.
+
+    Trusted authors are ``OWNER``/``MEMBER``/``COLLABORATOR`` associations
+    and repository Actions automation (``github-actions[bot]``), so a public
+    or untrusted commenter cannot forge completion. Comparison is
+    case-insensitive; missing or unrecognized authorship fails closed.
+    """
+
+    if isinstance(author_association, str):
+        if author_association.strip().upper() in TRUSTED_EVIDENCE_ASSOCIATIONS:
+            return True
+    if isinstance(author_login, str):
+        if author_login.strip().lower() in TRUSTED_EVIDENCE_AUTOMATION_LOGINS:
+            return True
+    return False
+
+
+def is_dispatch_instruction(comment_body: object) -> bool:
+    """Whether a comment is qualification dispatch/instructional prose.
+
+    Any comment carrying a ``continuum-qualification-dispatch`` marker is
+    instructional by definition and must never count as result evidence,
+    even when its prose quotes a result-looking marker.
+    """
+
+    return isinstance(comment_body, str) and DISPATCH_RE.search(comment_body) is not None
+
+
+def qualification_dispatch_for(
+    bodies: Iterable[object],
+    qualification_number: object,
+) -> Optional[Dict[str, object]]:
+    """The latest dispatch targeting one qualification issue, or None.
+
+    Returns a mapping with ``capability`` (int) and ``sha`` (normalized)
+    from the most recent ``continuum-qualification-dispatch`` marker for
+    the qualification issue, which is the exact main SHA a qualification
+    run must check out and test. Markers for other qualifications, prose
+    mentions, and malformed markers never match.
+    """
+
+    try:
+        wanted = int(qualification_number)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    found: Optional[Dict[str, object]] = None
+    for body in bodies or []:
+        if not isinstance(body, str):
+            continue
+        for match in DISPATCH_RE.finditer(body):
+            if int(match.group("qualification")) != wanted:
+                continue
+            sha = _normalize_sha(match.group("sha"))
+            if sha is None:
+                continue
+            found = {"capability": int(match.group("capability")), "sha": sha}
+    return found
+
+
+def _evidence_comment_parts(comment: object) -> Tuple[str, bool]:
+    """The (body, trusted) pair for one evidence comment.
+
+    Plain strings keep their historical trusted meaning so existing
+    single-body callers are unaffected. Mappings must carry author
+    metadata (``author_association``/``author_login``, or the GitHub API
+    shape with ``author_association`` and ``user.login``); a mapping
+    without recognizable trusted authorship fails closed as untrusted.
+    """
+
+    if isinstance(comment, str):
+        return comment, True
+    if isinstance(comment, dict):
+        body = comment.get("body", "")
+        if not isinstance(body, str):
+            body = ""
+        association = comment.get("author_association", comment.get("association"))
+        login = comment.get(
+            "author_login", comment.get("author", comment.get("login"))
+        )
+        user = comment.get("user")
+        if not isinstance(login, str) and isinstance(user, dict):
+            login = user.get("login")
+        return body, is_trusted_evidence_author(association, login)
+    return "", False
+
+
 def _attrs_to_dict(attrs: str) -> Dict[str, str]:
     values: Dict[str, str] = {}
     for match in re.finditer(r"([A-Za-z_]+)\s*=\s*([^\s>]+)", attrs or ""):
@@ -319,11 +451,17 @@ def parse_evidence_entries(comment_body: object) -> List[Dict[str, object]]:
     """Every machine-readable evidence entry in one comment body.
 
     Canonical markers and Docker/Render controller payloads are accepted.
-    Prose verdicts never count. Each entry is a mapping with ``sha`` and
-    ``result`` (``pass``/``fail``), plus ``source`` and ``issue`` when known.
+    Prose verdicts never count. Dispatch/instruction comments never count
+    either: a body carrying a ``continuum-qualification-dispatch`` marker
+    is instructional by definition, so even a quoted result-looking marker
+    inside it contributes nothing. Each entry is a mapping with ``sha``
+    and ``result`` (``pass``/``fail``), plus ``source`` and ``issue`` when
+    known.
     """
 
     if not isinstance(comment_body, str) or not comment_body:
+        return []
+    if is_dispatch_instruction(comment_body):
         return []
     entries: List[Dict[str, object]] = []
     for match in EVIDENCE_RE.finditer(comment_body):
@@ -390,11 +528,19 @@ def qualification_evidence_state(
 ) -> str:
     """The evidence verdict for one qualification at the required SHA.
 
-    Returns ``pass`` only when the latest evidence entry for the exact
-    required SHA is a pass. A fail for the required SHA returns ``fail``.
-    Anything else — no entries, entries only for older SHAs, malformed
-    markers, prose — returns ``unknown``. A merely closed qualification
-    issue without evidence is ``unknown`` by construction.
+    Returns ``pass`` only when the latest trusted evidence entry for the
+    exact required SHA is a pass. A trusted fail for the required SHA
+    returns ``fail``. Anything else — no entries, entries only for older
+    SHAs, malformed markers, prose, dispatch/instruction comments, or
+    entries from untrusted authors — returns ``unknown``. A merely closed
+    qualification issue without evidence is ``unknown`` by construction.
+
+    Each comment may be a plain body (trusted, preserving the historical
+    single-body behavior) or a mapping carrying author metadata, in which
+    case only ``OWNER``/``MEMBER``/``COLLABORATOR`` associations and
+    repository Actions automation count; forged markers from public or
+    untrusted commenters are rejected, as is any marker inside a
+    dispatch/instruction comment.
     """
 
     sha = _normalize_sha(required_sha)
@@ -406,7 +552,10 @@ def qualification_evidence_state(
         return EVIDENCE_UNKNOWN
     latest: Optional[str] = None
     for comment in comments or []:
-        for entry in parse_evidence_entries(comment):
+        body, trusted = _evidence_comment_parts(comment)
+        if not trusted:
+            continue
+        for entry in parse_evidence_entries(body):
             issue = entry.get("issue")
             if issue is not None and int(issue) != wanted:
                 continue
@@ -481,6 +630,103 @@ def should_dispatch_qualification(
     if qualification_paused:
         return True, "unpause-and-dispatch"
     return True, "dispatch"
+
+
+#: Qualification-run dispositions of :func:`classify_qualification_run`.
+QUAL_RUN_NOT_QUALIFICATION = "not-qualification"
+QUAL_RUN_REJECT_CHANGES = "reject-changes"
+QUAL_RUN_PASS = "pass"
+QUAL_RUN_RECORDED_FAIL = "recorded-fail"
+QUAL_RUN_MISSING_EVIDENCE = "missing-evidence"
+
+
+def qualification_permits_product_changes(is_qualification_mode: bool) -> bool:
+    """Whether an OpenCode run may change or push product code.
+
+    Qualification runs validate the exact required SHA and must leave the
+    repository untouched; every other run keeps the normal implementation
+    behavior.
+    """
+
+    return not is_qualification_mode
+
+
+def classify_qualification_run(
+    is_qualification_mode: bool,
+    has_code_changes: bool,
+    evidence_state: object,
+) -> Tuple[str, str]:
+    """The disposition of a finished OpenCode qualification run.
+
+    * Not a qualification run → ``not-qualification`` (the caller uses the
+      normal implementation path, including its no-code pause).
+    * Product changes in qualification mode → ``reject-changes`` (fail
+      closed; nothing may be pushed or opened as a PR).
+    * No changes plus trusted pass evidence for the exact SHA → ``pass``
+      (a successful qualification execution: no pause, no PR, and the
+      qualification issue stays open for the scheduler to complete the
+      capability).
+    * No changes plus trusted fail evidence → ``recorded-fail`` (still a
+      successful execution, never an infrastructure failure: the verdict
+      is recorded so the scheduler creates the existing P0 repair issue).
+    * No changes without valid evidence → ``missing-evidence`` (fail
+      closed; the run failed and stays automatically recoverable through
+      redispatch, never through a pause or a forged marker).
+    """
+
+    if not is_qualification_mode:
+        return QUAL_RUN_NOT_QUALIFICATION, "not-a-qualification-run"
+    if has_code_changes:
+        return (
+            QUAL_RUN_REJECT_CHANGES,
+            "qualification-mode-forbids-product-changes",
+        )
+    state = str(evidence_state)
+    if state == EVIDENCE_PASS:
+        return QUAL_RUN_PASS, "pass-evidence-recorded-for-exact-sha"
+    if state == EVIDENCE_FAIL:
+        return QUAL_RUN_RECORDED_FAIL, "fail-evidence-recorded-repair-routed"
+    return QUAL_RUN_MISSING_EVIDENCE, "no-valid-evidence-fail-closed"
+
+
+def should_redispatch_qualification(
+    *,
+    qualification_open: bool,
+    qualification_paused: bool,
+    capability_state: str,
+    already_dispatched_for_sha: bool,
+    required_sha: object,
+    evidence_state: object,
+    run_in_flight: bool,
+) -> Tuple[bool, str]:
+    """Whether the scheduler must retry a dispatch that left no evidence.
+
+    The first dispatch for a SHA is owned by
+    :func:`should_dispatch_qualification`; this gate owns every later one.
+    A dispatch whose run died without trusted evidence is retried
+    (``redispatch-after-failure``) so a missing-evidence failure stays
+    automatically recoverable. Anything already decided (pass/fail
+    evidence recorded), anything with a run still in flight, anything
+    paused, and anything for a completed capability or a closed
+    qualification is left alone, so duplicate result and reconcile events
+    cannot create repair or dispatch storms.
+    """
+
+    if _normalize_sha(required_sha) is None:
+        return False, "no-required-sha"
+    if capability_state not in (STAY_QUALIFYING, STAY_BLOCKED):
+        return False, "capability-complete"
+    if not qualification_open:
+        return False, "qualification-closed"
+    if not already_dispatched_for_sha:
+        return False, "not-yet-dispatched"
+    if str(evidence_state) in (EVIDENCE_PASS, EVIDENCE_FAIL):
+        return False, "already-decided"
+    if run_in_flight:
+        return False, "already-dispatched"
+    if qualification_paused:
+        return False, "dispatch-paused"
+    return True, "redispatch-after-failure"
 
 
 def repair_targets(evidence_by_qualification: Dict[int, str]) -> Tuple[int, ...]:

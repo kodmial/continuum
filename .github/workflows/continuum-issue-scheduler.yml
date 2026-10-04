@@ -852,8 +852,43 @@ jobs:
             // Machine-readable evidence only: the canonical marker, or a
             // Docker/Render controller payload whose head SHA matches. Prose
             // verdicts never count, and entries for any other SHA are stale.
+            // A dispatch/instruction comment never counts either, and only
+            // trusted repository actors count (see isTrustedEvidenceAuthor).
+            function isDispatchInstruction(commentBody) {
+              if (typeof commentBody !== 'string' || !commentBody) return false;
+              return /<!--\s*continuum-qualification-dispatch\s+capability\s*=\s*\d+\s+qualification\s*=\s*\d+\s+sha\s*=\s*[0-9a-f]{40}\s*-->/i.test(
+                commentBody
+              );
+            }
+
+            // Only trusted repository actors may publish qualification
+            // evidence: OWNER/MEMBER/COLLABORATOR, plus repository Actions
+            // automation where the result path is explicitly
+            // automation-driven. A public/untrusted commenter cannot forge
+            // completion. Plain string bodies keep their historical trusted
+            // meaning; mappings without recognizable trusted authorship fail
+            // closed as untrusted.
+            const TRUSTED_EVIDENCE_ASSOCIATIONS = new Set([
+              'OWNER',
+              'MEMBER',
+              'COLLABORATOR',
+            ]);
+            const TRUSTED_EVIDENCE_AUTOMATION_LOGINS = new Set([
+              'github-actions[bot]',
+            ]);
+
+            function isTrustedEvidenceAuthor(comment) {
+              const association = String(
+                comment?.author_association || ''
+              ).toUpperCase();
+              if (TRUSTED_EVIDENCE_ASSOCIATIONS.has(association)) return true;
+              const login = String(comment?.user?.login || '').toLowerCase();
+              return TRUSTED_EVIDENCE_AUTOMATION_LOGINS.has(login);
+            }
+
             function parseQualificationEvidenceEntries(commentBody) {
               if (typeof commentBody !== 'string' || !commentBody) return [];
+              if (isDispatchInstruction(commentBody)) return [];
               const entries = [];
               const canonical = /<!--\s*continuum-qualification-result\b([^>]*?)-->/gi;
               for (const match of commentBody.matchAll(canonical)) {
@@ -913,11 +948,16 @@ jobs:
               return entries;
             }
 
-            function qualificationEvidenceState(commentBodies, qualificationNumber, requiredSha) {
+            function qualificationEvidenceState(comments, qualificationNumber, requiredSha) {
               const sha = normalizeSha(requiredSha);
               if (!sha) return 'unknown';
               let latest = null;
-              for (const body of commentBodies || []) {
+              for (const comment of comments || []) {
+                const body =
+                  typeof comment === 'string' ? comment : comment?.body || '';
+                if (typeof comment !== 'string' && !isTrustedEvidenceAuthor(comment)) {
+                  continue;
+                }
                 for (const entry of parseQualificationEvidenceEntries(body)) {
                   if (entry.issue != null && entry.issue !== qualificationNumber) continue;
                   if (entry.sha !== sha) continue;
@@ -941,12 +981,83 @@ jobs:
               return cachedMainSha;
             }
 
-            async function issueCommentsBodies(issueNumber) {
+            // Trust-preserving evidence comments: bodies plus the authorship
+            // the evidence gate filters on. Dispatch-marker checks derive
+            // plain bodies from these objects; evidence verdicts use the
+            // objects themselves.
+            async function issueEvidenceComments(issueNumber) {
               const comments = await github.paginate(
                 github.rest.issues.listComments,
                 { owner, repo, issue_number: issueNumber, per_page: 100 }
               );
-              return comments.map(comment => comment.body || '');
+              return comments.map(comment => ({
+                body: comment.body || '',
+                author_association: comment.author_association || '',
+                user: { login: comment.user?.login || '' },
+              }));
+            }
+
+            // Whether a retry of an evidenced-less dispatch is due. Mirrors
+            // src/continuum/qualification.py should_redispatch_qualification:
+            // the first dispatch for a SHA is owned by the fresh path below,
+            // this owns every later one. A dispatch whose run died without
+            // trusted evidence is retried so a missing-evidence failure stays
+            // automatically recoverable; decided evidence, an in-flight run,
+            // a paused qualification, and completed capabilities are left
+            // alone so duplicate result/reconcile events cannot storm.
+            function shouldRedispatchQualification({
+              qualificationOpen,
+              qualificationPaused,
+              capabilityState,
+              alreadyDispatchedForSha,
+              requiredSha,
+              evidenceState,
+              runInFlight,
+            }) {
+              if (!normalizeSha(requiredSha)) return { redispatch: false, reason: 'no-required-sha' };
+              if (capabilityState !== 'qualifying' && capabilityState !== 'blocked') {
+                return { redispatch: false, reason: 'capability-complete' };
+              }
+              if (!qualificationOpen) {
+                return { redispatch: false, reason: 'qualification-closed' };
+              }
+              if (!alreadyDispatchedForSha) {
+                return { redispatch: false, reason: 'not-yet-dispatched' };
+              }
+              if (evidenceState === 'pass' || evidenceState === 'fail') {
+                return { redispatch: false, reason: 'already-decided' };
+              }
+              if (runInFlight) {
+                return { redispatch: false, reason: 'already-dispatched' };
+              }
+              if (qualificationPaused) {
+                return { redispatch: false, reason: 'dispatch-paused' };
+              }
+              return { redispatch: true, reason: 'redispatch-after-failure' };
+            }
+
+            // A qualification run is in flight while it holds the reservation
+            // label or while GitHub still reports its OpenCode run as active.
+            // Both are checked because the generic lease reconciliation may
+            // release a stale label while the run is still starting.
+            async function qualificationRunInFlight(qualificationNumber) {
+              const qualLabels = labelsByIssue.get(qualificationNumber) || new Set();
+              if (qualLabels.has(inProgressLabel)) return true;
+              const { data } = await github.rest.actions.listWorkflowRunsForRepo({
+                owner,
+                repo,
+                per_page: 30,
+              });
+              return (data.workflow_runs || []).some(run => {
+                const isOpenCode =
+                  run.path === opencodeWorkflowPath ||
+                  run.name === opencodeWorkflowName;
+                if (!isOpenCode || run.status === 'completed') return false;
+                const direct = (run.display_title || '').match(
+                  /^OpenCode issue #(\d+)$/
+                );
+                return direct !== null && Number(direct[1]) === qualificationNumber;
+              });
             }
 
             // Dispatch one mandatory qualification for an exact main SHA.
@@ -957,7 +1068,8 @@ jobs:
             async function dispatchQualificationIssue(
               capabilityNumber,
               qualificationNumber,
-              requiredSha
+              requiredSha,
+              capabilityState = 'qualifying'
             ) {
               const sha = normalizeSha(requiredSha);
               if (!sha) return 'no-required-sha';
@@ -977,25 +1089,100 @@ jobs:
               rememberIssue(qual);
               const qualLabels = labelsByIssue.get(qualificationNumber) || new Set();
               const wasPaused = qualLabels.has(pausedLabel);
-              await removeLabel(qualificationNumber, pausedLabel);
-              const bodies = await issueCommentsBodies(qualificationNumber);
-              if (
-                hasQualificationDispatch(
-                  bodies, capabilityNumber, qualificationNumber, sha
-                )
-              ) {
-                return wasPaused ? 'unpaused-already-dispatched' : 'already-dispatched';
+              const evidenceComments = await issueEvidenceComments(
+                qualificationNumber
+              );
+              const bodies = evidenceComments.map(comment => comment.body || '');
+              const alreadyDispatched = hasQualificationDispatch(
+                bodies, capabilityNumber, qualificationNumber, sha
+              );
+              if (alreadyDispatched) {
+                // The binding marker for this exact SHA is already recorded.
+                // Retry only a dispatch whose run died without trusted
+                // evidence and with no run in flight; decided evidence, an
+                // in-flight run, and a paused qualification are left alone
+                // so duplicate result/reconcile events cannot storm. The
+                // pause label is intentionally not cleared here: only the
+                // fresh path below unpauses, so an exhausted or human-paused
+                // qualification stays paused instead of looping.
+                const evidenceState = qualificationEvidenceState(
+                  evidenceComments, qualificationNumber, sha
+                );
+                const runInFlight = await qualificationRunInFlight(
+                  qualificationNumber
+                );
+                const decision = shouldRedispatchQualification({
+                  qualificationOpen: true,
+                  qualificationPaused: wasPaused,
+                  capabilityState,
+                  alreadyDispatchedForSha: true,
+                  requiredSha: sha,
+                  evidenceState,
+                  runInFlight,
+                });
+                if (!decision.redispatch) return decision.reason;
+                const retryNote =
+                  'Re-dispatched mandatory qualification for capability #' +
+                  capabilityNumber + ' at exact main `' + sha +
+                  '`: the prior attempt left no trusted result evidence ' +
+                  'and no run is in flight.';
+                if (opencodeDispatch === 'workflow') {
+                  await github.rest.issues.createComment({
+                    owner,
+                    repo,
+                    issue_number: qualificationNumber,
+                    body: [dispatchMarker, '', retryNote].join('\n'),
+                  });
+                  await github.request(
+                    'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
+                    {
+                      owner,
+                      repo,
+                      workflow_id: opencodeWorkflowPath.replace(
+                        /^\.github\/workflows\//,
+                        ''
+                      ),
+                      ref: dispatchRef,
+                      inputs: {
+                        mode: 'issue',
+                        issue_number: String(qualificationNumber),
+                      },
+                    }
+                  );
+                } else {
+                  await github.rest.issues.createComment({
+                    owner,
+                    repo,
+                    issue_number: qualificationNumber,
+                    body: ['/oc', '', dispatchMarker, '', retryNote].join('\n'),
+                  });
+                }
+                await addLabel(qualificationNumber, inProgressLabel);
+                return 'redispatch-after-failure';
               }
+              await removeLabel(qualificationNumber, pausedLabel);
               const marker = qualificationDispatchMarker(
                 capabilityNumber, qualificationNumber, sha
               );
+              // Instructional prose only: it names the marker and its exact
+              // attributes in words but never embeds a parseable
+              // `continuum-qualification-result` marker, so this dispatch
+              // comment itself can never satisfy the evidence gate for the
+              // SHA it dispatches.
               const note =
                 'Mandatory live qualification for capability #' + capabilityNumber +
-                ' at main `' + sha +
-                '`: automatically dispatched after implementation merge. ' +
-                'Qualification must publish `<!-- continuum-qualification-result' +
-                ' issue=' + qualificationNumber + ' sha=' + sha + ' result=pass -->`' +
-                ' evidence for this exact SHA.';
+                ' at exact main `' + sha +
+                '` (automatically dispatched after implementation merge). ' +
+                'Check out and test exactly this SHA, not whatever main has ' +
+                'advanced to later. Validate the issue Definition of Done; ' +
+                'do not implement product code, do not push product changes, ' +
+                'and do not close this issue. Publish exactly one result ' +
+                'comment on this issue carrying the canonical ' +
+                'continuum-qualification-result marker with issue=' +
+                qualificationNumber + ' sha=' + sha +
+                ' result=pass (or result=fail). Result comments count only ' +
+                'from trusted repository actors (OWNER, MEMBER, ' +
+                'COLLABORATOR, or repository Actions automation).';
               if (opencodeDispatch === 'workflow') {
                 await github.rest.issues.createComment({
                   owner,
@@ -1085,14 +1272,14 @@ jobs:
               }
               const evidence = {};
               for (const ref of refs) {
-                let bodies = [];
+                let comments = [];
                 try {
-                  bodies = await issueCommentsBodies(ref);
+                  comments = await issueEvidenceComments(ref);
                 } catch (err) {
                   if (err.status !== 404) throw err;
                 }
                 evidence[ref] = qualificationEvidenceState(
-                  bodies, ref, requiredSha
+                  comments, ref, requiredSha
                 );
               }
               const states = refs.map(ref => evidence[ref]);
@@ -1133,7 +1320,7 @@ jobs:
                 await ensureRepairIssue(capabilityNumber, failures, requiredSha);
                 for (const ref of refs) {
                   await dispatchQualificationIssue(
-                    capabilityNumber, ref, requiredSha
+                    capabilityNumber, ref, requiredSha, 'blocked'
                   );
                 }
                 core.warning(
@@ -1146,7 +1333,7 @@ jobs:
               await removeLabel(capabilityNumber, blockedLabel);
               for (const ref of refs) {
                 await dispatchQualificationIssue(
-                  capabilityNumber, ref, requiredSha
+                  capabilityNumber, ref, requiredSha, 'qualifying'
                 );
               }
               return 'qualifying';
@@ -1602,7 +1789,7 @@ jobs:
               const commentBodies = {};
               for (const ref of refs) {
                 try {
-                  commentBodies[ref] = await issueCommentsBodies(ref);
+                  commentBodies[ref] = await issueEvidenceComments(ref);
                 } catch (err) {
                   if (err.status === 404) commentBodies[ref] = [];
                   else throw err;

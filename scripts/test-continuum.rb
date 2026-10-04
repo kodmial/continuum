@@ -4424,4 +4424,123 @@ class ContinuumTest < Minitest::Test
                     'the CLI must delegate to the canonical gate, not reimplement it'
   end
 
+  # Issue #214: mandatory qualification evidence is trustworthy and
+  # executable without code changes. Dispatch/instruction comments never
+  # count as results, only trusted actors count, a failed-but-evidenced
+  # run stays automatically recoverable through redispatch, and duplicate
+  # result/reconcile events cannot storm.
+  def test_qualification_evidence_is_trusted_and_dispatch_safe
+    engine = File.read(File.join(ROOT, 'src/continuum/qualification.py'))
+    %w[
+      TRUSTED_EVIDENCE_ASSOCIATIONS
+      TRUSTED_EVIDENCE_AUTOMATION_LOGINS
+      is_trusted_evidence_author
+      is_dispatch_instruction
+      qualification_dispatch_for
+      classify_qualification_run
+      qualification_permits_product_changes
+      should_redispatch_qualification
+    ].each do |name|
+      assert_includes engine, name,
+                      "the qualification engine is missing #{name}"
+    end
+
+    scheduler = workflow_body('continuum-issue-scheduler.yml')
+    %w[
+      isDispatchInstruction
+      isTrustedEvidenceAuthor
+      TRUSTED_EVIDENCE_ASSOCIATIONS
+      TRUSTED_EVIDENCE_AUTOMATION_LOGINS
+      issueEvidenceComments
+      shouldRedispatchQualification
+      qualificationRunInFlight
+      redispatch-after-failure
+      already-decided
+      dispatch-paused
+      not-yet-dispatched
+    ].each do |name|
+      assert_includes scheduler, name,
+                      "the scheduler runtime is missing #{name}"
+    end
+
+    # The dispatch instruction must not embed a parseable result marker:
+    # the literal that used to let a dispatch satisfy its own gate is gone.
+    refute_includes scheduler, 'result=pass -->',
+                    'scheduler instructional prose embeds a parseable result marker'
+    # The evidence gate mirrors the engine: dispatch comments contribute
+    # nothing and untrusted authors are skipped.
+    assert_includes scheduler, 'if (isDispatchInstruction(commentBody)) return [];'
+    assert_includes scheduler, 'isTrustedEvidenceAuthor(comment)'
+    assert_includes scheduler, "comment?.author_association || ''"
+  end
+
+  # Issue #214: qualification runs validate the exact required SHA without
+  # product changes. No-code plus pass evidence succeeds without a pause,
+  # a fail verdict is recorded (never an infrastructure failure) so the
+  # scheduler routes repair, and missing evidence fails closed.
+  def test_qualification_execution_mode_validates_without_code_changes
+    opencode = workflow_body('continuum-opencode.yml')
+    implement = step_body(opencode, 'Implement issue')
+    refute_nil implement, 'the Implement issue step is gone'
+
+    # Qualification mode is recognized from the dispatch marker ...
+    assert_includes implement, 'continuum-qualification-dispatch'
+    qual_gate = shell_if_gate(implement, 'QUAL_REQUIRED_SHA')
+    refute_nil qual_gate, 'the qualification-mode gate is gone'
+
+    # ... checks out the exact required SHA, never a later main ...
+    assert_includes qual_gate, 'git switch --detach "$QUAL_REQUIRED_SHA"'
+    # ... instructs validation instead of implementation ...
+    assert_includes qual_gate, 'Validate the issue Definition of Done'
+    assert_includes qual_gate, 'do not implement product code'
+    # ... forbids product changes and fails closed ...
+    assert_includes qual_gate, 'Qualification mode forbids product changes'
+    assert_includes qual_gate, 'git status --porcelain'
+    # ... requires trusted pass/fail evidence for the exact SHA ...
+    assert_includes qual_gate, 'evidence-state'
+    assert_includes qual_gate, 'github-actions[bot]'
+    # ... and never pauses, closes, pushes, or opens a PR: no branch, no
+    # push, no PR creation, no pause label inside the qualification gate.
+    refute_includes qual_gate, 'git push'
+    refute_includes qual_gate, 'pr create'
+    refute_includes qual_gate, '--add-label "$PAUSE_LABEL"'
+    refute_includes qual_gate, 'issue close'
+    # A fail verdict is recorded as a successful execution (repair is
+    # routed by the scheduler) while missing evidence fails closed.
+    assert_includes qual_gate, 'is not an infrastructure failure'
+    assert_includes qual_gate, 'failing closed for automatic redispatch'
+
+    # The branch-recovery path must not resurrect a qualification run's
+    # worktree into a pushed branch/PR.
+    recover = step_body(opencode, 'Recover agent-managed issue branch')
+    refute_nil recover, 'the branch recovery step is gone'
+    assert_includes recover, 'continuum-qualification-dispatch'
+
+    # Qualification runs skip implementation readiness gating in-script.
+    assert_includes opencode, 'isQualificationRun'
+    assert_includes opencode, 'readiness gating is skipped'
+  end
+
+  # Issue #214: trusted qualification result comments wake the consumer
+  # scheduler caller immediately (canonical and supported specialized
+  # markers alike), while cron remains the missed-event backstop.
+  def test_scheduler_caller_wakes_for_trusted_qualification_results
+    stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-issue-scheduler.yml'))
+    gate = stub.fetch('jobs').fetch('call').fetch('if')
+    # The pre-existing owner-command wake is retained.
+    assert_includes gate, "github.event_name != 'issue_comment'"
+    assert_includes gate, 'github.actor == github.repository_owner'
+    assert_includes gate, "contains(github.event.comment.body, '/oc')"
+    # Trusted result comments wake the scheduler on the event.
+    assert_includes gate, 'continuum-qualification-result'
+    assert_includes gate, 'continuum-docker-qualification-result'
+    assert_includes gate, 'continuum-render-qualification-result'
+    assert_includes gate, 'author_association'
+    assert_includes gate, 'github-actions[bot]'
+    # Cron remains the missed-event backstop.
+    on = events(stub)
+    assert_equal ['7,17,27,37,47,57 * * * *'],
+                 on.fetch('schedule').map { |entry| entry.fetch('cron') }
+  end
+
   end

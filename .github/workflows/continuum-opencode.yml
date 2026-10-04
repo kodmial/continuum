@@ -375,6 +375,39 @@ jobs:
               return;
             }
 
+            // Mandatory qualification runs validate an exact main SHA; they
+            // are never subject to implementation readiness (dependency)
+            // gating, on either the comment or the workflow dispatch path.
+            const readinessComments = await github.paginate(
+              github.rest.issues.listComments,
+              {
+                owner,
+                repo,
+                issue_number: issueNumber,
+                per_page: 100,
+              }
+            );
+            const qualDispatchPattern = /<!--\s*continuum-qualification-dispatch\s+capability\s*=\s*\d+\s+qualification\s*=\s*(\d+)\s+sha\s*=\s*[0-9a-f]{40}\s*-->/gi;
+            let isQualificationRun = false;
+            for (const comment of readinessComments) {
+              for (const match of (comment.body || '').matchAll(
+                qualDispatchPattern
+              )) {
+                if (Number(match[1]) === issueNumber) {
+                  isQualificationRun = true;
+                  break;
+                }
+              }
+              if (isQualificationRun) break;
+            }
+            if (isQualificationRun) {
+              core.setOutput('ready', 'true');
+              core.notice(
+                `Issue #${issueNumber} is a mandatory qualification run; readiness gating is skipped.`
+              );
+              return;
+            }
+
             const blockerNumbers = new Set();
             const declared = (issue.body || '').match(
               /<!--\s*automation-blocked-by:\s*([0-9#\s,]+?)\s*-->/i
@@ -564,6 +597,10 @@ jobs:
       # permission guard above prevents normal Git writes from the LLM, but
       # this recovery path makes the workflow lossless if a future OpenCode
       # version, shell indirection, or tool bypass still changes branches.
+      # Qualification runs never own a branch: an agent that created one
+      # despite its instructions must not get it pushed or opened as a PR
+      # here, so qualification dispatches skip this recovery entirely and
+      # fail closed in the issue-mode contract instead.
       - name: Recover agent-managed issue branch
         if: >-
           steps.issue_readiness.outputs.ready != 'false' &&
@@ -572,7 +609,8 @@ jobs:
           github.actor == github.repository_owner &&
           (contains(github.event.comment.body, '/oc') ||
            contains(github.event.comment.body, '/opencode')) &&
-          !contains(github.event.comment.body, '/oc-cancel')
+          !contains(github.event.comment.body, '/oc-cancel') &&
+          !contains(github.event.comment.body, 'continuum-qualification-dispatch')
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           ISSUE_NUMBER: ${{ inputs.issue_number || github.event.issue.number }}
@@ -652,6 +690,111 @@ jobs:
           ISSUE_JSON="$(gh issue view "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --json title,body,url)"
           ISSUE_TITLE="$(jq -r .title <<<"$ISSUE_JSON")"
           ISSUE_BODY="$(jq -r '.body // ""' <<<"$ISSUE_JSON")"
+
+          # Mandatory qualification execution mode. When this issue was
+          # dispatched from a continuum-qualification-dispatch marker, the
+          # run validates the exact required main SHA instead of
+          # implementing product code: it checks out that SHA (never a
+          # later main), forbids every product change, requires exactly
+          # one canonical pass/fail marker for the exact SHA, and never
+          # closes the qualification issue itself.
+          QUAL_REQUIRED_SHA=""
+          if [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]]; then
+            QUAL_MARKERS="$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER/comments?per_page=100" \
+              --jq '.[].body // ""' 2>/dev/null | grep -Eo '<!--[[:space:]]*continuum-qualification-dispatch[^>]*-->' || true)"
+            QUAL_REQUIRED_SHA="$(grep -E "qualification[[:space:]]*=[[:space:]]*${ISSUE_NUMBER}([^0-9]|$)" <<<"$QUAL_MARKERS" \
+              | grep -Eo '[Ss][Hh][Aa][[:space:]]*=[[:space:]]*[0-9a-fA-F]{40}' | tail -n 1 \
+              | grep -Eo '[0-9a-fA-F]{40}$' | tr 'A-F' 'a-f' || true)"
+          fi
+
+          if [[ -n "$QUAL_REQUIRED_SHA" ]]; then
+            QUAL_CAPABILITY="$(grep -E "qualification[[:space:]]*=[[:space:]]*${ISSUE_NUMBER}([^0-9]|$)" <<<"$QUAL_MARKERS" \
+              | grep -Eo '[Cc][Aa][Pp][Aa][Bb][Ii][Ll][Ii][Tt][Yy][[:space:]]*=[[:space:]]*[0-9]+' | tail -n 1 \
+              | grep -Eo '[0-9]+$' || true)"
+            echo "Qualification mode: validating exact main $QUAL_REQUIRED_SHA for capability #${QUAL_CAPABILITY:-unknown}."
+
+            git fetch origin main --quiet
+            git cat-file -e "${QUAL_REQUIRED_SHA}^{commit}" 2>/dev/null || {
+              echo "::error::Required main SHA $QUAL_REQUIRED_SHA is not present; failing closed."
+              exit 1
+            }
+            git switch --detach "$QUAL_REQUIRED_SHA"
+
+            QUAL_PROMPT="$(cat <<EOF
+          Qualify the exact main revision ${QUAL_REQUIRED_SHA} for GitHub issue #${ISSUE_NUMBER} (mandatory live qualification for capability #${QUAL_CAPABILITY:-unknown}).
+
+          Context:
+          - The checkout is detached at exactly ${QUAL_REQUIRED_SHA}. Test this revision, not whatever main has advanced to later.
+          - The issue body below carries the Definition of Done to validate.
+
+          Title:
+          ${ISSUE_TITLE}
+
+          Specification:
+          ${ISSUE_BODY}
+
+          Requirements:
+          - Validate the issue Definition of Done against the checked-out revision; do not implement product code.
+          - Qualification mode forbids product and repository changes: do not edit, add, or delete repository files; do not create or switch branches; do not commit, push, or open a pull request. The workflow verifies the worktree afterwards and fails closed on any difference.
+          - Never close this qualification issue. A fail verdict is recorded evidence, not a reason to close.
+          - Publish exactly one result comment on issue #${ISSUE_NUMBER} carrying exactly one canonical marker for the exact SHA:
+            <!-- continuum-qualification-result issue=${ISSUE_NUMBER} sha=${QUAL_REQUIRED_SHA} result=pass -->
+            or the same marker with result=fail when the Definition of Done is not satisfied at this SHA.
+          - A fail verdict must describe the concrete defect so the follow-up repair task can fix it.
+          - Keep all comments and commit-facing text in English.
+          - You may use GitHub CLI/API to inspect the revision and to publish the single result comment.
+          EOF
+            )"
+
+            opencode run --auto --model "$OPENCODE_MODEL" "$QUAL_PROMPT"
+
+            # Qualification mode cannot push product changes: any worktree
+            # difference, HEAD movement, or branch creation fails closed
+            # here, and this path never creates a branch, a push, or a
+            # pull request.
+            if [[ -n "$(git status --porcelain)" ]]; then
+              echo "::error::Qualification mode forbids product changes: the worktree differs from $QUAL_REQUIRED_SHA."
+              git status --porcelain
+              exit 1
+            fi
+            if [[ "$(git rev-parse HEAD)" != "$QUAL_REQUIRED_SHA" ]]; then
+              echo "::error::Qualification mode must stay detached at $QUAL_REQUIRED_SHA."
+              exit 1
+            fi
+            if [[ -n "$(git branch --show-current)" ]]; then
+              echo "::error::Qualification mode must not create branches."
+              exit 1
+            fi
+
+            # Trusted evidence only: the scheduler completes the capability
+            # exclusively on OWNER/MEMBER/COLLABORATOR or repository
+            # automation markers, so this gate filters the same way instead
+            # of letting a forged public comment read as success.
+            QUAL_TRUSTED_BODIES="$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER/comments?per_page=100" \
+              --jq '.[] | select((.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR") or .user.login == "github-actions[bot]") | .body // ""')"
+            QUAL_EVIDENCE_FILE="$RUNNER_TEMP/continuum-qualification-evidence.md"
+            printf '%s' "$QUAL_TRUSTED_BODIES" > "$QUAL_EVIDENCE_FILE"
+            QUAL_STATE="$(python3 .github/scripts/qualification_gate.py evidence-state --body-file "$QUAL_EVIDENCE_FILE" --issue "$ISSUE_NUMBER" --sha "$QUAL_REQUIRED_SHA")"
+            rm -f "$QUAL_EVIDENCE_FILE"
+            case "$QUAL_STATE" in
+              pass)
+                gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                  --remove-label "$IN_PROGRESS_LABEL" >/dev/null 2>&1 || true
+                echo "Qualification passed for exact main $QUAL_REQUIRED_SHA with trusted evidence; no code changes required and no pause."
+                exit 0
+                ;;
+              fail)
+                gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                  --remove-label "$IN_PROGRESS_LABEL" >/dev/null 2>&1 || true
+                echo "Qualification failed for exact main $QUAL_REQUIRED_SHA; the fail verdict is recorded so the scheduler routes repair. This is not an infrastructure failure."
+                exit 0
+                ;;
+              *)
+                echo "::error::Qualification produced no valid trusted evidence for exact main $QUAL_REQUIRED_SHA; failing closed for automatic redispatch."
+                exit 1
+                ;;
+            esac
+          fi
 
           git fetch origin "$BASE_REF" --quiet
           git switch --detach "origin/$BASE_REF"

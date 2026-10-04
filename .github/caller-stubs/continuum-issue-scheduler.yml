@@ -121,12 +121,26 @@ jobs:
     # A manual owner `/oc` is in-flight work the scheduler must reserve. Gate the
     # event trigger the way the engine's own `issue_comment` branch expects, so an
     # unrelated comment costs a skipped run and not a full reconciliation.
+    # Trusted qualification result comments (canonical and supported
+    # specialized markers, from OWNER/MEMBER/COLLABORATOR or repository
+    # Actions automation) wake the scheduler immediately so pass/fail
+    # evidence reconciles on the event instead of waiting for cron, which
+    # remains the missed-event backstop. Public/untrusted markers never wake
+    # here; cron still reconciles (and rejects) them.
     if: >-
       vars.CONTINUUM_ROLE != 'child' &&
       (github.event_name != 'issue_comment' ||
        (github.actor == github.repository_owner &&
         (contains(github.event.comment.body, '/oc') ||
-         contains(github.event.comment.body, '/opencode'))))
+         contains(github.event.comment.body, '/opencode'))) ||
+       (github.event_name == 'issue_comment' &&
+        (contains(github.event.comment.body, 'continuum-qualification-result') ||
+         contains(github.event.comment.body, 'continuum-docker-qualification-result') ||
+         contains(github.event.comment.body, 'continuum-render-qualification-result')) &&
+        (github.event.comment.author_association == 'OWNER' ||
+         github.event.comment.author_association == 'MEMBER' ||
+         github.event.comment.author_association == 'COLLABORATOR' ||
+         github.event.comment.user.login == 'github-actions[bot]')))
     uses: kodmial/continuum/.github/workflows/continuum-issue-scheduler.yml@main
     secrets: inherit
     with:
