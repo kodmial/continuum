@@ -5272,12 +5272,23 @@ class ContinuumTest < Minitest::Test
     refute_nil inner, 'the bounded housekeeping implementation is missing'
 
     # Transient set: the live 403 core-REST exhaustion plus 429/5xx.
+    # A bare 403 is not transient: GitHub also uses 403 for deterministic
+    # permission/config denials, which must fail loudly. Only a 403 with
+    # rate-limit evidence (message or headers) skips cleanup.
     assert_includes body, 'function isHousekeepingTransientError(err)',
                     'the transient classifier is missing'
+    assert_includes body, 'function isHousekeepingRateLimit403(err)',
+                    'the 403 rate-limit evidence classifier is missing'
     assert_includes body, 'if (status === 429) return true;',
                     '429 must be treated as transient housekeeping failure'
-    assert_includes body, 'if (status === 403) return true;',
-                    '403 (the live shared-PAT exhaustion) must be treated as transient'
+    assert_includes body, 'if (status === 403) return isHousekeepingRateLimit403(err);',
+                    '403 must be transient only with rate-limit evidence'
+    refute_includes body, 'if (status === 403) return true;',
+                    'a bare 403 must not be treated as transient'
+    assert_includes body, 'rate[',
+                    'the 403 classifier must inspect rate-limit message evidence'
+    assert_includes body, 'x-ratelimit-remaining',
+                    'the 403 classifier must inspect rate-limit header evidence'
     assert_includes body, '[500, 502, 503, 504].includes(status)',
                     'transient 5xx must be treated as transient housekeeping failure'
 
@@ -5312,10 +5323,15 @@ class ContinuumTest < Minitest::Test
 
     # Executable classifier replica: the same status set the workflow
     # expresses must behave as specified (rate-limit skips, bug fails).
-    transient = lambda do |status|
-      status == 429 || status == 403 || [500, 502, 503, 504].include?(status)
+    # A 403 skips only with rate-limit evidence; a deterministic 403
+    # (permission/config denial) still fails loudly.
+    transient = lambda do |status, rate_limit_evidence = false|
+      next true if status == 429
+      next rate_limit_evidence if status == 403
+      [500, 502, 503, 504].include?(status)
     end
-    assert transient.call(403), 'the live 403 exhaustion must skip cleanup, not abort'
+    assert transient.call(403, true), 'a 403 with rate-limit evidence must skip cleanup, not abort'
+    refute transient.call(403, false), 'a deterministic 403 denial must still fail loudly'
     assert transient.call(429), '429 must skip cleanup, not abort'
     assert transient.call(503), '503 must skip cleanup, not abort'
     refute transient.call(422), 'a deterministic 422 must still fail loudly'

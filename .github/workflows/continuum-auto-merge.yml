@@ -197,10 +197,42 @@ jobs:
             // Best-effort housekeeping: a rate-limit/transient read or cancel
             // skips cleanup and lets core reconciliation continue. Any other
             // deterministic error (programming/config bug) still fails loudly.
+            // A 403 is transient only with rate-limit evidence: GitHub also
+            // uses 403 for deterministic permission/config denials (missing
+            // scope, private-repo denial, SSO enforcement), which must fail
+            // loudly instead of hiding as skipped cleanup.
+            function isHousekeepingRateLimit403(err) {
+              const message = [
+                err?.message,
+                err?.response?.data?.message,
+                typeof err?.response?.data === 'string'
+                  ? err.response.data
+                  : '',
+              ]
+                .filter(value => typeof value === 'string' && value.length > 0)
+                .join('\n')
+                .toLowerCase();
+              if (/rate[\s_-]*limit|secondary|abuse/.test(message)) {
+                return true;
+              }
+              const rawHeaders =
+                err?.response?.headers ?? err?.headers ?? null;
+              if (rawHeaders && typeof rawHeaders === 'object') {
+                const headers = {};
+                for (const [key, value] of Object.entries(rawHeaders)) {
+                  headers[String(key).toLowerCase()] =
+                    String(value).toLowerCase().trim();
+                }
+                if ('retry-after' in headers) return true;
+                if (headers['x-ratelimit-remaining'] === '0') return true;
+              }
+              return false;
+            }
+
             function isHousekeepingTransientError(err) {
               const status = housekeepingStatus(err);
               if (status === 429) return true;
-              if (status === 403) return true;
+              if (status === 403) return isHousekeepingRateLimit403(err);
               if ([500, 502, 503, 504].includes(status)) return true;
               return false;
             }
