@@ -316,9 +316,12 @@ class RecoveryWiringTests(unittest.TestCase):
             with self.subTest(read_call=read_call):
                 self.assertIn(read_call, body)
 
-        # One helper definition plus ten guarded read sites. Controller-state
-        # upsert also reads comments through the repository-scoped token.
-        self.assertEqual(body.count("withReadFallback("), 11)
+        # One helper definition plus twelve guarded read sites. Controller-state
+        # upsert also reads comments through the repository-scoped token, and
+        # both post-dispatch prune paths re-read fresh (grace-coalesce and
+        # coalesce-failure) so an interleaved controller write is never pruned
+        # from a stale pre-dispatch snapshot.
+        self.assertEqual(body.count("withReadFallback("), 13)
 
         # Item 1 keeps all mutation/dispatch calls on the PAT-authenticated
         # action client, preserving actor and event fan-out semantics.
@@ -881,10 +884,12 @@ class CodeRabbitDeadlockWiringTests(unittest.TestCase):
             "latestCodeRabbitDecision",
             "codeRabbitNitpickReviews",
             "directCodeRabbitReviewBasis",
+            "waitingForCompletedCodeRabbitReview",
             "codeRabbitExplicitlyResolved",
             "unresolvedCodeRabbitThreads",
         )
         extracted = [self._extract_js_function(gate, name) for name in needed]
+        self.assertIn("Review completed", extracted[5])
         self.assertIn("isResolved", extracted[-1])
 
         node = shutil.which("node")
@@ -981,28 +986,18 @@ REVIEWS = [
 RUNS = ciRun();
 const skippedStatus = {{ context: 'CodeRabbit', state: 'success', description: 'Review skipped' }};
 const completedStatus = {{ context: 'CodeRabbit', state: 'success', description: 'Review completed' }};
-function waitingForCompletedReview(reviewBasis, rabbitStatus) {{
-  return (
-    !reviewBasis &&
-    (
-      !rabbitStatus ||
-      rabbitStatus.state !== 'success' ||
-      !/Review completed/i.test(rabbitStatus.description || '')
-    )
-  );
-}}
 const changesBasis = await directCodeRabbitReviewBasis(pr, HEAD);
 results.changes_requested_blocked =
   changesBasis === null &&
-  waitingForCompletedReview(changesBasis, skippedStatus);
+  waitingForCompletedCodeRabbitReview(changesBasis, skippedStatus);
 // 4. "Review skipped" must not erase a durable exact-head approval.
 REVIEWS = [review({{ state: 'APPROVED' }})];
 RUNS = ciRun();
 const keptBasis = await directCodeRabbitReviewBasis(pr, HEAD);
 results.skipped_keeps_approval =
   keptBasis !== null &&
-  !waitingForCompletedReview(keptBasis, skippedStatus) &&
-  !waitingForCompletedReview(keptBasis, completedStatus);
+  !waitingForCompletedCodeRabbitReview(keptBasis, skippedStatus) &&
+  !waitingForCompletedCodeRabbitReview(keptBasis, completedStatus);
 // 5. A nitpick newer than the decision blocks the merge.
 REVIEWS = [
   review({{ state: 'APPROVED', submitted_at: '2026-01-01T00:00:00Z', id: 1 }}),

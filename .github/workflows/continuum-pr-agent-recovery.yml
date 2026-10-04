@@ -590,19 +590,35 @@ jobs:
               ) {
                 // The claim from the successful dispatch is already durable
                 // evidence, but a prior coalescing failure can leave it plus
-                // an older controller comment behind. Prune to one comment
-                // before coalescing so the bounded-at-one invariant holds
-                // even when an earlier upsert never succeeded.
+                // an older controller comment behind. Re-read fresh before
+                // pruning so an interleaved controller write after the
+                // pre-dispatch snapshot is never invisible: pruning the stale
+                // snapshot could delete pre-existing comments while leaving
+                // both the local claim and a concurrent claim (breaking the
+                // bounded-at-one invariant), and the generic controller
+                // marker alone cannot distinguish another head/kind. Keeping
+                // the fresh latest preserves a concurrent writer's state;
+                // the next successful upsert finishes coalescing.
                 try {
-                  const controllerDupes = refreshedComments
+                  const graceComments = await withReadFallback(client =>
+                    client.paginate(
+                      client.rest.issues.listComments,
+                      { owner, repo, issue_number: pr.number, per_page: 100 }
+                    )
+                  );
+                  const controllerDupes = graceComments
                     .filter(comment => String(comment.body || '').includes(CONTROLLER_STATE_MARKER))
                     .sort((a, b) => Number(a.id) - Number(b.id));
                   for (const stale of controllerDupes.slice(0, -1)) {
-                    await github.rest.issues.deleteComment({
-                      owner,
-                      repo,
-                      comment_id: stale.id,
-                    });
+                    try {
+                      await github.rest.issues.deleteComment({
+                        owner,
+                        repo,
+                        comment_id: stale.id,
+                      });
+                    } catch (deleteErr) {
+                      if (deleteErr.status !== 404) throw deleteErr;
+                    }
                   }
                 } catch (pruneErr) {
                   core.warning(
@@ -686,10 +702,14 @@ jobs:
               // Coalesce the pre-dispatch claim (plus any stale controller
               // comments) into the single controller comment. The claim is a
               // fresh controller-state comment, so on persistent upsert
-              // failure delete every prior controller comment and keep only
-              // the claim: exactly one controller comment remains. The
-              // failure is then thrown instead of a silent warn-and-true so
-              // the run goes red instead of claiming a clean coalesce.
+              // failure delete only pre-existing snapshot comments older
+              // than the claim and keep both the claim and any concurrent
+              // write: exactly-once evidence for both attempts survives and
+              // the next wakeup coalesces via grace. The dispatch already
+              // succeeded, so this path warns and returns true instead of
+              // throwing: a red run for a dispatched recovery would invite a
+              // manual retry that duplicates the same attempt once grace
+              // expires, and callers expect boolean dispatch() success.
               let stateError = null;
               for (let stateAttempt = 1; stateAttempt <= 3; stateAttempt++) {
                 try {
@@ -710,15 +730,31 @@ jobs:
               }
               if (stateError) {
                 try {
-                  const priorController = refreshedComments
+                  const freshController = await withReadFallback(client =>
+                    client.paginate(
+                      client.rest.issues.listComments,
+                      { owner, repo, issue_number: pr.number, per_page: 100 }
+                    )
+                  );
+                  const snapshotIds = new Set(
+                    refreshedComments.map(comment => Number(comment.id))
+                  );
+                  const claimId = Number(claim && claim.id);
+                  const priorController = freshController
                     .filter(comment => String(comment.body || '').includes(CONTROLLER_STATE_MARKER))
+                    .filter(comment => snapshotIds.has(Number(comment.id)))
+                    .filter(comment => Number(comment.id) !== claimId && Number(comment.id) < claimId)
                     .sort((a, b) => Number(a.id) - Number(b.id));
                   for (const stale of priorController) {
-                    await github.rest.issues.deleteComment({
-                      owner,
-                      repo,
-                      comment_id: stale.id,
-                    });
+                    try {
+                      await github.rest.issues.deleteComment({
+                        owner,
+                        repo,
+                        comment_id: stale.id,
+                      });
+                    } catch (deleteErr) {
+                      if (deleteErr.status !== 404) throw deleteErr;
+                    }
                   }
                 } catch (pruneErr) {
                   core.warning(
@@ -731,10 +767,11 @@ jobs:
                   'PR #' + pr.number + ' ' + kind +
                   ': dispatched recovery execution ' + (attempt + 1) + '/' + maxExecutions +
                   ' but coalescing into one controller comment failed; ' +
-                  'prior controller comments pruned, keeping only the pre-dispatch claim. ' +
+                  'kept the pre-dispatch claim plus any concurrent controller write. ' +
+                  'The next wakeup coalesces via dispatch grace; no duplicate dispatch was issued. ' +
                   (stateError.message || stateError)
                 );
-                throw stateError;
+                return true;
               }
               return true;
             }
