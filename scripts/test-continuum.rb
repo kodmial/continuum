@@ -1899,10 +1899,26 @@ class ContinuumTest < Minitest::Test
                       'the pre-review revalidation must stay read-only'
     refute_includes moved, 'gh workflow run',
                       'the moved-head check must stay read-only'
-    assert_includes review_tool, 'GITHUB__USER_TOKEN: ${{ github.token }}',
-                     'PR-Agent review tool execution must use repository token'
-    assert_includes improve_tool, 'GITHUB__USER_TOKEN: ${{ github.token }}',
-                     'PR-Agent improve tool execution must use repository token'
+    assert_includes review_tool, 'GITHUB__USER_TOKEN:',
+                     'PR-Agent review tool execution must set a user token'
+    assert_includes review_tool, conditional_token,
+                    'PR-Agent review tool execution must select TAP_PAT for delegated runs instead of an unconditional github.token'
+    assert_includes review_tool, empty_token_tail,
+                    'PR-Agent review tool execution must yield an empty token for delegated runs without PAT so auth itself fails closed'
+    refute_includes review_tool, 'secrets.TAP_PAT || github.token }}',
+                    'PR-Agent review tool execution must not fall back to github.token for delegated runs without PAT'
+    assert_includes review_tool, 'Delegated PR-Agent execution requires TAP_PAT',
+                    'PR-Agent review tool execution must fail closed for delegated runs without TAP_PAT'
+    assert_includes improve_tool, 'GITHUB__USER_TOKEN:',
+                     'PR-Agent improve tool execution must set a user token'
+    assert_includes improve_tool, conditional_token,
+                    'PR-Agent improve tool execution must select TAP_PAT for delegated runs instead of an unconditional github.token'
+    assert_includes improve_tool, empty_token_tail,
+                    'PR-Agent improve tool execution must yield an empty token for delegated runs without PAT so auth itself fails closed'
+    refute_includes improve_tool, 'secrets.TAP_PAT || github.token }}',
+                    'PR-Agent improve tool execution must not fall back to github.token for delegated runs without PAT'
+    assert_includes improve_tool, 'Delegated PR-Agent execution requires TAP_PAT',
+                    'PR-Agent improve tool execution must fail closed for delegated runs without TAP_PAT'
     assert_includes in_flight, conditional_token,
                     'in-flight commit-status publishing must select TAP_PAT for delegated writes instead of an unconditional github.token'
     assert_includes in_flight, empty_token_tail,
@@ -1920,17 +1936,19 @@ class ContinuumTest < Minitest::Test
                      'commit-status publishing must use repository token'
     # Target-aware (#243) delegated reads/writes require TAP_PAT, so the review
     # workflow is no longer entirely PAT-free: the admission/revalidation
-    # steps above plus the in-flight commit-status step legitimately carry
+    # steps above plus the in-flight commit-status step and the PR-Agent
+    # review/improve tool steps legitimately carry
     # the fail-closed conditional. The
     # PAT-quota isolation contract is preserved in scoped form: local
     # control-plane steps stay repository-token backed (asserted per step
-    # above), tool execution never consumes the shared PAT, there is no
+    # above), tool execution consumes the shared PAT only through the
+    # fail-closed conditional for delegated runs, there is no
     # unconditional fallback to github.token for delegated runs, and the
     # only bare TAP_PAT credential is the target-resolution fetch itself.
     refute_includes body, 'secrets.TAP_PAT || github.token }}',
                     'review workflow must never fall back to github.token for delegated runs without PAT'
     refute_includes body, 'GITHUB__USER_TOKEN: ${{ secrets.TAP_PAT }}',
-                    'review tool execution must never consume the shared user PAT'
+                    'review tool execution must never consume the shared user PAT unconditionally'
     resolve = step_body(body, 'Resolve PR-Agent target context')
     refute_nil resolve, 'the target-context resolution step is missing'
     assert_includes resolve, 'GH_TOKEN: ${{ secrets.TAP_PAT }}',
@@ -2125,15 +2143,18 @@ class ContinuumTest < Minitest::Test
     # Target-aware (#243) delegated cross-repository reads require TAP_PAT
     # through the fail-closed conditional, so the review workflow is no
     # longer entirely PAT-free. The repository-token contract is preserved
-    # in scoped form: local control-plane and tool execution stay
+    # in scoped form: local control-plane runs stay
     # repository-token backed, the shared PAT is never consumed
     # unconditionally, and delegated runs without PAT fail closed instead
-    # of silently falling back to github.token.
+    # of silently falling back to github.token. PR-Agent tool execution
+    # (pr-agent --pr_url against the resolved target) follows the same
+    # target-aware contract: TAP_PAT when delegated, github.token locally.
     refute_includes body, 'secrets.TAP_PAT || github.token }}',
                     'review workflow must never fall back to github.token for delegated runs without PAT'
     refute_includes body, 'GITHUB__USER_TOKEN: ${{ secrets.TAP_PAT }}',
-                    'review workflow must not consume the shared user PAT for tool execution'
-    assert_includes body, 'GITHUB__USER_TOKEN: ${{ github.token }}'
+                    'review workflow must not consume the shared user PAT unconditionally for tool execution'
+    assert_includes body, 'GITHUB__USER_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED',
+                    'PR-Agent tool execution must select its user token through the target-aware conditional'
     assert_includes body, 'GH_TOKEN: ${{ github.token }}'
     assert_includes body, "CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT",
                     'delegated target-aware reads must select TAP_PAT through the fail-closed conditional'

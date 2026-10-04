@@ -881,13 +881,19 @@ class IsolationTests(unittest.TestCase):
         # Target-aware (#243) delegated cross-repository reads require
         # TAP_PAT through the fail-closed conditional, so the review
         # workflow is no longer entirely PAT-free. The repository-token
-        # contract is preserved in scoped form: local control-plane and
-        # tool execution stay repository-token backed, the shared PAT is
-        # never consumed unconditionally, and delegated runs without PAT
-        # fail closed instead of silently falling back to github.token.
+        # contract is preserved in scoped form: local control-plane runs
+        # stay repository-token backed, the shared PAT is never consumed
+        # unconditionally, and delegated runs without PAT fail closed
+        # instead of silently falling back to github.token. PR-Agent tool
+        # execution (pr-agent --pr_url against the resolved target) follows
+        # the same target-aware contract: TAP_PAT when delegated,
+        # github.token locally.
         self.assertNotIn("secrets.TAP_PAT || github.token }}", body)
         self.assertNotIn("GITHUB__USER_TOKEN: ${{ secrets.TAP_PAT }}", body)
-        self.assertIn("GITHUB__USER_TOKEN: ${{ github.token }}", body)
+        self.assertIn(
+            "GITHUB__USER_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED",
+            body,
+        )
         self.assertIn("GH_TOKEN: ${{ github.token }}", body)
         self.assertIn(
             "CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT",
