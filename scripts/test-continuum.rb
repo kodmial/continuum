@@ -1688,10 +1688,13 @@ class ContinuumTest < Minitest::Test
     end
   end
 
-  # PR-Agent must not turn normal concurrency races or an upstream clean-review
-  # omission into a permanent red gate. A stale dispatch is ignored and
-  # recovery re-evaluates the current HEAD; a clean structured full review may
-  # synthesize only an empty persistent state, while findings still fail closed.
+  # PR-Agent must not turn normal concurrency races or an absent native
+  # persistent finding state into a permanent red gate. A stale dispatch is
+  # ignored and recovery re-evaluates the current HEAD; when native state is
+  # absent, a validated structured full review derives a schema-compatible
+  # fallback (empty for a clean review, ACTIVE findings otherwise) via the
+  # upstream v0.46.0 finding-state contract, while an unrepresentable finding
+  # still fails closed. Native state remains authoritative when present.
   def test_pr_agent_clean_review_and_stale_head_are_non_blocking
     pr_agent = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent.yml'))
 
@@ -1703,7 +1706,16 @@ class ContinuumTest < Minitest::Test
     assert_includes pr_agent, '"findings": []'
     assert_includes pr_agent, '"complete": True'
     assert_includes pr_agent, '"kind": "full"'
-    assert_includes pr_agent, 'Upstream review has key findings but published no persistent finding state.'
+    # Native state wins when present; otherwise the validated structured
+    # review derives an ACTIVE fallback instead of blocking repair.
+    assert_includes pr_agent, 'parse_review_state'
+    assert_includes pr_agent, 'reconcile_review_findings'
+    assert_includes pr_agent, 'normalize_finding'
+    refute_includes pr_agent, 'Upstream review has key findings but published no persistent finding state.'
+    # Only an unrepresentable finding fails closed; nothing is invented and
+    # nothing is marked resolved by the fallback.
+    assert_includes pr_agent, 'represented as persistent finding state; failing closed'
+    assert_includes pr_agent, 'cannot derive fallback state.'
 
     repair = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent-repair.yml'))
     assert_includes repair, 'git clean -fdX',
@@ -4380,6 +4392,34 @@ class ContinuumTest < Minitest::Test
   # wake-up loop and pinning the catch inside it is what actually asserts the
   # best-effort contract: a wake-up that cannot be delivered warns, and never
   # fails a run whose merge already landed.
+  # Conflict repair must dispatch the consumer-owned workflow_dispatch caller,
+  # not the reusable engine. Continuum dogfood names that caller opencode.yml,
+  # while installed consumers keep the continuum-opencode.yml default.
+  def test_auto_merge_conflict_repair_uses_configured_consumer_caller
+    inputs = events(yaml(File.join(ROOT, '.github/workflows/continuum-auto-merge.yml')))
+             .fetch('workflow_call').fetch('inputs')
+    knob = inputs.fetch('opencode_workflow')
+    assert_equal 'continuum-opencode.yml', knob.fetch('default')
+    assert_equal 'string', knob.fetch('type')
+    assert_equal false, knob.fetch('required')
+
+    body = auto_merge_body
+    assert_includes body,
+                    "OPENCODE_WORKFLOW: ${{ inputs.opencode_workflow || 'continuum-opencode.yml' }}"
+    refute_includes body, "workflow_id: 'continuum-opencode.yml'",
+                    'conflict repair must not hardcode the installed-consumer caller name'
+
+    repair_dispatch = dispatch_calls('continuum-auto-merge.yml').find do |call|
+      call.include?("mode: 'resolve-conflict'")
+    end
+    refute_nil repair_dispatch, 'automatic conflict-repair dispatch is missing'
+    assert_includes repair_dispatch, 'process.env.OPENCODE_WORKFLOW'
+
+    dogfood = workflow_body('automation.yml')
+    assert_match(/auto-merge:.*?opencode_workflow: 'opencode\.yml'/m, dogfood,
+                 'Continuum dogfood must route conflict repair through its real workflow_dispatch caller')
+  end
+
   def test_auto_merge_wakeup_catch_warns_inside_the_wakeup_loop
     body = auto_merge_body
 
