@@ -1984,14 +1984,22 @@ class CleanReviewImproveSkipTests(unittest.TestCase):
 
     def test_invalid_review_or_state_fails_closed_not_skip(self):
         life = self._life()
-        with self.assertRaises(life.LifecycleError):
-            life.should_skip_improve(
-                {"merge_recommendation": "safe_to_merge"},
-                make_persistent([], head_sha="abc1234"),
-                head_matches=True,
-                review_coverage_complete=True,
-                reviewed_head_sha="abc1234",
-            )
+        missing_key_issues = life.should_skip_improve(
+            {"merge_recommendation": "safe_to_merge"},
+            make_persistent([], head_sha="abc1234"),
+            head_matches=True,
+            review_coverage_complete=True,
+            reviewed_head_sha="abc1234",
+        )
+        self.assertFalse(missing_key_issues["skip"])
+        missing_recommendation = life.should_skip_improve(
+            {"key_issues_to_review": []},
+            make_persistent([], head_sha="abc1234"),
+            head_matches=True,
+            review_coverage_complete=True,
+            reviewed_head_sha="abc1234",
+        )
+        self.assertFalse(missing_recommendation["skip"])
         # Benign persistent format variations with a known HEAD run improve
         # (skip=False) instead of crashing the orchestrator.
         non_full = life.should_skip_improve(
@@ -2011,7 +2019,8 @@ class CleanReviewImproveSkipTests(unittest.TestCase):
             '{"nope": true}', json.dumps(make_persistent([], head_sha="abc1234")),
             {"headMatches": True, "reviewCoverageComplete": True, "reviewedHeadSha": "abc1234"},
         )
-        self.assertIn("threw", bad_review)
+        self.assertFalse(bad_review["skip"])
+        self.assertNotIn("threw", bad_review)
         benign_state = run_skip_policy(
             make_review([]), {"not": "state"},
             {"headMatches": True, "reviewCoverageComplete": True, "reviewedHeadSha": "abc1234"},
@@ -3110,6 +3119,33 @@ process.stdout.write(JSON.stringify(result === undefined ? null : result));
                 review = make_review([], extra=extra)
                 self.assertTrue(life.has_tool_error_signal(review))
                 self.assertTrue(self._js("tool", review=review))
+
+    def test_explicit_non_string_error_forces_improve(self):
+        life = self._life()
+        for value in (True, 1, {"count": 1}, [True]):
+            with self.subTest(value=value):
+                review = make_review([], extra={"errors": value})
+                self.assertTrue(life.has_tool_error_signal(review))
+                self.assertTrue(self._js("tool", review=review))
+                decision = life.should_skip_improve(
+                    review,
+                    make_persistent([], head_sha="abc1234"),
+                    head_matches=True,
+                    review_coverage_complete=True,
+                    reviewed_head_sha="abc1234",
+                )
+                self.assertFalse(decision["skip"])
+                js = run_skip_policy(
+                    review,
+                    make_persistent([], head_sha="abc1234"),
+                    {"headMatches": True, "reviewCoverageComplete": True, "reviewedHeadSha": "abc1234"},
+                )
+                self.assertFalse(js["skip"])
+        for clean_value in (False, 0, None, [], {}):
+            with self.subTest(clean_value=clean_value):
+                review = make_review([], extra={"errors": clean_value})
+                self.assertFalse(life.has_tool_error_signal(review))
+                self.assertFalse(self._js("tool", review=review))
 
     def test_empty_explicit_coverage_fails_closed(self):
         life = self._life()

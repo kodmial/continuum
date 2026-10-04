@@ -487,7 +487,11 @@ def _is_generic_tool_failure_text(value: object) -> bool:
             return False
         return any(_is_generic_tool_failure_text(item) for item in value)
     if not isinstance(value, str):
-        return False
+        # Explicit non-string error evidence (e.g. `errors: True` or
+        # `errors: 1`) must force improve instead of authorizing a clean
+        # skip: fail closed via the blocking check. Clean values
+        # (False, 0, None) stay clean.
+        return _security_value_is_blocking(value)
     if not _security_value_is_blocking(value):
         return False
     lowered = value.strip().lower()
@@ -900,25 +904,41 @@ def should_skip_improve(
     hex HEAD that exactly matches the reviewed HEAD can allow a skip.
 
     Anything else returns `skip=False` so `improve` may still run to
-    generate additional repair suggestions. Invalid review payloads and a
-    missing reviewed HEAD raise `LifecycleError` and fail closed instead
-    of skipping; a benign persistent format variation (non-object state,
-    non-list findings, missing `last_run`, non-full run, missing or
-    placeholder `head_sha`) with a known HEAD returns `skip=False` so
-    `improve` still runs.
+    generate additional repair suggestions. An invalid review payload
+    (unparseable envelope, missing/non-list `key_issues_to_review`, or
+    missing `merge_recommendation`) returns `skip=False` so `improve`
+    still runs for repair value; only a missing reviewed HEAD raises
+    `LifecycleError` and fails closed instead of skipping. A benign
+    persistent format variation (non-object state, non-list findings,
+    missing `last_run`, non-full run, missing or placeholder `head_sha`)
+    with a known HEAD returns `skip=False` so `improve` still runs.
     """
 
-    inner = _unwrap_review(review)
+    try:
+        inner = _unwrap_review(review)
+    except LifecycleError:
+        # An upstream review-shape variation must safely run improve for
+        # repair value instead of crashing the orchestrator: fail closed
+        # to skip=False, never to an exception.
+        return {"skip": False, "reason": "invalid review payload: failing closed"}
     if tool_error or has_tool_error_signal(inner):
         return {"skip": False, "reason": "tool error: failing closed"}
     if not head_matches:
         return {"skip": False, "reason": "stale head: result is not for the current HEAD"}
-    if "key_issues_to_review" not in inner:
-        raise LifecycleError("PR-Agent review JSON has no key_issues_to_review")
+    if "key_issues_to_review" not in inner or not isinstance(
+        inner.get("key_issues_to_review"), list
+    ):
+        return {
+            "skip": False,
+            "reason": "review has no key_issues_to_review list: failing closed",
+        }
     try:
         recommendation = merge_recommendation(inner)
-    except LifecycleError as exc:
-        raise LifecycleError(f"cannot decide improve skip: {exc}") from None
+    except LifecycleError:
+        return {
+            "skip": False,
+            "reason": "review has no merge_recommendation: failing closed",
+        }
     # The exact reviewed HEAD is mandatory for any skip decision: validate
     # it before interpreting coverage/persistent format variations so a
     # missing HEAD still fails closed by exception while benign variations

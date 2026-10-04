@@ -417,7 +417,13 @@ function isGenericToolFailureText(value) {
     if (keys.length === 0) return false;
     return keys.some((key) => isGenericToolFailureText(value[key]));
   }
-  if (typeof value !== 'string') return false;
+  if (typeof value !== 'string') {
+    // Explicit non-string error evidence (e.g. `errors: true` or
+    // `errors: 1`) must force improve for repair value instead of
+    // authorizing a clean skip: fail closed via the blocking check.
+    // Clean values (false, 0, null/undefined) stay clean.
+    return securityValueIsBlocking(value);
+  }
   if (!securityValueIsBlocking(value)) return false;
   const text = value.trim();
   if (!GENERIC_TOOL_WORD_PATTERNS.some((pattern) => pattern.test(text))) return false;
@@ -806,7 +812,15 @@ function isPlausibleHeadSha(value) {
 function isCleanReviewForImproveSkip(reviewPayload, persistentState, options = {}) {
   const opts = options && typeof options === 'object' ? options : {};
   const headMatches = opts.headMatches === true;
-  const review = unwrapReview(reviewPayload);
+  let review;
+  try {
+    review = unwrapReview(reviewPayload);
+  } catch (err) {
+    // An upstream review-shape variation must safely run improve for
+    // repair value instead of crashing the orchestrator: fail closed to
+    // skip:false, never to an exception.
+    return { skip: false, reason: 'invalid review payload: failing closed' };
+  }
   const toolError = opts.toolError === true || hasToolErrorSignal(review);
   if (toolError) {
     return { skip: false, reason: 'tool error: failing closed' };
@@ -816,11 +830,14 @@ function isCleanReviewForImproveSkip(reviewPayload, persistentState, options = {
   }
   const keyIssues = review.key_issues_to_review;
   if (!Array.isArray(keyIssues)) {
-    throw new Error('PR-Agent review JSON has no key_issues_to_review list.');
+    // A benign upstream shape variation must still run improve for repair
+    // value instead of crashing the orchestrator: fail closed to
+    // skip:false, never to an exception.
+    return { skip: false, reason: 'review has no key_issues_to_review list: failing closed' };
   }
   const recommendation = String(review.merge_recommendation || '').trim();
   if (!recommendation) {
-    throw new Error('PR-Agent review has no merge_recommendation.');
+    return { skip: false, reason: 'review has no merge_recommendation: failing closed' };
   }
   // The exact reviewed HEAD is mandatory for any skip decision: validate it
   // before interpreting coverage/persistent format variations so a missing

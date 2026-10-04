@@ -278,13 +278,34 @@ class ExactHeadSafetyTests(unittest.TestCase):
         )
         self.assertIn("threw", result)
 
-    def test_missing_key_issues_throws_fail_closed(self):
+    def test_missing_key_issues_runs_improve_fail_closed(self):
         result = run_skip_raw(
             json.dumps({"merge_recommendation": "safe_to_merge"}),
             json.dumps(make_persistent([], head_sha="abc1234")),
             dict(CLEAN_OPTS),
         )
-        self.assertIn("threw", result)
+        self.assertFalse(result["skip"])
+        self.assertNotIn("threw", result)
+
+    def test_missing_merge_recommendation_runs_improve_fail_closed(self):
+        result = run_skip_raw(
+            json.dumps({"key_issues_to_review": []}),
+            json.dumps(make_persistent([], head_sha="abc1234")),
+            dict(CLEAN_OPTS),
+        )
+        self.assertFalse(result["skip"])
+        self.assertNotIn("threw", result)
+
+    def test_invalid_review_payload_runs_improve_fail_closed(self):
+        for bad in ('{"nope": true}', 'null', '"not-an-object"'):
+            with self.subTest(bad=bad):
+                result = run_skip_raw(
+                    bad,
+                    json.dumps(make_persistent([], head_sha="abc1234")),
+                    dict(CLEAN_OPTS),
+                )
+                self.assertFalse(result["skip"])
+                self.assertNotIn("threw", result)
 
 
 class SplitEnvelopeTests(unittest.TestCase):
@@ -372,6 +393,25 @@ class GenericToolConjunctionTests(unittest.TestCase):
             with self.subTest(text=text):
                 review = make_review([], extra={"errors": text})
                 self.assertTrue(run_js("tool", review=review))
+
+    def test_explicit_non_string_error_blocks_skip(self):
+        for value in (True, 1, {"count": 1}, [True], ["upstream tool failed"]):
+            with self.subTest(value=value):
+                review = make_review([], extra={"errors": value})
+                self.assertTrue(run_js("tool", review=review))
+                result = run_js(
+                    "skip",
+                    review=review,
+                    state=make_persistent([], head_sha="abc1234"),
+                    options=dict(CLEAN_OPTS),
+                )
+                self.assertFalse(result["skip"])
+
+    def test_clean_non_string_error_stays_clean(self):
+        for value in (False, 0, None, [], {}):
+            with self.subTest(value=value):
+                review = make_review([], extra={"errors": value})
+                self.assertFalse(run_js("tool", review=review))
 
 
 class ConflictingNonSafeRecommendationTests(unittest.TestCase):
