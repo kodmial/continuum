@@ -1286,7 +1286,13 @@ jobs:
           steps.improve_gate.outputs.skip_improve != 'true'
         id: improve
         env:
-          GH_TOKEN: ${{ github.token }}
+          # Target-aware moved-head check (gh pr view for the current PR head
+          # only against the resolved target). Local reads use github.token;
+          # delegated cross-repository reads require TAP_PAT. The fallback is
+          # gated on non-delegated runs so a delegated run without PAT yields
+          # an empty token (auth itself fails closed).
+          GH_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
+          TAP_PAT: ${{ secrets.TAP_PAT }}
           GITHUB__USER_TOKEN: ${{ github.token }}
           CONFIG__GIT_PROVIDER: github
           CONFIG__MODEL: ${{ steps.stack.outputs.model }}
@@ -1310,6 +1316,10 @@ jobs:
           POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
         run: |
           set -euo pipefail
+          if [[ "${CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED:-false}" == "true" && -z "${TAP_PAT:-}" ]]; then
+            echo "::error::Delegated PR-Agent execution requires TAP_PAT; refusing to fall back to github.token."
+            exit 1
+          fi
           : "${CONTINUUM_PR_AGENT_WORKTREE:?PR-Agent worktree is unavailable; the manual checkout failed before exporting the worktree.}"
           : "${CONTINUUM_PR_AGENT_TARGET_REPOSITORY:?PR-Agent target repository is unset; refusing to fall back to the execution repository.}"
           cd "$CONTINUUM_PR_AGENT_WORKTREE"
@@ -1360,12 +1370,22 @@ jobs:
           steps.improve_gate.outputs.skip_improve == 'true'
         id: improve_skipped
         env:
-          GH_TOKEN: ${{ github.token }}
+          # Target-aware moved-head check (gh pr view for the current PR head
+          # only against the resolved target). Local reads use github.token;
+          # delegated cross-repository reads require TAP_PAT. The fallback is
+          # gated on non-delegated runs so a delegated run without PAT yields
+          # an empty token (auth itself fails closed).
+          GH_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
+          TAP_PAT: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           REVIEWED_SHA: ${{ steps.before.outputs.sha }}
           POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
         run: |
           set -euo pipefail
+          if [[ "${CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED:-false}" == "true" && -z "${TAP_PAT:-}" ]]; then
+            echo "::error::Delegated PR-Agent execution requires TAP_PAT; refusing to fall back to github.token."
+            exit 1
+          fi
           : "${CONTINUUM_PR_AGENT_WORKTREE:?PR-Agent worktree is unavailable; the manual checkout failed before exporting the worktree.}"
           : "${CONTINUUM_PR_AGENT_TARGET_REPOSITORY:?PR-Agent target repository is unset; refusing to fall back to the execution repository.}"
           cd "$CONTINUUM_PR_AGENT_WORKTREE"
