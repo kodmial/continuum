@@ -899,7 +899,7 @@ jobs:
                   recoverable = true;
                 } else if (
                   ageMs(operationStatus.updated_at || operationStatus.created_at) >= staleMs &&
-                  (runConclusion === null || runConclusion === undefined ||
+                  (runConclusion === null || runConclusion === undefined || String(runConclusion || '').trim() === '' ||
                     retryableConclusions.has(String(runConclusion || '').toLowerCase()))
                 ) {
                   recoverable = true;
