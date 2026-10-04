@@ -26,6 +26,20 @@ on:
         type: string
         default: ''
         required: false
+      target_child_id:
+        description: >-
+          Opaque verified child id for delegated routing. Empty routes the
+          pull request in the caller repository.
+        type: string
+        default: ''
+        required: false
+      expected_head_sha:
+        description: >-
+          Exact PR HEAD for delegated routing. Required when target_child_id
+          is set; empty resolves the HEAD from the event for local routing.
+        type: string
+        default: ''
+        required: false
 
 permissions: {}
 
@@ -40,6 +54,10 @@ permissions: {}
 
 jobs:
   route:
+    # Child-local routing is suppressed in verified child mode (issue #244):
+    # the parent is the only automatic execution plane for child PR-Agent.
+    # Local/non-child behavior is unchanged.
+    if: vars.CONTINUUM_ROLE != 'child'
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -57,6 +75,8 @@ jobs:
           INPUT_REVIEW_PROVIDER: ${{ inputs.review_provider }}
           CFG_REVIEW_PROVIDER: ${{ vars.CONTINUUM_REVIEW_PROVIDER }}
           INPUT_PR_NUMBER: ${{ inputs.pr_number }}
+          INPUT_TARGET_CHILD_ID: ${{ inputs.target_child_id }}
+          INPUT_EXPECTED_HEAD: ${{ inputs.expected_head_sha }}
           FALLBACK_DISPATCH_TOKEN: ${{ secrets.TAP_PAT }}
         with:
           github-token: ${{ github.token }}
@@ -115,29 +135,60 @@ jobs:
               core.setFailed('PR-Agent review router could not resolve a pull request number.');
               return;
             }
+            // Delegated routing (issue #244): only the opaque child id ever
+            // selects the target; concrete repository identity is resolved
+            // runner-local inside the heavy workflow. The id is validated
+            // here fail-closed so a malformed value never dispatches.
+            const targetChildId = String(process.env.INPUT_TARGET_CHILD_ID || '').trim();
+            if (targetChildId && !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$/.test(targetChildId)) {
+              core.setFailed('PR-Agent review router received an invalid target_child_id.');
+              return;
+            }
 
-            const { data: pr } = await github.rest.pulls.get({
-              owner, repo, pull_number: Number(prNumber),
-            });
-            if (pr.state !== 'open') {
-              core.notice('PR-Agent review router exits: PR #' + prNumber + ' is not open.');
-              return;
+            const expectedHeadInput = String(process.env.INPUT_EXPECTED_HEAD || '').trim().toLowerCase();
+            let head = '';
+            let operationKey = '';
+            if (targetChildId) {
+              // Delegated manual route (issue #244): the router cannot read
+              // the child PR without resolving concrete repository identity,
+              // which never leaves the trusted runner inside the heavy
+              // workflow. Exact-HEAD state is mandatory, so a delegated
+              // route fails closed without an explicit full HEAD. The heavy
+              // workflow re-verifies admission on that exact HEAD.
+              if (!/^([0-9a-f]{40}|[0-9a-f]{64})$/.test(expectedHeadInput) ||
+                  /^0+$/.test(expectedHeadInput)) {
+                core.setFailed(
+                  'PR-Agent review router requires an exact expected_head_sha for delegated routing.'
+                );
+                return;
+              }
+              head = expectedHeadInput;
+              operationKey = 'review:' + targetChildId + ':' + prNumber + ':' + head;
+              core.notice('PR-Agent review router operation key is ' + operationKey + '.');
+            } else {
+              const { data: pr } = await github.rest.pulls.get({
+                owner, repo, pull_number: Number(prNumber),
+              });
+              if (pr.state !== 'open') {
+                core.notice('PR-Agent review router exits: PR #' + prNumber + ' is not open.');
+                return;
+              }
+              if (pr.draft) {
+                core.notice('PR-Agent review router exits: PR #' + prNumber + ' is a draft.');
+                return;
+              }
+              if (!pr.head.repo || pr.head.repo.full_name !== repoFullName) {
+                core.notice('PR-Agent review router exits: PR #' + prNumber + ' is not same-repo.');
+                return;
+              }
+              head = String(pr.head.sha || '').toLowerCase();
+              if (!head) {
+                core.setFailed('PR-Agent review router could not resolve the current PR HEAD.');
+                return;
+              }
+              operationKey = 'review:' + prNumber + ':' + head;
+              core.notice('PR-Agent review router operation key is ' + operationKey + '.');
             }
-            if (pr.draft) {
-              core.notice('PR-Agent review router exits: PR #' + prNumber + ' is a draft.');
-              return;
-            }
-            if (!pr.head.repo || pr.head.repo.full_name !== repoFullName) {
-              core.notice('PR-Agent review router exits: PR #' + prNumber + ' is not same-repo.');
-              return;
-            }
-            const head = String(pr.head.sha || '').toLowerCase();
-            if (!head) {
-              core.setFailed('PR-Agent review router could not resolve the current PR HEAD.');
-              return;
-            }
-            const operationKey = 'review:' + prNumber + ':' + head;
-            core.notice('PR-Agent review router operation key is ' + operationKey + '.');
 
             const activeStatuses = new Set(['queued', 'in_progress', 'waiting', 'requested', 'pending']);
             // Coalescing only needs recent active workflow_dispatch runs.
@@ -169,6 +220,11 @@ jobs:
             }
 
             const ref = String(context.payload.repository?.default_branch || 'main');
+            // Local runs dispatch bare: a custom reviewWorkflow without the
+            // target_child_id workflow_dispatch input would reject an empty
+            // value, breaking local routing. Delegated runs preserve the
+            // opaque child selection so the heavy workflow resolves the
+            // verified child target runner-local.
             const dispatchArgs = {
               owner, repo, workflow_id: reviewWorkflow, ref,
               inputs: {
@@ -179,6 +235,9 @@ jobs:
                 recovery_kind: 'review',
               },
             };
+            if (targetChildId) {
+              dispatchArgs.inputs.target_child_id = targetChildId;
+            }
             try {
               await github.rest.actions.createWorkflowDispatch(dispatchArgs);
             } catch (err) {

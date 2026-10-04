@@ -26,6 +26,11 @@ permissions:
 
 jobs:
   call:
+    # Automatic PR-Agent callers skip in verified child mode (issue #244):
+    # the parent is the only automatic execution plane for child PR-Agent.
+    # An explicit owner workflow_dispatch still reaches the reusable, which
+    # fail-safes there. Local/non-child behavior is unchanged.
+    if: vars.CONTINUUM_ROLE != 'child' || github.event_name == 'workflow_dispatch'
     uses: ./.github/workflows/continuum-pr-agent-recovery.yml
     secrets: inherit
     with:
