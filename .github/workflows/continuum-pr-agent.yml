@@ -807,25 +807,50 @@ jobs:
               c for c in comments
               if "<!-- pr-agent-review-state:" in str(c.get("body") or "")
           ]
-          if not candidates:
+          def derive_current_fallback():
               try:
                   review = json.loads(os.environ.get("REVIEW_JSON", ""))
               except json.JSONDecodeError as exc:
-                  raise SystemExit(f"Cannot validate review without persistent state: {exc}")
+                  raise SystemExit(f"Cannot validate review for persistent-state fallback: {exc}")
               try:
-                  state = derive_fallback_state(
+                  return derive_fallback_state(
                       review,
                       reviewed,
                       run_id=f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/commit/{reviewed}",
                   )
               except FallbackStateError as exc:
                   raise SystemExit(f"Cannot derive fallback persistent state: {exc}")
-          else:
+
+          state = None
+          if candidates:
               latest = max(candidates, key=lambda c: str(c.get("updated_at") or c.get("created_at") or ""))
               parsed = parse_review_state(str(latest.get("body") or ""))
-              if not parsed.present or not parsed.valid or not isinstance(parsed.state, dict):
-                  raise SystemExit("Latest upstream PR-Agent persistent finding state is missing or invalid.")
-              state = parsed.state
+              if parsed.present and parsed.valid and isinstance(parsed.state, dict):
+                  candidate = parsed.state
+                  last = candidate.get("last_run")
+                  findings = candidate.get("findings")
+                  native_usable = (
+                      isinstance(last, dict)
+                      and str(last.get("head_sha") or "").strip().lower() == reviewed
+                      and last.get("complete") is True
+                      and str(last.get("kind") or "") == "full"
+                      and isinstance(findings, list)
+                      and all(
+                          isinstance(finding, dict)
+                          and str(finding.get("state") or "").upper() in {"ACTIVE", "RESOLVED"}
+                          for finding in findings
+                      )
+                  )
+                  if native_usable:
+                      state = candidate
+          if state is None:
+              # Upstream may publish a marker before its full-review last_run
+              # is complete. That incomplete marker is not authoritative.
+              # The exact-HEAD structured review has already passed schema and
+              # stale-HEAD validation, so derive the canonical fallback rather
+              # than dead-ending before repair routing.
+              state = derive_current_fallback()
+
           last = state.get("last_run")
           if not isinstance(last, dict):
               raise SystemExit("Upstream PR-Agent persistent state has no last_run.")

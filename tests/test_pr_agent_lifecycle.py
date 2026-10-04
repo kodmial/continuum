@@ -2153,5 +2153,22 @@ class ReviewDispositionIntegrationTests(unittest.TestCase):
         self.assertIn("state = derive_fallback_state(", review)
         self.assertNotIn("state = reconciled.state", review)
 
+
+class IncompleteNativePersistentStateContractTests(unittest.TestCase):
+    """Issue #252: an incomplete native marker cannot dead-end routing."""
+
+    def test_incomplete_native_marker_falls_back_to_validated_exact_head_review(self):
+        body = read_repo(".github/workflows/continuum-pr-agent.yml")
+        self.assertIn("native_usable = (", body)
+        self.assertIn("if native_usable:", body)
+        self.assertIn("if state is None:", body)
+        self.assertIn("state = derive_current_fallback()", body)
+        self.assertIn("last.get(\"complete\") is True", body)
+        self.assertIn('str(last.get("kind") or "") == "full"', body)
+        self.assertIn(
+            "incomplete marker is not authoritative",
+            body,
+        )
+
 if __name__ == "__main__":
     unittest.main()
