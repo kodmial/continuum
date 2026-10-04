@@ -81,6 +81,35 @@ class AgentRuntimeContractTest(unittest.TestCase):
             runtime.workflow_step_has_prepared_runtime_probe(warm_body),
             "prepared-runtime probe with pinned versions + image digest required",
         )
+        # The Python detector alone is not zero-download proof: the
+        # required evidence is the Ruby exit-0/else contract (the warm hit
+        # short-circuits before any download). The fixture must carry it.
+        hit_at = warm_body.index("prepared-runtime hit")
+        installer_at = warm_body.index("https://opencode.ai/install")
+        exit_at = warm_body.index("exit 0")
+        self.assertLess(hit_at, installer_at)
+        self.assertLess(hit_at, exit_at)
+        self.assertLess(exit_at, installer_at)
+        # A probe before the installer without the short-circuit is not a
+        # proven warm path: removing `exit 0` while leaving the probe must
+        # fail the exit-0/else contract even though the Python detector
+        # still classifies it as no bootstrap install.
+        no_short_circuit = warm_body.replace("            exit 0\n", "")
+        self.assertFalse(
+            runtime.normal_execution_uses_bootstrap_install(no_short_circuit),
+            "detector still sees the probe first (this is why it is not proof)",
+        )
+        stripped_lines = no_short_circuit.splitlines()
+        hit_line = next(i for i, line in enumerate(stripped_lines) if "prepared-runtime hit" in line)
+        installer_line = next(i for i, line in enumerate(stripped_lines) if "https://opencode.ai/install" in line)
+        short_circuited = any(
+            stripped_lines[i].strip() == "exit 0" or stripped_lines[i].strip() == "else"
+            for i in range(hit_line, installer_line)
+        )
+        self.assertFalse(
+            short_circuited,
+            "without exit 0 (or else) between hit and installer the Ruby short-circuit contract fails",
+        )
         cold_body = (
             "        run: |\n"
             "          curl -fsSL --retry 3 https://opencode.ai/install | bash\n"
@@ -439,6 +468,85 @@ class AgentRuntimeContractTest(unittest.TestCase):
         self.assertTrue(evidence["pass"], evidence["checks"])
         self.assertTrue(evidence["different_instance"])
         self.assertTrue(evidence["ip_equality_is_not_failure"])
+
+    def test_13b_orphan_network_without_instance_is_reclaimed(self):
+        # A crash between create_network and create_instance leaves a
+        # per-job attachment with no owning instance. The reconciler must
+        # reclaim it once past grace, and leave fresh ones alone.
+        controller = _controller()
+        profile = runtime.resolve_profile({"preset": "agent-linux"})
+        orphan_net = controller.provider.create_network(
+            runtime.profile_digest(profile), "job-lost", now=1000.0)
+        fresh_net = controller.provider.create_network(
+            runtime.profile_digest(profile), "job-fresh", now=1500.0)
+        removed = controller.sweep_orphans(now=1000.0 + controller.orphan_grace)
+        self.assertIn(orphan_net.id, removed)
+        self.assertIsNotNone(controller.provider.networks[orphan_net.id].destroyed_at)
+        self.assertIsNone(controller.provider.networks[fresh_net.id].destroyed_at)
+        self.assertNotIn(fresh_net.id, removed)
+
+    def test_13c_attached_network_is_not_swept_as_orphan(self):
+        # A network backing a live instance is owned: the network-only
+        # sweep must leave it alone even past grace.
+        controller = _controller()
+        profile = runtime.resolve_profile({"preset": "agent-linux"})
+        manifest = _manifest(profile)
+        provider = controller.provider
+        controller.images.ensure_image(manifest, profile, now=1000.0)
+        network = provider.create_network(runtime.profile_digest(profile), "job-held", now=1000.0)
+        live = provider.create_instance(
+            project_id="proj-a", repository="acme/app",
+            profile_digest=runtime.profile_digest(profile),
+            digest=runtime.image_digest(manifest, profile),
+            job_id="job-held", network_id=network.id, now=1000.0)
+        provider.jit_register(live)
+        controller.leases[live.id] = runtime.Lease(
+            project_id="proj-a", repository="acme/app", job_id="job-held", run_id="r-held",
+            profile_digest=runtime.profile_digest(profile), instance_id=live.id,
+            created_at=1000.0, lease_expires_at=1000.0 + controller.max_job_lifetime,
+            max_age_at=1000.0 + controller.global_max_age, state="running")
+        removed = controller.sweep_orphans(now=1000.0 + controller.orphan_grace + 1.0)
+        self.assertNotIn(network.id, removed)
+        self.assertIsNone(provider.networks[network.id].destroyed_at)
+        self.assertEqual(controller.live_instance_count(), 1)
+
+    def test_profile_toolchain_validation_matches_manifest(self):
+        # resolve_profile must enforce the same toolchain rules as
+        # canonical_manifest: empty, oversize, newline/NUL, duplicates.
+        for bad in ("", "x" * 121, "tool\ninjected", "tool\0injected", "tool\rinjected"):
+            with self.subTest(toolchain=repr(bad)):
+                with self.assertRaises(runtime.AgentRuntimeError):
+                    runtime.resolve_profile({"preset": "agent-linux", "toolchain": [bad, "ok-tool"]})
+                with self.assertRaises(runtime.AgentRuntimeError):
+                    runtime.canonical_manifest("linux", "x64", "main", (bad,))
+        with self.assertRaises(runtime.AgentRuntimeError):
+            runtime.resolve_profile({"preset": "agent-linux", "toolchain": ["go-1.23", "go-1.23"]})
+        good = runtime.resolve_profile({"preset": "agent-linux", "toolchain": ["go-1.23"]})
+        self.assertEqual(good.toolchain, ("go-1.23",))
+
+    def test_detector_ignores_trailing_comment_installer_url(self):
+        # A code line with a trailing comment containing an installer URL
+        # is not a bootstrap install.
+        body = (
+            "run: |\n"
+            "  run: echo ok # see https://opencode.ai/install\n"
+        )
+        self.assertFalse(runtime.normal_execution_uses_bootstrap_install(body))
+        # And a trailing-comment probe does not suppress a real installer.
+        installer_with_comment_probe = (
+            "run: |\n"
+            "  curl -fsSL --retry 3 https://opencode.ai/install | bash # command -v opencode\n"
+        )
+        self.assertTrue(runtime.normal_execution_uses_bootstrap_install(installer_with_comment_probe))
+
+    def test_persistent_attachment_is_recorded_as_persistent_egress(self):
+        # The no-persistent-egress qualification is only meaningful because
+        # the provider can record persistent attachments. A deliberately
+        # persistent network must populate the list (and fail the check).
+        provider = runtime.FakeProvider()
+        network = provider.create_network("digest", "job-x", now=1000.0, persistent=True)
+        self.assertTrue(network.persistent)
+        self.assertEqual(provider.persistent_egress_objects, [network.id])
 
     def test_detector_ignores_comment_only_probe_markers(self):
         # A comment mentioning the probe ahead of an unconditional

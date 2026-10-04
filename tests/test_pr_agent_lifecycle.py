@@ -314,6 +314,74 @@ class ProtectedBaselineTests(unittest.TestCase):
                             f"extra={sorted(set(actual) - set(expected))} "
                             f"missing={sorted(set(expected) - set(actual))}",
                         )
+                    else:
+                        # Empty committed drift must not blindly trust the
+                        # SHA: a new baseline that itself already bundled
+                        # unrelated protected-file drift would pass the
+                        # worktree checks below. Verify the baseline blob
+                        # content directly carries exactly the approved probe
+                        # contract before falling through, and confirm the
+                        # baseline is an ancestor of HEAD.
+                        ancestor = subprocess.run(
+                            ["git", "merge-base", "--is-ancestor", BASELINE_SHA, "HEAD"],
+                            cwd=ROOT,
+                            capture_output=True,
+                            text=True,
+                            timeout=30,
+                        )
+                        self.assertEqual(
+                            ancestor.returncode,
+                            0,
+                            f"{path} baseline {BASELINE_SHA} is not an ancestor of HEAD",
+                        )
+                        blob = subprocess.run(
+                            ["git", "show", f"{BASELINE_SHA}:{path}"],
+                            cwd=ROOT,
+                            capture_output=True,
+                            text=True,
+                            timeout=30,
+                        )
+                        self.assertEqual(blob.returncode, 0, blob.stderr)
+                        baseline_body = blob.stdout
+                        baseline_gated = [
+                            line
+                            for line in baseline_body.splitlines()
+                            if "CONTINUUM_IMAGE_DIGEST" in line
+                            and "command -v opencode" in line
+                            and line.strip()
+                            and not line.strip().startswith("#")
+                        ]
+                        self.assertEqual(
+                            len(baseline_gated),
+                            2,
+                            f"{path} baseline blob must itself carry both digest-gated "
+                            f"warm hits, found {len(baseline_gated)}",
+                        )
+                        baseline_ungated = [
+                            line
+                            for line in baseline_body.splitlines()
+                            if "command -v opencode" in line
+                            and "CONTINUUM_IMAGE_DIGEST" not in line
+                            and line.strip()
+                            and not line.strip().startswith("#")
+                        ]
+                        self.assertEqual(
+                            baseline_ungated,
+                            [],
+                            f"{path} baseline blob carries an ungated probe: {baseline_ungated}",
+                        )
+                        self.assertIn("vars.CONTINUUM_IMAGE_DIGEST", baseline_body)
+                        self.assertIn("prepared-runtime hit", baseline_body)
+                        self.assertLess(
+                            baseline_body.index(baseline_gated[0]),
+                            baseline_body.index("https://opencode.ai/install"),
+                            f"{path} baseline probe must precede the installer",
+                        )
+                        self.assertLess(
+                            baseline_body.index(baseline_gated[1]),
+                            baseline_body.rindex("https://opencode.ai/install"),
+                            f"{path} baseline probes must precede both site installers",
+                        )
                     # The probe must actually satisfy the #179 warm-path
                     # contract on the current worktree content.
                     body = read_repo(path)

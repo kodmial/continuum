@@ -5157,38 +5157,49 @@ class ContinuumTest < Minitest::Test
         lines[i].include?('command -v opencode') || lines[i].include?('pr-agent --version')
       end
       refute_empty probe_lines, "#{name}: no executable prepared-runtime probe found"
-      installer_lines.each do |at|
-        assert_operator probe_lines.min, :<, at,
-                        "#{name}: line #{at + 1} installs the runtime without a preceding probe (warm path downloads nothing)"
-      end
       gated_lines = lines.each_index.select do |i|
         lines[i].include?('CONTINUUM_IMAGE_DIGEST') &&
           (lines[i].include?('command -v opencode') || lines[i].include?('pr-agent --version'))
       end
       refute_empty gated_lines, "#{name}: the warm hit must be keyed by the image digest (no digest-gated probe line)"
-      assert_operator gated_lines.min, :<, installer_lines.min,
-                      "#{name}: the digest-gated probe must precede the installer"
       assert_match(/CONTINUUM_IMAGE_DIGEST.*=~\s*\^\[0-9a-f\]\{64\}\$/, body,
                    "#{name}: the digest gate must enforce the 64-char sha256 shape")
       hit_lines = lines.each_index.select { |i| lines[i].include?('prepared-runtime hit') }
       refute_empty hit_lines, "#{name}: a warm probe hit must be logged before any download"
-      assert_operator hit_lines.min, :<, installer_lines.min,
-                      "#{name}: the prepared-runtime hit must come before the installer"
-      # The hit path must actually short-circuit the download: exit-0 style
-      # steps stop before the installer, if/else (consumer-child) steps
-      # skip the download branch on a hit.
-      if name.start_with?('continuum-consumer-child-')
-        else_between = lines.each_index.any? do |i|
-          lines[i].strip == 'else' && i > hit_lines.min && i < installer_lines.max
+      # Per-site enforcement: every installer line needs its own
+      # probe-gated hit. Global minima are not enough: in a multi-site
+      # file the earlier site's probe would otherwise satisfy the check
+      # for a later installer whose own digest-gated probe was deleted.
+      # Each site spans (previous installer, installer): the site probe,
+      # digest-gated probe, hit log, and short-circuit must all sit inside
+      # it, ahead of that site's installer.
+      installer_lines.each do |at|
+        prev = installer_lines.select { |i| i < at }.max || -1
+        site_probes = probe_lines.select { |i| i > prev && i < at }
+        assert_operator site_probes.size, :>, 0,
+                        "#{name}: line #{at + 1} installs the runtime without a preceding probe in its own site (warm path downloads nothing)"
+        site_gated = gated_lines.select { |i| i > prev && i < at }
+        assert_operator site_gated.size, :>, 0,
+                        "#{name}: line #{at + 1} has no digest-gated probe in its own site"
+        site_hits = hit_lines.select { |i| i > prev && i < at }
+        assert_operator site_hits.size, :>, 0,
+                        "#{name}: line #{at + 1} has no prepared-runtime hit in its own site before the installer"
+        # The hit path must actually short-circuit the download: exit-0 style
+        # steps stop before the installer, if/else (consumer-child) steps
+        # skip the download branch on a hit.
+        if name.start_with?('continuum-consumer-child-')
+          else_between = lines.each_index.any? do |i|
+            lines[i].strip == 'else' && i > site_hits.min && i < at
+          end
+          assert else_between,
+                 "#{name}: line #{at + 1} warm hit branch must skip the download via if/else (no fall-through install)"
+        else
+          exit_between = lines.each_index.any? do |i|
+            lines[i].strip == 'exit 0' && i > site_hits.min && i < at
+          end
+          assert exit_between,
+                 "#{name}: line #{at + 1} warm hit must short-circuit with exit 0 before any download"
         end
-        assert else_between,
-               "#{name}: the warm hit branch must skip the download via if/else (no fall-through install)"
-      else
-        exit_between = lines.each_index.any? do |i|
-          lines[i].strip == 'exit 0' && i > hit_lines.min && i < installer_lines.min
-        end
-        assert exit_between,
-               "#{name}: the warm hit must short-circuit with exit 0 before any download"
       end
     end
 
@@ -5199,8 +5210,10 @@ class ContinuumTest < Minitest::Test
     version_probes = pr_lines.each_index.select { |i| pr_lines[i].include?('pr-agent --version') }
     refute_empty version_probes, 'continuum-pr-agent.yml: the PR-Agent prepared-runtime probe is missing'
     pip_lines.each do |at|
-      assert_operator version_probes.min, :<, at,
-                      'continuum-pr-agent.yml: the PR-Agent probe must precede every pip install'
+      prev_pip = pip_lines.select { |i| i < at }.max || -1
+      site_probes = version_probes.select { |i| i > prev_pip && i < at }
+      assert_operator site_probes.size, :>, 0,
+                      'continuum-pr-agent.yml: the PR-Agent probe must precede every pip install in its own site'
     end
     assert_includes pr_agent, '0.46.0', 'continuum-pr-agent.yml: the exact pinned PR-Agent version must be enforced'
   end

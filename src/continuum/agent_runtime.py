@@ -445,7 +445,13 @@ def resolve_profile(declaration: Mapping[str, Any]) -> RuntimeProfile:
     continuum_ref = str(base.get("continuum_ref", "main") or "main")
     if not continuum_ref.strip():
         raise AgentRuntimeError("continuum_ref must be a non-empty revision")
-    toolchain = tuple(str(item) for item in (base.get("toolchain", ()) or ()))
+    raw_toolchain = base.get("toolchain", ()) or ()
+    toolchain = tuple(str(item) for item in raw_toolchain)
+    for item in toolchain:
+        if not item or len(item) > 120 or any(char in item for char in "\n\r\0"):
+            raise AgentRuntimeError("invalid toolchain input {!r}".format(item))
+    if len(set(toolchain)) != len(toolchain):
+        raise AgentRuntimeError("toolchain inputs list {!r} twice".format(sorted(toolchain)))
     try:
         concurrency = int(base.get("concurrency_limit", 4))
     except (TypeError, ValueError):
@@ -831,14 +837,27 @@ class FakeProvider:
         self._counter += 1
         return "{}-{:06d}".format(prefix, self._counter)
 
-    def create_network(self, profile_digest: str, job_id: str, now: float) -> NetworkAttachment:
+    def create_network(
+        self,
+        profile_digest: str,
+        job_id: str,
+        now: float,
+        persistent: bool = False,
+    ) -> NetworkAttachment:
         network = NetworkAttachment(
             id=self._next_id("net"),
             profile_digest=profile_digest,
             job_id=job_id,
             created_at=now,
+            persistent=bool(persistent),
         )
         self.networks[network.id] = network
+        if network.persistent:
+            # A deliberately persisted attachment is recorded as persistent
+            # egress so lifecycle qualification can fail on it: the
+            # no-persistent-egress check below is only meaningful because
+            # this path can populate the list.
+            self.persistent_egress_objects.append(network.id)
         return network
 
     def create_instance(
@@ -1203,6 +1222,17 @@ class EphemeralController:
         """
 
         removed: List[str] = []
+        # Network-only sweep: a per-job attachment created before a crash
+        # between `create_network` and `create_instance` has no owning
+        # instance, so the live-instance loop below would never reclaim it.
+        # Reclaim attachments past grace with no live owner.
+        live_network_ids = {item.network_id for item in self.provider.live_instances() if item.network_id}
+        for network_id, network in list(self.provider.networks.items()):
+            if network.destroyed_at is None and network_id not in live_network_ids:
+                if now - network.created_at >= self.orphan_grace:
+                    network.destroyed_at = now
+                    removed.append(network_id)
+                    self.diagnostics.append("reconciled-orphan-network {} ({})".format(network_id, network.job_id))
         for instance in list(self.provider.live_instances()):
             lease = self.leases.get(instance.id)
             orphan = False
@@ -1383,6 +1413,39 @@ _BOOTSTRAP_PATTERNS = (
     "pip install pr-agent==",
 )
 
+#: Executable warm-path probes: a real CLI/version check that proves the
+#: prepared runtime is already present. `opencode --version` (exact-version
+#: grep) and `command -v pr-agent` are equivalent probes to the two
+#: canonical markers, so they also suppress bootstrap detection.
+_PROBE_PATTERNS = (
+    "command -v opencode",
+    "pr-agent --version",
+    "opencode --version",
+    "command -v pr-agent",
+)
+
+
+def _code_without_comment(line: str) -> str:
+    """Return the code portion of a line with `#` comments stripped.
+
+    Only a `#` outside single/double quotes starts a comment, so a quoted
+    `#` (e.g. inside an echo string) is preserved while a trailing comment
+    such as ``run: echo ok # see https://opencode.ai/install`` no longer
+    counts as an installer reference (and a trailing-comment probe no longer
+    counts as a warm-path probe).
+    """
+
+    in_single = False
+    in_double = False
+    for index, char in enumerate(line):
+        if char == "'" and not in_double:
+            in_single = not in_single
+        elif char == '"' and not in_single:
+            in_double = not in_double
+        elif char == "#" and not in_single and not in_double:
+            return line[:index]
+    return line
+
 
 def normal_execution_uses_bootstrap_install(workflow_text: str) -> bool:
     """Whether normal (non-reconstruction) execution would bootstrap-install.
@@ -1399,11 +1462,16 @@ def normal_execution_uses_bootstrap_install(workflow_text: str) -> bool:
     # Compare only code lines: a probe or installer URL inside a `#`
     # comment proves nothing about the warm path. A comment-only probe
     # marker must not suppress detection, and a comment-only installer
-    # URL must not count as a bootstrap install.
+    # URL must not count as a bootstrap install. Trailing comments are
+    # stripped as well: `run: echo ok # see https://opencode.ai/install`
+    # is not a bootstrap install, and an installer line carrying only a
+    # trailing-comment probe is not a warm path.
     code_lines = [
-        line for line in workflow_text.splitlines()
+        _code_without_comment(line)
+        for line in workflow_text.splitlines()
         if line.strip() and not line.strip().startswith("#")
     ]
+    code_lines = [line for line in code_lines if line.strip()]
     if not code_lines:
         return False
     first_bootstrap: Optional[int] = None
@@ -1412,14 +1480,12 @@ def normal_execution_uses_bootstrap_install(workflow_text: str) -> bool:
         if first_bootstrap is None and any(pattern in line for pattern in _BOOTSTRAP_PATTERNS):
             first_bootstrap = index
         # Only a real executable probe counts as a warm-path probe: an exact
-        # CLI/version check (`command -v opencode`, `pr-agent --version).
-        # A bare comment-grade marker such as `prepared-runtime` or
+        # CLI/version check (`command -v opencode`, `pr-agent --version`,
+        # `opencode --version`, `command -v pr-agent`). A bare
+        # comment-grade marker such as `prepared-runtime` or
         # `prepared agent runtime` in a job name, echo string, or comment is
         # not a probe and must never suppress bootstrap detection.
-        if first_probe is None and (
-            "command -v opencode" in line
-            or "pr-agent --version" in line
-        ):
+        if first_probe is None and any(pattern in line for pattern in _PROBE_PATTERNS):
             first_probe = index
         if first_bootstrap is not None and first_probe is not None:
             break
@@ -1449,10 +1515,14 @@ def workflow_step_has_prepared_runtime_probe(workflow_text: str) -> bool:
     # require a digest-gated probe line (a code line carrying both the
     # CONTINUUM_IMAGE_DIGEST gate and a real executable probe) so an empty
     # or unresolved digest cannot take the hit path and skip install.
+    # Comment portions are stripped so a trailing-comment probe cannot fake
+    # a digest-gated hit.
     gated = any(
-        "CONTINUUM_IMAGE_DIGEST" in line and ("command -v opencode" in line or "pr-agent --version" in line)
+        "CONTINUUM_IMAGE_DIGEST" in code and any(pattern in code for pattern in _PROBE_PATTERNS)
         for line in workflow_text.splitlines()
         if line.strip() and not line.strip().startswith("#")
+        for code in (_code_without_comment(line),)
+        if code.strip()
     )
     if not gated:
         return False
@@ -1563,7 +1633,10 @@ def live_qualification_evidence(
         "orphan_instance": orphan.id,
         "orphan_reconciled": orphan.id in reconciled,
         "live_final": controller.live_instance_count(),
+        "networks_created": len(provider.networks),
+        "live_networks_final": sum(1 for item in provider.networks.values() if item.destroyed_at is None),
     })
+    networks = list(provider.networks.values())
     checks = {
         "started_at_zero": evidence["start_live_instances"] == 0,
         "created_after_demand": first.instance_id not in ("", None),
@@ -1572,9 +1645,20 @@ def live_qualification_evidence(
         "destroyed_after_job": first.destroyed and second.destroyed,
         "idle_returned_to_zero": evidence["live_after_first"] == 0 and evidence["live_after_second"] == 0,
         "second_used_new_instance": evidence["different_instance"] and evidence["different_network"],
-        "no_persistent_egress": provider.persistent_egress_objects == [],
+        # Non-vacuous per-job egress lifecycle: the provider records
+        # deliberately persistent attachments in persistent_egress_objects
+        # (see FakeProvider.create_network), every attachment created by
+        # this harness is non-persistent and destroyed, and the harness
+        # exercises at least the two job networks plus the orphan network,
+        # so an empty list alone cannot pass without real lifecycle work.
+        "no_persistent_egress": (
+            provider.persistent_egress_objects == []
+            and all(not item.persistent for item in networks)
+        ),
+        "all_networks_destroyed": all(item.destroyed_at is not None for item in networks),
+        "egress_lifecycle_exercised": len(networks) >= 3,
         "orphan_reconciled": evidence["orphan_reconciled"],
-        "live_final_zero": evidence["live_final"] == 0,
+        "live_final_zero": evidence["live_final"] == 0 and evidence["live_networks_final"] == 0,
     }
     evidence["checks"] = checks
     evidence["pass"] = all(checks.values())
