@@ -208,14 +208,16 @@ jobs:
 
             async function listReviewRuns() {
               try {
-                return await readGithub.paginate(
-                  readGithub.rest.actions.listWorkflowRuns,
-                  {
-                    owner,
-                    repo,
-                    workflow_id: reviewWorkflow,
-                    per_page: 100,
-                  }
+                return await withReadFallback(client =>
+                  client.paginate(
+                    client.rest.actions.listWorkflowRuns,
+                    {
+                      owner,
+                      repo,
+                      workflow_id: reviewWorkflow,
+                      per_page: 100,
+                    }
+                  )
                 );
               } catch (err) {
                 core.setFailed(
@@ -241,11 +243,13 @@ jobs:
               const match = target.match(/\/actions\/runs\/(\d+)(?:$|[/?#])/);
               if (!match) return { conclusion: null, recoveryKind: null };
               try {
-                const { data: run } = await readGithub.rest.actions.getWorkflowRun({
-                  owner,
-                  repo,
-                  run_id: Number(match[1]),
-                });
+                const { data: run } = await withReadFallback(client =>
+                  client.rest.actions.getWorkflowRun({
+                    owner,
+                    repo,
+                    run_id: Number(match[1]),
+                  })
+                );
                 const title = String(run.display_title || '');
                 const identity = title.match(/\[(review|repair):\d+\]/);
                 const recoveryKind = identity ? identity[1] : null;
@@ -269,15 +273,17 @@ jobs:
             }
 
             async function exactHeadCiGreen(head) {
-              const runs = await readGithub.paginate(
-                readGithub.rest.actions.listWorkflowRunsForRepo,
-                {
-                  owner,
-                  repo,
-                  event: 'pull_request',
-                  head_sha: head,
-                  per_page: 100,
-                }
+              const runs = await withReadFallback(client =>
+                client.paginate(
+                  client.rest.actions.listWorkflowRunsForRepo,
+                  {
+                    owner,
+                    repo,
+                    event: 'pull_request',
+                    head_sha: head,
+                    per_page: 100,
+                  }
+                )
               );
               const latest = runs
                 .filter(run => run.name === ciWorkflowName && run.head_sha === head)
@@ -388,7 +394,9 @@ jobs:
             }
 
             async function defaultBranch() {
-              const { data } = await readGithub.rest.repos.get({ owner, repo });
+              const { data } = await withReadFallback(client =>
+                client.rest.repos.get({ owner, repo })
+              );
               return String(data.default_branch || 'main');
             }
 
@@ -409,11 +417,13 @@ jobs:
                 await new Promise(resolve => setTimeout(resolve, remaining * 1000));
               }
 
-              const { data: fresh } = await readGithub.rest.pulls.get({
-                owner,
-                repo,
-                pull_number: pr.number,
-              });
+              const { data: fresh } = await withReadFallback(client =>
+                client.rest.pulls.get({
+                  owner,
+                  repo,
+                  pull_number: pr.number,
+                })
+              );
               if (
                 fresh.state !== 'open' ||
                 fresh.draft ||
@@ -443,9 +453,11 @@ jobs:
                 return false;
               }
 
-              const refreshedComments = await readGithub.paginate(
-                readGithub.rest.issues.listComments,
-                { owner, repo, issue_number: pr.number, per_page: 100 }
+              const refreshedComments = await withReadFallback(client =>
+                client.paginate(
+                  client.rest.issues.listComments,
+                  { owner, repo, issue_number: pr.number, per_page: 100 }
+                )
               );
               const refreshedEvidence = parseEvidence(refreshedComments, head, kind);
               if (refreshedEvidence.exhausted) {
@@ -543,9 +555,11 @@ jobs:
               });
             }
 
-            const openPrs = await readGithub.paginate(
-              readGithub.rest.pulls.list,
-              { owner, repo, state: 'open', per_page: 100 }
+            const openPrs = await withReadFallback(client =>
+              client.paginate(
+                client.rest.pulls.list,
+                { owner, repo, state: 'open', per_page: 100 }
+              )
             );
             let reviewRuns = await listReviewRuns();
 
@@ -567,13 +581,17 @@ jobs:
               }
 
               const [statuses, comments] = await Promise.all([
-                readGithub.paginate(
-                  readGithub.rest.repos.listCommitStatusesForRef,
-                  { owner, repo, ref: head, per_page: 100 }
+                withReadFallback(client =>
+                  client.paginate(
+                    client.rest.repos.listCommitStatusesForRef,
+                    { owner, repo, ref: head, per_page: 100 }
+                  )
                 ),
-                readGithub.paginate(
-                  readGithub.rest.issues.listComments,
-                  { owner, repo, issue_number: pr.number, per_page: 100 }
+                withReadFallback(client =>
+                  client.paginate(
+                    client.rest.issues.listComments,
+                    { owner, repo, issue_number: pr.number, per_page: 100 }
+                  )
                 ),
               ]);
 
