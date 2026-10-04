@@ -514,6 +514,11 @@ jobs:
       CHILD_WORKER_WORKFLOW: ${{ vars.CONTINUUM_CHILD_WORKER_WORKFLOW || 'continuum-child-worker.yml' }}
       CHILD_REVIEW_WORKFLOW: ${{ vars.CONTINUUM_CHILD_REVIEW_WORKFLOW || 'continuum-child-review.yml' }}
       CHILD_PR_REVIEW_WORKFLOW: ${{ vars.CONTINUUM_CHILD_PR_REVIEW_WORKFLOW || 'continuum-child-pr-review.yml' }}
+      # Authoritative review provider for delegated child PRs (issue #244):
+      # `pr-agent` routes child PR-Agent lifecycles through the parent
+      # control plane; any other value keeps the legacy independent child
+      # review path. Exactly one path ever runs.
+      REVIEW_PROVIDER: ${{ vars.CONTINUUM_REVIEW_PROVIDER || 'none' }}
       COUNT_OPEN_PRS_AS_WIP: ${{ inputs.count_open_prs_as_wip || vars.AUTOMATION_COUNT_OPEN_PRS_AS_WIP || 'true' }}
       PAUSE_ON_FAILURE: ${{ inputs.pause_on_failure || vars.AUTOMATION_PAUSE_ON_FAILURE || 'false' }}
       READ_GITHUB_TOKEN: ${{ github.token }}
@@ -616,6 +621,19 @@ jobs:
 
           invalid=0
           review_dispatches=0
+
+          # Authoritative review path (issue #244): exactly one path ever
+          # runs per parent. `pr-agent` routes every child PR
+          # (owner-created and automation-created alike) through the
+          # parent-side PR-Agent lifecycle; any other value keeps the legacy
+          # independent child review path. Comparison is case-insensitive
+          # with whitespace trimmed so a `PR-Agent` spelling cannot silently
+          # fork both paths.
+          review_provider_normalized="$(tr '[:upper:]' '[:lower:]' <<<"${REVIEW_PROVIDER:-none}" | tr -d '[:space:]')"
+          pr_agent_authoritative=false
+          if [[ "$review_provider_normalized" == "pr-agent" ]]; then
+            pr_agent_authoritative=true
+          fi
 
           while IFS= read -r row; do
             [[ -n "$row" ]] || continue
@@ -729,6 +747,23 @@ jobs:
               (( command_epoch > 0 && now_epoch - command_epoch < command_grace_seconds ))
             }
 
+            if [[ "$pr_agent_authoritative" == true ]]; then
+              # Parent-side PR-Agent fan-out (issue #244): one recovery
+              # dispatch per verified child carries only the opaque child id;
+              # the recovery reconciler discovers/admits every eligible child
+              # PR in that target and dispatches parent-side review/repair
+              # with PR number + exact HEAD. Stable dedup/concurrency
+              # identity lives in the PR-Agent operation layer across
+              # scheduler/event/recovery wakeups, and review -> repair ->
+              # re-review -> recovery continues there as child HEADs change.
+              # No concrete child repository identity is passed. Owner and
+              # automation PRs share this single deterministic route: the
+              # reconciler admits every open same-repo non-draft target PR.
+              gh workflow run "continuum-pr-agent-recovery.yml" --repo "$GITHUB_REPOSITORY" \
+                -f target_child_id="$child_id" >/dev/null
+              review_dispatches=$((review_dispatches + 1))
+            fi
+
             if [[ -n "$open_prs" ]]; then
               selected_review_tasks=""
               while IFS=$'\t' read -r pr_number head_ref; do
@@ -755,32 +790,46 @@ jobs:
                    task_active "$child_id" review "$task_number"; then
                   continue
                 fi
+                if [[ "$pr_agent_authoritative" == true ]]; then
+                  # Legacy task review is owned by the per-child PR-Agent
+                  # recovery dispatch above (issue #244): never dispatch the
+                  # legacy review beside it. Completed-task close hygiene
+                  # above still runs in both modes.
+                  continue
+                fi
                 gh workflow run "$CHILD_REVIEW_WORKFLOW" --repo "$GITHUB_REPOSITORY" \
                   -f child_id="$child_id" -f task_number="$task_number" -f pr_number="$pr_number" >/dev/null
                 review_dispatches=$((review_dispatches + 1))
               done <<<"$open_prs"
             fi
 
-            manual_prs="$(
-              gh api --paginate "repos/$child_repo/pulls?state=open&per_page=100" \
-                --jq '.[] |
-                  select(.draft == false) |
-                  select(.head.repo.full_name == .base.repo.full_name) |
-                  select(.user.login == .base.repo.owner.login) |
-                  select(
-                    ((.head.ref | startswith("continuum-child/task-")) or
-                     (.head.ref | startswith("runtime-worker/task-"))) | not
-                  ) |
-                  select(([.labels[]?.name] | index("no-auto-merge")) | not) |
-                  .number' 2>/dev/null || true
-            )"
-            while IFS= read -r manual_pr; do
-              [[ -n "$manual_pr" ]] || continue
-              manual_pr_active "$child_id" "$manual_pr" && continue
-              gh workflow run "$CHILD_PR_REVIEW_WORKFLOW" --repo "$GITHUB_REPOSITORY" \
-                -f child_id="$child_id" -f pr_number="$manual_pr" >/dev/null
-              review_dispatches=$((review_dispatches + 1))
-            done <<<"$manual_prs"
+            # Legacy independent child review runs only where PR-Agent is not
+            # authoritative (issue #244): under `pr-agent` the per-child
+            # recovery dispatch above owns every child PR, so no legacy
+            # review may race it. No double review, double repair, or
+            # competing merge paths.
+            if [[ "$pr_agent_authoritative" != true ]]; then
+              manual_prs="$(
+                gh api --paginate "repos/$child_repo/pulls?state=open&per_page=100" \
+                  --jq '.[] |
+                    select(.draft == false) |
+                    select(.head.repo.full_name == .base.repo.full_name) |
+                    select(.user.login == .base.repo.owner.login) |
+                    select(
+                      ((.head.ref | startswith("continuum-child/task-")) or
+                       (.head.ref | startswith("runtime-worker/task-"))) | not
+                    ) |
+                    select(([.labels[]?.name] | index("no-auto-merge")) | not) |
+                    .number' 2>/dev/null || true
+              )"
+              while IFS= read -r manual_pr; do
+                [[ -n "$manual_pr" ]] || continue
+                manual_pr_active "$child_id" "$manual_pr" && continue
+                gh workflow run "$CHILD_PR_REVIEW_WORKFLOW" --repo "$GITHUB_REPOSITORY" \
+                  -f child_id="$child_id" -f pr_number="$manual_pr" >/dev/null
+                review_dispatches=$((review_dispatches + 1))
+              done <<<"$manual_prs"
+            fi
 
             issues_json="$(gh api --paginate "repos/$child_repo/issues?state=open&per_page=100" 2>/dev/null)"
 

@@ -32,6 +32,13 @@ permissions:
 
 jobs:
   call:
+    # Automatic PR-Agent callers skip in verified child mode (issue #244):
+    # the parent is the only automatic execution plane for child PR-Agent,
+    # so schedule, pull_request_target, and workflow_run events stay cheap
+    # caller skips in a child. An explicit owner workflow_dispatch still
+    # reaches the reusable, which fail-safes there for a deterministic,
+    # mutually exclusive outcome. Local/non-child behavior is unchanged.
+    if: vars.CONTINUUM_ROLE != 'child' || github.event_name == 'workflow_dispatch'
     uses: kodmial/continuum/.github/workflows/continuum-pr-agent-recovery.yml@main
     secrets: inherit
     with:
