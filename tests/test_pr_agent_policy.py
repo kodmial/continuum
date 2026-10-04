@@ -415,6 +415,68 @@ class GenericToolConjunctionTests(unittest.TestCase):
                 self.assertFalse(run_js("tool", review=review))
 
 
+class ReviewSignalRepairTests(unittest.TestCase):
+    def test_infrastructure_tool_failure_blocks_skip(self):
+        # Genuine tool failures that never use the literal word "tool"
+        # (e.g. "API timeout contacting model") must fail closed instead
+        # of authorizing a clean skip.
+        for text in (
+            "API timeout contacting model",
+            "model provider unavailable",
+            "upstream timeout contacting model",
+        ):
+            with self.subTest(text=text):
+                review = make_review([], extra={"errors": text})
+                self.assertTrue(run_js("tool", review=review))
+                result = run_js(
+                    "skip",
+                    review=review,
+                    state=make_persistent([], head_sha="abc1234"),
+                    options=dict(CLEAN_OPTS),
+                )
+                self.assertFalse(result["skip"])
+
+    def test_empty_truncation_flag_fails_closed(self):
+        # An explicit truncation key with an empty value is not evidence
+        # of complete coverage: `{"truncated": ""}` must never authorize
+        # an improve skip, like null/undefined.
+        for key in ("truncated", "partial", "incomplete"):
+            for empty in ("", "   "):
+                with self.subTest(key=key, empty=repr(empty)):
+                    review = make_review([], extra={key: empty})
+                    self.assertTrue(run_js("coverage", review=review))
+                    result = run_js(
+                        "skip",
+                        review=review,
+                        state=make_persistent([], head_sha="abc1234"),
+                        options=dict(CLEAN_OPTS),
+                    )
+                    self.assertFalse(result["skip"])
+
+    def test_null_sha_placeholder_never_skips(self):
+        # Matching all-zero placeholders must never satisfy the exact-HEAD
+        # skip check even though both sides are hex of plausible length.
+        for zero in ("0000000", "0" * 40, "0" * 64):
+            with self.subTest(zero=zero):
+                options = dict(CLEAN_OPTS)
+                options["reviewedHeadSha"] = zero
+                result = run_js(
+                    "skip",
+                    review=make_review([]),
+                    state=make_persistent([], head_sha=zero),
+                    options=options,
+                )
+                self.assertFalse(result["skip"])
+        # A genuine non-zero abbreviation still skips (no over-correction).
+        result = run_js(
+            "skip",
+            review=make_review([]),
+            state=make_persistent([], head_sha="abc1234"),
+            options=dict(CLEAN_OPTS),
+        )
+        self.assertTrue(result["skip"])
+
+
 class ConflictingNonSafeRecommendationTests(unittest.TestCase):
     def test_caution_vs_changes_required_keeps_most_restrictive(self):
         outer_caution = {

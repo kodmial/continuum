@@ -3286,6 +3286,87 @@ process.stdout.write(JSON.stringify(result === undefined ? null : result));
         self.assertTrue(self._js("skipped", raw=skipped))
         self.assertFalse(self._js("skipped", raw='{"payload": {"code_suggestions": []}}'))
 
+    def test_infrastructure_tool_failure_blocks_skip_in_both_stacks(self):
+        # Genuine tool failures that never use the literal word "tool"
+        # (e.g. "API timeout contacting model") must fail closed instead
+        # of authorizing a clean skip, in both stacks.
+        life = self._life()
+        for text in (
+            "API timeout contacting model",
+            "model provider unavailable",
+            "upstream timeout contacting model",
+        ):
+            with self.subTest(text=text):
+                review = make_review([], extra={"errors": text})
+                self.assertTrue(life.has_tool_error_signal(review))
+                self.assertTrue(self._js("tool", review=review))
+                decision = life.should_skip_improve(
+                    review,
+                    make_persistent([], head_sha="abc1234"),
+                    head_matches=True,
+                    review_coverage_complete=True,
+                    reviewed_head_sha="abc1234",
+                )
+                self.assertFalse(decision["skip"])
+                js = run_skip_policy(
+                    review,
+                    make_persistent([], head_sha="abc1234"),
+                    {"headMatches": True, "reviewCoverageComplete": True, "reviewedHeadSha": "abc1234"},
+                )
+                self.assertFalse(js["skip"])
+
+    def test_empty_truncation_flag_fails_closed_in_both_stacks(self):
+        # An explicit truncation key with an empty value is not evidence
+        # of complete coverage: `{"truncated": ""}` must never authorize
+        # an improve skip, like null/undefined, in both stacks.
+        life = self._life()
+        for key in ("truncated", "partial", "incomplete"):
+            for empty in ("", "   "):
+                with self.subTest(key=key, empty=repr(empty)):
+                    review = make_review([], extra={key: empty})
+                    self.assertTrue(life.has_incomplete_coverage_signal(review))
+                    self.assertTrue(self._js("coverage", review=review))
+                    decision = life.should_skip_improve(
+                        review,
+                        make_persistent([], head_sha="abc1234"),
+                        head_matches=True,
+                        review_coverage_complete=True,
+                        reviewed_head_sha="abc1234",
+                    )
+                    self.assertFalse(decision["skip"])
+                    js = run_skip_policy(
+                        review,
+                        make_persistent([], head_sha="abc1234"),
+                        {"headMatches": True, "reviewCoverageComplete": True, "reviewedHeadSha": "abc1234"},
+                    )
+                    self.assertFalse(js["skip"])
+
+    def test_null_sha_placeholder_never_skips_in_both_stacks(self):
+        # Matching all-zero placeholders must never satisfy the exact-HEAD
+        # skip check even though both sides are hex of plausible length.
+        life = self._life()
+        for zero in ("0000000", "0" * 40, "0" * 64):
+            with self.subTest(zero=zero):
+                review = make_review([])
+                state = make_persistent([], head_sha=zero)
+                decision = life.should_skip_improve(
+                    review, state, head_matches=True,
+                    review_coverage_complete=True, reviewed_head_sha=zero,
+                )
+                self.assertFalse(decision["skip"])
+                js = run_skip_policy(
+                    review, state,
+                    {"headMatches": True, "reviewCoverageComplete": True, "reviewedHeadSha": zero},
+                )
+                self.assertFalse(js["skip"])
+        # A genuine non-zero abbreviation still skips (no over-correction).
+        decision = life.should_skip_improve(
+            make_review([]), make_persistent([], head_sha="abc1234"),
+            head_matches=True, review_coverage_complete=True,
+            reviewed_head_sha="abc1234",
+        )
+        self.assertTrue(decision["skip"])
+
 class IncompleteNativePersistentStateContractTests(unittest.TestCase):
     """Issue #252: an incomplete native marker cannot dead-end routing."""
 

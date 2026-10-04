@@ -170,12 +170,23 @@ def _is_plausible_head_sha(value: object) -> bool:
     skip check, and trivially short hex fragments (e.g. "a", "123",
     "abc") from a bug or mocked HEAD must not authorize a skip either,
     so require at least short-SHA length instead of mere non-emptiness.
+    Git additionally reserves the all-zero object id ("0000000...") for
+    "no object": matching zero placeholders on both sides must never
+    pass the exact-HEAD check even though both sides are hex of
+    plausible length. Production always compares full HEADs from the
+    GitHub API, so abbreviated prefixes never occur there; the length
+    floor screens mocked fragments while genuine abbreviations stay
+    valid for the parity suite.
     """
 
     text = str(value or "").strip().lower()
     if not text:
         return False
-    return re.fullmatch(r"[0-9a-f]{7,64}", text) is not None
+    if re.fullmatch(r"[0-9a-f]{7,64}", text) is None:
+        return False
+    if set(text) == {"0"}:
+        return False
+    return True
 
 
 def admission_allowed(
@@ -394,18 +405,27 @@ _GENERIC_TOOL_ERROR_KEYS = (
 # generic `errors`/`error` value. Both groups are matched as whole words
 # (case-insensitive) against the raw text; negation/empty prose is already
 # excluded by _security_value_is_blocking before this check runs. A generic
-# summary counts as a tool failure only when it names the tool (`tool`/`tools`)
+# summary counts as a tool failure only when it names the failing
+# infrastructure (`tool`/`tools`, or an infrastructure noun such as `api`,
+# `model`, `llm`, `provider`, `server`, or `upstream` for reports like
+# "API timeout contacting model" that never use the literal word `tool`)
 # AND reports a failure (`failed`, `failure`, `timeout`, `timed out`,
 # `traceback`, `exception`, `unavailable`, `error`/`errors`). Requiring the
 # conjunction keeps ordinary code summaries such as `errors: 2 checks failed
-# in diff` or `errors: missing timeout handling` (failure word without a tool
-# mention) clean, while still catching explicit prose such as
-# "upstream tool failed" or "tool timeout contacting model". Whole-word
+# in diff` or `errors: missing timeout handling` (failure word without an
+# infrastructure mention) clean, while still catching explicit prose such as
+# "upstream tool failed" or "API timeout contacting model". Whole-word
 # matching additionally keeps substrings such as "tooling" or "exceptional"
 # clean.
 _GENERIC_TOOL_WORDS = (
     "tool",
     "tools",
+    "api",
+    "model",
+    "llm",
+    "provider",
+    "server",
+    "upstream",
 )
 
 _GENERIC_TOOL_FAILURE_WORDS = (
@@ -474,10 +494,12 @@ def _is_generic_tool_failure_text(value: object) -> bool:
     """Whether a generic `errors`/`error` value reports a tool failure.
 
     Negation/empty prose is clean (no signal). Any other value must name
-    the tool AND report a failure (whole-word conjunction): ordinary
-    code-error summaries such as "2 checks failed in diff" or
-    "missing timeout handling" (failure word without a tool mention) and
-    "tooling notes in diff" (substring, not a tool word) stay clean.
+    the failing infrastructure AND report a failure (whole-word
+    conjunction): ordinary code-error summaries such as
+    "2 checks failed in diff" or "missing timeout handling" (failure word
+    without an infrastructure mention) and "tooling notes in diff"
+    (substring, not a tool word) stay clean, while infrastructure reports
+    such as "API timeout contacting model" fail closed.
     """
 
     if isinstance(value, Mapping):
@@ -531,7 +553,11 @@ def _coverage_flag_value_is_incomplete(key: str, value: object) -> bool:
         if isinstance(value, str):
             lowered = value.strip().lower()
             if not lowered:
-                return False
+                # An explicit truncation key with an empty value is not
+                # evidence of complete coverage: fail closed like
+                # null/undefined so `{"truncated": ""}` never authorizes
+                # an improve skip.
+                return True
             if lowered in ("1", "true", "yes"):
                 return True
             if lowered in ("0", "false", "no"):

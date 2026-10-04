@@ -373,15 +373,19 @@ const GENERIC_TOOL_ERROR_KEYS = ['errors', 'error'];
 // a generic `errors`/`error` value (whole-word, case-insensitive).
 // Negation/empty prose is already excluded by securityValueIsBlocking
 // before this check runs. A generic summary counts as a tool failure only
-// when it names the tool (`tool`/`tools`) AND reports a failure
+// when it names the failing infrastructure (`tool`/`tools`, or an
+// infrastructure noun such as `api`, `model`, `llm`, `provider`, `server`,
+// or `upstream` for reports like "API timeout contacting model" that never
+// use the literal word `tool`) AND reports a failure
 // (`failed`, `failure`, `timeout`, `timed out`, `traceback`, `exception`,
 // `unavailable`, `error`/`errors`). Requiring the conjunction keeps
 // ordinary code summaries such as `errors: 2 checks failed in diff` or
-// `errors: missing timeout handling` (failure word without a tool mention)
+// `errors: missing timeout handling` (failure word without an
+// infrastructure mention)
 // clean while still catching explicit prose such as "upstream tool failed"
-// or "tool timeout contacting model". Whole-word matching additionally
+// or "API timeout contacting model". Whole-word matching additionally
 // keeps substrings such as "tooling" or "exceptional" clean.
-const GENERIC_TOOL_WORDS = ['tool', 'tools'];
+const GENERIC_TOOL_WORDS = ['tool', 'tools', 'api', 'model', 'llm', 'provider', 'server', 'upstream'];
 
 const GENERIC_TOOL_FAILURE_WORDS = [
   'failed',
@@ -476,7 +480,10 @@ function coverageFlagValueIsIncomplete(key, value) {
     if (value === null || value === undefined) return true;
     if (typeof value === 'string') {
       const lowered = value.trim().toLowerCase();
-      if (!lowered) return false;
+      // An explicit truncation key with an empty value is not evidence of
+      // complete coverage: fail closed like null/undefined so
+      // `{"truncated": ""}` never authorizes an improve skip.
+      if (!lowered) return true;
       if (['1', 'true', 'yes'].includes(lowered)) return true;
       if (['0', 'false', 'no'].includes(lowered)) return false;
       const numeric = Number(lowered);
@@ -810,8 +817,16 @@ function isPlausibleHeadSha(value) {
   // hex fragments (e.g. "a", "123", "abc") from a bug or mocked HEAD must
   // not authorize a skip either, so require at least short-SHA length
   // instead of mere non-emptiness (mirrors Python _is_plausible_head_sha).
+  // Git additionally reserves the all-zero object id ("0000000...") for
+  // "no object": matching zero placeholders on both sides must never pass
+  // the exact-HEAD check even though both sides are hex of plausible
+  // length. Production always compares full HEADs from the GitHub API, so
+  // abbreviated prefixes never occur there; the length floor screens
+  // mocked fragments while genuine abbreviations stay valid.
   const text = String(value || '').trim().toLowerCase();
-  return /^[0-9a-f]{7,64}$/.test(text);
+  if (!/^[0-9a-f]{7,64}$/.test(text)) return false;
+  if (/^0+$/.test(text)) return false;
+  return true;
 }
 
 function isCleanReviewForImproveSkip(reviewPayload, persistentState, options = {}) {
