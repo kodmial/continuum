@@ -97,6 +97,7 @@ publication are not part of the Swift profile.
 | `AUTOMATION_PAUSE_LABEL` | `automation:paused` | Pause label. |
 | `AUTOMATION_QUALIFYING_LABEL` | `automation:qualifying` | Implementation-merged capabilities waiting on mandatory live qualification. |
 | `AUTOMATION_BLOCKED_LABEL` | `automation:blocked` | Capabilities whose mandatory qualification failed and need repair. |
+| `AUTOMATION_READY_LABEL` | empty | Optional admission label for automatic implementation. When set (for example `automation:ready`), the scheduler auto-dispatches only issues carrying that label; empty keeps the current behavior. Qualification dispatch and manual owner `/oc` never require it. |
 | `CONTINUUM_CHILD_OWNED_MARKER` | `<!-- continuum-child-owned -->` | Current delegated-child ownership marker. |
 | `CONTINUUM_LEGACY_CHILD_OWNED_MARKER` | empty | Optional legacy marker supplied by a migrating consumer. |
 | `CONTINUUM_REVIEW_PROVIDER` | `none` | Authoritative review selector: `none`, `coderabbit`, or `pr-agent`. |
