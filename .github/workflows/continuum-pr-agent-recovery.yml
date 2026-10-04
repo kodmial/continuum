@@ -571,7 +571,7 @@ jobs:
             // so exactActiveRun still reliably prevents duplicate dispatch.
             // After a dispatch the caller re-invokes this bounded snapshot
             // to refresh only active state for later PRs in the same pass.
-            const ACTIVE_REVIEW_RUN_STATUSES = ['queued', 'in_progress', 'waiting', 'pending', 'requested'];
+            const ACTIVE_REVIEW_RUN_STATUSES = ['queued', 'in_progress', 'waiting', 'pending', 'requested', 'action_required'];
             const MAX_REVIEW_PAGES_PER_STATUS = 3;
             async function listReviewRuns() {
               try {
