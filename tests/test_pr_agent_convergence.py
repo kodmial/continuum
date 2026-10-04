@@ -155,6 +155,51 @@ class ConvergenceStateTests(unittest.TestCase):
         self.assertNotIn("RESOLVED", marker)
         self.assertNotIn("ACTIVE", marker)
 
+    def test_same_head_same_logical_finding_holds_despite_fp_drift(self):
+        from continuum.pr_agent_convergence import no_progress_marker
+
+        items = [item("bug")]
+        ids = finding_fingerprints(items)
+        marker = no_progress_marker(A, "2" * 64, ids)
+        decision = decide(
+            head_sha=A,
+            batch_fp="3" * 64,
+            current_finding_ids=ids,
+            comment_bodies=[marker],
+        )
+        self.assertTrue(decision.same_head_hold)
+        self.assertTrue(decision.held)
+
+    def test_same_head_new_logical_finding_stays_eligible(self):
+        from continuum.pr_agent_convergence import no_progress_marker
+
+        old_ids = finding_fingerprints([item("bug")])
+        marker = no_progress_marker(A, "2" * 64, old_ids)
+        current = finding_fingerprints([item("totally different")])
+        decision = decide(
+            head_sha=A,
+            batch_fp="3" * 64,
+            current_finding_ids=current,
+            comment_bodies=[marker],
+        )
+        self.assertFalse(decision.same_head_hold)
+        self.assertFalse(decision.held)
+        self.assertEqual(decision.eligible, frozenset(current))
+
+    def test_parse_transitions_is_bounded(self):
+        from continuum.pr_agent_convergence import parse_transitions
+
+        bodies = [transition_marker(A, B, finding_fingerprints([item("bug")]))]
+        capped = parse_transitions(bodies, max_markers=0)
+        self.assertEqual(capped, [])
+        many = [transition_marker(A, B, finding_fingerprints([item("bug")]))] * 5
+        self.assertEqual(len(parse_transitions(many, max_markers=2)), 2)
+        single = parse_transitions(
+            ["<!-- continuum-pr-agent-convergence from="
+             + A + " to=" + B + " findings=" + "ab" * 32 + " -->"]
+        )
+        self.assertEqual(len(single), 1)
+
 
 class WorkflowWiringTests(unittest.TestCase):
     @classmethod
@@ -197,6 +242,28 @@ class WorkflowWiringTests(unittest.TestCase):
     def test_no_upstream_resolution_is_written(self):
         self.assertNotIn("state=RESOLVED", self.workflow)
         self.assertNotIn("state=ACTIVE", self.workflow)
+
+    def test_js_whitespace_normalization_matches_python(self):
+        self.assertIn("replace(/\\s+/g, ' ')", self.workflow)
+        self.assertNotIn("replace(/\\\\s+/g, ' ')", self.workflow)
+
+    def test_js_identity_is_strict_and_fail_closed(self):
+        self.assertIn("const shaRe = /^[0-9a-f]{40}$/;", self.workflow)
+        self.assertIn("const fpRe = /^[0-9a-f]{64}$/;", self.workflow)
+        self.assertIn("failClosed(", self.workflow)
+        self.assertIn(
+            "steps.convergence.outcome == 'success'", self.workflow
+        )
+
+    def test_js_cross_checks_finding_ids(self):
+        self.assertIn("identifiedIds", self.workflow)
+        self.assertIn(
+            "PR-Agent finding IDs do not match identified batch.", self.workflow
+        )
+
+    def test_js_same_head_holds_logical_finding(self):
+        self.assertIn("sameHeadFindings", self.workflow)
+        self.assertIn("findings=${FINDING_IDS_LOWER_EARLY}", self.workflow)
 
 
 if __name__ == "__main__":

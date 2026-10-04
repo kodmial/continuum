@@ -213,7 +213,7 @@ jobs:
                     .map(key => [key, logicalStable(value[key])])
                 );
               }
-              if (typeof value === 'string') return value.trim().replace(/\\s+/g, ' ');
+              if (typeof value === 'string') return value.trim().replace(/\s+/g, ' ');
               return value;
             };
             const identified = items.map(item => ({
@@ -256,21 +256,27 @@ jobs:
             const findingIds = new Set(
               String(process.env.FINDING_IDS || '').toLowerCase().split(',').filter(Boolean)
             );
+            const failClosed = (message) => {
+              core.setOutput('held', 'true');
+              core.setOutput('eligible_batch', '[]');
+              core.setOutput('eligible_count', '0');
+              core.setOutput('surviving_findings', '');
+              core.setFailed(message);
+            };
             let identified;
             try {
               identified = JSON.parse(String(process.env.IDENTIFIED_BATCH || '[]'));
             } catch (err) {
-              core.setFailed('PR-Agent identified batch is invalid JSON: ' + err.message);
+              failClosed('PR-Agent identified batch is invalid JSON: ' + err.message);
               return;
             }
-            if (!prNumber || !headSha || !fingerprint || findingIds.size === 0 ||
+            const shaRe = /^[0-9a-f]{40}$/;
+            const fpRe = /^[0-9a-f]{64}$/;
+            if (!prNumber || !shaRe.test(headSha) || !fpRe.test(fingerprint) || findingIds.size === 0 ||
                 !Array.isArray(identified) || identified.length === 0) {
-              core.setFailed('PR-Agent no-progress check requires PR, HEAD, batch fingerprint, and identified logical findings.');
+              failClosed('PR-Agent no-progress check requires PR, HEAD, batch fingerprint, and identified logical findings.');
               return;
             }
-            const marker =
-              '<!-- continuum-pr-agent-no-progress head=' + headSha +
-              ' fingerprint=' + fingerprint + ' -->';
             const comments = await github.paginate(
               github.rest.issues.listComments,
               { owner, repo, issue_number: prNumber, per_page: 100 }
@@ -283,9 +289,39 @@ jobs:
             // is neither the repository owner nor the actions bot identity),
             // and a login allow-list would miss them, leaving `held` false
             // forever and repairing the same HEAD/state repeatedly.
-            const sameHeadHeld = comments.some(comment =>
+            // Same-HEAD hold is exact fingerprint (#33 contract) or same HEAD
+            // plus same logical finding: the optional findings= suffix lets a
+            // same logical finding hold even when volatile fields
+            // (line/whitespace) changed the whole-batch fingerprint.
+            const marker =
+              '<!-- continuum-pr-agent-no-progress head=' + headSha +
+              ' fingerprint=' + fingerprint + ' -->';
+            const noProgressRe =
+              /<!-- continuum-pr-agent-no-progress head=([0-9a-f]{40}) fingerprint=([0-9a-f]{64})(?: findings=([0-9a-f]{64}(?:,[0-9a-f]{64})*))? -->/gi;
+            let sameHeadHeld = comments.some(comment =>
               String(comment.body || '').toLowerCase().includes(marker)
             );
+            const sameHeadFindings = new Set();
+            for (const comment of comments) {
+              const body = String(comment.body || '');
+              for (const match of body.matchAll(noProgressRe)) {
+                if (String(match[1] || '').toLowerCase() !== headSha) continue;
+                if (String(match[2] || '').toLowerCase() === fingerprint) {
+                  sameHeadHeld = true;
+                }
+                for (const id of String(match[3] || '').toLowerCase().split(',').filter(Boolean).slice(0, 500)) {
+                  sameHeadFindings.add(id);
+                }
+              }
+            }
+            if (!sameHeadHeld) {
+              for (const id of findingIds) {
+                if (sameHeadFindings.has(id)) {
+                  sameHeadHeld = true;
+                  break;
+                }
+              }
+            }
             // Cross-HEAD state is per logical finding, not per whole batch.
             // This catches F surviving A->B even if some other findings were
             // resolved or new findings appeared on B.
@@ -305,16 +341,27 @@ jobs:
                 }
               }
             }
-            surviving = [...new Set(surviving)].sort();
-            const survivingSet = new Set(surviving);
             const idRe = /^[0-9a-f]{64}$/;
             for (const entry of identified) {
               const id = String(entry?.id || '').toLowerCase();
               if (!idRe.test(id) || typeof entry?.item !== 'object' || entry?.item === null) {
-                core.setFailed('PR-Agent identified batch contains an invalid logical finding entry.');
+                failClosed('PR-Agent identified batch contains an invalid logical finding entry.');
                 return;
               }
             }
+            const identifiedIds = new Set(identified.map(entry => String(entry.id || '').toLowerCase()));
+            for (const id of findingIds) {
+              if (!identifiedIds.has(id)) {
+                failClosed('PR-Agent finding IDs do not match identified batch.');
+                return;
+              }
+            }
+            if (identifiedIds.size !== findingIds.size) {
+              failClosed('PR-Agent finding IDs do not match identified batch.');
+              return;
+            }
+            surviving = [...new Set(surviving)].sort();
+            const survivingSet = new Set(surviving);
             const eligible = sameHeadHeld
               ? []
               : identified.filter(entry => !survivingSet.has(String(entry.id || '').toLowerCase()));
@@ -332,7 +379,7 @@ jobs:
             }
 
       - name: Resolve the writable PR source branch
-        if: steps.batch.outputs.empty != 'true' && steps.convergence.outputs.held != 'true'
+        if: steps.batch.outputs.empty != 'true' && steps.convergence.outcome == 'success' && steps.convergence.outputs.held != 'true'
         id: target
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
@@ -367,7 +414,7 @@ jobs:
 
       - name: Mark PR-Agent repair in flight
         id: repair_status
-        if: steps.batch.outputs.empty != 'true' && steps.convergence.outputs.held != 'true' && steps.target.outcome == 'success'
+        if: steps.batch.outputs.empty != 'true' && steps.convergence.outcome == 'success' && steps.convergence.outputs.held != 'true' && steps.target.outcome == 'success'
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           HEAD_SHA: ${{ inputs.head_sha }}
@@ -387,7 +434,7 @@ jobs:
             });
 
       - name: Checkout the writable PR source branch
-        if: steps.batch.outputs.empty != 'true' && steps.convergence.outputs.held != 'true'
+        if: steps.batch.outputs.empty != 'true' && steps.convergence.outcome == 'success' && steps.convergence.outputs.held != 'true'
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           fetch-depth: 0
@@ -396,7 +443,7 @@ jobs:
           ref: ${{ steps.target.outputs.head_ref }}
 
       - name: Confirm the checked-out branch is the reviewed HEAD
-        if: steps.batch.outputs.empty != 'true' && steps.convergence.outputs.held != 'true'
+        if: steps.batch.outputs.empty != 'true' && steps.convergence.outcome == 'success' && steps.convergence.outputs.held != 'true'
         env:
           HEAD_SHA: ${{ inputs.head_sha }}
           HEAD_REF: ${{ steps.target.outputs.head_ref }}
@@ -409,7 +456,7 @@ jobs:
 
       - name: Install pinned OpenCode CLI for PR-Agent repair
         id: install_opencode
-        if: steps.batch.outputs.empty != 'true' && steps.convergence.outputs.held != 'true'
+        if: steps.batch.outputs.empty != 'true' && steps.convergence.outcome == 'success' && steps.convergence.outputs.held != 'true'
         run: |
           set -euo pipefail
           for attempt in 1 2 3; do
@@ -426,7 +473,7 @@ jobs:
 
       - name: Run one bounded OpenCode repair pass over every current item
         id: repair_pass
-        if: steps.batch.outputs.empty != 'true' && steps.convergence.outputs.held != 'true'
+        if: steps.batch.outputs.empty != 'true' && steps.convergence.outcome == 'success' && steps.convergence.outputs.held != 'true'
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ inputs.pr_number }}
@@ -487,17 +534,21 @@ jobs:
             git restore --source="$START_HEAD" --worktree --staged -- "${TRACKED_IGNORED[@]}"
           fi
 
+          FINDING_IDS_LOWER_EARLY="${FINDING_IDS,,}"
+          if [[ "$FINDING_IDS_LOWER_EARLY" =~ ^[0-9a-f]{64}(,[0-9a-f]{64})*$ ]]; then
+            NO_PROGRESS_MARKER="<!-- continuum-pr-agent-no-progress head=${HEAD_SHA,,} fingerprint=${BATCH_FINGERPRINT,,} findings=${FINDING_IDS_LOWER_EARLY} -->"
+          else
+            NO_PROGRESS_MARKER="<!-- continuum-pr-agent-no-progress head=${HEAD_SHA,,} fingerprint=${BATCH_FINGERPRINT,,} -->"
+          fi
           if [[ -z "$(git status --porcelain)" ]]; then
-            MARKER="<!-- continuum-pr-agent-no-progress head=${HEAD_SHA,,} fingerprint=${BATCH_FINGERPRINT,,} -->"
-            printf -v BODY '%s\n%s' "$MARKER" "PR-Agent reported actionable structured findings, but the bounded OpenCode repair produced no code change for this exact HEAD/finding state. Automatic same-state repair is held until the HEAD or structured finding state changes."
+            printf -v BODY '%s\n%s' "$NO_PROGRESS_MARKER" "PR-Agent reported actionable structured findings, but the bounded OpenCode repair produced no code change for this exact HEAD/finding state. Automatic same-state repair is held until the HEAD or structured finding state changes."
             gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$BODY"
             echo "No repair diff; recorded durable no-progress state for PR #$PR_NUMBER HEAD $HEAD_SHA."
             exit 0
           fi
           git add -A
           if git diff --cached --quiet; then
-            MARKER="<!-- continuum-pr-agent-no-progress head=${HEAD_SHA,,} fingerprint=${BATCH_FINGERPRINT,,} -->"
-            printf -v BODY '%s\n%s' "$MARKER" "PR-Agent repair staged no effective change for this exact HEAD/finding state. Automatic same-state repair is held until the HEAD or structured finding state changes."
+            printf -v BODY '%s\n%s' "$NO_PROGRESS_MARKER" "PR-Agent repair staged no effective change for this exact HEAD/finding state. Automatic same-state repair is held until the HEAD or structured finding state changes."
             gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$BODY"
             echo "No staged repair diff; recorded durable no-progress state."
             exit 0
