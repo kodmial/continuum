@@ -216,7 +216,7 @@ def decide_conflict_repair(
 
     conflicted = is_conflicted(mergeable, mergeable_state)
 
-    if head_changed_since_dispatch and conflicted is not True:
+    if head_changed_since_dispatch and conflicted is False:
         # The repair (or any head update) moved the PR off the conflicted
         # HEAD: reconcile the lock so CI runs on the new HEAD and the normal
         # PR-Agent/review/merge lifecycle resumes from exact-HEAD gates.
