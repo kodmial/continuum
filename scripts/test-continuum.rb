@@ -91,7 +91,7 @@ class ContinuumTest < Minitest::Test
   # itself.
   def stamp_write?(code)
     return true if code.match?( />+\s*["']?\$[{'"]?STAMP_FILE/ )
-    return true if code.match?( />+\s*["']?\$?\{?HOME\/[^#\n]*image-digest/ )
+    return true if code.match?( />+\s*["']?\$?\{?HOME\}?\/[^#\n]*image-digest/ )
     return true if code.match?( /\btee\b[^#\n]*(STAMP_FILE|image-digest)/ )
 
     code.match?( /\b(cp|install|dd|mv)\b[^#\n]*(STAMP_FILE|image-digest)/ )

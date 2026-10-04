@@ -61,6 +61,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import time
 from copy import deepcopy
@@ -676,19 +677,58 @@ def _probe_expected_versions(manifest: AgentManifest, probe_text: str) -> List[s
             if binary in lowered]
 
 
+#: Exact allowlist for manifest probes. Only a bare `<binary> --version`
+#: or `command -v <binary>` attestation (extra whitespace tolerated) may
+#: ever execute: anything with shell metacharacters, flags, redirections,
+#: or chained commands (`;`, `|`, `&`, `$`, backticks, parens, `<`, `>`)
+#: is rejected before execution.
+_PROBE_ALLOWLIST_RE = re.compile(
+    r"(?:opencode|pr-agent|runner)\s+--version|command\s+-v\s+(?:opencode|pr-agent|runner)"
+)
+
+
+def _validated_probe_argv(probe_text: str) -> List[str]:
+    """Validate a probe against the allowlist and return its argv (no shell)."""
+
+    text = str(probe_text)
+    stripped = text.strip()
+    if not stripped or not _PROBE_ALLOWLIST_RE.fullmatch(stripped):
+        raise AgentRuntimeError(
+            "manifest probe {!r} is not an executable version check: "
+            "refusing to record probe execution".format(text)
+        )
+    parts = stripped.split()
+    if parts[0] == "command":
+        binary = parts[-1]
+        return ["command", "-v", binary]
+    return [parts[0], "--version"]
+
+
 def _run_probe_command(probe: str, timeout: float = MANIFEST_PROBE_TIMEOUT_SECONDS) -> str:
     """Run one manifest probe command; return its combined output.
 
-    A non-zero exit means the binary is absent or broken, so the probe
-    produces no execution evidence.
+    Probes run without a shell: the allowlisted argv executes directly
+    (``command -v`` resolves via ``PATH`` lookup), so injected shell
+    syntax can never execute. A non-zero exit means the binary is absent
+    or broken, so the probe produces no execution evidence.
     """
 
+    argv = _validated_probe_argv(probe)
+    if argv[0] == "command":
+        resolved = shutil.which(argv[-1])
+        if not resolved:
+            raise AgentRuntimeError(
+                "manifest probe {!r} failed with exit 1: "
+                "refusing to record probe execution".format(probe)
+            )
+        return resolved + "\n"
     try:
         completed = subprocess.run(
-            ["sh", "-c", probe],
+            argv,
             capture_output=True,
             text=True,
             timeout=timeout,
+            shell=False,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise AgentRuntimeError(
@@ -710,18 +750,18 @@ def execute_manifest_probes(
     """Execute each declared manifest probe in trusted build infrastructure.
 
     This is the single point where version probes are run at build time.
-    Each probe is actually executed here (via ``sh -c`` in the build
-    environment, or via ``executor`` when one is injected): a zero exit
-    proves the binary is present, and a ``--version`` probe must report
-    the manifest's pinned version or the binary is not the pinned one.
-    The returned tuple is output-bound evidence of the form
-    ``"<probe> => <output>"`` and is stored on the generation as
-    ``executed_probes``. It is distinct from the SBOM / provenance
-    version strings: echoing versions into metadata without running the
-    probes yields no execution record and fails validation, and copying
-    bare probe strings into ``executed_probes`` without output evidence
-    fails validation too. A base image missing binaries can never
-    produce this record.
+    Each probe is actually executed here (as an allowlisted argv with no
+    shell in the build environment, or via ``executor`` when one is
+    injected): a zero exit proves the binary is present, and a
+    ``--version`` probe must report the manifest's pinned version or the
+    binary is not the pinned one. The returned tuple is output-bound
+    evidence of the form ``"<probe> => <output>"`` and is stored on the
+    generation as ``executed_probes``. It is distinct from the SBOM /
+    provenance version strings: echoing versions into metadata without
+    running the probes yields no execution record and fails validation,
+    and copying bare probe strings into ``executed_probes`` without
+    output evidence fails validation too. A base image missing binaries
+    can never produce this record.
     """
 
     if not manifest.probes:
@@ -730,12 +770,12 @@ def execute_manifest_probes(
     executed: List[str] = []
     for probe in manifest.probes:
         text = str(probe)
+        # Allowlist first: anything outside `<binary> --version` /
+        # `command -v <binary>` (including `;`, `|`, `$()`, backticks, or
+        # redirections smuggling a payload after a valid prefix) is
+        # rejected before anything executes.
+        _validated_probe_argv(text)
         lowered = text.lower()
-        if "--version" not in lowered and "command -v" not in lowered:
-            raise AgentRuntimeError(
-                "manifest probe {!r} is not an executable version check: "
-                "refusing to record probe execution".format(text)
-            )
         expected = _probe_expected_versions(manifest, text)
         if not expected:
             raise AgentRuntimeError(
@@ -1038,6 +1078,43 @@ class CacheEntry:
     payload: Dict[str, Any] = field(default_factory=dict)
 
 
+#: Shell-executable syntax that cached dependency content must never carry:
+#: command substitution, backticks, pipes, chaining, or newlines would
+#: execute if a consumer sourced or evaluated the payload.
+_CACHE_EXECUTABLE_RE = re.compile(r"(\$\(|`|\$\{|[;|]|\n|\r|\0)")
+
+
+def _validate_cache_payload(payload: Any, _depth: int = 0) -> bool:
+    """Validate executable cache content before use (shape + no shell code)."""
+
+    if _depth > 8:
+        return False
+    if isinstance(payload, dict):
+        for cache_key, value in payload.items():
+            if not isinstance(cache_key, str) or not cache_key or len(cache_key) > 256:
+                return False
+            if not _validate_cache_payload(value, _depth + 1):
+                return False
+        bound_digest = payload.get("image_digest")
+        if bound_digest is not None and not re.fullmatch(r"[0-9a-f]{64}", str(bound_digest or "")):
+            return False
+        bound_profile = payload.get("profile_digest")
+        if bound_profile is not None and not re.fullmatch(r"[0-9a-f]{64}", str(bound_profile or "")):
+            return False
+        return True
+    if isinstance(payload, (list, tuple)):
+        if len(payload) > 1024:
+            return False
+        return all(_validate_cache_payload(item, _depth + 1) for item in payload)
+    if payload is None or isinstance(payload, (bool, int, float)):
+        return True
+    if isinstance(payload, str):
+        if len(payload) > 4096:
+            return False
+        return _CACHE_EXECUTABLE_RE.search(payload) is None
+    return False
+
+
 class DependencyCache:
     """Content-addressed dependency cache (project/repository scoped).
 
@@ -1104,8 +1181,12 @@ class DependencyCache:
 
         Cross-project restores are refused (isolation), untrusted
         (fork-published) entries are refused outright so a caller checking
-        only non-None can never consume poisoned cache, and validation
-        failure falls back to deterministic reconstruction (None).
+        only non-None can never consume poisoned cache, the stored entry
+        must bind to the requested key/digest (a mismatched, corrupt, or
+        transplanted entry falls back to deterministic reconstruction),
+        executable cache content is validated before use, and any
+        validation failure falls back to deterministic reconstruction
+        (None).
         """
 
         entry = self._entries.get((project_id, repository, key))
@@ -1115,7 +1196,28 @@ class DependencyCache:
             return None
         if not entry.trusted:
             return None
-        if image_contains_secret(entry.payload) is not None:
+        # The payload must bind to the requested key: the stored key must
+        # equal the requested key, the requested key must wrap a valid
+        # immutable digest, and a payload carrying its own digest binding
+        # must agree with it. Anything else is a mismatched/corrupt entry
+        # and reconstructs deterministically instead.
+        if entry.key != key:
+            return None
+        match = re.fullmatch(
+            r"([A-Za-z0-9][A-Za-z0-9._-]{0,31})-([0-9a-f]{64})", str(key or "")
+        )
+        if match is None:
+            return None
+        digest = match.group(2)
+        payload = entry.payload
+        if not isinstance(payload, dict):
+            return None
+        bound = payload.get("image_digest")
+        if bound is not None and str(bound) != digest:
+            return None
+        if image_contains_secret(payload) is not None:
+            return None
+        if not _validate_cache_payload(payload):
             return None
         entry.validated = True
         return entry
@@ -1861,7 +1963,6 @@ _BOOTSTRAP_PATTERNS = (
     "npm install opencode",
     "npm i opencode",
     "brew install opencode",
-    "releases/download",
 )
 
 #: Executable warm-path probes: a real CLI/version check that proves the
@@ -1876,18 +1977,33 @@ _PROBE_PATTERNS = (
 )
 
 #: Signals that make an `if`/`elif`/`case` line a validated cache-miss
-#: guard for the installer (the digest gate, the cache-hit flag, the stamp
-#: binding, or the probe itself on a shared line). A conditional without
-#: one of these guards nothing about the prepared runtime.
+#: guard for the installer (the digest gate, the cache-hit flag, or the
+#: stamp binding). A conditional on any other predicate -- including an
+#: unrelated `command -v foo` / `--version` check -- guards nothing about
+#: the prepared runtime and never suppresses bootstrap detection.
 _GUARD_MARKERS = (
     "CONTINUUM_IMAGE_DIGEST",
     "CACHE_HIT",
     "CACHE_MISS",
     "STAMP_FILE",
     "image-digest",
-    "command -v",
-    "--version",
 )
+
+
+def _is_bootstrap_line(line: str) -> bool:
+    """Whether one code line downloads/installs the agent runtime.
+
+    A bare `releases/download` is not an installer signal on its own: a
+    legitimate runner-binary asset download carries no opencode/pr-agent
+    reference. It counts only when the same line names the agent runtime
+    being probed.
+    """
+
+    if any(pattern in line for pattern in _BOOTSTRAP_PATTERNS):
+        return True
+    return "releases/download" in line and (
+        "opencode" in line or "pr-agent" in line
+    )
 
 
 def _code_without_comment(line: str) -> str:
@@ -1942,7 +2058,7 @@ def normal_execution_uses_bootstrap_install(workflow_text: str) -> bool:
     first_bootstrap: Optional[int] = None
     first_probe: Optional[int] = None
     for index, line in enumerate(code_lines):
-        if first_bootstrap is None and any(pattern in line for pattern in _BOOTSTRAP_PATTERNS):
+        if first_bootstrap is None and _is_bootstrap_line(line):
             first_bootstrap = index
         # Only a real executable probe counts as a warm-path probe: an exact
         # CLI/version check (`command -v opencode`, `pr-agent --version`,
@@ -1982,11 +2098,12 @@ def normal_execution_uses_bootstrap_install(workflow_text: str) -> bool:
         # curl https://opencode.ai/install | bash; fi` after a probe only
         # reinstalls on a validated cache miss. Only a conditional that
         # references the validated miss signal guards the download: the
-        # digest/cache-miss gate (or the probe itself on a shared line). A
-        # bare `if`/`elif`/`case` on an unrelated predicate (e.g.
-        # `if [ -f foo ]; then echo hi; fi`) followed by an unconditional
-        # installer still reinstalls on every run and counts as a
-        # bootstrap install.
+        # digest/cache-miss/stamp gate. A bare `if`/`elif`/`case` on an
+        # unrelated predicate (e.g. `if [ -f foo ]; then echo hi; fi`, or
+        # `if command -v foo; then curl ... | bash; fi` whose guard is
+        # unrelated to the image digest/cache-miss) followed by an
+        # unconditional installer still reinstalls on every run and counts
+        # as a bootstrap install.
         conditional = any(
             (
                 stripped.startswith("if ")
