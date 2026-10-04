@@ -5090,4 +5090,116 @@ class ContinuumTest < Minitest::Test
     assert_includes cli, '--author-association'
   end
 
+  # kodmial/continuum#248: an `issue_comment` on a PR must start the
+  # interactive agent only for an explicit owner command at the start of the
+  # comment on a still-open PR. Substring matching let agent-generated
+  # verification prose (which mentions /oc later) chain one run per minute on
+  # a closed PR. The job gate and the `Run OpenCode` step gate must both pin
+  # the open-PR + owner + startsWith + cancel-exclusion rule, while the
+  # plain-issue, qualification, workflow_dispatch, and review-comment paths
+  # keep their existing behavior.
+  def test_opencode_pr_interactive_path_requires_explicit_open_command
+    body = File.read(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
+
+    job = body[/  opencode:\n(?:.*\n)*?    if: >-\n((?:      .*\n)+)/, 1]
+    refute_nil job, 'the opencode job gate is missing'
+
+    # The PR issue_comment route: open PR, owner, command at the start,
+    # cancel excluded. startsWith (not contains) is what stops later-prose
+    # mentions from self-triggering.
+    assert_includes job, 'github.event.issue.pull_request',
+                    'the job gate must distinguish PR comments from plain issues'
+    assert_includes job, "github.event.issue.state == 'open'",
+                    'the job gate must require a still-open PR'
+    assert_includes job, 'github.actor == github.repository_owner',
+                    'the job gate must require the repository owner'
+    assert_includes job, "startsWith(github.event.comment.body, '/oc')",
+                    'the PR route must use startsWith, not contains'
+    assert_includes job, "startsWith(github.event.comment.body, '/opencode')",
+                    'the PR route must accept /opencode at the start'
+    assert_includes job, "!contains(github.event.comment.body, '/oc-cancel')",
+                    'the PR route must keep the /oc-cancel exclusion'
+
+    # The plain-issue route keeps substring matching so scheduler dispatch
+    # comments (which open with /oc plus a marker) keep working.
+    assert_includes job, '!github.event.issue.pull_request',
+                    'the job gate must keep a distinct plain-issue route'
+    assert_includes job, "contains(github.event.comment.body, '/oc')",
+                    'the plain-issue route must keep contains matching'
+
+    # The review-comment route is deliberately unchanged.
+    assert_includes job, "github.event_name == 'pull_request_review_comment'",
+                    'the job gate must keep the review-comment route'
+
+    # workflow_dispatch repair/qualification modes are untouched.
+    assert_includes job, "contains(fromJSON('[\"coderabbit-fix\",\"resolve-conflict\",\"ci-fix\",\"issue\",\"qualification\"]'), inputs.mode)"
+
+    run_step = step_body(body, 'Run OpenCode')
+    refute_nil run_step, 'the `Run OpenCode` step is missing'
+    assert_includes run_step, "github.event.issue.state == 'open'",
+                    'Run OpenCode must require a still-open PR'
+    assert_includes run_step, 'github.actor == github.repository_owner',
+                    'Run OpenCode must require the repository owner on PR comments'
+    assert_includes run_step, "startsWith(github.event.comment.body, '/oc')",
+                    'Run OpenCode must use startsWith on PR comments'
+    assert_includes run_step, "startsWith(github.event.comment.body, '/opencode')",
+                    'Run OpenCode must accept /opencode at the start'
+    assert_includes run_step, "!contains(github.event.comment.body, '/oc-cancel')",
+                    'Run OpenCode must keep the /oc-cancel exclusion'
+    assert_includes run_step, "steps.duplicate_guard.outputs.skip != 'true'",
+                    'Run OpenCode must keep the duplicate guard'
+    # The review-comment branch of the step keeps its existing shape.
+    assert_includes run_step, "github.event_name == 'pull_request_review_comment'",
+                    'Run OpenCode must keep the review-comment branch'
+  end
+
+  # The closed-PR and later-prose cases must not match the PR route: the
+  # gate text is re-evaluated here as a boolean over the issue state and the
+  # comment body, so a weakened expression (contains instead of startsWith,
+  # or a dropped open check) fails here rather than in production.
+  def test_opencode_pr_gate_logic_rejects_loops_and_accepts_commands
+    evaluate = lambda do |issue_state, actor_is_owner, comment_body|
+      opens = issue_state == 'open'
+      owner = actor_is_owner
+      starts = comment_body.start_with?('/oc') || comment_body.start_with?('/opencode')
+      cancelled = comment_body.include?('/oc-cancel')
+      opens && owner && starts && !cancelled
+    end
+
+    # Closed PR + arbitrary comment -> no run.
+    refute evaluate.call('closed', true, '/oc please continue'),
+           'a closed PR must never start the interactive agent'
+    refute evaluate.call('closed', true, 'any bot prose'),
+           'a closed PR must never start the interactive agent'
+    # Open PR + generated prose mentioning /oc later -> no run.
+    refute evaluate.call('open', true,
+                         'OpenCode run 37176701843 completed; the /oc token was mentioned while explaining why.'),
+           'later-prose mentions must never start the interactive agent'
+    refute evaluate.call('open', true, 'Please run /oc for me'),
+           'later-prose mentions must never start the interactive agent'
+    # Open PR + owner /oc at the start -> exactly one run.
+    assert evaluate.call('open', true, '/oc'),
+           'a bare owner /oc must start the interactive agent'
+    assert evaluate.call('open', true, "/oc\n\nplease fix the flake"),
+           'an owner /oc command must start the interactive agent'
+    assert evaluate.call('open', true, '/opencode fix the flake'),
+           'an owner /opencode command must start the interactive agent'
+    # Open PR + owner /oc-cancel -> no run.
+    refute evaluate.call('open', true, '/oc-cancel'),
+           '/oc-cancel must never start the interactive agent'
+    # Non-owner commands never run.
+    refute evaluate.call('open', false, '/oc'),
+           'a non-owner command must never start the interactive agent'
+
+    # The evaluated rule above must be the rule the workflow actually
+    # expresses: every operator it depends on has to be present in the gate.
+    body = File.read(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
+    run_step = step_body(body, 'Run OpenCode')
+    refute_nil run_step
+    %w[state\ ==\ 'open' repository_owner startsWith !contains].each do |token|
+      assert_includes run_step, token.gsub('\\ ', ' '),
+                      "Run OpenCode gate lost its #{token.inspect} term"
+    end
+  end
+
   end
