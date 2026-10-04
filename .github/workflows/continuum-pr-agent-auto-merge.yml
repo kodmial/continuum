@@ -544,16 +544,13 @@ jobs:
                 return { ok: false, reason: 'Current-head CI is not successful' };
               }
 
-              const combinedResponse =
-                await github.rest.repos.getCombinedStatusForRef({
-                  owner, repo, ref: pr.head.sha,
-                });
-              if (combinedResponse.data.state !== 'success') {
-                return {
-                  ok: false,
-                  reason: 'combined status is ' + combinedResponse.data.state + ', not success',
-                };
-              }
+              // Do not gate on GitHub's aggregate combined status here.
+              // Lifecycle contexts such as continuum/pr-agent-repair are
+              // historical per context: an earlier failed repair can remain
+              // failure even after a later complete review proves the exact
+              // HEAD clean. Required merge gates are checked explicitly below
+              // (current-head CI, packaging, and configured required workflow),
+              // while this reusable PR-Agent gate validates review state itself.
 
               const packaging =
                 await latestWorkflowForHead(pr, pr.head.sha, 'Packaging smoke');
