@@ -679,9 +679,11 @@ jobs:
                 SOURCE_MARKER="<!-- continuum-render-repair source=$ISSUE_NUMBER -->"
                 # Bounded open-issue scan (#254): repair issues are recent, so
                 # a capped newest-first window finds them without walking
-                # full history.
+                # full history. sort/direction are explicit: the default
+                # issue ordering keeps the oldest-first pages, which would
+                # miss a recent repair beyond the first ~500 open issues.
                 ALL_ISSUES_JSON="$(continuum_bounded_slurp \
-                  "repos/$GITHUB_REPOSITORY/issues?state=open" 2>/dev/null || echo "[]")"
+                  "repos/$GITHUB_REPOSITORY/issues?state=open&sort=created&direction=desc" 2>/dev/null || echo "[]")"
                 EXISTING_REPAIR="$(jq -r --arg marker "$SOURCE_MARKER" \
                   '.[][]? | select((.body // "") | contains($marker)) | .number' \
                   <<<"$ALL_ISSUES_JSON" | head -n 1)"
