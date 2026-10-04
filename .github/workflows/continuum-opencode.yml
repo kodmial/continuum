@@ -428,8 +428,9 @@ jobs:
               }
 
               if (!taskNumber) {
+                const headFullName = String(pr.head?.repo?.full_name || '').toLowerCase();
                 const branchIssue = String(pr.head?.ref || '').match(/^opencode\/issue(\d+)-/i);
-                if (branchIssue) {
+                if (branchIssue && headFullName === repository.toLowerCase()) {
                   taskRepository = repository;
                   taskNumber = Number(branchIssue[1]);
                   source = 'legacy-branch-identity';
@@ -799,7 +800,7 @@ jobs:
           set -euo pipefail
           [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::Missing or invalid issue number for issue mode: '${ISSUE_NUMBER}'."; exit 1; }
           [[ "$TASK_CONTEXT_PRESENT" == "true" ]] || { echo "::error::Authoritative task context was not resolved."; exit 1; }
-          [[ "$TASK_REPO" == "$GITHUB_REPOSITORY" && "$TASK_NUMBER" == "$ISSUE_NUMBER" ]] || {
+          [[ "${TASK_REPO,,}" == "${GITHUB_REPOSITORY,,}" && "$TASK_NUMBER" == "$ISSUE_NUMBER" ]] || {
             echo "::error::Resolved task context $TASK_REPO#$TASK_NUMBER does not match issue mode $GITHUB_REPOSITORY#$ISSUE_NUMBER."
             exit 1
           }
