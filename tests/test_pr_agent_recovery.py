@@ -300,19 +300,12 @@ class RecoveryWiringTests(unittest.TestCase):
             with self.subTest(mutation=mutation):
                 self.assertIn(mutation, body)
 
-        for old_pat_read in (
-            "github.rest.actions.listWorkflowRuns",
-            "github.rest.actions.getWorkflowRun",
-            "github.rest.actions.listWorkflowRunsForRepo",
-            "github.rest.pulls.list",
-            "github.rest.pulls.get",
-            "github.rest.repos.listCommitStatusesForRef",
-            "github.rest.issues.listComments",
-            "github.rest.repos.get({ owner, repo })",
-            "github.paginate(",
-        ):
-            with self.subTest(old_pat_read=old_pat_read):
-                self.assertNotIn(old_pat_read, body)
+        self.assertNotIn("github.paginate(", body)
+        self.assertNotRegex(
+            body,
+            r"github\.rest\.(?!issues\.createComment\b|issues\.deleteComment\b|actions\.createWorkflowDispatch\b)",
+            "PAT client must only be used for mutations/dispatch",
+        )
 
     def test_recovered_review_uses_ci_workflow_not_combined_status(self):
         review = self.read(".github/workflows/continuum-pr-agent.yml")

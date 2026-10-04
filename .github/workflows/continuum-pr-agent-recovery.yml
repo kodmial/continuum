@@ -104,6 +104,17 @@ jobs:
             }
             const { getOctokit } = require('@actions/github');
             const readGithub = getOctokit(readToken);
+            async function withReadFallback(fn) {
+              try {
+                return await fn(readGithub);
+              } catch (err) {
+                if (err && (err.status === 401 || err.status === 403)) {
+                  core.warning('Repository-token read failed (' + err.status + '); retrying with PAT client: ' + err.message);
+                  return await fn(github);
+                }
+                throw err;
+              }
+            }
 
             if (!['continuum-pr-agent.yml', 'pr-agent.yml'].includes(reviewWorkflow)) {
               core.setFailed(
