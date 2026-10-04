@@ -5968,6 +5968,40 @@ class ContinuumTest < Minitest::Test
                       "#{base}: a bare /input/ match misclassifies unrelated input validation as a missing target_child_id input"
     assert_includes reconcile, 'refusing bare retry to preserve the delegated target',
                       "#{base}: a review workflow without the target_child_id input must fail closed explicitly"
+    assert_includes reconcile, 'status === 404',
+                      "#{base}: cross-repository target reads surface as 404 under a repository-scoped token, so the PAT read fallback must cover it"
+  end
+
+  # Fail-closed guards around the delegated retry path: the manual checkout
+  # must reject a non-numeric PR number before it reaches the pull/ refspec,
+  # and both shell retry dispatches must detect a 422 unknown-input
+  # rejection naming target_child_id explicitly (mirroring the merge-wakeup
+  # and recovery 422 detection) instead of failing generically.
+  def test_pr_agent_retry_and_checkout_fail_closed_on_delegated_inputs
+    review_body = workflow_body('continuum-pr-agent.yml')
+    checkout = step_body(review_body, 'Checkout the pull request head without exposing delegated repository metadata')
+    refute_nil checkout, 'the manual review checkout step is missing'
+    assert_includes checkout, '^[0-9]+$',
+                    'the checkout must gate PR_NUMBER numerically before the pull/ refspec, mirroring HEAD_SHA validation'
+    assert_includes checkout, 'PR number is malformed',
+                    'a non-numeric PR number must fail closed with an explicit message'
+    assert_includes checkout, 'pull/$PR_NUMBER/head'
+
+    {
+      'continuum-pr-agent.yml' => 'Schedule bounded retry for retryable PR-Agent review failure',
+      'continuum-pr-agent-repair.yml' => 'Schedule bounded retry for retryable PR-Agent repair failure'
+    }.each do |base, step_name|
+      step = step_body(workflow_body(base), step_name)
+      refute_nil step, "#{base}: #{step_name} is missing"
+      assert_includes step, 'dispatch_isolated_retry',
+                      "#{base}: retry dispatch must go through the 422-detecting helper"
+      assert_includes step, '422',
+                      "#{base}: a delegated retry rejected as an unknown input must be detected via HTTP 422"
+      assert_includes step, 'target_child_id',
+                      "#{base}: the 422 detection must name the opaque target_child_id input"
+      assert_includes step, 'refusing bare retry to preserve the delegated target',
+                      "#{base}: a retry workflow without the target_child_id input must fail closed explicitly, never dispatch bare"
+    end
   end
 
   end

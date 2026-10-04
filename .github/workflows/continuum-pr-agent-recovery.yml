@@ -206,7 +206,11 @@ jobs:
                 return await fn(readGithub);
               } catch (err) {
                 const status = err ? (err.status ?? err.response?.status) : undefined;
-                if (status === 401 || status === 403 || status === 429) {
+                // Cross-repository target reads with github.token scoped
+                // to the execution repository conventionally surface as
+                // 404 (the documented inaccessible-repo response), so it
+                // falls back to TAP_PAT alongside 401/403/429.
+                if (status === 401 || status === 403 || status === 404 || status === 429) {
                   readTokenUnavailable = true;
                   core.warning('Repository-token read failed (' + status + '); retrying with PAT client: ' + err.message);
                   return await fn(github);

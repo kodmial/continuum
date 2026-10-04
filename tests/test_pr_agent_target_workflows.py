@@ -228,6 +228,46 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
         self.assertIn("^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$", review)
         self.assertNotIn("{4,64}", review)
 
+    def test_review_checkout_validates_pr_number_before_pull_refspec(self):
+        review = read(".github/workflows/continuum-pr-agent.yml")
+        start = review.index("Checkout the pull request head without exposing")
+        window = review[start:start + 4000]
+        # HEAD_SHA is fail-closed hex-gated; PR_NUMBER must be fail-closed
+        # numeric-gated before it reaches `pull/$PR_NUMBER/head`, mirroring
+        # the HEAD_SHA validation directly above it.
+        self.assertIn("^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$", window)
+        self.assertIn("^[0-9]+$", window)
+        self.assertIn("PR number is malformed", window)
+        self.assertIn('pull/$PR_NUMBER/head', review)
+
+    def test_shell_retry_dispatch_detects_unknown_target_input(self):
+        for path in (
+            ".github/workflows/continuum-pr-agent.yml",
+            ".github/workflows/continuum-pr-agent-repair.yml",
+        ):
+            with self.subTest(path=path):
+                body = read(path)
+                # The delegated retry carries the opaque id, but a retry
+                # workflow without the input rejects it as 422: that case
+                # fails closed with an explicit message (mirroring the
+                # merge-wakeup/recovery 422 detection) instead of a generic
+                # shell failure.
+                self.assertIn("dispatch_isolated_retry", body)
+                self.assertIn("422", body)
+                self.assertIn("target_child_id", body)
+                self.assertIn(
+                    "refusing bare retry to preserve the delegated target",
+                    body,
+                )
+
+    def test_recovery_read_fallback_covers_inaccessible_repo_404(self):
+        body = read(".github/workflows/continuum-pr-agent-recovery.yml")
+        # Cross-repository target reads with a repository-scoped token
+        # conventionally surface as 404, so the PAT fallback must cover it
+        # alongside 401/403/429.
+        self.assertIn("async function withReadFallback(fn)", body)
+        self.assertIn("status === 404", body)
+
     def test_coderabbit_workflows_remain_outside_target_context(self):
         for path in (
             ".github/workflows/continuum-coderabbit-retry.yml",

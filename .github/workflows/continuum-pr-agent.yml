@@ -529,6 +529,10 @@ jobs:
             echo "::error::PR-Agent target HEAD is missing or malformed; refusing to checkout."
             exit 1
           fi
+          if [[ -n "${PR_NUMBER:-}" ]] && ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "::error::PR-Agent target PR number is malformed; refusing to checkout."
+            exit 1
+          fi
           worktree="$RUNNER_TEMP/continuum-pr-agent-review-worktree"
           rm -rf "$worktree"
           mkdir -p "$worktree"
@@ -1422,11 +1426,28 @@ jobs:
           if [[ "$DEFAULT_BRANCH" == */.*/* || "$DEFAULT_BRANCH" == .*/ || "$DEFAULT_BRANCH" == */. ]] || [[ "$DEFAULT_BRANCH" =~ (^|/)\. ]] || [[ "$DEFAULT_BRANCH" =~ \.lock($|/) ]]; then DEFAULT_BRANCH="main"; fi
           # Local runs dispatch bare: a custom retry_workflow without the
           # target_child_id workflow_dispatch input rejects unknown inputs,
-          # so an empty value must be omitted (mirrors recovery JS).
+          # so an empty value must be omitted (mirrors recovery JS). A
+          # delegated dispatch rejected as an unknown input fails closed
+          # here with an explicit message instead of a generic shell error
+          # (mirrors the merge-wakeup 422 detection).
+          dispatch_isolated_retry() {
+            local dispatch_output dispatch_status
+            if dispatch_output="$(gh workflow run "$RETRY_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" "$@" 2>&1)"; then
+              printf '%s\n' "$dispatch_output"
+              return 0
+            fi
+            dispatch_status=$?
+            printf '%s\n' "$dispatch_output" >&2
+            if [[ -n "${TARGET_CHILD_ID:-}" ]] && [[ "$dispatch_output" == *"422"* ]] && [[ "${dispatch_output,,}" == *"target_child_id"* ]]; then
+              echo "::error::Delegated retry requires retry workflow $RETRY_WORKFLOW to declare a target_child_id workflow_dispatch input; refusing bare retry to preserve the delegated target."
+              return 1
+            fi
+            return "$dispatch_status"
+          }
           if [[ -n "${TARGET_CHILD_ID:-}" ]]; then
-            gh workflow run "$RETRY_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH"             -f pr_number="$PR_NUMBER"             -f expected_head_sha="$HEAD_SHA"             -f retry_attempt="$next"             -f retry_workflow="$RETRY_WORKFLOW"             -f recovery_kind="${CURRENT_RECOVERY_KIND:-review}"             -f target_child_id="$TARGET_CHILD_ID"
+            dispatch_isolated_retry -f pr_number="$PR_NUMBER" -f expected_head_sha="$HEAD_SHA" -f retry_attempt="$next" -f retry_workflow="$RETRY_WORKFLOW" -f recovery_kind="${CURRENT_RECOVERY_KIND:-review}" -f target_child_id="$TARGET_CHILD_ID"
           else
-            gh workflow run "$RETRY_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH"             -f pr_number="$PR_NUMBER"             -f expected_head_sha="$HEAD_SHA"             -f retry_attempt="$next"             -f retry_workflow="$RETRY_WORKFLOW"             -f recovery_kind="${CURRENT_RECOVERY_KIND:-review}"
+            dispatch_isolated_retry -f pr_number="$PR_NUMBER" -f expected_head_sha="$HEAD_SHA" -f retry_attempt="$next" -f retry_workflow="$RETRY_WORKFLOW" -f recovery_kind="${CURRENT_RECOVERY_KIND:-review}"
           fi
           echo "Dispatched isolated PR-Agent retry attempt $next/3 for PR #$PR_NUMBER HEAD $HEAD_SHA."
 
