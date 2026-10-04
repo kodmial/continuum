@@ -179,7 +179,10 @@ jobs:
           fetch_runtime_file ".github/scripts/delegation_repository.sh" "$RUNTIME_ROOT/.github/scripts/delegation_repository.sh"
           fetch_runtime_file ".github/scripts/delegation_runtime.py" "$RUNTIME_ROOT/.github/scripts/delegation_runtime.py"
           PARENT_CONFIG_FILE="$RUNTIME_ROOT/parent.continuum.yml"
-          if ! gh api --method GET "repos/$GITHUB_REPOSITORY/contents/.continuum.yml" -f ref="$CONTINUUM_REF" --jq .content 2>/dev/null \
+          # The parent config lives in the execution repository: fetch its
+          # default branch, never the Continuum engine pin (which may not
+          # exist in the execution repository).
+          if ! gh api --method GET "repos/$GITHUB_REPOSITORY/contents/.continuum.yml" --jq .content 2>/dev/null \
             | tr -d '\n' | continuum_b64_decode > "$PARENT_CONFIG_FILE" 2>/dev/null || [[ ! -s "$PARENT_CONFIG_FILE" ]]; then
             echo "::error::Unable to load the parent Continuum configuration for delegated target resolution; refusing to guess."
             exit 1
@@ -1020,12 +1023,11 @@ jobs:
                 }
                 core.notice('Woke ' + workflow + ' at ' + postMergeWakeupRef + '.');
               } catch (err) {
-                if (targetChildId) {
-                  // Delegated post-merge work must not be silently skipped:
-                  // rethrow so the merge run fails closed instead of
-                  // reporting success without the child post-merge chain.
-                  throw err;
-                }
+                // Post-merge wakeup is best-effort: the merge already
+                // succeeded, so a wakeup failure warns without failing the
+                // merge run. A delegated wakeup is never retried bare: the
+                // explicit refusal above surfaces here as a warning, never
+                // as a parent-targeted dispatch.
                 core.warning(
                   'PR #' + prNumber +
                   ': could not wake ' + workflow + ': ' + err.message

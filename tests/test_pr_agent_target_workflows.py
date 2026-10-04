@@ -99,9 +99,11 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
             resolve.index('if [[ -z "${TARGET_CHILD_ID:-}" ]]; then'),
             resolve.index('CONTINUUM_REF is required for pinned target resolution'),
         )
-        # The parent child-map config resolves from the pinned revision, not
-        # the moving default branch.
-        self.assertIn('contents/.continuum.yml" -f ref="$CONTINUUM_REF"', resolve)
+        # The parent child-map config lives in the execution repository,
+        # whose default branch is fetched: the Continuum engine pin may not
+        # exist there.
+        self.assertIn('contents/.continuum.yml" --jq', resolve)
+        self.assertNotIn('contents/.continuum.yml" -f ref="$CONTINUUM_REF"', resolve)
 
     def test_repair_validates_target_before_checkout(self):
         body = read(".github/workflows/continuum-pr-agent-repair.yml")
@@ -170,9 +172,11 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
         self.assertIn("CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED", resolve)
         self.assertIn("PR-Agent target context resolved locally.", resolve)
         self.assertIn("exit 0", resolve)
-        # The parent child-map config resolves from the pinned revision, not
-        # the moving default branch.
-        self.assertIn('contents/.continuum.yml" -f ref="$CONTINUUM_REF"', resolve)
+        # The parent child-map config lives in the execution repository,
+        # whose default branch is fetched: the Continuum engine pin may not
+        # exist there.
+        self.assertIn('contents/.continuum.yml" --jq', resolve)
+        self.assertNotIn('contents/.continuum.yml" -f ref="$CONTINUUM_REF"', resolve)
         # Concurrency scopes delegated wakeups by the opaque id (input, then
         # repository variable for schedule/workflow_run) while preserving the
         # exact local group string when empty.
@@ -283,8 +287,9 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
         body = read(".github/workflows/continuum-pr-agent-auto-merge.yml")
         self.assertIn("dispatchParams.inputs = { target_child_id: targetChildId }", body)
         # A delegated wakeup whose target workflow rejects the opaque input
-        # fails closed: it refuses the bare retry and rethrows for delegated
-        # runs so the missing child post-merge chain cannot report success.
+        # refuses the bare retry and warns best-effort: the merge already
+        # succeeded, so the run must never fail the merge nor dispatch bare
+        # against the parent execution repository.
         self.assertIn("refusing bare retry to preserve the delegated target", body)
         self.assertIn("if (targetChildId)", body)
         self.assertNotIn("skipping bare retry to preserve the delegated target", body)

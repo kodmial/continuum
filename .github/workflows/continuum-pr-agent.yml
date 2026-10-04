@@ -356,7 +356,10 @@ jobs:
           fetch_runtime_file ".github/scripts/delegation_repository.sh" "$RUNTIME_ROOT/.github/scripts/delegation_repository.sh"
           fetch_runtime_file ".github/scripts/delegation_runtime.py" "$RUNTIME_ROOT/.github/scripts/delegation_runtime.py"
           PARENT_CONFIG_FILE="$RUNTIME_ROOT/parent.continuum.yml"
-          if ! gh api --method GET "repos/$GITHUB_REPOSITORY/contents/.continuum.yml" -f ref="$CONTINUUM_REF" --jq .content 2>/dev/null \
+          # The parent config lives in the execution repository: fetch its
+          # default branch, never the Continuum engine pin (which may not
+          # exist in the execution repository).
+          if ! gh api --method GET "repos/$GITHUB_REPOSITORY/contents/.continuum.yml" --jq .content 2>/dev/null \
             | tr -d '\n' | continuum_b64_decode > "$PARENT_CONFIG_FILE" 2>/dev/null || [[ ! -s "$PARENT_CONFIG_FILE" ]]; then
             echo "::error::Unable to load the parent Continuum configuration for delegated target resolution; refusing to guess."
             exit 1
@@ -1332,6 +1335,7 @@ jobs:
            steps.pragent.outcome == 'failure')
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
+          TAP_PAT: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           HEAD_SHA: ${{ steps.admit.outputs.head_sha }}
           RETRY_ATTEMPT: ${{ steps.stack.outputs.retry_attempt }}
@@ -1341,6 +1345,14 @@ jobs:
           CI_WORKFLOW_NAME: ${{ inputs.ci_workflow_name || vars.CONTINUUM_CI_WORKFLOW_NAME || 'CI' }}
         run: |
           set -euo pipefail
+          # Target-aware revalidation runs wholly PAT-backed (GH_TOKEN is
+          # TAP_PAT) so delegated cross-repository reads succeed. Fail
+          # closed when delegated without PAT instead of masking an auth
+          # failure as stale-cancelled via the revalidation branches below.
+          if [[ "${CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED:-false}" == "true" && -z "${TAP_PAT:-}" ]]; then
+            echo "::error::Delegated PR-Agent retry requires TAP_PAT; refusing to silently cancel."
+            exit 1
+          fi
           attempt="${RETRY_ATTEMPT:-0}"
           [[ "$attempt" =~ ^[0-9]+$ ]] || attempt=0
           case "$RETRY_WORKFLOW" in

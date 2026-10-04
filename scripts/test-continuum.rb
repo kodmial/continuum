@@ -5723,8 +5723,10 @@ class ContinuumTest < Minitest::Test
       assert_includes resolve, 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED'
       assert_includes resolve, 'PR-Agent target context resolved locally.'
       assert_includes resolve, 'exit 0'
-      assert_includes resolve, 'contents/.continuum.yml" -f ref="$CONTINUUM_REF"',
-                        "#{base}: parent config must resolve from the pinned revision, not the moving default branch"
+      assert_includes resolve, 'contents/.continuum.yml" --jq',
+                        "#{base}: parent config must resolve from the execution repository default branch, not the engine pin"
+      refute_includes resolve, 'contents/.continuum.yml" -f ref="$CONTINUUM_REF"',
+                        "#{base}: the engine pin may not exist in the execution repository"
     end
   end
 
@@ -5837,9 +5839,9 @@ class ContinuumTest < Minitest::Test
     assert_includes reconcile, 'sha: reviewedHead',
                     'only the exact reviewed SHA may merge'
     assert_includes merge, 'refusing bare retry to preserve the delegated target',
-                    'delegated wakeups must fail closed instead of skipping the child post-merge chain'
+                     'delegated wakeups must never retry bare against the parent execution repository'
     assert_includes merge, 'if (targetChildId)',
-                    'delegated wakeup failures must propagate instead of warning-and-continuing'
+                     'delegated wakeups must still carry the opaque child id while warning best-effort on failure'
     refute_includes merge, 'skipping bare retry to preserve the delegated target',
                     'a delegated wakeup must never silently skip the child post-merge chain'
   end
@@ -5890,14 +5892,16 @@ class ContinuumTest < Minitest::Test
     refute_nil ref_require, "#{base}: delegated CONTINUUM_REF requirement is missing"
     assert_operator local_guard, :<, ref_require,
                     "#{base}: local runs must exit before CONTINUUM_REF is required"
-    assert_includes resolve, 'CONTINUUM_PR_AGENT_TARGET_REPOSITORY'
-    assert_includes resolve, 'CONTINUUM_PR_AGENT_TARGET_OWNER'
-    assert_includes resolve, 'CONTINUUM_PR_AGENT_TARGET_REPO'
-    assert_includes resolve, 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED'
-    assert_includes resolve, 'PR-Agent target context resolved locally.'
-    assert_includes resolve, 'exit 0'
-    assert_includes resolve, 'contents/.continuum.yml" -f ref="$CONTINUUM_REF"',
-                      "#{base}: parent config must resolve from the pinned revision, not the moving default branch"
+      assert_includes resolve, 'CONTINUUM_PR_AGENT_TARGET_REPOSITORY'
+      assert_includes resolve, 'CONTINUUM_PR_AGENT_TARGET_OWNER'
+      assert_includes resolve, 'CONTINUUM_PR_AGENT_TARGET_REPO'
+      assert_includes resolve, 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED'
+      assert_includes resolve, 'PR-Agent target context resolved locally.'
+      assert_includes resolve, 'exit 0'
+      assert_includes resolve, 'contents/.continuum.yml" --jq',
+                        "#{base}: parent config must resolve from the execution repository default branch, not the engine pin"
+      refute_includes resolve, 'contents/.continuum.yml" -f ref="$CONTINUUM_REF"',
+                        "#{base}: the engine pin may not exist in the execution repository"
 
     reconcile = step_body(body, 'Reconcile PR-Agent latest state')
     refute_nil reconcile, "#{base}: reconciliation step is missing"
