@@ -37,5 +37,35 @@ class AuthoritativeTaskContextTokenContractTest(unittest.TestCase):
         self.assertNotIn('require("@actions/github")', self.resolver)
 
 
+class IssueStartTokenContractTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        body = WORKFLOW.read_text(encoding="utf-8")
+        readiness_start = body.index("- name: Check issue Definition of Ready")
+        readiness_end = body.index("- name: Prepare consumer agent environment", readiness_start)
+        cls.readiness = body[readiness_start:readiness_end]
+
+        guard_start = body.index("- name: Skip duplicate issue implementation")
+        guard_end = body.index("# workflow_dispatch repair modes", guard_start)
+        cls.duplicate_guard = body[guard_start:guard_end]
+
+    def test_readiness_reads_use_repo_token_but_mutations_keep_pat(self):
+        self.assertIn("READ_GITHUB_TOKEN: ${{ github.token }}", self.readiness)
+        self.assertIn("github-token: ${{ secrets.TAP_PAT }}", self.readiness)
+        self.assertIn("new github.constructor({ auth: readToken })", self.readiness)
+        self.assertIn("async function withReadFallback(fn)", self.readiness)
+        self.assertIn("client.rest.issues.get", self.readiness)
+        self.assertIn("client.paginate(", self.readiness)
+        self.assertIn("client.rest.issues.listComments", self.readiness)
+        self.assertIn("github.rest.issues.removeLabel", self.readiness)
+        self.assertIn("github.rest.issues.createComment", self.readiness)
+        self.assertIn("status === 401 || status === 403 || status === 429", self.readiness)
+
+    def test_duplicate_guard_is_same_repo_read_only_on_repo_token(self):
+        self.assertIn("GH_TOKEN: ${{ github.token }}", self.duplicate_guard)
+        self.assertNotIn("GH_TOKEN: ${{ secrets.TAP_PAT }}", self.duplicate_guard)
+        self.assertIn("gh pr list", self.duplicate_guard)
+
+
 if __name__ == "__main__":
     unittest.main()
