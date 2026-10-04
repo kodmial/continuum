@@ -124,7 +124,11 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
         self.assertIn("const repoFullName = process.env.CONTINUUM_PR_AGENT_TARGET_REPOSITORY;", body)
         self.assertIn("owner: executionOwner", body)
         self.assertIn("repo: executionRepo", body)
-        self.assertIn("Delegated PR conflict repair needs the parent routing controller", body)
+        # Delegated conflicts dispatch target-aware repair in the parent
+        # execution repository with the opaque child id; the repair
+        # workflow resolves the child target runner-local.
+        self.assertIn("workflow_id: 'continuum-pr-agent-repair.yml'", body)
+        self.assertIn("target_child_id: targetChildId", body)
 
     def test_recovery_reads_target_but_dispatches_parent_workflow(self):
         body = read(".github/workflows/continuum-pr-agent-recovery.yml")
@@ -225,9 +229,12 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
         self.assertIn("target_child_id:", body)
         self.assertNotIn("target_repository:", body)
         self.assertIn("CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED", body)
-        # Privacy: delegated conflict tooling never dispatches into the
-        # child; the failure stays explicit instead of leaking a local run.
-        self.assertIn("Delegated PR conflict repair needs the parent routing controller", body)
+        # Privacy: delegated conflict repair dispatches target-aware in the
+        # parent execution repository with the opaque child id, never a
+        # target-local run in the child.
+        self.assertIn("workflow_id: 'continuum-pr-agent-repair.yml'", body)
+        self.assertIn("target_child_id: targetChildId", body)
+        self.assertIn("dispatched delegated conflict repair via parent", body)
 
 
 if __name__ == "__main__":

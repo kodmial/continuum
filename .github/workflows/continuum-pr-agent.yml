@@ -325,12 +325,25 @@ jobs:
             exit 0
           fi
           : "${CONTINUUM_REF:?CONTINUUM_REF is required for pinned target resolution}"
+          continuum_b64_decode() {
+            if printf '' | base64 --decode >/dev/null 2>&1; then
+              base64 --decode
+            elif printf '' | base64 -d >/dev/null 2>&1; then
+              base64 -d
+            elif printf '' | base64 -D >/dev/null 2>&1; then
+              base64 -D
+            elif command -v python3 >/dev/null 2>&1; then
+              python3 -c 'import sys,base64; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))'
+            else
+              openssl base64 -d
+            fi
+          }
           RUNTIME_ROOT="$RUNNER_TEMP/continuum-pr-agent-target-runtime"
           mkdir -p "$RUNTIME_ROOT/.github/scripts"
           fetch_runtime_file() {
             local path="$1" dest="$2"
             if ! gh api --method GET "repos/$CONTINUUM_SOURCE_REPO/contents/$path" -f ref="$CONTINUUM_REF" --jq .content 2>/dev/null \
-              | tr -d '\n' | base64 --decode > "$dest" 2>/dev/null; then
+              | tr -d '\n' | continuum_b64_decode > "$dest" 2>/dev/null; then
               echo "::error::Unable to load the Continuum PR-Agent target resolver."
               exit 1
             fi
@@ -344,7 +357,7 @@ jobs:
           fetch_runtime_file ".github/scripts/delegation_runtime.py" "$RUNTIME_ROOT/.github/scripts/delegation_runtime.py"
           PARENT_CONFIG_FILE="$RUNTIME_ROOT/parent.continuum.yml"
           if ! gh api --method GET "repos/$GITHUB_REPOSITORY/contents/.continuum.yml" --jq .content 2>/dev/null \
-            | tr -d '\n' | base64 --decode > "$PARENT_CONFIG_FILE" 2>/dev/null; then
+            | tr -d '\n' | continuum_b64_decode > "$PARENT_CONFIG_FILE" 2>/dev/null; then
             printf 'version: 1\n' > "$PARENT_CONFIG_FILE"
           fi
           CONTINUUM_ENGINE_ROOT="$RUNTIME_ROOT" PARENT_CONFIG="$PARENT_CONFIG_FILE" \
@@ -578,6 +591,19 @@ jobs:
           CONTINUUM_REF: ${{ inputs.continuum_ref }}
         run: |
           set -euo pipefail
+          continuum_b64_decode() {
+            if printf '' | base64 --decode >/dev/null 2>&1; then
+              base64 --decode
+            elif printf '' | base64 -d >/dev/null 2>&1; then
+              base64 -d
+            elif printf '' | base64 -D >/dev/null 2>&1; then
+              base64 -D
+            elif command -v python3 >/dev/null 2>&1; then
+              python3 -c 'import sys,base64; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))'
+            else
+              openssl base64 -d
+            fi
+          }
           RUNTIME_ROOT="$RUNNER_TEMP/continuum-pr-agent-runtime"
           BRIDGE_SCRIPT="$RUNTIME_ROOT/.github/scripts/pr_agent_bridge.py"
           POLICY_SCRIPT="$RUNTIME_ROOT/.github/scripts/pr_agent_policy.js"
@@ -586,19 +612,19 @@ jobs:
           gh api --method GET \
             "repos/kodmial/continuum/contents/.github/scripts/pr_agent_bridge.py" \
             -f ref="$CONTINUUM_REF" --jq .content \
-            | tr -d '\n' | base64 --decode > "$BRIDGE_SCRIPT"
+            | tr -d '\n' | continuum_b64_decode > "$BRIDGE_SCRIPT"
           gh api --method GET \
             "repos/kodmial/continuum/contents/src/continuum/pr_agent.py" \
             -f ref="$CONTINUUM_REF" --jq .content \
-            | tr -d '\n' | base64 --decode > "$RUNTIME_ROOT/src/continuum/pr_agent.py"
+            | tr -d '\n' | continuum_b64_decode > "$RUNTIME_ROOT/src/continuum/pr_agent.py"
           gh api --method GET \
             "repos/kodmial/continuum/contents/.github/scripts/pr_agent_policy.js" \
             -f ref="$CONTINUUM_REF" --jq .content \
-            | tr -d '\n' | base64 --decode > "$POLICY_SCRIPT"
+            | tr -d '\n' | continuum_b64_decode > "$POLICY_SCRIPT"
           gh api --method GET \
             "repos/kodmial/continuum/contents/src/continuum/pr_agent_fallback_state.py" \
             -f ref="$CONTINUUM_REF" --jq .content \
-            | tr -d '\n' | base64 --decode > "$FALLBACK_SCRIPT"
+            | tr -d '\n' | continuum_b64_decode > "$FALLBACK_SCRIPT"
           : > "$RUNTIME_ROOT/src/continuum/__init__.py"
           PYTHONPATH="$RUNTIME_ROOT/src" python3 -m py_compile \
             "$BRIDGE_SCRIPT" "$RUNTIME_ROOT/src/continuum/pr_agent.py" "$FALLBACK_SCRIPT"
