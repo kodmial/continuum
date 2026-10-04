@@ -218,7 +218,7 @@ function logicalFingerprint(items) {
 }
 
 function buildRepairBatch(reviewPayload, improveJsonl, threshold = IMPROVE_REPAIR_THRESHOLD) {
-  const review = reviewPayload && reviewPayload.review ? reviewPayload.review : reviewPayload;
+  const review = unwrapReview(reviewPayload);
   if (!review || typeof review !== 'object' || !Array.isArray(review.key_issues_to_review)) {
     throw new Error('PR-Agent review JSON has no key_issues_to_review list.');
   }
@@ -456,6 +456,47 @@ function hasIncompleteCoverageSignal(reviewPayload) {
   return false;
 }
 
+function coverageSingleValueIsIncomplete(key, value) {
+  if (COVERAGE_FLAG_KEYS.includes(key)) {
+    return coverageFlagValueIsIncomplete(key, value);
+  }
+  if (COVERAGE_OBJECT_KEYS.includes(key)) {
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      const reviewed = value.reviewed !== undefined ? value.reviewed : value.reviewed_chunks;
+      const total = value.total !== undefined ? value.total : value.total_chunks;
+      const hasReviewedKey = value.reviewed !== undefined || value.reviewed_chunks !== undefined;
+      const hasTotalKey = value.total !== undefined || value.total_chunks !== undefined;
+      const reviewedNum = reviewed === undefined || reviewed === null || reviewed === '' ? null : Number(reviewed);
+      const totalNum = total === undefined || total === null || total === '' ? null : Number(total);
+      const hasCountSignal = hasReviewedKey || hasTotalKey;
+      const hasFlagSignal = COVERAGE_FLAG_KEYS.some((flagKey) => flagKey in value);
+      if (hasCountSignal) {
+        if (reviewedNum === null || totalNum === null || !Number.isFinite(reviewedNum) || !Number.isFinite(totalNum)) {
+          return true;
+        }
+        if (totalNum <= 0 || reviewedNum < totalNum) return true;
+      }
+      for (const flagKey of COVERAGE_FLAG_KEYS) {
+        if (flagKey in value && coverageFlagValueIsIncomplete(flagKey, value[flagKey])) {
+          return true;
+        }
+      }
+      if (!hasCountSignal && !hasFlagSignal) return true;
+      return false;
+    }
+    if (typeof value === 'string') {
+      const lowered = value.trim().toLowerCase();
+      if (!lowered) return false;
+      const mentionsGap =
+        lowered.includes('partial') || lowered.includes('incomplete') || lowered.includes('truncated');
+      const claimsComplete = lowered.replace(/incomplete/g, '').includes('complete');
+      return mentionsGap && !claimsComplete;
+    }
+    return false;
+  }
+  return false;
+}
+
 function unwrapReview(reviewPayload) {
   if (!reviewPayload || typeof reviewPayload !== 'object' || Array.isArray(reviewPayload)) {
     throw new Error('PR-Agent review JSON must be an object.');
@@ -463,28 +504,110 @@ function unwrapReview(reviewPayload) {
   const nested = reviewPayload.review;
   const nestedIsObject =
     nested && typeof nested === 'object' && !Array.isArray(nested);
-  if (nestedIsObject) {
-    // A top-level review payload may itself contain a `review` object
-    // field: only unwrap the envelope when the top level does not already
-    // carry review fields. Otherwise unwrapping would discard
-    // `key_issues_to_review`/`merge_recommendation`/security signals and
-    // decide skip on the nested object. Tool-error and coverage signals
-    // live at the top level of split envelopes too, so they also pin the
-    // outer payload; otherwise unwrapping would drop a top-level
-    // `tool_errors`/`coverage` signal and read clean.
-    if (
-      'key_issues_to_review' in reviewPayload ||
-      'merge_recommendation' in reviewPayload ||
-      BLOCKING_SECURITY_SIGNAL_KEYS.some((key) => key in reviewPayload) ||
-      TOOL_ERROR_SIGNAL_KEYS.some((key) => key in reviewPayload) ||
-      COVERAGE_FLAG_KEYS.some((key) => key in reviewPayload) ||
-      COVERAGE_OBJECT_KEYS.some((key) => key in reviewPayload)
-    ) {
-      return reviewPayload;
-    }
+  if (!nestedIsObject) {
+    return reviewPayload;
+  }
+  const outerHasSignal =
+    'key_issues_to_review' in reviewPayload ||
+    'merge_recommendation' in reviewPayload ||
+    BLOCKING_SECURITY_SIGNAL_KEYS.some((key) => key in reviewPayload) ||
+    TOOL_ERROR_SIGNAL_KEYS.some((key) => key in reviewPayload) ||
+    COVERAGE_FLAG_KEYS.some((key) => key in reviewPayload) ||
+    COVERAGE_OBJECT_KEYS.some((key) => key in reviewPayload);
+  if (!outerHasSignal) {
     return nested;
   }
-  return reviewPayload;
+  // Split envelope: signals are divided between the outer payload and the
+  // nested `review` object. Returning only one side discards the other:
+  // `{coverage_complete: true, review: {key_issues...}}` would miss the
+  // nested findings, and `{key_issues: [], review: {security_concerns:
+  // ...}}` would miss nested blocking security. Merge both sides
+  // fail-closed so no finding, recommendation, security, tool-error, or
+  // coverage signal is lost.
+  const merged = {};
+  for (const [key, value] of Object.entries(nested)) {
+    if (key === 'review') continue;
+    merged[key] = value;
+  }
+  for (const [key, value] of Object.entries(reviewPayload)) {
+    if (key === 'review') continue;
+    if (!(key in merged)) {
+      merged[key] = value;
+      continue;
+    }
+    const current = merged[key];
+    if (key === 'key_issues_to_review') {
+      const currentIsList = Array.isArray(current);
+      const outerIsList = Array.isArray(value);
+      if (currentIsList && outerIsList) {
+        merged[key] = [...value, ...current];
+      } else if (!currentIsList) {
+        // Keep the non-list so callers fail closed on invalid shape
+        // instead of silently reading the clean side.
+      } else {
+        // Outer is non-list while nested is a list: surface the invalid
+        // shape so validation throws rather than reading clean.
+        merged[key] = value;
+      }
+      continue;
+    }
+    if (key === 'merge_recommendation') {
+      const currentText = String(current || '').trim();
+      const outerText = String(value || '').trim();
+      if (!currentText) {
+        merged[key] = value;
+      } else if (!outerText) {
+        // Keep the present recommendation.
+      } else if (currentText !== outerText) {
+        // Most restrictive wins: any non-safe recommendation blocks.
+        if (currentText === REVIEW_MERGE_SAFE && outerText !== REVIEW_MERGE_SAFE) {
+          merged[key] = value;
+        }
+      }
+      continue;
+    }
+    if (
+      BLOCKING_SECURITY_SIGNAL_KEYS.includes(key) ||
+      TOOL_ERROR_SIGNAL_KEYS.includes(key)
+    ) {
+      // Either side blocking must block the merged view.
+      if (!securityValueIsBlocking(current) && securityValueIsBlocking(value)) {
+        merged[key] = value;
+      }
+      continue;
+    }
+    if (COVERAGE_FLAG_KEYS.includes(key) || COVERAGE_OBJECT_KEYS.includes(key)) {
+      // Either side incomplete must read as incomplete.
+      const currentIncomplete = coverageSingleValueIsIncomplete(key, current);
+      const outerIncomplete = coverageSingleValueIsIncomplete(key, value);
+      if (outerIncomplete && !currentIncomplete) {
+        merged[key] = value;
+      } else if (!currentIncomplete && !outerIncomplete) {
+        if (
+          current &&
+          typeof current === 'object' &&
+          !Array.isArray(current) &&
+          value &&
+          typeof value === 'object' &&
+          !Array.isArray(value)
+        ) {
+          merged[key] = { ...current, ...value };
+          // Re-check the shallow merge: if either original was incomplete
+          // the branch above already kept it, so a complete+complete merge
+          // stays complete unless the combination itself is incomplete.
+          if (coverageSingleValueIsIncomplete(key, merged[key])) {
+            // Keep the merged incomplete object (fail closed).
+          }
+        } else {
+          merged[key] = value;
+        }
+      }
+      // Else keep the incomplete current value (fail closed).
+      continue;
+    }
+    merged[key] = value;
+  }
+  return merged;
 }
 
 function hasBlockingSecuritySignal(reviewPayload) {

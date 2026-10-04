@@ -473,6 +473,33 @@ jobs:
           PYTHONPATH="$RUNTIME_ROOT/src" python3 -m py_compile \
             "$BRIDGE_SCRIPT" "$RUNTIME_ROOT/src/continuum/pr_agent.py"
           node --check "$POLICY_SCRIPT"
+          # Policy-bundle sync: the gate/route/threshold steps below require
+          # these exports with fail-closed semantics. Validate immediately so
+          # a stale bundle (CONTINUUM_REF predating the improve-skip policy)
+          # fails closed here with a clear message instead of throwing in the
+          # gate and blocking all admitted HEADs.
+          POLICY_SCRIPT="$POLICY_SCRIPT" node -e '
+            const p = require(process.env.POLICY_SCRIPT);
+            for (const key of [
+              "IMPROVE_REPAIR_THRESHOLD",
+              "isCleanReviewForImproveSkip",
+              "hasIncompleteCoverageSignal",
+              "hasToolErrorSignal",
+              "hasBlockingSecuritySignal",
+              "isSkippedCleanImprovePayload",
+              "qualifyingImproveSuggestions",
+              "unwrapReview"
+            ]) {
+              if (p[key] === undefined) {
+                console.error("::error::Continuum PR-Agent policy bundle is missing export: " + key);
+                process.exit(1);
+              }
+            }
+            if (!/^[0-9]+$/.test(String(p.IMPROVE_REPAIR_THRESHOLD))) {
+              console.error("::error::Invalid centralized PR-Agent improve threshold in policy bundle.");
+              process.exit(1);
+            }
+          '
           echo "bridge_script=$BRIDGE_SCRIPT" >> "$GITHUB_OUTPUT"
           echo "policy_script=$POLICY_SCRIPT" >> "$GITHUB_OUTPUT"
 
@@ -641,6 +668,7 @@ jobs:
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           REVIEWED_SHA: ${{ steps.before.outputs.sha }}
           REVIEW_JSON: ${{ steps.pragent.outputs.review }}
+          POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
         with:
           # Pure same-repository read-only revalidation (pulls.get for the
           # current PR head only). Repository token is sufficient.
@@ -672,7 +700,15 @@ jobs:
               core.setFailed(`Upstream PR-Agent review output is invalid JSON: ${err.message}`);
               return;
             }
-            const inner = review.review || review;
+            // Split envelopes carry signals on both sides: merge fail-closed
+            // via the centralized policy so no finding is lost.
+            let inner;
+            try {
+              inner = require(process.env.POLICY_SCRIPT).unwrapReview(review);
+            } catch (err) {
+              core.setFailed(err.message);
+              return;
+            }
             if (!inner || typeof inner !== 'object' || !Array.isArray(inner.key_issues_to_review)) {
               core.setFailed('Upstream PR-Agent review output does not match the expected PRReview schema.');
               return;
@@ -736,8 +772,26 @@ jobs:
                   review = json.loads(os.environ.get("REVIEW_JSON", ""))
               except json.JSONDecodeError as exc:
                   raise SystemExit(f"Cannot validate review without persistent state: {exc}")
-              inner = review.get("review", review) if isinstance(review, dict) else None
-              findings = inner.get("key_issues_to_review") if isinstance(inner, dict) else None
+              # Split envelopes carry findings on both sides: merge
+              # fail-closed (union) so no actionable finding is dropped from
+              # the derived fallback state.
+              if not isinstance(review, dict):
+                  raise SystemExit(
+                      "Structured review has no key_issues_to_review list; cannot derive fallback state."
+                  )
+              outer_findings = review.get("key_issues_to_review")
+              nested = review.get("review")
+              nested_findings = nested.get("key_issues_to_review") if isinstance(nested, dict) else None
+              if outer_findings is None:
+                  findings = nested_findings
+              elif nested_findings is None:
+                  findings = outer_findings
+              elif isinstance(outer_findings, list) and isinstance(nested_findings, list):
+                  findings = [*outer_findings, *nested_findings]
+              elif isinstance(outer_findings, list):
+                  findings = nested_findings
+              else:
+                  findings = outer_findings
               if not isinstance(findings, list):
                   raise SystemExit(
                       "Structured review has no key_issues_to_review list; cannot derive fallback state."
@@ -1159,7 +1213,15 @@ jobs:
           script: |
             const policy = require(process.env.POLICY_SCRIPT);
             const review = JSON.parse(String(process.env.REVIEW_JSON || ''));
-            const inner = review.review || review;
+            // Split envelopes share the merged helper: checking only one
+            // side would miss nested findings or nested blocking security.
+            let inner;
+            try {
+              inner = policy.unwrapReview(review);
+            } catch (err) {
+              core.setFailed(err.message);
+              return;
+            }
             const keyIssues = Array.isArray(inner.key_issues_to_review)
               ? inner.key_issues_to_review
               : [];

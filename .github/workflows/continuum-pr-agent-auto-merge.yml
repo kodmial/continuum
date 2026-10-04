@@ -127,6 +127,26 @@ jobs:
             -f ref="$CONTINUUM_REF" --jq .content \
             | tr -d '\n' | base64 --decode > "$POLICY_SCRIPT"
           node --check "$POLICY_SCRIPT"
+          # Policy-bundle sync: the merge gate requires these exports with
+          # fail-closed semantics (mirrors GateInputs.improve_skipped_clean).
+          # Validate now so a stale bundle fails closed here instead of
+          # throwing in the gate and blocking the exact HEAD.
+          POLICY_SCRIPT="$POLICY_SCRIPT" node -e '
+            const p = require(process.env.POLICY_SCRIPT);
+            for (const key of [
+              "unwrapReview",
+              "qualifyingImproveSuggestions",
+              "isSkippedCleanImprovePayload",
+              "hasToolErrorSignal",
+              "hasIncompleteCoverageSignal",
+              "hasBlockingSecuritySignal"
+            ]) {
+              if (typeof p[key] !== "function") {
+                console.error("::error::Continuum PR-Agent policy bundle is missing export: " + key);
+                process.exit(1);
+              }
+            }
+          '
           echo "policy_script=$POLICY_SCRIPT" >> "$GITHUB_OUTPUT"
 
       - name: Evaluate the exact-head PR-Agent gate

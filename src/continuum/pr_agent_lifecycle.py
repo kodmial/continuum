@@ -190,7 +190,9 @@ def parse_review_json(payload: object) -> Dict[str, Any]:
             raise LifecycleError(f"PR-Agent review JSON is invalid: {exc}") from None
     if not isinstance(payload, dict):
         raise LifecycleError("PR-Agent review JSON must be an object")
-    review = payload.get("review", payload)
+    # Merge split envelopes fail-closed so outer and nested findings are
+    # both preserved (see _unwrap_review).
+    review = _unwrap_review(payload)
     if not isinstance(review, dict):
         raise LifecycleError("PR-Agent review JSON has no review object")
     if "key_issues_to_review" not in review:
@@ -479,29 +481,141 @@ def has_incomplete_coverage_signal(review: Mapping[str, Any]) -> bool:
     return False
 
 
+def _coverage_single_value_is_incomplete(key: str, value: object) -> bool:
+    """Whether one coverage key/value pair alone reports incomplete coverage."""
+
+    if key in _COVERAGE_FLAG_KEYS:
+        return _coverage_flag_value_is_incomplete(key, value)
+    if key in _COVERAGE_OBJECT_KEYS:
+        if isinstance(value, Mapping):
+            has_reviewed_key = "reviewed" in value or "reviewed_chunks" in value
+            has_total_key = "total" in value or "total_chunks" in value
+            reviewed = value.get("reviewed", value.get("reviewed_chunks"))
+            total = value.get("total", value.get("total_chunks"))
+            try:
+                reviewed_num = float(reviewed) if reviewed is not None else None
+            except (TypeError, ValueError):
+                reviewed_num = None
+            try:
+                total_num = float(total) if total is not None else None
+            except (TypeError, ValueError):
+                total_num = None
+            has_count_signal = has_reviewed_key or has_total_key
+            has_flag_signal = any(flag_key in value for flag_key in _COVERAGE_FLAG_KEYS)
+            if has_count_signal:
+                if reviewed_num is None or total_num is None:
+                    return True
+                if (
+                    reviewed_num != reviewed_num
+                    or total_num != total_num
+                    or reviewed_num in (float("inf"), float("-inf"))
+                    or total_num in (float("inf"), float("-inf"))
+                ):
+                    return True
+                if total_num <= 0 or reviewed_num < total_num:
+                    return True
+            for flag_key in _COVERAGE_FLAG_KEYS:
+                if flag_key in value and _coverage_flag_value_is_incomplete(
+                    flag_key, value.get(flag_key)
+                ):
+                    return True
+            if not has_count_signal and not has_flag_signal:
+                return True
+            return False
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if not lowered:
+                return False
+            return any(
+                word in lowered for word in ("partial", "incomplete", "truncated")
+            ) and "complete" not in lowered.replace("incomplete", "")
+        return False
+    return False
+
+
 def _unwrap_review(review: Mapping[str, Any]) -> Mapping[str, Any]:
     """Accept the canonical review payload in either envelope shape.
 
     The GitHub Action output may be the flat PRReview object or
     `{"review": <PRReview>}`; both are canonical machine sources.
+    Split envelopes carry signals on both sides, so both sides are
+    merged fail-closed: returning only the outer object would discard
+    nested findings (breaking the clean fast path) or miss nested
+    blocking security (failing open).
     """
 
-    if isinstance(review, Mapping):
-        inner = review.get("review", None)
-        if isinstance(inner, dict):
-            if (
-                "key_issues_to_review" in review
-                or "merge_recommendation" in review
-                or any(key in review for key in BLOCKING_SECURITY_SIGNAL_KEYS)
-                or any(key in review for key in _TOOL_ERROR_SIGNAL_KEYS)
-                or any(key in review for key in _COVERAGE_FLAG_KEYS)
-                or any(key in review for key in _COVERAGE_OBJECT_KEYS)
-            ):
-                return review
-            return inner
     if not isinstance(review, Mapping):
         raise LifecycleError("PR-Agent review JSON must be an object")
-    return review
+    inner = review.get("review", None)
+    if not isinstance(inner, dict):
+        return review
+    outer_has_signal = (
+        "key_issues_to_review" in review
+        or "merge_recommendation" in review
+        or any(key in review for key in BLOCKING_SECURITY_SIGNAL_KEYS)
+        or any(key in review for key in _TOOL_ERROR_SIGNAL_KEYS)
+        or any(key in review for key in _COVERAGE_FLAG_KEYS)
+        or any(key in review for key in _COVERAGE_OBJECT_KEYS)
+    )
+    if not outer_has_signal:
+        return inner
+    merged: Dict[str, Any] = {
+        key: value for key, value in inner.items() if key != "review"
+    }
+    for key, value in review.items():
+        if key == "review":
+            continue
+        if key not in merged:
+            merged[key] = value
+            continue
+        current = merged[key]
+        if key == "key_issues_to_review":
+            current_is_list = isinstance(current, list)
+            outer_is_list = isinstance(value, list)
+            if current_is_list and outer_is_list:
+                merged[key] = [*value, *current]
+            elif not current_is_list:
+                # Keep the non-list so callers fail closed on invalid
+                # shape instead of silently reading the clean side.
+                pass
+            else:
+                # Outer is non-list while nested is a list: surface the
+                # invalid shape so validation throws (fail closed).
+                merged[key] = value
+            continue
+        if key == "merge_recommendation":
+            current_text = str(current or "").strip()
+            outer_text = str(value or "").strip()
+            if not current_text:
+                merged[key] = value
+            elif not outer_text:
+                pass
+            elif current_text != outer_text:
+                # Most restrictive wins: any non-safe blocks.
+                if current_text == REVIEW_MERGE_SAFE and outer_text != REVIEW_MERGE_SAFE:
+                    merged[key] = value
+            continue
+        if key in BLOCKING_SECURITY_SIGNAL_KEYS or key in _TOOL_ERROR_SIGNAL_KEYS:
+            # Either side blocking must block the merged view.
+            if not _security_value_is_blocking(current) and _security_value_is_blocking(value):
+                merged[key] = value
+            continue
+        if key in _COVERAGE_FLAG_KEYS or key in _COVERAGE_OBJECT_KEYS:
+            # Either side incomplete must read as incomplete.
+            current_incomplete = _coverage_single_value_is_incomplete(key, current)
+            outer_incomplete = _coverage_single_value_is_incomplete(key, value)
+            if outer_incomplete and not current_incomplete:
+                merged[key] = value
+            elif not current_incomplete and not outer_incomplete:
+                if isinstance(current, Mapping) and isinstance(value, Mapping):
+                    combined = {**current, **value}
+                    merged[key] = combined
+                else:
+                    merged[key] = value
+            # Else keep the incomplete current value (fail closed).
+            continue
+        merged[key] = value
+    return merged
 
 
 def has_blocking_security_signal(review: Mapping[str, Any]) -> bool:
