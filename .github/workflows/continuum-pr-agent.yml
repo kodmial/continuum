@@ -125,18 +125,29 @@ permissions:
   statuses: read
 
 # Orchestration serialization (issue #227): this reusable layer owns the only
-# authoritative per-PR serialization for PR-Agent operations. Callers carry
+# authoritative per-PR serialization for PR-Agent operations. The
+# workflow-level group below serializes the whole run, including the
+# downstream repair/merge wrappers that consume `admitted` outputs, so a
+# stale run past `pr_agent` can never run its downstream jobs in parallel
+# with the new run (no duplicate publish/auto-merge races). Callers carry
 # no concurrency block so no-op issue_comment runs can never queue ahead of
-# useful exact-HEAD work. Review work below is cancellable per PR so a newer
-# HEAD supersedes stale work; repair publication keeps its own
+# useful exact-HEAD work. There is no unconditional preemption: an
+# out-of-order or duplicate old-HEAD event must never cancel newer
+# exact-HEAD work, and same-HEAD duplicates coalesce instead of
+# cancelling/restarting. Staleness is decided by exact-HEAD comparison only
+# (stale_review_may_be_cancelled): the admission expected-HEAD check, the
+# before/after review revalidation, and the retry-backoff HEAD recheck below
+# implement that predicate. Repair publication keeps its own
 # non-cancellable per-PR-HEAD group in continuum-pr-agent-repair.yml and is
-# never part of the cancellable review group.
+# never part of any cancellable review group
+# (repair_is_protected_from_review_preemption).
+
+concurrency:
+  group: pr-agent-${{ github.event.issue.number || github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || inputs.pr_number || github.run_id }}
+  cancel-in-progress: false
 
 jobs:
   pr_agent:
-    concurrency:
-      group: pr-agent-${{ github.event.issue.number || github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || inputs.pr_number || github.run_id }}
-      cancel-in-progress: true
     runs-on: ubuntu-latest
     timeout-minutes: ${{ fromJSON(vars.AUTOMATION_PR_AGENT_TIMEOUT_MINUTES || '60') }}
     outputs:
