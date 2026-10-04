@@ -1819,6 +1819,39 @@ class ContinuumTest < Minitest::Test
                     'commit-status publishing must stay PAT-backed'
   end
 
+  # kodmial/continuum#239: the dogfood PR-Agent caller is a direct caller
+  # of the reusable PR-Agent workflow, just like the installed caller stub.
+  # An explicitly-scoped caller leaves unspecified permissions as none, and a
+  # called reusable workflow cannot elevate that token, so the dogfood caller
+  # must grant every permission the reusable workflow requires. The stub-only
+  # contract in test_callers_grant_required_permissions cannot see this file.
+  def test_pr_agent_dogfood_caller_grants_required_permissions
+    reusable = yaml(File.join(ROOT, '.github/workflows/continuum-pr-agent.yml'))
+    stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-pr-agent.yml'))
+    caller = yaml(File.join(ROOT, '.github/workflows/pr-agent.yml'))
+    rank = { 'none' => 0, 'read' => 1, 'write' => 2 }
+
+    permissions = caller.fetch('permissions')
+    ([reusable['permissions']] + reusable['jobs'].values.map { |job| job['permissions'] }).compact.each do |required|
+      required.each do |key, value|
+        assert_operator rank.fetch(permissions.fetch(key, 'none')), :>=, rank.fetch(value),
+                        "pr-agent.yml dogfood caller: #{key} grants #{permissions.fetch(key, 'none')}, needs #{value}"
+      end
+    end
+
+    # The exact-HEAD admission reads Actions runs under github.token: least
+    # privilege is read, never write, and never absent.
+    assert_equal 'read', permissions.fetch('actions'),
+                 'pr-agent.yml dogfood caller must grant actions:read because reusable workflows cannot elevate GITHUB_TOKEN'
+    refute_equal 'write', permissions.fetch('actions'),
+                 'pr-agent.yml dogfood caller must not widen to actions:write'
+
+    # The stub and the dogfood caller call the same reusable workflow, so
+    # their permission grants must not diverge again.
+    assert_equal stub.fetch('permissions'), permissions,
+                 'pr-agent.yml dogfood caller and continuum-pr-agent.yml stub must grant the same permissions'
+  end
+
   # kodmial/continuum#229: ordinary PR comments must not create heavy
   # PR-Agent workflow runs. The heavy entry workflows are dispatch-only;
   # explicit `/review` is routed through a thin router that validates the
