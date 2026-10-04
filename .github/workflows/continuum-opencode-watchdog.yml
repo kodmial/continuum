@@ -90,6 +90,11 @@ jobs:
     timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || vars.AUTOMATION_WATCHDOG_TIMEOUT_MINUTES || '5') }}
 
     permissions:
+      # Same-repository reads below run on READ_GITHUB_TOKEN (`github.token`),
+      # so they honour these job permissions (unlike PAT reads): issues for
+      # issues.get/listForRepo/listComments, pull-requests for pulls.list, and
+      # actions for listWorkflowRunsForRepo. The caller stub must grant at
+      # least the same scopes.
       actions: read
       contents: read
       issues: write
@@ -103,6 +108,7 @@ jobs:
       PAUSE_LABEL: ${{ inputs.pause_marker || vars.AUTOMATION_PAUSE_LABEL || 'automation:paused' }}
       DISPATCH_MARKER: ${{ inputs.dispatch_marker || vars.AUTOMATION_DISPATCH_MARKER || '<!-- issue-scheduler-dispatch -->' }}
       PAUSE_ON_FAILURE: ${{ inputs.pause_on_failure || vars.AUTOMATION_PAUSE_ON_FAILURE || 'true' }}
+      READ_GITHUB_TOKEN: ${{ github.token }}
 
     steps:
       - name: Recover failed OpenCode issue run
@@ -125,6 +131,39 @@ jobs:
             const pauseOnFailure =
               (process.env.PAUSE_ON_FAILURE || 'true') !== 'false';
 
+            // Use the repository-scoped token for same-repository reads.
+            // Keep the github-script action client PAT-authenticated below for
+            // label/comment writes whose PAT actor intentionally fans out events.
+            const readToken = String(process.env.READ_GITHUB_TOKEN || '').trim();
+            if (!readToken) {
+              throw new Error(
+                'READ_GITHUB_TOKEN is required for same-repository watchdog reads.'
+              );
+            }
+            const readGithub = new github.constructor({
+              auth: readToken,
+              baseUrl: github.request.endpoint.DEFAULTS.baseUrl,
+            });
+            // github-script supplies the plugin-composed Octokit class, so
+            // reusing its constructor keeps the `paginate`/`rest` plugins
+            // (dynamically requiring `@actions/github` is not resolvable from
+            // the script sandbox). Confirm the composition at runtime so a
+            // future actions/github-script upgrade that returns a bare core
+            // fails fast here instead of mid-recovery with
+            // `readGithub.paginate is not a function`.
+            if (
+              typeof readGithub.paginate !== 'function' ||
+              typeof readGithub.rest?.issues?.get !== 'function' ||
+              typeof readGithub.rest?.issues?.listForRepo !== 'function' ||
+              typeof readGithub.rest?.issues?.listComments !== 'function' ||
+              typeof readGithub.rest?.pulls?.list !== 'function' ||
+              typeof readGithub.rest?.actions?.listWorkflowRunsForRepo !== 'function'
+            ) {
+              throw new Error(
+                'readGithub client lacks the paginate/rest plugins; ' +
+                'cannot perform same-repository watchdog reads.'
+              );
+            }
             let issueNumber = null;
             // Consumers that give their OpenCode caller a `run-name` of
             // `OpenCode issue #<n>` get an exact, unambiguous issue number here.
@@ -137,8 +176,8 @@ jobs:
               // Without a `run-name`, GitHub uses the issue title as
               // display_title. Only accept an exact, unique open-issue match so
               // an unrelated run can never be mapped onto an issue.
-              const openIssues = await github.paginate(
-                github.rest.issues.listForRepo,
+              const openIssues = await readGithub.paginate(
+                readGithub.rest.issues.listForRepo,
                 {
                   owner,
                   repo,
@@ -173,7 +212,7 @@ jobs:
               'stale',
             ]);
 
-            const issueResponse = await github.rest.issues.get({
+            const issueResponse = await readGithub.rest.issues.get({
               owner,
               repo,
               issue_number: issueNumber,
@@ -223,7 +262,7 @@ jobs:
             const declaredOpenBlockers = [];
             for (const blockerNumber of declaredDependencyNumbers) {
               if (blockerNumber === issueNumber) continue;
-              const blocker = await github.rest.issues.get({
+              const blocker = await readGithub.rest.issues.get({
                 owner,
                 repo,
                 issue_number: blockerNumber,
@@ -252,7 +291,7 @@ jobs:
             // Native GitHub issue dependencies are authoritative. A cancelled
             // or failed run for an issue that is currently blocked must not be
             // resurrected by the watchdog before its blockers are completed.
-            const blockers = await github.paginate(
+            const blockers = await readGithub.paginate(
               'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
               {
                 owner,
@@ -299,7 +338,7 @@ jobs:
 
             // If OpenCode managed to create a PR before the workflow failed,
             // that PR is authoritative. Do not start another implementation.
-            const pulls = await github.paginate(github.rest.pulls.list, {
+            const pulls = await readGithub.paginate(readGithub.rest.pulls.list, {
               owner,
               repo,
               state: 'open',
@@ -321,8 +360,8 @@ jobs:
 
             // A manually queued/restarted run may already exist. Never add a
             // second retry when another run for the same issue is active.
-            const runs = await github.paginate(
-              github.rest.actions.listWorkflowRunsForRepo,
+            const runs = await readGithub.paginate(
+              readGithub.rest.actions.listWorkflowRunsForRepo,
               {
                 owner,
                 repo,
@@ -365,8 +404,8 @@ jobs:
               return;
             }
 
-            const comments = await github.paginate(
-              github.rest.issues.listComments,
+            const comments = await readGithub.paginate(
+              readGithub.rest.issues.listComments,
               {
                 owner,
                 repo,
