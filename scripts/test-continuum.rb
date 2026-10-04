@@ -1840,6 +1840,107 @@ class ContinuumTest < Minitest::Test
                     'commit-status publishing must stay PAT-backed'
   end
 
+  # Work-Lock #58 item 5 (conservative subset, kodmial/continuum#236): only
+  # the two verified-safe pure same-repository read-only PR-Agent repair
+  # paths leave the shared TAP_PAT budget. Mixed read/write/dispatch/push
+  # and cross-repository paths stay PAT-backed.
+  def test_pr_agent_repair_verified_safe_reads_use_repository_token
+    body = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent-repair.yml'))
+    workflow = yaml(File.join(ROOT, '.github/workflows/continuum-pr-agent-repair.yml'))
+    stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-pr-agent-repair.yml'))
+
+    # Existing job/caller issues and pull-requests permissions already
+    # provide read capability; the migration must not widen permissions.
+    assert_equal 'write', workflow.fetch('jobs').fetch('repair').fetch('permissions').fetch('issues')
+    assert_equal 'write', workflow.fetch('jobs').fetch('repair').fetch('permissions').fetch('pull-requests')
+    assert_equal 'write', stub.fetch('permissions').fetch('issues')
+    assert_equal 'write', stub.fetch('permissions').fetch('pull-requests')
+
+    convergence = step_body(body, 'Check durable PR-Agent no-progress state')
+    target = step_body(body, 'Resolve the writable PR source branch')
+    refute_nil convergence, 'the no-progress read step is missing'
+    refute_nil target, 'the writable-branch resolution read step is missing'
+
+    # 1. No-progress check: pure issues.listComments read plus
+    # workflow-owned marker parsing under github.token.
+    assert_includes convergence, 'github-token: ${{ github.token }}'
+    refute_includes convergence, 'secrets.TAP_PAT',
+                      'the no-progress read must leave the shared TAP_PAT budget'
+    assert_includes convergence, 'github.rest.issues.listComments'
+    assert_includes convergence, 'continuum-pr-agent-no-progress head='
+    assert_includes convergence, 'continuum-pr-agent-convergence from='
+    assert_includes convergence, 'failClosed'
+    refute_includes convergence, 'createComment'
+    refute_includes convergence, 'updateComment'
+    refute_includes convergence, 'deleteComment'
+    refute_includes convergence, 'createCommitStatus'
+    refute_includes convergence, 'gh api'
+    refute_includes convergence, 'gh pr view'
+    refute_includes convergence, 'gh workflow run'
+    refute_includes convergence, 'git push'
+
+    # 2. Writable-branch resolution: GET the current pull only, under
+    # github.token. Every GitHub operation in the step is read-only.
+    assert_includes target, 'GH_TOKEN: ${{ github.token }}'
+    refute_includes target, 'secrets.TAP_PAT',
+                      'the target-resolution read must leave the shared TAP_PAT budget'
+    assert_includes target, 'repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER'
+    assert_includes target, "CURRENT_SHA=\"$(jq -r '.head.sha'"
+    assert_includes target, 'PR_STATE="$(jq -r'
+    assert_includes target, 'PR_DRAFT="$(jq -r'
+    assert_includes target, '"$CURRENT_SHA" != "$HEAD_SHA"'
+    assert_includes target, '"$HEAD_REPO" != "$GITHUB_REPOSITORY"'
+    refute_includes target, 'gh pr view'
+    refute_includes target, 'gh workflow run'
+    refute_includes target, 'git push'
+    refute_includes target, '--method POST'
+    refute_includes target, '--method PATCH'
+    refute_includes target, '--method DELETE'
+
+    # Excluded mixed/write/dispatch/push/cross-repo paths stay PAT-backed.
+    policy = step_body(body, 'Resolve PR-Agent signal policy')
+    repair_pass = step_body(body, 'Run one bounded OpenCode repair pass over every current item')
+    checkout = step_body(body, 'Checkout the writable PR source branch')
+    persist = step_body(body, 'Persist PR-Agent no-progress controller state')
+    retry_state = step_body(body, 'Update persistent PR-Agent repair retry controller state')
+    retry_step = step_body(body, 'Schedule bounded retry for retryable PR-Agent repair failure')
+    in_flight = step_body(body, 'Mark PR-Agent repair in flight')
+    publish = step_body(body, 'Publish durable PR-Agent repair state')
+    failed = step_body(body, 'Publish failed PR-Agent repair state')
+    [policy, repair_pass, checkout, persist, retry_state, retry_step, in_flight, publish, failed].each do |step|
+      refute_nil step, 'an excluded PAT-backed repair step is missing'
+    end
+    assert_includes policy, 'GH_TOKEN: ${{ secrets.TAP_PAT }}',
+                    'signal-policy reads kodmial/continuum explicitly and may be cross-repo; it must stay PAT-backed'
+    assert_includes policy, 'repos/kodmial/continuum/contents'
+    assert_includes repair_pass, 'GH_TOKEN: ${{ secrets.TAP_PAT }}',
+                    'the repair pass mixes revalidation, comment writes, commit, and push; it must stay wholly PAT-backed'
+    refute_includes repair_pass, 'github.token',
+                      'the repair pass must not be partially migrated to github.token'
+    assert_includes checkout, 'token: ${{ secrets.TAP_PAT }}',
+                    'repair checkout must stay PAT-backed so it can push'
+    assert_includes persist, 'github-token: ${{ secrets.TAP_PAT }}',
+                    'no-progress persistence mixes comment read/update/create/delete; it must stay PAT-backed'
+    assert_includes retry_state, 'github-token: ${{ secrets.TAP_PAT }}',
+                    'retry controller state mixes comment read/write; it must stay PAT-backed'
+    assert_includes retry_step, 'GH_TOKEN: ${{ secrets.TAP_PAT }}',
+                    'the repair retry step mixes reads with workflow_dispatch; it must stay wholly PAT-backed'
+    assert_includes retry_step, 'gh workflow run'
+    refute_includes retry_step, 'github.token',
+                      'the repair retry step must not be partially migrated to github.token'
+    refute_includes target, 'gh workflow run',
+                      'the target-resolution read must stay read-only'
+    assert_includes in_flight, 'github-token: ${{ secrets.TAP_PAT }}',
+                    'commit-status publishing must stay PAT-backed'
+    assert_includes publish, 'github-token: ${{ secrets.TAP_PAT }}',
+                    'commit-status publishing must stay PAT-backed'
+    assert_includes failed, 'github-token: ${{ secrets.TAP_PAT }}',
+                    'commit-status publishing must stay PAT-backed'
+
+    # No global TAP_PAT replacement: the mixed/write paths still draw on it.
+    assert_includes body, 'secrets.TAP_PAT'
+  end
+
   # kodmial/continuum#239: the dogfood PR-Agent caller is a direct caller
   # of the reusable PR-Agent workflow, just like the installed caller stub.
   # An explicitly-scoped caller leaves unspecified permissions as none, and a
