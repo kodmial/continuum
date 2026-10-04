@@ -339,14 +339,15 @@ def _security_value_is_blocking(value: object) -> bool:
 
 # Review-payload keys that carry an explicit tool-error signal when
 # `config.propagate_tool_errors` surfaces a failed tool. Any non-clean
-# entry fails closed; absent keys mean no signal.
+# entry fails closed; absent keys mean no signal. Only tool-specific keys
+# qualify: generic `errors`/`error` routinely carry ordinary review content
+# (e.g. "2 lint errors noted in diff") rather than a failed tool, so they
+# must never force automatic improve on their own.
 _TOOL_ERROR_SIGNAL_KEYS = (
     "tool_errors",
     "tool_error",
     "tool_failures",
     "failed_tools",
-    "errors",
-    "error",
 )
 
 # Review-payload keys that carry an explicit coverage signal. Absent keys
@@ -642,7 +643,7 @@ def should_skip_improve(
     *,
     head_matches: bool,
     tool_error: bool = False,
-    review_coverage_complete: bool = True,
+    review_coverage_complete: bool = False,
     reviewed_head_sha: object = None,
 ) -> Dict[str, Any]:
     """Decide whether the automatic `improve` pass can be skipped.
@@ -650,8 +651,9 @@ def should_skip_improve(
     `review` remains the authoritative merge gate. A skip is allowed only
     when the review is provably clean for the exact HEAD: no tool error
     (caller flag or an explicit tool-error signal in the review payload),
-    complete review coverage (caller flag and no incomplete-coverage
-    signal in the review payload), matching HEAD, `safe_to_merge`, zero
+    complete review coverage (explicit caller `review_coverage_complete=True`
+    and no incomplete-coverage signal in the review payload; the flag
+    defaults to False so an omitted flag never skips), matching HEAD, `safe_to_merge`, zero
     current key issues (a batch at the findings cap is never clean), no
     explicit blocking security signal, and native persistent state that
     is a complete full review for the exact reviewed HEAD with no ACTIVE

@@ -1740,13 +1740,14 @@ class CleanReviewImproveSkipTests(unittest.TestCase):
             make_review([]),
             make_persistent([], head_sha="abc"),
             head_matches=True,
+            review_coverage_complete=True,
             reviewed_head_sha="abc",
         )
         self.assertTrue(decision["skip"])
         js = run_skip_policy(
             make_review([]),
             make_persistent([], head_sha="abc"),
-            {"headMatches": True, "reviewedHeadSha": "abc"},
+            {"headMatches": True, "reviewCoverageComplete": True, "reviewedHeadSha": "abc"},
         )
         self.assertTrue(js["skip"])
 
@@ -1764,13 +1765,14 @@ class CleanReviewImproveSkipTests(unittest.TestCase):
                     review,
                     make_persistent([], head_sha="abc"),
                     head_matches=True,
+                    review_coverage_complete=True,
                     reviewed_head_sha="abc",
                 )
                 self.assertFalse(decision["skip"])
                 js = run_skip_policy(
                     review,
                     make_persistent([], head_sha="abc"),
-                    {"headMatches": True, "reviewedHeadSha": "abc"},
+                    {"headMatches": True, "reviewCoverageComplete": True, "reviewedHeadSha": "abc"},
                 )
                 self.assertFalse(js["skip"])
 
@@ -1778,11 +1780,13 @@ class CleanReviewImproveSkipTests(unittest.TestCase):
         life = self._life()
         state = make_persistent([{"state": "ACTIVE"}], head_sha="abc")
         decision = life.should_skip_improve(
-            make_review([]), state, head_matches=True, reviewed_head_sha="abc"
+            make_review([]), state, head_matches=True,
+            review_coverage_complete=True, reviewed_head_sha="abc",
         )
         self.assertFalse(decision["skip"])
         js = run_skip_policy(
-            make_review([]), state, {"headMatches": True, "reviewedHeadSha": "abc"}
+            make_review([]), state,
+            {"headMatches": True, "reviewCoverageComplete": True, "reviewedHeadSha": "abc"},
         )
         self.assertFalse(js["skip"])
 
@@ -1793,19 +1797,19 @@ class CleanReviewImproveSkipTests(unittest.TestCase):
         )
         decision = life.should_skip_improve(
             review, make_persistent([], head_sha="abc"), head_matches=True,
-            reviewed_head_sha="abc",
+            review_coverage_complete=True, reviewed_head_sha="abc",
         )
         self.assertFalse(decision["skip"])
         js = run_skip_policy(
             review, make_persistent([], head_sha="abc"),
-            {"headMatches": True, "reviewedHeadSha": "abc"},
+            {"headMatches": True, "reviewCoverageComplete": True, "reviewedHeadSha": "abc"},
         )
         self.assertFalse(js["skip"])
 
     def test_tool_error_and_incomplete_coverage_still_run_improve(self):
         life = self._life()
         for kwargs in (
-            {"tool_error": True},
+            {"tool_error": True, "review_coverage_complete": True},
             {"review_coverage_complete": False},
         ):
             with self.subTest(kwargs=kwargs):
@@ -1820,7 +1824,7 @@ class CleanReviewImproveSkipTests(unittest.TestCase):
         js = run_skip_policy(
             make_review([]),
             make_persistent([], head_sha="abc"),
-            {"headMatches": True, "toolError": True, "reviewedHeadSha": "abc"},
+            {"headMatches": True, "toolError": True, "reviewCoverageComplete": True, "reviewedHeadSha": "abc"},
         )
         self.assertFalse(js["skip"])
         js = run_skip_policy(
@@ -1831,9 +1835,11 @@ class CleanReviewImproveSkipTests(unittest.TestCase):
         self.assertFalse(js["skip"])
 
     def test_error_negation_prose_is_not_a_tool_error_signal(self):
-        # A clean review reporting `errors: "No errors"` (or the
-        # `error: "No tool errors"` mirror) must not force an automatic
-        # improve: negation prose is clean, not a blocking tool error.
+        # Generic `errors`/`error` keys carry ordinary review content (e.g.
+        # "2 lint errors noted in diff"), not failed tools, so they never
+        # force automatic improve on their own. Only tool-specific keys
+        # (`tool_errors`, `tool_error`, `tool_failures`, `failed_tools`)
+        # with non-negation content block the clean fast path.
         life = self._life()
         for extra in (
             {"errors": "No errors"},
@@ -1848,6 +1854,7 @@ class CleanReviewImproveSkipTests(unittest.TestCase):
                     review,
                     make_persistent([], head_sha="abc"),
                     head_matches=True,
+                    review_coverage_complete=True,
                     reviewed_head_sha="abc",
                 )
                 self.assertTrue(decision["skip"])
@@ -1859,24 +1866,49 @@ class CleanReviewImproveSkipTests(unittest.TestCase):
         ):
             with self.subTest(extra=extra):
                 self.assertFalse(run_tool_error_signal(make_review([], extra=extra)))
+        # Generic code-error summaries must not force improve either.
+        for extra in (
+            {"errors": "2 lint errors noted in diff"},
+            {"error": "upstream tool failed"},
+            {"errors": "upstream tool failed"},
+        ):
+            with self.subTest(extra=extra):
+                review = make_review([], extra=extra)
+                self.assertFalse(life.has_tool_error_signal(review))
+                self.assertFalse(run_tool_error_signal(review))
+                decision = life.should_skip_improve(
+                    review,
+                    make_persistent([], head_sha="abc"),
+                    head_matches=True,
+                    review_coverage_complete=True,
+                    reviewed_head_sha="abc",
+                )
+                self.assertTrue(decision["skip"])
+                js = run_skip_policy(
+                    review,
+                    make_persistent([], head_sha="abc"),
+                    {"headMatches": True, "reviewCoverageComplete": True, "reviewedHeadSha": "abc"},
+                )
+                self.assertTrue(js["skip"])
         # A genuine tool failure still fails closed and keeps improve.
         self.assertTrue(life.has_tool_error_signal(
             make_review([], extra={"tool_errors": ["timeout contacting model"]})
         ))
         self.assertTrue(run_tool_error_signal(
-            make_review([], extra={"errors": "upstream tool failed"})
+            make_review([], extra={"tool_errors": "upstream tool failed"})
         ))
         decision = life.should_skip_improve(
-            make_review([], extra={"errors": "upstream tool failed"}),
+            make_review([], extra={"tool_errors": "upstream tool failed"}),
             make_persistent([], head_sha="abc"),
             head_matches=True,
+            review_coverage_complete=True,
             reviewed_head_sha="abc",
         )
         self.assertFalse(decision["skip"])
         js = run_skip_policy(
-            make_review([], extra={"errors": "upstream tool failed"}),
+            make_review([], extra={"tool_errors": "upstream tool failed"}),
             make_persistent([], head_sha="abc"),
-            {"headMatches": True, "reviewedHeadSha": "abc"},
+            {"headMatches": True, "reviewCoverageComplete": True, "reviewedHeadSha": "abc"},
         )
         self.assertFalse(js["skip"])
 
@@ -1907,12 +1939,14 @@ class CleanReviewImproveSkipTests(unittest.TestCase):
             make_review([]),
             make_persistent([], head_sha="abc"),
             head_matches=False,
+            review_coverage_complete=True,
+            reviewed_head_sha="abc",
         )
         self.assertFalse(decision["skip"])
         js = run_skip_policy(
             make_review([]),
             make_persistent([], head_sha="abc"),
-            {"headMatches": False},
+            {"headMatches": False, "reviewCoverageComplete": True, "reviewedHeadSha": "abc"},
         )
         self.assertFalse(js["skip"])
 
@@ -1923,39 +1957,46 @@ class CleanReviewImproveSkipTests(unittest.TestCase):
                 {"merge_recommendation": "safe_to_merge"},
                 make_persistent([], head_sha="abc"),
                 head_matches=True,
+                review_coverage_complete=True,
+                reviewed_head_sha="abc",
             )
-        with self.assertRaises(life.LifecycleError):
-            life.should_skip_improve(
-                make_review([]),
-                {"findings": [], "last_run": {"complete": False, "kind": "full"}},
-                head_matches=True,
-            )
-        with self.assertRaises(life.LifecycleError):
-            life.should_skip_improve(
-                make_review([]), {"not": "state"}, head_matches=True
-            )
+        # Benign persistent format variations with a known HEAD run improve
+        # (skip=False) instead of crashing the orchestrator.
+        non_full = life.should_skip_improve(
+            make_review([]),
+            {"findings": [], "last_run": {"complete": False, "kind": "full"}},
+            head_matches=True,
+            review_coverage_complete=True,
+            reviewed_head_sha="abc",
+        )
+        self.assertFalse(non_full["skip"])
+        non_list = life.should_skip_improve(
+            make_review([]), {"not": "state"}, head_matches=True,
+            review_coverage_complete=True, reviewed_head_sha="abc",
+        )
+        self.assertFalse(non_list["skip"])
         bad_review = run_skip_policy_raw(
             '{"nope": true}', json.dumps(make_persistent([], head_sha="abc")),
-            {"headMatches": True},
+            {"headMatches": True, "reviewCoverageComplete": True, "reviewedHeadSha": "abc"},
         )
         self.assertIn("threw", bad_review)
-        bad_state = run_skip_policy_raw(
-            json.dumps(make_review([])), '{"not": "state"}',
-            {"headMatches": True},
+        benign_state = run_skip_policy(
+            make_review([]), {"not": "state"},
+            {"headMatches": True, "reviewCoverageComplete": True, "reviewedHeadSha": "abc"},
         )
-        self.assertIn("threw", bad_state)
+        self.assertFalse(benign_state["skip"])
 
     def test_wrapped_review_envelope_skips_when_clean(self):
         life = self._life()
         wrapped = {"review": make_review([])}
         decision = life.should_skip_improve(
             wrapped, make_persistent([], head_sha="abc"), head_matches=True,
-            reviewed_head_sha="abc",
+            review_coverage_complete=True, reviewed_head_sha="abc",
         )
         self.assertTrue(decision["skip"])
         js = run_skip_policy(
             wrapped, make_persistent([], head_sha="abc"),
-            {"headMatches": True, "reviewedHeadSha": "abc"},
+            {"headMatches": True, "reviewCoverageComplete": True, "reviewedHeadSha": "abc"},
         )
         self.assertTrue(js["skip"])
 
@@ -1974,13 +2015,14 @@ class CleanReviewImproveSkipTests(unittest.TestCase):
                     review,
                     make_persistent([], head_sha="abc"),
                     head_matches=True,
+                    review_coverage_complete=True,
                     reviewed_head_sha="abc",
                 )
                 self.assertFalse(decision["skip"])
                 js = run_skip_policy(
                     review,
                     make_persistent([], head_sha="abc"),
-                    {"headMatches": True, "reviewedHeadSha": "abc"},
+                    {"headMatches": True, "reviewCoverageComplete": True, "reviewedHeadSha": "abc"},
                 )
                 self.assertFalse(js["skip"])
 
@@ -1991,20 +2033,70 @@ class CleanReviewImproveSkipTests(unittest.TestCase):
                 make_review([]),
                 make_persistent([], head_sha="abc"),
                 head_matches=True,
+                review_coverage_complete=True,
             )
         stale = life.should_skip_improve(
             make_review([]),
             make_persistent([], head_sha="abc"),
             head_matches=True,
+            review_coverage_complete=True,
             reviewed_head_sha="def",
         )
         self.assertFalse(stale["skip"])
         missing = run_skip_policy_raw(
             json.dumps(make_review([])),
             json.dumps(make_persistent([], head_sha="abc")),
-            {"headMatches": True},
+            {"headMatches": True, "reviewCoverageComplete": True},
         )
         self.assertIn("threw", missing)
+
+    def test_omitted_coverage_flag_never_skips_clean_review(self):
+        # Fail-closed default: a clean review with no coverage object called
+        # without the flag must run improve, never skip. Only an explicit
+        # `review_coverage_complete=True` (plus no incomplete signal) skips.
+        life = self._life()
+        clean = make_review([])
+        state = make_persistent([], head_sha="abc")
+        omitted = life.should_skip_improve(
+            clean, state, head_matches=True, reviewed_head_sha="abc",
+        )
+        self.assertFalse(omitted["skip"])
+        omitted_js = run_skip_policy(
+            clean, state, {"headMatches": True, "reviewedHeadSha": "abc"},
+        )
+        self.assertFalse(omitted_js["skip"])
+        explicit = life.should_skip_improve(
+            clean, state, head_matches=True,
+            review_coverage_complete=True, reviewed_head_sha="abc",
+        )
+        self.assertTrue(explicit["skip"])
+        explicit_js = run_skip_policy(
+            clean, state,
+            {"headMatches": True, "reviewCoverageComplete": True, "reviewedHeadSha": "abc"},
+        )
+        self.assertTrue(explicit_js["skip"])
+
+    def test_generic_error_keys_never_force_improve(self):
+        # Otherwise-clean review carrying an ordinary code-error summary
+        # must still skip: generic keys are not tool-error signals.
+        life = self._life()
+        review = make_review([], extra={"errors": "2 lint errors noted in diff"})
+        self.assertFalse(life.has_tool_error_signal(review))
+        self.assertFalse(run_tool_error_signal(review))
+        decision = life.should_skip_improve(
+            review, make_persistent([], head_sha="abc"), head_matches=True,
+            review_coverage_complete=True, reviewed_head_sha="abc",
+        )
+        self.assertTrue(decision["skip"])
+        js = run_skip_policy(
+            review, make_persistent([], head_sha="abc"),
+            {"headMatches": True, "reviewCoverageComplete": True, "reviewedHeadSha": "abc"},
+        )
+        self.assertTrue(js["skip"])
+        # Tool-specific keys still fail closed and keep improve.
+        tool_review = make_review([], extra={"tool_errors": "2 lint errors noted in diff"})
+        self.assertTrue(life.has_tool_error_signal(tool_review))
+        self.assertTrue(run_tool_error_signal(tool_review))
 
     def test_merge_gate_greens_for_skipped_clean_improve(self):
         life = self._life()

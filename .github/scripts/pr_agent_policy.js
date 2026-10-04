@@ -349,8 +349,6 @@ const TOOL_ERROR_SIGNAL_KEYS = [
   'tool_error',
   'tool_failures',
   'failed_tools',
-  'errors',
-  'error',
 ];
 
 const COVERAGE_FLAG_KEYS = [
@@ -646,8 +644,11 @@ function isCleanReviewForImproveSkip(reviewPayload, persistentState, options = {
   const headMatches = opts.headMatches === true;
   const review = unwrapReview(reviewPayload);
   const toolError = opts.toolError === true || hasToolErrorSignal(review);
+  // Fail closed: coverage must be proven complete with an explicit opt-in.
+  // An omitted flag never skips (a clean review with no coverage object
+  // called without the flag must run improve).
   const reviewCoverageComplete =
-    opts.reviewCoverageComplete !== false && !hasIncompleteCoverageSignal(review);
+    opts.reviewCoverageComplete === true && !hasIncompleteCoverageSignal(review);
   if (toolError) {
     return { skip: false, reason: 'tool error: failing closed' };
   }
