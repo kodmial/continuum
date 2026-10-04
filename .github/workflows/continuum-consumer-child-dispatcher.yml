@@ -368,7 +368,7 @@ jobs:
             # steady-state passes skip re-reading them below.
             while IFS= read -r open_number; do
               [[ -n "$open_number" && "$open_number" =~ ^[0-9]+$ ]] || continue
-              CONTINUUM_DEP_STATE[$open_number]="${CONTINUUM_DEP_STATE[$open_number]:-open}"
+              CONTINUUM_DEP_STATE[$open_number]="open"
             done < <(jq -r '.[].number' <<<"$issues_json" 2>/dev/null || true)
 
             while IFS= read -r encoded; do
