@@ -782,13 +782,14 @@ jobs:
               # Width (#254) caps the since scan (A4).
               grace_since="$(date -u -d "@$(( $(date +%s) - command_grace_seconds - 120 ))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)"
               recent_command=""; override_seen=""
-              override_total="$(gh api "repos/$child_repo/issues/$task_number" --jq '.comments' 2>/dev/null || echo 0)"
-              [[ "$override_total" =~ ^[0-9]+$ ]] || override_total=0
-              override_last_page=$(( (override_total + 99) / 100 ))
-              [[ "$override_last_page" -ge 1 ]] || override_last_page=1
-              override_first_page=$(( override_last_page - 4 ))
-              [[ "$override_first_page" -ge 1 ]] || override_first_page=1
-              for override_page in $(seq "$(( override_last_page - override_first_page + 1 ))"); do
+              # Since-filtered pagination starts at page 1: the filtered set
+              # is already only recent comments, so pages 1..5 cover it
+              # without the extra issue-total read. Keep the first/last
+              # names so the bounded-scan contract still identifies the
+              # window.
+              override_first_page=1
+              override_last_page=5
+              for override_page in $(seq "$override_first_page" "$override_last_page"); do
                 override_json="$(gh api "repos/$child_repo/issues/$task_number/comments?per_page=100&page=$override_page&since=$grace_since" 2>/dev/null || true)"
                 override_count="$(jq 'length' <<<"$override_json" 2>/dev/null)"
                 [[ "$override_count" =~ ^[0-9]+$ ]] || continue

@@ -852,13 +852,22 @@ jobs:
               if ! gh api \
                 "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100&page=$controller_page" > "$controller_page_file" 2>/dev/null; then
                 rm -f "$controller_page_file"
-                break
+                echo "classification=transient" >> "$GITHUB_OUTPUT"
+                echo "::error::Could not read controller comments; GitHub API failure is retryable."
+                exit 1
               fi
               if ! controller_page_len="$(jq 'length' "$controller_page_file" 2>/dev/null)"; then
                 rm -f "$controller_page_file"
-                break
+                echo "classification=transient" >> "$GITHUB_OUTPUT"
+                echo "::error::Could not parse controller comments; GitHub API failure is retryable."
+                exit 1
               fi
-              [[ "$controller_page_len" =~ ^[0-9]+$ ]] || { rm -f "$controller_page_file"; break; }
+              if ! [[ "$controller_page_len" =~ ^[0-9]+$ ]]; then
+                rm -f "$controller_page_file"
+                echo "classification=transient" >> "$GITHUB_OUTPUT"
+                echo "::error::Could not parse controller comments; GitHub API failure is retryable."
+                exit 1
+              fi
               cat "$controller_page_file" >> "$CONTROLLER_JSON.pages"
               echo >> "$CONTROLLER_JSON.pages"
               rm -f "$controller_page_file"
