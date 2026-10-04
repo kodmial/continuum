@@ -2449,6 +2449,7 @@ class ContinuumTest < Minitest::Test
       'post_pause_comment' => 'true',
       'reset_markers' => 'false',
       'require_priority_label' => 'false',
+      'ready_label' => '',
       'command_grace_minutes' => '5',
       'child_owned_marker' => '<!-- continuum-child-owned -->',
       'legacy_child_owned_marker' => '<!-- runtime-worker-owned -->',
@@ -3657,7 +3658,7 @@ class ContinuumTest < Minitest::Test
       continuum_ref wip_limit lease_minutes max_dispatch_attempts dispatch_marker
       in_progress_label pause_marker qualifying_label blocked_label
       post_pause_comment reset_markers
-      require_priority_label command_grace_minutes child_owned_marker
+      require_priority_label ready_label command_grace_minutes child_owned_marker
       legacy_child_owned_marker opencode_workflow_name opencode_workflow_path
       dispatch_ref opencode_dispatch execution_label_routes
       child_dispatch_workflow
@@ -4098,14 +4099,89 @@ class ContinuumTest < Minitest::Test
       "freshIssue.state !== 'open'",
       '(pauseOnFailure && freshLabels.has(pausedLabel))',
       'freshLabels.has(inProgressLabel)',
+      'if (readyLabel && !freshLabels.has(readyLabel)) {',
       'const freshDeclaredBlockers = await openDeclaredBlockers(freshIssue);',
       'freshOpenBlockers.length > 0',
       'if (commandAgeMs < commandGraceMs) {'
     ].each { |guard| assert_includes dispatch, guard, "missing just-in-time guard: #{guard}" }
     local_dispatch = dispatch[/\/\/ Re-check mutable state immediately before dispatch\..*\z/m]
     refute_nil local_dispatch, 'the local just-in-time re-check block is gone'
-    assert_equal 4, local_dispatch.scan(/^\s+continue;\s*$/).size,
+    assert_equal 5, local_dispatch.scan(/^\s+continue;\s*$/).size,
                  'every local just-in-time guard must be a skip, not a fall-through'
+  end
+
+  # kodmial/continuum#266: the optional `automation:ready` admission gate.
+  # Empty configuration preserves current behavior; when configured, automatic
+  # dispatch admits only issues carrying the label. Priority stays a ranking
+  # signal, qualification dispatch and manual owner `/oc` never require it.
+  def test_scheduler_ready_label_admission_gate_is_optional
+    workflow_path = File.join(ROOT, '.github/workflows/continuum-issue-scheduler.yml')
+    scheduler = workflow_body('continuum-issue-scheduler.yml')
+    inputs = events(yaml(workflow_path)).fetch('workflow_call').fetch('inputs')
+
+    # Optional `ready_label` input with an empty safe default.
+    ready = inputs.fetch('ready_label')
+    assert_equal '', ready.fetch('default'), 'ready_label must default to empty so current behavior is unchanged'
+    assert_equal 'string', ready.fetch('type')
+    assert_equal false, ready.fetch('required')
+    assert_includes ready.fetch('description'), 'AUTOMATION_READY_LABEL'
+
+    # Env binding follows the consumer knob with no literal default.
+    assert_includes scheduler, 'READY_LABEL: ${{ inputs.ready_label || vars.AUTOMATION_READY_LABEL }}'
+    assert_includes scheduler, "const readyLabel = (process.env.READY_LABEL || '').trim();"
+
+    # The configured label is created so it can be applied from the issue page;
+    # empty creates nothing.
+    assert_includes scheduler, '...(readyLabel ? [{'
+    assert_includes scheduler, 'name: readyLabel,'
+    assert_includes scheduler, 'Admits this issue to automatic implementation by the issue scheduler.'
+
+    # Selection-time gate: present stays eligible, absent is skipped. The gate
+    # must be conditional on configuration so empty preserves behavior.
+    assert_includes scheduler, 'if (readyLabel && !labels.has(readyLabel)) {'
+    assert_includes scheduler, 'missing required ready label `'
+
+    # Delegated child selection applies the same gate in the bash queue step
+    # without disturbing priority ranking.
+    assert_includes scheduler, '--arg ready "$READY_LABEL"'
+    assert_includes scheduler, 'select($ready == "" or ([.labels[]?.name] | index($ready) != null))'
+    assert_includes scheduler, 'sort_by(._rank, .number)'
+
+    # Just-in-time re-verification for both local and delegated dispatch: a
+    # label removed after selection must prevent dispatch.
+    assert_includes scheduler, 'if (readyLabel && !freshLabels.has(readyLabel)) {'
+    assert_includes scheduler, 'if (readyLabel) {'
+    assert_includes scheduler, 'if (!freshChildLabels.has(readyLabel)) {'
+
+    # Priority ordering is unchanged: P0 -> P1 -> P2 -> unprioritized.
+    assert_includes scheduler, "'priority:p0',"
+    assert_includes scheduler, "'priority:p1',"
+    assert_includes scheduler, "'priority:p2',"
+    assert_includes scheduler, 'a.rank - b.rank'
+
+    # Qualification dispatch never requires the ready label.
+    qualification = scheduler[/async function dispatchQualificationIssue\(.*?return wasPaused \? 'unpause-and-dispatch' : 'dispatch';\s*\}/m]
+    refute_nil qualification, 'the qualification dispatch helper is gone'
+    refute_includes qualification, 'readyLabel',
+                     'qualification dispatch must not require automation:ready'
+
+    # Manual owner `/oc` reservation never requires the ready label.
+    reservation = scheduler[/if \(context\.eventName === 'issue_comment'\) \{\s*\n\s*const eventIssue.*?\n            \}/m]
+    refute_nil reservation, 'the owner-command reservation block is gone'
+    refute_includes reservation, 'readyLabel',
+                     'manual owner /oc must start without automation:ready'
+
+    # Caller stub exposes and forwards the knob as a bare passthrough.
+    stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-issue-scheduler.yml'))
+    stub_inputs = events(stub).fetch('workflow_dispatch').fetch('inputs')
+    assert stub_inputs.key?('ready_label'), 'caller stub must expose ready_label'
+    call_with = stub.fetch('jobs').fetch('call').fetch('with')
+    assert_equal '${{ inputs.ready_label }}', call_with.fetch('ready_label'),
+                 'the stub must forward ready_label as a bare passthrough'
+
+    # Consumer contract documents the repository fallback.
+    doc = File.read(File.join(ROOT, 'docs/consumer-variables.md'))
+    assert_includes doc, 'AUTOMATION_READY_LABEL'
   end
 
   # Closed issues are terminal scheduler state. A stale in-progress label on a
