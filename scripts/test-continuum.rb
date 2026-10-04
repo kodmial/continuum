@@ -1764,28 +1764,41 @@ class ContinuumTest < Minitest::Test
     moved = step_body(body, 'Fail closed on a moved head')
     [admit, before, after, moved].each { |step| refute_nil step, 'a verified-safe read step is missing' }
 
-    # 1. Admission: pulls.get plus exact-HEAD CI evidence under github.token.
-    assert_includes admit, 'github-token: ${{ github.token }}'
-    refute_includes admit, 'secrets.TAP_PAT'
+    # 1. Admission: pulls.get plus exact-HEAD CI evidence against the
+    # resolved target. Local same-repository reads use github.token;
+    # delegated cross-repository reads require TAP_PAT via the conditional.
+    assert_includes admit, 'github.token'
+    assert_includes admit, 'secrets.TAP_PAT'
+    assert_includes admit, 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED'
     assert_includes admit, 'github.rest.pulls.get'
     assert_includes admit, 'github.rest.actions.listWorkflowRunsForRepo'
+    assert_includes admit, 'CONTINUUM_PR_AGENT_TARGET_OWNER'
+    refute_includes admit, 'owner: context.repo.owner'
 
     # 2. Immediately-before-review revalidation: gh pr view plus exact-HEAD
-    # CI evidence under github.token.
-    assert_includes before, 'GH_TOKEN: ${{ github.token }}'
-    refute_includes before, 'secrets.TAP_PAT'
+    # CI evidence against the resolved target (conditional token as above).
+    assert_includes before, 'github.token'
+    assert_includes before, 'secrets.TAP_PAT'
+    assert_includes before, 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED'
     assert_includes before, 'gh pr view'
     assert_includes before, 'actions/runs?event=pull_request&head_sha='
+    assert_includes before, 'CONTINUUM_PR_AGENT_TARGET_REPOSITORY'
 
-    # 3. Immediately-after-review revalidation: pulls.get for current PR/head only.
-    assert_includes after, 'github-token: ${{ github.token }}'
-    refute_includes after, 'secrets.TAP_PAT'
+    # 3. Immediately-after-review revalidation: pulls.get for current PR/head
+    # only against the resolved target.
+    assert_includes after, 'github.token'
+    assert_includes after, 'secrets.TAP_PAT'
+    assert_includes after, 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED'
     assert_includes after, 'github.rest.pulls.get'
+    assert_includes after, 'CONTINUUM_PR_AGENT_TARGET_OWNER'
 
-    # 4. Final fail-closed moved-head check: gh pr view for current PR/head only.
-    assert_includes moved, 'GH_TOKEN: ${{ github.token }}'
-    refute_includes moved, 'secrets.TAP_PAT'
+    # 4. Final fail-closed moved-head check: gh pr view for current PR/head
+    # only against the resolved target.
+    assert_includes moved, 'github.token'
+    assert_includes moved, 'secrets.TAP_PAT'
+    assert_includes moved, 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED'
     assert_includes moved, 'gh pr view'
+    assert_includes moved, 'CONTINUUM_PR_AGENT_TARGET_REPOSITORY'
 
     # github-script pure reads use the injected client directly: no dynamic
     # require of @actions/github and no secondary Octokit client to audit.
@@ -1852,11 +1865,14 @@ class ContinuumTest < Minitest::Test
     refute_nil convergence, 'the no-progress read step is missing'
     refute_nil target, 'the writable-branch resolution read step is missing'
 
-    # 1. No-progress check: pure issues.listComments read plus
-    # workflow-owned marker parsing under github.token.
-    assert_includes convergence, 'github-token: ${{ github.token }}'
-    refute_includes convergence, 'secrets.TAP_PAT',
-                      'the no-progress read must leave the shared TAP_PAT budget'
+    # 1. No-progress check: issues.listComments read plus workflow-owned
+    # marker parsing against the resolved target. Local reads use
+    # github.token; delegated cross-repository reads require TAP_PAT via the
+    # conditional.
+    assert_includes convergence, 'github.token'
+    assert_includes convergence, 'secrets.TAP_PAT'
+    assert_includes convergence, 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED'
+    assert_includes convergence, 'CONTINUUM_PR_AGENT_TARGET_OWNER'
     assert_includes convergence, 'github.rest.issues.listComments'
     assert_includes convergence, 'continuum-pr-agent-no-progress head='
     assert_includes convergence, 'continuum-pr-agent-convergence from='
@@ -1870,17 +1886,18 @@ class ContinuumTest < Minitest::Test
     refute_includes convergence, 'gh workflow run'
     refute_includes convergence, 'git push'
 
-    # 2. Writable-branch resolution: GET the current pull only, under
-    # github.token. Every GitHub operation in the step is read-only.
-    assert_includes target, 'GH_TOKEN: ${{ github.token }}'
-    refute_includes target, 'secrets.TAP_PAT',
-                      'the target-resolution read must leave the shared TAP_PAT budget'
-    assert_includes target, 'repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER'
+    # 2. Writable-branch resolution: GET the current pull only against the
+    # resolved target (conditional token as above). Every GitHub operation in
+    # this step is read-only and fails closed on mismatch.
+    assert_includes target, 'github.token'
+    assert_includes target, 'secrets.TAP_PAT'
+    assert_includes target, 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED'
+    assert_includes target, 'repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/pulls/$PR_NUMBER'
     assert_includes target, "CURRENT_SHA=\"$(jq -r '.head.sha'"
     assert_includes target, 'PR_STATE="$(jq -r'
     assert_includes target, 'PR_DRAFT="$(jq -r'
     assert_includes target, '"$CURRENT_SHA" != "$HEAD_SHA"'
-    assert_includes target, '"$HEAD_REPO" != "$GITHUB_REPOSITORY"'
+    assert_includes target, '"$HEAD_REPO" != "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY"'
     refute_includes target, 'gh pr view'
     refute_includes target, 'gh workflow run'
     refute_includes target, 'git push'
@@ -3280,23 +3297,23 @@ class ContinuumTest < Minitest::Test
       head_ref_pattern auto_merge_workflow opencode_workflow
     ],
     'continuum-opencode-unresolved.yml' => %w[continuum_ref],
-    'continuum-pr-agent-recovery.yml' => %w[continuum_ref],
+    'continuum-pr-agent-recovery.yml' => %w[continuum_ref target_child_id],
     'continuum-pr-agent-canary.yml' => %w[
       continuum_ref canary_enabled base_ref opencode_model model max_tokens
       api_base bridge_port server_port pr_agent_version
     ],
     'continuum-pr-agent.yml' => %w[
-      continuum_ref pr_number expected_head_sha retry_attempt retry_workflow recovery_kind
+      continuum_ref pr_number target_child_id expected_head_sha retry_attempt retry_workflow recovery_kind
     ],
     'continuum-pr-agent-router.yml' => %w[
       continuum_ref review_workflow review_provider pr_number
     ],
     'continuum-pr-agent-repair.yml' => %w[
-      continuum_ref pr_number head_sha review_json improve_jsonl
+      continuum_ref pr_number target_child_id head_sha review_json improve_jsonl
       retry_attempt retry_workflow
     ],
     'continuum-pr-agent-auto-merge.yml' => %w[
-      continuum_ref pr_number head_sha review_json improve_jsonl persistent_state_json
+      continuum_ref pr_number target_child_id head_sha review_json improve_jsonl persistent_state_json
       post_merge_wakeups post_merge_wakeup_ref
       required_workflow_gate_label required_workflow_gate_name
     ],

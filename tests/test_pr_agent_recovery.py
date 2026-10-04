@@ -311,10 +311,15 @@ class RecoveryWiringTests(unittest.TestCase):
             "client.rest.pulls.get",
             "client.rest.repos.listCommitStatusesForRef",
             "client.rest.issues.listComments",
-            "client.rest.repos.get({ owner, repo })",
         ):
             with self.subTest(read_call=read_call):
                 self.assertIn(read_call, body)
+        # Target-aware recovery: target PR/CI/status/comment reads use the
+        # resolved target (owner/repo), while execution-run inspection and the
+        # dispatch-ref lookup stay in the parent execution repository.
+        self.assertIn("const executionOwner = context.repo.owner;", body)
+        self.assertIn("const owner = process.env.CONTINUUM_PR_AGENT_TARGET_OWNER;", body)
+        self.assertIn("client.rest.repos.get({ owner: executionOwner, repo: executionRepo })", body)
 
         # One helper definition plus ten guarded read sites. Controller-state
         # upsert also reads comments through the repository-scoped token.

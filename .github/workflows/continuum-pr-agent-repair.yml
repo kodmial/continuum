@@ -20,6 +20,11 @@ on:
         type: string
         default: ''
         required: false
+      target_child_id:
+        description: Opaque verified child id for delegated execution. Empty targets the caller repository.
+        type: string
+        default: ''
+        required: false
       head_sha:
         description: Exact HEAD SHA the review evaluated.
         type: string
@@ -53,7 +58,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: pr-agent-repair-${{ inputs.pr_number || github.run_id }}-${{ inputs.head_sha || github.sha }}
+  group: pr-agent-repair-${{ inputs.target_child_id && format('child-{0}', inputs.target_child_id) || 'local' }}-${{ inputs.pr_number || github.run_id }}-${{ inputs.head_sha || github.sha }}
   cancel-in-progress: false
 
 jobs:
@@ -93,6 +98,58 @@ jobs:
               return;
             }
             core.setOutput('stack', 'pr-agent');
+
+      - name: Resolve PR-Agent target context
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          TARGET_CHILD_ID: ${{ inputs.target_child_id }}
+          CONTINUUM_REF: ${{ inputs.continuum_ref }}
+        run: |
+          set -euo pipefail
+          : "${CONTINUUM_REF:?CONTINUUM_REF is required for pinned target resolution}"
+          CONTINUUM_SOURCE_REPO="${GITHUB_WORKFLOW_REF:-}"
+          CONTINUUM_SOURCE_REPO="${CONTINUUM_SOURCE_REPO%%/.github/workflows/*}"
+          if ! [[ "$CONTINUUM_SOURCE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            CONTINUUM_SOURCE_REPO="kodmial/continuum"
+          fi
+          if [[ -z "${TARGET_CHILD_ID:-}" ]]; then
+            if ! [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+              echo "::error::PR-Agent target repository identity is invalid."
+              exit 2
+            fi
+            {
+              printf 'CONTINUUM_PR_AGENT_TARGET_REPOSITORY=%s\n' "$GITHUB_REPOSITORY"
+              printf 'CONTINUUM_PR_AGENT_TARGET_OWNER=%s\n' "${GITHUB_REPOSITORY%%/*}"
+              printf 'CONTINUUM_PR_AGENT_TARGET_REPO=%s\n' "${GITHUB_REPOSITORY#*/}"
+              printf 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED=%s\n' "false"
+            } >> "$GITHUB_ENV"
+            echo "PR-Agent target context resolved locally."
+            exit 0
+          fi
+          RUNTIME_ROOT="$RUNNER_TEMP/continuum-pr-agent-target-runtime"
+          mkdir -p "$RUNTIME_ROOT/.github/scripts"
+          fetch_runtime_file() {
+            local path="$1" dest="$2"
+            if ! gh api --method GET "repos/$CONTINUUM_SOURCE_REPO/contents/$path" -f ref="$CONTINUUM_REF" --jq .content 2>/dev/null \
+              | tr -d '\n' | base64 --decode > "$dest" 2>/dev/null; then
+              echo "::error::Unable to load the Continuum PR-Agent target resolver."
+              exit 1
+            fi
+            if [[ ! -s "$dest" ]]; then
+              echo "::error::Unable to load the Continuum PR-Agent target resolver."
+              exit 1
+            fi
+          }
+          fetch_runtime_file ".github/scripts/pr_agent_target.sh" "$RUNTIME_ROOT/.github/scripts/pr_agent_target.sh"
+          fetch_runtime_file ".github/scripts/delegation_repository.sh" "$RUNTIME_ROOT/.github/scripts/delegation_repository.sh"
+          fetch_runtime_file ".github/scripts/delegation_runtime.py" "$RUNTIME_ROOT/.github/scripts/delegation_runtime.py"
+          PARENT_CONFIG_FILE="$RUNTIME_ROOT/parent.continuum.yml"
+          if ! gh api --method GET "repos/$GITHUB_REPOSITORY/contents/.continuum.yml" --jq .content 2>/dev/null \
+            | tr -d '\n' | base64 --decode > "$PARENT_CONFIG_FILE" 2>/dev/null; then
+            printf 'version: 1\n' > "$PARENT_CONFIG_FILE"
+          fi
+          CONTINUUM_ENGINE_ROOT="$RUNTIME_ROOT" PARENT_CONFIG="$PARENT_CONFIG_FILE" \
+            bash "$RUNTIME_ROOT/.github/scripts/pr_agent_target.sh" "$TARGET_CHILD_ID"
 
       - name: Resolve PR-Agent signal policy
         id: policy
@@ -221,13 +278,14 @@ jobs:
           FINDING_IDS: ${{ steps.batch.outputs.finding_ids }}
           IDENTIFIED_BATCH: ${{ steps.batch.outputs.identified_batch }}
         with:
-          # Pure same-repository read-only no-progress check
-          # (issues.listComments plus marker parsing only). Repository token
-          # is sufficient; PAT actor identity must not gate the read.
-          github-token: ${{ github.token }}
+          # Target-aware no-progress check (issues.listComments plus marker
+          # parsing only against the resolved target). Local same-repository
+          # reads use github.token; delegated cross-repository reads require
+          # TAP_PAT.
+          github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || github.token }}
           script: |
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
+            const owner = process.env.CONTINUUM_PR_AGENT_TARGET_OWNER;
+            const repo = process.env.CONTINUUM_PR_AGENT_TARGET_REPO;
             const prNumber = Number(process.env.PR_NUMBER);
             const headSha = String(process.env.HEAD_SHA || '').toLowerCase();
             const fingerprint = String(process.env.FINGERPRINT || '').toLowerCase();
@@ -361,15 +419,16 @@ jobs:
         if: steps.batch.outputs.empty != 'true' && steps.convergence.outcome == 'success' && steps.convergence.outputs.held != 'true'
         id: target
         env:
-          # Pure same-repository read-only PR resolution (GET the current
-          # pull only). Repository token is sufficient; every GitHub
-          # operation in this step is read-only.
-          GH_TOKEN: ${{ github.token }}
+          # Target-aware PR resolution (GET the current pull only against the
+          # resolved target). Local reads use github.token; delegated
+          # cross-repository reads require TAP_PAT. Every GitHub operation in
+          # this step is read-only and fails closed on mismatch.
+          GH_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || github.token }}
           PR_NUMBER: ${{ inputs.pr_number }}
           HEAD_SHA: ${{ inputs.head_sha }}
         run: |
           set -euo pipefail
-          PR_JSON="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")"
+          PR_JSON="$(gh api "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/pulls/$PR_NUMBER")"
           CURRENT_SHA="$(jq -r '.head.sha' <<<"$PR_JSON")"
           HEAD_REF="$(jq -r '.head.ref' <<<"$PR_JSON")"
           HEAD_REPO="$(jq -r '.head.repo.full_name' <<<"$PR_JSON")"
@@ -383,7 +442,7 @@ jobs:
             echo "::error::PR head moved ($HEAD_SHA -> $CURRENT_SHA); discarding this repair batch."
             exit 1
           fi
-          if [[ "$HEAD_REPO" != "$GITHUB_REPOSITORY" ]]; then
+          if [[ "$HEAD_REPO" != "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" ]]; then
             echo "::error::PR-Agent automatic repair supports same-repository PR branches only."
             exit 1
           fi
@@ -404,8 +463,8 @@ jobs:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
             await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
+              owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+              repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
               sha: process.env.HEAD_SHA,
               state: 'pending',
               context: 'continuum/pr-agent-repair',
@@ -422,6 +481,7 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.TAP_PAT }}
           persist-credentials: true
+          repository: ${{ env.CONTINUUM_PR_AGENT_TARGET_REPOSITORY }}
           ref: ${{ steps.target.outputs.head_ref }}
 
       - name: Confirm the checked-out branch is the reviewed HEAD
@@ -533,7 +593,7 @@ jobs:
           fi
           # Revalidate immediately before publication so a long repair run can
           # never publish against a PR branch that moved after repair started.
-          CURRENT_STATE="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid,state,isDraft --jq '[.headRefOid,.state,(.isDraft|tostring)]|@tsv' || true)"
+          CURRENT_STATE="$(gh pr view "$PR_NUMBER" --repo "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" --json headRefOid,state,isDraft --jq '[.headRefOid,.state,(.isDraft|tostring)]|@tsv' || true)"
           CURRENT_SHA="$(cut -f1 <<<"$CURRENT_STATE")"
           CURRENT_PR_STATE="$(cut -f2 <<<"$CURRENT_STATE")"
           CURRENT_DRAFT="$(cut -f3 <<<"$CURRENT_STATE")"
@@ -580,26 +640,26 @@ jobs:
             "Repair prepared ${HEAD_SHA_LOWER} -> ${NEW_HEAD_LOWER}; a fresh exact-HEAD review will hold only surviving logical findings."
 
           mapfile -t CONTROLLER_IDS < <(
-            gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100" \
+            gh api --paginate "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100" \
               --jq '.[] | select(.body | contains("<!-- continuum-pr-agent-controller-state:v1 -->")) | .id'
           )
           if (( ${#CONTROLLER_IDS[@]} > 0 )); then
             LAST_INDEX=$((${#CONTROLLER_IDS[@]} - 1))
             CONTROLLER_ID="${CONTROLLER_IDS[$LAST_INDEX]}"
-            gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$CONTROLLER_ID" \
+            gh api --method PATCH "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/issues/comments/$CONTROLLER_ID" \
               -f body="$BODY" >/dev/null
             if (( LAST_INDEX > 0 )); then
               for STALE_ID in "${CONTROLLER_IDS[@]:0:$LAST_INDEX}"; do
-                gh api --method DELETE "repos/$GITHUB_REPOSITORY/issues/comments/$STALE_ID" >/dev/null
+                gh api --method DELETE "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/issues/comments/$STALE_ID" >/dev/null
               done
             fi
           else
-            gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
+            gh api --method POST "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/issues/$PR_NUMBER/comments" \
               -f body="$BODY" >/dev/null
           fi
 
           if ! git push --force-with-lease="refs/heads/$HEAD_REF:$HEAD_SHA" origin "HEAD:refs/heads/$HEAD_REF"; then
-            CURRENT_AFTER="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid || true)"
+            CURRENT_AFTER="$(gh pr view "$PR_NUMBER" --repo "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" --json headRefOid --jq .headRefOid || true)"
             REMOTE_AFTER="$(git ls-remote origin "refs/heads/$HEAD_REF" | awk '{print $1}' || true)"
             if [[ "$CURRENT_AFTER" != "$HEAD_SHA" || "$REMOTE_AFTER" != "$HEAD_SHA" ]]; then
               echo "classification=deterministic" >> "$GITHUB_OUTPUT"
@@ -644,7 +704,7 @@ jobs:
             const body = policy.controllerStateBody(stateMarker, summary);
             const comments = await github.paginate(
               github.rest.issues.listComments,
-              { owner: context.repo.owner, repo: context.repo.repo, issue_number: prNumber, per_page: 100 }
+              { owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER, repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO, issue_number: prNumber, per_page: 100 }
             );
             const controller = comments
               .filter(comment => String(comment.body || '').includes(policy.CONTROLLER_STATE_MARKER))
@@ -652,23 +712,23 @@ jobs:
             const latest = controller.at(-1);
             if (latest) {
               await github.rest.issues.updateComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
+                owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+                repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
                 comment_id: latest.id,
                 body,
               });
             } else {
               await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
+                owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+                repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
                 issue_number: prNumber,
                 body,
               });
             }
             for (const stale of controller.slice(0, -1)) {
               await github.rest.issues.deleteComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
+                owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+                repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
                 comment_id: stale.id,
               });
             }
@@ -682,8 +742,8 @@ jobs:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
             await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
+              owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+              repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
               sha: process.env.HEAD_SHA,
               state: 'success',
               context: 'continuum/pr-agent-repair',
@@ -703,8 +763,8 @@ jobs:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
             await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
+              owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+              repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
               sha: process.env.HEAD_SHA,
               state: 'failure',
               context: 'continuum/pr-agent-repair',
@@ -752,7 +812,7 @@ jobs:
             const body = policy.controllerStateBody(stateMarker, summary);
             const comments = await github.paginate(
               github.rest.issues.listComments,
-              { owner: context.repo.owner, repo: context.repo.repo, issue_number: prNumber, per_page: 100 }
+              { owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER, repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO, issue_number: prNumber, per_page: 100 }
             );
             const controller = comments
               .filter(comment => String(comment.body || '').includes(policy.CONTROLLER_STATE_MARKER))
@@ -760,23 +820,23 @@ jobs:
             const latest = controller.at(-1);
             if (latest) {
               await github.rest.issues.updateComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
+                owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+                repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
                 comment_id: latest.id,
                 body,
               });
             } else {
               await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
+                owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+                repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
                 issue_number: prNumber,
                 body,
               });
             }
             for (const stale of controller.slice(0, -1)) {
               await github.rest.issues.deleteComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
+                owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
+                repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO,
                 comment_id: stale.id,
               });
             }
@@ -796,6 +856,7 @@ jobs:
           HEAD_SHA: ${{ inputs.head_sha }}
           RETRY_ATTEMPT: ${{ inputs.retry_attempt || '0' }}
           RETRY_WORKFLOW: ${{ inputs.retry_workflow || 'continuum-pr-agent.yml' }}
+          TARGET_CHILD_ID: ${{ inputs.target_child_id }}
           CI_WORKFLOW_NAME: ${{ vars.CONTINUUM_CI_WORKFLOW_NAME || 'CI' }}
         run: |
           set -euo pipefail
@@ -809,7 +870,7 @@ jobs:
               ;;
           esac
 
-          current_sha="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid || true)"
+          current_sha="$(gh pr view "$PR_NUMBER" --repo "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" --json headRefOid --jq .headRefOid || true)"
           if [[ -z "$current_sha" || "$current_sha" != "$HEAD_SHA" ]]; then
             echo "PR HEAD changed during failed repair; stale retry cancelled."
             exit 0
@@ -824,7 +885,7 @@ jobs:
           delay=$((15 * (1 << attempt)))
           sleep "$delay"
 
-          if ! current="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid,state,isDraft --jq '[.headRefOid,.state,(.isDraft|tostring)]|@tsv')"; then
+          if ! current="$(gh pr view "$PR_NUMBER" --repo "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" --json headRefOid,state,isDraft --jq '[.headRefOid,.state,(.isDraft|tostring)]|@tsv')"; then
             echo "Could not revalidate PR state after backoff; stale retry cancelled."
             exit 0
           fi
@@ -836,7 +897,7 @@ jobs:
             exit 0
           fi
           CI_JSON="$RUNNER_TEMP/pr-agent-repair-ci-runs.json"
-          if ! gh api "repos/$GITHUB_REPOSITORY/actions/runs?event=pull_request&head_sha=$HEAD_SHA&per_page=100" > "$CI_JSON"; then
+          if ! gh api "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/actions/runs?event=pull_request&head_sha=$HEAD_SHA&per_page=100" > "$CI_JSON"; then
             echo "Could not revalidate exact-HEAD CI after backoff; stale retry cancelled."
             exit 0
           fi
@@ -867,5 +928,5 @@ jobs:
           esac
           if ! [[ "$DEFAULT_BRANCH" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]]; then DEFAULT_BRANCH="main"; fi
           if [[ "$DEFAULT_BRANCH" == */.*/* || "$DEFAULT_BRANCH" == .*/ || "$DEFAULT_BRANCH" == */. ]] || [[ "$DEFAULT_BRANCH" =~ (^|/)\. ]] || [[ "$DEFAULT_BRANCH" =~ \.lock($|/) ]]; then DEFAULT_BRANCH="main"; fi
-          gh workflow run "$RETRY_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH"             -f pr_number="$PR_NUMBER"             -f expected_head_sha="$HEAD_SHA"             -f retry_attempt="$next"             -f retry_workflow="$RETRY_WORKFLOW"             -f recovery_kind="repair"
+          gh workflow run "$RETRY_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH"             -f pr_number="$PR_NUMBER"             -f expected_head_sha="$HEAD_SHA"             -f retry_attempt="$next"             -f retry_workflow="$RETRY_WORKFLOW"             -f recovery_kind="repair"             -f target_child_id="$TARGET_CHILD_ID"
           echo "Dispatched isolated PR-Agent repair retry via fresh review attempt $next/3."
