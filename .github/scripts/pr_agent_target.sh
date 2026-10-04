@@ -24,7 +24,7 @@ if [[ -n "$child_id" ]]; then
   target_repository="$(
     PARENT_CONFIG="${PARENT_CONFIG:-.continuum.yml}" \
     CHILD_REPOSITORIES="${CHILD_REPOSITORIES:-}" \
-      bash "$resolver" resolve "$child_id"
+      bash "$resolver" resolve "$child_id" 2>/dev/null
   )" || resolve_rc=$?
   # Repository names cannot contain whitespace: strip carriage returns and
   # trim leading/trailing whitespace so a trailing newline/CR from the

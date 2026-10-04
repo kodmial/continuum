@@ -999,20 +999,16 @@ jobs:
                 } catch (dispatchErr) {
                   const dispatchMessage = String(dispatchErr.message || dispatchErr);
                   if (dispatchParams.inputs && /input/i.test(dispatchMessage)) {
+                    // A delegated wakeup must never retry bare: a bare
+                    // dispatch would wake the execution repository instead of
+                    // the delegated child target. Skip and stay visible.
                     core.warning(
                       'PR #' + prNumber +
-                      ': wakeup ' + workflow + ' rejected target_child_id inputs; retrying bare: ' +
+                      ': wakeup ' + workflow + ' does not accept target_child_id inputs; ' +
+                      'skipping bare retry to preserve the delegated target: ' +
                       dispatchMessage
                     );
-                    await github.request(
-                      'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
-                      {
-                        owner: executionOwner,
-                        repo: executionRepo,
-                        workflow_id: workflow,
-                        ref: postMergeWakeupRef,
-                      }
-                    );
+                    continue;
                   } else {
                     throw dispatchErr;
                   }

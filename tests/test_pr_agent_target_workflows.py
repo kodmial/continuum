@@ -96,6 +96,9 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
 
     def test_delegated_identity_is_masked_and_target_checkout_is_quiet(self):
         helper = read(".github/scripts/pr_agent_target.sh")
+        # Resolver stderr is suppressed so delegated identity cannot leak
+        # before the ::add-mask:: calls are installed.
+        self.assertIn('resolve "$child_id" 2>/dev/null', helper)
         self.assertIn("echo \"::add-mask::$target_repository\"", helper)
         self.assertIn("echo \"::add-mask::$target_repo\"", helper)
         review = read(".github/workflows/continuum-pr-agent.yml")
@@ -116,6 +119,59 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
                 body = read(path)
                 self.assertNotIn("target_child_id", body)
                 self.assertNotIn("CONTINUUM_PR_AGENT_TARGET", body)
+
+    def test_delegated_reads_fail_closed_without_pat(self):
+        body = read(".github/workflows/continuum-pr-agent.yml")
+        # A dedicated guard fails the run before any delegated read when
+        # TAP_PAT is empty, so the conditional token can never silently fall
+        # back to github.token for cross-repository reads.
+        self.assertIn("Fail closed when delegated without PAT", body)
+        self.assertIn("Delegated PR-Agent execution requires TAP_PAT", body)
+        self.assertIn("refusing to fall back to github.token", body)
+        for step in (
+            "Admit only a review-ready PR with green CI on the exact HEAD",
+            "Revalidate the admitted exact HEAD immediately before review",
+            "Revalidate the PR head and native review output after review",
+            "Fail closed on a moved head",
+        ):
+            with self.subTest(step=step):
+                start = body.index(step)
+                window = body[start:start + 4000]
+                self.assertIn("CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED", window)
+                self.assertIn("TAP_PAT", window)
+                self.assertIn("requires TAP_PAT", window)
+
+    def test_checkout_credential_is_scoped_to_resolved_target(self):
+        body = read(".github/workflows/continuum-pr-agent.yml")
+        start = body.index("Checkout the pull request head without exposing")
+        window = body[start:start + 4000]
+        # Local checkout uses github.token; only delegated checkout uses
+        # TAP_PAT, and delegated runs without PAT fail closed.
+        self.assertIn("github.token", window)
+        self.assertIn("secrets.TAP_PAT", window)
+        self.assertIn("CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED", window)
+        self.assertIn("requires TAP_PAT", window)
+
+    def test_delegated_wakeup_never_retries_bare(self):
+        body = read(".github/workflows/continuum-pr-agent-auto-merge.yml")
+        self.assertIn("dispatchParams.inputs = { target_child_id: targetChildId }", body)
+        self.assertIn("skipping bare retry to preserve the delegated target", body)
+        self.assertNotIn("retrying bare", body)
+
+    def test_auto_merge_exact_head_and_privacy(self):
+        body = read(".github/workflows/continuum-pr-agent-auto-merge.yml")
+        # Exact-HEAD: only the reviewed SHA may merge; any moved HEAD fails.
+        self.assertIn("pr.head.sha.toLowerCase() !== reviewedHead", body)
+        self.assertIn("sha: reviewedHead", body)
+        self.assertIn("refusing to merge a stale result", body)
+        # Delegated-vs-local branching: opaque child id only, never a
+        # concrete repository input.
+        self.assertIn("target_child_id:", body)
+        self.assertNotIn("target_repository:", body)
+        self.assertIn("CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED", body)
+        # Privacy: delegated conflict tooling never dispatches into the
+        # child; the failure stays explicit instead of leaking a local run.
+        self.assertIn("Delegated PR conflict repair needs the parent routing controller", body)
 
 
 if __name__ == "__main__":

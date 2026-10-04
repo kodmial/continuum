@@ -340,6 +340,17 @@ jobs:
           CONTINUUM_ENGINE_ROOT="$RUNTIME_ROOT" PARENT_CONFIG="$PARENT_CONFIG_FILE" \
             bash "$RUNTIME_ROOT/.github/scripts/pr_agent_target.sh" "$TARGET_CHILD_ID"
 
+      - name: Fail closed when delegated without PAT
+        if: steps.stack.outputs.enabled == 'true'
+        env:
+          TAP_PAT: ${{ secrets.TAP_PAT }}
+        run: |
+          set -euo pipefail
+          if [[ "${CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED:-false}" == "true" && -z "${TAP_PAT:-}" ]]; then
+            echo "::error::Delegated PR-Agent execution requires TAP_PAT; refusing to fall back to github.token."
+            exit 1
+          fi
+
       - name: Report the disabled provider explicitly
         if: steps.stack.outputs.enabled != 'true'
         run: echo "PR-Agent skipped because CONTINUUM_REVIEW_PROVIDER is not pr-agent."
@@ -352,16 +363,25 @@ jobs:
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           EXPECTED_HEAD: ${{ steps.stack.outputs.expected_head }}
           CI_WORKFLOW_NAME: ${{ inputs.ci_workflow_name || vars.CONTINUUM_CI_WORKFLOW_NAME || 'CI' }}
+          TAP_PAT: ${{ secrets.TAP_PAT }}
         with:
           # Target-aware admission (pulls.get plus exact-HEAD workflow-run
           # evidence against the resolved target repository). Local
           # same-repository reads use github.token; delegated cross-repository
-          # reads require TAP_PAT. Only the opaque child id ever selects the
+          # reads require TAP_PAT and fail closed without it (never fall back
+          # to github.token). Only the opaque child id ever selects the
           # target; concrete repository identity stays runner-local.
           github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || github.token }}
           script: |
             // Admission: open, non-draft, same-repo PR whose exact current HEAD
             // has green CI. Anything else is skipped, never reviewed.
+            if (process.env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED === 'true' &&
+                !String(process.env.TAP_PAT || '').trim()) {
+              core.setFailed(
+                'Delegated PR-Agent execution requires TAP_PAT; refusing to fall back to github.token.'
+              );
+              return;
+            }
             const prNumber = Number(process.env.PR_NUMBER);
             const { data: pr } = await github.rest.pulls.get({
               owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER,
@@ -456,10 +476,19 @@ jobs:
       - name: Checkout the pull request head without exposing delegated repository metadata
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
         env:
-          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          # Scoped to the resolved target: local same-repository checkout
+          # uses github.token so a missing PAT never breaks local-only runs;
+          # delegated cross-repository checkout requires TAP_PAT and fails
+          # closed without it (never falls back to github.token).
+          GH_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || github.token }}
+          TAP_PAT: ${{ secrets.TAP_PAT }}
           HEAD_SHA: ${{ steps.admit.outputs.head_sha }}
         run: |
           set -euo pipefail
+          if [[ "${CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED:-false}" == "true" && -z "${TAP_PAT:-}" ]]; then
+            echo "::error::Delegated PR-Agent execution requires TAP_PAT; refusing to fall back to github.token."
+            exit 1
+          fi
           worktree="$RUNNER_TEMP/continuum-pr-agent-review-worktree"
           rm -rf "$worktree"
           mkdir -p "$worktree"
@@ -593,13 +622,19 @@ jobs:
         env:
           # Target-aware revalidation (gh pr view plus exact-HEAD workflow-run
           # evidence against the resolved target). Local same-repository reads
-          # use github.token; delegated cross-repository reads require TAP_PAT.
+          # use github.token; delegated cross-repository reads require TAP_PAT
+          # and fail closed without it (never fall back to github.token).
           GH_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || github.token }}
+          TAP_PAT: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           ADMITTED_SHA: ${{ steps.admit.outputs.head_sha }}
           CI_WORKFLOW_NAME: ${{ inputs.ci_workflow_name || vars.CONTINUUM_CI_WORKFLOW_NAME || 'CI' }}
         run: |
           set -euo pipefail
+          if [[ "${CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED:-false}" == "true" && -z "${TAP_PAT:-}" ]]; then
+            echo "::error::Delegated PR-Agent execution requires TAP_PAT; refusing to fall back to github.token."
+            exit 1
+          fi
           CURRENT_SHA="$(gh pr view "$PR_NUMBER" --repo "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" --json headRefOid --jq .headRefOid)"
           if [[ "${CURRENT_SHA,,}" != "${ADMITTED_SHA,,}" ]]; then
             echo "::error::PR head moved after CI admission ($ADMITTED_SHA -> $CURRENT_SHA); refusing to review an unqualified HEAD."
@@ -763,12 +798,21 @@ jobs:
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           REVIEWED_SHA: ${{ steps.before.outputs.sha }}
           REVIEW_JSON: ${{ steps.pragent.outputs.review }}
+          TAP_PAT: ${{ secrets.TAP_PAT }}
         with:
           # Target-aware revalidation (pulls.get for the current PR head only
           # against the resolved target). Local reads use github.token;
-          # delegated cross-repository reads require TAP_PAT.
+          # delegated cross-repository reads require TAP_PAT and fail closed
+          # without it (never fall back to github.token).
           github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || github.token }}
           script: |
+            if (process.env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED === 'true' &&
+                !String(process.env.TAP_PAT || '').trim()) {
+              core.setFailed(
+                'Delegated PR-Agent execution requires TAP_PAT; refusing to fall back to github.token.'
+              );
+              return;
+            }
             const prNumber = Number(process.env.PR_NUMBER);
             const reviewedSha = String(process.env.REVIEWED_SHA || '').toLowerCase();
             const { data: pr } = await github.rest.pulls.get({
@@ -1101,12 +1145,18 @@ jobs:
         env:
           # Target-aware moved-head check (gh pr view for the current PR head
           # only against the resolved target). Local reads use github.token;
-          # delegated cross-repository reads require TAP_PAT.
+          # delegated cross-repository reads require TAP_PAT and fail closed
+          # without it (never fall back to github.token).
           GH_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || github.token }}
+          TAP_PAT: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           REVIEWED_SHA: ${{ steps.before.outputs.sha }}
         run: |
           set -euo pipefail
+          if [[ "${CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED:-false}" == "true" && -z "${TAP_PAT:-}" ]]; then
+            echo "::error::Delegated PR-Agent execution requires TAP_PAT; refusing to fall back to github.token."
+            exit 1
+          fi
           if [[ -z "${REVIEWED_SHA:-}" ]]; then
             echo "No review was admitted; nothing to revalidate."
             exit 0

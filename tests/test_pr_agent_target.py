@@ -152,6 +152,34 @@ class PrAgentTargetContextTests(unittest.TestCase):
         self.assertEqual(values, {})
         self.assertIn("invalid", proc.stderr.lower())
 
+    def test_delegated_resolver_stderr_is_suppressed_before_masking(self):
+        proc, values, _ = self.run_target(
+            "opaque-a",
+            """
+            #!/usr/bin/env bash
+            set -euo pipefail
+            echo "$*" >> "__CALLS__"
+            case "$1" in
+              resolve)
+                printf 'private-owner/private-child\\n'
+                echo "leak private-owner/private-child" >&2
+                ;;
+              verify) [[ "$2" == opaque-a && "$3" == private-owner/private-child ]] ;;
+              *) exit 2 ;;
+            esac
+            """,
+            github_actions="true",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            values["CONTINUUM_PR_AGENT_TARGET_REPOSITORY"],
+            "private-owner/private-child",
+        )
+        self.assertEqual(values["CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED"], "true")
+        self.assertNotIn("private-owner/private-child", proc.stderr)
+        self.assertNotIn("leak", proc.stderr)
+        self.assertIn("::add-mask::private-owner/private-child", proc.stdout)
+
     def test_delegated_masks_target_identity_in_actions(self):
         proc, values, _ = self.run_target(
             "opaque-a",
