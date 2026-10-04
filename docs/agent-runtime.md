@@ -77,7 +77,7 @@ Continuum owns one versioned manifest (`AgentManifest`,
 | Python bridge deps | `3.12`, standard library only |
 | Utilities | `bash curl git gh jq python3` |
 | Base image | per `(os, arch)` in `BASE_IMAGES` |
-| Probes | `opencode --version`, `pr-agent --version`, `run --version` |
+| Probes | `opencode --version`, `pr-agent --version`, `runner --version` |
 
 The contract produces Linux, macOS, and Windows manifests from the same
 schema — never one universal Linux image. Runner software updates happen by

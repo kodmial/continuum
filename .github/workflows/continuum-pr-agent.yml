@@ -422,6 +422,12 @@ jobs:
           # recorded by the validated image build (or a prior
           # reconstruction): a stale or unrelated 0.46.0 binary whose stamp
           # does not match the digest cannot take the hit path.
+          # Fresh GitHub-hosted runners carry no pre-populated stamp or
+          # binaries, so with the default empty digest they take the
+          # reconstruction path below: that fall-through is the expected
+          # cold path, not a warm hit. The hit path serves jobs whose
+          # image build (or provider cache restore) pre-populated the
+          # stamp and binaries for this digest.
           if [[ "$PR_AGENT_VERSION" != "0.46.0" ]]; then
             echo "::error::Isolated PR-Agent stack pins upstream v0.46.0, got $PR_AGENT_VERSION."
             exit 1
@@ -462,6 +468,12 @@ jobs:
           # build (or a prior reconstruction): a stale or unrelated
           # opencode 1.18.34 binary whose stamp does not match the digest
           # cannot take the hit path.
+          # Fresh GitHub-hosted runners carry no pre-populated stamp or
+          # binaries, so with the default empty digest they take the
+          # reconstruction path below: that fall-through is the expected
+          # cold path, not a warm hit. The hit path serves jobs whose
+          # image build (or provider cache restore) pre-populated the
+          # stamp and binaries for this digest.
           export PATH="$HOME/.opencode/bin:$PATH"
           STAMP_FILE="$HOME/.opencode/image-digest"
           if [[ -n "${CONTINUUM_IMAGE_DIGEST:-}" ]] && ! [[ "$CONTINUUM_IMAGE_DIGEST" =~ ^[0-9a-f]{64}$ ]]; then

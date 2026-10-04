@@ -632,6 +632,99 @@ class AgentRuntimeContractTest(unittest.TestCase):
             created_at=0.0, lease_expires_at=1.0, max_age_at=2.0)
         self.assertNotIn("ghost", controller.leases)
 
+    def test_multi_profile_active_pointers_are_independent(self):
+        controller = _controller()
+        linux = runtime.resolve_profile({"preset": "agent-linux"})
+        macos = runtime.resolve_profile({"preset": "agent-macos"})
+        linux_manifest = _manifest(linux)
+        macos_manifest = _manifest(macos)
+        controller.queue_job("acme/app", linux, run_id="r-linux")
+        first = controller.run_next_job(linux_manifest, now=1000.0)
+        self.assertTrue(first.destroyed)
+        # Promoting the second platform must not invalidate the first:
+        # each profile keeps its own active digest.
+        controller.queue_job("acme/app", macos, run_id="r-macos")
+        second = controller.run_next_job(macos_manifest, now=2000.0)
+        self.assertTrue(second.destroyed)
+        self.assertEqual(controller.images.active_digest_for(linux),
+                         runtime.image_digest(linux_manifest, linux))
+        self.assertEqual(controller.images.active_digest_for(macos),
+                         runtime.image_digest(macos_manifest, macos))
+        # A stale digest for one profile is still rejected for that
+        # profile even while the other profile serves.
+        stale_manifest = runtime.AgentManifest(
+            **{**linux_manifest.to_canonical(), "opencode_version": "9.9.9"})
+        controller.queue_job("acme/app", linux, run_id="r-stale")
+        with self.assertRaises(runtime.AgentRuntimeError):
+            controller.run_next_job(stale_manifest, now=3000.0)
+
+    def test_top_level_network_lifecycle_persistent_is_rejected(self):
+        with self.assertRaises(runtime.AgentRuntimeError):
+            runtime.resolve_profile({"preset": "agent-linux",
+                                     "network_lifecycle": "persistent"})
+        with self.assertRaises(runtime.AgentRuntimeError):
+            runtime.resolve_profile({"preset": "agent-linux",
+                                     "network": "persistent"})
+
+    def test_runner_probe_requires_executable_version_check(self):
+        profile = runtime.resolve_profile({"preset": "agent-linux"})
+        manifest = runtime.canonical_manifest("linux", "x64", "main")
+        weak = runtime.AgentManifest(**{**manifest.to_canonical(), "probes": (
+            "opencode --version",
+            "pr-agent --version",
+            "echo runner",
+        )})
+        store = runtime.ImageStore(project_id="proj-probe")
+        with self.assertRaises(runtime.AgentRuntimeError):
+            store.ensure_image(weak, profile, now=1000.0)
+        strong = runtime.AgentManifest(**{**manifest.to_canonical(), "probes": (
+            "opencode --version",
+            "pr-agent --version",
+            "runner --version",
+        )})
+        strong_generation = store.ensure_image(strong, profile, now=2000.0)
+        runtime.validate_image(strong, profile, strong_generation)
+
+    def test_live_idle_count_without_clock_exposes_expired_lease(self):
+        controller = _controller()
+        profile = runtime.resolve_profile({"preset": "agent-linux"})
+        manifest = _manifest(profile)
+        digest = runtime.image_digest(manifest, profile)
+        network = controller.provider.create_network(
+            runtime.profile_digest(profile), "job-leak", now=1000.0)
+        leaked = controller.provider.create_instance(
+            project_id="proj-a", repository="acme/app",
+            profile_digest=runtime.profile_digest(profile), digest=digest,
+            job_id="job-leak", network_id=network.id, now=1000.0)
+        controller.leases[leaked.id] = runtime.Lease(
+            project_id="proj-a", repository="acme/app", job_id="job-leak",
+            run_id="r-leak",
+            profile_digest=runtime.profile_digest(profile),
+            instance_id=leaked.id,
+            created_at=1000.0,
+            lease_expires_at=1000.0 + controller.max_job_lifetime,
+            max_age_at=1000.0 + controller.global_max_age, state="running")
+        # The lease expired long ago and the sweeper has not run: even
+        # without an explicit clock the leaked live compute must count as
+        # idle instead of reporting a vacuous zero.
+        self.assertGreaterEqual(
+            controller.live_idle_count(now=1000.0 + controller.global_max_age + 1.0), 1)
+        self.assertGreaterEqual(controller.live_idle_count(), 1)
+
+    def test_resolve_profile_from_env_reads_preset_and_provider(self):
+        profile = runtime.resolve_profile_from_env(
+            {"CONTINUUM_RUNTIME_PRESET": "agent-macos",
+             "CONTINUUM_RUNTIME_PROVIDER": "gce"})
+        self.assertEqual(profile.os, "macos")
+        self.assertEqual(profile.provider, "gce")
+        with self.assertRaises(runtime.AgentRuntimeError):
+            runtime.resolve_profile_from_env(
+                {"CONTINUUM_RUNTIME_PRESET": "no-such-preset"})
+        with self.assertRaises(runtime.AgentRuntimeError):
+            runtime.resolve_profile_from_env(
+                {"CONTINUUM_RUNTIME_PRESET": "agent-linux",
+                 "CONTINUUM_RUNTIME_PROVIDER": "no-such-provider"})
+
 
 if __name__ == "__main__":
     unittest.main()

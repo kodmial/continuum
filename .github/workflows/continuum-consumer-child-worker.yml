@@ -126,6 +126,15 @@ jobs:
           # build (or a prior reconstruction): a stale or unrelated
           # opencode 1.18.34 binary whose stamp does not match the digest
           # cannot take the hit path.
+          # The digest is content-addressed per runtime profile (Continuum
+          # ref, profile digest including os/arch, base image, toolchain):
+          # this single variable carries the digest for this worker's
+          # profile (ubuntu-latest / linux-x64 here). Multi-profile
+          # consumers promote one digest per profile; per-job network
+          # attachment, JIT registration, single-use execution, teardown,
+          # and orphan reconciliation are owned by the Continuum
+          # provisioning path, whose warm-with-zero-idle qualification is
+          # recorded by the engine harness.
           export PATH="$HOME/.opencode/bin:$PATH"
           STAMP_FILE="$HOME/.opencode/image-digest"
           if [[ -n "${CONTINUUM_IMAGE_DIGEST:-}" ]] && ! [[ "$CONTINUUM_IMAGE_DIGEST" =~ ^[0-9a-f]{64}$ ]]; then

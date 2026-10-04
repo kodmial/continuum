@@ -35,6 +35,27 @@ class ContinuumTest < Minitest::Test
     File.read(File.join(ROOT, '.github/workflows', name))
   end
 
+  # The code portion of a workflow line with `#` comments stripped (mirrors
+  # the Python worktree contract `_code_without_comment`). Only a `#`
+  # outside single/double quotes starts a comment, so a quoted `#` is
+  # preserved while a trailing comment is not code. Comment-only lines
+  # yield an empty string and never count as installer/probe/gated/hit
+  # evidence.
+  def code_without_comment(line)
+    in_single = false
+    in_double = false
+    line.each_char.with_index do |char, index|
+      if char == "'" && !in_double
+        in_single = !in_single
+      elsif char == '"' && !in_single
+        in_double = !in_double
+      elsif char == '#' && !in_single && !in_double
+        return line[0...index]
+      end
+    end
+    line
+  end
+
   # Only the embedded `script: |` block. Assertions about *engine* literals must
   # not see the `workflow_call.inputs` defaults, which legitimately name the
   # same values as the fallback chain.
@@ -5148,23 +5169,28 @@ class ContinuumTest < Minitest::Test
       # carrying both the CONTINUUM_IMAGE_DIGEST gate and a real probe) so
       # an empty or malformed digest cannot take the hit path and skip the
       # install. Format-only validation is not identity enforcement.
-      installer_lines = lines.each_index.select do |i|
-        lines[i].include?('https://opencode.ai/install') ||
-          (lines[i].include?('pip install') && lines[i].include?('pr-agent'))
+      # Comment portions never count: a `#`-leading line (or the `#`
+      # comment tail of a code line) mentioning an installer URL is not an
+      # installer site, and a comment mentioning a probe or
+      # `prepared-runtime hit` is not executable evidence.
+      code_lines = lines.map { |line| code_without_comment(line) }
+      installer_lines = code_lines.each_index.select do |i|
+        code_lines[i].include?('https://opencode.ai/install') ||
+          (code_lines[i].include?('pip install') && code_lines[i].include?('pr-agent'))
       end
       refute_empty installer_lines, "#{name}: the deterministic reconstruction fallback is missing"
-      probe_lines = lines.each_index.select do |i|
-        lines[i].include?('command -v opencode') || lines[i].include?('pr-agent --version')
+      probe_lines = code_lines.each_index.select do |i|
+        code_lines[i].include?('command -v opencode') || code_lines[i].include?('pr-agent --version')
       end
       refute_empty probe_lines, "#{name}: no executable prepared-runtime probe found"
-      gated_lines = lines.each_index.select do |i|
-        lines[i].include?('CONTINUUM_IMAGE_DIGEST') &&
-          (lines[i].include?('command -v opencode') || lines[i].include?('pr-agent --version'))
+      gated_lines = code_lines.each_index.select do |i|
+        code_lines[i].include?('CONTINUUM_IMAGE_DIGEST') &&
+          (code_lines[i].include?('command -v opencode') || code_lines[i].include?('pr-agent --version'))
       end
       refute_empty gated_lines, "#{name}: the warm hit must be keyed by the image digest (no digest-gated probe line)"
       assert_match(/CONTINUUM_IMAGE_DIGEST.*=~\s*\^\[0-9a-f\]\{64\}\$/, body,
                    "#{name}: the digest gate must enforce the 64-char sha256 shape")
-      hit_lines = lines.each_index.select { |i| lines[i].include?('prepared-runtime hit') }
+      hit_lines = code_lines.each_index.select { |i| code_lines[i].include?('prepared-runtime hit') }
       refute_empty hit_lines, "#{name}: a warm probe hit must be logged before any download"
       # Per-site enforcement: every installer line needs its own
       # probe-gated hit. Global minima are not enough: in a multi-site
@@ -5186,16 +5212,18 @@ class ContinuumTest < Minitest::Test
                         "#{name}: line #{at + 1} has no prepared-runtime hit in its own site before the installer"
         # The hit path must actually short-circuit the download: exit-0 style
         # steps stop before the installer, if/else (consumer-child) steps
-        # skip the download branch on a hit.
+        # skip the download branch on a hit. The comparison runs on the
+        # comment-stripped code so a semantically identical
+        # `exit 0 # warm hit` or `else # cache hit` still matches.
         if name.start_with?('continuum-consumer-child-')
-          else_between = lines.each_index.any? do |i|
-            lines[i].strip == 'else' && i > site_hits.min && i < at
+          else_between = code_lines.each_index.any? do |i|
+            code_lines[i].strip == 'else' && i > site_hits.min && i < at
           end
           assert else_between,
                  "#{name}: line #{at + 1} warm hit branch must skip the download via if/else (no fall-through install)"
         else
-          exit_between = lines.each_index.any? do |i|
-            lines[i].strip == 'exit 0' && i > site_hits.min && i < at
+          exit_between = code_lines.each_index.any? do |i|
+            code_lines[i].strip == 'exit 0' && i > site_hits.min && i < at
           end
           assert exit_between,
                  "#{name}: line #{at + 1} warm hit must short-circuit with exit 0 before any download"
@@ -5205,9 +5233,10 @@ class ContinuumTest < Minitest::Test
 
     pr_agent = workflow_body('continuum-pr-agent.yml')
     pr_lines = pr_agent.lines
-    pip_lines = pr_lines.each_index.select { |i| pr_lines[i].include?('pip install') && pr_lines[i].include?('pr-agent') }
+    pr_code = pr_lines.map { |line| code_without_comment(line) }
+    pip_lines = pr_code.each_index.select { |i| pr_code[i].include?('pip install') && pr_code[i].include?('pr-agent') }
     refute_empty pip_lines, 'continuum-pr-agent.yml: the pinned PR-Agent reconstruction is missing'
-    version_probes = pr_lines.each_index.select { |i| pr_lines[i].include?('pr-agent --version') }
+    version_probes = pr_code.each_index.select { |i| pr_code[i].include?('pr-agent --version') }
     refute_empty version_probes, 'continuum-pr-agent.yml: the PR-Agent prepared-runtime probe is missing'
     pip_lines.each do |at|
       prev_pip = pip_lines.select { |i| i < at }.max || -1

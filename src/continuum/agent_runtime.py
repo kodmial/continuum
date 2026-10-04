@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import time
 from copy import deepcopy
@@ -218,7 +219,7 @@ class AgentManifest:
     probes: Tuple[str, ...] = (
         "opencode --version",
         "pr-agent --version",
-        "run --version",
+        "runner --version",
     )
 
     def to_canonical(self) -> Dict[str, Any]:
@@ -323,6 +324,48 @@ PRESETS: Dict[str, Dict[str, Any]] = {
     },
 }
 
+#: Repository variables consumed from the environment by the provisioning
+#: path (see docs/consumer-variables.md). They select the strict ephemeral
+#: preset and provider backend; strict invariants (zero idle, one job per
+#: instance, per-job network) are still enforced by ``resolve_profile`` so
+#: the variables cannot retune a strict profile into a persistent runner.
+CONTINUUM_RUNTIME_PRESET_VAR = "CONTINUUM_RUNTIME_PRESET"
+CONTINUUM_RUNTIME_PROVIDER_VAR = "CONTINUUM_RUNTIME_PROVIDER"
+DEFAULT_RUNTIME_PRESET = "agent-linux"
+DEFAULT_RUNTIME_PROVIDER = "github-hosted"
+
+
+def resolve_profile_from_env(
+    env: Optional[Mapping[str, Any]] = None,
+    **overrides: Any,
+) -> RuntimeProfile:
+    """Resolve the consumer runtime profile from repository-variable config.
+
+    Reads ``CONTINUUM_RUNTIME_PRESET`` (default ``agent-linux``) and
+    ``CONTINUUM_RUNTIME_PROVIDER`` (default ``github-hosted``) from ``env``
+    (default ``os.environ``). Explicit keyword overrides win over the
+    environment. Enforcement stays in ``resolve_profile``: unknown presets,
+    unsupported providers, persistent lifecycles, non-zero idle instances,
+    non-single max uses, and paid-provider keys all raise.
+    """
+
+    source: Any = os.environ if env is None else env
+
+    def _read(name: str, default: str) -> str:
+        try:
+            raw = source.get(name)
+        except AttributeError:
+            raw = None
+        text = str(raw).strip() if raw is not None else ""
+        return text or default
+
+    declaration: Dict[str, Any] = {
+        "preset": _read(CONTINUUM_RUNTIME_PRESET_VAR, DEFAULT_RUNTIME_PRESET),
+        "provider": _read(CONTINUUM_RUNTIME_PROVIDER_VAR, DEFAULT_RUNTIME_PROVIDER),
+    }
+    declaration.update(overrides)
+    return resolve_profile(declaration)
+
 
 @dataclass(frozen=True)
 class RuntimeProfile:
@@ -402,7 +445,7 @@ def resolve_profile(declaration: Mapping[str, Any]) -> RuntimeProfile:
         name = str(decl.get("name") or preset)
     for key in ("os", "arch", "features", "provider", "continuum_ref", "toolchain",
                 "lifecycle", "max_uses_per_instance", "idle_instances",
-                "network", "cache", "concurrency_limit",
+                "network", "network_lifecycle", "cache", "concurrency_limit",
                 "provisioning_timeout_seconds", "max_job_lifetime_seconds",
                 "golden_image", "dependencies"):
         if key in decl:
@@ -435,7 +478,14 @@ def resolve_profile(declaration: Mapping[str, Any]) -> RuntimeProfile:
         )
     network_block = base.get("network", {})
     if isinstance(network_block, Mapping):
-        network_lifecycle = str(network_block.get("lifecycle", STRICT_NETWORK_LIFECYCLE))
+        if "lifecycle" in network_block:
+            network_lifecycle = str(network_block["lifecycle"])
+        else:
+            # A top-level {"network_lifecycle": ...} declaration must not be
+            # masked by the default empty network block: fall through to it
+            # so persistent intent is validated (and rejected) instead of
+            # silently defaulting to per-job.
+            network_lifecycle = str(base.get("network_lifecycle", STRICT_NETWORK_LIFECYCLE))
     elif isinstance(network_block, str):
         # A scalar network declaration is a lifecycle intent (e.g.
         # {"network": "persistent"}): validate it as the lifecycle instead
@@ -591,7 +641,12 @@ class ImageStore:
 
     Images are content-addressed by digest and immutable once validated.
     Consumers never share writable image state: each project owns its store
-    instance (and its active-image pointer).
+    instance. The active-image pointer is per runtime profile (keyed by
+    profile digest): multi-platform consumers promoting e.g. linux-x64 and
+    macos-arm64 keep one active digest per profile instead of one global
+    pointer where the second profile's jobs would be rejected as "not the
+    active image". ``active_digest`` remains as the most recently promoted
+    digest for single-profile callers.
     """
 
     def __init__(self, project_id: str) -> None:
@@ -600,11 +655,26 @@ class ImageStore:
         self.project_id = project_id
         self._generations: Dict[str, ImageGeneration] = {}
         self._active_digest: Optional[str] = None
+        self._active_by_profile: Dict[str, str] = {}
         self._history: List[Tuple[str, float, str]] = []
 
     @property
     def active_digest(self) -> Optional[str]:
         return self._active_digest
+
+    def active_digest_for(self, profile: Any) -> Optional[str]:
+        """Return the active digest serving one runtime profile.
+
+        Accepts a ``RuntimeProfile`` or an already-computed profile-digest
+        string. Returns ``None`` when no generation has been promoted for
+        that profile yet.
+        """
+
+        if isinstance(profile, RuntimeProfile):
+            key = profile_digest(profile)
+        else:
+            key = str(profile)
+        return self._active_by_profile.get(key)
 
     def ensure_image(
         self,
@@ -656,28 +726,50 @@ class ImageStore:
         self._generations[digest] = generation
         return generation
 
-    def promote(self, digest: str, now: Optional[float] = None) -> None:
-        """Atomically promote one validated generation to the active pointer."""
+    def promote(self, digest: str, now: Optional[float] = None, profile: Any = None) -> None:
+        """Atomically promote one validated generation to the active pointer.
+
+        The pointer is per runtime profile: the profile key is the explicit
+        ``profile`` argument when given (a ``RuntimeProfile`` or a
+        profile-digest string), otherwise the promoted generation's own
+        profile. Each profile keeps its own active digest so queuing a
+        second platform never invalidates the first.
+        """
 
         generation = self._generations.get(digest)
         if generation is None or not generation.validated:
             raise AgentRuntimeError("cannot promote unknown or unvalidated image {}".format(digest))
         timestamp = time.time() if now is None else float(now)
-        previous = self._active_digest
+        if profile is None:
+            profile_key = profile_digest(generation.profile)
+        elif isinstance(profile, RuntimeProfile):
+            profile_key = profile_digest(profile)
+        else:
+            profile_key = str(profile)
+        previous = self._active_by_profile.get(profile_key)
+        self._active_by_profile[profile_key] = digest
         self._active_digest = digest
         self._history.append((digest, timestamp, previous or ""))
 
-    def rollback(self, digest: str, now: Optional[float] = None) -> None:
+    def rollback(self, digest: str, now: Optional[float] = None, profile: Any = None) -> None:
         """Rollback changes the active immutable image pointer only."""
 
-        self.promote(digest, now=now)
+        self.promote(digest, now=now, profile=profile)
+
+    def active_digests(self) -> Dict[str, str]:
+        """Return a copy of the per-profile active-image pointers."""
+
+        return dict(self._active_by_profile)
 
     def garbage_collect(self, now: float, retention_seconds: float = DEFAULT_ROLLBACK_RETENTION_SECONDS) -> List[str]:
         """Remove old generations only after rollback retention expires."""
 
         removed: List[str] = []
+        protected = set(self._active_by_profile.values())
+        if self._active_digest is not None:
+            protected.add(self._active_digest)
         for digest, generation in list(self._generations.items()):
-            if digest == self._active_digest:
+            if digest in protected:
                 continue
             if now - generation.built_at >= retention_seconds:
                 del self._generations[digest]
@@ -709,17 +801,17 @@ def validate_image(manifest: AgentManifest, profile: RuntimeProfile, generation:
         raise AgentRuntimeError("manifest declares no validation/version probes")
     lowered = [str(probe).lower() for probe in manifest.probes]
     # Probes must be executable version checks, not bare name mentions: a
-    # substring test (`"run" in probe`) accepts `prune --help` (contains
-    # `run`) as a runner probe. Require an executable form (`--version` or
-    # `command -v`) naming the binary so the declared probe could actually
-    # prove the binary exists and reports its version.
+    # substring test (`"runner" in probe`) accepts `echo runner` as a runner
+    # probe. Require an executable form (`--version` or `command -v`)
+    # naming the runner binary so the declared probe could actually prove
+    # the binary exists and reports its version.
     if not any("opencode" in probe and ("--version" in probe or "command -v" in probe)
                for probe in lowered):
         raise AgentRuntimeError("manifest declares no opencode version probe")
     if not any("pr-agent" in probe and ("--version" in probe or "command -v" in probe)
                for probe in lowered):
         raise AgentRuntimeError("manifest declares no pr-agent version probe")
-    if not any("run --version" in probe or "command -v run" in probe or "runner" in probe
+    if not any("runner" in probe and ("--version" in probe or "command -v" in probe)
                for probe in lowered):
         raise AgentRuntimeError("manifest declares no runner version probe")
     # The declared probes must actually have been executed at build time: the
@@ -1094,19 +1186,18 @@ class EphemeralController:
         orphan sweep, not actively serving a job: its compute is idle
         leaked compute and must count as idle so the metric cannot report
         zero idle while live compute leaks until reconciliation runs. When
-        ``now`` is omitted the legacy membership check applies (every lease
-        entry counts as bound) so callers without a clock keep working.
+        ``now`` is omitted the current clock applies, so expiry is still
+        evaluated and callers cannot get a vacuous zero-idle pass from an
+        unswept expired lease.
         """
 
-        if now is None:
-            leased = set(self.leases)
-            return sum(1 for item in self.provider.live_instances() if item.id not in leased)
+        clock = time.time() if now is None else float(now)
         live_leased = set()
         for instance_id, lease in self.leases.items():
             expired = False
-            if now >= lease.max_age_at or now >= lease.lease_expires_at:
+            if clock >= lease.max_age_at or clock >= lease.lease_expires_at:
                 expired = True
-            elif lease.state == "provisioning" and now - lease.created_at >= self.provisioning_timeout:
+            elif lease.state == "provisioning" and clock - lease.created_at >= self.provisioning_timeout:
                 expired = True
             if not expired:
                 live_leased.add(instance_id)
@@ -1160,16 +1251,18 @@ class EphemeralController:
             )
 
         digest = image_digest(manifest, profile)
-        # Promotion/rollback gate execution: once an image is active, only
-        # the active digest may serve jobs. A queued job requesting any
-        # other digest must wait for an explicit promotion instead of
+        # Promotion/rollback gate execution: each runtime profile keeps its
+        # own active digest. A queued job requesting any other digest for
+        # its profile must wait for an explicit promotion instead of
         # building/validating and running unpromoted. Demand is kept (not
-        # popped) so the refused job is retried after promotion.
-        active = self.images.active_digest
+        # popped) so the refused job is retried after promotion. Profiles
+        # are independent: promoting linux-x64 never blocks macos-arm64.
+        active = self.images.active_digest_for(profile)
         if active is not None and digest != active:
             raise AgentRuntimeError(
-                "image digest {} is not the active image {}: promote it before serving jobs".format(
-                    digest, active
+                "image digest {} is not the active image {} for profile {!r}: "
+                "promote it before serving jobs".format(
+                    digest, active, profile_digest(profile)
                 )
             )
         # Layer C (dependency/build cache): restore validated, scoped cache
@@ -1189,8 +1282,8 @@ class EphemeralController:
                 events.append("cache-miss {} fallback-to-reconstruction".format(cache_key))
         generation = self.images.ensure_image(manifest, profile, now=now)
         events.append("ensured-image {}".format(digest))
-        if self.images.active_digest is None:
-            self.images.promote(generation.digest, now=now)
+        if self.images.active_digest_for(profile) is None:
+            self.images.promote(generation.digest, now=now, profile=profile)
         validate_image(manifest, profile, generation)
         events.append("validated-identity {}".format(digest))
         pending = self.queued.pop(0)
