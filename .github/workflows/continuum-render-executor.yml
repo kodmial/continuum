@@ -572,7 +572,7 @@ jobs:
               # repository repair issue. The source stays eligible for an
               # automatic retry; the marker budget stops an endless loop.
               TRANSIENT_COUNT="$(jq '[.[][]? | select((.body // "") | contains("<!-- continuum-render-transient-attempt -->"))] | length' \
-                <<<"$COMMENTS_JSON" 2>/dev/null || echo 0)"
+                <<<"$COMMENTS_JSON" 2>/dev/null || echo "$MAX_RENDER_REPAIR_ATTEMPTS")"
               if [[ "${TRANSIENT_COUNT:-0}" -ge "$MAX_RENDER_REPAIR_ATTEMPTS" ]]; then
                 gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
                   --add-label "$PAUSE_LABEL" >/dev/null 2>&1 || true

@@ -627,12 +627,20 @@ def classify_render_failure(
         limit = _find_first_bytes(result, _LIMIT_KEYS)
     if limit is None:
         limit = _find_first_bytes(state, _LIMIT_KEYS)
+    if limit is None:
+        limit = _find_first_bytes(qualification, _LIMIT_KEYS)
     current = _find_first_bytes(memory_summary, _CURRENT_KEYS)
     if current is None:
         current = _find_first_bytes(result, _CURRENT_KEYS)
+    if current is None:
+        current = _find_first_bytes(state, _CURRENT_KEYS)
+    if current is None:
+        current = _find_first_bytes(qualification, _CURRENT_KEYS)
     peak = _find_first_bytes(memory_summary, _PEAK_KEYS)
     if peak is None:
         peak = _find_first_bytes(result, _PEAK_KEYS)
+    if peak is None:
+        peak = _find_first_bytes(state, _PEAK_KEYS)
     if peak is None:
         peak = _find_first_bytes(qualification, _PEAK_KEYS)
     restarts = _count_restarts(result, memory_summary, state, qualification)
@@ -653,7 +661,7 @@ def classify_render_failure(
         if "restart storm" in _value_text or _value_text.count("replacement") >= 2:
             restarts = RESTART_STORM_THRESHOLD
     events = _memory_events(memory_summary)
-    for other in (result, state):
+    for other in (result, state, qualification):
         other_events = _memory_events(other)
         for key, value in other_events.items():
             events[key] = max(events[key], value)
