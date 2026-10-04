@@ -119,6 +119,14 @@ def _segment_is_installer(segment):
         return True
     elif "pip install" in segment and ("pr-agent" in segment or "opencode" in segment):
         return True
+    elif "pipx install" in segment and ("pr-agent" in segment or "opencode" in segment):
+        return True
+    elif "uv tool install" in segment and ("pr-agent" in segment or "opencode" in segment):
+        return True
+    elif "uv pip install" in segment and ("pr-agent" in segment or "opencode" in segment):
+        return True
+    elif "cargo install" in segment and ("pr-agent" in segment or "opencode" in segment):
+        return True
     elif ("npm install" in segment or "npm i " in segment or "npm ci" in segment) and "opencode" in segment:
         return True
     elif "brew install" in segment and "opencode" in segment:
@@ -205,6 +213,81 @@ def detect_tool_and_version(condition):
     return tool, match.group(1).replace("\\", "")
 
 
+def _nth_warm_hit_if_index(full_lines, condition, occurrence):
+    """Return the file index of the site's warm-hit `if` line.
+
+    Identical probe copies share one condition string, so the Nth site
+    (in file order) is the Nth occurrence of the `if <condition>; then`
+    line.
+    """
+    wanted = ("if " + condition + "; then").strip()
+    seen = 0
+    for i, line in enumerate(full_lines):
+        if line.strip() == wanted:
+            if seen == occurrence:
+                return i
+            seen += 1
+    raise AssertionError("warm-hit condition line not found in workflow file")
+
+
+def _warm_hit_path_and_tail(full_lines, if_idx):
+    """Split the warm-hit `if` into hit-path lines and the shared tail.
+
+    Returns (hit_lines, tail_lines, has_else). `hit_lines` always run on
+    a warm hit (the `if` branch). `tail_lines` (the lines right after the
+    closing `fi`) run on a hit only for the `if/else` shape, where the
+    hit falls through to shared code (consumer-child); for the `exit 0`
+    shape the hit short-circuits, so the tail never runs on a hit and a
+    cold-path-only export there must not count.
+    """
+    def _first_word(stripped):
+        parts = stripped.split()
+        return parts[0] if parts else ""
+
+    def _opens_block(stripped):
+        first = _first_word(stripped)
+        return (
+            first in ("if", "for", "while", "until", "select")
+            or stripped.startswith("case ")
+            or stripped == "case"
+        )
+
+    def _closes_block(stripped):
+        first = _first_word(stripped)
+        return first in ("fi", "done", "esac")
+
+    depth = 1
+    else_idx = None
+    close_idx = None
+    index = if_idx + 1
+    while index < len(full_lines):
+        stripped = code_without_comment(full_lines[index]).strip()
+        if _closes_block(stripped):
+            depth -= 1
+            if depth == 0:
+                close_idx = index
+                break
+        elif _opens_block(stripped):
+            depth += 1
+        elif depth == 1 and (
+            stripped == "else"
+            or stripped.startswith("else ")
+            or stripped.startswith("else;")
+            or _first_word(stripped) == "elif"
+        ):
+            if else_idx is None:
+                else_idx = index
+        index += 1
+    if close_idx is None:
+        raise AssertionError("warm-hit `if` starting at line {} is never closed".format(if_idx + 1))
+    if else_idx is not None:
+        hit_lines = full_lines[if_idx + 1:else_idx]
+    else:
+        hit_lines = full_lines[if_idx + 1:close_idx]
+    tail_lines = full_lines[close_idx + 1:close_idx + 7]
+    return hit_lines, tail_lines, else_idx is not None
+
+
 class PreparedRuntimeProbeTests(unittest.TestCase):
     def sites(self, name):
         """Return one probe region per installer: the malformed-digest guard
@@ -250,7 +333,7 @@ class PreparedRuntimeProbeTests(unittest.TestCase):
                     len(sites), len(expected),
                     "{}: expected {} install site(s), found {}".format(
                         name, len(expected), len(sites)))
-                for site_lines, (tool, version) in zip(sites, expected):
+                for site_pos, (site_lines, (tool, version)) in enumerate(zip(sites, expected)):
                     with self.subTest(site=tool):
                         text = "\n".join(site_lines)
                         # Digest shape gate on both the malformed guard and
@@ -298,6 +381,41 @@ class PreparedRuntimeProbeTests(unittest.TestCase):
                         self.assertTrue(
                             short_circuited,
                             "{}: warm hit must short-circuit before the download".format(name))
+                        # Warm-hit PATH export (opencode sites only: pr-agent
+                        # is pip-installed onto PATH already, so its hit
+                        # needs no GITHUB_PATH export). The warm-hit path
+                        # must place `$HOME/.opencode/bin` on PATH for later
+                        # steps via `$GITHUB_PATH`: either directly in the
+                        # hit branch, or — for the consumer-child `if/else`
+                        # shape — via the shared post-`fi` export that also
+                        # runs on a hit. A site with a correct condition
+                        # but a missing export would pass the hit/miss
+                        # probe yet leave later steps without `opencode` on
+                        # PATH on a warm hit. For the `exit 0` shape the
+                        # hit short-circuits, so a cold-path-only export
+                        # after the closing `fi` must not count.
+                        if tool == "opencode":
+                            full_lines = read_workflow(name).splitlines()
+                            cond = extract_condition(site_lines)
+                            occurrence = sum(
+                                1 for j in range(site_pos)
+                                if extract_condition(sites[j]) == cond
+                            )
+                            if_idx = _nth_warm_hit_if_index(full_lines, cond, occurrence)
+                            hit_lines, tail_lines, has_else = _warm_hit_path_and_tail(
+                                full_lines, if_idx)
+
+                            def _is_path_export(line):
+                                code = code_without_comment(line)
+                                return "GITHUB_PATH" in code and ".opencode/bin" in code
+
+                            hit_exports = any(_is_path_export(line) for line in hit_lines)
+                            shared_exports = has_else and any(
+                                _is_path_export(line) for line in tail_lines)
+                            self.assertTrue(
+                                hit_exports or shared_exports,
+                                "{}: warm hit must export $HOME/.opencode/bin to $GITHUB_PATH "
+                                "on the hit path".format(name))
 
     def run_probe(self, site_lines, digest, stamp, tool_version):
         """Evaluate the site's own guard + condition in a bash sandbox.

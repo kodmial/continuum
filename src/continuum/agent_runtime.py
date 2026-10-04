@@ -1272,6 +1272,7 @@ class RunnerInstance:
     uses: int = 0
     jit_registered: bool = False
     jit_id: Optional[str] = None
+    jit_config: Optional[str] = None
     destroyed_at: Optional[float] = None
     network_id: Optional[str] = None
     public_ip: Optional[str] = None
@@ -1597,29 +1598,57 @@ class GitHubHostedProvider(FakeProvider):
         runner_id = runner.get("id") if isinstance(runner, dict) else None
         jit_id = "jit-{}-{}".format(instance.id, runner_id) if runner_id else "jit-{}".format(instance.id)
         encoded = response.get("encoded_jit_config")
+        if not isinstance(encoded, str) or not encoded:
+            raise AgentRuntimeError("github-hosted JIT registration returned no encoded_jit_config")
         self.registrations[jit_id] = instance.id
         instance.jit_registered = True
         instance.jit_id = jit_id
-        if isinstance(encoded, str) and encoded:
-            instance.public_ip = instance.public_ip
+        instance.jit_config = encoded
         return jit_id
 
     def jit_deregister(self, instance: RunnerInstance) -> None:
-        token = _provider_github_token(self._explicit_token)
-        if instance.jit_id is not None:
-            self.registrations.pop(instance.jit_id, None)
-            instance.jit_registered = False
-            if token and instance.repository and "/" in instance.repository:
-                parts = (instance.jit_id or "").split("-")
+        jit_id = instance.jit_id
+        if jit_id is None:
+            return
+        # Derive the remote runner id only from our own registration id:
+        # jit_register stores "jit-<instance.id>-<runner_id>" when GitHub
+        # returns a runner id and "jit-<instance.id>" otherwise. Parsing
+        # int(parts[-1]) unconditionally mistakes the instance counter
+        # suffix (e.g. "jit-i-000001" -> 1) for a runner id and DELETEs an
+        # unrelated low-numbered runner. Only a suffix after the exact
+        # "jit-<instance.id>-" prefix is a runner id; anything else means
+        # no remote id was recorded, so skip the remote DELETE and clear
+        # only local state.
+        runner_id: Optional[int] = None
+        prefix = "jit-{}-".format(instance.id)
+        if jit_id.startswith(prefix):
+            suffix = jit_id[len(prefix):]
+            if suffix.isdigit():
                 try:
-                    runner_id = int(parts[-1])
+                    runner_id = int(suffix)
                 except (TypeError, ValueError):
-                    return
-                url = "{}/repos/{}/actions/runners/{}".format(self.api_base, instance.repository, runner_id)
-                try:
-                    _github_api_delete(url, token)
-                except AgentRuntimeError:
-                    pass
+                    runner_id = None
+        if runner_id is None:
+            self.registrations.pop(jit_id, None)
+            instance.jit_registered = False
+            return
+        token = _provider_github_token(self._explicit_token)
+        if not (token and instance.repository and "/" in instance.repository):
+            self.registrations.pop(jit_id, None)
+            instance.jit_registered = False
+            return
+        url = "{}/repos/{}/actions/runners/{}".format(self.api_base, instance.repository, runner_id)
+        # Attempt the remote DELETE before clearing local state, and let
+        # failures propagate: swallowing them while popping the
+        # registration marks teardown destroyed locally while the remote
+        # ephemeral runner stays registered with no record and no retry.
+        # _github_api_delete already tolerates 404; any remaining
+        # AgentRuntimeError is a real outage and must surface so
+        # FakeProvider.destroy never marks the instance destroyed and the
+        # controller retries via _teardown/sweep_orphans.
+        _github_api_delete(url, token)
+        self.registrations.pop(jit_id, None)
+        instance.jit_registered = False
 
 
 class CustomProvider(FakeProvider):

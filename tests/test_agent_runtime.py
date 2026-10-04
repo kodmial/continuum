@@ -830,12 +830,15 @@ class AgentRuntimeContractTest(unittest.TestCase):
     def test_opencode_version_probe_is_equivalent_to_command_v(self):
         # `opencode --version` (the canonical manifest probe) plus pinned
         # version and digest counts as a prepared-runtime probe, exactly
-        # like `command -v opencode`.
+        # like `command -v opencode`. The pin tracks the canonical
+        # runtime.OPENCODE_VERSION so a bump exercises the new literal
+        # instead of silently testing a stale one.
+        _opencode_version = runtime.OPENCODE_VERSION
         workflow = (
             "run: |\n"
             "  if [[ \"${CONTINUUM_IMAGE_DIGEST:-}\" =~ ^[0-9a-f]{64}$ ]] && "
-            "opencode --version 2>&1 | grep -E -q \"1.18.34\"; then\n"
-            "    echo prepared-runtime hit 1.18.34\n"
+            "opencode --version 2>&1 | grep -E -q \"" + _opencode_version + "\"; then\n"
+            "    echo prepared-runtime hit " + _opencode_version + "\n"
             "  fi\n"
         )
         self.assertTrue(runtime.workflow_step_has_prepared_runtime_probe(workflow))
@@ -843,11 +846,14 @@ class AgentRuntimeContractTest(unittest.TestCase):
     def test_guarded_cache_miss_reconstruction_is_not_a_bootstrap_install(self):
         # A correctly guarded cache-miss branch after a probe only
         # reconstructs on a validated miss; it must not count as a
-        # bootstrap install.
+        # bootstrap install. The pin tracks the canonical
+        # runtime.OPENCODE_VERSION so a bump exercises the new literal
+        # instead of silently testing a stale one.
+        _opencode_version = runtime.OPENCODE_VERSION
         guarded = (
             "run: |\n"
             "  command -v opencode >/dev/null 2>&1\n"
-            "  opencode --version 2>&1 | grep -E -q \"1.18.34\"\n"
+            "  opencode --version 2>&1 | grep -E -q \"" + _opencode_version + "\"\n"
             "  if [ \"$CACHE_HIT\" != \"true\" ]; then curl -fsSL https://opencode.ai/install | bash; fi\n"
         )
         self.assertFalse(runtime.normal_execution_uses_bootstrap_install(guarded))
