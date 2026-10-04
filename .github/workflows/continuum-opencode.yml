@@ -1762,7 +1762,7 @@ jobs:
       DISPATCH_BACKOFF_SECONDS: ${{ vars.AUTOMATION_DISPATCH_BACKOFF_SECONDS || '120' }}
       IN_PROGRESS_LABEL: ${{ inputs.in_progress_label || vars.AUTOMATION_IN_PROGRESS_LABEL || 'automation:in-progress' }}
       PAUSE_LABEL: ${{ inputs.pause_marker || vars.AUTOMATION_PAUSE_LABEL || 'automation:paused' }}
-      PAUSE_ON_FAILURE: ${{ inputs.pause_on_failure || vars.AUTOMATION_PAUSE_ON_FAILURE || 'true' }}
+      PAUSE_ON_FAILURE: ${{ inputs.pause_on_failure || vars.AUTOMATION_PAUSE_ON_FAILURE || 'false' }}
 
     steps:
       - name: Brief backoff before retrying scheduler
@@ -1791,7 +1791,7 @@ jobs:
             const inProgress = process.env.IN_PROGRESS_LABEL || 'automation:in-progress';
             const paused = process.env.PAUSE_LABEL || 'automation:paused';
             const pauseOnFailure =
-              (process.env.PAUSE_ON_FAILURE || 'true') !== 'false';
+              (process.env.PAUSE_ON_FAILURE || 'false') !== 'false';
             const maxAttempts = Number.parseInt(
               process.env.MAX_DISPATCH_ATTEMPTS || '2',
               10
