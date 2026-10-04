@@ -95,6 +95,16 @@ on:
         type: string
         required: false
         default: 'false'
+      ready_label:
+        description: >-
+          Optional admission label for automatic implementation. Empty (the
+          default) keeps the current behavior unchanged. When set, falls back
+          to AUTOMATION_READY_LABEL, and the scheduler auto-dispatches only
+          issues carrying that label. Qualification dispatch and manual owner
+          `/oc` never require it.
+        type: string
+        required: false
+        default: ''
       command_grace_minutes:
         description: >-
           Race window after a manual owner `/oc` in which the scheduler will not
@@ -518,6 +528,7 @@ jobs:
       POST_PAUSE_COMMENT: ${{ inputs.post_pause_comment || 'true' }}
       RESET_MARKERS: ${{ inputs.reset_markers || 'false' }}
       REQUIRE_PRIORITY_LABEL: ${{ inputs.require_priority_label || vars.AUTOMATION_REQUIRE_PRIORITY_LABEL || 'false' }}
+      READY_LABEL: ${{ inputs.ready_label || vars.AUTOMATION_READY_LABEL }}
       COMMAND_GRACE_MINUTES: ${{ inputs.command_grace_minutes || vars.AUTOMATION_COMMAND_GRACE_MINUTES || '5' }}
       OPENCODE_WORKFLOW_NAME: ${{ inputs.opencode_workflow_name || vars.CONTINUUM_OPENCODE_WORKFLOW_NAME || 'OpenCode agent' }}
       OPENCODE_WORKFLOW_PATH: ${{ inputs.opencode_workflow_path || vars.CONTINUUM_OPENCODE_WORKFLOW_PATH || '.github/workflows/continuum-opencode.yml' }}
@@ -910,9 +921,10 @@ jobs:
                   priority:(if $priority == "" then null else $priority end),rank:$rank}' \
                 >> "$candidate_lines"
             done < <(
-              jq -r '
+              jq -r --arg ready "$READY_LABEL" '
                 map(
                   select(.pull_request == null)
+                  | select($ready == "" or ([.labels[]?.name] | index($ready) != null))
                   | . + {
                       _rank:
                         (if any(.labels[]?.name; . == "priority:p0") then 0
@@ -1032,6 +1044,12 @@ jobs:
               (process.env.RESET_MARKERS || 'false') === 'true';
             const requirePriorityLabel =
               (process.env.REQUIRE_PRIORITY_LABEL || 'false') === 'true';
+            // Optional admission gate (kodmial/continuum#266): empty keeps the
+            // current behavior unchanged; when configured, automatic dispatch
+            // admits only issues carrying this label. Priority stays a ranking
+            // signal only, and qualification dispatch plus manual owner `/oc`
+            // never require it.
+            const readyLabel = (process.env.READY_LABEL || '').trim();
             const opencodeWorkflowName =
               process.env.OPENCODE_WORKFLOW_NAME || 'OpenCode agent';
             const opencodeWorkflowPath =
@@ -1884,6 +1902,16 @@ jobs:
                 description:
                   'Routes this issue to a configured execution workflow instead of the OpenCode agent.',
               })),
+              // The optional admission label is created here for the same
+              // reason: a consumer can apply it from the issue page without
+              // a missing-label selection silently no-op. Empty creates
+              // nothing and keeps current behavior unchanged.
+              ...(readyLabel ? [{
+                name: readyLabel,
+                color: '0E8A16',
+                description:
+                  'Admits this issue to automatic implementation by the issue scheduler.',
+              }] : []),
             ];
 
             for (const spec of labelSpecs) {
@@ -2602,6 +2630,16 @@ jobs:
                   priorities.join(', ') + '); using ' + priority + '.'
                 );
               }
+              // Optional admission gate: only an explicitly admitted issue may
+              // enter automatic implementation. Empty keeps current behavior;
+              // priority remains a ranking signal only.
+              if (readyLabel && !labels.has(readyLabel)) {
+                core.info(
+                  'Skipping #' + issue.number + ': missing required ready label `' +
+                    readyLabel + '`.'
+                );
+                continue;
+              }
 
               candidates.push({ source: 'local', issue, priority, rank });
             }
@@ -2738,6 +2776,22 @@ jobs:
                   );
                   continue;
                 }
+                // Optional admission gate, re-verified just in time: a label
+                // removed after selection must prevent dispatch.
+                if (readyLabel) {
+                  const freshChildLabels = new Set(
+                    (freshChildIssue.labels || []).map(label =>
+                      typeof label === 'string' ? label : label.name
+                    )
+                  );
+                  if (!freshChildLabels.has(readyLabel)) {
+                    core.info(
+                      'Skipping SubTask #' + child.task_number +
+                      ': missing required ready label `' + readyLabel + '`.'
+                    );
+                    continue;
+                  }
+                }
 
                 const childDeclaredBlockers = await openDeclaredBlockers(
                   freshChildIssue,
@@ -2809,6 +2863,15 @@ jobs:
                 core.info(
                   'Skipping #' + issue.number +
                   ': state changed before dispatch.'
+                );
+                continue;
+              }
+              // Optional admission gate, re-verified just in time: a label
+              // removed after selection must prevent dispatch.
+              if (readyLabel && !freshLabels.has(readyLabel)) {
+                core.info(
+                  'Skipping #' + issue.number +
+                  ': missing required ready label `' + readyLabel + '`.'
                 );
                 continue;
               }

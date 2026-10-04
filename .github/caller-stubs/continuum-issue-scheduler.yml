@@ -47,6 +47,10 @@ on:
         description: "Dispatch only labelled issues"
         required: false
         type: string
+      ready_label:
+        description: "Optional admission label for automatic implementation"
+        required: false
+        type: string
       command_grace_minutes:
         description: "Race window after a manual owner command"
         required: false
@@ -169,6 +173,7 @@ jobs:
       post_pause_comment: "${{ inputs.post_pause_comment }}"
       reset_markers: "${{ inputs.reset_markers }}"
       require_priority_label: "${{ inputs.require_priority_label }}"
+      ready_label: "${{ inputs.ready_label }}"
       command_grace_minutes: "${{ inputs.command_grace_minutes }}"
       child_owned_marker: "${{ inputs.child_owned_marker }}"
       legacy_child_owned_marker: "${{ inputs.legacy_child_owned_marker }}"
