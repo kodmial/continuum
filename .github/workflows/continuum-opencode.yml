@@ -1462,6 +1462,8 @@ jobs:
           if [[ -n "$(git status --porcelain)" ]]; then
             git add -A
             git commit -m "fix: address CodeRabbit review findings for PR #${PR_NUMBER}" -m "Continuum-Component: opencode"
+          fi
+          if [[ "$(git rev-list --count "origin/${HEAD_REF}"..HEAD)" -gt 0 ]]; then
             git push origin "HEAD:${HEAD_REF}"
           fi
 
