@@ -94,6 +94,26 @@ class PrAgentTargetContextTests(unittest.TestCase):
         self.assertNotIn("private-owner/private-child", proc.stdout)
         self.assertNotIn("private-owner/private-child", proc.stderr)
 
+    def test_delegated_verify_failure_is_fail_closed(self):
+        proc, values, calls = self.run_target(
+            "opaque-a",
+            """
+            #!/usr/bin/env bash
+            set -euo pipefail
+            echo "$*" >> "__CALLS__"
+            case "$1" in
+              resolve) printf 'private-owner/private-child\\n' ;;
+              verify) exit 3 ;;
+              *) exit 2 ;;
+            esac
+            """,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(values, {})
+        self.assertIn("failed closed", proc.stderr)
+        self.assertIn("resolve opaque-a", calls)
+        self.assertIn("verify opaque-a private-owner/private-child", calls)
+
     def test_delegated_resolution_failure_is_fail_closed(self):
         proc, values, _ = self.run_target(
             "opaque-a",

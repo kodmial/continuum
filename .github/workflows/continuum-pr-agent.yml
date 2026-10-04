@@ -357,8 +357,9 @@ jobs:
           fetch_runtime_file ".github/scripts/delegation_runtime.py" "$RUNTIME_ROOT/.github/scripts/delegation_runtime.py"
           PARENT_CONFIG_FILE="$RUNTIME_ROOT/parent.continuum.yml"
           if ! gh api --method GET "repos/$GITHUB_REPOSITORY/contents/.continuum.yml" --jq .content 2>/dev/null \
-            | tr -d '\n' | continuum_b64_decode > "$PARENT_CONFIG_FILE" 2>/dev/null; then
-            printf 'version: 1\n' > "$PARENT_CONFIG_FILE"
+            | tr -d '\n' | continuum_b64_decode > "$PARENT_CONFIG_FILE" 2>/dev/null || [[ ! -s "$PARENT_CONFIG_FILE" ]]; then
+            echo "::error::Unable to load the parent Continuum configuration for delegated target resolution; refusing to guess."
+            exit 1
           fi
           CONTINUUM_ENGINE_ROOT="$RUNTIME_ROOT" PARENT_CONFIG="$PARENT_CONFIG_FILE" \
             bash "$RUNTIME_ROOT/.github/scripts/pr_agent_target.sh" "$TARGET_CHILD_ID"
@@ -506,10 +507,20 @@ jobs:
           GH_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || github.token }}
           TAP_PAT: ${{ secrets.TAP_PAT }}
           HEAD_SHA: ${{ steps.admit.outputs.head_sha }}
+          PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
         run: |
           set -euo pipefail
           if [[ "${CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED:-false}" == "true" && -z "${TAP_PAT:-}" ]]; then
             echo "::error::Delegated PR-Agent execution requires TAP_PAT; refusing to fall back to github.token."
+            exit 1
+          fi
+          : "${CONTINUUM_PR_AGENT_TARGET_REPOSITORY:?PR-Agent target repository is unset; refusing to fall back to the execution repository.}"
+          if ! [[ "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::PR-Agent target repository identity is invalid."
+            exit 2
+          fi
+          if ! [[ "${HEAD_SHA:-}" =~ ^[0-9a-fA-F]{4,64}$ ]]; then
+            echo "::error::PR-Agent target HEAD is missing or malformed; refusing to checkout."
             exit 1
           fi
           worktree="$RUNNER_TEMP/continuum-pr-agent-review-worktree"
@@ -520,8 +531,24 @@ jobs:
           gh auth setup-git >/dev/null 2>&1
           trap 'git config --unset credential.helper || true; git config --unset credential.https://github.com.helper || true; git config --global --unset credential.helper || true; git config --global --unset credential.https://github.com.helper || true' EXIT
           git remote add origin "https://github.com/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY.git"
-          if ! git fetch --depth=1 --no-tags origin "$HEAD_SHA" --quiet >/dev/null 2>&1 ||
-             ! git checkout --detach FETCH_HEAD --quiet >/dev/null 2>&1 ||
+          fetched=false
+          for attempt in 1 2 3; do
+            if git fetch --depth=1 --no-tags origin "$HEAD_SHA" --quiet >/dev/null 2>&1; then
+              fetched=true
+              break
+            fi
+            sleep $((attempt * 5))
+          done
+          if [[ "$fetched" != true && -n "${PR_NUMBER:-}" ]]; then
+            if git fetch --depth=1 --no-tags origin "pull/$PR_NUMBER/head" --quiet >/dev/null 2>&1; then
+              fetched=true
+            fi
+          fi
+          if [[ "$fetched" != true ]]; then
+            echo "::error::Unable to fetch the exact PR-Agent target HEAD."
+            exit 1
+          fi
+          if ! git checkout --detach FETCH_HEAD --quiet >/dev/null 2>&1 ||
              [[ "$(git rev-parse HEAD)" != "${HEAD_SHA,,}" ]]; then
             echo "::error::Unable to checkout the exact PR-Agent target HEAD."
             exit 1
@@ -751,6 +778,8 @@ jobs:
           POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
         run: |
           set -euo pipefail
+          : "${CONTINUUM_PR_AGENT_WORKTREE:?PR-Agent worktree is unavailable; the manual checkout failed before exporting the worktree.}"
+          : "${CONTINUUM_PR_AGENT_TARGET_REPOSITORY:?PR-Agent target repository is unset; refusing to fall back to the execution repository.}"
           cd "$CONTINUUM_PR_AGENT_WORKTREE"
           PR_URL="https://github.com/${CONTINUUM_PR_AGENT_TARGET_REPOSITORY}/pull/${PR_NUMBER}"
           IMPROVE_REPAIR_THRESHOLD="$(node -e 'const p=require(process.env.POLICY_SCRIPT); process.stdout.write(String(p.IMPROVE_REPAIR_THRESHOLD));')"
@@ -820,6 +849,7 @@ jobs:
         id: improve_output
         run: |
           set -euo pipefail
+          : "${CONTINUUM_PR_AGENT_WORKTREE:?PR-Agent worktree is unavailable; the manual checkout failed before exporting the worktree.}"
           cd "$CONTINUUM_PR_AGENT_WORKTREE"
           [[ -s pr-agent-outputs/continuum.jsonl ]] || {
             echo "::error::Native PR-Agent improve output file is missing."

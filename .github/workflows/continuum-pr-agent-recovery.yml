@@ -122,8 +122,9 @@ jobs:
           fetch_runtime_file ".github/scripts/delegation_runtime.py" "$RUNTIME_ROOT/.github/scripts/delegation_runtime.py"
           PARENT_CONFIG_FILE="$RUNTIME_ROOT/parent.continuum.yml"
           if ! gh api --method GET "repos/$GITHUB_REPOSITORY/contents/.continuum.yml" --jq .content 2>/dev/null \
-            | tr -d '\n' | continuum_b64_decode > "$PARENT_CONFIG_FILE" 2>/dev/null; then
-            printf 'version: 1\n' > "$PARENT_CONFIG_FILE"
+            | tr -d '\n' | continuum_b64_decode > "$PARENT_CONFIG_FILE" 2>/dev/null || [[ ! -s "$PARENT_CONFIG_FILE" ]]; then
+            echo "::error::Unable to load the parent Continuum configuration for delegated target resolution; refusing to guess."
+            exit 1
           fi
           CONTINUUM_ENGINE_ROOT="$RUNTIME_ROOT" PARENT_CONFIG="$PARENT_CONFIG_FILE" \
             bash "$RUNTIME_ROOT/.github/scripts/pr_agent_target.sh" "$TARGET_CHILD_ID"
@@ -763,13 +764,26 @@ jobs:
                 if (recoveryChildId) {
                   recoveryInputs.target_child_id = recoveryChildId;
                 }
-                await github.rest.actions.createWorkflowDispatch({
-                  owner: executionOwner,
-                  repo: executionRepo,
-                  workflow_id: reviewWorkflow,
-                  ref,
-                  inputs: recoveryInputs,
-                });
+                try {
+                  await github.rest.actions.createWorkflowDispatch({
+                    owner: executionOwner,
+                    repo: executionRepo,
+                    workflow_id: reviewWorkflow,
+                    ref,
+                    inputs: recoveryInputs,
+                  });
+                } catch (dispatchErr) {
+                  const dispatchMessage = String(dispatchErr.message || dispatchErr);
+                  if (recoveryChildId && /unknown inputs?|invalid inputs?|unexpected inputs?|unrecognized inputs?/i.test(dispatchMessage)) {
+                    throw new Error(
+                      'Delegated recovery requires reviewWorkflow ' + reviewWorkflow +
+                      ' to declare a target_child_id workflow_dispatch input; ' +
+                      'refusing bare retry to preserve the delegated target: ' +
+                      dispatchMessage
+                    );
+                  }
+                  throw dispatchErr;
+                }
                 core.notice(
                   'PR #' + pr.number + ' HEAD ' + head + ': dispatched ' +
                   kind + ' recovery execution ' + (attempt + 1) + '/' + maxExecutions + '.'
