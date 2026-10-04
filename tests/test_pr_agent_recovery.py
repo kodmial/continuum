@@ -270,6 +270,53 @@ class RecoveryWiringTests(unittest.TestCase):
         self.assertNotIn("continuum-coderabbit-retry.yml", body)
         self.assertNotIn("continuum-coderabbit-unresolved.yml", body)
 
+    def test_recovery_reads_use_repository_token_but_mutations_keep_pat(self):
+        body = self.read(".github/workflows/continuum-pr-agent-recovery.yml")
+        self.assertIn("READ_GITHUB_TOKEN: ${{ github.token }}", body)
+        self.assertIn("github-token: ${{ secrets.TAP_PAT }}", body)
+        self.assertIn("const { getOctokit } = require('@actions/github')", body)
+        self.assertIn("const readGithub = readToken ? getOctokit(readToken) : github", body)
+        self.assertIn("using PAT client for PR-Agent recovery reads", body)
+        self.assertIn("let readTokenUnavailable = false", body)
+        self.assertIn("async function withReadFallback(fn)", body)
+        self.assertIn("err.status ?? err.response?.status", body)
+        self.assertIn("status === 401 || status === 403 || status === 429", body)
+        self.assertIn("if (readTokenUnavailable || readGithub === github)", body)
+
+        for read_call in (
+            "client.rest.actions.listWorkflowRuns",
+            "client.rest.actions.getWorkflowRun",
+            "client.rest.actions.listWorkflowRunsForRepo",
+            "client.rest.pulls.list",
+            "client.rest.pulls.get",
+            "client.rest.repos.listCommitStatusesForRef",
+            "client.rest.issues.listComments",
+            "client.rest.repos.get({ owner, repo })",
+        ):
+            with self.subTest(read_call=read_call):
+                self.assertIn(read_call, body)
+
+        # One helper definition plus nine guarded read sites. This prevents a
+        # future direct repository-token read from bypassing the liveness fallback.
+        self.assertEqual(body.count("withReadFallback("), 10)
+
+        # Item 1 keeps all mutation/dispatch calls on the PAT-authenticated
+        # action client, preserving actor and event fan-out semantics.
+        for mutation in (
+            "github.rest.issues.createComment",
+            "github.rest.issues.deleteComment",
+            "github.rest.actions.createWorkflowDispatch",
+        ):
+            with self.subTest(mutation=mutation):
+                self.assertIn(mutation, body)
+
+        self.assertNotIn("github.paginate(", body)
+        self.assertNotRegex(
+            body,
+            r"github\.rest\.(?!issues\.createComment\b|issues\.deleteComment\b|actions\.createWorkflowDispatch\b)",
+            "PAT client must only be used for mutations/dispatch",
+        )
+
     def test_recovered_review_uses_ci_workflow_not_combined_status(self):
         review = self.read(".github/workflows/continuum-pr-agent.yml")
         self.assertIn("listWorkflowRunsForRepo", review)
