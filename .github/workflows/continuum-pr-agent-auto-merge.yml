@@ -178,7 +178,14 @@ jobs:
               core.setFailed(`Invalid PR-Agent review JSON: ${err.message}`);
               return;
             }
-            const inner = review.review || review;
+            const policy = require(process.env.POLICY_SCRIPT);
+            let inner;
+            try {
+              inner = policy.unwrapReview(review);
+            } catch (err) {
+              core.setFailed(err.message);
+              return;
+            }
             const keyIssues = inner.key_issues_to_review;
             if (!Array.isArray(keyIssues)) {
               core.setFailed('PR-Agent review JSON has no key_issues_to_review list.');
@@ -189,7 +196,6 @@ jobs:
               core.setFailed('PR-Agent review has no merge_recommendation (require_merge_recommendation).');
               return;
             }
-            const policy = require(process.env.POLICY_SCRIPT);
             const raw = String(process.env.IMPROVE_JSONL || '').trim();
             let qualifying;
             try {
@@ -310,6 +316,20 @@ jobs:
               } else {
                 fail(`${keyIssues.length} current key issue(s) remain`);
               }
+              return;
+            }
+            // Security leg (mirrors the improve skip policy): explicit
+            // blocking security prose never greens, even with zero key
+            // issues and safe_to_merge.
+            let blockingSecurity = false;
+            try {
+              blockingSecurity = policy.hasBlockingSecuritySignal(review);
+            } catch (err) {
+              core.setFailed(err.message);
+              return;
+            }
+            if (blockingSecurity) {
+              fail('blocking security signal remains');
               return;
             }
             if (improveSkippedClean && qualifying.length > 0) {

@@ -489,6 +489,15 @@ def _unwrap_review(review: Mapping[str, Any]) -> Mapping[str, Any]:
     if isinstance(review, Mapping):
         inner = review.get("review", None)
         if isinstance(inner, dict):
+            if (
+                "key_issues_to_review" in review
+                or "merge_recommendation" in review
+                or any(key in review for key in BLOCKING_SECURITY_SIGNAL_KEYS)
+                or any(key in review for key in _TOOL_ERROR_SIGNAL_KEYS)
+                or any(key in review for key in _COVERAGE_FLAG_KEYS)
+                or any(key in review for key in _COVERAGE_OBJECT_KEYS)
+            ):
+                return review
             return inner
     if not isinstance(review, Mapping):
         raise LifecycleError("PR-Agent review JSON must be an object")
@@ -600,7 +609,11 @@ def should_skip_improve(
         raise LifecycleError("upstream PR-Agent persistent state has no last_run.head_sha.")
     if not is_same_head(state_head, expected_head):
         return {"skip": False, "reason": "stale persistent state: not for the reviewed HEAD"}
-    if upstream_state_has_active(persistent_state):
+    try:
+        has_active = upstream_state_has_active(persistent_state)
+    except Exception:
+        return {"skip": False, "reason": "persistent state has an unrecognized finding state: failing closed"}
+    if has_active:
         return {"skip": False, "reason": "native persistent state has an ACTIVE finding"}
     return {
         "skip": True,

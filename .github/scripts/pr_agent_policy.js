@@ -468,11 +468,17 @@ function unwrapReview(reviewPayload) {
     // field: only unwrap the envelope when the top level does not already
     // carry review fields. Otherwise unwrapping would discard
     // `key_issues_to_review`/`merge_recommendation`/security signals and
-    // decide skip on the nested object.
+    // decide skip on the nested object. Tool-error and coverage signals
+    // live at the top level of split envelopes too, so they also pin the
+    // outer payload; otherwise unwrapping would drop a top-level
+    // `tool_errors`/`coverage` signal and read clean.
     if (
       'key_issues_to_review' in reviewPayload ||
       'merge_recommendation' in reviewPayload ||
-      BLOCKING_SECURITY_SIGNAL_KEYS.some((key) => key in reviewPayload)
+      BLOCKING_SECURITY_SIGNAL_KEYS.some((key) => key in reviewPayload) ||
+      TOOL_ERROR_SIGNAL_KEYS.some((key) => key in reviewPayload) ||
+      COVERAGE_FLAG_KEYS.some((key) => key in reviewPayload) ||
+      COVERAGE_OBJECT_KEYS.some((key) => key in reviewPayload)
     ) {
       return reviewPayload;
     }
