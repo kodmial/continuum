@@ -1124,6 +1124,7 @@ class StabilizationParityTests(unittest.TestCase):
         # bounded-retry contract is preserved via transient classification
         # and retryable API-failure handling against the resolved target.
         self.assertIn('GH_TOKEN: ${{ secrets.TAP_PAT }}', repair)
+        self.assertNotIn('READ_GH_TOKEN: ${{ github.token }}', repair)
         self.assertIn('repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/issues/$PR_NUMBER/comments', repair)
         self.assertIn('gh pr view "$PR_NUMBER" --repo "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY"', repair)
         self.assertIn("GitHub API failure is retryable", repair)
