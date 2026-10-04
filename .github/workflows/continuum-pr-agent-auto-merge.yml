@@ -191,8 +191,8 @@ jobs:
             //     merge, plus draft/conflict revalidation
             //   - matching HEAD (results for SHA A never merge SHA B;
             //     main synchronization never carries approval)
-            //   - merge_recommendation == safe_to_merge only (caution and
-            //     changes_required block)
+            //   - safe_to_merge, or a narrowly validated non-actionable caution with
+            //     explicit no-security/no-ticket-noncompliance evidence; changes_required blocks
             //   - empty current key_issues_to_review (a batch at the findings
             //     cap is potentially truncated and never clean)
             //   - no high-signal improve code_suggestions according to the

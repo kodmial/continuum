@@ -973,6 +973,27 @@ function isSkippedCleanImprovePayload(raw) {
   return sawLine && foundMarker;
 }
 
+function nonActionableCautionIsMergeable(review) {
+  // A complete review can legitimately choose merge_with_caution solely for
+  // external/live verification that cannot be repaired on this HEAD. Re-running
+  // the same review cannot create new machine evidence and previously caused an
+  // endless rereview loop. Only accept that caution when the structured review
+  // explicitly proves there is no security concern and no ticket non-compliance.
+  const security = String(review && review.security_concerns || '').trim().toLowerCase();
+  if (!['no', 'none', 'false', 'n/a', 'na', '-'].includes(security)) return false;
+
+  const ticket = review && review.ticket_compliance_check;
+  if (!Array.isArray(ticket) || ticket.length === 0) return false;
+  const empty = new Set(['', '-', 'none', 'n/a', 'na', 'no']);
+  for (const entry of ticket) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
+    if (!Object.prototype.hasOwnProperty.call(entry, 'not_compliant_requirements')) return false;
+    const value = String(entry.not_compliant_requirements ?? '').trim().toLowerCase();
+    if (!empty.has(value)) return false;
+  }
+  return true;
+}
+
 function reviewDisposition(reviewPayload, improveJsonl, threshold = IMPROVE_REPAIR_THRESHOLD) {
   // Split envelopes carry signals on both sides: merge fail-closed via the
   // centralized unwrapReview so no finding is lost from the disposition.
@@ -1005,11 +1026,17 @@ function reviewDisposition(reviewPayload, improveJsonl, threshold = IMPROVE_REPA
         qualifying.length + ' qualifying improve suggestion(s)',
     };
   }
-  if (recommendation === 'safe_to_merge') {
+  if (
+    recommendation === 'safe_to_merge' ||
+    (recommendation === 'merge_with_caution' && nonActionableCautionIsMergeable(review))
+  ) {
     return {
       ...common,
       action: 'merge',
-      reason: 'safe_to_merge with no actionable review/improve items',
+      reason:
+        recommendation === 'safe_to_merge'
+          ? 'safe_to_merge with no actionable review/improve items'
+          : 'non-actionable caution with explicit no-security/no-noncompliance evidence',
     };
   }
   return {
@@ -1052,6 +1079,7 @@ module.exports = {
   persistentHasActive,
   qualifyingImproveSuggestions,
   reviewDisposition,
+  nonActionableCautionIsMergeable,
   sameLogicalDefect,
   unwrapReview,
 };
