@@ -62,6 +62,11 @@ jobs:
           fi
           [[ "$MAX_PAGES" -gt 5 ]] && MAX_PAGES=5
           INCLUDE="$(gh api --include "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/comments?per_page=100&page=1" 2>/dev/null || true)"
+          if [[ -z "$INCLUDE" ]]; then
+            echo "Could not determine the newest review-comment page; ignoring UNRESOLVED reply."
+            echo "dispatch=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           HEADERS="$(tr -d '\r' <<<"$INCLUDE" | sed -n '1,/^$/p')"
           LINK_LAST="$(grep -i '^link:' <<<"$HEADERS" | tr '[:upper:]' '[:lower:]' | sed -nE 's/.*<[^>]*[?&]page=([0-9]+)[^>]*>[[:space:]]*;[[:space:]]*rel="last".*/\1/p' | tail -n 1)"
           if [[ -n "$LINK_LAST" ]]; then

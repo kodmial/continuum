@@ -900,10 +900,12 @@ jobs:
               CONTROLLER_FIRST_PAGE=$(( CONTROLLER_LAST_PAGE - 4 ))
               [[ "$CONTROLLER_FIRST_PAGE" -ge 1 ]] || CONTROLLER_FIRST_PAGE=1
             else
-              # Issue-total lookup failed; keep the previous oldest-first
-              # 5-page bound rather than narrowing to a single page.
-              CONTROLLER_FIRST_PAGE=1
-              CONTROLLER_LAST_PAGE=5
+              # Issue-total lookup failed: the newest window cannot be
+              # anchored, so fail closed (transient) rather than scanning
+              # oldest-first pages 1-5 and missing a recent marker.
+              echo "classification=transient" >> "$GITHUB_OUTPUT"
+              echo "::error::Could not determine controller comment window; GitHub API failure is retryable."
+              exit 1
             fi
             for controller_page in $(seq "$CONTROLLER_FIRST_PAGE" "$CONTROLLER_LAST_PAGE"); do
               controller_page_file="$RUNNER_TEMP/pr-agent-controller-page-$controller_page.json"

@@ -206,33 +206,30 @@ jobs:
                 | sed -nE 's#^opencode/issue([0-9]+)-.*#\1#p'
             )"
             local_opencode_run_tasks="$(
-              # Only recent active work matters here. Filter server-side by
-              # active status so a long-lived run cannot fall outside the
-              # window behind newer completed runs and read as idle.
-              # `pending` is not a valid workflow-run status filter while
-              # `action_required` (e.g. waiting for approval) is a valid
-              # non-completed status: querying it keeps such runs visible so
-              # they never read as idle and dispatch twice. A fetch or parse
+              # Single unfiltered list with client-side active filtering:
+              # one request answers the idle no-op case; pages 2-3 are
+              # read only when the previous page is full. A fetch or parse
               # failure must fail closed as active (sentinel __unknown__) so
               # a transient error never reads as idle and double-dispatches.
-              for run_status in in_progress queued waiting requested action_required; do
-                for page in 1 2 3; do
-                  if ! run_json="$(gh api "repos/$child_repo/actions/runs?per_page=100&page=$page&status=$run_status" 2>/dev/null)"; then
-                    echo "::warning::run lookup failed for status=$run_status page=$page; assuming active to avoid double-dispatch." >&2
-                    echo "__unknown__"
-                    break 2
-                  fi
-                  run_count="$(jq '.workflow_runs | length' <<<"$run_json" 2>/dev/null || echo -1)"
-                  [[ "$run_count" =~ ^[0-9]+$ ]] || { echo "__unknown__"; break 2; }
-                  [[ "$run_count" -gt 0 ]] || break
-                  jq -r '.workflow_runs[]
-                      | select(.status != "completed")
-                      | .display_title
-                      | select(test("^OpenCode issue #[0-9]+$"))
-                      | capture("^OpenCode issue #(?<task>[0-9]+)$").task' \
-                    <<<"$run_json" 2>/dev/null || { echo "__unknown__"; break 2; }
-                  [[ "$run_count" -lt 100 ]] && break
-                done
+              for page in 1 2 3; do
+                if ! run_json="$(gh api "repos/$child_repo/actions/runs?per_page=100&page=$page" 2>/dev/null)"; then
+                  echo "::warning::run lookup failed for page=$page; assuming active to avoid double-dispatch." >&2
+                  echo "__unknown__"
+                  break
+                fi
+                run_count="$(jq '.workflow_runs | length' <<<"$run_json" 2>/dev/null || echo -1)"
+                [[ "$run_count" =~ ^[0-9]+$ ]] || { echo "__unknown__"; break; }
+                if ! run_tasks="$(jq -r '.workflow_runs[]
+                    | select(.status != "completed")
+                    | .display_title
+                    | select(test("^OpenCode issue #[0-9]+$"))
+                    | capture("^OpenCode issue #(?<task>[0-9]+)$").task' \
+                  <<<"$run_json" 2>/dev/null)"; then
+                  echo "__unknown__"
+                  break
+                fi
+                [[ -n "$run_tasks" ]] && echo "$run_tasks"
+                [[ "$run_count" -lt 100 ]] && break
               done
             )"
             child_owner="$(gh api "repos/$child_repo" --jq '.owner.login' 2>/dev/null || true)"
@@ -240,7 +237,7 @@ jobs:
 
             local_override_active() {
               local task_number="$1"
-              local recent_command command_epoch now_epoch
+              local recent_command command_epoch now_epoch grace_since
 
               # Fail closed: an unknown run-lookup state means active work
               # cannot be ruled out, so never dispatch behind it.
@@ -253,36 +250,34 @@ jobs:
               fi
 
               [[ -n "$child_owner" ]] || return 1
-              # Bounded comment window (#254): owner override commands are
-              # recent by construction, so the newest five pages bound the
-              # cost without walking full comment history. Comments list
-              # oldest-first, so pages 1-5 would miss a recent override on
-              # a long thread; scan newest-first instead.
-              recent_command=""
-              override_seen=""
-              # Fail closed: an unknown comment total cannot anchor the
-              # newest window, so treat the task as active instead of
-              # scanning only the oldest page and missing a recent override.
-              if ! override_total="$(gh api "repos/$child_repo/issues/$task_number" --jq '.comments // 0' 2>/dev/null)"; then
-                return 0
-              fi
-              [[ "$override_total" =~ ^[0-9]+$ ]] || return 0
-              override_last_page=$(( (override_total + 99) / 100 ))
-              [[ "$override_last_page" -ge 1 ]] || override_last_page=1
-              override_first_page=$(( override_last_page - 4 ))
-              [[ "$override_first_page" -ge 1 ]] || override_first_page=1
+              # Width (#254) caps the since scan.
+              grace_since="$(date -u -d "@$(( $(date +%s) - command_grace_seconds - 120 ))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)"
+              recent_command=""; override_seen=""
+              # Since-filtered pagination starts at page 1: the filtered set
+              # is already only recent comments, so pages 1..5 cover it
+              # without the extra issue-total read. Keep the first/last
+              # names so the bounded-scan contract still identifies the
+              # window.
+              override_first_page=1
+              override_last_page=5
+              override_failed=0
               for override_page in $(seq "$override_first_page" "$override_last_page"); do
-                override_json="$(
-                  gh api "repos/$child_repo/issues/$task_number/comments?per_page=100&page=$override_page" \
-                    2>/dev/null || true
-                )"
-                override_count="$(jq 'length' <<<"$override_json" 2>/dev/null || echo 0)"
-                [[ "$override_count" =~ ^[0-9]+$ ]] && [[ "$override_count" -gt 0 ]] || continue
-                override_seen+="$(jq -r --arg owner "$child_owner" \
-                  '.[] | select(.user.login == $owner) | select((.body // "") | test("(^|[[:space:]])/(oc|opencode)([[:space:]]|$)")) | .created_at' \
-                  <<<"$override_json" 2>/dev/null)"$'\n'
-                [[ "$override_page" -eq "$override_last_page" ]] && break
+                # Fail closed: a fetch or parse failure leaves the window
+                # unknown, so report active instead of reading an empty
+                # window as idle and double-dispatching.
+                if ! override_json="$(gh api "repos/$child_repo/issues/$task_number/comments?per_page=100&page=$override_page&since=$grace_since" 2>/dev/null)"; then
+                  override_failed=1
+                  break
+                fi
+                if ! override_count="$(jq 'length' <<<"$override_json" 2>/dev/null)"; then
+                  override_failed=1
+                  break
+                fi
+                [[ "$override_count" =~ ^[0-9]+$ ]] || { override_failed=1; break; }
+                override_seen+="$(jq -r --arg owner "$child_owner" '.[] | select(.user.login == $owner) | select((.body // "") | test("(^|[[:space:]])/(oc|opencode)([[:space:]]|$)")) | .created_at' <<<"$override_json" 2>/dev/null || true)"$'\n'
+                [[ "$override_count" -ge 100 ]] || break
               done
+              [[ "$override_failed" -eq 0 ]] || return 0
               recent_command="$(grep -v '^$' <<<"$override_seen" | tail -n 1 | tr -d '[:space:]' || true)"
               [[ -n "$recent_command" ]] || return 1
 
