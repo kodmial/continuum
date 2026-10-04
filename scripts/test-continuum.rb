@@ -4203,7 +4203,7 @@ class ContinuumTest < Minitest::Test
     refute_nil step, 'the `issue` mode step is missing'
 
     assert_includes step, "inputs.mode == 'issue'"
-    assert_includes step, '[[ -n "$ISSUE_NUMBER" ]]'
+    assert_includes step, '[[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]]'
     assert_includes step, 'BRANCH="opencode/issue${ISSUE_NUMBER}-${GITHUB_RUN_ID}"'
     assert_includes step, 'opencode run --auto --model "$OPENCODE_MODEL"'
     assert_includes step, "if [[ \"\$CURRENT_BRANCH\" != \"\$BRANCH\" ]]; then"

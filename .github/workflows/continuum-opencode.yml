@@ -384,9 +384,15 @@ jobs:
                 core.setFailed('CI repair has no valid pull request number.');
                 return;
               }
-              const { data: pr } = await github.rest.pulls.get({
-                owner, repo, pull_number: prNumber,
-              });
+              let pr;
+              try {
+                ({ data: pr } = await github.rest.pulls.get({
+                  owner, repo, pull_number: prNumber,
+                }));
+              } catch (err) {
+                core.setFailed(`CI repair could not fetch pull request #${prNumber}: ${err.message || err}`);
+                return;
+              }
               prTitle = String(pr.title || '');
               prBody = String(pr.body || '');
 
@@ -791,7 +797,7 @@ jobs:
           CI_WORKFLOW_ID: ${{ inputs.ci_workflow_id }}
         run: |
           set -euo pipefail
-          [[ -n "$ISSUE_NUMBER" ]] || { echo "::error::Missing issue number for issue mode."; exit 1; }
+          [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::Missing or invalid issue number for issue mode: '${ISSUE_NUMBER}'."; exit 1; }
           [[ "$TASK_CONTEXT_PRESENT" == "true" ]] || { echo "::error::Authoritative task context was not resolved."; exit 1; }
           [[ "$TASK_REPO" == "$GITHUB_REPOSITORY" && "$TASK_NUMBER" == "$ISSUE_NUMBER" ]] || {
             echo "::error::Resolved task context $TASK_REPO#$TASK_NUMBER does not match issue mode $GITHUB_REPOSITORY#$ISSUE_NUMBER."
