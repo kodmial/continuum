@@ -238,6 +238,22 @@ class RecoveryDecisionTests(unittest.TestCase):
         self.assertEqual(decision.action, "wait")
         self.assertIsNone(decision.attempt)
 
+    def test_shipped_recovery_defines_operation_liveness_recheck(self):
+        body = self.read(".github/workflows/continuum-pr-agent-recovery.yml")
+        definition = "async function operationIsActive(prNumber, head, kind)"
+        call = "await operationIsActive(pr.number, head, kind)"
+        self.assertIn(definition, body)
+        self.assertIn("const runs = await listReviewRuns();", body)
+        self.assertIn(
+            "return Boolean(exactActiveRun(runs, prNumber, kind, head));",
+            body,
+        )
+        self.assertLess(
+            body.index(definition),
+            body.index(call),
+            "operationIsActive must be defined before the dispatch-grace call site",
+        )
+
     def test_newer_dispatch_marker_coalesces_independent_wakeup(self):
         evidence = recovery.RetryEvidence(latest_attempt=1)
         decision = recovery.decide_recovery(

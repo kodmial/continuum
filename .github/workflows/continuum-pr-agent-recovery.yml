@@ -487,6 +487,16 @@ jobs:
               ) || null;
             }
 
+            async function operationIsActive(prNumber, head, kind) {
+              // Re-read immediately before dispatch-grace coalescing. A fresh
+              // controller marker is only proof of a live dispatch while the
+              // exact PR/HEAD/operation run is still active; if that run was
+              // lost or already terminated, recovery must replay the same
+              // bounded attempt instead of waiting out the grace window.
+              const runs = await listReviewRuns();
+              return Boolean(exactActiveRun(runs, prNumber, kind, head));
+            }
+
             async function statusRunMetadata(status) {
               const target = String(status?.target_url || '');
               const match = target.match(/\/actions\/runs\/(\d+)(?:$|[/?#])/);
