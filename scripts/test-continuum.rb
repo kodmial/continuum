@@ -4586,11 +4586,107 @@ class ContinuumTest < Minitest::Test
       call.include?("mode: 'resolve-conflict'")
     end
     refute_nil repair_dispatch, 'automatic conflict-repair dispatch is missing'
-    assert_includes repair_dispatch, 'process.env.OPENCODE_WORKFLOW'
+    # The dispatch carries the resolved caller variable; the resolver itself
+    # reads the configured knob (asserted below), so dogfood's opencode.yml
+    # override still reaches the dispatch without a hardcoded file name.
+    assert_includes repair_dispatch, 'workflow_id: opencodeWorkflow'
+    resolver = js_block(body, 'function resolveOpencodeWorkflow()')
+    refute_nil resolver, 'the caller resolver is missing from the auto-merger'
+    assert_includes resolver, 'process.env.OPENCODE_WORKFLOW'
 
     dogfood = workflow_body('automation.yml')
     assert_match(/auto-merge:.*?opencode_workflow: 'opencode\.yml'/m, dogfood,
                  'Continuum dogfood must route conflict repair through its real workflow_dispatch caller')
+  end
+
+  # Issue #246: dirty-PR conflict recovery must be self-healing. Every
+  # reconciliation pass rediscovers already-dirty PRs (no fresh PR event or
+  # manual kick), a stale lock with no live repair run is reconciled and
+  # redispatched, dispatches stay idempotent per PR/HEAD and bounded, and a
+  # repaired HEAD resumes the normal CI/review lifecycle without weakening
+  # exact-HEAD gates.
+  def test_auto_merge_conflict_recovery_is_self_healing
+    body = auto_merge_body
+    script = script_body('continuum-auto-merge.yml')
+             .lines.reject { |line| line.strip.start_with?('//') }.join
+
+    # Every pass scans every open PR against main: the dirty check cannot
+    # depend on a fresh PR event.
+    assert_includes body, "state: 'open'"
+    assert_includes body, "base: 'main'"
+    assert_includes body, 'await reconcileDirtyPr(pr)'
+
+    # The early scan detects mergeable=false / mergeable_state=dirty and runs
+    # before the CI/review gates, so a conflicted HEAD is never stranded
+    # behind a red CI check.
+    scan = js_block(body, 'async function reconcileDirtyPr(pr)')
+    refute_nil scan, 'the early dirty-PR reconciler is missing from the auto-merger'
+    assert_includes scan, "mergeable_state"
+    assert_includes scan, 'await dispatchConflictRepair('
+    early_at = body.index('await reconcileDirtyPr(pr)')
+    ci_at = body.index('const ci = await latestCurrentHeadCi(pr);')
+    refute_nil ci_at, 'the current-head CI gate is missing'
+    assert_operator early_at, :<, ci_at,
+                     'the dirty-PR scan must run before the CI gate, or dirty PRs strand behind red CI'
+
+    # The reusable engine is never dispatched directly: the caller file name
+    # always comes from the configured knob and is validated.
+    assert_includes body, 'function resolveOpencodeWorkflow()'
+    assert_includes body, 'process.env.OPENCODE_WORKFLOW'
+    repair_dispatch = dispatch_calls('continuum-auto-merge.yml').find do |call|
+      call.include?("mode: 'resolve-conflict'")
+    end
+    refute_nil repair_dispatch, 'automatic conflict-repair dispatch is missing'
+    assert_includes repair_dispatch, 'workflow_id: opencodeWorkflow'
+    refute_includes script, "workflow_id: 'continuum-opencode.yml'",
+                    'conflict repair must not hardcode the engine file name'
+
+    # A live repair run suppresses duplicates; a stale lock with no active
+    # run is reconciled and redispatched.
+    assert_includes body, 'findActiveConflictRepairRun'
+    assert_includes body, 'already active for this PR; waiting'
+    assert_includes body, '(?!\\\\d)',
+                    'the active-run probe must not match PR #23 against the live run for PR #237'
+    assert_includes body, 'reconciled stale'
+    assert_includes body, 'redispatching'
+
+    # Idempotency per PR/current HEAD plus a bounded per-HEAD budget: repeated
+    # wakeups coalesce instead of duplicating repairs.
+    assert_includes body, 'continuum-conflict-repair head='
+    assert_includes body, 'CONFLICT_DISPATCH_GRACE_MS'
+    assert_includes body, 'inside its grace window; waiting'
+    assert_includes body, 'MAX_CONFLICT_DISPATCHES_PER_HEAD'
+    assert_includes body, 'budget exhausted for head'
+
+    # A repaired HEAD reconciles the lock and resumes CI/review instead of
+    # merging or pausing; failure stays autonomous and bounded.
+    assert_includes body, 'is no longer dirty; reconciled'
+    assert_includes body, 'resuming CI/review lifecycle'
+    repair_window = body[body.index('async function dispatchConflictRepair')..]
+    refute_includes repair_window, 'automation:paused',
+                    'conflict recovery must never terminally pause for manual label removal'
+
+    # Exact-HEAD checks are preserved: dispatch revalidates the head and the
+    # merge still binds to the exact SHA.
+    assert_includes body, 'head advanced from'
+    assert_includes body, 'sha: pr.head.sha,'
+  end
+
+  # The scan that rediscovers pre-existing dirty PRs needs wake-ups that do
+  # not depend on PR activity: main pushes, a schedule safety net, CI
+  # completions, and review/status events.
+  def test_auto_merge_conflict_scan_wakes_without_pr_events
+    stub = File.read(File.join(ROOT, '.github/caller-stubs/continuum-auto-merge.yml'))
+    assert_includes stub, 'push:'
+    assert_includes stub, 'branches: [main]'
+    assert_includes stub, "cron: '17,47 * * * *'"
+    assert_includes stub, 'pull_request_review:'
+    assert_includes stub, 'status:'
+
+    dogfood = workflow_body('automation.yml')
+    assert_match(/\(github\.event_name == 'schedule' && github\.event\.schedule == '17,47 \* \* \* \*'\)/, dogfood)
+    assert_includes dogfood, "github.event_name == 'push'"
+    assert_includes dogfood, ".github/workflows/ci.yml"
   end
 
   def test_auto_merge_wakeup_catch_warns_inside_the_wakeup_loop
@@ -5497,7 +5593,19 @@ class ContinuumTest < Minitest::Test
                     'the merge SHA guard must remain'
     assert_includes body, 'merge_method:'
     assert_includes body, "'squash'"
-    assert_includes body, 'pr.mergeable === false'
+    # Issue #246 canonical dirty detection: every mergeability read is routed
+    # through isConflictedMergeability(pr.mergeable, pr.mergeable_state),
+    # which returns true for mergeable=false and mergeable_state=dirty (plus
+    # GraphQL CONFLICTING etc.) and null while GitHub recomputes. The pre-#246
+    # inline `pr.mergeable === false` literal covered only the REST boolean
+    # and is superseded by this strictly broader helper; assert the helper
+    # and its call sites instead so REST and GraphQL dirty shapes stay gated.
+    assert_includes body, 'function isConflictedMergeability('
+    assert_includes body, "if (state === 'dirty') return true;"
+    assert_includes body, "if (typeof mergeable === 'boolean') return !mergeable;"
+    assert_includes body, 'isConflictedMergeability('
+    assert_includes body, 'pr.mergeable,'
+    assert_includes body, 'pr.mergeable_state'
     assert_includes body, "hasLabel(pr, AUTO_MERGE_BLOCK_LABEL)"
     assert_includes body, 'for (const workflow of postMergeWakeups) {'
   end
