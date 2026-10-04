@@ -125,11 +125,11 @@ on:
         required: false
 
 permissions:
-  actions: read
+  actions: write
   contents: write
   issues: write
   pull-requests: write
-  statuses: read
+  statuses: write
 
 # Orchestration serialization (issue #227): this reusable layer owns the only
 # authoritative per-PR serialization for PR-Agent operations. The
