@@ -98,18 +98,23 @@ jobs:
             // A distinct Octokit instance handles read-only same-repository calls
             // with github.token, keeping those requests off TAP_PAT's shared budget.
             const readToken = String(process.env.READ_GITHUB_TOKEN || '').trim();
-            if (!readToken) {
-              core.setFailed('READ_GITHUB_TOKEN is required for PR-Agent recovery reads.');
-              return;
-            }
             const { getOctokit } = require('@actions/github');
-            const readGithub = getOctokit(readToken);
+            const readGithub = readToken ? getOctokit(readToken) : github;
+            if (!readToken) {
+              core.warning('READ_GITHUB_TOKEN is empty; using PAT client for PR-Agent recovery reads.');
+            }
+            let readTokenUnavailable = false;
             async function withReadFallback(fn) {
+              if (readTokenUnavailable || readGithub === github) {
+                return await fn(github);
+              }
               try {
                 return await fn(readGithub);
               } catch (err) {
-                if (err && (err.status === 401 || err.status === 403)) {
-                  core.warning('Repository-token read failed (' + err.status + '); retrying with PAT client: ' + err.message);
+                const status = err ? (err.status ?? err.response?.status) : undefined;
+                if (status === 401 || status === 403 || status === 429) {
+                  readTokenUnavailable = true;
+                  core.warning('Repository-token read failed (' + status + '); retrying with PAT client: ' + err.message);
                   return await fn(github);
                 }
                 throw err;
