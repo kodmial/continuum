@@ -260,8 +260,13 @@ jobs:
               # a long thread; scan newest-first instead.
               recent_command=""
               override_seen=""
-              override_total="$(gh api "repos/$child_repo/issues/$task_number" --jq '.comments // 0' 2>/dev/null || echo 0)"
-              [[ "$override_total" =~ ^[0-9]+$ ]] || override_total=0
+              # Fail closed: an unknown comment total cannot anchor the
+              # newest window, so treat the task as active instead of
+              # scanning only the oldest page and missing a recent override.
+              if ! override_total="$(gh api "repos/$child_repo/issues/$task_number" --jq '.comments // 0' 2>/dev/null)"; then
+                return 0
+              fi
+              [[ "$override_total" =~ ^[0-9]+$ ]] || return 0
               override_last_page=$(( (override_total + 99) / 100 ))
               [[ "$override_last_page" -ge 1 ]] || override_last_page=1
               override_first_page=$(( override_last_page - 4 ))

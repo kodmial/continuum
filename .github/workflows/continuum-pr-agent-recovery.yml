@@ -418,9 +418,11 @@ jobs:
             // newest records into a truncated oldest-first comment scan so
             // the PR can still be serviced on this pass. Deciding markers
             // (retry/exhausted/controller state) are written by recent
-            // activity, which the merged newest window always keeps; only a
-            // middle window on very large threads may stay unseen. Only a
-            // newest-recovery failure defers the PR to the next wakeup.
+            // activity, which the merged newest window always keeps. When the
+            // thread spans more than twice the page budget the merged
+            // oldest+newest window still leaves an unseen middle, so the
+            // recovery throws and callers defer/skip instead of deciding as
+            // if complete. Only a complete merged window clears truncated.
             // Runs on the caller's already-resolved read client so the
             // per-PR auth fallback is resolved once per scan, not once per
             // recovery page.
@@ -433,6 +435,14 @@ jobs:
               }
               if (!lastPage) {
                 throw new Error('cannot anchor newest comments window');
+              }
+              // Oldest MAX_COMMENT_PAGES cover 1..MAX and newest MAX cover
+              // lastPage-(MAX-1)..lastPage. Beyond twice the budget the
+              // middle stays unseen where a deciding marker would be missed.
+              if (lastPage > MAX_COMMENT_PAGES * 2) {
+                throw new Error(
+                  'comment scan spans more than the bounded oldest+newest window (pages=' + lastPage + '); holding instead of deciding with an unseen middle window'
+                );
               }
               const seen = new Set(items.map(entry => entry && entry.id));
               for (let page = 1; page <= MAX_COMMENT_PAGES; page += 1) {

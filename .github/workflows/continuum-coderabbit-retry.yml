@@ -163,8 +163,11 @@ jobs:
             // still be serviced on this pass. Eligibility markers
             // (full-review commands, rate-limit replies, HEAD markers) are
             // written by recent activity, which the merged newest window
-            // always keeps; only a middle window on very large threads may
-            // stay unseen, and that is warned about by the caller.
+            // always keeps. When the thread spans more than twice the page
+            // budget the merged oldest+newest window still leaves an unseen
+            // middle, so the recovery throws and the caller defers the PR
+            // to the next wake-up (fail closed, like the thread-budget path)
+            // instead of deciding as if complete.
             async function mergeNewestWindow(request, params, items, label) {
               let lastPage = Number(items.lastPage || 0);
               if (!lastPage && label === 'comments') {
@@ -179,6 +182,14 @@ jobs:
               }
               if (!lastPage) {
                 throw new Error(`cannot anchor newest ${label} window`);
+              }
+              // Oldest MAX_THREAD_PAGES cover 1..MAX and newest MAX cover
+              // lastPage-(MAX-1)..lastPage. Beyond twice the budget the
+              // middle stays unseen where a deciding marker would be missed.
+              if (lastPage > MAX_THREAD_PAGES * 2) {
+                throw new Error(
+                  `${label} scan spans more than the bounded oldest+newest window (pages=${lastPage}); skipping this PR instead of deciding with an unseen middle window`
+                );
               }
               const seen = new Set(items.map(entry => entry && entry.id));
               for (let page = 1; page <= MAX_THREAD_PAGES; page += 1) {
