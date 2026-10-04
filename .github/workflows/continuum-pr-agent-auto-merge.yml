@@ -645,7 +645,7 @@ jobs:
             async function latestWorkflowForHead(pr, headSha, workflowName) {
               const cacheKey = `${pr.head.ref}|${headSha}|${workflowName}`;
               if (gateCache.has(cacheKey)) return gateCache.get(cacheKey);
-              // Branch/event-filtered server-side; only the newest runs can
+              // Branch/event/head-filtered server-side; only the newest runs can
               // decide the gate, so two pages bound the cost (#254).
               const runs = [];
               for (let page = 1; page <= 2; page += 1) {
@@ -655,6 +655,7 @@ jobs:
                     repo,
                     branch: pr.head.ref,
                     event: 'pull_request',
+                    head_sha: headSha,
                     per_page: 100,
                     page,
                   }
