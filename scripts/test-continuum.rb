@@ -4692,12 +4692,12 @@ class ContinuumTest < Minitest::Test
     lines = body.lines
     at = lines.index { |line| line.include?("workflow_id: 'continuum-coderabbit-retry.yml'") }
     window = lines[[at - 8, 0].max..at].join
-    assert_match(/if \(requireCodeRabbit && queuedForCodeRabbit\) \{\s*\n\s*await github\.rest\.actions\.createWorkflowDispatch\(\{/, window,
+    assert_match(/if \(requireCodeRabbit && queuedForCodeRabbit\) \{\s*\n\s*await patClient\(\)\.rest\.actions\.createWorkflowDispatch\(\{/, window,
                  'the CodeRabbit retry dispatch must be gated on the flag')
 
     # The CI-driven auto-merge wake-up is NOT part of the CodeRabbit path and
     # must keep firing for a repository that disabled CodeRabbit.
-    assert_match(/if \(ours\.length > 0\) \{\s*\n\s*await github\.rest\.actions\.createWorkflowDispatch\(\{\s*\n\s*owner,\s*\n\s*repo,\s*\n\s*workflow_id: 'continuum-auto-merge\.yml'/, body,
+    assert_match(/if \(ours\.length > 0\) \{\s*\n\s*await patClient\(\)\.rest\.actions\.createWorkflowDispatch\(\{\s*\n\s*owner,\s*\n\s*repo,\s*\n\s*workflow_id: 'continuum-auto-merge\.yml'/, body,
                  'the auto-merge wake-up must stay unconditional')
   end
 
@@ -6918,10 +6918,13 @@ class ContinuumTest < Minitest::Test
   def test_api_budget_review_label_reads_use_repository_token_and_bounded_scans
     body = workflow_body('continuum-add-review-label.yml')
 
-    # Same-repo reads leave the shared PAT budget; mutations keep PAT actor
-    # semantics so label/dispatch events still fan out.
+    # Same-repo reads leave the shared PAT budget via readGithub; label
+    # mutations use the GITHUB_TOKEN actor (github-actions[bot]) while the
+    # two workflow dispatches stay PAT-backed via patClient so downstream
+    # event chaining is preserved.
     assert_includes body, 'READ_GITHUB_TOKEN: ${{ github.token }}'
-    assert_includes body, 'github-token: ${{ secrets.TAP_PAT }}'
+    assert_includes body, 'TAP_PAT: ${{ secrets.TAP_PAT }}'
+    assert_includes body, 'github-token: ${{ github.token }}'
     assert_includes body, 'const readGithub = new github.constructor({'
     assert_includes body, 'readGithub.rest.repos.listPullRequestsAssociatedWithCommit'
     assert_includes body, 'readGithub.rest.pulls.listFiles'
@@ -6939,9 +6942,10 @@ class ContinuumTest < Minitest::Test
     assert_includes body, 'MAX_FILES_PAGES'
     assert_includes body, 'continuum-api-budget:'
 
-    # Mutations stay PAT-backed.
+    # Label mutations use the default GITHUB_TOKEN client while dispatches
+    # stay PAT-backed via the dedicated PAT client.
     assert_includes body, 'await github.rest.issues.addLabels({'
-    assert_includes body, 'await github.rest.actions.createWorkflowDispatch({'
+    assert_includes body, 'await patClient().rest.actions.createWorkflowDispatch({'
   end
 
   def test_api_budget_coderabbit_retry_reads_use_repository_token_and_bounded_scans

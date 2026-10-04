@@ -68,10 +68,14 @@ jobs:
           REQUIRED_WORKFLOW_GATE_NAME: ${{ vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_NAME || '' }}
           READ_GITHUB_TOKEN: ${{ github.token }}
         with:
-          # TAP_PAT stays for the label/comment mutations below (their PAT
-          # actor fans events out to downstream automation). Same-repo
-          # reads move to READ_GITHUB_TOKEN via readGithub (#254).
-          github-token: ${{ secrets.TAP_PAT }}
+          # kodmial/continuum#259: same-repository queue mutations (labels and
+          # the @coderabbitai command comment) use the repository-scoped
+          # GITHUB_TOKEN so GitHub attributes them to github-actions[bot].
+          # CodeRabbit is notified as an external app regardless of actor, and
+          # no GitHub workflow is triggered by these writes (wake-ups arrive
+          # via CodeRabbit events, schedule, and workflow_dispatch).
+          # Same-repo reads move to READ_GITHUB_TOKEN via readGithub (#254).
+          github-token: ${{ github.token }}
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
@@ -87,7 +91,7 @@ jobs:
               core.notice(
                 `continuum-api-budget: total_calls=${apiBudget.reads + apiBudget.mutations} ` +
                 `reads=${apiBudget.reads} (repository-token) ` +
-                `mutations=${apiBudget.mutations} (shared-PAT) ` +
+                `mutations=${apiBudget.mutations} (github-token) ` +
                 `pages=${apiBudget.pages} event_substitutions=${apiBudget.event}`
               );
             }
