@@ -48,7 +48,7 @@ workflow name as the interface.
 | `AUTOMATION_OPENCODE_RUNNER` | `ubuntu-latest` | Runner used by OpenCode. |
 | `AUTOMATION_OPENCODE_TIMEOUT_MINUTES` | `180` | OpenCode timeout. |
 | `CONTINUUM_AGENT_PREPARE_COMMAND` | empty | Consumer-owned toolchain/environment setup run after checkout. |
-| `CONTINUUM_IMAGE_DIGEST` | empty | Immutable digest of the prepared agent-runtime image serving this job. Recorded by the provisioning path; warm jobs probe the prepared runtime first and perform zero downloads. See `docs/agent-runtime.md`. |
+| `CONTINUUM_IMAGE_DIGEST` | empty | Immutable digest of the prepared agent-runtime image serving this job. Recorded by the provisioning path; warm jobs probe the prepared runtime first and perform zero downloads. The warm hit additionally requires this variable to hold a 64-char sha256 digest (wired into each install step from the repository variable); when empty, jobs fall through to deterministic reconstruction, and a malformed value fails closed. See `docs/agent-runtime.md`. |
 | `CONTINUUM_RUNTIME_PRESET` | `agent-linux` | Named ephemeral runtime preset (`agent-linux`, `agent-macos`, `agent-windows`, ...). Strict presets keep `idle_instances: 0` and `max_uses_per_instance: 1`; they cannot be retuned into persistent waiting runners. |
 | `CONTINUUM_RUNTIME_PROVIDER` | `github-hosted` | Provider backend for ephemeral instances (`github-hosted`, `gce`, `ec2`, `azure`, `custom`). |
 

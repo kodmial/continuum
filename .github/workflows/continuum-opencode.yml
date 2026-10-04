@@ -877,22 +877,24 @@ jobs:
       # checked-out PR branch and has no built-in PR-creation lifecycle.
       - name: Install OpenCode CLI for automated repair
         if: github.event_name == 'workflow_dispatch' && steps.issue_readiness.outputs.ready != 'false'
+        env:
+          CONTINUUM_IMAGE_DIGEST: ${{ vars.CONTINUUM_IMAGE_DIGEST }}
         run: |
           set -euo pipefail
           # Continuum #179 prepared agent runtime: the immutable golden image
-          # (or its provider-native cache equivalent keyed by the image digest
-          # in CONTINUUM_IMAGE_DIGEST) already carries pinned OpenCode 1.18.34,
-          # so warm jobs perform zero downloads. Probe the prepared agent
-          # runtime first via `command -v opencode` and the exact version;
-          # only a validated cache miss falls through to deterministic
-          # reconstruction below.
+          # (or its provider-native cache equivalent) already carries pinned
+          # OpenCode 1.18.34. The warm hit below is keyed by the image digest
+          # in CONTINUUM_IMAGE_DIGEST (wired from the repository variable):
+          # only a set, well-formed digest plus `command -v opencode` and the
+          # exact version takes the hit path with zero downloads; an empty
+          # digest falls through to deterministic reconstruction below.
           export PATH="$HOME/.opencode/bin:$PATH"
           if [[ -n "${CONTINUUM_IMAGE_DIGEST:-}" ]] && ! [[ "$CONTINUUM_IMAGE_DIGEST" =~ ^[0-9a-f]{64}$ ]]; then
             echo "::error::CONTINUUM_IMAGE_DIGEST must be a 64-char sha256 hex digest when set."
             exit 1
           fi
-          if command -v opencode >/dev/null 2>&1 && opencode --version 2>&1 | grep -E -q "(^|[^0-9.])1\.18\.34([^0-9.]|$)"; then
-            echo "prepared-runtime hit: opencode 1.18.34 already present (image digest ${CONTINUUM_IMAGE_DIGEST:-unresolved})."
+          if [[ "${CONTINUUM_IMAGE_DIGEST:-}" =~ ^[0-9a-f]{64}$ ]] && command -v opencode >/dev/null 2>&1 && opencode --version 2>&1 | grep -E -q "(^|[^0-9.])1\.18\.34([^0-9.]|$)"; then
+            echo "prepared-runtime hit: opencode 1.18.34 already present (image digest ${CONTINUUM_IMAGE_DIGEST})."
             echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
             exit 0
           fi
@@ -915,22 +917,24 @@ jobs:
       # rate limiting cannot prevent issue/PR-comment sessions from starting.
       - name: Install OpenCode CLI for interactive agent
         if: github.event_name != 'workflow_dispatch' && steps.issue_readiness.outputs.ready != 'false'
+        env:
+          CONTINUUM_IMAGE_DIGEST: ${{ vars.CONTINUUM_IMAGE_DIGEST }}
         run: |
           set -euo pipefail
           # Continuum #179 prepared agent runtime: the immutable golden image
-          # (or its provider-native cache equivalent keyed by the image digest
-          # in CONTINUUM_IMAGE_DIGEST) already carries pinned OpenCode 1.18.34,
-          # so warm jobs perform zero downloads. Probe the prepared agent
-          # runtime first via `command -v opencode` and the exact version;
-          # only a validated cache miss falls through to deterministic
-          # reconstruction below.
+          # (or its provider-native cache equivalent) already carries pinned
+          # OpenCode 1.18.34. The warm hit below is keyed by the image digest
+          # in CONTINUUM_IMAGE_DIGEST (wired from the repository variable):
+          # only a set, well-formed digest plus `command -v opencode` and the
+          # exact version takes the hit path with zero downloads; an empty
+          # digest falls through to deterministic reconstruction below.
           export PATH="$HOME/.opencode/bin:$PATH"
           if [[ -n "${CONTINUUM_IMAGE_DIGEST:-}" ]] && ! [[ "$CONTINUUM_IMAGE_DIGEST" =~ ^[0-9a-f]{64}$ ]]; then
             echo "::error::CONTINUUM_IMAGE_DIGEST must be a 64-char sha256 hex digest when set."
             exit 1
           fi
-          if command -v opencode >/dev/null 2>&1 && opencode --version 2>&1 | grep -E -q "(^|[^0-9.])1\.18\.34([^0-9.]|$)"; then
-            echo "prepared-runtime hit: opencode 1.18.34 already present (image digest ${CONTINUUM_IMAGE_DIGEST:-unresolved})."
+          if [[ "${CONTINUUM_IMAGE_DIGEST:-}" =~ ^[0-9a-f]{64}$ ]] && command -v opencode >/dev/null 2>&1 && opencode --version 2>&1 | grep -E -q "(^|[^0-9.])1\.18\.34([^0-9.]|$)"; then
+            echo "prepared-runtime hit: opencode 1.18.34 already present (image digest ${CONTINUUM_IMAGE_DIGEST})."
             echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
             exit 0
           fi

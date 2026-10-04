@@ -164,19 +164,25 @@ For each queued job (`EphemeralController.run_next_job`):
 1. GitHub queues the job for a Continuum runtime profile (`queue_job`
    creates no compute).
 2. The controller resolves target repository, requested profile, pinned
-   Continuum ref, and desired immutable image digest.
+   Continuum ref, and desired immutable image digest, and refuses to
+   provision once the profile's `concurrency_limit` live instances already
+   exist (queued demand is kept for a later attempt, never dropped).
 3. `ensure-image(profile, digest)` verifies the prepared image exists.
 4. If absent, it is built and validated automatically in trusted
    infrastructure.
-5. A **new** compute instance is created from the prepared image.
-6. The job-scoped network identity required by the profile is attached.
-7. Short-lived GitHub JIT/ephemeral runner configuration is generated.
-8. The instance is registered for the target repository/scale set.
-9. Runtime/image identity is validated before accepting work.
-10. Exactly one job executes.
-11. On completion/failure/cancellation the instance and job-scoped network
+5. The Layer C dependency cache is restored (validated, project/repository
+   scoped, trusted entries only); a miss falls back to deterministic
+   reconstruction, and a successful job publishes fresh cache state
+   (fork contexts never publish trusted state).
+6. A **new** compute instance is created from the prepared image.
+7. The job-scoped network identity required by the profile is attached.
+8. Short-lived GitHub JIT/ephemeral runner configuration is generated.
+9. The instance is registered for the target repository/scale set.
+10. Runtime/image identity is validated before accepting work.
+11. Exactly one job executes.
+12. On completion/failure/cancellation the instance and job-scoped network
     attachment are deregistered and destroyed.
-12. Provider state is reconciled to verify deletion.
+13. Provider state is reconciled to verify deletion.
 
 ## Autoscaling / control plane
 

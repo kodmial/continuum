@@ -241,6 +241,69 @@ class AgentRuntimeContractTest(unittest.TestCase):
             cache.publish(key=key, project_id="proj-a", repository="acme/app",
                           payload={"token": "ghp_secret"}, is_fork=False, trusted_context=True)
 
+    def test_17b_untrusted_cache_restore_refused(self):
+        cache = runtime.DependencyCache()
+        key = runtime.DependencyCache.cache_key("b" * 64)
+        cache.publish(key=key, project_id="proj-a", repository="acme/app",
+                      payload={"files": ["x"]}, is_fork=True, trusted_context=True)
+        # Fork-published entries are never usable: restore refuses them so a
+        # caller checking only non-None cannot consume poisoned cache, and
+        # the job falls back to deterministic reconstruction.
+        self.assertIsNone(cache.restore(key=key, project_id="proj-a", repository="acme/app"))
+
+    def test_17c_provisioning_path_restores_and_publishes_dependency_cache(self):
+        controller = _controller()
+        profile = runtime.resolve_profile({"preset": "agent-linux"})
+        manifest = _manifest(profile)
+        controller.queue_job("acme/app", profile)
+        first = controller.run_next_job(manifest, now=1000.0)
+        self.assertIn("cache-miss", " ".join(first.events))
+        self.assertIn("published-dependencies", " ".join(first.events))
+        key = runtime.DependencyCache.cache_key(first.image_digest)
+        kept = controller.cache.restore(key=key, project_id="proj-a", repository="acme/app")
+        self.assertIsNotNone(kept)
+        self.assertTrue(kept.validated)
+        controller.queue_job("acme/app", profile)
+        second = controller.run_next_job(manifest, now=2000.0)
+        self.assertIn("restored-dependencies", " ".join(second.events))
+
+    def test_17d_fork_job_never_leaves_usable_cache(self):
+        controller = _controller()
+        profile = runtime.resolve_profile({"preset": "agent-linux"})
+        manifest = _manifest(profile)
+        controller.queue_job("acme/app", profile)
+        result = controller.run_next_job(manifest, now=1000.0, is_fork=True)
+        self.assertEqual(result.outcome, "success")
+        key = runtime.DependencyCache.cache_key(result.image_digest)
+        self.assertIsNone(controller.cache.restore(key=key, project_id="proj-a",
+                                                   repository="acme/app"))
+
+    def test_17e_concurrency_limit_bounds_live_provisioning(self):
+        controller = _controller()
+        profile = runtime.resolve_profile({"preset": "agent-linux", "concurrency_limit": 1})
+        manifest = _manifest(profile)
+        store = controller.images
+        provider = controller.provider
+        digest = runtime.image_digest(manifest, profile)
+        store.ensure_image(manifest, profile, now=1000.0)
+        network = provider.create_network(runtime.profile_digest(profile), "job-live", now=1000.0)
+        live = provider.create_instance(
+            project_id="proj-a", repository="acme/app",
+            profile_digest=runtime.profile_digest(profile), digest=digest,
+            job_id="job-live", network_id=network.id, now=1000.0)
+        provider.jit_register(live)
+        controller.leases[live.id] = runtime.Lease(
+            project_id="proj-a", repository="acme/app", job_id="job-live", run_id="r-live",
+            profile_digest=runtime.profile_digest(profile), instance_id=live.id,
+            created_at=1000.0, lease_expires_at=1000.0 + controller.max_job_lifetime,
+            max_age_at=1000.0 + controller.global_max_age, state="running")
+        controller.queue_job("acme/app", profile)
+        with self.assertRaises(runtime.AgentRuntimeError):
+            controller.run_next_job(manifest, now=1100.0)
+        # Refused demand is kept, not dropped; the live instance is untouched.
+        self.assertEqual(len(controller.queued), 1)
+        self.assertEqual(controller.live_instance_count(), 1)
+
     def test_18_linux_and_macos_derive_from_same_contract(self):
         linux = runtime.LinuxAdapter().manifest("main")
         macos = runtime.MacOSAdapter().manifest("main")
@@ -316,6 +379,29 @@ class AgentRuntimeContractTest(unittest.TestCase):
             "  echo hello\n"
         )
         self.assertFalse(runtime.normal_execution_uses_bootstrap_install(comment_only))
+
+    def test_detector_rejects_bare_marker_code_before_installer(self):
+        # A bare `prepared-runtime` marker on a code line (job name, echo
+        # string) is not an executable probe: an unconditional installer
+        # preceded only by such a string must still count as a bootstrap
+        # install instead of being misclassified as a warm path.
+        body = (
+            "run: |\n"
+            '  echo "prepared-runtime ready"\n'
+            "  curl -fsSL --retry 3 https://opencode.ai/install | bash\n"
+        )
+        self.assertTrue(runtime.normal_execution_uses_bootstrap_install(body))
+        # A real executable probe ahead of the installer is still the warm
+        # path, even with marker prose nearby.
+        warm = (
+            "run: |\n"
+            "  # prepared agent runtime lives on the golden image\n"
+            "  command -v opencode >/dev/null 2>&1\n"
+            '  echo "prepared-runtime hit"\n'
+            "  exit 0\n"
+            "  curl -fsSL --retry 3 https://opencode.ai/install | bash\n"
+        )
+        self.assertFalse(runtime.normal_execution_uses_bootstrap_install(warm))
 
     def test_resolve_profile_rejects_non_numeric_limits_as_domain_error(self):
         for declaration in (

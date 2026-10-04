@@ -736,15 +736,18 @@ class DependencyCache:
     ) -> Optional[CacheEntry]:
         """Restore validated, project-scoped cache state or return None.
 
-        Cross-project restores are refused (isolation), untrusted entries
-        are treated as untrusted input, and validation failure falls back to
-        deterministic reconstruction (None).
+        Cross-project restores are refused (isolation), untrusted
+        (fork-published) entries are refused outright so a caller checking
+        only non-None can never consume poisoned cache, and validation
+        failure falls back to deterministic reconstruction (None).
         """
 
         entry = self._entries.get((project_id, key))
         if entry is None:
             return None
         if entry.repository != repository:
+            return None
+        if not entry.trusted:
             return None
         if image_contains_secret(entry.payload) is not None:
             return None
@@ -990,8 +993,10 @@ class EphemeralController:
         fail_jit: bool = False,
         fail_startup: bool = False,
         teardown_retries: Optional[int] = None,
+        is_fork: bool = False,
+        trusted_context: bool = True,
     ) -> JobResult:
-        """Execute steps 2-12 of the required provisioning path for one job."""
+        """Execute steps 2-13 of the required provisioning path for one job."""
 
         if not self.queued:
             raise AgentRuntimeError("no queued demand: the controller never provisions without demand")
@@ -1004,7 +1009,38 @@ class EphemeralController:
         run_id: str = queued["run_id"]
         events: List[str] = ["queued {}".format(job_id)]
 
+        # Consumer-owned concurrency/cost limit: never provision beyond the
+        # profile's concurrency_limit live instances. The queued demand is
+        # kept (not popped) so a refused job is retried later instead of
+        # being silently dropped.
+        try:
+            concurrency_limit = int(profile.concurrency_limit)
+        except (TypeError, ValueError):
+            raise AgentRuntimeError("concurrency_limit must be an integer between 1 and 256")
+        live = len(self.provider.live_instances())
+        if live >= concurrency_limit:
+            raise AgentRuntimeError(
+                "concurrency limit {} reached ({} live instances): refusing to provision {}".format(
+                    concurrency_limit, live, job_id
+                )
+            )
+
         digest = image_digest(manifest, profile)
+        # Layer C (dependency/build cache): restore validated, scoped cache
+        # state before provisioning; a miss (or a disabled dependency cache)
+        # falls back to deterministic reconstruction below.
+        cache_key: Optional[str] = None
+        if profile.dependencies_cache:
+            try:
+                cache_key = DependencyCache.cache_key(digest)
+            except AgentRuntimeError:
+                cache_key = None
+        if cache_key is not None:
+            hit = self.cache.restore(key=cache_key, project_id=self.project_id, repository=repository)
+            if hit is not None:
+                events.append("restored-dependencies {}".format(cache_key))
+            else:
+                events.append("cache-miss {} fallback-to-reconstruction".format(cache_key))
         generation = self.images.ensure_image(manifest, profile, now=now)
         events.append("ensured-image {}".format(digest))
         if self.images.active_digest is None:
@@ -1085,6 +1121,20 @@ class EphemeralController:
         self.leases.pop(instance.id, None)
         if not destroyed:
             events.append("teardown-deferred-to-reconciler {}".format(instance.id))
+        if cache_key is not None and terminal == OUTCOME_SUCCESS:
+            try:
+                self.cache.publish(
+                    key=cache_key,
+                    project_id=self.project_id,
+                    repository=repository,
+                    payload={"image_digest": digest,
+                             "profile_digest": profile_digest(profile)},
+                    is_fork=is_fork,
+                    trusted_context=trusted_context,
+                )
+                events.append("published-dependencies {}".format(cache_key))
+            except AgentRuntimeError:
+                events.append("cache-publish-refused {}".format(cache_key))
         return JobResult(job_id, terminal, instance.id, network.id,
                          instance.public_ip, digest, destroyed, events)
 
@@ -1348,11 +1398,14 @@ def normal_execution_uses_bootstrap_install(workflow_text: str) -> bool:
     for index, line in enumerate(code_lines):
         if first_bootstrap is None and any(pattern in line for pattern in _BOOTSTRAP_PATTERNS):
             first_bootstrap = index
+        # Only a real executable probe counts as a warm-path probe: an exact
+        # CLI/version check (`command -v opencode`, `pr-agent --version).
+        # A bare comment-grade marker such as `prepared-runtime` or
+        # `prepared agent runtime` in a job name, echo string, or comment is
+        # not a probe and must never suppress bootstrap detection.
         if first_probe is None and (
             "command -v opencode" in line
             or "pr-agent --version" in line
-            or "prepared-runtime" in line
-            or "prepared agent runtime" in line
         ):
             first_probe = index
         if first_bootstrap is not None and first_probe is not None:
@@ -1378,6 +1431,17 @@ def workflow_step_has_prepared_runtime_probe(workflow_text: str) -> bool:
     digest = ("image digest" in workflow_text.lower() or "CONTINUUM_IMAGE_DIGEST" in workflow_text
               or "prepared-runtime" in workflow_text.lower() or "prepared agent runtime" in workflow_text.lower())
     if not (probe and pinned and digest):
+        return False
+    # The warm hit must be keyed by the image digest, not just mention it:
+    # require a digest-gated probe line (a code line carrying both the
+    # CONTINUUM_IMAGE_DIGEST gate and a real executable probe) so an empty
+    # or unresolved digest cannot take the hit path and skip install.
+    gated = any(
+        "CONTINUUM_IMAGE_DIGEST" in line and ("command -v opencode" in line or "pr-agent --version" in line)
+        for line in workflow_text.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    )
+    if not gated:
         return False
     if "pr-agent==" in workflow_text:
         if "pr-agent --version" not in workflow_text:

@@ -5112,31 +5112,80 @@ class ContinuumTest < Minitest::Test
       'continuum-consumer-child-pr-review.yml' => %w[1.18.34],
     }.each do |name, pins|
       body = workflow_body(name)
+      lines = body.lines
       assert_includes body, 'command -v opencode',
                       "#{name}: the prepared-runtime probe must check for the preinstalled CLI"
       assert_includes body.downcase, 'prepared agent runtime',
                       "#{name}: the install site must name the prepared agent runtime it probes"
       assert_includes body, 'CONTINUUM_IMAGE_DIGEST',
                       "#{name}: the probe must key on the immutable image digest"
+      assert_includes body, 'vars.CONTINUUM_IMAGE_DIGEST',
+                      "#{name}: the image digest must be wired from the repository variable into the shell"
       pins.each do |pin|
         assert_includes body, pin, "#{name}: the exact pinned version #{pin} must be enforced"
       end
-      probe_at = body.index('command -v opencode')
-      installer_at = body.index('https://opencode.ai/install')
-      refute_nil installer_at, "#{name}: the deterministic reconstruction fallback is missing"
-      assert_operator probe_at, :<, installer_at,
-                      "#{name}: the prepared-runtime probe must precede the installer (warm path downloads nothing)"
-      assert_includes body, 'prepared-runtime hit',
-                      "#{name}: a warm probe hit must short-circuit before any download"
+      # Every installer site (not just the first) must sit behind a probe:
+      # each line that downloads or pip-installs the runtime must have an
+      # executable probe (`command -v opencode` / `pr-agent --version`) on
+      # an earlier line, and the warm hit must be digest-gated (a line
+      # carrying both the CONTINUUM_IMAGE_DIGEST gate and a real probe) so
+      # an empty or malformed digest cannot take the hit path and skip the
+      # install. Format-only validation is not identity enforcement.
+      installer_lines = lines.each_index.select do |i|
+        lines[i].include?('https://opencode.ai/install') ||
+          (lines[i].include?('pip install') && lines[i].include?('pr-agent'))
+      end
+      refute_empty installer_lines, "#{name}: the deterministic reconstruction fallback is missing"
+      probe_lines = lines.each_index.select do |i|
+        lines[i].include?('command -v opencode') || lines[i].include?('pr-agent --version')
+      end
+      refute_empty probe_lines, "#{name}: no executable prepared-runtime probe found"
+      installer_lines.each do |at|
+        assert_operator probe_lines.min, :<, at,
+                        "#{name}: line #{at + 1} installs the runtime without a preceding probe (warm path downloads nothing)"
+      end
+      gated_lines = lines.each_index.select do |i|
+        lines[i].include?('CONTINUUM_IMAGE_DIGEST') &&
+          (lines[i].include?('command -v opencode') || lines[i].include?('pr-agent --version'))
+      end
+      refute_empty gated_lines, "#{name}: the warm hit must be keyed by the image digest (no digest-gated probe line)"
+      assert_operator gated_lines.min, :<, installer_lines.min,
+                      "#{name}: the digest-gated probe must precede the installer"
+      assert_match(/CONTINUUM_IMAGE_DIGEST.*=~\s*\^\[0-9a-f\]\{64\}\$/, body,
+                   "#{name}: the digest gate must enforce the 64-char sha256 shape")
+      hit_lines = lines.each_index.select { |i| lines[i].include?('prepared-runtime hit') }
+      refute_empty hit_lines, "#{name}: a warm probe hit must be logged before any download"
+      assert_operator hit_lines.min, :<, installer_lines.min,
+                      "#{name}: the prepared-runtime hit must come before the installer"
+      # The hit path must actually short-circuit the download: exit-0 style
+      # steps stop before the installer, if/else (consumer-child) steps
+      # skip the download branch on a hit.
+      if name.start_with?('continuum-consumer-child-')
+        else_between = lines.each_index.any? do |i|
+          lines[i].strip == 'else' && i > hit_lines.min && i < installer_lines.max
+        end
+        assert else_between,
+               "#{name}: the warm hit branch must skip the download via if/else (no fall-through install)"
+      else
+        exit_between = lines.each_index.any? do |i|
+          lines[i].strip == 'exit 0' && i > hit_lines.min && i < installer_lines.min
+        end
+        assert exit_between,
+               "#{name}: the warm hit must short-circuit with exit 0 before any download"
+      end
     end
 
     pr_agent = workflow_body('continuum-pr-agent.yml')
-    probe_at = pr_agent.index('pr-agent --version')
-    pip_at = pr_agent.index('pr-agent==')
-    refute_nil probe_at, 'continuum-pr-agent.yml: the PR-Agent prepared-runtime probe is missing'
-    refute_nil pip_at, 'continuum-pr-agent.yml: the pinned PR-Agent reconstruction is missing'
-    assert_operator probe_at, :<, pip_at,
-                    'continuum-pr-agent.yml: the PR-Agent probe must precede the pip install'
+    pr_lines = pr_agent.lines
+    pip_lines = pr_lines.each_index.select { |i| pr_lines[i].include?('pip install') && pr_lines[i].include?('pr-agent') }
+    refute_empty pip_lines, 'continuum-pr-agent.yml: the pinned PR-Agent reconstruction is missing'
+    version_probes = pr_lines.each_index.select { |i| pr_lines[i].include?('pr-agent --version') }
+    refute_empty version_probes, 'continuum-pr-agent.yml: the PR-Agent prepared-runtime probe is missing'
+    pip_lines.each do |at|
+      assert_operator version_probes.min, :<, at,
+                      'continuum-pr-agent.yml: the PR-Agent probe must precede every pip install'
+    end
+    assert_includes pr_agent, '0.46.0', 'continuum-pr-agent.yml: the exact pinned PR-Agent version must be enforced'
   end
 
   # kodmial/continuum#179: strict ephemeral profiles keep zero live idle
