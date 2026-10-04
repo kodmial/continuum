@@ -923,7 +923,7 @@ def should_skip_improve(
         return {"skip": False, "reason": "invalid review payload: failing closed"}
     if tool_error or has_tool_error_signal(inner):
         return {"skip": False, "reason": "tool error: failing closed"}
-    if not head_matches:
+    if head_matches is not True:
         return {"skip": False, "reason": "stale head: result is not for the current HEAD"}
     if "key_issues_to_review" not in inner or not isinstance(
         inner.get("key_issues_to_review"), list
@@ -948,7 +948,7 @@ def should_skip_improve(
         raise LifecycleError(
             "cannot decide improve skip without the exact reviewed HEAD."
         )
-    if (not review_coverage_complete) or has_incomplete_coverage_signal(inner):
+    if (review_coverage_complete is not True) or has_incomplete_coverage_signal(inner):
         return {"skip": False, "reason": "incomplete review coverage: failing closed"}
     if recommendation != REVIEW_MERGE_SAFE:
         return {"skip": False, "reason": f"merge recommendation blocks: {recommendation}"}
