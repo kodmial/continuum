@@ -195,7 +195,7 @@ APPROVED_258_OPENCODE_ATTRIBUTION_ADDED_LINES = (
 # commits, so the BASELINE..HEAD drift assertion above (which allowlists
 # only the #179 probe plus the #258 attribution bodies) is stale for
 # exactly the commit-ownership lines below. The allowlist is narrow:
-# eleven removed baseline commit/prompt lines replaced by the fifty-six
+# eleven removed baseline commit/prompt lines replaced by the fifty-eight
 # workflow-owned provenance lines (bot-identity trailers, deterministic
 # ownership guards, and agent-prompt ownership bans). Any other deletion,
 # modification, or addition still fails, and the #179 probe plus the #258
@@ -266,7 +266,9 @@ APPROVED_260_OPENCODE_PROVENANCE_ADDED_LINES = (
     '          fi',
     '          fi',
     '          fi',
+    '          fi',
     '          git commit -m "${COMMIT_PREFIX}: implement issue #${ISSUE_NUMBER}" -m "Continuum-Component: opencode"',
+    '          if [[ "$(git rev-list --count "origin/${HEAD_REF}"..HEAD)" -gt 0 ]]; then',
     '          if [[ "$(git rev-list --count "origin/${HEAD_REF}"..HEAD)" -gt 0 ]]; then',
     '          if [[ -n "$(git status --porcelain)" ]]; then',
     '          if [[ -n "$(git status --porcelain)" ]]; then',
