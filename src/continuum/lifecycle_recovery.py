@@ -261,16 +261,6 @@ def _parse_time(value: object) -> Optional[datetime]:
     return parsed.astimezone(timezone.utc)
 
 
-def _parse_not_before(body: str) -> Optional[int]:
-    match = re.search(r"not-before=(\d+)", body)
-    if not match:
-        return None
-    try:
-        return int(match.group(1))
-    except ValueError:
-        return None
-
-
 def classify_infrastructure_failure(
     *,
     status: object = None,
