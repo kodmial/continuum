@@ -4392,6 +4392,34 @@ class ContinuumTest < Minitest::Test
   # wake-up loop and pinning the catch inside it is what actually asserts the
   # best-effort contract: a wake-up that cannot be delivered warns, and never
   # fails a run whose merge already landed.
+  # Conflict repair must dispatch the consumer-owned workflow_dispatch caller,
+  # not the reusable engine. Continuum dogfood names that caller opencode.yml,
+  # while installed consumers keep the continuum-opencode.yml default.
+  def test_auto_merge_conflict_repair_uses_configured_consumer_caller
+    inputs = events(yaml(File.join(ROOT, '.github/workflows/continuum-auto-merge.yml')))
+             .fetch('workflow_call').fetch('inputs')
+    knob = inputs.fetch('opencode_workflow')
+    assert_equal 'continuum-opencode.yml', knob.fetch('default')
+    assert_equal 'string', knob.fetch('type')
+    assert_equal false, knob.fetch('required')
+
+    body = auto_merge_body
+    assert_includes body,
+                    "OPENCODE_WORKFLOW: ${{ inputs.opencode_workflow || 'continuum-opencode.yml' }}"
+    refute_includes body, "workflow_id: 'continuum-opencode.yml'",
+                    'conflict repair must not hardcode the installed-consumer caller name'
+
+    repair_dispatch = dispatch_calls('continuum-auto-merge.yml').find do |call|
+      call.include?("mode: 'resolve-conflict'")
+    end
+    refute_nil repair_dispatch, 'automatic conflict-repair dispatch is missing'
+    assert_includes repair_dispatch, 'process.env.OPENCODE_WORKFLOW'
+
+    dogfood = workflow_body('automation.yml')
+    assert_match(/auto-merge:.*?opencode_workflow: 'opencode\.yml'/m, dogfood,
+                 'Continuum dogfood must route conflict repair through its real workflow_dispatch caller')
+  end
+
   def test_auto_merge_wakeup_catch_warns_inside_the_wakeup_loop
     body = auto_merge_body
 
