@@ -4256,7 +4256,13 @@ class ContinuumTest < Minitest::Test
     assert_equal false, knob.fetch('required')
 
     body = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent-recovery.yml'))
-    assert_includes body, "MAX_EXECUTIONS: ${{ inputs.max_executions || vars.PR_AGENT_RECOVERY_MAX_EXECUTIONS || '10' }}"
+    # The operator fallback survives a truthy-but-non-numeric override:
+    # raw input and vars fallback travel in separate envs so a bad
+    # input falls back to vars instead of widening to hardcoded 10.
+    assert_includes body, 'MAX_EXECUTIONS_RAW: ${{ inputs.max_executions }}'
+    assert_includes body, "MAX_EXECUTIONS_FALLBACK: ${{ vars.PR_AGENT_RECOVERY_MAX_EXECUTIONS || '10' }}"
+    assert_includes body, 'process.env.MAX_EXECUTIONS_RAW'
+    assert_includes body, 'process.env.MAX_EXECUTIONS_FALLBACK'
     assert_includes body, 'const MAX_TRANSIENT_EXECUTIONS = 10;'
     assert_includes body, 'Math.max(MIN_TRANSIENT_EXECUTIONS, parsed)'
 
@@ -4264,6 +4270,62 @@ class ContinuumTest < Minitest::Test
     with = stub.fetch('jobs').fetch('call').fetch('with')
     assert_match(/\A\$\{\{ inputs\.max_executions/, with.fetch('max_executions').to_s,
                  'the stub must pass max_executions through instead of pinning a literal')
+  end
+
+  # Lifecycle self-healing DoD (#224): one deterministic contract test per
+  # guarantee so a regression in any behavior fails fast here.
+  def test_pr_agent_recovery_lifecycle_dod_contract
+    recovery = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent-recovery.yml'))
+    automerge = File.read(File.join(ROOT, '.github/workflows/continuum-auto-merge.yml'))
+
+    # Rate-limit reset resumption without sleeping a runner.
+    assert_includes recovery, 'extractRateLimitSignals'
+    assert_includes recovery, 'retry-after'
+    assert_includes recovery, 'ratelimitResetEpoch'
+    assert_includes recovery, 'resetAwareDelaySeconds'
+    assert_includes recovery, 'MAX_INLINE_WAIT_SECONDS'
+    assert_includes recovery, 'scheduled safety net will redispatch'
+
+    # Bounded retry classification: 429/5xx/network/cancelled retry via the
+    # transient classifier; deterministic failures hold loudly per PR.
+    assert_includes recovery, 'isTransientApiError'
+    assert_includes recovery, 'retryableConclusions'
+    assert_includes recovery, 'deterministicFailure'
+    assert_includes recovery, 'skipping PR but continuing run'
+    assert_includes automerge, 'deterministic fetch error; skipping PR'
+    assert_includes automerge, 'transient fetch error; deferred to next wakeup'
+
+    # Watchdog resume, duplicate-wakeup coalescing, independent-PR progress.
+    assert_includes recovery, 'tryAcquireLease'
+    assert_includes recovery, 'leaseKey'
+    assert_includes recovery, 'ownedLeases'
+    assert_includes automerge, 'tryAcquireLease'
+    assert_includes automerge, 'cancel-in-progress: false'
+
+    # Old-HEAD isolation: exact full-commit identity, no prefix overlap.
+    assert_includes recovery, '[0-9a-f]{40,64}'
+    refute_includes recovery, '[0-9a-f]{7,64}'
+    assert_includes recovery, 'marker === current'
+
+    # Success clears state; exhaustion is observable and fail-closed.
+    assert_includes recovery, 'operation already settled'
+    assert_includes recovery, 'continuum-lifecycle-retry-exhausted'
+    assert_includes recovery, 'attempts='
+    assert_includes recovery, "action: 'exhaust'"
+
+    # No TAP_PAT reads on watchdog wakeups: same-repository scans use the
+    # repository-token client; dispatches/mutations stay PAT-backed.
+    assert_includes recovery, 'READ_GITHUB_TOKEN'
+    assert_includes recovery, 'withReadFallback'
+    assert_includes automerge, 'withReadFallback'
+    assert_includes automerge, 'client.rest.pulls.listReviews'
+    assert_includes automerge, 'client.rest.actions.listWorkflowRunsForRepo'
+    assert_includes automerge, 'client.graphql'
+    refute_includes automerge, 'github.rest.pulls.listReviews'
+    refute_includes automerge, 'github.rest.actions.listWorkflowRunsForRepo'
+    refute_includes automerge, 'github.paginate('
+    assert_includes automerge, 'github.rest.pulls.merge'
+    assert_includes automerge, 'github.rest.actions.createWorkflowDispatch'
   end
 
   # Both branches of the flag, checked in the body that acts on them. Asserting
@@ -5455,14 +5517,22 @@ class ContinuumTest < Minitest::Test
     assert_equal 'write', workflow.fetch('jobs').fetch('controller').fetch('permissions').fetch('contents')
     assert_equal 'write', workflow.fetch('jobs').fetch('controller').fetch('permissions').fetch('pull-requests')
 
-    # Gate reads outside housekeeping stay on the PAT path: the exact-HEAD CI
-    # lookup is merge-gate evidence, not housekeeping, and is not migrated.
+    # Same-repository gate reads use the repository token so watchdog
+    # wakeups never spend shared TAP_PAT budget on polling (#224): the
+    # exact-HEAD CI lookup is a read like any other; only
+    # mutations/dispatches stay PAT-backed.
     assert_includes body, 'async function latestWorkflowForHead',
                     'the CI gate lookup must still exist'
     gate = js_block(body, 'async function latestWorkflowForHead')
     refute_nil gate
-    assert_includes gate, 'github.paginate(',
-                    'the branch-scoped CI gate keeps its existing client; only housekeeping moves'
+    assert_includes gate, 'withReadFallback',
+                    'the branch-scoped CI gate must read via the repository token'
+    assert_includes gate, 'client.rest.actions.listWorkflowRunsForRepo',
+                    'the CI gate listing must use the repository-token client'
+    refute_includes gate, 'github.paginate(',
+                    'the CI gate must not poll on TAP_PAT'
+    refute_includes gate, 'github.rest.actions.listWorkflowRunsForRepo',
+                    'the CI gate listing must not use TAP_PAT'
   end
 
   # Covers DoD regression items 5 and 6: a rate-limit/transient failure on

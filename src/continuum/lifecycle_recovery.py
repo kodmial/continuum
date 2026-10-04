@@ -91,18 +91,19 @@ _LIFECYCLE_EXHAUSTED_RE = re.compile(
     r"attempts=(\d+)\s*-->"
 )
 # Work Lock #38 markers remain readable so PR-Agent durable state survives
-# the generalization; new markers use the lifecycle prefix. Legacy patterns
-# keep the original 7..64 width so pre-existing short-SHA markers still count
-# toward the budget instead of resetting it.
+# the generalization; new markers use the lifecycle prefix. Legacy markers
+# are only honored for the exact full commit id they carry: short-SHA prefix
+# matching is rejected because two distinct commits can share a 7-char
+# prefix, which would let old-HEAD evidence authorize a new HEAD.
 _LEGACY_RETRY_RE = re.compile(
     r"<!--\s*continuum-pr-agent-retry\s+"
-    r"head=([0-9a-fA-F]{7,64})\s+"
+    r"head=([0-9a-fA-F]{40,64})\s+"
     r"kind=(review|repair)\s+"
     r"attempt=(\d+)\s*-->"
 )
 _LEGACY_EXHAUSTED_RE = re.compile(
     r"<!--\s*continuum-pr-agent-retry-exhausted\s+"
-    r"head=([0-9a-fA-F]{7,64})\s+"
+    r"head=([0-9a-fA-F]{40,64})\s+"
     r"kind=(review|repair)\s+"
     r"attempts=(\d+)\s*-->"
 )
@@ -248,20 +249,40 @@ def concurrency_key(repo: object, pr_number: object, head_sha: object) -> str:
 def _same_head(marker_head: str, head: str) -> bool:
     """Whether a durable marker refers to the same logical HEAD.
 
-    New writes always carry a full commit id, but pre-existing markers may
-    carry a short prefix. A short marker that prefixes the full HEAD (minimum
-    7 hex chars) is the same logical commit and must still count; otherwise
-    the budget would reset and re-retry an exhausted operation.
+    Identity is the exact full commit id (case-insensitive). Prefix
+    matching is rejected: two distinct commits can share a 7-char prefix,
+    so a prefix match would let old-HEAD budget/exhaustion authorize a new
+    HEAD and violate changed-HEAD-invalidates and old-cannot-mutate-new.
     """
 
     marker = str(marker_head or "").strip().lower()
     current = str(head or "").strip().lower()
-    if marker == current:
-        return True
-    if len(marker) >= 7 and len(current) >= 7:
-        if current.startswith(marker) or marker.startswith(current):
-            return True
-    return False
+    return bool(marker) and marker == current
+
+
+_RECOVERY_ELIGIBLE_RE = re.compile(r"\brecovery eligible\b", re.IGNORECASE)
+_NEGATED_RECOVERY_ELIGIBLE_RE = re.compile(
+    r"\b(?:not|no|non|never)[\s\-]+recovery eligible\b", re.IGNORECASE
+)
+
+
+def _is_explicit_recovery_eligible(description: str) -> bool:
+    """Whether a status description carries the explicit recovery token.
+
+    Only the exact ``recovery eligible`` token (as synthesized by the
+    reconciler itself) authorizes a retry without an explicit classifier
+    input. A bare ``transient`` substring is never sufficient: deterministic
+    messages such as ``non-transient policy failure`` contain it and must
+    never burn the transient budget. Negated forms (``not/no/non/never
+    recovery eligible``) hold as well.
+    """
+
+    text = str(description or "")
+    if not _RECOVERY_ELIGIBLE_RE.search(text):
+        return False
+    if _NEGATED_RECOVERY_ELIGIBLE_RE.search(text):
+        return False
+    return True
 
 
 def _parse_int(value: object) -> Optional[int]:
@@ -691,16 +712,24 @@ def decide_recovery(
         return RecoveryDecision("hold", None, "HEAD moved: old recovery cannot mutate new HEAD")
     if malformed_state:
         return RecoveryDecision("hold", None, "malformed lifecycle state is deterministic")
+
+    state = str(operation_state or "").strip().lower() or None
+    conclusion = str(run_conclusion or "").strip().lower() or None
+    description = str(operation_description or "")
+
+    # Settled dominates every wait/hold below: a success starts a new
+    # episode and must clear obsolete durable state (exhaustion markers,
+    # stale leases, not-before waits) via the success path instead of
+    # holding on stale evidence for an already-finished operation.
+    if state == "success":
+        return RecoveryDecision("settled", None, "operation already settled")
+
     if not ci_green:
         return RecoveryDecision("wait", None, "exact HEAD CI is not green")
     if evidence.exhausted:
         return RecoveryDecision("hold", None, "retry budget already exhausted")
     if active_exact_lease or active_operation:
         return RecoveryDecision("wait", None, "exact PR/HEAD operation already owns the lease")
-
-    state = str(operation_state or "").strip().lower() or None
-    conclusion = str(run_conclusion or "").strip().lower() or None
-    description = str(operation_description or "")
 
     if (
         marker_newer_than_status
@@ -743,7 +772,7 @@ def decide_recovery(
             transient_failure = True
         elif failure_transient is False:
             return RecoveryDecision("hold", None, "deterministic failure is not automatically retried")
-        elif "recovery eligible" in description.lower() or "transient" in description.lower():
+        elif _is_explicit_recovery_eligible(description):
             recoverable = True
             transient_failure = True
         else:

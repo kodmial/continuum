@@ -482,17 +482,21 @@ jobs:
             }
 
             async function latestWorkflowForHead(pr, headSha, workflowName) {
-              // Merge-gate evidence stays PAT-backed; only housekeeping
-              // moves to the repository token.
-              const runs = await github.paginate(
-                github.rest.actions.listWorkflowRunsForRepo,
-                {
-                  owner,
-                  repo,
-                  branch: pr.head.ref,
-                  event: 'pull_request',
-                  per_page: 100,
-                }
+              // Same-repository merge-gate evidence reads use the
+              // repository token via withReadFallback so watchdog wakeups
+              // never spend shared TAP_PAT budget on polling. Mutations
+              // below stay PAT-backed.
+              const runs = await withReadFallback(client =>
+                client.paginate(
+                  client.rest.actions.listWorkflowRunsForRepo,
+                  {
+                    owner,
+                    repo,
+                    branch: pr.head.ref,
+                    event: 'pull_request',
+                    per_page: 100,
+                  }
+                )
               );
 
               return runs
@@ -815,16 +819,18 @@ jobs:
             }
 
             async function latestCodeRabbitDecision(pr, headSha = pr.head.sha) {
-              // Merge-gate evidence stays PAT-backed; only housekeeping
-              // moves to the repository token.
-              const reviews = await github.paginate(
-                github.rest.pulls.listReviews,
-                {
-                  owner,
-                  repo,
-                  pull_number: pr.number,
-                  per_page: 100,
-                }
+              // Same-repository review reads use the repository token so
+              // watchdog wakeups never spend shared TAP_PAT budget.
+              const reviews = await withReadFallback(client =>
+                client.paginate(
+                  client.rest.pulls.listReviews,
+                  {
+                    owner,
+                    repo,
+                    pull_number: pr.number,
+                    per_page: 100,
+                  }
+                )
               );
 
               return reviews
@@ -844,16 +850,18 @@ jobs:
             }
 
             async function codeRabbitNitpickReviews(pr, headSha = pr.head.sha) {
-              // Merge-gate evidence stays PAT-backed; only housekeeping
-              // moves to the repository token.
-              const reviews = await github.paginate(
-                github.rest.pulls.listReviews,
-                {
-                  owner,
-                  repo,
-                  pull_number: pr.number,
-                  per_page: 100,
-                }
+              // Same-repository review reads use the repository token so
+              // watchdog wakeups never spend shared TAP_PAT budget.
+              const reviews = await withReadFallback(client =>
+                client.paginate(
+                  client.rest.pulls.listReviews,
+                  {
+                    owner,
+                    repo,
+                    pull_number: pr.number,
+                    per_page: 100,
+                  }
+                )
               );
 
               const headReviews = reviews.filter(review =>
@@ -1030,9 +1038,12 @@ jobs:
               let cursor = null;
 
               do {
-                // Merge-gate evidence stays PAT-backed; only housekeeping
-                // moves to the repository token.
-                const data = await github.graphql(
+                // Same-repository review-thread reads use the repository
+                // token so watchdog wakeups never spend shared TAP_PAT
+                // budget. The resolveReviewThread mutation below stays
+                // PAT-backed.
+                const data = await withReadFallback(client =>
+                  client.graphql(
                     `query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
                     repository(owner: $owner, name: $repo) {
                       pullRequest(number: $number) {
@@ -1064,6 +1075,7 @@ jobs:
                       number: pr.number,
                       cursor,
                     }
+                  )
                 );
 
                 const connection =
@@ -1480,14 +1492,18 @@ jobs:
               const opencodeWorkflow = resolveOpencodeWorkflow();
               let runs;
               try {
-                runs = await github.paginate(
-                  github.rest.actions.listWorkflowRuns,
-                  {
-                    owner,
-                    repo,
-                    workflow_id: opencodeWorkflow,
-                    per_page: 100,
-                  }
+                // Same-repository run discovery uses the repository token
+                // so watchdog wakeups never spend shared TAP_PAT budget.
+                runs = await withReadFallback(client =>
+                  client.paginate(
+                    client.rest.actions.listWorkflowRuns,
+                    {
+                      owner,
+                      repo,
+                      workflow_id: opencodeWorkflow,
+                      per_page: 100,
+                    }
+                  )
                 );
               } catch (err) {
                 // A missing caller file surfaces loudly at dispatch time;
@@ -1587,14 +1603,16 @@ jobs:
                 return;
               }
 
-              const comments = await github.paginate(
-                github.rest.issues.listComments,
-                {
-                  owner,
-                  repo,
-                  issue_number: pr.number,
-                  per_page: 100,
-                }
+              const comments = await withReadFallback(client =>
+                client.paginate(
+                  client.rest.issues.listComments,
+                  {
+                    owner,
+                    repo,
+                    issue_number: pr.number,
+                    per_page: 100,
+                  }
+                )
               );
               const markers = conflictRepairMarkers(comments, headSha);
               const latest = markers.at(-1) || null;
@@ -1664,14 +1682,16 @@ jobs:
                   );
                   return;
                 }
-                const confirmComments = await github.paginate(
-                  github.rest.issues.listComments,
-                  {
-                    owner,
-                    repo,
-                    issue_number: pr.number,
-                    per_page: 100,
-                  }
+                const confirmComments = await withReadFallback(client =>
+                  client.paginate(
+                    client.rest.issues.listComments,
+                    {
+                      owner,
+                      repo,
+                      issue_number: pr.number,
+                      per_page: 100,
+                    }
+                  )
                 );
                 const confirmMarkers = conflictRepairMarkers(
                   confirmComments,
@@ -1734,14 +1754,16 @@ jobs:
                 throw markerErr;
               }
               {
-                const electionComments = await github.paginate(
-                  github.rest.issues.listComments,
-                  {
-                    owner,
-                    repo,
-                    issue_number: pr.number,
-                    per_page: 100,
-                  }
+                const electionComments = await withReadFallback(client =>
+                  client.paginate(
+                    client.rest.issues.listComments,
+                    {
+                      owner,
+                      repo,
+                      issue_number: pr.number,
+                      per_page: 100,
+                    }
+                  )
                 );
                 let winnerId = claimCommentId;
                 for (const comment of electionComments) {
@@ -2052,7 +2074,21 @@ jobs:
             let deterministicFailure = null;
 
             for (const listed of pulls) {
-              let pr = await getPull(listed.number);
+              // Guarded per-PR fetch: one transient or deterministic fetch
+              // failure must not abort the repository loop and strand
+              // healthy PRs behind a single bad PR.
+              let pr;
+              try {
+                pr = await getPull(listed.number);
+              } catch (err) {
+                if (isTransientApiError(err)) {
+                  core.warning(`PR #${listed.number}: transient fetch error; deferred to next wakeup: ` + (err.message || err));
+                } else {
+                  core.error(`PR #${listed.number}: deterministic fetch error; skipping PR: ` + (err.stack || err.message || err));
+                  if (!deterministicFailure) deterministicFailure = err;
+                }
+                continue;
+              }
 
               if (
                 pr.state !== 'open' ||

@@ -51,7 +51,7 @@ KINDS = frozenset({"review", "repair"})
 
 _RETRY_RE = re.compile(
     r"<!--\s*continuum-pr-agent-retry\s+"
-    r"head=([0-9a-fA-F]{7,64})\s+"
+    r"head=([0-9a-fA-F]{40,64})\s+"
     r"kind=(review|repair)\s+"
     r"attempt=(\d+)\s*-->"
 )
@@ -69,7 +69,7 @@ _LIFECYCLE_RETRY_RE = re.compile(
 )
 _EXHAUSTED_RE = re.compile(
     r"<!--\s*continuum-pr-agent-retry-exhausted\s+"
-    r"head=([0-9a-fA-F]{7,64})\s+"
+    r"head=([0-9a-fA-F]{40,64})\s+"
     r"kind=(review|repair)\s+"
     r"attempts=(\d+)\s*-->"
 )
@@ -127,21 +127,15 @@ def operation_key(pr_number: object, head_sha: object, kind: object) -> str:
 def _same_head(marker_head: str, head: str) -> bool:
     """Whether a durable marker refers to the same logical HEAD.
 
-    New writes always carry a full commit id, but pre-existing Work Lock #38
-    markers may carry a short prefix. A short marker that is a prefix of the
-    full HEAD (or vice versa, minimum 7 hex chars) is the same logical commit
-    and must still count toward the budget; otherwise tightening the pattern
-    would reset prior attempts/exhaustion and re-retry an exhausted operation.
+    Identity is the exact full commit id (case-insensitive). Prefix
+    matching is rejected: two distinct commits can share a 7-char prefix,
+    so a prefix match would let old-HEAD budget/exhaustion authorize a new
+    HEAD.
     """
 
     marker = str(marker_head or "").strip().lower()
     current = str(head or "").strip().lower()
-    if marker == current:
-        return True
-    if len(marker) >= 7 and len(current) >= 7:
-        if current.startswith(marker) or marker.startswith(current):
-            return True
-    return False
+    return bool(marker) and marker == current
 
 
 def _parse_time(value: object) -> Optional[datetime]:
@@ -314,6 +308,15 @@ def decide_recovery(
     waits instead of dispatching early.
     """
 
+    state = str(operation_state or "").strip().lower() or None
+    conclusion = str(run_conclusion or "").strip().lower() or None
+    description = str(operation_description or "")
+
+    # Settled dominates every wait/hold below so a success clears obsolete
+    # durable state (exhaustion markers, stale leases, not-before waits)
+    # via the success path instead of holding on stale evidence.
+    if state == "success":
+        return RecoveryDecision("settled", None, "operation already settled")
     if not ci_green:
         return RecoveryDecision("wait", None, "exact HEAD CI is not green")
     if evidence.exhausted:
@@ -328,10 +331,6 @@ def decide_recovery(
         return RecoveryDecision(
             "wait", None, "durable reset-aware not-before time has not arrived"
         )
-
-    state = str(operation_state or "").strip().lower() or None
-    conclusion = str(run_conclusion or "").strip().lower() or None
-    description = str(operation_description or "")
 
     if (
         marker_newer_than_status
@@ -351,7 +350,14 @@ def decide_recovery(
     elif state == "success":
         return RecoveryDecision("settled", None, "operation already settled")
     elif state == "failure":
-        if "recovery eligible" in description.lower() or "transient" in description.lower():
+        lowered = description.lower()
+        if (
+            "recovery eligible" in lowered
+            and "not recovery eligible" not in lowered
+            and "no recovery eligible" not in lowered
+            and "non-recovery eligible" not in lowered
+            and "non recovery eligible" not in lowered
+        ):
             recoverable = True
         else:
             return RecoveryDecision(

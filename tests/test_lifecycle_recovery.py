@@ -334,6 +334,66 @@ class LatestStateReconciliationTests(unittest.TestCase):
         )
         self.assertEqual(decision.action, "hold")
 
+    def test_success_settles_despite_exhaustion_and_stale_lease(self):
+        # A prior exhausted marker or a stale lease must never block the
+        # success path: obsolete durable state is cleared via settled.
+        exhausted = lifecycle.decide_recovery(
+            ci_green=True,
+            operation_state="success",
+            evidence=lifecycle.RetryEvidence(latest_attempt=9, exhausted=True),
+        )
+        self.assertEqual(exhausted.action, "settled")
+        leased = lifecycle.decide_recovery(
+            ci_green=True,
+            operation_state="success",
+            active_exact_lease=True,
+            active_operation=True,
+        )
+        self.assertEqual(leased.action, "settled")
+
+    def test_non_transient_substring_holds_without_burning_budget(self):
+        # A deterministic message containing the "transient" substring
+        # (e.g. "non-transient policy failure") must hold without an
+        # explicit classifier input, never burning transient budget.
+        for description in (
+            "non-transient policy failure",
+            "not transient: policy denied",
+            "policy failure: transient handling disabled",
+        ):
+            with self.subTest(description=description):
+                decision = lifecycle.decide_recovery(
+                    ci_green=True,
+                    operation_state="failure",
+                    operation_description=description,
+                    failure_transient=None,
+                )
+                self.assertEqual(decision.action, "hold")
+                self.assertIsNone(decision.attempt)
+
+    def test_negated_recovery_eligible_holds(self):
+        for description in (
+            "not recovery eligible",
+            "no recovery eligible for this HEAD",
+            "non-recovery eligible outcome",
+        ):
+            with self.subTest(description=description):
+                decision = lifecycle.decide_recovery(
+                    ci_green=True,
+                    operation_state="failure",
+                    operation_description=description,
+                    failure_transient=None,
+                )
+                self.assertEqual(decision.action, "hold")
+
+    def test_explicit_recovery_eligible_still_dispatches(self):
+        decision = lifecycle.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="PR-Agent blocking review: recovery eligible",
+            failure_transient=None,
+        )
+        self.assertEqual(decision.action, "dispatch")
+
     def test_success_clears_recovery_state(self):
         self.assertTrue(lifecycle.forward_progress_clears("success"))
         self.assertTrue(lifecycle.forward_progress_clears("SUCCESS"))
@@ -392,6 +452,35 @@ class LatestStateReconciliationTests(unittest.TestCase):
 
 
 class DurableEvidenceTests(unittest.TestCase):
+    def test_prefix_collision_does_not_share_budget(self):
+        # Two distinct full SHAs sharing a 7-char prefix are different
+        # HEADs: old-HEAD evidence must never authorize a new HEAD.
+        old_head = "abc1234" + "0" * 33
+        new_head = "abc1234" + "1" * 33
+        self.assertNotEqual(old_head, new_head)
+        comments = [comment(lifecycle.retry_marker(old_head, "review", 5))]
+        evidence = lifecycle.retry_evidence(comments, head_sha=new_head, kind="review")
+        self.assertIsNone(evidence.latest_attempt)
+        self.assertFalse(evidence.exhausted)
+        exhausted_comments = [
+            comment(lifecycle.exhausted_marker(old_head, "review", attempts=10))
+        ]
+        exhausted = lifecycle.retry_evidence(
+            exhausted_comments, head_sha=new_head, kind="review"
+        )
+        self.assertFalse(exhausted.exhausted)
+
+    def test_short_prefix_marker_never_matches_full_head(self):
+        short = HEAD[:7]
+        comments = [
+            comment(
+                f"<!-- continuum-pr-agent-retry head={short} kind=review attempt=3 -->"
+            )
+        ]
+        evidence = lifecycle.retry_evidence(comments, head_sha=HEAD, kind="review")
+        self.assertIsNone(evidence.latest_attempt)
+        self.assertFalse(evidence.exhausted)
+
     def test_changed_head_invalidates_stale_retry_state(self):
         comments = [comment(lifecycle.retry_marker(OLD_HEAD, "review", 2))]
         evidence = lifecycle.retry_evidence(comments, head_sha=HEAD, kind="review")
@@ -488,10 +577,11 @@ class TokenPolicyTests(unittest.TestCase):
         self.assertIn("new github.constructor({ auth: readToken, baseUrl: readBaseUrl })", automerge)
         self.assertIn("async function withReadFallback(fn)", automerge)
         # Recovery/discovery scans use the repository-token client with PAT
-        # fallback. Merge-gate evidence reads (exact-HEAD CI lookup,
-        # CodeRabbit reviews/threads) intentionally stay PAT-backed per the
-        # main-branch housekeeping contract: they are merge evidence, not
-        # housekeeping, so they are asserted PAT-backed below instead.
+        # fallback. Same-repository merge-gate evidence reads (exact-HEAD CI
+        # lookup, CodeRabbit reviews/threads, conflict-repair discovery)
+        # also use the repository token so watchdog wakeups never spend
+        # shared TAP_PAT budget on polling; only mutations/dispatches stay
+        # PAT-backed.
         for read_call in (
             "client.rest.pulls.get",
             "client.rest.pulls.list",
@@ -499,19 +589,23 @@ class TokenPolicyTests(unittest.TestCase):
             "client.rest.issues.listComments",
             "client.rest.repos.getCommit",
             "client.rest.repos.getBranch",
+            "client.rest.pulls.listReviews",
+            "client.rest.actions.listWorkflowRunsForRepo",
+            "client.graphql",
         ):
             with self.subTest(read_call=read_call):
                 self.assertIn(read_call, automerge)
-        # Merge-gate evidence stays on the PAT-authenticated client; only
-        # housekeeping and recovery/discovery scans move to the token.
-        for gate_call in (
-            "github.paginate(",
+        # No same-repository read stays on the PAT-authenticated client:
+        # every watchdog wakeup must avoid TAP_PAT's shared budget.
+        for pat_read in (
             "github.rest.pulls.listReviews",
             "github.rest.actions.listWorkflowRunsForRepo",
-            "github.graphql(",
+            "github.paginate(",
         ):
-            with self.subTest(gate_call=gate_call):
-                self.assertIn(gate_call, automerge)
+            with self.subTest(pat_read=pat_read):
+                self.assertNotIn(pat_read, automerge)
+        # The CodeRabbit thread-resolution mutation stays PAT-backed.
+        self.assertIn("github.graphql(", automerge)
         # Mutations and dispatches stay on the PAT-authenticated client.
         for mutation in (
             "github.rest.pulls.merge",
@@ -641,6 +735,10 @@ class CrossStackContractTests(unittest.TestCase):
         )
         self.assertIn("[0-9a-f]{40,64}", body)
         self.assertNotIn("[0-9a-f]{7,64}", body)
+        self.assertNotIn("{7,39}", body)
+        # Exact-HEAD comparison only: no prefix overlap is accepted.
+        self.assertIn("marker === current", body)
+        self.assertNotIn("startsWith(marker)", body)
 
 
 if __name__ == "__main__":

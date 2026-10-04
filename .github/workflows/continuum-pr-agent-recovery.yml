@@ -71,7 +71,8 @@ jobs:
           CI_WORKFLOW_NAME: ${{ inputs.ci_workflow_name || 'CI' }}
           STALE_MINUTES: ${{ inputs.stale_minutes || vars.PR_AGENT_RECOVERY_STALE_MINUTES || '70' }}
           DISPATCH_GRACE_SECONDS: ${{ inputs.dispatch_grace_seconds || vars.PR_AGENT_RECOVERY_DISPATCH_GRACE_SECONDS || '90' }}
-          MAX_EXECUTIONS: ${{ inputs.max_executions || vars.PR_AGENT_RECOVERY_MAX_EXECUTIONS || '10' }}
+          MAX_EXECUTIONS_RAW: ${{ inputs.max_executions }}
+          MAX_EXECUTIONS_FALLBACK: ${{ vars.PR_AGENT_RECOVERY_MAX_EXECUTIONS || '10' }}
           # Item 1 of Work Lock #58: same-repo reads use the repository-scoped
           # installation token. PAT remains the mutation/dispatch identity.
           READ_GITHUB_TOKEN: ${{ github.token }}
@@ -109,7 +110,10 @@ jobs:
               }
               return toBounded(raw);
             }
-            const maxExecutions = resolveMaxExecutions(process.env.MAX_EXECUTIONS);
+            const maxExecutions = resolveMaxExecutions(
+              process.env.MAX_EXECUTIONS_RAW,
+              process.env.MAX_EXECUTIONS_FALLBACK
+            );
             const staleMs = Number.parseInt(process.env.STALE_MINUTES || '70', 10) * 60_000;
             const dispatchGraceMs =
               Number.parseInt(process.env.DISPATCH_GRACE_SECONDS || '90', 10) * 1_000;
@@ -333,27 +337,23 @@ jobs:
             }
             function parseEvidence(comments, head, kind) {
               const exactHead = String(head).toLowerCase();
-              // Legacy Work Lock #38 markers may carry a short prefix; the
-              // alternation below covers 7..64 without resetting prior
-              // attempts/exhaustion for the same logical HEAD. New canonical
-              // markers always carry a full commit id.
+              // Exact-HEAD identity only: prefix matching is rejected
+              // because two distinct commits can share a 7-char prefix,
+              // which would let old-HEAD evidence authorize a new HEAD.
+              // Markers always carry a full commit id.
               function sameHead(markerHead, currentHead) {
                 const marker = String(markerHead || '').toLowerCase();
                 const current = String(currentHead || '').toLowerCase();
-                if (marker === current) return true;
-                if (marker.length >= 7 && current.length >= 7) {
-                  if (current.startsWith(marker) || marker.startsWith(current)) return true;
-                }
-                return false;
+                return marker.length > 0 && marker === current;
               }
               const retryRe =
                 /<!--\s*continuum-lifecycle-retry\s+head=([0-9a-f]{40,64})\s+kind=(review|repair)\s+attempt=(\d+)(?:\s+not-before=(\d+))?[^>]*-->/ig;
               const legacyRetryRe =
-                /<!--\s*continuum-pr-agent-retry\s+head=([0-9a-f]{7,39}|[0-9a-f]{40,64})\s+kind=(review|repair)\s+attempt=(\d+)[^>]*-->/ig;
+                /<!--\s*continuum-pr-agent-retry\s+head=([0-9a-f]{40,64})\s+kind=(review|repair)\s+attempt=(\d+)[^>]*-->/ig;
               const exhaustedRe =
                 /<!--\s*continuum-lifecycle-retry-exhausted\s+head=([0-9a-f]{40,64})\s+kind=(review|repair)\s+attempts=(\d+)\s*-->/ig;
               const legacyExhaustedRe =
-                /<!--\s*continuum-pr-agent-retry-exhausted\s+head=([0-9a-f]{7,39}|[0-9a-f]{40,64})\s+kind=(review|repair)\s+attempts=(\d+)\s*-->/ig;
+                /<!--\s*continuum-pr-agent-retry-exhausted\s+head=([0-9a-f]{40,64})\s+kind=(review|repair)\s+attempts=(\d+)\s*-->/ig;
               let latestAttempt = null;
               let latestMarkerAt = null;
               let notBeforeEpoch = null;
@@ -652,6 +652,14 @@ jobs:
               runConclusion,
               evidence,
             }) {
+              const state = String(operationStatus?.state || '').toLowerCase() || null;
+              const description = String(operationStatus?.description || '');
+              // Settled dominates every wait/hold below so a success clears
+              // obsolete durable state (exhaustion markers, stale leases,
+              // not-before waits) via the success path.
+              if (state === 'success') {
+                return { action: 'settled', reason: 'operation already settled' };
+              }
               if (!ciGreen) return { action: 'wait', reason: 'exact HEAD CI is not green' };
               if (evidence.exhausted) {
                 return { action: 'hold', reason: 'durable retry exhaustion marker exists' };
@@ -671,8 +679,6 @@ jobs:
                 return { action: 'wait', reason: 'durable reset-aware not-before time has not arrived' };
               }
 
-              const state = String(operationStatus?.state || '').toLowerCase() || null;
-              const description = String(operationStatus?.description || '');
               const statusAt = operationStatus
                 ? Date.parse(String(operationStatus.updated_at || operationStatus.created_at || ''))
                 : null;
@@ -701,7 +707,19 @@ jobs:
               } else if (state === 'success') {
                 return { action: 'settled', reason: 'operation already settled' };
               } else if (state === 'failure') {
-                if (/recovery eligible|transient/i.test(description)) {
+                // Only the explicit reconciler-synthesized token
+                // authorizes a retry without classifier input. A bare
+                // "transient" substring is never sufficient: deterministic
+                // messages such as "non-transient policy failure" contain
+                // it and must never burn the transient budget.
+                const lowered = description.toLowerCase();
+                if (
+                  lowered.includes('recovery eligible') &&
+                  !lowered.includes('not recovery eligible') &&
+                  !lowered.includes('no recovery eligible') &&
+                  !lowered.includes('non-recovery eligible') &&
+                  !lowered.includes('non recovery eligible')
+                ) {
                   recoverable = true;
                 } else {
                   return {
@@ -1100,15 +1118,36 @@ jobs:
             async function exhaust(pr, head, kind, comments) {
               const marker = exhaustedMarker(head, kind);
               // Fail-closed and observable: the exhausted marker is the
-              // durable record. Legacy markers count as already-exhausted so
-              // a renamed prefix can never double-spend the budget.
-              const legacyMarker = '<!-- continuum-pr-agent-retry-exhausted head=' +
-                String(head).toLowerCase() + ' kind=' + kind;
-              const already = comments.some(comment =>
-                trustedAssociations.has(String(comment.author_association || '').toUpperCase()) &&
-                (String(comment.body || '').includes(marker) ||
-                 String(comment.body || '').includes(legacyMarker))
-              );
+              // durable record. An existing marker only counts as
+              // already-exhausted when it matches this exact HEAD/kind and
+              // its attempts meet the current budget (same rule as
+              // parseEvidence): a legacy attempts=3 marker from an older
+              // budget must not suppress the canonical attempts=10 write.
+              const exactHead = String(head).toLowerCase();
+              const exhaustedRes = [
+                /<!--\s*continuum-lifecycle-retry-exhausted\s+head=([0-9a-f]{40,64})\s+kind=(review|repair)\s+attempts=(\d+)\s*-->/gi,
+                /<!--\s*continuum-pr-agent-retry-exhausted\s+head=([0-9a-f]{40,64})\s+kind=(review|repair)\s+attempts=(\d+)\s*-->/gi,
+              ];
+              const already = comments.some(comment => {
+                if (!trustedAssociations.has(String(comment.author_association || '').toUpperCase())) {
+                  return false;
+                }
+                const body = String(comment.body || '');
+                if (body.includes(marker)) return true;
+                for (const re of exhaustedRes) {
+                  re.lastIndex = 0;
+                  for (const match of body.matchAll(re)) {
+                    if (
+                      String(match[1] || '').toLowerCase() === exactHead &&
+                      match[2] === kind &&
+                      Number.parseInt(match[3], 10) >= maxExecutions
+                    ) {
+                      return true;
+                    }
+                  }
+                }
+                return false;
+              });
               if (already) return;
               await upsertControllerState(
                 pr.number,

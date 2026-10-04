@@ -1019,6 +1019,9 @@ const github = {
   },
 };
 const core = { info() {}, notice() {}, warning() {} };
+// Same-repository reads go through the repository-token client in the
+// shipped workflow; the harness routes them to the fixture client.
+const withReadFallback = async (fn) => await fn(github);
 """ + "\n".join(extracted) + """
 async function main() {
 """ + f"""
