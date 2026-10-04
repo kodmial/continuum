@@ -790,9 +790,17 @@ jobs:
             echo "::error::PR branch moved before publish (reviewed=$HEAD_SHA current=$CURRENT_SHA remote=$REMOTE_SHA); discarding repair."
             exit 1
           fi
-          git -c user.name="github-actions[bot]" \
-            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-            commit -m "fix: apply PR-Agent review findings for HEAD $HEAD_SHA"
+          # kodmial/continuum#260: workflow-owned repair commit uses the bot
+          # identity inline plus the component trailer so automated repair is
+          # visibly machine-generated and never rewrites developer commits.
+          if [[ -n "$(git status --porcelain)" ]]; then
+            git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -m "fix: apply PR-Agent review findings for HEAD $HEAD_SHA" \
+              -m "Continuum-Component: pr-agent-repair"
+          else
+            echo "No repair changes to commit for HEAD $HEAD_SHA."
+          fi
           if ! git merge-base --is-ancestor "$HEAD_SHA" HEAD; then
             echo "classification=deterministic" >> "$GITHUB_OUTPUT"
             echo "::error::Local repair is not based on reviewed HEAD $HEAD_SHA; discarding repair."

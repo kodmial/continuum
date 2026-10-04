@@ -235,7 +235,7 @@ jobs:
           - Do not create another branch or another pull request.
           - Never expose credentials or secret values.
           - Do not upload child source, diffs, logs, or transcripts to the public parent repository.
-          - You may make local commits. Do not push; the outer workflow pushes the branch.
+          - Leave fixes as working-tree changes; do not commit or push. The outer workflow publishes one bot-identity commit.
           - Before finishing, create or replace exactly: $review_file
           - Record findings, repairs, verification and remaining risks.
           - End that file with a standalone line exactly: Review: PASS
@@ -296,7 +296,8 @@ jobs:
 
           if [[ -n "$(git status --porcelain)" ]]; then
             git add -A
-            git commit -m "fix: repair PR #$PR_NUMBER after independent review" >/dev/null 2>&1
+            # kodmial/continuum#260: bot identity plus component trailer.
+            git commit -m "fix: repair PR #$PR_NUMBER after independent review" -m "Continuum-Component: delegation-pr-review" >/dev/null 2>&1
           fi
           if [[ "$(git rev-list --count "origin/$head_ref"..HEAD)" -gt 0 ]]; then
             git push origin "HEAD:$head_ref" >/dev/null 2>&1

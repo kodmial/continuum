@@ -1082,7 +1082,10 @@ jobs:
           # edits rather than letting the runner discard them.
           if [[ -n "$(git status --porcelain)" ]]; then
             git add -A
-            git commit -m "chore: recover OpenCode issue changes"
+            # kodmial/continuum#260: workflow-owned recovery commit uses the
+            # bot identity (see Configure Git identity) plus a stable
+            # component trailer so it is visibly machine-generated.
+            git commit -m "chore: recover OpenCode issue changes" -m "Continuum-Component: opencode"
           fi
 
           git fetch origin main --quiet
@@ -1232,7 +1235,11 @@ jobs:
           find . -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
 
           git add -A
-          git commit -m "${COMMIT_PREFIX}: implement issue #${ISSUE_NUMBER}"
+          # kodmial/continuum#260: workflow-owned task commit sets the bot
+          # identity (see Configure Git identity) and carries the component
+          # trailer. The agent itself never commits (see prompt: the workflow
+          # owns Git state), so this is the single deterministic owner.
+          git commit -m "${COMMIT_PREFIX}: implement issue #${ISSUE_NUMBER}" -m "Continuum-Component: opencode"
           TASK_COMMIT="$(git rev-parse HEAD)"
 
           # The checkout credential is TAP_PAT, which must carry repo + workflow
@@ -1475,7 +1482,9 @@ jobs:
           - Run the relevant tests, linters, or validation for the files you change.
           - Work only in the current checked-out PR branch. Do not create or switch to
             another branch and do not create a new pull request.
-          - Commit and push fixes to the current PR branch so the existing PR is updated.
+          - Do not commit, push, switch branches, rebase, or reset; the workflow
+            owns Git state and publishes exactly one bot-identity commit after
+            this run. Leave fixes as working-tree changes.
           - If a finding is incorrect or no longer applicable, do not make a speculative
             code change; explain the reason in the existing PR conversation.
           - Do not resolve or dismiss CodeRabbit review threads yourself. CodeRabbit will
@@ -1485,6 +1494,17 @@ jobs:
           EOF
           )
           opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
+
+          # kodmial/continuum#260: deterministic ownership — the workflow owns
+          # the final commit with the bot identity (see Configure Git
+          # identity) plus the component trailer. The agent never commits.
+          if [[ -n "$(git status --porcelain)" ]]; then
+            git add -A
+            git commit -m "fix: address CodeRabbit review findings for PR #${PR_NUMBER}" -m "Continuum-Component: opencode"
+          fi
+          if [[ "$(git rev-list --count "origin/${HEAD_REF}"..HEAD)" -gt 0 ]]; then
+            git push origin "HEAD:${HEAD_REF}"
+          fi
 
       - name: Ask CodeRabbit to verify every original finding
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'coderabbit-fix'
@@ -1676,19 +1696,20 @@ jobs:
             - Every file that both sides changed must end up containing the
               intended behavior from BOTH the PR and main; resolving a conflict
               by taking either side wholesale is a failure.
-            - Push the result to the current PR branch with
-              `git push --force-with-lease`, because re-checking out rewrites the
-              commits the branch already had.
+            - Leave the reconciled tree as working-tree changes; the workflow
+              publishes the result. Never rebase, force-push, or reset.
           BLOCK
           else
             read -r -d '' STRATEGY_BLOCK <<'BLOCK' || true
             - Fetch the current origin/main and merge it into the current PR
-              branch, resolving the conflicts as part of that merge.
+              branch, resolving the conflicts as part of that merge without
+              committing yet (leave the merge result staged/unstaged for the
+              workflow to commit).
             - Resolve every merge conflict while preserving the intended behavior
               from both the PR and main; do not discard unrelated changes from
               either side.
-            - Commit the merge and push it to the current PR branch. Never rebase,
-              force-push, or reset away either side.
+            - Leave the merge result uncommitted for the workflow to publish.
+              Never rebase, force-push, or reset away either side.
           BLOCK
           fi
           PROMPT=$(cat <<EOF
@@ -1704,11 +1725,26 @@ jobs:
           ${STRATEGY_BLOCK}
           - Work only in the current checked-out PR branch. Do not create or switch to
             another branch and do not create a new pull request.
+          - Do not commit, push, switch branches, rebase, or reset; the workflow
+            owns Git state and publishes the merge result as a bot-identity
+            commit after this run. Leave the resolved tree as working-tree
+            changes (including the merge state).
           - Run the relevant tests, linters, or validation after resolving the conflicts.
           - Keep all comments and commit messages in English.
           EOF
           )
           opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
+
+          # kodmial/continuum#260: deterministic ownership — the workflow owns
+          # the final conflict-repair commit with the bot identity plus the
+          # component trailer. Never rebase or reset away either side.
+          if [[ -n "$(git status --porcelain)" ]]; then
+            git add -A
+            git commit -m "fix: resolve merge conflict with main for PR #${PR_NUMBER}" -m "Continuum-Component: opencode"
+          fi
+          if [[ "$(git rev-list --count "origin/${HEAD_REF}"..HEAD)" -gt 0 ]]; then
+            git push origin "HEAD:${HEAD_REF}"
+          fi
 
       - name: Fix failed blocking workflow
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'ci-fix'
@@ -1772,12 +1808,23 @@ jobs:
           - If the failure is clearly transient or external infrastructure, do not make a speculative code change; explain the reason in the existing PR conversation.
           - Work only in the current checked-out PR branch. Do not create or switch to another branch and do not create a new pull request.
           - Run the repository's complete relevant validation locally after the final edit when possible.
-          - Commit and push any required fix to the current PR branch so the existing PR updates.
+          - Do not commit, push, switch branches, rebase, or reset; the workflow
+            owns Git state and publishes the repair as a bot-identity commit
+            after this run. Leave fixes as working-tree changes.
           - Keep all comments and commit messages in English.
           EOF
           )
-          BEFORE_SHA=$(git rev-parse HEAD)
           opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
+
+          # kodmial/continuum#260: deterministic ownership — the workflow owns
+          # the final repair commit with the bot identity plus the component
+          # trailer. The agent never commits.
+          BEFORE_SHA=$(git rev-parse HEAD)
+          if [[ -n "$(git status --porcelain)" ]]; then
+            git add -A
+            git commit -m "fix: repair blocking workflow for PR #${PR_NUMBER}" -m "Continuum-Component: opencode"
+            git push origin "HEAD:${HEAD_REF}"
+          fi
           AFTER_SHA=$(git rev-parse HEAD)
 
           # If the agent correctly decided there is no code fix to make (for

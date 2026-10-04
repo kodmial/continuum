@@ -7680,4 +7680,115 @@ class ContinuumTest < Minitest::Test
                     'watchdog recovery must still carry the origin marker after the command'
   end
 
+  # Commit and review provenance (kodmial/continuum#260). Every
+  # workflow-owned commit uses the github-actions[bot] identity plus the
+  # stable `Continuum-Component:` trailer; no automated path manufactures
+  # a human-looking approval; status/merge gates stay pinned to the exact
+  # HEAD; trailers never leak secrets or repository identity; and residual
+  # PAT operations are documented as future GitHub App candidates.
+  COMMIT_PROVENANCE_SITES = [
+    ['continuum-opencode.yml', 'Implement issue', 'opencode', 'implement issue #'],
+    ['continuum-opencode.yml', 'Recover agent-managed issue branch', 'opencode', 'recover OpenCode issue changes'],
+    ['continuum-opencode.yml', 'Fix CodeRabbit review findings', 'opencode', 'address CodeRabbit review findings for PR #'],
+    ['continuum-opencode.yml', 'Resolve merge conflict with main', 'opencode', 'resolve merge conflict with main for PR #'],
+    ['continuum-opencode.yml', 'Fix failed blocking workflow', 'opencode', 'repair blocking workflow for PR #'],
+    ['continuum-coderabbit-unresolved.yml', 'Fix all unresolved findings in one OpenCode run', 'coderabbit-unresolved', 'address unresolved CodeRabbit findings'],
+    ['continuum-pr-agent-repair.yml', 'Run one bounded OpenCode repair pass over every current item', 'pr-agent-repair', 'apply PR-Agent review findings'],
+    ['continuum-pr-agent-canary.yml', 'Run the disposable-PR end to end', 'pr-agent-canary', 'seed disposable PR-Agent canary defect'],
+    ['continuum-pr-agent-canary.yml', 'Run the disposable-PR end to end', 'pr-agent-canary', 'correct disposable PR-Agent canary defect'],
+    ['continuum-consumer-child-worker.yml', 'Execute child task', 'delegation-worker', 'delegated implementation'],
+    ['continuum-consumer-child-review.yml', 'Review and repair child task', 'delegation-review', 'delegated independent review'],
+    ['continuum-consumer-child-pr-review.yml', 'Review and repair owner-created child pull request', 'delegation-pr-review', 'repair PR #'],
+  ].freeze
+
+  FORBIDDEN_REVIEW_APIS = %w[createReview submitReview reviews.create pulls.createReview].freeze
+
+  def test_workflow_owned_commits_carry_bot_identity_and_trailer
+    COMMIT_PROVENANCE_SITES.each do |file, step, component, subject|
+      body = File.read(File.join(ROOT, '.github/workflows', file))
+      assert_includes body, step, "#{file}: owning step gone: #{step}"
+      assert_includes body, subject, "#{file}::#{step}: commit subject gone: #{subject}"
+      assert_includes body, "Continuum-Component: #{component}",
+                      "#{file}::#{step}: commit lacks the #{component} trailer"
+      assert_includes body, 'github-actions[bot]',
+                      "#{file}::#{step}: commit lacks the bot identity"
+    end
+    # The canonical noreply bot email is the stable committer identity.
+    COMMIT_PROVENANCE_SITES.map(&:first).uniq.each do |file|
+      body = File.read(File.join(ROOT, '.github/workflows', file))
+      assert_includes body, '41898282+github-actions[bot]@users.noreply.github.com',
+                      "#{file}: bot committer email gone"
+    end
+  end
+
+  def test_no_workflow_manufactures_a_human_looking_approval
+    checked = Dir[File.join(ROOT, '.github/workflows/*.yml')].sort +
+              Dir[File.join(ROOT, '.github/scripts/*')].select { |p| File.file?(p) }.sort
+    checked.each do |path|
+      body = File.read(path)
+      FORBIDDEN_REVIEW_APIS.each do |api|
+        refute_includes body, api,
+                        "#{File.basename(path)}: review-creation API #{api} would manufacture a human-looking approval"
+      end
+      refute_includes body, 'gh pr review',
+                      "#{File.basename(path)}: must not emit review decisions via gh"
+    end
+  end
+
+  def test_status_and_merge_gates_remain_exact_head
+    %w[continuum-pr-agent.yml continuum-pr-agent-repair.yml continuum-validation.yml].each do |file|
+      body = File.read(File.join(ROOT, '.github/workflows', file))
+      assert_includes body, 'createCommitStatus', "#{file}: status gate gone"
+      assert_match(/sha: process\.env\.(HEAD_SHA|TARGET_SHA)/, body,
+                   "#{file}: commit status must target the exact HEAD SHA")
+    end
+    %w[continuum-auto-merge.yml continuum-pr-agent-auto-merge.yml].each do |file|
+      body = File.read(File.join(ROOT, '.github/workflows', file))
+      assert_includes body, 'pulls.merge', "#{file}: merge gate gone"
+      assert_match(/pulls\.merge\(\{\s*[^}]*sha:/m, body,
+                   "#{file}: pulls.merge without an exact sha: would merge a moving head")
+    end
+  end
+
+  def test_provenance_trailers_carry_no_secret_or_repo_identity
+    COMMIT_PROVENANCE_SITES.each do |file, _step, component, _subject|
+      assert_match(/\A[a-z0-9]+(?:-[a-z0-9]+)*\z/, component,
+                   "#{file}: trailer components must be kebab-case without repository identity")
+      refute_includes component, '/',
+                       "#{file}: trailer components must never hide an owner/repo identity"
+    end
+    Dir[File.join(ROOT, '.github/workflows/continuum-*.yml')].each do |path|
+      body = File.read(path)
+      body.scan(/Continuum-Component:\s*([^\s"']+)/).each do |match|
+        assert_match(/\A[a-z0-9]+(?:-[a-z0-9]+)*\z/, match.first,
+                     "#{File.basename(path)}: trailer component #{match.first} must be kebab-case")
+      end
+      refute_match(/ghp_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+|\brnd_[A-Za-z0-9]+\b/, body,
+                   "#{File.basename(path)}: workflows must not embed secret-shaped tokens")
+    end
+  end
+
+  def test_provenance_needs_no_new_consumer_secret
+    %w[continuum-opencode.yml continuum-coderabbit-unresolved.yml continuum-pr-agent-repair.yml
+       continuum-pr-agent-canary.yml continuum-consumer-child-worker.yml
+       continuum-consumer-child-review.yml continuum-consumer-child-pr-review.yml].each do |file|
+      body = File.read(File.join(ROOT, '.github/workflows', file))
+      body.scan(/secrets\.([A-Za-z0-9_]+)/).flatten.uniq.each do |secret|
+        assert_includes %w[TAP_PAT RENDER_API_KEY CHILD_RUNTIME_TOKEN CHILD_RUNTIME_REPOSITORIES GITHUB_TOKEN],
+                        secret,
+                        "#{file}: baseline provenance must not require a new secret secrets.#{secret}"
+      end
+    end
+  end
+
+  def test_residual_pat_operations_are_documented_app_candidates
+    provenance = File.read(File.join(ROOT, 'src/continuum/commit_provenance.py'))
+    assert_includes provenance, 'RESIDUAL_PAT_OPS',
+                    'residual PAT operations must be documented in the provenance contract'
+    assert_includes provenance, 'GitHub App',
+                    'residual operations must be isolated as future GitHub App candidates'
+    assert_includes provenance, 'about-authentication-with-a-github-app',
+                    'the App model reference must point at the GitHub App authentication docs'
+  end
+
   end

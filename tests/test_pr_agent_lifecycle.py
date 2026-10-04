@@ -194,14 +194,106 @@ APPROVED_258_OPENCODE_ATTRIBUTION_REMOVED_LINES = (
 )
 
 APPROVED_258_OPENCODE_ATTRIBUTION_ADDED_LINES = (
-    "                    '\u26a1 **Continuum \u00b7 opencode**',",
+    "                    '⚡ **Continuum · opencode**',",
     "                    '<!-- continuum-origin role=continuum component=opencode -->',",
-    '              --body "$(printf \'%s\\n%s\\n%s\' \'\u26a1 **Continuum \u00b7 opencode**\' \'<!-- continuum-origin role=continuum component=opencode -->\' \'Automation produced no code changes; pausing this issue for manual inspection.\')"',
-    '              --body "$(printf \'%s\\n%s\\n%s\' \'\u26a1 **Continuum \u00b7 opencode**\' \'<!-- continuum-origin role=continuum component=opencode -->\' \'Qualification attempted product changes in qualification mode, which is forbidden. The run is recorded as failed without evidence; it will be retried automatically.\')" >/dev/null 2>&1 || true',
-    '                --body "$(printf \'%s\\n%s\\n%s\' \'\u26a1 **Continuum \u00b7 opencode**\' \'<!-- continuum-origin role=continuum component=opencode -->\' "Qualification run for exact SHA \\`$REQUIRED_SHA\\` produced no trusted pass/fail evidence; it will be retried automatically with the same run identity (capability #$CAPABILITY_NUMBER, qualification #$QUALIFICATION_NUMBER, sha \\`$REQUIRED_SHA\\`).")" >/dev/null 2>&1 || true',
-    "                  '\u26a1 **Continuum \u00b7 opencode**',",
+    '              --body "$(printf \'%s\\n%s\\n%s\' \'⚡ **Continuum · opencode**\' \'<!-- continuum-origin role=continuum component=opencode -->\' \'Automation produced no code changes; pausing this issue for manual inspection.\')"',
+    '              --body "$(printf \'%s\\n%s\\n%s\' \'⚡ **Continuum · opencode**\' \'<!-- continuum-origin role=continuum component=opencode -->\' \'Qualification attempted product changes in qualification mode, which is forbidden. The run is recorded as failed without evidence; it will be retried automatically.\')" >/dev/null 2>&1 || true',
+    '                --body "$(printf \'%s\\n%s\\n%s\' \'⚡ **Continuum · opencode**\' \'<!-- continuum-origin role=continuum component=opencode -->\' "Qualification run for exact SHA \\`$REQUIRED_SHA\\` produced no trusted pass/fail evidence; it will be retried automatically with the same run identity (capability #$CAPABILITY_NUMBER, qualification #$QUALIFICATION_NUMBER, sha \\`$REQUIRED_SHA\\`).")" >/dev/null 2>&1 || true',
+    "                  '⚡ **Continuum · opencode**',",
     "                  '<!-- continuum-origin role=continuum component=opencode -->',",
-    '                  body: `@coderabbitai full review\\n\\n\u26a1 **Continuum \u00b7 opencode**\\n<!-- continuum-origin role=continuum component=opencode -->\\n\\n${marker}`,',
+    '                  body: `@coderabbitai full review\\n\\n⚡ **Continuum · opencode**\\n<!-- continuum-origin role=continuum component=opencode -->\\n\\n${marker}`,',
+)
+
+# kodmial/continuum#260 is the authoritative task that explicitly requires
+# the deterministic workflow-owned commit provenance contract in
+# .github/workflows/continuum-opencode.yml: every workflow-owned git
+# commit carries the github-actions[bot] identity (set once by the
+# Configure Git identity step) plus a stable `Continuum-Component:
+# opencode` trailer, and agent prompts forbid the tool from committing so
+# the workflow owns the final commit. Its scope explicitly includes
+# initial implementation commits, CI/repair commits,
+# main-sync/conflict-repair commits, and CodeRabbit review-repair
+# commits, so the BASELINE..HEAD drift assertion above (which allowlists
+# only the #179 probe plus the #258 attribution bodies) is stale for
+# exactly the commit-ownership lines below. The allowlist is narrow:
+# eleven removed baseline commit/prompt lines replaced by the fifty-eight
+# workflow-owned provenance lines (bot-identity trailers, deterministic
+# ownership guards, and agent-prompt ownership bans). Any other deletion,
+# modification, or addition still fails, and the #179 probe plus the #258
+# attribution bodies above are still required in full.
+APPROVED_260_OPENCODE_PROVENANCE_REMOVED_LINES = (
+    '              `git push --force-with-lease`, because re-checking out rewrites the',
+    '              branch, resolving the conflicts as part of that merge.',
+    '              commits the branch already had.',
+    '              force-push, or reset away either side.',
+    '            - Commit the merge and push it to the current PR branch. Never rebase,',
+    '            - Push the result to the current PR branch with',
+    '            git commit -m "chore: recover OpenCode issue changes"',
+    '          - Commit and push any required fix to the current PR branch so the existing PR updates.',
+    '          - Commit and push fixes to the current PR branch so the existing PR is updated.',
+    '          BEFORE_SHA=$(git rev-parse HEAD)',
+    '          git commit -m "${COMMIT_PREFIX}: implement issue #${ISSUE_NUMBER}"',
+)
+
+APPROVED_260_OPENCODE_PROVENANCE_ADDED_LINES = (
+    '',
+    '',
+    '',
+    '              Never rebase, force-push, or reset away either side.',
+    '              branch, resolving the conflicts as part of that merge without',
+    '              committing yet (leave the merge result staged/unstaged for the',
+    '              publishes the result. Never rebase, force-push, or reset.',
+    '              workflow to commit).',
+    '            # bot identity (see Configure Git identity) plus a stable',
+    '            # component trailer so it is visibly machine-generated.',
+    '            # kodmial/continuum#260: workflow-owned recovery commit uses the',
+    '            - Leave the merge result uncommitted for the workflow to publish.',
+    '            - Leave the reconciled tree as working-tree changes; the workflow',
+    '            after this run. Leave fixes as working-tree changes.',
+    '            changes (including the merge state).',
+    '            commit after this run. Leave the resolved tree as working-tree',
+    '            git add -A',
+    '            git add -A',
+    '            git add -A',
+    '            git commit -m "chore: recover OpenCode issue changes" -m "Continuum-Component: opencode"',
+    '            git commit -m "fix: address CodeRabbit review findings for PR #${PR_NUMBER}" -m "Continuum-Component: opencode"',
+    '            git commit -m "fix: repair blocking workflow for PR #${PR_NUMBER}" -m "Continuum-Component: opencode"',
+    '            git commit -m "fix: resolve merge conflict with main for PR #${PR_NUMBER}" -m "Continuum-Component: opencode"',
+    '            git push origin "HEAD:${HEAD_REF}"',
+    '            git push origin "HEAD:${HEAD_REF}"',
+    '            git push origin "HEAD:${HEAD_REF}"',
+    '            owns Git state and publishes exactly one bot-identity commit after',
+    '            owns Git state and publishes the merge result as a bot-identity',
+    '            owns Git state and publishes the repair as a bot-identity commit',
+    '            this run. Leave fixes as working-tree changes.',
+    '          # component trailer. Never rebase or reset away either side.',
+    '          # identity (see Configure Git identity) and carries the component',
+    '          # identity) plus the component trailer. The agent never commits.',
+    '          # kodmial/continuum#260: deterministic ownership \u2014 the workflow owns',
+    '          # kodmial/continuum#260: deterministic ownership \u2014 the workflow owns',
+    '          # kodmial/continuum#260: deterministic ownership \u2014 the workflow owns',
+    '          # kodmial/continuum#260: workflow-owned task commit sets the bot',
+    '          # owns Git state), so this is the single deterministic owner.',
+    '          # the final commit with the bot identity (see Configure Git',
+    '          # the final conflict-repair commit with the bot identity plus the',
+    '          # the final repair commit with the bot identity plus the component',
+    '          # trailer. The agent itself never commits (see prompt: the workflow',
+    '          # trailer. The agent never commits.',
+    '          - Do not commit, push, switch branches, rebase, or reset; the workflow',
+    '          - Do not commit, push, switch branches, rebase, or reset; the workflow',
+    '          - Do not commit, push, switch branches, rebase, or reset; the workflow',
+    '          BEFORE_SHA=$(git rev-parse HEAD)',
+    '          fi',
+    '          fi',
+    '          fi',
+    '          fi',
+    '          fi',
+    '          git commit -m "${COMMIT_PREFIX}: implement issue #${ISSUE_NUMBER}" -m "Continuum-Component: opencode"',
+    '          if [[ "$(git rev-list --count "origin/${HEAD_REF}"..HEAD)" -gt 0 ]]; then',
+    '          if [[ "$(git rev-list --count "origin/${HEAD_REF}"..HEAD)" -gt 0 ]]; then',
+    '          if [[ -n "$(git status --porcelain)" ]]; then',
+    '          if [[ -n "$(git status --porcelain)" ]]; then',
+    '          if [[ -n "$(git status --porcelain)" ]]; then',
 )
 
 # Fixed-history pin for the old-to-new baseline range check below
@@ -523,12 +615,19 @@ class ProtectedBaselineTests(unittest.TestCase):
                         # #258 explicitly requires OpenCode controller comment
                         # bodies in this file to carry attribution, so the
                         # four baseline bodies above are approved for
-                        # replacement. Any other deletion still fails.
+                        # replacement. #260 explicitly requires the
+                        # workflow-owned commit provenance contract in the
+                        # same file (bot-identity trailers plus deterministic
+                        # workflow-owned commits), so the eleven baseline
+                        # commit/prompt lines above are additionally approved
+                        # for replacement. Any other deletion still fails.
                         self.assertEqual(
                             _Counter(deleted),
-                            _Counter(APPROVED_258_OPENCODE_ATTRIBUTION_REMOVED_LINES),
+                            _Counter(APPROVED_258_OPENCODE_ATTRIBUTION_REMOVED_LINES)
+                            + _Counter(APPROVED_260_OPENCODE_PROVENANCE_REMOVED_LINES),
                             f"{path} must not delete or modify baseline lines "
-                            f"outside the approved #258 attribution replacement",
+                            f"outside the approved #258 attribution plus #260 "
+                            f"provenance replacement",
                         )
                         actual = _Counter(added)
                         approved = _Counter(APPROVED_179_OPENCODE_PROBE_LINES)
@@ -536,12 +635,14 @@ class ProtectedBaselineTests(unittest.TestCase):
                             {line: 2 * count for line, count in approved.items()}
                         )
                         expected.update(APPROVED_258_OPENCODE_ATTRIBUTION_ADDED_LINES)
+                        expected.update(APPROVED_260_OPENCODE_PROVENANCE_ADDED_LINES)
                         self.assertEqual(
                             actual,
                             expected,
                             f"{path} drift must be exactly the approved #179 probe "
                             f"(both install sites, no extra copies) plus the approved "
-                            f"#258 attribution bodies: "
+                            f"#258 attribution bodies plus the approved #260 "
+                            f"provenance lines: "
                             f"extra={sorted(set(actual) - set(expected))} "
                             f"missing={sorted(set(expected) - set(actual))}",
                         )
