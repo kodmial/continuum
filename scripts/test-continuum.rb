@@ -15,7 +15,7 @@ class ContinuumTest < Minitest::Test
   # Project-owned entry workflows used only by the Continuum repository itself.
   # They deliberately stay outside the `continuum-` namespace so installer
   # ownership and reusable-engine ownership remain unambiguous.
-  PROJECT_ENTRY_WORKFLOWS = %w[automation.yml ci.yml opencode.yml pr-agent.yml pr-agent-recovery.yml].freeze
+  PROJECT_ENTRY_WORKFLOWS = %w[automation.yml ci.yml opencode.yml pr-agent.yml pr-agent-recovery.yml pr-agent-router.yml].freeze
   # Every caller stub in every layer, for the checks that must not care which
   # layer a file belongs to.
   ALL_STUBS = (CORE_STUBS + TECH_STUBS + PARENT_STUBS).sort
@@ -857,7 +857,7 @@ class ContinuumTest < Minitest::Test
   # three sets are independent files in one directory, so a one-line edit to the
   # prune candidate list — or a future edit to `"${STUBS[@]}"` — could delete a
   # consumer's whole tech or parent layer with no warning. The growth
-  # 18 -> 19 -> 23 is the observable form of that guarantee.
+  # 19 -> 20 -> 24 is the observable form of that guarantee.
   def test_installing_one_set_does_not_delete_another_sets_callers
     fixture do |dir|
       target = File.join(dir, 'consumer')
@@ -882,11 +882,11 @@ class ContinuumTest < Minitest::Test
           PARENT_STUBS.each { |stub| assert_includes installed, File.basename(stub) }
         end
       end
-      # Each set adds exactly its own files: 18 core, +1 tech, +4 parent.
+      # Each set adds exactly its own files: 19 core, +1 tech, +4 parent.
       assert_equal CORE_STUBS.size, counts['core']
       assert_equal CORE_STUBS.size + TECH_STUBS.size, counts['tech']
       assert_equal ALL_STUBS.size, counts['parent']
-      assert_equal 23, ALL_STUBS.size,
+      assert_equal 24, ALL_STUBS.size,
                    'every caller Continuum ships, across all three layers'
     end
   end
@@ -1280,6 +1280,7 @@ class ContinuumTest < Minitest::Test
     opencode.yml
     pr-agent.yml
     pr-agent-recovery.yml
+    pr-agent-router.yml
     continuum-consumer-child-dispatcher.yml
     continuum-validation.yml
   ].freeze
@@ -1315,9 +1316,9 @@ class ContinuumTest < Minitest::Test
   # count was taken from the workflow tree and then compared against the stub
   # tree, so adding a workflow and its stub together — exactly what a new
   # feature does — moved both sides and passed. A literal is the third,
-  # independent source: to change the eighteen core callers someone has to say so
+  # independent source: to change the nineteen core callers someone has to say so
   # here, which is where a reviewer sees it.
-  CORE_COUNT = 18
+  CORE_COUNT = 19
 
   # Every core workflow is either called by a stub in one of the three layers
   # or is a repository-owned/shared engine intentionally invoked from a
@@ -1717,6 +1718,92 @@ class ContinuumTest < Minitest::Test
                     'repair must revalidate draft state immediately before publication'
     assert_includes repair, 'became closed or draft during repair',
                     'a mid-repair draft transition must discard local repair changes'
+  end
+
+  # kodmial/continuum#229: ordinary PR comments must not create heavy
+  # PR-Agent workflow runs. The heavy entry workflows are dispatch-only;
+  # explicit `/review` is routed through a thin router that validates the
+  # event, resolves the exact HEAD, and coalesces duplicates on the logical
+  # operation key review:<pr>:<head>.
+  def test_pr_agent_heavy_workflows_are_dispatch_only
+    %w[pr-agent.yml].each do |entry|
+      parsed = yaml(File.join(ROOT, '.github/workflows', entry))
+      assert_equal %w[workflow_dispatch], events(parsed).keys,
+                   "#{entry}: heavy PR-Agent entry must not subscribe to issue_comment"
+    end
+    stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-pr-agent.yml'))
+    assert_equal %w[workflow_dispatch], events(stub).keys,
+                 'continuum-pr-agent stub: heavy caller must not subscribe to issue_comment'
+    %w[pr-agent.yml continuum-pr-agent.yml].each do |base|
+      path = base == 'pr-agent.yml' \
+        ? File.join(ROOT, '.github/workflows/pr-agent.yml') \
+        : File.join(ROOT, '.github/caller-stubs/continuum-pr-agent.yml')
+      job = yaml(path).fetch('jobs').fetch('call')
+      assert_includes job.fetch('if').to_s, "github.event_name == 'workflow_dispatch'",
+                      "#{base}: heavy job must only run on workflow_dispatch"
+      refute_includes File.read(path), 'issue_comment',
+                      "#{base}: heavy caller must not mention issue_comment"
+    end
+  end
+
+  def test_pr_agent_router_validates_and_dispatches_exact_head
+    router = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent-router.yml'))
+    # The router validates PR membership, owner-gated actor/policy, and the
+    # actionable command before any dispatch.
+    assert_includes router, '!issue.pull_request',
+                    'router must validate the event belongs to a pull request'
+    assert_includes router, 'context.actor !== context.repo.owner',
+                    'router must validate the actor is allowed'
+    assert_includes router, '/\/review\b/',
+                    'router must validate an actionable /review command'
+    assert_includes router, "!== 'pr-agent'",
+                    'router must validate the review provider policy'
+    # Non-actionable comments exit without dispatching.
+    assert_includes router, 'no actionable /review command',
+                    'ordinary comments must exit without dispatching'
+    # The heavy workflow is dispatched with an explicit PR number and the
+    # exact current HEAD.
+    assert_includes router, 'expected_head_sha',
+                    'router must dispatch the heavy workflow with the exact HEAD'
+    assert_includes router, 'createWorkflowDispatch',
+                    'router must dispatch the heavy workflow via the API'
+    assert_includes router, 'pr.head.sha',
+                    'router must resolve the exact current HEAD from the PR'
+    # Duplicate signals for the same logical operation key are coalesced.
+    assert_includes router, 'review:',
+                    'router must key duplicate detection on the logical operation'
+    assert_includes router, 'already active',
+                    'router must coalesce duplicate exact-HEAD dispatches'
+    assert_includes router, 'coalesced a duplicate dispatch',
+                    'router must log coalesced duplicates instead of dispatching'
+    # The router never enters the heavy scheduling path.
+    assert_includes router, 'pr-agent-router-',
+                    'router must use its own concurrency group, not the heavy one'
+    refute_includes router, 'group: pr-agent-${',
+                    'router must not share the heavy concurrency group'
+    refute_includes router, 'group: pr-agent-caller-',
+                    'router must not share the heavy caller concurrency group'
+  end
+
+  def test_pr_agent_router_wiring_for_entries_and_consumers
+    # The self-hosted entry routes issue_comment through the reusable router
+    # with the local heavy workflow as the dispatch target.
+    entry = yaml(File.join(ROOT, '.github/workflows/pr-agent-router.yml'))
+    assert_includes events(entry).keys, 'issue_comment',
+                    'router entry must subscribe to issue_comment'
+    assert_includes events(entry).keys, 'workflow_dispatch',
+                    'router entry must keep an explicit manual dispatch path'
+    entry_job = entry.fetch('jobs').fetch('call')
+    assert_includes entry_job.fetch('uses'), 'continuum-pr-agent-router.yml'
+    assert_includes entry_job.fetch('with').fetch('review_workflow'), 'pr-agent.yml'
+    # The consumer stub mirrors the entry and calls the same reusable.
+    stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-pr-agent-router.yml'))
+    assert_includes events(stub).keys, 'issue_comment',
+                    'router stub must subscribe to issue_comment'
+    assert_equal entry.fetch('name').sub(' entry', ''), stub.fetch('name'),
+                 'router stub and reusable must share one workflow identity'
+    stub_job = stub.fetch('jobs').fetch('call')
+    assert_includes stub_job.fetch('uses'), 'continuum-pr-agent-router.yml@main'
   end
 
   # The free default model must be the single documented fallback everywhere an
@@ -2941,6 +3028,9 @@ class ContinuumTest < Minitest::Test
     ],
     'continuum-pr-agent.yml' => %w[
       continuum_ref pr_number expected_head_sha retry_attempt retry_workflow recovery_kind
+    ],
+    'continuum-pr-agent-router.yml' => %w[
+      continuum_ref review_workflow review_provider pr_number
     ],
     'continuum-pr-agent-repair.yml' => %w[
       continuum_ref pr_number head_sha review_json improve_jsonl
