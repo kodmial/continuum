@@ -4183,6 +4183,7 @@ class ContinuumTest < Minitest::Test
     assert_includes body, 'no runner sleep'
     assert_includes body, 'auto-merge safety-net reconciliation will wake the controller again'
     assert_includes body, 'timeout-minutes: 15'
+    assert_includes body, 'cancel-in-progress: true'
     refute_includes body, 'MAX_WAIT_MS'
     refute_includes body, 'Sleeping until'
     refute_includes body, 'setTimeout(resolve, waitMs)'
