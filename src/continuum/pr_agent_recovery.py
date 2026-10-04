@@ -7,6 +7,13 @@ Durable retry evidence is scoped by PR + exact HEAD + operation kind
 ("review" or "repair").  GitHub issue comments are accepted as retry evidence
 only when their author association is trusted by the repository; arbitrary
 external comments must never consume or exhaust the automatic retry budget.
+
+The budget, schedule, and trust roots are the single lifecycle contract in
+:mod:`continuum.lifecycle_recovery` (#224): 10 total transient executions by
+default (configurable through a safe bounded Continuum variable), the
+~10s/30s/60s/3m/5m/10m/20m/40m/60m retry schedule with bounded jitter,
+reset-aware minimums, and durable not-before redispatch.  A success or a new
+HEAD resets the episode; deterministic failures never consume the budget.
 """
 
 from __future__ import annotations
@@ -16,14 +23,30 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Mapping, Optional, Sequence
 
-
-MAX_EXECUTIONS = 3
-STALE_AFTER_SECONDS = 70 * 60
-DISPATCH_GRACE_SECONDS = 90
-TRUSTED_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
-RETRYABLE_RUN_CONCLUSIONS = frozenset(
-    {"cancelled", "timed_out", "stale", "startup_failure"}
+from continuum.lifecycle_recovery import (
+    DISPATCH_GRACE_SECONDS as _LIFECYCLE_DISPATCH_GRACE,
 )
+from continuum.lifecycle_recovery import (
+    MAX_TRANSIENT_EXECUTIONS as _LIFECYCLE_MAX_EXECUTIONS,
+)
+from continuum.lifecycle_recovery import (
+    RETRYABLE_RUN_CONCLUSIONS as _LIFECYCLE_RETRYABLE,
+)
+from continuum.lifecycle_recovery import STALE_AFTER_SECONDS as _LIFECYCLE_STALE
+from continuum.lifecycle_recovery import (
+    TRUSTED_ASSOCIATIONS as _LIFECYCLE_TRUSTED,
+)
+from continuum.lifecycle_recovery import exponential_backoff_seconds as _lifecycle_backoff
+from continuum.lifecycle_recovery import resolve_max_executions as _resolve_budget
+
+
+MAX_EXECUTIONS = _LIFECYCLE_MAX_EXECUTIONS
+MIN_EXECUTIONS = 1
+RETRY_DELAY_SCHEDULE = (0, 10, 30, 60, 180, 300, 600, 1200, 2400, 3600)
+STALE_AFTER_SECONDS = _LIFECYCLE_STALE
+DISPATCH_GRACE_SECONDS = _LIFECYCLE_DISPATCH_GRACE
+TRUSTED_ASSOCIATIONS = _LIFECYCLE_TRUSTED
+RETRYABLE_RUN_CONCLUSIONS = _LIFECYCLE_RETRYABLE
 KINDS = frozenset({"review", "repair"})
 
 _RETRY_RE = re.compile(
@@ -101,6 +124,7 @@ def retry_evidence(
     *,
     head_sha: str,
     kind: str,
+    max_executions: int = MAX_EXECUTIONS,
 ) -> RetryEvidence:
     """Read trusted durable retry markers for one exact operation.
 
@@ -114,6 +138,7 @@ def retry_evidence(
     if normalized_kind not in KINDS:
         raise RecoveryError("kind must be review or repair")
 
+    budget = _resolve_budget(max_executions)
     latest_attempt: Optional[int] = None
     latest_marker_at: Optional[datetime] = None
     exhausted = False
@@ -141,7 +166,7 @@ def retry_evidence(
             marker_head, marker_kind, attempts_text = match.groups()
             if marker_head.lower() != head or marker_kind != normalized_kind:
                 continue
-            if int(attempts_text) >= MAX_EXECUTIONS:
+            if int(attempts_text) >= budget:
                 exhausted = True
 
     return RetryEvidence(
@@ -151,14 +176,31 @@ def retry_evidence(
     )
 
 
+def resolve_max_executions(raw: object = None, default: int = MAX_EXECUTIONS) -> int:
+    """Resolve the bounded transient-execution budget (1..10, default 10)."""
+
+    return _resolve_budget(raw, default)
+
+
+def retry_delay_schedule() -> tuple[int, ...]:
+    """Return the canonical per-execution delay schedule (index 0..9)."""
+
+    return RETRY_DELAY_SCHEDULE
+
+
 def backoff_seconds(attempt: int) -> int:
-    """Delay before execution index 1/2; initial execution index 0 is immediate."""
+    """Delay for execution index 0..9 from the single lifecycle schedule.
+
+    Index 0 runs immediately; retries 1..9 wait ~10s, 30s, 60s, 3m, 5m,
+    10m, 20m, 40m, 60m (bounded jitter is added by the caller).
+    """
 
     if attempt < 0:
         raise RecoveryError("attempt must be non-negative")
-    if attempt == 0:
-        return 0
-    return 15 * (1 << (attempt - 1))
+    try:
+        return _lifecycle_backoff(attempt)
+    except ValueError as exc:
+        raise RecoveryError(str(exc)) from exc
 
 
 def _next_attempt(
@@ -192,8 +234,14 @@ def decide_recovery(
     marker_age_seconds: Optional[int] = None,
     stale_after_seconds: int = STALE_AFTER_SECONDS,
     dispatch_grace_seconds: int = DISPATCH_GRACE_SECONDS,
+    max_executions: int = MAX_EXECUTIONS,
 ) -> RecoveryDecision:
-    """Reconcile one review/repair operation from latest authoritative state."""
+    """Reconcile one review/repair operation from latest authoritative state.
+
+    The budget defaults to the single lifecycle contract (10 total transient
+    executions, safe-bounded).  Deterministic failures never consume it; a
+    success or a new HEAD resets the episode.
+    """
 
     if not ci_green:
         return RecoveryDecision("wait", None, "exact HEAD CI is not green")
@@ -247,12 +295,13 @@ def decide_recovery(
     if not recoverable:
         return RecoveryDecision("hold", None, "operation is not recoverable")
 
+    budget = _resolve_budget(max_executions)
     attempt = _next_attempt(
         operation_seen=operation_seen,
         evidence=evidence,
         marker_newer_than_status=marker_newer_than_status,
     )
-    if attempt >= MAX_EXECUTIONS:
+    if attempt >= budget:
         return RecoveryDecision("exhaust", None, "automatic execution budget exhausted")
     return RecoveryDecision(
         "dispatch",
@@ -263,6 +312,8 @@ def decide_recovery(
 
 __all__ = [
     "MAX_EXECUTIONS",
+    "MIN_EXECUTIONS",
+    "RETRY_DELAY_SCHEDULE",
     "STALE_AFTER_SECONDS",
     "DISPATCH_GRACE_SECONDS",
     "TRUSTED_ASSOCIATIONS",
@@ -273,6 +324,8 @@ __all__ = [
     "RecoveryDecision",
     "operation_key",
     "retry_evidence",
+    "resolve_max_executions",
+    "retry_delay_schedule",
     "backoff_seconds",
     "decide_recovery",
 ]

@@ -33,6 +33,15 @@ on:
         type: string
         default: ''
         required: false
+      max_executions:
+        description: >-
+          Total transient executions per exact PR/HEAD/operation (default 10,
+          clamped to 1..10). Empty falls back to
+          vars.PR_AGENT_RECOVERY_MAX_EXECUTIONS, then to 10. Success or a new
+          HEAD resets the episode; deterministic failures never consume it.
+        type: string
+        default: ''
+        required: false
 
 permissions: {}
 
@@ -62,6 +71,7 @@ jobs:
           CI_WORKFLOW_NAME: ${{ inputs.ci_workflow_name || 'CI' }}
           STALE_MINUTES: ${{ inputs.stale_minutes || vars.PR_AGENT_RECOVERY_STALE_MINUTES || '70' }}
           DISPATCH_GRACE_SECONDS: ${{ inputs.dispatch_grace_seconds || vars.PR_AGENT_RECOVERY_DISPATCH_GRACE_SECONDS || '90' }}
+          MAX_EXECUTIONS: ${{ inputs.max_executions || vars.PR_AGENT_RECOVERY_MAX_EXECUTIONS || '10' }}
           # Item 1 of Work Lock #58: same-repo reads use the repository-scoped
           # installation token. PAT remains the mutation/dispatch identity.
           READ_GITHUB_TOKEN: ${{ github.token }}
@@ -73,7 +83,28 @@ jobs:
             const repoFullName = owner + '/' + repo;
             const reviewWorkflow = String(process.env.REVIEW_WORKFLOW || 'continuum-pr-agent.yml').trim();
             const ciWorkflowName = String(process.env.CI_WORKFLOW_NAME || 'CI').trim();
-            const maxExecutions = 3;
+            // Single 10-execution transient budget (#224): default 10 total
+            // executions per exact PR/HEAD/operation, configurable through a
+            // safe bounded Continuum variable and always clamped to 1..10 so
+            // a misconfigured value can neither silence recovery nor grant
+            // an unbounded budget. Success or a new HEAD resets the episode.
+            const MAX_TRANSIENT_EXECUTIONS = 10;
+            const MIN_TRANSIENT_EXECUTIONS = 1;
+            function resolveMaxExecutions(raw, fallback = MAX_TRANSIENT_EXECUTIONS) {
+              const toBounded = (value) => {
+                const parsed = Number.parseInt(String(value ?? '').trim(), 10);
+                if (!Number.isFinite(parsed)) return MAX_TRANSIENT_EXECUTIONS;
+                return Math.min(
+                  MAX_TRANSIENT_EXECUTIONS,
+                  Math.max(MIN_TRANSIENT_EXECUTIONS, parsed)
+                );
+              };
+              if (raw === undefined || raw === null || String(raw).trim() === '') {
+                return toBounded(fallback);
+              }
+              return toBounded(raw);
+            }
+            const maxExecutions = resolveMaxExecutions(process.env.MAX_EXECUTIONS);
             const staleMs = Number.parseInt(process.env.STALE_MINUTES || '70', 10) * 60_000;
             const dispatchGraceMs =
               Number.parseInt(process.env.DISPATCH_GRACE_SECONDS || '90', 10) * 1_000;
@@ -172,17 +203,25 @@ jobs:
               return Number.isFinite(parsed) ? Math.max(0, nowMs() - parsed) : Number.MAX_SAFE_INTEGER;
             }
 
+            // Canonical durable marker contract (#224): exactly one marker
+            // shape carries retry state, with not-before INSIDE the trailing
+            // --> so a single parseable comment holds the whole record.
+            // Legacy continuum-pr-agent-retry markers remain readable so
+            // existing durable state survives; all new writes use the
+            // continuum-lifecycle-retry prefix.
+            const LIFECYCLE_RETRY_PREFIX = 'continuum-lifecycle-retry';
+            const LIFECYCLE_EXHAUSTED_PREFIX = 'continuum-lifecycle-retry-exhausted';
             function retryMarker(head, kind, attempt, notBefore) {
               const suffix = Number.isFinite(Number(notBefore)) && Number(notBefore) > 0
                 ? ' not-before=' + Number(notBefore)
                 : '';
-              return '<!-- continuum-pr-agent-retry head=' +
+              return '<!-- ' + LIFECYCLE_RETRY_PREFIX + ' head=' +
                 String(head).toLowerCase() + ' kind=' + kind +
                 ' attempt=' + String(attempt) + suffix + ' -->';
             }
 
             function exhaustedMarker(head, kind) {
-              return '<!-- continuum-pr-agent-retry-exhausted head=' +
+              return '<!-- ' + LIFECYCLE_EXHAUSTED_PREFIX + ' head=' +
                 String(head).toLowerCase() + ' kind=' + kind +
                 ' attempts=' + String(maxExecutions) + ' -->';
             }
@@ -262,15 +301,45 @@ jobs:
               });
             }
 
+            // not-before lives inside the canonical marker only; a stray
+            // not-before= outside any marker is ignored so producers cannot
+            // diverge. Legacy markers predate durable not-before and carry none.
+            function markerNotBefore(match) {
+              const raw = match && match[4] !== undefined ? match[4] : null;
+              const parsed = Number.parseInt(String(raw ?? ''), 10);
+              return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+            }
             function parseEvidence(comments, head, kind) {
               const exactHead = String(head).toLowerCase();
               const retryRe =
+                /<!--\s*continuum-lifecycle-retry\s+head=([0-9a-f]{7,64})\s+kind=(review|repair)\s+attempt=(\d+)(?:\s+not-before=(\d+))?[^>]*-->/ig;
+              const legacyRetryRe =
                 /<!--\s*continuum-pr-agent-retry\s+head=([0-9a-f]{7,64})\s+kind=(review|repair)\s+attempt=(\d+)[^>]*-->/ig;
               const exhaustedRe =
+                /<!--\s*continuum-lifecycle-retry-exhausted\s+head=([0-9a-f]{7,64})\s+kind=(review|repair)\s+attempts=(\d+)\s*-->/ig;
+              const legacyExhaustedRe =
                 /<!--\s*continuum-pr-agent-retry-exhausted\s+head=([0-9a-f]{7,64})\s+kind=(review|repair)\s+attempts=(\d+)\s*-->/ig;
               let latestAttempt = null;
               let latestMarkerAt = null;
+              let notBeforeEpoch = null;
               let exhausted = false;
+              const consider = (markerHead, markerKind, attemptText, markerNotBeforeEpoch, createdAt) => {
+                if (markerHead.toLowerCase() !== exactHead || markerKind !== kind) return;
+                const attempt = Number.parseInt(attemptText, 10);
+                if (
+                  latestAttempt === null ||
+                  attempt > latestAttempt ||
+                  (attempt === latestAttempt &&
+                   Number.isFinite(createdAt) &&
+                   (latestMarkerAt === null || createdAt > latestMarkerAt))
+                ) {
+                  latestAttempt = attempt;
+                  latestMarkerAt = Number.isFinite(createdAt) ? createdAt : null;
+                  notBeforeEpoch = markerNotBeforeEpoch;
+                } else if (attempt === latestAttempt && markerNotBeforeEpoch !== null && notBeforeEpoch === null) {
+                  notBeforeEpoch = markerNotBeforeEpoch;
+                }
+              };
               for (const comment of comments) {
                 if (!trustedAssociations.has(String(comment.author_association || '').toUpperCase())) {
                   continue;
@@ -278,20 +347,14 @@ jobs:
                 const body = String(comment.body || '');
                 const createdAt = Date.parse(String(comment.updated_at || comment.created_at || ''));
                 retryRe.lastIndex = 0;
+                legacyRetryRe.lastIndex = 0;
                 exhaustedRe.lastIndex = 0;
+                legacyExhaustedRe.lastIndex = 0;
                 for (const match of body.matchAll(retryRe)) {
-                  if (match[1].toLowerCase() !== exactHead || match[2] !== kind) continue;
-                  const attempt = Number.parseInt(match[3], 10);
-                  if (
-                    latestAttempt === null ||
-                    attempt > latestAttempt ||
-                    (attempt === latestAttempt &&
-                     Number.isFinite(createdAt) &&
-                     (latestMarkerAt === null || createdAt > latestMarkerAt))
-                  ) {
-                    latestAttempt = attempt;
-                    latestMarkerAt = Number.isFinite(createdAt) ? createdAt : null;
-                  }
+                  consider(match[1], match[2], match[3], markerNotBefore(match), createdAt);
+                }
+                for (const match of body.matchAll(legacyRetryRe)) {
+                  consider(match[1], match[2], match[3], null, createdAt);
                 }
                 for (const match of body.matchAll(exhaustedRe)) {
                   if (
@@ -302,8 +365,17 @@ jobs:
                     exhausted = true;
                   }
                 }
+                for (const match of body.matchAll(legacyExhaustedRe)) {
+                  if (
+                    match[1].toLowerCase() === exactHead &&
+                    match[2] === kind &&
+                    Number.parseInt(match[3], 10) >= maxExecutions
+                  ) {
+                    exhausted = true;
+                  }
+                }
               }
-              return { latestAttempt, latestMarkerAt, exhausted };
+              return { latestAttempt, latestMarkerAt, notBeforeEpoch, exhausted };
             }
 
             function latestContext(statuses, name) {
@@ -406,9 +478,25 @@ jobs:
               );
             }
 
+            // Canonical 10-execution schedule (#224): execution index 0 runs
+            // immediately; retries 1..9 wait ~10s, 30s, 60s, 3m, 5m, 10m,
+            // 20m, 40m, 60m. Bounded deterministic jitter keeps concurrent
+            // PRs from dispatching in lockstep.
+            const RETRY_DELAY_SCHEDULE = [0, 10, 30, 60, 180, 300, 600, 1200, 2400, 3600];
+            const JITTER_CAP_SECONDS = 5;
             function backoffSeconds(attempt) {
               if (attempt <= 0) return 0;
-              return 15 * (1 << (attempt - 1));
+              if (attempt < RETRY_DELAY_SCHEDULE.length) return RETRY_DELAY_SCHEDULE[attempt];
+              return RETRY_DELAY_SCHEDULE[RETRY_DELAY_SCHEDULE.length - 1];
+            }
+            function jitterSeconds(key, attempt, cap = JITTER_CAP_SECONDS) {
+              let hash = 2166136261;
+              const text = String(key || 'lifecycle') + ':' + String(attempt);
+              for (let i = 0; i < text.length; i += 1) {
+                hash ^= text.charCodeAt(i);
+                hash = Math.imul(hash, 16777619);
+              }
+              return cap > 0 ? (hash >>> 0) % (cap + 1) : 0;
             }
 
             // Generic transient-failure classification for lifecycle
@@ -431,33 +519,43 @@ jobs:
                 if (/rate limit|rate-limit|ratelimit|quota exhaustion|secondary rate limit/i.test(message)) return true;
                 return false;
               }
-              return /timeout|timed out|econnreset|econnrefused|eai_again|epipe|socket hang up|network error|network failure|network timeout|network unreachable|dns error|dns failure|dns resolution|tls handshake|tls error|ssl error|connection reset|connection refused|connection aborted|temporarily unavailable|service unavailable|bad gateway|gateway timeout|bootstrap failed|bootstrap error|runner evicted|runner cancelled|runner timeout|runner lost|evicted|cancelled/i.test(
+              return /timeout|timed out|econnreset|econnrefused|eai_again|epipe|socket hang up|network error|network failure|network timeout|network unreachable|dns error|dns failure|dns resolution|tls handshake|tls error|ssl error|connection reset|connection refused|connection aborted|temporarily unavailable|service unavailable|bad gateway|gateway timeout|bootstrap failed|bootstrap error|runner evicted|runner cancelled|runner timeout|runner lost|run evicted|run cancelled/i.test(
                 String((err && err.message) || '')
               );
             }
 
-            // Reset-aware scheduling (#224): Retry-After and
-            // X-RateLimit-Reset are a minimum next-attempt time. A runner
-            // never sleeps through a long wait: delays beyond the inline
-            // threshold defer to the scheduled safety net, which redispatches
-            // when the window expires. Short backoffs are awaited inline.
+            // Reset-aware scheduling (#224): Retry-After, X-RateLimit-Reset
+            // and any provider reset are a minimum next-attempt time. The
+            // schedule plus bounded jitter is the floor; a longer reset wait
+            // wins. A runner never sleeps through a long wait: delays beyond
+            // the inline threshold persist not-before/next-attempt state and
+            // defer to the scheduled safety net, which redispatches when the
+            // window expires. Short backoffs are awaited inline.
             const MAX_INLINE_WAIT_SECONDS = 60;
-            function resetAwareDelaySeconds({ attempt, retryAfterSeconds, ratelimitResetEpoch, nowEpoch }) {
-              let delay = backoffSeconds(attempt);
+            function resetAwareDelaySeconds({ attempt, retryAfterSeconds, ratelimitResetEpoch, providerResetEpoch, nowEpoch, operationKey }) {
+              let delay = backoffSeconds(attempt) + jitterSeconds(operationKey || 'lifecycle', attempt);
               if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds >= 0) {
                 delay = Math.max(delay, retryAfterSeconds);
               }
-              if (Number.isFinite(ratelimitResetEpoch) && Number.isFinite(nowEpoch)) {
-                delay = Math.max(delay, Math.max(0, ratelimitResetEpoch - nowEpoch));
+              for (const resetEpoch of [ratelimitResetEpoch, providerResetEpoch]) {
+                if (Number.isFinite(resetEpoch) && Number.isFinite(nowEpoch)) {
+                  delay = Math.max(delay, Math.max(0, resetEpoch - nowEpoch));
+                }
               }
               return delay;
             }
 
-            // Per-PR/HEAD lease (#224): at most one authoritative
-            // reconciliation owns a PR/HEAD transition at a time. Duplicate
-            // review comments, status events and workflow completions for the
-            // same key coalesce; independent PRs never starve each other
-            // behind a repository-global lock.
+            // Per-PR/HEAD/operation lease (#224): the in-memory Set below only
+            // coalesces duplicate wakeups WITHIN a single run. Cross-run
+            // safety comes from three durable mechanisms, not from the Set:
+            // the repository-global concurrency group serializes reconciler
+            // runs (cancel-in-progress:false, so a queued run re-reconciles
+            // from latest state instead of racing), the durable dispatch
+            // marker inside its grace window coalesces a lost dispatch replay,
+            // and every dispatch re-reads the exact HEAD, CI, active runs and
+            // durable evidence immediately before mutating. A stale queued run
+            // therefore becomes a safe no-op instead of a concurrent writer,
+            // and independent PRs never starve each other.
             const ownedLeases = new Set();
             function leaseKey(prNumber, head, kind) {
               return String(prNumber) + ':' + String(head || '').toLowerCase() + ':' + String(kind || '');
@@ -482,6 +580,17 @@ jobs:
               }
               if (activeRun) {
                 return { action: 'wait', reason: 'exact PR/HEAD/operation already active' };
+              }
+              // Durable reset-aware not-before (#224): a deferred execution
+              // waits for the scheduled safety net to redispatch; it never
+              // burns budget early and never sleeps a runner.
+              if (
+                evidence.notBeforeEpoch !== null &&
+                evidence.notBeforeEpoch !== undefined &&
+                Number.isFinite(evidence.notBeforeEpoch) &&
+                Math.floor(nowMs() / 1000) < evidence.notBeforeEpoch
+              ) {
+                return { action: 'wait', reason: 'durable reset-aware not-before time has not arrived' };
               }
 
               const state = String(operationStatus?.state || '').toLowerCase() || null;
@@ -572,7 +681,9 @@ jobs:
                 attempt,
                 retryAfterSeconds: signals.retryAfterSeconds,
                 ratelimitResetEpoch: signals.ratelimitResetEpoch,
+                providerResetEpoch: signals.providerResetEpoch,
                 nowEpoch: Math.floor(nowMs() / 1000),
+                operationKey: repoFullName + '#' + pr.number + ':' + head + ':' + kind,
               });
               const statusTime = status
                 ? Date.parse(String(status.updated_at || status.created_at || ''))
@@ -655,6 +766,19 @@ jobs:
                 core.info('PR #' + pr.number + ' ' + kind + ': retry budget is already exhausted.');
                 return false;
               }
+              // Exact-HEAD revalidation immediately before mutation: a
+              // reset-aware not-before written by a concurrent reconciler (or
+              // an earlier deferred dispatch) wins over this stale wakeup.
+              if (
+                Number.isFinite(refreshedEvidence.notBeforeEpoch) &&
+                Math.floor(nowMs() / 1000) < refreshedEvidence.notBeforeEpoch
+              ) {
+                core.info(
+                  'PR #' + pr.number + ' ' + kind +
+                  ': durable not-before has not arrived; stale dispatch cancelled.'
+                );
+                return false;
+              }
               if (
                 refreshedEvidence.latestAttempt !== null &&
                 refreshedEvidence.latestAttempt > attempt
@@ -720,9 +844,15 @@ jobs:
 
             async function exhaust(pr, head, kind, comments) {
               const marker = exhaustedMarker(head, kind);
+              // Fail-closed and observable: the exhausted marker is the
+              // durable record. Legacy markers count as already-exhausted so
+              // a renamed prefix can never double-spend the budget.
+              const legacyMarker = '<!-- continuum-pr-agent-retry-exhausted head=' +
+                String(head).toLowerCase() + ' kind=' + kind;
               const already = comments.some(comment =>
                 trustedAssociations.has(String(comment.author_association || '').toUpperCase()) &&
-                String(comment.body || '').includes(marker)
+                (String(comment.body || '').includes(marker) ||
+                 String(comment.body || '').includes(legacyMarker))
               );
               if (already) return;
               await upsertControllerState(

@@ -179,7 +179,7 @@ jobs:
               }
               const retryable = new Set(['cancelled', 'timed_out', 'stale', 'startup_failure']);
               if (err && retryable.has(String(err.conclusion || '').toLowerCase())) return true;
-              return /timeout|timed out|econnreset|econnrefused|eai_again|epipe|socket hang up|network error|network failure|network timeout|network unreachable|dns error|dns failure|dns resolution|tls handshake|tls error|ssl error|connection reset|connection refused|connection aborted|temporarily unavailable|service unavailable|bad gateway|gateway timeout|bootstrap failed|bootstrap error|runner evicted|runner cancelled|runner timeout|runner lost|evicted|cancelled/i.test(
+              return /timeout|timed out|econnreset|econnrefused|eai_again|epipe|socket hang up|network error|network failure|network timeout|network unreachable|dns error|dns failure|dns resolution|tls handshake|tls error|ssl error|connection reset|connection refused|connection aborted|temporarily unavailable|service unavailable|bad gateway|gateway timeout|bootstrap failed|bootstrap error|runner evicted|runner cancelled|runner timeout|runner lost|run evicted|run cancelled/i.test(
                 String((err && err.message) || '')
               );
             }

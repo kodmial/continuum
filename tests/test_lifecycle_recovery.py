@@ -128,13 +128,61 @@ class TransientClassificationTests(unittest.TestCase):
                 classified = lifecycle.classify_operation_failure(**kwargs)
                 self.assertFalse(classified.transient)
 
+    def test_bare_policy_words_are_not_transient(self):
+        # Bare substrings such as "runner configuration unsupported" or
+        # "network policy denied" are deterministic policy outcomes, not
+        # infrastructure gaps, and must never consume the transient budget.
+        for message in (
+            "runner configuration unsupported",
+            "network policy denied",
+            "dns policy violation",
+            "tls version not allowed",
+            "bootstrap configuration invalid",
+            "cancelled by user policy",
+            "evicted by quota policy review",
+        ):
+            with self.subTest(message=message):
+                self.assertFalse(
+                    lifecycle.classify_infrastructure_failure(error=message).transient
+                )
+        # Qualified infrastructure signatures still retry.
+        for message in (
+            "runner evicted by the provider",
+            "connection reset by peer",
+            "tls handshake failed",
+            "network unreachable",
+        ):
+            with self.subTest(message=message):
+                self.assertTrue(
+                    lifecycle.classify_infrastructure_failure(error=message).transient
+                )
+
 
 class ResetAwareBackoffTests(unittest.TestCase):
-    def test_three_attempt_budget_with_exponential_backoff(self):
-        self.assertEqual(lifecycle.MAX_TRANSIENT_ATTEMPTS, 3)
+    def test_ten_execution_budget_with_canonical_schedule(self):
+        self.assertEqual(lifecycle.MAX_TRANSIENT_ATTEMPTS, 10)
+        self.assertEqual(lifecycle.MAX_TRANSIENT_EXECUTIONS, 10)
+        self.assertEqual(
+            lifecycle.retry_delay_schedule(),
+            (0, 10, 30, 60, 180, 300, 600, 1200, 2400, 3600),
+        )
         self.assertEqual(lifecycle.exponential_backoff_seconds(0), 0)
-        self.assertEqual(lifecycle.exponential_backoff_seconds(1), 15)
+        self.assertEqual(lifecycle.exponential_backoff_seconds(1), 10)
         self.assertEqual(lifecycle.exponential_backoff_seconds(2), 30)
+        self.assertEqual(lifecycle.exponential_backoff_seconds(3), 60)
+        self.assertEqual(lifecycle.exponential_backoff_seconds(4), 180)
+        self.assertEqual(lifecycle.exponential_backoff_seconds(9), 3600)
+
+    def test_budget_is_configurable_but_safe_bounded(self):
+        self.assertEqual(lifecycle.resolve_max_executions(None), 10)
+        self.assertEqual(lifecycle.resolve_max_executions(""), 10)
+        self.assertEqual(lifecycle.resolve_max_executions("5"), 5)
+        # A misconfigured variable can neither silence recovery nor grant an
+        # unbounded budget.
+        self.assertEqual(lifecycle.resolve_max_executions("0"), 1)
+        self.assertEqual(lifecycle.resolve_max_executions("-3"), 1)
+        self.assertEqual(lifecycle.resolve_max_executions("99"), 10)
+        self.assertEqual(lifecycle.resolve_max_executions("not-a-number"), 10)
 
     def test_retry_after_and_reset_are_minimum_times(self):
         now = 1000
@@ -148,6 +196,10 @@ class ResetAwareBackoffTests(unittest.TestCase):
             attempt=0, ratelimit_reset_epoch=now + 600, now_epoch=now
         )
         self.assertGreaterEqual(reset_delay, 600)
+        provider_delay = lifecycle.next_retry_delay_seconds(
+            attempt=1, provider_reset_epoch=now + 900, now_epoch=now
+        )
+        self.assertGreaterEqual(provider_delay, 900)
 
     def test_long_waits_defer_instead_of_sleeping(self):
         self.assertFalse(lifecycle.should_defer_dispatch(0))
@@ -254,20 +306,31 @@ class LatestStateReconciliationTests(unittest.TestCase):
         self.assertEqual(decision.action, "settled")
 
     def test_attempt_exhaustion_holds_observably(self):
+        # Nine retries consumed (execution index 9 seen): the next execution
+        # would be index 10, outside the 10-execution budget.
         decision = lifecycle.decide_recovery(
             ci_green=True,
             operation_state="failure",
             failure_transient=True,
-            evidence=lifecycle.RetryEvidence(latest_attempt=2),
+            evidence=lifecycle.RetryEvidence(latest_attempt=9),
         )
         self.assertEqual(decision.action, "exhaust")
         held = lifecycle.decide_recovery(
             ci_green=True,
             operation_state="failure",
             failure_transient=True,
-            evidence=lifecycle.RetryEvidence(latest_attempt=2, exhausted=True),
+            evidence=lifecycle.RetryEvidence(latest_attempt=9, exhausted=True),
         )
         self.assertEqual(held.action, "hold")
+        # Mid-budget work still dispatches.
+        mid = lifecycle.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            failure_transient=True,
+            evidence=lifecycle.RetryEvidence(latest_attempt=2),
+        )
+        self.assertEqual(mid.action, "dispatch")
+        self.assertEqual(mid.attempt, 3)
 
     def test_two_prs_recover_without_global_starvation(self):
         first = lifecycle.concurrency_key(REPO, 1, HEAD)
@@ -313,6 +376,22 @@ class DurableEvidenceTests(unittest.TestCase):
             )
         ]
         evidence = lifecycle.retry_evidence(comments, head_sha=HEAD, kind="review")
+        self.assertIsNone(evidence.latest_attempt)
+
+    def test_not_before_lives_inside_the_canonical_marker(self):
+        marker = lifecycle.retry_marker(HEAD, "review", 1, not_before_epoch=2000)
+        self.assertIn("not-before=2000 -->", marker)
+        self.assertNotIn("--> not-before=", marker)
+        evidence = lifecycle.retry_evidence(
+            [comment(marker)], head_sha=HEAD, kind="review"
+        )
+        self.assertEqual(evidence.not_before_epoch, 2000)
+
+    def test_stray_not_before_outside_any_marker_is_ignored(self):
+        evidence = lifecycle.retry_evidence(
+            [comment("hello not-before=2000")], head_sha=HEAD, kind="review"
+        )
+        self.assertIsNone(evidence.not_before_epoch)
         self.assertIsNone(evidence.latest_attempt)
 
     def test_not_before_is_durable_across_runs(self):
@@ -395,10 +474,16 @@ class CrossStackContractTests(unittest.TestCase):
                 self.assertIn(kind, key)
 
     def test_provider_policy_semantics_are_unchanged(self):
-        # The generic contract reuses the legacy PR-Agent budget and trust
-        # roots; provider gating itself is untouched.
+        # One compatible recovery contract: the generic lifecycle budget and
+        # the legacy PR-Agent helper agree on 10 executions and the same
+        # schedule; provider gating itself is untouched.
+        self.assertEqual(lifecycle.MAX_TRANSIENT_ATTEMPTS, 10)
         self.assertEqual(
             lifecycle.MAX_TRANSIENT_ATTEMPTS, legacy.MAX_EXECUTIONS
+        )
+        self.assertEqual(
+            tuple(lifecycle.retry_delay_schedule()),
+            tuple(legacy.retry_delay_schedule()),
         )
         self.assertEqual(
             lifecycle.TRUSTED_ASSOCIATIONS, legacy.TRUSTED_ASSOCIATIONS

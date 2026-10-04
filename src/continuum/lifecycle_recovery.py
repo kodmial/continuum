@@ -12,11 +12,15 @@ token-policy semantics without changing any provider-specific review policy:
 - latest repository state is authoritative; a stale failed run is only a
   wakeup, never state;
 - only generic infrastructure failures consume the bounded transient budget
-  (3 total attempts per identity); deterministic policy/code failures hold;
-- backoff is exponential with jitter, honors ``Retry-After`` and GitHub
-  ``X-RateLimit-Reset`` as a minimum next-attempt time, and never asks a
-  runner to sleep through a long wait (the caller schedules a future
-  redispatch and exits; the scheduled watchdog is the safety net);
+  (10 total executions per identity by default, configurable through a safe
+  bounded Continuum variable); deterministic policy/code failures hold and
+  a success or a new HEAD resets the episode;
+- backoff follows the configured schedule (~10s, 30s, 60s, 3m, 5m, 10m,
+  20m, 40m, 60m for retries 1..9) with bounded jitter, honors
+  ``Retry-After`` and GitHub ``X-RateLimit-Reset`` (or any provider reset)
+  as a minimum next-attempt time, and never asks a runner to sleep through
+  a long wait (the caller persists not-before/next-attempt and exits; the
+  scheduled watchdog redispatches when the window expires);
 - duplicate wakeups coalesce onto one per-PR/HEAD lease;
 - same-repository read-only discovery uses the run-scoped ``GITHUB_TOKEN``;
   PAT/TAP_PAT is reserved for mutations/dispatches.
@@ -31,8 +35,16 @@ from datetime import datetime, timezone
 from typing import Any, Mapping, Optional, Sequence
 
 
-MAX_TRANSIENT_ATTEMPTS = 3
-BASE_BACKOFF_SECONDS = 15
+MAX_TRANSIENT_ATTEMPTS = 10
+# Alias kept so callers can name the budget either way; both denote the same
+# 10-execution contract.
+MAX_TRANSIENT_EXECUTIONS = 10
+MIN_TRANSIENT_EXECUTIONS = 1
+# Canonical retry schedule: execution index 0 runs immediately; retries 1..9
+# wait approximately 10s, 30s, 60s, 3m, 5m, 10m, 20m, 40m, 60m (plus bounded
+# jitter, and never earlier than Retry-After / rate-limit / provider reset).
+RETRY_DELAY_SCHEDULE = (0, 10, 30, 60, 180, 300, 600, 1200, 2400, 3600)
+BASE_BACKOFF_SECONDS = 10
 JITTER_CAP_SECONDS = 5
 STALE_AFTER_SECONDS = 70 * 60
 DISPATCH_GRACE_SECONDS = 90
@@ -66,7 +78,9 @@ _LIFECYCLE_RETRY_RE = re.compile(
     r"<!--\s*continuum-lifecycle-retry\s+"
     r"head=([0-9a-fA-F]{7,64})\s+"
     r"kind=([A-Za-z][A-Za-z0-9-]*)\s+"
-    r"attempt=(\d+)[^>]*-->"
+    r"attempt=(\d+)"
+    r"(?:\s+not-before=(\d+))?"
+    r"[^>]*-->"
 )
 _LIFECYCLE_EXHAUSTED_RE = re.compile(
     r"<!--\s*continuum-lifecycle-retry-exhausted\s+"
@@ -120,8 +134,8 @@ _TRANSIENT_ERROR_PATTERNS = (
     "runner cancelled",
     "runner timeout",
     "runner lost",
-    "evicted",
-    "cancelled",
+    "run evicted",
+    "run cancelled",
     "rate limit",
     "rate-limit",
     "ratelimit",
@@ -362,6 +376,29 @@ def classify_operation_failure(
     return FailureClassification(False, "no transient infrastructure evidence")
 
 
+def resolve_max_executions(raw: object = None, default: int = MAX_TRANSIENT_ATTEMPTS) -> int:
+    """Resolve the bounded transient-execution budget from a Continuum variable.
+
+    The budget is always clamped to [MIN_TRANSIENT_EXECUTIONS,
+    MAX_TRANSIENT_EXECUTIONS] so a misconfigured variable can neither disable
+    recovery silently nor grant an unbounded budget.  Unparseable values fall
+    back to ``default`` (itself clamped).
+    """
+
+    try:
+        fallback = int(str(default).strip())
+    except (TypeError, ValueError):
+        fallback = MAX_TRANSIENT_ATTEMPTS
+    fallback = max(MIN_TRANSIENT_EXECUTIONS, min(MAX_TRANSIENT_EXECUTIONS, fallback))
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return fallback
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return fallback
+    return max(MIN_TRANSIENT_EXECUTIONS, min(MAX_TRANSIENT_EXECUTIONS, value))
+
+
 def jitter_seconds(key: str, attempt: int, cap: int = JITTER_CAP_SECONDS) -> int:
     """Deterministic 0..cap jitter so tests and controllers agree."""
 
@@ -374,15 +411,24 @@ def jitter_seconds(key: str, attempt: int, cap: int = JITTER_CAP_SECONDS) -> int
 
 
 def exponential_backoff_seconds(attempt: int, base: int = BASE_BACKOFF_SECONDS) -> int:
-    """Exponential backoff for execution index 0/1/2 (0s, 15s, 30s)."""
+    """Canonical schedule delay for execution index 0..9.
+
+    Index 0 runs immediately; retries 1..9 wait ~10s, 30s, 60s, 3m, 5m,
+    10m, 20m, 40m, 60m.  ``base`` is retained for signature compatibility
+    and is ignored: the schedule is the contract.
+    """
 
     if attempt < 0:
         raise LifecycleRecoveryError("attempt must be non-negative")
-    if base < 0:
-        raise LifecycleRecoveryError("base must be non-negative")
-    if attempt == 0:
-        return 0
-    return base * (1 << (attempt - 1))
+    if attempt < len(RETRY_DELAY_SCHEDULE):
+        return RETRY_DELAY_SCHEDULE[attempt]
+    return RETRY_DELAY_SCHEDULE[-1]
+
+
+def retry_delay_schedule() -> tuple[int, ...]:
+    """Return the canonical per-execution delay schedule (index 0..9)."""
+
+    return RETRY_DELAY_SCHEDULE
 
 
 def next_retry_delay_seconds(
@@ -391,9 +437,17 @@ def next_retry_delay_seconds(
     operation_key_value: str = "",
     retry_after_seconds: Optional[int] = None,
     ratelimit_reset_epoch: Optional[int] = None,
+    provider_reset_epoch: Optional[int] = None,
     now_epoch: Optional[int] = None,
 ) -> int:
-    """Reset-aware delay honoring Retry-After / X-RateLimit-Reset as minimum."""
+    """Reset-aware delay honoring Retry-After / reset epochs as minimum.
+
+    The canonical schedule plus bounded jitter is the floor; any
+    ``Retry-After``, ``X-RateLimit-Reset``, or provider reset wait that is
+    longer becomes the delay.  ``provider_reset_epoch`` is an explicit alias
+    for a non-GitHub provider reset so callers can name it without routing
+    through the GitHub header name.
+    """
 
     if attempt < 0:
         raise LifecycleRecoveryError("attempt must be non-negative")
@@ -403,12 +457,13 @@ def next_retry_delay_seconds(
     candidates = [delay]
     if retry_after_seconds is not None and retry_after_seconds >= 0:
         candidates.append(int(retry_after_seconds))
-    if ratelimit_reset_epoch is not None and now_epoch is not None:
-        try:
-            wait = int(ratelimit_reset_epoch) - int(now_epoch)
-        except (TypeError, ValueError) as exc:
-            raise LifecycleRecoveryError("reset/now epochs must be integers") from exc
-        candidates.append(max(0, wait))
+    for reset_epoch in (ratelimit_reset_epoch, provider_reset_epoch):
+        if reset_epoch is not None and now_epoch is not None:
+            try:
+                wait = int(reset_epoch) - int(now_epoch)
+            except (TypeError, ValueError) as exc:
+                raise LifecycleRecoveryError("reset/now epochs must be integers") from exc
+            candidates.append(max(0, wait))
     return max(candidates)
 
 
@@ -448,28 +503,38 @@ def retry_evidence(
     *,
     head_sha: str,
     kind: str,
+    max_executions: int = MAX_TRANSIENT_ATTEMPTS,
 ) -> RetryEvidence:
     """Read trusted durable retry markers for one exact operation.
 
-    Both the generic ``continuum-lifecycle-retry`` markers and the legacy
+    Both the canonical ``continuum-lifecycle-retry`` markers and the legacy
     Work Lock #38 ``continuum-pr-agent-retry`` markers count for
     review/repair kinds so existing durable state survives generalization.
+    ``not-before`` is read from the single canonical marker itself (the
+    ``not-before=<epoch>`` field inside the trailing ``-->``); a stray
+    ``not-before=`` outside any marker is ignored so producers cannot diverge.
     """
 
     head = normalize_head(head_sha)
     normalized_kind = normalize_kind(kind)
+    budget = resolve_max_executions(max_executions)
 
     latest_attempt: Optional[int] = None
     latest_marker_at: Optional[datetime] = None
     not_before: Optional[int] = None
     exhausted = False
 
-    def consider(match_head: str, match_kind: str, attempt_text: str, body: str, created_at: Optional[datetime]) -> None:
+    def consider(
+        match_head: str,
+        match_kind: str,
+        attempt_text: str,
+        marker_not_before: Optional[int],
+        created_at: Optional[datetime],
+    ) -> None:
         nonlocal latest_attempt, latest_marker_at, not_before
         if match_head.lower() != head or match_kind.lower() != normalized_kind:
             return
         attempt = int(attempt_text)
-        marker_not_before = _parse_not_before(body)
         if latest_attempt is None or attempt > latest_attempt:
             latest_attempt = attempt
             latest_marker_at = created_at
@@ -486,22 +551,25 @@ def retry_evidence(
         body = str(comment.get("body") or "")
         created_at = _parse_time(comment.get("updated_at") or comment.get("created_at"))
         for match in _LIFECYCLE_RETRY_RE.finditer(body):
-            marker_head, marker_kind, attempt_text = match.groups()
-            consider(marker_head, marker_kind, attempt_text, body, created_at)
+            marker_head, marker_kind, attempt_text, not_before_text = match.groups()
+            marker_not_before = int(not_before_text) if not_before_text else None
+            consider(marker_head, marker_kind, attempt_text, marker_not_before, created_at)
         if normalized_kind in PR_AGENT_KINDS:
             for match in _LEGACY_RETRY_RE.finditer(body):
                 marker_head, marker_kind, attempt_text = match.groups()
-                consider(marker_head, marker_kind, attempt_text, body, created_at)
+                # Legacy markers predate durable not-before; fall back to a
+                # whole-body scan only for those markers.
+                consider(marker_head, marker_kind, attempt_text, _parse_not_before(body), created_at)
         for match in _LIFECYCLE_EXHAUSTED_RE.finditer(body):
             marker_head, marker_kind, attempts_text = match.groups()
             if marker_head.lower() == head and marker_kind.lower() == normalized_kind:
-                if int(attempts_text) >= MAX_TRANSIENT_ATTEMPTS:
+                if int(attempts_text) >= budget:
                     exhausted = True
         if normalized_kind in PR_AGENT_KINDS:
             for match in _LEGACY_EXHAUSTED_RE.finditer(body):
                 marker_head, marker_kind, attempts_text = match.groups()
                 if marker_head.lower() == head and marker_kind.lower() == normalized_kind:
-                    if int(attempts_text) >= MAX_TRANSIENT_ATTEMPTS:
+                    if int(attempts_text) >= budget:
                         exhausted = True
 
     return RetryEvidence(
@@ -546,16 +614,23 @@ def decide_recovery(
     now_epoch: Optional[int] = None,
     retry_after_seconds: Optional[int] = None,
     ratelimit_reset_epoch: Optional[int] = None,
+    provider_reset_epoch: Optional[int] = None,
     stale_after_seconds: int = STALE_AFTER_SECONDS,
     dispatch_grace_seconds: int = DISPATCH_GRACE_SECONDS,
+    max_executions: int = MAX_TRANSIENT_ATTEMPTS,
+    operation_key_value: str = "lifecycle",
 ) -> RecoveryDecision:
     """Reconcile one lifecycle operation from latest authoritative state.
 
     Fail-closed: anything that is not a proven transient infrastructure gap
     waits or holds without consuming the transient budget.  An old HEAD can
-    never authorize a mutation for a new HEAD (``head_moved`` holds).
+    never authorize a mutation for a new HEAD (``head_moved`` holds); a
+    success or a new HEAD starts a new episode and resets the budget.
+    Exhaustion after the bounded budget is fail-closed and observable
+    (``exhaust`` once, then ``hold`` while the durable marker exists).
     """
 
+    budget = resolve_max_executions(max_executions)
     if head_moved:
         return RecoveryDecision("hold", None, "HEAD moved: old recovery cannot mutate new HEAD")
     if malformed_state:
@@ -645,18 +720,23 @@ def decide_recovery(
         evidence=evidence,
         marker_newer_than_status=marker_newer_than_status,
     )
-    if attempt >= MAX_TRANSIENT_ATTEMPTS:
+    if attempt >= budget:
         return RecoveryDecision("exhaust", None, "automatic transient budget exhausted")
 
     delay = next_retry_delay_seconds(
         attempt=attempt,
-        operation_key_value="lifecycle",
+        operation_key_value=operation_key_value,
         retry_after_seconds=retry_after_seconds,
         ratelimit_reset_epoch=ratelimit_reset_epoch,
+        provider_reset_epoch=provider_reset_epoch,
         now_epoch=now_epoch,
     )
     computed_not_before: Optional[int] = None
-    if now_epoch is not None and (retry_after_seconds is not None or ratelimit_reset_epoch is not None):
+    if now_epoch is not None and (
+        retry_after_seconds is not None
+        or ratelimit_reset_epoch is not None
+        or provider_reset_epoch is not None
+    ):
         computed_not_before = int(now_epoch) + delay
     return RecoveryDecision(
         "dispatch",
@@ -714,6 +794,9 @@ def requires_pat(action: object) -> bool:
 
 __all__ = [
     "MAX_TRANSIENT_ATTEMPTS",
+    "MAX_TRANSIENT_EXECUTIONS",
+    "MIN_TRANSIENT_EXECUTIONS",
+    "RETRY_DELAY_SCHEDULE",
     "BASE_BACKOFF_SECONDS",
     "JITTER_CAP_SECONDS",
     "STALE_AFTER_SECONDS",
@@ -733,6 +816,8 @@ __all__ = [
     "concurrency_key",
     "classify_infrastructure_failure",
     "classify_operation_failure",
+    "resolve_max_executions",
+    "retry_delay_schedule",
     "jitter_seconds",
     "exponential_backoff_seconds",
     "next_retry_delay_seconds",

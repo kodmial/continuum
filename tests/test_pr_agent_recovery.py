@@ -216,16 +216,26 @@ class RecoveryDecisionTests(unittest.TestCase):
             ci_green=True,
             operation_state="failure",
             operation_description="transient; recovery eligible",
-            evidence=recovery.RetryEvidence(latest_attempt=2),
+            evidence=recovery.RetryEvidence(latest_attempt=9),
         )
         self.assertEqual(decision.action, "exhaust")
+
+    def test_mid_budget_attempt_still_dispatches(self):
+        decision = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="transient; recovery eligible",
+            evidence=recovery.RetryEvidence(latest_attempt=2),
+        )
+        self.assertEqual(decision.action, "dispatch")
+        self.assertEqual(decision.attempt, 3)
 
     def test_durable_exhausted_marker_holds_future_wakeups(self):
         decision = recovery.decide_recovery(
             ci_green=True,
             operation_state="failure",
             operation_description="transient; recovery eligible",
-            evidence=recovery.RetryEvidence(latest_attempt=2, exhausted=True),
+            evidence=recovery.RetryEvidence(latest_attempt=9, exhausted=True),
         )
         self.assertEqual(decision.action, "hold")
 
@@ -236,11 +246,24 @@ class RecoveryDecisionTests(unittest.TestCase):
         )
         self.assertEqual(decision.action, "settled")
 
-    def test_backoff_matches_three_execution_budget(self):
-        self.assertEqual(recovery.MAX_EXECUTIONS, 3)
+    def test_backoff_matches_ten_execution_budget(self):
+        self.assertEqual(recovery.MAX_EXECUTIONS, 10)
+        self.assertEqual(
+            recovery.retry_delay_schedule(),
+            (0, 10, 30, 60, 180, 300, 600, 1200, 2400, 3600),
+        )
         self.assertEqual(recovery.backoff_seconds(0), 0)
-        self.assertEqual(recovery.backoff_seconds(1), 15)
+        self.assertEqual(recovery.backoff_seconds(1), 10)
         self.assertEqual(recovery.backoff_seconds(2), 30)
+        self.assertEqual(recovery.backoff_seconds(3), 60)
+        self.assertEqual(recovery.backoff_seconds(9), 3600)
+
+    def test_budget_is_configurable_but_safe_bounded(self):
+        self.assertEqual(recovery.resolve_max_executions(None), 10)
+        self.assertEqual(recovery.resolve_max_executions("5"), 5)
+        self.assertEqual(recovery.resolve_max_executions("0"), 1)
+        self.assertEqual(recovery.resolve_max_executions("99"), 10)
+        self.assertEqual(recovery.resolve_max_executions("nope"), 10)
 
 
 class RecoveryWiringTests(unittest.TestCase):
