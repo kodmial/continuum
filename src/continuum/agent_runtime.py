@@ -508,11 +508,15 @@ def resolve_profile(declaration: Mapping[str, Any]) -> RuntimeProfile:
         )
     idle_instances = base.get("idle_instances", STRICT_IDLE_INSTANCES)
     max_uses = base.get("max_uses_per_instance", STRICT_MAX_USES_PER_INSTANCE)
-    try:
-        idle_number = int(idle_instances)  # type: ignore[arg-type]
-        max_uses_number = int(max_uses)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+    if (
+        isinstance(idle_instances, bool)
+        or not isinstance(idle_instances, int)
+        or isinstance(max_uses, bool)
+        or not isinstance(max_uses, int)
+    ):
         raise AgentRuntimeError("idle_instances and max_uses_per_instance must be integers")
+    idle_number = idle_instances
+    max_uses_number = max_uses
     if idle_number != STRICT_IDLE_INSTANCES:
         raise AgentRuntimeError(
             "idle_instances={} is rejected: strict ephemeral profiles keep zero live idle instances".format(idle_number)
@@ -561,20 +565,26 @@ def resolve_profile(declaration: Mapping[str, Any]) -> RuntimeProfile:
             raise AgentRuntimeError("invalid toolchain input {!r}".format(item))
     if len(set(toolchain)) != len(toolchain):
         raise AgentRuntimeError("toolchain inputs list {!r} twice".format(sorted(toolchain)))
-    try:
-        concurrency = int(base.get("concurrency_limit", 4))
-    except (TypeError, ValueError):
+    raw_concurrency = base.get("concurrency_limit", 4)
+    if isinstance(raw_concurrency, bool) or not isinstance(raw_concurrency, int):
         raise AgentRuntimeError("concurrency_limit must be an integer between 1 and 256")
+    concurrency = raw_concurrency
     if concurrency < 1 or concurrency > 256:
         raise AgentRuntimeError("concurrency_limit must be between 1 and 256")
-    try:
-        provisioning_timeout = int(base.get("provisioning_timeout_seconds", DEFAULT_PROVISIONING_TIMEOUT_SECONDS))
-    except (TypeError, ValueError):
+    raw_provisioning_timeout = base.get(
+        "provisioning_timeout_seconds", DEFAULT_PROVISIONING_TIMEOUT_SECONDS
+    )
+    if isinstance(raw_provisioning_timeout, bool) or not isinstance(
+        raw_provisioning_timeout, int
+    ):
         raise AgentRuntimeError("provisioning_timeout_seconds must be a positive integer")
-    try:
-        max_lifetime = int(base.get("max_job_lifetime_seconds", DEFAULT_MAX_JOB_LIFETIME_SECONDS))
-    except (TypeError, ValueError):
+    provisioning_timeout = raw_provisioning_timeout
+    raw_max_lifetime = base.get(
+        "max_job_lifetime_seconds", DEFAULT_MAX_JOB_LIFETIME_SECONDS
+    )
+    if isinstance(raw_max_lifetime, bool) or not isinstance(raw_max_lifetime, int):
         raise AgentRuntimeError("max_job_lifetime_seconds must be a positive integer")
+    max_lifetime = raw_max_lifetime
     if provisioning_timeout <= 0 or max_lifetime <= 0:
         raise AgentRuntimeError("timeouts must be positive; no state may wait indefinitely")
     if max_lifetime > DEFAULT_GLOBAL_MAX_INSTANCE_AGE_SECONDS:

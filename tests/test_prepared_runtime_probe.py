@@ -425,7 +425,9 @@ class PreparedRuntimeProbeTests(unittest.TestCase):
         `stamp` None means no stamp file; `tool_version` None means the
         binary is absent from PATH.
         """
-        tmp = tempfile.mkdtemp(prefix="continuum-probe-")
+        tmp_root = os.path.join(ROOT, ".opencode-tmp")
+        os.makedirs(tmp_root, exist_ok=True)
+        tmp = tempfile.mkdtemp(prefix="continuum-probe-", dir=tmp_root)
         self.addCleanup(shutil.rmtree, tmp, True)
         bin_dir = os.path.join(tmp, "bin")
         os.mkdir(bin_dir)

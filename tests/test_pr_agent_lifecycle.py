@@ -443,9 +443,9 @@ class ProtectedBaselineTests(unittest.TestCase):
                     # Authoritative task #179 requires the prepared-runtime
                     # probe in this file. The committed BASELINE..HEAD drift
                     # must contain exactly the approved probe (both install
-                    # sites carry the same 32-line stamp-bound digest-gated
-                    # probe with the stamp-directory mkdir, 64 added lines
-                    # total); any deletion,
+                    # sites carry the same 30-line digest-gated probe with
+                    # no stamp-write lines, 60 added lines total; stamp
+                    # writes must be empty per the check below); any deletion,
                     # modification, or unapproved addition still fails. The two-sided check below reports
                     # a missing probe separately from unapproved drift so a
                     # worktree without the probe cannot pass silently, and an
@@ -712,6 +712,21 @@ class ProtectedBaselineTests(unittest.TestCase):
                             text=True,
                             timeout=30,
                         )
+                        if oldest_ancestor.returncode != 0:
+                            subprocess.run(
+                                ["git", "fetch", "--deepen", "50", "origin", PREVIOUS_BASELINE_SHA],
+                                cwd=ROOT,
+                                capture_output=True,
+                                text=True,
+                                timeout=120,
+                            )
+                            oldest_ancestor = subprocess.run(
+                                ["git", "merge-base", "--is-ancestor", OLDEST_BASELINE_SHA, PREVIOUS_BASELINE_SHA],
+                                cwd=ROOT,
+                                capture_output=True,
+                                text=True,
+                                timeout=30,
+                            )
                         _assert_git_ok(
                             oldest_ancestor,
                             f"{path} oldest baseline {OLDEST_BASELINE_SHA} is not an ancestor of {PREVIOUS_BASELINE_SHA}",
