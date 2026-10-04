@@ -320,7 +320,16 @@ jobs:
               core.setOutput('blocking_sha', head);
 
               const reviewComment = await github.rest.issues.createComment({
-                owner, repo, issue_number: prNumber, body: '/review',
+                owner, repo, issue_number: prNumber,
+                // Continuum comment attribution (kodmial/continuum#258): the
+                // /review command stays first for third-party parser safety;
+                // the header is the first rendered line after it.
+                body: [
+                  '/review',
+                  '',
+                  '⚡ **Continuum · pr-agent-canary**',
+                  '<!-- continuum-origin role=continuum component=pr-agent-canary -->',
+                ].join('\n'),
               });
               reviewCommandId = reviewComment.data.id;
               core.setOutput('review_command_id', String(reviewCommandId));
@@ -403,7 +412,16 @@ jobs:
               core.setOutput('fixed_sha', head);
 
               const verifyComment = await github.rest.issues.createComment({
-                owner, repo, issue_number: prNumber, body: `/verify ${findingId}`,
+                owner, repo, issue_number: prNumber,
+                // Continuum comment attribution (kodmial/continuum#258): the
+                // /verify command stays on its own first line (the verify
+                // parser matches one command per line); the header follows.
+                body: [
+                  `/verify ${findingId}`,
+                  '',
+                  '⚡ **Continuum · pr-agent-canary**',
+                  '<!-- continuum-origin role=continuum component=pr-agent-canary -->',
+                ].join('\n'),
               });
               verifyCommandId = verifyComment.data.id;
               core.setOutput('verify_command_id', String(verifyCommandId));
@@ -437,7 +455,15 @@ jobs:
               // Clean-HEAD proof: one more owner /review must approve the
               // exact current HEAD with no blocking findings left.
               const cleanComment = await github.rest.issues.createComment({
-                owner, repo, issue_number: prNumber, body: '/review',
+                owner, repo, issue_number: prNumber,
+                // Continuum comment attribution (kodmial/continuum#258): the
+                // /review command stays first for third-party parser safety.
+                body: [
+                  '/review',
+                  '',
+                  '⚡ **Continuum · pr-agent-canary**',
+                  '<!-- continuum-origin role=continuum component=pr-agent-canary -->',
+                ].join('\n'),
               });
               core.setOutput('clean_review_command_id', String(cleanComment.data.id));
               const cleanHead = head;
@@ -480,6 +506,8 @@ jobs:
                 owner, repo, issue_number: prNumber,
                 body: [
                   '<!-- continuum-pr-agent-canary-evidence -->',
+                  '⚡ **Continuum · pr-agent-canary**',
+                  '<!-- continuum-origin role=continuum component=pr-agent-canary -->',
                   'Canary evidence bundle:',
                   '',
                   '```json',

@@ -1058,7 +1058,10 @@ jobs:
                 owner,
                 repo,
                 issue_number: selected.prNumber,
-                body: '@coderabbitai full review',
+                // Continuum comment attribution (kodmial/continuum#258): the
+                // @coderabbitai command stays first so the review request
+                // still triggers; the header is the first rendered line.
+                body: '@coderabbitai full review\n\n⚡ **Continuum · coderabbit-retry**\n<!-- continuum-origin role=continuum component=coderabbit-retry -->',
               });
               apiBudget.mutations += 1;
             } catch (err) {

@@ -3630,8 +3630,13 @@ class ContinuumTest < Minitest::Test
     # matched literally, or a renamed label classifies nothing.
     assert_includes body, "jq -r --arg label \"$QUALIFICATION_LABEL\" '[.labels[].name] | index($label) != null'"
     assert_includes body, 'jq -e --arg label "$QUALIFICATION_LABEL"'
-    # The result marker is a variable, not the fork's literal.
-    assert_includes body, 'printf \'%s\n%s\' "$QUALIFICATION_MARKER" "$BODY"'
+    # The result marker is a variable, not the fork's literal. The recorded
+    # comment speaks as the consumer project (#258): the repository display
+    # name is derived from context and the hidden origin marker carries no
+    # repository identity.
+    assert_includes body, '"$QUALIFICATION_MARKER" "$BODY"'
+    assert_includes body, '"🛰️ **Project · ${GITHUB_REPOSITORY##*/}**"'
+    assert_includes body, '"<!-- continuum-origin role=project component=qualification -->"'
     refute_includes body, '<!-- runtime-lab-render-qualification-result -->'
   end
 
@@ -3780,9 +3785,14 @@ class ContinuumTest < Minitest::Test
 
   # The recorded verdict must carry the configured marker and pause the issue
   # with the configured label, or a renamed marker makes the result unreadable.
+  # The result comment speaks as the consumer project (#258): the repository
+  # display name is derived from context and the hidden origin marker carries
+  # no repository identity.
   def test_docker_qualification_records_the_configured_marker_and_labels
     body = docker_body
-    assert_includes body, 'printf \'%s\n%s\' "$RESULT_MARKER" "$BODY"'
+    assert_includes body, '"$RESULT_MARKER" "$BODY"'
+    assert_includes body, '"🛰️ **Project · ${GITHUB_REPOSITORY##*/}**"'
+    assert_includes body, '"<!-- continuum-origin role=project component=qualification -->"'
     assert_includes body, '--add-label "$PAUSE_LABEL" --remove-label "$IN_PROGRESS_LABEL"'
     assert_includes body, 'classification:"infrastructure"'
     # The optional chain must not dispatch a file the consumer may not have.
@@ -4887,8 +4897,12 @@ class ContinuumTest < Minitest::Test
 
     # The requested label remains the exact-head/idempotency lock and there is
     # still one authoritative command emission site in the serialized queue.
+    # The emitted command carries the Continuum attribution contract (#258):
+    # the @coderabbitai command stays first so the review still triggers,
+    # followed by the visible automation header and the hidden origin marker.
     assert_includes body, 'const requested = labels.has(REQUESTED_LABEL);'
-    assert_equal 1, body.scan("body: '@coderabbitai full review'").size
+    assert_equal 1, body.scan('@coderabbitai full review').size
+    assert_includes body, "'@coderabbitai full review\\n\\n⚡ **Continuum · coderabbit-retry**\\n<!-- continuum-origin role=continuum component=coderabbit-retry -->'"
   end
 
   # Hour-scale CodeRabbit quota waits must never pin a GitHub runner. The
@@ -7576,6 +7590,90 @@ class ContinuumTest < Minitest::Test
     config = File.read(File.join(ROOT, 'src/continuum/config.py'))
     assert_includes config, 'strip(".")',
                     'child parent configuration must reject dot-only repository components'
+  end
+
+  # Continuum comment attribution (kodmial/continuum#258). Every
+  # human-visible comment created or updated by Continuum must make machine
+  # authorship unambiguous even when the GitHub actor renders as the
+  # repository owner: one visible automation header plus one stable hidden
+  # origin marker, inserted into the existing body (never a second comment).
+  COMMENT_ATTRIBUTION_WORKFLOWS = %w[
+    continuum-auto-merge.yml
+    continuum-coderabbit-retry.yml
+    continuum-coderabbit-unresolved.yml
+    continuum-consumer-child-dispatcher.yml
+    continuum-consumer-child-pr-review.yml
+    continuum-consumer-child-review.yml
+    continuum-consumer-child-worker.yml
+    continuum-docker-qualification.yml
+    continuum-issue-scheduler.yml
+    continuum-opencode-watchdog.yml
+    continuum-opencode.yml
+    continuum-pr-agent-auto-merge.yml
+    continuum-pr-agent-canary.yml
+    continuum-pr-agent-recovery.yml
+    continuum-pr-agent-repair.yml
+    continuum-pr-agent.yml
+    continuum-render-executor.yml
+  ].freeze
+
+  def test_policy_bundle_defines_the_attribution_contract
+    policy = File.read(File.join(ROOT, '.github/scripts/pr_agent_policy.js'))
+    assert_includes policy, 'COMMENT_ATTRIBUTION_CONTINUUM_PREFIX',
+                    'the policy bundle must centralize the Continuum header typography'
+    assert_includes policy, 'controllerAttributionComponent',
+                    'the shared controller body must derive its component from the state marker'
+    assert_includes policy, "originMarker('continuum', component)",
+                    'the shared controller body must stamp the hidden origin marker'
+  end
+
+  def test_every_comment_writing_workflow_carries_attribution
+    policy = File.read(File.join(ROOT, '.github/scripts/pr_agent_policy.js'))
+    COMMENT_ATTRIBUTION_WORKFLOWS.each do |base|
+      body = File.read(File.join(ROOT, '.github/workflows', base))
+      if body.include?('policy.controllerStateBody') && !body.include?('continuum-origin')
+        # Bodies assembled at runtime by the shared policy bundle compose
+        # the marker from the canonical helper (pinned by
+        # test_policy_bundle_defines_the_attribution_contract above and the
+        # Python node suites); the workflow must reference the builder.
+        assert_includes policy, "originMarker('continuum', component)",
+                        "#{base}: the shared bundle must stamp the origin marker"
+        next
+      end
+      assert_includes body, 'continuum-origin',
+                      "#{base}: every Continuum-authored comment must carry the hidden origin marker"
+      assert_match(/⚡ \*\*Continuum · |🦾 \*\*Agent Coder · |🛰️ \*\*Project · /,
+                   body,
+                   "#{base}: every Continuum-authored comment must carry a visible automation header")
+    end
+  end
+
+  def test_origin_markers_carry_no_repository_identity_or_secret
+    COMMENT_ATTRIBUTION_WORKFLOWS.each do |base|
+      body = File.read(File.join(ROOT, '.github/workflows', base))
+      body.scan(/<!--\s*continuum-origin\s+role=([^\s]+)\s+component=([^\s]+?)\s*-->/).each do |role, component|
+        assert_includes %w[continuum agent-coder project], role,
+                        "#{base}: unexpected origin role #{role}"
+        assert_match(/\A[a-z0-9]+(?:-[a-z0-9]+)*\z/, component,
+                     "#{base}: origin components must be kebab-case without repository identity")
+        refute_includes component, '/',
+                        "#{base}: origin components must never hide an owner/repo identity"
+      end
+      refute_match(/ghp_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+|\brnd_[A-Za-z0-9]+\b/,
+                   body,
+                   "#{base}: workflows must not embed secret-shaped tokens")
+    end
+  end
+
+  def test_command_comments_keep_their_command_first
+    scheduler = File.read(File.join(ROOT, '.github/workflows/continuum-issue-scheduler.yml'))
+    assert_includes scheduler, "body: ['/oc', '', marker, dispatchMarker,",
+                    'scheduler dispatch must keep /oc on the first significant line'
+    watchdog = File.read(File.join(ROOT, '.github/workflows/continuum-opencode-watchdog.yml'))
+    assert_includes watchdog, "'/oc',",
+                    'watchdog recovery must keep /oc on the first significant line'
+    assert_includes watchdog, '<!-- continuum-origin role=continuum component=opencode-watchdog -->',
+                    'watchdog recovery must still carry the origin marker after the command'
   end
 
   end

@@ -355,9 +355,17 @@ jobs:
             }
 
             function controllerStateBody(stateMarker, summary) {
+              // Continuum comment attribution (kodmial/continuum#258): the
+              // legacy hidden marker lines stay first so positional
+              // upsert/election matching is unchanged (HTML comments do not
+              // render, so the attribution header is still the first
+              // rendered line). Mirrors src/continuum/comment_attribution.py
+              // and .github/scripts/pr_agent_policy.js byte-for-byte.
               return [
                 CONTROLLER_STATE_MARKER,
                 String(stateMarker || '').trim(),
+                '⚡ **Continuum · pr-agent-recovery**',
+                '<!-- continuum-origin role=continuum component=pr-agent-recovery -->',
                 '<details>',
                 '<summary>Continuum PR-Agent controller state</summary>',
                 '',

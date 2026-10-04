@@ -277,7 +277,7 @@ jobs:
                 )"
                 if [[ "$task_state" != "open" ]]; then
                   gh pr comment "$pr_number" --repo "$child_repo" \
-                    --body "Closed automatically: delegated task #$task_number is already completed." \
+                    --body "$(printf '%s\n%s\n%s' '⚡ **Continuum · delegation-dispatcher**' '<!-- continuum-origin role=continuum component=delegation-dispatcher -->' "Closed automatically: delegated task #$task_number is already completed.")" \
                     >/dev/null 2>&1 || true
                   gh pr close "$pr_number" --repo "$child_repo" >/dev/null 2>&1 || true
                   echo "Closed stale delegated PR #$pr_number for completed task #$task_number."

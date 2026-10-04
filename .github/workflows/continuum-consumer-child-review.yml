@@ -125,11 +125,11 @@ jobs:
           if [[ "$pr_state" != "OPEN" ]]; then
             if gh pr reopen "$PR_NUMBER" --repo "$child_repo" >/dev/null 2>&1; then
               gh issue comment "$TASK_NUMBER" --repo "$child_repo" \
-                --body "<!-- continuum-child-review-reopened --> Reopened the automation-owned PR so delegated review can continue." \
+                --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-review-reopened -->' '⚡ **Continuum · delegation-review**' '<!-- continuum-origin role=continuum component=delegation-review -->' 'Reopened the automation-owned PR so delegated review can continue.')" \
                 >/dev/null 2>&1 || true
             else
               gh issue comment "$TASK_NUMBER" --repo "$child_repo" \
-                --body "<!-- continuum-child-review-retry --> The automation-owned PR is closed and could not be reopened in this cycle; the dispatcher will retry or recreate work." \
+                --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-review-retry -->' '⚡ **Continuum · delegation-review**' '<!-- continuum-origin role=continuum component=delegation-review -->' 'The automation-owned PR is closed and could not be reopened in this cycle; the dispatcher will retry or recreate work.')" \
                 >/dev/null 2>&1 || true
               exit 0
             fi
@@ -139,7 +139,7 @@ jobs:
           transcript="$RUNNER_TEMP/continuum-child-review.log"
           review_file="$RUNNER_TEMP/continuum-child-review-${TASK_NUMBER}.md"
 
-          review_started="<!-- continuum-child-review-started --> Independent delegated review/repair for child task #$TASK_NUMBER started on PR #$PR_NUMBER."
+          review_started="$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-review-started -->' '⚡ **Continuum · delegation-review**' '<!-- continuum-origin role=continuum component=delegation-review -->' "Independent delegated review/repair for child task #$TASK_NUMBER started on PR #$PR_NUMBER.")"
           gh issue comment "$TASK_NUMBER" --repo "$child_repo" --body "$review_started" >/dev/null 2>&1 || true
 
           head_ref="$(jq -r '.headRefName' <<<"$pr_state_json")"
@@ -180,7 +180,7 @@ jobs:
           initial_validation="not configured"
           if [[ -n "$validation_script" ]]; then
             if ! git cat-file -e "origin/$base_ref:$validation_script" 2>/dev/null; then
-              gh issue comment "$TASK_NUMBER" --repo "$child_repo"                 --body "<!-- continuum-child-validation-missing --> The configured delegated validation gate is missing from the base branch."                 >/dev/null 2>&1 || true
+              gh issue comment "$TASK_NUMBER" --repo "$child_repo"                 --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-validation-missing -->' '⚡ **Continuum · delegation-review**' '<!-- continuum-origin role=continuum component=delegation-review -->' 'The configured delegated validation gate is missing from the base branch.')"                 >/dev/null 2>&1 || true
               exit 5
             fi
             trusted_validation="$RUNNER_TEMP/continuum-child-validation.sh"
@@ -238,7 +238,7 @@ jobs:
               break
             fi
             if [[ "$attempt" -eq 3 ]]; then
-              gh issue comment "$TASK_NUMBER" --repo "$child_repo"                 --body "<!-- continuum-child-review-infra --> Review for child task #$TASK_NUMBER could not install the agent runtime."                 >/dev/null 2>&1 || true
+              gh issue comment "$TASK_NUMBER" --repo "$child_repo"                 --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-review-infra -->' '⚡ **Continuum · delegation-review**' '<!-- continuum-origin role=continuum component=delegation-review -->' "Review for child task #$TASK_NUMBER could not install the agent runtime.")"                 >/dev/null 2>&1 || true
               exit 4
             fi
             sleep $((attempt * 5))
@@ -337,12 +337,12 @@ jobs:
           done
 
           if [[ "$accepted" != true ]]; then
-            gh issue comment "$TASK_NUMBER" --repo "$child_repo"               --body "<!-- continuum-child-review-needs-retry --> Review for child task #$TASK_NUMBER did not reach verified acceptance, including its delegated validation gate."               >/dev/null 2>&1 || true
+            gh issue comment "$TASK_NUMBER" --repo "$child_repo"               --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-review-needs-retry -->' '⚡ **Continuum · delegation-review**' '<!-- continuum-origin role=continuum component=delegation-review -->' "Review for child task #$TASK_NUMBER did not reach verified acceptance, including its delegated validation gate.")"               >/dev/null 2>&1 || true
             exit 30
           fi
 
           if git diff --no-ext-diff -- . | grep -Eiq '(github_pat_[A-Za-z0-9_]+|ghp_[A-Za-z0-9]+|rnd_[A-Za-z0-9]+)'; then
-            gh issue comment "$TASK_NUMBER" --repo "$child_repo"               --body "<!-- continuum-child-review-security --> Review detected token-like material; merge was blocked."               >/dev/null 2>&1 || true
+            gh issue comment "$TASK_NUMBER" --repo "$child_repo"               --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-review-security -->' '⚡ **Continuum · delegation-review**' '<!-- continuum-origin role=continuum component=delegation-review -->' 'Review detected token-like material; merge was blocked.')"               >/dev/null 2>&1 || true
             exit 31
           fi
 
@@ -393,7 +393,7 @@ jobs:
 
           if [[ "$merge_ok" != true ]]; then
             gh issue comment "$TASK_NUMBER" --repo "$child_repo" \
-              --body "<!-- continuum-child-review-merge-retry --> Child task #$TASK_NUMBER passed review, but the PR could not be merged in this cycle. The PR remains/reopens for automatic delegated retry; this is not a terminal task pause." \
+              --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-review-merge-retry -->' '⚡ **Continuum · delegation-review**' '<!-- continuum-origin role=continuum component=delegation-review -->' "Child task #$TASK_NUMBER passed review, but the PR could not be merged in this cycle. The PR remains/reopens for automatic delegated retry; this is not a terminal task pause.")" \
               >/dev/null 2>&1 || true
             echo "SubTask #$TASK_NUMBER merge deferred for automatic retry."
             exit 0
@@ -423,10 +423,10 @@ jobs:
           while IFS= read -r stale_pr; do
             [[ -n "$stale_pr" && "$stale_pr" != "$PR_NUMBER" ]] || continue
             gh pr comment "$stale_pr" --repo "$child_repo" \
-              --body "Closed automatically: task #$TASK_NUMBER completed via PR #$PR_NUMBER." \
+              --body "$(printf '%s\n%s\n%s' '⚡ **Continuum · delegation-review**' '<!-- continuum-origin role=continuum component=delegation-review -->' "Closed automatically: task #$TASK_NUMBER completed via PR #$PR_NUMBER.")" \
               >/dev/null 2>&1 || true
             gh pr close "$stale_pr" --repo "$child_repo" >/dev/null 2>&1 || true
           done
 
-          gh issue comment "$TASK_NUMBER" --repo "$child_repo"             --body "<!-- continuum-child-review-merged --> Child task #$TASK_NUMBER passed delegated review and its PR was merged."             >/dev/null 2>&1 || true
+          gh issue comment "$TASK_NUMBER" --repo "$child_repo"             --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-review-merged -->' '⚡ **Continuum · delegation-review**' '<!-- continuum-origin role=continuum component=delegation-review -->' "Child task #$TASK_NUMBER passed delegated review and its PR was merged.")"             >/dev/null 2>&1 || true
           echo "SubTask #$TASK_NUMBER reviewed, merged, and closed."

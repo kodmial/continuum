@@ -833,7 +833,7 @@ jobs:
                 )"
                 if [[ "$task_state" != "open" ]]; then
                   gh pr comment "$pr_number" --repo "$child_repo" \
-                    --body "Closed automatically: delegated task #$task_number is already completed." \
+                    --body "$(printf '%s\n%s\n%s' '⚡ **Continuum · issue-scheduler**' '<!-- continuum-origin role=continuum component=issue-scheduler -->' "Closed automatically: delegated task #$task_number is already completed.")" \
                     >/dev/null 2>&1 || true
                   gh pr close "$pr_number" --repo "$child_repo" >/dev/null 2>&1 || true
                   continue
@@ -1669,7 +1669,7 @@ jobs:
                   owner,
                   repo,
                   issue_number: qualificationNumber,
-                  body: [marker, dispatchMarker, '', note].join('\n'),
+                  body: [marker, dispatchMarker, '⚡ **Continuum · issue-scheduler**', '<!-- continuum-origin role=continuum component=issue-scheduler -->', '', note].join('\n'),
                 });
                 await github.request(
                   'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
@@ -1695,7 +1695,7 @@ jobs:
                   owner,
                   repo,
                   issue_number: qualificationNumber,
-                  body: ['/oc', '', marker, dispatchMarker, '', note].join('\n'),
+                  body: ['/oc', '', marker, dispatchMarker, '⚡ **Continuum · issue-scheduler**', '<!-- continuum-origin role=continuum component=issue-scheduler -->', '', note].join('\n'),
                 });
               }
               await addLabel(qualificationNumber, inProgressLabel);
@@ -1800,6 +1800,8 @@ jobs:
                     repo,
                     issue_number: capabilityNumber,
                     body: [
+                      '⚡ **Continuum · issue-scheduler**',
+                      '<!-- continuum-origin role=continuum component=issue-scheduler -->',
                       'Capability complete: mandatory qualification passed for exact main `' +
                         requiredSha + '` (' +
                         refs.map(ref => '#' + ref).join(', ') + ').',
@@ -1954,8 +1956,12 @@ jobs:
                   owner,
                   repo,
                   issue_number: capabilityNumber,
-                  body: 'Qualification #' + failure + ' failed at main `' +
-                    requiredSha + '`; repair tracked in #' + created.data.number + '.',
+                  body: [
+                    '⚡ **Continuum · issue-scheduler**',
+                    '<!-- continuum-origin role=continuum component=issue-scheduler -->',
+                    'Qualification #' + failure + ' failed at main `' +
+                      requiredSha + '`; repair tracked in #' + created.data.number + '.',
+                  ].join('\n'),
                 });
                 core.warning(
                   'Created repair issue #' + created.data.number +
@@ -2033,6 +2039,8 @@ jobs:
                 repo,
                 issue_number: issueNumber,
                 body: [
+                  '⚡ **Continuum · issue-scheduler**',
+                  '<!-- continuum-origin role=continuum component=issue-scheduler -->',
                   'Implementation merged (' + originText + ') at main `' + sha + '`.',
                   '',
                   'Capability #' + issueNumber + ' enters `' + qualifyingLabel +
@@ -2190,6 +2198,8 @@ jobs:
                     repo,
                     issue_number: issueNumber,
                     body: [
+                      '⚡ **Continuum · issue-scheduler**',
+                      '<!-- continuum-origin role=continuum component=issue-scheduler -->',
                       'Automation paused: ' + reason + '.',
                       '',
                       'Remove the `' + pausedLabel + '` label to retry.',
@@ -2407,6 +2417,8 @@ jobs:
                 repo,
                 issue_number: closed.number,
                 body: [
+                  '⚡ **Continuum · issue-scheduler**',
+                  '<!-- continuum-origin role=continuum component=issue-scheduler -->',
                   'Reopened by the qualification gate: this capability declares mandatory qualification (' +
                     refs.map(ref => '#' + ref).join(', ') +
                     ') but holds no exact-SHA pass evidence' +
@@ -3154,6 +3166,8 @@ jobs:
 
                 const markerComment = [
                   dispatchMarker,
+                  '⚡ **Continuum · issue-scheduler**',
+                  '<!-- continuum-origin role=continuum component=issue-scheduler -->',
                   'Automatically dispatched by the issue scheduler (' +
                     (priority || 'no explicit priority') + ').',
                 ].join('\n');

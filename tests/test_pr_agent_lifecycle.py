@@ -176,6 +176,34 @@ APPROVED_179_OPENCODE_PROBE_LINES = (
     '              opencode --version 2>&1 | grep -E -q "(^|[^0-9.])1\\.18\\.34([^0-9.]|$)" || exit 1',
 )
 
+# kodmial/continuum#258 is the authoritative task that explicitly requires
+# every Continuum-authored GitHub comment to carry visible automation
+# attribution plus a stable hidden origin marker. Its scope explicitly
+# includes "issue scheduler / OpenCode controller comments", so the
+# zero-deletion assertion for .github/workflows/continuum-opencode.yml is
+# stale for exactly the comment-body lines below. The allowlist is narrow:
+# four removed baseline bodies replaced by eight attribution-carrying
+# bodies (two JS insertion pairs plus three shell printf wrappers plus the
+# full-review body). Any other deletion, modification, or addition still
+# fails, and the #179 probe above is still required in full.
+APPROVED_258_OPENCODE_ATTRIBUTION_REMOVED_LINES = (
+    '              --body "Automation produced no code changes; pausing this issue for manual inspection."',
+    '              --body "Qualification attempted product changes in qualification mode, which is forbidden. The run is recorded as failed without evidence; it will be retried automatically." >/dev/null 2>&1 || true',
+    '                --body "Qualification run for exact SHA \\`$REQUIRED_SHA\\` produced no trusted pass/fail evidence; it will be retried automatically with the same run identity (capability #$CAPABILITY_NUMBER, qualification #$QUALIFICATION_NUMBER, sha \\`$REQUIRED_SHA\\`)." >/dev/null 2>&1 || true',
+    '                  body: `@coderabbitai full review\\n\\n${marker}`,',
+)
+
+APPROVED_258_OPENCODE_ATTRIBUTION_ADDED_LINES = (
+    "                    '\u26a1 **Continuum \u00b7 opencode**',",
+    "                    '<!-- continuum-origin role=continuum component=opencode -->',",
+    '              --body "$(printf \'%s\\n%s\\n%s\' \'\u26a1 **Continuum \u00b7 opencode**\' \'<!-- continuum-origin role=continuum component=opencode -->\' \'Automation produced no code changes; pausing this issue for manual inspection.\')"',
+    '              --body "$(printf \'%s\\n%s\\n%s\' \'\u26a1 **Continuum \u00b7 opencode**\' \'<!-- continuum-origin role=continuum component=opencode -->\' \'Qualification attempted product changes in qualification mode, which is forbidden. The run is recorded as failed without evidence; it will be retried automatically.\')" >/dev/null 2>&1 || true',
+    '                --body "$(printf \'%s\\n%s\\n%s\' \'\u26a1 **Continuum \u00b7 opencode**\' \'<!-- continuum-origin role=continuum component=opencode -->\' "Qualification run for exact SHA \\`$REQUIRED_SHA\\` produced no trusted pass/fail evidence; it will be retried automatically with the same run identity (capability #$CAPABILITY_NUMBER, qualification #$QUALIFICATION_NUMBER, sha \\`$REQUIRED_SHA\\`).")" >/dev/null 2>&1 || true',
+    "                  '\u26a1 **Continuum \u00b7 opencode**',",
+    "                  '<!-- continuum-origin role=continuum component=opencode -->',",
+    '                  body: `@coderabbitai full review\\n\\n\u26a1 **Continuum \u00b7 opencode**\\n<!-- continuum-origin role=continuum component=opencode -->\\n\\n${marker}`,',
+)
+
 # Fixed-history pin for the old-to-new baseline range check below
 # (PREVIOUS_BASELINE_SHA..BASELINE_SHA): that range landed before the
 # reconstruction self-stamp was removed, so it still carries the four
@@ -465,11 +493,14 @@ class ProtectedBaselineTests(unittest.TestCase):
                 _assert_git_ok(out)
                 if path == ".github/workflows/continuum-opencode.yml":
                     # Authoritative task #179 requires the prepared-runtime
-                    # probe in this file. The committed BASELINE..HEAD drift
-                    # must contain exactly the approved probe (both install
-                    # sites carry the same 30-line digest-gated probe with
-                    # no stamp-write lines, 60 added lines total; stamp
-                    # writes must be empty per the check below); any deletion,
+                    # probe in this file, and authoritative task #258 requires
+                    # OpenCode controller comment attribution in the same file.
+                    # The committed BASELINE..HEAD drift must contain exactly
+                    # the approved probe (both install sites carry the same
+                    # 30-line digest-gated probe with no stamp-write lines, 60
+                    # added lines total; stamp writes must be empty per the
+                    # check below) plus exactly the approved #258 attribution
+                    # bodies (8 added, 4 removed); any other deletion,
                     # modification, or unapproved addition still fails. The two-sided check below reports
                     # a missing probe separately from unapproved drift so a
                     # worktree without the probe cannot pass silently, and an
@@ -488,22 +519,29 @@ class ProtectedBaselineTests(unittest.TestCase):
                             added.append(line[1:])
                         elif line.startswith("-"):
                             deleted.append(line[1:])
-                    self.assertEqual(
-                        deleted,
-                        [],
-                        f"{path} must not delete or modify baseline lines",
-                    )
                     if added:
+                        # #258 explicitly requires OpenCode controller comment
+                        # bodies in this file to carry attribution, so the
+                        # four baseline bodies above are approved for
+                        # replacement. Any other deletion still fails.
+                        self.assertEqual(
+                            _Counter(deleted),
+                            _Counter(APPROVED_258_OPENCODE_ATTRIBUTION_REMOVED_LINES),
+                            f"{path} must not delete or modify baseline lines "
+                            f"outside the approved #258 attribution replacement",
+                        )
                         actual = _Counter(added)
                         approved = _Counter(APPROVED_179_OPENCODE_PROBE_LINES)
                         expected = _Counter(
                             {line: 2 * count for line, count in approved.items()}
                         )
+                        expected.update(APPROVED_258_OPENCODE_ATTRIBUTION_ADDED_LINES)
                         self.assertEqual(
                             actual,
                             expected,
                             f"{path} drift must be exactly the approved #179 probe "
-                            f"(both install sites, no extra copies): "
+                            f"(both install sites, no extra copies) plus the approved "
+                            f"#258 attribution bodies: "
                             f"extra={sorted(set(actual) - set(expected))} "
                             f"missing={sorted(set(expected) - set(actual))}",
                         )
@@ -564,6 +602,13 @@ class ProtectedBaselineTests(unittest.TestCase):
                             "after first installer",
                         )
                     else:
+                        # Empty committed drift: no baseline line may be
+                        # deleted without a corresponding approved addition.
+                        self.assertEqual(
+                            deleted,
+                            [],
+                            f"{path} must not delete or modify baseline lines",
+                        )
                         # Empty committed drift must not blindly trust the
                         # SHA: a new baseline that itself already bundled
                         # unrelated protected-file drift would pass the
