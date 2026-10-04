@@ -290,7 +290,7 @@ jobs:
             // Each waitFor poll below therefore costs one request instead
             // of a history-sized scan.
             const prAgentRuns = async () => (await github.rest.actions.listWorkflowRunsForRepo({
-              owner, repo, per_page: 50, page: 1,
+              owner, repo, per_page: 50, page: 1, branch,
             })).data.workflow_runs.filter((run) => run.name === 'PR Agent (OpenCode backend)');
 
             try {
