@@ -12,10 +12,53 @@ pinned-ref stability.
 from __future__ import annotations
 
 import os
+import shutil
+import tempfile
 import unittest
 from unittest import mock
 
 from continuum import agent_runtime as runtime
+
+
+_STUB_BIN_DIR = None
+_SAVED_PATH = None
+
+
+def _write_probe_stub(path: str, version: str) -> None:
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write('#!/bin/sh\necho "{} version {}"\n'.format(
+            os.path.basename(path), version))
+    os.chmod(path, 0o755)
+
+
+def setUpModule() -> None:
+    # Manifest probes are really executed at build time, so the suite
+    # provides deterministic stub binaries reporting the pinned versions.
+    # The stubs live under .opencode-tmp inside the worktree and shadow
+    # any ambient binaries via PATH for the duration of the module.
+    global _STUB_BIN_DIR, _SAVED_PATH
+    tmp_root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", ".opencode-tmp"))
+    os.makedirs(tmp_root, exist_ok=True)
+    _STUB_BIN_DIR = tempfile.mkdtemp(prefix="probe-stubs-", dir=tmp_root)
+    _write_probe_stub(
+        os.path.join(_STUB_BIN_DIR, "opencode"), runtime.OPENCODE_VERSION)
+    _write_probe_stub(
+        os.path.join(_STUB_BIN_DIR, "pr-agent"), runtime.PR_AGENT_VERSION)
+    _write_probe_stub(
+        os.path.join(_STUB_BIN_DIR, "runner"), runtime.RUNNER_VERSION)
+    _SAVED_PATH = os.environ.get("PATH", "")
+    os.environ["PATH"] = _STUB_BIN_DIR + os.pathsep + _SAVED_PATH
+
+
+def tearDownModule() -> None:
+    global _STUB_BIN_DIR, _SAVED_PATH
+    if _SAVED_PATH is not None:
+        os.environ["PATH"] = _SAVED_PATH
+        _SAVED_PATH = None
+    if _STUB_BIN_DIR and os.path.isdir(_STUB_BIN_DIR):
+        shutil.rmtree(_STUB_BIN_DIR, ignore_errors=True)
+        _STUB_BIN_DIR = None
 
 
 def _controller(project="proj-a"):
@@ -714,16 +757,51 @@ class AgentRuntimeContractTest(unittest.TestCase):
         )
         with self.assertRaises(runtime.AgentRuntimeError):
             runtime.validate_image(manifest, profile, forged)
-        # The trusted build path records execution: ensure_image runs the
-        # declared probes and the result validates.
+        # Bare probe strings copied into executed_probes without output
+        # evidence prove nothing: the record must bind each probe to the
+        # output that reported its pinned version.
+        string_only = runtime.ImageGeneration(
+            digest=runtime.image_digest(manifest, profile),
+            manifest=manifest,
+            profile=profile,
+            built_at=1000.0,
+            validated=False,
+            sbom=forged.sbom,
+            provenance=forged.provenance,
+            executed_probes=tuple(manifest.probes),
+        )
+        with self.assertRaises(runtime.AgentRuntimeError):
+            runtime.validate_image(manifest, profile, string_only)
+        # The trusted build path executes the probes and records
+        # output-bound evidence: ensure_image runs the declared probes
+        # and the result validates.
         genuine = runtime.ImageStore(project_id="proj-probe-exec").ensure_image(
             manifest, profile, now=1000.0)
-        self.assertEqual(tuple(genuine.executed_probes), tuple(manifest.probes))
+        self.assertEqual(len(genuine.executed_probes), len(manifest.probes))
+        for probe, entry in zip(manifest.probes, genuine.executed_probes):
+            self.assertTrue(
+                entry.startswith("{} => ".format(probe)),
+                "executed probe record must bind the probe to its output",
+            )
         runtime.validate_image(manifest, profile, genuine)
         # A non-executable probe can never produce an execution record.
         with self.assertRaises(runtime.AgentRuntimeError):
             runtime.execute_manifest_probes(
                 runtime.AgentManifest(**{**manifest.to_canonical(), "probes": ("echo runner",)}))
+        # A base image missing the binaries (the probe cannot run) or
+        # reporting the wrong versions produces no execution record even
+        # though the probe strings are correctly shaped.
+        def _missing(probe):
+            raise runtime.AgentRuntimeError("probe {!r} failed: no such binary".format(probe))
+
+        with self.assertRaises(runtime.AgentRuntimeError):
+            runtime.execute_manifest_probes(manifest, executor=_missing)
+
+        def _wrong_version(probe):
+            return "not the pinned runtime at all"
+
+        with self.assertRaises(runtime.AgentRuntimeError):
+            runtime.execute_manifest_probes(manifest, executor=_wrong_version)
 
     def test_opencode_version_probe_is_equivalent_to_command_v(self):
         # `opencode --version` (the canonical manifest probe) plus pinned
@@ -874,8 +952,111 @@ class AgentRuntimeContractTest(unittest.TestCase):
         self.assertEqual(result.outcome, "success")
         self.assertEqual(captured["lease_expires_at"], 1000.0 + 120)
         self.assertEqual(captured["max_age_at"],
-                         1000.0 + max(controller.global_max_age, 120))
+                         1000.0 + controller.global_max_age)
         self.assertEqual(captured["provisioning_timeout_seconds"], 60)
+
+    def test_profile_lifetime_capped_by_global_max_age(self):
+        # A profile must never extend the global 4h reclamation ceiling:
+        # a 30-day max_job_lifetime would let a hung instance and its
+        # lease evade the global-max-age sweep for that duration.
+        with self.assertRaises(runtime.AgentRuntimeError):
+            runtime.resolve_profile({
+                "preset": "agent-linux",
+                "max_job_lifetime_seconds": 2592000,
+            })
+        with self.assertRaises(runtime.AgentRuntimeError):
+            runtime.resolve_profile({
+                "preset": "agent-linux",
+                "max_job_lifetime_seconds":
+                    runtime.DEFAULT_GLOBAL_MAX_INSTANCE_AGE_SECONDS + 1,
+            })
+        at_ceiling = runtime.resolve_profile({
+            "preset": "agent-linux",
+            "max_job_lifetime_seconds":
+                runtime.DEFAULT_GLOBAL_MAX_INSTANCE_AGE_SECONDS,
+        })
+        self.assertEqual(at_ceiling.max_job_lifetime_seconds,
+                         runtime.DEFAULT_GLOBAL_MAX_INSTANCE_AGE_SECONDS)
+
+    def test_global_max_age_is_a_hard_ceiling(self):
+        # Even the longest admissible profile lifetime never pushes the
+        # lease's max_age_at past the controller's global maximum age.
+        controller = _controller()
+        profile = runtime.resolve_profile({
+            "preset": "agent-linux",
+            "max_job_lifetime_seconds":
+                runtime.DEFAULT_GLOBAL_MAX_INSTANCE_AGE_SECONDS,
+        })
+        manifest = _manifest(profile)
+        captured = {}
+        real_lease = runtime.Lease
+
+        def spy(**kwargs):
+            captured.update(kwargs)
+            return real_lease(**kwargs)
+
+        controller.queue_job("acme/app", profile)
+        with mock.patch("continuum.agent_runtime.Lease", side_effect=spy):
+            controller.run_next_job(manifest, now=1000.0)
+        self.assertEqual(captured["max_age_at"],
+                         1000.0 + controller.global_max_age)
+
+    def test_detector_treats_unrelated_conditional_as_bootstrap(self):
+        # An `if` on an unrelated predicate between the probe and the
+        # installer guards nothing: every run still reinstalls.
+        body = (
+            "run: |\n"
+            "  command -v opencode >/dev/null 2>&1\n"
+            "  if [ -f foo ]; then echo hi; fi\n"
+            "  curl -fsSL https://opencode.ai/install | bash\n"
+        )
+        self.assertTrue(runtime.normal_execution_uses_bootstrap_install(body))
+
+    def test_provisioning_exception_retries_teardown(self):
+        # A transient destroy failure plus a provisioning-time exception
+        # must not leave a live instance after one destroy attempt: the
+        # except path uses the same bounded-retry teardown as every other
+        # path, then requeues the demand and re-raises.
+        controller = _controller()
+        profile = runtime.resolve_profile({"preset": "agent-linux"})
+        manifest = _manifest(profile)
+        controller.queue_job("acme/app", profile)
+        controller.provider.destroy_failures_remaining = 1
+
+        def _boom(instance):
+            raise RuntimeError("jit outage")
+
+        controller.provider.jit_register = _boom  # type: ignore[method-assign]
+        with self.assertRaises(RuntimeError):
+            controller.run_next_job(manifest, now=1000.0)
+        self.assertEqual(controller.live_instance_count(), 0)
+        self.assertEqual(len(controller.leases), 0)
+        self.assertEqual(len(controller.queued), 1)
+
+    def test_provisioning_exception_defers_to_reconciler(self):
+        # When bounded retries are exhausted on the provisioning except
+        # path, the failure is recorded for the reconciler instead of
+        # passing silently.
+        controller = _controller()
+        profile = runtime.resolve_profile({"preset": "agent-linux"})
+        manifest = _manifest(profile)
+        controller.queue_job("acme/app", profile)
+        controller.provider.destroy_failures_remaining = 99
+
+        def _boom(instance):
+            raise RuntimeError("jit outage")
+
+        controller.provider.jit_register = _boom  # type: ignore[method-assign]
+        with self.assertRaises(RuntimeError):
+            controller.run_next_job(manifest, now=1000.0)
+        self.assertEqual(controller.live_instance_count(), 1)
+        self.assertEqual(len(controller.leases), 0)
+        self.assertEqual(len(controller.queued), 1)
+        self.assertTrue(
+            any(entry.startswith("teardown-deferred-to-reconciler")
+                for entry in controller.diagnostics),
+            "exhausted provisioning teardown must defer to the reconciler",
+        )
 
     def test_orphan_sweep_honors_per_lease_provisioning_timeout(self):
         controller = _controller()

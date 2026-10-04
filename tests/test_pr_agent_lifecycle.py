@@ -211,21 +211,43 @@ def read_repo(path: str) -> str:
 # Any write to the image-digest stamp, not just the canonical
 # `> "$STAMP_FILE"` redirect: append redirects (`>>`), unquoted/braced
 # paths (`$STAMP_FILE`, `${STAMP_FILE}`), redirects to the literal
-# image-digest path, and `tee`/`cp`/`install`/`dd`/`mv` writes all create
-# the stamp. The probe's own `>/dev/null` redirects, the
-# `$(cat "$STAMP_FILE")` stamp read, and the `STAMP_FILE=` assignment
-# never match because the redirect/command target must be the stamp
-# itself.
+# image-digest path via `$HOME`, `${HOME}`, or `~`
+# (`> ~/.opencode/image-digest`, `> "${HOME}/.opencode/image-digest"`),
+# and `tee`/`cp`/`install`/`dd`/`mv` writes all create the stamp. The
+# probe's own `>/dev/null` redirects, the `$(cat "$STAMP_FILE")` stamp
+# read, and the `STAMP_FILE=` assignment never match because the
+# redirect/command target must be the stamp itself.
 STAMP_WRITE_RE = re.compile(
     r">+\s*[\"']?\$[\{\"']?STAMP_FILE"
-    r"|>+\s*[\"']?\$?\{?HOME/[^#\n]*image-digest"
+    r"|>+\s*[\"']?(?:~|\$?\{?HOME\}?)/[^#\n]*image-digest"
     r"|\btee\b[^#\n]*(STAMP_FILE|image-digest)"
     r"|\b(cp|install|dd|mv)\b[^#\n]*(STAMP_FILE|image-digest)"
 )
 
 
+def _stamp_code_without_comment(line: str) -> str:
+    """Return the code portion of a line with `#` comments stripped.
+
+    Only a `#` outside single/double quotes starts a comment, so a quoted
+    `#` (e.g. `echo "#reconstruction" > "$STAMP_FILE"`) is preserved and
+    the stamp redirect after it is still detected, while a trailing
+    comment (`echo hi # > "$STAMP_FILE"`) never counts as a stamp write.
+    """
+
+    in_single = False
+    in_double = False
+    for index, char in enumerate(line):
+        if char == "'" and not in_double:
+            in_single = not in_single
+        elif char == '"' and not in_single:
+            in_double = not in_double
+        elif char == "#" and not in_single and not in_double:
+            return line[:index]
+    return line
+
+
 def is_stamp_write(line: str) -> bool:
-    code = line.split("#", 1)[0]
+    code = _stamp_code_without_comment(line)
     if not code.strip():
         return False
     return bool(STAMP_WRITE_RE.search(code))
@@ -315,6 +337,35 @@ def issue_entry(relevant_file="src/app.py", header="Possible Bug", n: int = 0) -
         "start_line": 10 + n,
         "end_line": 12 + n,
     }
+
+
+class StampDetectorTests(unittest.TestCase):
+    def test_stamp_write_spellings_are_detected(self):
+        for line in (
+            'echo "$CONTINUUM_IMAGE_DIGEST" > "$STAMP_FILE"',
+            "echo x >> $STAMP_FILE",
+            "echo x >> ${STAMP_FILE}",
+            "echo x > ~/.opencode/image-digest",
+            'echo x > "${HOME}/.opencode/image-digest"',
+            "echo x > ${HOME}/.opencode/image-digest",
+            "echo x > $HOME/.opencode/image-digest",
+            'echo "#reconstruction" > "$STAMP_FILE"',
+            "echo x | tee $STAMP_FILE >/dev/null",
+        ):
+            with self.subTest(line=line):
+                self.assertTrue(is_stamp_write(line), line)
+
+    def test_stamp_non_writes_are_ignored(self):
+        for line in (
+            "command -v opencode >/dev/null 2>&1",
+            'STAMP_FILE="$HOME/.opencode/image-digest"',
+            '[[ "$(cat "$STAMP_FILE")" == "$CONTINUUM_IMAGE_DIGEST" ]]',
+            'echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"',
+            'echo hi # > "$STAMP_FILE"',
+            "# echo x > $STAMP_FILE",
+        ):
+            with self.subTest(line=line):
+                self.assertFalse(is_stamp_write(line), line)
 
 
 class ProtectedBaselineTests(unittest.TestCase):

@@ -3068,7 +3068,7 @@ class ContinuumTest < Minitest::Test
     # No paid provider key may be presented as part of the contract. The rule
     # is that no workflow reads one, so naming one in the table would invite a
     # consumer to define a credential nothing consumes.
-    %w[OPENCODE_API_KEY ANTHROPIC_API_KEY GROQ_API_KEY].each do |key|
+    %w[OPENCODE_API_KEY ANTHROPIC_API_KEY GROQ_API_KEY GROQ.KEY].each do |key|
       WORKFLOWS.each do |path|
         refute_includes File.read(path), "secrets.#{key}",
                         "#{File.basename(path)} reads a paid provider key, which the no-paid-provider rule forbids"
@@ -5302,7 +5302,7 @@ class ContinuumTest < Minitest::Test
       continuum-consumer-child-pr-review.yml
     ].each do |name|
       body = workflow_body(name)
-      %w[OPENCODE_API_KEY ANTHROPIC_API_KEY GROQ_API_KEY].each do |key|
+      %w[OPENCODE_API_KEY ANTHROPIC_API_KEY GROQ_API_KEY GROQ.KEY].each do |key|
         refute_includes body, key, "#{name}: core execution must never read a paid provider key"
       end
       refute_match(/idle_instances:\s*[1-9]\d*/, body,

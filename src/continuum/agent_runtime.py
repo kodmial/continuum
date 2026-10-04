@@ -61,6 +61,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import time
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -574,6 +575,13 @@ def resolve_profile(declaration: Mapping[str, Any]) -> RuntimeProfile:
         raise AgentRuntimeError("max_job_lifetime_seconds must be a positive integer")
     if provisioning_timeout <= 0 or max_lifetime <= 0:
         raise AgentRuntimeError("timeouts must be positive; no state may wait indefinitely")
+    if max_lifetime > DEFAULT_GLOBAL_MAX_INSTANCE_AGE_SECONDS:
+        raise AgentRuntimeError(
+            "max_job_lifetime_seconds={} exceeds the global maximum instance age ceiling "
+            "of {} seconds: a profile must never extend global-max-age reclamation".format(
+                max_lifetime, DEFAULT_GLOBAL_MAX_INSTANCE_AGE_SECONDS
+            )
+        )
     return RuntimeProfile(
         name=name,
         os=os_name,
@@ -646,22 +654,79 @@ def image_contains_secret(image_body: Mapping[str, Any]) -> Optional[str]:
     return None
 
 
-def execute_manifest_probes(manifest: AgentManifest) -> Tuple[str, ...]:
+#: How long trusted build infrastructure waits for one manifest version
+#: probe before the image fails validation.
+MANIFEST_PROBE_TIMEOUT_SECONDS = 60
+
+#: Binaries a manifest probe may attest, mapped to the manifest attribute
+#: carrying their pinned version. A probe naming none of these proves
+#: nothing about the agent runtime and is rejected.
+_PROBE_BINARY_VERSION_ATTRS = (
+    ("opencode", "opencode_version"),
+    ("pr-agent", "pr_agent_version"),
+    ("runner", "runner_version"),
+)
+
+
+def _probe_expected_versions(manifest: AgentManifest, probe_text: str) -> List[str]:
+    """Return the pinned versions the probe text claims to attest."""
+
+    lowered = str(probe_text).lower()
+    return [str(getattr(manifest, attr)) for binary, attr in _PROBE_BINARY_VERSION_ATTRS
+            if binary in lowered]
+
+
+def _run_probe_command(probe: str, timeout: float = MANIFEST_PROBE_TIMEOUT_SECONDS) -> str:
+    """Run one manifest probe command; return its combined output.
+
+    A non-zero exit means the binary is absent or broken, so the probe
+    produces no execution evidence.
+    """
+
+    try:
+        completed = subprocess.run(
+            ["sh", "-c", probe],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise AgentRuntimeError(
+            "manifest probe {!r} could not be executed: {}".format(probe, exc)
+        )
+    output = "{}{}".format(completed.stdout or "", completed.stderr or "")
+    if completed.returncode != 0:
+        raise AgentRuntimeError(
+            "manifest probe {!r} failed with exit {}: "
+            "refusing to record probe execution".format(probe, completed.returncode)
+        )
+    return output
+
+
+def execute_manifest_probes(
+    manifest: AgentManifest,
+    executor: Any = None,
+) -> Tuple[str, ...]:
     """Execute each declared manifest probe in trusted build infrastructure.
 
     This is the single point where version probes are run at build time.
-    Each declared probe must be an executable version check (``--version``
-    or ``command -v`` naming the binary); a bare name mention such as
-    ``echo runner`` proves nothing and is rejected here so a base image
-    missing binaries can never produce an execution record. The returned
-    tuple is the exact probe commands that were executed and is stored on
-    the generation as ``executed_probes``. It is distinct from the SBOM /
-    provenance version strings: echoing versions into metadata without
-    running the probes yields no execution record and fails validation.
+    Each probe is actually executed here (via ``sh -c`` in the build
+    environment, or via ``executor`` when one is injected): a zero exit
+    proves the binary is present, and a ``--version`` probe must report
+    the manifest's pinned version or the binary is not the pinned one.
+    The returned tuple is output-bound evidence of the form
+    ``"<probe> => <output>"`` and is stored on the generation as
+    ``executed_probes``. It is distinct from the SBOM / provenance
+    version strings: echoing versions into metadata without running the
+    probes yields no execution record and fails validation, and copying
+    bare probe strings into ``executed_probes`` without output evidence
+    fails validation too. A base image missing binaries can never
+    produce this record.
     """
 
     if not manifest.probes:
         raise AgentRuntimeError("manifest declares no validation/version probes")
+    run = executor if executor is not None else _run_probe_command
     executed: List[str] = []
     for probe in manifest.probes:
         text = str(probe)
@@ -671,7 +736,33 @@ def execute_manifest_probes(manifest: AgentManifest) -> Tuple[str, ...]:
                 "manifest probe {!r} is not an executable version check: "
                 "refusing to record probe execution".format(text)
             )
-        executed.append(text)
+        expected = _probe_expected_versions(manifest, text)
+        if not expected:
+            raise AgentRuntimeError(
+                "manifest probe {!r} names no pinned runtime binary "
+                "(opencode/pr-agent/runner): refusing to record probe execution".format(text)
+            )
+        try:
+            output = run(text)
+        except AgentRuntimeError:
+            raise
+        except Exception as exc:
+            raise AgentRuntimeError(
+                "manifest probe {!r} could not be executed: {}".format(text, exc)
+            )
+        output = str(output or "")
+        # A `command -v` probe proves presence by exiting zero; its output
+        # is a filesystem path, so no version binding is possible. A
+        # `--version` probe must report every pinned version it names.
+        if "--version" in lowered:
+            missing = [version for version in expected if version not in output]
+            if missing:
+                raise AgentRuntimeError(
+                    "manifest probe {!r} output does not report pinned version(s) {}: "
+                    "refusing to record probe execution".format(text, ", ".join(missing))
+                )
+        one_line = " ".join(output.split())[:500]
+        executed.append("{} => {}".format(text, one_line))
     return tuple(executed)
 
 
@@ -759,9 +850,11 @@ class ImageStore:
         if offender is not None:
             raise AgentRuntimeError("refusing to bake secret marker {!r} into image".format(offender))
         # Trusted build infrastructure runs the declared version probes now:
-        # the execution record below is what validation requires, not the
-        # version strings alone. A base image missing binaries cannot
-        # produce this record (the helper rejects non-executable probes).
+        # the output-bound evidence below is what validation requires, not
+        # the version strings alone. A base image missing binaries cannot
+        # produce this record (the helper executes each probe and rejects
+        # non-executable probes, failed runs, and output that does not
+        # report the pinned versions).
         executed_probes = execute_manifest_probes(manifest)
         generation = ImageGeneration(
             digest=digest,
@@ -878,21 +971,33 @@ def validate_image(manifest: AgentManifest, profile: RuntimeProfile, generation:
     # versions by the store, so they prove nothing on their own. A base
     # image carrying correct metadata but lacking the binaries would
     # otherwise validate on metadata alone and serve jobs that cannot run.
-    # The same executed evidence must therefore also be recorded as an
-    # explicit probe-execution record (``executed_probes``, written only by
-    # trusted build infrastructure via ``execute_manifest_probes`` after
-    # running the probes), so a generation with echoed SBOM/provenance but
-    # no probe execution record still fails.
+    # The same executed evidence must therefore also be recorded as
+    # output-bound probe-execution evidence (``executed_probes`` entries
+    # of the form ``"<probe> => <output>"``, written only by trusted
+    # build infrastructure via ``execute_manifest_probes`` after running
+    # the probes and checking the output reports the pinned versions), so
+    # a generation with echoed SBOM/provenance but no probe execution
+    # record still fails -- as does one whose ``executed_probes`` merely
+    # repeats the bare probe strings without output evidence.
     executed = tuple(generation.executed_probes or ())
     if not executed:
         raise AgentRuntimeError(
             "image carries no executed probe record: refusing to serve unvalidated generation"
         )
     for probe in manifest.probes:
-        if probe not in executed:
+        prefix = "{} => ".format(probe)
+        matches = [entry for entry in executed if entry.startswith(prefix)]
+        if not matches:
             raise AgentRuntimeError(
                 "image probe {!r} was never executed: refusing to serve unvalidated generation".format(probe)
             )
+        if "--version" in str(probe).lower():
+            for expected in _probe_expected_versions(manifest, str(probe)):
+                if not any(expected in entry.split(" => ", 1)[1] for entry in matches):
+                    raise AgentRuntimeError(
+                        "image probe {!r} output does not report pinned version {!r}: "
+                        "refusing to serve unvalidated generation".format(probe, expected)
+                    )
     expected_probe_evidence = (
         "opencode=={}".format(manifest.opencode_version),
         "pr-agent=={}".format(manifest.pr_agent_version),
@@ -1398,9 +1503,10 @@ class EphemeralController:
             # already enforced from it above): the lease must expire from the
             # profile's timeouts, not from the controller-level defaults, or
             # profile timeout tuning has no effect. The global maximum age
-            # stays a hard instance-age ceiling, extended only when the
-            # profile's own job lifetime exceeds it so the instance survives
-            # at least its own lease.
+            # stays a hard instance-age ceiling: it is never extended by the
+            # profile's job lifetime (profiles are capped at the global
+            # ceiling in ``resolve_profile``), so a hung or orphaned
+            # instance is always reclaimed by the global-max-age sweep.
             try:
                 profile_provisioning_timeout = float(profile.provisioning_timeout_seconds)
             except (TypeError, ValueError):
@@ -1422,7 +1528,7 @@ class EphemeralController:
                 instance_id=instance.id,
                 created_at=now,
                 lease_expires_at=now + profile_max_lifetime,
-                max_age_at=now + max(self.global_max_age, profile_max_lifetime),
+                max_age_at=now + self.global_max_age,
                 state="provisioning",
                 provisioning_timeout_seconds=profile_provisioning_timeout,
             )
@@ -1440,11 +1546,19 @@ class EphemeralController:
             events.append("jit-registered {}".format(jit_id))
         except Exception:
             # Provisioning failed before the job could run: destroy any
-            # partially created resources, requeue the demand at the front
-            # so no queued work is lost, then re-raise.
+            # partially created resources with the same bounded-retry
+            # teardown used on every other path (a single destroy attempt
+            # leaves a live instance behind on a transient failure),
+            # requeue the demand at the front so no queued work is lost,
+            # then re-raise.
             if instance is not None:
                 try:
-                    self.provider.destroy(instance, now=now)
+                    destroyed = self._teardown(instance, now=now, retries=teardown_retries)
+                    if not destroyed:
+                        events.append("teardown-deferred-to-reconciler {}".format(instance.id))
+                        self.diagnostics.append(
+                            "teardown-deferred-to-reconciler {}".format(instance.id)
+                        )
                 finally:
                     self.leases.pop(instance.id, None)
             elif network is not None:
@@ -1761,6 +1875,20 @@ _PROBE_PATTERNS = (
     "command -v pr-agent",
 )
 
+#: Signals that make an `if`/`elif`/`case` line a validated cache-miss
+#: guard for the installer (the digest gate, the cache-hit flag, the stamp
+#: binding, or the probe itself on a shared line). A conditional without
+#: one of these guards nothing about the prepared runtime.
+_GUARD_MARKERS = (
+    "CONTINUUM_IMAGE_DIGEST",
+    "CACHE_HIT",
+    "CACHE_MISS",
+    "STAMP_FILE",
+    "image-digest",
+    "command -v",
+    "--version",
+)
+
 
 def _code_without_comment(line: str) -> str:
     """Return the code portion of a line with `#` comments stripped.
@@ -1852,16 +1980,22 @@ def normal_execution_uses_bootstrap_install(workflow_text: str) -> bool:
         # A conditionally guarded reconstruction is also a warm path, not a
         # bootstrap install: e.g. `if [ "$CACHE_HIT" != "true" ]; then
         # curl https://opencode.ai/install | bash; fi` after a probe only
-        # reinstalls on a validated cache miss. Any `if`/`elif`/`case`
-        # conditional opened between the probe and the installer (including
-        # an installer that shares its line with the `if`) guards the
-        # download, so it must not count as an unconditional bootstrap.
+        # reinstalls on a validated cache miss. Only a conditional that
+        # references the validated miss signal guards the download: the
+        # digest/cache-miss gate (or the probe itself on a shared line). A
+        # bare `if`/`elif`/`case` on an unrelated predicate (e.g.
+        # `if [ -f foo ]; then echo hi; fi`) followed by an unconditional
+        # installer still reinstalls on every run and counts as a
+        # bootstrap install.
         conditional = any(
-            stripped.startswith("if ")
-            or stripped.startswith("if\t")
-            or stripped.startswith("elif ")
-            or stripped.startswith("case ")
-            or stripped == "case"
+            (
+                stripped.startswith("if ")
+                or stripped.startswith("if\t")
+                or stripped.startswith("elif ")
+                or stripped.startswith("case ")
+                or stripped == "case"
+            )
+            and any(marker in stripped for marker in _GUARD_MARKERS)
             for stripped in (
                 code_lines[index].strip() for index in range(first_probe + 1, first_bootstrap + 1)
             )
