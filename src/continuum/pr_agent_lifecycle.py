@@ -749,6 +749,141 @@ def needs_fresh_review(old_head_sha: str, new_head_sha: str) -> bool:
     return old_head_sha.strip().lower() != new_head_sha.strip().lower()
 
 
+def caller_review_event_is_actionable(
+    event_name: object,
+    *,
+    is_pull_request_comment: bool = False,
+    actor_is_owner: bool = False,
+    comment_body: object = "",
+) -> bool:
+    """Whether a caller event may invoke the reusable PR-Agent operation layer.
+
+    Mirrors the thin-router gate in `continuum-pr-agent-router.yml` (heavy
+    callers are dispatch-only): workflow_dispatch (bounded retries/recovery)
+    is always actionable, while issue_comment is actionable only for an
+    owner `/review` comment on a pull request. Every other event is a no-op
+    that must never create a heavy run or hold a per-PR lock.
+    """
+
+    name = str(event_name or "").strip()
+    if name == "workflow_dispatch":
+        return True
+    if name != "issue_comment":
+        return False
+    if not is_pull_request_comment or not actor_is_owner:
+        return False
+    return "/review" in str(comment_body or "")
+
+
+def stale_review_may_be_cancelled(running_head_sha: object, current_head_sha: object) -> bool:
+    """Whether a running/queued review may be superseded for a newer HEAD.
+
+    A review is stale exactly when the PR HEAD moved: the newer HEAD needs
+    fresh CI plus a complete review, so the older run may be superseded
+    without losing useful work. Same-HEAD duplicates must coalesce instead
+    of cancelling/restarting because exact-HEAD work is idempotent.
+    Missing SHAs fail closed to False: never discard work blindly.
+
+    The reusable workflow implements this predicate with exact-HEAD
+    admission, before/after review revalidation, and retry-backoff HEAD
+    rechecks. Native `cancel-in-progress` is never used for preemption
+    because it cannot compare HEADs: an out-of-order old-HEAD event
+    starting later must not cancel newer exact-HEAD work.
+    """
+
+    running = str(running_head_sha or "").strip().lower()
+    current = str(current_head_sha or "").strip().lower()
+    if not running or not current:
+        return False
+    return running != current
+
+
+def repair_is_protected_from_review_preemption(
+    *,
+    repair_active: bool = False,
+    repair_head_sha: object = "",
+    review_head_sha: object = "",
+) -> bool:
+    """Whether an active repair publication blocks review preemption.
+
+    Repair mutates and publishes the PR branch under exact-HEAD
+    revalidation plus force-with-lease. While such a publication is
+    active for the HEAD under review, a newer review event must wait
+    rather than interrupt it: reviews are serializable, repairs are not
+    interruptible. With no active repair there is nothing to protect.
+    Unknown HEADs fail closed to protected so a blind preemption can
+    never interrupt a publish it cannot identify; a repair for a
+    different HEAD does not block the review because that stale repair
+    fails closed on its own exact-HEAD check.
+    """
+
+    if not repair_active:
+        return False
+    repair = str(repair_head_sha or "").strip().lower()
+    review = str(review_head_sha or "").strip().lower()
+    if not repair or not review:
+        return True
+    return repair == review
+
+
+def review_supersession_decision(
+    running_head_sha: object,
+    current_head_sha: object,
+    *,
+    repair_active: bool = False,
+    repair_head_sha: object = "",
+    review_head_sha: object = "",
+    event_name: object = "workflow_dispatch",
+    is_pull_request_comment: bool = False,
+    actor_is_owner: bool = False,
+    comment_body: object = "",
+) -> Dict[str, Any]:
+    """Single HEAD-guarded scheduling decision for PR-Agent review work.
+
+    Composition root wiring the three scheduling predicates so none is
+    dead code: non-actionable caller events are ignored before any HEAD
+    comparison (caller_review_event_is_actionable), an active repair for
+    the HEAD under review blocks preemption
+    (repair_is_protected_from_review_preemption), and only a moved HEAD
+    supersedes older review work (stale_review_may_be_cancelled).
+    Same-HEAD duplicates coalesce; a current HEAD with no running review
+    proceeds; missing SHAs fail closed to wait rather than discard
+    blindly. The reusable workflow implements this decision with
+    workflow-level serialization (no native preemption) plus exact-HEAD
+    admission, before/after revalidation, and retry-backoff HEAD rechecks:
+    `proceed` enters the admission path, `supersede` means the stale
+    run's results are discarded by those exact-HEAD checks and the newer
+    HEAD is reviewed fresh once the lock frees (a stale running review is
+    never interrupted mid-flight), `coalesce` skips duplicate same-HEAD
+    work, and `wait` holds while a same-HEAD repair publishes or a HEAD
+    is still unknown.
+    """
+
+    if not caller_review_event_is_actionable(
+        event_name,
+        is_pull_request_comment=is_pull_request_comment,
+        actor_is_owner=actor_is_owner,
+        comment_body=comment_body,
+    ):
+        return {"action": "ignore", "reason": "non-actionable caller event"}
+    review_head = str(review_head_sha or current_head_sha or "").strip().lower()
+    if repair_is_protected_from_review_preemption(
+        repair_active=repair_active,
+        repair_head_sha=repair_head_sha,
+        review_head_sha=review_head,
+    ):
+        return {"action": "wait", "reason": "repair publication in flight"}
+    if stale_review_may_be_cancelled(running_head_sha, current_head_sha):
+        return {"action": "supersede", "reason": "HEAD moved: fresh review required"}
+    running = str(running_head_sha or "").strip().lower()
+    current = str(current_head_sha or "").strip().lower()
+    if running and current and running == current:
+        return {"action": "coalesce", "reason": "same HEAD: exact-HEAD work is idempotent"}
+    if current and not running:
+        return {"action": "proceed", "reason": "no active review: admit fresh HEAD"}
+    return {"action": "wait", "reason": "missing HEAD: fail closed"}
+
+
 def required_toml() -> Dict[str, Any]:
     """Minimum upstream configuration this stack requires."""
 
@@ -841,5 +976,9 @@ __all__ = [
     "retry_backoff_seconds",
     "resolve_dispatch_ref",
     "needs_fresh_review",
+    "caller_review_event_is_actionable",
+    "stale_review_may_be_cancelled",
+    "repair_is_protected_from_review_preemption",
+    "review_supersession_decision",
     "required_toml",
 ]

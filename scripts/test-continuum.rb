@@ -1688,10 +1688,13 @@ class ContinuumTest < Minitest::Test
     end
   end
 
-  # PR-Agent must not turn normal concurrency races or an upstream clean-review
-  # omission into a permanent red gate. A stale dispatch is ignored and
-  # recovery re-evaluates the current HEAD; a clean structured full review may
-  # synthesize only an empty persistent state, while findings still fail closed.
+  # PR-Agent must not turn normal concurrency races or an absent native
+  # persistent finding state into a permanent red gate. A stale dispatch is
+  # ignored and recovery re-evaluates the current HEAD; when native state is
+  # absent, a validated structured full review derives a schema-compatible
+  # fallback (empty for a clean review, ACTIVE findings otherwise) via the
+  # upstream v0.46.0 finding-state contract, while an unrepresentable finding
+  # still fails closed. Native state remains authoritative when present.
   def test_pr_agent_clean_review_and_stale_head_are_non_blocking
     pr_agent = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent.yml'))
 
@@ -1703,7 +1706,16 @@ class ContinuumTest < Minitest::Test
     assert_includes pr_agent, '"findings": []'
     assert_includes pr_agent, '"complete": True'
     assert_includes pr_agent, '"kind": "full"'
-    assert_includes pr_agent, 'Upstream review has key findings but published no persistent finding state.'
+    # Native state wins when present; otherwise the validated structured
+    # review derives an ACTIVE fallback instead of blocking repair.
+    assert_includes pr_agent, 'parse_review_state'
+    assert_includes pr_agent, 'reconcile_review_findings'
+    assert_includes pr_agent, 'normalize_finding'
+    refute_includes pr_agent, 'Upstream review has key findings but published no persistent finding state.'
+    # Only an unrepresentable finding fails closed; nothing is invented and
+    # nothing is marked resolved by the fallback.
+    assert_includes pr_agent, 'represented as persistent finding state; failing closed'
+    assert_includes pr_agent, 'cannot derive fallback state.'
 
     repair = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent-repair.yml'))
     assert_includes repair, 'git clean -fdX',
@@ -1819,6 +1831,39 @@ class ContinuumTest < Minitest::Test
                     'commit-status publishing must stay PAT-backed'
   end
 
+  # kodmial/continuum#239: the dogfood PR-Agent caller is a direct caller
+  # of the reusable PR-Agent workflow, just like the installed caller stub.
+  # An explicitly-scoped caller leaves unspecified permissions as none, and a
+  # called reusable workflow cannot elevate that token, so the dogfood caller
+  # must grant every permission the reusable workflow requires. The stub-only
+  # contract in test_callers_grant_required_permissions cannot see this file.
+  def test_pr_agent_dogfood_caller_grants_required_permissions
+    reusable = yaml(File.join(ROOT, '.github/workflows/continuum-pr-agent.yml'))
+    stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-pr-agent.yml'))
+    caller = yaml(File.join(ROOT, '.github/workflows/pr-agent.yml'))
+    rank = { 'none' => 0, 'read' => 1, 'write' => 2 }
+
+    permissions = caller.fetch('permissions')
+    ([reusable['permissions']] + reusable['jobs'].values.map { |job| job['permissions'] }).compact.each do |required|
+      required.each do |key, value|
+        assert_operator rank.fetch(permissions.fetch(key, 'none')), :>=, rank.fetch(value),
+                        "pr-agent.yml dogfood caller: #{key} grants #{permissions.fetch(key, 'none')}, needs #{value}"
+      end
+    end
+
+    # The exact-HEAD admission reads Actions runs under github.token: least
+    # privilege is read, never write, and never absent.
+    assert_equal 'read', permissions.fetch('actions'),
+                 'pr-agent.yml dogfood caller must grant actions:read because reusable workflows cannot elevate GITHUB_TOKEN'
+    refute_equal 'write', permissions.fetch('actions'),
+                 'pr-agent.yml dogfood caller must not widen to actions:write'
+
+    # The stub and the dogfood caller call the same reusable workflow, so
+    # their permission grants must not diverge again.
+    assert_equal stub.fetch('permissions'), permissions,
+                 'pr-agent.yml dogfood caller and continuum-pr-agent.yml stub must grant the same permissions'
+  end
+
   # kodmial/continuum#229: ordinary PR comments must not create heavy
   # PR-Agent workflow runs. The heavy entry workflows are dispatch-only;
   # explicit `/review` is routed through a thin router that validates the
@@ -1875,13 +1920,27 @@ class ContinuumTest < Minitest::Test
                     'router must coalesce duplicate exact-HEAD dispatches'
     assert_includes router, 'coalesced a duplicate dispatch',
                     'router must log coalesced duplicates instead of dispatching'
-    # The router never enters the heavy scheduling path.
-    assert_includes router, 'pr-agent-router-',
-                    'router must use its own concurrency group, not the heavy one'
+    # The router never holds a per-PR lock: the actionable filter and the
+    # operation-key coalescing run inside the route step, so a plain
+    # non-/review comment run can never queue ahead of a useful dispatch.
+    # Only the heavy operation layer serializes per PR.
+    refute_includes router, 'concurrency:',
+                    'router must not hold a per-PR lock that queues no-op runs'
+    refute_includes router, 'cancel-in-progress',
+                    'router must not serialize via native concurrency'
     refute_includes router, 'group: pr-agent-${',
                     'router must not share the heavy concurrency group'
     refute_includes router, 'group: pr-agent-caller-',
                     'router must not share the heavy caller concurrency group'
+    refute_includes router, 'group: pr-agent-router-',
+                    'router must not hold its own per-PR lock either'
+    %w[.github/caller-stubs/continuum-pr-agent-router.yml .github/workflows/pr-agent-router.yml].each do |path|
+      body = File.read(File.join(ROOT, path))
+      refute_includes body, 'concurrency:',
+                      "#{path}: router entry/stub must not queue no-op runs ahead of useful dispatches"
+      refute_includes body, 'cancel-in-progress',
+                      "#{path}: router entry/stub must not serialize via native concurrency"
+    end
   end
 
   def test_pr_agent_router_wiring_for_entries_and_consumers
@@ -4357,6 +4416,34 @@ class ContinuumTest < Minitest::Test
   # wake-up loop and pinning the catch inside it is what actually asserts the
   # best-effort contract: a wake-up that cannot be delivered warns, and never
   # fails a run whose merge already landed.
+  # Conflict repair must dispatch the consumer-owned workflow_dispatch caller,
+  # not the reusable engine. Continuum dogfood names that caller opencode.yml,
+  # while installed consumers keep the continuum-opencode.yml default.
+  def test_auto_merge_conflict_repair_uses_configured_consumer_caller
+    inputs = events(yaml(File.join(ROOT, '.github/workflows/continuum-auto-merge.yml')))
+             .fetch('workflow_call').fetch('inputs')
+    knob = inputs.fetch('opencode_workflow')
+    assert_equal 'continuum-opencode.yml', knob.fetch('default')
+    assert_equal 'string', knob.fetch('type')
+    assert_equal false, knob.fetch('required')
+
+    body = auto_merge_body
+    assert_includes body,
+                    "OPENCODE_WORKFLOW: ${{ inputs.opencode_workflow || 'continuum-opencode.yml' }}"
+    refute_includes body, "workflow_id: 'continuum-opencode.yml'",
+                    'conflict repair must not hardcode the installed-consumer caller name'
+
+    repair_dispatch = dispatch_calls('continuum-auto-merge.yml').find do |call|
+      call.include?("mode: 'resolve-conflict'")
+    end
+    refute_nil repair_dispatch, 'automatic conflict-repair dispatch is missing'
+    assert_includes repair_dispatch, 'process.env.OPENCODE_WORKFLOW'
+
+    dogfood = workflow_body('automation.yml')
+    assert_match(/auto-merge:.*?opencode_workflow: 'opencode\.yml'/m, dogfood,
+                 'Continuum dogfood must route conflict repair through its real workflow_dispatch caller')
+  end
+
   def test_auto_merge_wakeup_catch_warns_inside_the_wakeup_loop
     body = auto_merge_body
 

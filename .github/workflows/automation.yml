@@ -82,3 +82,4 @@ jobs:
     secrets: inherit
     with:
       continuum_ref: main
+      opencode_workflow: 'opencode.yml'

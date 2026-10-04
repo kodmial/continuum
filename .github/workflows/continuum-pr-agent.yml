@@ -125,6 +125,25 @@ permissions:
   pull-requests: write
   statuses: read
 
+# Orchestration serialization (issue #227): this reusable layer owns the only
+# authoritative per-PR serialization for PR-Agent operations. The
+# workflow-level group below serializes the whole run, including the
+# downstream repair/merge wrappers that consume `admitted` outputs, so a
+# stale run past `pr_agent` can never run its downstream jobs in parallel
+# with the new run (no duplicate publish/auto-merge races). Callers carry
+# no concurrency block so no-op issue_comment runs can never queue ahead of
+# useful exact-HEAD work. There is no unconditional preemption: an
+# out-of-order or duplicate old-HEAD event must never cancel newer
+# exact-HEAD work, and same-HEAD duplicates coalesce instead of
+# cancelling/restarting. Staleness is decided by exact-HEAD comparison only
+# (stale_review_may_be_cancelled): the admission expected-HEAD check, the
+# before/after review revalidation, and the retry-backoff HEAD recheck below
+# implement that predicate. Repair publication keeps its own
+# non-cancellable per-PR-HEAD group in continuum-pr-agent-repair.yml and is
+# never interrupted by serialized review work
+# (repair_is_protected_from_review_preemption): the review group itself
+# is non-preemptive (cancel-in-progress: false).
+
 concurrency:
   group: pr-agent-${{ github.event.issue.number || github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || inputs.pr_number || github.run_id }}
   cancel-in-progress: false
@@ -751,10 +770,18 @@ jobs:
           import json
           import os
           import sys
-          from pr_agent.algo.review_finding_state import parse_review_state
+          from pr_agent.algo.review_finding_state import (
+              normalize_finding,
+              parse_review_state,
+              reconcile_review_findings,
+          )
 
           path = sys.argv[1]
           reviewed = os.environ["REVIEWED_SHA"].strip().lower()
+          if not reviewed:
+              raise SystemExit(
+                  "No validated reviewed HEAD; refusing to export persistent finding state."
+              )
           with open(path, "r", encoding="utf-8") as handle:
               pages = json.load(handle)
           comments = []
@@ -766,36 +793,66 @@ jobs:
               if "<!-- pr-agent-review-state:" in str(c.get("body") or "")
           ]
           if not candidates:
-              # Upstream v0.46.0 does not always publish a persistent-state
-              # marker for a clean full review with zero key findings. At this
-              # point the structured review has already passed exact-HEAD/schema
-              # validation in the previous step, so synthesize only the one
-              # unambiguous empty state. Any reported review finding still
-              # requires native persistent state and fails closed.
+              # Native upstream persistent state is absent. At this point the
+              # structured review has already passed exact-HEAD/schema
+              # validation in the previous step, so derive a
+              # schema-compatible fallback via the upstream v0.46.0
+              # finding-state contract instead of blocking repair: an empty
+              # state for a clean review, or an ACTIVE finding state
+              # preserving every actionable key finding. A finding that
+              # cannot be represented safely/losslessly fails closed rather
+              # than inventing data, and nothing is ever marked RESOLVED
+              # here. Native state remains authoritative whenever present
+              # (else branch below).
               try:
                   review = json.loads(os.environ.get("REVIEW_JSON", ""))
               except json.JSONDecodeError as exc:
-                  raise SystemExit(f"Cannot validate clean review without persistent state: {exc}")
+                  raise SystemExit(f"Cannot validate review without persistent state: {exc}")
               inner = review.get("review", review) if isinstance(review, dict) else None
               findings = inner.get("key_issues_to_review") if isinstance(inner, dict) else None
               if not isinstance(findings, list):
                   raise SystemExit(
-                      "Structured review has no key_issues_to_review list; cannot synthesize empty state."
+                      "Structured review has no key_issues_to_review list; cannot derive fallback state."
                   )
-              if findings:
-                  raise SystemExit(
-                      "Upstream review has key findings but published no persistent finding state."
+              for entry in findings:
+                  if not isinstance(entry, dict):
+                      raise SystemExit(
+                          "Structured review contains a non-object finding; cannot derive fallback state."
+                      )
+              if not findings:
+                  state = {
+                      "schema_version": 1,
+                      "findings": [],
+                      "last_run": {
+                          "complete": True,
+                          "kind": "full",
+                          "head_sha": reviewed,
+                          "run_id": f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/commit/{reviewed}",
+                      },
+                  }
+              else:
+                  unrepresentable = [
+                      index for index, entry in enumerate(findings)
+                      if normalize_finding(entry) is None
+                  ]
+                  if unrepresentable:
+                      raise SystemExit(
+                          f"Upstream review finding(s) {unrepresentable} cannot be "
+                          "represented as persistent finding state; failing closed "
+                          "rather than inventing data."
+                      )
+                  reconciled = reconcile_review_findings(
+                      None,
+                      findings,
+                      allow_resolution=True,
+                      head_sha=reviewed,
+                      run_id=f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/commit/{reviewed}",
                   )
-              state = {
-                  "schema_version": 1,
-                  "findings": [],
-                  "last_run": {
-                      "complete": True,
-                      "kind": "full",
-                      "head_sha": reviewed,
-                      "run_id": f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/commit/{reviewed}",
-                  },
-              }
+                  state = reconciled.state
+                  if not state.get("findings"):
+                      raise SystemExit(
+                          "Derived fallback finding state is empty despite actionable findings."
+                      )
           else:
               latest = max(candidates, key=lambda c: str(c.get("updated_at") or c.get("created_at") or ""))
               parsed = parse_review_state(str(latest.get("body") or ""))

@@ -8,6 +8,14 @@ on:
         type: string
         default: main
         required: false
+      opencode_workflow:
+        description: >-
+          Consumer-owned OpenCode caller workflow used for automatic conflict
+          repair. Defaults to continuum-opencode.yml for installed consumers;
+          Continuum dogfood overrides this to opencode.yml.
+        type: string
+        default: 'continuum-opencode.yml'
+        required: false
       review_provider:
         description: >-
           Review provider: none, coderabbit, or pr-agent. Empty falls back to
@@ -95,6 +103,7 @@ jobs:
         env:
           CONTINUUM_VERSION_FILE: ${{ vars.CONTINUUM_VERSION_FILE || '' }}
           REVIEW_PROVIDER: ${{ inputs.review_provider || vars.CONTINUUM_REVIEW_PROVIDER || 'none' }}
+          OPENCODE_WORKFLOW: ${{ inputs.opencode_workflow || 'continuum-opencode.yml' }}
           POST_MERGE_WAKEUPS: ${{ inputs.post_merge_wakeups || vars.CONTINUUM_POST_MERGE_WAKEUPS }}
           POST_MERGE_WAKEUP_REF: ${{ inputs.post_merge_wakeup_ref || vars.CONTINUUM_POST_MERGE_WAKEUP_REF || github.event.repository.default_branch || 'main' }}
           REQUIRED_WORKFLOW_GATE_LABEL: ${{ inputs.required_workflow_gate_label || vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_LABEL || '' }}
@@ -1217,7 +1226,9 @@ jobs:
                   {
                     owner,
                     repo,
-                    workflow_id: 'continuum-opencode.yml',
+                    workflow_id: String(
+                      process.env.OPENCODE_WORKFLOW || 'continuum-opencode.yml'
+                    ).trim(),
                     ref: 'main',
                     inputs: {
                       mode: 'resolve-conflict',
