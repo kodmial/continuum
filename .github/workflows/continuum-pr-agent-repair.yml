@@ -560,7 +560,7 @@ jobs:
           # If marker publication fails, no repair commit is pushed. If the
           # subsequent push fails, the marker targets an unreachable SHA and
           # therefore cannot block the still-current PR HEAD.
-          MARKER="<!-- continuum-pr-agent-convergence from=${HEAD_SHA_LOWER} to=${NEW_HEAD_LOWER} findings=${FINDING_IDS_LOWER} -->"
+          MARKER="<!-- continuum-pr-agent-convergence from=${HEAD_SHA,,} to=${NEW_HEAD,,} findings=${FINDING_IDS,,} -->"
           printf -v BODY '%s\n%s' "$MARKER" "PR-Agent bounded repair prepared a workflow-generated HEAD transition. A fresh full review on that exact HEAD will hold only logical findings that survived this repair; materially changed findings and genuine new work remain eligible."
           gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$BODY"
 
