@@ -4692,12 +4692,12 @@ class ContinuumTest < Minitest::Test
     lines = body.lines
     at = lines.index { |line| line.include?("workflow_id: 'continuum-coderabbit-retry.yml'") }
     window = lines[[at - 8, 0].max..at].join
-    assert_match(/if \(requireCodeRabbit && queuedForCodeRabbit\) \{\s*\n\s*await github\.rest\.actions\.createWorkflowDispatch\(\{/, window,
+    assert_match(/if \(requireCodeRabbit && queuedForCodeRabbit\) \{\s*\n\s*await (?:github|patClient\(\))\.rest\.actions\.createWorkflowDispatch\(\{/, window,
                  'the CodeRabbit retry dispatch must be gated on the flag')
 
     # The CI-driven auto-merge wake-up is NOT part of the CodeRabbit path and
     # must keep firing for a repository that disabled CodeRabbit.
-    assert_match(/if \(ours\.length > 0\) \{\s*\n\s*await github\.rest\.actions\.createWorkflowDispatch\(\{\s*\n\s*owner,\s*\n\s*repo,\s*\n\s*workflow_id: 'continuum-auto-merge\.yml'/, body,
+    assert_match(/if \(ours\.length > 0\) \{\s*\n\s*await (?:github|patClient\(\))\.rest\.actions\.createWorkflowDispatch\(\{\s*\n\s*owner,\s*\n\s*repo,\s*\n\s*workflow_id: 'continuum-auto-merge\.yml'/, body,
                  'the auto-merge wake-up must stay unconditional')
   end
 
