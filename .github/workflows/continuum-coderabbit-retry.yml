@@ -673,8 +673,8 @@ jobs:
                     core.warning(`PR #${pr.number}: comment/review scan hit budget and newest-page confirm failed; skipping this pass.`);
                     continue;
                   }
-                  if (reviews.truncated) {
-                    core.warning(`PR #${pr.number}: review scan hit the ${MAX_THREAD_PAGES}-page budget; skipping this PR for this pass.`);
+                  if (reviews.truncated || comments.truncated) {
+                    core.warning(`PR #${pr.number}: comment/review scan hit the ${MAX_THREAD_PAGES}-page budget; skipping this PR for this pass.`);
                     continue;
                   }
                 }

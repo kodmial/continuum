@@ -208,13 +208,16 @@ jobs:
               # window behind newer completed runs and read as idle.
               for run_status in in_progress queued waiting requested pending; do
                 for page in 1 2 3; do
-                  gh api "repos/$child_repo/actions/runs?per_page=100&page=$page&status=$run_status" \
-                    --jq '.workflow_runs[]
+                  run_json="$(gh api "repos/$child_repo/actions/runs?per_page=100&page=$page&status=$run_status" 2>/dev/null || true)"
+                  run_count="$(jq '.workflow_runs | length' <<<"$run_json" 2>/dev/null || echo 0)"
+                  [[ "$run_count" =~ ^[0-9]+$ ]] && [[ "$run_count" -gt 0 ]] || break
+                  jq -r '.workflow_runs[]
                       | select(.status != "completed")
                       | .display_title
                       | select(test("^OpenCode issue #[0-9]+$"))
                       | capture("^OpenCode issue #(?<task>[0-9]+)$").task' \
-                    2>/dev/null || break
+                    <<<"$run_json" 2>/dev/null || break
+                  [[ "$run_count" -lt 100 ]] && break
                 done
               done
             )"
