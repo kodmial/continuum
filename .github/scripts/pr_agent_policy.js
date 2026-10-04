@@ -248,6 +248,51 @@ function buildRepairBatch(reviewPayload, improveJsonl, threshold = IMPROVE_REPAI
   };
 }
 
+
+function reviewDisposition(reviewPayload, improveJsonl, threshold = IMPROVE_REPAIR_THRESHOLD) {
+  const review = reviewPayload && reviewPayload.review ? reviewPayload.review : reviewPayload;
+  if (!review || typeof review !== 'object' || Array.isArray(review)) {
+    throw new Error('PR-Agent review payload must be an object.');
+  }
+  if (!Array.isArray(review.key_issues_to_review)) {
+    throw new Error('PR-Agent review JSON has no key_issues_to_review list.');
+  }
+  const recommendation = String(review.merge_recommendation || '').trim();
+  if (!['safe_to_merge', 'merge_with_caution', 'changes_required'].includes(recommendation)) {
+    throw new Error(
+      'PR-Agent review has invalid merge_recommendation: ' + (recommendation || '<empty>')
+    );
+  }
+  const qualifying = qualifyingImproveSuggestions(improveJsonl, threshold);
+  const reviewCount = review.key_issues_to_review.length;
+  const common = {
+    recommendation,
+    reviewCount,
+    qualifyingSuggestionCount: qualifying.length,
+  };
+  if (reviewCount > 0 || qualifying.length > 0) {
+    return {
+      ...common,
+      action: 'repair',
+      reason:
+        reviewCount + ' review finding(s), ' +
+        qualifying.length + ' qualifying improve suggestion(s)',
+    };
+  }
+  if (recommendation === 'safe_to_merge') {
+    return {
+      ...common,
+      action: 'merge',
+      reason: 'safe_to_merge with no actionable review/improve items',
+    };
+  }
+  return {
+    ...common,
+    action: 'rereview',
+    reason: 'blocking merge recommendation without actionable payload: ' + recommendation,
+  };
+}
+
 function controllerStateBody(stateMarker, summary) {
   return [
     CONTROLLER_STATE_MARKER,
@@ -271,5 +316,6 @@ module.exports = {
   overlappingLocation,
   parseImproveJsonl,
   qualifyingImproveSuggestions,
+  reviewDisposition,
   sameLogicalDefect,
 };

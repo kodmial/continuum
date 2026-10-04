@@ -21,6 +21,12 @@ on:
       needs_repair:
         description: Whether current native review/improve output requires repair.
         value: ${{ jobs.pr_agent.outputs.needs_repair }}
+      ready_to_merge:
+        description: Whether review policy is safe-to-merge with no actionable items.
+        value: ${{ jobs.pr_agent.outputs.ready_to_merge }}
+      needs_rereview:
+        description: Whether a blocking recommendation has no actionable payload and needs bounded re-review.
+        value: ${{ jobs.pr_agent.outputs.needs_rereview }}
     inputs:
       continuum_ref:
         description: Continuum revision supplying fallback scripts
@@ -161,6 +167,8 @@ jobs:
       improve_jsonl: ${{ steps.improve_output.outputs.improve_jsonl }}
       persistent_state_json: ${{ steps.persistent.outputs.persistent_state_json }}
       needs_repair: ${{ steps.route.outputs.needs_repair }}
+      ready_to_merge: ${{ steps.route.outputs.ready_to_merge }}
+      needs_rereview: ${{ steps.route.outputs.needs_rereview }}
       retry_attempt: ${{ steps.stack.outputs.retry_attempt }}
       retry_workflow: ${{ steps.stack.outputs.retry_workflow }}
       recovery_kind: ${{ steps.stack.outputs.recovery_kind }}
@@ -456,6 +464,7 @@ jobs:
           RUNTIME_ROOT="$RUNNER_TEMP/continuum-pr-agent-runtime"
           BRIDGE_SCRIPT="$RUNTIME_ROOT/.github/scripts/pr_agent_bridge.py"
           POLICY_SCRIPT="$RUNTIME_ROOT/.github/scripts/pr_agent_policy.js"
+          FALLBACK_SCRIPT="$RUNTIME_ROOT/src/continuum/pr_agent_fallback_state.py"
           mkdir -p "$RUNTIME_ROOT/.github/scripts" "$RUNTIME_ROOT/src/continuum"
           gh api --method GET \
             "repos/kodmial/continuum/contents/.github/scripts/pr_agent_bridge.py" \
@@ -469,12 +478,17 @@ jobs:
             "repos/kodmial/continuum/contents/.github/scripts/pr_agent_policy.js" \
             -f ref="$CONTINUUM_REF" --jq .content \
             | tr -d '\n' | base64 --decode > "$POLICY_SCRIPT"
+          gh api --method GET \
+            "repos/kodmial/continuum/contents/src/continuum/pr_agent_fallback_state.py" \
+            -f ref="$CONTINUUM_REF" --jq .content \
+            | tr -d '\n' | base64 --decode > "$FALLBACK_SCRIPT"
           : > "$RUNTIME_ROOT/src/continuum/__init__.py"
           PYTHONPATH="$RUNTIME_ROOT/src" python3 -m py_compile \
-            "$BRIDGE_SCRIPT" "$RUNTIME_ROOT/src/continuum/pr_agent.py"
+            "$BRIDGE_SCRIPT" "$RUNTIME_ROOT/src/continuum/pr_agent.py" "$FALLBACK_SCRIPT"
           node --check "$POLICY_SCRIPT"
           echo "bridge_script=$BRIDGE_SCRIPT" >> "$GITHUB_OUTPUT"
           echo "policy_script=$POLICY_SCRIPT" >> "$GITHUB_OUTPUT"
+          echo "fallback_pythonpath=$RUNTIME_ROOT/src" >> "$GITHUB_OUTPUT"
 
       - name: Start the OpenAI-compatibility bridge on loopback
         id: start_bridge
@@ -760,21 +774,22 @@ jobs:
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           REVIEWED_SHA: ${{ steps.result.outputs.head_sha }}
           REVIEW_JSON: ${{ steps.pragent.outputs.review }}
+          FALLBACK_PYTHONPATH: ${{ steps.runtime.outputs.fallback_pythonpath }}
         run: |
           set -euo pipefail
           COMMENTS_JSON="$RUNNER_TEMP/pr-agent-comments.json"
           gh api --paginate --slurp \
             "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100" \
             > "$COMMENTS_JSON"
-          python3 - "$COMMENTS_JSON" <<'PY'
+          PYTHONPATH="$FALLBACK_PYTHONPATH" python3 - "$COMMENTS_JSON" <<'PY'
           import json
           import os
           import sys
-          from pr_agent.algo.review_finding_state import (
-              normalize_finding,
-              parse_review_state,
-              reconcile_review_findings,
+          from continuum.pr_agent_fallback_state import (
+              FallbackStateError,
+              derive_fallback_state,
           )
+          from pr_agent.algo.review_finding_state import parse_review_state
 
           path = sys.argv[1]
           reviewed = os.environ["REVIEWED_SHA"].strip().lower()
@@ -793,66 +808,18 @@ jobs:
               if "<!-- pr-agent-review-state:" in str(c.get("body") or "")
           ]
           if not candidates:
-              # Native upstream persistent state is absent. At this point the
-              # structured review has already passed exact-HEAD/schema
-              # validation in the previous step, so derive a
-              # schema-compatible fallback via the upstream v0.46.0
-              # finding-state contract instead of blocking repair: an empty
-              # state for a clean review, or an ACTIVE finding state
-              # preserving every actionable key finding. A finding that
-              # cannot be represented safely/losslessly fails closed rather
-              # than inventing data, and nothing is ever marked RESOLVED
-              # here. Native state remains authoritative whenever present
-              # (else branch below).
               try:
                   review = json.loads(os.environ.get("REVIEW_JSON", ""))
               except json.JSONDecodeError as exc:
                   raise SystemExit(f"Cannot validate review without persistent state: {exc}")
-              inner = review.get("review", review) if isinstance(review, dict) else None
-              findings = inner.get("key_issues_to_review") if isinstance(inner, dict) else None
-              if not isinstance(findings, list):
-                  raise SystemExit(
-                      "Structured review has no key_issues_to_review list; cannot derive fallback state."
-                  )
-              for entry in findings:
-                  if not isinstance(entry, dict):
-                      raise SystemExit(
-                          "Structured review contains a non-object finding; cannot derive fallback state."
-                      )
-              if not findings:
-                  state = {
-                      "schema_version": 1,
-                      "findings": [],
-                      "last_run": {
-                          "complete": True,
-                          "kind": "full",
-                          "head_sha": reviewed,
-                          "run_id": f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/commit/{reviewed}",
-                      },
-                  }
-              else:
-                  unrepresentable = [
-                      index for index, entry in enumerate(findings)
-                      if normalize_finding(entry) is None
-                  ]
-                  if unrepresentable:
-                      raise SystemExit(
-                          f"Upstream review finding(s) {unrepresentable} cannot be "
-                          "represented as persistent finding state; failing closed "
-                          "rather than inventing data."
-                      )
-                  reconciled = reconcile_review_findings(
-                      None,
-                      findings,
-                      allow_resolution=True,
-                      head_sha=reviewed,
+              try:
+                  state = derive_fallback_state(
+                      review,
+                      reviewed,
                       run_id=f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/commit/{reviewed}",
                   )
-                  state = reconciled.state
-                  if not state.get("findings"):
-                      raise SystemExit(
-                          "Derived fallback finding state is empty despite actionable findings."
-                      )
+              except FallbackStateError as exc:
+                  raise SystemExit(f"Cannot derive fallback persistent state: {exc}")
           else:
               latest = max(candidates, key=lambda c: str(c.get("updated_at") or c.get("created_at") or ""))
               parsed = parse_review_state(str(latest.get("body") or ""))
@@ -896,25 +863,25 @@ jobs:
           script: |
             const policy = require(process.env.POLICY_SCRIPT);
             const review = JSON.parse(String(process.env.REVIEW_JSON || ''));
-            const inner = review.review || review;
-            const keyIssues = Array.isArray(inner.key_issues_to_review)
-              ? inner.key_issues_to_review
-              : [];
-            const suggestions = policy.qualifyingImproveSuggestions(
+            const disposition = policy.reviewDisposition(
+              review,
               String(process.env.IMPROVE_JSONL || '')
             );
-            const needsRepair = keyIssues.length > 0 || suggestions.length > 0;
+            const needsRepair = disposition.action === 'repair';
+            const readyToMerge = disposition.action === 'merge';
+            const needsRereview = disposition.action === 'rereview';
             core.setOutput('needs_repair', needsRepair ? 'true' : 'false');
-            core.setOutput('review_findings', String(keyIssues.length));
-            core.setOutput('improve_suggestions', String(suggestions.length));
+            core.setOutput('ready_to_merge', readyToMerge ? 'true' : 'false');
+            core.setOutput('needs_rereview', needsRereview ? 'true' : 'false');
+            core.setOutput('review_disposition', disposition.action);
+            core.setOutput('review_findings', String(disposition.reviewCount));
+            core.setOutput('improve_suggestions', String(disposition.qualifyingSuggestionCount));
             core.notice(
-              needsRepair
-                ? `Routing ${keyIssues.length} review finding(s) and ${suggestions.length} improve suggestion(s) to PR-Agent repair.`
-                : 'No current actionable review/improve items; routing this exact HEAD to the PR-Agent merge gate.'
+              'PR-Agent disposition=' + disposition.action + ': ' + disposition.reason
             );
 
       - name: Clear settled PR-Agent controller state
-        if: steps.route.outcome == 'success' && steps.route.outputs.needs_repair == 'false'
+        if: steps.route.outcome == 'success' && steps.route.outputs.ready_to_merge == 'true'
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
@@ -946,20 +913,27 @@ jobs:
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           HEAD_SHA: ${{ steps.result.outputs.head_sha }}
-          NEEDS_REPAIR: ${{ steps.route.outputs.needs_repair }}
+          REVIEW_DISPOSITION: ${{ steps.route.outputs.review_disposition }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
-            const actionable = process.env.NEEDS_REPAIR === 'true';
+            const disposition = String(process.env.REVIEW_DISPOSITION || '').trim();
+            const descriptions = {
+              repair: 'PR-Agent review complete: actionable',
+              merge: 'PR-Agent review complete: clean',
+              rereview: 'PR-Agent review complete: blocking; recovery eligible',
+            };
+            if (!descriptions[disposition]) {
+              core.setFailed('Unknown PR-Agent review disposition: ' + (disposition || '<empty>'));
+              return;
+            }
             await github.rest.repos.createCommitStatus({
               owner: context.repo.owner,
               repo: context.repo.repo,
               sha: process.env.HEAD_SHA,
               state: 'success',
               context: 'continuum/pr-agent-review',
-              description: actionable
-                ? 'PR-Agent review complete: actionable'
-                : 'PR-Agent review complete: clean',
+              description: descriptions[disposition],
               target_url:
                 context.serverUrl + '/' + context.repo.owner + '/' +
                 context.repo.repo + '/actions/runs/' + context.runId,
@@ -1209,7 +1183,7 @@ jobs:
     needs: pr_agent
     if: >-
       needs.pr_agent.outputs.admitted == 'true' &&
-      needs.pr_agent.outputs.needs_repair == 'false'
+      needs.pr_agent.outputs.ready_to_merge == 'true'
     uses: ./.github/workflows/continuum-pr-agent-auto-merge.yml
     secrets: inherit
     with:

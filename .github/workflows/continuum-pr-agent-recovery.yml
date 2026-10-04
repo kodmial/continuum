@@ -841,12 +841,21 @@ jobs:
               let operationRun = reviewRun;
 
               if (reviewStatus?.state === 'success') {
-                if (/actionable/i.test(String(reviewStatus.description || ''))) {
+                const reviewDescription = String(reviewStatus.description || '');
+                if (/actionable/i.test(reviewDescription)) {
                   kind = 'repair';
                   operationStatus = latestContext(statuses, REPAIR_CONTEXT);
                   operationRun = operationStatus
                     ? await statusRunMetadata(operationStatus)
                     : { conclusion: null, recoveryKind: null };
+                } else if (/blocking; recovery eligible/i.test(reviewDescription)) {
+                  kind = 'review';
+                  operationStatus = {
+                    ...reviewStatus,
+                    state: 'failure',
+                    description: 'PR-Agent blocking review: recovery eligible',
+                  };
+                  operationRun = reviewRun;
                 } else {
                   core.info(
                     'PR #' + pr.number + ' HEAD ' + head +
