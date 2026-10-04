@@ -1908,13 +1908,27 @@ class ContinuumTest < Minitest::Test
                     'router must coalesce duplicate exact-HEAD dispatches'
     assert_includes router, 'coalesced a duplicate dispatch',
                     'router must log coalesced duplicates instead of dispatching'
-    # The router never enters the heavy scheduling path.
-    assert_includes router, 'pr-agent-router-',
-                    'router must use its own concurrency group, not the heavy one'
+    # The router never holds a per-PR lock: the actionable filter and the
+    # operation-key coalescing run inside the route step, so a plain
+    # non-/review comment run can never queue ahead of a useful dispatch.
+    # Only the heavy operation layer serializes per PR.
+    refute_includes router, 'concurrency:',
+                    'router must not hold a per-PR lock that queues no-op runs'
+    refute_includes router, 'cancel-in-progress',
+                    'router must not serialize via native concurrency'
     refute_includes router, 'group: pr-agent-${',
                     'router must not share the heavy concurrency group'
     refute_includes router, 'group: pr-agent-caller-',
                     'router must not share the heavy caller concurrency group'
+    refute_includes router, 'group: pr-agent-router-',
+                    'router must not hold its own per-PR lock either'
+    %w[.github/caller-stubs/continuum-pr-agent-router.yml .github/workflows/pr-agent-router.yml].each do |path|
+      body = File.read(File.join(ROOT, path))
+      refute_includes body, 'concurrency:',
+                      "#{path}: router entry/stub must not queue no-op runs ahead of useful dispatches"
+      refute_includes body, 'cancel-in-progress',
+                      "#{path}: router entry/stub must not serialize via native concurrency"
+    end
   end
 
   def test_pr_agent_router_wiring_for_entries_and_consumers
