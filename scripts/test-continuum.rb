@@ -1831,6 +1831,107 @@ class ContinuumTest < Minitest::Test
                     'commit-status publishing must stay PAT-backed'
   end
 
+  # Work-Lock #58 item 5 (conservative subset, kodmial/continuum#236): only
+  # the two verified-safe pure same-repository read-only PR-Agent repair
+  # paths leave the shared TAP_PAT budget. Mixed read/write/dispatch/push
+  # and cross-repository paths stay PAT-backed.
+  def test_pr_agent_repair_verified_safe_reads_use_repository_token
+    body = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent-repair.yml'))
+    workflow = yaml(File.join(ROOT, '.github/workflows/continuum-pr-agent-repair.yml'))
+    stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-pr-agent-repair.yml'))
+
+    # Existing job/caller issues and pull-requests permissions already
+    # provide read capability; the migration must not widen permissions.
+    assert_equal 'write', workflow.fetch('jobs').fetch('repair').fetch('permissions').fetch('issues')
+    assert_equal 'write', workflow.fetch('jobs').fetch('repair').fetch('permissions').fetch('pull-requests')
+    assert_equal 'write', stub.fetch('permissions').fetch('issues')
+    assert_equal 'write', stub.fetch('permissions').fetch('pull-requests')
+
+    convergence = step_body(body, 'Check durable PR-Agent no-progress state')
+    target = step_body(body, 'Resolve the writable PR source branch')
+    refute_nil convergence, 'the no-progress read step is missing'
+    refute_nil target, 'the writable-branch resolution read step is missing'
+
+    # 1. No-progress check: pure issues.listComments read plus
+    # workflow-owned marker parsing under github.token.
+    assert_includes convergence, 'github-token: ${{ github.token }}'
+    refute_includes convergence, 'secrets.TAP_PAT',
+                      'the no-progress read must leave the shared TAP_PAT budget'
+    assert_includes convergence, 'github.rest.issues.listComments'
+    assert_includes convergence, 'continuum-pr-agent-no-progress head='
+    assert_includes convergence, 'continuum-pr-agent-convergence from='
+    assert_includes convergence, 'failClosed'
+    refute_includes convergence, 'createComment'
+    refute_includes convergence, 'updateComment'
+    refute_includes convergence, 'deleteComment'
+    refute_includes convergence, 'createCommitStatus'
+    refute_includes convergence, 'gh api'
+    refute_includes convergence, 'gh pr view'
+    refute_includes convergence, 'gh workflow run'
+    refute_includes convergence, 'git push'
+
+    # 2. Writable-branch resolution: GET the current pull only, under
+    # github.token. Every GitHub operation in the step is read-only.
+    assert_includes target, 'GH_TOKEN: ${{ github.token }}'
+    refute_includes target, 'secrets.TAP_PAT',
+                      'the target-resolution read must leave the shared TAP_PAT budget'
+    assert_includes target, 'repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER'
+    assert_includes target, "CURRENT_SHA=\"$(jq -r '.head.sha'"
+    assert_includes target, 'PR_STATE="$(jq -r'
+    assert_includes target, 'PR_DRAFT="$(jq -r'
+    assert_includes target, '"$CURRENT_SHA" != "$HEAD_SHA"'
+    assert_includes target, '"$HEAD_REPO" != "$GITHUB_REPOSITORY"'
+    refute_includes target, 'gh pr view'
+    refute_includes target, 'gh workflow run'
+    refute_includes target, 'git push'
+    refute_includes target, '--method POST'
+    refute_includes target, '--method PATCH'
+    refute_includes target, '--method DELETE'
+
+    # Excluded mixed/write/dispatch/push/cross-repo paths stay PAT-backed.
+    policy = step_body(body, 'Resolve PR-Agent signal policy')
+    repair_pass = step_body(body, 'Run one bounded OpenCode repair pass over every current item')
+    checkout = step_body(body, 'Checkout the writable PR source branch')
+    persist = step_body(body, 'Persist PR-Agent no-progress controller state')
+    retry_state = step_body(body, 'Update persistent PR-Agent repair retry controller state')
+    retry_step = step_body(body, 'Schedule bounded retry for retryable PR-Agent repair failure')
+    in_flight = step_body(body, 'Mark PR-Agent repair in flight')
+    publish = step_body(body, 'Publish durable PR-Agent repair state')
+    failed = step_body(body, 'Publish failed PR-Agent repair state')
+    [policy, repair_pass, checkout, persist, retry_state, retry_step, in_flight, publish, failed].each do |step|
+      refute_nil step, 'an excluded PAT-backed repair step is missing'
+    end
+    assert_includes policy, 'GH_TOKEN: ${{ secrets.TAP_PAT }}',
+                    'signal-policy reads kodmial/continuum explicitly and may be cross-repo; it must stay PAT-backed'
+    assert_includes policy, 'repos/kodmial/continuum/contents'
+    assert_includes repair_pass, 'GH_TOKEN: ${{ secrets.TAP_PAT }}',
+                    'the repair pass mixes revalidation, comment writes, commit, and push; it must stay wholly PAT-backed'
+    refute_includes repair_pass, 'github.token',
+                      'the repair pass must not be partially migrated to github.token'
+    assert_includes checkout, 'token: ${{ secrets.TAP_PAT }}',
+                    'repair checkout must stay PAT-backed so it can push'
+    assert_includes persist, 'github-token: ${{ secrets.TAP_PAT }}',
+                    'no-progress persistence mixes comment read/update/create/delete; it must stay PAT-backed'
+    assert_includes retry_state, 'github-token: ${{ secrets.TAP_PAT }}',
+                    'retry controller state mixes comment read/write; it must stay PAT-backed'
+    assert_includes retry_step, 'GH_TOKEN: ${{ secrets.TAP_PAT }}',
+                    'the repair retry step mixes reads with workflow_dispatch; it must stay wholly PAT-backed'
+    assert_includes retry_step, 'gh workflow run'
+    refute_includes retry_step, 'github.token',
+                      'the repair retry step must not be partially migrated to github.token'
+    refute_includes target, 'gh workflow run',
+                      'the target-resolution read must stay read-only'
+    assert_includes in_flight, 'github-token: ${{ secrets.TAP_PAT }}',
+                    'commit-status publishing must stay PAT-backed'
+    assert_includes publish, 'github-token: ${{ secrets.TAP_PAT }}',
+                    'commit-status publishing must stay PAT-backed'
+    assert_includes failed, 'github-token: ${{ secrets.TAP_PAT }}',
+                    'commit-status publishing must stay PAT-backed'
+
+    # No global TAP_PAT replacement: the mixed/write paths still draw on it.
+    assert_includes body, 'secrets.TAP_PAT'
+  end
+
   # kodmial/continuum#239: the dogfood PR-Agent caller is a direct caller
   # of the reusable PR-Agent workflow, just like the installed caller stub.
   # An explicitly-scoped caller leaves unspecified permissions as none, and a
@@ -4891,6 +4992,118 @@ class ContinuumTest < Minitest::Test
     assert_includes opencode, 'isTrustedDispatchComment'
     assert_includes opencode, '--untracked-files=no'
     assert_includes cli, '--author-association'
+  end
+
+  # kodmial/continuum#248: an `issue_comment` on a PR must start the
+  # interactive agent only for an explicit owner command at the start of the
+  # comment on a still-open PR. Substring matching let agent-generated
+  # verification prose (which mentions /oc later) chain one run per minute on
+  # a closed PR. The job gate and the `Run OpenCode` step gate must both pin
+  # the open-PR + owner + startsWith + cancel-exclusion rule, while the
+  # plain-issue, qualification, workflow_dispatch, and review-comment paths
+  # keep their existing behavior.
+  def test_opencode_pr_interactive_path_requires_explicit_open_command
+    body = File.read(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
+
+    job = body[/  opencode:\n(?:.*\n)*?    if: >-\n((?:      .*\n)+)/, 1]
+    refute_nil job, 'the opencode job gate is missing'
+
+    # The PR issue_comment route: open PR, owner, command at the start,
+    # cancel excluded. startsWith (not contains) is what stops later-prose
+    # mentions from self-triggering.
+    assert_includes job, 'github.event.issue.pull_request',
+                    'the job gate must distinguish PR comments from plain issues'
+    assert_includes job, "github.event.issue.state == 'open'",
+                    'the job gate must require a still-open PR'
+    assert_includes job, 'github.actor == github.repository_owner',
+                    'the job gate must require the repository owner'
+    assert_includes job, "startsWith(github.event.comment.body, '/oc')",
+                    'the PR route must use startsWith, not contains'
+    assert_includes job, "startsWith(github.event.comment.body, '/opencode')",
+                    'the PR route must accept /opencode at the start'
+    assert_includes job, "!contains(github.event.comment.body, '/oc-cancel')",
+                    'the PR route must keep the /oc-cancel exclusion'
+
+    # The plain-issue route keeps substring matching so scheduler dispatch
+    # comments (which open with /oc plus a marker) keep working.
+    assert_includes job, '!github.event.issue.pull_request',
+                    'the job gate must keep a distinct plain-issue route'
+    assert_includes job, "contains(github.event.comment.body, '/oc')",
+                    'the plain-issue route must keep contains matching'
+
+    # The review-comment route is deliberately unchanged.
+    assert_includes job, "github.event_name == 'pull_request_review_comment'",
+                    'the job gate must keep the review-comment route'
+
+    # workflow_dispatch repair/qualification modes are untouched.
+    assert_includes job, "contains(fromJSON('[\"coderabbit-fix\",\"resolve-conflict\",\"ci-fix\",\"issue\",\"qualification\"]'), inputs.mode)"
+
+    run_step = step_body(body, 'Run OpenCode')
+    refute_nil run_step, 'the `Run OpenCode` step is missing'
+    assert_includes run_step, "github.event.issue.state == 'open'",
+                    'Run OpenCode must require a still-open PR'
+    assert_includes run_step, 'github.actor == github.repository_owner',
+                    'Run OpenCode must require the repository owner on PR comments'
+    assert_includes run_step, "startsWith(github.event.comment.body, '/oc')",
+                    'Run OpenCode must use startsWith on PR comments'
+    assert_includes run_step, "startsWith(github.event.comment.body, '/opencode')",
+                    'Run OpenCode must accept /opencode at the start'
+    assert_includes run_step, "!contains(github.event.comment.body, '/oc-cancel')",
+                    'Run OpenCode must keep the /oc-cancel exclusion'
+    assert_includes run_step, "steps.duplicate_guard.outputs.skip != 'true'",
+                    'Run OpenCode must keep the duplicate guard'
+    # The review-comment branch of the step keeps its existing shape.
+    assert_includes run_step, "github.event_name == 'pull_request_review_comment'",
+                    'Run OpenCode must keep the review-comment branch'
+  end
+
+  # The closed-PR and later-prose cases must not match the PR route: the
+  # gate text is re-evaluated here as a boolean over the issue state and the
+  # comment body, so a weakened expression (contains instead of startsWith,
+  # or a dropped open check) fails here rather than in production.
+  def test_opencode_pr_gate_logic_rejects_loops_and_accepts_commands
+    evaluate = lambda do |issue_state, actor_is_owner, comment_body|
+      opens = issue_state == 'open'
+      owner = actor_is_owner
+      starts = comment_body.start_with?('/oc') || comment_body.start_with?('/opencode')
+      cancelled = comment_body.include?('/oc-cancel')
+      opens && owner && starts && !cancelled
+    end
+
+    # Closed PR + arbitrary comment -> no run.
+    refute evaluate.call('closed', true, '/oc please continue'),
+           'a closed PR must never start the interactive agent'
+    refute evaluate.call('closed', true, 'any bot prose'),
+           'a closed PR must never start the interactive agent'
+    # Open PR + generated prose mentioning /oc later -> no run.
+    refute evaluate.call('open', true,
+                         'OpenCode run 37176701843 completed; the /oc token was mentioned while explaining why.'),
+           'later-prose mentions must never start the interactive agent'
+    refute evaluate.call('open', true, 'Please run /oc for me'),
+           'later-prose mentions must never start the interactive agent'
+    # Open PR + owner /oc at the start -> exactly one run.
+    assert evaluate.call('open', true, '/oc'),
+           'a bare owner /oc must start the interactive agent'
+    assert evaluate.call('open', true, "/oc\n\nplease fix the flake"),
+           'an owner /oc command must start the interactive agent'
+    assert evaluate.call('open', true, '/opencode fix the flake'),
+           'an owner /opencode command must start the interactive agent'
+    # Open PR + owner /oc-cancel -> no run.
+    refute evaluate.call('open', true, '/oc-cancel'),
+           '/oc-cancel must never start the interactive agent'
+    # Non-owner commands never run.
+    refute evaluate.call('open', false, '/oc'),
+           'a non-owner command must never start the interactive agent'
+
+    # The evaluated rule above must be the rule the workflow actually
+    # expresses: every operator it depends on has to be present in the gate.
+    body = File.read(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
+    run_step = step_body(body, 'Run OpenCode')
+    refute_nil run_step
+    %w[state\ ==\ 'open' repository_owner startsWith !contains].each do |token|
+      assert_includes run_step, token.gsub('\\ ', ' '),
+                      "Run OpenCode gate lost its #{token.inspect} term"
+    end
   end
 
   end

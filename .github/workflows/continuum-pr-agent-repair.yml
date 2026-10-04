@@ -221,7 +221,10 @@ jobs:
           FINDING_IDS: ${{ steps.batch.outputs.finding_ids }}
           IDENTIFIED_BATCH: ${{ steps.batch.outputs.identified_batch }}
         with:
-          github-token: ${{ secrets.TAP_PAT }}
+          # Pure same-repository read-only no-progress check
+          # (issues.listComments plus marker parsing only). Repository token
+          # is sufficient; PAT actor identity must not gate the read.
+          github-token: ${{ github.token }}
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
@@ -358,7 +361,10 @@ jobs:
         if: steps.batch.outputs.empty != 'true' && steps.convergence.outcome == 'success' && steps.convergence.outputs.held != 'true'
         id: target
         env:
-          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          # Pure same-repository read-only PR resolution (GET the current
+          # pull only). Repository token is sufficient; every GitHub
+          # operation in this step is read-only.
+          GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ inputs.pr_number }}
           HEAD_SHA: ${{ inputs.head_sha }}
         run: |
