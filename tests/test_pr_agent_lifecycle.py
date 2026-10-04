@@ -373,8 +373,11 @@ class ProtectedBaselineTests(unittest.TestCase):
         # The validation workflow checks out with fetch-depth 1, so the
         # baseline objects may be absent ("fatal: bad object"). Fetch each
         # on demand; when history is unavailable (shallow checkout without
-        # network), skip instead of erroring so a depth-1 checkout never
-        # fails for missing history it was never given.
+        # network), fail instead of skipping so a transient fetch failure
+        # or an offline depth-1 checkout can never pass without verifying
+        # committed drift. The worktree probe contract is verified
+        # independently below (and again inside the loop), so neither check
+        # can pass silently when history is missing.
         def _ensure_object(sha):
             present = subprocess.run(
                 ["git", "cat-file", "-e", sha],
@@ -405,8 +408,9 @@ class ProtectedBaselineTests(unittest.TestCase):
 
         for _sha in (BASELINE_SHA, PREVIOUS_BASELINE_SHA, OLDEST_BASELINE_SHA):
             if not _ensure_object(_sha):
-                self.skipTest(
-                    "baseline history {} unavailable in shallow checkout".format(_sha))
+                self.fail(
+                    "baseline history {} unavailable in shallow checkout: "
+                    "refusing to pass without verifying committed drift".format(_sha))
 
         def _assert_git_ok(completed, msg=None):
             if completed.returncode != 0 and (
@@ -414,8 +418,9 @@ class ProtectedBaselineTests(unittest.TestCase):
                 or "unknown revision" in (completed.stderr or "")
                 or "bad revision" in (completed.stderr or "")
             ):
-                self.skipTest(
-                    "baseline history unavailable in shallow checkout: {}".format(
+                self.fail(
+                    "baseline history unavailable in shallow checkout: {}: "
+                    "refusing to pass without verifying committed drift".format(
                         (completed.stderr or "").strip().splitlines()[:1]))
             self.assertEqual(completed.returncode, 0, msg or completed.stderr)
         for path in PROTECTED_FILES:
@@ -816,6 +821,66 @@ class ProtectedBaselineTests(unittest.TestCase):
                     "",
                     f"{path} differs from baseline {BASELINE_SHA}",
                 )
+
+    def test_worktree_probe_contract_without_baseline(self):
+        # Fail-closed backstop for shallow/offline checkouts: the worktree
+        # probe contract needs no git history, so it always runs even when
+        # the baseline objects above are unavailable. A transient fetch
+        # failure must never pass without verifying this contract.
+        for path in PROTECTED_FILES:
+            with self.subTest(path=path):
+                body = read_repo(path)
+                if path != ".github/workflows/continuum-opencode.yml":
+                    continue
+                self.assertIn("command -v opencode", body)
+                self.assertIn("CONTINUUM_IMAGE_DIGEST", body)
+                self.assertIn("prepared-runtime hit", body)
+                self.assertIn("vars.CONTINUUM_IMAGE_DIGEST", body)
+                gated = [
+                    line
+                    for line in body.splitlines()
+                    if "CONTINUUM_IMAGE_DIGEST" in line
+                    and "command -v opencode" in line
+                    and line.strip()
+                    and not line.strip().startswith("#")
+                ]
+                self.assertEqual(
+                    len(gated),
+                    2,
+                    "both opencode install sites must carry the digest-gated "
+                    f"warm hit, found {len(gated)}",
+                )
+                ungated = [
+                    line
+                    for line in body.splitlines()
+                    if "command -v opencode" in line
+                    and "CONTINUUM_IMAGE_DIGEST" not in line
+                    and line.strip()
+                    and not line.strip().startswith("#")
+                ]
+                self.assertEqual(
+                    ungated,
+                    [],
+                    "no ungated warm hit may remain: every "
+                    f"`command -v opencode` probe must be digest-gated: {ungated}",
+                )
+                body_lines = body.splitlines()
+                probe_nos = [
+                    i
+                    for i, line in enumerate(body_lines)
+                    if "CONTINUUM_IMAGE_DIGEST" in line and "command -v opencode" in line
+                    and line.strip() and not line.strip().startswith("#")
+                ]
+                installer_nos = [
+                    i
+                    for i, line in enumerate(body_lines)
+                    if "https://opencode.ai/install" in line
+                ]
+                self.assertEqual(len(probe_nos), 2)
+                self.assertEqual(len(installer_nos), 2)
+                self.assertLess(probe_nos[0], installer_nos[0])
+                self.assertLess(probe_nos[1], installer_nos[1])
+                self.assertLess(installer_nos[0], probe_nos[1])
 
     def test_no_coderabbit_protected_file_is_modified_in_worktree(self):
         out = subprocess.run(

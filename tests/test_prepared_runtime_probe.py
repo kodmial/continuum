@@ -63,32 +63,92 @@ def code_without_comment(line):
     return line
 
 
+def _shell_segments(code):
+    """Split one shell line into `;`/`&&`/`||`/`|` segments outside quotes.
+
+    A single `run:` line can both echo and execute the installer
+    (e.g. `echo downloading; curl https://opencode.ai/install | sh`):
+    the whole line must not be skipped just because one segment echoes.
+    Splitting respects single/double quotes so `echo "a; b"` stays whole.
+    """
+    segments = []
+    current: list = []
+    in_single = False
+    in_double = False
+    index = 0
+    while index < len(code):
+        char = code[index]
+        if char == "'" and not in_double:
+            in_single = not in_single
+            current.append(char)
+        elif char == '"' and not in_single:
+            in_double = not in_double
+            current.append(char)
+        elif not in_single and not in_double:
+            two = code[index:index + 2]
+            if char == ";":
+                segments.append("".join(current))
+                current = []
+            elif two in ("&&", "||"):
+                segments.append("".join(current))
+                current = []
+                index += 1
+            elif char == "|":
+                segments.append("".join(current))
+                current = []
+            else:
+                current.append(char)
+        else:
+            current.append(char)
+        index += 1
+    segments.append("".join(current))
+    return segments
+
+
+def _is_echo_segment(segment):
+    # A docs example that merely mentions an installer URL (`echo ...` /
+    # `printf ...`, optionally via `sudo`) is not an executable site. Only
+    # the echo segment itself is ignored; other segments on the same line
+    # are still checked so `echo downloading; curl <installer> | sh`
+    # counts as a site.
+    return re.match(r"^\s*(sudo\s+)?(echo|printf)\b", segment) is not None
+
+
+def _segment_is_installer(segment):
+    if "https://opencode.ai/install" in segment:
+        return True
+    elif "pip install" in segment and ("pr-agent" in segment or "opencode" in segment):
+        return True
+    elif ("npm install" in segment or "npm i " in segment or "npm ci" in segment) and "opencode" in segment:
+        return True
+    elif "brew install" in segment and "opencode" in segment:
+        return True
+    elif ("curl" in segment or "wget" in segment) and (
+        "releases/download" in segment
+        or ("github.com" in segment and "releases" in segment)
+        or ("opencode" in segment and (".tar.gz" in segment or ".zip" in segment or "download" in segment))
+    ):
+        return True
+    elif "gh release download" in segment and "opencode" in segment:
+        return True
+    elif "releases/download" in segment and "opencode" in segment:
+        return True
+    return False
+
+
 def installer_indices(lines):
     found = []
     for i, line in enumerate(lines):
         code = code_without_comment(line)
-        # An `echo`/`printf` docs example that merely mentions an installer
-        # URL is not an executable installer site: real sites run the
-        # installer, they never echo it.
-        if re.search(r"\b(echo|printf)\b", code):
+        # Check each shell segment separately: an `echo`/`printf` docs
+        # example that merely mentions an installer URL is not an
+        # executable installer site, but a line that echoes and then runs
+        # the installer is. Real sites run the installer in at least one
+        # non-echo segment; they never only echo it.
+        executable = [seg for seg in _shell_segments(code) if not _is_echo_segment(seg)]
+        if not executable:
             continue
-        if "https://opencode.ai/install" in code:
-            found.append(i)
-        elif "pip install" in code and ("pr-agent" in code or "opencode" in code):
-            found.append(i)
-        elif ("npm install" in code or "npm i " in code or "npm ci" in code) and "opencode" in code:
-            found.append(i)
-        elif "brew install" in code and "opencode" in code:
-            found.append(i)
-        elif ("curl" in code or "wget" in code) and (
-            "releases/download" in code
-            or ("github.com" in code and "releases" in code)
-            or ("opencode" in code and (".tar.gz" in code or ".zip" in code or "download" in code))
-        ):
-            found.append(i)
-        elif "gh release download" in code and "opencode" in code:
-            found.append(i)
-        elif "releases/download" in code and "opencode" in code:
+        if any(_segment_is_installer(seg) for seg in executable):
             found.append(i)
     return found
 

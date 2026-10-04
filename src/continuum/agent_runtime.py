@@ -835,13 +835,19 @@ class ImageStore:
     single-profile caller into serving another platform's image.
     """
 
-    def __init__(self, project_id: str) -> None:
+    def __init__(self, project_id: str, probe_executor: Any = None) -> None:
         if not project_id or not isinstance(project_id, str):
             raise AgentRuntimeError("project_id must be a non-empty string")
         self.project_id = project_id
         self._generations: Dict[str, ImageGeneration] = {}
         self._active_by_profile: Dict[str, str] = {}
         self._history: List[Tuple[str, float, str]] = []
+        # Injected probe runner for trusted build infrastructure. When set,
+        # image builds execute manifest probes through it instead of the
+        # real subprocess executor, so hosts without the runtime binaries
+        # on PATH (or deterministic tests) can supply build-infra evidence
+        # without failing provisioning before any compute is created.
+        self._probe_executor = probe_executor
 
     @property
     def active_digest(self) -> Optional[str]:
@@ -869,12 +875,18 @@ class ImageStore:
         manifest: AgentManifest,
         profile: RuntimeProfile,
         now: Optional[float] = None,
+        executor: Any = None,
     ) -> ImageGeneration:
         """Verify the prepared image exists; build and validate it if absent.
 
         Building happens in trusted infrastructure; the result is validated
         before it is stored. Rebuilds occur only when the desired digest
-        changes or policy requires a base/security refresh.
+        changes or policy requires a base/security refresh. ``executor``
+        overrides the probe runner for this build (falling back to the
+        store-level ``probe_executor`` and finally the real subprocess
+        executor), so controllers on hosts without the runtime binaries on
+        PATH can inject build-infra evidence instead of failing
+        provisioning before any compute is created.
         """
 
         digest = image_digest(manifest, profile)
@@ -895,8 +907,11 @@ class ImageStore:
         # the version strings alone. A base image missing binaries cannot
         # produce this record (the helper executes each probe and rejects
         # non-executable probes, failed runs, and output that does not
-        # report the pinned versions).
-        executed_probes = execute_manifest_probes(manifest)
+        # report the pinned versions). The executor override (per-call,
+        # then store-level, then the real subprocess runner) is the
+        # injection path for hosts without the binaries on PATH.
+        probe_runner = executor if executor is not None else self._probe_executor
+        executed_probes = execute_manifest_probes(manifest, executor=probe_runner)
         generation = ImageGeneration(
             digest=digest,
             manifest=manifest,
@@ -1426,6 +1441,432 @@ class FakeProvider:
         }
 
 
+#: Generic compute-provider contract behind ``EphemeralController``.
+#:
+#: Any object implementing ``create_network`` / ``create_instance`` /
+#: ``jit_register`` / ``jit_deregister`` / ``destroy`` / ``live_instances``
+#: / ``provider_tags`` plus the ``instances`` / ``networks`` /
+#: ``persistent_egress_objects`` collections can back a controller.
+#: ``FakeProvider`` is the deterministic in-memory member; the concrete
+#: providers below implement the same contract against real infrastructure
+#: using only the standard library (urllib/subprocess) so consumer projects
+#: have a path to real compute, GitHub JIT registration, and per-job
+#: networks without extra dependencies.
+RunnerProvider = Any
+
+
+def _provider_github_token(explicit: Optional[str] = None) -> Optional[str]:
+    """Return the GitHub credential for real JIT calls (never a paid key).
+
+    Reads only the ``TAP_PAT`` repository secret (falling back to the
+    ephemeral ``GITHUB_TOKEN``). Paid provider keys are never consulted:
+    see ``FORBIDDEN_PROVIDER_KEYS``.
+    """
+
+    if explicit:
+        return explicit
+    for name in ("TAP_PAT", "GITHUB_TOKEN"):
+        try:
+            value = os.environ.get(name, "")
+        except Exception:
+            value = ""
+        if value and str(value).strip():
+            return str(value).strip()
+    return None
+
+
+def _github_api_post_json(url: str, token: str, payload: Mapping[str, Any]) -> Dict[str, Any]:
+    """POST a JSON payload to the GitHub REST API (stdlib only)."""
+
+    import urllib.request
+    import urllib.error
+
+    body = json.dumps(dict(payload)).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": "Bearer {}".format(token),
+            "Content-Type": "application/json",
+            "User-Agent": "continuum-ephemeral-controller",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            raw = response.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", "replace")[:500]
+        except Exception:
+            detail = ""
+        raise AgentRuntimeError(
+            "GitHub JIT registration failed with HTTP {}: {}".format(exc.code, detail)
+        )
+    except Exception as exc:
+        raise AgentRuntimeError("GitHub JIT registration could not be reached: {}".format(exc))
+    try:
+        parsed = json.loads(raw or "{}")
+    except ValueError:
+        raise AgentRuntimeError("GitHub JIT registration returned non-JSON output")
+    if not isinstance(parsed, dict):
+        raise AgentRuntimeError("GitHub JIT registration returned an unexpected payload")
+    return parsed
+
+
+def _github_api_delete(url: str, token: str) -> None:
+    """DELETE a GitHub REST resource (stdlib only); missing token fails closed."""
+
+    import urllib.request
+    import urllib.error
+
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": "Bearer {}".format(token),
+            "User-Agent": "continuum-ephemeral-controller",
+        },
+        method="DELETE",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30):
+            return
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return
+        raise AgentRuntimeError("GitHub runner deregistration failed with HTTP {}".format(exc.code))
+    except Exception as exc:
+        raise AgentRuntimeError("GitHub runner deregistration could not be reached: {}".format(exc))
+
+
+class GitHubHostedProvider(FakeProvider):
+    """Real GitHub-backed provider: JIT-register ephemeral runners via GitHub.
+
+    Compute itself is provisioned by GitHub Actions on demand; this provider
+    supplies the real JIT-registration path (``generate-jitconfig``) against
+    the consumer repository using ``TAP_PAT``/``GITHUB_TOKEN``, tracks the
+    per-job network attachment as a non-persistent logical attachment (there
+    is no consumer VPC to create on GitHub-hosted), and deregisters the
+    runner on teardown. Missing credentials fail explicitly instead of
+    passing as a silent no-op.
+    """
+
+    def __init__(self, *, api_base: str = "https://api.github.com", token: Optional[str] = None) -> None:
+        super().__init__()
+        self.api_base = str(api_base or "https://api.github.com").rstrip("/")
+        self._explicit_token = token
+
+    @property
+    def backend(self) -> str:
+        return "github-hosted"
+
+    def jit_register(self, instance: RunnerInstance) -> str:
+        token = _provider_github_token(self._explicit_token)
+        if not token:
+            raise AgentRuntimeError(
+                "github-hosted JIT registration requires TAP_PAT (or GITHUB_TOKEN): "
+                "refusing to record a local-only registration as real"
+            )
+        repository = instance.repository
+        if not repository or "/" not in repository:
+            raise AgentRuntimeError(
+                "github-hosted JIT registration requires repository 'owner/repo', got {!r}".format(repository)
+            )
+        url = "{}/repos/{}/actions/runners/generate-jitconfig".format(self.api_base, repository)
+        payload = {
+            "name": instance.id,
+            "runner_group_id": 1,
+            "labels": ["continuum-ephemeral", "continuum-{}".format(instance.job_id or "job")],
+            "work_folder": "_work",
+        }
+        try:
+            response = _github_api_post_json(url, token, payload)
+        except AgentRuntimeError:
+            raise
+        runner = response.get("runner") if isinstance(response.get("runner"), dict) else {}
+        runner_id = runner.get("id") if isinstance(runner, dict) else None
+        jit_id = "jit-{}-{}".format(instance.id, runner_id) if runner_id else "jit-{}".format(instance.id)
+        encoded = response.get("encoded_jit_config")
+        self.registrations[jit_id] = instance.id
+        instance.jit_registered = True
+        instance.jit_id = jit_id
+        if isinstance(encoded, str) and encoded:
+            instance.public_ip = instance.public_ip
+        return jit_id
+
+    def jit_deregister(self, instance: RunnerInstance) -> None:
+        token = _provider_github_token(self._explicit_token)
+        if instance.jit_id is not None:
+            self.registrations.pop(instance.jit_id, None)
+            instance.jit_registered = False
+            if token and instance.repository and "/" in instance.repository:
+                parts = (instance.jit_id or "").split("-")
+                try:
+                    runner_id = int(parts[-1])
+                except (TypeError, ValueError):
+                    return
+                url = "{}/repos/{}/actions/runners/{}".format(self.api_base, instance.repository, runner_id)
+                try:
+                    _github_api_delete(url, token)
+                except AgentRuntimeError:
+                    pass
+
+
+class CustomProvider(FakeProvider):
+    """Bring-your-own-infrastructure provider behind the generic contract.
+
+    Optional callables receive the same arguments as the corresponding
+    ``FakeProvider`` method and may perform real cloud/VM/container work
+    (create compute, attach a per-job network, JIT-register, destroy).
+    When a hook is omitted the in-memory bookkeeping applies, so consumers
+    can adopt one real operation at a time. Hooks must return the same
+    shapes (a ``NetworkAttachment`` / ``RunnerInstance`` / JIT id / bool);
+    exceptions propagate and the controller requeues demand.
+    """
+
+    def __init__(
+        self,
+        *,
+        create_network_fn: Any = None,
+        create_instance_fn: Any = None,
+        jit_register_fn: Any = None,
+        jit_deregister_fn: Any = None,
+        destroy_fn: Any = None,
+    ) -> None:
+        super().__init__()
+        self._create_network_fn = create_network_fn
+        self._create_instance_fn = create_instance_fn
+        self._jit_register_fn = jit_register_fn
+        self._jit_deregister_fn = jit_deregister_fn
+        self._destroy_fn = destroy_fn
+
+    @property
+    def backend(self) -> str:
+        return "custom"
+
+    def create_network(
+        self,
+        profile_digest: str,
+        job_id: str,
+        now: float,
+        persistent: bool = False,
+    ) -> NetworkAttachment:
+        if self._create_network_fn is None:
+            return super().create_network(
+                profile_digest=profile_digest, job_id=job_id, now=now, persistent=persistent
+            )
+        network = self._create_network_fn(
+            profile_digest=profile_digest, job_id=job_id, now=now, persistent=persistent
+        )
+        if not isinstance(network, NetworkAttachment):
+            raise AgentRuntimeError("custom create_network hook must return a NetworkAttachment")
+        if network.persistent:
+            raise AgentRuntimeError("per-job network attachment must not be persistent")
+        self.networks[network.id] = network
+        return network
+
+    def create_instance(
+        self,
+        *,
+        project_id: str,
+        repository: str,
+        profile_digest: str,
+        digest: str,
+        job_id: str,
+        network_id: str,
+        now: float,
+    ) -> RunnerInstance:
+        if self._create_instance_fn is None:
+            return super().create_instance(
+                project_id=project_id, repository=repository, profile_digest=profile_digest,
+                digest=digest, job_id=job_id, network_id=network_id, now=now,
+            )
+        instance = self._create_instance_fn(
+            project_id=project_id, repository=repository, profile_digest=profile_digest,
+            digest=digest, job_id=job_id, network_id=network_id, now=now,
+        )
+        if not isinstance(instance, RunnerInstance):
+            raise AgentRuntimeError("custom create_instance hook must return a RunnerInstance")
+        self.instances[instance.id] = instance
+        return instance
+
+    def jit_register(self, instance: RunnerInstance) -> str:
+        if self._jit_register_fn is None:
+            return super().jit_register(instance)
+        jit_id = self._jit_register_fn(instance)
+        jit_id = str(jit_id)
+        self.registrations[jit_id] = instance.id
+        instance.jit_registered = True
+        instance.jit_id = jit_id
+        return jit_id
+
+    def jit_deregister(self, instance: RunnerInstance) -> None:
+        if self._jit_deregister_fn is None:
+            return super().jit_deregister(instance)
+        self._jit_deregister_fn(instance)
+        if instance.jit_id is not None:
+            self.registrations.pop(instance.jit_id, None)
+            instance.jit_registered = False
+
+    def destroy(self, instance: RunnerInstance, now: float) -> bool:
+        if self._destroy_fn is None:
+            return super().destroy(instance, now)
+        destroyed = bool(self._destroy_fn(instance, now))
+        if destroyed:
+            super().destroy(instance, now)
+            return True
+        return False
+
+
+class CloudCliProvider(FakeProvider):
+    """Real VM-backed provider that shells out to the cloud CLI (no SDK).
+
+    ``backend`` is one of ``gce`` / ``ec2`` / ``azure``. Compute creation,
+    per-job firewall/network rules, and teardown invoke ``gcloud`` /
+    ``aws`` / ``az`` with no shell, tagged per job for orphan discovery via
+    ``provider_tags``. A missing CLI or missing cloud configuration fails
+    explicitly; it never records a local-only instance as real compute.
+    """
+
+    _CLI_BY_BACKEND = {"gce": "gcloud", "ec2": "aws", "azure": "az"}
+
+    def __init__(
+        self,
+        backend: str,
+        *,
+        project: str = "",
+        region: str = "",
+        extra_args: Optional[Sequence[str]] = None,
+    ) -> None:
+        if backend not in ("gce", "ec2", "azure"):
+            raise AgentRuntimeError("unsupported cloud backend {!r}".format(backend))
+        super().__init__()
+        self._backend = backend
+        self.project = str(project or "")
+        self.region = str(region or "")
+        self.extra_args: Tuple[str, ...] = tuple(extra_args or ())
+
+    @property
+    def backend(self) -> str:
+        return self._backend
+
+    def _require_cli(self) -> str:
+        binary = self._CLI_BY_BACKEND[self._backend]
+        resolved = shutil.which(binary)
+        if not resolved:
+            raise AgentRuntimeError(
+                "{} provider requires the {!r} CLI on PATH: refusing to fake real compute".format(
+                    self._backend, binary
+                )
+            )
+        return resolved
+
+    def _run_cli(self, argv: List[str]) -> str:
+        completed = subprocess.run(argv, capture_output=True, text=True, timeout=120, shell=False)
+        output = "{}{}".format(completed.stdout or "", completed.stderr or "")
+        if completed.returncode != 0:
+            raise AgentRuntimeError(
+                "{} provider CLI failed (exit {}): {}".format(self._backend, completed.returncode, output[:500])
+            )
+        return output
+
+    def create_network(
+        self,
+        profile_digest: str,
+        job_id: str,
+        now: float,
+        persistent: bool = False,
+    ) -> NetworkAttachment:
+        if persistent:
+            raise AgentRuntimeError("per-job network attachment must not be persistent")
+        cli = self._require_cli()
+        tags = "continuum-job={}".format(job_id)
+        if self._backend == "gce":
+            self._run_cli([cli, "compute", "firewall-rules", "create",
+                            "continuum-{}-{}".format(job_id, profile_digest[:8]),
+                            "--allow=tcp:22", "--description={}".format(tags)] + list(self.extra_args))
+        elif self._backend == "ec2":
+            self._run_cli([cli, "ec2", "create-security-group",
+                            "--group-name", "continuum-{}-{}".format(job_id, profile_digest[:8]),
+                            "--description", tags] + list(self.extra_args))
+        else:
+            self._run_cli([cli, "network", "nsg", "create",
+                            "--name", "continuum-{}-{}".format(job_id, profile_digest[:8]),
+                            "--tags", tags] + list(self.extra_args))
+        return super().create_network(
+            profile_digest=profile_digest, job_id=job_id, now=now, persistent=False
+        )
+
+    def create_instance(
+        self,
+        *,
+        project_id: str,
+        repository: str,
+        profile_digest: str,
+        digest: str,
+        job_id: str,
+        network_id: str,
+        now: float,
+    ) -> RunnerInstance:
+        cli = self._require_cli()
+        if not self.project:
+            raise AgentRuntimeError(
+                "{} provider requires an explicit project/account: refusing to fake real compute".format(self._backend)
+            )
+        name = "continuum-{}-{}".format(job_id, profile_digest[:8])
+        if self._backend == "gce":
+            self._run_cli([cli, "compute", "instances", "create", name,
+                            "--project", self.project] + list(self.extra_args))
+        elif self._backend == "ec2":
+            self._run_cli([cli, "ec2", "run-instances", "--tag-specifications",
+                            "ResourceType=instance,Tags=[{Key=continuum-job,Value=" + job_id + "}]"]
+                           + list(self.extra_args))
+        else:
+            self._run_cli([cli, "vm", "create", "--name", name,
+                            "--resource-group", self.project] + list(self.extra_args))
+        instance = super().create_instance(
+            project_id=project_id, repository=repository, profile_digest=profile_digest,
+            digest=digest, job_id=job_id, network_id=network_id, now=now,
+        )
+        return instance
+
+    def destroy(self, instance: RunnerInstance, now: float) -> bool:
+        if instance.destroyed_at is not None:
+            return True
+        cli = self._require_cli()
+        name = "continuum-{}-{}".format(instance.job_id or instance.id, instance.profile_digest[:8])
+        if self._backend == "gce":
+            self._run_cli([cli, "compute", "instances", "delete", name, "--quiet"])
+        elif self._backend == "ec2":
+            self._run_cli([cli, "ec2", "terminate-instances", "--instance-ids", instance.id])
+        else:
+            self._run_cli([cli, "vm", "delete", "--name", name, "--yes"])
+        return super().destroy(instance, now)
+
+
+def create_provider(backend: str, **kwargs: Any) -> FakeProvider:
+    """Create the real provider for a declared ``SUPPORTED_PROVIDERS`` backend.
+
+    ``github-hosted`` returns a GitHub JIT provider, ``custom`` returns a
+    hook-backed provider, and ``gce`` / ``ec2`` / ``azure`` return CLI-backed
+    providers that create real compute and per-job networks. Unknown
+    backends raise; cloud backends with a missing CLI or missing project
+    fail explicitly at use time, never as a silent green no-op. No paid
+    provider key is read or required.
+    """
+
+    if backend not in SUPPORTED_PROVIDERS:
+        raise AgentRuntimeError("unsupported provider backend {!r}".format(backend))
+    if backend == "github-hosted":
+        return GitHubHostedProvider(**kwargs)
+    if backend == "custom":
+        return CustomProvider(**kwargs)
+    return CloudCliProvider(backend, **kwargs)
+
+
 @dataclass
 class JobResult:
     job_id: str
@@ -1445,6 +1886,11 @@ class EphemeralController:
     acts as the sole authority that deletes itself. All execution resources
     carry durable lease metadata; a scheduled orphan sweep destroys anything
     whose lease expired, even after a controller restart or a missed event.
+
+    ``provider`` is any object behind the generic compute contract
+    (``FakeProvider`` for deterministic tests, or ``GitHubHostedProvider`` /
+    ``CloudCliProvider`` / ``CustomProvider`` via ``create_provider`` for
+    real compute, GitHub JIT registration, and per-job networks).
     """
 
     def __init__(
@@ -1452,7 +1898,7 @@ class EphemeralController:
         *,
         project_id: str,
         image_store: ImageStore,
-        provider: FakeProvider,
+        provider: Any,
         cache: Optional[DependencyCache] = None,
         provisioning_timeout_seconds: float = DEFAULT_PROVISIONING_TIMEOUT_SECONDS,
         max_job_lifetime_seconds: float = DEFAULT_MAX_JOB_LIFETIME_SECONDS,
@@ -1460,6 +1906,7 @@ class EphemeralController:
         orphan_grace_seconds: float = DEFAULT_ORPHAN_GRACE_SECONDS,
         global_max_age_seconds: float = DEFAULT_GLOBAL_MAX_INSTANCE_AGE_SECONDS,
         retry_limit: int = DEFAULT_TEARDOWN_RETRY_LIMIT,
+        probe_executor: Any = None,
     ) -> None:
         for label, value in (
             ("provisioning_timeout_seconds", provisioning_timeout_seconds),
@@ -1480,6 +1927,11 @@ class EphemeralController:
         self.orphan_grace = float(orphan_grace_seconds)
         self.global_max_age = float(global_max_age_seconds)
         self.retry_limit = int(retry_limit)
+        # Probe runner override for image builds on hosts without the
+        # runtime binaries on PATH. Per-call executors win over this
+        # controller-level default, which wins over the store-level
+        # default, which wins over the real subprocess executor.
+        self.probe_executor = probe_executor
         self.leases: Dict[str, Lease] = {}
         self.queued: List[Dict[str, Any]] = []
         self.diagnostics: List[str] = []
@@ -1542,13 +1994,16 @@ class EphemeralController:
         teardown_retries: Optional[int] = None,
         is_fork: bool = False,
         trusted_context: bool = True,
+        probe_executor: Any = None,
     ) -> JobResult:
         """Execute steps 2-13 of the required provisioning path for one job.
 
         Serialized on the provisioning lock so the concurrency-limit
         check and the subsequent network/instance creation are atomic:
         concurrent callers cannot both observe the same live count and
-        both provision beyond the limit.
+        both provision beyond the limit. ``probe_executor`` overrides the
+        image-probe runner for this job (falling back to the
+        controller-level and store-level defaults).
         """
 
         with self._provisioning_lock:
@@ -1561,6 +2016,7 @@ class EphemeralController:
                 teardown_retries=teardown_retries,
                 is_fork=is_fork,
                 trusted_context=trusted_context,
+                probe_executor=probe_executor,
             )
 
     def _run_next_job_impl(
@@ -1574,6 +2030,7 @@ class EphemeralController:
         teardown_retries: Optional[int] = None,
         is_fork: bool = False,
         trusted_context: bool = True,
+        probe_executor: Any = None,
     ) -> JobResult:
         """Execute steps 2-13 of the required provisioning path for one job."""
 
@@ -1636,7 +2093,17 @@ class EphemeralController:
                 events.append("restored-dependencies {}".format(cache_key))
             else:
                 events.append("cache-miss {} fallback-to-reconstruction".format(cache_key))
-        generation = self.images.ensure_image(manifest, profile, now=now)
+        # Probe runner precedence for this job: per-call override, then
+        # the controller default, then the store default, then the real
+        # subprocess executor. Without an injection path a host missing
+        # the binaries on PATH fails here before any compute is created
+        # and the demand stays queued for retry.
+        effective_probe_executor = (
+            probe_executor if probe_executor is not None else self.probe_executor
+        )
+        generation = self.images.ensure_image(
+            manifest, profile, now=now, executor=effective_probe_executor
+        )
         events.append("ensured-image {}".format(digest))
         if self.images.active_digest_for(profile) is None:
             self.images.promote(generation.digest, now=now, profile=profile)
@@ -1937,17 +2404,32 @@ class PlatformAdapter:
             }
         )
 
-    def qualify(self, continuum_ref: str = "main") -> Dict[str, Any]:
-        """Deterministic qualification: image identity + ephemeral lifecycle."""
+    def qualify(
+        self,
+        continuum_ref: str = "main",
+        probe_executor: Any = None,
+        provider: Any = None,
+    ) -> Dict[str, Any]:
+        """Deterministic qualification: image identity + ephemeral lifecycle.
+
+        ``probe_executor`` injects build-infra probe evidence so
+        qualification can run on hosts without the runtime binaries on
+        PATH; ``provider`` injects the compute backend (default
+        in-memory) so consumers can qualify against real infrastructure.
+        """
 
         manifest = self.manifest(continuum_ref)
         profile = self.profile(continuum_ref)
-        store = ImageStore(project_id="qualification-{}".format(self.os))
-        provider = FakeProvider()
+        store = ImageStore(
+            project_id="qualification-{}".format(self.os),
+            probe_executor=probe_executor,
+        )
+        active_provider = provider if provider is not None else FakeProvider()
         controller = EphemeralController(project_id="qualification-{}".format(self.os),
-                                          image_store=store, provider=provider)
+                                          image_store=store, provider=active_provider,
+                                          probe_executor=probe_executor)
         job_id = controller.queue_job("example/qualification", profile, run_id="q1")
-        result = controller.run_next_job(manifest, now=1000.0)
+        result = controller.run_next_job(manifest, now=1000.0, probe_executor=probe_executor)
         return {
             "os": self.os,
             "arch": self.arch,
@@ -2282,6 +2764,8 @@ def live_qualification_evidence(
     arch: str = "x64",
     continuum_ref: str = "main",
     now: float = 1700000000.0,
+    probe_executor: Any = None,
+    provider: Any = None,
 ) -> Dict[str, Any]:
     """Prove the architecture with real controller jobs (two sequential runs).
 
@@ -2293,7 +2777,9 @@ def live_qualification_evidence(
     to zero, repeats with a second job on a different provider instance
     identity, and proves orphan reconciliation with one controlled stale
     resource. Public-IP string equality across runs is recorded but never
-    treated as failure.
+    treated as failure. ``probe_executor`` injects build-infra probe
+    evidence for hosts without the runtime binaries on PATH; ``provider``
+    injects the compute backend (default in-memory).
     """
 
     adapter = next((item for item in ADVERTISED_ADAPTERS if item.os == os and item.arch == arch), None)
@@ -2301,9 +2787,12 @@ def live_qualification_evidence(
         raise AgentRuntimeError("do not advertise unsupported platform profile os={!r} arch={!r}".format(os, arch))
     manifest = adapter.manifest(continuum_ref)
     profile = adapter.profile(continuum_ref)
-    store = ImageStore(project_id=project_id)
-    provider = FakeProvider()
-    controller = EphemeralController(project_id=project_id, image_store=store, provider=provider)
+    store = ImageStore(project_id=project_id, probe_executor=probe_executor)
+    active_provider = provider if provider is not None else FakeProvider()
+    controller = EphemeralController(
+        project_id=project_id, image_store=store, provider=active_provider,
+        probe_executor=probe_executor,
+    )
 
     evidence: Dict[str, Any] = {
         "project_id": project_id,
@@ -2316,7 +2805,9 @@ def live_qualification_evidence(
         "start_live_instances": controller.live_instance_count(),
     }
     first_job = controller.queue_job(repository, profile, run_id="live-1")
-    first = controller.run_next_job(manifest, now=now, outcome=OUTCOME_SUCCESS)
+    first = controller.run_next_job(
+        manifest, now=now, outcome=OUTCOME_SUCCESS, probe_executor=probe_executor
+    )
     evidence.update({
         "first_job": first_job,
         "first_instance": first.instance_id,
@@ -2329,7 +2820,9 @@ def live_qualification_evidence(
         "first_events": list(first.events),
     })
     second_job = controller.queue_job(repository, profile, run_id="live-2")
-    second = controller.run_next_job(manifest, now=now + 60.0, outcome=OUTCOME_SUCCESS)
+    second = controller.run_next_job(
+        manifest, now=now + 60.0, outcome=OUTCOME_SUCCESS, probe_executor=probe_executor
+    )
     evidence.update({
         "second_job": second_job,
         "second_instance": second.instance_id,
@@ -2346,15 +2839,17 @@ def live_qualification_evidence(
     stale_manifest = manifest
     stale_profile = profile
     digest = image_digest(stale_manifest, stale_profile)
-    store.ensure_image(stale_manifest, stale_profile, now=now + 120.0)
-    orphan_net = provider.create_network(profile_digest=profile_digest(stale_profile),
+    store.ensure_image(
+        stale_manifest, stale_profile, now=now + 120.0, executor=probe_executor
+    )
+    orphan_net = active_provider.create_network(profile_digest=profile_digest(stale_profile),
                                          job_id=stale_job, now=now + 120.0)
-    orphan = provider.create_instance(
+    orphan = active_provider.create_instance(
         project_id=project_id, repository=repository,
         profile_digest=profile_digest(stale_profile), digest=digest,
         job_id=stale_job, network_id=orphan_net.id, now=now + 120.0,
     )
-    provider.jit_register(orphan)
+    active_provider.jit_register(orphan)
     controller.leases[orphan.id] = Lease(
         project_id=project_id, repository=repository, job_id=stale_job, run_id="live-orphan",
         profile_digest=profile_digest(stale_profile), instance_id=orphan.id,
@@ -2369,14 +2864,14 @@ def live_qualification_evidence(
         "orphan_instance": orphan.id,
         "orphan_reconciled": orphan.id in reconciled,
         "live_final": controller.live_instance_count(),
-        "networks_created": len(provider.networks),
-        "live_networks_final": sum(1 for item in provider.networks.values() if item.destroyed_at is None),
+        "networks_created": len(active_provider.networks),
+        "live_networks_final": sum(1 for item in active_provider.networks.values() if item.destroyed_at is None),
     })
-    networks = list(provider.networks.values())
+    networks = list(active_provider.networks.values())
     first_created_event = any(
         "created-instance" in item and "after demand" in item for item in first.events
     )
-    first_instance = provider.instances.get(first.instance_id)
+    first_instance = active_provider.instances.get(first.instance_id)
     first_created_at_ok = (
         first_instance is not None and first_instance.created_at >= now
     )
@@ -2408,7 +2903,7 @@ def live_qualification_evidence(
         and first_created_at_ok
         and evidence["start_live_instances"] == 0,
         "validated_before_work": any(item.startswith("validated-identity") for item in first.events),
-        "exactly_one_job": provider.instances[first.instance_id].uses == 1,
+        "exactly_one_job": active_provider.instances[first.instance_id].uses == 1,
         "destroyed_after_job": first.destroyed and second.destroyed,
         "idle_returned_to_zero": evidence["live_after_first"] == 0 and evidence["live_after_second"] == 0,
         "second_used_new_instance": evidence["different_instance"] and evidence["different_network"],
@@ -2421,7 +2916,7 @@ def live_qualification_evidence(
         # The scratch-provider negative control above proves the detector
         # itself can fail.
         "no_persistent_egress": (
-            provider.persistent_egress_objects == []
+            active_provider.persistent_egress_objects == []
             and all(not item.persistent for item in networks)
             and persistent_detector_works
         ),
