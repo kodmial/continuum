@@ -50,47 +50,53 @@ PROTECTED_FILES = [
 # normal agent execution to stop reinstalling OpenCode/PR-Agent and instead
 # probe the prepared immutable runtime first. That task therefore requires a
 # narrow, auditable change to .github/workflows/continuum-opencode.yml: a
-# prepared-runtime probe (boundary-anchored `grep -E` exact version +
-# CONTINUUM_IMAGE_DIGEST format guard + GITHUB_PATH export + post-install
-# exact-version verification) ahead of the deterministic reconstruction
-# fallback. The zero-diff assertion below is stale for that one file unless
-# it allowlists exactly this probe; any other drift must still fail. Each
-# entry is a full added line without the leading "+" as produced by
-# `git diff` (multiset: APPROVED_179_OPENCODE_PROBE_LINES lists one install
-# site, 19 lines; both sites carry it, 38 added lines total).
+# digest-gated prepared-runtime probe (step-level `env:` wiring the image
+# digest from `vars.CONTINUUM_IMAGE_DIGEST` + boundary-anchored `grep -E`
+# exact version + CONTINUUM_IMAGE_DIGEST 64-char sha256 shape enforcement +
+# GITHUB_PATH export + post-install exact-version verification) ahead of the
+# deterministic reconstruction fallback. The zero-diff assertion below is
+# stale for that one file unless it allowlists exactly this probe; any other
+# drift must still fail. Each entry is a full added line without the leading
+# "+" as produced by `git diff` (multiset:
+# APPROVED_179_OPENCODE_PROBE_LINES lists one install site, 21 lines; both
+# sites carry it, 42 added lines total).
 # The GITHUB_PATH export on the warm hit is required: the cold fallback does
 # `echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"`, so a warm hit that exits
 # without it would leave later steps without opencode on PATH and prove no
 # useful work. `grep -E` with `(^|[^0-9.])...([^0-9.]|$)` is required for
 # the task's "exact version" probe: plain `grep -F "1.18.34"` false-hits on
 # "1.18.340", and `grep "1.18.34"` treats dots as regex wildcards. The
-# CONTINUUM_IMAGE_DIGEST guard rejects a malformed digest when set, and the
-# post-install `opencode --version | grep -E` line fails the step when
-# deterministic reconstruction did not produce the pinned runtime.
+# CONTINUUM_IMAGE_DIGEST shape gate is required for identity enforcement: a
+# set, well-formed digest is required to take the hit path with zero
+# downloads, so an empty/unresolved digest falls through to deterministic
+# reconstruction instead of skipping install; a malformed set digest fails
+# explicitly. The post-install `opencode --version | grep -E` line fails the
+# step when deterministic reconstruction did not produce the pinned runtime.
 #
-# The committed BASELINE..HEAD drift above is only the first layer. A second,
-# still-uncommitted worktree repair (digest-gated hit + `vars.` env wiring,
-# see APPROVED_179_WORKTREE_* below) replaces the format-only guard so an
-# empty/unresolved digest can no longer take the hit path and skip install.
-# The baseline test therefore checks the committed drift against
-# APPROVED_179_OPENCODE_PROBE_LINES and the live worktree contract
-# separately; an empty committed diff with a conforming worktree (probe
-# landed before the baseline) passes via the worktree contract alone.
+# The digest-gated hit plus `vars.` env wiring repair (see
+# APPROVED_179_WORKTREE_* below) has landed in HEAD, so the committed
+# BASELINE..HEAD drift below already carries it. The baseline test checks
+# the committed drift against APPROVED_179_OPENCODE_PROBE_LINES and the live
+# worktree contract separately; an empty committed diff with a conforming
+# worktree (probe landed before the baseline) passes via the worktree
+# contract alone.
 APPROVED_179_OPENCODE_PROBE_LINES = (
+    "        env:",
+    "          CONTINUUM_IMAGE_DIGEST: ${{ vars.CONTINUUM_IMAGE_DIGEST }}",
     "          # Continuum #179 prepared agent runtime: the immutable golden image",
-    "          # (or its provider-native cache equivalent keyed by the image digest",
-    "          # in CONTINUUM_IMAGE_DIGEST) already carries pinned OpenCode 1.18.34,",
-    "          # so warm jobs perform zero downloads. Probe the prepared agent",
-    "          # runtime first via `command -v opencode` and the exact version;",
-    "          # only a validated cache miss falls through to deterministic",
-    "          # reconstruction below.",
+    "          # (or its provider-native cache equivalent) already carries pinned",
+    "          # OpenCode 1.18.34. The warm hit below is keyed by the image digest",
+    "          # in CONTINUUM_IMAGE_DIGEST (wired from the repository variable):",
+    "          # only a set, well-formed digest plus `command -v opencode` and the",
+    "          # exact version takes the hit path with zero downloads; an empty",
+    "          # digest falls through to deterministic reconstruction below.",
     '          export PATH="$HOME/.opencode/bin:$PATH"',
     '          if [[ -n "${CONTINUUM_IMAGE_DIGEST:-}" ]] && ! [[ "$CONTINUUM_IMAGE_DIGEST" =~ ^[0-9a-f]{64}$ ]]; then',
     '            echo "::error::CONTINUUM_IMAGE_DIGEST must be a 64-char sha256 hex digest when set."',
     "            exit 1",
     "          fi",
-    '          if command -v opencode >/dev/null 2>&1 && opencode --version 2>&1 | grep -E -q "(^|[^0-9.])1\\.18\\.34([^0-9.]|$)"; then',
-    '            echo "prepared-runtime hit: opencode 1.18.34 already present (image digest ${CONTINUUM_IMAGE_DIGEST:-unresolved})."',
+    '          if [[ "${CONTINUUM_IMAGE_DIGEST:-}" =~ ^[0-9a-f]{64}$ ]] && command -v opencode >/dev/null 2>&1 && opencode --version 2>&1 | grep -E -q "(^|[^0-9.])1\\.18\\.34([^0-9.]|$)"; then',
+    '            echo "prepared-runtime hit: opencode 1.18.34 already present (image digest ${CONTINUUM_IMAGE_DIGEST})."',
     '            echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"',
     "            exit 0",
     "          fi",
@@ -98,14 +104,16 @@ APPROVED_179_OPENCODE_PROBE_LINES = (
     '              opencode --version 2>&1 | grep -E -q "(^|[^0-9.])1\\.18\\.34([^0-9.]|$)" || exit 1',
 )
 
-# Worktree repair layer for the #179 probe: the warm hit is keyed by the
-# image digest (a set, well-formed CONTINUUM_IMAGE_DIGEST is required to
-# take the hit path; an empty digest falls through to deterministic
-# reconstruction), the digest reaches the shell via an explicit step-level
-# `env:` wired from the repository variable, and the duplicate PATH export
-# on the consumer-child warm path is removed. Each tuple lists the unique
-# worktree-vs-HEAD lines for one install site (both opencode sites carry
-# them, so worktree diff counts are doubled).
+# Worktree repair layer for the #179 probe, now landed in HEAD: the warm hit
+# is keyed by the image digest (a set, well-formed CONTINUUM_IMAGE_DIGEST is
+# required to take the hit path; an empty digest falls through to
+# deterministic reconstruction), the digest reaches the shell via an explicit
+# step-level `env:` wired from the repository variable, and the duplicate
+# PATH export on the consumer-child warm path is removed. The tuples below
+# record the landed transition (old format-only probe -> digest-gated probe)
+# for the worktree-drift check; a clean worktree passes without using them.
+# Each tuple lists the unique worktree-vs-HEAD lines for one install site
+# (both opencode sites carry them, so worktree diff counts are doubled).
 APPROVED_179_WORKTREE_ADDED_LINES = (
     "        env:",
     "          CONTINUUM_IMAGE_DIGEST: ${{ vars.CONTINUUM_IMAGE_DIGEST }}",
@@ -267,8 +275,8 @@ class ProtectedBaselineTests(unittest.TestCase):
                     # Authoritative task #179 requires the prepared-runtime
                     # probe in this file. The committed BASELINE..HEAD drift
                     # must contain exactly the approved probe (both install
-                    # sites carry the same 19-line probe, 38 added lines
-                    # total); any deletion, modification, or unapproved
+                    # sites carry the same 21-line digest-gated probe, 42
+                    # added lines total); any deletion, modification, or unapproved
                     # addition still fails. The two-sided check below reports
                     # a missing probe separately from unapproved drift so a
                     # worktree without the probe cannot pass silently, and an
