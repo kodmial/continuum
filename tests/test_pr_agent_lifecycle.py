@@ -560,6 +560,8 @@ class NoCustomProtocolTests(unittest.TestCase):
         self.assertIn("enable_large_pr_chunking = true", toml)
         body = read_repo(".github/workflows/continuum-pr-agent.yml")
         self.assertIn("PR_REVIEWER__ENABLE_LARGE_PR_CHUNKING", body)
+        self.assertIn("PR_REVIEWER__MAX_NUMBER_OF_CALLS: '10'", body)
+        self.assertIn("PR_CODE_SUGGESTIONS__MAX_NUMBER_OF_CALLS: '10'", body)
         self.assertIn("PR_REVIEWER__EXTRA_INSTRUCTIONS", body)
         self.assertIn("Never infer that implementation, tests,", body)
         self.assertIn("absent from the current review chunk", body)
@@ -581,7 +583,7 @@ class ConfigurationTests(unittest.TestCase):
             "persistent_finding_state = true",
             "inline_key_issues = true",
             "enable_large_pr_chunking = true",
-            "max_number_of_calls = 3",
+            "max_number_of_calls = 10",
             "require_tests_review = true",
             "require_security_review = true",
             "require_risk_assessment = true",
