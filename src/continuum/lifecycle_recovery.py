@@ -262,7 +262,7 @@ def _same_head(marker_head: str, head: str) -> bool:
 
 _RECOVERY_ELIGIBLE_RE = re.compile(r"\brecovery eligible\b", re.IGNORECASE)
 _NEGATED_RECOVERY_ELIGIBLE_RE = re.compile(
-    r"\b(?:not|no|non|never)[\s\-]+recovery eligible\b", re.IGNORECASE
+    r"\b(?:not|no|non|never)[\s\-_]*recovery[\s\-_]+eligible\b", re.IGNORECASE
 )
 
 
@@ -273,8 +273,9 @@ def _is_explicit_recovery_eligible(description: str) -> bool:
     reconciler itself) authorizes a retry without an explicit classifier
     input. A bare ``transient`` substring is never sufficient: deterministic
     messages such as ``non-transient policy failure`` contain it and must
-    never burn the transient budget. Negated forms (``not/no/non/never
-    recovery eligible``) hold as well.
+    never burn the transient budget. Negated forms (``not/no/non/never``
+    plus any space/hyphen/underscore separator, including the concatenated
+    ``nonrecovery eligible``) hold as well.
     """
 
     text = str(description or "")
@@ -705,6 +706,8 @@ def decide_recovery(
     success or a new HEAD starts a new episode and resets the budget.
     Exhaustion after the bounded budget is fail-closed and observable
     (``exhaust`` once, then ``hold`` while the durable marker exists).
+    ``main_sync_required`` gates merge-kind callers: when True the decision
+    waits for the outstanding main sync instead of dispatching a merge.
     """
 
     budget = resolve_max_executions(max_executions)
@@ -726,6 +729,12 @@ def decide_recovery(
 
     if not ci_green:
         return RecoveryDecision("wait", None, "exact HEAD CI is not green")
+    if main_sync_required:
+        # Callers set this only for merge-kind reconciliation while a main
+        # sync is still outstanding: a merge dispatch must wait for the
+        # sync instead of racing it. Main-sync operations themselves pass
+        # False so this gate never deadlocks the sync.
+        return RecoveryDecision("wait", None, "main sync required before merge reconciliation")
     if evidence.exhausted:
         return RecoveryDecision("hold", None, "retry budget already exhausted")
     if active_exact_lease or active_operation:
@@ -780,6 +789,14 @@ def decide_recovery(
                 return RecoveryDecision("hold", None, "deterministic merge block is not automatically retried")
             return RecoveryDecision("hold", None, "deterministic failure is not automatically retried")
     elif state == "pending":
+        # An explicit deterministic verdict dominates staleness: a caller
+        # that already proved the outcome deterministic (e.g. a user
+        # cancellation classified as failure_transient=False) must hold
+        # even when the run conclusion looks retryable or the status is
+        # old. Otherwise retry budget would be burned redispatching work
+        # the failure path would hold.
+        if failure_transient is False:
+            return RecoveryDecision("hold", None, "deterministic failure is not automatically retried")
         if conclusion in RETRYABLE_RUN_CONCLUSIONS:
             recoverable = True
             transient_failure = True
@@ -850,7 +867,17 @@ def forward_progress_clears(operation_state: Optional[str]) -> bool:
 
 
 def dedupe_wakeups(keys: Sequence[str]) -> list[str]:
-    """Coalesce multiple wakeups for the same PR/HEAD into one operation."""
+    """Coalesce multiple wakeups for the same PR/HEAD into one operation.
+
+    In-memory only: this coalesces duplicate wakeups WITHIN a single
+    process/run. Cross-run safety (cron plus an event wakeup overlapping)
+    never comes from this helper; it comes from the durable mechanisms the
+    callers combine it with: the repository-global concurrency group that
+    serializes reconciler runs, the durable dispatch marker inside its
+    dispatch-grace window, and an exact-HEAD/CI/active-run re-read
+    immediately before every mutation. A stale queued run therefore becomes
+    a safe no-op instead of a concurrent writer.
+    """
 
     seen: dict[str, None] = {}
     for key in keys:
@@ -861,7 +888,14 @@ def dedupe_wakeups(keys: Sequence[str]) -> list[str]:
 
 
 def should_coalesce(active_leases: Sequence[str], key: str) -> bool:
-    """Whether a wakeup must stand down because its lease is already owned."""
+    """Whether a wakeup must stand down because its lease is already owned.
+
+    In-memory only: ``active_leases`` is the per-process owned-lease set for
+    the current run. Two independent runs do not share it, so this alone
+    cannot guarantee at-most-one-operation across runs; callers must combine
+    it with the repository-global concurrency group, the durable dispatch
+    marker grace window, and the pre-mutation latest-state re-read.
+    """
 
     normalized = str(key or "").strip()
     return normalized in {str(item or "").strip() for item in active_leases}

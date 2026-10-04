@@ -124,6 +124,30 @@ def operation_key(pr_number: object, head_sha: object, kind: object) -> str:
     return f"{number}:{head}:{normalized_kind}"
 
 
+_RECOVERY_ELIGIBLE_RE = re.compile(r"\brecovery eligible\b")
+_NEGATED_RECOVERY_ELIGIBLE_RE = re.compile(
+    r"\b(?:not|no|non|never)[\s\-_]*recovery[\s\-_]+eligible\b"
+)
+
+
+def _is_explicit_recovery_eligible(description: str) -> bool:
+    """Whether a status description carries the explicit recovery token.
+
+    Mirrors the single lifecycle contract in
+    :mod:`continuum.lifecycle_recovery`: only the exact ``recovery
+    eligible`` token authorizes a retry, and negated forms (``not/no/non/
+    never`` plus any space/hyphen/underscore separator, including the
+    concatenated ``nonrecovery eligible``) hold.
+    """
+
+    text = str(description or "")
+    if not _RECOVERY_ELIGIBLE_RE.search(text.lower()):
+        return False
+    if _NEGATED_RECOVERY_ELIGIBLE_RE.search(text.lower()):
+        return False
+    return True
+
+
 def _same_head(marker_head: str, head: str) -> bool:
     """Whether a durable marker refers to the same logical HEAD.
 
@@ -169,6 +193,8 @@ def retry_evidence(
     """
 
     head = str(head_sha or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40,64}", head):
+        raise RecoveryError("head_sha must be a full hexadecimal commit id")
     normalized_kind = str(kind or "").strip().lower()
     if normalized_kind not in KINDS:
         raise RecoveryError("kind must be review or repair")
@@ -350,14 +376,7 @@ def decide_recovery(
     elif state == "success":
         return RecoveryDecision("settled", None, "operation already settled")
     elif state == "failure":
-        lowered = description.lower()
-        if (
-            "recovery eligible" in lowered
-            and "not recovery eligible" not in lowered
-            and "no recovery eligible" not in lowered
-            and "non-recovery eligible" not in lowered
-            and "non recovery eligible" not in lowered
-        ):
+        if _is_explicit_recovery_eligible(description):
             recoverable = True
         else:
             return RecoveryDecision(

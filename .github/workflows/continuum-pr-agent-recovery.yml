@@ -361,16 +361,22 @@ jobs:
               const consider = (markerHead, markerKind, attemptText, markerNotBeforeEpoch, createdAt) => {
                 if (markerKind !== kind || !sameHead(markerHead, exactHead)) return;
                 const attempt = Number.parseInt(attemptText, 10);
-                if (
-                  latestAttempt === null ||
-                  attempt > latestAttempt ||
-                  (attempt === latestAttempt &&
-                   Number.isFinite(createdAt) &&
-                   (latestMarkerAt === null || createdAt > latestMarkerAt))
-                ) {
+                if (latestAttempt === null || attempt > latestAttempt) {
                   latestAttempt = attempt;
                   latestMarkerAt = Number.isFinite(createdAt) ? createdAt : null;
                   notBeforeEpoch = markerNotBeforeEpoch;
+                } else if (
+                  attempt === latestAttempt &&
+                  Number.isFinite(createdAt) &&
+                  (latestMarkerAt === null || createdAt > latestMarkerAt)
+                ) {
+                  latestMarkerAt = Number.isFinite(createdAt) ? createdAt : null;
+                  // Preserve a durable wait: a duplicate same-attempt marker
+                  // without not-before must never clear the future reset time
+                  // written by the deferred attempt.
+                  if (markerNotBeforeEpoch !== null && markerNotBeforeEpoch !== undefined) {
+                    notBeforeEpoch = markerNotBeforeEpoch;
+                  }
                 } else if (attempt === latestAttempt && markerNotBeforeEpoch !== null && notBeforeEpoch === null) {
                   notBeforeEpoch = markerNotBeforeEpoch;
                 }
@@ -711,14 +717,14 @@ jobs:
                 // authorizes a retry without classifier input. A bare
                 // "transient" substring is never sufficient: deterministic
                 // messages such as "non-transient policy failure" contain
-                // it and must never burn the transient budget.
+                // it and must never burn the transient budget. Negated
+                // forms (not/no/non/never plus any space/hyphen/underscore
+                // separator, including concatenated "nonrecovery eligible")
+                // hold, matching the single lifecycle contract.
                 const lowered = description.toLowerCase();
                 if (
-                  lowered.includes('recovery eligible') &&
-                  !lowered.includes('not recovery eligible') &&
-                  !lowered.includes('no recovery eligible') &&
-                  !lowered.includes('non-recovery eligible') &&
-                  !lowered.includes('non recovery eligible')
+                  /\brecovery eligible\b/.test(lowered) &&
+                  !/\b(?:not|no|non|never)[\s\-_]*recovery[\s\-_]+eligible\b/.test(lowered)
                 ) {
                   recoverable = true;
                 } else {
@@ -793,10 +799,14 @@ jobs:
                 // Never keep a runner sleeping through a long rate-limit or
                 // quota wait. Record the reset-aware not-before time so the
                 // scheduled safety net redispatches when the window expires.
+                // The deferral performs no execution, so it must never burn
+                // budget: persist attempt-1 so the next wakeup re-derives the
+                // same pending attempt index instead of advancing to latest+1
+                // without any execution.
                 const notBefore = Math.floor(nowMs() / 1000) + remaining;
                 await upsertControllerState(
                   pr.number,
-                  retryMarker(head, kind, attempt, notBefore),
+                  retryMarker(head, kind, Math.max(0, attempt - 1), notBefore),
                   'Deferred PR-Agent ' + kind + ' recovery for exact HEAD ' + head +
                     ' until ' + new Date(notBefore * 1000).toISOString() +
                     ' (reset-aware backoff ' + remaining + 's).'
@@ -1001,26 +1011,27 @@ jobs:
                   );
                 }
                 // Reset-aware deferral (#224): when the dispatch itself is
-                // rate-limited, persist the server-provided minimum as a
-                // durable not-before marker so the scheduled safety net
-                // honors it instead of retrying on schedule+jitter alone.
-                // The runner still exits; nothing sleeps.
+                // transiently rate-limited or fails on dispatch transport
+                // (5xx/network without Retry-After/Reset headers), persist a
+                // durable attempt marker so the next wakeup advances toward
+                // the bounded exhaustion/hold instead of re-deriving the same
+                // attempt index forever. The runner still exits; nothing sleeps.
                 if (isTransientApiError(err)) {
                   const signals = extractRateLimitSignals(err);
-                  if (
+                  const delaySeconds = resetAwareDelaySeconds({
+                    attempt,
+                    retryAfterSeconds: signals.retryAfterSeconds,
+                    ratelimitResetEpoch: signals.ratelimitResetEpoch,
+                    providerResetEpoch: signals.providerResetEpoch,
+                    nowEpoch: Math.floor(nowMs() / 1000),
+                    operationKey: repoFullName + '#' + pr.number + ':' + head + ':' + kind,
+                  });
+                  const notBefore = Math.floor(nowMs() / 1000) + delaySeconds;
+                  const hasResetSignal =
                     signals.retryAfterSeconds !== undefined ||
                     signals.ratelimitResetEpoch !== undefined ||
-                    signals.providerResetEpoch !== undefined
-                  ) {
-                    const delaySeconds = resetAwareDelaySeconds({
-                      attempt,
-                      retryAfterSeconds: signals.retryAfterSeconds,
-                      ratelimitResetEpoch: signals.ratelimitResetEpoch,
-                      providerResetEpoch: signals.providerResetEpoch,
-                      nowEpoch: Math.floor(nowMs() / 1000),
-                      operationKey: repoFullName + '#' + pr.number + ':' + head + ':' + kind,
-                    });
-                    const notBefore = Math.floor(nowMs() / 1000) + delaySeconds;
+                    signals.providerResetEpoch !== undefined;
+                  if (hasResetSignal) {
                     await upsertControllerState(
                       pr.number,
                       retryMarker(head, kind, attempt, notBefore),
@@ -1031,6 +1042,20 @@ jobs:
                     core.warning(
                       'PR #' + pr.number + ' ' + kind +
                       ': dispatch was rate-limited; deferred to ' +
+                      new Date(notBefore * 1000).toISOString() +
+                      ' for the scheduled safety net to redispatch.'
+                    );
+                  } else {
+                    await upsertControllerState(
+                      pr.number,
+                      retryMarker(head, kind, attempt, notBefore),
+                      'Deferred PR-Agent ' + kind + ' recovery for exact HEAD ' + head +
+                        ' until ' + new Date(notBefore * 1000).toISOString() +
+                        ' (dispatch was transiently unreachable; reset-aware backoff ' + delaySeconds + 's).'
+                    );
+                    core.warning(
+                      'PR #' + pr.number + ' ' + kind +
+                      ': dispatch was transiently unreachable; deferred to ' +
                       new Date(notBefore * 1000).toISOString() +
                       ' for the scheduled safety net to redispatch.'
                     );

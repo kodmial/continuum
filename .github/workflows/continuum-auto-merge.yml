@@ -135,6 +135,23 @@ jobs:
               return;
             }
             const readGithub = new github.constructor({ auth: readToken, baseUrl: readBaseUrl });
+            // Fail fast when the injected constructor lacks the composed
+            // paginate/rest plugins. Without this, per-PR housekeeping reads
+            // fail later with `client.paginate is not a function`, which the
+            // per-PR isTransientApiError catch would misclassify as
+            // deterministic and fail the whole run obscurely.
+            if (
+              typeof readGithub.paginate !== 'function' ||
+              typeof readGithub.rest?.issues?.listComments !== 'function' ||
+              typeof readGithub.rest?.pulls?.get !== 'function' ||
+              typeof readGithub.rest?.pulls?.list !== 'function' ||
+              typeof readGithub.rest?.actions?.listWorkflowRunsForRepo !== 'function'
+            ) {
+              throw new Error(
+                'readGithub client lacks the paginate/rest plugins; ' +
+                'cannot perform same-repository housekeeping reads.'
+              );
+            }
             let readTokenUnavailable = false;
             function isRateLimitError(err, status) {
               if (status === 429) return true;
