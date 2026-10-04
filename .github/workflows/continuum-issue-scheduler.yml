@@ -296,7 +296,9 @@ jobs:
             return "$rc"
           }
 
-          if ! child_role="$(fetch_variable "$GITHUB_REPOSITORY" CONTINUUM_ROLE)"; then
+          if child_role="$(fetch_variable "$GITHUB_REPOSITORY" CONTINUUM_ROLE)"; then
+            :
+          else
             rc=$?
             if [ "$rc" -eq 2 ]; then
               echo "::error::Child relationship variable CONTINUUM_ROLE is missing; parent wake-up refused."
@@ -305,7 +307,9 @@ jobs:
             echo "::error::Child relationship lookup is unavailable; parent wake-up refused."
             exit 4
           fi
-          if ! child_id="$(fetch_variable "$GITHUB_REPOSITORY" CONTINUUM_CHILD_ID)"; then
+          if child_id="$(fetch_variable "$GITHUB_REPOSITORY" CONTINUUM_CHILD_ID)"; then
+            :
+          else
             rc=$?
             if [ "$rc" -eq 2 ]; then
               echo "::error::Child relationship variable CONTINUUM_CHILD_ID is missing; parent wake-up refused."
@@ -314,7 +318,9 @@ jobs:
             echo "::error::Child relationship lookup is unavailable; parent wake-up refused."
             exit 4
           fi
-          if ! parent="$(fetch_variable "$GITHUB_REPOSITORY" CONTINUUM_PARENT)"; then
+          if parent="$(fetch_variable "$GITHUB_REPOSITORY" CONTINUUM_PARENT)"; then
+            :
+          else
             rc=$?
             if [ "$rc" -eq 2 ]; then
               echo "::error::Child relationship variable CONTINUUM_PARENT is missing; parent wake-up refused."
@@ -350,7 +356,9 @@ jobs:
             echo "::error::Bidirectional parent/child verification failed; parent wake-up refused."
             exit 2
           fi
-          if ! parent_role="$(fetch_variable "$parent" CONTINUUM_ROLE)"; then
+          if parent_role="$(fetch_variable "$parent" CONTINUUM_ROLE)"; then
+            :
+          else
             rc=$?
             if [ "$rc" -eq 2 ]; then
               echo "::error::Parent relationship variable CONTINUUM_ROLE is missing; parent wake-up refused."
@@ -359,7 +367,9 @@ jobs:
             echo "::error::Parent relationship lookup is unavailable; parent wake-up refused."
             exit 4
           fi
-          if ! parent_children="$(fetch_variable "$parent" CONTINUUM_CHILDREN)"; then
+          if parent_children="$(fetch_variable "$parent" CONTINUUM_CHILDREN)"; then
+            :
+          else
             rc=$?
             if [ "$rc" -eq 2 ]; then
               echo "::error::Parent relationship variable CONTINUUM_CHILDREN is missing; parent wake-up refused."
