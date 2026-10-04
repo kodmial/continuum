@@ -248,11 +248,17 @@ class DelegatedChildCommandTests(unittest.TestCase):
     def test_child_lookup_bounded_while_keeping_pat_and_identity(self):
         body = scheduler_body()
         start = body.index("local_override_active() {")
-        window = body[start:start + 2200]
+        # Window covers the whole function body (bounded since-scan loop
+        # grew the function past the previous 2200-char slice).
+        window = body[start:start + 3000]
         self.assertIn("since=$grace_since", window)
         self.assertIn("grace_since=", window)
         # Owner identity, both spellings and the grace comparison survive.
-        self.assertIn('select(.user.login == "', window)
+        # Owner is bound via --arg (injection-safe) rather than inline
+        # shell interpolation: equivalent identity, safer quoting.
+        self.assertIn("select(.user.login == $owner)", window)
+        self.assertIn("--arg owner", window)
+        self.assertIn('"$child_owner"', window)
         self.assertIn("/(oc|opencode)", window)
         self.assertIn("now_epoch - command_epoch < command_grace_seconds", window)
         # PAT credential for the cross-repository read is unchanged.
