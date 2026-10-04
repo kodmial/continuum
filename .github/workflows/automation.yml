@@ -84,3 +84,123 @@ jobs:
     with:
       continuum_ref: main
       opencode_workflow: 'opencode.yml'
+
+  # Global cross-repository PR watchdog (kodmial/continuum#256). A liveness
+  # wake-up only: it discovers Continuum consumers, checks for any open PR,
+  # and wakes the existing repository-local reconcilers. It owns no review,
+  # CI, merge, or retry semantics. Reuses the existing 17,47 safety-net slot
+  # and manual dispatch; no new cron. Consumer names never reach logs.
+  global-pr-watchdog:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'schedule' && github.event.schedule == '17,47 * * * *')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: continuum-global-pr-watchdog
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout Continuum control plane
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Wake repository-local reconcilers
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          TAP_PAT: ${{ secrets.TAP_PAT }}
+          CONTINUUM_REPO: ${{ github.repository }}
+          CONTINUUM_REPO_ID: ${{ github.event.repository.id }}
+        with:
+          script: |
+            const watchdog = require('./.github/scripts/global_pr_watchdog.js');
+
+            const token = process.env.TAP_PAT;
+            if (!token) {
+              core.setFailed('global-pr-watchdog: TAP_PAT is not configured');
+              return;
+            }
+            const continuumRepo = process.env.CONTINUUM_REPO;
+            const continuumRepoId = Number(process.env.CONTINUUM_REPO_ID);
+            if (!continuumRepo || !Number.isFinite(continuumRepoId)) {
+              core.setFailed('global-pr-watchdog: continuum repository identity is not configured');
+              return;
+            }
+
+            const API_ROOT = 'https://api.github.com';
+
+            async function authed(method, path, operation, body) {
+              watchdog.assertApprovedEndpoint(method, path);
+              const headers = watchdog.buildHeaders(token);
+              let payload = undefined;
+              if (body !== undefined) {
+                headers['Content-Type'] = 'application/json';
+                payload = JSON.stringify(body);
+              }
+              const requestHeaders = { ...headers };
+              if (operation === watchdog.OPERATIONS.CONSUMER_MARKER) {
+                requestHeaders.Accept = 'application/vnd.github.raw';
+              }
+              const response = await fetch(`${API_ROOT}${path}`, {
+                method,
+                headers: requestHeaders,
+                body: payload,
+              });
+              if (!response.ok) {
+                throw new watchdog.HttpError(
+                  response.status,
+                  operation,
+                  { 'x-ratelimit-remaining': response.headers.get('x-ratelimit-remaining') }
+                );
+              }
+              return response;
+            }
+
+            const client = {
+              async getRateLimit() {
+                const response = await authed('GET', watchdog.rateLimitPath(), watchdog.OPERATIONS.RATE_LIMIT);
+                const payload = await response.json();
+                return {
+                  limit: payload.resources.core.limit,
+                  remaining: payload.resources.core.remaining,
+                  reset: payload.resources.core.reset,
+                };
+              },
+              async listRepositories(page) {
+                const response = await authed('GET', watchdog.listReposPath(page), watchdog.OPERATIONS.DISCOVERY);
+                return response.json();
+              },
+              async getConsumerMarker(owner, repo, ref) {
+                const response = await authed(
+                  'GET', watchdog.consumerMarkerPath(owner, repo, ref), watchdog.OPERATIONS.CONSUMER_MARKER
+                );
+                return response.text();
+              },
+              async probeOpenPulls(owner, repo) {
+                const response = await authed(
+                  'GET', watchdog.openPrProbePath(owner, repo), watchdog.OPERATIONS.OPEN_PR_PROBE
+                );
+                const pulls = await response.json();
+                return Array.isArray(pulls) && pulls.length > 0;
+              },
+              async dispatchWorkflow(owner, repo, workflowFile, ref) {
+                await authed(
+                  'POST', watchdog.dispatchPath(owner, repo, workflowFile),
+                  watchdog.DISPATCH_OPERATIONS[workflowFile], { ref }
+                );
+              },
+            };
+
+            try {
+              await watchdog.runScan(client, {
+                continuumRepo,
+                continuumRepoId,
+                log: { info: (msg) => core.info(msg), warn: (msg) => core.warning(msg) },
+              });
+            } catch (error) {
+              // runScan only throws generic configuration errors; no
+              // repository-identifying detail ever reaches this message.
+              core.setFailed(error instanceof Error ? error.message : String(error));
+            }
