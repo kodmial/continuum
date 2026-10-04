@@ -29,8 +29,8 @@ concurrency:
   # The controller is a short latest-state reconciler. When the next legal
   # review slot is in the future it exits immediately; durable CodeRabbit
   # comments/review timestamps retain the due time and existing event/safety-net
-  # wake-ups reconcile again later. Keep at most one pending successor.
-  cancel-in-progress: false
+  # wake-ups reconcile again later. Newer wake-ups supersede stale scans.
+  cancel-in-progress: true
 
 jobs:
   controller:
