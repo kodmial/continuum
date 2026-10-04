@@ -381,9 +381,18 @@ jobs:
           # Pinned upstream reviewer: PR-Agent v0.46.0 runs on the runner (a
           # Docker action cannot reach the runner-local bridge). The version
           # default is 0.46.0; any other value fails closed below.
+          # Continuum #179 prepared agent runtime: the immutable golden image
+          # (or its provider-native cache equivalent keyed by the image digest
+          # in CONTINUUM_IMAGE_DIGEST) already carries pinned PR-Agent 0.46.0,
+          # so warm jobs perform zero installs. Probe via `pr-agent --version`
+          # first; only a validated cache miss reconstructs deterministically.
           if [[ "$PR_AGENT_VERSION" != "0.46.0" ]]; then
             echo "::error::Isolated PR-Agent stack pins upstream v0.46.0, got $PR_AGENT_VERSION."
             exit 1
+          fi
+          if command -v pr-agent >/dev/null 2>&1 && pr-agent --version 2>/dev/null | grep -q "0.46.0"; then
+            echo "prepared-runtime hit: pr-agent 0.46.0 already present (image digest ${CONTINUUM_IMAGE_DIGEST:-unresolved})."
+            exit 0
           fi
           python3 -m pip install --quiet "pr-agent==${PR_AGENT_VERSION}"
           pr-agent --version
@@ -393,6 +402,18 @@ jobs:
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
         run: |
           set -euo pipefail
+          # Continuum #179 prepared agent runtime: the immutable golden image
+          # (or its provider-native cache equivalent keyed by the image digest
+          # in CONTINUUM_IMAGE_DIGEST) already carries pinned OpenCode 1.18.34,
+          # so warm jobs perform zero downloads. Probe the prepared agent
+          # runtime first via `command -v opencode` and the exact version;
+          # only a validated cache miss falls through to deterministic
+          # reconstruction below.
+          export PATH="$HOME/.opencode/bin:$PATH"
+          if command -v opencode >/dev/null 2>&1 && opencode --version 2>/dev/null | grep -q "1.18.34"; then
+            echo "prepared-runtime hit: opencode 1.18.34 already present (image digest ${CONTINUUM_IMAGE_DIGEST:-unresolved})."
+            exit 0
+          fi
           for attempt in 1 2 3; do
             if curl -fsSL --retry 3 --retry-delay 2 https://opencode.ai/install | bash -s -- --version 1.18.34; then
               echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"

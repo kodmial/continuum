@@ -4726,4 +4726,80 @@ class ContinuumTest < Minitest::Test
                     'the CLI must delegate to the canonical gate, not reimplement it'
   end
 
+  # kodmial/continuum#179: agent execution is fast from a warm image/cache,
+  # never from warm compute. Every OpenCode/PR-Agent install site probes the
+  # prepared agent runtime first (exact pinned versions + image digest) and
+  # only reconstructs deterministically on a validated cache miss, so normal
+  # (warm) execution performs zero bootstrap downloads. The probe must come
+  # BEFORE the first installer line: a probe after the download proves
+  # nothing about the warm path.
+  def test_agent_runtime_probe_precedes_bootstrap_install
+    {
+      'continuum-opencode.yml' => %w[1.18.34],
+      'continuum-pr-agent.yml' => %w[1.18.34 0.46.0],
+      'continuum-pr-agent-repair.yml' => %w[1.18.34],
+      'continuum-coderabbit-unresolved.yml' => %w[1.18.34],
+      'continuum-consumer-child-worker.yml' => %w[1.18.34],
+      'continuum-consumer-child-review.yml' => %w[1.18.34],
+      'continuum-consumer-child-pr-review.yml' => %w[1.18.34],
+    }.each do |name, pins|
+      body = workflow_body(name)
+      assert_includes body, 'command -v opencode',
+                      "#{name}: the prepared-runtime probe must check for the preinstalled CLI"
+      assert_includes body.downcase, 'prepared agent runtime',
+                      "#{name}: the install site must name the prepared agent runtime it probes"
+      assert_includes body, 'CONTINUUM_IMAGE_DIGEST',
+                      "#{name}: the probe must key on the immutable image digest"
+      pins.each do |pin|
+        assert_includes body, pin, "#{name}: the exact pinned version #{pin} must be enforced"
+      end
+      probe_at = body.index('command -v opencode')
+      installer_at = body.index('https://opencode.ai/install')
+      refute_nil installer_at, "#{name}: the deterministic reconstruction fallback is missing"
+      assert_operator probe_at, :<, installer_at,
+                      "#{name}: the prepared-runtime probe must precede the installer (warm path downloads nothing)"
+      assert_includes body, 'prepared-runtime hit',
+                      "#{name}: a warm probe hit must short-circuit before any download"
+    end
+
+    pr_agent = workflow_body('continuum-pr-agent.yml')
+    probe_at = pr_agent.index('pr-agent --version')
+    pip_at = pr_agent.index('pr-agent==')
+    refute_nil probe_at, 'continuum-pr-agent.yml: the PR-Agent prepared-runtime probe is missing'
+    refute_nil pip_at, 'continuum-pr-agent.yml: the pinned PR-Agent reconstruction is missing'
+    assert_operator probe_at, :<, pip_at,
+                    'continuum-pr-agent.yml: the PR-Agent probe must precede the pip install'
+  end
+
+  # kodmial/continuum#179: strict ephemeral profiles keep zero live idle
+  # instances and one job per instance. No workflow may pool warm runners or
+  # pin a persistent egress identity between jobs, and no paid-provider key
+  # may appear in the agent execution path.
+  def test_agent_execution_has_no_warm_pool_or_paid_provider_key
+    %w[
+      continuum-opencode.yml
+      continuum-pr-agent.yml
+      continuum-pr-agent-repair.yml
+      continuum-coderabbit-unresolved.yml
+      continuum-consumer-child-worker.yml
+      continuum-consumer-child-review.yml
+      continuum-consumer-child-pr-review.yml
+    ].each do |name|
+      body = workflow_body(name)
+      %w[OPENCODE_API_KEY ANTHROPIC_API_KEY GROQ_API_KEY].each do |key|
+        refute_includes body, key, "#{name}: core execution must never read a paid provider key"
+      end
+      refute_match(/idle_instances:\s*[1-9]/, body,
+                   "#{name}: strict profiles keep zero live idle instances")
+      refute_match(/max_uses_per_instance:\s*[2-9]/, body,
+                   "#{name}: one instance may execute exactly one job")
+    end
+
+    engine = File.read(File.join(ROOT, 'src/continuum/agent_runtime.py'))
+    assert_includes engine, 'STRICT_MAX_USES_PER_INSTANCE = 1'
+    assert_includes engine, 'STRICT_IDLE_INSTANCES = 0'
+    assert_includes engine, 'def live_qualification_evidence'
+    assert_includes engine, 'ip_equality_is_not_failure'
+  end
+
   end

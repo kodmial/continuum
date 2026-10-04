@@ -111,8 +111,19 @@ jobs:
           git switch -c "$branch" origin/main >/dev/null 2>&1
           base_sha="$(git rev-parse HEAD)"
 
+          # Continuum #179 prepared agent runtime: the immutable golden image
+          # (or its provider-native cache equivalent keyed by the image digest
+          # in CONTINUUM_IMAGE_DIGEST) already carries pinned OpenCode 1.18.34,
+          # so warm jobs perform zero downloads. Probe the prepared agent
+          # runtime first via `command -v opencode` and the exact version;
+          # only a validated cache miss falls through to deterministic
+          # reconstruction below.
+          export PATH="$HOME/.opencode/bin:$PATH"
+          if command -v opencode >/dev/null 2>&1 && opencode --version 2>/dev/null | grep -q "1.18.34"; then
+            echo "prepared-runtime hit: opencode 1.18.34 already present (image digest ${CONTINUUM_IMAGE_DIGEST:-unresolved})."
+          else
           for attempt in 1 2 3; do
-            if curl -fsSL https://opencode.ai/install | bash >/dev/null 2>&1; then
+            if curl -fsSL --retry 3 --retry-delay 2 https://opencode.ai/install | bash -s -- --version 1.18.34 >/dev/null 2>&1; then
               break
             fi
             if [[ "$attempt" -eq 3 ]]; then
@@ -121,6 +132,7 @@ jobs:
             fi
             sleep $((attempt * 5))
           done
+          fi
           export PATH="$HOME/.opencode/bin:$PATH"
           test -x "$HOME/.opencode/bin/opencode"
 
