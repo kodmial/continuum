@@ -930,6 +930,23 @@ jobs:
               title="$(jq -r '.title' <<<"$decoded")"
               rank="$(jq -r '.rank' <<<"$decoded")"
               priority="$(jq -r '.priority' <<<"$decoded")"
+              normalized="$(jq -r '.normalized // false' <<<"$decoded")"
+
+              # One priority contract (kodmial/continuum#262): a legacy
+              # `P0:`/`P1:`/`P2:` title prefix normalizes to the matching
+              # priority label when no explicit priority label exists, so a
+              # delegated child task ranks identically to a local issue.
+              # Labels stay authoritative: an explicit label always wins and
+              # is never overridden here. Persisting the label is idempotent
+              # (a second pass observes the label and skips) and never
+              # duplicates; ranking already reflects the effective priority
+              # even if this best-effort write fails. No repository identity
+              # is echoed: public logs carry only the opaque task number.
+              if [[ "$normalized" == "true" && -n "$priority" ]]; then
+                gh api --method POST "repos/$child_repo/issues/$task_number/labels" \
+                  -f "labels[]=$priority" >/dev/null 2>&1 || true
+                echo "Normalized delegated task #$task_number to $priority."
+              fi
 
               task_active "$child_id" task "$task_number" && continue
               task_active "$child_id" review "$task_number" && continue
@@ -970,19 +987,31 @@ jobs:
                   select(.pull_request == null)
                   | select($ready == "" or ([.labels[]?.name] | index($ready) != null))
                   | . + {
-                      _rank:
-                        (if any(.labels[]?.name; . == "priority:p0") then 0
-                         elif any(.labels[]?.name; . == "priority:p1") then 1
-                         elif any(.labels[]?.name; . == "priority:p2") then 2 else 3 end),
-                      _priority:
+                      _label_priority:
                         (if any(.labels[]?.name; . == "priority:p0") then "priority:p0"
                          elif any(.labels[]?.name; . == "priority:p1") then "priority:p1"
-                         elif any(.labels[]?.name; . == "priority:p2") then "priority:p2" else "" end)
+                         elif any(.labels[]?.name; . == "priority:p2") then "priority:p2" else "" end),
+                      _title_priority:
+                        (if (.title // "" | test("^P[0-2]:\\s+"; "i"))
+                         then ("priority:p" + ((.title // "" | capture("^P(?<digit>[0-2]):\\s+"; "i").digit | ascii_downcase)))
+                         else "" end)
+                    }
+                  | . + {
+                      _priority:
+                        (if ._label_priority != "" then ._label_priority
+                         elif ._title_priority != "" then ._title_priority else "" end),
+                      _normalized: (._label_priority == "" and ._title_priority != "")
+                    }
+                  | . + {
+                      _rank:
+                        (if ._priority == "priority:p0" then 0
+                         elif ._priority == "priority:p1" then 1
+                         elif ._priority == "priority:p2" then 2 else 3 end)
                     }
                 )
                 | sort_by(._rank, .number)
                 | .[]
-                | {number:.number,body:(.body//""),title:(.title//""),rank:._rank,priority:._priority}
+                | {number:.number,body:(.body//""),title:(.title//""),rank:._rank,priority:._priority,normalized:._normalized}
                 | @base64
               ' <<<"$issues_json"
             )
