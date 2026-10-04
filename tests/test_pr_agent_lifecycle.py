@@ -26,9 +26,16 @@ SRC = os.path.join(ROOT, "src")
 # review-comment routes keep their existing behavior. The authoritative task
 # contract and scripts/test-continuum.rb require those gate strings in
 # continuum-opencode.yml, so the pre-#248 zero-diff assertion from 87d139b is
-# stale. Keeping the immutable commit baseline means any later
-# protected-file drift still fails.
-BASELINE_SHA = "3df3b1e231c395d425385107e9dea03a8911274d"
+# stale.
+# Intentional P0 baseline advance to 1a93faa: current main keeps OpenCode
+# recovery automatic across stale locks and exhaustion by defaulting
+# PAUSE_ON_FAILURE to 'false' in continuum-opencode.yml (plus the scheduler
+# and watchdog). scripts/test-continuum.rb on current main explicitly
+# requires the 'false' default, so the 3df3b1e zero-diff assertion (which
+# pins the old 'true' default) is stale and fails even on clean main. This
+# PR makes no protected-file change versus current main. Keeping the
+# immutable commit baseline means any later protected-file drift still fails.
+BASELINE_SHA = "1a93faa10739ca104be871093908b5d15cad1d4a"
 
 PROTECTED_FILES = [
     ".github/workflows/continuum-opencode.yml",
