@@ -1,0 +1,25 @@
+name: Temporary rename PR 207 branch
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/zz-rename-39-branch-temp.yml"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  rename:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Rename branch into OpenCode repair namespace
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OLD_BRANCH: work-lock/39-pr-agent-convergence
+          NEW_BRANCH: opencode/39-pr-agent-convergence
+        run: |
+          set -euo pipefail
+          encoded_old="${OLD_BRANCH//\//%2F}"
+          gh api             --method POST             "repos/$GITHUB_REPOSITORY/branches/$encoded_old/rename"             -f new_name="$NEW_BRANCH"
