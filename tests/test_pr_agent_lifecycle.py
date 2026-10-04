@@ -19,7 +19,7 @@ SRC = os.path.join(ROOT, "src")
 # Protected OpenCode files may move only through an explicit, independently
 # reviewed core change. Issue #212 intentionally advances the handoff contract;
 # PR-Agent isolation remains a zero-diff check from this new baseline.
-BASELINE_SHA = "e489ec0d3af72eaf870b4c09bc6cb4b1275c228f"
+BASELINE_SHA = "c552a3727821455dda7d1993d004dc7a27463901"
 
 PROTECTED_FILES = [
     ".github/workflows/continuum-opencode.yml",
