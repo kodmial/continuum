@@ -2006,6 +2006,18 @@ class ContinuumTest < Minitest::Test
     end
   end
 
+  def test_pr_agent_review_workflow_uses_repository_token_not_shared_pat
+    body = workflow_body('continuum-pr-agent.yml')
+    refute_includes body, 'secrets.TAP_PAT',
+                    'review workflow must not consume the shared user PAT'
+    assert_includes body, 'GITHUB__USER_TOKEN: ${{ github.token }}'
+    assert_includes body, 'GH_TOKEN: ${{ github.token }}'
+    workflow = yaml(File.join(ROOT, '.github/caller-stubs/continuum-pr-agent.yml'))
+    permissions = workflow.fetch('permissions')
+    assert_equal 'write', permissions.fetch('actions')
+    assert_equal 'write', permissions.fetch('statuses')
+  end
+
   def test_pr_agent_router_validates_and_dispatches_exact_head
     router = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent-router.yml'))
     # The router validates PR membership, owner-gated actor/policy, and the
