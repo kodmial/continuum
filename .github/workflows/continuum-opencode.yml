@@ -545,7 +545,10 @@ jobs:
         env:
           ISSUE_NUMBER: ${{ inputs.issue_number || github.event.issue.number }}
           IN_PROGRESS_LABEL: ${{ inputs.in_progress_label || vars.AUTOMATION_IN_PROGRESS_LABEL || 'automation:in-progress' }}
+          READ_GITHUB_TOKEN: ${{ github.token }}
         with:
+          # Preserve PAT identity for readiness mutations while moving the
+          # same-repository readiness reads off the shared PAT core budget.
           github-token: ${{ secrets.TAP_PAT }}
           script: |
             const owner = context.repo.owner;
@@ -553,17 +556,43 @@ jobs:
             const issueNumber = Number(process.env.ISSUE_NUMBER);
             const inProgressLabel =
               process.env.IN_PROGRESS_LABEL || 'automation:in-progress';
+            const readToken = String(process.env.READ_GITHUB_TOKEN || '').trim();
+            const readGithub = readToken
+              ? new github.constructor({ auth: readToken })
+              : github;
+            let readTokenUnavailable = false;
+            async function withReadFallback(fn) {
+              if (readTokenUnavailable || readGithub === github) {
+                return await fn(github);
+              }
+              try {
+                return await fn(readGithub);
+              } catch (err) {
+                const status = err ? (err.status ?? err.response?.status) : undefined;
+                if (status === 401 || status === 403 || status === 429) {
+                  readTokenUnavailable = true;
+                  core.warning(
+                    'Repository-token readiness read failed (' + status + '); ' +
+                    'retrying with TAP_PAT for liveness.'
+                  );
+                  return await fn(github);
+                }
+                throw err;
+              }
+            }
 
             if (!Number.isInteger(issueNumber) || issueNumber <= 0) {
               core.setFailed('Invalid issue number for readiness check.');
               return;
             }
 
-            const { data: issue } = await github.rest.issues.get({
-              owner,
-              repo,
-              issue_number: issueNumber,
-            });
+            const { data: issue } = await withReadFallback(client =>
+              client.rest.issues.get({
+                owner,
+                repo,
+                issue_number: issueNumber,
+              })
+            );
             if (issue.state !== 'open') {
               core.setOutput('ready', 'false');
               core.notice(`Issue #${issueNumber} is not open; implementation will not start.`);
@@ -578,26 +607,30 @@ jobs:
               for (const match of declared[1].matchAll(/\d+/g)) {
                 const blockerNumber = Number(match[0]);
                 if (blockerNumber === issueNumber) continue;
-                const { data: blocker } = await github.rest.issues.get({
-                  owner,
-                  repo,
-                  issue_number: blockerNumber,
-                });
+                const { data: blocker } = await withReadFallback(client =>
+                  client.rest.issues.get({
+                    owner,
+                    repo,
+                    issue_number: blockerNumber,
+                  })
+                );
                 if (blocker.state === 'open') blockerNumbers.add(blockerNumber);
               }
             }
 
-            const nativeBlockers = await github.paginate(
-              'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
-              {
-                owner,
-                repo,
-                issue_number: issueNumber,
-                per_page: 100,
-                headers: {
-                  'X-GitHub-Api-Version': '2026-03-10',
-                },
-              }
+            const nativeBlockers = await withReadFallback(client =>
+              client.paginate(
+                'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
+                {
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                  per_page: 100,
+                  headers: {
+                    'X-GitHub-Api-Version': '2026-03-10',
+                  },
+                }
+              )
             );
             for (const blocker of nativeBlockers) {
               if (blocker.state === 'open') blockerNumbers.add(blocker.number);
@@ -623,14 +656,16 @@ jobs:
             const blockerText = openBlockers.map(number => `#${number}`).join(', ');
             const marker =
               `<!-- continuum-issue-readiness-blocked issue=${issueNumber} blockers=${openBlockers.join(',')} -->`;
-            const comments = await github.paginate(
-              github.rest.issues.listComments,
-              {
-                owner,
-                repo,
-                issue_number: issueNumber,
-                per_page: 100,
-              }
+            const comments = await withReadFallback(client =>
+              client.paginate(
+                client.rest.issues.listComments,
+                {
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                  per_page: 100,
+                }
+              )
             );
             if (!comments.some(comment => (comment.body || '').includes(marker))) {
               await github.rest.issues.createComment({
@@ -675,13 +710,13 @@ jobs:
           ((github.event_name == 'workflow_dispatch' && inputs.mode == 'issue') ||
            (github.event_name == 'issue_comment' && !github.event.issue.pull_request))
         env:
-          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          GH_TOKEN: ${{ github.token }}
           ISSUE_NUMBER: ${{ inputs.issue_number || github.event.issue.number }}
         run: |
           set -euo pipefail
           [[ -n "$ISSUE_NUMBER" ]] || { echo "skip=false" >> "$GITHUB_OUTPUT"; exit 0; }
 
-          EXISTING_PR="$(gh pr list \
+          # Read-only same-repository duplicate detection must not depend on TAP_PAT.\n          EXISTING_PR="$(gh pr list \
             --repo "$GITHUB_REPOSITORY" \
             --state open \
             --json number,headRefName \
