@@ -2018,20 +2018,17 @@ jobs:
             // accumulate in the newest window with every retry, so ten
             // pages preserve the attempt budget without walking history.
             const comments = [];
-            const total = (await github.rest.issues.get({ owner, repo, issue_number: issueNumber })).data.comments || 0;
-            const lastPage = Math.max(1, Math.ceil(total / 100));
             for (let page = 1; page <= 10; page += 1) {
-              const targetPage = lastPage - (page - 1);
-              if (targetPage < 1) break;
               const { data } = await github.rest.issues.listComments({
                 owner,
                 repo,
                 issue_number: issueNumber,
                 per_page: 100,
-                page: targetPage,
+                page,
               });
-              if (!Array.isArray(data) || data.length === 0) continue;
+              if (!Array.isArray(data) || data.length === 0) break;
               comments.push(...data);
+              if (data.length < 100) break;
             }
             const attempts = comments.filter(comment =>
               (comment.body || '').includes(marker)
