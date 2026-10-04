@@ -689,7 +689,7 @@ class DependencyCache:
     """
 
     def __init__(self) -> None:
-        self._entries: Dict[Tuple[str, str], CacheEntry] = {}
+        self._entries: Dict[Tuple[str, str, str], CacheEntry] = {}
 
     @staticmethod
     def cache_key(digest: str, cache_version: str = "v1") -> str:
@@ -724,7 +724,14 @@ class DependencyCache:
             validated=False,
             payload=body,
         )
-        self._entries[(project_id, key)] = entry
+        if not trusted:
+            # Untrusted (fork or untrusted-context) results are never
+            # stored: storing under the shared (project, repository, key)
+            # would clobber a prior trusted entry for the same digest and
+            # force subsequent trusted restores to miss. The caller still
+            # receives the untrusted entry so it can record the refusal.
+            return entry
+        self._entries[(project_id, repository, key)] = entry
         return entry
 
     def restore(
@@ -742,10 +749,10 @@ class DependencyCache:
         failure falls back to deterministic reconstruction (None).
         """
 
-        entry = self._entries.get((project_id, key))
+        entry = self._entries.get((project_id, repository, key))
         if entry is None:
             return None
-        if entry.repository != repository:
+        if entry.project_id != project_id or entry.repository != repository:
             return None
         if not entry.trusted:
             return None
@@ -1122,19 +1129,25 @@ class EphemeralController:
         if not destroyed:
             events.append("teardown-deferred-to-reconciler {}".format(instance.id))
         if cache_key is not None and terminal == OUTCOME_SUCCESS:
-            try:
-                self.cache.publish(
-                    key=cache_key,
-                    project_id=self.project_id,
-                    repository=repository,
-                    payload={"image_digest": digest,
-                             "profile_digest": profile_digest(profile)},
-                    is_fork=is_fork,
-                    trusted_context=trusted_context,
-                )
-                events.append("published-dependencies {}".format(cache_key))
-            except AgentRuntimeError:
+            if not (trusted_context and not is_fork):
+                # Fork/untrusted successes never publish: even an isolated
+                # write would be unusable on restore, and a shared-key write
+                # would clobber the trusted entry for this digest.
                 events.append("cache-publish-refused {}".format(cache_key))
+            else:
+                try:
+                    self.cache.publish(
+                        key=cache_key,
+                        project_id=self.project_id,
+                        repository=repository,
+                        payload={"image_digest": digest,
+                                 "profile_digest": profile_digest(profile)},
+                        is_fork=is_fork,
+                        trusted_context=trusted_context,
+                    )
+                    events.append("published-dependencies {}".format(cache_key))
+                except AgentRuntimeError:
+                    events.append("cache-publish-refused {}".format(cache_key))
         return JobResult(job_id, terminal, instance.id, network.id,
                          instance.public_ip, digest, destroyed, events)
 

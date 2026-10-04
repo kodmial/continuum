@@ -303,17 +303,16 @@ class ProtectedBaselineTests(unittest.TestCase):
                     if added:
                         actual = _Counter(added)
                         approved = _Counter(APPROVED_179_OPENCODE_PROBE_LINES)
-                        for line, count in approved.items():
-                            self.assertGreaterEqual(
-                                actual[line],
-                                2 * count,
-                                f"{path} is missing the approved #179 probe line: {line!r}",
-                            )
-                        unapproved = sorted(set(actual) - set(approved))
+                        expected = _Counter(
+                            {line: 2 * count for line, count in approved.items()}
+                        )
                         self.assertEqual(
-                            unapproved,
-                            [],
-                            f"{path} adds lines outside the approved #179 probe: {unapproved}",
+                            actual,
+                            expected,
+                            f"{path} drift must be exactly the approved #179 probe "
+                            f"(both install sites, no extra copies): "
+                            f"extra={sorted(set(actual) - set(expected))} "
+                            f"missing={sorted(set(expected) - set(actual))}",
                         )
                     # The probe must actually satisfy the #179 warm-path
                     # contract on the current worktree content.
@@ -330,15 +329,35 @@ class ProtectedBaselineTests(unittest.TestCase):
                         and line.strip()
                         and not line.strip().startswith("#")
                     ]
-                    self.assertTrue(
-                        gated,
-                        "the warm hit must be keyed by the image digest: no "
-                        "digest-gated probe line found",
+                    self.assertEqual(
+                        len(gated),
+                        2,
+                        "both opencode install sites must carry the digest-gated "
+                        f"warm hit, found {len(gated)}",
+                    )
+                    ungated = [
+                        line
+                        for line in body.splitlines()
+                        if "command -v opencode" in line
+                        and "CONTINUUM_IMAGE_DIGEST" not in line
+                        and line.strip()
+                        and not line.strip().startswith("#")
+                    ]
+                    self.assertEqual(
+                        ungated,
+                        [],
+                        "no ungated warm hit may remain: every "
+                        f"`command -v opencode` probe must be digest-gated: {ungated}",
                     )
                     self.assertLess(
                         body.index(gated[0]),
                         body.index("https://opencode.ai/install"),
                         "the digest-gated prepared-runtime probe must precede the installer",
+                    )
+                    self.assertLess(
+                        body.index(gated[1]),
+                        body.rindex("https://opencode.ai/install"),
+                        "both digest-gated probes must precede their site installer",
                     )
                     continue
                 self.assertEqual(
@@ -380,15 +399,64 @@ class ProtectedBaselineTests(unittest.TestCase):
                     elif line.startswith("-"):
                         removed.append(line[1:])
                 self.assertTrue(added or removed, f"{path} shows as modified with an empty diff")
-                self.assertEqual(
-                    sorted(set(removed) - set(APPROVED_179_WORKTREE_REMOVED_LINES)),
-                    [],
-                    f"{path} worktree change removes lines outside the approved repair",
+                from collections import Counter as _WorktreeCounter
+                actual_added = _WorktreeCounter(added)
+                approved_added = _WorktreeCounter(APPROVED_179_WORKTREE_ADDED_LINES)
+                expected_added = _WorktreeCounter(
+                    {line: 2 * count for line, count in approved_added.items()}
                 )
                 self.assertEqual(
-                    sorted(set(added) - set(APPROVED_179_WORKTREE_ADDED_LINES)),
+                    actual_added,
+                    expected_added,
+                    f"{path} worktree repair must touch both install sites together "
+                    f"(each approved added line exactly twice): "
+                    f"extra={sorted(set(actual_added) - set(expected_added))} "
+                    f"missing={sorted(set(expected_added) - set(actual_added))}",
+                )
+                actual_removed = _WorktreeCounter(removed)
+                approved_removed = _WorktreeCounter(APPROVED_179_WORKTREE_REMOVED_LINES)
+                expected_removed = _WorktreeCounter(
+                    {line: 2 * count for line, count in approved_removed.items()}
+                )
+                self.assertEqual(
+                    actual_removed,
+                    expected_removed,
+                    f"{path} worktree repair must touch both install sites together "
+                    f"(each approved removed line exactly twice): "
+                    f"extra={sorted(set(actual_removed) - set(expected_removed))} "
+                    f"missing={sorted(set(expected_removed) - set(actual_removed))}",
+                )
+                # Both sites must be repaired together for digest-keyed
+                # identity to hold: a single-site repair still leaves one old
+                # ungated probe that takes a warm hit without a digest.
+                worktree_body = read_repo(path)
+                gated_sites = [
+                    line
+                    for line in worktree_body.splitlines()
+                    if "CONTINUUM_IMAGE_DIGEST" in line
+                    and "command -v opencode" in line
+                    and line.strip()
+                    and not line.strip().startswith("#")
+                ]
+                self.assertEqual(
+                    len(gated_sites),
+                    2,
+                    "both opencode install sites must carry the digest-gated "
+                    f"warm hit, found {len(gated_sites)}",
+                )
+                lingering = [
+                    line
+                    for line in worktree_body.splitlines()
+                    if "command -v opencode" in line
+                    and "CONTINUUM_IMAGE_DIGEST" not in line
+                    and line.strip()
+                    and not line.strip().startswith("#")
+                ]
+                self.assertEqual(
+                    lingering,
                     [],
-                    f"{path} worktree change adds lines outside the approved repair",
+                    "one install site still carries the old ungated probe: "
+                    f"{lingering}",
                 )
                 continue
             self.assertNotIn(path, changed, f"{path} is modified")

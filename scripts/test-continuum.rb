@@ -5215,6 +5215,21 @@ class ContinuumTest < Minitest::Test
     engine = File.read(File.join(ROOT, 'src/continuum/agent_runtime.py'))
     assert_includes engine, 'STRICT_MAX_USES_PER_INSTANCE = 1'
     assert_includes engine, 'STRICT_IDLE_INSTANCES = 0'
+    # Positive proof: the refutes above pass vacuously when neither key is
+    # present (the github-hosted workflows declare no such keys), so the
+    # engine must be proven to declare and enforce the strict values.
+    assert_match(/["']max_uses_per_instance["']\s*:\s*1\b/, engine,
+                 'engine strict profiles must declare max_uses_per_instance: 1')
+    assert_match(/["']idle_instances["']\s*:\s*0\b/, engine,
+                 'engine strict profiles must declare idle_instances: 0')
+    assert_match(/if idle_number != STRICT_IDLE_INSTANCES/, engine,
+                 'engine must reject any idle_instances other than zero')
+    assert_match(/if max_uses_number != STRICT_MAX_USES_PER_INSTANCE/, engine,
+                 'engine must reject any max_uses_per_instance other than one')
+    assert_includes engine, 'idle_instances={} is rejected',
+                    'engine must fail explicitly on non-zero idle_instances'
+    assert_includes engine, 'one instance may execute exactly one job',
+                    'engine must fail explicitly on non-single max_uses_per_instance'
     assert_includes engine, 'def live_qualification_evidence'
     assert_includes engine, 'ip_equality_is_not_failure'
   end
