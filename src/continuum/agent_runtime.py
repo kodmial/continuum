@@ -2293,8 +2293,9 @@ class EphemeralController:
             if fail_jit or outcome == OUTCOME_JIT_FAILURE:
                 events.append("jit-registration-failed {}".format(instance.id))
                 destroyed = self._teardown(instance, now=now, retries=teardown_retries)
-                self.leases.pop(instance.id, None)
-                if not destroyed:
+                if destroyed:
+                    self.leases.pop(instance.id, None)
+                else:
                     events.append("teardown-deferred-to-reconciler {}".format(instance.id))
                 assert network is not None and instance is not None
                 return JobResult(job_id, OUTCOME_JIT_FAILURE, instance.id, network.id,

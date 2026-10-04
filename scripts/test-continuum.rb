@@ -5481,6 +5481,33 @@ class ContinuumTest < Minitest::Test
   end
 
   # kodmial/continuum#179: golden-image provenance and per-profile digests.
+  # The literal-path branch of `stamp_write?` must catch a self-stamp via a
+  # literal redirect (`> $HOME/.opencode/image-digest`,
+  # `>> ~/.opencode/image-digest`) exactly like the `$STAMP_FILE` redirects
+  # and tee/cp writes, so a deterministic-reconstruction step can never pass
+  # the no-self-stamp provenance check by spelling the stamp literally.
+  def test_stamp_write_catches_literal_redirect_spellings
+    assert stamp_write?('echo "$digest" > $HOME/.opencode/image-digest'),
+           'literal `> $HOME/.opencode/image-digest` redirect must count as a stamp write'
+    assert stamp_write?('echo "$digest" >> ~/.opencode/image-digest'),
+           'literal `>> ~/.opencode/image-digest` redirect must count as a stamp write'
+    assert stamp_write?('echo "$digest" > "${HOME}/.opencode/image-digest"'),
+           'braced literal redirect must count as a stamp write'
+    assert stamp_write?('echo "$digest" > $STAMP_FILE'),
+           '$STAMP_FILE redirect must count as a stamp write'
+    assert stamp_write?('echo "$digest" | tee "$STAMP_FILE" >/dev/null'),
+           'tee write must count as a stamp write'
+    assert stamp_write?('cp /tmp/digest "$STAMP_FILE"'),
+           'cp write must count as a stamp write'
+    refute stamp_write?('opencode --version >/dev/null'),
+           'probe `>/dev/null` redirect must not count as a stamp write'
+    refute stamp_write?('if [ "$(cat "$STAMP_FILE")" = "$digest" ]; then'),
+           'stamp read must not count as a stamp write'
+    refute stamp_write?('STAMP_FILE="$HOME/.opencode/image-digest"'),
+           'STAMP_FILE assignment must not count as a stamp write'
+  end
+
+  # kodmial/continuum#179: golden-image provenance and per-profile digests.
   # Only a validated image build (or a provider cache restore of it) may
   # create the image-digest stamp, so deterministic reconstruction never
   # self-stamps; and the content-addressed digest is per profile, so the

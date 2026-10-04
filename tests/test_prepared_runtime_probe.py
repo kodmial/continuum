@@ -326,6 +326,21 @@ class PreparedRuntimeProbeTests(unittest.TestCase):
         return regions
 
     def test_every_install_site_carries_the_full_probe(self):
+        # Lock the duplication surface: a new workflow file containing an
+        # installer URL, or a new installer line, must not slip past this
+        # suite just because EXPECTED_SITES was not updated.
+        found = {}
+        for name in sorted(os.listdir(WORKFLOWS_DIR)):
+            if not name.endswith(".yml"):
+                continue
+            body = read_workflow(name)
+            sites = installer_indices(body.splitlines())
+            if sites:
+                found[name] = len(sites)
+        unlisted = sorted(set(found) - set(EXPECTED_SITES))
+        self.assertEqual(
+            unlisted, [],
+            "installer sites found in untracked workflow files: {}".format(unlisted))
         for name, expected in sorted(EXPECTED_SITES.items()):
             with self.subTest(workflow=name):
                 sites = self.sites(name)

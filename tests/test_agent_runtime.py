@@ -274,7 +274,8 @@ class AgentRuntimeContractTest(unittest.TestCase):
         self.assertEqual(result.outcome, "jit-failure")
         self.assertTrue(result.destroyed)
         self.assertEqual(controller.live_instance_count(), 0)
-        self.assertNotIn("jit-{}".format(result.instance_id), controller.provider.registrations.values())
+        self.assertNotIn("jit-{}".format(result.instance_id), controller.provider.registrations)
+        self.assertNotIn(result.instance_id, controller.provider.registrations.values())
 
     def test_11_restart_plus_orphan_lease_swept_by_reconciler(self):
         controller = _controller()
