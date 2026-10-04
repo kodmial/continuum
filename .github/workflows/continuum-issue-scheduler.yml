@@ -2611,8 +2611,16 @@ jobs:
             }
 
             for (const issueNumber of activeRunIssues) {
-              if (!issueByNumber.has(issueNumber)) continue;
-              activeIssueNumbers.add(issueNumber);
+              const activeIssue = issueByNumber.get(issueNumber);
+              if (!activeIssue) continue;
+              const activeLabels = labelsByIssue.get(issueNumber) || new Set();
+              // With explicit admission enabled, implementation WIP counts only
+              // admitted coding work. Qualification/control/manual runs may
+              // execute concurrently but must not consume automatic coding
+              // capacity.
+              if (!readyLabel || activeLabels.has(readyLabel)) {
+                activeIssueNumbers.add(issueNumber);
+              }
               await addLabel(issueNumber, inProgressLabel);
               await removeLabel(issueNumber, pausedLabel);
             }
@@ -2642,6 +2650,14 @@ jobs:
 
               const labels = labelsByIssue.get(issueNumber);
               if (!labels.has(inProgressLabel)) continue;
+
+              // When explicit admission is enabled, a non-admitted in-progress
+              // issue belongs to another lane (qualification/control/manual).
+              // Leave its lifecycle label intact but do not reconcile/count it
+              // as automatic implementation WIP.
+              if (readyLabel && !labels.has(readyLabel)) {
+                continue;
+              }
 
               // Qualification lifecycle is not implementation WIP. Once the
               // implementation run is gone, release any stale reservation so a
