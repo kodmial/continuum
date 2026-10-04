@@ -279,7 +279,11 @@ jobs:
                   break
                 fi
                 [[ "$override_count" =~ ^[0-9]+$ ]] || { override_failed=1; break; }
-                override_seen+="$(jq -r --arg owner "$child_owner" '.[] | select(.user.login == $owner) | select((.body // "") | test("(^|[[:space:]])/(oc|opencode)([[:space:]]|$)")) | .created_at' <<<"$override_json" 2>/dev/null || true)"$'\n'
+                if ! override_cmds="$(jq -r --arg owner "$child_owner" '.[] | select(.user.login == $owner) | select((.body // "") | test("(^|[[:space:]])/(oc|opencode)([[:space:]]|$)")) | .created_at' <<<"$override_json" 2>/dev/null)"; then
+                  override_failed=1
+                  break
+                fi
+                override_seen+="${override_cmds}"$'\n'
                 [[ "$override_count" -ge 100 ]] || break
               done
               [[ "$override_failed" -eq 0 ]] || return 0
