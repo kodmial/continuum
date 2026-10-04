@@ -295,9 +295,12 @@ jobs:
               require('fs').mkdirSync('canary', { recursive: true });
               require('fs').writeFileSync(defectPath, defect);
               sh(`git add "${defectPath}"`);
+              // kodmial/continuum#260: disposable canary commits use the bot
+              // identity plus the component trailer (visibly machine-made).
               sh('git -c user.name="github-actions[bot]" '
                 + '-c user.email="41898282+github-actions[bot]@users.noreply.github.com" '
-                + 'commit -m "test: seed disposable PR-Agent canary defect"');
+                + 'commit -m "test: seed disposable PR-Agent canary defect" '
+                + '-m "Continuum-Component: pr-agent-canary"');
               sh(`git push -u origin "${branch}"`);
               const pr = await github.rest.pulls.create({
                 owner, repo, head: branch, base: baseRef,
@@ -385,7 +388,8 @@ jobs:
               sh(`git add "${defectPath}"`);
               sh('git -c user.name="github-actions[bot]" '
                 + '-c user.email="41898282+github-actions[bot]@users.noreply.github.com" '
-                + 'commit -m "test: correct disposable PR-Agent canary defect"');
+                + 'commit -m "test: correct disposable PR-Agent canary defect" '
+                + '-m "Continuum-Component: pr-agent-canary"');
               sh(`git push origin "${branch}"`);
               head = (await github.rest.pulls.get({ owner, repo, pull_number: prNumber })).data.head.sha;
               core.setOutput('fixed_sha', head);
