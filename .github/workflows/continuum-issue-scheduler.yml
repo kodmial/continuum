@@ -755,14 +755,19 @@ jobs:
 
             local_override_active() {
               local task_number="$1"
-              local recent_command command_epoch now_epoch
+              local recent_command command_epoch now_epoch grace_since
               if grep -Fxq "$task_number" <<<"$local_opencode_pr_tasks" ||
                  grep -Fxq "$task_number" <<<"$local_opencode_run_tasks"; then
                 return 0
               fi
               [[ -n "$child_owner" ]] || return 1
+              # Bounded grace-window read (Work-Lock #58 item 6 A4): only
+              # comments since grace plus a small clock-skew margin are
+              # fetched. Cross-repository PAT credential, owner identity,
+              # both command spellings and the grace comparison are unchanged.
+              grace_since="$(date -u -d "@$(( $(date +%s) - command_grace_seconds - 120 ))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)"
               recent_command="$(
-                gh api --paginate "repos/$child_repo/issues/$task_number/comments?per_page=100" \
+                gh api --paginate "repos/$child_repo/issues/$task_number/comments?per_page=100&since=$grace_since" \
                   --jq '.[] | select(.user.login == "'"$child_owner"'") | select((.body // "") | test("(^|[[:space:]])/(oc|opencode)([[:space:]]|$)")) | .created_at' \
                   2>/dev/null | tail -1 || true
               )"
@@ -1139,16 +1144,145 @@ jobs:
               )];
             }
 
+            // Pass-level open-issue snapshot for non-mutating admission
+            // (Work-Lock #58 item 6 A1/A5). Populated once from the primary
+            // open-issue pagination as the complete open inventory (issues
+            // and PRs alike). Same-repository snapshot admission only: an
+            // issue present in the snapshot is open; an issue absent from
+            // the complete snapshot is not an open local blocker. This
+            // avoids one issues.get per declared blocker during candidate
+            // selection. Fresh per-blocker reads still run immediately
+            // before every dispatch; cross-repository child checks stay on
+            // the PAT path below and never consult this snapshot.
+            let openSnapshotByNumber = null;
+            // Flipped once snapshot admission ends so the just-in-time
+            // pre-dispatch guards below always re-read instead of reusing
+            // pass-start state. Call strings stay unchanged on purpose.
+            let useOpenSnapshot = true;
+            function rememberOpenSnapshot(items) {
+              openSnapshotByNumber = new Map(
+                (items || []).map(item => [item.number, item])
+              );
+            }
+            function updateOpenSnapshot(issue) {
+              if (!openSnapshotByNumber) return;
+              if (!issue || typeof issue.number !== 'number') return;
+              if (issue.state === 'closed') {
+                openSnapshotByNumber.delete(issue.number);
+              } else {
+                openSnapshotByNumber.set(issue.number, issue);
+              }
+            }
+            function invalidateOpenSnapshot() {
+              openSnapshotByNumber = null;
+            }
+
+            // Non-mutating native-blocker snapshot (Work-Lock #58 item 6
+            // A2), memoized by local issue number so reservation
+            // reconciliation and candidate selection share one read per
+            // issue. The PAT-backed qualification check keeps its own
+            // credential-scoped entry; neither cache is consulted by the
+            // fresh pre-dispatch revalidation, which always re-reads.
+            const nativeBlockerSnapshotRead = new Map();
+            const nativeBlockerSnapshotPat = new Map();
+            async function snapshotNativeBlockers(issueNumber) {
+              if (nativeBlockerSnapshotRead.has(issueNumber)) {
+                return nativeBlockerSnapshotRead.get(issueNumber);
+              }
+              const blockers = await readGithub.paginate(
+                'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
+                {
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                  per_page: 100,
+                  headers: { 'X-GitHub-Api-Version': '2022-11-28' },
+                }
+              );
+              nativeBlockerSnapshotRead.set(issueNumber, blockers);
+              return blockers;
+            }
+            async function snapshotNativeBlockersPat(issueNumber) {
+              if (nativeBlockerSnapshotPat.has(issueNumber)) {
+                return nativeBlockerSnapshotPat.get(issueNumber);
+              }
+              const blockers = await github.paginate(
+                'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
+                {
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                  per_page: 100,
+                  headers: { 'X-GitHub-Api-Version': '2022-11-28' },
+                }
+              );
+              nativeBlockerSnapshotPat.set(issueNumber, blockers);
+              return blockers;
+            }
+            function invalidateNativeBlockers(issueNumber) {
+              if (issueNumber === undefined) {
+                nativeBlockerSnapshotRead.clear();
+                nativeBlockerSnapshotPat.clear();
+              } else {
+                nativeBlockerSnapshotRead.delete(issueNumber);
+                nativeBlockerSnapshotPat.delete(issueNumber);
+              }
+            }
+
+            // Bounded recent owner-command guard (Work-Lock #58 item 6 A3).
+            // The final dispatch guard only cares about an owner /oc or
+            // /opencode inside COMMAND_GRACE_MINUTES, so it queries the
+            // smallest safe recent window (grace plus a small clock-skew
+            // margin via the API since parameter) instead of paginating
+            // full comment history. Owner identity, both command spellings
+            // and the exact age comparison are preserved; the query is
+            // always fresh, never a cached snapshot.
+            function commandGraceSinceIso() {
+              const skewMs = 2 * 60 * 1000;
+              return new Date(Date.now() - commandGraceMs - skewMs).toISOString();
+            }
+            async function recentOwnerCommandWithinGrace(issueNumber) {
+              const comments = await readGithub.paginate(
+                readGithub.rest.issues.listComments,
+                {
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                  per_page: 100,
+                  since: commandGraceSinceIso(),
+                }
+              );
+              return comments
+                .filter(comment => {
+                  const body = comment.body || '';
+                  return comment.user?.login === owner &&
+                    (body.includes('/oc') || body.includes('/opencode'));
+                })
+                .sort(
+                  (a, b) =>
+                    new Date(a.created_at).getTime() -
+                    new Date(b.created_at).getTime()
+                )
+                .at(-1) || null;
+            }
+
             async function openDeclaredBlockers(
               issue,
               targetOwner = owner,
               targetRepo = repo
             ) {
               const open = [];
+              const sameRepo =
+                targetOwner === owner && targetRepo === repo;
               for (const blockerNumber of declaredDependencyNumbers(issue)) {
                 if (blockerNumber === issue.number) continue;
+                if (sameRepo && useOpenSnapshot && openSnapshotByNumber) {
+                  const snap = openSnapshotByNumber.get(blockerNumber);
+                  if (snap && snap.state === 'open') open.push(snap);
+                  continue;
+                }
                 const readClient =
-                  targetOwner === owner && targetRepo === repo ? readGithub : github;
+                  sameRepo ? readGithub : github;
                 const response = await readClient.rest.issues.get({
                   owner: targetOwner,
                   repo: targetRepo,
@@ -1545,16 +1679,7 @@ jobs:
                 return 'blocked-waiting';
               }
               try {
-                const nativeBlockers = await github.paginate(
-                  'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
-                  {
-                    owner,
-                    repo,
-                    issue_number: capabilityNumber,
-                    per_page: 100,
-                    headers: { 'X-GitHub-Api-Version': '2022-11-28' },
-                  }
-                );
+                const nativeBlockers = await snapshotNativeBlockersPat(capabilityNumber);
                 if (nativeBlockers.some(blocker => blocker.state === 'open')) {
                   core.info(
                     'Capability #' + capabilityNumber +
@@ -1624,6 +1749,8 @@ jobs:
                     state: 'closed',
                     state_reason: 'completed',
                   });
+                  updateOpenSnapshot({ ...capabilityIssue, state: 'closed' });
+                  invalidateNativeBlockers();
                 }
                 core.notice(
                   'Capability #' + capabilityNumber +
@@ -1669,10 +1796,23 @@ jobs:
               requiredSha,
               evidenceBodiesByRef
             ) {
-              const openIssues = await readGithub.paginate(
-                readGithub.rest.issues.listForRepo,
-                { owner, repo, state: 'open', per_page: 100 }
-              );
+              // Pass-level open-issue inventory (Work-Lock #58 item 6 A5):
+              // reuse the scheduler's snapshot when available instead of a
+              // duplicate full open-issue pagination. The inventory is
+              // updated below whenever this run creates or refreshes a
+              // repair issue so later decisions cannot use knowingly stale
+              // state; a run without a snapshot falls back to one lazy
+              // paginated fetch that then seeds the snapshot.
+              let openIssues;
+              if (openSnapshotByNumber) {
+                openIssues = [...openSnapshotByNumber.values()];
+              } else {
+                openIssues = await readGithub.paginate(
+                  readGithub.rest.issues.listForRepo,
+                  { owner, repo, state: 'open', per_page: 100 }
+                );
+                rememberOpenSnapshot(openIssues);
+              }
               for (const failure of failures) {
                 const bodies = (evidenceBodiesByRef && evidenceBodiesByRef[failure]) || [];
                 const latestEvidence = latestTrustedEvidenceBody(bodies, failure, requiredSha) || '';
@@ -1724,6 +1864,7 @@ jobs:
                       issue_number: existing.number,
                       body: handoffBody,
                     });
+                    updateOpenSnapshot({ ...existing, body: handoffBody, state: 'open' });
                     core.warning(
                       'Refreshed repair issue #' + existing.number +
                       ' with latest exact-SHA failure evidence for qualification #' + failure + '.'
@@ -1744,6 +1885,8 @@ jobs:
                   body: handoffBody,
                   labels: ['priority:p0'],
                 });
+                updateOpenSnapshot({ ...created.data, body: handoffBody, state: 'open' });
+                invalidateNativeBlockers();
                 await github.rest.issues.createComment({
                   owner,
                   repo,
@@ -1810,6 +1953,8 @@ jobs:
                   issue_number: issueNumber,
                   state: 'open',
                 });
+                updateOpenSnapshot({ ...fresh, state: 'open' });
+                invalidateNativeBlockers();
                 core.warning(
                   'Capability #' + issueNumber +
                   ' closed with pending mandatory qualification (' + originText +
@@ -2039,6 +2184,8 @@ jobs:
                             state: 'closed',
                             state_reason: 'completed',
                           });
+                          updateOpenSnapshot({ number: issueNumber, state: 'closed' });
+                          invalidateNativeBlockers();
                         }
                         core.notice(
                           'Merged OpenCode PR #' + pr.number +
@@ -2052,18 +2199,7 @@ jobs:
                         );
                       }
                     } else {
-                      const blockers = await readGithub.paginate(
-                        'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
-                        {
-                          owner,
-                          repo,
-                          issue_number: issueNumber,
-                          per_page: 100,
-                          headers: {
-                            'X-GitHub-Api-Version': '2022-11-28',
-                          },
-                        }
-                      );
+                      const blockers = await snapshotNativeBlockers(issueNumber);
                       const openBlockers = blockers.filter(
                         blocker => blocker.state === 'open'
                       );
@@ -2126,6 +2262,10 @@ jobs:
               state: 'open',
               per_page: 100,
             });
+            // Seed the pass-level open-issue inventory before filtering so
+            // declared-blocker admission sees the complete open set (an
+            // absent number is not an open local blocker, present is open).
+            rememberOpenSnapshot(issues);
             issues = issues.filter(issue => !issue.pull_request);
             for (const issue of issues) rememberIssue(issue);
 
@@ -2216,6 +2356,8 @@ jobs:
                 ' with pending mandatory qualification.'
               );
               issues.push({ ...closed, state: 'open' });
+              updateOpenSnapshot({ ...closed, state: 'open' });
+              invalidateNativeBlockers();
             }
 
             // Open-capability reconcile: exact-SHA evidence may complete the
@@ -2415,18 +2557,8 @@ jobs:
               // dispatch lease still exists. Once the actual OpenCode run is
               // gone, release the reservation immediately so blocked work does
               // not consume WIP capacity or get resurrected from old comments.
-              const reservationBlockers = await readGithub.paginate(
-                'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
-                {
-                  owner,
-                  repo,
-                  issue_number: issueNumber,
-                  per_page: 100,
-                  headers: {
-                    'X-GitHub-Api-Version': '2022-11-28',
-                  },
-                }
-              );
+              // Snapshot-scoped read shared with candidate selection (A2).
+              const reservationBlockers = await snapshotNativeBlockers(issueNumber);
               const openReservationBlockers = reservationBlockers.filter(
                 blocker => blocker.state === 'open'
               );
@@ -2511,6 +2643,8 @@ jobs:
                         state: 'closed',
                         state_reason: 'completed',
                       });
+                      updateOpenSnapshot({ number: issueNumber, state: 'closed' });
+                      invalidateNativeBlockers();
                       core.notice(
                         'Reconciled merged PR #' + latestPr.number +
                         ' -> completed issue #' + issueNumber + '.'
@@ -2705,18 +2839,9 @@ jobs:
                 continue;
               }
 
-              const blockers = await readGithub.paginate(
-                'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
-                {
-                  owner,
-                  repo,
-                  issue_number: issue.number,
-                  per_page: 100,
-                  headers: {
-                    'X-GitHub-Api-Version': '2022-11-28',
-                  },
-                }
-              );
+              // Snapshot-scoped read shared with reservation reconciliation
+              // (A2); the fresh pre-dispatch query below always re-reads.
+              const blockers = await snapshotNativeBlockers(issue.number);
               const openBlockers = blockers.filter(
                 blocker => blocker.state === 'open'
               );
@@ -2747,6 +2872,11 @@ jobs:
                 )
                 .join(', ') + '.'
             );
+
+            // Snapshot admission ends here: every guard inside the dispatch
+            // loop below re-reads fresh state (issue/PR open, labels,
+            // declared and native blockers, owner-command race window).
+            useOpenSnapshot = false;
 
             for (const candidate of selected) {
               const { issue, priority } = candidate;
@@ -2911,27 +3041,9 @@ jobs:
                 continue;
               }
 
-              const freshComments = await readGithub.paginate(
-                readGithub.rest.issues.listComments,
-                {
-                  owner,
-                  repo,
-                  issue_number: issue.number,
-                  per_page: 100,
-                }
-              );
-              const latestOpenCodeCommand = freshComments
-                .filter(comment => {
-                  const body = comment.body || '';
-                  return comment.user?.login === owner &&
-                    (body.includes('/oc') || body.includes('/opencode'));
-                })
-                .sort(
-                  (a, b) =>
-                    new Date(a.created_at).getTime() -
-                    new Date(b.created_at).getTime()
-                )
-                .at(-1);
+              // Bounded grace-window guard (A3): one small recent query,
+              // always fresh, preserves owner identity and both spellings.
+              const latestOpenCodeCommand = await recentOwnerCommandWithinGrace(issue.number);
 
               if (latestOpenCodeCommand) {
                 const commandAgeMs =

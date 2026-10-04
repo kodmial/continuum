@@ -563,19 +563,45 @@ jobs:
                 )[0] || null;
             }
 
+            // Bounded active review-run snapshot (Work-Lock #58 item 6
+            // B1). The recovery decision only needs active/relevant runs,
+            // so query active statuses only (at most 3 pages per status)
+            // instead of paginating complete workflow history. Any active
+            // exact PR/HEAD/kind operation carries one of these statuses,
+            // so exactActiveRun still reliably prevents duplicate dispatch.
+            // After a dispatch the caller re-invokes this bounded snapshot
+            // to refresh only active state for later PRs in the same pass.
+            const ACTIVE_REVIEW_RUN_STATUSES = ['queued', 'in_progress', 'waiting', 'pending', 'requested'];
+            const MAX_REVIEW_PAGES_PER_STATUS = 3;
             async function listReviewRuns() {
               try {
-                return await withReadFallback(client =>
-                  client.paginate(
-                    client.rest.actions.listWorkflowRuns,
-                    {
-                      owner: executionOwner,
-                      repo: executionRepo,
-                      workflow_id: reviewWorkflow,
-                      per_page: 100,
+                const seen = new Map();
+                for (const status of ACTIVE_REVIEW_RUN_STATUSES) {
+                  let page = 1;
+                  for (;;) {
+                    const response = await withReadFallback(client =>
+                      client.rest.actions.listWorkflowRuns({
+                        owner: executionOwner,
+                        repo: executionRepo,
+                        workflow_id: reviewWorkflow,
+                        per_page: 100,
+                        page,
+                        status,
+                      })
+                    );
+                    const batch = (response && response.data && response.data.workflow_runs) || [];
+                    for (const run of batch) {
+                      if (run && run.id !== undefined && run.id !== null) {
+                        const key = Number(run.id);
+                        if (!seen.has(key)) seen.set(key, run);
+                      }
                     }
-                  )
-                );
+                    if (batch.length < 100) break;
+                    page += 1;
+                    if (page > MAX_REVIEW_PAGES_PER_STATUS) break;
+                  }
+                }
+                return [...seen.values()];
               } catch (err) {
                 // A transient/rate-limit read must never fail the run here:
                 // callers defer green to the next wakeup instead of spending
@@ -587,6 +613,35 @@ jobs:
                 );
                 throw err;
               }
+            }
+            // Run-ID metadata index (Work-Lock #58 item 6 B2), built from
+            // the already-fetched review-run snapshot so status target URLs
+            // that point at a snapshot run need no extra GET. Misses fall
+            // back to the exact getWorkflowRun below with 404 semantics
+            // unchanged.
+            let runMetadataById = new Map();
+            function rememberReviewRuns(runs) {
+              runMetadataById = new Map(
+                (runs || []).map(run => [Number(run && run.id), run])
+              );
+            }
+            function snapshotRunMetadata(runId) {
+              const run = runMetadataById.get(Number(runId));
+              if (!run) return null;
+              const title = String(run.display_title || '');
+              const identity = title.match(/\[(review|repair):\d+\]/);
+              const recoveryKind = identity ? identity[1] : null;
+              if (activeStatuses.has(String(run.status || '').toLowerCase())) {
+                return {
+                  conclusion: String(run.status || '').toLowerCase(),
+                  recoveryKind,
+                };
+              }
+              return {
+                conclusion:
+                  String(run.conclusion || run.status || '').toLowerCase() || null,
+                recoveryKind,
+              };
             }
 
             function exactActiveRun(runs, prNumber, kind, head) {
@@ -613,6 +668,8 @@ jobs:
               const target = String(status?.target_url || '');
               const match = target.match(/\/actions\/runs\/(\d+)(?:$|[/?#])/);
               if (!match) return { conclusion: null, recoveryKind: null };
+              const snapshotHit = snapshotRunMetadata(match[1]);
+              if (snapshotHit) return snapshotHit;
               try {
                 const { data: run } = await withReadFallback(client =>
                   client.rest.actions.getWorkflowRun({
@@ -666,6 +723,61 @@ jobs:
                 latest.status === 'completed' &&
                 latest.conclusion === 'success'
               );
+            }
+
+            // Bounded CI snapshot for the non-mutating initial scan
+            // (Work-Lock #58 item 6 B3): one bounded recent run listing
+            // (at most 3 pages) indexed by exact HEAD SHA. PRs represented
+            // in the snapshot need no per-HEAD CI-run-list request; a HEAD
+            // missing from the snapshot falls back to exactHeadCiGreen
+            // above instead of assuming red/green. The fresh exact-HEAD
+            // query inside dispatch() below is unchanged and still gates
+            // every mutation, so a stale green snapshot can never
+            // authorize a dispatch.
+            let ciSnapshotByHead = null;
+            async function fetchCiSnapshot() {
+              if (ciSnapshotByHead) return ciSnapshotByHead;
+              const byHead = new Map();
+              for (let page = 1; page <= 3; page += 1) {
+                const response = await withReadFallback(client =>
+                  client.rest.actions.listWorkflowRunsForRepo({
+                    owner,
+                    repo,
+                    event: 'pull_request',
+                    per_page: 100,
+                    page,
+                  })
+                );
+                const batch = (response && response.data && response.data.workflow_runs) || [];
+                for (const run of batch) {
+                  if (run.name !== ciWorkflowName) continue;
+                  const sha = String(run.head_sha || '').toLowerCase();
+                  if (!sha) continue;
+                  const prev = byHead.get(sha);
+                  if (!prev || Date.parse(run.created_at || 0) > Date.parse(prev.created_at || 0)) {
+                    byHead.set(sha, run);
+                  }
+                }
+                if (batch.length < 100) break;
+              }
+              ciSnapshotByHead = byHead;
+              return byHead;
+            }
+            function ciSnapshotGreen(head) {
+              if (!ciSnapshotByHead) return null;
+              const key = String(head || '').toLowerCase();
+              if (!ciSnapshotByHead.has(key)) return null;
+              const run = ciSnapshotByHead.get(key);
+              return Boolean(
+                run &&
+                run.status === 'completed' &&
+                run.conclusion === 'success'
+              );
+            }
+            async function scanCiGreen(head) {
+              const snapshotVerdict = ciSnapshotGreen(head);
+              if (snapshotVerdict !== null) return snapshotVerdict;
+              return await exactHeadCiGreen(head);
             }
 
             // Canonical 10-execution schedule (#224): execution index 0 runs
@@ -1520,6 +1632,7 @@ jobs:
             let reviewRuns;
             try {
               reviewRuns = await listReviewRuns();
+              rememberReviewRuns(reviewRuns);
             } catch (err) {
               if (isTransientApiError(err)) {
                 core.warning(
@@ -1530,6 +1643,24 @@ jobs:
                 return;
               }
               throw err;
+            }
+            // One bounded CI snapshot for the non-mutating initial scan
+            // (B3). A snapshot failure never fails the scan: per-PR exact
+            // lookups remain as fallback, and dispatch() always re-reads
+            // fresh exact-HEAD CI before mutating.
+            try {
+              await fetchCiSnapshot();
+            } catch (err) {
+              if (isTransientApiError(err)) {
+                core.warning(
+                  'CI snapshot hit a transient/rate-limit read; ' +
+                  'falling back to per-PR exact HEAD CI: ' +
+                  (err.message || err)
+                );
+                ciSnapshotByHead = null;
+              } else {
+                throw err;
+              }
             }
             // Deterministic per-PR failures must not strand healthy PRs
             // behind one bad PR in the same run: record loudly and continue.
@@ -1569,29 +1700,43 @@ jobs:
               }
               try {
                 // Latest-state reconciliation body (flat inside the loop so
-                // per-PR skip stays a plain `continue`).
-                const ciGreen = await exactHeadCiGreen(head);
+                // per-PR skip stays a plain `continue`). The initial CI
+                // verdict comes from the bounded snapshot with exact
+                // fallback; dispatch() still re-reads fresh exact-HEAD CI
+                // before mutating.
+                const ciGreen = await scanCiGreen(head);
               if (!ciGreen) {
                 core.info('PR #' + pr.number + ' HEAD ' + head + ': exact-head CI not green; skip.');
                 continue;
               }
 
-              const [statuses, comments] = await Promise.all([
-                withReadFallback(client =>
-                  client.paginate(
-                    client.rest.repos.listCommitStatusesForRef,
-                    { owner, repo, ref: head, per_page: 100 }
-                  )
-                ),
-                withReadFallback(client =>
-                  client.paginate(
-                    client.rest.issues.listComments,
-                    { owner, repo, issue_number: pr.number, per_page: 100 }
-                  )
-                ),
-              ]);
+              // Read-side evaluation order (B4): statuses first so an
+              // already-clean reviewed PR stops here with no durable
+              // retry-comment scan and no status run-metadata GET.
+              const statuses = await withReadFallback(client =>
+                client.paginate(
+                  client.rest.repos.listCommitStatusesForRef,
+                  { owner, repo, ref: head, per_page: 100 }
+                )
+              );
 
               const reviewStatus = latestContext(statuses, REVIEW_CONTEXT);
+              if (reviewStatus?.state === 'success') {
+                const cleanDescription = String(reviewStatus.description || '');
+                if (!/actionable/i.test(cleanDescription) && !/blocking; recovery eligible/i.test(cleanDescription)) {
+                  core.info(
+                    'PR #' + pr.number + ' HEAD ' + head +
+                    ': review is settled clean; recovery has nothing to do.'
+                  );
+                  continue;
+                }
+              }
+              const comments = await withReadFallback(client =>
+                client.paginate(
+                  client.rest.issues.listComments,
+                  { owner, repo, issue_number: pr.number, per_page: 100 }
+                )
+              );
               const reviewRun = reviewStatus
                 ? await statusRunMetadata(reviewStatus)
                 : { conclusion: null, recoveryKind: null };
@@ -1673,6 +1818,7 @@ jobs:
               );
               if (dispatched) {
                 reviewRuns = await listReviewRuns();
+                rememberReviewRuns(reviewRuns);
               }
               } catch (err) {
                 // Generic transient classification (#224): infrastructure
