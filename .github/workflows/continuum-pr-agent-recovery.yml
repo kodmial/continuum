@@ -380,17 +380,30 @@ jobs:
             // listings are newest-first, so a capped window preserves the
             // deciding records. Issue comments and pull reviews are
             // oldest-first, so a capped window may hide the newest markers:
-            // the collected array carries a `truncated` flag and comment
-            // readers deciding retry budgets must defer when it is true
-            // instead of deciding on partial oldest data.
+            // the collected array carries a `truncated` flag plus the
+            // `lastPage` anchor, and truncated comment scans recover a
+            // bounded newest window (see recoverNewestComments) so a PR
+            // with sustained high activity is still serviced instead of
+            // deferred on every pass while the same truncation recurs.
             const MAX_COMMENT_PAGES = 10;
             const MAX_QUEUE_PAGES = 5;
             const MAX_GATE_PAGES = 2;
             async function boundedCollect(client, request, params, maxPages) {
               const items = [];
               let truncated = false;
+              // Newest-window anchor: paginated REST responses carry an
+              // RFC5988 Link header whose rel="last" page lets a truncated
+              // oldest-first window re-anchor at the newest end with a
+              // bounded number of reads instead of walking history.
+              let lastPage = 0;
               for (let page = 1; page <= maxPages; page += 1) {
-                const { data } = await request({ ...params, page });
+                const response = await request({ ...params, page });
+                const link = response && response.headers && response.headers.link;
+                if (typeof link === 'string') {
+                  const match = link.match(/[?&]page=(\d+)[^>]*>;\s*rel="last"/);
+                  if (match) lastPage = Math.max(lastPage, Number(match[1]));
+                }
+                const data = response && response.data;
                 const batch = Array.isArray(data) ? data : (data.workflow_runs || []);
                 if (batch.length === 0) break;
                 items.push(...batch);
@@ -398,28 +411,75 @@ jobs:
                 if (page === maxPages) truncated = true;
               }
               items.truncated = truncated;
+              items.lastPage = lastPage;
               return items;
+            }
+            // Bounded newest-window recovery: merges up to MAX_COMMENT_PAGES
+            // newest records into a truncated oldest-first comment scan so
+            // the PR can still be serviced on this pass. Deciding markers
+            // (retry/exhausted/controller state) are written by recent
+            // activity, which the merged newest window always keeps; only a
+            // middle window on very large threads may stay unseen. Only a
+            // newest-recovery failure defers the PR to the next wakeup.
+            // Runs on the caller's already-resolved read client so the
+            // per-PR auth fallback is resolved once per scan, not once per
+            // recovery page.
+            async function recoverNewestComments(client, prNumber, items) {
+              let lastPage = Number(items.lastPage || 0);
+              if (!lastPage) {
+                const meta = await client.rest.issues.get({ owner, repo, issue_number: prNumber });
+                const total = Number(meta && meta.data && meta.data.comments || 0);
+                if (total > 0) lastPage = Math.max(1, Math.ceil(total / 100));
+              }
+              if (!lastPage) {
+                throw new Error('cannot anchor newest comments window');
+              }
+              const seen = new Set(items.map(entry => entry && entry.id));
+              for (let page = 1; page <= MAX_COMMENT_PAGES; page += 1) {
+                const targetPage = lastPage - (page - 1);
+                if (targetPage < 1) break;
+                const { data } = await client.rest.issues.listComments(
+                  { owner, repo, issue_number: prNumber, per_page: 100, page: targetPage }
+                );
+                if (!Array.isArray(data) || data.length === 0) continue;
+                for (const entry of data) {
+                  if (!entry || seen.has(entry.id)) continue;
+                  seen.add(entry.id);
+                  items.push(entry);
+                }
+              }
+              items.truncated = false;
             }
 
             async function upsertControllerState(prNumber, stateMarker, summary) {
-              const comments = await withReadFallback(client =>
-                boundedCollect(
+              const comments = await withReadFallback(async (client) => {
+                const items = await boundedCollect(
                   client,
                   (params) => client.rest.issues.listComments(params),
                   { owner, repo, issue_number: prNumber, per_page: 100 },
                   MAX_COMMENT_PAGES
-                )
-              );
-              // Fail closed on truncation: the listing is oldest-first, so a
-              // truncated window may hide the newest controller marker. Never
-              // update-or-prune from partial oldest data; defer to the next
-              // wakeup instead.
-              if (comments.truncated) {
-                throw new Error(
-                  'CONTINUUM_COMMENT_BUDGET_EXCEEDED pr=' + prNumber +
-                  ': comment scan hit the ' + MAX_COMMENT_PAGES + '-page budget; holding controller write instead of deciding on a truncated window.'
                 );
-              }
+                // Truncated oldest-first windows hide the newest controller
+                // marker, so recover the bounded newest window before
+                // deciding. Only a newest-recovery failure holds the
+                // controller write; a middle window may stay unseen on very
+                // large threads.
+                if (items.truncated) {
+                  try {
+                    await recoverNewestComments(client, prNumber, items);
+                    core.warning(
+                      'CONTINUUM_COMMENT_BUDGET_EXCEEDED pr=' + prNumber +
+                      ': comment scan hit the ' + MAX_COMMENT_PAGES + '-page budget; deciding on the merged oldest+newest window.'
+                    );
+                  } catch (recoveryErr) {
+                    throw new Error(
+                      'CONTINUUM_COMMENT_BUDGET_EXCEEDED pr=' + prNumber +
+                      ': comment scan hit the ' + MAX_COMMENT_PAGES + '-page budget and newest-window recovery failed; holding controller write instead of deciding on a truncated window.'
+                    );
+                  }
+                }
+                return items;
+              });
               const controller = comments
                 .filter(comment => String(comment.body || '').includes(CONTROLLER_STATE_MARKER))
                 .sort((a, b) => Number(a.id) - Number(b.id));
@@ -1306,22 +1366,34 @@ jobs:
                 return false;
               }
 
-                  const refreshedComments = await withReadFallback(client =>
-                    boundedCollect(
+                  const refreshedComments = await withReadFallback(async (client) => {
+                    const items = await boundedCollect(
                       client,
                       (params) => client.rest.issues.listComments(params),
                       { owner, repo, issue_number: pr.number, per_page: 100 },
                       MAX_COMMENT_PAGES
-                    )
-                  );
-              // Fail closed on truncation: the listing is oldest-first, so a
+                    );
+              // Recover on truncation: the listing is oldest-first, so a
               // truncated window hides the newest retry/exhausted markers.
-              // Hold the dispatch instead of deciding from partial data.
+              // Merge the bounded newest window and decide on the merged
+              // set; only a newest-recovery failure holds the dispatch.
+              if (items.truncated) {
+                try {
+                  await recoverNewestComments(client, pr.number, items);
+                  core.warning(
+                    'PR #' + pr.number + ' ' + kind +
+                    ': comment scan hit the ' + MAX_COMMENT_PAGES + '-page budget; deciding on the merged oldest+newest window.'
+                  );
+                } catch {
+                  core.warning(
+                    'PR #' + pr.number + ' ' + kind +
+                    ': comment scan hit the ' + MAX_COMMENT_PAGES + '-page budget and newest-window recovery failed; holding dispatch instead of deciding on a truncated window.'
+                  );
+                }
+              }
+                    return items;
+                  });
               if (refreshedComments.truncated) {
-                core.warning(
-                  'PR #' + pr.number + ' ' + kind +
-                  ': comment scan hit the ' + MAX_COMMENT_PAGES + '-page budget; holding dispatch instead of deciding on a truncated window.'
-                );
                 return false;
               }
               const refreshedEvidence = parseEvidence(refreshedComments, head, kind);
@@ -1370,24 +1442,35 @@ jobs:
                 // the fresh latest preserves a concurrent writer's state;
                 // the next successful upsert finishes coalescing.
                     try {
-                      const graceComments = await withReadFallback(client =>
-                        boundedCollect(
+                      const graceComments = await withReadFallback(async (client) => {
+                        const items = await boundedCollect(
                           client,
                           (params) => client.rest.issues.listComments(params),
                           { owner, repo, issue_number: pr.number, per_page: 100 },
                           MAX_COMMENT_PAGES
-                        )
-                      );
-                  // Fail closed on truncation: the listing is oldest-first,
+                        );
+                  // Recover on truncation: the listing is oldest-first,
                   // so a truncated window may hide a concurrent controller
-                  // write. Never prune from partial data; coalescing still
-                  // defers this wakeup and the next upsert finishes cleanup.
-                  if (graceComments.truncated) {
-                    core.warning(
-                      'PR #' + pr.number + ' ' + kind +
-                      ': comment scan hit the ' + MAX_COMMENT_PAGES + '-page budget; skipping dispatch-grace prune on a truncated window.'
-                    );
-                  } else {
+                  // write. Merge the bounded newest window before pruning;
+                  // only a newest-recovery failure skips the prune (the next
+                  // upsert still finishes cleanup).
+                  if (items.truncated) {
+                    try {
+                      await recoverNewestComments(client, pr.number, items);
+                      core.warning(
+                        'PR #' + pr.number + ' ' + kind +
+                        ': comment scan hit the ' + MAX_COMMENT_PAGES + '-page budget; pruning on the merged oldest+newest window.'
+                      );
+                    } catch {
+                      core.warning(
+                        'PR #' + pr.number + ' ' + kind +
+                        ': comment scan hit the ' + MAX_COMMENT_PAGES + '-page budget and newest-window recovery failed; skipping dispatch-grace prune on a truncated window.'
+                      );
+                    }
+                  }
+                        return items;
+                      });
+                  if (!graceComments.truncated) {
                   const controllerDupes = graceComments
                     .filter(comment => String(comment.body || '').includes(CONTROLLER_STATE_MARKER))
                     .sort((a, b) => Number(a.id) - Number(b.id));
@@ -1597,24 +1680,35 @@ jobs:
               }
                   if (stateError) {
                     try {
-                      const freshController = await withReadFallback(client =>
-                        boundedCollect(
+                      const freshController = await withReadFallback(async (client) => {
+                        const items = await boundedCollect(
                           client,
                           (params) => client.rest.issues.listComments(params),
                           { owner, repo, issue_number: pr.number, per_page: 100 },
                           MAX_COMMENT_PAGES
-                        )
-                      );
-                  // Fail closed on truncation: the listing is oldest-first,
+                        );
+                  // Recover on truncation: the listing is oldest-first,
                   // so a truncated window may hide controller comments.
-                  // Never prune from partial data; the next wakeup coalesces
-                  // via dispatch grace instead.
-                  if (freshController.truncated) {
-                    core.warning(
-                      'PR #' + pr.number + ' ' + kind +
-                      ': comment scan hit the ' + MAX_COMMENT_PAGES + '-page budget; skipping post-dispatch prune on a truncated window.'
-                    );
-                  } else {
+                  // Merge the bounded newest window before pruning; only a
+                  // newest-recovery failure skips the prune (the next wakeup
+                  // still coalesces via dispatch grace).
+                  if (items.truncated) {
+                    try {
+                      await recoverNewestComments(client, pr.number, items);
+                      core.warning(
+                        'PR #' + pr.number + ' ' + kind +
+                        ': comment scan hit the ' + MAX_COMMENT_PAGES + '-page budget; pruning on the merged oldest+newest window.'
+                      );
+                    } catch {
+                      core.warning(
+                        'PR #' + pr.number + ' ' + kind +
+                        ': comment scan hit the ' + MAX_COMMENT_PAGES + '-page budget and newest-window recovery failed; skipping post-dispatch prune on a truncated window.'
+                      );
+                    }
+                  }
+                        return items;
+                      });
+                  if (!freshController.truncated) {
                   const snapshotIds = new Set(
                     refreshedComments.map(comment => Number(comment.id))
                   );
@@ -1836,23 +1930,35 @@ jobs:
                   continue;
                 }
               }
-              const comments = await withReadFallback(client =>
-                boundedCollect(
+              const comments = await withReadFallback(async (client) => {
+                const items = await boundedCollect(
                   client,
                   (params) => client.rest.issues.listComments(params),
                   { owner, repo, issue_number: pr.number, per_page: 100 },
                   MAX_COMMENT_PAGES
-                )
-              );
-              // Fail closed on truncation: the listing is oldest-first, so a
-              // truncated window hides the newest retry/exhausted markers.
-              // Defer this PR instead of deriving a retry budget from partial
-              // oldest data.
-              if (comments.truncated) {
-                core.warning(
-                  'PR #' + pr.number + ' HEAD ' + head +
-                  ': comment scan hit the ' + MAX_COMMENT_PAGES + '-page budget; deferring recovery instead of deciding on a truncated window.'
                 );
+              // Recover on truncation: the listing is oldest-first, so a
+              // truncated window hides the newest retry/exhausted markers.
+              // Merge the bounded newest window and decide on the merged
+              // set; only a newest-recovery failure defers this PR to the
+              // next wakeup.
+              if (items.truncated) {
+                try {
+                  await recoverNewestComments(client, pr.number, items);
+                  core.warning(
+                    'PR #' + pr.number + ' HEAD ' + head +
+                    ': comment scan hit the ' + MAX_COMMENT_PAGES + '-page budget; deciding on the merged oldest+newest window.'
+                  );
+                } catch {
+                  core.warning(
+                    'PR #' + pr.number + ' HEAD ' + head +
+                    ': comment scan hit the ' + MAX_COMMENT_PAGES + '-page budget and newest-window recovery failed; deferring recovery instead of deciding on a truncated window.'
+                  );
+                }
+              }
+                return items;
+              });
+              if (comments.truncated) {
                 continue;
               }
               const reviewRun = reviewStatus

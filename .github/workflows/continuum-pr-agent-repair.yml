@@ -1008,18 +1008,24 @@ jobs:
               ' (' + String(process.env.REASON || 'no-effective-change') +
               '); automatic same-state repair is held until the HEAD or logical finding state changes.';
             const body = policy.controllerStateBody(stateMarker, summary);
-            // Bounded scan (#254): ten pages cover any realistic controller
-            // history; a truncated window only risks one duplicate state
+            // Bounded scan (#254): controller markers are written by recent
+            // activity, so the newest window preserves live state.
+            // `listComments` is oldest-first and ignores sort/direction, so
+            // count down from the issue total to scan newest-first. A
+            // truncated newest window only risks one duplicate state
             // comment, which the prune loop below removes once visible.
             // Target-aware: delegated reads use the resolved child.
             const comments = [];
+            const noProgressTotal = (await github.rest.issues.get({ owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER, repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO, issue_number: prNumber })).data.comments || 0;
+            const noProgressLastPage = Math.max(1, Math.ceil(noProgressTotal / 100));
             for (let page = 1; page <= 10; page += 1) {
+              const targetPage = noProgressLastPage - (page - 1);
+              if (targetPage < 1) break;
               const { data } = await github.rest.issues.listComments(
-                { owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER, repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO, issue_number: prNumber, per_page: 100, page }
+                { owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER, repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO, issue_number: prNumber, per_page: 100, page: targetPage }
               );
-              if (!Array.isArray(data) || data.length === 0) break;
+              if (!Array.isArray(data) || data.length === 0) continue;
               comments.push(...data);
-              if (data.length < 100) break;
             }
             const controller = comments
               .filter(comment => String(comment.body || '').includes(policy.CONTROLLER_STATE_MARKER))
@@ -1125,18 +1131,24 @@ jobs:
               ? 'Retry budget exhausted for repair on exact HEAD ' + head + '.'
               : 'Transient repair failure; bounded retry ' + next + '/3 is scheduled for exact HEAD ' + head + '.';
             const body = policy.controllerStateBody(stateMarker, summary);
-            // Bounded scan (#254): ten pages cover any realistic controller
-            // history; a truncated window only risks one duplicate state
+            // Bounded scan (#254): controller markers are written by recent
+            // activity, so the newest window preserves live state.
+            // `listComments` is oldest-first and ignores sort/direction, so
+            // count down from the issue total to scan newest-first. A
+            // truncated newest window only risks one duplicate state
             // comment, which the prune loop below removes once visible.
             // Target-aware: delegated reads use the resolved child.
             const comments = [];
+            const retryTotal = (await github.rest.issues.get({ owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER, repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO, issue_number: prNumber })).data.comments || 0;
+            const retryLastPage = Math.max(1, Math.ceil(retryTotal / 100));
             for (let page = 1; page <= 10; page += 1) {
+              const targetPage = retryLastPage - (page - 1);
+              if (targetPage < 1) break;
               const { data } = await github.rest.issues.listComments(
-                { owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER, repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO, issue_number: prNumber, per_page: 100, page }
+                { owner: process.env.CONTINUUM_PR_AGENT_TARGET_OWNER, repo: process.env.CONTINUUM_PR_AGENT_TARGET_REPO, issue_number: prNumber, per_page: 100, page: targetPage }
               );
-              if (!Array.isArray(data) || data.length === 0) break;
+              if (!Array.isArray(data) || data.length === 0) continue;
               comments.push(...data);
-              if (data.length < 100) break;
             }
             const controller = comments
               .filter(comment => String(comment.body || '').includes(policy.CONTROLLER_STATE_MARKER))
