@@ -450,6 +450,73 @@ class DisabledPathTests(unittest.TestCase):
         self.assertTrue(report["reason"])
 
 
+class PrAgentRouterTests(unittest.TestCase):
+    def test_ordinary_comment_is_not_actionable(self):
+        decision = pr_agent.classify_pr_agent_comment(
+            is_pull_request=True,
+            actor="owner",
+            owner="owner",
+            body="Looks good, just a note.",
+            provider="pr-agent",
+        )
+        self.assertFalse(decision["actionable"])
+
+    def test_valid_review_is_actionable(self):
+        decision = pr_agent.classify_pr_agent_comment(
+            is_pull_request=True,
+            actor="owner",
+            owner="owner",
+            body="/review",
+            provider="pr-agent",
+        )
+        self.assertTrue(decision["actionable"])
+
+    def test_non_pr_comment_is_not_actionable(self):
+        decision = pr_agent.classify_pr_agent_comment(
+            is_pull_request=False,
+            actor="owner",
+            owner="owner",
+            body="/review",
+            provider="pr-agent",
+        )
+        self.assertFalse(decision["actionable"])
+
+    def test_invalid_actor_is_not_actionable(self):
+        decision = pr_agent.classify_pr_agent_comment(
+            is_pull_request=True,
+            actor="stranger",
+            owner="owner",
+            body="/review",
+            provider="pr-agent",
+        )
+        self.assertFalse(decision["actionable"])
+
+    def test_invalid_provider_is_not_actionable(self):
+        for provider in ("none", "coderabbit", ""):
+            with self.subTest(provider=provider):
+                decision = pr_agent.classify_pr_agent_comment(
+                    is_pull_request=True,
+                    actor="owner",
+                    owner="owner",
+                    body="/review",
+                    provider=provider,
+                )
+                self.assertFalse(decision["actionable"])
+
+    def test_review_command_requires_word_boundary(self):
+        self.assertTrue(pr_agent.is_review_command("/review please"))
+        self.assertTrue(pr_agent.is_review_command("please\n/review\nthanks"))
+        self.assertFalse(pr_agent.is_review_command("ordinary comment"))
+        self.assertFalse(pr_agent.is_review_command("/reviewer please"))
+
+    def test_operation_key_coalesces_duplicates(self):
+        key = pr_agent.pr_agent_operation_key(222, "ABC123")
+        self.assertEqual(key, "review:222:abc123")
+        self.assertTrue(pr_agent.is_duplicate_operation([key], "review:222:ABC123"))
+        self.assertFalse(pr_agent.is_duplicate_operation(["review:222:def456"], key))
+        self.assertFalse(pr_agent.is_duplicate_operation([], key))
+
+
 class VerifyCommandTests(unittest.TestCase):
     def test_parse_verify_command(self):
         self.assertEqual(pr_agent.parse_verify_command("/verify pra-abc123"), "pra-abc123")
