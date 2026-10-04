@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import math
 import random
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 
@@ -218,22 +219,31 @@ class RetryPolicy:
 
 
 def read_with_budget(fetch: Callable[[], Any], policy: Optional[RetryPolicy] = None,
-                     fallback: Any = None, is_rate_limited: Callable[[Exception], bool] = lambda _e: True) -> Any:
+                     fallback: Any = None, is_rate_limited: Callable[[Exception], bool] = lambda _e: True,
+                     sleep: Optional[Callable[[float], None]] = None, seed: int = 0) -> Any:
     """Run one non-critical read under a bounded retry budget.
 
     Retries at most ``policy.max_attempts`` times total (never unbounded),
     then returns ``fallback`` (or reraises when ``policy.reraise`` is set).
+
+    Transient/rate-limited failures back off between attempts using the
+    bounded, jittered ``policy.delays()`` schedule instead of retrying
+    immediately inside the rate-limit window.
     """
     active = policy or RetryPolicy()
     attempts = max(1, active.max_attempts)
+    delays = list(active.delays(seed=seed))
+    waiter = sleep if sleep is not None else time.sleep
     last: Optional[Exception] = None
-    for _ in range(attempts):
+    for attempt in range(attempts):
         try:
             return fetch()
         except Exception as exc:  # noqa: BLE001 - budget applies to any transient failure
             last = exc
             if not is_rate_limited(exc):
                 break
+            if attempt < attempts - 1 and attempt < len(delays):
+                waiter(delays[attempt])
     if active.reraise and last is not None:
         raise last
     return fallback
