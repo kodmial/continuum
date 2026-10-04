@@ -692,6 +692,36 @@ jobs:
               return;
             }
 
+            // Qualification dispatch bypass (kodmial/continuum#278): a trusted
+            // qualification-dispatch marker for this exact qualification issue
+            // bypasses normal implementation-readiness admission for the
+            // declared capability relation only. All other blockers still
+            // block, and the immutable required SHA plus
+            // qualification-specific safety rules still apply in
+            // qualification mode.
+            let bypassCapability = 0;
+            try {
+              const triggerBody = String(context.payload?.comment?.body || '');
+              const dispatchMarker = triggerBody.match(
+                /<!--\s*continuum-qualification-dispatch\s+capability\s*=\s*(\d+)\s+qualification\s*=\s*(\d+)\s+sha\s*=\s*([0-9a-f]{40})\s*-->/i
+              );
+              const commentTrusted =
+                context.payload?.comment?.user?.login === owner;
+              if (
+                dispatchMarker &&
+                commentTrusted &&
+                Number(dispatchMarker[2]) === issueNumber
+              ) {
+                bypassCapability = Number(dispatchMarker[1]);
+                core.notice(
+                  `Qualification dispatch for issue #${issueNumber}: ` +
+                  `ignoring capability back-edge blocker #${bypassCapability} for readiness.`
+                );
+              }
+            } catch (err) {
+              bypassCapability = 0;
+            }
+
             const blockerNumbers = new Set();
             const declared = (issue.body || '').match(
               /<!--\s*automation-blocked-by:\s*([0-9#\s,]+?)\s*-->/i
@@ -700,6 +730,7 @@ jobs:
               for (const match of declared[1].matchAll(/\d+/g)) {
                 const blockerNumber = Number(match[0]);
                 if (blockerNumber === issueNumber) continue;
+                if (blockerNumber === bypassCapability) continue;
                 const blocker = await readWithFallback(
                   async () => {
                     const { data } = await github.rest.issues.get({
@@ -727,7 +758,9 @@ jobs:
               { paginate: true, apiVersion: '2026-03-10' }
             );
             for (const blocker of nativeBlockers) {
-              if (blocker.state === 'open') blockerNumbers.add(blocker.number);
+              if (blocker.state === 'open' && blocker.number !== bypassCapability) {
+                blockerNumbers.add(blocker.number);
+              }
             }
 
             const openBlockers = [...blockerNumbers].sort((a, b) => a - b);

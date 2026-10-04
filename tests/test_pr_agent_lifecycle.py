@@ -275,6 +275,58 @@ APPROVED_260_OPENCODE_PROVENANCE_ADDED_LINES = (
     '          if [[ -n "$(git status --porcelain)" ]]; then',
 )
 
+# kodmial/continuum#278 is the authoritative task that explicitly requires
+# the qualification-DAG bypass in .github/workflows/continuum-opencode.yml:
+# a trusted qualification-dispatch marker for the exact qualification issue
+# bypasses normal implementation-readiness admission for the declared
+# capability relation only (one removed baseline line replaced, all other
+# blockers still block, and the immutable required SHA plus
+# qualification-specific safety rules still apply in qualification mode).
+# The allowlist is narrow: exactly the bypass lines below. Any other
+# deletion, modification, or addition still fails, and the #179 probe plus
+# the #258 attribution bodies plus the #260 provenance lines above are
+# still required in full.
+APPROVED_278_OPENCODE_DAG_REMOVED_LINES = (
+    "              if (blocker.state === 'open') blockerNumbers.add(blocker.number);",
+)
+
+APPROVED_278_OPENCODE_DAG_ADDED_LINES = (
+    '            // Qualification dispatch bypass (kodmial/continuum#278): a trusted',
+    '            // qualification-dispatch marker for this exact qualification issue',
+    '            // bypasses normal implementation-readiness admission for the',
+    '            // declared capability relation only. All other blockers still',
+    '            // block, and the immutable required SHA plus',
+    '            // qualification-specific safety rules still apply in',
+    '            // qualification mode.',
+    '            let bypassCapability = 0;',
+    '            try {',
+    "              const triggerBody = String(context.payload?.comment?.body || '');",
+    '              const dispatchMarker = triggerBody.match(',
+    '                /<!--\\s*continuum-qualification-dispatch\\s+capability\\s*=\\s*(\\d+)\\s+qualification\\s*=\\s*(\\d+)\\s+sha\\s*=\\s*([0-9a-f]{40})\\s*-->/i',
+    '              );',
+    '              const commentTrusted =',
+    '                context.payload?.comment?.user?.login === owner;',
+    '              if (',
+    '                dispatchMarker &&',
+    '                commentTrusted &&',
+    '                Number(dispatchMarker[2]) === issueNumber',
+    '              ) {',
+    '                bypassCapability = Number(dispatchMarker[1]);',
+    '                core.notice(',
+    '                  `Qualification dispatch for issue #${issueNumber}: ` +',
+    '                  `ignoring capability back-edge blocker #${bypassCapability} for readiness.`',
+    '                );',
+    '              }',
+    '            } catch (err) {',
+    '              bypassCapability = 0;',
+    '            }',
+    '',
+    '                if (blockerNumber === bypassCapability) continue;',
+    "              if (blocker.state === 'open' && blocker.number !== bypassCapability) {",
+    '                blockerNumbers.add(blocker.number);',
+    '              }',
+)
+
 # Fixed-history pin for the old-to-new baseline range check below
 # (PREVIOUS_BASELINE_SHA..BASELINE_SHA): that range landed before the
 # reconstruction self-stamp was removed, so it still carries the four
@@ -603,10 +655,11 @@ class ProtectedBaselineTests(unittest.TestCase):
                         self.assertEqual(
                             _Counter(deleted),
                             _Counter(APPROVED_258_OPENCODE_ATTRIBUTION_REMOVED_LINES)
-                            + _Counter(APPROVED_260_OPENCODE_PROVENANCE_REMOVED_LINES),
+                            + _Counter(APPROVED_260_OPENCODE_PROVENANCE_REMOVED_LINES)
+                            + _Counter(APPROVED_278_OPENCODE_DAG_REMOVED_LINES),
                             f"{path} must not delete or modify baseline lines "
                             f"outside the approved #258 attribution plus #260 "
-                            f"provenance replacement",
+                            f"provenance plus #278 DAG-bypass replacement",
                         )
                         actual = _Counter(added)
                         approved = _Counter(APPROVED_179_OPENCODE_PROBE_LINES)
@@ -615,13 +668,15 @@ class ProtectedBaselineTests(unittest.TestCase):
                         )
                         expected.update(APPROVED_258_OPENCODE_ATTRIBUTION_ADDED_LINES)
                         expected.update(APPROVED_260_OPENCODE_PROVENANCE_ADDED_LINES)
+                        expected.update(APPROVED_278_OPENCODE_DAG_ADDED_LINES)
                         self.assertEqual(
                             actual,
                             expected,
                             f"{path} drift must be exactly the approved #179 probe "
                             f"(both install sites, no extra copies) plus the approved "
                             f"#258 attribution bodies plus the approved #260 "
-                            f"provenance lines: "
+                            f"provenance lines plus the approved #278 "
+                            f"DAG-bypass lines: "
                             f"extra={sorted(set(actual) - set(expected))} "
                             f"missing={sorted(set(expected) - set(actual))}",
                         )

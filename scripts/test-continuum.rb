@@ -4297,13 +4297,15 @@ class ContinuumTest < Minitest::Test
       '(pauseOnFailure && freshLabels.has(pausedLabel))',
       'freshLabels.has(inProgressLabel)',
       'if (readyLabel && !freshLabels.has(readyLabel)) {',
+      'shouldAdmitToImplementation(',
+      'qualification tracker needs explicit dispatch, not generic implementation.',
       'const freshDeclaredBlockers = await openDeclaredBlockers(freshIssue);',
       'freshOpenBlockers.length > 0',
       'if (commandAgeMs < commandGraceMs) {'
     ].each { |guard| assert_includes dispatch, guard, "missing just-in-time guard: #{guard}" }
     local_dispatch = dispatch[/\/\/ Re-check mutable state immediately before dispatch\..*\z/m]
     refute_nil local_dispatch, 'the local just-in-time re-check block is gone'
-    assert_equal 5, local_dispatch.scan(/^\s+continue;\s*$/).size,
+    assert_equal 6, local_dispatch.scan(/^\s+continue;\s*$/).size,
                  'every local just-in-time guard must be a skip, not a fall-through'
   end
 
@@ -6451,6 +6453,75 @@ class ContinuumTest < Minitest::Test
     assert_includes opencode, 'isTrustedDispatchComment'
     assert_includes opencode, '--untracked-files=no'
     assert_includes cli, '--author-association'
+  end
+
+  # kodmial/continuum#278: the qualification relation is first-class, so a
+  # consumer cannot strand it as a normal dependency. The AA topology is the
+  # contract fixture: capability #6 declares qualification #7 while #7
+  # declares automation-blocked-by #6 (likewise #9 / #40). The back-edge is
+  # detected, qualification dispatch bypasses implementation readiness for
+  # the declared capability relation only, trackers never enter generic
+  # implementation admission, and reusable PASS evidence is consumable
+  # without tracker closure.
+  def test_qualification_dag_semantics_prevent_cycles_and_deadlocks
+    scheduler = workflow_body('continuum-issue-scheduler.yml')
+    opencode = File.read(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
+    engine = File.read(File.join(ROOT, 'src/continuum/qualification.py'))
+    cli = File.read(File.join(ROOT, '.github/scripts/qualification_gate.py'))
+
+    # The engine owns the DAG contract and its deterministic diagnostics.
+    assert_includes engine, 'def parse_blocked_by_refs'
+    assert_includes engine, 'def qualification_cycle_edges'
+    assert_includes engine, 'def has_qualification_blocker_cycle'
+    assert_includes engine, 'def effective_qualification_blockers'
+    assert_includes engine, 'def qualification_dispatch_bypass'
+    assert_includes engine, 'ready-ignoring-qualification-back-edge'
+    assert_includes engine, 'dispatch-ignoring-capability-back-edge'
+    assert_includes engine, 'def collect_qualification_trackers'
+    assert_includes engine, 'def should_admit_to_implementation'
+    assert_includes engine, 'qualification-tracker-needs-explicit-dispatch'
+    assert_includes engine, 'def qualification_result_tuple'
+    assert_includes engine, 'def has_trusted_pass_for_sha'
+
+    # The scheduler mirrors the DAG helpers byte-for-byte in semantics.
+    %w[
+      blockedByRefs
+      qualificationCycleEdges
+      hasQualificationBlockerCycle
+      effectiveQualificationBlockers
+      qualificationDispatchBypass
+      collectQualificationTrackers
+      shouldAdmitToImplementation
+      qualificationResultTuple
+      hasTrustedPassForSha
+    ].each do |name|
+      assert_includes scheduler, name,
+                      "the scheduler runtime is missing the qualification DAG helper #{name}"
+    end
+
+    # Back-edges are ignored with a diagnostic, never honored as blockers.
+    assert_includes scheduler, 'ignoring qualification back-edge blocker(s)'
+    assert_includes scheduler, 'dispatch-ignoring-capability-back-edge'
+    assert_includes scheduler, 'qualification-tracker-needs-explicit-dispatch'
+    assert_includes scheduler, 'qualification tracker needs explicit dispatch, not generic implementation'
+    assert_includes scheduler, 'Skipping delegated task #'
+    assert_includes scheduler, 'ignoring qualification back-edge blocker #'
+
+    # Qualification dispatch stays independent of the optional ready gate.
+    qualification = scheduler[/async function dispatchQualificationIssue\(.*?return wasPaused \? 'unpause-and-dispatch' : 'dispatch';\s*\}/m]
+    refute_nil qualification, 'the qualification dispatch helper is gone'
+    refute_includes qualification, 'readyLabel',
+                     'qualification dispatch must not require automation:ready'
+
+    # The OpenCode readiness gate bypasses exactly the declared capability
+    # relation for a trusted qualification dispatch, nothing more.
+    assert_includes opencode, 'ignoring capability back-edge blocker #'
+    assert_includes opencode, 'continuum-qualification-dispatch\\s+capability'
+
+    # The reusable result-state contract is a first-class CLI surface.
+    assert_includes cli, 'result-tuple'
+    assert_includes cli, 'blocked-by'
+    assert_includes cli, 'qualification_result_tuple'
   end
 
   # kodmial/continuum#248: an `issue_comment` on a PR must start the

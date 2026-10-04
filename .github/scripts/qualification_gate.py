@@ -10,8 +10,10 @@ Usage (body via argument, file, or stdin)::
 
     qualification_gate.py refs --body '...'
     qualification_gate.py refs --body-file issue.md --self 182
+    qualification_gate.py blocked-by --body-file issue.md --self 184
     qualification_gate.py has-closing-keyword --body 'Fixes #182' --issue 182
     qualification_gate.py evidence-state --body-file comment.md --issue 184 --sha <40-hex> --author-association OWNER --author-login owner
+    qualification_gate.py result-tuple --body-file comment.md --issue 184 --sha <40-hex> --author-association OWNER --author-login owner
     gh api ... --jq .body | qualification_gate.py refs
 
 ``refs`` prints one qualification issue number per line (nothing when the
@@ -43,8 +45,10 @@ if SRC not in sys.path:
 from continuum.qualification import (  # noqa: E402
     contains_closing_keyword,
     latest_required_sha,
+    parse_blocked_by_refs,
     parse_qualification_refs,
     qualification_evidence_state,
+    qualification_result_tuple,
 )
 
 
@@ -109,6 +113,30 @@ def _cmd_evidence_state(args) -> int:
     return 0
 
 
+def _cmd_blocked_by(args) -> int:
+    for number in parse_blocked_by_refs(_read_body(args), args.self_number):
+        print(number)
+    return 0
+
+
+def _cmd_result_tuple(args) -> int:
+    # Reusable result-state contract (kodmial/continuum#278): the trusted
+    # exact revision/fingerprint tuple for one evidence comment, consumable
+    # without closing the reusable tracker. Prints compact JSON or nothing.
+    import json as _json
+
+    comment = {
+        "body": _read_body(args),
+        "author_association": args.author_association,
+        "user": {"login": args.author_login},
+        "author": {"login": args.author_login},
+    }
+    result = qualification_result_tuple([comment], args.issue, args.sha)
+    if result is not None:
+        print(_json.dumps(result, sort_keys=True, separators=(",", ":")))
+    return 0
+
+
 def _add_body_options(parser) -> None:
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--body", default=None, help="Issue or comment body text.")
@@ -128,6 +156,32 @@ def build_parser() -> argparse.ArgumentParser:
     _add_body_options(has_refs)
     has_refs.add_argument("--self", dest="self_number", default=None)
     has_refs.set_defaults(func=_cmd_has_refs)
+
+    blocked = sub.add_parser(
+        "blocked-by", help="Print declared automation-blocked-by issue numbers."
+    )
+    _add_body_options(blocked)
+    blocked.add_argument("--self", dest="self_number", default=None)
+    blocked.set_defaults(func=_cmd_blocked_by)
+
+    result_tuple = sub.add_parser(
+        "result-tuple",
+        help="Print the trusted exact-SHA result tuple (JSON) for one evidence comment.",
+    )
+    _add_body_options(result_tuple)
+    result_tuple.add_argument("--issue", required=True, help="Qualification issue number.")
+    result_tuple.add_argument("--sha", required=True, help="Required 40-hex main SHA.")
+    result_tuple.add_argument(
+        "--author-association",
+        default="NONE",
+        help="Comment author_association attested by the caller (OWNER/MEMBER/COLLABORATOR trusted).",
+    )
+    result_tuple.add_argument(
+        "--author-login",
+        default="",
+        help="Comment author login attested by the caller (github-actions[bot] trusted for automation payloads).",
+    )
+    result_tuple.set_defaults(func=_cmd_result_tuple)
 
     closing = sub.add_parser(
         "has-closing-keyword",
