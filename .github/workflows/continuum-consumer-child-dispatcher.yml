@@ -119,8 +119,11 @@ jobs:
                 __cached="${CONTINUUM_DEP_STATE[$__dep]}"
               fi
               if [[ "$__cached" == "__missing__" ]]; then
-                __cached="$(gh api "repos/$child_repo/issues/$__dep" --jq '.state' 2>/dev/null || echo open)"
-                CONTINUUM_DEP_STATE[$__dep]="$__cached"
+                if __cached="$(gh api "repos/$child_repo/issues/$__dep" --jq '.state' 2>/dev/null)" && [[ "$__cached" == "open" || "$__cached" == "closed" ]]; then
+                  CONTINUUM_DEP_STATE[$__dep]="$__cached"
+                else
+                  __cached="open"
+                fi
               fi
               printf -v "$__out" '%s' "$__cached"
             }

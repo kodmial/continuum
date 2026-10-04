@@ -46,14 +46,14 @@ jobs:
           # finding and the *current* PR HEAD. This makes stale UNRESOLVED replies
           # harmless if the branch has already advanced.
           #
-          # Bounded page walk (#254): review comments are scanned newest
-          # activity last, so cap the walk at CONTINUUM_MAX_PAGES instead of
+          # Bounded newest-first page walk (#254): review comments are scanned
+          # newest-first, so cap the walk at CONTINUUM_MAX_PAGES instead of
           # full-history pagination. A truncated window fails closed
           # (dispatch=false) and never fires a stale retry.
           COMMENT_PAGES=""
           page=1
           while [[ "$page" -le "${CONTINUUM_MAX_COMMENT_PAGES:-5}" ]]; do
-            page_json="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/comments?per_page=100&page=${page}" 2>/dev/null || true)"
+            page_json="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/comments?per_page=100&page=${page}&sort=created&direction=desc" 2>/dev/null || true)"
             count="$(jq 'length' <<<"$page_json" 2>/dev/null || echo 0)"
             [[ "$count" =~ ^[0-9]+$ ]] && [[ "$count" -gt 0 ]] || break
             COMMENT_PAGES+="$page_json"$'\n'
