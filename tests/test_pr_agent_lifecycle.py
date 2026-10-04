@@ -39,31 +39,10 @@ SRC = os.path.join(ROOT, "src")
 # kodmial/continuum#179 owns the prepared agent runtime and never touches
 # PAUSE_ON_FAILURE, so this advance does not narrow #179. Any other
 # protected-file drift beyond the #179 probe still fails.
-# Intentional P0 baseline advance: c64a1b2 implements kodmial/continuum#254
-# (audit and minimize GitHub API/PAT usage outside #253) in
-# continuum-opencode.yml: unbounded github.paginate() scans are replaced by
-# page-bounded newest-first windows (3 pages for review-comment findings, 5
-# pages for open-PR/marker idempotency checks, 10 pages for attempt-budget
-# scans, 5 pages for the duplicate-guard PAT fallback). The authoritative
-# task contract (#254 sections 1/4, "OpenCode worker/repair/watchdog" and
-# "PR review/repair paths") and scripts/test-continuum.rb
-# (test_api_budget_opencode_scans_are_bounded_but_keep_guard_semantics)
-# require those bounded-scan strings in continuum-opencode.yml, so the
-# pre-#254 zero-diff assertion from 3df3b1e is stale. The #248 anti-recursion
-# gate strings (still-open PR, owner, startsWith /oc|/opencode, /oc-cancel
-# exclusion) remain present and pinned by scripts/test-continuum.rb, and
-# guard semantics are unchanged.
-# Merge resolution (PR #264 into main): c64a1b2 descends from 197bafd, so it
-# already carries the #248 gates and the PAUSE_ON_FAILURE 'true' baseline
-# plus the #254 bounded scans. Merging origin/main (prepared #179 runtime)
-# adds only the approved #179 digest-gated probe on top of c64a1b2, so the
-# committed BASELINE_SHA..HEAD drift below is exactly that probe (both
-# install sites, 60 added lines, no deletions). Keeping the immutable commit
-# baseline means any later protected-file drift still fails.
 # Merged with origin/main: main restores the same 'true' PAUSE_ON_FAILURE
 # baseline at 3df3b1e (identical protected-file content to 197bafd); it is
 # retained here as OLDEST_BASELINE_SHA so neither baseline reference is lost.
-BASELINE_SHA = "c64a1b226bee603942eec71c876470b90d08be6b"
+BASELINE_SHA = "197bafdb6b157ad7d4e77888a1fed5a921a3f125"
 
 # Previous protected baseline before the PAUSE_ON_FAILURE advance above.
 # The empty-drift fallback below verifies the old-to-new baseline range
