@@ -2500,15 +2500,19 @@ class FallbackPersistentStateTests(unittest.TestCase):
 
     def test_native_state_remains_authoritative(self):
         body = read_repo(".github/workflows/continuum-pr-agent.yml")
-        # The fallback exists only in the native-absent branch; a published
-        # native marker is parsed and used verbatim instead.
+        # A native marker is authoritative only when it is valid, exact-head,
+        # complete/full, and has a valid findings list. Missing/incomplete
+        # native state falls back to the validated structured review.
         self.assertIn("parse_review_state", body)
         self.assertIn("derive_fallback_state", body)
-        absent = body.index("if not candidates:")
-        fallback = body.index("state = derive_fallback_state(")
-        native = body.index("parsed = parse_review_state")
-        self.assertLess(absent, fallback)
-        self.assertLess(fallback, native)
+        self.assertIn("native_usable = (", body)
+        self.assertIn("if native_usable:", body)
+        self.assertIn("if state is None:", body)
+        parse_at = body.index("parsed = parse_review_state")
+        usable_at = body.index("native_usable = (")
+        fallback_at = body.index("state = derive_current_fallback()")
+        self.assertLess(parse_at, usable_at)
+        self.assertLess(usable_at, fallback_at)
 
     def test_validated_findings_route_reaches_repair(self):
         body = read_repo(".github/workflows/continuum-pr-agent.yml")
@@ -2848,8 +2852,26 @@ class ReviewDispositionIntegrationTests(unittest.TestCase):
         )
         self.assertIn('FALLBACK_PYTHONPATH:', review)
         self.assertIn('PYTHONPATH="$FALLBACK_PYTHONPATH" python3', review)
-        self.assertIn("state = derive_fallback_state(", review)
+        self.assertIn("return derive_fallback_state(", review)
+        self.assertIn("state = derive_current_fallback()", review)
         self.assertNotIn("state = reconciled.state", review)
+
+
+class IncompleteNativePersistentStateContractTests(unittest.TestCase):
+    """Issue #252: an incomplete native marker cannot dead-end routing."""
+
+    def test_incomplete_native_marker_falls_back_to_validated_exact_head_review(self):
+        body = read_repo(".github/workflows/continuum-pr-agent.yml")
+        self.assertIn("native_usable = (", body)
+        self.assertIn("if native_usable:", body)
+        self.assertIn("if state is None:", body)
+        self.assertIn("state = derive_current_fallback()", body)
+        self.assertIn("last.get(\"complete\") is True", body)
+        self.assertIn('str(last.get("kind") or "") == "full"', body)
+        self.assertIn(
+            "incomplete marker is not authoritative",
+            body,
+        )
 
 if __name__ == "__main__":
     unittest.main()
