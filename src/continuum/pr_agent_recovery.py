@@ -114,7 +114,11 @@ class RecoveryDecision:
 
 
 def operation_key(pr_number: object, head_sha: object, kind: object) -> str:
-    """Return the durable PR + exact HEAD + operation identity."""
+    """Return the durable PR + exact HEAD + operation identity.
+
+    Batch callers must isolate per-PR failures (catch per PR and continue,
+    or pre-check with :func:`is_full_head`) so one short/truncated SHA
+    never aborts a repository-global open-PR scan."""
 
     try:
         number = int(str(pr_number).strip())
@@ -205,6 +209,16 @@ def _same_head(marker_head: str, head: str) -> bool:
     marker = str(marker_head or "").strip().lower()
     current = str(head or "").strip().lower()
     return bool(marker) and marker == current
+
+
+def is_full_head(head_sha: object) -> bool:
+    """Whether a value is a full commit id usable as recovery identity.
+
+    Batch loops use this as a per-PR guard (`continue` on False) so one
+    malformed HEAD skips loudly instead of raising out of the whole scan.
+    """
+
+    return bool(re.fullmatch(r"[0-9a-f]{40,64}", str(head_sha or "").strip().lower()))
 
 
 def _parse_time(value: object) -> Optional[datetime]:
@@ -306,16 +320,10 @@ def retry_evidence(
                 continue
             if int(attempts_text) >= budget:
                 exhausted = True
-        # Legacy short-SHA exhaustion is fail-closed only: a short marker
-        # that prefixes the current full HEAD preserves exhaustion so the
-        # budget never restarts. Short retry markers never advance
-        # latest_attempt (no prefix authorization).
-        for match in _LEGACY_SHORT_EXHAUSTED_RE.finditer(body):
-            marker_head, marker_kind, attempts_text = match.groups()
-            if marker_kind != normalized_kind:
-                continue
-            if head.startswith(marker_head.lower()) and int(attempts_text) >= budget:
-                exhausted = True
+        # Legacy short-SHA markers are ignored: two distinct commits can
+        # share a 7-char prefix, so prefix matching would let old-HEAD
+        # evidence strand an unrelated healthy HEAD with no expiry path.
+        # Exact-HEAD isolation requires full-commit identity only.
 
     return RetryEvidence(
         latest_attempt=latest_attempt,
@@ -513,8 +521,14 @@ def decide_recovery(
         elif (
             status_age_seconds is not None
             and status_age_seconds >= stale_after_seconds
-            and conclusion not in {"queued", "in_progress", "waiting", "requested"}
+            and (
+                conclusion is None
+                or conclusion in RETRYABLE_RUN_CONCLUSIONS
+            )
         ):
+            # Stale alone never proves transient: a stale deterministic
+            # failure/success conclusion waits instead of dispatching and
+            # burning the transient budget.
             recoverable = True
         else:
             return RecoveryDecision("wait", None, "pending operation is not stale")
@@ -553,6 +567,7 @@ __all__ = [
     "RetryEvidence",
     "RecoveryDecision",
     "operation_key",
+    "is_full_head",
     "retry_evidence",
     "resolve_max_executions",
     "retry_delay_schedule",

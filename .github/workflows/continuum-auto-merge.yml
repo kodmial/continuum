@@ -214,9 +214,22 @@ jobs:
               }
               const retryable = new Set(['cancelled', 'timed_out', 'stale', 'startup_failure']);
               if (err && retryable.has(String(err.conclusion || '').toLowerCase())) return true;
-              return /timeout|timed out|econnreset|econnrefused|eai_again|epipe|socket hang up|network error|network failure|network timeout|network unreachable|dns error|dns failure|dns resolution|tls handshake|tls error|ssl error|connection reset|connection refused|connection aborted|temporarily unavailable|service unavailable|bad gateway|gateway timeout|bootstrap failed|bootstrap error|runner evicted|runner cancelled|runner timeout|runner lost|run evicted|run cancelled/i.test(
+              // Bare timeout alone never proves infrastructure: deterministic
+              // current-head CI text such as `tests timed out: assertion
+              // failed` must hold. Only qualified infrastructure timeouts
+              // retry; any assertion mention holds.
+              if (String((err && err.message) || '').toLowerCase().includes('assert')) return false;
+              if (/econnreset|econnrefused|eai_again|epipe|socket hang up|network error|network failure|network timeout|network unreachable|dns error|dns failure|dns resolution|tls handshake|tls error|ssl error|connection reset|connection refused|connection aborted|temporarily unavailable|service unavailable|bad gateway|gateway timeout|bootstrap failed|bootstrap error|runner evicted|runner cancelled|runner timeout|runner lost|run evicted|run cancelled/i.test(
                 String((err && err.message) || '')
-              );
+              )) {
+                return true;
+              }
+              if (/timed out|timeout/i.test(String((err && err.message) || ''))) {
+                return /read|connection|network|runner|socket|dns|tls|ssl|gateway|http|request|operation|bootstrap|provider/i.test(
+                  String((err && err.message) || '')
+                );
+              }
+              return false;
             }
             // Reset-aware scheduling (#224, single lifecycle contract): the
             // canonical retry schedule plus bounded jitter is the floor and
@@ -341,6 +354,42 @@ jobs:
             ]);
             const CONFLICT_MARKER_RE =
               /<!--\s*continuum-conflict-repair\s+head=([0-9a-f]{7,64})\s+attempt=(\d+)\s*-->/gi;
+            // Durable rate-limit wait (#224): a conflict-repair dispatch that
+            // fails rate-limited persists a deferred not-before so the next
+            // wakeup waits for the reset window instead of retrying
+            // immediately against an unexpired limit. Deferred waits never
+            // consume the bounded per-HEAD dispatch budget.
+            const CONFLICT_DEFER_RE =
+              /<!--\s*continuum-conflict-repair-deferred\s+head=([0-9a-f]{7,64})\s+not-before=(\d+)\s*-->/gi;
+            function conflictRepairNotBefore(comments, headSha, nowEpoch) {
+              const exactHead = String(headSha || '').toLowerCase();
+              let notBefore = null;
+              for (const comment of comments || []) {
+                const association = String(
+                  comment.author_association || ''
+                ).toUpperCase();
+                const login = String(
+                  comment.user?.login || ''
+                ).toLowerCase();
+                const trusted =
+                  TRUSTED_COMMENT_ASSOCIATIONS.has(association) ||
+                  login === 'github-actions[bot]' ||
+                  login === owner.toLowerCase();
+                if (!trusted) continue;
+                const body = String(comment.body || '');
+                CONFLICT_DEFER_RE.lastIndex = 0;
+                for (const match of body.matchAll(CONFLICT_DEFER_RE)) {
+                  if (String(match[1] || '').toLowerCase() !== exactHead) continue;
+                  const epoch = Number.parseInt(match[2], 10);
+                  if (!Number.isFinite(epoch) || epoch <= 0) continue;
+                  if (notBefore === null || epoch > notBefore) notBefore = epoch;
+                }
+              }
+              if (notBefore !== null && Number.isFinite(nowEpoch) && nowEpoch < notBefore) {
+                return notBefore;
+              }
+              return null;
+            }
             // CodeRabbit is an optional integration. When this project did not
             // ask for it, every CodeRabbit gate below is skipped and no
             // CodeRabbit workflow is ever dispatched: requiring an approval
@@ -1721,6 +1770,17 @@ jobs:
                 )
               );
               const markers = conflictRepairMarkers(comments, headSha);
+              // Durable rate-limit wait: a deferred not-before from a prior
+              // rate-limited dispatch wins over a fresh dispatch.
+              const deferredNotBefore = conflictRepairNotBefore(
+                comments, headSha, Math.floor(Date.now() / 1000)
+              );
+              if (deferredNotBefore !== null) {
+                core.info(
+                  `PR #${pr.number}: conflict-repair deferred until ${new Date(deferredNotBefore * 1000).toISOString()}; waiting for the scheduled safety net.`
+                );
+                return;
+              }
               const latest = markers.at(-1) || null;
               const markerAgeMs =
                 latest && Number.isFinite(latest.createdAt)
@@ -1988,6 +2048,35 @@ jobs:
                     `without sleeping the runner: ` + (err.message || err)
                   );
                 }
+                // Durable not-before: persist the reset-aware wait so the
+                // next wakeup honors it instead of retrying immediately
+                // against an unexpired limit. Deferred waits never consume
+                // the per-HEAD dispatch budget (no conflict-repair marker is
+                // written for work that never executed).
+                {
+                  const hasResetSignal =
+                    signals.retryAfterSeconds !== undefined ||
+                    signals.ratelimitResetEpoch !== undefined ||
+                    signals.providerResetEpoch !== undefined;
+                  if (hasResetSignal && resetDelay > 0) {
+                    const notBefore = Math.floor(Date.now() / 1000) + resetDelay;
+                    try {
+                      await github.rest.issues.createComment({
+                        owner,
+                        repo,
+                        issue_number: pr.number,
+                        body:
+                          `<!-- continuum-conflict-repair-deferred head=${headSha} not-before=${notBefore} -->\n` +
+                          `Continuum deferred automatic OpenCode conflict repair for this exact HEAD until ` +
+                          `${new Date(notBefore * 1000).toISOString()} (rate-limited dispatch; reset-aware backoff ${resetDelay}s).`,
+                      });
+                    } catch (deferErr) {
+                      core.warning(
+                        `PR #${pr.number}: could not persist conflict-repair deferral: ${deferErr.message}`
+                      );
+                    }
+                  }
+                }
                 try {
                   await github.rest.issues.deleteComment({
                     owner,
@@ -2185,25 +2274,33 @@ jobs:
             // already queued skips its scan entirely: the newer run
             // re-reconciles from latest state when it starts, so this run
             // would only duplicate its work and its read API load. The probe
-            // is one single-page read (never paginated); if it fails
-            // deterministically the run scans anyway (fail-open: a broken
-            // probe must never strand reconciliation), and a transient probe
-            // failure defers green to the next wakeup.
+            // pages repo-wide runs (up to 3 pages, newest first) so a newer
+            // queued reconciler is not missed when a busy repository pushes
+            // it outside the first page; if it fails deterministically the
+            // run scans anyway (fail-open: a broken probe must never strand
+            // reconciliation), and a transient probe failure defers green to
+            // the next wakeup.
             try {
-              const { data: recentRuns } = await withReadFallback(client =>
-                client.rest.actions.listWorkflowRunsForRepo({
-                  owner,
-                  repo,
-                  per_page: 100,
-                })
-              );
               const queuedStatuses = new Set(['queued', 'waiting', 'requested', 'pending']);
-              const newerQueued = (recentRuns.workflow_runs || []).some(run =>
-                run.name === context.workflow &&
-                typeof run.id === 'number' &&
-                run.id > context.runId &&
-                queuedStatuses.has(String(run.status || '').toLowerCase())
-              );
+              let newerQueued = false;
+              for (let page = 1; page <= 3 && !newerQueued; page += 1) {
+                const { data: recentRuns } = await withReadFallback(client =>
+                  client.rest.actions.listWorkflowRunsForRepo({
+                    owner,
+                    repo,
+                    per_page: 100,
+                    page,
+                  })
+                );
+                const runs = recentRuns.workflow_runs || [];
+                newerQueued = runs.some(run =>
+                  run.name === context.workflow &&
+                  typeof run.id === 'number' &&
+                  run.id > context.runId &&
+                  queuedStatuses.has(String(run.status || '').toLowerCase())
+                );
+                if (runs.length < 100) break;
+              }
               if (newerQueued) {
                 core.info(
                   'A newer run of this workflow is already queued; skipping this scan ' +

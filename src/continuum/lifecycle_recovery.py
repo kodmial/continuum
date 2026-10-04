@@ -25,13 +25,16 @@ token-policy semantics without changing any provider-specific review policy:
 - same-repository read-only discovery uses the run-scoped ``GITHUB_TOKEN``;
   PAT/TAP_PAT is reserved for mutations/dispatches.
 
-Required caller wiring (without it a stranded PR has no automatic
-rediscovery/redispatch): every reconciler built on this contract must
-combine the pure decisions below with
+Required caller wiring (shipped alongside the pure decisions below, so a
+stranded PR has an automatic rediscovery/redispatch path): every reconciler
+built on this contract combines the pure decisions with
 
 - event triggers plus a scheduled watchdog (the ``continuum-*.yml``
   caller stubs provide ``pull_request_target``/``workflow_run`` events
-  and a cron schedule, so every pass rediscovers already-stranded PRs);
+  and a cron schedule, so every pass rediscovers already-stranded PRs;
+  implemented for PR-Agent review/repair by
+  ``.github/workflows/continuum-pr-agent-recovery.yml`` and
+  ``.github/caller-stubs/continuum-pr-agent-recovery.yml``);
 - a repository-global ``concurrency`` group (``cancel-in-progress:false``,
   so a queued run re-reconciles from latest state instead of racing)
   plus the per-PR/HEAD in-memory lease (:func:`concurrency_key`,
@@ -125,6 +128,50 @@ _LEGACY_EXHAUSTED_RE = re.compile(
     r"kind=(review|repair)\s+"
     r"attempts=(\d+)\s*-->"
 )
+# Bare `timeout`/`timed out` alone never proves infrastructure: a
+# deterministic current-head CI failure such as
+# `tests timed out: assertion failed` must hold, never burn the transient
+# budget. Only a qualified infrastructure timeout (read/connection/
+# network/runner/run/socket/dns/tls/gateway/http/request/...) retries.
+_TIMEOUT_INFRA_QUALIFIERS = (
+    "read",
+    "connection",
+    "network",
+    "runner",
+    "socket",
+    "dns",
+    "tls",
+    "ssl",
+    "gateway",
+    "http",
+    "request",
+    "operation",
+    "bootstrap",
+    "provider",
+)
+
+
+def _has_transient_signature(message: str) -> bool:
+    """Whether a lowercased message carries transient infrastructure evidence.
+
+    Deterministic test assertions dominate: any `assert` mention holds even
+    when a timeout substring is present.
+    """
+
+    if not message:
+        return False
+    if "assert" in message:
+        return False
+    for token in _TRANSIENT_ERROR_PATTERNS:
+        if token in ("timeout", "timed out"):
+            continue
+        if token in message:
+            return True
+    if "timed out" in message or "timeout" in message:
+        return any(qual in message for qual in _TIMEOUT_INFRA_QUALIFIERS)
+    return False
+
+
 # Pre-existing short-SHA exhausted markers (7-39 hex) from before exact-HEAD
 # safety: they can never authorize a retry attempt (no prefix matching for
 # budget), but an exhausted marker that prefix-matches the current HEAD must
@@ -258,10 +305,23 @@ def normalize_head(head_sha: object) -> str:
     # Exact-HEAD identity requires a full commit id (40-hex SHA-1 or 64-hex
     # SHA-256). Short prefixes are rejected: a short-SHA identity and a
     # full-SHA identity for the same commit would split budget/exhaustion
-    # and let stale recovery authorize a new HEAD.
+    # and let stale recovery authorize a new HEAD. Batch callers must
+    # isolate per-PR failures (catch per PR and continue) so one short or
+    # truncated SHA never aborts a repository-global scan and strands
+    # healthy PRs behind it.
     if not re.fullmatch(r"[0-9a-f]{40,64}", head):
         raise LifecycleRecoveryError("head_sha must be a full hexadecimal commit id")
     return head
+
+
+def is_full_head(head_sha: object) -> bool:
+    """Whether a value is a full commit id usable as recovery identity.
+
+    Batch loops use this as a per-PR guard (`continue` on False) so one
+    malformed HEAD skips loudly instead of raising out of the whole scan.
+    """
+
+    return bool(re.fullmatch(r"[0-9a-f]{40,64}", str(head_sha or "").strip().lower()))
 
 
 def normalize_kind(kind: object) -> str:
@@ -460,7 +520,7 @@ def classify_infrastructure_failure(
             retry_after_seconds=retry_after(),
             ratelimit_reset_epoch=reset_epoch(),
         )
-    if message and any(token in message for token in _TRANSIENT_ERROR_PATTERNS):
+    if message and _has_transient_signature(message):
         return FailureClassification(
             True, "transient network/runner/provider error signature",
             retry_after_seconds=retry_after(),
@@ -711,16 +771,10 @@ def retry_evidence(
                 if _same_head(marker_head, head) and marker_kind.lower() == normalized_kind:
                     if int(attempts_text) >= budget:
                         exhausted = True
-            # Legacy short-SHA exhaustion is fail-closed only: a short
-            # marker that is a prefix of the current full HEAD preserves
-            # exhaustion so the budget never restarts. Short retry markers
-            # never advance latest_attempt (no prefix authorization).
-            for match in _LEGACY_SHORT_EXHAUSTED_RE.finditer(body):
-                marker_head, marker_kind, attempts_text = match.groups()
-                if marker_kind.lower() != normalized_kind:
-                    continue
-                if head.startswith(marker_head.lower()) and int(attempts_text) >= budget:
-                    exhausted = True
+            # Legacy short-SHA markers are ignored: two distinct commits can
+            # share a 7-char prefix, so prefix matching would let old-HEAD
+            # evidence strand an unrelated healthy HEAD with no expiry path.
+            # Exact-HEAD isolation requires full-commit identity only.
 
     return RetryEvidence(
         latest_attempt=latest_attempt,
@@ -924,8 +978,14 @@ def decide_recovery(
         elif (
             status_age_seconds is not None
             and status_age_seconds >= stale_after_seconds
-            and conclusion not in {"queued", "in_progress", "waiting", "requested"}
+            and (
+                conclusion is None
+                or conclusion in RETRYABLE_RUN_CONCLUSIONS
+            )
         ):
+            # Stale alone never proves transient: a stale deterministic
+            # `failure`/`success` conclusion holds via the wait below instead
+            # of dispatching and burning the transient budget.
             recoverable = True
             transient_failure = True
         else:
@@ -987,12 +1047,21 @@ def decide_recovery(
         # this, a schedule-only long wait returns defer=true with no durable
         # wait and the next watchdog retries immediately, burning the budget.
         computed_not_before = int(now_epoch) + delay
+    # Without a clock the 10s/30s/60s schedule cannot persist a durable
+    # not-before, so a retry (attempt > 0) must still signal deferral instead
+    # of dispatching as immediate (defer=false): the caller then sleeps or
+    # defers to the next wakeup instead of letting the next watchdog retry
+    # immediately and compress the canonical backoff. Attempt 0 runs
+    # immediately; only retries carry backoff.
+    defer_dispatch = should_defer_dispatch(delay) or (
+        now_epoch is None and attempt > 0 and delay > 0
+    )
     return RecoveryDecision(
         "dispatch",
         attempt,
         "lost/missing operation" if state is None else "transient/stale operation",
         not_before_epoch=computed_not_before,
-        defer_dispatch=should_defer_dispatch(delay),
+        defer_dispatch=defer_dispatch,
     )
 
 
@@ -1054,6 +1123,20 @@ TRUSTED_OPERATION_CONTEXTS = frozenset(
 # defaults to read (query); a mutation is identified by its operation
 # content (``resolve``/``mutation``), and the workflow wiring keeps queries
 # on the read client and mutations on the PAT client.
+# GraphQL/request bodies are judged by mutation evidence, never by bare
+# substring: a read-only query fetching `updatedAt`/`updateTime`/
+# `createDate` must stay on GITHUB_TOKEN. Word boundaries reject those field
+# names (`update` followed by a letter is not a mutation verb), while the
+# explicit `mutation` keyword and the `resolve...thread` tunneled mutation
+# still route to PAT.
+_BODY_MUTATION_WORD_RE = re.compile(
+    r"(?<![a-z0-9])(create|update|delete|merge|dispatch|push|cancel|"
+    r"mutate|mutation|write|submit)(?![a-z0-9])"
+)
+_BODY_COMPOUND_MUTATION_RE = re.compile(r"(addlabel|removelabel|createlabel)")
+_BODY_RESOLVE_THREAD_RE = re.compile(
+    r"resolve[\s_\-]*review[\s_\-]*thread|resolvereviewthread|resolvethread"
+)
 _READ_TOKENS = (
     "read", "list", "get", "discover", "scan", "reconcile_read",
     "status", "check", "poll", "paginate", "graphql", "graphql_query",
@@ -1108,9 +1191,15 @@ def requires_pat(action: object, content: object = "") -> bool:
         # them, so any hit here is a real mutation/dispatch.
         if leaf_word not in {"listreviewcomments", "listcomments", "listreviews"}:
             return True
-    if body and any(marker in body for marker in mutation_markers):
+    if body and (
+        _BODY_MUTATION_WORD_RE.search(body)
+        or _BODY_COMPOUND_MUTATION_RE.search(body)
+        or _BODY_RESOLVE_THREAD_RE.search(body)
+    ):
         # A mutation tunneled through a generic client (graphql/request
-        # body carrying resolve/mutation/create/...) is PAT-backed.
+        # body carrying a mutation verb or resolve...thread) is PAT-backed.
+        # Word boundaries keep read-only field names (`updatedAt`,
+        # `updateTime`, `createDate`) on GITHUB_TOKEN.
         return True
     # Fail closed for generic paths on the PAT receiver or without a
     # receiver: "github.graphql" is the mutation channel (see the
@@ -1178,6 +1267,7 @@ __all__ = [
     "RetryEvidence",
     "RecoveryDecision",
     "normalize_head",
+    "is_full_head",
     "normalize_kind",
     "operation_key",
     "concurrency_key",

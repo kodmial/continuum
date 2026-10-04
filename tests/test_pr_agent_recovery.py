@@ -504,6 +504,9 @@ class RecoveryDecisionTests(unittest.TestCase):
         self.assertIsNone(evidence.not_before_epoch)
 
     def test_legacy_short_exhausted_marker_preserves_exhaustion(self):
+        # Exact-HEAD isolation: a short-SHA exhausted marker for a different
+        # commit that merely shares a 7-char prefix must never strand the
+        # current HEAD. Short markers are ignored entirely.
         short = HEAD[:7]
         evidence = recovery.retry_evidence(
             [comment(
@@ -512,14 +515,7 @@ class RecoveryDecisionTests(unittest.TestCase):
             head_sha=HEAD,
             kind="review",
         )
-        self.assertTrue(evidence.exhausted)
-        held = recovery.decide_recovery(
-            ci_green=True,
-            operation_state="failure",
-            operation_description="transient; recovery eligible",
-            evidence=evidence,
-        )
-        self.assertEqual(held.action, "hold")
+        self.assertFalse(evidence.exhausted)
 
     def test_non_green_ci_never_dispatches(self):
         decision = recovery.decide_recovery(
@@ -800,12 +796,11 @@ console.log('sandbox construction OK');
         self.assertIn("comment.updated_at || comment.created_at", body)
 
     def test_short_sha_exhaustion_is_preserved_fail_closed(self):
-        # Pre-existing short-SHA exhausted markers must preserve exhaustion
-        # fail-closed so the bounded budget never restarts, while short SHAs
-        # must never authorize a retry attempt (no prefix budget sharing).
+        # Exact-HEAD isolation: short-SHA markers are ignored entirely so an
+        # old HEAD sharing a 7-char prefix can never strand a new HEAD.
         body = self.read(".github/workflows/continuum-pr-agent-recovery.yml")
-        self.assertIn("legacyShortExhaustedRe", body)
-        self.assertIn("never touches latestAttempt", body)
+        self.assertIn("short-SHA markers are ignored", body)
+        self.assertNotIn("exactHead.startsWith(shortHead)", body)
         self.assertNotIn("legacyShortRetryRe", body)
         # Exact-HEAD identity still governs the retry budget itself.
         self.assertIn("marker === current", body)

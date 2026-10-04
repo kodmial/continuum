@@ -894,9 +894,8 @@ class CrossStackContractTests(unittest.TestCase):
         self.assertEqual(override.action, "dispatch")
 
     def test_legacy_short_exhausted_marker_preserves_exhaustion(self):
-        # A pre-existing short-SHA exhausted marker that prefixes the
-        # current HEAD preserves exhaustion fail-closed instead of
-        # restarting the budget; short retry markers never authorize work.
+        # Exact-HEAD isolation: a short-SHA exhausted marker sharing a prefix
+        # with the current HEAD is ignored instead of preserving exhaustion.
         short = HEAD[:7]
         exhausted_comments = [
             comment(
@@ -906,14 +905,7 @@ class CrossStackContractTests(unittest.TestCase):
         exhausted = lifecycle.retry_evidence(
             exhausted_comments, head_sha=HEAD, kind="review"
         )
-        self.assertTrue(exhausted.exhausted)
-        held = lifecycle.decide_recovery(
-            ci_green=True,
-            operation_state="failure",
-            failure_transient=True,
-            evidence=exhausted,
-        )
-        self.assertEqual(held.action, "hold")
+        self.assertFalse(exhausted.exhausted)
         retry_comments = [
             comment(
                 f"<!-- continuum-pr-agent-retry head={short} kind=review attempt=3 -->"

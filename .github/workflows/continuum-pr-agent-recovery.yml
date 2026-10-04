@@ -408,12 +408,10 @@ jobs:
                   (latestMarkerAt === null || createdAt > latestMarkerAt)
                 ) {
                   latestMarkerAt = Number.isFinite(createdAt) ? createdAt : null;
-                  // Preserve a durable wait: a duplicate same-attempt marker
-                  // without not-before must never clear the future reset time
-                  // written by the deferred attempt.
-                  if (markerNotBeforeEpoch !== null && markerNotBeforeEpoch !== undefined) {
-                    notBeforeEpoch = markerNotBeforeEpoch;
-                  }
+                  // Latest write wins, including clearing: a newer
+                  // same-attempt marker without not-before lifts the older
+                  // reset-aware wait instead of waiting past the clearing.
+                  notBeforeEpoch = markerNotBeforeEpoch;
                 } else if (attempt === latestAttempt && markerNotBeforeEpoch !== null && notBeforeEpoch === null) {
                   notBeforeEpoch = markerNotBeforeEpoch;
                 }
@@ -453,21 +451,11 @@ jobs:
                     exhausted = true;
                   }
                 }
-                // Fail-closed short-SHA exhaustion only: a short marker that
-                // prefixes the current full HEAD preserves exhaustion so the
-                // budget never restarts. It never touches latestAttempt (no
-                // prefix authorization for retry attempts).
-                for (const match of body.matchAll(legacyShortExhaustedRe)) {
-                  if (match[2] !== kind) continue;
-                  const shortHead = String(match[1] || '').toLowerCase();
-                  if (
-                    shortHead &&
-                    exactHead.startsWith(shortHead) &&
-                    Number.parseInt(match[3], 10) >= maxExecutions
-                  ) {
-                    exhausted = true;
-                  }
-                }
+                // Legacy short-SHA markers are ignored: two distinct commits
+                // can share a 7-char prefix, so prefix matching would let
+                // old-HEAD evidence strand an unrelated healthy HEAD with no
+                // expiry path. Exact-HEAD isolation requires full-commit
+                // identity only.
               }
               return { latestAttempt, latestMarkerAt, notBeforeEpoch, exhausted };
             }
@@ -633,9 +621,23 @@ jobs:
               // Mirrors continuum-auto-merge.yml.
               const retryable = new Set(['cancelled', 'timed_out', 'stale', 'startup_failure']);
               if (err && retryable.has(String(err.conclusion || '').toLowerCase())) return true;
-              return /timeout|timed out|econnreset|econnrefused|eai_again|epipe|socket hang up|network error|network failure|network timeout|network unreachable|dns error|dns failure|dns resolution|tls handshake|tls error|ssl error|connection reset|connection refused|connection aborted|temporarily unavailable|service unavailable|bad gateway|gateway timeout|bootstrap failed|bootstrap error|runner evicted|runner cancelled|runner timeout|runner lost|run evicted|run cancelled/i.test(
+              // Bare timeout alone never proves infrastructure: deterministic
+              // current-head CI text such as `tests timed out: assertion
+              // failed` must hold. Only qualified infrastructure timeouts
+              // retry; any assertion mention holds.
+              const message = String((err && err.message) || '').toLowerCase();
+              if (message.includes('assert')) return false;
+              if (/econnreset|econnrefused|eai_again|epipe|socket hang up|network error|network failure|network timeout|network unreachable|dns error|dns failure|dns resolution|tls handshake|tls error|ssl error|connection reset|connection refused|connection aborted|temporarily unavailable|service unavailable|bad gateway|gateway timeout|bootstrap failed|bootstrap error|runner evicted|runner cancelled|runner timeout|runner lost|run evicted|run cancelled/i.test(
                 String((err && err.message) || '')
-              );
+              )) {
+                return true;
+              }
+              if (/timed out|timeout/i.test(String((err && err.message) || ''))) {
+                return /read|connection|network|runner|socket|dns|tls|ssl|gateway|http|request|operation|bootstrap|provider/i.test(
+                  String((err && err.message) || '')
+                );
+              }
+              return false;
             }
 
             // Reset-aware scheduling (#224): Retry-After, X-RateLimit-Reset
@@ -730,6 +732,7 @@ jobs:
               activeRun,
               runConclusion,
               evidence,
+              failureTransient,
             }) {
               const state = String(operationStatus?.state || '').toLowerCase() || null;
               const description = String(operationStatus?.description || '');
@@ -803,9 +806,21 @@ jobs:
               } else if (state === 'success') {
                 return { action: 'settled', reason: 'operation already settled' };
               } else if (state === 'failure') {
-                // Only the explicit reconciler-synthesized token from the
-                // trusted review/repair commit-status contexts authorizes a
-                // retry without classifier input. A bare "transient"
+                // Explicit classifier verdicts dominate the token gate,
+                // mirroring src/continuum/pr_agent_recovery.py: a proven
+                // transient dispatches even without the token (so real
+                // infrastructure gaps never strand for lack of a token), and
+                // a proven deterministic holds even with it.
+                if (failureTransient === true) {
+                  recoverable = true;
+                } else if (failureTransient === false) {
+                  return {
+                    action: 'hold',
+                    reason: 'deterministic failure is not automatically retried',
+                  };
+                } else {
+                // Only the explicit reconciler-synthesized token authorizes
+                // a retry without classifier input. A bare "transient"
                 // substring is never sufficient: deterministic messages such
                 // as "non-transient policy failure" contain it and must never
                 // burn the transient budget. Negated forms (not/no/non/never
@@ -834,12 +849,27 @@ jobs:
                     reason: 'deterministic failure is not automatically retried',
                   };
                 }
+                }
               } else if (state === 'pending') {
-                if (retryableConclusions.has(String(runConclusion || '').toLowerCase())) {
+                // An explicit deterministic verdict dominates staleness; an
+                // explicit transient verdict dispatches without waiting for
+                // staleness. Stale alone never proves transient: only a
+                // retryable conclusion (or no conclusion) recovers, so a
+                // stale deterministic failure waits instead of burning
+                // budget.
+                if (failureTransient === false) {
+                  return {
+                    action: 'hold',
+                    reason: 'deterministic failure is not automatically retried',
+                  };
+                } else if (failureTransient === true) {
+                  recoverable = true;
+                } else if (retryableConclusions.has(String(runConclusion || '').toLowerCase())) {
                   recoverable = true;
                 } else if (
                   ageMs(operationStatus.updated_at || operationStatus.created_at) >= staleMs &&
-                  !activeStatuses.has(String(runConclusion || '').toLowerCase())
+                  (runConclusion === null || runConclusion === undefined ||
+                    retryableConclusions.has(String(runConclusion || '').toLowerCase()))
                 ) {
                   recoverable = true;
                 } else {
@@ -901,31 +931,22 @@ jobs:
                 // Never keep a runner sleeping through a long rate-limit or
                 // quota wait. Record the reset-aware not-before time so the
                 // scheduled safety net redispatches when the window expires.
-                // The deferral performs no execution, so it must never burn
-                // budget: persist attempt-1 so the next wakeup re-derives the
-                // same pending attempt index instead of advancing to latest+1
-                // without any execution. Attempt 0 has no predecessor, so
-                // persisting attempt 0 would advance latestAttempt from null
-                // to 0 and burn the first execution for work never attempted:
-                // write nothing and let the next wakeup re-derive attempt 0
-                // when the scheduled safety net redispatches.
+                // The deferral performs no execution, so it must never
+                // advance the budget: persist attempt-1 so the next wakeup
+                // re-derives the same pending attempt index instead of
+                // advancing to latest+1 without any execution. Attempt 0 has
+                // no predecessor, so persist attempt 0 itself with the same
+                // not-before: the next wakeup waits inside the window instead
+                // of re-deriving a fresh attempt 0 without the original
+                // Retry-After/RateLimit-Reset signals and re-hammering quota.
                 const notBefore = Math.floor(nowMs() / 1000) + remaining;
-                if (attempt > 0) {
-                  await upsertControllerState(
-                    pr.number,
-                    retryMarker(head, kind, attempt - 1, notBefore),
-                    'Deferred PR-Agent ' + kind + ' recovery for exact HEAD ' + head +
-                      ' until ' + new Date(notBefore * 1000).toISOString() +
-                      ' (reset-aware backoff ' + remaining + 's).'
-                  );
-                } else {
-                  core.notice(
-                    'PR #' + pr.number + ' ' + kind +
-                    ': deferring first execution for ' + remaining +
-                    's without persisting a marker (no budget burned); ' +
-                    'the scheduled safety net will redispatch.'
-                  );
-                }
+                await upsertControllerState(
+                  pr.number,
+                  retryMarker(head, kind, attempt > 0 ? attempt - 1 : 0, notBefore),
+                  'Deferred PR-Agent ' + kind + ' recovery for exact HEAD ' + head +
+                    ' until ' + new Date(notBefore * 1000).toISOString() +
+                    ' (reset-aware backoff ' + remaining + 's).'
+                );
                 core.notice(
                   'PR #' + pr.number + ' ' + kind +
                   ': deferring execution index ' + attempt + ' for ' + remaining +
@@ -1351,6 +1372,17 @@ jobs:
               }
               const head = String(pr.head.sha || '').toLowerCase();
               if (!head) continue;
+              // One bad fetch must not abort the loop: a non-full HEAD is a
+              // per-PR programming/fetch error, so skip loudly and continue
+              // with healthy PRs behind it instead of throwing out of the
+              // repository-global scan.
+              if (!FULL_HEAD_RE.test(head)) {
+                core.warning(
+                  'PR #' + pr.number + ': skipping recovery for non-full HEAD; ' +
+                  'producers must pass the full 40-hex (or 64-hex) commit id.'
+                );
+                continue;
+              }
 
               // Per-PR/HEAD/operation lease (#224): duplicate wakeups for the
               // same transition coalesce; independent PRs never starve each

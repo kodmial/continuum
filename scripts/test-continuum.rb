@@ -4379,12 +4379,12 @@ class ContinuumTest < Minitest::Test
     assert_includes automerge, 'liveBeforeSync'
     assert_includes automerge, 'holding stale reconciliation'
     assert_includes automerge, 'sha: pr.head.sha'
-    # Fail-closed legacy short-SHA exhaustion only: a pre-existing short
-    # exhausted marker that prefixes the current HEAD preserves exhaustion
-    # so the bounded budget never restarts. Short SHAs must never authorize
-    # retry attempts, so no short retry regex may feed latestAttempt.
-    assert_includes recovery, 'legacyShortExhaustedRe'
-    assert_includes recovery, 'never touches latestAttempt'
+    # Exact-HEAD isolation: short-SHA markers are ignored entirely so an
+    # old HEAD sharing a 7-char prefix can never strand a new HEAD. No
+    # short retry regex may feed latestAttempt and no prefix match may
+    # preserve exhaustion.
+    assert_includes recovery, 'short-SHA markers are ignored'
+    refute_includes recovery, 'exactHead.startsWith(shortHead)'
     refute_includes recovery, 'legacyShortRetryRe'
     refute_includes recovery, 'startsWith(marker)'
   end
