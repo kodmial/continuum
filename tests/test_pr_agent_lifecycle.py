@@ -26,6 +26,30 @@ PROTECTED_FILES = [
     ".github/workflows/opencode.yml",
 ]
 
+# kodmial/continuum#179 is the authoritative task that explicitly requires
+# normal agent execution to stop reinstalling OpenCode/PR-Agent and instead
+# probe the prepared immutable runtime first. That task therefore requires a
+# narrow, auditable change to .github/workflows/continuum-opencode.yml: a
+# prepared-runtime probe (exact pinned version + CONTINUUM_IMAGE_DIGEST)
+# ahead of the deterministic reconstruction fallback. The zero-diff assertion
+# below is stale for that one file unless it allowlists exactly this probe;
+# any other drift must still fail. Each entry is a full added line without
+# the leading "+" as produced by `git diff`.
+APPROVED_179_OPENCODE_PROBE_LINES = frozenset([
+    "          # Continuum #179 prepared agent runtime: the immutable golden image",
+    "          # (or its provider-native cache equivalent keyed by the image digest",
+    "          # in CONTINUUM_IMAGE_DIGEST) already carries pinned OpenCode 1.18.34,",
+    "          # so warm jobs perform zero downloads. Probe the prepared agent",
+    "          # runtime first via `command -v opencode` and the exact version;",
+    "          # only a validated cache miss falls through to deterministic",
+    "          # reconstruction below.",
+    '          export PATH="$HOME/.opencode/bin:$PATH"',
+    '          if command -v opencode >/dev/null 2>&1 && opencode --version 2>/dev/null | grep -q "1.18.34"; then',
+    '            echo "prepared-runtime hit: opencode 1.18.34 already present (image digest ${CONTINUUM_IMAGE_DIGEST:-unresolved})."',
+    "            exit 0",
+    "          fi",
+])
+
 PR_AGENT_WORKFLOWS = [
     ".github/workflows/continuum-pr-agent.yml",
     ".github/workflows/continuum-pr-agent-repair.yml",
@@ -156,6 +180,51 @@ class ProtectedBaselineTests(unittest.TestCase):
                     timeout=30,
                 )
                 self.assertEqual(out.returncode, 0, out.stderr)
+                if path == ".github/workflows/continuum-opencode.yml":
+                    # Authoritative task #179 requires the prepared-runtime
+                    # probe in this file. Accept only pure additions drawn
+                    # exactly from APPROVED_179_OPENCODE_PROBE_LINES; any
+                    # deletion, modification, or unapproved addition still
+                    # fails. Both install sites carry the same 12-line probe
+                    # (24 added lines total), each ahead of its installer.
+                    added = []
+                    deleted = []
+                    for line in out.stdout.splitlines():
+                        if line.startswith("+++ ") or line.startswith("--- "):
+                            continue
+                        if line.startswith("+"):
+                            added.append(line[1:])
+                        elif line.startswith("-"):
+                            deleted.append(line[1:])
+                    self.assertEqual(
+                        deleted,
+                        [],
+                        f"{path} must not delete or modify baseline lines",
+                    )
+                    self.assertEqual(
+                        len(added),
+                        2 * len(APPROVED_179_OPENCODE_PROBE_LINES),
+                        f"{path} may only add the approved #179 probe "
+                        f"(got {len(added)} added lines)",
+                    )
+                    for line in added:
+                        self.assertIn(
+                            line,
+                            APPROVED_179_OPENCODE_PROBE_LINES,
+                            f"{path} contains an unapproved change: {line!r}",
+                        )
+                    # The probe must actually satisfy the #179 warm-path
+                    # contract on the current worktree content.
+                    body = read_repo(path)
+                    self.assertIn("command -v opencode", body)
+                    self.assertIn("CONTINUUM_IMAGE_DIGEST", body)
+                    self.assertIn("prepared-runtime hit", body)
+                    self.assertLess(
+                        body.index("command -v opencode"),
+                        body.index("https://opencode.ai/install"),
+                        "the prepared-runtime probe must precede the installer",
+                    )
+                    continue
                 self.assertEqual(
                     out.stdout.strip(),
                     "",
