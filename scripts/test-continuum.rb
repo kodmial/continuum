@@ -5302,12 +5302,16 @@ class ContinuumTest < Minitest::Test
       continuum-consumer-child-pr-review.yml
     ].each do |name|
       body = workflow_body(name)
+      # Comment portions never count: an explanatory comment naming a key
+      # to document the prohibition must not fail the check; only
+      # executable code reading the key is forbidden.
+      code_body = body.lines.map { |line| code_without_comment(line) }.join
       %w[OPENCODE_API_KEY ANTHROPIC_API_KEY GROQ_API_KEY GROQ.KEY].each do |key|
-        refute_includes body, key, "#{name}: core execution must never read a paid provider key"
+        refute_includes code_body, key, "#{name}: core execution must never read a paid provider key"
       end
-      refute_match(/idle_instances:\s*[1-9]\d*/, body,
+      refute_match(/idle_instances:\s*["']?[1-9]\d*/, body,
                    "#{name}: strict profiles keep zero live idle instances")
-      refute_match(/max_uses_per_instance:\s*(0|[2-9]\d*|1\d+)/, body,
+      refute_match(/max_uses_per_instance:\s*["']?(0|[2-9]\d*|1\d+)/, body,
                    "#{name}: one instance may execute exactly one job")
     end
 

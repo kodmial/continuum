@@ -44,13 +44,34 @@ def read_workflow(name):
 
 
 def code_without_comment(line):
-    return line.split("#", 1)[0]
+    """Return the code portion of a line with `#` comments stripped.
+
+    Only a `#` outside single/double quotes starts a comment, so a quoted
+    `#` (e.g. a URL fragment or `echo "#hi"`) is preserved while a trailing
+    comment is not code. Mirrors the Ruby helper and
+    `_stamp_code_without_comment`.
+    """
+    in_single = False
+    in_double = False
+    for index, char in enumerate(line):
+        if char == "'" and not in_double:
+            in_single = not in_single
+        elif char == '"' and not in_single:
+            in_double = not in_double
+        elif char == "#" and not in_single and not in_double:
+            return line[:index]
+    return line
 
 
 def installer_indices(lines):
     found = []
     for i, line in enumerate(lines):
         code = code_without_comment(line)
+        # An `echo`/`printf` docs example that merely mentions an installer
+        # URL is not an executable installer site: real sites run the
+        # installer, they never echo it.
+        if re.search(r"\b(echo|printf)\b", code):
+            continue
         if "https://opencode.ai/install" in code:
             found.append(i)
         elif "pip install" in code and ("pr-agent" in code or "opencode" in code):

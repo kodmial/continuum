@@ -98,19 +98,23 @@ class AgentRuntimeContractTest(unittest.TestCase):
     def test_03_normal_execution_contains_no_bootstrap_install(self):
         # Hermetic warm-path contract: inline fixtures exercise the
         # detectors without a hard dependency on checked-in workflow files.
+        # The pin tracks the canonical runtime.OPENCODE_VERSION so a bump
+        # exercises the new literal instead of silently testing the old one.
+        _opencode_version = runtime.OPENCODE_VERSION
+        _escaped = _opencode_version.replace(".", "\\.")
         warm_body = (
             "        env:\n"
             "          CONTINUUM_IMAGE_DIGEST: ${{ vars.CONTINUUM_IMAGE_DIGEST }}\n"
             "        run: |\n"
             "          # Continuum prepared agent runtime: the immutable golden image\n"
             "          # (or its provider-native cache equivalent) already carries pinned\n"
-            "          # OpenCode 1.18.34. The warm hit below is keyed by the image digest\n"
+            "          # OpenCode " + _opencode_version + ". The warm hit below is keyed by the image digest\n"
             "          # in CONTINUUM_IMAGE_DIGEST (wired from the repository variable).\n"
             '          export PATH="$HOME/.opencode/bin:$PATH"\n'
             '          if [[ "${CONTINUUM_IMAGE_DIGEST:-}" =~ ^[0-9a-f]{64}$ ]]'
             " && command -v opencode >/dev/null 2>&1"
-            ' && opencode --version 2>&1 | grep -E -q "(^|[^0-9.])1\\.18\\.34([^0-9.]|$)"; then\n'
-            '            echo "prepared-runtime hit: opencode 1.18.34 already present'
+            ' && opencode --version 2>&1 | grep -E -q "(^|[^0-9.])' + _escaped + '([^0-9.]|$)"; then\n'
+            '            echo "prepared-runtime hit: opencode ' + _opencode_version + ' already present'
             ' (image digest ${CONTINUUM_IMAGE_DIGEST})."\n'
             '            echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"\n'
             "            exit 0\n"
@@ -162,15 +166,17 @@ class AgentRuntimeContractTest(unittest.TestCase):
         self.assertFalse(runtime.workflow_step_has_prepared_runtime_probe(cold_body))
 
     def test_03_integration_workflow_warm_path(self):
-        # Separate integration check over the checked-in workflows. Missing
-        # files skip instead of raising FileNotFoundError so the unit suite
-        # never fails for reasons outside this module.
+        # Separate integration check over the checked-in workflows. Every
+        # expected file must exist and satisfy the warm-path contract: a
+        # missing or regressed file fails instead of being skipped.
         names = ("continuum-opencode.yml", "continuum-pr-agent.yml",
                  "continuum-pr-agent-repair.yml")
         checked = 0
+        missing = []
         for name in names:
             path = os.path.join(os.path.dirname(__file__), "..", ".github", "workflows", name)
             if not os.path.exists(path):
+                missing.append(name)
                 continue
             with open(path, encoding="utf-8") as handle:
                 body = handle.read()
@@ -180,6 +186,8 @@ class AgentRuntimeContractTest(unittest.TestCase):
                 self.assertTrue(runtime.workflow_step_has_prepared_runtime_probe(body),
                                 "{}: prepared-runtime probe with pinned versions + image digest required".format(name))
             checked += 1
+        if missing:
+            self.fail("missing workflow files: {}".format(", ".join(missing)))
         if checked == 0:
             self.fail("no workflow files present; checked-in warm-path workflows must exist")
 
@@ -854,12 +862,14 @@ class AgentRuntimeContractTest(unittest.TestCase):
             created_at=1000.0,
             lease_expires_at=1000.0 + controller.max_job_lifetime,
             max_age_at=1000.0 + controller.global_max_age, state="running")
-        # The lease expired long ago and the sweeper has not run: even
-        # without an explicit clock the leaked live compute must count as
-        # idle instead of reporting a vacuous zero.
+        # The lease expired long ago and the sweeper has not run: the
+        # leaked live compute must count as idle instead of reporting a
+        # vacuous zero. Both assertions use an explicit clock so the
+        # result never depends on wall-clock time.time().
+        _expired_now = 1000.0 + controller.global_max_age + 1.0
         self.assertGreaterEqual(
-            controller.live_idle_count(now=1000.0 + controller.global_max_age + 1.0), 1)
-        self.assertGreaterEqual(controller.live_idle_count(), 1)
+            controller.live_idle_count(now=_expired_now), 1)
+        self.assertGreaterEqual(controller.live_idle_count(now=_expired_now), 1)
 
     def test_resolve_profile_from_env_reads_preset_and_provider(self):
         profile = runtime.resolve_profile_from_env(

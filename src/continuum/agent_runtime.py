@@ -63,6 +63,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -1386,7 +1387,29 @@ class FakeProvider:
             network.destroyed_at = now
         instance.log_forwarded = True
         instance.destroyed_at = now
+        self.prune_destroyed_resources()
         return True
+
+    def prune_destroyed_resources(self, max_retained_destroyed: int = 256) -> int:
+        """Prune oldest destroyed instances/networks beyond a bounded history.
+
+        Destroyed resources are retained for post-job assertions, but a
+        long-lived controller must not grow linearly in memory. Only the
+        most recent ``max_retained_destroyed`` destroyed entries per
+        collection are kept; live resources are never pruned.
+        """
+
+        pruned = 0
+        for collection in (self.instances, self.networks):
+            destroyed = sorted(
+                (key for key, item in collection.items() if item.destroyed_at is not None),
+                key=lambda key: collection[key].destroyed_at or 0.0,
+            )
+            excess = len(destroyed) - int(max_retained_destroyed)
+            for key in destroyed[: max(0, excess)]:
+                del collection[key]
+                pruned += 1
+        return pruned
 
     def live_instances(self) -> List[RunnerInstance]:
         return [item for item in self.instances.values() if item.destroyed_at is None]
@@ -1461,6 +1484,11 @@ class EphemeralController:
         self.queued: List[Dict[str, Any]] = []
         self.diagnostics: List[str] = []
         self._job_counter = 0
+        # Serializes provisioning so concurrent callers cannot both pass
+        # the concurrency-limit check and over-provision beyond the
+        # consumer cost cap. The public run_next_job holds this across
+        # the whole check-then-provision path.
+        self._provisioning_lock = threading.Lock()
 
     # -- demand ------------------------------------------------------
     def queue_job(self, repository: str, profile: RuntimeProfile, run_id: str = "") -> str:
@@ -1504,6 +1532,38 @@ class EphemeralController:
 
     # -- provisioning path (section 5) --------------------------------
     def run_next_job(
+        self,
+        manifest: AgentManifest,
+        *,
+        now: float,
+        outcome: str = OUTCOME_SUCCESS,
+        fail_jit: bool = False,
+        fail_startup: bool = False,
+        teardown_retries: Optional[int] = None,
+        is_fork: bool = False,
+        trusted_context: bool = True,
+    ) -> JobResult:
+        """Execute steps 2-13 of the required provisioning path for one job.
+
+        Serialized on the provisioning lock so the concurrency-limit
+        check and the subsequent network/instance creation are atomic:
+        concurrent callers cannot both observe the same live count and
+        both provision beyond the limit.
+        """
+
+        with self._provisioning_lock:
+            return self._run_next_job_impl(
+                manifest,
+                now=now,
+                outcome=outcome,
+                fail_jit=fail_jit,
+                fail_startup=fail_startup,
+                teardown_retries=teardown_retries,
+                is_fork=is_fork,
+                trusted_context=trusted_context,
+            )
+
+    def _run_next_job_impl(
         self,
         manifest: AgentManifest,
         *,
