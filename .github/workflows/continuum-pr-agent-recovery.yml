@@ -33,6 +33,14 @@ on:
         type: string
         default: ''
         required: false
+      target_child_id:
+        description: >-
+          Opaque verified child id for delegated recovery. Empty targets the
+          caller repository, unless vars.CONTINUUM_PR_AGENT_TARGET_CHILD_ID
+          selects a child.
+        type: string
+        default: ''
+        required: false
       max_executions:
         description: >-
           Total transient executions per exact PR/HEAD/operation (default 10,
@@ -46,7 +54,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: pr-agent-recovery-${{ github.repository }}
+  group: ${{ (inputs.target_child_id || vars.CONTINUUM_PR_AGENT_TARGET_CHILD_ID) && format('pr-agent-recovery-child-{0}-{1}', inputs.target_child_id || vars.CONTINUUM_PR_AGENT_TARGET_CHILD_ID, github.repository) || format('pr-agent-recovery-{0}', github.repository) }}
   cancel-in-progress: false
 
 jobs:
@@ -64,6 +72,75 @@ jobs:
       statuses: read
 
     steps:
+      - name: Resolve PR-Agent target context
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          TARGET_CHILD_ID: ${{ inputs.target_child_id || vars.CONTINUUM_PR_AGENT_TARGET_CHILD_ID }}
+          CONTINUUM_REF: ${{ inputs.continuum_ref }}
+        run: |
+          set -euo pipefail
+          continuum_b64_decode() {
+            if printf '' | base64 --decode >/dev/null 2>&1; then
+              base64 --decode
+            elif printf '' | base64 -d >/dev/null 2>&1; then
+              base64 -d
+            elif printf '' | base64 -D >/dev/null 2>&1; then
+              base64 -D
+            elif command -v python3 >/dev/null 2>&1; then
+              python3 -c 'import sys,base64; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))'
+            else
+              openssl base64 -d
+            fi
+          }
+          CONTINUUM_SOURCE_REPO="${GITHUB_WORKFLOW_REF:-}"
+          CONTINUUM_SOURCE_REPO="${CONTINUUM_SOURCE_REPO%%/.github/workflows/*}"
+          if ! [[ "$CONTINUUM_SOURCE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || [[ "${CONTINUUM_SOURCE_REPO%%/*}" =~ ^\.+$ ]] || [[ "${CONTINUUM_SOURCE_REPO#*/}" =~ ^\.+$ ]]; then
+            CONTINUUM_SOURCE_REPO="kodmial/continuum"
+          fi
+          if [[ -z "${TARGET_CHILD_ID:-}" ]]; then
+            if ! [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || [[ "${GITHUB_REPOSITORY%%/*}" =~ ^\.+$ ]] || [[ "${GITHUB_REPOSITORY#*/}" =~ ^\.+$ ]]; then
+              echo "::error::PR-Agent target repository identity is invalid."
+              exit 2
+            fi
+            {
+              printf 'CONTINUUM_PR_AGENT_TARGET_REPOSITORY=%s\n' "$GITHUB_REPOSITORY"
+              printf 'CONTINUUM_PR_AGENT_TARGET_OWNER=%s\n' "${GITHUB_REPOSITORY%%/*}"
+              printf 'CONTINUUM_PR_AGENT_TARGET_REPO=%s\n' "${GITHUB_REPOSITORY#*/}"
+              printf 'CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED=%s\n' "false"
+            } >> "$GITHUB_ENV"
+            echo "PR-Agent target context resolved locally."
+            exit 0
+          fi
+          : "${CONTINUUM_REF:?CONTINUUM_REF is required for pinned target resolution}"
+          RUNTIME_ROOT="$RUNNER_TEMP/continuum-pr-agent-target-runtime"
+          mkdir -p "$RUNTIME_ROOT/.github/scripts"
+          fetch_runtime_file() {
+            local path="$1" dest="$2"
+            if ! gh api --method GET "repos/$CONTINUUM_SOURCE_REPO/contents/$path" -f ref="$CONTINUUM_REF" --jq .content 2>/dev/null \
+              | tr -d '\n' | continuum_b64_decode > "$dest" 2>/dev/null; then
+              echo "::error::Unable to load the Continuum PR-Agent target resolver."
+              exit 1
+            fi
+            if [[ ! -s "$dest" ]]; then
+              echo "::error::Unable to load the Continuum PR-Agent target resolver."
+              exit 1
+            fi
+          }
+          fetch_runtime_file ".github/scripts/pr_agent_target.sh" "$RUNTIME_ROOT/.github/scripts/pr_agent_target.sh"
+          fetch_runtime_file ".github/scripts/delegation_repository.sh" "$RUNTIME_ROOT/.github/scripts/delegation_repository.sh"
+          fetch_runtime_file ".github/scripts/delegation_runtime.py" "$RUNTIME_ROOT/.github/scripts/delegation_runtime.py"
+          PARENT_CONFIG_FILE="$RUNTIME_ROOT/parent.continuum.yml"
+          # The parent config lives in the execution repository: fetch its
+          # default branch, never the Continuum engine pin (which may not
+          # exist in the execution repository).
+          if ! gh api --method GET "repos/$GITHUB_REPOSITORY/contents/.continuum.yml" --jq .content 2>/dev/null \
+            | tr -d '\n' | continuum_b64_decode > "$PARENT_CONFIG_FILE" 2>/dev/null || [[ ! -s "$PARENT_CONFIG_FILE" ]]; then
+            echo "::error::Unable to load the parent Continuum configuration for delegated target resolution; refusing to guess."
+            exit 1
+          fi
+          CONTINUUM_ENGINE_ROOT="$RUNTIME_ROOT" PARENT_CONFIG="$PARENT_CONFIG_FILE" \
+            bash "$RUNTIME_ROOT/.github/scripts/pr_agent_target.sh" "$TARGET_CHILD_ID"
+
       - name: Reconcile PR-Agent latest state
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
@@ -71,17 +148,23 @@ jobs:
           CI_WORKFLOW_NAME: ${{ inputs.ci_workflow_name || 'CI' }}
           STALE_MINUTES: ${{ inputs.stale_minutes || vars.PR_AGENT_RECOVERY_STALE_MINUTES || '70' }}
           DISPATCH_GRACE_SECONDS: ${{ inputs.dispatch_grace_seconds || vars.PR_AGENT_RECOVERY_DISPATCH_GRACE_SECONDS || '90' }}
+          TARGET_CHILD_ID: ${{ inputs.target_child_id || vars.CONTINUUM_PR_AGENT_TARGET_CHILD_ID }}
           MAX_EXECUTIONS_RAW: ${{ inputs.max_executions }}
           MAX_EXECUTIONS_FALLBACK: ${{ vars.PR_AGENT_RECOVERY_MAX_EXECUTIONS || '10' }}
           # Item 1 of Work Lock #58: same-repo reads use the repository-scoped
           # installation token. PAT remains the mutation/dispatch identity.
+          # For delegated recovery, cross-repository target reads fall back
+          # to the PAT client via withReadFallback when github.token cannot
+          # see the child.
           READ_GITHUB_TOKEN: ${{ github.token }}
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const repoFullName = owner + '/' + repo;
+            const executionOwner = context.repo.owner;
+            const executionRepo = context.repo.repo;
+            const owner = process.env.CONTINUUM_PR_AGENT_TARGET_OWNER;
+            const repo = process.env.CONTINUUM_PR_AGENT_TARGET_REPO;
+            const repoFullName = process.env.CONTINUUM_PR_AGENT_TARGET_REPOSITORY;
             const reviewWorkflow = String(process.env.REVIEW_WORKFLOW || 'continuum-pr-agent.yml').trim();
             const ciWorkflowName = String(process.env.CI_WORKFLOW_NAME || 'CI').trim();
             // Single 10-execution transient budget (#224): default 10 total
@@ -185,7 +268,11 @@ jobs:
                 // defers to the next wakeup instead of re-issuing the scan
                 // on the PAT client. Only authentication/permission gaps
                 // (401, non-rate-limit 403) fall back, one call at a time.
-                if (status === 401 || (status === 403 && !isRateLimitError(err, status))) {
+                // Cross-repository target reads with github.token scoped
+                // to the execution repository conventionally surface as
+                // 404 (the documented inaccessible-repo response), so those
+                // also fall back to TAP_PAT alongside 401/non-rate-limit 403.
+                if (status === 401 || (status === 403 && !isRateLimitError(err, status)) || status === 404) {
                   core.warning('Repository-token read failed (' + status + '); retrying with PAT client: ' + err.message);
                   return await fn(github);
                 }
@@ -493,23 +580,25 @@ jobs:
                 )[0] || null;
             }
 
-                async function listReviewRuns() {
-                  try {
-                    // Workflow-filtered server-side; recovery only needs
-                    // recent active/stale runs, so two pages bound the cost.
-                    return await withReadFallback(client =>
-                      boundedCollect(
-                        client,
-                        (params) => client.rest.actions.listWorkflowRuns(params),
-                        {
-                          owner,
-                          repo,
-                          workflow_id: reviewWorkflow,
-                          per_page: 100,
-                        },
-                        MAX_GATE_PAGES
-                      )
-                    );
+            async function listReviewRuns() {
+              try {
+                // Workflow-filtered server-side; recovery only needs
+                // recent active/stale runs, so two pages bound the cost.
+                // Execution-scoped: review controller runs live in the
+                // execution repository while PR reads use the target.
+                return await withReadFallback(client =>
+                  boundedCollect(
+                    client,
+                    (params) => client.rest.actions.listWorkflowRuns(params),
+                    {
+                      owner: executionOwner,
+                      repo: executionRepo,
+                      workflow_id: reviewWorkflow,
+                      per_page: 100,
+                    },
+                    MAX_GATE_PAGES
+                  )
+                );
               } catch (err) {
                 // A transient/rate-limit read must never fail the run here:
                 // callers defer green to the next wakeup instead of spending
@@ -550,8 +639,8 @@ jobs:
               try {
                 const { data: run } = await withReadFallback(client =>
                   client.rest.actions.getWorkflowRun({
-                    owner,
-                    repo,
+                    owner: executionOwner,
+                    repo: executionRepo,
                     run_id: Number(match[1]),
                   })
                 );
@@ -969,7 +1058,7 @@ jobs:
 
             async function defaultBranch() {
               const { data } = await withReadFallback(client =>
-                client.rest.repos.get({ owner, repo })
+                client.rest.repos.get({ owner: executionOwner, repo: executionRepo })
               );
               return String(data.default_branch || 'main');
             }
@@ -1198,19 +1287,52 @@ jobs:
               }
               try {
                 const ref = await defaultBranch();
-                await github.rest.actions.createWorkflowDispatch({
-                  owner,
-                  repo,
-                  workflow_id: reviewWorkflow,
-                  ref,
-                  inputs: {
-                    pr_number: String(pr.number),
-                    expected_head_sha: head,
-                    retry_attempt: String(attempt),
-                    retry_workflow: reviewWorkflow,
-                    recovery_kind: kind,
-                  },
-                });
+                // Local runs dispatch bare: a custom reviewWorkflow without
+                // the target_child_id workflow_dispatch input would reject
+                // an empty value, breaking local recovery. Delegated runs
+                // preserve the opaque child selection.
+                const recoveryInputs = {
+                  pr_number: String(pr.number),
+                  expected_head_sha: head,
+                  retry_attempt: String(attempt),
+                  retry_workflow: reviewWorkflow,
+                  recovery_kind: kind,
+                };
+                const recoveryChildId = String(process.env.TARGET_CHILD_ID || '');
+                if (recoveryChildId) {
+                  recoveryInputs.target_child_id = recoveryChildId;
+                }
+                try {
+                  await github.rest.actions.createWorkflowDispatch({
+                    owner: executionOwner,
+                    repo: executionRepo,
+                    workflow_id: reviewWorkflow,
+                    ref,
+                    inputs: recoveryInputs,
+                  });
+                } catch (dispatchErr) {
+                  const dispatchMessage = String(dispatchErr.message || dispatchErr);
+                  const dispatchStatus = Number(dispatchErr.status || 0);
+                  // Narrow input-rejection detection: only a 422 whose
+                  // message names the opaque target_child_id input means
+                  // the review workflow lacks the delegated selector. Any
+                  // other 422 (invalid pr_number/expected_head_sha, ref, or
+                  // payload validation) or any message merely containing
+                  // the word "input" is rethrown verbatim so the operator
+                  // fixes the true remediation path.
+                  const isMissingTargetInput =
+                    dispatchStatus === 422 &&
+                    /target_child_id/i.test(dispatchMessage);
+                  if (recoveryChildId && isMissingTargetInput) {
+                    throw new Error(
+                      'Delegated recovery requires reviewWorkflow ' + reviewWorkflow +
+                      ' to declare a target_child_id workflow_dispatch input; ' +
+                      'refusing bare retry to preserve the delegated target: ' +
+                      dispatchMessage
+                    );
+                  }
+                  throw dispatchErr;
+                }
                 core.notice(
                   'PR #' + pr.number + ' HEAD ' + head + ': dispatched ' +
                   kind + ' recovery execution ' + (attempt + 1) + '/' + maxExecutions + '.'
