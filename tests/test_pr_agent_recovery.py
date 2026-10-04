@@ -461,38 +461,134 @@ console.log('sandbox construction OK');
         self.assertIn("continuum-pr-agent-retry markers", body)
 
     def test_controller_touch_body_differs_per_run_but_keeps_retry_identity(self):
-        def controller_state_body(state_marker: str, summary: str) -> str:
-            return "\n".join(
-                [
-                    "<!-- continuum-pr-agent-controller-state:v1 -->",
-                    state_marker.strip(),
-                    "<details>",
-                    "<summary>Continuum PR-Agent controller state</summary>",
-                    "",
-                    summary.strip(),
-                    "",
-                    "</details>",
-                ]
-            )
+        """Exercise the real shipped JS, not a Python reimplementation.
 
-        marker = f"<!-- continuum-pr-agent-retry head={HEAD} kind=review attempt=1 -->"
-        base_summary = "Automatic PR-Agent review recovery for exact HEAD."
-        body_run_a = controller_state_body(
-            marker, base_summary + "\n\nController dispatch run: 111"
+        The static pins fail if the workflow touch is reverted; the Node
+        harness below extracts the real `controllerStateBody` plus the real
+        touch expression from the workflow text and executes them, so this
+        test cannot stay green while the shipped code regresses.
+        """
+        import json
+        import re
+        import shutil
+        import subprocess
+        import tempfile
+
+        body = self.read(".github/workflows/continuum-pr-agent-recovery.yml")
+        # Static pins against revert: the unsafe bare concatenation must be
+        # gone and the null-safe coercion must be present.
+        self.assertNotIn("summary + '\\n\\nController dispatch run:'", body)
+        self.assertIn(
+            "String(summary || '').trim() + '\\n\\nController dispatch run: '"
+            " + String(context.runId)",
+            body,
         )
-        body_run_b = controller_state_body(
-            marker, base_summary + "\n\nController dispatch run: 222"
+
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("node is required to execute the shipped JS")
+
+        marker_match = re.search(
+            r"const CONTROLLER_STATE_MARKER = '([^']*)';", body
         )
-        # Different runs produce different bodies, so GitHub advances
-        # updated_at on every committed dispatch instead of treating the
-        # marker as older than it really is.
-        self.assertNotEqual(body_run_a, body_run_b)
-        # Durable retry identity (the stateMarker line) is unchanged.
-        self.assertIn(marker, body_run_a)
-        self.assertIn(marker, body_run_b)
-        self.assertEqual(
-            body_run_a.splitlines()[1],
-            body_run_b.splitlines()[1],
+        self.assertIsNotNone(marker_match, "controller state marker const is missing")
+        marker_const = marker_match.group(1)
+
+        fn_start = body.index("function controllerStateBody(stateMarker, summary)")
+        brace = body.index("{", fn_start)
+        depth = 0
+        fn_end = None
+        for pos in range(brace, len(body)):
+            if body[pos] == "{":
+                depth += 1
+            elif body[pos] == "}":
+                depth -= 1
+                if depth == 0:
+                    fn_end = pos + 1
+                    break
+        self.assertIsNotNone(fn_end, "could not extract controllerStateBody")
+        fn_source = body[fn_start:fn_end]
+
+        touch_match = re.search(
+            r"const body = controllerStateBody\(\s*stateMarker,\s*([\s\S]*?)\n\s*\);",
+            body,
+        )
+        self.assertIsNotNone(touch_match, "could not extract the touch expression")
+        touch_expr = touch_match.group(1).strip()
+        self.assertIn("Controller dispatch run:", touch_expr)
+
+        harness = (
+            "const assert = require('assert');\n"
+            f"const CONTROLLER_STATE_MARKER = {json.dumps(marker_const)};\n"
+            + fn_source
+            + "\n"
+            "function touchedSummary(summary, runId) {\n"
+            "  const context = { runId };\n"
+            f"  return ({touch_expr});\n"
+            "}\n"
+            f"const marker = {json.dumps(f'<!-- continuum-pr-agent-retry head={HEAD} kind=review attempt=1 -->')};\n"
+            "const base = 'Automatic PR-Agent review recovery for exact HEAD.';\n"
+            "const a = controllerStateBody(marker, touchedSummary(base, 111));\n"
+            "const b = controllerStateBody(marker, touchedSummary(base, 222));\n"
+            "assert.notStrictEqual(a, b, 'different runs must produce different bodies');\n"
+            "assert.ok(a.includes('Controller dispatch run: 111'));\n"
+            "assert.ok(b.includes('Controller dispatch run: 222'));\n"
+            "assert.strictEqual(a.split('\\n')[1], marker);\n"
+            "assert.strictEqual(b.split('\\n')[1], marker);\n"
+            "for (const summary of [undefined, null, 0, 12345, '']) {\n"
+            "  const touched = controllerStateBody(marker, touchedSummary(summary, 999));\n"
+            "  assert.ok(!/\\bundefined\\b/.test(touched), 'summary must never render undefined: ' + touched);\n"
+            "  assert.ok(!/\\bnull\\b/.test(touched), 'summary must never render null: ' + touched);\n"
+            "  assert.ok(touched.includes(marker), 'retry identity must survive nullish summary');\n"
+            "  assert.ok(touched.includes('Controller dispatch run: 999'));\n"
+            "}\n"
+            "console.log('TOUCH_OK');\n"
+        )
+        tmpdir = os.path.join(ROOT, ".opencode-tmp")
+        os.makedirs(tmpdir, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".js", delete=False, dir=tmpdir
+        ) as handle:
+            handle.write(harness)
+            script = handle.name
+        try:
+            completed = subprocess.run(
+                [node, script],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        finally:
+            os.unlink(script)
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        self.assertIn("TOUCH_OK", completed.stdout)
+
+    def test_failed_dispatch_leaves_controller_state_untouched(self):
+        """A dispatch that throws must not advance comment timestamps.
+
+        The durable controller write (and any rollback touch) may only happen
+        after a successful createWorkflowDispatch; otherwise parseEvidence
+        reads the failed dispatch as a fresh marker inside the grace window
+        and coalesces a retry that never dispatched.
+        """
+        body = self.read(".github/workflows/continuum-pr-agent-recovery.yml")
+        window = body[
+            body.index("async function dispatch("): body.index("async function exhaust(")
+        ]
+        self.assertLess(
+            window.index("github.rest.actions.createWorkflowDispatch"),
+            window.index("await upsertControllerState("),
+            "controller state must commit only after a successful dispatch",
+        )
+        self.assertNotIn(
+            "rollbackControllerState",
+            window,
+            "a failed dispatch must not touch controller comments",
+        )
+        self.assertNotIn(
+            "await upsertControllerState",
+            window[: window.index("github.rest.actions.createWorkflowDispatch")],
+            "no controller write may precede the dispatch call",
         )
 
     def test_controller_touch_line_never_consumes_retry_budget(self):
@@ -646,6 +742,283 @@ class CodeRabbitDeadlockWiringTests(unittest.TestCase):
         gate = self.read(".github/workflows/continuum-auto-merge.yml")
         self.assertIn("auto-merge-coderabbit-verification", gate)
         self.assertIn("if (duplicate) continue", gate)
+
+    @staticmethod
+    def _extract_js_function(source: str, name: str) -> str:
+        """Extract one top-level JS function, skipping braces in strings.
+
+        A naive brace counter miscounts the GraphQL template literals in the
+        auto-merge gate, so this scanner tracks line/block comments,
+        single/double-quoted strings, and template literals with ${}
+        interpolation.
+        """
+        import re
+
+        match = re.search(
+            r"(?:async\s+)?function\s+" + re.escape(name) + r"\s*\(", source
+        )
+        assert match is not None, f"JS function {name} not found"
+        brace = source.index("{", match.end() - 1)
+        depth = 1
+        mode = ["code"]
+        i = brace + 1
+        total = len(source)
+        while i < total:
+            char = source[i]
+            nxt = source[i + 1] if i + 1 < total else ""
+            top = mode[-1]
+            if top == "line":
+                if char == "\n":
+                    mode.pop()
+            elif top == "block":
+                if char == "*" and nxt == "/":
+                    mode.pop()
+                    i += 1
+            elif top == "str1":
+                if char == "\\":
+                    i += 1
+                elif char == "'":
+                    mode.pop()
+            elif top == "str2":
+                if char == "\\":
+                    i += 1
+                elif char == '"':
+                    mode.pop()
+            elif top == "tpl":
+                if char == "\\":
+                    i += 1
+                elif char == "`":
+                    mode.pop()
+                elif char == "$" and nxt == "{":
+                    mode.append("{tpl}")
+                    depth += 1
+                    i += 1
+            else:  # code or {tpl}
+                if char == "/" and nxt == "/" and top == "code":
+                    mode.append("line")
+                    i += 1
+                elif char == "/" and nxt == "*" and top == "code":
+                    mode.append("block")
+                    i += 1
+                elif char == "'" and top == "code":
+                    mode.append("str1")
+                elif char == '"' and top == "code":
+                    mode.append("str2")
+                elif char == "`" and top == "code":
+                    mode.append("tpl")
+                elif char == "{":
+                    depth += 1
+                elif char == "}":
+                    depth -= 1
+                    if top == "{tpl}":
+                        mode.pop()
+                    if depth == 0:
+                        return source[match.start() : i + 1]
+            i += 1
+        raise AssertionError(f"unterminated JS function {name}")
+
+    def test_deadlock_ticket_cases_distinguish_green_from_blocked(self):
+        """Execute the real gate logic against fixtures for the deadlock cases.
+
+        Substring presence cannot tell a green gate from a blocked one, so
+        this test extracts the real decision functions from
+        continuum-auto-merge.yml and runs green-vs-blocked fixtures under
+        Node: stale-head approval, CHANGES_REQUESTED over a skipped status,
+        skipped status preserving a durable approval, newer vs superseded
+        nitpicks, RESOLVED normalization, UNRESOLVED blocking, and fail-closed
+        normalization failure.
+        """
+        import json
+        import shutil
+        import subprocess
+        import tempfile
+
+        gate = self.read(".github/workflows/continuum-auto-merge.yml")
+        needed = (
+            "latestWorkflowForHead",
+            "latestCiForHead",
+            "latestCodeRabbitDecision",
+            "codeRabbitNitpickReviews",
+            "directCodeRabbitReviewBasis",
+            "codeRabbitExplicitlyResolved",
+            "unresolvedCodeRabbitThreads",
+        )
+        extracted = [self._extract_js_function(gate, name) for name in needed]
+        self.assertIn("isResolved", extracted[-1])
+
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("node is required to execute the shipped JS")
+
+        head = "a" * 40
+        old_head = "b" * 40
+        driver = """
+const assert = require('assert');
+const owner = 'acme';
+const repo = 'demo';
+let REVIEWS = [];
+let RUNS = [];
+let THREAD_NODES = [];
+let MUTATION_SHOULD_FAIL = false;
+let MUTATIONS = 0;
+const LIST_REVIEWS = { kind: 'listReviews' };
+const LIST_RUNS = { kind: 'listRuns' };
+const github = {
+  rest: {
+    pulls: { listReviews: LIST_REVIEWS },
+    actions: { listWorkflowRunsForRepo: LIST_RUNS },
+  },
+  paginate: async (endpoint, params) => {
+    if (endpoint === LIST_REVIEWS) return REVIEWS;
+    if (endpoint === LIST_RUNS) return RUNS;
+    throw new Error('unexpected paginate endpoint');
+  },
+  graphql: async (query, vars) => {
+    if (query.includes('mutation')) {
+      MUTATIONS += 1;
+      if (MUTATION_SHOULD_FAIL) throw new Error('resolution failed');
+      return { resolveReviewThread: { thread: { id: vars.threadId, isResolved: true } } };
+    }
+    return {
+      repository: {
+        pullRequest: {
+          reviewThreads: { nodes: THREAD_NODES, pageInfo: { hasNextPage: false, endCursor: null } },
+        },
+      },
+    };
+  },
+};
+const core = { info() {}, notice() {}, warning() {} };
+""" + "\n".join(extracted) + """
+async function main() {
+""" + f"""
+const HEAD = {json.dumps(head)};
+const OLD_HEAD = {json.dumps(old_head)};
+const review = (over = {{}}) => Object.assign(
+  {{
+    user: {{ login: 'coderabbitai[bot]' }},
+    commit_id: HEAD,
+    state: 'APPROVED',
+    submitted_at: '2026-01-01T00:00:00Z',
+    id: 1,
+    body: '',
+  }},
+  over,
+);
+const pr = {{ number: 7, head: {{ sha: HEAD, ref: 'feature' }} }};
+const ciRun = () => [{{
+  name: 'CI', head_sha: HEAD, status: 'completed',
+  conclusion: 'success', id: 10, created_at: '2026-01-01T00:00:00Z',
+}}];
+function threadWith(id, replyBodies) {{
+  const nodes = [{{ databaseId: 1, body: 'finding', author: {{ login: 'coderabbitai[bot]' }} }}];
+  replyBodies.forEach((reply, index) => {{
+    nodes.push({{ databaseId: 10 + index, body: reply, author: {{ login: 'coderabbitai[bot]' }} }});
+  }});
+  return [{{
+    id, isResolved: false, isOutdated: false, path: 'a.ts',
+    comments: {{ nodes }},
+  }}];
+}}
+const results = {{}};
+// 1. Exact-head approval with green CI and no findings merges.
+REVIEWS = [review()];
+RUNS = ciRun();
+results.green_direct = !!(await directCodeRabbitReviewBasis(pr, HEAD));
+// 2. Approval for a stale head must not merge the new head.
+REVIEWS = [review({{ commit_id: OLD_HEAD }})];
+RUNS = ciRun();
+results.stale_head_blocked = (await directCodeRabbitReviewBasis(pr, HEAD)) === null;
+// 3. A newer CHANGES_REQUESTED verdict blocks even when the status was
+// overwritten with "Review skipped" by an auto-review-disabled event.
+REVIEWS = [
+  review({{ state: 'APPROVED', submitted_at: '2026-01-01T00:00:00Z', id: 1 }}),
+  review({{ state: 'CHANGES_REQUESTED', submitted_at: '2026-01-02T00:00:00Z', id: 2 }}),
+];
+RUNS = ciRun();
+const skippedStatus = {{ context: 'CodeRabbit', description: 'Review skipped' }};
+results.changes_requested_blocked =
+  (await directCodeRabbitReviewBasis(pr, HEAD)) === null &&
+  /skipped/i.test(skippedStatus.description);
+// 4. "Review skipped" must not erase a durable exact-head approval.
+REVIEWS = [review({{ state: 'APPROVED' }})];
+RUNS = ciRun();
+results.skipped_keeps_approval = !!(await directCodeRabbitReviewBasis(pr, HEAD));
+// 5. A nitpick newer than the decision blocks the merge.
+REVIEWS = [
+  review({{ state: 'APPROVED', submitted_at: '2026-01-01T00:00:00Z', id: 1 }}),
+  review({{
+    state: 'COMMENTED', submitted_at: '2026-01-02T00:00:00Z', id: 2,
+    body: 'Nitpick comments (2): check bounds',
+  }}),
+];
+RUNS = ciRun();
+results.newer_nitpick_blocks =
+  (await directCodeRabbitReviewBasis(pr, HEAD)) === null &&
+  (await codeRabbitNitpickReviews(pr, HEAD)).length === 1;
+// 6. A nitpick older than the latest decision is superseded and merges.
+REVIEWS = [
+  review({{
+    state: 'COMMENTED', submitted_at: '2026-01-01T00:00:00Z', id: 1,
+    body: 'Nitpick comments (3): stale advice',
+  }}),
+  review({{ state: 'APPROVED', submitted_at: '2026-01-02T00:00:00Z', id: 2 }}),
+];
+RUNS = ciRun();
+results.superseded_nitpick_green =
+  !!(await directCodeRabbitReviewBasis(pr, HEAD)) &&
+  (await codeRabbitNitpickReviews(pr, HEAD)).length === 0;
+// 7. A RESOLVED bot reply normalizes the thread and merges.
+THREAD_NODES = threadWith('T1', ['**RESOLVED** fixed in latest push']);
+MUTATIONS = 0;
+MUTATION_SHOULD_FAIL = false;
+results.resolved_normalized =
+  (await unresolvedCodeRabbitThreads(pr)).length === 0 && MUTATIONS === 1;
+// 8. UNRESOLVED always wins and blocks without a resolution attempt.
+THREAD_NODES = threadWith('T2', ['UNRESOLVED: still broken on current HEAD']);
+MUTATIONS = 0;
+const stillOpen = await unresolvedCodeRabbitThreads(pr);
+results.unresolved_blocks = stillOpen.length === 1 && MUTATIONS === 0;
+// 9. A failed GitHub thread resolution stays fail-closed and blocks.
+THREAD_NODES = threadWith('T3', ['✅ Review thread resolved.']);
+MUTATIONS = 0;
+MUTATION_SHOULD_FAIL = true;
+results.normalization_failure_blocks =
+  (await unresolvedCodeRabbitThreads(pr)).length === 1 && MUTATIONS === 1;
+console.log('CASES:' + JSON.stringify(results));
+}}
+""" + """main().then(
+  () => {},
+  (err) => {
+    console.error((err && err.stack) || err);
+    process.exit(1);
+  },
+);
+"""
+        tmpdir = os.path.join(ROOT, ".opencode-tmp")
+        os.makedirs(tmpdir, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".js", delete=False, dir=tmpdir
+        ) as handle:
+            handle.write(driver)
+            script = handle.name
+        try:
+            completed = subprocess.run(
+                [node, script],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        finally:
+            os.unlink(script)
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        line = next(
+            entry for entry in completed.stdout.splitlines() if entry.startswith("CASES:")
+        )
+        results = json.loads(line[len("CASES:"):])
+        for case, green in results.items():
+            with self.subTest(case=case):
+                self.assertTrue(green, f"deadlock fixture {case} regressed")
 
 
 if __name__ == "__main__":

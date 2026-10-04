@@ -199,9 +199,11 @@ jobs:
               // forces a body change so GitHub advances updated_at on every
               // committed dispatch; it is never parsed as retry state and its
               // literal prefix cannot match the retry/exhausted regexes.
+              // The summary is coerced null-safe: a missing/non-string
+              // summary must render as empty, never as "undefined"/"null".
               const body = controllerStateBody(
                 stateMarker,
-                summary + '\n\nController dispatch run: ' + String(context.runId)
+                String(summary || '').trim() + '\n\nController dispatch run: ' + String(context.runId)
               );
               let result;
               if (latest) {
@@ -235,6 +237,11 @@ jobs:
               return result;
             }
 
+            // Retained for the single-comment coalescing contract: every
+            // controller-state change goes through upsertControllerState
+            // (update latest, prune stale). Dispatch commits state only
+            // after a successful createWorkflowDispatch, so a failed
+            // dispatch performs no rollback and leaves updated_at untouched.
             async function rollbackControllerState(stateWrite) {
               if (!stateWrite || !stateWrite.comment) return;
               if (stateWrite.created) {
@@ -587,13 +594,13 @@ jobs:
               }
 
               const marker = retryMarker(head, kind, attempt);
-              const markerState = await upsertControllerState(
-                pr.number,
-                marker,
-                'Automatic PR-Agent ' + kind + ' recovery for exact HEAD ' + head +
-                  ' (execution ' + (attempt + 1) + '/' + maxExecutions + ').'
-              );
-
+              // Durable controller state is committed only after a successful
+              // dispatch. Writing the touch before createWorkflowDispatch (or
+              // rolling it back afterwards) advances updated_at even when the
+              // dispatch throws, so parseEvidence would read the failed
+              // dispatch as a fresh marker inside dispatchGraceMs and coalesce
+              // a retry that never dispatched. A failed dispatch must leave
+              // comment timestamps untouched.
               try {
                 const ref = await defaultBranch();
                 await github.rest.actions.createWorkflowDispatch({
@@ -613,18 +620,16 @@ jobs:
                   'PR #' + pr.number + ' HEAD ' + head + ': dispatched ' +
                   kind + ' recovery execution ' + (attempt + 1) + '/' + maxExecutions + '.'
                 );
-                return true;
               } catch (err) {
-                try {
-                  await rollbackControllerState(markerState);
-                } catch (cleanupErr) {
-                  core.warning(
-                    'Could not roll back uncommitted recovery controller state: ' +
-                    (cleanupErr.message || cleanupErr)
-                  );
-                }
                 throw err;
               }
+              await upsertControllerState(
+                pr.number,
+                marker,
+                'Automatic PR-Agent ' + kind + ' recovery for exact HEAD ' + head +
+                  ' (execution ' + (attempt + 1) + '/' + maxExecutions + ').'
+              );
+              return true;
             }
 
             async function exhaust(pr, head, kind, comments) {
