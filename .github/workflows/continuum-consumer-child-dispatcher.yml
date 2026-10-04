@@ -230,6 +230,11 @@ jobs:
                 fi
                 [[ -n "$run_tasks" ]] && echo "$run_tasks"
                 [[ "$run_count" -lt 100 ]] && break
+                if [[ "$page" -eq 3 ]]; then
+                  echo "::warning::run window truncated at 3 pages; assuming active to avoid double-dispatch." >&2
+                  echo "__unknown__"
+                  break
+                fi
               done
             )"
             child_owner="$(gh api "repos/$child_repo" --jq '.owner.login' 2>/dev/null || true)"

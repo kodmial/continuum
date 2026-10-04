@@ -228,7 +228,7 @@ def _is_transient_default(exc: Exception) -> bool:
     response = getattr(exc, "response", None)
     if response is not None:
         status = getattr(response, "status", getattr(response, "status_code", status))
-    if status in (429, 502, 503, 504):
+    if status == 429 or (isinstance(status, int) and 500 <= status <= 599):
         return True
     msg = str(exc).lower()
     return ("rate limit" in msg or "rate-limit" in msg or "try again" in msg

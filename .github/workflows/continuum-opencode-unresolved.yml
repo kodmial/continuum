@@ -68,6 +68,8 @@ jobs:
             exit 0
           fi
           HEADERS="$(tr -d '\r' <<<"$INCLUDE" | sed -n '1,/^$/p')"
+          # Reuse the probe body for page 1 below instead of refetching it.
+          PROBE_BODY="$(tr -d '\r' <<<"$INCLUDE" | sed -n '/^$/,$p' | tail -n +2)"
           LINK_LAST="$(grep -i '^link:' <<<"$HEADERS" | tr '[:upper:]' '[:lower:]' | sed -nE 's/.*<[^>]*[?&]page=([0-9]+)[^>]*>[[:space:]]*;[[:space:]]*rel="last".*/\1/p' | tail -n 1)"
           if [[ -n "$LINK_LAST" ]]; then
             if [[ "$LINK_LAST" =~ ^[0-9]+$ ]] && [[ "$LINK_LAST" -ge 1 ]]; then
@@ -90,7 +92,11 @@ jobs:
           COMMENT_PAGES=""
           page="$FIRST_PAGE"
           while [[ "$page" -le "$LAST_PAGE" ]]; do
-            page_json="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/comments?per_page=100&page=${page}" 2>/dev/null || true)"
+            if [[ "$page" -eq 1 ]]; then
+              page_json="$PROBE_BODY"
+            else
+              page_json="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/comments?per_page=100&page=${page}" 2>/dev/null || true)"
+            fi
             if ! jq -e 'type == "array"' <<<"$page_json" >/dev/null 2>&1; then page=$((page + 1)); continue; fi
             count="$(jq 'length' <<<"$page_json" 2>/dev/null || echo 0)"
             [[ "$count" =~ ^[0-9]+$ ]] && [[ "$count" -gt 0 ]] || { page=$((page + 1)); continue; }
