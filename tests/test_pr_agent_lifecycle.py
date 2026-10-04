@@ -16,7 +16,10 @@ import unittest
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 SRC = os.path.join(ROOT, "src")
 
-BASELINE_SHA = "4a52c185ca92aa7268b7b404ba7dff29ebd03897"
+# Intentional P0 baseline advance: 5bcab89 removes the secondary Octokit
+# from issue readiness while preserving the issue-start token split in
+# continuum-opencode.yml. Later protected-file drift must still fail.
+BASELINE_SHA = "5bcab8948f15a8f55fc0de5f87bd851a651a2630"
 
 PROTECTED_FILES = [
     ".github/workflows/continuum-opencode.yml",
