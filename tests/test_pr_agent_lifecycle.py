@@ -28,14 +28,16 @@ SRC = os.path.join(ROOT, "src")
 # continuum-opencode.yml, so the pre-#248 zero-diff assertion from 87d139b is
 # stale. Keeping the immutable commit baseline means any later
 # protected-file drift still fails.
-# Follow-up P0 baseline advance: 1a93faa keeps OpenCode recovery automatic
-# across stale locks and exhaustion by defaulting PAUSE_ON_FAILURE to
-# 'false' in continuum-opencode.yml (and the watchdog). The contract test
-# in scripts/test-continuum.rb explicitly requires the 'false' default, so
-# the 3df3b1e zero-diff assertion (which pinned 'true') is stale. Advancing
-# the immutable baseline to 1a93faa preserves the #248 gates and the
-# zero-drift invariant for any later protected-file change.
-BASELINE_SHA = "1a93faa10739ca104be871093908b5d15cad1d4a"
+# Follow-up P0 baseline restoration: 197bafd restored the protected
+# continuum-opencode.yml baseline to PAUSE_ON_FAILURE 'true'
+# ("without touching CodeRabbit baseline"), and main commit 749c3ac removed
+# the stale scripts/test-continuum.rb assertion that required 'false' for
+# continuum-opencode.yml. Task #224 must not change provider-specific review
+# semantics merely to implement recovery, so the 1a93faa advance (which
+# pinned 'false') is stale. Restoring the immutable baseline to 3df3b1e
+# preserves the #248 gates and the zero-drift invariant for any later
+# protected-file change.
+BASELINE_SHA = "3df3b1e231c395d425385107e9dea03a8911274d"
 
 PROTECTED_FILES = [
     ".github/workflows/continuum-opencode.yml",
