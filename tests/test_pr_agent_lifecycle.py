@@ -16,9 +16,6 @@ import unittest
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 SRC = os.path.join(ROOT, "src")
 
-# Protected OpenCode files may move only through an explicit, independently
-# reviewed core change. Issue #212 intentionally advances the handoff contract;
-# PR-Agent isolation remains a zero-diff check from this new baseline.
 BASELINE_SHA = "4a52c185ca92aa7268b7b404ba7dff29ebd03897"
 
 PROTECTED_FILES = [
@@ -33,6 +30,7 @@ PR_AGENT_WORKFLOWS = [
 ]
 
 LIFECYCLE_MODULE = os.path.join(SRC, "continuum", "pr_agent_lifecycle.py")
+POLICY_MODULE = os.path.join(ROOT, ".github", "scripts", "pr_agent_policy.js")
 
 
 def read_repo(path: str) -> str:
@@ -43,6 +41,46 @@ def read_repo(path: str) -> str:
 def lifecycle_source() -> str:
     with open(LIFECYCLE_MODULE, "r", encoding="utf-8") as handle:
         return handle.read()
+
+def run_policy(op: str, payload: dict | list | None = None):
+    env = os.environ.copy()
+    env["POLICY_MODULE"] = POLICY_MODULE
+    env["POLICY_OP"] = op
+    env["POLICY_PAYLOAD"] = json.dumps(payload)
+    code = r"""
+const policy = require(process.env.POLICY_MODULE);
+const payload = JSON.parse(process.env.POLICY_PAYLOAD || 'null');
+let result;
+switch (process.env.POLICY_OP) {
+  case 'threshold':
+    result = policy.IMPROVE_REPAIR_THRESHOLD;
+    break;
+  case 'qualifying':
+    result = policy.qualifyingImproveSuggestions(payload || []);
+    break;
+  case 'build':
+    result = policy.buildRepairBatch(payload.review, payload.improve_jsonl || '');
+    break;
+  case 'same':
+    result = policy.sameLogicalDefect(payload.review, payload.improve);
+    break;
+  default:
+    throw new Error('unknown policy op');
+}
+process.stdout.write(JSON.stringify(result));
+"""
+    completed = subprocess.run(
+        ["node", "-e", code],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(completed.stderr)
+    return json.loads(completed.stdout)
+
 
 
 def make_review(
@@ -238,7 +276,7 @@ class ImproveChannelTests(unittest.TestCase):
         self.assertIn("pr-agent-outputs/continuum.jsonl", repair)
         self.assertIn("payload.code_suggestions", repair)
 
-    def test_suggestions_threshold_is_one_and_nothing_silently_dropped(self):
+    def test_suggestions_threshold_is_high_signal_and_unscored_is_non_actionable(self):
         import sys
 
         sys.path.insert(0, SRC)
@@ -246,16 +284,25 @@ class ImproveChannelTests(unittest.TestCase):
             from continuum import pr_agent_lifecycle as life
         finally:
             sys.path.remove(SRC)
-        self.assertEqual(life.SUGGESTIONS_SCORE_THRESHOLD, 1)
+        self.assertEqual(life.SUGGESTIONS_SCORE_THRESHOLD, 7)
+        self.assertEqual(run_policy("threshold"), 7)
         toml = read_repo(".pr_agent.toml")
-        self.assertIn("suggestions_score_threshold = 1", toml)
+        self.assertIn("suggestions_score_threshold = 7", toml)
         suggestions = [
-            {"file": "a.py", "score": 1},
-            {"file": "b.py", "score": 9},
-            {"file": "c.py"},
+            {"file": "low.py", "score": 6},
+            {"file": "high.py", "score": 7},
+            {"file": "very-high.py", "score": 9},
+            {"file": "unscored.py"},
+            {"file": "invalid.py", "score": "unknown"},
         ]
-        self.assertEqual(len(life.qualifying_suggestions(suggestions)), 3)
-        self.assertEqual(life.qualifying_suggestions([{"score": 0}]), [])
+        self.assertEqual(
+            [item["file"] for item in life.qualifying_suggestions(suggestions)],
+            ["high.py", "very-high.py"],
+        )
+        self.assertEqual(
+            [item["file"] for item in run_policy("qualifying", suggestions)],
+            ["high.py", "very-high.py"],
+        )
 
 
 class RepairBatchTests(unittest.TestCase):
@@ -268,13 +315,112 @@ class RepairBatchTests(unittest.TestCase):
         finally:
             sys.path.remove(SRC)
         review = make_review([issue_entry(n=0), issue_entry(n=1), issue_entry(n=2)])
-        suggestions = [{"file": "a.py", "score": 2}, {"file": "b.py", "score": 5}]
+        suggestions = [{"file": "a.py", "score": 7}, {"file": "b.py", "score": 9}]
         batch = life.build_repair_batch(review, suggestions, head_sha="abc123")
         self.assertTrue(batch.bounded)
         self.assertEqual(len(batch.items), 5)
         sources = [item["source"] for item in batch.items]
         self.assertEqual(sources.count("review"), 3)
         self.assertEqual(sources.count("improve"), 2)
+
+    def test_review_improve_duplicate_becomes_one_repair_item(self):
+        import sys
+
+        sys.path.insert(0, SRC)
+        try:
+            from continuum import pr_agent_lifecycle as life
+        finally:
+            sys.path.remove(SRC)
+        finding = {
+            "relevant_file": "src/app.py",
+            "issue_header": "Force push race can overwrite concurrent branch updates",
+            "issue_content": "Use force-with-lease so a concurrent branch update cannot be silently overwritten.",
+            "start_line": 20,
+            "end_line": 25,
+        }
+        suggestion = {
+            "relevant_file": "src/app.py",
+            "one_sentence_summary": "Force push race can overwrite concurrent branch updates",
+            "suggestion_content": "Use force-with-lease so a concurrent branch update cannot be silently overwritten.",
+            "relevant_lines_start": 22,
+            "relevant_lines_end": 24,
+            "score": 9,
+        }
+        py_batch = life.build_repair_batch(
+            make_review([finding]), [suggestion], head_sha="head"
+        )
+        self.assertEqual(len(py_batch.items), 1)
+        js_batch = run_policy(
+            "build",
+            {
+                "review": make_review([finding]),
+                "improve_jsonl": json.dumps(
+                    {"payload": {"code_suggestions": [suggestion]}}
+                ),
+            },
+        )
+        self.assertEqual(len(js_batch["items"]), 1)
+        self.assertEqual(js_batch["deduplicatedSuggestions"], 1)
+
+    def test_distinct_same_file_findings_are_not_deduplicated(self):
+        finding = {
+            "relevant_file": "src/app.py",
+            "issue_header": "Force push race can overwrite concurrent branch updates",
+            "issue_content": "Use force-with-lease so a concurrent branch update cannot be silently overwritten.",
+            "start_line": 20,
+            "end_line": 25,
+        }
+        suggestion = {
+            "relevant_file": "src/app.py",
+            "one_sentence_summary": "Force push race can overwrite concurrent branch updates",
+            "suggestion_content": "Use force-with-lease so a concurrent branch update cannot be silently overwritten.",
+            "relevant_lines_start": 80,
+            "relevant_lines_end": 84,
+            "score": 9,
+        }
+        js_batch = run_policy(
+            "build",
+            {
+                "review": make_review([finding]),
+                "improve_jsonl": json.dumps(
+                    {"payload": {"code_suggestions": [suggestion]}}
+                ),
+            },
+        )
+        self.assertEqual(len(js_batch["items"]), 2)
+        self.assertEqual(js_batch["deduplicatedSuggestions"], 0)
+
+    def test_no_progress_fingerprint_uses_deduplicated_logical_set(self):
+        finding = {
+            "relevant_file": "src/app.py",
+            "issue_header": "Force push race can overwrite concurrent branch updates",
+            "issue_content": "Use force-with-lease so a concurrent branch update cannot be silently overwritten.",
+            "start_line": 20,
+            "end_line": 25,
+        }
+        duplicate = {
+            "relevant_file": "src/app.py",
+            "one_sentence_summary": "Force push race can overwrite concurrent branch updates",
+            "suggestion_content": "Use force-with-lease so a concurrent branch update cannot be silently overwritten.",
+            "relevant_lines_start": 21,
+            "relevant_lines_end": 23,
+            "score": 10,
+        }
+        base = run_policy(
+            "build",
+            {"review": make_review([finding]), "improve_jsonl": ""},
+        )
+        with_duplicate = run_policy(
+            "build",
+            {
+                "review": make_review([finding]),
+                "improve_jsonl": json.dumps(
+                    {"payload": {"code_suggestions": [duplicate]}}
+                ),
+            },
+        )
+        self.assertEqual(base["fingerprint"], with_duplicate["fingerprint"])
+        self.assertEqual(base["items"], with_duplicate["items"])
 
     def test_multi_finding_review_includes_every_item_not_only_first(self):
         import sys
@@ -418,8 +564,9 @@ class ConfigurationTests(unittest.TestCase):
             "persistent_inline_comments = true",
             "propagate_tool_errors = true",
             "focus_only_on_problems = true",
-            "publish_output_no_suggestions = true",
-            "suggestions_score_threshold = 1",
+            "final_update_message = false",
+            "publish_output_no_suggestions = false",
+            "suggestions_score_threshold = 7",
             "max_suggestions_per_file = 0",
             "enable_suggestions_coverage_footer = true",
             "enable = true",
@@ -445,7 +592,10 @@ class ConfigurationTests(unittest.TestCase):
             "GITHUB_ACTION_CONFIG__ENABLE_OUTPUT",
             "GITHUB_ACTION_CONFIG__FAIL_ON_TOOL_ERRORS",
             "GITHUB__PUBLISH_AS_CHECK_RUN",
-            "PR_CODE_SUGGESTIONS__SUGGESTIONS_SCORE_THRESHOLD",
+            "PR_REVIEWER__FINAL_UPDATE_MESSAGE",
+            "PR_CODE_SUGGESTIONS__PUBLISH_OUTPUT_NO_SUGGESTIONS",
+            '--pr_code_suggestions.suggestions_score_threshold="$IMPROVE_REPAIR_THRESHOLD"',
+            "pr_agent_policy.js",
             "PUSH_OUTPUTS__FILE_PATH",
             "steps.pragent.outputs.review",
             "pr-agent-outputs/continuum.jsonl",
@@ -875,9 +1025,52 @@ class StabilizationParityTests(unittest.TestCase):
             self.assertNotIn("continuum-coderabbit-unresolved.yml", body)
         self.assertIn("workflow_dispatch:", caller)
 
+    def test_review_presentation_is_persistent_but_notification_noise_is_disabled(self):
+        review = read_repo(".github/workflows/continuum-pr-agent.yml")
+        self.assertIn("PR_REVIEWER__PERSISTENT_COMMENT: 'true'", review)
+        self.assertIn("PR_REVIEWER__FINAL_UPDATE_MESSAGE: 'false'", review)
+        self.assertIn("--pr_reviewer.final_update_message=false", review)
+        self.assertIn("PR_CODE_SUGGESTIONS__PUBLISH_OUTPUT_NO_SUGGESTIONS: 'false'", review)
+        self.assertIn("--pr_code_suggestions.publish_output_no_suggestions=false", review)
+        self.assertIn("Normalize persistent improve presentation", review)
+        self.assertIn("stale improve presentation removed", review)
+
+    def test_improve_presentation_cleanup_runs_only_after_exact_head_revalidation(self):
+        review = read_repo(".github/workflows/continuum-pr-agent.yml")
+        self.assertLess(
+            review.index("Revalidate the PR head and native review output after review"),
+            review.index("Normalize persistent improve presentation"),
+        )
+        self.assertIn("steps.result.outcome == 'success'", review)
+        self.assertIn("steps.result.outputs.head_sha", review)
+
+    def test_retry_and_no_progress_use_one_upsertable_controller_comment(self):
+        review = read_repo(".github/workflows/continuum-pr-agent.yml")
+        repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
+        policy = read_repo(".github/scripts/pr_agent_policy.js")
+        self.assertIn("continuum-pr-agent-controller-state:v1", policy)
+        for body in (review, repair):
+            self.assertNotIn("gh pr comment", body)
+            self.assertIn("github.rest.issues.updateComment", body)
+            self.assertIn("github.rest.issues.createComment", body)
+            self.assertIn("github.rest.issues.deleteComment", body)
+            self.assertIn("CONTROLLER_STATE_MARKER", body)
+
+    def test_runtime_review_repair_and_merge_share_central_policy(self):
+        review = read_repo(".github/workflows/continuum-pr-agent.yml")
+        repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
+        merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
+        for body in (review, repair, merge):
+            self.assertIn("pr_agent_policy.js", body)
+        self.assertIn("IMPROVE_REPAIR_THRESHOLD", review)
+        self.assertIn("policy.buildRepairBatch", repair)
+        self.assertIn("policy.qualifyingImproveSuggestions", merge)
+
     def test_no_progress_uses_structured_fingerprint_and_head(self):
         repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
-        self.assertIn("createHash('sha256')", repair)
+        policy = read_repo(".github/scripts/pr_agent_policy.js")
+        self.assertIn("createHash('sha256')", policy)
+        self.assertIn("policy.buildRepairBatch", repair)
         self.assertIn("continuum-pr-agent-no-progress head=", repair)
         self.assertIn("fingerprint=", repair)
         self.assertIn("identical structured PR-Agent finding state", repair)
@@ -974,11 +1167,20 @@ class StabilizationParityTests(unittest.TestCase):
         self.assertIn("combined status is ", merge)
 
     def test_finding_fingerprint_is_order_independent(self):
-        repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
-        self.assertIn(
-            "stable(items).map(entry => JSON.stringify(entry)).sort()", repair
+        first = issue_entry(n=0)
+        second = issue_entry(n=1)
+        forward = run_policy(
+            "build",
+            {"review": make_review([first, second]), "improve_jsonl": ""},
         )
-        self.assertIn("JSON.stringify(canonical)", repair)
+        reverse = run_policy(
+            "build",
+            {"review": make_review([second, first]), "improve_jsonl": ""},
+        )
+        self.assertEqual(forward["fingerprint"], reverse["fingerprint"])
+        policy = read_repo(".github/scripts/pr_agent_policy.js")
+        self.assertIn("function logicalFingerprint", policy)
+        self.assertIn(".sort()", policy)
 
     def test_default_branch_resolution_is_validated(self):
         merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
