@@ -2643,6 +2643,19 @@ jobs:
               const labels = labelsByIssue.get(issueNumber);
               if (!labels.has(inProgressLabel)) continue;
 
+              // Qualification lifecycle is not implementation WIP. Once the
+              // implementation run is gone, release any stale reservation so a
+              // qualifying/qualification-blocked capability cannot consume a
+              // coding slot or be re-dispatched as ordinary implementation.
+              if (labels.has(qualifyingLabel) || labels.has(blockedLabel)) {
+                await removeLabel(issueNumber, inProgressLabel);
+                core.notice(
+                  'Released implementation reservation on issue #' + issueNumber +
+                  ': capability is in qualification lifecycle.'
+                );
+                continue;
+              }
+
               // A native open dependency is authoritative even when an older
               // dispatch lease still exists. Once the actual OpenCode run is
               // gone, release the reservation immediately so blocked work does
@@ -2828,6 +2841,13 @@ jobs:
               const labels = labelsByIssue.get(issue.number);
               if (pauseOnFailure && labels.has(pausedLabel)) {
                 core.info('Skipping #' + issue.number + ': automation is paused.');
+                continue;
+              }
+              if (labels.has(qualifyingLabel) || labels.has(blockedLabel)) {
+                core.info(
+                  'Skipping #' + issue.number +
+                  ': capability is in qualification lifecycle.'
+                );
                 continue;
               }
 
