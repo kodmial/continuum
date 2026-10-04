@@ -1298,7 +1298,7 @@ jobs:
           steps.result.outputs.stale_head != 'true' &&
           steps.persistent.outputs.stale_head != 'true' &&
           steps.improve.outputs.stale_head != 'true' &&
-          steps.improve_skipped.outputs.stale_head != 'true')
+          steps.improve_skipped.outputs.stale_head != 'true'
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
@@ -1397,7 +1397,7 @@ jobs:
           steps.result.outputs.stale_head != 'true' &&
           steps.persistent.outputs.stale_head != 'true' &&
           steps.improve.outputs.stale_head != 'true' &&
-          steps.improve_skipped.outputs.stale_head != 'true')
+          steps.improve_skipped.outputs.stale_head != 'true'
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
