@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from unittest import mock
 
 from continuum import agent_runtime as runtime
 
@@ -449,7 +450,7 @@ class AgentRuntimeContractTest(unittest.TestCase):
         # is a pointer change back to the still-stored immutable digest.
         store.promote(new_gen.digest, now=2000.0)
         store.rollback(gen.digest, now=3000.0)
-        self.assertEqual(store.active_digest, gen.digest)
+        self.assertEqual(store.active_digest_for(old_profile), gen.digest)
 
     def test_strict_invariants_reject_persistent_runners(self):
         with self.assertRaises(runtime.AgentRuntimeError):
@@ -724,6 +725,126 @@ class AgentRuntimeContractTest(unittest.TestCase):
             runtime.resolve_profile_from_env(
                 {"CONTINUUM_RUNTIME_PRESET": "agent-linux",
                  "CONTINUUM_RUNTIME_PROVIDER": "no-such-provider"})
+
+    def test_toolchain_string_is_rejected_like_features(self):
+        # A bare string toolchain must not iterate into characters:
+        # "nodejs" became ('n','o','d','e','j','s') and "gcc" tripped a
+        # duplicate-character error instead of a type rejection.
+        for bad in ("nodejs", "gcc", "", "go-1.23"):
+            with self.subTest(toolchain=repr(bad)):
+                with self.assertRaises(runtime.AgentRuntimeError):
+                    runtime.resolve_profile({"preset": "agent-linux", "toolchain": bad})
+                with self.assertRaises(runtime.AgentRuntimeError):
+                    runtime.canonical_manifest("linux", "x64", "main", bad)
+        for bad in (123, {"go-1.23"}, {"items": ["go-1.23"]}):
+            with self.subTest(toolchain=repr(bad)):
+                with self.assertRaises(runtime.AgentRuntimeError):
+                    runtime.resolve_profile({"preset": "agent-linux", "toolchain": bad})
+        # List and tuple inputs (including empty) still resolve.
+        self.assertEqual(runtime.resolve_profile({"preset": "agent-linux"}).toolchain, ())
+        self.assertEqual(
+            runtime.resolve_profile(
+                {"preset": "agent-linux", "toolchain": ["go-1.23"]}).toolchain,
+            ("go-1.23",))
+        self.assertEqual(
+            runtime.resolve_profile(
+                {"preset": "agent-linux", "toolchain": ("go-1.23",)}).toolchain,
+            ("go-1.23",))
+
+    def test_scalar_cache_false_disables_both_caches(self):
+        # An explicit scalar disable must take effect instead of silently
+        # leaving both caches enabled via the True defaults.
+        disabled = runtime.resolve_profile({"preset": "agent-linux", "cache": False})
+        self.assertFalse(disabled.golden_image)
+        self.assertFalse(disabled.dependencies_cache)
+        enabled = runtime.resolve_profile({"preset": "agent-linux", "cache": True})
+        self.assertTrue(enabled.golden_image)
+        self.assertTrue(enabled.dependencies_cache)
+        # Mapping and top-level declarations keep working: the nested block
+        # defers to an explicit top-level key instead of masking it.
+        nested = runtime.resolve_profile(
+            {"preset": "agent-linux", "cache": {"golden_image": False}})
+        self.assertFalse(nested.golden_image)
+        self.assertTrue(nested.dependencies_cache)
+        top_level = runtime.resolve_profile(
+            {"preset": "agent-linux", "golden_image": False})
+        self.assertFalse(top_level.golden_image)
+        self.assertTrue(top_level.dependencies_cache)
+        mixed = runtime.resolve_profile(
+            {"preset": "agent-linux", "cache": False, "dependencies": True})
+        self.assertFalse(mixed.golden_image)
+        self.assertTrue(mixed.dependencies_cache)
+        with self.assertRaises(runtime.AgentRuntimeError):
+            runtime.resolve_profile({"preset": "agent-linux", "cache": "disabled"})
+
+    def test_profile_timeouts_govern_lease_expiry(self):
+        # Consumer timeout tuning on the profile must reach the lease:
+        # concurrency is already enforced from the profile while the lease
+        # used only controller defaults.
+        controller = _controller()
+        profile = runtime.resolve_profile({
+            "preset": "agent-linux",
+            "provisioning_timeout_seconds": 60,
+            "max_job_lifetime_seconds": 120,
+        })
+        manifest = _manifest(profile)
+        self.assertNotEqual(profile.max_job_lifetime_seconds,
+                            controller.max_job_lifetime)
+        captured = {}
+        real_lease = runtime.Lease
+
+        def spy(**kwargs):
+            captured.update(kwargs)
+            return real_lease(**kwargs)
+
+        controller.queue_job("acme/app", profile)
+        with mock.patch("continuum.agent_runtime.Lease", side_effect=spy):
+            result = controller.run_next_job(manifest, now=1000.0)
+        self.assertEqual(result.outcome, "success")
+        self.assertEqual(captured["lease_expires_at"], 1000.0 + 120)
+        self.assertEqual(captured["max_age_at"],
+                         1000.0 + max(controller.global_max_age, 120))
+        self.assertEqual(captured["provisioning_timeout_seconds"], 60)
+
+    def test_orphan_sweep_honors_per_lease_provisioning_timeout(self):
+        controller = _controller()
+        profile = runtime.resolve_profile({"preset": "agent-linux"})
+        digest = runtime.image_digest(_manifest(profile), profile)
+        network = controller.provider.create_network(
+            runtime.profile_digest(profile), "job-slow", now=1000.0)
+        slow = controller.provider.create_instance(
+            project_id="proj-a", repository="acme/app",
+            profile_digest=runtime.profile_digest(profile), digest=digest,
+            job_id="job-slow", network_id=network.id, now=1000.0)
+        # The profile allows a long provisioning window: past the
+        # controller default (600s) the lease must not count as expired.
+        controller.leases[slow.id] = runtime.Lease(
+            project_id="proj-a", repository="acme/app", job_id="job-slow",
+            run_id="r-slow", profile_digest=runtime.profile_digest(profile),
+            instance_id=slow.id, created_at=1000.0,
+            lease_expires_at=1000.0 + controller.max_job_lifetime,
+            max_age_at=1000.0 + controller.global_max_age,
+            state="provisioning", provisioning_timeout_seconds=3600.0)
+        self.assertEqual(controller.live_idle_count(now=1000.0 + 601.0), 0)
+        self.assertNotIn(slow.id, controller.sweep_orphans(now=1000.0 + 601.0))
+        self.assertIn(slow.id, controller.sweep_orphans(now=1000.0 + 3601.0))
+
+    def test_global_active_digest_is_none_when_profiles_diverge(self):
+        # Sharing one store across platforms must not flip a global pointer
+        # onto the other platform: per-profile pointers stay authoritative
+        # and the global one refuses to pick a side.
+        store = runtime.ImageStore(project_id="proj-multi")
+        linux = runtime.resolve_profile({"preset": "agent-linux"})
+        macos = runtime.resolve_profile({"preset": "agent-macos"})
+        linux_gen = store.ensure_image(_manifest(linux), linux, now=1000.0)
+        macos_gen = store.ensure_image(_manifest(macos), macos, now=2000.0)
+        self.assertIsNone(store.active_digest)
+        store.promote(linux_gen.digest, now=3000.0)
+        self.assertEqual(store.active_digest, linux_gen.digest)
+        store.promote(macos_gen.digest, now=4000.0)
+        self.assertIsNone(store.active_digest)
+        self.assertEqual(store.active_digest_for(linux), linux_gen.digest)
+        self.assertEqual(store.active_digest_for(macos), macos_gen.digest)
 
 
 if __name__ == "__main__":

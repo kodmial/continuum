@@ -271,6 +271,10 @@ def canonical_manifest(
         )
     if not isinstance(continuum_ref, str) or not continuum_ref.strip():
         raise AgentRuntimeError("continuum_ref must be a non-empty revision, got {!r}".format(continuum_ref))
+    if isinstance(toolchain, str) or not isinstance(toolchain, (list, tuple)):
+        raise AgentRuntimeError(
+            "toolchain must be a list of inputs, got {!r}".format(type(toolchain).__name__)
+        )
     tools = tuple(str(item) for item in (toolchain or ()))
     for item in tools:
         if not item or len(item) > 120 or any(char in item for char in "\n\r\0"):
@@ -519,18 +523,35 @@ def resolve_profile(declaration: Mapping[str, Any]) -> RuntimeProfile:
     if provider not in SUPPORTED_PROVIDERS:
         raise AgentRuntimeError("unsupported provider backend {!r}".format(provider))
     cache_block = base.get("cache", {})
+    if cache_block is None:
+        cache_block = {}
     golden_image = True
     dependencies_cache = True
     if isinstance(cache_block, Mapping):
-        golden_image = bool(cache_block.get("golden_image", True))
-        dependencies_cache = bool(cache_block.get("dependencies", True))
+        golden_image = bool(cache_block.get("golden_image", base.get("golden_image", True)))
+        dependencies_cache = bool(cache_block.get("dependencies", base.get("dependencies", True)))
+    elif isinstance(cache_block, bool):
+        # A scalar cache declaration is an enable/disable intent for both
+        # caches (e.g. {"cache": False} disables the golden image and the
+        # dependency cache). An explicit top-level golden_image/dependencies
+        # key still overrides its own cache so mixed declarations stay
+        # expressible; without one the scalar governs both.
+        golden_image = bool(base.get("golden_image", cache_block))
+        dependencies_cache = bool(base.get("dependencies", cache_block))
     else:
-        golden_image = bool(base.get("golden_image", True))
-        dependencies_cache = bool(base.get("dependencies", True))
+        raise AgentRuntimeError(
+            "cache must be a mapping or boolean, got {!r}".format(type(cache_block).__name__)
+        )
     continuum_ref = str(base.get("continuum_ref", "main") or "main")
     if not continuum_ref.strip():
         raise AgentRuntimeError("continuum_ref must be a non-empty revision")
-    raw_toolchain = base.get("toolchain", ()) or ()
+    raw_toolchain = base.get("toolchain", ())
+    if raw_toolchain is None:
+        raw_toolchain = ()
+    if isinstance(raw_toolchain, str) or not isinstance(raw_toolchain, (list, tuple)):
+        raise AgentRuntimeError(
+            "toolchain must be a list of inputs, got {!r}".format(type(raw_toolchain).__name__)
+        )
     toolchain = tuple(str(item) for item in raw_toolchain)
     for item in toolchain:
         if not item or len(item) > 120 or any(char in item for char in "\n\r\0"):
@@ -645,8 +666,11 @@ class ImageStore:
     profile digest): multi-platform consumers promoting e.g. linux-x64 and
     macos-arm64 keep one active digest per profile instead of one global
     pointer where the second profile's jobs would be rejected as "not the
-    active image". ``active_digest`` remains as the most recently promoted
-    digest for single-profile callers.
+    active image". ``active_digest`` is derived from those per-profile
+    pointers and is only defined when they agree on a single digest: with
+    divergent per-profile promotions there is no global digest, so it
+    returns ``None`` instead of the most recent promotion misleading a
+    single-profile caller into serving another platform's image.
     """
 
     def __init__(self, project_id: str) -> None:
@@ -654,13 +678,15 @@ class ImageStore:
             raise AgentRuntimeError("project_id must be a non-empty string")
         self.project_id = project_id
         self._generations: Dict[str, ImageGeneration] = {}
-        self._active_digest: Optional[str] = None
         self._active_by_profile: Dict[str, str] = {}
         self._history: List[Tuple[str, float, str]] = []
 
     @property
     def active_digest(self) -> Optional[str]:
-        return self._active_digest
+        distinct = set(self._active_by_profile.values())
+        if len(distinct) == 1:
+            return next(iter(distinct))
+        return None
 
     def active_digest_for(self, profile: Any) -> Optional[str]:
         """Return the active digest serving one runtime profile.
@@ -748,7 +774,6 @@ class ImageStore:
             profile_key = str(profile)
         previous = self._active_by_profile.get(profile_key)
         self._active_by_profile[profile_key] = digest
-        self._active_digest = digest
         self._history.append((digest, timestamp, previous or ""))
 
     def rollback(self, digest: str, now: Optional[float] = None, profile: Any = None) -> None:
@@ -766,8 +791,6 @@ class ImageStore:
 
         removed: List[str] = []
         protected = set(self._active_by_profile.values())
-        if self._active_digest is not None:
-            protected.add(self._active_digest)
         for digest, generation in list(self._generations.items()):
             if digest in protected:
                 continue
@@ -990,6 +1013,25 @@ class Lease:
     lease_expires_at: float
     max_age_at: float
     state: str = "provisioning"
+    provisioning_timeout_seconds: float = DEFAULT_PROVISIONING_TIMEOUT_SECONDS
+
+
+def _lease_provisioning_timeout(lease: Lease, default: float) -> float:
+    """Provisioning timeout governing one lease.
+
+    Leases created by ``run_next_job`` carry the queued profile's
+    ``provisioning_timeout_seconds``; leases built by hand (or before the
+    profile-carried timeout existed) fall back to the controller default so
+    expiry is still evaluated instead of waiting indefinitely.
+    """
+
+    try:
+        timeout = float(getattr(lease, "provisioning_timeout_seconds", default))
+    except (TypeError, ValueError):
+        return float(default)
+    if not timeout > 0:
+        return float(default)
+    return timeout
 
 
 class FakeProvider:
@@ -1197,7 +1239,7 @@ class EphemeralController:
             expired = False
             if clock >= lease.max_age_at or clock >= lease.lease_expires_at:
                 expired = True
-            elif lease.state == "provisioning" and clock - lease.created_at >= self.provisioning_timeout:
+            elif lease.state == "provisioning" and clock - lease.created_at >= _lease_provisioning_timeout(lease, self.provisioning_timeout):
                 expired = True
             if not expired:
                 live_leased.add(instance_id)
@@ -1305,6 +1347,25 @@ class EphemeralController:
                 now=now,
             )
             events.append("created-instance {} after demand".format(instance.id))
+            # Consumer timeout tuning lives on the profile (concurrency is
+            # already enforced from it above): the lease must expire from the
+            # profile's timeouts, not from the controller-level defaults, or
+            # profile timeout tuning has no effect. The global maximum age
+            # stays a hard instance-age ceiling, extended only when the
+            # profile's own job lifetime exceeds it so the instance survives
+            # at least its own lease.
+            try:
+                profile_provisioning_timeout = float(profile.provisioning_timeout_seconds)
+            except (TypeError, ValueError):
+                profile_provisioning_timeout = self.provisioning_timeout
+            try:
+                profile_max_lifetime = float(profile.max_job_lifetime_seconds)
+            except (TypeError, ValueError):
+                profile_max_lifetime = self.max_job_lifetime
+            if not profile_provisioning_timeout > 0:
+                profile_provisioning_timeout = self.provisioning_timeout
+            if not profile_max_lifetime > 0:
+                profile_max_lifetime = self.max_job_lifetime
             lease = Lease(
                 project_id=self.project_id,
                 repository=repository,
@@ -1313,9 +1374,10 @@ class EphemeralController:
                 profile_digest=profile_digest(profile),
                 instance_id=instance.id,
                 created_at=now,
-                lease_expires_at=now + self.max_job_lifetime,
-                max_age_at=now + self.global_max_age,
+                lease_expires_at=now + profile_max_lifetime,
+                max_age_at=now + max(self.global_max_age, profile_max_lifetime),
                 state="provisioning",
+                provisioning_timeout_seconds=profile_provisioning_timeout,
             )
             self.leases[instance.id] = lease
             if fail_jit or outcome == OUTCOME_JIT_FAILURE:
@@ -1467,7 +1529,7 @@ class EphemeralController:
             else:
                 if now >= lease.max_age_at:
                     orphan, reason = True, "global-max-age"
-                elif lease.state == "provisioning" and now - lease.created_at >= self.provisioning_timeout:
+                elif lease.state == "provisioning" and now - lease.created_at >= _lease_provisioning_timeout(lease, self.provisioning_timeout):
                     orphan, reason = True, "provisioning-timeout"
                 elif lease.state == "running" and now >= lease.lease_expires_at:
                     orphan, reason = True, "job-lifetime-exceeded"

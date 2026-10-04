@@ -1,0 +1,306 @@
+"""Coverage for the duplicated prepared-runtime probe logic.
+
+The digest regex, stamp comparison, version grep, warning fallback, and
+warm-path short-circuit are duplicated across every agent-runtime install
+site. A typo in one copy, or a version-output format drift that breaks the
+grep, would otherwise surface only as failed or silently cold agent jobs.
+These tests execute each site's own shell (extracted verbatim from the
+workflow file) in a sandbox for the hit, miss, and malformed-digest cases,
+and statically pin the per-site wiring so no copy can drift.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import unittest
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+WORKFLOWS_DIR = os.path.join(ROOT, ".github", "workflows")
+
+# Every agent-runtime install site: file -> one (tool, version) entry per
+# installer line, in file order. This map locks the duplication surface: a
+# new install site without probe coverage fails here until it is added.
+EXPECTED_SITES = {
+    "continuum-opencode.yml": [("opencode", "1.18.34"), ("opencode", "1.18.34")],
+    "continuum-pr-agent.yml": [("pr-agent", "0.46.0"), ("opencode", "1.18.34")],
+    "continuum-pr-agent-repair.yml": [("opencode", "1.18.34")],
+    "continuum-coderabbit-unresolved.yml": [("opencode", "1.18.34")],
+    "continuum-consumer-child-worker.yml": [("opencode", "1.18.34")],
+    "continuum-consumer-child-review.yml": [("opencode", "1.18.34")],
+    "continuum-consumer-child-pr-review.yml": [("opencode", "1.18.34")],
+}
+
+DIGEST = "a" * 64
+OTHER_DIGEST = "b" * 64
+
+
+def read_workflow(name):
+    with open(os.path.join(WORKFLOWS_DIR, name), "r", encoding="utf-8") as handle:
+        return handle.read()
+
+
+def code_without_comment(line):
+    return line.split("#", 1)[0]
+
+
+def installer_indices(lines):
+    found = []
+    for i, line in enumerate(lines):
+        code = code_without_comment(line)
+        if "https://opencode.ai/install" in code or (
+            "pip install" in code and "pr-agent" in code
+        ):
+            found.append(i)
+    return found
+
+
+def site_bounds(installers):
+    bounds = []
+    prev = -1
+    for at in installers:
+        bounds.append((prev + 1, at))
+        prev = at
+    return bounds
+
+
+def extract_guard(site_lines):
+    """Return the 4-line malformed-digest guard block verbatim."""
+    for i, line in enumerate(site_lines):
+        if "CONTINUUM_IMAGE_DIGEST is malformed" in line:
+            block = site_lines[i - 1:i + 3]
+            text = "\n".join(block)
+            assert '[[ -n "${CONTINUUM_IMAGE_DIGEST:-}" ]]' in block[0], text
+            assert 'CONTINUUM_IMAGE_DIGEST=""' in block[2], text
+            assert block[3].strip() == "fi", text
+            return block
+    raise AssertionError("malformed-digest guard block is missing from the install site")
+
+
+def extract_condition(site_lines):
+    """Return the digest-gated probe test expression verbatim.
+
+    The warm-hit `if` is a single shell line; stripping the leading `if`
+    and trailing `; then` yields the exact conjunction the workflow
+    evaluates (digest shape, stamp comparison, binary probe, version grep).
+    """
+    for line in site_lines:
+        stripped = line.strip()
+        if (
+            stripped.startswith("if [[")
+            and "CONTINUUM_IMAGE_DIGEST" in line
+            and ("command -v" in line or "--version" in line)
+            and stripped.endswith("; then")
+        ):
+            return stripped[len("if "):-len("; then")]
+    raise AssertionError("digest-gated warm-hit condition is missing from the install site")
+
+
+def detect_tool_and_version(condition):
+    if "command -v pr-agent" in condition:
+        tool = "pr-agent"
+    else:
+        assert "command -v opencode" in condition, condition
+        tool = "opencode"
+    match = re.search(r"([0-9]+\\?\.[0-9]+\\?\.[0-9]+)", condition)
+    assert match, condition
+    return tool, match.group(1).replace("\\", "")
+
+
+class PreparedRuntimeProbeTests(unittest.TestCase):
+    def sites(self, name):
+        """Return one probe region per installer: the malformed-digest guard
+        through the installer line, so assertions never bleed into
+        unrelated steps earlier in the file."""
+        body = read_workflow(name)
+        lines = body.splitlines()
+        installers = installer_indices(lines)
+        self.assertTrue(installers, "{}: no installer site found".format(name))
+        regions = []
+        for at in installers:
+            cond_at = None
+            for i in range(at - 1, -1, -1):
+                stripped = lines[i].strip()
+                if (
+                    stripped.startswith("if [[")
+                    and "CONTINUUM_IMAGE_DIGEST" in lines[i]
+                    and ("command -v" in lines[i] or "--version" in lines[i])
+                    and stripped.endswith("; then")
+                ):
+                    cond_at = i
+                    break
+            self.assertIsNotNone(
+                cond_at,
+                "{}: no digest-gated warm-hit condition before installer line {}".format(name, at + 1))
+            warn_at = None
+            for i in range(cond_at - 1, -1, -1):
+                if "CONTINUUM_IMAGE_DIGEST is malformed" in lines[i]:
+                    warn_at = i
+                    break
+            self.assertIsNotNone(
+                warn_at,
+                "{}: no malformed-digest guard before installer line {}".format(name, at + 1))
+            regions.append(lines[warn_at - 1:at + 1])
+        return regions
+
+    def test_every_install_site_carries_the_full_probe(self):
+        for name, expected in sorted(EXPECTED_SITES.items()):
+            with self.subTest(workflow=name):
+                sites = self.sites(name)
+                self.assertEqual(
+                    len(sites), len(expected),
+                    "{}: expected {} install site(s), found {}".format(
+                        name, len(expected), len(sites)))
+                for site_lines, (tool, version) in zip(sites, expected):
+                    with self.subTest(site=tool):
+                        text = "\n".join(site_lines)
+                        # Digest shape gate on both the malformed guard and
+                        # the warm-hit condition.
+                        self.assertRegex(
+                            text, r"CONTINUUM_IMAGE_DIGEST.*=~\s*\^\[0-9a-f\]\{64\}\$")
+                        # Malformed digest warns and falls back, never fails
+                        # closed: the guard clears the digest instead of
+                        # exiting, so every `exit 1` left in the site is a
+                        # post-install version verification (`|| exit 1`).
+                        self.assertIn(
+                            "::warning::CONTINUUM_IMAGE_DIGEST is malformed", text)
+                        self.assertIn('CONTINUUM_IMAGE_DIGEST=""', text)
+                        for line in site_lines:
+                            code = code_without_comment(line).strip()
+                            if code == "exit 1":
+                                self.fail(
+                                    "{}: bare `exit 1` would fail closed on a "
+                                    "cache failure: {}".format(name, line))
+                        # Stamp binding: the hit requires the image-digest
+                        # stamp to match the digest.
+                        condition = extract_condition(site_lines)
+                        self.assertIn("STAMP_FILE", condition)
+                        self.assertIn("CONTINUUM_IMAGE_DIGEST", condition)
+                        # Exact version grep with boundary anchors (plain
+                        # substring matching false-hits on "1.18.340").
+                        escaped = version.replace(".", r"\.")
+                        self.assertIn(
+                            "grep -E -q \"(^|[^0-9.]){}([^0-9.]|$)\"".format(escaped),
+                            condition)
+                        self.assertIn("command -v {}".format(tool), condition)
+                        # Warm hit is logged and short-circuits before any
+                        # download (`exit 0`, or `else` on consumer-child).
+                        hit_at = next(
+                            i for i, line in enumerate(site_lines)
+                            if "prepared-runtime hit" in line)
+                        short_circuited = any(
+                            code_without_comment(line).strip() in ("exit 0", "else")
+                            for line in site_lines[hit_at:])
+                        self.assertTrue(
+                            short_circuited,
+                            "{}: warm hit must short-circuit before the download".format(name))
+
+    def run_probe(self, site_lines, digest, stamp, tool_version):
+        """Evaluate the site's own guard + condition in a bash sandbox.
+
+        Returns (marker, output) where marker is PROBE_HIT or PROBE_MISS.
+        `digest` None means the variable is unset (empty-digest cold path);
+        `stamp` None means no stamp file; `tool_version` None means the
+        binary is absent from PATH.
+        """
+        tmp = tempfile.mkdtemp(prefix="continuum-probe-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        bin_dir = os.path.join(tmp, "bin")
+        os.mkdir(bin_dir)
+        tool, _ = detect_tool_and_version(extract_condition(site_lines))
+        if tool_version is not None:
+            with open(os.path.join(bin_dir, tool), "w", encoding="utf-8") as handle:
+                handle.write("#!/bin/sh\necho '{}'\n".format(tool_version))
+            os.chmod(os.path.join(bin_dir, tool), 0o755)
+        stamp_file = os.path.join(tmp, "image-digest")
+        if stamp is not None:
+            with open(stamp_file, "w", encoding="utf-8") as handle:
+                handle.write(stamp)
+        guard = extract_guard(site_lines)
+        condition = extract_condition(site_lines)
+        script = (
+            "export PATH=\"{bin}:/usr/bin:/bin\"\n"
+            "STAMP_FILE=\"{stamp}\"\n"
+            "{unset}{export}"
+            "{guard}\n"
+            "if {cond}; then echo PROBE_HIT; else echo PROBE_MISS; fi\n"
+        ).format(
+            bin=bin_dir,
+            stamp=stamp_file,
+            unset="" if digest is not None else "unset CONTINUUM_IMAGE_DIGEST\n",
+            export="" if digest is None else "CONTINUUM_IMAGE_DIGEST=\"{}\"\n".format(digest),
+            guard="\n".join(guard),
+            cond=condition,
+        )
+        completed = subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        marker = "PROBE_HIT" if "PROBE_HIT" in completed.stdout else "PROBE_MISS"
+        return marker, completed.stdout
+
+    def check_all_sites(self, func):
+        for name in sorted(EXPECTED_SITES):
+            for site_lines in self.sites(name):
+                with self.subTest(workflow=name):
+                    func(site_lines)
+
+    def test_hit_with_matching_stamp_and_exact_version(self):
+        def check(site_lines):
+            tool, version = detect_tool_and_version(extract_condition(site_lines))
+            marker, _ = self.run_probe(site_lines, DIGEST, DIGEST, version)
+            self.assertEqual(marker, "PROBE_HIT")
+            # A version prefix around the exact pin still hits.
+            marker, _ = self.run_probe(
+                site_lines, DIGEST, DIGEST, "{}-release (abc123)".format(version))
+            self.assertEqual(marker, "PROBE_HIT")
+        self.check_all_sites(check)
+
+    def test_miss_with_empty_digest(self):
+        def check(site_lines):
+            tool, version = detect_tool_and_version(extract_condition(site_lines))
+            marker, _ = self.run_probe(site_lines, None, DIGEST, version)
+            self.assertEqual(marker, "PROBE_MISS")
+        self.check_all_sites(check)
+
+    def test_malformed_digest_warns_and_misses(self):
+        def check(site_lines):
+            tool, version = detect_tool_and_version(extract_condition(site_lines))
+            marker, output = self.run_probe(
+                site_lines, "not-a-digest", DIGEST, version)
+            self.assertEqual(marker, "PROBE_MISS")
+            self.assertIn("CONTINUUM_IMAGE_DIGEST is malformed", output)
+        self.check_all_sites(check)
+
+    def test_miss_with_stale_stamp_or_missing_binary(self):
+        def check(site_lines):
+            tool, version = detect_tool_and_version(extract_condition(site_lines))
+            marker, _ = self.run_probe(site_lines, DIGEST, OTHER_DIGEST, version)
+            self.assertEqual(marker, "PROBE_MISS")
+            marker, _ = self.run_probe(site_lines, DIGEST, None, version)
+            self.assertEqual(marker, "PROBE_MISS")
+            marker, _ = self.run_probe(site_lines, DIGEST, DIGEST, None)
+            self.assertEqual(marker, "PROBE_MISS")
+        self.check_all_sites(check)
+
+    def test_version_drift_misses(self):
+        # A typo in one copy's pin, or an upstream output-format drift that
+        # appends digits ("1.18.340"), must miss instead of taking the warm
+        # path on the wrong runtime.
+        def check(site_lines):
+            tool, version = detect_tool_and_version(extract_condition(site_lines))
+            major, minor, patch = version.split(".")
+            drifted = "{}.{}.{}0".format(major, minor, patch)
+            marker, _ = self.run_probe(site_lines, DIGEST, DIGEST, drifted)
+            self.assertEqual(marker, "PROBE_MISS")
+            marker, _ = self.run_probe(site_lines, DIGEST, DIGEST, "9.9.9")
+            self.assertEqual(marker, "PROBE_MISS")
+        self.check_all_sites(check)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -419,9 +419,12 @@ jobs:
           # malformed digest) falls back to deterministic reconstruction
           # below, never failing closed. The digest is bound to the runtime
           # by the image-digest stamp ($HOME/.opencode/image-digest)
-          # recorded by the validated image build (or a prior
-          # reconstruction): a stale or unrelated 0.46.0 binary whose stamp
-          # does not match the digest cannot take the hit path.
+          # recorded by the validated image build: a stale or unrelated
+          # 0.46.0 binary whose stamp does not match the digest cannot take
+          # the hit path. Deterministic reconstruction below never records
+          # the stamp, so a later job cannot take the warm path from a
+          # reconstruction self-stamp: only the validated image build (or a
+          # provider cache restore of it) proves golden-image provenance.
           # Fresh GitHub-hosted runners carry no pre-populated stamp or
           # binaries, so with the default empty digest they take the
           # reconstruction path below: that fall-through is the expected
@@ -438,15 +441,11 @@ jobs:
             CONTINUUM_IMAGE_DIGEST=""
           fi
           if [[ "${CONTINUUM_IMAGE_DIGEST:-}" =~ ^[0-9a-f]{64}$ ]] && [[ -f "$STAMP_FILE" ]] && [[ "$(cat "$STAMP_FILE")" == "$CONTINUUM_IMAGE_DIGEST" ]] && command -v pr-agent >/dev/null 2>&1 && pr-agent --version 2>&1 | grep -E -q "(^|[^0-9.])0\.46\.0([^0-9.]|$)"; then
-            echo "prepared-runtime hit: pr-agent 0.46.0 already present (image digest ${CONTINUUM_IMAGE_DIGEST} validated against ${STAMP_FILE})."
+            echo "prepared-runtime hit: pr-agent 0.46.0 already present (image digest ${CONTINUUM_IMAGE_DIGEST} matched stamp ${STAMP_FILE} recorded by the validated image build)."
             exit 0
           fi
           python3 -m pip install --quiet "pr-agent==${PR_AGENT_VERSION}"
           pr-agent --version 2>&1 | grep -E -q "(^|[^0-9.])0\.46\.0([^0-9.]|$)" || exit 1
-          if [[ "${CONTINUUM_IMAGE_DIGEST:-}" =~ ^[0-9a-f]{64}$ ]]; then
-            mkdir -p "$(dirname "$STAMP_FILE")"
-            echo "$CONTINUUM_IMAGE_DIGEST" > "$STAMP_FILE"
-          fi
 
       - name: Install pinned OpenCode CLI for the PR-Agent backend
         id: install_opencode
@@ -465,9 +464,12 @@ jobs:
           # reconstruction below, never failing closed. The digest is bound
           # to the runtime by the image-digest stamp
           # ($HOME/.opencode/image-digest) recorded by the validated image
-          # build (or a prior reconstruction): a stale or unrelated
-          # opencode 1.18.34 binary whose stamp does not match the digest
-          # cannot take the hit path.
+          # build: a stale or unrelated opencode 1.18.34 binary whose stamp
+          # does not match the digest cannot take the hit path.
+          # Deterministic reconstruction below never records the stamp, so
+          # a later job cannot take the warm path from a reconstruction
+          # self-stamp: only the validated image build (or a provider cache
+          # restore of it) proves golden-image provenance.
           # Fresh GitHub-hosted runners carry no pre-populated stamp or
           # binaries, so with the default empty digest they take the
           # reconstruction path below: that fall-through is the expected
@@ -481,7 +483,7 @@ jobs:
             CONTINUUM_IMAGE_DIGEST=""
           fi
           if [[ "${CONTINUUM_IMAGE_DIGEST:-}" =~ ^[0-9a-f]{64}$ ]] && [[ -f "$STAMP_FILE" ]] && [[ "$(cat "$STAMP_FILE")" == "$CONTINUUM_IMAGE_DIGEST" ]] && command -v opencode >/dev/null 2>&1 && opencode --version 2>&1 | grep -E -q "(^|[^0-9.])1\.18\.34([^0-9.]|$)"; then
-            echo "prepared-runtime hit: opencode 1.18.34 already present (image digest ${CONTINUUM_IMAGE_DIGEST} validated against ${STAMP_FILE})."
+            echo "prepared-runtime hit: opencode 1.18.34 already present (image digest ${CONTINUUM_IMAGE_DIGEST} matched stamp ${STAMP_FILE} recorded by the validated image build)."
             echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
             exit 0
           fi
@@ -489,10 +491,6 @@ jobs:
             if curl -fsSL --retry 3 --retry-delay 2 https://opencode.ai/install | bash -s -- --version 1.18.34; then
               export PATH="$HOME/.opencode/bin:$PATH"
               opencode --version 2>&1 | grep -E -q "(^|[^0-9.])1\.18\.34([^0-9.]|$)" || exit 1
-              if [[ "${CONTINUUM_IMAGE_DIGEST:-}" =~ ^[0-9a-f]{64}$ ]]; then
-                mkdir -p "$(dirname "$STAMP_FILE")"
-                echo "$CONTINUUM_IMAGE_DIGEST" > "$STAMP_FILE"
-              fi
               echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
               exit 0
             fi
