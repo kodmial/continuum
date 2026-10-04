@@ -2370,6 +2370,12 @@ process.stdout.write(JSON.stringify(result));
             "but qualifying suggestions remain", merge
         )
         self.assertIn("improveSkippedClean", merge)
+        # The skipped-clean marker alone never greens: the gate
+        # re-validates the clean-review skip policy for the exact HEAD
+        # with the explicit review-coverage flag.
+        self.assertIn("policy.isCleanReviewForImproveSkip(", merge)
+        self.assertIn("reviewCoverageComplete", merge)
+        self.assertIn("improve skip not justified", merge)
 
     def test_improve_gate_stale_discards_flag_stale_head(self):
         body = read_repo(".github/workflows/continuum-pr-agent.yml")

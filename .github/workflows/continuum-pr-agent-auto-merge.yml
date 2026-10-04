@@ -323,7 +323,11 @@ jobs:
               core.setFailed(`PR-Agent gate blocks PR #${prNumber}: ${reason}`);
             };
             // Tool-error and review-coverage legs: a failing tool or a
-            // partial review never greens, even with zero findings.
+            // partial review never greens, even with zero findings. The
+            // coverage leg mirrors GateInputs.review_coverage_complete and
+            // the improve-skip policy's explicit `reviewCoverageComplete`
+            // flag: only an explicit complete signal greens, never the mere
+            // absence of a failure.
             let toolError = false;
             try {
               toolError = policy.hasToolErrorSignal(review);
@@ -335,14 +339,14 @@ jobs:
               fail('tool error: failing closed');
               return;
             }
-            let reviewCoverageIncomplete = false;
+            let reviewCoverageComplete = false;
             try {
-              reviewCoverageIncomplete = policy.hasIncompleteCoverageSignal(review);
+              reviewCoverageComplete = !policy.hasIncompleteCoverageSignal(review);
             } catch (err) {
               core.setFailed(err.message);
               return;
             }
-            if (reviewCoverageIncomplete) {
+            if (!reviewCoverageComplete) {
               fail('incomplete review coverage: failing closed');
               return;
             }
@@ -360,7 +364,10 @@ jobs:
             // that emitted no suggestions (or a missing/miswired
             // `improve_skipped` step) cannot deadlock a clean HEAD.
             // Truncated/invalid payloads still fail closed on the
-            // improve-coverage leg above.
+            // improve-coverage leg above. A marked skipped-clean payload is
+            // additionally re-validated through
+            // policy.isCleanReviewForImproveSkip below, so the marker alone
+            // never greens a dirty review.
             if (recommendation !== policy.REVIEW_MERGE_SAFE) {
               fail(`merge recommendation blocks: ${recommendation}`);
               return;
@@ -386,6 +393,41 @@ jobs:
             if (blockingSecurity) {
               fail('blocking security signal remains');
               return;
+            }
+            // Skipped-clean re-validation: a marked payload only greens when
+            // the review itself satisfies the clean-review skip policy for
+            // this exact HEAD (producer: continuum-pr-agent.yml
+            // `improve_gate` skip_improve decision via
+            // policy.isCleanReviewForImproveSkip). A miswired or stale marker
+            // for a dirty review still blocks here with the skip reason.
+            // Exact-HEAD liveness against the live PR head is revalidated in
+            // the next step immediately before merge; headMatches is true
+            // here because persistent state was already pinned to headSha
+            // above.
+            if (improveSkippedClean) {
+              let skipDecision;
+              try {
+                skipDecision = policy.isCleanReviewForImproveSkip(
+                  review,
+                  persistentState,
+                  {
+                    headMatches: true,
+                    toolError,
+                    reviewCoverageComplete,
+                    reviewedHeadSha: headSha,
+                  }
+                );
+              } catch (err) {
+                core.setFailed(err.message);
+                return;
+              }
+              if (!skipDecision || skipDecision.skip !== true) {
+                fail(
+                  'improve skip not justified: ' +
+                    String((skipDecision && skipDecision.reason) || 'failing closed')
+                );
+                return;
+              }
             }
             if (improveSkippedClean && qualifying.length > 0) {
               fail('improve was skipped but qualifying suggestions remain');

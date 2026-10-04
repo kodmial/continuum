@@ -512,6 +512,12 @@ class PrAgentWorkflowContractTests(unittest.TestCase):
         )
         self.assertIn("isSkippedCleanImprovePayload", merge)
         self.assertIn("incomplete improve coverage: failing closed", merge)
+        # The merge gate consumes the skip decision itself, not just the
+        # marker: a skipped-clean payload is re-validated through the
+        # clean-review skip policy with the explicit review-coverage flag.
+        self.assertIn("policy.isCleanReviewForImproveSkip(", merge)
+        self.assertIn("reviewCoverageComplete", merge)
+        self.assertIn("improve skip not justified", merge)
 
     def test_truncated_improve_payload_has_explicit_coverage_leg(self):
         merge = self._read(
