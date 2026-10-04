@@ -61,6 +61,7 @@ import hashlib
 import json
 import re
 import time
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -445,11 +446,20 @@ def resolve_profile(declaration: Mapping[str, Any]) -> RuntimeProfile:
     if not continuum_ref.strip():
         raise AgentRuntimeError("continuum_ref must be a non-empty revision")
     toolchain = tuple(str(item) for item in (base.get("toolchain", ()) or ()))
-    concurrency = int(base.get("concurrency_limit", 4))
+    try:
+        concurrency = int(base.get("concurrency_limit", 4))
+    except (TypeError, ValueError):
+        raise AgentRuntimeError("concurrency_limit must be an integer between 1 and 256")
     if concurrency < 1 or concurrency > 256:
         raise AgentRuntimeError("concurrency_limit must be between 1 and 256")
-    provisioning_timeout = int(base.get("provisioning_timeout_seconds", DEFAULT_PROVISIONING_TIMEOUT_SECONDS))
-    max_lifetime = int(base.get("max_job_lifetime_seconds", DEFAULT_MAX_JOB_LIFETIME_SECONDS))
+    try:
+        provisioning_timeout = int(base.get("provisioning_timeout_seconds", DEFAULT_PROVISIONING_TIMEOUT_SECONDS))
+    except (TypeError, ValueError):
+        raise AgentRuntimeError("provisioning_timeout_seconds must be a positive integer")
+    try:
+        max_lifetime = int(base.get("max_job_lifetime_seconds", DEFAULT_MAX_JOB_LIFETIME_SECONDS))
+    except (TypeError, ValueError):
+        raise AgentRuntimeError("max_job_lifetime_seconds must be a positive integer")
     if provisioning_timeout <= 0 or max_lifetime <= 0:
         raise AgentRuntimeError("timeouts must be positive; no state may wait indefinitely")
     return RuntimeProfile(
@@ -1001,45 +1011,64 @@ class EphemeralController:
             self.images.promote(generation.digest, now=now)
         validate_image(manifest, profile, generation)
         events.append("validated-identity {}".format(digest))
-        self.queued.pop(0)
+        pending = self.queued.pop(0)
 
-        network = self.provider.create_network(profile_digest=profile_digest(profile), job_id=job_id, now=now)
-        if network.persistent:
-            raise AgentRuntimeError("per-job network attachment must not be persistent")
-        events.append("attached-network {}".format(network.id))
-        instance = self.provider.create_instance(
-            project_id=self.project_id,
-            repository=repository,
-            profile_digest=profile_digest(profile),
-            digest=digest,
-            job_id=job_id,
-            network_id=network.id,
-            now=now,
-        )
-        events.append("created-instance {} after demand".format(instance.id))
-        lease = Lease(
-            project_id=self.project_id,
-            repository=repository,
-            job_id=job_id,
-            run_id=run_id,
-            profile_digest=profile_digest(profile),
-            instance_id=instance.id,
-            created_at=now,
-            lease_expires_at=now + self.max_job_lifetime,
-            max_age_at=now + self.global_max_age,
-            state="provisioning",
-        )
-        self.leases[instance.id] = lease
+        network: Optional[NetworkAttachment] = None
+        instance: Optional[RunnerInstance] = None
+        try:
+            network = self.provider.create_network(profile_digest=profile_digest(profile), job_id=job_id, now=now)
+            if network.persistent:
+                raise AgentRuntimeError("per-job network attachment must not be persistent")
+            events.append("attached-network {}".format(network.id))
+            instance = self.provider.create_instance(
+                project_id=self.project_id,
+                repository=repository,
+                profile_digest=profile_digest(profile),
+                digest=digest,
+                job_id=job_id,
+                network_id=network.id,
+                now=now,
+            )
+            events.append("created-instance {} after demand".format(instance.id))
+            lease = Lease(
+                project_id=self.project_id,
+                repository=repository,
+                job_id=job_id,
+                run_id=run_id,
+                profile_digest=profile_digest(profile),
+                instance_id=instance.id,
+                created_at=now,
+                lease_expires_at=now + self.max_job_lifetime,
+                max_age_at=now + self.global_max_age,
+                state="provisioning",
+            )
+            self.leases[instance.id] = lease
+            if fail_jit or outcome == OUTCOME_JIT_FAILURE:
+                events.append("jit-registration-failed {}".format(instance.id))
+                self._teardown(instance, now=now, retries=teardown_retries)
+                self.leases.pop(instance.id, None)
+                assert network is not None and instance is not None
+                return JobResult(job_id, OUTCOME_JIT_FAILURE, instance.id, network.id,
+                                 instance.public_ip, digest, instance.destroyed_at is not None, events)
+            jit_id = self.provider.jit_register(instance)
+            events.append("jit-registered {}".format(jit_id))
+        except Exception:
+            # Provisioning failed before the job could run: destroy any
+            # partially created resources, requeue the demand at the front
+            # so no queued work is lost, then re-raise.
+            if instance is not None:
+                try:
+                    self.provider.destroy(instance, now=now)
+                finally:
+                    self.leases.pop(instance.id, None)
+            elif network is not None:
+                stored = self.provider.networks.get(network.id)
+                if stored is not None and stored.destroyed_at is None:
+                    stored.destroyed_at = now
+            self.queued.insert(0, pending)
+            raise
 
-        if fail_jit or outcome == OUTCOME_JIT_FAILURE:
-            events.append("jit-registration-failed {}".format(instance.id))
-            self._teardown(instance, now=now, retries=teardown_retries)
-            self.leases.pop(instance.id, None)
-            return JobResult(job_id, OUTCOME_JIT_FAILURE, instance.id, network.id,
-                             instance.public_ip, digest, instance.destroyed_at is not None, events)
-        jit_id = self.provider.jit_register(instance)
-        events.append("jit-registered {}".format(jit_id))
-
+        assert network is not None and instance is not None
         if fail_startup or outcome == OUTCOME_STARTUP_FAILURE:
             events.append("job-startup-failed {}".format(instance.id))
             self._teardown(instance, now=now, retries=teardown_retries)
@@ -1084,14 +1113,17 @@ class EphemeralController:
         # Bound teardown work by teardown_timeout_seconds: each retry costs
         # one DEFAULT_TEARDOWN_RETRY_BASE_SECONDS slot. Explicit retry
         # requests are still capped by the timeout so no teardown waits
-        # indefinitely.
+        # indefinitely. The effective clock advances one slot per attempt
+        # so the deadline actually bounds retry work instead of being dead
+        # code on a frozen timestamp.
         budget = max(1, int(self.teardown_timeout // DEFAULT_TEARDOWN_RETRY_BASE_SECONDS))
         attempts = max(1, min(int(requested), budget))
         deadline = float(now) + float(self.teardown_timeout)
-        for _ in range(attempts):
-            if float(now) > deadline:
+        for attempt in range(attempts):
+            effective_now = float(now) + float(attempt) * float(DEFAULT_TEARDOWN_RETRY_BASE_SECONDS)
+            if effective_now > deadline:
                 break
-            if self.provider.destroy(instance, now=now):
+            if self.provider.destroy(instance, now=effective_now):
                 self.diagnostics.append("destroyed {}".format(instance.id))
                 return True
         self.diagnostics.append("teardown-retry-exhausted {}".format(instance.id))
@@ -1166,8 +1198,8 @@ class EphemeralController:
             global_max_age_seconds=self.global_max_age,
             retry_limit=self.retry_limit,
         )
-        restarted.leases = dict(self.leases)
-        restarted.queued = [dict(item) for item in self.queued]
+        restarted.leases = deepcopy(self.leases)
+        restarted.queued = deepcopy(self.queued)
         restarted.diagnostics = list(self.diagnostics)
         restarted.diagnostics.append("controller-restarted")
         return restarted
@@ -1301,29 +1333,39 @@ def normal_execution_uses_bootstrap_install(workflow_text: str) -> bool:
 
     if not isinstance(workflow_text, str) or not workflow_text:
         return False
-    positions = [workflow_text.find(pattern)
-                 for pattern in _BOOTSTRAP_PATTERNS if pattern in workflow_text]
-    if not positions:
+    # Compare only code lines: a probe or installer URL inside a `#`
+    # comment proves nothing about the warm path. A comment-only probe
+    # marker must not suppress detection, and a comment-only installer
+    # URL must not count as a bootstrap install.
+    code_lines = [
+        line for line in workflow_text.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    if not code_lines:
         return False
-    first_bootstrap = min(positions)
-    # A prepared-runtime probe (exact-version check that exits before any
-    # download) ahead of the first installer line means the warm path
-    # performs zero downloads: the installer below is deterministic
-    # reconstruction on a validated cache miss only.
-    probe_markers = ("command -v opencode", "prepared-runtime", "prepared agent runtime")
-    probe_positions = [workflow_text.find(marker)
-                       for marker in probe_markers if marker in workflow_text]
-    if probe_positions and min(probe_positions) < first_bootstrap:
+    first_bootstrap: Optional[int] = None
+    first_probe: Optional[int] = None
+    for index, line in enumerate(code_lines):
+        if first_bootstrap is None and any(pattern in line for pattern in _BOOTSTRAP_PATTERNS):
+            first_bootstrap = index
+        if first_probe is None and (
+            "command -v opencode" in line
+            or "pr-agent --version" in line
+            or "prepared-runtime" in line
+            or "prepared agent runtime" in line
+        ):
+            first_probe = index
+        if first_bootstrap is not None and first_probe is not None:
+            break
+    if first_bootstrap is None:
         return False
-    lines = workflow_text.splitlines()
-    for line in lines:
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        for pattern in _BOOTSTRAP_PATTERNS:
-            if pattern in line:
-                return True
-    return False
+    # A prepared-runtime probe (exact-version check) on a code line ahead
+    # of the first installer code line means the warm path performs zero
+    # downloads: the installer below is deterministic reconstruction on a
+    # validated cache miss only.
+    if first_probe is not None and first_probe < first_bootstrap:
+        return False
+    return True
 
 
 def workflow_step_has_prepared_runtime_probe(workflow_text: str) -> bool:

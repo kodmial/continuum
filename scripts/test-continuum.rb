@@ -4822,9 +4822,9 @@ class ContinuumTest < Minitest::Test
       %w[OPENCODE_API_KEY ANTHROPIC_API_KEY GROQ_API_KEY].each do |key|
         refute_includes body, key, "#{name}: core execution must never read a paid provider key"
       end
-      refute_match(/idle_instances:\s*[1-9]/, body,
+      refute_match(/idle_instances:\s*[1-9]\d*/, body,
                    "#{name}: strict profiles keep zero live idle instances")
-      refute_match(/max_uses_per_instance:\s*[2-9]/, body,
+      refute_match(/max_uses_per_instance:\s*(0|[2-9]\d*|1\d+)/, body,
                    "#{name}: one instance may execute exactly one job")
     end
 
@@ -4833,6 +4833,27 @@ class ContinuumTest < Minitest::Test
     assert_includes engine, 'STRICT_IDLE_INSTANCES = 0'
     assert_includes engine, 'def live_qualification_evidence'
     assert_includes engine, 'ip_equality_is_not_failure'
+  end
+
+  # kodmial/continuum#179: the prepared-runtime repository variables are a
+  # documented consumer contract. CONTINUUM_IMAGE_DIGEST keys the immutable
+  # image digest probed on the warm path; CONTINUUM_RUNTIME_PRESET selects
+  # the strict ephemeral preset; CONTINUUM_RUNTIME_PROVIDER selects the
+  # provider backend. They are repository variables (vars context), not
+  # reusable-workflow inputs, so no caller stub carries them; this test is
+  # the contract that keeps docs, engine presets/providers, and workflows
+  # in agreement.
+  def test_agent_runtime_variables_are_documented
+    docs = File.read(File.join(ROOT, 'docs/consumer-variables.md'))
+    engine = File.read(File.join(ROOT, 'src/continuum/agent_runtime.py'))
+    %w[CONTINUUM_IMAGE_DIGEST CONTINUUM_RUNTIME_PRESET CONTINUUM_RUNTIME_PROVIDER].each do |name|
+      assert_includes docs, name, "docs/consumer-variables.md must document #{name}"
+    end
+    assert_includes engine, 'agent-linux', 'engine must define the agent-linux preset'
+    assert_includes engine, 'github-hosted', 'engine must support the github-hosted provider'
+    body = workflow_body('continuum-opencode.yml')
+    assert_includes body, 'CONTINUUM_IMAGE_DIGEST',
+                    'continuum-opencode.yml: the probe must key on the immutable image digest'
   end
 
   # kodmial/continuum#214: mandatory qualification evidence must be

@@ -300,6 +300,67 @@ class AgentRuntimeContractTest(unittest.TestCase):
         self.assertTrue(evidence["different_instance"])
         self.assertTrue(evidence["ip_equality_is_not_failure"])
 
+    def test_detector_ignores_comment_only_probe_markers(self):
+        # A comment mentioning the probe ahead of an unconditional
+        # installer must not suppress bootstrap detection.
+        body = (
+            "# prepared agent runtime probe would go here\n"
+            "run: |\n"
+            "  curl -fsSL --retry 3 https://opencode.ai/install | bash\n"
+        )
+        self.assertTrue(runtime.normal_execution_uses_bootstrap_install(body))
+        # Comment-only installer URLs do not count as bootstrap installs.
+        comment_only = (
+            "# see https://opencode.ai/install for docs\n"
+            "run: |\n"
+            "  echo hello\n"
+        )
+        self.assertFalse(runtime.normal_execution_uses_bootstrap_install(comment_only))
+
+    def test_resolve_profile_rejects_non_numeric_limits_as_domain_error(self):
+        for declaration in (
+            {"preset": "agent-linux", "concurrency_limit": "many"},
+            {"preset": "agent-linux", "provisioning_timeout_seconds": "soon"},
+            {"preset": "agent-linux", "max_job_lifetime_seconds": "long"},
+        ):
+            with self.subTest(declaration=declaration):
+                with self.assertRaises(runtime.AgentRuntimeError):
+                    runtime.resolve_profile(declaration)
+
+    def test_provisioning_failure_requeues_demand_and_cleans_partial(self):
+        controller = _controller()
+        profile = runtime.resolve_profile({"preset": "agent-linux"})
+        manifest = _manifest(profile)
+        controller.queue_job("acme/app", profile)
+        original_create = controller.provider.create_instance
+
+        def _boom(**kwargs):
+            raise RuntimeError("provider outage")
+
+        controller.provider.create_instance = _boom  # type: ignore[method-assign]
+        try:
+            with self.assertRaises(RuntimeError):
+                controller.run_next_job(manifest, now=1000.0)
+        finally:
+            controller.provider.create_instance = original_create  # type: ignore[method-assign]
+        self.assertEqual(len(controller.queued), 1)
+        self.assertEqual(controller.live_idle_count(), 1 - 1)  # network cleaned, nothing live-idle leaked
+        self.assertEqual(controller.live_instance_count(), 0)
+
+    def test_restart_deep_copies_leases(self):
+        controller = _controller()
+        profile = runtime.resolve_profile({"preset": "agent-linux"})
+        manifest = _manifest(profile)
+        controller.queue_job("acme/app", profile, run_id="r1")
+        controller.run_next_job(manifest, now=1000.0)
+        controller.queue_job("acme/app", profile, run_id="r2")
+        restarted = controller.restart()
+        restarted.leases["ghost"] = runtime.Lease(
+            project_id="proj-a", repository="acme/app", job_id="ghost", run_id="g",
+            profile_digest=runtime.profile_digest(profile), instance_id="ghost",
+            created_at=0.0, lease_expires_at=1.0, max_age_at=2.0)
+        self.assertNotIn("ghost", controller.leases)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -39,18 +39,24 @@ PROTECTED_FILES = [
 # normal agent execution to stop reinstalling OpenCode/PR-Agent and instead
 # probe the prepared immutable runtime first. That task therefore requires a
 # narrow, auditable change to .github/workflows/continuum-opencode.yml: a
-# prepared-runtime probe (exact pinned version via `grep -F` + CONTINUUM_IMAGE_DIGEST
-# + GITHUB_PATH export) ahead of the deterministic reconstruction fallback.
-# The zero-diff assertion below is stale for that one file unless it
-# allowlists exactly this probe; any other drift must still fail. Each entry
-# is a full added line without the leading "+" as produced by `git diff`.
+# prepared-runtime probe (boundary-anchored `grep -E` exact version +
+# CONTINUUM_IMAGE_DIGEST format guard + GITHUB_PATH export + post-install
+# exact-version verification) ahead of the deterministic reconstruction
+# fallback. The zero-diff assertion below is stale for that one file unless
+# it allowlists exactly this probe; any other drift must still fail. Each
+# entry is a full added line without the leading "+" as produced by
+# `git diff` (multiset: APPROVED_179_OPENCODE_PROBE_LINES lists one install
+# site, 19 lines; both sites carry it, 38 added lines total).
 # The GITHUB_PATH export on the warm hit is required: the cold fallback does
 # `echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"`, so a warm hit that exits
 # without it would leave later steps without opencode on PATH and prove no
-# useful work. `grep -F` is required for the task's "exact version" probe:
-# without -F the dots in "1.18.34" are regex wildcards. Both install sites
-# carry the same 13-line probe (26 added lines total).
-APPROVED_179_OPENCODE_PROBE_LINES = frozenset([
+# useful work. `grep -E` with `(^|[^0-9.])...([^0-9.]|$)` is required for
+# the task's "exact version" probe: plain `grep -F "1.18.34"` false-hits on
+# "1.18.340", and `grep "1.18.34"` treats dots as regex wildcards. The
+# CONTINUUM_IMAGE_DIGEST guard rejects a malformed digest when set, and the
+# post-install `opencode --version | grep -E` line fails the step when
+# deterministic reconstruction did not produce the pinned runtime.
+APPROVED_179_OPENCODE_PROBE_LINES = (
     "          # Continuum #179 prepared agent runtime: the immutable golden image",
     "          # (or its provider-native cache equivalent keyed by the image digest",
     "          # in CONTINUUM_IMAGE_DIGEST) already carries pinned OpenCode 1.18.34,",
@@ -59,12 +65,18 @@ APPROVED_179_OPENCODE_PROBE_LINES = frozenset([
     "          # only a validated cache miss falls through to deterministic",
     "          # reconstruction below.",
     '          export PATH="$HOME/.opencode/bin:$PATH"',
-    '          if command -v opencode >/dev/null 2>&1 && opencode --version 2>/dev/null | grep -F -q "1.18.34"; then',
+    '          if [[ -n "${CONTINUUM_IMAGE_DIGEST:-}" ]] && ! [[ "$CONTINUUM_IMAGE_DIGEST" =~ ^[0-9a-f]{64}$ ]]; then',
+    '            echo "::error::CONTINUUM_IMAGE_DIGEST must be a 64-char sha256 hex digest when set."',
+    "            exit 1",
+    "          fi",
+    '          if command -v opencode >/dev/null 2>&1 && opencode --version 2>&1 | grep -E -q "(^|[^0-9.])1\\.18\\.34([^0-9.]|$)"; then',
     '            echo "prepared-runtime hit: opencode 1.18.34 already present (image digest ${CONTINUUM_IMAGE_DIGEST:-unresolved})."',
     '            echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"',
     "            exit 0",
     "          fi",
-])
+    '              export PATH="$HOME/.opencode/bin:$PATH"',
+    '              opencode --version 2>&1 | grep -E -q "(^|[^0-9.])1\\.18\\.34([^0-9.]|$)" || exit 1',
+)
 
 PR_AGENT_WORKFLOWS = [
     ".github/workflows/continuum-pr-agent.yml",
@@ -201,8 +213,11 @@ class ProtectedBaselineTests(unittest.TestCase):
                     # probe in this file. Accept only pure additions drawn
                     # exactly from APPROVED_179_OPENCODE_PROBE_LINES; any
                     # deletion, modification, or unapproved addition still
-                    # fails. Both install sites carry the same 13-line probe
-                    # (26 added lines total), each ahead of its installer.
+                    # fails. Both install sites carry the same 19-line probe
+                    # (38 added lines total), each ahead of its installer.
+                    # Multiset comparison: the digest guard and the probe
+                    # each close with `fi`, so duplicates are expected.
+                    from collections import Counter as _Counter
                     added = []
                     deleted = []
                     for line in out.stdout.splitlines():
@@ -218,17 +233,11 @@ class ProtectedBaselineTests(unittest.TestCase):
                         f"{path} must not delete or modify baseline lines",
                     )
                     self.assertEqual(
-                        len(added),
-                        2 * len(APPROVED_179_OPENCODE_PROBE_LINES),
+                        _Counter(added),
+                        _Counter({line: 2 * count for line, count in _Counter(APPROVED_179_OPENCODE_PROBE_LINES).items()}),
                         f"{path} may only add the approved #179 probe "
                         f"(got {len(added)} added lines)",
                     )
-                    for line in added:
-                        self.assertIn(
-                            line,
-                            APPROVED_179_OPENCODE_PROBE_LINES,
-                            f"{path} contains an unapproved change: {line!r}",
-                        )
                     # The probe must actually satisfy the #179 warm-path
                     # contract on the current worktree content.
                     body = read_repo(path)

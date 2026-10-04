@@ -168,7 +168,11 @@ jobs:
           # only a validated cache miss falls through to deterministic
           # reconstruction below.
           export PATH="$HOME/.opencode/bin:$PATH"
-          if command -v opencode >/dev/null 2>&1 && opencode --version 2>/dev/null | grep -F -q "1.18.34"; then
+          if [[ -n "${CONTINUUM_IMAGE_DIGEST:-}" ]] && ! [[ "$CONTINUUM_IMAGE_DIGEST" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::CONTINUUM_IMAGE_DIGEST must be a 64-char sha256 hex digest when set."
+            exit 1
+          fi
+          if command -v opencode >/dev/null 2>&1 && opencode --version 2>&1 | grep -E -q "(^|[^0-9.])1\.18\.34([^0-9.]|$)"; then
             echo "prepared-runtime hit: opencode 1.18.34 already present (image digest ${CONTINUUM_IMAGE_DIGEST:-unresolved})."
             echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
           else
@@ -186,6 +190,7 @@ jobs:
           export PATH="$HOME/.opencode/bin:$PATH"
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
           command -v opencode >/dev/null 2>&1
+          opencode --version 2>&1 | grep -E -q "(^|[^0-9.])1\.18\.34([^0-9.]|$)"
 
           python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/opencode_instructions.py" install             --source "$CONTINUUM_ENGINE_ROOT/.github/agents/AGENTS.md"
 

@@ -187,12 +187,18 @@ jobs:
           # only a validated cache miss falls through to deterministic
           # reconstruction below.
           export PATH="$HOME/.opencode/bin:$PATH"
-          if command -v opencode >/dev/null 2>&1 && opencode --version 2>/dev/null | grep -F -q "1.18.34"; then
+          if [[ -n "${CONTINUUM_IMAGE_DIGEST:-}" ]] && ! [[ "$CONTINUUM_IMAGE_DIGEST" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::CONTINUUM_IMAGE_DIGEST must be a 64-char sha256 hex digest when set."
+            exit 1
+          fi
+          if command -v opencode >/dev/null 2>&1 && opencode --version 2>&1 | grep -E -q "(^|[^0-9.])1\.18\.34([^0-9.]|$)"; then
             echo "prepared-runtime hit: opencode 1.18.34 already present (image digest ${CONTINUUM_IMAGE_DIGEST:-unresolved})."
             echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
             exit 0
           fi
           curl -fsSL --retry 3 --retry-delay 2 https://opencode.ai/install | bash -s -- --version 1.18.34
+          export PATH="$HOME/.opencode/bin:$PATH"
+          opencode --version 2>&1 | grep -E -q "(^|[^0-9.])1\.18\.34([^0-9.]|$)" || exit 1
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
 
       - name: Fix all unresolved findings in one OpenCode run
