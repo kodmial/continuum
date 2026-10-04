@@ -280,26 +280,11 @@ jobs:
             if (reviewState === 'changes_requested' && findings.length === 0) {
               const marker =
                 `<!-- continuum-coderabbit-no-progress head=${expectedHead} review=${reviewId} kind=non-code -->`;
-              // Bounded idempotency check (#254): five newest pages instead
-              // of full history; issues.listComments is always
-              // oldest-first (it ignores sort/direction), so resolve the
-              // tail window from the issue comment count. A missed marker
-              // only duplicates a visible notice comment, never a repair
-              // dispatch.
+              // Bounded idempotency check (#254): five pages instead of
+              // full history; a missed marker only duplicates a visible
+              // notice comment, never a repair dispatch.
               const issueComments = [];
-              let commentTotal = 0;
-              try {
-                const { data: issueMeta } = await github.rest.issues.get({
-                  owner,
-                  repo,
-                  issue_number: pullNumber,
-                });
-                commentTotal = Number(issueMeta?.comments || 0);
-              } catch { commentTotal = 0; }
-              if (!Number.isFinite(commentTotal) || commentTotal < 0) commentTotal = 0;
-              const lastCommentPage = Math.max(1, Math.ceil(commentTotal / 100) || 1);
-              const firstCommentPage = Math.max(1, lastCommentPage - 4);
-              for (let page = firstCommentPage; page <= lastCommentPage; page += 1) {
+              for (let page = 1; page <= 5; page += 1) {
                 const { data } = await github.rest.issues.listComments({
                   owner,
                   repo,
