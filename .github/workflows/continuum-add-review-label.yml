@@ -32,19 +32,69 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+      - name: Mark PR ready and wake controllers
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           CONTINUUM_VERSION_FILE: ${{ vars.CONTINUUM_VERSION_FILE || '' }}
           CONTINUUM_RELEASE_MANIFEST_FILES: ${{ vars.CONTINUUM_RELEASE_MANIFEST_FILES || '[]' }}
           REVIEW_PROVIDER: ${{ inputs.review_provider || vars.CONTINUUM_REVIEW_PROVIDER || 'none' }}
+          TAP_PAT: ${{ secrets.TAP_PAT }}
         with:
-          github-token: ${{ secrets.TAP_PAT }}
+          # kodmial/continuum#259: same-repository label mutations use the
+          # repository-scoped GITHUB_TOKEN (github-actions[bot] actor). The two
+          # workflow dispatches below intentionally stay PAT-backed via a
+          # dedicated PAT client so downstream event chaining is preserved.
+          github-token: ${{ github.token }}
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const repoFullName = `${owner}/${repo}`;
             const run = context.payload.workflow_run;
             const REQUESTED_LABEL = 'coderabbit-review-requested';
+            // PAT client for workflow dispatches only. Label/comment/state
+            // mutations above use the default GITHUB_TOKEN client (`github`)
+            // so GitHub attributes them to github-actions[bot]; dispatches
+            // must fan out into downstream runs and therefore keep PAT actor
+            // semantics. Reuses the github-script Octokit composition so
+            // `rest`/`paginate` plugins stay available.
+            const patToken = String(process.env.TAP_PAT || '').trim();
+            // github-script supplies the plugin-composed Octokit class, so
+            // reusing its constructor keeps the `paginate`/`rest` plugins
+            // (dynamically requiring `@actions/github` is not resolvable from
+            // the script sandbox). Preserve the enterprise base URL and
+            // confirm the composition at runtime so a future
+            // actions/github-script upgrade that returns a bare core fails
+            // here instead of mid-dispatch with
+            // `patClient(...).paginate is not a function`.
+            const patBaseUrl = (
+              (github && github.request && github.request.endpoint &&
+                github.request.endpoint.DEFAULTS && github.request.endpoint.DEFAULTS.baseUrl) ||
+              process.env.GITHUB_API_URL || 'https://api.github.com'
+            );
+            let cachedPatClient = null;
+            function patClient() {
+              if (cachedPatClient) return cachedPatClient;
+              if (!patToken) {
+                throw new Error(
+                  'TAP_PAT is required for workflow dispatches; refusing to dispatch without it.'
+                );
+              }
+              const client = new github.constructor({
+                auth: patToken,
+                baseUrl: patBaseUrl,
+              });
+              if (
+                typeof client.paginate !== 'function' ||
+                typeof client.rest?.actions?.createWorkflowDispatch !== 'function'
+              ) {
+                throw new Error(
+                  'patClient lacks the paginate/rest plugins; ' +
+                  'cannot dispatch downstream workflows.'
+                );
+              }
+              cachedPatClient = client;
+              return cachedPatClient;
+            }
             // CodeRabbit is an OPTIONAL integration. With the flag off this
             // workflow must stay a pure CI wake-up for the auto-merge
             // reconciler: no CodeRabbit lock label, no `review-ready` label,
@@ -251,6 +301,13 @@ jobs:
             // optional integration off they must not be written at all. The
             // auto-merge wake-up stays outside this gate: it is CI-driven and
             // belongs to the repository whether or not CodeRabbit exists.
+            // Fail fast before any label mutation when a dispatch is certain:
+            // with a green run and matched PRs the auto-merge wake-up below
+            // always dispatches, so a missing TAP_PAT or a broken PAT-client
+            // composition must throw here rather than after partial writes.
+            if (ours.length > 0) {
+              patClient();
+            }
             if (requireCodeRabbit) {
               // A visible lock label makes the request idempotent across workflow
               // reruns for the same head. It is removed on every PR synchronize.
@@ -326,7 +383,7 @@ jobs:
               // `continuum-coderabbit-retry.yml` would answer the dispatch with
               // a 404.
               if (requireCodeRabbit && queuedForCodeRabbit) {
-                await github.rest.actions.createWorkflowDispatch({
+                await patClient().rest.actions.createWorkflowDispatch({
                   owner,
                   repo,
                   workflow_id: 'continuum-coderabbit-retry.yml',
@@ -344,7 +401,7 @@ jobs:
             // concurrency group and full pre-write revalidation, so duplicate
             // wake-ups from status/review/push/cron remain harmless.
             if (ours.length > 0) {
-              await github.rest.actions.createWorkflowDispatch({
+              await patClient().rest.actions.createWorkflowDispatch({
                 owner,
                 repo,
                 workflow_id: 'continuum-auto-merge.yml',

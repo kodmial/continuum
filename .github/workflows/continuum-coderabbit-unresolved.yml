@@ -50,7 +50,10 @@ jobs:
         id: context
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         with:
-          github-token: ${{ secrets.TAP_PAT }}
+          # kodmial/continuum#259: read-only collection uses GITHUB_TOKEN so
+          # the run is attributed to github-actions[bot] and never spends
+          # TAP_PAT budget. Checkout/push below intentionally stay PAT-backed.
+          github-token: ${{ github.token }}
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
@@ -316,7 +319,11 @@ jobs:
           PR_NUMBER: ${{ steps.context.outputs.pr_number }}
           VERIFY_ITEMS_JSON: ${{ steps.fix.outputs.verify_items_json }}
         with:
-          github-token: ${{ secrets.TAP_PAT }}
+          # kodmial/continuum#259: verification replies address CodeRabbit
+          # (external app) and never need to trigger a GitHub workflow, so
+          # they use GITHUB_TOKEN (github-actions[bot] actor). The fix push
+          # above intentionally stays PAT-backed so CI still fans out.
+          github-token: ${{ github.token }}
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;

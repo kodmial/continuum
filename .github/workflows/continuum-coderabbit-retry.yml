@@ -67,7 +67,13 @@ jobs:
           REQUIRED_WORKFLOW_GATE_LABEL: ${{ vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_LABEL || '' }}
           REQUIRED_WORKFLOW_GATE_NAME: ${{ vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_NAME || '' }}
         with:
-          github-token: ${{ secrets.TAP_PAT }}
+          # kodmial/continuum#259: same-repository queue mutations (labels and
+          # the @coderabbitai command comment) use the repository-scoped
+          # GITHUB_TOKEN so GitHub attributes them to github-actions[bot].
+          # CodeRabbit is notified as an external app regardless of actor, and
+          # no GitHub workflow is triggered by these writes (wake-ups arrive
+          # via CodeRabbit events, schedule, and workflow_dispatch).
+          github-token: ${{ github.token }}
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
