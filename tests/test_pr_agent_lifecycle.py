@@ -867,7 +867,8 @@ class IsolationTests(unittest.TestCase):
         for body in (engine, caller, self_caller):
             self.assertIn("contents: write", body)
             self.assertIn("pull-requests: write", body)
-        self.assertIn("statuses: read", engine)
+        self.assertIn("statuses: write", engine)
+        self.assertIn("actions: write", engine)
 
     def test_improve_uses_env_for_push_outputs_not_forbidden_cli_args(self):
         body = read_repo(".github/workflows/continuum-pr-agent.yml")
