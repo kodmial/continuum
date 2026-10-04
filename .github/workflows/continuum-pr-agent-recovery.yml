@@ -187,6 +187,12 @@ jobs:
                 .filter(comment => String(comment.body || '').includes(CONTROLLER_STATE_MARKER))
                 .sort((a, b) => Number(a.id) - Number(b.id));
               const latest = controller.at(-1);
+              // Presentation-only liveness touch. The durable retry identity
+              // is the stateMarker line alone (parseEvidence matches only
+              // continuum-pr-agent-retry markers). This summary line only
+              // forces a body change so GitHub advances updated_at on every
+              // committed dispatch; it is never parsed as retry state and its
+              // literal prefix cannot match the retry/exhausted regexes.
               const body = controllerStateBody(
                 stateMarker,
                 summary + '\n\nController dispatch run: ' + String(context.runId)

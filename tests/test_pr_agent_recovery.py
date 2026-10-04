@@ -352,6 +352,100 @@ class RecoveryWiringTests(unittest.TestCase):
             body.index("Controller dispatch run:"),
             body.index("github.rest.actions.createWorkflowDispatch"),
         )
+        # The touch is presentation-only: durable retry identity is the
+        # stateMarker line alone, and the touch prefix cannot match the
+        # retry/exhausted marker regexes.
+        self.assertIn("durable retry identity", body)
+        self.assertIn("is the stateMarker line alone", body)
+        self.assertIn("continuum-pr-agent-retry markers", body)
+
+    def test_controller_touch_body_differs_per_run_but_keeps_retry_identity(self):
+        def controller_state_body(state_marker: str, summary: str) -> str:
+            return "\n".join(
+                [
+                    "<!-- continuum-pr-agent-controller-state:v1 -->",
+                    state_marker.strip(),
+                    "<details>",
+                    "<summary>Continuum PR-Agent controller state</summary>",
+                    "",
+                    summary.strip(),
+                    "",
+                    "</details>",
+                ]
+            )
+
+        marker = f"<!-- continuum-pr-agent-retry head={HEAD} kind=review attempt=1 -->"
+        base_summary = "Automatic PR-Agent review recovery for exact HEAD."
+        body_run_a = controller_state_body(
+            marker, base_summary + "\n\nController dispatch run: 111"
+        )
+        body_run_b = controller_state_body(
+            marker, base_summary + "\n\nController dispatch run: 222"
+        )
+        # Different runs produce different bodies, so GitHub advances
+        # updated_at on every committed dispatch instead of treating the
+        # marker as older than it really is.
+        self.assertNotEqual(body_run_a, body_run_b)
+        # Durable retry identity (the stateMarker line) is unchanged.
+        self.assertIn(marker, body_run_a)
+        self.assertIn(marker, body_run_b)
+        self.assertEqual(
+            body_run_a.splitlines()[1],
+            body_run_b.splitlines()[1],
+        )
+
+    def test_controller_touch_line_never_consumes_retry_budget(self):
+        marker = f"<!-- continuum-pr-agent-retry head={HEAD} kind=review attempt=1 -->"
+        touched = (
+            "<!-- continuum-pr-agent-controller-state:v1 -->\n"
+            f"{marker}\n"
+            "<details>\n"
+            "<summary>Continuum PR-Agent controller state</summary>\n"
+            "\n"
+            "Automatic recovery.\n"
+            "\n"
+            "Controller dispatch run: 999\n"
+            "\n"
+            "</details>"
+        )
+        plain = (
+            "<!-- continuum-pr-agent-controller-state:v1 -->\n"
+            f"{marker}\n"
+            "<details>\n"
+            "<summary>Continuum PR-Agent controller state</summary>\n"
+            "\n"
+            "Automatic recovery.\n"
+            "\n"
+            "</details>"
+        )
+        touched_evidence = recovery.retry_evidence(
+            [comment(touched)], head_sha=HEAD, kind="review"
+        )
+        plain_evidence = recovery.retry_evidence(
+            [comment(plain)], head_sha=HEAD, kind="review"
+        )
+        self.assertEqual(touched_evidence.latest_attempt, 1)
+        self.assertEqual(
+            touched_evidence.latest_attempt, plain_evidence.latest_attempt
+        )
+        self.assertFalse(touched_evidence.exhausted)
+        # The touch prefix itself carries no retry marker.
+        self.assertNotRegex(
+            "Controller dispatch run: 999",
+            r"continuum-pr-agent-retry",
+        )
+
+    def test_controller_state_stays_in_one_comment_with_rollback(self):
+        body = self.read(".github/workflows/continuum-pr-agent-recovery.yml")
+        # Single-comment coalescing: update the latest controller comment,
+        # delete every older one, and roll back on dispatch failure.
+        self.assertIn("github.rest.issues.updateComment", body)
+        self.assertIn("github.rest.issues.createComment", body)
+        self.assertIn("controller.slice(0, -1)", body)
+        self.assertIn("rollbackControllerState", body)
+        self.assertIn("previousBody", body)
+        # Grace/coalescing reads the bumped timestamp.
+        self.assertIn("comment.updated_at || comment.created_at", body)
 
     def test_recovered_review_uses_ci_workflow_not_combined_status(self):
         review = self.read(".github/workflows/continuum-pr-agent.yml")
@@ -405,6 +499,52 @@ class RecoveryWiringTests(unittest.TestCase):
             "it still belongs to the durable repair",
             recovery_workflow,
         )
+
+
+class CodeRabbitDeadlockWiringTests(unittest.TestCase):
+    """Lock the issue-37 P0 merge-gate deadlock semantics in place.
+
+    The controller-touch follow-up above must never regress or silently
+    substitute for these CodeRabbit adapter guarantees: exact-head
+    APPROVED identity, Review-skipped tolerance, nitpick supersession,
+    RESOLVED/UNRESOLVED normalization with fail-closed behavior, and
+    quota serialization.
+    """
+
+    def read(self, path: str) -> str:
+        with open(os.path.join(ROOT, path), "r", encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_exact_head_approved_identity(self):
+        gate = self.read(".github/workflows/continuum-auto-merge.yml")
+        self.assertIn("review.commit_id === headSha", gate)
+        self.assertIn("decision.state !== 'APPROVED'", gate)
+        self.assertIn("CHANGES_REQUESTED", gate)
+        self.assertIn("relative timestamps do not add safety", gate)
+        self.assertIn("sha: pr.head.sha", gate)
+
+    def test_review_skipped_does_not_erase_durable_approval(self):
+        gate = self.read(".github/workflows/continuum-auto-merge.yml")
+        self.assertIn("Review skipped", gate)
+        self.assertIn("Review completed", gate)
+
+    def test_nitpick_supersession(self):
+        gate = self.read(".github/workflows/continuum-auto-merge.yml")
+        self.assertIn("supersedes earlier advisory", gate)
+        self.assertIn("codeRabbitNitpickReviews", gate)
+        self.assertIn("> decisionAt", gate)
+
+    def test_thread_normalization_is_fail_closed(self):
+        gate = self.read(".github/workflows/continuum-auto-merge.yml")
+        self.assertIn("resolveReviewThread", gate)
+        self.assertIn("UNRESOLVED always wins", gate)
+        self.assertIn("unresolved.push", gate)
+        self.assertIn("unresolvedCodeRabbitThreads", gate)
+
+    def test_verification_requests_are_serialized_and_deduplicated(self):
+        gate = self.read(".github/workflows/continuum-auto-merge.yml")
+        self.assertIn("auto-merge-coderabbit-verification", gate)
+        self.assertIn("if (duplicate) continue", gate)
 
 
 if __name__ == "__main__":
