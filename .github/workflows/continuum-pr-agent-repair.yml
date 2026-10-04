@@ -1000,6 +1000,7 @@ jobs:
           RETRY_ATTEMPT: ${{ inputs.retry_attempt || '0' }}
           RETRY_WORKFLOW: ${{ inputs.retry_workflow || 'continuum-pr-agent.yml' }}
           TARGET_CHILD_ID: ${{ inputs.target_child_id }}
+          CONTINUUM_REF_INPUT: ${{ inputs.continuum_ref }}
           CI_WORKFLOW_NAME: ${{ vars.CONTINUUM_CI_WORKFLOW_NAME || 'CI' }}
         run: |
           set -euo pipefail
@@ -1087,11 +1088,12 @@ jobs:
           # (mirrors the merge-wakeup 422 detection).
           dispatch_isolated_retry() {
             local dispatch_output dispatch_status
-            if dispatch_output="$(gh workflow run "$RETRY_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" "$@" 2>&1)"; then
+            dispatch_output="$(gh workflow run "$RETRY_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" "$@" 2>&1)"
+            dispatch_status=$?
+            if (( dispatch_status == 0 )); then
               printf '%s\n' "$dispatch_output"
               return 0
             fi
-            dispatch_status=$?
             printf '%s\n' "$dispatch_output" >&2
             if [[ -n "${TARGET_CHILD_ID:-}" ]] && [[ "$dispatch_output" == *"422"* ]] && [[ "${dispatch_output,,}" == *"target_child_id"* ]]; then
               echo "::error::Delegated retry requires retry workflow $RETRY_WORKFLOW to declare a target_child_id workflow_dispatch input; refusing bare retry to preserve the delegated target."
@@ -1099,8 +1101,10 @@ jobs:
             fi
             return "$dispatch_status"
           }
+          CONTINUUM_REF_INPUT="${CONTINUUM_REF_INPUT:-}"
           if [[ -n "${TARGET_CHILD_ID:-}" ]]; then
-            dispatch_isolated_retry -f pr_number="$PR_NUMBER" -f expected_head_sha="$HEAD_SHA" -f retry_attempt="$next" -f retry_workflow="$RETRY_WORKFLOW" -f recovery_kind="repair" -f target_child_id="$TARGET_CHILD_ID"
+            : "${CONTINUUM_REF_INPUT:?CONTINUUM_REF is required for delegated retry}"
+            dispatch_isolated_retry -f pr_number="$PR_NUMBER" -f expected_head_sha="$HEAD_SHA" -f retry_attempt="$next" -f retry_workflow="$RETRY_WORKFLOW" -f recovery_kind="repair" -f target_child_id="$TARGET_CHILD_ID" -f continuum_ref="$CONTINUUM_REF_INPUT"
           else
             dispatch_isolated_retry -f pr_number="$PR_NUMBER" -f expected_head_sha="$HEAD_SHA" -f retry_attempt="$next" -f retry_workflow="$RETRY_WORKFLOW" -f recovery_kind="repair"
           fi

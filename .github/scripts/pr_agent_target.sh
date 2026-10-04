@@ -14,7 +14,9 @@ fi
 # Strict repository identity: the charset class alone still accepts
 # dot-only components (`owner/..`, `owner/.`) which are never valid GitHub
 # identities and would otherwise flow into `gh`, `git remote`, and checkout
-# steps. Reject dot-only components plus leading/trailing dots fail-closed.
+# steps. Reject dot-only components plus leading/trailing dots fail-closed,
+# except the reserved `.github` repository name which legitimately starts
+# with a dot.
 pr_agent_valid_target_repository() {
   local candidate="${1:-}"
   [[ "$candidate" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 1
@@ -23,7 +25,9 @@ pr_agent_valid_target_repository() {
   [[ "$candidate_owner" =~ ^\.+$ ]] && return 1
   [[ "$candidate_name" =~ ^\.+$ ]] && return 1
   [[ "$candidate_owner" == .* || "$candidate_owner" == *. ]] && return 1
-  [[ "$candidate_name" == .* || "$candidate_name" == *. ]] && return 1
+  if [[ "$candidate_name" != ".github" ]]; then
+    [[ "$candidate_name" == .* || "$candidate_name" == *. ]] && return 1
+  fi
   return 0
 }
 target_repository="$GITHUB_REPOSITORY"
