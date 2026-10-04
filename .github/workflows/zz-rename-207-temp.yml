@@ -1,0 +1,21 @@
+name: Temporary rename PR207 branch
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/zz-rename-207-temp.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  rename:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Rename branch for PR 207
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api             -X POST             "repos/$GITHUB_REPOSITORY/branches/work-lock%2F39-pr-agent-convergence/rename"             -f new_name='opencode/work-lock-39-pr-agent-convergence'
