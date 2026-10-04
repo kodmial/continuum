@@ -551,6 +551,10 @@ class NoCustomProtocolTests(unittest.TestCase):
         self.assertIn("enable_large_pr_chunking = true", toml)
         body = read_repo(".github/workflows/continuum-pr-agent.yml")
         self.assertIn("PR_REVIEWER__ENABLE_LARGE_PR_CHUNKING", body)
+        self.assertIn("PR_REVIEWER__EXTRA_INSTRUCTIONS", body)
+        self.assertIn("Never infer that implementation, tests,", body)
+        self.assertIn("absent from the current review chunk", body)
+        self.assertIn("Large-PR reviews may be chunked:", toml)
 
     def test_no_custom_approval_or_severity_semantics(self):
         source = lifecycle_source()
