@@ -394,6 +394,19 @@ class DurableEvidenceTests(unittest.TestCase):
         self.assertIsNone(evidence.not_before_epoch)
         self.assertIsNone(evidence.latest_attempt)
 
+    def test_legacy_marker_with_stray_not_before_carries_no_wait(self):
+        # Legacy Work Lock #38 markers predate durable not-before: a stray
+        # ``not-before=`` next to one must not become a durable wait.
+        comments = [
+            comment(
+                f"<!-- continuum-pr-agent-retry head={HEAD} kind=review attempt=1 -->"
+                " not-before=2000"
+            )
+        ]
+        evidence = lifecycle.retry_evidence(comments, head_sha=HEAD, kind="review")
+        self.assertEqual(evidence.latest_attempt, 1)
+        self.assertIsNone(evidence.not_before_epoch)
+
     def test_not_before_is_durable_across_runs(self):
         marker = lifecycle.retry_marker(HEAD, "review", 1, not_before_epoch=2000)
         evidence = lifecycle.retry_evidence(

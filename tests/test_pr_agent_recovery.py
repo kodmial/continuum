@@ -111,6 +111,49 @@ class DurableEvidenceTests(unittest.TestCase):
         self.assertEqual(review.latest_attempt, 2)
         self.assertEqual(repair.latest_attempt, 1)
 
+    def test_canonical_lifecycle_markers_share_the_same_budget(self):
+        from continuum import lifecycle_recovery as lifecycle
+
+        marker = lifecycle.retry_marker(HEAD, "review", 3, not_before_epoch=2000)
+        evidence = recovery.retry_evidence(
+            [comment(marker)], head_sha=HEAD, kind="review"
+        )
+        self.assertEqual(evidence.latest_attempt, 3)
+        self.assertEqual(evidence.not_before_epoch, 2000)
+        # Canonical exhausted markers are honored as well.
+        exhausted = recovery.retry_evidence(
+            [comment(lifecycle.exhausted_marker(HEAD, "review", attempts=10))],
+            head_sha=HEAD,
+            kind="review",
+        )
+        self.assertTrue(exhausted.exhausted)
+
+    def test_stray_not_before_outside_any_marker_is_ignored(self):
+        evidence = recovery.retry_evidence(
+            [comment("hello not-before=2000")], head_sha=HEAD, kind="review"
+        )
+        self.assertIsNone(evidence.not_before_epoch)
+        self.assertIsNone(evidence.latest_attempt)
+
+    def test_durable_not_before_waits_for_the_safety_net(self):
+        evidence = recovery.RetryEvidence(latest_attempt=1, not_before_epoch=2000)
+        early = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="transient; recovery eligible",
+            evidence=evidence,
+            now_epoch=1000,
+        )
+        self.assertEqual(early.action, "wait")
+        late = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="failure",
+            operation_description="transient; recovery eligible",
+            evidence=evidence,
+            now_epoch=3000,
+        )
+        self.assertEqual(late.action, "dispatch")
+
 
 class RecoveryDecisionTests(unittest.TestCase):
     def test_lost_ci_wakeup_dispatches_initial_exact_head_review(self):

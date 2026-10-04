@@ -3120,7 +3120,7 @@ class ContinuumTest < Minitest::Test
       head_ref_pattern auto_merge_workflow opencode_workflow
     ],
     'continuum-opencode-unresolved.yml' => %w[continuum_ref],
-    'continuum-pr-agent-recovery.yml' => %w[continuum_ref],
+    'continuum-pr-agent-recovery.yml' => %w[continuum_ref max_executions],
     'continuum-pr-agent-canary.yml' => %w[
       continuum_ref canary_enabled base_ref opencode_model model max_tokens
       api_base bridge_port server_port pr_agent_version
@@ -3996,7 +3996,31 @@ class ContinuumTest < Minitest::Test
     refute_nil sync_guard
     refute_nil generic_ci
     assert_operator sync_guard, :<, generic_ci,
-                    'PR-Agent sync-only mode must exit before generic review/merge gates'
+                     'PR-Agent sync-only mode must exit before generic review/merge gates'
+  end
+
+  # The transient budget is 10 total executions per exact PR/HEAD/operation by
+  # default (#224), configurable through a safe bounded Continuum variable. A
+  # misconfigured value can neither silence recovery nor grant an unbounded
+  # budget: the workflow clamps to 1..10.
+  def test_pr_agent_recovery_budget_is_ten_executions_and_variable_driven
+    inputs = events(yaml(File.join(ROOT, '.github/workflows/continuum-pr-agent-recovery.yml')))
+             .fetch('workflow_call').fetch('inputs')
+    knob = inputs.fetch('max_executions')
+    assert_equal '', knob.fetch('default'),
+                 "max_executions must default to empty so vars.PR_AGENT_RECOVERY_MAX_EXECUTIONS decides"
+    assert_equal 'string', knob.fetch('type')
+    assert_equal false, knob.fetch('required')
+
+    body = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent-recovery.yml'))
+    assert_includes body, "MAX_EXECUTIONS: ${{ inputs.max_executions || vars.PR_AGENT_RECOVERY_MAX_EXECUTIONS || '10' }}"
+    assert_includes body, 'const MAX_TRANSIENT_EXECUTIONS = 10;'
+    assert_includes body, 'Math.max(MIN_TRANSIENT_EXECUTIONS, parsed)'
+
+    stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-pr-agent-recovery.yml'))
+    with = stub.fetch('jobs').fetch('call').fetch('with')
+    assert_match(/\A\$\{\{ inputs\.max_executions/, with.fetch('max_executions').to_s,
+                 'the stub must pass max_executions through instead of pinning a literal')
   end
 
   # Both branches of the flag, checked in the body that acts on them. Asserting

@@ -55,8 +55,26 @@ _RETRY_RE = re.compile(
     r"kind=(review|repair)\s+"
     r"attempt=(\d+)\s*-->"
 )
+# Canonical lifecycle markers (#224) carry the same review/repair budget with
+# an optional durable ``not-before=<epoch>`` inside the marker. They are read
+# here so the two helpers share one compatible recovery contract; new writes
+# use the lifecycle prefix.
+_LIFECYCLE_RETRY_RE = re.compile(
+    r"<!--\s*continuum-lifecycle-retry\s+"
+    r"head=([0-9a-fA-F]{7,64})\s+"
+    r"kind=(review|repair)\s+"
+    r"attempt=(\d+)"
+    r"(?:\s+not-before=(\d+))?"
+    r"[^>]*-->"
+)
 _EXHAUSTED_RE = re.compile(
     r"<!--\s*continuum-pr-agent-retry-exhausted\s+"
+    r"head=([0-9a-fA-F]{7,64})\s+"
+    r"kind=(review|repair)\s+"
+    r"attempts=(\d+)\s*-->"
+)
+_LIFECYCLE_EXHAUSTED_RE = re.compile(
+    r"<!--\s*continuum-lifecycle-retry-exhausted\s+"
     r"head=([0-9a-fA-F]{7,64})\s+"
     r"kind=(review|repair)\s+"
     r"attempts=(\d+)\s*-->"
@@ -74,6 +92,7 @@ class RetryEvidence:
     latest_attempt: Optional[int] = None
     latest_marker_at: Optional[datetime] = None
     exhausted: bool = False
+    not_before_epoch: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -141,7 +160,29 @@ def retry_evidence(
     budget = _resolve_budget(max_executions)
     latest_attempt: Optional[int] = None
     latest_marker_at: Optional[datetime] = None
+    not_before: Optional[int] = None
     exhausted = False
+
+    def consider(
+        marker_head: str,
+        marker_kind: str,
+        attempt_text: str,
+        marker_not_before: Optional[int],
+        created_at: Optional[datetime],
+    ) -> None:
+        nonlocal latest_attempt, latest_marker_at, not_before
+        if marker_head.lower() != head or marker_kind != normalized_kind:
+            return
+        attempt = int(attempt_text)
+        if latest_attempt is None or attempt > latest_attempt:
+            latest_attempt = attempt
+            latest_marker_at = created_at
+            not_before = marker_not_before
+        elif attempt == latest_attempt and created_at is not None:
+            if latest_marker_at is None or created_at > latest_marker_at:
+                latest_marker_at = created_at
+                if marker_not_before is not None:
+                    not_before = marker_not_before
 
     for comment in comments:
         association = str(comment.get("author_association") or "").upper()
@@ -150,18 +191,22 @@ def retry_evidence(
         body = str(comment.get("body") or "")
         created_at = _parse_time(comment.get("updated_at") or comment.get("created_at"))
 
+        for match in _LIFECYCLE_RETRY_RE.finditer(body):
+            marker_head, marker_kind, attempt_text, not_before_text = match.groups()
+            marker_not_before = int(not_before_text) if not_before_text else None
+            consider(marker_head, marker_kind, attempt_text, marker_not_before, created_at)
         for match in _RETRY_RE.finditer(body):
             marker_head, marker_kind, attempt_text = match.groups()
+            # Legacy markers predate durable not-before and carry none; a
+            # stray ``not-before=`` outside any canonical marker is ignored.
+            consider(marker_head, marker_kind, attempt_text, None, created_at)
+
+        for match in _LIFECYCLE_EXHAUSTED_RE.finditer(body):
+            marker_head, marker_kind, attempts_text = match.groups()
             if marker_head.lower() != head or marker_kind != normalized_kind:
                 continue
-            attempt = int(attempt_text)
-            if latest_attempt is None or attempt > latest_attempt:
-                latest_attempt = attempt
-                latest_marker_at = created_at
-            elif attempt == latest_attempt and created_at is not None:
-                if latest_marker_at is None or created_at > latest_marker_at:
-                    latest_marker_at = created_at
-
+            if int(attempts_text) >= budget:
+                exhausted = True
         for match in _EXHAUSTED_RE.finditer(body):
             marker_head, marker_kind, attempts_text = match.groups()
             if marker_head.lower() != head or marker_kind != normalized_kind:
@@ -173,6 +218,7 @@ def retry_evidence(
         latest_attempt=latest_attempt,
         latest_marker_at=latest_marker_at,
         exhausted=exhausted,
+        not_before_epoch=not_before,
     )
 
 
@@ -235,12 +281,15 @@ def decide_recovery(
     stale_after_seconds: int = STALE_AFTER_SECONDS,
     dispatch_grace_seconds: int = DISPATCH_GRACE_SECONDS,
     max_executions: int = MAX_EXECUTIONS,
+    now_epoch: Optional[int] = None,
 ) -> RecoveryDecision:
     """Reconcile one review/repair operation from latest authoritative state.
 
     The budget defaults to the single lifecycle contract (10 total transient
     executions, safe-bounded).  Deterministic failures never consume it; a
-    success or a new HEAD resets the episode.
+    success or a new HEAD resets the episode.  A durable reset-aware
+    not-before (canonical marker, redispatch via the scheduled safety net)
+    waits instead of dispatching early.
     """
 
     if not ci_green:
@@ -249,6 +298,14 @@ def decide_recovery(
         return RecoveryDecision("hold", None, "retry budget already exhausted")
     if active_exact_run:
         return RecoveryDecision("wait", None, "exact operation already active")
+    if (
+        evidence.not_before_epoch is not None
+        and now_epoch is not None
+        and int(now_epoch) < int(evidence.not_before_epoch)
+    ):
+        return RecoveryDecision(
+            "wait", None, "durable reset-aware not-before time has not arrived"
+        )
 
     state = str(operation_state or "").strip().lower() or None
     conclusion = str(run_conclusion or "").strip().lower() or None

@@ -557,9 +557,10 @@ def retry_evidence(
         if normalized_kind in PR_AGENT_KINDS:
             for match in _LEGACY_RETRY_RE.finditer(body):
                 marker_head, marker_kind, attempt_text = match.groups()
-                # Legacy markers predate durable not-before; fall back to a
-                # whole-body scan only for those markers.
-                consider(marker_head, marker_kind, attempt_text, _parse_not_before(body), created_at)
+                # Legacy markers predate durable not-before and carry none:
+                # a stray ``not-before=`` outside any canonical marker is
+                # ignored so producers cannot diverge.
+                consider(marker_head, marker_kind, attempt_text, None, created_at)
         for match in _LIFECYCLE_EXHAUSTED_RE.finditer(body):
             marker_head, marker_kind, attempts_text = match.groups()
             if marker_head.lower() == head and marker_kind.lower() == normalized_kind:
