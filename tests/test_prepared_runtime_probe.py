@@ -51,9 +51,23 @@ def installer_indices(lines):
     found = []
     for i, line in enumerate(lines):
         code = code_without_comment(line)
-        if "https://opencode.ai/install" in code or (
-            "pip install" in code and "pr-agent" in code
+        if "https://opencode.ai/install" in code:
+            found.append(i)
+        elif "pip install" in code and ("pr-agent" in code or "opencode" in code):
+            found.append(i)
+        elif ("npm install" in code or "npm i " in code or "npm ci" in code) and "opencode" in code:
+            found.append(i)
+        elif "brew install" in code and "opencode" in code:
+            found.append(i)
+        elif ("curl" in code or "wget" in code) and (
+            "releases/download" in code
+            or ("github.com" in code and "releases" in code)
+            or ("opencode" in code and (".tar.gz" in code or ".zip" in code or "download" in code))
         ):
+            found.append(i)
+        elif "gh release download" in code and "opencode" in code:
+            found.append(i)
+        elif "releases/download" in code and "opencode" in code:
             found.append(i)
     return found
 
@@ -121,8 +135,9 @@ class PreparedRuntimeProbeTests(unittest.TestCase):
         self.assertTrue(installers, "{}: no installer site found".format(name))
         regions = []
         for at in installers:
+            prev_installer = installers[installers.index(at) - 1] if at != installers[0] else -1
             cond_at = None
-            for i in range(at - 1, -1, -1):
+            for i in range(at - 1, prev_installer, -1):
                 stripped = lines[i].strip()
                 if (
                     stripped.startswith("if [[")
@@ -136,7 +151,7 @@ class PreparedRuntimeProbeTests(unittest.TestCase):
                 cond_at,
                 "{}: no digest-gated warm-hit condition before installer line {}".format(name, at + 1))
             warn_at = None
-            for i in range(cond_at - 1, -1, -1):
+            for i in range(cond_at - 1, prev_installer, -1):
                 if "CONTINUUM_IMAGE_DIGEST is malformed" in lines[i]:
                     warn_at = i
                     break

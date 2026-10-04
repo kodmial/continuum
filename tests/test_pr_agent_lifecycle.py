@@ -48,6 +48,14 @@ BASELINE_SHA = "197bafdb6b157ad7d4e77888a1fed5a921a3f125"
 # worktree contract alone.
 PREVIOUS_BASELINE_SHA = "1a93faa10739ca104be871093908b5d15cad1d4a"
 
+# Oldest protected baseline (kodmial/continuum#248 anti-recursion gate).
+# The fallback below additionally verifies the oldest-to-previous baseline
+# range carries only the PAUSE_ON_FAILURE 'true'->'false' flip that
+# 1a93faa landed (the inverse of the false->true advance above), so drift
+# between 3df3b1e and 1a93faa bundled outside the previous-to-new range
+# cannot pass silently either.
+OLDEST_BASELINE_SHA = "3df3b1e231c395d425385107e9dea03a8911274d"
+
 # PAUSE_ON_FAILURE baseline lines claimed by BASELINE_SHA (kodmial/continuum
 # #248 follow-up): the only non-#179 protected-file drift permitted in the
 # old-to-new baseline range.
@@ -198,6 +206,29 @@ POLICY_MODULE = os.path.join(ROOT, ".github", "scripts", "pr_agent_policy.js")
 def read_repo(path: str) -> str:
     with open(os.path.join(ROOT, path), "r", encoding="utf-8") as handle:
         return handle.read()
+
+
+# Any write to the image-digest stamp, not just the canonical
+# `> "$STAMP_FILE"` redirect: append redirects (`>>`), unquoted/braced
+# paths (`$STAMP_FILE`, `${STAMP_FILE}`), redirects to the literal
+# image-digest path, and `tee`/`cp`/`install`/`dd`/`mv` writes all create
+# the stamp. The probe's own `>/dev/null` redirects, the
+# `$(cat "$STAMP_FILE")` stamp read, and the `STAMP_FILE=` assignment
+# never match because the redirect/command target must be the stamp
+# itself.
+STAMP_WRITE_RE = re.compile(
+    r">+\s*[\"']?\$[\{\"']?STAMP_FILE"
+    r"|>+\s*[\"']?\$?\{?HOME/[^#\n]*image-digest"
+    r"|\btee\b[^#\n]*(STAMP_FILE|image-digest)"
+    r"|\b(cp|install|dd|mv)\b[^#\n]*(STAMP_FILE|image-digest)"
+)
+
+
+def is_stamp_write(line: str) -> bool:
+    code = line.split("#", 1)[0]
+    if not code.strip():
+        return False
+    return bool(STAMP_WRITE_RE.search(code))
 
 
 def lifecycle_source() -> str:
@@ -563,6 +594,56 @@ class ProtectedBaselineTests(unittest.TestCase):
                             f"{path} old-to-new baseline range removes unapproved lines: "
                             f"{sorted(set(range_removed) - allowed_removed)}",
                         )
+                        # The previous-to-new range above leaves the
+                        # oldest-to-previous gap (3df3b1e..1a93faa)
+                        # unverified on its own: unrelated protected-file
+                        # drift bundled there would pass silently. That gap
+                        # must carry only the PAUSE_ON_FAILURE
+                        # 'true'->'false' flip 1a93faa landed (the inverse
+                        # of the advance claimed above).
+                        oldest_ancestor = subprocess.run(
+                            ["git", "merge-base", "--is-ancestor", OLDEST_BASELINE_SHA, PREVIOUS_BASELINE_SHA],
+                            cwd=ROOT,
+                            capture_output=True,
+                            text=True,
+                            timeout=30,
+                        )
+                        self.assertEqual(
+                            oldest_ancestor.returncode,
+                            0,
+                            f"{path} oldest baseline {OLDEST_BASELINE_SHA} is not an ancestor of {PREVIOUS_BASELINE_SHA}",
+                        )
+                        oldest_ranged = subprocess.run(
+                            ["git", "diff", OLDEST_BASELINE_SHA, PREVIOUS_BASELINE_SHA, "--", path],
+                            cwd=ROOT,
+                            capture_output=True,
+                            text=True,
+                            timeout=30,
+                        )
+                        self.assertEqual(oldest_ranged.returncode, 0, oldest_ranged.stderr)
+                        oldest_added = []
+                        oldest_removed = []
+                        for line in oldest_ranged.stdout.splitlines():
+                            if line.startswith("+++ ") or line.startswith("--- "):
+                                continue
+                            if line.startswith("+"):
+                                oldest_added.append(line[1:])
+                            elif line.startswith("-"):
+                                oldest_removed.append(line[1:])
+                        self.assertEqual(
+                            _RangeCounter(oldest_added),
+                            _RangeCounter(APPROVED_PAUSE_BASELINE_REMOVED_LINES),
+                            f"{path} oldest-to-previous baseline range must carry only the "
+                            f"PAUSE_ON_FAILURE 'true'->'false' flip: "
+                            f"extra={sorted(set(oldest_added) - set(APPROVED_PAUSE_BASELINE_REMOVED_LINES))} "
+                            f"missing={sorted(set(APPROVED_PAUSE_BASELINE_REMOVED_LINES) - set(oldest_added))}",
+                        )
+                        self.assertEqual(
+                            sorted(set(oldest_removed) - set(APPROVED_PAUSE_BASELINE_ADDED_LINES)),
+                            [],
+                            f"{path} oldest-to-previous baseline range removes unapproved lines: "
+                            f"{sorted(set(oldest_removed) - set(APPROVED_PAUSE_BASELINE_ADDED_LINES))}",
+                        )
                     # The probe must actually satisfy the #179 warm-path
                     # contract on the current worktree content.
                     body = read_repo(path)
@@ -642,9 +723,9 @@ class ProtectedBaselineTests(unittest.TestCase):
                     stamp_writes = [
                         line
                         for line in body.splitlines()
-                        if '> "$STAMP_FILE"' in line
-                        and line.strip()
+                        if line.strip()
                         and not line.strip().startswith("#")
+                        and is_stamp_write(line)
                     ]
                     self.assertEqual(
                         stamp_writes,
@@ -714,9 +795,9 @@ class ProtectedBaselineTests(unittest.TestCase):
                 stamp_writes = [
                     line
                     for line in worktree_body.splitlines()
-                    if '> "$STAMP_FILE"' in line
-                    and line.strip()
+                    if line.strip()
                     and not line.strip().startswith("#")
+                    and is_stamp_write(line)
                 ]
                 self.assertEqual(
                     stamp_writes,

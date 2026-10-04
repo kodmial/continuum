@@ -56,6 +56,47 @@ class ContinuumTest < Minitest::Test
     line
   end
 
+  # An installer site: any line that downloads or installs the agent
+  # runtime. New bootstrap channels (npm/brew/curl of a release asset or
+  # GitHub release) count alongside the canonical installer URL and pip
+  # installs, so an unprobed installer cannot pass coverage by using a new
+  # channel while the expected site count still matches.
+  def installer_site?(code)
+    return true if code.include?('https://opencode.ai/install')
+    if code.include?('pip install')
+      return true if code.include?('pr-agent') || code.include?('opencode')
+    end
+    if code.include?('npm install') || code.include?('npm i ') || code.include?('npm ci')
+      return true if code.include?('opencode')
+    end
+    return true if code.include?('brew install') && code.include?('opencode')
+    if code.include?('curl') || code.include?('wget')
+      return true if code.include?('releases/download')
+      return true if code.include?('github.com') && code.include?('releases')
+      if code.include?('opencode')
+        return true if code.include?('.tar.gz') || code.include?('.zip') || code.include?('download')
+      end
+    end
+    return true if code.include?('gh release download') && code.include?('opencode')
+
+    code.include?('releases/download') && code.include?('opencode')
+  end
+
+  # A write to the image-digest stamp in any spelling: `>`/`>>` redirects
+  # to $STAMP_FILE (quoted, unquoted, or braced) or to the literal
+  # image-digest path, and tee/cp/install/dd/mv writes targeting the
+  # stamp. The probe's own `>/dev/null` redirects, the
+  # `$(cat "$STAMP_FILE")` stamp read, and the `STAMP_FILE=` assignment
+  # never match because the redirect/command target must be the stamp
+  # itself.
+  def stamp_write?(code)
+    return true if code.match?( />+\s*["']?\$[{'"]?STAMP_FILE/ )
+    return true if code.match?( />+\s*["']?\$?\{?HOME\/[^#\n]*image-digest/ )
+    return true if code.match?( /\btee\b[^#\n]*(STAMP_FILE|image-digest)/ )
+
+    code.match?( /\b(cp|install|dd|mv)\b[^#\n]*(STAMP_FILE|image-digest)/ )
+  end
+
   # Only the embedded `script: |` block. Assertions about *engine* literals must
   # not see the `workflow_call.inputs` defaults, which legitimately name the
   # same values as the fallback chain.
@@ -5175,8 +5216,7 @@ class ContinuumTest < Minitest::Test
       # `prepared-runtime hit` is not executable evidence.
       code_lines = lines.map { |line| code_without_comment(line) }
       installer_lines = code_lines.each_index.select do |i|
-        code_lines[i].include?('https://opencode.ai/install') ||
-          (code_lines[i].include?('pip install') && code_lines[i].include?('pr-agent'))
+        installer_site?(code_lines[i])
       end
       refute_empty installer_lines, "#{name}: the deterministic reconstruction fallback is missing"
       probe_lines = code_lines.each_index.select do |i|
@@ -5331,11 +5371,28 @@ class ContinuumTest < Minitest::Test
   # global variable that a second promotion would evict.
   def test_prepared_runtime_provenance_and_per_profile_digest
     opencode = workflow_body('continuum-opencode.yml')
-    opencode_code = opencode.lines.map { |line| code_without_comment(line) }.join
-    refute_match(/>\s*"\$STAMP_FILE"/, opencode_code,
-                 'continuum-opencode.yml: deterministic reconstruction must never record the stamp')
     assert_includes opencode, 'never records the stamp',
                     'continuum-opencode.yml: the no-self-stamp provenance rule must be documented at the install sites'
+
+    # Every agent-runtime workflow: deterministic reconstruction never
+    # self-stamps in any spelling (redirect, append, unquoted/braced
+    # path, literal image-digest path, or tee/cp/install/dd/mv write),
+    # so a just-downloaded binary can never masquerade as golden-image
+    # provenance on a backend that reuses filesystem state.
+    %w[
+      continuum-opencode.yml
+      continuum-pr-agent.yml
+      continuum-pr-agent-repair.yml
+      continuum-coderabbit-unresolved.yml
+      continuum-consumer-child-worker.yml
+      continuum-consumer-child-review.yml
+      continuum-consumer-child-pr-review.yml
+    ].each do |name|
+      code = workflow_body(name).lines.map { |line| code_without_comment(line) }
+      writes = code.select { |line| stamp_write?(line) }
+      assert_empty writes,
+                   "#{name}: deterministic reconstruction must never record the stamp: #{writes.inspect}"
+    end
 
     worker = workflow_body('continuum-consumer-child-worker.yml')
     worker_inputs = events(yaml(File.join(ROOT, '.github/workflows/continuum-consumer-child-worker.yml')))
@@ -5348,9 +5405,35 @@ class ContinuumTest < Minitest::Test
     assert_includes digest_input.fetch('description').to_s, 'vars.CONTINUUM_IMAGE_DIGEST'
     assert_includes worker, 'inputs.image_digest || vars.CONTINUUM_IMAGE_DIGEST',
                     'continuum-consumer-child-worker.yml: the per-profile input must fall back to the repository variable'
-    worker_code = worker.lines.map { |line| code_without_comment(line) }.join
-    refute_match(/>\s*"\$STAMP_FILE"/, worker_code,
-                 'continuum-consumer-child-worker.yml: deterministic reconstruction must never record the stamp')
+
+    # The review workflows run one job per profile too: they take the same
+    # per-profile input with the same repository-variable fallback so a
+    # second profile promotion cannot evict the first.
+    {
+      'continuum-consumer-child-review.yml' => 'continuum-child-review.yml',
+      'continuum-consumer-child-pr-review.yml' => 'continuum-child-pr-review.yml',
+    }.each do |workflow_name, stub_name|
+      body = workflow_body(workflow_name)
+      inputs = events(yaml(File.join(ROOT, '.github/workflows', workflow_name)))
+               .fetch('workflow_call').fetch('inputs')
+      review_digest = inputs.fetch('image_digest')
+      assert_equal 'string', review_digest.fetch('type')
+      assert_equal false, review_digest.fetch('required')
+      assert_equal '', review_digest.fetch('default'),
+                   "#{workflow_name}: image_digest must default to empty so vars.CONTINUUM_IMAGE_DIGEST remains the fallback"
+      assert_includes review_digest.fetch('description').to_s, 'vars.CONTINUUM_IMAGE_DIGEST'
+      assert_includes body, 'inputs.image_digest || vars.CONTINUUM_IMAGE_DIGEST',
+                      "#{workflow_name}: the per-profile input must fall back to the repository variable"
+
+      stub = yaml(File.join(ROOT, '.github/caller-stubs/parent', stub_name))
+      stub_with = nil
+      stub.fetch('jobs').each_value do |job|
+        stub_with = job['with'] if job['uses']
+      end
+      refute_nil stub_with, "the parent #{stub_name} stub must call the reusable workflow"
+      assert_equal '${{ inputs.image_digest || \'\' }}', stub_with['image_digest'],
+                   "the parent #{stub_name} stub must forward the digest as an explicit empty string when unset"
+    end
 
     parent_stub = yaml(File.join(ROOT, '.github/caller-stubs/parent/continuum-child-worker.yml'))
     parent_with = nil
@@ -5358,8 +5441,8 @@ class ContinuumTest < Minitest::Test
       parent_with = job['with'] if job['uses']
     end
     refute_nil parent_with, 'the parent child-worker stub must call the reusable workflow'
-    assert_equal '${{ inputs.image_digest }}', parent_with['image_digest'],
-                 'the parent stub must pass the per-profile digest through to the reusable worker'
+    assert_equal '${{ inputs.image_digest || \'\' }}', parent_with['image_digest'],
+                 'the parent stub must pass the per-profile digest through to the reusable worker as an explicit empty string when unset'
 
     engine = File.read(File.join(ROOT, 'src/continuum/agent_runtime.py'))
     assert_includes engine, 'def execute_manifest_probes',

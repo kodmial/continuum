@@ -1743,6 +1743,11 @@ _BOOTSTRAP_PATTERNS = (
     'pip install "pr-agent==',
     "pip install 'pr-agent==",
     "pip install pr-agent==",
+    "pip install opencode",
+    "npm install opencode",
+    "npm i opencode",
+    "brew install opencode",
+    "releases/download",
 )
 
 #: Executable warm-path probes: a real CLI/version check that proves the
@@ -1879,7 +1884,19 @@ def workflow_step_has_prepared_runtime_probe(workflow_text: str) -> bool:
 
     if not isinstance(workflow_text, str):
         return False
-    probe = ("command -v opencode" in workflow_text or "opencode --version" in workflow_text)
+    # Compare only code lines (mirrors
+    # normal_execution_uses_bootstrap_install): a probe marker inside a
+    # `#` comment proves nothing about the warm path, so a comment-only
+    # `command -v opencode` or `opencode --version` alongside pinned
+    # version/digest strings must not count as a prepared-runtime probe.
+    code_lines = [
+        _code_without_comment(line)
+        for line in workflow_text.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    code_lines = [code for code in code_lines if code.strip()]
+    code_text = "\n".join(code_lines)
+    probe = ("command -v opencode" in code_text or "opencode --version" in code_text)
     pinned = OPENCODE_VERSION in workflow_text
     digest = ("image digest" in workflow_text.lower() or "CONTINUUM_IMAGE_DIGEST" in workflow_text
               or "prepared-runtime" in workflow_text.lower() or "prepared agent runtime" in workflow_text.lower())
@@ -1891,14 +1908,8 @@ def workflow_step_has_prepared_runtime_probe(workflow_text: str) -> bool:
     # multi-line gate where a digest conditional within a short window of
     # the probe guards the hit path) so an empty or unresolved digest
     # cannot take the hit path and skip install.
-    # Comment portions are stripped so a trailing-comment probe cannot fake
-    # a digest-gated hit.
-    code_lines = [
-        _code_without_comment(line)
-        for line in workflow_text.splitlines()
-        if line.strip() and not line.strip().startswith("#")
-    ]
-    code_lines = [code for code in code_lines if code.strip()]
+    # Comment portions are already stripped above so a trailing-comment
+    # probe cannot fake a digest-gated hit.
     gated = any(
         "CONTINUUM_IMAGE_DIGEST" in code and any(pattern in code for pattern in _PROBE_PATTERNS)
         for code in code_lines
@@ -1940,8 +1951,8 @@ def workflow_step_has_prepared_runtime_probe(workflow_text: str) -> bool:
         )
     if not gated:
         return False
-    if "pr-agent==" in workflow_text:
-        if "pr-agent --version" not in workflow_text:
+    if "pr-agent==" in code_text:
+        if "pr-agent --version" not in code_text:
             return False
         if PR_AGENT_VERSION not in workflow_text:
             return False

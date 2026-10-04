@@ -453,9 +453,11 @@ jobs:
           # reconstruction below, never failing closed. The digest is bound
           # to the runtime by the image-digest stamp
           # ($HOME/.opencode/image-digest) recorded by the validated image
-          # build (or a prior reconstruction): a stale or unrelated
+          # build: a stale or unrelated
           # opencode 1.18.34 binary whose stamp does not match the digest
-          # cannot take the hit path.
+          # cannot take the hit path. Deterministic reconstruction below
+          # never records the stamp, so a later job cannot take the warm
+          # path from a reconstruction self-stamp.
           export PATH="$HOME/.opencode/bin:$PATH"
           STAMP_FILE="$HOME/.opencode/image-digest"
           if [[ -n "${CONTINUUM_IMAGE_DIGEST:-}" ]] && ! [[ "$CONTINUUM_IMAGE_DIGEST" =~ ^[0-9a-f]{64}$ ]]; then
@@ -471,10 +473,9 @@ jobs:
             if curl -fsSL --retry 3 --retry-delay 2 https://opencode.ai/install | bash -s -- --version 1.18.34; then
               export PATH="$HOME/.opencode/bin:$PATH"
               opencode --version 2>&1 | grep -E -q "(^|[^0-9.])1\.18\.34([^0-9.]|$)" || exit 1
-              if [[ "${CONTINUUM_IMAGE_DIGEST:-}" =~ ^[0-9a-f]{64}$ ]]; then
-                mkdir -p "$(dirname "$STAMP_FILE")"
-                echo "$CONTINUUM_IMAGE_DIGEST" > "$STAMP_FILE"
-              fi
+              # Deterministic reconstruction never records the stamp: only
+              # the validated image build (or a provider cache restore of
+              # it) proves golden-image provenance.
               echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
               exit 0
             fi
