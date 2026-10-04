@@ -192,6 +192,23 @@ on:
         type: string
         required: false
         default: 'true'
+      caller_event_name:
+        description: >-
+          Event name observed by the caller (github.event_name). A called
+          workflow always sees github.event_name as workflow_call, so the
+          caller must forward its own trigger name for the child wake-up
+          gate. Empty disables the wake-up; cron remains the backstop.
+        type: string
+        required: false
+        default: ''
+      caller_issue_number:
+        description: >-
+          Issue number observed by the caller (github.event.issue.number).
+          Empty for non-issue events; the wake-up concurrency group falls
+          back to the run id when empty.
+        type: string
+        required: false
+        default: ''
 
 # No `actions: write` here: every dispatch in this workflow authenticates with
 # the TAP_PAT classic PAT (repo + workflow scopes), exactly like every other
@@ -212,14 +229,20 @@ jobs:
     # only verify the bidirectional relationship and wake the parent's public
     # scheduler; the caller keeps child cron events skipped to avoid consuming
     # private child runner minutes as a polling mechanism.
-    if: vars.CONTINUUM_ROLE == 'child' && (github.event_name == 'issues' || github.event_name == 'issue_comment')
+    # The gate reads inputs.caller_event_name (not github.event_name, which is
+    # always workflow_call inside a called workflow) and groups by
+    # inputs.caller_issue_number (not github.event.issue, which is empty in a
+    # called workflow). Bursts coalesce per issue: the parent dispatch is
+    # idempotent, so a newer wake supersedes queued duplicates and cron stays
+    # the missed-event backstop.
+    if: vars.CONTINUUM_ROLE == 'child' && (inputs.caller_event_name == 'issues' || inputs.caller_event_name == 'issue_comment')
     runs-on: ubuntu-latest
     permissions:
       contents: read
     timeout-minutes: ${{ fromJSON(vars.AUTOMATION_SCHEDULER_TIMEOUT_MINUTES || '5') }}
     concurrency:
-      group: continuum-child-parent-wakeup-${{ github.event.issue.number || github.run_id }}
-      cancel-in-progress: false
+      group: continuum-child-parent-wakeup-${{ inputs.caller_issue_number || github.run_id }}
+      cancel-in-progress: true
     steps:
       - name: Checkout Continuum engine for parent wake-up verification
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

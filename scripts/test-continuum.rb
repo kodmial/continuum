@@ -3266,6 +3266,7 @@ class ContinuumTest < Minitest::Test
       dispatch_ref opencode_dispatch execution_label_routes
       child_dispatch_workflow
       count_open_prs_as_wip pause_on_failure
+      caller_event_name caller_issue_number
     ],
     'continuum-opencode.yml' => %w[
       continuum_ref mode issue_number pr_number head_ref review_id run_id
@@ -3336,6 +3337,10 @@ class ContinuumTest < Minitest::Test
       with.each do |key, value|
         next if key == 'continuum_ref'
         next if key == 'watched_workflow'
+        # Event plumbing carries the caller's own trigger context, not a
+        # consumer knob: it binds github.* rather than inputs.* by design.
+        next if base == 'continuum-issue-scheduler.yml' &&
+                %w[caller_event_name caller_issue_number].include?(key)
 
         assert_match(/\A\$\{\{ inputs\.#{key}/, value.to_s,
                      "#{base}: `#{key}` must be a bare inputs.* passthrough, got #{value.inspect} — " \
@@ -3459,14 +3464,23 @@ class ContinuumTest < Minitest::Test
     workflow = yaml(File.join(ROOT, '.github/workflows/continuum-issue-scheduler.yml'))
     assert_equal "vars.CONTINUUM_ROLE != 'child'",
                  workflow.fetch('jobs').fetch('schedule').fetch('if')
-    assert_equal "vars.CONTINUUM_ROLE == 'child' && (github.event_name == 'issues' || github.event_name == 'issue_comment')",
-                 workflow.fetch('jobs').fetch('wake_parent').fetch('if')
+    assert_equal "vars.CONTINUUM_ROLE == 'child' && (inputs.caller_event_name == 'issues' || inputs.caller_event_name == 'issue_comment')",
+                 workflow.fetch('jobs').fetch('wake_parent').fetch('if'),
+                 'the reusable always sees github.event_name as workflow_call, so the wake gate must read the caller-forwarded event name'
 
     stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-issue-scheduler.yml'))
     caller_gate = stub.fetch('jobs').fetch('call').fetch('if')
     assert_includes caller_gate, "vars.CONTINUUM_ROLE != 'child' || github.event_name == 'issues'"
     assert_includes caller_gate, "github.event_name == 'issue_comment'",
                     'a child admits only issue events matching the reusable wake-up job; child push, pull_request_target, workflow_run, and workflow_dispatch stay cheap caller skips'
+    assert_includes caller_gate, "github.event_name != 'issues'",
+                    'child issues wakes must be trust-gated or any user with issue access burns a TAP_PAT parent dispatch'
+    assert_includes caller_gate, "github.event.action == 'opened'",
+                    'child issues wakes must admit only open/reopen/close transitions so bulk label churn cannot fan out to N parent dispatches'
+    assert_includes caller_gate, "github.event.action == 'reopened'",
+                    'child issues wakes must admit only open/reopen/close transitions so bulk label churn cannot fan out to N parent dispatches'
+    assert_includes caller_gate, "github.event.action == 'closed'",
+                    'child issues wakes must admit only open/reopen/close transitions so bulk label churn cannot fan out to N parent dispatches'
     assert_includes caller_gate, "github.event_name != 'issue_comment'"
     assert_includes caller_gate, 'github.actor == github.repository_owner',
                     'the parent wake gate must stay owner-only or any comment wakes a TAP_PAT dispatch'
@@ -3480,8 +3494,10 @@ class ContinuumTest < Minitest::Test
                     'qualification-result wakes must stay trust-gated'
 
     wake_parent = workflow.fetch('jobs').fetch('wake_parent')
-    assert_equal false, wake_parent.fetch('concurrency').fetch('cancel-in-progress'),
-                     'a wake-up signal must not be cancelled mid-dispatch'
+    assert_equal true, wake_parent.fetch('concurrency').fetch('cancel-in-progress'),
+                     'the parent dispatch is idempotent, so a newer per-issue wake supersedes queued duplicates instead of fanning out N sequential dispatches'
+    assert_includes wake_parent.fetch('concurrency').fetch('group').to_s, 'inputs.caller_issue_number',
+                    'the called workflow sees no github.event.issue, so per-issue grouping must use the caller-forwarded issue number'
 
     assert_includes scheduler, 'CONTINUUM_CHILD_ID'
     assert_includes scheduler, 'CONTINUUM_PARENT'
@@ -3516,6 +3532,18 @@ class ContinuumTest < Minitest::Test
     inputs = events(workflow).fetch('workflow_call').fetch('inputs')
     assert_includes inputs.fetch('child_owned_marker').fetch('description'), 'Deprecated'
     assert_includes inputs.fetch('legacy_child_owned_marker').fetch('description'), 'Deprecated'
+
+    %w[caller_event_name caller_issue_number].each do |key|
+      assert inputs.key?(key), "issue-scheduler missing event-plumbing input #{key}"
+      assert_equal '', inputs.fetch(key).fetch('default'), key
+      assert_equal 'string', inputs.fetch(key).fetch('type'), key
+      assert_equal false, inputs.fetch(key).fetch('required'), key
+    end
+    call_with = stub.fetch('jobs').fetch('call').fetch('with')
+    assert_equal '${{ github.event_name }}', call_with.fetch('caller_event_name'),
+                 'the caller must forward its own trigger name; the reusable otherwise always sees workflow_call'
+    assert_equal '${{ github.event.issue.number }}', call_with.fetch('caller_issue_number'),
+                 'the caller must forward its issue number; the reusable otherwise sees an empty github.event'
   end
 
   # A parent has one scheduling queue. Local issues and verified child issues
