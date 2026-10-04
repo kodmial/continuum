@@ -218,8 +218,25 @@ class RetryPolicy:
         return out
 
 
+def _is_transient_default(exc: Exception) -> bool:
+    """Default classifier: only transient/rate-limit signals are retryable.
+
+    Programming errors (``ValueError``, ``TypeError``, ...) fail fast
+    instead of being retried with backoff and swallowed as ``fallback``.
+    """
+    status = getattr(exc, "status", None)
+    response = getattr(exc, "response", None)
+    if response is not None:
+        status = getattr(response, "status", getattr(response, "status_code", status))
+    if status in (429, 502, 503, 504):
+        return True
+    msg = str(exc).lower()
+    return ("rate limit" in msg or "rate-limit" in msg or "try again" in msg
+            or "timeout" in msg or "temporarily" in msg)
+
+
 def read_with_budget(fetch: Callable[[], Any], policy: Optional[RetryPolicy] = None,
-                     fallback: Any = None, is_rate_limited: Callable[[Exception], bool] = lambda _e: True,
+                     fallback: Any = None, is_rate_limited: Optional[Callable[[Exception], bool]] = None,
                      sleep: Optional[Callable[[float], None]] = None, seed: int = 0) -> Any:
     """Run one non-critical read under a bounded retry budget.
 
@@ -228,9 +245,14 @@ def read_with_budget(fetch: Callable[[], Any], policy: Optional[RetryPolicy] = N
 
     Transient/rate-limited failures back off between attempts using the
     bounded, jittered ``policy.delays()`` schedule instead of retrying
-    immediately inside the rate-limit window.
+    immediately inside the rate-limit window.  When ``is_rate_limited`` is
+    omitted only transient signals (HTTP 429/502/503/504 or rate-limit /
+    try-again / timeout / temporarily messages) are retried; any other
+    exception fails fast to ``fallback`` (or reraises) without further
+    attempts.
     """
     active = policy or RetryPolicy()
+    classifier = is_rate_limited if is_rate_limited is not None else _is_transient_default
     attempts = max(1, active.max_attempts)
     delays = list(active.delays(seed=seed))
     waiter = sleep if sleep is not None else time.sleep
@@ -240,7 +262,7 @@ def read_with_budget(fetch: Callable[[], Any], policy: Optional[RetryPolicy] = N
             return fetch()
         except Exception as exc:  # noqa: BLE001 - budget applies to any transient failure
             last = exc
-            if not is_rate_limited(exc):
+            if not classifier(exc):
                 break
             if attempt < attempts - 1 and attempt < len(delays):
                 waiter(delays[attempt])
