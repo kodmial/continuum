@@ -1688,10 +1688,13 @@ class ContinuumTest < Minitest::Test
     end
   end
 
-  # PR-Agent must not turn normal concurrency races or an upstream clean-review
-  # omission into a permanent red gate. A stale dispatch is ignored and
-  # recovery re-evaluates the current HEAD; a clean structured full review may
-  # synthesize only an empty persistent state, while findings still fail closed.
+  # PR-Agent must not turn normal concurrency races or an absent native
+  # persistent finding state into a permanent red gate. A stale dispatch is
+  # ignored and recovery re-evaluates the current HEAD; when native state is
+  # absent, a validated structured full review derives a schema-compatible
+  # fallback (empty for a clean review, ACTIVE findings otherwise) via the
+  # upstream v0.46.0 finding-state contract, while an unrepresentable finding
+  # still fails closed. Native state remains authoritative when present.
   def test_pr_agent_clean_review_and_stale_head_are_non_blocking
     pr_agent = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent.yml'))
 
@@ -1703,7 +1706,16 @@ class ContinuumTest < Minitest::Test
     assert_includes pr_agent, '"findings": []'
     assert_includes pr_agent, '"complete": True'
     assert_includes pr_agent, '"kind": "full"'
-    assert_includes pr_agent, 'Upstream review has key findings but published no persistent finding state.'
+    # Native state wins when present; otherwise the validated structured
+    # review derives an ACTIVE fallback instead of blocking repair.
+    assert_includes pr_agent, 'parse_review_state'
+    assert_includes pr_agent, 'reconcile_review_findings'
+    assert_includes pr_agent, 'normalize_finding'
+    refute_includes pr_agent, 'Upstream review has key findings but published no persistent finding state.'
+    # Only an unrepresentable finding fails closed; nothing is invented and
+    # nothing is marked resolved by the fallback.
+    assert_includes pr_agent, 'represented as persistent finding state; failing closed'
+    assert_includes pr_agent, 'cannot derive fallback state.'
 
     repair = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent-repair.yml'))
     assert_includes repair, 'git clean -fdX',
