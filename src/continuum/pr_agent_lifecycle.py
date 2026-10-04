@@ -59,7 +59,7 @@ PUSH_OUTPUTS_FILE_PATH = "pr-agent-outputs/continuum.jsonl"
 
 NUM_MAX_FINDINGS = 6
 
-SUGGESTIONS_SCORE_THRESHOLD = 1
+SUGGESTIONS_SCORE_THRESHOLD = 7
 
 REVIEW_MERGE_SAFE = "safe_to_merge"
 REVIEW_MERGE_CAUTION = "merge_with_caution"
@@ -293,30 +293,141 @@ def qualifying_suggestions(
     suggestions: Sequence[Mapping[str, Any]],
     threshold: int = SUGGESTIONS_SCORE_THRESHOLD,
 ) -> List[Dict[str, Any]]:
-    """Qualifying native improve suggestions for the same repair batch.
+    """High-signal native improve suggestions eligible for autonomous repair.
 
-    The threshold of 1 is intentional: actionable native suggestions must
-    not be silently discarded by an arbitrary Continuum severity filter.
-    A missing score is treated conservatively as qualifying.
+    Work Lock #37 raises the autonomous threshold to 7. Missing or malformed
+    scores remain visible presentation data but do not trigger automatic code
+    changes or block the merge gate.
     """
 
     out: List[Dict[str, Any]] = []
     for entry in suggestions:
         score = entry.get("score", None)
         if score is None:
-            out.append(dict(entry))
             continue
         try:
-            numeric = int(score)
+            numeric = float(score)
         except (TypeError, ValueError):
-            try:
-                numeric = int(float(str(score)))
-            except (TypeError, ValueError):
-                out.append(dict(entry))
-                continue
+            continue
         if numeric >= threshold:
             out.append(dict(entry))
     return out
+
+
+_PATH_KEYS = ("relevant_file", "path", "file", "filename")
+_START_KEYS = ("relevant_lines_start", "line_start", "start_line", "line")
+_END_KEYS = ("relevant_lines_end", "line_end", "end_line", "line")
+_REVIEW_TEXT_KEYS = ("issue_header", "issue_content", "title", "body", "description")
+_IMPROVE_TEXT_KEYS = (
+    "one_sentence_summary",
+    "suggestion_content",
+    "title",
+    "body",
+    "description",
+    "label",
+)
+
+
+def _first_string(entry: Mapping[str, Any], keys: Sequence[str]) -> str:
+    for key in keys:
+        value = entry.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _first_number(entry: Mapping[str, Any], keys: Sequence[str]) -> int | None:
+    for key in keys:
+        value = entry.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _normalize_path(entry: Mapping[str, Any]) -> str:
+    return (
+        _first_string(entry, _PATH_KEYS)
+        .removeprefix("./")
+        .strip("'\"` ")
+        .lower()
+    )
+
+
+def _line_range(entry: Mapping[str, Any]) -> tuple[int | None, int | None]:
+    start = _first_number(entry, _START_KEYS)
+    end = _first_number(entry, _END_KEYS)
+    raw = entry.get("relevant_lines")
+    if (start is None or end is None) and isinstance(raw, str):
+        pair = re.search(r"(\d+)\D+(\d+)", raw)
+        if pair:
+            start = start if start is not None else int(pair.group(1))
+            end = end if end is not None else int(pair.group(2))
+        else:
+            one = re.search(r"\d+", raw)
+            if one:
+                start = start if start is not None else int(one.group(0))
+                end = end if end is not None else int(one.group(0))
+    if start is not None and end is None:
+        end = start
+    if end is not None and start is None:
+        start = end
+    if start is not None and end is not None and end < start:
+        start, end = end, start
+    return start, end
+
+
+def _normalize_problem(entry: Mapping[str, Any], source: str) -> str:
+    keys = _REVIEW_TEXT_KEYS if source == "review" else _IMPROVE_TEXT_KEYS
+    text = " ".join(
+        str(entry.get(key) or "") for key in keys if isinstance(entry.get(key), str)
+    )
+    text = re.sub(r"https?://\S+", " ", text)
+    text = re.sub(r"[\`*_>#()\[\]{}]", " ", text)
+    text = re.sub(r"[^\w./-]+", " ", text.lower(), flags=re.UNICODE)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _equivalent_problem(left: str, right: str) -> bool:
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    shorter, longer = sorted((left, right), key=len)
+    if len(shorter) >= 32 and shorter in longer:
+        return True
+    left_tokens = {token for token in left.split() if len(token) >= 3}
+    right_tokens = {token for token in right.split() if len(token) >= 3}
+    if not left_tokens or not right_tokens:
+        return False
+    common = len(left_tokens & right_tokens)
+    union = len(left_tokens | right_tokens)
+    jaccard = common / union if union else 0.0
+    containment = common / min(len(left_tokens), len(right_tokens))
+    return common >= 5 and (jaccard >= 0.75 or containment >= 0.85)
+
+
+def _same_logical_defect(
+    review_finding: Mapping[str, Any],
+    improve_suggestion: Mapping[str, Any],
+) -> bool:
+    if _normalize_path(review_finding) != _normalize_path(improve_suggestion):
+        return False
+    if not _normalize_path(review_finding):
+        return False
+    r_start, r_end = _line_range(review_finding)
+    i_start, i_end = _line_range(improve_suggestion)
+    if None in (r_start, r_end, i_start, i_end):
+        return False
+    if not (r_start <= i_end and i_start <= r_end):
+        return False
+    return _equivalent_problem(
+        _normalize_problem(review_finding, "review"),
+        _normalize_problem(improve_suggestion, "improve"),
+    )
 
 
 @dataclass
@@ -341,21 +452,26 @@ def build_repair_batch(
     *,
     head_sha: str,
 ) -> RepairBatch:
-    """Batch every current review finding plus every qualifying suggestion.
+    """Batch current review findings plus unique high-signal suggestions.
 
-    Each item preserves its native source (review or improve). The batch
-    processes every item together; it never stops after the first finding
-    and never dispatches one agent per finding. The OpenCode pass itself
-    is bounded; the item list is complete, never truncated.
+    Native review findings are authoritative when /review and /improve emit
+    the same logical defect at an overlapping location. Distinct findings are
+    retained even when they touch the same file.
     """
 
     if not head_sha or not head_sha.strip():
         raise LifecycleError("repair batch requires the exact reviewed HEAD")
-    items: List[Dict[str, Any]] = []
-    for index, finding in enumerate(current_key_issues(review)):
-        items.append({"source": "review", "index": index, "finding": dict(finding)})
+    review_findings = current_key_issues(review)
+    items: List[Dict[str, Any]] = [
+        {"source": "review", "index": index, "finding": dict(finding)}
+        for index, finding in enumerate(review_findings)
+    ]
     for index, suggestion in enumerate(qualifying_suggestions(suggestions)):
-        items.append({"source": "improve", "index": index, "suggestion": dict(suggestion)})
+        if any(_same_logical_defect(finding, suggestion) for finding in review_findings):
+            continue
+        items.append(
+            {"source": "improve", "index": index, "suggestion": dict(suggestion)}
+        )
     return RepairBatch(head_sha=head_sha.strip(), items=items, bounded=True)
 
 

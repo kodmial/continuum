@@ -93,6 +93,7 @@ jobs:
             ]);
             const REVIEW_CONTEXT = 'continuum/pr-agent-review';
             const REPAIR_CONTEXT = 'continuum/pr-agent-repair';
+            const CONTROLLER_STATE_MARKER = '<!-- continuum-pr-agent-controller-state:v1 -->';
 
             // Keep the action client PAT-authenticated for mutations/dispatch.
             // A distinct Octokit instance handles read-only same-repository calls
@@ -158,6 +159,81 @@ jobs:
                 ' attempts=' + String(maxExecutions) + ' -->';
             }
 
+            function controllerStateBody(stateMarker, summary) {
+              return [
+                CONTROLLER_STATE_MARKER,
+                String(stateMarker || '').trim(),
+                '<details>',
+                '<summary>Continuum PR-Agent controller state</summary>',
+                '',
+                String(summary || '').trim(),
+                '',
+                '</details>',
+              ].join('\n');
+            }
+
+            async function upsertControllerState(prNumber, stateMarker, summary) {
+              const comments = await withReadFallback(client =>
+                client.paginate(
+                  client.rest.issues.listComments,
+                  { owner, repo, issue_number: prNumber, per_page: 100 }
+                )
+              );
+              const controller = comments
+                .filter(comment => String(comment.body || '').includes(CONTROLLER_STATE_MARKER))
+                .sort((a, b) => Number(a.id) - Number(b.id));
+              const latest = controller.at(-1);
+              const body = controllerStateBody(stateMarker, summary);
+              let result;
+              if (latest) {
+                const { data } = await github.rest.issues.updateComment({
+                  owner,
+                  repo,
+                  comment_id: latest.id,
+                  body,
+                });
+                result = {
+                  comment: data,
+                  created: false,
+                  previousBody: String(latest.body || ''),
+                };
+              } else {
+                const { data } = await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: prNumber,
+                  body,
+                });
+                result = { comment: data, created: true, previousBody: '' };
+              }
+              for (const stale of controller.slice(0, -1)) {
+                await github.rest.issues.deleteComment({
+                  owner,
+                  repo,
+                  comment_id: stale.id,
+                });
+              }
+              return result;
+            }
+
+            async function rollbackControllerState(stateWrite) {
+              if (!stateWrite || !stateWrite.comment) return;
+              if (stateWrite.created) {
+                await github.rest.issues.deleteComment({
+                  owner,
+                  repo,
+                  comment_id: stateWrite.comment.id,
+                });
+                return;
+              }
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: stateWrite.comment.id,
+                body: stateWrite.previousBody,
+              });
+            }
+
             function parseEvidence(comments, head, kind) {
               const exactHead = String(head).toLowerCase();
               const retryRe =
@@ -172,7 +248,7 @@ jobs:
                   continue;
                 }
                 const body = String(comment.body || '');
-                const createdAt = Date.parse(String(comment.created_at || comment.updated_at || ''));
+                const createdAt = Date.parse(String(comment.updated_at || comment.created_at || ''));
                 retryRe.lastIndex = 0;
                 exhaustedRe.lastIndex = 0;
                 for (const match of body.matchAll(retryRe)) {
@@ -492,16 +568,12 @@ jobs:
               }
 
               const marker = retryMarker(head, kind, attempt);
-              const { data: markerComment } = await github.rest.issues.createComment({
-                owner,
-                repo,
-                issue_number: pr.number,
-                body: [
-                  marker,
-                  'Automatic PR-Agent ' + kind + ' recovery for exact HEAD ' + head +
-                    ' (execution ' + (attempt + 1) + '/' + maxExecutions + ').',
-                ].join('\n'),
-              });
+              const markerState = await upsertControllerState(
+                pr.number,
+                marker,
+                'Automatic PR-Agent ' + kind + ' recovery for exact HEAD ' + head +
+                  ' (execution ' + (attempt + 1) + '/' + maxExecutions + ').'
+              );
 
               try {
                 const ref = await defaultBranch();
@@ -525,14 +597,10 @@ jobs:
                 return true;
               } catch (err) {
                 try {
-                  await github.rest.issues.deleteComment({
-                    owner,
-                    repo,
-                    comment_id: markerComment.id,
-                  });
+                  await rollbackControllerState(markerState);
                 } catch (cleanupErr) {
                   core.warning(
-                    'Could not remove uncommitted recovery marker: ' +
+                    'Could not roll back uncommitted recovery controller state: ' +
                     (cleanupErr.message || cleanupErr)
                   );
                 }
@@ -547,17 +615,13 @@ jobs:
                 String(comment.body || '').includes(marker)
               );
               if (already) return;
-              await github.rest.issues.createComment({
-                owner,
-                repo,
-                issue_number: pr.number,
-                body: [
-                  marker,
-                  'PR-Agent ' + kind + ' recovery exhausted the bounded ' +
-                    maxExecutions + '-execution budget for exact HEAD ' + head +
-                    '. A changed HEAD starts a new recovery identity.',
-                ].join('\n'),
-              });
+              await upsertControllerState(
+                pr.number,
+                marker,
+                'PR-Agent ' + kind + ' recovery exhausted the bounded ' +
+                  maxExecutions + '-execution budget for exact HEAD ' + head +
+                  '. A changed HEAD starts a new recovery identity.'
+              );
             }
 
             const openPrs = await withReadFallback(client =>

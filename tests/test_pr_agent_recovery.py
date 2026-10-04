@@ -296,14 +296,15 @@ class RecoveryWiringTests(unittest.TestCase):
             with self.subTest(read_call=read_call):
                 self.assertIn(read_call, body)
 
-        # One helper definition plus nine guarded read sites. This prevents a
-        # future direct repository-token read from bypassing the liveness fallback.
-        self.assertEqual(body.count("withReadFallback("), 10)
+        # One helper definition plus ten guarded read sites. Controller-state
+        # upsert also reads comments through the repository-scoped token.
+        self.assertEqual(body.count("withReadFallback("), 11)
 
         # Item 1 keeps all mutation/dispatch calls on the PAT-authenticated
         # action client, preserving actor and event fan-out semantics.
         for mutation in (
             "github.rest.issues.createComment",
+            "github.rest.issues.updateComment",
             "github.rest.issues.deleteComment",
             "github.rest.actions.createWorkflowDispatch",
         ):
@@ -313,9 +314,18 @@ class RecoveryWiringTests(unittest.TestCase):
         self.assertNotIn("github.paginate(", body)
         self.assertNotRegex(
             body,
-            r"github\.rest\.(?!issues\.createComment\b|issues\.deleteComment\b|actions\.createWorkflowDispatch\b)",
+            r"github\.rest\.(?!issues\.createComment\b|issues\.updateComment\b|issues\.deleteComment\b|actions\.createWorkflowDispatch\b)",
             "PAT client must only be used for mutations/dispatch",
         )
+
+    def test_recovery_coalesces_retry_state_into_one_controller_comment(self):
+        body = self.read(".github/workflows/continuum-pr-agent-recovery.yml")
+        self.assertIn("continuum-pr-agent-controller-state:v1", body)
+        self.assertIn("async function upsertControllerState", body)
+        self.assertIn("github.rest.issues.updateComment", body)
+        self.assertIn("controller.slice(0, -1)", body)
+        self.assertIn("rollbackControllerState", body)
+        self.assertIn("comment.updated_at || comment.created_at", body)
 
     def test_recovered_review_uses_ci_workflow_not_combined_status(self):
         review = self.read(".github/workflows/continuum-pr-agent.yml")
