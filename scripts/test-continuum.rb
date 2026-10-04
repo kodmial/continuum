@@ -3527,6 +3527,57 @@ class ContinuumTest < Minitest::Test
     end
   end
 
+  # kodmial/continuum#263: a proven worker-capacity failure must never create
+  # or keep a repository-code repair task. The controller classifies from
+  # durable machine evidence through the authoritative engine before choosing
+  # a recovery route: capacity/provider/timeout/unknown hold with a
+  # machine-readable reason, transient retries through a bounded budget, and
+  # only positive defect evidence creates a repository repair.
+  def test_render_executor_classifies_capacity_before_repairing
+    body = render_body
+
+    # The dedicated capacity route is an optional knob with a vars fallback;
+    # empty holds the source safely instead of dispatching.
+    definition = events(render_core).fetch('workflow_call').fetch('inputs').fetch('capacity_workflow')
+    assert_equal '', definition.fetch('default'), 'capacity_workflow must default to empty'
+    assert_equal false, definition.fetch('required'), 'capacity_workflow'
+    assert_equal 'string', definition.fetch('type'), 'capacity_workflow'
+    assert_includes body, 'CAPACITY_WORKFLOW: ${{ inputs.capacity_workflow || vars.RENDER_CAPACITY_WORKFLOW }}'
+    assert_includes body, 'gh workflow run "$CAPACITY_WORKFLOW"'
+
+    # Authoritative engine classification runs on every outcome, reads the
+    # durable harness evidence, and fails closed to hold when it errors.
+    assert_includes body, 'Classify Render failure with the authoritative engine'
+    assert_includes body, 'python3 -m continuum.render_execution'
+    assert_includes body, '--memory "$RENDER_MEMORY_SUMMARY_FILE"'
+    assert_includes body, '--state "$RENDER_STATE_FILE"'
+    assert_includes body, 'failing closed to hold without repository repair'
+
+    # Terminal holds: no repository repair, no blind rerun, WIP released via
+    # the unconditional reservation removal above, identical fingerprints
+    # coalesce, and a changed profile may re-arm.
+    assert_includes body, 'continuum-render-capacity-hold'
+    assert_includes body, 'No repository repair was created and the workload was not blindly rerun'
+    assert_includes body, 'Identical Render $ENGINE_CLASSIFICATION failure fingerprint repeated'
+    assert_includes body, 'may explicitly re-arm the source'
+
+    # Bounded transient infrastructure recovery without a repair issue.
+    assert_includes body, 'continuum-render-transient-attempt'
+    assert_includes body, 'Bounded automatic recovery attempt'
+    assert_includes body, 'no repository repair was created.'
+
+    # Repository repair is evidence-driven: the repair branch only runs for
+    # the engine repository classification and carries that classification.
+    assert_includes body, 'continuum-render-failure-classification=$ENGINE_CLASSIFICATION'
+    assert_includes body, 'Engine classification: $ENGINE_CLASSIFICATION ($ENGINE_SUBTYPE)'
+
+    # Cleanup stays mandatory and independently verified on every path: the
+    # unconditional cleanup step survives, and a cleanup failure holds
+    # without creating a repair.
+    assert_includes body, 'Delete ephemeral Render service'
+    assert_includes body, 'Mandatory Render cleanup failed'
+  end
+
   # ------------------------------------------------- docker qualification controller
 
   # The artifact store, the memory ceiling and the payload schema were all
@@ -3652,7 +3703,7 @@ class ContinuumTest < Minitest::Test
       qualification_label qualification_marker artifact_prefix dispatch_ref
       job_script cleanup_script qualification_script in_progress_label
       pause_label repair_label e2e_branch_prefix chain_workflow
-      scheduler_workflow concurrency_group timeout_minutes
+      capacity_workflow scheduler_workflow concurrency_group timeout_minutes
     ],
     'continuum-issue-scheduler.yml' => %w[
       continuum_ref wip_limit lease_minutes max_dispatch_attempts dispatch_marker

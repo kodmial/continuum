@@ -125,9 +125,10 @@ consumer-owned hooks. Continuum deliberately supplies no repository-path default
 | `RENDER_JOB_SCRIPT` | empty | Consumer-owned script that drives the Render lifecycle. Required for Render execution. |
 | `RENDER_CLEANUP_SCRIPT` | empty | Consumer-owned script that deletes the ephemeral Render service. Required for Render execution. |
 | `RENDER_QUALIFICATION_SCRIPT` | empty | Consumer-owned qualification/classification script. Required only for qualification-labelled runs. |
+| `RENDER_CAPACITY_WORKFLOW` | empty | Dedicated optimization/profile/capacity decision workflow woken for capacity-classified failures. Empty holds the source safely. |
 
 The same values may be passed as the reusable-workflow inputs `job_script`,
-`cleanup_script`, and `qualification_script`. A missing required hook fails
+`cleanup_script`, `qualification_script`, and `capacity_workflow`. A missing required hook fails
 explicitly; core never guesses a consumer repository layout. Docker qualification
 consumers configure their artifact repository, binary name, image, memory/trial
 limits and result paths.
