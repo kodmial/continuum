@@ -276,19 +276,25 @@ class RecoveryWiringTests(unittest.TestCase):
         self.assertIn("github-token: ${{ secrets.TAP_PAT }}", body)
         self.assertIn("const { getOctokit } = require('@actions/github')", body)
         self.assertIn("const readGithub = getOctokit(readToken)", body)
+        self.assertIn("async function withReadFallback(fn)", body)
+        self.assertIn("err.status === 401 || err.status === 403", body)
 
         for read_call in (
-            "readGithub.rest.actions.listWorkflowRuns",
-            "readGithub.rest.actions.getWorkflowRun",
-            "readGithub.rest.actions.listWorkflowRunsForRepo",
-            "readGithub.rest.pulls.list",
-            "readGithub.rest.pulls.get",
-            "readGithub.rest.repos.listCommitStatusesForRef",
-            "readGithub.rest.issues.listComments",
-            "readGithub.rest.repos.get({ owner, repo })",
+            "client.rest.actions.listWorkflowRuns",
+            "client.rest.actions.getWorkflowRun",
+            "client.rest.actions.listWorkflowRunsForRepo",
+            "client.rest.pulls.list",
+            "client.rest.pulls.get",
+            "client.rest.repos.listCommitStatusesForRef",
+            "client.rest.issues.listComments",
+            "client.rest.repos.get({ owner, repo })",
         ):
             with self.subTest(read_call=read_call):
                 self.assertIn(read_call, body)
+
+        # One helper definition plus nine guarded read sites. This prevents a
+        # future direct repository-token read from bypassing the liveness fallback.
+        self.assertEqual(body.count("withReadFallback("), 10)
 
         # Item 1 keeps all mutation/dispatch calls on the PAT-authenticated
         # action client, preserving actor and event fan-out semantics.
