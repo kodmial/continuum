@@ -1747,18 +1747,15 @@ class ContinuumTest < Minitest::Test
     workflow = yaml(File.join(ROOT, '.github/workflows/continuum-pr-agent.yml'))
     stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-pr-agent.yml'))
 
-    # The exact-HEAD workflow-run lookup runs under github.token, so both the
-    # reusable workflow and its caller must grant actions:read (least
-    # privilege: never write). Reusable workflows cannot elevate GITHUB_TOKEN
-    # beyond the caller grant.
-    assert_equal 'read', workflow.fetch('permissions').fetch('actions'),
-                 'reusable workflow must grant actions:read for exact-HEAD CI evidence'
-    assert_equal 'read', workflow.fetch('jobs').fetch('pr_agent').fetch('permissions').fetch('actions'),
-                 'pr_agent job must grant actions:read for exact-HEAD CI evidence'
-    assert_equal 'read', stub.fetch('permissions').fetch('actions'),
-                 'caller stub must grant actions:read because reusable workflows cannot elevate GITHUB_TOKEN'
-    refute_equal 'write', workflow.fetch('permissions').fetch('actions')
-    refute_equal 'write', stub.fetch('permissions').fetch('actions')
+    # The review path now owns same-repository workflow_dispatch for bounded
+    # recovery, so GITHUB_TOKEN needs actions:write end-to-end. Reusable
+    # workflows cannot elevate beyond the caller grant.
+    assert_equal 'write', workflow.fetch('permissions').fetch('actions'),
+                 'reusable workflow must grant actions:write for bounded same-repo review dispatch'
+    assert_equal 'write', workflow.fetch('jobs').fetch('pr_agent').fetch('permissions').fetch('actions'),
+                 'pr_agent job must grant actions:write for bounded same-repo review dispatch'
+    assert_equal 'write', stub.fetch('permissions').fetch('actions'),
+                 'caller stub must grant actions:write because reusable workflows cannot elevate GITHUB_TOKEN'
     # pull-requests read capability is preserved (write implies read; the
     # contract keeps write for the mutating steps below).
     assert_equal 'write', workflow.fetch('jobs').fetch('pr_agent').fetch('permissions').fetch('pull-requests')
@@ -1967,12 +1964,12 @@ class ContinuumTest < Minitest::Test
       end
     end
 
-    # The exact-HEAD admission reads Actions runs under github.token: least
-    # privilege is read, never write, and never absent.
-    assert_equal 'read', permissions.fetch('actions'),
-                 'pr-agent.yml dogfood caller must grant actions:read because reusable workflows cannot elevate GITHUB_TOKEN'
-    refute_equal 'write', permissions.fetch('actions'),
-                 'pr-agent.yml dogfood caller must not widen to actions:write'
+    # The same-repo review controller dispatches bounded recovery using
+    # GITHUB_TOKEN, so the dogfood caller must grant actions:write.
+    assert_equal 'write', permissions.fetch('actions'),
+                 'pr-agent.yml dogfood caller must grant actions:write for same-repo workflow_dispatch'
+    assert_equal 'write', permissions.fetch('statuses'),
+                 'pr-agent.yml dogfood caller must grant statuses:write for review lifecycle status'
 
     # The stub and the dogfood caller call the same reusable workflow, so
     # their permission grants must not diverge again.
