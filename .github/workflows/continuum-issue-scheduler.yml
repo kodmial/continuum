@@ -1835,6 +1835,54 @@ jobs:
               if (qual.pull_request) return 'qualification-missing';
               if (qual.state !== 'open') return 'qualification-closed';
               rememberIssue(qual);
+
+              // A qualification tracker may have its own implementation
+              // prerequisites. Explicit qualification dispatch bypasses only
+              // the back-edge to the capability it validates; every other
+              // declared/native blocker must remain closed before execution.
+              const declaredQualificationBlockers = await openDeclaredBlockers(qual);
+              const declaredQualificationGate = qualificationDispatchBypass(
+                qualificationNumber,
+                capabilityNumber,
+                declaredQualificationBlockers.map(blocker => blocker.number)
+              );
+              if (declaredQualificationGate.effective.length > 0) {
+                core.info(
+                  'Qualification #' + qualificationNumber + ' waits for tracker blocker(s) ' +
+                  declaredQualificationGate.effective.map(number => '#' + number).join(', ') + '.'
+                );
+                return 'qualification-blocked';
+              }
+              if (declaredQualificationGate.bypassed.length > 0) {
+                core.notice(
+                  'Qualification #' + qualificationNumber +
+                  ': ignoring capability back-edge #' + capabilityNumber +
+                  ' while preserving all other tracker blockers.'
+                );
+              }
+
+              let nativeQualificationBlockers = [];
+              try {
+                nativeQualificationBlockers =
+                  await snapshotNativeBlockersPat(qualificationNumber);
+              } catch (err) {
+                if (err.status !== 404) throw err;
+              }
+              const nativeQualificationGate = qualificationDispatchBypass(
+                qualificationNumber,
+                capabilityNumber,
+                nativeQualificationBlockers
+                  .filter(blocker => blocker.state === 'open')
+                  .map(blocker => blocker.number)
+              );
+              if (nativeQualificationGate.effective.length > 0) {
+                core.info(
+                  'Qualification #' + qualificationNumber + ' waits for native blocker(s) ' +
+                  nativeQualificationGate.effective.map(number => '#' + number).join(', ') + '.'
+                );
+                return 'qualification-blocked';
+              }
+
               const qualLabels = labelsByIssue.get(qualificationNumber) || new Set();
               const wasPaused = qualLabels.has(pausedLabel);
               await removeLabel(qualificationNumber, pausedLabel);

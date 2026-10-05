@@ -45,6 +45,13 @@ SRC = os.path.join(ROOT, "src")
 # retained here as OLDEST_BASELINE_SHA so neither baseline reference is lost.
 BASELINE_SHA = "0d1c3fb63299e2321f719b4e66cae70b309efbf0"
 
+# Protected-workflow baseline immediately before the systemic qualification
+# isolation/checkpoint fix. This immutable main commit already contains and
+# passed all historical #179/#258/#260/#278/PAT-boundary protections. New
+# continuum-opencode.yml drift is therefore checked directly against this
+# tighter baseline instead of composing multiple generations of allowlists.
+OPENCODE_PROTECTED_BASELINE_SHA = "0f388e15929adb33307f27aecff325f4df47bf72"
+
 # Previous protected baseline before the PAUSE_ON_FAILURE advance above.
 # The empty-drift fallback below verifies the old-to-new baseline range
 # carries only the approved #179 probe plus this PAUSE change, so a new
@@ -354,6 +361,120 @@ APPROVED_CODERABBIT_NO_PROGRESS_PAT_ADDED_LINES = (
     "                await commentGithub.rest.issues.createComment({",
 )
 
+
+# Systemic qualification isolation / interruption recovery. This allowlist is
+# generated from the exact protected-workflow diff for the change: validation
+# dispatch comments cannot enter generic implementation, validation-only
+# trackers fail closed outside qualification mode, and long issue work is
+# checkpointed on runner termination and resumed on retry. Keeping every
+# added/deleted line enumerated preserves the protected-baseline invariant:
+# unrelated workflow drift still fails this test.
+APPROVED_QUALIFICATION_ISOLATION_CHECKPOINT_REMOVED_LINES = (
+    "           !contains(github.event.comment.body, '/oc-cancel'))",
+    "           !contains(github.event.comment.body, '/oc-cancel'))",
+    "          !contains(github.event.comment.body, '/oc-cancel')",
+    "          !contains(github.event.comment.body, '/oc-cancel')",
+    "            !contains(github.event.comment.body, '/oc-cancel'))) &&",
+    "          git switch --detach \"origin/$BASE_REF\"",
+    "          git switch -c \"$BRANCH\"",
+    "            exit 75",
+    "          if [[ -z \"$(git status --porcelain)\" ]]; then",
+    "          git add -A",
+    "          # kodmial/continuum#260: workflow-owned task commit sets the bot",
+    "          # identity (see Configure Git identity) and carries the component",
+    "          # trailer. The agent itself never commits (see prompt: the workflow",
+    "          # owns Git state), so this is the single deterministic owner.",
+    "          git commit -m \"${COMMIT_PREFIX}: implement issue #${ISSUE_NUMBER}\" -m \"Continuum-Component: opencode\"",
+)
+
+APPROVED_QUALIFICATION_ISOLATION_CHECKPOINT_ADDED_LINES = (
+    "           !contains(github.event.comment.body, '/oc-cancel') &&",
+    "           !contains(github.event.comment.body, 'continuum-qualification-dispatch'))",
+    "           !contains(github.event.comment.body, '/oc-cancel') &&",
+    "           !contains(github.event.comment.body, 'continuum-qualification-dispatch'))",
+    "            // Validation-only trackers are never ordinary implementation work.",
+    "            // They execute only through the immutable qualification-dispatch path.",
+    "            if (/<!--\\s*automation-validation-only\\s*-->/i.test(issue.body || '')) {",
+    "              core.setOutput('ready', 'false');",
+    "              core.notice(",
+    "                `Issue #${issueNumber} is validation-only; generic implementation is disabled.`",
+    "              );",
+    "              return;",
+    "            }",
+    "",
+    "          !contains(github.event.comment.body, '/oc-cancel') &&",
+    "          !contains(github.event.comment.body, 'continuum-qualification-dispatch')",
+    "          !contains(github.event.comment.body, '/oc-cancel') &&",
+    "          !contains(github.event.comment.body, 'continuum-qualification-dispatch')",
+    "            !contains(github.event.comment.body, '/oc-cancel') &&",
+    "           !contains(github.event.comment.body, 'continuum-qualification-dispatch'))) &&",
+    "          PAUSE_ON_FAILURE: ${{ inputs.pause_on_failure || vars.AUTOMATION_PAUSE_ON_FAILURE || 'true' }}",
+    "          BASE_START_SHA=\"$(git rev-parse \"origin/$BASE_REF\")\"",
+    "          CHECKPOINT_BRANCH=\"opencode/checkpoint-issue${ISSUE_NUMBER}\"",
+    "",
+    "          # Resume the latest interruption checkpoint if one exists. This",
+    "          # branch is workflow-owned and is deleted after a PR is published.",
+    "          if git ls-remote --exit-code --heads origin \"refs/heads/$CHECKPOINT_BRANCH\" >/dev/null 2>&1; then",
+    "            git fetch origin \"$CHECKPOINT_BRANCH\" --quiet",
+    "            git switch -c \"$BRANCH\" FETCH_HEAD",
+    "            echo \"Resuming issue #$ISSUE_NUMBER from interruption checkpoint $CHECKPOINT_BRANCH.\"",
+    "          else",
+    "            git switch --detach \"origin/$BASE_REF\"",
+    "            git switch -c \"$BRANCH\"",
+    "          fi",
+    "",
+    "          checkpoint_issue_progress() {",
+    "            local exit_code=\"${1:-143}\"",
+    "            trap - TERM INT HUP",
+    "            set +e",
+    "            if [[ \"$(git branch --show-current)\" == \"$BRANCH\" ]]; then",
+    "              find . -type d -name '__pycache__' -prune -exec rm -rf {} +",
+    "              find . -type f \\( -name '*.pyc' -o -name '*.pyo' \\) -delete",
+    "              if [[ -n \"$(git status --porcelain)\" ]]; then",
+    "                git add -A",
+    "                git commit -m \"chore: checkpoint interrupted issue #${ISSUE_NUMBER}\" \\",
+    "                  -m \"Continuum-Checkpoint-Issue: #${ISSUE_NUMBER}\" \\",
+    "                  -m \"Continuum-Component: opencode\" || true",
+    "              fi",
+    "              if [[ \"$(git rev-parse HEAD)\" != \"$BASE_START_SHA\" ]]; then",
+    "                git push --force origin \"HEAD:refs/heads/$CHECKPOINT_BRANCH\" || true",
+    "                echo \"::warning::Checkpointed issue #$ISSUE_NUMBER progress before runner exit.\"",
+    "              fi",
+    "            fi",
+    "            exit \"$exit_code\"",
+    "          }",
+    "          trap 'checkpoint_issue_progress 143' TERM",
+    "          trap 'checkpoint_issue_progress 130' INT",
+    "          trap 'checkpoint_issue_progress 129' HUP",
+    "          if [[ \"$OPENCODE_RUN_RC\" -eq 143 || \"$OPENCODE_RUN_RC\" -eq 130 || \"$OPENCODE_RUN_RC\" -eq 129 ]]; then",
+    "            rm -f \"$OPENCODE_RUN_LOG\"",
+    "            checkpoint_issue_progress \"$OPENCODE_RUN_RC\"",
+    "          fi",
+    "          trap - TERM INT HUP",
+    "            checkpoint_issue_progress 75",
+    "          WORKTREE_DIRTY=false",
+    "          if [[ -n \"$(git status --porcelain)\" ]]; then",
+    "            WORKTREE_DIRTY=true",
+    "          fi",
+    "          COMMITS_FROM_START=\"$(git rev-list --count \"$BASE_START_SHA..HEAD\" 2>/dev/null || echo 0)\"",
+    "          if [[ \"$WORKTREE_DIRTY\" != \"true\" && \"$COMMITS_FROM_START\" -eq 0 ]]; then",
+    "            if [[ \"${PAUSE_ON_FAILURE,,}\" == \"false\" ]]; then",
+    "              echo \"::error::No repository changes; autonomous mode delegates bounded retry/recovery instead of pausing.\"",
+    "              exit 1",
+    "            fi",
+    "          if [[ -n \"$(git status --porcelain)\" ]]; then",
+    "            git add -A",
+    "            # kodmial/continuum#260: workflow-owned task commit sets the bot",
+    "            # identity (see Configure Git identity) and carries the component",
+    "            # trailer. The agent itself never commits (see prompt: the workflow",
+    "            # owns Git state), so this is the single deterministic owner.",
+    "            git commit -m \"${COMMIT_PREFIX}: implement issue #${ISSUE_NUMBER}\" -m \"Continuum-Component: opencode\"",
+    "          fi",
+    "          gh api --method DELETE \\",
+    "            \"repos/$GITHUB_REPOSITORY/git/refs/heads/$CHECKPOINT_BRANCH\" \\",
+    "            >/dev/null 2>&1 || true",
+)
+
 # Fixed-history pin for the old-to-new baseline range check below
 # (PREVIOUS_BASELINE_SHA..BASELINE_SHA): that range landed before the
 # reconstruction self-stamp was removed, so it still carries the four
@@ -638,7 +759,12 @@ class ProtectedBaselineTests(unittest.TestCase):
             )
             return present.returncode == 0
 
-        for _sha in (BASELINE_SHA, PREVIOUS_BASELINE_SHA, OLDEST_BASELINE_SHA):
+        for _sha in (
+            BASELINE_SHA,
+            PREVIOUS_BASELINE_SHA,
+            OLDEST_BASELINE_SHA,
+            OPENCODE_PROTECTED_BASELINE_SHA,
+        ):
             if not _ensure_object(_sha):
                 self.fail(
                     "baseline history {} unavailable in shallow checkout: "
@@ -657,8 +783,13 @@ class ProtectedBaselineTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, msg or completed.stderr)
         for path in PROTECTED_FILES:
             with self.subTest(path=path):
+                protected_base = (
+                    OPENCODE_PROTECTED_BASELINE_SHA
+                    if path == ".github/workflows/continuum-opencode.yml"
+                    else BASELINE_SHA
+                )
                 out = subprocess.run(
-                    ["git", "diff", BASELINE_SHA, "HEAD", "--", path],
+                    ["git", "diff", protected_base, "HEAD", "--", path],
                     cwd=ROOT,
                     capture_output=True,
                     text=True,
@@ -705,31 +836,19 @@ class ProtectedBaselineTests(unittest.TestCase):
                         # for replacement. Any other deletion still fails.
                         self.assertEqual(
                             _Counter(deleted),
-                            _Counter(APPROVED_258_OPENCODE_ATTRIBUTION_REMOVED_LINES)
-                            + _Counter(APPROVED_260_OPENCODE_PROVENANCE_REMOVED_LINES)
-                            + _Counter(APPROVED_278_OPENCODE_DAG_REMOVED_LINES)
-                            + _Counter(APPROVED_CODERABBIT_NO_PROGRESS_PAT_REMOVED_LINES),
-                            f"{path} must not delete or modify baseline lines "
-                            f"outside the approved #258 attribution plus #260 "
-                            f"provenance plus #278 DAG-bypass plus cb673954 PAT-boundary replacement",
+                            _Counter(APPROVED_QUALIFICATION_ISOLATION_CHECKPOINT_REMOVED_LINES),
+                            f"{path} must not delete or modify lines beyond the exact "
+                            "qualification-isolation/checkpoint allowlist",
                         )
                         actual = _Counter(added)
-                        approved = _Counter(APPROVED_179_OPENCODE_PROBE_LINES)
                         expected = _Counter(
-                            {line: 2 * count for line, count in approved.items()}
+                            APPROVED_QUALIFICATION_ISOLATION_CHECKPOINT_ADDED_LINES
                         )
-                        expected.update(APPROVED_258_OPENCODE_ATTRIBUTION_ADDED_LINES)
-                        expected.update(APPROVED_260_OPENCODE_PROVENANCE_ADDED_LINES)
-                        expected.update(APPROVED_278_OPENCODE_DAG_ADDED_LINES)
-                        expected.update(APPROVED_CODERABBIT_NO_PROGRESS_PAT_ADDED_LINES)
                         self.assertEqual(
                             actual,
                             expected,
-                            f"{path} drift must be exactly the approved #179 probe "
-                            f"(both install sites, no extra copies) plus the approved "
-                            f"#258 attribution bodies plus the approved #260 "
-                            f"provenance lines plus the approved #278 "
-                            f"DAG-bypass lines: "
+                            f"{path} drift from the protected pre-fix main must be exactly "
+                            "the qualification-isolation/checkpoint change: "
                             f"extra={sorted(set(actual) - set(expected))} "
                             f"missing={sorted(set(expected) - set(actual))}",
                         )
