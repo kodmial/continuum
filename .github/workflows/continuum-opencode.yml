@@ -200,6 +200,7 @@ jobs:
           REVIEW_STATE: ${{ github.event.review.state }}
           REVIEW_BODY: ${{ github.event.review.body }}
           REVIEWED_SHA: ${{ github.event.review.commit_id }}
+          COMMENT_PAT: ${{ secrets.TAP_PAT }}
         with:
           github-token: ${{ github.token }}
           script: |
@@ -211,6 +212,16 @@ jobs:
             const reviewedSha = process.env.REVIEWED_SHA || '';
             const reviewState = (process.env.REVIEW_STATE || '').toLowerCase();
             const reviewBody = process.env.REVIEW_BODY || '';
+            const commentToken = String(process.env.COMMENT_PAT || '').trim();
+            if (!commentToken) {
+              throw new Error(
+                'COMMENT_PAT is required to publish CodeRabbit no-progress state.'
+              );
+            }
+            const commentGithub = new github.constructor({
+              auth: commentToken,
+              baseUrl: github.request.endpoint.DEFAULTS.baseUrl,
+            });
 
             const { data: pr } = await github.rest.pulls.get({
               owner,
@@ -278,7 +289,7 @@ jobs:
                 }
               );
               if (!issueComments.some(comment => (comment.body || '').includes(marker))) {
-                await github.rest.issues.createComment({
+                await commentGithub.rest.issues.createComment({
                   owner,
                   repo,
                   issue_number: pullNumber,

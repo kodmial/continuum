@@ -3459,7 +3459,7 @@ class ContinuumTest < Minitest::Test
       secrets_read_by(stubs).reject { |name| name == 'GITHUB_TOKEN' }
     end
 
-    assert_equal %w[RENDER_API_KEY TAP_PAT], consumer_defined.call(CORE_STUBS)
+    assert_equal %w[CONTINUUM_CHILD_REPOSITORIES RENDER_API_KEY TAP_PAT], consumer_defined.call(CORE_STUBS)
     assert_equal %w[CHILD_RUNTIME_REPOSITORIES CHILD_RUNTIME_TOKEN TAP_PAT],
                  consumer_defined.call(PARENT_STUBS)
     assert_empty consumer_defined.call(TECH_STUBS),
@@ -7867,7 +7867,7 @@ class ContinuumTest < Minitest::Test
        continuum-consumer-child-review.yml continuum-consumer-child-pr-review.yml].each do |file|
       body = File.read(File.join(ROOT, '.github/workflows', file))
       body.scan(/secrets\.([A-Za-z0-9_]+)/).flatten.uniq.each do |secret|
-        assert_includes %w[TAP_PAT RENDER_API_KEY CHILD_RUNTIME_TOKEN CHILD_RUNTIME_REPOSITORIES GITHUB_TOKEN],
+        assert_includes %w[TAP_PAT RENDER_API_KEY CHILD_RUNTIME_TOKEN CHILD_RUNTIME_REPOSITORIES CONTINUUM_CHILD_REPOSITORIES GITHUB_TOKEN],
                         secret,
                         "#{file}: baseline provenance must not require a new secret secrets.#{secret}"
       end
