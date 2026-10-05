@@ -40,12 +40,24 @@ if [[ -n "$child_id" ]]; then
     exit 2
   }
 
+  legacy_repository_map="${CHILD_REPOSITORIES:-}"
   resolve_rc=0
+  # Repository variables are the authoritative relationship contract. The
+  # legacy secret map is only a compatibility fallback and must never override
+  # a valid variable-based child relationship.
   target_repository="$(
     PARENT_CONFIG="${PARENT_CONFIG:-.continuum.yml}" \
-    CHILD_REPOSITORIES="${CHILD_REPOSITORIES:-}" \
+    CHILD_REPOSITORIES="" \
       bash "$resolver" resolve "$child_id" 2>/dev/null
   )" || resolve_rc=$?
+  if [[ "$resolve_rc" -ne 0 || -z "$target_repository" ]] && [[ -n "$legacy_repository_map" ]]; then
+    resolve_rc=0
+    target_repository="$(
+      PARENT_CONFIG="${PARENT_CONFIG:-.continuum.yml}" \
+      CHILD_REPOSITORIES="$legacy_repository_map" \
+        bash "$resolver" resolve "$child_id" 2>/dev/null
+    )" || resolve_rc=$?
+  fi
   # Repository names cannot contain whitespace: strip carriage returns and
   # trim leading/trailing whitespace so a trailing newline/CR from the
   # resolver cannot fail a valid delegation closed. Internal whitespace is
@@ -63,9 +75,17 @@ if [[ -n "$child_id" ]]; then
     echo "::error::PR-Agent target repository identity is invalid." >&2
     exit 2
   fi
-  if ! PARENT_CONFIG="${PARENT_CONFIG:-.continuum.yml}" \
-       CHILD_REPOSITORIES="${CHILD_REPOSITORIES:-}" \
-       bash "$resolver" verify "$child_id" "$target_repository" >/dev/null 2>&1; then
+  verify_rc=0
+  PARENT_CONFIG="${PARENT_CONFIG:-.continuum.yml}" \
+    CHILD_REPOSITORIES="" \
+    bash "$resolver" verify "$child_id" "$target_repository" >/dev/null 2>&1 || verify_rc=$?
+  if [[ "$verify_rc" -ne 0 && -n "$legacy_repository_map" ]]; then
+    verify_rc=0
+    PARENT_CONFIG="${PARENT_CONFIG:-.continuum.yml}" \
+      CHILD_REPOSITORIES="$legacy_repository_map" \
+      bash "$resolver" verify "$child_id" "$target_repository" >/dev/null 2>&1 || verify_rc=$?
+  fi
+  if [[ "$verify_rc" -ne 0 ]]; then
     echo "::error::PR-Agent delegated target verification failed closed." >&2
     exit 2
   fi

@@ -11,7 +11,13 @@ SCRIPT = ROOT / ".github" / "scripts" / "pr_agent_target.sh"
 
 
 class PrAgentTargetContextTests(unittest.TestCase):
-    def run_target(self, child_id="", resolver_body=None, github_actions="false"):
+    def run_target(
+        self,
+        child_id="",
+        resolver_body=None,
+        github_actions="false",
+        child_repositories="",
+    ):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             scripts = root / ".github" / "scripts"
@@ -40,6 +46,7 @@ class PrAgentTargetContextTests(unittest.TestCase):
                     # separately asserts that delegated Actions runs install
                     # the required masks.
                     "GITHUB_ACTIONS": github_actions,
+                    "CHILD_REPOSITORIES": child_repositories,
                 }
             )
             proc = subprocess.run(
@@ -93,6 +100,39 @@ class PrAgentTargetContextTests(unittest.TestCase):
         self.assertIn("verify opaque-a private-owner/private-child", calls)
         self.assertNotIn("private-owner/private-child", proc.stdout)
         self.assertNotIn("private-owner/private-child", proc.stderr)
+
+    def test_variable_discovery_wins_over_stale_legacy_repository_map(self):
+        proc, values, calls = self.run_target(
+            "opaque-a",
+            """
+            #!/usr/bin/env bash
+            set -euo pipefail
+            echo "${CHILD_REPOSITORIES:-}<map> $*" >> "__CALLS__"
+            case "$1" in
+              resolve)
+                if [[ -n "${CHILD_REPOSITORIES:-}" ]]; then
+                  exit 4
+                fi
+                printf 'private-owner/private-child\\n'
+                ;;
+              verify)
+                [[ -z "${CHILD_REPOSITORIES:-}" ]]
+                [[ "$2" == opaque-a && "$3" == private-owner/private-child ]]
+                ;;
+              *) exit 2 ;;
+            esac
+            """,
+            child_repositories='{"opaque-a":"stale-owner/stale-child"}',
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            values["CONTINUUM_PR_AGENT_TARGET_REPOSITORY"],
+            "private-owner/private-child",
+        )
+        first_call = calls.splitlines()[0]
+        self.assertTrue(first_call.startswith("<map> resolve opaque-a"), calls)
+        self.assertNotIn("stale-owner/stale-child", proc.stdout)
+        self.assertNotIn("stale-owner/stale-child", proc.stderr)
 
     def test_delegated_verify_failure_is_fail_closed(self):
         proc, values, calls = self.run_target(
