@@ -19,6 +19,9 @@ permissions:
 
 jobs:
   remove-label:
+    # Verified child PR lifecycle runs in the public parent. Do not allocate
+    # private child Actions minutes for duplicate label housekeeping.
+    if: vars.CONTINUUM_ROLE != 'child'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

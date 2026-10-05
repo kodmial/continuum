@@ -29,6 +29,8 @@ permissions:
 
 jobs:
   add-label:
+    # Verified child PR review/readiness is owned by the public parent.
+    if: vars.CONTINUUM_ROLE != 'child'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

@@ -88,6 +88,9 @@ concurrency:
 
 jobs:
   controller:
+    # Verified child PR merge/review is owned by the public parent delegated
+    # review workflow; never allocate a private child runner here.
+    if: vars.CONTINUUM_ROLE != 'child'
     runs-on: ubuntu-latest
     timeout-minutes: ${{ fromJSON(vars.AUTOMATION_AUTOMERGE_TIMEOUT_MINUTES || '10') }}
 
