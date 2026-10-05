@@ -480,6 +480,14 @@ switch (process.env.POLICY_OP) {
   case 'disposition':
     result = policy.reviewDisposition(payload.review, payload.improve_jsonl || '');
     break;
+  case 'merge_gate':
+    result = policy.mergeGateSummary(
+      payload.review,
+      payload.improve_jsonl || '',
+      payload.persistent_state,
+      payload.head_sha
+    );
+    break;
   case 'same':
     result = policy.sameLogicalDefect(payload.review, payload.improve);
     break;
@@ -4014,6 +4022,73 @@ class SchedulingSemanticsTests(unittest.TestCase):
                 body = read_repo(path)
                 self.assertNotIn("concurrency:", body)
                 self.assertNotIn("cancel-in-progress", body)
+
+
+class CompactMergeGateTests(unittest.TestCase):
+    def test_compact_gate_is_small_even_when_review_payload_is_large(self):
+        head = "a" * 40
+        review = make_review(
+            [],
+            extra={
+                "security_concerns": "No",
+                "ticket_compliance_check": [
+                    {"not_compliant_requirements": "-"}
+                ],
+                "diagnostic_padding": "x" * 200_000,
+            },
+        )
+        gate = run_policy(
+            "merge_gate",
+            {
+                "review": review,
+                "improve_jsonl": "",
+                "persistent_state": make_persistent([], head_sha=head),
+                "head_sha": head,
+            },
+        )
+        self.assertTrue(gate["green"])
+        self.assertEqual(gate["head_sha"], head)
+        self.assertEqual(gate["schema_version"], 1)
+        self.assertLess(len(json.dumps(gate)), 4096)
+
+    def test_compact_gate_fails_closed_on_stale_or_active_persistent_state(self):
+        head = "a" * 40
+        with self.assertRaises(AssertionError):
+            run_policy(
+                "merge_gate",
+                {
+                    "review": make_review([]),
+                    "improve_jsonl": "",
+                    "persistent_state": make_persistent([], head_sha="b" * 40),
+                    "head_sha": head,
+                },
+            )
+        active = make_persistent(
+            [{"state": "ACTIVE", "last_seen_head_sha": head}],
+            head_sha=head,
+        )
+        gate = run_policy(
+            "merge_gate",
+            {
+                "review": make_review([]),
+                "improve_jsonl": "",
+                "persistent_state": active,
+                "head_sha": head,
+            },
+        )
+        self.assertFalse(gate["green"])
+        self.assertIn("ACTIVE", gate["reason"])
+
+    def test_merge_workflow_prefers_compact_gate_and_review_job_stops_forwarding_large_state(self):
+        review = read_repo(".github/workflows/continuum-pr-agent.yml")
+        merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
+        self.assertIn("merge_gate_json:", review)
+        self.assertIn("merge_gate_json: ${{ needs.pr_agent.outputs.merge_gate_json }}", review)
+        merge_block = review.split("\n  merge:\n", 1)[1]
+        self.assertNotIn("review_json: ${{ needs.pr_agent.outputs.review_json }}", merge_block)
+        self.assertNotIn("persistent_state_json: ${{ needs.pr_agent.outputs.persistent_state_json }}", merge_block)
+        self.assertIn("MERGE_GATE_JSON: ${{ inputs.merge_gate_json }}", merge)
+        self.assertIn("Backward-compatible legacy path", merge)
 
 
 class ReviewDispositionIntegrationTests(unittest.TestCase):
