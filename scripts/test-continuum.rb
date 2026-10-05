@@ -3459,7 +3459,7 @@ class ContinuumTest < Minitest::Test
       secrets_read_by(stubs).reject { |name| name == 'GITHUB_TOKEN' }
     end
 
-    assert_equal %w[CONTINUUM_CHILD_REPOSITORIES RENDER_API_KEY TAP_PAT], consumer_defined.call(CORE_STUBS)
+    assert_equal %w[RENDER_API_KEY TAP_PAT], consumer_defined.call(CORE_STUBS)
     assert_equal %w[CHILD_RUNTIME_REPOSITORIES CHILD_RUNTIME_TOKEN TAP_PAT],
                  consumer_defined.call(PARENT_STUBS)
     assert_empty consumer_defined.call(TECH_STUBS),
