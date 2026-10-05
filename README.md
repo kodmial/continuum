@@ -225,7 +225,6 @@ part of the contract and never change per consumer):
 | `RENDER_API_KEY` | `core` | `continuum-render-executor.yml` | Render API key. A different credential from `TAP_PAT`, with **no** fallback: the controller fails explicitly when it is unset. |
 | `CHILD_RUNTIME_TOKEN` | `parent` | `consumer-child-*` | Parent delegation token; the caller stubs map it from `TAP_PAT`. |
 | `CHILD_RUNTIME_REPOSITORIES` | `parent` | `consumer-child-*` (optional) | Pre-variables compatibility path; see `docs/parent-child-delegation.md`. |
-| `CONTINUUM_CHILD_REPOSITORIES` | `parent` | PR-Agent delegated target resolution (optional) | Legacy pre-variables compatibility map; new integrations should use repository variables. |
 
 No paid provider key is part of this contract: **no workflow reads
 `OPENCODE_API_KEY` or `GROQ_API_KEY`.** The core runs on free anonymous models
