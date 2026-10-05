@@ -103,7 +103,7 @@ ALLOWED_TRANSITIONS: Dict[str, frozenset] = {
     RATE_LIMITED: frozenset({RATE_LIMITED, WAITING_REVIEW, REVIEW_IN_FLIGHT,
                              TERMINAL_BLOCK}),
     REPAIR_IN_FLIGHT: frozenset({REPAIR_IN_FLIGHT, WAITING_RECHECK,
-                                 WAITING_REVIEW, TERMINAL_BLOCK}),
+                                 WAITING_REVIEW, MERGE_READY, TERMINAL_BLOCK}),
     WAITING_RECHECK: frozenset({WAITING_RECHECK, WAITING_REVIEW,
                                 REVIEW_IN_FLIGHT, REPAIR_IN_FLIGHT,
                                 MERGE_READY, CONFLICT_REPAIR, TERMINAL_BLOCK,
@@ -111,7 +111,7 @@ ALLOWED_TRANSITIONS: Dict[str, frozenset] = {
     MERGE_READY: frozenset({MERGE_READY, MERGED, WAITING_RECHECK,
                             WAITING_CI, TERMINAL_BLOCK}),
     CONFLICT_REPAIR: frozenset({CONFLICT_REPAIR, WAITING_CI, WAITING_RECHECK,
-                                TERMINAL_BLOCK}),
+                                MERGE_READY, TERMINAL_BLOCK}),
     MERGED: frozenset({MERGED}),
     TERMINAL_BLOCK: frozenset({TERMINAL_BLOCK, WAITING_CI}),
 }
@@ -608,7 +608,7 @@ def sanitize_parent_state(state: Mapping[str, object]) -> Dict[str, object]:
                 projected[key] = "-"
         elif key == "last_event":
             text = str(value or "redacted")
-            if not _LAST_EVENT_RE.match(text):
+            if "/" in text or not _LAST_EVENT_RE.match(text):
                 projected[key] = "redacted"
         elif isinstance(value, str) and "/" in value:
             projected[key] = "redacted"
@@ -699,7 +699,7 @@ def _facts_changed_since(prior: LifecycleState, facts: LifecycleFacts,
     the material facts are also identical.
     """
     if not facts.config_valid or not facts.authenticated:
-        return prior.phase != TERMINAL_BLOCK
+        return True
     if facts.wip_full:
         return True
     if facts.mergeable == "dirty":
@@ -801,17 +801,9 @@ def reduce(prior: Optional[LifecycleState], facts: LifecycleFacts,
         # review supersedes historical findings/statuses).
         review = None
 
-    # Duplicate wakeup: same event identity and no material change coalesces.
-    if event_id == prior.last_event and not _facts_changed_since(
-            prior, facts, review):
-        return Transition(
-            state=prior,
-            decision=Decision(action="noop", workflow_failure=False,
-                              reason="duplicate wakeup coalesced",
-                              emit_side_effect=False,
-                              idempotency_key=prior.idempotency_key()),
-        )
-
+    # Config/auth failures are deterministic ERROR and must never be masked
+    # by duplicate-wakeup coalescing: check them before the noop path so a
+    # replayed event_id after a broken-config error preserves the error.
     if not facts.config_valid:
         nxt = replace(prior, last_event=event_id[:64])
         if _checked_transition(prior, TERMINAL_BLOCK):
@@ -835,6 +827,17 @@ def reduce(prior: Optional[LifecycleState], facts: LifecycleFacts,
                               idempotency_key=nxt.idempotency_key()),
         )
 
+    # Duplicate wakeup: same event identity and no material change coalesces.
+    if event_id == prior.last_event and not _facts_changed_since(
+            prior, facts, review):
+        return Transition(
+            state=prior,
+            decision=Decision(action="noop", workflow_failure=False,
+                              reason="duplicate wakeup coalesced",
+                              emit_side_effect=False,
+                              idempotency_key=prior.idempotency_key()),
+        )
+
     def move(phase: str, reason: str, action: str, emit: bool,
              failure: bool = False, **updates: object) -> Transition:
         if not _checked_transition(prior, phase):
@@ -851,13 +854,17 @@ def reduce(prior: Optional[LifecycleState], facts: LifecycleFacts,
                               not_before=int(getattr(nxt, "not_before", 0))),
         )
 
-    # Conflict path owns dirty PRs: one dispatch per generation.
+    # Conflict path owns dirty PRs: one dispatch per generation. The budget
+    # is per HEAD generation (conflict_generation), not per phase: once one
+    # repair has been dispatched for this HEAD, any further dirty sighting
+    # on the same HEAD waits, even if the record has since left
+    # CONFLICT_REPAIR for another phase.
     if facts.mergeable == "dirty":
-        if prior.phase == CONFLICT_REPAIR and prior.conflict_generation >= \
+        if int(prior.conflict_generation) >= \
                 MAX_CONFLICT_DISPATCHES_PER_HEAD:
             return _wait(replace(prior, last_event=event_id[:64]),
                          "conflict-repair budget exhausted for this HEAD")
-        if prior.phase == CONFLICT_REPAIR and prior.conflict_generation >= 1:
+        if prior.phase == CONFLICT_REPAIR and int(prior.conflict_generation) >= 1:
             return _wait(replace(prior, last_event=event_id[:64]),
                          "conflict repair already in flight for this HEAD")
         return move(CONFLICT_REPAIR, "dirty PR needs conflict repair",
