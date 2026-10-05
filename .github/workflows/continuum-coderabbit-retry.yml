@@ -224,7 +224,7 @@ jobs:
               /Review rate limited|Review limit reached/i;
             const REQUESTED_LABEL = 'coderabbit-review-requested';
             const FULL_REVIEW_COMMAND_RE =
-              /^@coderabbitai\s+(?:full\s+)?review\s*$/i;
+              /^@coderabbitai\s+(?:full\s+)?review(?:\s*$|\s*\n)/i;
             const priorityRank = new Map([
               ['priority:p0', 0],
               ['priority:p1', 1],
@@ -1193,7 +1193,7 @@ jobs:
             // legally due; P0 beats P1 beats P2, then lower source issue number.
             let acquiredInitialLock = false;
             if (selected.kind === 'initial') {
-              await github.rest.issues.addLabels({
+              await commentGithub.rest.issues.addLabels({
                 owner,
                 repo,
                 issue_number: selected.prNumber,
@@ -1211,13 +1211,13 @@ jobs:
                 // Continuum comment attribution (kodmial/continuum#258): the
                 // @coderabbitai command stays first so the review request
                 // still triggers; the header is the first rendered line.
-                body: '@coderabbitai full review\n\n⚡ **Continuum · coderabbit-retry**\n<!-- continuum-origin role=continuum component=coderabbit-retry -->',
+                body: `@coderabbitai full review\n\n⚡ **Continuum · coderabbit-retry**\n<!-- continuum-origin role=continuum component=coderabbit-retry -->\n<!-- continuum-coderabbit-command head=${selected.headSha} -->`,
               });
               apiBudget.mutations += 1;
             } catch (err) {
               if (acquiredInitialLock) {
                 try {
-                  await github.rest.issues.removeLabel({
+                  await commentGithub.rest.issues.removeLabel({
                     owner,
                     repo,
                     issue_number: selected.prNumber,
