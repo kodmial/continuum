@@ -1090,25 +1090,47 @@ function mergeGateSummary(reviewPayload, improveJsonl, persistentState, headSha)
   if (!isPlausibleHeadSha(head)) {
     throw new Error('PR-Agent compact merge gate requires a plausible exact reviewed HEAD.');
   }
+  // WAIT vs ERROR split: a missing/stale/incomplete persistent review is a
+  // normal exact-HEAD supersession/wait case (concurrent push race or first
+  // run with no last_run), never a workflow failure. Return a healthy
+  // non-green WAIT summary so the caller emits green=false/recheck instead
+  // of core.setFailed. Only a malformed HEAD or review payload throws.
+  function earlyBlocked(reason) {
+    return {
+      schema_version: 1,
+      head_sha: head,
+      disposition: 'wait',
+      recommendation: '',
+      review_count: 0,
+      qualifying_suggestion_count: 0,
+      persistent_active: false,
+      review_coverage_complete: false,
+      tool_error: false,
+      blocking_security: false,
+      green: false,
+      reason: String(reason || 'blocked'),
+    };
+  }
   if (!persistentState || typeof persistentState !== 'object' || Array.isArray(persistentState)) {
-    throw new Error('PR-Agent compact merge gate requires persistent state object.');
+    return earlyBlocked('persistent state not yet available for this HEAD: awaiting complete full review');
   }
   if (persistentState.schema_version !== 1 || !Array.isArray(persistentState.findings)) {
-    throw new Error('PR-Agent compact merge gate persistent state schema is invalid.');
+    return earlyBlocked('persistent state schema is invalid: awaiting complete full review');
   }
   const lastRun = persistentState.last_run;
   if (!lastRun || typeof lastRun !== 'object') {
-    throw new Error('PR-Agent compact merge gate persistent state has no last_run.');
+    return earlyBlocked('persistent state has no last_run: awaiting complete full review');
   }
   const stateHead = String(lastRun.head_sha || '').trim().toLowerCase();
   if (stateHead !== head) {
-    throw new Error(
-      'PR-Agent compact merge gate persistent state is stale: ' +
-      (stateHead || '<empty>') + ' != ' + head
+    return earlyBlocked(
+      'persistent state is stale: ' +
+      (stateHead || '<empty>') + ' != ' + head +
+      ': awaiting recheck for the current HEAD'
     );
   }
   if (lastRun.complete !== true || String(lastRun.kind || '') !== 'full') {
-    throw new Error('PR-Agent compact merge gate requires a complete full persistent review.');
+    return earlyBlocked('persistent review is not a complete full review: awaiting complete full review');
   }
 
   const review = unwrapReview(reviewPayload);
@@ -1127,7 +1149,27 @@ function mergeGateSummary(reviewPayload, improveJsonl, persistentState, headSha)
   const toolError = hasToolErrorSignal(review);
   const reviewCoverageComplete = !hasIncompleteCoverageSignal(review);
   const blockingSecurity = hasBlockingSecuritySignal(review);
-  const hasActive = persistentHasActive(persistentState);
+  let hasActive;
+  try {
+    hasActive = persistentHasActive(persistentState);
+  } catch (err) {
+    // An unrecognized upstream finding state is failing-closed WAIT, never
+    // a workflow failure: recheck once the persistent review settles.
+    return {
+      schema_version: 1,
+      head_sha: head,
+      disposition: String(disposition.action || ''),
+      recommendation,
+      review_count: review.key_issues_to_review.length,
+      qualifying_suggestion_count: qualifying.length,
+      persistent_active: false,
+      review_coverage_complete: reviewCoverageComplete,
+      tool_error: toolError,
+      blocking_security: blockingSecurity,
+      green: false,
+      reason: 'persistent finding state is unrecognized: failing closed',
+    };
+  }
 
   const base = {
     schema_version: 1,

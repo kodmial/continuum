@@ -350,18 +350,27 @@ def load_authoritative_state(
 
     Only the newest ``max_comments`` bodies are inspected and only hidden
     markers are parsed: no full-history scan is ever needed for idempotency.
-    When ``repo``/``pr`` are given, markers for another PR are ignored so an
-    old record from elsewhere can never authorize this PR.
+    ``repo``/``pr`` are required: markers for another PR are always ignored
+    so an old record from elsewhere can never authorize this PR. Callers
+    that omit identity fail closed with :class:`LifecycleError` instead of
+    returning another PR's phase/generation/head.
     """
+    _require_repo(repo)
+    try:
+        pr_int = int(pr)
+    except (TypeError, ValueError):
+        raise LifecycleError(f"invalid PR identity: {pr!r}")
+    if pr_int <= 0:
+        raise LifecycleError(f"invalid PR identity: {pr!r}")
     window = list(comment_bodies)[-max_comments:] if comment_bodies else []
     # Newest wins: scan from the tail.
     for body in reversed(window):
         state = parse_state_marker(body)
         if state is None:
             continue
-        if repo and state.repo != repo:
+        if state.repo != repo:
             continue
-        if pr and int(state.pr) != int(pr):
+        if int(state.pr) != pr_int:
             continue
         return state
     return None
@@ -762,22 +771,19 @@ def reduce(prior: Optional[LifecycleState], facts: LifecycleFacts,
                               reason=str(exc), emit_side_effect=False,
                               idempotency_key=dummy.idempotency_key()),
         )
+    if prior is None:
+        # LifecycleFacts carries no repo/pr; never invent identity here.
+        # Callers must seed with initial_state(repo, pr, head).
+        raise LifecycleError(
+            "reduce() requires prior state from initial_state() or "
+            "load_authoritative_state()")
     if facts.event not in EVENTS:
-        if prior is None:
-            return _error("unknown/unknown", 0, head, 1,
-                          f"unknown event: {facts.event!r}")
         return _error(prior.repo, prior.pr, prior.head, prior.generation,
                       f"unknown event: {facts.event!r}",
                       last_event=facts.event_id or prior.last_event)
 
     event_id = _sanitize_last_event(
         str(facts.event_id or "").strip() or f"{facts.event}:{head[:12]}", 64)
-
-    if prior is None:
-        repo_guess = "unknown/unknown"
-        state = LifecycleState(repo=repo_guess, pr=0, head=head, generation=1,
-                               phase=WAITING_CI, last_event=event_id[:64])
-        return _wait(state, "initialized authoritative record; awaiting CI")
 
     # Exact-HEAD gate: a new HEAD always starts a new generation. Stale
     # commands/labels/statuses from the old HEAD are dropped here, so they

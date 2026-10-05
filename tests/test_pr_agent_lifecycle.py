@@ -4197,16 +4197,20 @@ class CompactMergeGateTests(unittest.TestCase):
 
     def test_compact_gate_fails_closed_on_stale_or_active_persistent_state(self):
         head = "a" * 40
-        with self.assertRaises(AssertionError):
-            run_policy(
-                "merge_gate",
-                {
-                    "review": make_review([]),
-                    "improve_jsonl": "",
-                    "persistent_state": make_persistent([], head_sha="b" * 40),
-                    "head_sha": head,
-                },
-            )
+        # A stale persistent state (concurrent push race) is a healthy WAIT,
+        # not a workflow failure: the gate returns non-green so the caller
+        # rechecks the new HEAD instead of failing red.
+        stale = run_policy(
+            "merge_gate",
+            {
+                "review": make_review([]),
+                "improve_jsonl": "",
+                "persistent_state": make_persistent([], head_sha="b" * 40),
+                "head_sha": head,
+            },
+        )
+        self.assertFalse(stale["green"])
+        self.assertIn("stale", stale["reason"])
         active = make_persistent(
             [{"state": "ACTIVE", "last_seen_head_sha": head}],
             head_sha=head,
