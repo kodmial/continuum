@@ -1954,6 +1954,15 @@ jobs:
             echo "restart_required=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Publish OpenCode 429 recovery artifact
+        if: always() && steps.runner_recovery.outputs.restart_required == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: continuum-opencode-429-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/continuum-opencode-429
+          if-no-files-found: error
+          retention-days: 1
+
       - name: Clear conflict-repair lock
         if: >-
           always() &&
@@ -1967,37 +1976,6 @@ jobs:
           gh api --method DELETE \
             "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/labels/opencode-conflict-repair" \
             >/dev/null 2>&1 || true
-
-  recover-opencode-429:
-    name: Recover OpenCode 429 on fresh runner
-    needs: opencode
-    if: >-
-      always() &&
-      needs.opencode.outputs.restart_required == 'true' &&
-      github.run_attempt < 4
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-
-    permissions:
-      actions: write
-      contents: read
-
-    steps:
-      - name: Re-run current workflow on fresh hosted runners
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
-        with:
-          github-token: ${{ github.token }}
-          script: |
-            const attempt = Number(context.runAttempt || process.env.GITHUB_RUN_ATTEMPT || '1');
-            await github.rest.actions.reRunWorkflow({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              run_id: context.runId,
-            });
-            core.notice(
-              'OpenCode 429: re-running workflow on fresh runner; attempt ' +
-              (attempt + 1) + '/4.'
-            );
 
   cleanup-workflow-repair-lock:
     name: Release workflow-repair lock
