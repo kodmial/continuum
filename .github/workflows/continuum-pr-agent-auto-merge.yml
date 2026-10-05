@@ -30,10 +30,17 @@ on:
         type: string
         default: ''
         required: false
+      merge_gate_json:
+        description: >-
+          Compact versioned exact-HEAD review gate produced by the PR-Agent
+          review job. When present it is authoritative for the review portion.
+        type: string
+        default: ''
+        required: false
       review_json:
         description: >-
-          Canonical upstream review JSON (steps.pragent.outputs.review) for the
-          exact HEAD.
+          Legacy canonical upstream review JSON for callers not yet migrated
+          to merge_gate_json.
         type: string
         default: ''
         required: false
@@ -262,6 +269,7 @@ jobs:
         env:
           PR_NUMBER: ${{ inputs.pr_number }}
           HEAD_SHA: ${{ inputs.head_sha }}
+          MERGE_GATE_JSON: ${{ inputs.merge_gate_json }}
           REVIEW_JSON: ${{ inputs.review_json }}
           IMPROVE_JSONL: ${{ inputs.improve_jsonl }}
           PERSISTENT_STATE_JSON: ${{ inputs.persistent_state_json }}
@@ -300,6 +308,51 @@ jobs:
               core.setFailed('PR-Agent merge requires pr_number and head_sha.');
               return;
             }
+            const compactRaw = String(process.env.MERGE_GATE_JSON || '').trim();
+            if (compactRaw) {
+              let compact;
+              try {
+                compact = JSON.parse(compactRaw);
+              } catch (err) {
+                core.setFailed('Invalid compact PR-Agent merge gate JSON: ' + err.message);
+                return;
+              }
+              if (
+                !compact ||
+                typeof compact !== 'object' ||
+                Array.isArray(compact) ||
+                compact.schema_version !== 1
+              ) {
+                core.setFailed('Compact PR-Agent merge gate schema is invalid.');
+                return;
+              }
+              const compactHead = String(compact.head_sha || '').trim().toLowerCase();
+              if (compactHead !== headSha) {
+                core.setFailed(
+                  'Compact PR-Agent merge gate is stale: head=' +
+                  (compactHead || '<empty>') + ', expected=' + headSha + '.'
+                );
+                return;
+              }
+              if (compact.green !== true || String(compact.disposition || '') !== 'merge') {
+                core.setFailed(
+                  'Compact PR-Agent merge gate blocks PR #' + prNumber + ': ' +
+                  String(compact.reason || compact.disposition || 'blocked')
+                );
+                return;
+              }
+              core.setOutput('green', 'true');
+              core.setOutput('reason', 'review portion satisfied by compact exact-head gate');
+              core.setOutput('head_sha', headSha);
+              core.notice(
+                'PR #' + prNumber +
+                ' review portion satisfied by compact exact-head gate at ' + headSha + '.'
+              );
+              return;
+            }
+
+            // Backward-compatible legacy path for callers that have not yet
+            // migrated to the compact exact-head gate.
             let review;
             try {
               review = JSON.parse(String(process.env.REVIEW_JSON || ''));
