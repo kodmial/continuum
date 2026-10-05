@@ -51,7 +51,7 @@ ENTRIES = (
     {
         "workflow": "continuum-coderabbit-retry.yml",
         "step": "Reconcile global CodeRabbit review queue",
-        "operation": "issues.addLabels/removeLabel + @coderabbitai command comment",
+        "operation": "issues.addLabels/removeLabel + @coderabbitai command comment (split actor)",
         "kind": "label/comment",
         "same_repo": True,
         "permission": "issues:write",
@@ -59,9 +59,9 @@ ENTRIES = (
         "cross_repo": False,
         "needs_push_dispatch": False,
         "needs_human_actor": False,
-        "verdict": GITHUB_TOKEN,
-        "reason": "Queue state + external CodeRabbit command; no GitHub workflow watches these writes.",
-        "evidence": ("github-token: ${{ github.token }}",),
+        "verdict": KEEP_PAT,
+        "reason": "GitHub integration permission rejects the CodeRabbit-triggering PR comment from GITHUB_TOKEN; queue labels remain github-actions[bot] while only the command comment retains PAT.",
+        "evidence": ("COMMENT_PAT: ${{ secrets.TAP_PAT }}",),
     },
     {
         "workflow": "continuum-coderabbit-unresolved.yml",
