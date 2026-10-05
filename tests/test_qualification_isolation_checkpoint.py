@@ -77,10 +77,6 @@ class InterruptedIssueCheckpointTests(unittest.TestCase):
         self.assertLess(autonomous, pause)
 
 
-    @classmethod
-    def setUpClass(cls) -> None:
-        cls.body = OPENCODE.read_text(encoding="utf-8")
-
     def test_interrupted_agent_work_is_checkpointed_and_resumed(self) -> None:
         implement = step_block(self.body, "Implement issue")
         for marker in (
