@@ -217,6 +217,13 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
                 self.assertIn("target_child_id", body)
                 self.assertNotIn("target_repository", body)
 
+    def test_pr_agent_caller_accepts_forwarded_continuum_ref(self):
+        body = read(".github/caller-stubs/continuum-pr-agent.yml")
+        dispatch = body.split("workflow_dispatch:", 1)[1].split("\npermissions:", 1)[0]
+        self.assertIn("continuum_ref:", dispatch)
+        self.assertIn("default: main", dispatch)
+        self.assertIn("continuum_ref: \"${{ inputs.continuum_ref || 'main' }}\"", body)
+
     def test_delegated_identity_is_masked_and_target_checkout_is_quiet(self):
         helper = read(".github/scripts/pr_agent_target.sh")
         # Resolver stderr is suppressed so delegated identity cannot leak
