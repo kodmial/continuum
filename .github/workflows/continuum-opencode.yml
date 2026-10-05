@@ -372,6 +372,9 @@ jobs:
       group: opencode-${{ inputs.pr_number || inputs.issue_number || github.event.issue.number || github.event.pull_request.number || github.run_id }}
       cancel-in-progress: false
 
+    outputs:
+      restart_required: ${{ steps.runner_recovery.outputs.restart_required }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -1016,6 +1019,32 @@ jobs:
             sleep $((attempt * 15))
           done
 
+      - name: Install Continuum OpenCode rate-limit wrapper
+        if: steps.issue_readiness.outputs.ready != 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          wrapper="${RUNNER_TEMP:-/tmp}/continuum-opencode"
+          cat > "$wrapper" <<'SH'
+          #!/usr/bin/env bash
+          set -uo pipefail
+          log="$(mktemp)"
+          set +e
+          opencode "$@" 2>&1 | tee "$log"
+          status=${PIPESTATUS[0]}
+          set -e
+          if grep -Eiq 'FreeUsageLimitError|HTTP[[:space:]]*429|http[[:space:]]*=[[:space:]]*429|statusCode[^0-9]*429|"status"[^0-9]*429|429[^[:alnum:]]+.*rate[ -]?limit' "$log"; then
+            : > "${RUNNER_TEMP:-/tmp}/continuum-opencode-429"
+            rm -f "$log"
+            echo "::error::OpenCode 429: retire this runner and recover on a fresh runner."
+            exit 75
+          fi
+          rm -f "$log"
+          exit "$status"
+          SH
+          chmod +x "$wrapper"
+          echo "${RUNNER_TEMP:-/tmp}" >> "$GITHUB_PATH"
+
       # Interactive OpenCode remains available for PR/review comments. A /oc
       # comment on a plain issue is an implementation command and is routed
       # through the deterministic issue-mode contract below instead of letting
@@ -1047,7 +1076,7 @@ jobs:
           SHARE: "false"
           OPENCODE_CONFIG_CONTENT: >-
             {"permission":{"bash":{"*":"allow","git *":"deny","git status":"allow","git status *":"allow","git diff":"allow","git diff *":"allow","git log":"allow","git log *":"allow","git show":"allow","git show *":"allow","git rev-parse *":"allow","git ls-files":"allow","git ls-files *":"allow","git grep *":"allow","git blame *":"allow","git branch --show-current":"allow","git remote -v":"allow","git tag":"allow","git tag --list *":"allow","git tag -l *":"allow","git describe *":"allow"}}}
-        run: opencode github run
+        run: continuum-opencode github run
 
       # Upstream OpenCode deliberately skips its infrastructure push/PR when
       # the agent leaves the branch that OpenCode created for an issue. The
@@ -1202,7 +1231,7 @@ jobs:
 
           OPENCODE_RUN_LOG="$(mktemp)"
           set +e
-          opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
+          continuum-opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
           OPENCODE_RUN_RC=${PIPESTATUS[0]}
           set -e
           if grep -Eiq 'FreeUsageLimitError' "$OPENCODE_RUN_LOG" || \
@@ -1417,7 +1446,7 @@ jobs:
           )"
           OPENCODE_RUN_LOG="$(mktemp)"
           set +e
-          opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
+          continuum-opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
           OPENCODE_RUN_RC=${PIPESTATUS[0]}
           set -e
           if grep -Eiq 'FreeUsageLimitError' "$OPENCODE_RUN_LOG" || \
@@ -1528,7 +1557,7 @@ jobs:
           )
           OPENCODE_RUN_LOG="$(mktemp)"
           set +e
-          opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
+          continuum-opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
           OPENCODE_RUN_RC=${PIPESTATUS[0]}
           set -e
           if grep -Eiq 'FreeUsageLimitError' "$OPENCODE_RUN_LOG" || \
@@ -1765,7 +1794,7 @@ jobs:
           )
           OPENCODE_RUN_LOG="$(mktemp)"
           set +e
-          opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
+          continuum-opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
           OPENCODE_RUN_RC=${PIPESTATUS[0]}
           set -e
           if grep -Eiq 'FreeUsageLimitError' "$OPENCODE_RUN_LOG" || \
@@ -1860,7 +1889,7 @@ jobs:
           )
           OPENCODE_RUN_LOG="$(mktemp)"
           set +e
-          opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
+          continuum-opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
           OPENCODE_RUN_RC=${PIPESTATUS[0]}
           set -e
           if grep -Eiq 'FreeUsageLimitError' "$OPENCODE_RUN_LOG" || \
@@ -1913,6 +1942,18 @@ jobs:
           gh workflow run "$CI_WORKFLOW_ID" --ref "$HEAD_REF" \
             || echo "::warning::Could not dispatch $CI_WORKFLOW_ID for $HEAD_REF"
 
+      - name: Detect OpenCode 429 runner lifecycle recovery
+        id: runner_recovery
+        if: always()
+        shell: bash
+        run: |
+          if [[ -f "${RUNNER_TEMP:-/tmp}/continuum-opencode-429" ]]; then
+            echo "restart_required=true" >> "$GITHUB_OUTPUT"
+            echo "OpenCode 429 classified as runner lifecycle failure."
+          else
+            echo "restart_required=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Clear conflict-repair lock
         if: always() && github.event_name == 'workflow_dispatch' && inputs.mode == 'resolve-conflict'
         env:
@@ -1923,11 +1964,43 @@ jobs:
             "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/labels/opencode-conflict-repair" \
             >/dev/null 2>&1 || true
 
+  recover-opencode-429:
+    name: Recover OpenCode 429 on fresh runner
+    needs: opencode
+    if: >-
+      always() &&
+      needs.opencode.outputs.restart_required == 'true' &&
+      github.run_attempt < 4
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    permissions:
+      actions: write
+      contents: read
+
+    steps:
+      - name: Re-run current workflow on fresh hosted runners
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const attempt = Number(context.runAttempt || process.env.GITHUB_RUN_ATTEMPT || '1');
+            await github.rest.actions.reRunWorkflow({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: context.runId,
+            });
+            core.notice(
+              'OpenCode 429: re-running workflow on fresh runner; attempt ' +
+              (attempt + 1) + '/4.'
+            );
+
   cleanup-workflow-repair-lock:
     name: Release workflow-repair lock
     needs: opencode
     if: >-
       always() &&
+      needs.opencode.outputs.restart_required != 'true' &&
       github.event_name == 'workflow_dispatch' &&
       inputs.mode == 'ci-fix'
     runs-on: ubuntu-latest
@@ -1966,6 +2039,7 @@ jobs:
     needs: opencode
     if: >-
       always() &&
+      needs.opencode.outputs.restart_required != 'true' &&
       needs.opencode.result != 'success' &&
       needs.opencode.result != 'skipped' &&
       ((github.event_name == 'issue_comment' &&
