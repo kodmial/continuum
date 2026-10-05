@@ -239,6 +239,7 @@ jobs:
             // A completed full review therefore moves the shared controller
             // window for every other PR, even if their old per-PR timer expired.
             const REVIEW_COOLDOWN_MS = 60 * 60_000;
+            const NO_PROGRESS_MAX_REVIEWS = 3;
             const SAFETY_MARGIN_MS = 30_000;
             const IN_FLIGHT_TIMEOUT_MS = 30 * 60_000;
 
@@ -870,7 +871,7 @@ jobs:
 
                 const noProgressMarkerPrefix =
                   `<!-- continuum-coderabbit-no-progress head=${pr.head.sha} `;
-                const latestNoProgress = comments
+                const noProgressMarkers = comments
                   .filter(comment => {
                     const login = comment.user?.login || '';
                     const trusted =
@@ -882,7 +883,8 @@ jobs:
                     (a, b) =>
                       new Date(b.created_at || 0).getTime() -
                       new Date(a.created_at || 0).getTime()
-                  )[0] || null;
+                  );
+                const latestNoProgress = noProgressMarkers[0] || null;
                 const noProgressAt = latestNoProgress
                   ? new Date(latestNoProgress.created_at || 0).getTime()
                   : 0;
@@ -892,9 +894,17 @@ jobs:
                   review.state === 'APPROVED' &&
                   new Date(review.submitted_at || 0).getTime() > noProgressAt
                 );
-                if (latestNoProgress && !laterApproval) {
-                  core.notice(
-                    `PR #${pr.number}: exact HEAD ${pr.head.sha} has a non-code CodeRabbit no-progress marker; it is not eligible for automatic re-review until the head changes or a later explicit approval supersedes the marker.`
+                const noProgressRetryDueAt =
+                  latestNoProgress && !laterApproval
+                    ? noProgressAt + REVIEW_COOLDOWN_MS
+                    : 0;
+                if (
+                  latestNoProgress &&
+                  !laterApproval &&
+                  noProgressMarkers.length >= NO_PROGRESS_MAX_REVIEWS
+                ) {
+                  core.warning(
+                    `PR #${pr.number}: exact HEAD ${pr.head.sha} exhausted bounded non-code CodeRabbit re-review budget (${noProgressMarkers.length}/${NO_PROGRESS_MAX_REVIEWS}); waiting for a new HEAD or later explicit approval.`
                   );
                   continue;
                 }
@@ -1026,6 +1036,11 @@ jobs:
                       kind = 'orphan-lock-retry';
                     }
                   }
+                }
+
+                if (noProgressRetryDueAt > 0) {
+                  dueAt = Math.max(dueAt, noProgressRetryDueAt);
+                  kind = 'no-progress-retry';
                 }
 
                 const priority = await sourcePriority(pr);
