@@ -351,6 +351,7 @@ jobs:
               ownedLeases.delete(leaseKey(prNumber, headSha));
             }
             const AUTO_MERGE_BLOCK_LABEL = 'no-auto-merge';
+            const NO_PROGRESS_MAX_REVIEWS = 3;
             const CONFLICT_LOCK_LABEL = 'opencode-conflict-repair';
             // Self-healing conflict recovery (issue #246). Every
             // reconciliation pass rediscovers every open dirty PR, including
@@ -744,7 +745,7 @@ jobs:
               );
               const markerPrefix =
                 `<!-- continuum-coderabbit-no-progress head=${headSha} `;
-              const marker = comments
+              const markers = comments
                 .filter(comment => {
                   const login = comment.user?.login || '';
                   const trusted =
@@ -756,7 +757,8 @@ jobs:
                   (a, b) =>
                     new Date(b.created_at || 0).getTime() -
                     new Date(a.created_at || 0).getTime()
-                )[0] || null;
+                );
+              const marker = markers[0] || null;
               if (!marker) return false;
 
               const decision = await latestCodeRabbitDecision(pr, headSha);
@@ -767,7 +769,7 @@ jobs:
               ) {
                 return false;
               }
-              return true;
+              return markers.length >= NO_PROGRESS_MAX_REVIEWS;
             }
 
             function retryWindowText(body = '') {
@@ -2575,13 +2577,14 @@ jobs:
                   : false;
 
               // A policy/task-contract verdict with no actionable code finding
-              // is terminal for this exact HEAD. Re-dispatching CodeRabbit or a
-              // coding agent cannot make progress and would only burn quota.
-              // A new HEAD has no matching marker; a later explicit APPROVED
-              // review on the same HEAD also supersedes the marker.
+              // is not a coding-agent repair request, but it is also not
+              // terminal after one review. The global CodeRabbit controller
+              // gets a bounded same-HEAD re-review budget after cooldown.
+              // Only exhaustion of that budget blocks until a new HEAD or a
+              // later explicit APPROVED decision.
               if (reviewNoProgressBlocked) {
                 core.warning(
-                  `PR #${pr.number}: exact HEAD ${pr.head.sha} is blocked by a non-code CodeRabbit verdict; automatic review/fix retries are suppressed.`
+                  `PR #${pr.number}: exact HEAD ${pr.head.sha} is blocked by a non-code CodeRabbit verdict; bounded non-code CodeRabbit re-review budget is exhausted.`
                 );
                 continue;
               }
