@@ -409,19 +409,10 @@ def reconcile(
                     created_at=now,
                 )
             )
-        except Exception as exc:
+        except Exception:
             labels.discard(in_progress)
-            if number in result.reservations_added:
-                result.reservations_added.remove(number)
-            result.skip_reasons[number] = (
-                "automatic dispatch failed and reservation released: %s" % exc
-            )
-            result.failed = True
-            result.failed_message = (
-                "Issue scheduler automatic dispatch failed; "
-                "partial progress preserved."
-            )
-            continue
+            result.reservations_added.remove(number)
+            raise
         result.dispatched.append(number)
         result.skip_reasons.pop(number, None)
 
