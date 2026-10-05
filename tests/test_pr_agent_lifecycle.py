@@ -353,6 +353,114 @@ APPROVED_CODERABBIT_NO_PROGRESS_PAT_ADDED_LINES = (
     "                await commentGithub.rest.issues.createComment({",
 )
 
+
+# Systemic qualification isolation / interruption recovery. This allowlist is
+# generated from the exact protected-workflow diff for the change: validation
+# dispatch comments cannot enter generic implementation, validation-only
+# trackers fail closed outside qualification mode, and long issue work is
+# checkpointed on runner termination and resumed on retry. Keeping every
+# added/deleted line enumerated preserves the protected-baseline invariant:
+# unrelated workflow drift still fails this test.
+APPROVED_QUALIFICATION_ISOLATION_CHECKPOINT_REMOVED_LINES = (
+    "           !contains(github.event.comment.body, '/oc-cancel'))",
+    "           !contains(github.event.comment.body, '/oc-cancel'))",
+    "          !contains(github.event.comment.body, '/oc-cancel')",
+    "          !contains(github.event.comment.body, '/oc-cancel')",
+    "            !contains(github.event.comment.body, '/oc-cancel'))) &&",
+    "          git switch --detach \"origin/$BASE_REF\"",
+    "          git switch -c \"$BRANCH\"",
+    "          if [[ -z \"$(git status --porcelain)\" ]]; then",
+    "          git add -A",
+    "          # kodmial/continuum#260: workflow-owned task commit sets the bot",
+    "          # identity (see Configure Git identity) and carries the component",
+    "          # trailer. The agent itself never commits (see prompt: the workflow",
+    "          # owns Git state), so this is the single deterministic owner.",
+    "          git commit -m \"${COMMIT_PREFIX}: implement issue #${ISSUE_NUMBER}\" -m \"Continuum-Component: opencode\"",
+)
+
+APPROVED_QUALIFICATION_ISOLATION_CHECKPOINT_ADDED_LINES = (
+    "           !contains(github.event.comment.body, '/oc-cancel') &&",
+    "           !contains(github.event.comment.body, 'continuum-qualification-dispatch'))",
+    "           !contains(github.event.comment.body, '/oc-cancel') &&",
+    "           !contains(github.event.comment.body, 'continuum-qualification-dispatch'))",
+    "            // Validation-only trackers are never ordinary implementation work.",
+    "            // They execute only through the immutable qualification-dispatch path.",
+    "            if (/<!--\\s*automation-validation-only\\s*-->/i.test(issue.body || '')) {",
+    "              core.setOutput('ready', 'false');",
+    "              core.notice(",
+    "                `Issue #${issueNumber} is validation-only; generic implementation is disabled.`",
+    "              );",
+    "              return;",
+    "            }",
+    "",
+    "          !contains(github.event.comment.body, '/oc-cancel') &&",
+    "          !contains(github.event.comment.body, 'continuum-qualification-dispatch')",
+    "          !contains(github.event.comment.body, '/oc-cancel') &&",
+    "          !contains(github.event.comment.body, 'continuum-qualification-dispatch')",
+    "            !contains(github.event.comment.body, '/oc-cancel') &&",
+    "           !contains(github.event.comment.body, 'continuum-qualification-dispatch'))) &&",
+    "          BASE_START_SHA=\"$(git rev-parse \"origin/$BASE_REF\")\"",
+    "          CHECKPOINT_BRANCH=\"opencode/checkpoint-issue${ISSUE_NUMBER}\"",
+    "",
+    "          # Resume the latest interruption checkpoint if one exists. This",
+    "          # branch is workflow-owned and is deleted after a PR is published.",
+    "          if git ls-remote --exit-code --heads origin \"refs/heads/$CHECKPOINT_BRANCH\" >/dev/null 2>&1; then",
+    "            git fetch origin \"$CHECKPOINT_BRANCH\" --quiet",
+    "            git switch -c \"$BRANCH\" FETCH_HEAD",
+    "            echo \"Resuming issue #$ISSUE_NUMBER from interruption checkpoint $CHECKPOINT_BRANCH.\"",
+    "          else",
+    "            git switch --detach \"origin/$BASE_REF\"",
+    "            git switch -c \"$BRANCH\"",
+    "          fi",
+    "",
+    "          checkpoint_issue_progress() {",
+    "            local exit_code=\"${1:-143}\"",
+    "            trap - TERM INT HUP",
+    "            set +e",
+    "            if [[ \"$(git branch --show-current)\" == \"$BRANCH\" ]]; then",
+    "              find . -type d -name '__pycache__' -prune -exec rm -rf {} +",
+    "              find . -type f \\( -name '*.pyc' -o -name '*.pyo' \\) -delete",
+    "              if [[ -n \"$(git status --porcelain)\" ]]; then",
+    "                git add -A",
+    "                git commit -m \"chore: checkpoint interrupted issue #${ISSUE_NUMBER}\" \\",
+    "                  -m \"Continuum-Checkpoint-Issue: #${ISSUE_NUMBER}\" \\",
+    "                  -m \"Continuum-Component: opencode\" || true",
+    "              fi",
+    "              if [[ \"$(git rev-parse HEAD)\" != \"$BASE_START_SHA\" ]]; then",
+    "                git push --force origin \"HEAD:refs/heads/$CHECKPOINT_BRANCH\" || true",
+    "                echo \"::warning::Checkpointed issue #$ISSUE_NUMBER progress before runner exit.\"",
+    "              fi",
+    "            fi",
+    "            exit \"$exit_code\"",
+    "          }",
+    "          trap 'checkpoint_issue_progress 143' TERM",
+    "          trap 'checkpoint_issue_progress 130' INT",
+    "          trap 'checkpoint_issue_progress 129' HUP",
+    "          if [[ \"$OPENCODE_RUN_RC\" -eq 143 || \"$OPENCODE_RUN_RC\" -eq 130 || \"$OPENCODE_RUN_RC\" -eq 129 ]]; then",
+    "            rm -f \"$OPENCODE_RUN_LOG\"",
+    "            checkpoint_issue_progress \"$OPENCODE_RUN_RC\"",
+    "          fi",
+    "          trap - TERM INT HUP",
+    "          WORKTREE_DIRTY=false",
+    "          if [[ -n \"$(git status --porcelain)\" ]]; then",
+    "            WORKTREE_DIRTY=true",
+    "          fi",
+    "          COMMITS_FROM_START=\"$(git rev-list --count \"$BASE_START_SHA..HEAD\" 2>/dev/null || echo 0)\"",
+    "          if [[ \"$WORKTREE_DIRTY\" != \"true\" && \"$COMMITS_FROM_START\" -eq 0 ]]; then",
+    "          if [[ -n \"$(git status --porcelain)\" ]]; then",
+    "            git add -A",
+    "            # kodmial/continuum#260: workflow-owned task commit sets the bot",
+    "            # identity (see Configure Git identity) and carries the component",
+    "            # trailer. The agent itself never commits (see prompt: the workflow",
+    "            # owns Git state), so this is the single deterministic owner.",
+    "            git commit -m \"${COMMIT_PREFIX}: implement issue #${ISSUE_NUMBER}\" -m \"Continuum-Component: opencode\"",
+    "          fi",
+    "          gh api --method DELETE \\",
+    "            \"repos/$GITHUB_REPOSITORY/git/refs/heads/$CHECKPOINT_BRANCH\" \\",
+    "            >/dev/null 2>&1 || true",
+)
+
+
 # Fixed-history pin for the old-to-new baseline range check below
 # (PREVIOUS_BASELINE_SHA..BASELINE_SHA): that range landed before the
 # reconstruction self-stamp was removed, so it still carries the four
@@ -683,7 +791,8 @@ class ProtectedBaselineTests(unittest.TestCase):
                             _Counter(APPROVED_258_OPENCODE_ATTRIBUTION_REMOVED_LINES)
                             + _Counter(APPROVED_260_OPENCODE_PROVENANCE_REMOVED_LINES)
                             + _Counter(APPROVED_278_OPENCODE_DAG_REMOVED_LINES)
-                            + _Counter(APPROVED_CODERABBIT_NO_PROGRESS_PAT_REMOVED_LINES),
+                            + _Counter(APPROVED_CODERABBIT_NO_PROGRESS_PAT_REMOVED_LINES)
+                            + _Counter(APPROVED_QUALIFICATION_ISOLATION_CHECKPOINT_REMOVED_LINES),
                             f"{path} must not delete or modify baseline lines "
                             f"outside the approved #258 attribution plus #260 "
                             f"provenance plus #278 DAG-bypass plus cb673954 PAT-boundary replacement",
@@ -697,6 +806,7 @@ class ProtectedBaselineTests(unittest.TestCase):
                         expected.update(APPROVED_260_OPENCODE_PROVENANCE_ADDED_LINES)
                         expected.update(APPROVED_278_OPENCODE_DAG_ADDED_LINES)
                         expected.update(APPROVED_CODERABBIT_NO_PROGRESS_PAT_ADDED_LINES)
+                        expected.update(APPROVED_QUALIFICATION_ISOLATION_CHECKPOINT_ADDED_LINES)
                         self.assertEqual(
                             actual,
                             expected,
