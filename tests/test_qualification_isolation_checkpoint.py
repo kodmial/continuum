@@ -74,6 +74,7 @@ class InterruptedIssueCheckpointTests(unittest.TestCase):
             'git ls-remote --exit-code --heads origin "refs/heads/$CHECKPOINT_BRANCH"',
             "checkpoint_issue_progress()",
             "trap 'checkpoint_issue_progress 143' TERM",
+            "checkpoint_issue_progress 75",
             'git push --force origin "HEAD:refs/heads/$CHECKPOINT_BRANCH"',
             'COMMITS_FROM_START="$(git rev-list --count "$BASE_START_SHA..HEAD"',
         ):
