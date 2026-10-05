@@ -1188,6 +1188,7 @@ jobs:
           COMMIT_PREFIX: ${{ inputs.issue_commit_prefix || vars.CONTINUUM_ISSUE_COMMIT_PREFIX || 'fix' }}
           IN_PROGRESS_LABEL: ${{ inputs.in_progress_label || vars.AUTOMATION_IN_PROGRESS_LABEL || 'automation:in-progress' }}
           PAUSE_LABEL: ${{ inputs.pause_marker || vars.AUTOMATION_PAUSE_LABEL || 'automation:paused' }}
+          PAUSE_ON_FAILURE: ${{ inputs.pause_on_failure || vars.AUTOMATION_PAUSE_ON_FAILURE || 'true' }}
           CI_WORKFLOW_ID: ${{ inputs.ci_workflow_id }}
         run: |
           set -euo pipefail
@@ -1329,6 +1330,10 @@ jobs:
               exit 0
             fi
             echo "OpenCode produced no repository changes."
+            if [[ "${PAUSE_ON_FAILURE,,}" == "false" ]]; then
+              echo "::error::No repository changes; autonomous mode delegates bounded retry/recovery instead of pausing."
+              exit 1
+            fi
             gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
               --body "$(printf '%s\n%s\n%s' '⚡ **Continuum · opencode**' '<!-- continuum-origin role=continuum component=opencode -->' 'Automation produced no code changes; pausing this issue for manual inspection.')"
             gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
