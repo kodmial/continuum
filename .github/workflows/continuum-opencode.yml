@@ -299,7 +299,7 @@ jobs:
                     '<!-- continuum-origin role=continuum component=opencode -->',
                     'Continuum classified this CodeRabbit **CHANGES_REQUESTED** verdict as a non-code/policy blocker because the review contains no actionable inline finding.',
                     '',
-                    'No OpenCode repair was dispatched for this unchanged HEAD because there is no concrete code finding. Continuum will retry a bounded full CodeRabbit review after cooldown; a later approval, a new HEAD, or exhaustion of the bounded retry budget resolves this state.',
+                    'No OpenCode repair was dispatched for this unchanged HEAD. There is no concrete code finding, so Continuum will retry a bounded full CodeRabbit review after cooldown; a later approval, a new HEAD, or exhaustion of the bounded retry budget resolves this state.',
                   ].join('\n'),
                 });
               }
