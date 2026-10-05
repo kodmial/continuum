@@ -685,8 +685,17 @@ jobs:
               // initial/final/pre-merge evaluations never reuse a stale entry.
               gateCache.clear();
               const ci = await latestWorkflowForHead(pr, pr.head.sha, 'CI');
-              if (!ci || ci.status !== 'completed' || ci.conclusion !== 'success') {
-                return { ok: false, reason: 'Current-head CI is not successful' };
+              const delegatedSkippedCi =
+                delegated &&
+                ci &&
+                ci.status === 'completed' &&
+                ci.conclusion === 'skipped';
+              if (
+                !ci ||
+                ci.status !== 'completed' ||
+                (ci.conclusion !== 'success' && !delegatedSkippedCi)
+              ) {
+                return { ok: false, reason: 'Current-head CI is not acceptable' };
               }
 
               // Do not gate on GitHub's aggregate combined status here.

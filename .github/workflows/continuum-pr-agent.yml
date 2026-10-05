@@ -480,21 +480,33 @@ jobs:
                   new Date(b.created_at).getTime() -
                   new Date(a.created_at).getTime()
               )[0];
+            const delegatedTarget =
+              process.env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED === 'true';
+            const delegatedSkippedCi =
+              delegatedTarget &&
+              latestCi &&
+              latestCi.status === 'completed' &&
+              latestCi.conclusion === 'skipped';
             if (
               !latestCi ||
               latestCi.status !== 'completed' ||
-              latestCi.conclusion !== 'success'
+              (latestCi.conclusion !== 'success' && !delegatedSkippedCi)
             ) {
               core.setOutput('admitted', 'false');
               core.notice(
-                `PR #${prNumber} HEAD ${headSha} has no successful current-head ` +
-                `${ciWorkflowName} run; PR-Agent waits for exact-head CI.`
+                `PR #${prNumber} HEAD ${headSha} has no acceptable current-head ` +
+                `${ciWorkflowName} evidence; PR-Agent waits for exact-head CI.`
               );
               return;
             }
             core.setOutput('admitted', 'true');
             core.setOutput('head_sha', headSha);
-            core.notice(`PR #${prNumber} admitted at HEAD ${headSha} with green CI.`);
+            core.notice(
+              `PR #${prNumber} admitted at HEAD ${headSha} with ` +
+              (delegatedSkippedCi
+                ? 'verified delegated child CI suppression.'
+                : 'green CI.')
+            );
 
       - name: Mark PR-Agent review in flight
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
@@ -852,9 +864,9 @@ jobs:
           fi
           CI_JSON="$RUNNER_TEMP/pr-agent-before-review-ci-runs.json"
           gh api "repos/$CONTINUUM_PR_AGENT_TARGET_REPOSITORY/actions/runs?event=pull_request&head_sha=$ADMITTED_SHA&per_page=100" > "$CI_JSON"
-          if ! python3 - "$CI_JSON" "$CI_WORKFLOW_NAME" "$ADMITTED_SHA" <<'PY'
+          if ! python3 - "$CI_JSON" "$CI_WORKFLOW_NAME" "$ADMITTED_SHA" "${CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED:-false}" <<'PY'
           import json, sys
-          path, workflow, head = sys.argv[1:4]
+          path, workflow, head, delegated = sys.argv[1:5]
           with open(path, "r", encoding="utf-8") as handle:
               runs = json.load(handle).get("workflow_runs", [])
           current = sorted(
@@ -862,10 +874,16 @@ jobs:
               key=lambda run: run.get("created_at") or "",
               reverse=True,
           )
-          raise SystemExit(
-              0 if current and current[0].get("status") == "completed"
-              and current[0].get("conclusion") == "success" else 1
+          conclusion = current[0].get("conclusion") if current else None
+          accepted = (
+              current
+              and current[0].get("status") == "completed"
+              and (
+                  conclusion == "success"
+                  or (delegated == "true" and conclusion == "skipped")
+              )
           )
+          raise SystemExit(0 if accepted else 1)
           PY
           then
             echo "::error::CI for admitted HEAD $ADMITTED_SHA is no longer completed:success."
@@ -2185,9 +2203,9 @@ jobs:
             echo "Could not revalidate exact-HEAD CI after backoff; stale retry cancelled."
             exit 0
           fi
-          if ! python3 - "$CI_JSON" "$CI_WORKFLOW_NAME" "$HEAD_SHA" <<'PY'
+          if ! python3 - "$CI_JSON" "$CI_WORKFLOW_NAME" "$HEAD_SHA" "${CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED:-false}" <<'PY'
           import json, sys
-          path, workflow, head = sys.argv[1:4]
+          path, workflow, head, delegated = sys.argv[1:5]
           with open(path, "r", encoding="utf-8") as handle:
               runs = json.load(handle).get("workflow_runs", [])
           current = sorted(
@@ -2195,10 +2213,16 @@ jobs:
               key=lambda run: run.get("created_at") or "",
               reverse=True,
           )
-          raise SystemExit(
-              0 if current and current[0].get("status") == "completed"
-              and current[0].get("conclusion") == "success" else 1
+          conclusion = current[0].get("conclusion") if current else None
+          accepted = (
+              current
+              and current[0].get("status") == "completed"
+              and (
+                  conclusion == "success"
+                  or (delegated == "true" and conclusion == "skipped")
+              )
           )
+          raise SystemExit(0 if accepted else 1)
           PY
           then
             echo "Exact HEAD no longer has green CI; retry cancelled until a fresh CI event."

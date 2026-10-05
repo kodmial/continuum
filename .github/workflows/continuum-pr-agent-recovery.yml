@@ -171,6 +171,16 @@ jobs:
             const repoFullName = process.env.CONTINUUM_PR_AGENT_TARGET_REPOSITORY;
             const reviewWorkflow = String(process.env.REVIEW_WORKFLOW || 'continuum-pr-agent.yml').trim();
             const ciWorkflowName = String(process.env.CI_WORKFLOW_NAME || 'CI').trim();
+            const delegatedTarget =
+              process.env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED === 'true';
+            const ciRunAccepted = (run) => Boolean(
+              run &&
+              run.status === 'completed' &&
+              (
+                run.conclusion === 'success' ||
+                (delegatedTarget && run.conclusion === 'skipped')
+              )
+            );
             // Single 10-execution transient budget (#224): default 10 total
             // executions per exact PR/HEAD/operation, configurable through a
             // safe bounded Continuum variable and always clamped to 1..10 so
@@ -885,11 +895,7 @@ jobs:
                 .sort((a, b) =>
                   Date.parse(b.created_at || 0) - Date.parse(a.created_at || 0)
                 )[0];
-              return Boolean(
-                latest &&
-                latest.status === 'completed' &&
-                latest.conclusion === 'success'
-              );
+              return ciRunAccepted(latest);
             }
 
             // Bounded CI snapshot for the non-mutating initial scan
@@ -935,11 +941,7 @@ jobs:
               const key = String(head || '').toLowerCase();
               if (!ciSnapshotByHead.has(key)) return null;
               const run = ciSnapshotByHead.get(key);
-              return Boolean(
-                run &&
-                run.status === 'completed' &&
-                run.conclusion === 'success'
-              );
+              return ciRunAccepted(run);
             }
             async function scanCiGreen(head) {
               const snapshotVerdict = ciSnapshotGreen(head);

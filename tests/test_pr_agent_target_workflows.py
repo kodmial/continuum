@@ -491,6 +491,17 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
                     resolve,
                 )
 
+    def test_verified_child_pr_agent_accepts_intentionally_skipped_child_ci(self):
+        review = read(".github/workflows/continuum-pr-agent.yml")
+        recovery = read(".github/workflows/continuum-pr-agent-recovery.yml")
+        merge = read(".github/workflows/continuum-pr-agent-auto-merge.yml")
+        self.assertIn("delegatedSkippedCi", review)
+        self.assertIn("conclusion == \"skipped\"", review)
+        self.assertIn("const ciRunAccepted = (run)", recovery)
+        self.assertIn("delegatedTarget && run.conclusion === 'skipped'", recovery)
+        self.assertIn("delegatedSkippedCi", merge)
+        self.assertIn("ci.conclusion === 'skipped'", merge)
+
     def test_delegated_target_bootstrap_fetches_config_runtime_dependencies(self):
         for path in self.reusable:
             with self.subTest(path=path):
