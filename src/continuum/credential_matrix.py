@@ -31,13 +31,14 @@ KEEP_PAT = "PAT"
 
 #: Secrets a workflow may reference. No new user-created secret is allowed by
 #: #259: only the pre-existing TAP_PAT, the Render key (Render API only), the
-#: delegated child runtime token, and the automatic github.token.
+#: delegated child runtime token, legacy child-repository compatibility secrets, and the automatic github.token.
 ALLOWED_SECRETS = frozenset(
     {
         "TAP_PAT",
         "RENDER_API_KEY",
         "CHILD_RUNTIME_TOKEN",
         "CHILD_RUNTIME_REPOSITORIES",
+        "CONTINUUM_CHILD_REPOSITORIES",
     }
 )
 
