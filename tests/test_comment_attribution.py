@@ -124,7 +124,7 @@ FUNCTIONAL_ANCHORS = {
         "continuum-conflict-repair-deferred head=",
         "auto-main-sync head=${fresh.head.sha}",
     ),
-    "continuum-coderabbit-retry.yml": ("'@coderabbitai full review",),
+    "continuum-coderabbit-retry.yml": ("@coderabbitai full review",),
     "continuum-coderabbit-unresolved.yml": (
         "Re-check this exact original finding after the batched OpenCode retry.",
     ),
