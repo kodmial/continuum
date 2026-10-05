@@ -125,9 +125,12 @@ jobs:
   validate:
     name: Validate
     if: >-
-      !fromJSON(inputs.skip_opencode_pull_request || vars.CONTINUUM_SKIP_OPENCODE_PR || 'false') ||
-      github.event_name != 'pull_request' ||
-      !startsWith(github.head_ref, 'opencode/')
+      vars.CONTINUUM_ROLE != 'child' &&
+      (
+        !fromJSON(inputs.skip_opencode_pull_request || vars.CONTINUUM_SKIP_OPENCODE_PR || 'false') ||
+        github.event_name != 'pull_request' ||
+        !startsWith(github.head_ref, 'opencode/')
+      )
     runs-on: ${{ inputs.runner || vars.CONTINUUM_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || vars.CONTINUUM_VALIDATION_TIMEOUT_MINUTES || '25') }}
 
