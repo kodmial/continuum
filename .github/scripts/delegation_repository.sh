@@ -59,7 +59,19 @@ assert_parent_allows_child() {
 repository_variables() {
   local repository="$1"
   local payload
-  if ! payload="$(gh api "repos/$repository/actions/variables?per_page=100" 2>/dev/null)"; then
+
+  # Repository variables are paginated. A single first-page read can silently
+  # miss CONTINUUM_ROLE / CONTINUUM_CHILDREN / child binding variables once a
+  # repository has more than 100 variables, which turns a valid relationship
+  # into an empty plan and strands otherwise eligible child work.
+  #
+  # Slurp every page into one normalized payload. Keep API stderr suppressed so
+  # public parent logs never disclose a private child repository name; pipefail
+  # still propagates an API or jq failure as UNAVAILABLE.
+  if ! payload="$(
+    gh api --paginate "repos/$repository/actions/variables?per_page=100" 2>/dev/null |
+      jq -cs '{variables: [.[].variables[]?]}'
+  )"; then
     echo "::error::Delegated child discovery is unavailable; refusing to guess." >&2
     return "$UNAVAILABLE"
   fi
