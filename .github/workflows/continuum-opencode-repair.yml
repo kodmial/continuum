@@ -81,6 +81,7 @@ concurrency:
 jobs:
   sync-current-pr:
     if: >-
+      vars.CONTINUUM_ROLE != 'child' &&
       github.event_name == 'pull_request_target' &&
       github.event.pull_request.state == 'open' &&
       github.event.pull_request.head.repo.full_name == github.repository &&
@@ -177,6 +178,7 @@ jobs:
   # reports through a status/API has no run for Continuum to watch at all.
   ci-repair-dispatch:
     if: >-
+      vars.CONTINUUM_ROLE != 'child' &&
       github.event_name == 'workflow_dispatch' &&
       inputs.pr_number != '' && inputs.head_sha != '' && inputs.conclusion != ''
     runs-on: ubuntu-latest
@@ -281,6 +283,7 @@ jobs:
 
   ci-repair:
     if: >-
+      vars.CONTINUUM_ROLE != 'child' &&
       github.event_name == 'workflow_run' &&
       github.event.workflow_run.event == 'pull_request' &&
       (github.event.workflow_run.conclusion == 'success' ||
