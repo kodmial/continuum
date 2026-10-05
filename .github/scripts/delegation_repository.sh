@@ -148,7 +148,7 @@ resolve_by_roles() {
     [[ "$candidate" == "$GITHUB_REPOSITORY" ]] && continue
 
     local candidate_rc=0
-    verify_child_repository "$candidate" "$child_id" || candidate_rc=$?
+    verify_child_repository "$candidate" "$child_id" >/dev/null 2>&1 || candidate_rc=$?
     if [[ "$candidate_rc" -eq 0 ]]; then
       matched="$candidate"
       count=$((count + 1))
