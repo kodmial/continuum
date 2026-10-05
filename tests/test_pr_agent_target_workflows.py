@@ -491,6 +491,29 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
                     resolve,
                 )
 
+    def test_delegated_target_bootstrap_fetches_config_runtime_dependencies(self):
+        for path in self.reusable:
+            with self.subTest(path=path):
+                body = read(path)
+                resolve_at = body.index("Resolve PR-Agent target context")
+                resolve = body[resolve_at : resolve_at + 9000]
+                self.assertIn(
+                    'mkdir -p "$RUNTIME_ROOT/.github/scripts" "$RUNTIME_ROOT/src/continuum"',
+                    resolve,
+                )
+                self.assertIn(
+                    'fetch_runtime_file "src/continuum/__init__.py" "$RUNTIME_ROOT/src/continuum/__init__.py"',
+                    resolve,
+                )
+                self.assertIn(
+                    'fetch_runtime_file "src/continuum/config.py" "$RUNTIME_ROOT/src/continuum/config.py"',
+                    resolve,
+                )
+                self.assertIn(
+                    'fetch_runtime_file "src/continuum/yamlmini.py" "$RUNTIME_ROOT/src/continuum/yamlmini.py"',
+                    resolve,
+                )
+
     def test_target_identity_rejects_dot_only_components(self):
         helper = read(".github/scripts/pr_agent_target.sh")
         self.assertIn("pr_agent_valid_target_repository", helper)
