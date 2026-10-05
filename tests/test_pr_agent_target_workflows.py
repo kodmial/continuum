@@ -10,6 +10,16 @@ def read(path: str) -> str:
 
 
 class PrAgentTargetWorkflowContractTests(unittest.TestCase):
+    def test_delegated_target_resolution_does_not_depend_on_stale_repository_map_secret(self):
+        for path in [
+            ".github/workflows/continuum-pr-agent.yml",
+            ".github/workflows/continuum-pr-agent-repair.yml",
+            ".github/workflows/continuum-pr-agent-recovery.yml",
+        ]:
+            with self.subTest(path=path):
+                body = read(path)
+                self.assertNotIn("secrets.CONTINUUM_CHILD_REPOSITORIES", body)
+
     reusable = (
         ".github/workflows/continuum-pr-agent.yml",
         ".github/workflows/continuum-pr-agent-repair.yml",
