@@ -67,27 +67,28 @@ def step_window(text, step, span=6000):
         None,
     )
     assert start is not None, f"step marker gone: {step}"
-    end = len(lines)
-    for i in range(start + 1, len(lines)):
-        line = lines[i]
-        if line.startswith("      - name: ") or line.startswith("      - uses: "):
-            end = i
-            break
-        if re.match(r"^  [A-Za-z0-9_-]+:\s*$", line) or re.match(r"^jobs:\s*$", line):
-            end = i
-            break
-    block = "\n".join(lines[start:end])
-    if len(block) < 200:
-        # Job-name anchor (e.g. a job-level site): the step-boundary scan
-        # above stops at the first `- uses:` line and would exclude the step
-        # bodies that carry the evidence. Extend to the enclosing job
-        # boundary instead so the whole job is visible.
+    # Matrix entries may intentionally name a job-level mutation site
+    # rather than a named step. Detect that structurally instead of using a
+    # length heuristic: adding a legitimate job-level guard/comment must not
+    # make the helper stop at the first child step and hide its evidence.
+    if re.match(r"^  [A-Za-z0-9_-]+:\s*$", lines[start]):
         job_end = len(lines)
         for i in range(start + 1, len(lines)):
             if re.match(r"^  [A-Za-z0-9_-]+:\s*$", lines[i]) or re.match(r"^jobs:\s*$", lines[i]):
                 job_end = i
                 break
-        block = "\n".join(lines[max(0, start - 60): job_end])
+        block = "\n".join(lines[start:job_end])
+    else:
+        end = len(lines)
+        for i in range(start + 1, len(lines)):
+            line = lines[i]
+            if line.startswith("      - name: ") or line.startswith("      - uses: "):
+                end = i
+                break
+            if re.match(r"^  [A-Za-z0-9_-]+:\s*$", line) or re.match(r"^jobs:\s*$", line):
+                end = i
+                break
+        block = "\n".join(lines[start:end])
     if len(block) > span * 2:
         block = block[: span * 2]
     return block
