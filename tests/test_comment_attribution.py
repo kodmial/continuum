@@ -51,7 +51,7 @@ POLICY_JS = os.path.join(ROOT, ".github", "scripts", "pr_agent_policy.js")
 RECOVERY_WORKFLOW = os.path.join(WORKFLOWS_DIR, "continuum-pr-agent-recovery.yml")
 
 MUTATION_RES = (
-    re.compile(r"github\.rest\.issues\.(?:createComment|updateComment)"),
+    re.compile(r"(?:github|commentGithub)\.rest\.issues\.(?:createComment|updateComment)"),
     re.compile(r"gh\s+(?:issue|pr)\s+comment\b"),
     re.compile(r"gh\s+issue\s+close\b"),
     re.compile(
