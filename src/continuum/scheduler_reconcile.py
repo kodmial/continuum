@@ -35,6 +35,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+import re
 from typing import Callable, Dict, List, Optional, Set
 
 from .delegation_priority import effective_priority
@@ -93,8 +94,20 @@ class ReconcileResult:
     failed_message: str = ""
 
 
+# An owner command is a command token at the start of a line (up to three
+# leading spaces, mirroring the canonical manual-command rule), followed by
+# whitespace or end of input. Trailing prose on the same line (``/oc please``)
+# still counts as owner intent for the scheduler race guard, but substrings
+# such as ``/ocean`` or ``/ock``, mid-line prose mentions, quoted/inline-code
+# examples, and ``/oc-cancel`` (a launch guard, not a run) must not stall an
+# otherwise eligible issue.
+_OWNER_COMMAND_RE = re.compile(r"^[ ]{0,3}/(?:opencode|oc)(?=\s|$)", re.MULTILINE)
+
+
 def _is_owner_command(body: str) -> bool:
-    return "/oc" in body or "/opencode" in body
+    if not isinstance(body, str) or not body:
+        return False
+    return _OWNER_COMMAND_RE.search(body) is not None
 
 
 def _scheduler_dispatch_comments(
@@ -157,11 +170,12 @@ def reconcile(
         labels.add(in_progress)
         labels.discard(config.pause_label)
     for number in sorted(open_pr_issues):
+        if number not in issues or not issues[number].is_open:
+            continue
         if config.count_open_prs_as_wip:
             active.add(number)
-        if number in issues and issues[number].is_open:
-            labels_of(number).add(in_progress)
-            labels_of(number).discard(config.pause_label)
+        labels_of(number).add(in_progress)
+        labels_of(number).discard(config.pause_label)
 
     # -- Reservation reconciliation (lease / stale / attempts). -----------
     lease = timedelta(minutes=config.lease_minutes)
@@ -291,6 +305,20 @@ def reconcile(
                 "missing required ready label `%s`" % config.ready_label
             )
             continue
+        blockers = [
+            b for b in declared_open_blockers.get(number, []) if b != number
+        ]
+        if blockers:
+            result.skip_reasons[number] = (
+                "declared blocked by " + ", ".join("#%d" % b for b in blockers)
+            )
+            continue
+        native = [b for b in native_open_blockers.get(number, []) if b != number]
+        if native:
+            result.skip_reasons[number] = (
+                "blocked by " + ", ".join("#%d" % b for b in native)
+            )
+            continue
         waiters.append(number)
 
     if free_slots == 0:
@@ -307,22 +335,10 @@ def reconcile(
             )
         return result
 
+    # Blocked issues were already assigned skip reasons during candidate
+    # selection, so `waiters` holds only eligible backlog here.
     ranked = []
     for number in waiters:
-        blockers = [
-            b for b in declared_open_blockers.get(number, []) if b != number
-        ]
-        if blockers:
-            result.skip_reasons[number] = (
-                "declared blocked by " + ", ".join("#%d" % b for b in blockers)
-            )
-            continue
-        native = [b for b in native_open_blockers.get(number, []) if b != number]
-        if native:
-            result.skip_reasons[number] = (
-                "blocked by " + ", ".join("#%d" % b for b in native)
-            )
-            continue
         priority, rank = priority_of(issues[number])
         ranked.append((rank, number, priority))
     ranked.sort()
@@ -393,10 +409,19 @@ def reconcile(
                     created_at=now,
                 )
             )
-        except Exception:
+        except Exception as exc:
             labels.discard(in_progress)
-            result.reservations_added.remove(number)
-            raise
+            if number in result.reservations_added:
+                result.reservations_added.remove(number)
+            result.skip_reasons[number] = (
+                "automatic dispatch failed and reservation released: %s" % exc
+            )
+            result.failed = True
+            result.failed_message = (
+                "Issue scheduler automatic dispatch failed; "
+                "partial progress preserved."
+            )
+            continue
         result.dispatched.append(number)
         result.skip_reasons.pop(number, None)
 
