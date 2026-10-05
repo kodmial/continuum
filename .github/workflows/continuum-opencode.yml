@@ -407,7 +407,8 @@ jobs:
            github.actor == github.repository_owner &&
            (contains(github.event.comment.body, '/oc') ||
             contains(github.event.comment.body, '/opencode')) &&
-           !contains(github.event.comment.body, '/oc-cancel'))
+           !contains(github.event.comment.body, '/oc-cancel') &&
+           !contains(github.event.comment.body, 'continuum-qualification-dispatch'))
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           MODE: ${{ inputs.mode }}
@@ -598,7 +599,8 @@ jobs:
            github.actor == github.repository_owner &&
            (contains(github.event.comment.body, '/oc') ||
             contains(github.event.comment.body, '/opencode')) &&
-           !contains(github.event.comment.body, '/oc-cancel'))
+           !contains(github.event.comment.body, '/oc-cancel') &&
+           !contains(github.event.comment.body, 'continuum-qualification-dispatch'))
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           ISSUE_NUMBER: ${{ inputs.issue_number || github.event.issue.number }}
@@ -703,6 +705,16 @@ jobs:
             if (issue.state !== 'open') {
               core.setOutput('ready', 'false');
               core.notice(`Issue #${issueNumber} is not open; implementation will not start.`);
+              return;
+            }
+
+            // Validation-only trackers are never ordinary implementation work.
+            // They execute only through the immutable qualification-dispatch path.
+            if (/<!--\s*automation-validation-only\s*-->/i.test(issue.body || '')) {
+              core.setOutput('ready', 'false');
+              core.notice(
+                `Issue #${issueNumber} is validation-only; generic implementation is disabled.`
+              );
               return;
             }
 
@@ -1066,7 +1078,8 @@ jobs:
             (startsWith(github.event.comment.body, '/oc') ||
              startsWith(github.event.comment.body, '/opencode')))) &&
           steps.duplicate_guard.outputs.skip != 'true' &&
-          !contains(github.event.comment.body, '/oc-cancel')
+          !contains(github.event.comment.body, '/oc-cancel') &&
+          !contains(github.event.comment.body, 'continuum-qualification-dispatch')
         env:
           GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
           ISSUE_NUMBER: ${{ inputs.issue_number }}
@@ -1154,7 +1167,8 @@ jobs:
             github.actor == github.repository_owner &&
             (contains(github.event.comment.body, '/oc') ||
              contains(github.event.comment.body, '/opencode')) &&
-            !contains(github.event.comment.body, '/oc-cancel'))) &&
+            !contains(github.event.comment.body, '/oc-cancel') &&
+           !contains(github.event.comment.body, 'continuum-qualification-dispatch'))) &&
           steps.duplicate_guard.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
@@ -1184,9 +1198,44 @@ jobs:
           }
 
           git fetch origin "$BASE_REF" --quiet
-          git switch --detach "origin/$BASE_REF"
+          BASE_START_SHA="$(git rev-parse "origin/$BASE_REF")"
           BRANCH="opencode/issue${ISSUE_NUMBER}-${GITHUB_RUN_ID}"
-          git switch -c "$BRANCH"
+          CHECKPOINT_BRANCH="opencode/checkpoint-issue${ISSUE_NUMBER}"
+
+          # Resume the latest interruption checkpoint if one exists. This
+          # branch is workflow-owned and is deleted after a PR is published.
+          if git ls-remote --exit-code --heads origin "refs/heads/$CHECKPOINT_BRANCH" >/dev/null 2>&1; then
+            git fetch origin "$CHECKPOINT_BRANCH" --quiet
+            git switch -c "$BRANCH" FETCH_HEAD
+            echo "Resuming issue #$ISSUE_NUMBER from interruption checkpoint $CHECKPOINT_BRANCH."
+          else
+            git switch --detach "origin/$BASE_REF"
+            git switch -c "$BRANCH"
+          fi
+
+          checkpoint_issue_progress() {
+            local exit_code="${1:-143}"
+            trap - TERM INT HUP
+            set +e
+            if [[ "$(git branch --show-current)" == "$BRANCH" ]]; then
+              find . -type d -name '__pycache__' -prune -exec rm -rf {} +
+              find . -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
+              if [[ -n "$(git status --porcelain)" ]]; then
+                git add -A
+                git commit -m "chore: checkpoint interrupted issue #${ISSUE_NUMBER}" \
+                  -m "Continuum-Checkpoint-Issue: #${ISSUE_NUMBER}" \
+                  -m "Continuum-Component: opencode" || true
+              fi
+              if [[ "$(git rev-parse HEAD)" != "$BASE_START_SHA" ]]; then
+                git push --force origin "HEAD:refs/heads/$CHECKPOINT_BRANCH" || true
+                echo "::warning::Checkpointed issue #$ISSUE_NUMBER progress before runner exit."
+              fi
+            fi
+            exit "$exit_code"
+          }
+          trap 'checkpoint_issue_progress 143' TERM
+          trap 'checkpoint_issue_progress 130' INT
+          trap 'checkpoint_issue_progress 129' HUP
 
           PROMPT="$(cat <<EOF
           Implement the authoritative task ${TASK_REPO}#${TASK_NUMBER} completely.
@@ -1234,6 +1283,11 @@ jobs:
           continuum-opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
           OPENCODE_RUN_RC=${PIPESTATUS[0]}
           set -e
+          if [[ "$OPENCODE_RUN_RC" -eq 143 || "$OPENCODE_RUN_RC" -eq 130 || "$OPENCODE_RUN_RC" -eq 129 ]]; then
+            rm -f "$OPENCODE_RUN_LOG"
+            checkpoint_issue_progress "$OPENCODE_RUN_RC"
+          fi
+          trap - TERM INT HUP
           if grep -Eiq 'FreeUsageLimitError' "$OPENCODE_RUN_LOG" || \
              { [[ "$OPENCODE_RUN_RC" -ne 0 ]] && grep -Eiq 'APIError.*429|HTTP[^0-9]*429([^0-9]|$)|429[[:space:]]+Too[[:space:]]+Many[[:space:]]+Requests|statusCode[^0-9]*429([^0-9]|$)' "$OPENCODE_RUN_LOG"; }; then
             echo "::error::CONTINUUM_OPENCODE_429_RESTART_REQUIRED"
@@ -1260,7 +1314,12 @@ jobs:
             exit 1
           fi
 
-          if [[ -z "$(git status --porcelain)" ]]; then
+          WORKTREE_DIRTY=false
+          if [[ -n "$(git status --porcelain)" ]]; then
+            WORKTREE_DIRTY=true
+          fi
+          COMMITS_FROM_START="$(git rev-list --count "$BASE_START_SHA..HEAD" 2>/dev/null || echo 0)"
+          if [[ "$WORKTREE_DIRTY" != "true" && "$COMMITS_FROM_START" -eq 0 ]]; then
             ISSUE_STATE="$(gh issue view "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --json state --jq .state)"
             if [[ "$ISSUE_STATE" == "CLOSED" ]]; then
               gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
@@ -1282,12 +1341,14 @@ jobs:
           find . -type d -name '__pycache__' -prune -exec rm -rf {} +
           find . -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
 
-          git add -A
-          # kodmial/continuum#260: workflow-owned task commit sets the bot
-          # identity (see Configure Git identity) and carries the component
-          # trailer. The agent itself never commits (see prompt: the workflow
-          # owns Git state), so this is the single deterministic owner.
-          git commit -m "${COMMIT_PREFIX}: implement issue #${ISSUE_NUMBER}" -m "Continuum-Component: opencode"
+          if [[ -n "$(git status --porcelain)" ]]; then
+            git add -A
+            # kodmial/continuum#260: workflow-owned task commit sets the bot
+            # identity (see Configure Git identity) and carries the component
+            # trailer. The agent itself never commits (see prompt: the workflow
+            # owns Git state), so this is the single deterministic owner.
+            git commit -m "${COMMIT_PREFIX}: implement issue #${ISSUE_NUMBER}" -m "Continuum-Component: opencode"
+          fi
           TASK_COMMIT="$(git rev-parse HEAD)"
 
           # The checkout credential is TAP_PAT, which must carry repo + workflow
@@ -1333,6 +1394,9 @@ jobs:
             gh workflow run "$CI_WORKFLOW_ID" --repo "$GITHUB_REPOSITORY" --ref "$BASE_REF" -f "pr_number=$PR_NUMBER" \
               || echo "::warning::Could not dispatch $CI_WORKFLOW_ID for PR #$PR_NUMBER"
           fi
+          gh api --method DELETE \
+            "repos/$GITHUB_REPOSITORY/git/refs/heads/$CHECKPOINT_BRANCH" \
+            >/dev/null 2>&1 || true
           echo "Created/updated PR #$PR_NUMBER for issue #$ISSUE_NUMBER."
 
       - name: Resolve qualification run identity
