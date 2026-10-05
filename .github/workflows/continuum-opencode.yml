@@ -1955,7 +1955,11 @@ jobs:
           fi
 
       - name: Clear conflict-repair lock
-        if: always() && github.event_name == 'workflow_dispatch' && inputs.mode == 'resolve-conflict'
+        if: >-
+          always() &&
+          steps.runner_recovery.outputs.restart_required != 'true' &&
+          github.event_name == 'workflow_dispatch' &&
+          inputs.mode == 'resolve-conflict'
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ inputs.pr_number }}
