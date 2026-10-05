@@ -154,6 +154,23 @@ _ATTRIBUTION_PREFIXES = (
 _ORIGIN_MARKER_RE = re.compile(r"<!--\s*continuum-origin\b[^>]*-->")
 _HIDDEN_LINE_RE = re.compile(r"^\s*<!--.*?-->\s*$")
 
+_FINDING_RE = re.compile(r"^[0-9a-f]{64}$")
+_LAST_EVENT_RE = re.compile(r"^[A-Za-z0-9_:\-./+]{1,128}$")
+
+
+def _sanitize_last_event(value: object, max_len: int = 128) -> str:
+    """Return a marker-safe event identity (parseable by ``parse_state_marker``).
+
+    ``render_state_marker`` interpolates ``last_event`` verbatim while
+    ``_STATE_RE`` only accepts ``[A-Za-z0-9_:./+-]{1,128}``. Any space,
+    ``-->`` or overlong ``event_id`` would render an unparsable marker and
+    lose the authoritative record on next load, so sanitize and bound here
+    and when assigning ``event_id`` in :func:`reduce`.
+    """
+    bound = max(1, min(int(max_len or 128), 128))
+    safe = re.sub(r"[^A-Za-z0-9_:\-./+]", "_", str(value or "init"))[:bound]
+    return safe or "init"
+
 
 class LifecycleError(ValueError):
     """Raised for malformed lifecycle inputs (fail-closed ERROR path)."""
@@ -270,6 +287,7 @@ def render_state_marker(state: LifecycleState) -> str:
     _require_phase(state.phase)
     if int(state.generation) < 1:
         raise LifecycleError("generation must be >= 1")
+    safe_event = _sanitize_last_event(state.last_event, 128)
     return (
         f"<!-- {STATE_MARKER_NAME} "
         f"v={STATE_SCHEMA_VERSION} "
@@ -279,7 +297,7 @@ def render_state_marker(state: LifecycleState) -> str:
         f"repair_attempt={int(state.repair_attempt)} "
         f"conflict_generation={int(state.conflict_generation)} "
         f"not_before={int(state.not_before)} finding={state.finding} "
-        f"last_event={state.last_event} -->"
+        f"last_event={safe_event} -->"
     )
 
 
@@ -567,8 +585,28 @@ def sanitize_parent_state(state: Mapping[str, object]) -> Dict[str, object]:
     # Belt and braces: drop any owner/name shaped value under a child key.
     for key in ("child", "child_id", "child_repo", "child_repository"):
         data.pop(key, None)
-    return {k: v for k, v in data.items() if k in PARENT_SAFE_FIELDS
-            or k in ("repo", "pr")}
+    projected = {k: v for k, v in data.items() if k in PARENT_SAFE_FIELDS
+                 or k in ("repo", "pr")}
+    # Scrub values: key allowlisting alone still leaks when child identity is
+    # embedded in an allowed value such as last_event, finding, or repo.
+    for key in list(projected.keys()):
+        value = projected[key]
+        if key == "repo":
+            # Any repo value is repository identity. The parent knows its own
+            # repo from its own context; a projected (child) repo must never
+            # be parent-visible.
+            projected[key] = "redacted"
+        elif key == "finding":
+            text = str(value or "-")
+            if text != "-" and ("/" in text or not _FINDING_RE.match(text)):
+                projected[key] = "-"
+        elif key == "last_event":
+            text = str(value or "redacted")
+            if "/" in text or not _LAST_EVENT_RE.match(text):
+                projected[key] = "redacted"
+        elif isinstance(value, str) and "/" in value:
+            projected[key] = "redacted"
+    return projected
 
 
 # -- Legacy compatibility (migration only) ----------------------------------
@@ -617,8 +655,8 @@ def shadow_compare(old_action: str, decision: Decision) -> Dict[str, object]:
 def _error(repo: str, pr: int, head: str, generation: int, reason: str,
            last_event: str = "error") -> Transition:
     state = LifecycleState(repo=repo, pr=pr, head=head, generation=generation,
-                           phase=TERMINAL_BLOCK, last_event=last_event[:64]
-                           or "error")
+                           phase=TERMINAL_BLOCK,
+                           last_event=_sanitize_last_event(last_event, 64))
     return Transition(
         state=state,
         decision=Decision(action="error", workflow_failure=True, reason=reason,
@@ -642,6 +680,58 @@ def _checked_transition(prior: LifecycleState,
                         phase: str) -> bool:
     allowed = ALLOWED_TRANSITIONS.get(prior.phase, frozenset())
     return phase in allowed
+
+
+def _facts_changed_since(prior: LifecycleState, facts: LifecycleFacts,
+                         review: Optional[ReviewFact]) -> bool:
+    """Whether material lifecycle facts changed since ``prior``.
+
+    The default ``event_id`` (``f"{facts.event}:{head[:12]}"``) repeats for
+    every cron wakeup without an explicit id, so coalescing on
+    ``event_id == prior.last_event`` alone would treat a CI flip from pending
+    to pass as a duplicate noop and stick the lifecycle. Only coalesce when
+    the material facts are also identical.
+    """
+    if not facts.config_valid or not facts.authenticated:
+        return prior.phase != TERMINAL_BLOCK
+    if facts.wip_full:
+        return True
+    if facts.mergeable == "dirty":
+        return prior.phase != CONFLICT_REPAIR
+    if facts.ci == "fail":
+        return prior.phase != WAITING_RECHECK
+    if facts.ci == "pass":
+        if prior.phase in (WAITING_CI, WAITING_REVIEW, WAITING_RECHECK):
+            return True
+    if review is not None:
+        if review.decision == "quota_wait":
+            if prior.phase != RATE_LIMITED:
+                return True
+            try:
+                quota = int(review.quota_not_before or 0)
+            except (TypeError, ValueError):
+                quota = 0
+            return quota != int(prior.not_before or 0)
+        if review.decision == "disabled":
+            return prior.phase != REVIEW_IN_FLIGHT
+        try:
+            fingerprint = _finding_fp(review.actionable)
+        except Exception:
+            fingerprint = "-"
+        if fingerprint != (prior.finding or "-"):
+            return True
+        if review.decision == "approved" and not review.actionable:
+            if facts.mergeable == "clean":
+                return prior.phase not in (MERGE_READY, MERGED)
+            return prior.phase in (WAITING_CI, WAITING_REVIEW,
+                                   WAITING_RECHECK, REVIEW_IN_FLIGHT,
+                                   REPAIR_IN_FLIGHT)
+        if review.decision == "changes_requested" or review.actionable:
+            return prior.phase != REPAIR_IN_FLIGHT
+        if review.decision in ("comment", "unknown"):
+            return prior.phase != WAITING_RECHECK
+        return prior.phase in (WAITING_CI, WAITING_REVIEW, WAITING_RECHECK)
+    return False
 
 
 def reduce(prior: Optional[LifecycleState], facts: LifecycleFacts,
@@ -674,7 +764,8 @@ def reduce(prior: Optional[LifecycleState], facts: LifecycleFacts,
                       f"unknown event: {facts.event!r}",
                       last_event=facts.event_id or prior.last_event)
 
-    event_id = str(facts.event_id or "").strip() or f"{facts.event}:{head[:12]}"
+    event_id = _sanitize_last_event(
+        str(facts.event_id or "").strip() or f"{facts.event}:{head[:12]}", 64)
 
     if prior is None:
         repo_guess = "unknown/unknown"
@@ -698,8 +789,15 @@ def reduce(prior: Optional[LifecycleState], facts: LifecycleFacts,
         )
         return _wait(nxt, "new HEAD started a new generation; awaiting CI")
 
+    review = facts.review
+    if review is not None and review.head != head:
+        # Stale review from another HEAD is ignored (current exact-HEAD
+        # review supersedes historical findings/statuses).
+        review = None
+
     # Duplicate wakeup: same event identity and no material change coalesces.
-    if event_id == prior.last_event:
+    if event_id == prior.last_event and not _facts_changed_since(
+            prior, facts, review):
         return Transition(
             state=prior,
             decision=Decision(action="noop", workflow_failure=False,
@@ -730,12 +828,6 @@ def reduce(prior: Optional[LifecycleState], facts: LifecycleFacts,
                               emit_side_effect=False,
                               idempotency_key=nxt.idempotency_key()),
         )
-
-    review = facts.review
-    if review is not None and review.head != head:
-        # Stale review from another HEAD is ignored (current exact-HEAD
-        # review supersedes historical findings/statuses).
-        review = None
 
     def move(phase: str, reason: str, action: str, emit: bool,
              failure: bool = False, **updates: object) -> Transition:
