@@ -376,6 +376,7 @@ APPROVED_QUALIFICATION_ISOLATION_CHECKPOINT_REMOVED_LINES = (
     "            !contains(github.event.comment.body, '/oc-cancel'))) &&",
     "          git switch --detach \"origin/$BASE_REF\"",
     "          git switch -c \"$BRANCH\"",
+    "            exit 75",
     "          if [[ -z \"$(git status --porcelain)\" ]]; then",
     "          git add -A",
     "          # kodmial/continuum#260: workflow-owned task commit sets the bot",
@@ -448,6 +449,7 @@ APPROVED_QUALIFICATION_ISOLATION_CHECKPOINT_ADDED_LINES = (
     "            checkpoint_issue_progress \"$OPENCODE_RUN_RC\"",
     "          fi",
     "          trap - TERM INT HUP",
+    "            checkpoint_issue_progress 75",
     "          WORKTREE_DIRTY=false",
     "          if [[ -n \"$(git status --porcelain)\" ]]; then",
     "            WORKTREE_DIRTY=true",
@@ -466,7 +468,6 @@ APPROVED_QUALIFICATION_ISOLATION_CHECKPOINT_ADDED_LINES = (
     "            \"repos/$GITHUB_REPOSITORY/git/refs/heads/$CHECKPOINT_BRANCH\" \\",
     "            >/dev/null 2>&1 || true",
 )
-
 
 # Fixed-history pin for the old-to-new baseline range check below
 # (PREVIOUS_BASELINE_SHA..BASELINE_SHA): that range landed before the
