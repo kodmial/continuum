@@ -67,15 +67,14 @@ jobs:
           REQUIRED_WORKFLOW_GATE_LABEL: ${{ vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_LABEL || '' }}
           REQUIRED_WORKFLOW_GATE_NAME: ${{ vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_NAME || '' }}
           READ_GITHUB_TOKEN: ${{ github.token }}
+          COMMENT_PAT: ${{ secrets.TAP_PAT }}
         with:
-          # Same-repository reads stay on the repository token via
-          # READ_GITHUB_TOKEN (#254). The @coderabbitai command comment remains
-          # PAT-backed: GitHub rejects this integration-triggering PR comment
-          # from GITHUB_TOKEN with "Resource not accessible by integration"
-          # even when the job has issues:write. Keeping only this low-volume
-          # mutation on TAP_PAT preserves liveness without moving polling back
-          # onto the shared user quota.
-          github-token: ${{ secrets.TAP_PAT }}
+          # Queue state mutations stay on the repository token so they are
+          # attributed to github-actions[bot]. Only the @coderabbitai command
+          # comment uses the low-volume PAT client below: GitHub rejects this
+          # integration-triggering PR comment from GITHUB_TOKEN with
+          # "Resource not accessible by integration" even with issues:write.
+          github-token: ${{ github.token }}
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
@@ -105,6 +104,16 @@ jobs:
             }
             const readGithub = new github.constructor({
               auth: readToken,
+              baseUrl: github.request.endpoint.DEFAULTS.baseUrl,
+            });
+            const commentToken = String(process.env.COMMENT_PAT || '').trim();
+            if (!commentToken) {
+              throw new Error(
+                'COMMENT_PAT is required to trigger CodeRabbit full review.'
+              );
+            }
+            const commentGithub = new github.constructor({
+              auth: commentToken,
               baseUrl: github.request.endpoint.DEFAULTS.baseUrl,
             });
             if (
@@ -1180,7 +1189,7 @@ jobs:
             }
 
             try {
-              await github.rest.issues.createComment({
+              await commentGithub.rest.issues.createComment({
                 owner,
                 repo,
                 issue_number: selected.prNumber,
