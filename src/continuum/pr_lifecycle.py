@@ -461,7 +461,10 @@ def normalize_coderabbit_review(raw: Mapping[str, object],
     else:
         norm = "unknown"
     fps = tuple(str(x) for x in (data.get("actionable") or []) if str(x))
-    not_before = int(data.get("quota_not_before") or data.get("not_before") or 0)
+    try:
+        not_before = int(data.get("quota_not_before") or data.get("not_before") or 0)
+    except (TypeError, ValueError):
+        not_before = 0
     return ReviewFact(provider="coderabbit", decision=norm, head=head,
                       actionable=fps, quota_not_before=not_before)
 
@@ -490,7 +493,10 @@ def normalize_pragent_review(raw: Mapping[str, object],
         raw_issues = data.get("key_issues_to_review") or data.get("issues") or []
         norm = "changes_requested" if raw_issues else "unknown"
     fps = tuple(str(x) for x in (data.get("actionable") or []) if str(x))
-    not_before = int(data.get("quota_not_before") or data.get("not_before") or 0)
+    try:
+        not_before = int(data.get("quota_not_before") or data.get("not_before") or 0)
+    except (TypeError, ValueError):
+        not_before = 0
     return ReviewFact(provider="pr-agent", decision=norm, head=head,
                       actionable=fps, quota_not_before=not_before)
 
@@ -602,7 +608,7 @@ def sanitize_parent_state(state: Mapping[str, object]) -> Dict[str, object]:
                 projected[key] = "-"
         elif key == "last_event":
             text = str(value or "redacted")
-            if "/" in text or not _LAST_EVENT_RE.match(text):
+            if not _LAST_EVENT_RE.match(text):
                 projected[key] = "redacted"
         elif isinstance(value, str) and "/" in value:
             projected[key] = "redacted"
