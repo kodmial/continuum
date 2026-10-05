@@ -68,14 +68,14 @@ jobs:
           REQUIRED_WORKFLOW_GATE_NAME: ${{ vars.CONTINUUM_REQUIRED_WORKFLOW_GATE_NAME || '' }}
           READ_GITHUB_TOKEN: ${{ github.token }}
         with:
-          # kodmial/continuum#259: same-repository queue mutations (labels and
-          # the @coderabbitai command comment) use the repository-scoped
-          # GITHUB_TOKEN so GitHub attributes them to github-actions[bot].
-          # CodeRabbit is notified as an external app regardless of actor, and
-          # no GitHub workflow is triggered by these writes (wake-ups arrive
-          # via CodeRabbit events, schedule, and workflow_dispatch).
-          # Same-repo reads move to READ_GITHUB_TOKEN via readGithub (#254).
-          github-token: ${{ github.token }}
+          # Same-repository reads stay on the repository token via
+          # READ_GITHUB_TOKEN (#254). The @coderabbitai command comment remains
+          # PAT-backed: GitHub rejects this integration-triggering PR comment
+          # from GITHUB_TOKEN with "Resource not accessible by integration"
+          # even when the job has issues:write. Keeping only this low-volume
+          # mutation on TAP_PAT preserves liveness without moving polling back
+          # onto the shared user quota.
+          github-token: ${{ secrets.TAP_PAT }}
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
