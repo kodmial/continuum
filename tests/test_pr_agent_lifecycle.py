@@ -327,6 +327,32 @@ APPROVED_278_OPENCODE_DAG_ADDED_LINES = (
     '              }',
 )
 
+
+# Hotfix cb673954 keeps CodeRabbit no-progress publication PAT-backed while
+# same-repository classification reads remain on github.token. This is a
+# narrow credential-boundary change: exactly one mutation call is redirected
+# to the dedicated PAT client and that client is constructed from COMMENT_PAT.
+# Keep this explicit allowlist instead of advancing the protected baseline so
+# unrelated continuum-opencode.yml drift still fails closed.
+APPROVED_CODERABBIT_NO_PROGRESS_PAT_REMOVED_LINES = (
+    "                await github.rest.issues.createComment({",
+)
+
+APPROVED_CODERABBIT_NO_PROGRESS_PAT_ADDED_LINES = (
+    "          COMMENT_PAT: ${{ secrets.TAP_PAT }}",
+    "            const commentToken = String(process.env.COMMENT_PAT || '').trim();",
+    "            if (!commentToken) {",
+    "              throw new Error(",
+    "                'COMMENT_PAT is required to publish CodeRabbit no-progress state.'",
+    "              );",
+    "            }",
+    "            const commentGithub = new github.constructor({",
+    "              auth: commentToken,",
+    "              baseUrl: github.request.endpoint.DEFAULTS.baseUrl,",
+    "            });",
+    "                await commentGithub.rest.issues.createComment({",
+)
+
 # Fixed-history pin for the old-to-new baseline range check below
 # (PREVIOUS_BASELINE_SHA..BASELINE_SHA): that range landed before the
 # reconstruction self-stamp was removed, so it still carries the four
@@ -656,10 +682,11 @@ class ProtectedBaselineTests(unittest.TestCase):
                             _Counter(deleted),
                             _Counter(APPROVED_258_OPENCODE_ATTRIBUTION_REMOVED_LINES)
                             + _Counter(APPROVED_260_OPENCODE_PROVENANCE_REMOVED_LINES)
-                            + _Counter(APPROVED_278_OPENCODE_DAG_REMOVED_LINES),
+                            + _Counter(APPROVED_278_OPENCODE_DAG_REMOVED_LINES)
+                            + _Counter(APPROVED_CODERABBIT_NO_PROGRESS_PAT_REMOVED_LINES),
                             f"{path} must not delete or modify baseline lines "
                             f"outside the approved #258 attribution plus #260 "
-                            f"provenance plus #278 DAG-bypass replacement",
+                            f"provenance plus #278 DAG-bypass plus cb673954 PAT-boundary replacement",
                         )
                         actual = _Counter(added)
                         approved = _Counter(APPROVED_179_OPENCODE_PROBE_LINES)
@@ -669,6 +696,7 @@ class ProtectedBaselineTests(unittest.TestCase):
                         expected.update(APPROVED_258_OPENCODE_ATTRIBUTION_ADDED_LINES)
                         expected.update(APPROVED_260_OPENCODE_PROVENANCE_ADDED_LINES)
                         expected.update(APPROVED_278_OPENCODE_DAG_ADDED_LINES)
+                        expected.update(APPROVED_CODERABBIT_NO_PROGRESS_PAT_ADDED_LINES)
                         self.assertEqual(
                             actual,
                             expected,
