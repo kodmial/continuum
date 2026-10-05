@@ -11,6 +11,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 import unittest
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -459,13 +460,24 @@ def lifecycle_source() -> str:
         return handle.read()
 
 def run_policy(op: str, payload: dict | list | None = None):
-    env = os.environ.copy()
-    env["POLICY_MODULE"] = POLICY_MODULE
-    env["POLICY_OP"] = op
-    env["POLICY_PAYLOAD"] = json.dumps(payload)
-    code = r"""
+    # Payloads travel via a temp file, not an env string: Linux caps a
+    # single env value at MAX_ARG_STRLEN (128 KiB), so a realistic large
+    # review payload (e.g. 200 KiB diagnostic padding) would fail with
+    # E2BIG ("Argument list too long") before node even starts. The file
+    # channel preserves exact JSON semantics for every payload size.
+    payload_json = json.dumps(payload)
+    fd, payload_path = tempfile.mkstemp(prefix="policy-payload-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload_json)
+        env = os.environ.copy()
+        env["POLICY_MODULE"] = POLICY_MODULE
+        env["POLICY_OP"] = op
+        env["POLICY_PAYLOAD_FILE"] = payload_path
+        code = r"""
+const fs = require('fs');
 const policy = require(process.env.POLICY_MODULE);
-const payload = JSON.parse(process.env.POLICY_PAYLOAD || 'null');
+const payload = JSON.parse(fs.readFileSync(process.env.POLICY_PAYLOAD_FILE, 'utf8'));
 let result;
 switch (process.env.POLICY_OP) {
   case 'threshold':
@@ -496,17 +508,22 @@ switch (process.env.POLICY_OP) {
 }
 process.stdout.write(JSON.stringify(result));
 """
-    completed = subprocess.run(
-        ["node", "-e", code],
-        cwd=ROOT,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    if completed.returncode != 0:
-        raise AssertionError(completed.stderr)
-    return json.loads(completed.stdout)
+        completed = subprocess.run(
+            ["node", "-e", code],
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if completed.returncode != 0:
+            raise AssertionError(completed.stderr)
+        return json.loads(completed.stdout)
+    finally:
+        try:
+            os.unlink(payload_path)
+        except OSError:
+            pass
 
 
 
@@ -3833,10 +3850,18 @@ class FallbackPersistentStateTests(unittest.TestCase):
         self.assertIn("review_json: ${{ needs.pr_agent.outputs.review_json }}", review)
         self.assertIn("REVIEW_JSON: ${{ inputs.review_json }}", repair)
         self.assertIn("git push", repair)
-        # The merge gate still requires persistent state for the exact HEAD
-        # and stays closed until a clean exact-HEAD review.
+        # The merge gate still requires exact-HEAD evidence and stays
+        # closed until a clean exact-HEAD review. Since the compact-gate
+        # migration the merge job receives the versioned compact gate
+        # (derived inside the review job from persistent state + review
+        # for the exact HEAD) instead of the full persistent payload;
+        # the review job must still derive that gate from persistent state.
         self.assertIn(
-            "persistent_state_json: ${{ needs.pr_agent.outputs.persistent_state_json }}",
+            "merge_gate_json: ${{ needs.pr_agent.outputs.merge_gate_json }}",
+            review,
+        )
+        self.assertIn(
+            "PERSISTENT_STATE_JSON: ${{ steps.persistent.outputs.persistent_state_json }}",
             review,
         )
         self.assertIn("PR-Agent gate requires native persistent finding state", merge)
