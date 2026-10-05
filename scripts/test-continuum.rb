@@ -4831,6 +4831,17 @@ class ContinuumTest < Minitest::Test
                     'the classifier must stay within the existing caller permission contract'
   end
 
+  def test_coderabbit_retry_splits_state_actor_from_command_actor
+    body = workflow_body('continuum-coderabbit-retry.yml')
+    assert_includes body, 'github-token: ${{ github.token }}'
+    assert_includes body, 'COMMENT_PAT: ${{ secrets.TAP_PAT }}'
+    assert_includes body, 'await github.rest.issues.addLabels({'
+    assert_includes body, 'await github.rest.issues.removeLabel({'
+    assert_includes body, 'await commentGithub.rest.issues.createComment({'
+    refute_includes body, 'await commentGithub.rest.issues.addLabels({'
+    refute_includes body, 'await commentGithub.rest.issues.removeLabel({'
+  end
+
   # One exact HEAD plus one non-code blocker is a terminal no-progress state.
   # Both the global review queue and auto-merge reconciler must honour it rather
   # than repeatedly buying another CodeRabbit review of identical code.
