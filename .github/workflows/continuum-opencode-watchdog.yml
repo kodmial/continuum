@@ -34,6 +34,13 @@ on:
         required: false
         type: string
         default: ''
+      max_429_runner_restarts:
+        description: >-
+          Fresh-runner restarts after an OpenCode 429 marker. Empty falls back
+          to AUTOMATION_WATCHDOG_MAX_429_RUNNER_RESTARTS, then 3.
+        required: false
+        type: string
+        default: ''
       retry_marker:
         description: >-
           Hidden HTML marker counted to decide how many recovery retries an
@@ -95,7 +102,7 @@ jobs:
       # issues.get/listForRepo/listComments, pull-requests for pulls.list, and
       # actions for listWorkflowRunsForRepo. The caller stub must grant at
       # least the same scopes.
-      actions: read
+      actions: write
       contents: read
       issues: write
       pull-requests: read
@@ -103,6 +110,8 @@ jobs:
     env:
       WATCHED_WORKFLOW: ${{ inputs.watched_workflow }}
       MAX_RECOVERY_RETRIES: ${{ inputs.max_recovery_retries || vars.AUTOMATION_WATCHDOG_MAX_RETRIES || '1' }}
+      MAX_429_RUNNER_RESTARTS: ${{ inputs.max_429_runner_restarts || vars.AUTOMATION_WATCHDOG_MAX_429_RUNNER_RESTARTS || '3' }}
+      GITHUB_API_URL: ${{ github.api_url }}
       RETRY_MARKER: ${{ inputs.retry_marker || vars.AUTOMATION_WATCHDOG_RETRY_MARKER || '<!-- opencode-watchdog-retry -->' }}
       IN_PROGRESS_LABEL: ${{ inputs.in_progress_label || vars.AUTOMATION_IN_PROGRESS_LABEL || 'automation:in-progress' }}
       PAUSE_LABEL: ${{ inputs.pause_marker || vars.AUTOMATION_PAUSE_LABEL || 'automation:paused' }}
@@ -157,13 +166,92 @@ jobs:
               typeof readGithub.rest?.issues?.listForRepo !== 'function' ||
               typeof readGithub.rest?.issues?.listComments !== 'function' ||
               typeof readGithub.rest?.pulls?.list !== 'function' ||
-              typeof readGithub.rest?.actions?.listWorkflowRunsForRepo !== 'function'
+              typeof readGithub.rest?.actions?.listWorkflowRunsForRepo !== 'function' ||
+              typeof readGithub.rest?.actions?.listJobsForWorkflowRun !== 'function' ||
+              typeof readGithub.rest?.actions?.reRunWorkflow !== 'function'
             ) {
               throw new Error(
                 'readGithub client lacks the paginate/rest plugins; ' +
                 'cannot perform same-repository watchdog reads.'
               );
             }
+            // 429 is a runner-lifecycle failure, not an issue/task failure.
+            // The OpenCode workflow emits this exact marker only when its CLI
+            // invocation itself failed with provider rate limiting. Re-run the
+            // same workflow run so GitHub preserves its original event/inputs,
+            // while all jobs are scheduled again on fresh hosted runners.
+            const rateLimitMarker = 'CONTINUUM_OPENCODE_429_RESTART_REQUIRED';
+            const max429Restarts = Number.parseInt(
+              process.env.MAX_429_RUNNER_RESTARTS || '3',
+              10
+            );
+            if (!Number.isInteger(max429Restarts) || max429Restarts < 0) {
+              throw new Error(
+                'Invalid MAX_429_RUNNER_RESTARTS: ' +
+                process.env.MAX_429_RUNNER_RESTARTS
+              );
+            }
+            const jobs = await readGithub.paginate(
+              readGithub.rest.actions.listJobsForWorkflowRun,
+              {
+                owner,
+                repo,
+                run_id: run.id,
+                filter: 'latest',
+                per_page: 100,
+              }
+            );
+            let runnerRestartRequired = false;
+            const apiBase = String(process.env.GITHUB_API_URL || 'https://api.github.com')
+              .replace(/\/+$/, '');
+            for (const job of jobs) {
+              const response = await fetch(
+                apiBase + '/repos/' + owner + '/' + repo +
+                  '/actions/jobs/' + job.id + '/logs',
+                {
+                  headers: {
+                    accept: 'application/vnd.github+json',
+                    authorization: 'Bearer ' + readToken,
+                    'x-github-api-version': '2022-11-28',
+                  },
+                  redirect: 'follow',
+                }
+              );
+              if (!response.ok) {
+                core.warning(
+                  'Could not inspect job ' + job.id +
+                  ' for 429 recovery marker: HTTP ' + response.status
+                );
+                continue;
+              }
+              const logText = await response.text();
+              if (logText.includes(rateLimitMarker)) {
+                runnerRestartRequired = true;
+                break;
+              }
+            }
+            if (runnerRestartRequired) {
+              const attempt = Number(run.run_attempt || 1);
+              if (attempt <= max429Restarts) {
+                await readGithub.rest.actions.reRunWorkflow({
+                  owner,
+                  repo,
+                  run_id: run.id,
+                });
+                core.notice(
+                  'OpenCode 429: restarted workflow run ' + run.id +
+                  ' on fresh runner(s), attempt ' + (attempt + 1) +
+                  '/' + (max429Restarts + 1) + '.'
+                );
+              } else {
+                core.warning(
+                  'OpenCode 429 fresh-runner recovery exhausted after ' +
+                  max429Restarts + ' restart(s) for run ' + run.id + '.'
+                );
+              }
+              return;
+            }
+
             let issueNumber = null;
             // Consumers that give their OpenCode caller a `run-name` of
             // `OpenCode issue #<n>` get an exact, unambiguous issue number here.
