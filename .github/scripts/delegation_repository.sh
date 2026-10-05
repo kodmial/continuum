@@ -176,7 +176,13 @@ resolve_by_roles() {
 resolve_child() {
   local child_id="$1"
   if [[ -n "$repository_map_json" ]]; then
-    python3 "$relation" resolve-child       --config "$parent_config"       --repository-map-json "$repository_map_json"       --child-id "$child_id"
+    local child_ids allowed_ids_json
+    child_ids="$(parent_child_ids)"
+    allowed_ids_json="$(
+      printf '%s\n' "$child_ids" |
+        jq -Rsc 'split("\n") | map(select(length > 0))'
+    )"
+    python3 "$relation" resolve-child-ids       --repository-map-json "$repository_map_json"       --allowed-ids-json "$allowed_ids_json"       --child-id "$child_id"
   else
     resolve_by_roles "$child_id"
   fi

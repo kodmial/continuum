@@ -74,6 +74,17 @@ else:
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout), [{'id': 'alpha', 'repository': 'owner/child'}])
 
+    def test_repository_map_resolves_against_parent_variables_not_stale_file(self):
+        result = self.run_resolver(
+            'resolve',
+            'alpha',
+            extra_env={
+                'CHILD_REPOSITORIES': json.dumps({'alpha': 'owner/child'}),
+            },
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), 'owner/child')
+
     def test_relationship_variables_beyond_first_page_are_discovered(self):
         parent = {f'DUMMY_PARENT_{i:03d}': 'x' for i in range(105)}
         parent.update({

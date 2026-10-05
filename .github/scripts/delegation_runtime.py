@@ -197,6 +197,20 @@ def resolve_child(
     raise DelegationError("child id is not allowed by delegation.children")
 
 
+def resolve_child_from_ids(
+    repository_map_json: str,
+    allowed_ids_json: str,
+    *,
+    child_id: str,
+) -> str:
+    allowed = parent_variable_ids(DELEGATION_PARENT, allowed_ids_json)
+    repositories = load_repository_map(repository_map_json, allowed)
+    expected = _slug(child_id, "child id")
+    if expected not in repositories:
+        raise DelegationError("child id is not allowed by CONTINUUM_CHILDREN")
+    return repositories[expected]
+
+
 def parent_child_ids(config_path: str) -> List[str]:
     config = load_config(config_path)
     if config.delegation.role != DELEGATION_PARENT:
@@ -238,6 +252,11 @@ def main(argv=None) -> int:
     resolve.add_argument("--config", default=".continuum.yml")
     resolve.add_argument("--repository-map-json", required=True)
     resolve.add_argument("--child-id", required=True)
+
+    resolve_ids = sub.add_parser("resolve-child-ids")
+    resolve_ids.add_argument("--repository-map-json", required=True)
+    resolve_ids.add_argument("--allowed-ids-json", required=True)
+    resolve_ids.add_argument("--child-id", required=True)
 
     verify = sub.add_parser("verify-child")
     verify.add_argument("--config", required=True)
@@ -285,6 +304,20 @@ def main(argv=None) -> int:
                 resolve_child(
                     args.config,
                     args.repository_map_json,
+                    child_id=args.child_id,
+                )
+                + "\n"
+            )
+            return 0
+        if args.command == "resolve-child-ids":
+            # Variable-backed parent relationships are authoritative once
+            # present. Resolve the private repository map against that same
+            # allowlist instead of falling back to a possibly stale tracked
+            # .continuum.yml file.
+            sys.stdout.write(
+                resolve_child_from_ids(
+                    args.repository_map_json,
+                    args.allowed_ids_json,
                     child_id=args.child_id,
                 )
                 + "\n"
