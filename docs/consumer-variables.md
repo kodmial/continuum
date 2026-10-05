@@ -156,7 +156,6 @@ limits and result paths.
 | `RENDER_API_KEY` | Render execution is enabled | Render API credential. |
 | `CHILD_RUNTIME_TOKEN` | Direct parent reusable workflow invocation | Delegated child access; installed parent callers map their configured parent credential. |
 | `CHILD_RUNTIME_REPOSITORIES` | Legacy parent configuration only | Optional compatibility input for child repository relationships. |
-| `CONTINUUM_CHILD_REPOSITORIES` | Legacy delegated PR-Agent target resolution only | Optional compatibility child-repository map while existing parents migrate to repository variables. |
 
 The optional Swift profile defines **no signing or release secrets**. Product
 signing/release credentials belong to the consumer.
