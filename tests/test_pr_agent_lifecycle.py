@@ -44,6 +44,13 @@ SRC = os.path.join(ROOT, "src")
 # retained here as OLDEST_BASELINE_SHA so neither baseline reference is lost.
 BASELINE_SHA = "0d1c3fb63299e2321f719b4e66cae70b309efbf0"
 
+# Protected-workflow baseline immediately before the systemic qualification
+# isolation/checkpoint fix. This immutable main commit already contains and
+# passed all historical #179/#258/#260/#278/PAT-boundary protections. New
+# continuum-opencode.yml drift is therefore checked directly against this
+# tighter baseline instead of composing multiple generations of allowlists.
+OPENCODE_PROTECTED_BASELINE_SHA = "0f388e15929adb33307f27aecff325f4df47bf72"
+
 # Previous protected baseline before the PAUSE_ON_FAILURE advance above.
 # The empty-drift fallback below verifies the old-to-new baseline range
 # carries only the approved #179 probe plus this PAUSE change, so a new
@@ -721,7 +728,12 @@ class ProtectedBaselineTests(unittest.TestCase):
             )
             return present.returncode == 0
 
-        for _sha in (BASELINE_SHA, PREVIOUS_BASELINE_SHA, OLDEST_BASELINE_SHA):
+        for _sha in (
+            BASELINE_SHA,
+            PREVIOUS_BASELINE_SHA,
+            OLDEST_BASELINE_SHA,
+            OPENCODE_PROTECTED_BASELINE_SHA,
+        ):
             if not _ensure_object(_sha):
                 self.fail(
                     "baseline history {} unavailable in shallow checkout: "
@@ -740,8 +752,13 @@ class ProtectedBaselineTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, msg or completed.stderr)
         for path in PROTECTED_FILES:
             with self.subTest(path=path):
+                protected_base = (
+                    OPENCODE_PROTECTED_BASELINE_SHA
+                    if path == ".github/workflows/continuum-opencode.yml"
+                    else BASELINE_SHA
+                )
                 out = subprocess.run(
-                    ["git", "diff", BASELINE_SHA, "HEAD", "--", path],
+                    ["git", "diff", protected_base, "HEAD", "--", path],
                     cwd=ROOT,
                     capture_output=True,
                     text=True,
@@ -788,33 +805,19 @@ class ProtectedBaselineTests(unittest.TestCase):
                         # for replacement. Any other deletion still fails.
                         self.assertEqual(
                             _Counter(deleted),
-                            _Counter(APPROVED_258_OPENCODE_ATTRIBUTION_REMOVED_LINES)
-                            + _Counter(APPROVED_260_OPENCODE_PROVENANCE_REMOVED_LINES)
-                            + _Counter(APPROVED_278_OPENCODE_DAG_REMOVED_LINES)
-                            + _Counter(APPROVED_CODERABBIT_NO_PROGRESS_PAT_REMOVED_LINES)
-                            + _Counter(APPROVED_QUALIFICATION_ISOLATION_CHECKPOINT_REMOVED_LINES),
-                            f"{path} must not delete or modify baseline lines "
-                            f"outside the approved #258 attribution plus #260 "
-                            f"provenance plus #278 DAG-bypass plus cb673954 PAT-boundary replacement",
+                            _Counter(APPROVED_QUALIFICATION_ISOLATION_CHECKPOINT_REMOVED_LINES),
+                            f"{path} must not delete or modify lines beyond the exact "
+                            "qualification-isolation/checkpoint allowlist",
                         )
                         actual = _Counter(added)
-                        approved = _Counter(APPROVED_179_OPENCODE_PROBE_LINES)
                         expected = _Counter(
-                            {line: 2 * count for line, count in approved.items()}
+                            APPROVED_QUALIFICATION_ISOLATION_CHECKPOINT_ADDED_LINES
                         )
-                        expected.update(APPROVED_258_OPENCODE_ATTRIBUTION_ADDED_LINES)
-                        expected.update(APPROVED_260_OPENCODE_PROVENANCE_ADDED_LINES)
-                        expected.update(APPROVED_278_OPENCODE_DAG_ADDED_LINES)
-                        expected.update(APPROVED_CODERABBIT_NO_PROGRESS_PAT_ADDED_LINES)
-                        expected.update(APPROVED_QUALIFICATION_ISOLATION_CHECKPOINT_ADDED_LINES)
                         self.assertEqual(
                             actual,
                             expected,
-                            f"{path} drift must be exactly the approved #179 probe "
-                            f"(both install sites, no extra copies) plus the approved "
-                            f"#258 attribution bodies plus the approved #260 "
-                            f"provenance lines plus the approved #278 "
-                            f"DAG-bypass lines: "
+                            f"{path} drift from the protected pre-fix main must be exactly "
+                            "the qualification-isolation/checkpoint change: "
                             f"extra={sorted(set(actual) - set(expected))} "
                             f"missing={sorted(set(expected) - set(actual))}",
                         )
