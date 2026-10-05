@@ -896,7 +896,7 @@ jobs:
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
         id: pragent
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           TAP_PAT: ${{ secrets.TAP_PAT }}
           # Target-aware PR-Agent auth (pr-agent --pr_url against the resolved
           # target). Local same-repository runs use github.token; delegated
@@ -1088,13 +1088,18 @@ jobs:
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
         id: persistent
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
+          TAP_PAT: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           REVIEWED_SHA: ${{ steps.result.outputs.head_sha }}
           REVIEW_JSON: ${{ steps.pragent.outputs.review }}
           FALLBACK_PYTHONPATH: ${{ steps.runtime.outputs.fallback_pythonpath }}
         run: |
           set -euo pipefail
+          if [[ "${CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED:-false}" == "true" && -z "${TAP_PAT:-}" ]]; then
+            echo "::error::Delegated PR-Agent persistent-state export requires TAP_PAT; refusing to fall back to github.token."
+            exit 1
+          fi
           COMMENTS_JSON="$RUNNER_TEMP/pr-agent-comments.json"
           # Bounded persistent-state lookup (#254): state markers for the
           # reviewed HEAD are written by recent reviews, so a server-side
@@ -1335,7 +1340,7 @@ jobs:
           PRAGENT_OUTCOME: ${{ steps.pragent.outcome }}
           POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
         with:
-          github-token: ${{ github.token }}
+          github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           script: |
             // Automatic-improve gate: review is the authoritative merge gate.
             // A clean authoritative review (safe_to_merge, zero
@@ -1656,7 +1661,7 @@ jobs:
           POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
           IMPROVE_JSONL: ${{ steps.improve_output.outputs.improve_jsonl }}
         with:
-          github-token: ${{ github.token }}
+          github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           script: |
             const policy = require(process.env.POLICY_SCRIPT);
             const prNumber = Number(process.env.PR_NUMBER);
@@ -1821,7 +1826,7 @@ jobs:
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
         with:
-          github-token: ${{ github.token }}
+          github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           script: |
             const policy = require(process.env.POLICY_SCRIPT);
             // Bounded cleanup scan (#254): controller markers gate the next
@@ -1864,7 +1869,7 @@ jobs:
           HEAD_SHA: ${{ steps.result.outputs.head_sha }}
           REVIEW_DISPOSITION: ${{ steps.route.outputs.review_disposition }}
         with:
-          github-token: ${{ github.token }}
+          github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           script: |
             const disposition = String(process.env.REVIEW_DISPOSITION || '').trim();
             const descriptions = {
@@ -1900,7 +1905,7 @@ jobs:
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           RETRYABLE_FAILURE: ${{ (steps.install_pragent.outcome == 'failure' || steps.install_opencode.outcome == 'failure' || steps.start_opencode.outcome == 'failure' || steps.runtime.outcome == 'failure' || steps.start_bridge.outcome == 'failure' || steps.pragent.outcome == 'failure' || steps.result.outcome == 'failure' || steps.persistent.outcome == 'failure' || steps.improve_gate.outcome == 'failure' || steps.improve.outcome == 'failure' || steps.improve_skipped.outcome == 'failure' || steps.post_improve.outcome == 'failure' || steps.improve_output.outcome == 'failure') && steps.result.outputs.stale_head != 'true' && steps.persistent.outputs.stale_head != 'true' && steps.improve_gate.outputs.stale_head != 'true' && steps.improve.outputs.stale_head != 'true' && steps.improve_skipped.outputs.stale_head != 'true' && steps.post_improve.outputs.stale_head != 'true' && 'true' || 'false' }}
         with:
-          github-token: ${{ github.token }}
+          github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           script: |
             // Defense in depth: every stale-head discard above carries its
             // own flag, but revalidate the live PR head anyway so a
@@ -2022,7 +2027,7 @@ jobs:
           RECOVERY_KIND: ${{ steps.stack.outputs.recovery_kind }}
           POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
         with:
-          github-token: ${{ github.token }}
+          github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           script: |
             const policy = require(process.env.POLICY_SCRIPT);
             const prNumber = Number(process.env.PR_NUMBER);
