@@ -1200,7 +1200,21 @@ jobs:
           - Before finishing, write exactly one run record at ${KNOWLEDGE_RECORDS_DIR}/issue-${ISSUE_NUMBER}-run-${GITHUB_RUN_ID}.md following the protocol. Never include secrets. The workflow validates this record and fails closed if it is missing."
           fi
 
-          opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
+          OPENCODE_RUN_LOG="$(mktemp)"
+          set +e
+          opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
+          OPENCODE_RUN_RC=${PIPESTATUS[0]}
+          set -e
+          if grep -Eiq 'FreeUsageLimitError' "$OPENCODE_RUN_LOG" || \
+             { [[ "$OPENCODE_RUN_RC" -ne 0 ]] && grep -Eiq 'APIError.*429|HTTP[^0-9]*429([^0-9]|$)|429[[:space:]]+Too[[:space:]]+Many[[:space:]]+Requests|statusCode[^0-9]*429([^0-9]|$)' "$OPENCODE_RUN_LOG"; }; then
+            echo "::error::CONTINUUM_OPENCODE_429_RESTART_REQUIRED"
+            rm -f "$OPENCODE_RUN_LOG"
+            exit 75
+          fi
+          rm -f "$OPENCODE_RUN_LOG"
+          if [[ "$OPENCODE_RUN_RC" -ne 0 ]]; then
+            exit "$OPENCODE_RUN_RC"
+          fi
 
           if [[ -n "$KNOWLEDGE_RECORDS_DIR" ]]; then
             RECORD_PATH="${KNOWLEDGE_RECORDS_DIR}/issue-${ISSUE_NUMBER}-run-${GITHUB_RUN_ID}.md"
@@ -1401,7 +1415,21 @@ jobs:
           - Do not perform git commits, pushes, branch switches, rebases, resets, merges, or PR creation; the workflow owns Git state.
           EOF
           )"
-          opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
+          OPENCODE_RUN_LOG="$(mktemp)"
+          set +e
+          opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
+          OPENCODE_RUN_RC=${PIPESTATUS[0]}
+          set -e
+          if grep -Eiq 'FreeUsageLimitError' "$OPENCODE_RUN_LOG" || \
+             { [[ "$OPENCODE_RUN_RC" -ne 0 ]] && grep -Eiq 'APIError.*429|HTTP[^0-9]*429([^0-9]|$)|429[[:space:]]+Too[[:space:]]+Many[[:space:]]+Requests|statusCode[^0-9]*429([^0-9]|$)' "$OPENCODE_RUN_LOG"; }; then
+            echo "::error::CONTINUUM_OPENCODE_429_RESTART_REQUIRED"
+            rm -f "$OPENCODE_RUN_LOG"
+            exit 75
+          fi
+          rm -f "$OPENCODE_RUN_LOG"
+          if [[ "$OPENCODE_RUN_RC" -ne 0 ]]; then
+            exit "$OPENCODE_RUN_RC"
+          fi
 
           # Qualification mode cannot push product changes: untracked tool
           # droppings are discarded silently, and only tracked working-tree
@@ -1498,7 +1526,21 @@ jobs:
           - Keep all comments and commit messages in English.
           EOF
           )
-          opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
+          OPENCODE_RUN_LOG="$(mktemp)"
+          set +e
+          opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
+          OPENCODE_RUN_RC=${PIPESTATUS[0]}
+          set -e
+          if grep -Eiq 'FreeUsageLimitError' "$OPENCODE_RUN_LOG" || \
+             { [[ "$OPENCODE_RUN_RC" -ne 0 ]] && grep -Eiq 'APIError.*429|HTTP[^0-9]*429([^0-9]|$)|429[[:space:]]+Too[[:space:]]+Many[[:space:]]+Requests|statusCode[^0-9]*429([^0-9]|$)' "$OPENCODE_RUN_LOG"; }; then
+            echo "::error::CONTINUUM_OPENCODE_429_RESTART_REQUIRED"
+            rm -f "$OPENCODE_RUN_LOG"
+            exit 75
+          fi
+          rm -f "$OPENCODE_RUN_LOG"
+          if [[ "$OPENCODE_RUN_RC" -ne 0 ]]; then
+            exit "$OPENCODE_RUN_RC"
+          fi
 
           # kodmial/continuum#260: deterministic ownership — the workflow owns
           # the final commit with the bot identity (see Configure Git
@@ -1721,7 +1763,21 @@ jobs:
           - Keep all comments and commit messages in English.
           EOF
           )
-          opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
+          OPENCODE_RUN_LOG="$(mktemp)"
+          set +e
+          opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
+          OPENCODE_RUN_RC=${PIPESTATUS[0]}
+          set -e
+          if grep -Eiq 'FreeUsageLimitError' "$OPENCODE_RUN_LOG" || \
+             { [[ "$OPENCODE_RUN_RC" -ne 0 ]] && grep -Eiq 'APIError.*429|HTTP[^0-9]*429([^0-9]|$)|429[[:space:]]+Too[[:space:]]+Many[[:space:]]+Requests|statusCode[^0-9]*429([^0-9]|$)' "$OPENCODE_RUN_LOG"; }; then
+            echo "::error::CONTINUUM_OPENCODE_429_RESTART_REQUIRED"
+            rm -f "$OPENCODE_RUN_LOG"
+            exit 75
+          fi
+          rm -f "$OPENCODE_RUN_LOG"
+          if [[ "$OPENCODE_RUN_RC" -ne 0 ]]; then
+            exit "$OPENCODE_RUN_RC"
+          fi
 
           # kodmial/continuum#260: deterministic ownership — the workflow owns
           # the final conflict-repair commit with the bot identity plus the
@@ -1802,7 +1858,21 @@ jobs:
           - Keep all comments and commit messages in English.
           EOF
           )
-          opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT"
+          OPENCODE_RUN_LOG="$(mktemp)"
+          set +e
+          opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
+          OPENCODE_RUN_RC=${PIPESTATUS[0]}
+          set -e
+          if grep -Eiq 'FreeUsageLimitError' "$OPENCODE_RUN_LOG" || \
+             { [[ "$OPENCODE_RUN_RC" -ne 0 ]] && grep -Eiq 'APIError.*429|HTTP[^0-9]*429([^0-9]|$)|429[[:space:]]+Too[[:space:]]+Many[[:space:]]+Requests|statusCode[^0-9]*429([^0-9]|$)' "$OPENCODE_RUN_LOG"; }; then
+            echo "::error::CONTINUUM_OPENCODE_429_RESTART_REQUIRED"
+            rm -f "$OPENCODE_RUN_LOG"
+            exit 75
+          fi
+          rm -f "$OPENCODE_RUN_LOG"
+          if [[ "$OPENCODE_RUN_RC" -ne 0 ]]; then
+            exit "$OPENCODE_RUN_RC"
+          fi
 
           # kodmial/continuum#260: deterministic ownership — the workflow owns
           # the final repair commit with the bot identity plus the component
