@@ -458,6 +458,29 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
         self.assertIn('contents/.continuum.yml" --jq', resolve)
         self.assertNotIn('contents/.continuum.yml" -f ref="$CONTINUUM_REF"', resolve)
 
+    def test_delegated_target_bootstrap_uses_canonical_engine_and_local_read_token(self):
+        for path in (
+            ".github/workflows/continuum-pr-agent.yml",
+            ".github/workflows/continuum-pr-agent-repair.yml",
+            ".github/workflows/continuum-pr-agent-auto-merge.yml",
+            ".github/workflows/continuum-pr-agent-recovery.yml",
+        ):
+            with self.subTest(path=path):
+                body = read(path)
+                resolve_at = body.index("Resolve PR-Agent target context")
+                resolve = body[resolve_at:resolve_at + 7000]
+                self.assertIn("READ_GITHUB_TOKEN: ${{ github.token }}", resolve)
+                self.assertIn('CONTINUUM_SOURCE_REPO="kodmial/continuum"', resolve)
+                self.assertNotIn("GITHUB_WORKFLOW_REF", resolve)
+                self.assertIn(
+                    'GH_TOKEN="$READ_GITHUB_TOKEN" gh api --method GET "repos/$CONTINUUM_SOURCE_REPO/contents/$path"',
+                    resolve,
+                )
+                self.assertIn(
+                    'GH_TOKEN="$READ_GITHUB_TOKEN" gh api --method GET "repos/$GITHUB_REPOSITORY/contents/.continuum.yml"',
+                    resolve,
+                )
+
     def test_target_identity_rejects_dot_only_components(self):
         helper = read(".github/scripts/pr_agent_target.sh")
         self.assertIn("pr_agent_valid_target_repository", helper)

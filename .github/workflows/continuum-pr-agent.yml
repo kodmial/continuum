@@ -299,18 +299,12 @@ jobs:
         if: steps.stack.outputs.enabled == 'true'
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
+          READ_GITHUB_TOKEN: ${{ github.token }}
           TARGET_CHILD_ID: ${{ inputs.target_child_id }}
           CONTINUUM_REF: ${{ inputs.continuum_ref }}
         run: |
           set -euo pipefail
-          # Derive the Continuum source repository from the reusable workflow
-          # origin so forks, renames, and mirrors fetch their own runtime.
-          # GITHUB_WORKFLOW_REF looks like <owner>/<repo>/.github/workflows/<file>@<ref>.
-          CONTINUUM_SOURCE_REPO="${GITHUB_WORKFLOW_REF:-}"
-          CONTINUUM_SOURCE_REPO="${CONTINUUM_SOURCE_REPO%%/.github/workflows/*}"
-          if ! [[ "$CONTINUUM_SOURCE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || [[ "${CONTINUUM_SOURCE_REPO%%/*}" =~ ^\.+$ ]] || [[ "${CONTINUUM_SOURCE_REPO#*/}" =~ ^\.+$ ]]; then
-            CONTINUUM_SOURCE_REPO="kodmial/continuum"
-          fi
+          CONTINUUM_SOURCE_REPO="kodmial/continuum"
           if [[ -z "${TARGET_CHILD_ID:-}" ]]; then
             # Local fast path: no delegated resolver is needed, so skip every
             # network fetch and resolve directly from the execution repository.
@@ -348,7 +342,7 @@ jobs:
           mkdir -p "$RUNTIME_ROOT/.github/scripts"
           fetch_runtime_file() {
             local path="$1" dest="$2"
-            if ! gh api --method GET "repos/$CONTINUUM_SOURCE_REPO/contents/$path" -f ref="$CONTINUUM_REF" --jq .content 2>/dev/null \
+            if ! GH_TOKEN="$READ_GITHUB_TOKEN" gh api --method GET "repos/$CONTINUUM_SOURCE_REPO/contents/$path" -f ref="$CONTINUUM_REF" --jq .content 2>/dev/null \
               | tr -d '\n' | continuum_b64_decode > "$dest" 2>/dev/null; then
               echo "::error::Unable to load the Continuum PR-Agent target resolver."
               exit 1
@@ -365,7 +359,7 @@ jobs:
           # The parent config lives in the execution repository: fetch its
           # default branch, never the Continuum engine pin (which may not
           # exist in the execution repository).
-          if ! gh api --method GET "repos/$GITHUB_REPOSITORY/contents/.continuum.yml" --jq .content 2>/dev/null \
+          if ! GH_TOKEN="$READ_GITHUB_TOKEN" gh api --method GET "repos/$GITHUB_REPOSITORY/contents/.continuum.yml" --jq .content 2>/dev/null \
             | tr -d '\n' | continuum_b64_decode > "$PARENT_CONFIG_FILE" 2>/dev/null || [[ ! -s "$PARENT_CONFIG_FILE" ]]; then
             echo "::error::Unable to load the parent Continuum configuration for delegated target resolution; refusing to guess."
             exit 1
