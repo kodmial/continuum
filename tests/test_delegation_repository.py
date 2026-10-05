@@ -38,7 +38,12 @@ if endpoint.startswith('/user/repos'):
 elif '/actions/variables' in endpoint:
     repo = endpoint.split('/')[1:3]
     values = data['parent'] if '/'.join(repo) == 'owner/parent' else data['children'].get('/'.join(repo), {})
-    print(json.dumps({'variables': [{'name': k, 'value': v} for k,v in values.items()]}))
+    variables = [{'name': k, 'value': v} for k,v in values.items()]
+    # Simulate GitHub's 100-variable page size. The real resolver must ask gh
+    # to paginate or relationship variables beyond page one disappear.
+    if '--paginate' not in sys.argv:
+        variables = variables[:100]
+    print(json.dumps({'variables': variables}))
 elif '/contents/.continuum.yml' in endpoint and data.get('legacy'):
     print(base64.b64encode(data['legacy'].encode()).decode())
 else:
@@ -68,6 +73,28 @@ else:
         result = self.run_resolver('plan')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout), [{'id': 'alpha', 'repository': 'owner/child'}])
+
+    def test_relationship_variables_beyond_first_page_are_discovered(self):
+        parent = {f'DUMMY_PARENT_{i:03d}': 'x' for i in range(105)}
+        parent.update({
+            'CONTINUUM_ROLE': 'parent',
+            'CONTINUUM_CHILDREN': '["alpha"]',
+        })
+        child = {f'DUMMY_CHILD_{i:03d}': 'x' for i in range(105)}
+        child.update({
+            'CONTINUUM_ROLE': 'child',
+            'CONTINUUM_CHILD_ID': 'alpha',
+            'CONTINUUM_PARENT': 'owner/parent',
+        })
+        self.data['parent'] = parent
+        self.data['children']['owner/child'] = child
+
+        result = self.run_resolver('plan')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            [{'id': 'alpha', 'repository': 'owner/child'}],
+        )
 
     def test_invalid_parent_is_an_error_not_an_empty_success(self):
         self.data['parent']['CONTINUUM_ROLE'] = 'child'

@@ -7,6 +7,12 @@ REVIEW = ROOT / ".github" / "workflows" / "continuum-consumer-child-review.yml"
 
 
 class ChildValidationEnvironmentTest(unittest.TestCase):
+    def test_generic_validation_does_not_allocate_child_runner(self):
+        validation = (
+            ROOT / ".github" / "workflows" / "continuum-validation.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("vars.CONTINUUM_ROLE != 'child'", validation)
+
     def test_delegated_validation_receives_child_role_without_credentials(self):
         body = REVIEW.read_text(encoding="utf-8")
         marker = 'CONTINUUM_ROLE=child'
