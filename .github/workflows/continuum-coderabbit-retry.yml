@@ -69,11 +69,11 @@ jobs:
           READ_GITHUB_TOKEN: ${{ github.token }}
           COMMENT_PAT: ${{ secrets.TAP_PAT }}
         with:
-          # Queue state mutations stay on the repository token so they are
-          # attributed to github-actions[bot]. Only the @coderabbitai command
-          # comment uses the low-volume PAT client below: GitHub rejects this
-          # integration-triggering PR comment from GITHUB_TOKEN with
-          # "Resource not accessible by integration" even with issues:write.
+          # Same-repository discovery stays on the repository token. The
+          # CodeRabbit command and its tiny exact-head lock mutation share the
+          # low-volume PAT client: real consumer runs can reject that lock
+          # mutation from GITHUB_TOKEN, and the command itself must use the
+          # non-Actions actor to trigger CodeRabbit.
           github-token: ${{ github.token }}
           script: |
             const owner = context.repo.owner;
