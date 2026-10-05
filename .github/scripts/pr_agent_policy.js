@@ -1085,6 +1085,113 @@ function reviewDisposition(reviewPayload, improveJsonl, threshold = IMPROVE_REPA
   };
 }
 
+function mergeGateSummary(reviewPayload, improveJsonl, persistentState, headSha) {
+  const head = String(headSha || '').trim().toLowerCase();
+  if (!isPlausibleHeadSha(head)) {
+    throw new Error('PR-Agent compact merge gate requires a plausible exact reviewed HEAD.');
+  }
+  if (!persistentState || typeof persistentState !== 'object' || Array.isArray(persistentState)) {
+    throw new Error('PR-Agent compact merge gate requires persistent state object.');
+  }
+  if (persistentState.schema_version !== 1 || !Array.isArray(persistentState.findings)) {
+    throw new Error('PR-Agent compact merge gate persistent state schema is invalid.');
+  }
+  const lastRun = persistentState.last_run;
+  if (!lastRun || typeof lastRun !== 'object') {
+    throw new Error('PR-Agent compact merge gate persistent state has no last_run.');
+  }
+  const stateHead = String(lastRun.head_sha || '').trim().toLowerCase();
+  if (stateHead !== head) {
+    throw new Error(
+      'PR-Agent compact merge gate persistent state is stale: ' +
+      (stateHead || '<empty>') + ' != ' + head
+    );
+  }
+  if (lastRun.complete !== true || String(lastRun.kind || '') !== 'full') {
+    throw new Error('PR-Agent compact merge gate requires a complete full persistent review.');
+  }
+
+  const review = unwrapReview(reviewPayload);
+  if (!Array.isArray(review.key_issues_to_review)) {
+    throw new Error('PR-Agent compact merge gate review has no key_issues_to_review list.');
+  }
+  const recommendation = String(review.merge_recommendation || '').trim();
+  if (!recommendation) {
+    throw new Error('PR-Agent compact merge gate review has no merge_recommendation.');
+  }
+
+  const raw = String(improveJsonl || '').trim();
+  const qualifying = qualifyingImproveSuggestions(raw);
+  const disposition = reviewDisposition(reviewPayload, raw);
+  const improveSkippedClean = isSkippedCleanImprovePayload(raw);
+  const toolError = hasToolErrorSignal(review);
+  const reviewCoverageComplete = !hasIncompleteCoverageSignal(review);
+  const blockingSecurity = hasBlockingSecuritySignal(review);
+  const hasActive = persistentHasActive(persistentState);
+
+  const base = {
+    schema_version: 1,
+    head_sha: head,
+    disposition: String(disposition.action || ''),
+    recommendation,
+    review_count: review.key_issues_to_review.length,
+    qualifying_suggestion_count: qualifying.length,
+    persistent_active: hasActive,
+    review_coverage_complete: reviewCoverageComplete,
+    tool_error: toolError,
+    blocking_security: blockingSecurity,
+  };
+
+  function blocked(reason) {
+    return { ...base, green: false, reason: String(reason || 'blocked') };
+  }
+
+  if (toolError) return blocked('tool error: failing closed');
+  if (!reviewCoverageComplete) return blocked('incomplete review coverage: failing closed');
+  if (!disposition || disposition.action !== 'merge') {
+    return blocked(
+      'central review disposition blocks merge: ' +
+      String(disposition && disposition.action || 'unknown') + ': ' +
+      String(disposition && disposition.reason || recommendation)
+    );
+  }
+  if (review.key_issues_to_review.length > 0) {
+    if (review.key_issues_to_review.length === REVIEW_MAX_FINDINGS) {
+      return blocked('review batch reached the findings cap: potentially truncated');
+    }
+    return blocked(review.key_issues_to_review.length + ' current key issue(s) remain');
+  }
+  if (blockingSecurity) return blocked('blocking security signal remains');
+  if (improveSkippedClean) {
+    const skipDecision = isCleanReviewForImproveSkip(
+      reviewPayload,
+      persistentState,
+      {
+        headMatches: true,
+        toolError,
+        reviewCoverageComplete,
+        reviewedHeadSha: head,
+      }
+    );
+    if (!skipDecision || skipDecision.skip !== true) {
+      return blocked(
+        'improve skip not justified: ' +
+        String(skipDecision && skipDecision.reason || 'failing closed')
+      );
+    }
+  }
+  if (qualifying.length > 0) {
+    return blocked(qualifying.length + ' qualifying suggestion(s) remain');
+  }
+  if (hasActive) return blocked('native persistent state has an ACTIVE finding');
+
+  return {
+    ...base,
+    green: true,
+    reason: 'review portion satisfied',
+  };
+}
+
 function controllerStateBody(stateMarker, summary) {
   // Layout: the legacy hidden marker lines stay first so positional
   // upsert/election matching is unchanged (HTML comments do not render,
@@ -1123,6 +1230,7 @@ module.exports = {
   isCleanReviewForImproveSkip,
   isSkippedCleanImprovePayload,
   logicalFingerprint,
+  mergeGateSummary,
   normalizeProblem,
   originMarker,
   overlappingLocation,
