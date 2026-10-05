@@ -18,6 +18,9 @@ on:
       persistent_state_json:
         description: Native upstream persistent finding state for head_sha.
         value: ${{ jobs.pr_agent.outputs.persistent_state_json }}
+      merge_gate_json:
+        description: Compact versioned exact-HEAD merge decision derived inside the review job.
+        value: ${{ jobs.pr_agent.outputs.merge_gate_json }}
       needs_repair:
         description: Whether current native review/improve output requires repair.
         value: ${{ jobs.pr_agent.outputs.needs_repair }}
@@ -180,8 +183,9 @@ jobs:
       review_json: ${{ steps.pragent.outputs.review }}
       improve_jsonl: ${{ steps.improve_output.outputs.improve_jsonl }}
       persistent_state_json: ${{ steps.persistent.outputs.persistent_state_json }}
+      merge_gate_json: ${{ steps.merge_gate.outputs.merge_gate_json }}
       needs_repair: ${{ steps.route.outputs.needs_repair }}
-      ready_to_merge: ${{ steps.route.outputs.ready_to_merge }}
+      ready_to_merge: ${{ steps.merge_gate.outputs.green }}
       needs_rereview: ${{ steps.route.outputs.needs_rereview }}
       retry_attempt: ${{ steps.stack.outputs.retry_attempt }}
       retry_workflow: ${{ steps.stack.outputs.retry_workflow }}
@@ -1819,6 +1823,70 @@ jobs:
               'PR-Agent disposition=' + disposition.action + ': ' + disposition.reason
             );
 
+      - name: Build compact exact-head PR-Agent merge gate
+        if: steps.route.outcome == 'success' && steps.result.outputs.head_sha
+        id: merge_gate
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          HEAD_SHA: ${{ steps.result.outputs.head_sha }}
+          REVIEW_JSON: ${{ steps.pragent.outputs.review }}
+          IMPROVE_JSONL: ${{ steps.improve_output.outputs.improve_jsonl }}
+          PERSISTENT_STATE_JSON: ${{ steps.persistent.outputs.persistent_state_json }}
+          ROUTE_READY_TO_MERGE: ${{ steps.route.outputs.ready_to_merge }}
+          POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const policy = require(process.env.POLICY_SCRIPT);
+            let persistentState;
+            try {
+              persistentState = JSON.parse(String(process.env.PERSISTENT_STATE_JSON || ''));
+            } catch (err) {
+              core.setFailed('Cannot build compact PR-Agent merge gate: invalid persistent state JSON: ' + err.message);
+              return;
+            }
+            let review;
+            try {
+              review = JSON.parse(String(process.env.REVIEW_JSON || ''));
+            } catch (err) {
+              core.setFailed('Cannot build compact PR-Agent merge gate: invalid review JSON: ' + err.message);
+              return;
+            }
+            let summary;
+            try {
+              summary = policy.mergeGateSummary(
+                review,
+                String(process.env.IMPROVE_JSONL || ''),
+                persistentState,
+                String(process.env.HEAD_SHA || '')
+              );
+            } catch (err) {
+              core.setFailed('Cannot build compact PR-Agent merge gate: ' + err.message);
+              return;
+            }
+            const compact = JSON.stringify(summary);
+            if (compact.length > 4096) {
+              core.setFailed('Compact PR-Agent merge gate exceeded 4096 bytes; refusing oversized cross-job state.');
+              return;
+            }
+            core.setOutput('merge_gate_json', compact);
+            core.setOutput('green', summary.green === true ? 'true' : 'false');
+            core.notice(
+              'Compact PR-Agent merge gate: head=' + summary.head_sha +
+              ' green=' + summary.green +
+              ' disposition=' + summary.disposition +
+              ' reason=' + summary.reason
+            );
+            if (
+              String(process.env.ROUTE_READY_TO_MERGE || '') === 'true' &&
+              summary.green !== true
+            ) {
+              core.setFailed(
+                'Route marked the exact HEAD merge-ready but compact merge gate blocks it: ' +
+                summary.reason
+              );
+            }
+
       - name: Clear settled PR-Agent controller state
         if: steps.route.outcome == 'success' && steps.route.outputs.ready_to_merge == 'true'
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
@@ -2303,7 +2371,5 @@ jobs:
       review_provider: ${{ needs.pr_agent.outputs.review_provider }}
       pr_number: ${{ needs.pr_agent.outputs.pr_number }}
       head_sha: ${{ needs.pr_agent.outputs.head_sha }}
-      review_json: ${{ needs.pr_agent.outputs.review_json }}
-      improve_jsonl: ${{ needs.pr_agent.outputs.improve_jsonl }}
-      persistent_state_json: ${{ needs.pr_agent.outputs.persistent_state_json }}
+      merge_gate_json: ${{ needs.pr_agent.outputs.merge_gate_json }}
       target_child_id: ${{ inputs.target_child_id }}
