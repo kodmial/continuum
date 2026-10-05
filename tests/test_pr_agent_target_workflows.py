@@ -342,6 +342,28 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
                 self.assertNotIn("GH_TOKEN: ${{ github.token }}", window)
                 self.assertNotIn("secrets.TAP_PAT || github.token }}", window)
 
+    def test_post_review_target_operations_use_delegated_pat(self):
+        body = read(".github/workflows/continuum-pr-agent.yml")
+        token = "CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '')"
+        for step in (
+            "Export native persistent finding state for the reviewed HEAD",
+            "Decide whether automatic improve can be skipped",
+            "Normalize persistent improve presentation",
+            "Clear settled PR-Agent controller state",
+            "Publish durable PR-Agent review state",
+            "Publish failed PR-Agent review state",
+            "Update persistent PR-Agent retry controller state",
+        ):
+            with self.subTest(step=step):
+                start = body.index("      - name: " + step)
+                following = body.find("\n      - name: ", start + 1)
+                window = body[start:following if following != -1 else start + 12000]
+                self.assertIn(token, window)
+                self.assertNotIn("github-token: ${{ github.token }}", window)
+        persistent_at = body.index("Export native persistent finding state for the reviewed HEAD")
+        persistent = body[persistent_at:persistent_at + 5000]
+        self.assertIn("Delegated PR-Agent persistent-state export requires TAP_PAT", persistent)
+
     def test_checkout_credential_is_scoped_to_resolved_target(self):
         body = read(".github/workflows/continuum-pr-agent.yml")
         start = body.index("Checkout the pull request head without exposing")
