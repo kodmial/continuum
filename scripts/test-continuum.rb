@@ -384,6 +384,12 @@ class ContinuumTest < Minitest::Test
       events(caller).fetch('workflow_dispatch', nil).to_h.fetch('inputs', {}).each do |key, value|
         expected = value['type'] == 'choice' ? 'string' : value['type']
         assert_equal expected, call.fetch('inputs').fetch(key).fetch('type')
+        # continuum_ref is accepted by dispatch callers so isolated retries can
+        # preserve a pinned-revision payload without receiving HTTP 422. The
+        # installed caller pin remains authoritative and is rewritten by
+        # install.sh; forwarding a runtime expression here would defeat that
+        # deterministic pinning contract.
+        next if key == 'continuum_ref'
         assert_includes job.fetch('with').fetch(key), "inputs.#{key}"
       end
       job.fetch('with').each_key { |key| assert call.fetch('inputs').key?(key) }
