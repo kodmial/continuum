@@ -215,7 +215,13 @@ jobs:
             const dispatchGraceMs =
               Number.parseInt(process.env.DISPATCH_GRACE_SECONDS || '90', 10) * 1_000;
             const trustedAssociations = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
+            // A completed failed run with a still-pending lifecycle status
+            // means the producer terminated before it could publish its final
+            // deterministic/transient verdict. That is an incomplete
+            // control-plane lifecycle, so bounded recovery retries it
+            // immediately instead of waiting the full stale timeout.
             const retryableConclusions = new Set([
+              'failure',
               'cancelled',
               'timed_out',
               'stale',
