@@ -217,6 +217,12 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
                 self.assertIn("target_child_id", body)
                 self.assertNotIn("target_repository", body)
 
+    def test_recovery_retries_failed_run_left_with_pending_status(self):
+        body = read(".github/workflows/continuum-pr-agent-recovery.yml")
+        self.assertIn("const retryableConclusions = new Set([", body)
+        self.assertIn("'failure',", body)
+        self.assertIn("pending operation is not stale", body)
+
     def test_pr_agent_caller_accepts_forwarded_continuum_ref(self):
         body = read(".github/caller-stubs/continuum-pr-agent.yml")
         dispatch = body.split("workflow_dispatch:", 1)[1].split("\npermissions:", 1)[0]
