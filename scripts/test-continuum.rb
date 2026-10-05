@@ -4924,12 +4924,17 @@ class ContinuumTest < Minitest::Test
 
     # The requested label remains the exact-head/idempotency lock and there is
     # still one authoritative command emission site in the serialized queue.
-    # The emitted command carries the Continuum attribution contract (#258):
-    # the @coderabbitai command stays first so the review still triggers,
-    # followed by the visible automation header and the hidden origin marker.
+    # The emitted command carries the Continuum attribution contract (#258).
+    # Critically, the recognizer must accept the attribution lines after the
+    # first @coderabbitai command line; otherwise the controller cannot see its
+    # own in-flight command and repeatedly burns the shared review quota.
     assert_includes body, 'const requested = labels.has(REQUESTED_LABEL);'
     assert_equal 1, body.scan('@coderabbitai full review').size
-    assert_includes body, "'@coderabbitai full review\\n\\n⚡ **Continuum · coderabbit-retry**\\n<!-- continuum-origin role=continuum component=coderabbit-retry -->'"
+    assert_includes body, '^@coderabbitai\\s+(?:full\\s+)?review(?:\\s*$|\\s*\\n)'
+    assert_includes body, '<!-- continuum-origin role=continuum component=coderabbit-retry -->'
+    assert_includes body, '<!-- continuum-coderabbit-command head=${selected.headSha} -->'
+    assert_includes body, 'await commentGithub.rest.issues.addLabels({'
+    assert_includes body, 'await commentGithub.rest.issues.removeLabel({'
   end
 
   # Hour-scale CodeRabbit quota waits must never pin a GitHub runner. The
