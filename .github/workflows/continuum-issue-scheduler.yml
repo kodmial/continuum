@@ -3055,23 +3055,85 @@ jobs:
                 .join(', ') || 'none') + '.'
             );
 
-            if (freeSlots === 0) {
-              core.info('No free WIP slots; nothing will be dispatched.');
-              return;
-            }
-
             // Qualification/validation trackers are never generic
             // implementation work (kodmial/continuum#278): they need explicit
             // qualification dispatch, independent of automation:ready. The set
             // is derived from the open inventory without extra API reads.
             const qualificationTrackers = collectQualificationTrackers(issues);
 
+            if (freeSlots === 0) {
+              // Cron is the missed-event backstop (kodmial/continuum#280): a
+              // pass that leaves eligible backlog unexplained while reporting
+              // success can stall autonomous development silently for days.
+              // Name every eligible-looking waiter (label-level admission
+              // only, so no extra API reads) with its priority and the WIP
+              // holders blocking it. When such backlog waits the run must
+              // fail instead of reporting success with zero progress; a full
+              // WIP with no waiters is routine busy state and stays green.
+              const holderDetails = [...activeIssueNumbers]
+                .sort((a, b) => a - b)
+                .map(number => {
+                  const holderLabels = labelsByIssue.get(number) || new Set();
+                  const holderPriorities = [...holderLabels].filter(name =>
+                    priorityRank.has(name)
+                  );
+                  return '#' + number + ' (' +
+                    (holderPriorities[0] || 'no priority') + ')';
+                })
+                .join(', ') || 'none';
+              const wipWaiters = [];
+              for (const issue of issues) {
+                if (activeIssueNumbers.has(issue.number)) continue;
+                if (openPrIssues.has(issue.number)) continue;
+                const admission = shouldAdmitToImplementation(
+                  issue.number, qualificationTrackers
+                );
+                if (!admission.admit) continue;
+                const waiterLabels = labelsByIssue.get(issue.number);
+                if (pauseOnFailure && waiterLabels.has(pausedLabel)) continue;
+                if (waiterLabels.has(qualifyingLabel) || waiterLabels.has(blockedLabel)) continue;
+                const waiterPriorities = [...waiterLabels]
+                  .filter(name => priorityRank.has(name))
+                  .sort((a, b) => priorityRank.get(a) - priorityRank.get(b));
+                const waiterPriority = waiterPriorities[0] || null;
+                if (requirePriorityLabel && waiterPriority === null) continue;
+                if (readyLabel && !waiterLabels.has(readyLabel)) continue;
+                wipWaiters.push(issue.number);
+                core.warning(
+                  'Skipping #' + issue.number +
+                  ': waiting for a free WIP slot (' +
+                  (waiterPriority || 'no priority') +
+                  '); active WIP holders: ' + holderDetails + '.'
+                );
+              }
+              if (wipWaiters.length > 0) {
+                core.setFailed(
+                  'Issue scheduler WIP exhausted with eligible backlog waiting.'
+                );
+              } else {
+                core.info('No free WIP slots; nothing will be dispatched.');
+              }
+              return;
+            }
+
             const candidates = [];
             for (const issue of issues) {
-              if (activeIssueNumbers.has(issue.number)) continue;
+              if (activeIssueNumbers.has(issue.number)) {
+                core.info(
+                  'Skipping #' + issue.number +
+                  ': WIP slot held by an active reservation or run.'
+                );
+                continue;
+              }
               // An existing implementation PR must never be duplicated even
               // when it is configured not to consume a WIP slot.
-              if (openPrIssues.has(issue.number)) continue;
+              if (openPrIssues.has(issue.number)) {
+                core.info(
+                  'Skipping #' + issue.number +
+                  ': open implementation PR must not be duplicated.'
+                );
+                continue;
+              }
 
               const admission = shouldAdmitToImplementation(
                 issue.number, qualificationTrackers
@@ -3178,7 +3240,18 @@ jobs:
 
             const selected = [];
             for (const candidate of candidates) {
-              if (selected.length >= freeSlots) break;
+              if (selected.length >= freeSlots) {
+                core.info(
+                  'Skipping #' + candidate.issue.number +
+                  ': waiting for a free WIP slot (' +
+                  (candidate.priority || 'no priority') +
+                  '); selected ahead: ' +
+                  (selected
+                    .map(item => '#' + item.issue.number)
+                    .join(', ') || 'none') + '.'
+                );
+                continue;
+              }
 
               const issue = candidate.issue;
               if (candidate.source === 'child') {
