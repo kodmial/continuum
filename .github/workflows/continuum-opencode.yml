@@ -1293,7 +1293,7 @@ jobs:
              { [[ "$OPENCODE_RUN_RC" -ne 0 ]] && grep -Eiq 'APIError.*429|HTTP[^0-9]*429([^0-9]|$)|429[[:space:]]+Too[[:space:]]+Many[[:space:]]+Requests|statusCode[^0-9]*429([^0-9]|$)' "$OPENCODE_RUN_LOG"; }; then
             echo "::error::CONTINUUM_OPENCODE_429_RESTART_REQUIRED"
             rm -f "$OPENCODE_RUN_LOG"
-            exit 75
+            checkpoint_issue_progress 75
           fi
           rm -f "$OPENCODE_RUN_LOG"
           if [[ "$OPENCODE_RUN_RC" -ne 0 ]]; then
