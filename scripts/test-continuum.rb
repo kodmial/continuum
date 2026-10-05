@@ -2072,11 +2072,15 @@ class ContinuumTest < Minitest::Test
                     'in-flight commit-status publishing must fail closed for delegated writes without TAP_PAT'
     refute_includes in_flight, 'github-token: ${{ github.token }}',
                     'in-flight commit-status publishing must not set an unconditional github.token credential'
-    assert_includes normalize, 'github-token: ${{ github.token }}',
-                    'comment maintenance must use repository token'
+    assert_includes normalize, conditional_token,
+                    'target-aware comment maintenance must use TAP_PAT only for delegated runs'
+    assert_includes normalize, empty_token_tail,
+                    'target-aware comment maintenance must preserve github.token for local runs and fail closed without delegated PAT'
     assert_includes normalize, 'deleteComment'
-    assert_includes publish, 'github-token: ${{ github.token }}',
-                     'commit-status publishing must use repository token'
+    assert_includes publish, conditional_token,
+                     'target-aware commit-status publishing must use TAP_PAT only for delegated runs'
+    assert_includes publish, empty_token_tail,
+                     'target-aware commit-status publishing must preserve github.token for local runs and fail closed without delegated PAT'
     # Target-aware (#243) delegated reads/writes require TAP_PAT, so the review
     # workflow is no longer entirely PAT-free: the admission/revalidation
     # steps above plus the in-flight commit-status step and the PR-Agent
