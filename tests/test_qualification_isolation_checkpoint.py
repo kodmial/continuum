@@ -67,6 +67,20 @@ class InterruptedIssueCheckpointTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.body = OPENCODE.read_text(encoding="utf-8")
 
+    def test_autonomous_no_change_does_not_pause_for_manual_inspection(self) -> None:
+        implement = step_block(self.body, "Implement issue")
+        self.assertIn("PAUSE_ON_FAILURE:", implement)
+        self.assertIn('${PAUSE_ON_FAILURE,,}', implement)
+        self.assertIn("autonomous mode delegates bounded retry/recovery instead of pausing", implement)
+        autonomous = implement.index("autonomous mode delegates bounded retry/recovery instead of pausing")
+        pause = implement.index("--add-label \"$PAUSE_LABEL\"")
+        self.assertLess(autonomous, pause)
+
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.body = OPENCODE.read_text(encoding="utf-8")
+
     def test_interrupted_agent_work_is_checkpointed_and_resumed(self) -> None:
         implement = step_block(self.body, "Implement issue")
         for marker in (
