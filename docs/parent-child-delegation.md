@@ -65,10 +65,10 @@ triggers, so a run that fails unavailable retries deterministically once the
 budget resets, resolving the same configured child before and after
 delegated completion.
 
-The old `.continuum.yml` relationship declaration and optional
-`CONTINUUM_CHILD_REPOSITORIES` secret remain readable only as a compatibility
-path while existing consumers migrate. New integrations should use repository
-variables.
+The old `.continuum.yml` relationship declaration remains readable only as a
+compatibility path while existing consumers migrate. New integrations and
+PR-Agent delegated target resolution use repository variables as the
+authoritative relationship contract.
 
 ## Parent workflows
 
