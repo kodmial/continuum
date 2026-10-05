@@ -81,6 +81,7 @@ jobs:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           READ_GITHUB_TOKEN: ${{ github.token }}
           TARGET_CHILD_ID: ${{ inputs.target_child_id || vars.CONTINUUM_PR_AGENT_TARGET_CHILD_ID }}
+          CHILD_REPOSITORIES: ${{ secrets.CONTINUUM_CHILD_REPOSITORIES }}
           CONTINUUM_REF: ${{ inputs.continuum_ref }}
         run: |
           set -euo pipefail
