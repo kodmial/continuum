@@ -328,10 +328,10 @@ jobs:
               }
               const compactHead = String(compact.head_sha || '').trim().toLowerCase();
               if (compactHead !== headSha) {
-                core.setFailed(
-                  'Compact PR-Agent merge gate is stale: head=' +
-                  (compactHead || '<empty>') + ', expected=' + headSha + '.'
-                );
+                core.setOutput('green', 'false');
+                core.setOutput('reason', 'Compact PR-Agent merge gate is stale: head=' + (compactHead || '<empty>') + ', expected=' + headSha + ': awaiting recheck for the current HEAD');
+                core.setOutput('head_sha', headSha);
+                core.notice('Compact PR-Agent merge gate is stale for ' + headSha + ': awaiting recheck.');
                 return;
               }
               if (compact.green !== true || String(compact.disposition || '') !== 'merge') {
