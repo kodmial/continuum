@@ -193,7 +193,7 @@ class CleanSkipTests(unittest.TestCase):
         )
         self.assertEqual(clean["action"], "merge")
 
-    def test_clean_review_with_qualifying_improve_routes_to_repair(self):
+    def test_clean_review_with_qualifying_improve_still_reaches_merge(self):
         qualifying = (
             '{"payload": {"code_suggestions": ['
             '{"relevant_file": "src/app.py", "score": 9}]}}'
@@ -203,7 +203,21 @@ class CleanSkipTests(unittest.TestCase):
             review=make_review([]),
             raw=qualifying,
         )
+        self.assertEqual(result["action"], "merge")
+        self.assertEqual(result["qualifyingSuggestionCount"], 1)
+
+    def test_actionable_review_can_carry_improve_into_single_repair(self):
+        qualifying = (
+            '{"payload": {"code_suggestions": ['
+            '{"relevant_file": "src/app.py", "score": 9}]}}'
+        )
+        result = run_js(
+            "disposition",
+            review=make_review([issue_entry(n=0)]),
+            raw=qualifying,
+        )
         self.assertEqual(result["action"], "repair")
+        self.assertEqual(result["reviewCount"], 1)
         self.assertEqual(result["qualifyingSuggestionCount"], 1)
 
     def test_clean_review_with_sub_threshold_improve_reaches_merge(self):
