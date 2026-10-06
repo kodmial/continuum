@@ -526,13 +526,14 @@ jobs:
                 return;
               }
             }
-            if (improveSkippedClean && qualifying.length > 0) {
-              fail('improve was skipped but qualifying suggestions remain');
-              return;
-            }
+            // /improve suggestions are advisory once the authoritative
+            // exact-HEAD review is clean. They can enrich a repair batch only
+            // when the review itself found an actionable defect; they are not
+            // an independent merge gate.
             if (qualifying.length > 0) {
-              fail(`${qualifying.length} qualifying suggestion(s) remain`);
-              return;
+              core.notice(
+                `${qualifying.length} advisory improve suggestion(s) ignored after clean authoritative review.`
+              );
             }
             if (disposition.action !== 'merge') {
               fail(disposition.reason);
