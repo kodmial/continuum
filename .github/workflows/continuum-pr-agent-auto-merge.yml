@@ -699,6 +699,25 @@ jobs:
                 return { ok: false, reason: 'Current-head CI is not acceptable' };
               }
 
+              if (repoFullName === 'kodmial/continuum') {
+                const contractGate =
+                  await latestWorkflowForHead(
+                    pr,
+                    pr.head.sha,
+                    'Continuum Contract Gate'
+                  );
+                if (
+                  !contractGate ||
+                  contractGate.status !== 'completed' ||
+                  contractGate.conclusion !== 'success'
+                ) {
+                  return {
+                    ok: false,
+                    reason: 'Continuum Contract Gate is not successful',
+                  };
+                }
+              }
+
               // Do not gate on GitHub's aggregate combined status here.
               // Lifecycle contexts such as continuum/pr-agent-repair are
               // historical per context: an earlier failed repair can remain
