@@ -218,7 +218,9 @@ jobs:
               )
           )
           assert failed.outcome == contract.CANARY_STALLED_FAILED, failed
-          assert "canary-main" in failed.detail and "review" not in failed.detail or "worker" in failed.detail
+          for token in ("canary-main", "issue=1", "pr=2", "run=3", "stage=worker"):
+              assert token in failed.detail, (token, failed)
+          assert "review" not in failed.detail, failed
           print("Layer 3 canary probe passed")
           PY
 
