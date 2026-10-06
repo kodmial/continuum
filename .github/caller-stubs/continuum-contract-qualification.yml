@@ -36,4 +36,4 @@ jobs:
       continuum_ref: main
       pr_number: "${{ inputs.pr_number || github.event.pull_request.number }}"
       head_sha: "${{ inputs.head_sha || github.event.pull_request.head.sha }}"
-      mode: "${{ inputs.mode }}"
+      mode: "${{ inputs.mode || (github.event_name == 'schedule' && 'canary' || 'verify') }}"
