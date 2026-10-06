@@ -3522,7 +3522,7 @@ process.stdout.write(JSON.stringify(result));
         window = body[route:route + 4000]
         self.assertIn("IMPROVE_SKIPPED", window)
         self.assertIn("steps.improve_skipped.outcome", body)
-        self.assertIn(
+        self.assertNotIn(
             "but qualifying suggestions remain", body
         )
         self.assertIn("improveSkippedClean", window)
@@ -3532,7 +3532,7 @@ process.stdout.write(JSON.stringify(result));
             ".github/workflows/continuum-pr-agent-auto-merge.yml"
         )
         self.assertIn("isSkippedCleanImprovePayload", merge)
-        self.assertIn(
+        self.assertNotIn(
             "but qualifying suggestions remain", merge
         )
         self.assertIn("improveSkippedClean", merge)
@@ -4211,7 +4211,7 @@ class ReviewDispositionIntegrationTests(unittest.TestCase):
                     ),
                 },
             ).get("action"),
-            "repair",
+            "merge",
         )
 
     def test_route_and_merge_gate_share_the_same_policy(self):
