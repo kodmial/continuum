@@ -699,6 +699,25 @@ jobs:
                 return { ok: false, reason: 'Current-head CI is not acceptable' };
               }
 
+              if (repoFullName === 'kodmial/continuum') {
+                const continuumContractGate =
+                  await latestWorkflowForHead(
+                    pr,
+                    pr.head.sha,
+                    'Continuum Contract Gate'
+                  );
+                if (
+                  !continuumContractGate ||
+                  continuumContractGate.status !== 'completed' ||
+                  continuumContractGate.conclusion !== 'success'
+                ) {
+                  return {
+                    ok: false,
+                    reason: 'Continuum Contract Gate is not successful',
+                  };
+                }
+              }
+
               // Do not gate on GitHub's aggregate combined status here.
               // Lifecycle contexts such as continuum/pr-agent-repair are
               // historical per context: an earlier failed repair can remain
@@ -712,18 +731,18 @@ jobs:
               // PR-Agent merge path obeys the same qualification contract
               // as generic auto-merge. Absent, stale, or red
               // exact-HEAD contract evidence blocks the merge. Fail closed.
-              const contractGate =
+              const contractQualificationGate =
                 await latestWorkflowForHead(pr, pr.head.sha, 'Contract qualification');
               if (
-                !contractGate ||
-                contractGate.status !== 'completed' ||
-                contractGate.conclusion !== 'success'
+                !contractQualificationGate ||
+                contractQualificationGate.status !== 'completed' ||
+                contractQualificationGate.conclusion !== 'success'
               ) {
                 return {
                   ok: false,
                   reason:
                     'Contract qualification is ' +
-                    (contractGate ? contractGate.status + '/' + (contractGate.conclusion || 'pending') : 'missing') +
+                    (contractQualificationGate ? contractQualificationGate.status + '/' + (contractQualificationGate.conclusion || 'pending') : 'missing') +
                     ' for the exact HEAD',
                 };
               }

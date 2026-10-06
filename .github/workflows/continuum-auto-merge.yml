@@ -699,6 +699,15 @@ jobs:
               return latestCiForHead(pr, pr.head.sha);
             }
 
+            async function latestContinuumContractGate(pr, headSha = pr.head.sha) {
+              if (repoFullName !== 'kodmial/continuum') return null;
+              return latestWorkflowForHead(
+                pr,
+                headSha,
+                'Continuum Contract Gate'
+              );
+            }
+
             async function latestCurrentHeadPackagingSmoke(pr) {
               return latestWorkflowForHead(pr, pr.head.sha, 'Packaging smoke');
             }
@@ -2539,6 +2548,22 @@ jobs:
                 continue;
               }
 
+              const continuumContractGate =
+                await latestContinuumContractGate(pr);
+              if (
+                repoFullName === 'kodmial/continuum' &&
+                (
+                  !continuumContractGate ||
+                  continuumContractGate.status !== 'completed' ||
+                  continuumContractGate.conclusion !== 'success'
+                )
+              ) {
+                core.info(
+                  `PR #${pr.number}: waiting for successful Continuum Contract Gate on head ${pr.head.sha}.`
+                );
+                continue;
+              }
+
               // Packaging smoke is conditional/path-filtered. If this HEAD has
               // a Packaging smoke run, it is a blocking quality gate just like
               // CI; an absent run means the workflow was not applicable.
@@ -2751,6 +2776,8 @@ jobs:
               }
 
               const finalCi = await latestCurrentHeadCi(pr);
+              const finalContinuumContractGate =
+                await latestContinuumContractGate(pr, pr.head.sha);
               const finalPackagingSmoke =
                 await latestCurrentHeadPackagingSmoke(pr);
               const finalExtraWorkflowGate =
@@ -2771,6 +2798,10 @@ jobs:
                 !finalCi ||
                 finalCi.status !== 'completed' ||
                 finalCi.conclusion !== 'success' ||
+                (repoFullName === 'kodmial/continuum' &&
+                 (!finalContinuumContractGate ||
+                  finalContinuumContractGate.status !== 'completed' ||
+                  finalContinuumContractGate.conclusion !== 'success')) ||
                 !finalContractGate ||
                 finalContractGate.status !== 'completed' ||
                 finalContractGate.conclusion !== 'success' ||
