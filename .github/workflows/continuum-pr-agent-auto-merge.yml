@@ -704,8 +704,29 @@ jobs:
               // historical per context: an earlier failed repair can remain
               // failure even after a later complete review proves the exact
               // HEAD clean. Required merge gates are checked explicitly below
-              // (current-head CI, packaging, and configured required workflow),
-              // while this reusable PR-Agent gate validates review state itself.
+              // (current-head CI, contract qualification, packaging, and
+              // configured required workflow), while this reusable PR-Agent
+              // gate validates review state itself.
+
+              // Contract qualification gate (kodmial/continuum#286): the
+              // PR-Agent merge path obeys the same qualification contract
+              // as generic auto-merge. Absent, stale, or red
+              // exact-HEAD contract evidence blocks the merge. Fail closed.
+              const contractGate =
+                await latestWorkflowForHead(pr, pr.head.sha, 'Contract qualification');
+              if (
+                !contractGate ||
+                contractGate.status !== 'completed' ||
+                contractGate.conclusion !== 'success'
+              ) {
+                return {
+                  ok: false,
+                  reason:
+                    'Contract qualification is ' +
+                    (contractGate ? contractGate.status + '/' + (contractGate.conclusion || 'pending') : 'missing') +
+                    ' for the exact HEAD',
+                };
+              }
 
               const packaging =
                 await latestWorkflowForHead(pr, pr.head.sha, 'Packaging smoke');

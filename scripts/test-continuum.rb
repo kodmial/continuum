@@ -1000,7 +1000,7 @@ class ContinuumTest < Minitest::Test
   # three sets are independent files in one directory, so a one-line edit to the
   # prune candidate list — or a future edit to `"${STUBS[@]}"` — could delete a
   # consumer's whole tech or parent layer with no warning. The growth
-  # 19 -> 20 -> 24 is the observable form of that guarantee.
+  # 19 -> 20 -> 24 -> 25 is the observable form of that guarantee.
   def test_installing_one_set_does_not_delete_another_sets_callers
     fixture do |dir|
       target = File.join(dir, 'consumer')
@@ -1025,11 +1025,11 @@ class ContinuumTest < Minitest::Test
           PARENT_STUBS.each { |stub| assert_includes installed, File.basename(stub) }
         end
       end
-      # Each set adds exactly its own files: 19 core, +1 tech, +4 parent.
+      # Each set adds exactly its own files: 20 core, +1 tech, +4 parent.
       assert_equal CORE_STUBS.size, counts['core']
       assert_equal CORE_STUBS.size + TECH_STUBS.size, counts['tech']
       assert_equal ALL_STUBS.size, counts['parent']
-      assert_equal 24, ALL_STUBS.size,
+      assert_equal 25, ALL_STUBS.size,
                    'every caller Continuum ships, across all three layers'
     end
   end
@@ -1459,9 +1459,9 @@ class ContinuumTest < Minitest::Test
   # count was taken from the workflow tree and then compared against the stub
   # tree, so adding a workflow and its stub together — exactly what a new
   # feature does — moved both sides and passed. A literal is the third,
-  # independent source: to change the nineteen core callers someone has to say so
+  # independent source: to change the twenty core callers someone has to say so
   # here, which is where a reviewer sees it.
-  CORE_COUNT = 19
+  CORE_COUNT = 20
 
   # Every core workflow is either called by a stub in one of the three layers
   # or is a repository-owned/shared engine intentionally invoked from a
@@ -3845,6 +3845,7 @@ class ContinuumTest < Minitest::Test
     'continuum-bootstrap-runtime-secret.yml' => %w[continuum_ref repository],
     'continuum-coderabbit-retry.yml' => %w[continuum_ref],
     'continuum-coderabbit-unresolved.yml' => %w[continuum_ref],
+    'continuum-contract-qualification.yml' => %w[continuum_ref pr_number head_sha mode],
     'continuum-docker-qualification.yml' => %w[
       continuum_ref issue_number artifact_repository binary_name model
       docker_image memory_mib min_headroom_mib trials result_schema
@@ -7898,6 +7899,61 @@ class ContinuumTest < Minitest::Test
                     'residual operations must be isolated as future GitHub App candidates'
     assert_includes provenance, 'about-authentication-with-a-github-app',
                     'the App model reference must point at the GitHub App authentication docs'
+  end
+
+  # ------------------------------------------------- contract qualification (kodmial/continuum#286)
+  # One merge-blocking qualification contract with three layers (regression
+  # gate + lifecycle E2E + live canary). The reusable workflow and its caller
+  # stub are a pair like every other core workflow, and both merge paths
+  # require its exact-HEAD success before any pulls.merge call.
+
+  def test_contract_qualification_workflow_and_stub_are_a_pair
+    workflow = File.join(ROOT, '.github/workflows/continuum-contract-qualification.yml')
+    stub = File.join(ROOT, '.github/caller-stubs/continuum-contract-qualification.yml')
+    assert File.exist?(workflow), 'continuum-contract-qualification.yml workflow is missing'
+    assert File.exist?(stub), 'continuum-contract-qualification.yml caller stub is missing'
+    engine = yaml(workflow)
+    caller = yaml(stub)
+    assert_equal 'Contract qualification', engine.fetch('name')
+    assert_equal engine.fetch('name'), caller.fetch('name')
+    assert_equal ['workflow_call'], events(engine).keys
+    assert_includes Dir[File.join(ROOT, '.github/caller-stubs/*.yml')].map { |p| File.basename(p) },
+                    'continuum-contract-qualification.yml'
+  end
+
+  def test_contract_qualification_gate_is_a_first_class_lifecycle
+    body = File.read(File.join(ROOT, '.github/workflows/continuum-contract-qualification.yml'))
+    assert_includes body, 'scripts/test-continuum.rb', 'Layer 1 regression gate must run the contract tests'
+    assert_includes body, 'contract_qualification', 'Layer 2 lifecycle probe must exercise the contract module'
+    assert_includes body, 'canary', 'Layer 3 live-canary probe must exist'
+    assert_includes body, 'continuum/contract-qualification', 'contract status context must be published'
+    engine = File.read(File.join(ROOT, 'src/continuum/contract_qualification.py'))
+    assert_includes engine, 'evaluate_regression_gate'
+    assert_includes engine, 'evaluate_reservation_liveness'
+    assert_includes engine, 'evaluate_canary'
+    assert_includes engine, 'merge_path_allowed'
+    assert File.exist?(File.join(ROOT, 'docs/contract-qualification.md')),
+                    'main-branch safety (branch protection + required checks) must be documented'
+    docs = File.read(File.join(ROOT, 'docs/contract-qualification.md'))
+    assert_includes docs, 'Contract qualification'
+    assert_includes docs, 'branch protection'
+  end
+
+  def test_every_merge_path_requires_exact_head_contract_evidence
+    %w[continuum-auto-merge.yml continuum-pr-agent-auto-merge.yml].each do |file|
+      body = File.read(File.join(ROOT, '.github/workflows', file))
+      assert_includes body, 'Contract qualification', "#{file}: contract gate gone"
+      assert_match(/latestWorkflowForHead\(pr,\s*pr\.head\.sha,\s*'Contract qualification'\)/m, body,
+                   "#{file}: contract evidence must be looked up for the exact PR HEAD")
+      assert_match(/conclusion !== 'success'/, body,
+                   "#{file}: red contract evidence must block the merge")
+    end
+    generic = File.read(File.join(ROOT, '.github/workflows/continuum-auto-merge.yml'))
+    assert_match(/waiting for successful Contract qualification on head/, generic,
+                 'generic auto-merge must wait (not bypass) when contract evidence is absent/stale/red')
+    pr_agent = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent-auto-merge.yml'))
+    assert_match(/Contract qualification is .*for the exact HEAD/m, pr_agent,
+                 'PR-Agent merge must fail closed on absent/stale/red contract evidence')
   end
 
   end
