@@ -1056,13 +1056,17 @@ function reviewDisposition(reviewPayload, improveJsonl, threshold = IMPROVE_REPA
     reviewCount,
     qualifyingSuggestionCount: qualifying.length,
   };
-  if (reviewCount > 0 || qualifying.length > 0) {
+  // The authoritative review is the merge/repair gate. /improve is an
+  // auxiliary repair input only after that review has already found an
+  // actionable defect. A clean reviewed HEAD must never be held in an endless
+  // polish loop by a fresh suggestion discovered by the optional second pass.
+  if (reviewCount > 0) {
     return {
       ...common,
       action: 'repair',
       reason:
-        reviewCount + ' review finding(s), ' +
-        qualifying.length + ' qualifying improve suggestion(s)',
+        reviewCount + ' authoritative review finding(s), ' +
+        qualifying.length + ' auxiliary improve suggestion(s)',
     };
   }
   if (
