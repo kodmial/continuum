@@ -1780,26 +1780,16 @@ jobs:
             const suggestions = policy.qualifyingImproveSuggestions(
               String(process.env.IMPROVE_JSONL || '')
             );
-            // Wire the skipped-clean flag into repair/merge gating (mirrors
-            // GateInputs.improve_skipped_clean): a skipped-clean HEAD
-            // carries an empty improve payload with incomplete improve
-            // coverage, so only this flag routes it to the merge gate.
-            // A skipped HEAD with remaining qualifying suggestions never
-            // greens: it routes to repair instead.
+            // The authoritative review owns repair/merge disposition.
+            // /improve is auxiliary input to an already-required repair and
+            // cannot promote a clean reviewed HEAD into another polish cycle.
             const improveSkippedClean =
               String(process.env.IMPROVE_SKIPPED || '').trim().toLowerCase() === 'true';
             if (improveSkippedClean && suggestions.length > 0) {
-              core.setOutput('needs_repair', 'true');
-              core.setOutput('ready_to_merge', 'false');
-              core.setOutput('needs_rereview', 'false');
-              core.setOutput('review_disposition', 'repair');
-              core.setOutput('review_findings', String(keyIssues.length));
-              core.setOutput('improve_suggestions', String(suggestions.length));
               core.notice(
-                'Improve was skipped but qualifying suggestions remain; ' +
-                `routing ${keyIssues.length} review finding(s) and ${suggestions.length} improve suggestion(s) to PR-Agent repair.`
+                'Clean authoritative review carries advisory/stale improve suggestions; ' +
+                'ignoring them for merge disposition.'
               );
-              return;
             }
             // One canonical policy owns repair/merge/re-review routing.
             const disposition = policy.reviewDisposition(
