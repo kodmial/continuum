@@ -139,6 +139,7 @@ jobs:
           echo "regression=pass" >> "$GITHUB_OUTPUT"
 
       - name: Run Layer 2 lifecycle integration probe
+        id: lifecycle
         shell: bash
         env:
           TARGET_SHA: ${{ steps.target.outputs.sha }}
@@ -187,6 +188,7 @@ jobs:
           PY
 
       - name: Run Layer 3 live-canary deadline probe
+        id: canary
         if: inputs.mode == 'canary'
         shell: bash
         run: |
@@ -226,11 +228,13 @@ jobs:
         env:
           TARGET_SHA: ${{ steps.target.outputs.sha }}
           REGRESSION_OUTCOME: ${{ steps.regression.outcome }}
+          LIFECYCLE_OUTCOME: ${{ steps.lifecycle.outcome }}
+          CANARY_OUTCOME: ${{ steps.canary.outcome }}
           STATUS_CONTEXT: ${{ inputs.status_context || vars.CONTINUUM_CONTRACT_STATUS_CONTEXT || 'continuum/contract-qualification' }}
           PUBLISH_STATUS: ${{ inputs.publish_status || vars.CONTINUUM_PUBLISH_STATUS || 'true' }}
         with:
           script: |
-            const passed = process.env.REGRESSION_OUTCOME === 'success';
+            const passed = process.env.REGRESSION_OUTCOME === 'success' && process.env.LIFECYCLE_OUTCOME === 'success' && (process.env.CANARY_OUTCOME === 'success' || process.env.CANARY_OUTCOME === 'skipped');
             const state = passed ? 'success' : 'failure';
             if (process.env.PUBLISH_STATUS === 'true') {
               await github.rest.repos.createCommitStatus({
