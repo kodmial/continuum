@@ -15,7 +15,7 @@ class ContinuumTest < Minitest::Test
   # Project-owned entry workflows used only by the Continuum repository itself.
   # They deliberately stay outside the `continuum-` namespace so installer
   # ownership and reusable-engine ownership remain unambiguous.
-  PROJECT_ENTRY_WORKFLOWS = %w[automation.yml ci.yml contract-gate.yml opencode.yml pr-agent.yml pr-agent-recovery.yml pr-agent-router.yml].freeze
+  PROJECT_ENTRY_WORKFLOWS = %w[automation.yml ci.yml contract-gate.yml contract-qualification.yml opencode.yml pr-agent.yml pr-agent-recovery.yml pr-agent-router.yml].freeze
   # Every caller stub in every layer, for the checks that must not care which
   # layer a file belongs to.
   ALL_STUBS = (CORE_STUBS + TECH_STUBS + PARENT_STUBS).sort
@@ -1421,11 +1421,13 @@ class ContinuumTest < Minitest::Test
     automation.yml
     ci.yml
     contract-gate.yml
+    contract-qualification.yml
     opencode.yml
     pr-agent.yml
     pr-agent-recovery.yml
     pr-agent-router.yml
     continuum-consumer-child-dispatcher.yml
+    continuum-contract-qualification.yml
     continuum-validation.yml
   ].freeze
 
@@ -1462,7 +1464,7 @@ class ContinuumTest < Minitest::Test
   # feature does — moved both sides and passed. A literal is the third,
   # independent source: to change the twenty core callers someone has to say so
   # here, which is where a reviewer sees it.
-  CORE_COUNT = 20
+  CORE_COUNT = 19
 
   # Every core workflow is either called by a stub in one of the three layers
   # or is a repository-owned/shared engine intentionally invoked from a
@@ -3846,7 +3848,6 @@ class ContinuumTest < Minitest::Test
     'continuum-bootstrap-runtime-secret.yml' => %w[continuum_ref repository],
     'continuum-coderabbit-retry.yml' => %w[continuum_ref],
     'continuum-coderabbit-unresolved.yml' => %w[continuum_ref],
-    'continuum-contract-qualification.yml' => %w[continuum_ref pr_number head_sha mode],
     'continuum-docker-qualification.yml' => %w[
       continuum_ref issue_number artifact_repository binary_name model
       docker_image memory_mib min_headroom_mib trials result_schema
@@ -7903,22 +7904,24 @@ class ContinuumTest < Minitest::Test
   end
 
   # ------------------------------------------------- contract qualification (kodmial/continuum#286)
-  # One merge-blocking qualification contract with three layers (regression
-  # gate + lifecycle E2E + live canary). The reusable workflow and its caller
-  # stub are a pair like every other core workflow, and both merge paths
-  # require its exact-HEAD success before any pulls.merge call.
+  # This three-layer gate validates changes to Continuum itself. Its caller is
+  # deliberately project-owned: installing it into consumers would run
+  # Continuum's own scripts/test-continuum.rb against unrelated repositories
+  # and, for delegated children, consume private Actions minutes.
 
-  def test_contract_qualification_workflow_and_stub_are_a_pair
+  def test_contract_qualification_is_continuum_project_owned
     workflow = File.join(ROOT, '.github/workflows/continuum-contract-qualification.yml')
-    stub = File.join(ROOT, '.github/caller-stubs/continuum-contract-qualification.yml')
+    entry = File.join(ROOT, '.github/workflows/contract-qualification.yml')
     assert File.exist?(workflow), 'continuum-contract-qualification.yml workflow is missing'
-    assert File.exist?(stub), 'continuum-contract-qualification.yml caller stub is missing'
+    assert File.exist?(entry), 'project-owned contract-qualification.yml caller is missing'
     engine = yaml(workflow)
-    caller = yaml(stub)
+    caller = yaml(entry)
     assert_equal 'Contract qualification', engine.fetch('name')
     assert_equal engine.fetch('name'), caller.fetch('name')
     assert_equal ['workflow_call'], events(engine).keys
-    assert_includes Dir[File.join(ROOT, '.github/caller-stubs/*.yml')].map { |p| File.basename(p) },
+    assert_includes PROJECT_ENTRY_WORKFLOWS, 'contract-qualification.yml'
+    assert_includes REPO_OWNED_WORKFLOWS, 'contract-qualification.yml'
+    refute_includes Dir[File.join(ROOT, '.github/caller-stubs/*.yml')].map { |p| File.basename(p) },
                     'continuum-contract-qualification.yml'
   end
 
@@ -7940,21 +7943,23 @@ class ContinuumTest < Minitest::Test
     assert_includes docs, 'branch protection'
   end
 
-  def test_every_merge_path_requires_exact_head_contract_evidence
+  def test_every_continuum_merge_path_requires_exact_head_contract_evidence
     %w[continuum-auto-merge.yml continuum-pr-agent-auto-merge.yml].each do |file|
       body = File.read(File.join(ROOT, '.github/workflows', file))
-      assert_includes body, 'Contract qualification', "#{file}: contract gate gone"
+      assert_includes body, 'Contract qualification', "#{file}: Continuum contract gate gone"
+      assert_includes body, "repoFullName === 'kodmial/continuum'",
+                      "#{file}: Continuum-only contract gate lost its repository scope"
       assert_match(/latestWorkflowForHead\(pr,\s*pr\.head\.sha,\s*'Contract qualification'\)/m, body,
-                   "#{file}: contract evidence must be looked up for the exact PR HEAD")
+                   "#{file}: contract evidence must be looked up for the exact Continuum PR HEAD")
       assert_match(/conclusion !== 'success'/, body,
-                   "#{file}: red contract evidence must block the merge")
+                   "#{file}: red Continuum contract evidence must block the merge")
     end
     generic = File.read(File.join(ROOT, '.github/workflows/continuum-auto-merge.yml'))
     assert_match(/waiting for successful Contract qualification on head/, generic,
-                 'generic auto-merge must wait (not bypass) when contract evidence is absent/stale/red')
+                 'generic auto-merge must wait when Continuum contract evidence is absent/stale/red')
     pr_agent = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent-auto-merge.yml'))
     assert_match(/Contract qualification is .*for the exact HEAD/m, pr_agent,
-                 'PR-Agent merge must fail closed on absent/stale/red contract evidence')
+                 'PR-Agent merge must fail closed on absent/stale/red Continuum contract evidence')
   end
 
   # The Continuum repository's contract gate is intentionally project-owned,
