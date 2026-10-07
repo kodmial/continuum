@@ -51,7 +51,7 @@ jobs:
        startsWith(github.event.comment.user.login, 'coderabbitai') &&
        github.event.pull_request.state == 'open'))
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 85
 
     permissions:
       actions: read
@@ -258,10 +258,6 @@ jobs:
             // serialized bounded waiter for the normal hourly CodeRabbit
             // quota window. Private repositories never pay this runner cost.
             const MAX_PUBLIC_DEFER_WAIT_MS = 70 * 60_000;
-            // CodeRabbit's observed/fallback quota window is <=65 minutes.
-            // Keep one serialized waiter alive rather than depending on GitHub
-            // scheduled-event delivery, which can be delayed for hours.
-            const MAX_CONTROLLER_WAIT_MS = 70 * 60_000;
 
             function retryWindowText(body = '') {
               const patterns = [
@@ -1174,37 +1170,70 @@ jobs:
                 .sort(candidateOrder)[0] || null;
             }
 
-            async function waitUntil(whenMs, reason) {
+            async function waitUntilNextCandidate(state) {
               const now = Date.now();
-              if (whenMs <= now) return;
-              const waitMs = whenMs - now;
-              if (waitMs > MAX_CONTROLLER_WAIT_MS) {
-                throw new Error(
-                  `CodeRabbit wait ${Math.ceil(waitMs / 60_000)} minutes exceeds the bounded controller contract (${MAX_CONTROLLER_WAIT_MS / 60_000} minutes): ${reason}`
-                );
+              let nextAt = Number.POSITIVE_INFINITY;
+              let reason = 'shared CodeRabbit quota window';
+
+              if (state.latestInFlightCommand) {
+                const unlockAt =
+                  state.latestInFlightCommand.at + IN_FLIGHT_TIMEOUT_MS;
+                if (unlockAt > now && unlockAt < nextAt) {
+                  nextAt = unlockAt;
+                  reason =
+                    `in-flight review slot for PR #${state.latestInFlightCommand.prNumber}`;
+                }
               }
+
+              if (state.candidates.length > 0) {
+                const candidateAt = Math.min(
+                  ...state.candidates.map(candidate => candidate.effectiveDueAt)
+                );
+                if (candidateAt < nextAt) {
+                  nextAt = candidateAt;
+                  reason = 'shared CodeRabbit quota window';
+                }
+              }
+
+              if (!Number.isFinite(nextAt)) {
+                core.notice('No CodeRabbit review is currently queued.');
+                return false;
+              }
+              if (nextAt <= now) return true;
+
+              const waitMs = nextAt - now;
+              const publicRepository =
+                context.payload.repository?.private === false;
+              if (!publicRepository || waitMs > MAX_PUBLIC_DEFER_WAIT_MS) {
+                core.notice(
+                  `CodeRabbit deferred until ${new Date(nextAt).toISOString()} (${reason}); private repository or wait exceeds cap, so this run exits and a later lifecycle wake will revalidate.`
+                );
+                return false;
+              }
+
               core.notice(
-                `CodeRabbit controller waiting ${Math.ceil(waitMs / 1000)}s until ${new Date(whenMs).toISOString()} (${reason}). Newer lifecycle events cancel this waiter and revalidate latest state.`
+                `CodeRabbit controller waiting ${Math.ceil(waitMs / 1000)}s until ${new Date(nextAt).toISOString()} (${reason}); any newer wake cancels and recomputes it.`
               );
               await new Promise(resolve => setTimeout(resolve, waitMs));
+              return true;
             }
 
-            // One serialized controller owns future liveness. This deliberately
-            // does not rely on GitHub cron delivery: scheduled events can be
-            // delayed for hours. Any new review/comment/controller event cancels
-            // this run via concurrency and starts a fresh reconciliation.
-            let state;
+            // GitHub schedule is best-effort and can be delayed for hours.
+            // Public consumers therefore keep at most one bounded serialized
+            // waiter; private repositories stay event-driven. Concurrency
+            // cancellation ensures every new lifecycle event recomputes latest
+            // state instead of allowing a stale sleeper to emit a command.
+            let state = await collectState();
             let selected = null;
             while (!selected) {
-              state = await collectState();
-
               if (state.latestInFlightCommand) {
                 const ageMs = Date.now() - state.latestInFlightCommand.at;
                 if (ageMs < IN_FLIGHT_TIMEOUT_MS) {
-                  await waitUntil(
-                    state.latestInFlightCommand.at + IN_FLIGHT_TIMEOUT_MS,
-                    `in-flight review slot for PR #${state.latestInFlightCommand.prNumber}`
-                  );
+                  if (!(await waitUntilNextCandidate(state))) {
+                    reportBudget();
+                    return;
+                  }
+                  state = await collectState();
                   continue;
                 }
                 core.warning(
@@ -1215,26 +1244,21 @@ jobs:
               selected = await chooseDueCandidate(state);
               if (selected) break;
 
-              if (state.candidates.length === 0) {
-                core.notice('No CodeRabbit review is currently queued.');
+              if (state.candidates.length > 0) {
+                const queue = [...state.candidates]
+                  .sort(candidateOrder)
+                  .map(candidate =>
+                    `#${candidate.prNumber}/issue#${candidate.issueNumber === Number.MAX_SAFE_INTEGER ? '?' : candidate.issueNumber} ${candidate.priority} stage=${candidate.stage} reviews=${candidate.fullReviewCount} due=${new Date(candidate.effectiveDueAt).toISOString()}`
+                  )
+                  .join(', ');
+                core.notice(`CodeRabbit queue: ${queue}.`);
+              }
+
+              if (!(await waitUntilNextCandidate(state))) {
                 reportBudget();
                 return;
               }
-
-              const nextAt = Math.min(
-                ...state.candidates.map(candidate => candidate.effectiveDueAt)
-              );
-              const queue = [...state.candidates]
-                .sort(candidateOrder)
-                .map(candidate =>
-                  `#${candidate.prNumber}/issue#${candidate.issueNumber === Number.MAX_SAFE_INTEGER ? '?' : candidate.issueNumber} ${candidate.priority} stage=${candidate.stage} reviews=${candidate.fullReviewCount} due=${new Date(candidate.effectiveDueAt).toISOString()}`
-                )
-                .join(', ');
-
-              core.notice(
-                `CodeRabbit queue: ${queue}. Earliest legal slot is ${new Date(nextAt).toISOString()}.`
-              );
-              await waitUntil(nextAt, 'shared CodeRabbit quota window');
+              state = await collectState();
             }
 
             // Final exact-head/status/comment revalidation is implicit in the
