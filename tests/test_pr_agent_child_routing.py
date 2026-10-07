@@ -195,7 +195,7 @@ class PrivacyAndExactHeadTests(unittest.TestCase):
         merge = read(".github/workflows/continuum-pr-agent-auto-merge.yml")
         self.assertIn("pr.head.sha.toLowerCase() !== reviewedHead", merge)
 
-    def test_coderabbit_remains_untouched(self):
+    def test_coderabbit_remains_free_of_pr_agent_target_routing(self):
         for path in (
             ".github/workflows/continuum-coderabbit-retry.yml",
             ".github/workflows/continuum-coderabbit-unresolved.yml",
@@ -204,7 +204,13 @@ class PrivacyAndExactHeadTests(unittest.TestCase):
                 body = read(path)
                 self.assertNotIn("target_child_id", body)
                 self.assertNotIn("CONTINUUM_PR_AGENT_TARGET", body)
-                self.assertNotIn("CONTINUUM_ROLE", body)
+
+        # CodeRabbit retry now shares the zero-private-child-runner invariant,
+        # but it must not inherit any PR-Agent target-routing semantics.
+        retry = read(".github/workflows/continuum-coderabbit-retry.yml")
+        self.assertIn("vars.CONTINUUM_ROLE != 'child'", retry)
+        unresolved = read(".github/workflows/continuum-coderabbit-unresolved.yml")
+        self.assertNotIn("CONTINUUM_ROLE", unresolved)
 
 
 if __name__ == "__main__":
