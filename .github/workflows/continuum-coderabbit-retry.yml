@@ -802,11 +802,15 @@ jobs:
                   const at = new Date(
                     comment.updated_at || comment.created_at
                   ).getTime();
-                  latestRateLimitAt = Math.max(latestRateLimitAt, at);
-                  globalRateLimitNotBefore = Math.max(
-                    globalRateLimitNotBefore,
-                    at + delayMs + SAFETY_MARGIN_MS
-                  );
+                  // A newer provider reply supersedes an older estimate.
+                  // This matters when an older response had no countdown and
+                  // used the conservative 65-minute fallback, while a later
+                  // response provides the real shorter reset window.
+                  if (at > latestRateLimitAt) {
+                    latestRateLimitAt = at;
+                    globalRateLimitNotBefore =
+                      at + delayMs + SAFETY_MARGIN_MS;
+                  }
                 }
 
                 const carriedApprovalMarker = comments.some(comment =>
