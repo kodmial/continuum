@@ -2595,3 +2595,5 @@ jobs:
       head_sha: ${{ needs.pr_agent.outputs.head_sha }}
       gate_verified: ${{ needs.pr_agent.outputs.merge_gate_verified }}
       target_child_id: ${{ inputs.target_child_id }}
+      post_merge_wakeups: ${{ vars.CONTINUUM_POST_MERGE_WAKEUPS || 'continuum-issue-scheduler.yml' }}
+      post_merge_wakeup_ref: ${{ vars.CONTINUUM_POST_MERGE_WAKEUP_REF || github.event.repository.default_branch || 'main' }}
