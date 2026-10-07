@@ -182,6 +182,7 @@ jobs:
       persistent_state_json: ${{ steps.persistent.outputs.persistent_state_json }}
       needs_repair: ${{ steps.route.outputs.needs_repair }}
       ready_to_merge: ${{ steps.route.outputs.ready_to_merge }}
+      merge_gate_verified: ${{ steps.merge_evidence.outputs.green }}
       needs_rereview: ${{ steps.route.outputs.needs_rereview }}
       retry_attempt: ${{ steps.stack.outputs.retry_attempt }}
       retry_workflow: ${{ steps.stack.outputs.retry_workflow }}
@@ -1809,6 +1810,304 @@ jobs:
               'PR-Agent disposition=' + disposition.action + ': ' + disposition.reason
             );
 
+      - name: Attest exact-head merge evidence before job boundary
+        if: steps.route.outcome == 'success' && steps.route.outputs.ready_to_merge == 'true'
+        id: merge_evidence
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.result.outputs.head_sha }}
+          REVIEW_JSON: ${{ steps.pragent.outputs.review }}
+          IMPROVE_JSONL: ${{ steps.improve_output.outputs.improve_jsonl }}
+          PERSISTENT_STATE_JSON: ${{ steps.persistent.outputs.persistent_state_json }}
+          POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            // Exact-head, fail-closed PR-Agent gate. Green requires every
+            // native signal at once for the exact current HEAD:
+            //   - no tool error (config.propagate_tool_errors,
+            //     github_action_config.fail_on_tool_errors)
+            //   - complete review and improve coverage (upstream chunking
+            //     coverage footers; truncated/invalid improve payloads never
+            //     green), except that a marked skipped-clean improve payload
+            //     (continuum.improve_skipped_clean) satisfies the improve leg
+            //     with zero suggestions and no improve run, and an empty
+            //     improve payload parses to zero suggestions judged via
+            //     `disposition` so a clean HEAD cannot deadlock
+            //   - green CI on the exact HEAD, revalidated immediately before
+            //     merge, plus draft/conflict revalidation
+            //   - matching HEAD (results for SHA A never merge SHA B;
+            //     main synchronization never carries approval)
+            //   - safe_to_merge, or a narrowly validated non-actionable caution with
+            //     explicit no-security/no-ticket-noncompliance evidence; changes_required blocks
+            //   - empty current key_issues_to_review (a batch at the findings
+            //     cap is potentially truncated and never clean)
+            //   - no high-signal improve code_suggestions according to the
+            //     centralized PR-Agent provider policy (threshold 7)
+            //   - native persistent review state has no ACTIVE finding
+            // Inline presentation (inline_key_issues) never decides the gate:
+            // absence of inline comments cannot produce green while summary
+            // or output findings remain.
+            const prNumber = Number(process.env.PR_NUMBER);
+            const headSha = String(process.env.HEAD_SHA || '').trim().toLowerCase();
+            if (!prNumber || !headSha) {
+              core.setFailed('PR-Agent merge requires pr_number and head_sha.');
+              return;
+            }
+            let review;
+            try {
+              review = JSON.parse(String(process.env.REVIEW_JSON || ''));
+            } catch (err) {
+              core.setFailed(`Invalid PR-Agent review JSON: ${err.message}`);
+              return;
+            }
+            const policy = require(process.env.POLICY_SCRIPT);
+            let inner;
+            try {
+              inner = policy.unwrapReview(review);
+            } catch (err) {
+              core.setFailed(err.message);
+              return;
+            }
+            const keyIssues = inner.key_issues_to_review;
+            if (!Array.isArray(keyIssues)) {
+              core.setFailed('PR-Agent review JSON has no key_issues_to_review list.');
+              return;
+            }
+            const recommendation = String(inner.merge_recommendation || '').trim();
+            if (!recommendation) {
+              core.setFailed('PR-Agent review has no merge_recommendation (require_merge_recommendation).');
+              return;
+            }
+            const raw = String(process.env.IMPROVE_JSONL || '').trim();
+            let qualifying;
+            try {
+              qualifying = policy.qualifyingImproveSuggestions(raw);
+            } catch (err) {
+              // A non-empty but truncated/invalid improve payload must fail
+              // closed on the improve-coverage leg explicitly, not as a
+              // generic error: no complete improve evidence exists for this
+              // HEAD.
+              core.setOutput('green', 'false');
+              core.setOutput('reason', 'incomplete improve coverage: failing closed');
+              core.setFailed(
+                `PR-Agent gate blocks PR #${prNumber}: incomplete improve coverage: failing closed (${err.message})`
+              );
+              return;
+            }
+            let disposition;
+            try {
+              disposition = policy.reviewDisposition(review, raw);
+            } catch (err) {
+              core.setFailed(err.message);
+              return;
+            }
+            // Wire the skipped-clean flag into the merge gate (mirrors
+            // GateInputs.improve_skipped_clean): a skipped-clean HEAD
+            // carries an empty improve payload with incomplete improve
+            // coverage, so only the marked payload greens here without an
+            // improve run. A skipped HEAD with remaining qualifying
+            // suggestions never greens.
+            let improveSkippedClean = false;
+            try {
+              improveSkippedClean = policy.isSkippedCleanImprovePayload(raw);
+            } catch (err) {
+              core.setFailed(err.message);
+              return;
+            }
+            const stateRaw = String(process.env.PERSISTENT_STATE_JSON || '').trim();
+            if (!stateRaw) {
+              core.setFailed('PR-Agent gate requires native persistent finding state for the exact reviewed HEAD.');
+              return;
+            }
+            let persistentState;
+            try {
+              persistentState = JSON.parse(stateRaw);
+            } catch (err) {
+              core.setFailed(`Invalid PR-Agent persistent state JSON: ${err.message}`);
+              return;
+            }
+            if (!persistentState || typeof persistentState !== 'object' || Array.isArray(persistentState)) {
+              core.setFailed('PR-Agent persistent state must be the upstream state object.');
+              return;
+            }
+            if (persistentState.schema_version !== 1 || !Array.isArray(persistentState.findings)) {
+              core.setFailed('PR-Agent persistent state does not match upstream v0.46.0 schema.');
+              return;
+            }
+            const lastRun = persistentState.last_run;
+            if (!lastRun || typeof lastRun !== 'object') {
+              core.setFailed('PR-Agent persistent state has no last_run metadata.');
+              return;
+            }
+            const stateHead = String(lastRun.head_sha || '').trim().toLowerCase();
+            if (stateHead !== headSha) {
+              core.setFailed(
+                `PR-Agent persistent state is stale: last_run.head_sha=${stateHead || '<empty>'}, expected=${headSha}.`
+              );
+              return;
+            }
+            if (lastRun.complete !== true || String(lastRun.kind || '') !== 'full') {
+              core.setFailed('PR-Agent persistent state is not from a complete full review.');
+              return;
+            }
+            let hasActive = false;
+            for (const entry of persistentState.findings) {
+              if (!entry || typeof entry !== 'object') {
+                core.setFailed('PR-Agent persistent state contains a non-object finding.');
+                return;
+              }
+              const state = String(entry.state || '').trim().toUpperCase();
+              if (!['ACTIVE', 'RESOLVED'].includes(state)) {
+                core.setFailed(`PR-Agent persistent finding has invalid state "${state || '<empty>'}".`);
+                return;
+              }
+              if (state === 'ACTIVE') hasActive = true;
+            }
+            const fail = (reason) => {
+              core.setOutput('green', 'false');
+              core.setOutput('reason', reason);
+              core.setFailed(`PR-Agent gate blocks PR #${prNumber}: ${reason}`);
+            };
+            // Tool-error and review-coverage legs: a failing tool or a
+            // partial review never greens, even with zero findings. The
+            // coverage leg mirrors GateInputs.review_coverage_complete and
+            // the improve-skip policy's explicit `reviewCoverageComplete`
+            // flag: only an explicit complete signal greens, never the mere
+            // absence of a failure.
+            let toolError = false;
+            try {
+              toolError = policy.hasToolErrorSignal(review);
+            } catch (err) {
+              core.setFailed(err.message);
+              return;
+            }
+            if (toolError) {
+              fail('tool error: failing closed');
+              return;
+            }
+            let reviewCoverageComplete = false;
+            try {
+              reviewCoverageComplete = !policy.hasIncompleteCoverageSignal(review);
+            } catch (err) {
+              core.setFailed(err.message);
+              return;
+            }
+            if (!reviewCoverageComplete) {
+              fail('incomplete review coverage: failing closed');
+              return;
+            }
+            // Improve-coverage leg wired to the skipped-clean flag
+            // (mirrors GateInputs.improve_skipped_clean): a skipped-clean
+            // HEAD carries the marked empty payload
+            // `{"payload": {"code_suggestions": []}, "continuum":
+            // {"improve_skipped_clean": true}}` for the exact clean HEAD
+            // (producer: continuum-pr-agent.yml `improve_gate`
+            // skip_improve decision plus the `improve_skipped` step, which
+            // forwards it here as `improve_jsonl`; the `improve` step runs
+            // only when `skip_improve != 'true'`). An empty improve payload
+            // without the marker parses to zero suggestions and proceeds
+            // via `disposition` below, so an improve run for the exact HEAD
+            // that emitted no suggestions (or a missing/miswired
+            // `improve_skipped` step) cannot deadlock a clean HEAD.
+            // Truncated/invalid payloads still fail closed on the
+            // improve-coverage leg above. A marked skipped-clean payload is
+            // additionally re-validated through
+            // policy.isCleanReviewForImproveSkip below, so the marker alone
+            // never greens a dirty review.
+            if (!disposition || disposition.action !== 'merge') {
+              fail(
+                'central review disposition blocks merge: ' +
+                  String(disposition?.action || 'unknown') + ': ' +
+                  String(disposition?.reason || recommendation)
+              );
+              return;
+            }
+            if (keyIssues.length > 0) {
+              if (keyIssues.length === policy.REVIEW_MAX_FINDINGS) {
+                fail('review batch reached the findings cap: potentially truncated');
+              } else {
+                fail(`${keyIssues.length} current key issue(s) remain`);
+              }
+              return;
+            }
+            // Security leg (mirrors the improve skip policy): explicit
+            // blocking security prose never greens, even with zero key
+            // issues and safe_to_merge.
+            let blockingSecurity = false;
+            try {
+              blockingSecurity = policy.hasBlockingSecuritySignal(review);
+            } catch (err) {
+              core.setFailed(err.message);
+              return;
+            }
+            if (blockingSecurity) {
+              fail('blocking security signal remains');
+              return;
+            }
+            // Skipped-clean re-validation: a marked payload only greens when
+            // the review itself satisfies the clean-review skip policy for
+            // this exact HEAD (producer: continuum-pr-agent.yml
+            // `improve_gate` skip_improve decision via
+            // policy.isCleanReviewForImproveSkip). A miswired or stale marker
+            // for a dirty review still blocks here with the skip reason.
+            // Exact-HEAD liveness against the live PR head is revalidated in
+            // the next step immediately before merge; headMatches is true
+            // here because persistent state was already pinned to headSha
+            // above.
+            if (improveSkippedClean) {
+              let skipDecision;
+              try {
+                skipDecision = policy.isCleanReviewForImproveSkip(
+                  review,
+                  persistentState,
+                  {
+                    headMatches: true,
+                    toolError,
+                    reviewCoverageComplete,
+                    reviewedHeadSha: headSha,
+                  }
+                );
+              } catch (err) {
+                core.setFailed(err.message);
+                return;
+              }
+              if (!skipDecision || skipDecision.skip !== true) {
+                fail(
+                  'improve skip not justified: ' +
+                    String((skipDecision && skipDecision.reason) || 'failing closed')
+                );
+                return;
+              }
+            }
+            // /improve suggestions are advisory once the authoritative
+            // exact-HEAD review is clean. They can enrich a repair batch only
+            // when the review itself found an actionable defect; they are not
+            // an independent merge gate.
+            if (qualifying.length > 0) {
+              core.notice(
+                `${qualifying.length} advisory improve suggestion(s) ignored after clean authoritative review.`
+              );
+            }
+            if (disposition.action !== 'merge') {
+              fail(disposition.reason);
+              return;
+            }
+            if (hasActive) {
+              fail('native persistent state has an ACTIVE finding');
+              return;
+            }
+            // Exact-HEAD plus CI plus draft/conflict revalidation happens in
+            // the next step immediately before merge; this step records that
+            // the review portion of the gate is satisfied for this HEAD.
+            core.setOutput('green', 'true');
+            core.setOutput('reason', 'review portion satisfied');
+            core.setOutput('head_sha', headSha);
+            core.notice(`PR #${prNumber} review portion satisfied at ${headSha}.`);
+
+
+
       - name: Clear settled PR-Agent controller state
         if: steps.route.outcome == 'success' && steps.route.outputs.ready_to_merge == 'true'
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
@@ -2285,7 +2584,8 @@ jobs:
     needs: pr_agent
     if: >-
       needs.pr_agent.outputs.admitted == 'true' &&
-      needs.pr_agent.outputs.ready_to_merge == 'true'
+      needs.pr_agent.outputs.ready_to_merge == 'true' &&
+      needs.pr_agent.outputs.merge_gate_verified == 'true'
     uses: ./.github/workflows/continuum-pr-agent-auto-merge.yml
     secrets: inherit
     with:
@@ -2293,7 +2593,5 @@ jobs:
       review_provider: ${{ needs.pr_agent.outputs.review_provider }}
       pr_number: ${{ needs.pr_agent.outputs.pr_number }}
       head_sha: ${{ needs.pr_agent.outputs.head_sha }}
-      review_json: ${{ needs.pr_agent.outputs.review_json }}
-      improve_jsonl: ${{ needs.pr_agent.outputs.improve_jsonl }}
-      persistent_state_json: ${{ needs.pr_agent.outputs.persistent_state_json }}
+      gate_verified: ${{ needs.pr_agent.outputs.merge_gate_verified }}
       target_child_id: ${{ inputs.target_child_id }}
