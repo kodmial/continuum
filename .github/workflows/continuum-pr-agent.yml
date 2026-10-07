@@ -1247,15 +1247,29 @@ jobs:
               c for c in comments
               if "<!-- pr-agent-review-state:" in str(c.get("body") or "")
           ]
-          def derive_current_fallback():
+          def load_current_review():
+              review_file = os.environ.get("REVIEW_FILE", "").strip()
+              if not review_file:
+                  raise SystemExit(
+                      "Runner-local PR-Agent review file is missing from persistent-state export."
+                  )
               try:
-                  review = json.loads(os.environ.get("REVIEW_JSON", ""))
-              except json.JSONDecodeError as exc:
-                  raise SystemExit(f"Cannot validate review for persistent-state fallback: {exc}")
-              # Split-envelope union is handled inside derive_fallback_state (union + fail-closed on invalid shapes). Do not pre-merge here to avoid duplicating findings.
+                  with open(review_file, "r", encoding="utf-8") as handle:
+                      return json.load(handle)
+              except (OSError, json.JSONDecodeError) as exc:
+                  raise SystemExit(
+                      f"Cannot read runner-local review for persistent-state export: {exc}"
+                  )
+
+          current_review = load_current_review()
+
+          def derive_current_fallback():
+              # Split-envelope union is handled inside derive_fallback_state
+              # (union + fail-closed on invalid shapes). Do not pre-merge here
+              # to avoid duplicating findings.
               try:
                   return derive_fallback_state(
-                      review,
+                      current_review,
                       reviewed,
                       run_id=f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/commit/{reviewed}",
                   )
@@ -1309,10 +1323,6 @@ jobs:
           findings = state.get("findings")
           if not isinstance(findings, list):
               raise SystemExit("Upstream PR-Agent persistent state findings is not a list.")
-          try:
-              current_review = json.loads(os.environ.get("REVIEW_JSON", ""))
-          except json.JSONDecodeError as exc:
-              raise SystemExit(f"Cannot validate current review against persistent state: {exc}")
           current_inner = current_review.get("review", current_review) if isinstance(current_review, dict) else None
           current_key_issues = current_inner.get("key_issues_to_review") if isinstance(current_inner, dict) else None
           if not isinstance(current_key_issues, list):
