@@ -225,6 +225,17 @@ jobs:
             const REQUESTED_LABEL = 'coderabbit-review-requested';
             const FULL_REVIEW_COMMAND_RE =
               /^@coderabbitai\s+(?:full\s+)?review(?:\s*$|\s*\n)/i;
+            const FULL_REVIEW_COMMAND_HEAD_RE =
+              /<!-- continuum-coderabbit-command head=([0-9a-f]{40}) -->/i;
+            function fullReviewCommandTargetsHead(comment, headSha) {
+              const match = String(comment?.body || '').match(
+                FULL_REVIEW_COMMAND_HEAD_RE
+              );
+              // Legacy commands predate exact-HEAD markers. Keep them
+              // conservative; every command emitted by the current controller
+              // is marked and can be invalidated immediately when HEAD moves.
+              return !match || match[1].toLowerCase() === String(headSha).toLowerCase();
+            }
             const priorityRank = new Map([
               ['priority:p0', 0],
               ['priority:p1', 1],
@@ -788,7 +799,8 @@ jobs:
                 const commands = comments
                   .filter(comment =>
                     comment.user?.login !== 'coderabbitai[bot]' &&
-                    FULL_REVIEW_COMMAND_RE.test(comment.body?.trim() || '')
+                    FULL_REVIEW_COMMAND_RE.test(comment.body?.trim() || '') &&
+                    fullReviewCommandTargetsHead(comment, pr.head.sha)
                   )
                   .sort(
                     (a, b) =>
