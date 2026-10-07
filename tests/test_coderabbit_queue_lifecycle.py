@@ -530,6 +530,24 @@ class WorkflowBindingTests(unittest.TestCase):
             "thread convergence must happen before the generic completed-review wait",
         )
 
+    def test_in_flight_review_commands_are_exact_head_scoped(self):
+        self.assertIn(
+            "FULL_REVIEW_COMMAND_HEAD_RE",
+            self.workflow,
+        )
+        self.assertIn(
+            "fullReviewCommandTargetsHead(comment, pr.head.sha)",
+            self.workflow,
+        )
+        self.assertIn(
+            "return !match || match[1].toLowerCase() === String(headSha).toLowerCase()",
+            self.workflow,
+        )
+        self.assertIn(
+            "<!-- continuum-coderabbit-command head=${selected.headSha} -->",
+            self.workflow,
+        )
+
     def test_safety_net_tick_is_non_blocking_and_never_sleeps(self):
         for contract in (
             "function deferUntilNextCandidate(state)",
