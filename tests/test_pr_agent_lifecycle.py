@@ -2152,6 +2152,18 @@ class StabilizationParityTests(unittest.TestCase):
             with self.subTest(needle=needle):
                 self.assertIn(needle, merge)
 
+    def test_pr_agent_merge_wakes_scheduler_by_default(self):
+        review = read_repo(".github/workflows/continuum-pr-agent.yml")
+        merge_job = review[review.index("\n  merge:"):]
+        self.assertIn(
+            "post_merge_wakeups: ${{ vars.CONTINUUM_POST_MERGE_WAKEUPS || 'continuum-issue-scheduler.yml' }}",
+            merge_job,
+        )
+        self.assertIn(
+            "post_merge_wakeup_ref: ${{ vars.CONTINUUM_POST_MERGE_WAKEUP_REF || github.event.repository.default_branch || 'main' }}",
+            merge_job,
+        )
+
     def test_pr_agent_main_sync_never_carries_old_review(self):
         merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
         self.assertIn("fresh CI and a fresh full PR-Agent review", merge)
