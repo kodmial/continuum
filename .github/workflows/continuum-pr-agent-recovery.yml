@@ -2000,14 +2000,34 @@ jobs:
               );
 
               const reviewStatus = latestContext(statuses, REVIEW_CONTEXT);
+              // A clean review status is terminal only when the orchestration
+              // run that published it also completed successfully. GitHub can
+              // preserve the clean exact-HEAD status even when a downstream
+              // merge job fails (for example because a cross-job output was
+              // suppressed). In that case the PR is still open and the
+              // lifecycle is incomplete: replay the bounded review
+              // orchestration so the current merge path gets fresh,
+              // runner-local evidence instead of stranding a clean PR.
+              let cleanReviewRun = null;
               if (reviewStatus?.state === 'success') {
                 const cleanDescription = String(reviewStatus.description || '');
                 if (!/actionable/i.test(cleanDescription) && !/blocking; recovery eligible/i.test(cleanDescription)) {
-                  core.info(
+                  cleanReviewRun = await statusRunMetadata(reviewStatus);
+                  const cleanRunConclusion =
+                    String(cleanReviewRun.conclusion || '').toLowerCase();
+                  if (!retryableConclusions.has(cleanRunConclusion)) {
+                    core.info(
+                      'PR #' + pr.number + ' HEAD ' + head +
+                      ': review is settled clean; recovery has nothing to do.'
+                    );
+                    continue;
+                  }
+                  core.warning(
                     'PR #' + pr.number + ' HEAD ' + head +
-                    ': review is settled clean; recovery has nothing to do.'
+                    ': clean review belongs to an incomplete orchestration run (' +
+                    (cleanRunConclusion || 'unknown') +
+                    '); bounded recovery will replay the review/merge lifecycle.'
                   );
-                  continue;
                 }
               }
               const comments = await withReadFallback(async (client) => {
@@ -2042,7 +2062,7 @@ jobs:
                 continue;
               }
               const reviewRun = reviewStatus
-                ? await statusRunMetadata(reviewStatus)
+                ? (cleanReviewRun || await statusRunMetadata(reviewStatus))
                 : { conclusion: null, recoveryKind: null };
               let kind = 'review';
               let operationStatus = reviewStatus;
@@ -2062,6 +2082,19 @@ jobs:
                     ...reviewStatus,
                     state: 'failure',
                     description: 'PR-Agent blocking review: recovery eligible',
+                  };
+                  operationRun = reviewRun;
+                } else if (
+                  retryableConclusions.has(
+                    String(reviewRun.conclusion || '').toLowerCase()
+                  )
+                ) {
+                  kind = 'review';
+                  operationStatus = {
+                    ...reviewStatus,
+                    state: 'failure',
+                    description:
+                      'PR-Agent clean review lifecycle incomplete: recovery eligible',
                   };
                   operationRun = reviewRun;
                 } else {
