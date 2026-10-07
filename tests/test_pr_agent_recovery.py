@@ -1310,10 +1310,15 @@ class CodeRabbitDeadlockWiringTests(unittest.TestCase):
         self.assertIn("unresolved.push", gate)
         self.assertIn("unresolvedCodeRabbitThreads", gate)
 
-    def test_verification_requests_are_serialized_and_deduplicated(self):
+    def test_verification_requests_are_serialized_and_recover_lost_replies(self):
         gate = self.read(".github/workflows/continuum-auto-merge.yml")
         self.assertIn("auto-merge-coderabbit-verification", gate)
-        self.assertIn("if (duplicate) continue", gate)
+        self.assertIn("CODERABBIT_THREAD_VERIFICATION_TIMEOUT_MS = 30 * 60_000", gate)
+        self.assertIn("const latestVerification = verificationRequests[0] || null", gate)
+        self.assertIn("const verdictAfter = comments.some", gate)
+        self.assertIn("Date.now() - verificationAt <", gate)
+        self.assertIn("CodeRabbit did not answer thread verification", gate)
+        self.assertNotIn("if (duplicate) continue", gate)
 
     @staticmethod
     def _extract_js_function(source: str, name: str) -> str:
