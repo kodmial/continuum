@@ -646,6 +646,52 @@ jobs:
 
           invalid=0
           review_dispatches=0
+          pr_agent_dispatch_failures=0
+          pr_agent_transient_failures=0
+          pr_agent_deterministic_failures=0
+
+          # Resilient delegated PR-Agent fan-out (kodmial/continuum#289): one
+          # transient workflow_dispatch failure (for example GitHub HTTP 500
+          # from `gh workflow run`) must not abort the whole scheduler pass.
+          # Classification is authoritative in
+          # src/continuum/delegated_dispatch.py: HTTP 5xx, HTTP 429 /
+          # rate-limit signals, and 403 only with a rate-limit/transient
+          # marker retry with bounded backoff (minimum 5s, never a tight
+          # loop); anything else (400/401/plain 403/404/422/auth) fails
+          # closed on the first attempt and is never retried as transient.
+          # Retries cannot duplicate logical review work: a failed dispatch
+          # creates no run, and a landed recovery run dedups downstream
+          # through the stable PR-Agent operation identity. Only the opaque
+          # child id is ever passed or logged; no resolved repository name
+          # or API URL is printed here.
+          pr_agent_dispatch_is_transient() {
+            CONTINUUM_DISPATCH_OUTPUT="$1" python3 -c 'import os; from continuum.delegated_dispatch import classify_dispatch_failure; raise SystemExit(0 if classify_dispatch_failure(os.environ.get("CONTINUUM_DISPATCH_OUTPUT", "")) == "transient" else 1)'
+          }
+
+          dispatch_pr_agent_recovery_with_retry() {
+            local child_id="$1"
+            local attempt=1 max_attempts=3 delay=5
+            local dispatch_output dispatch_status
+            while true; do
+              set +e
+              dispatch_output="$(gh workflow run "continuum-pr-agent-recovery.yml" --repo "$GITHUB_REPOSITORY" -f target_child_id="$child_id" 2>&1)"
+              dispatch_status=$?
+              set -e
+              if (( dispatch_status == 0 )); then
+                return 0
+              fi
+              if pr_agent_dispatch_is_transient "$dispatch_output"; then
+                if (( attempt >= max_attempts )); then
+                  return 1
+                fi
+                sleep "$delay"
+                attempt=$((attempt + 1))
+                delay=$((delay * 2))
+                continue
+              fi
+              return 2
+            done
+          }
 
           # Authoritative review path (issue #244): exactly one path ever
           # runs per parent. `pr-agent` routes every child PR
@@ -830,9 +876,24 @@ jobs:
               # No concrete child repository identity is passed. Owner and
               # automation PRs share this single deterministic route: the
               # reconciler admits every open same-repo non-draft target PR.
-              gh workflow run "continuum-pr-agent-recovery.yml" --repo "$GITHUB_REPOSITORY" \
-                -f target_child_id="$child_id" >/dev/null
-              review_dispatches=$((review_dispatches + 1))
+              # A single transient dispatch failure never aborts this loop:
+              # the bounded retry above absorbs 5xx/429/transient-403, an
+              # exhausted or deterministic target is recorded, and fan-out
+              # continues with the next verified child.
+              dispatch_rc=0
+              if dispatch_pr_agent_recovery_with_retry "$child_id"; then
+                review_dispatches=$((review_dispatches + 1))
+              else
+                dispatch_rc=$?
+                pr_agent_dispatch_failures=$((pr_agent_dispatch_failures + 1))
+                if (( dispatch_rc == 2 )); then
+                  pr_agent_deterministic_failures=$((pr_agent_deterministic_failures + 1))
+                  echo "::error::Delegated PR-Agent recovery dispatch failed deterministically for one verified child; fan-out continues."
+                else
+                  pr_agent_transient_failures=$((pr_agent_transient_failures + 1))
+                  echo "::warning::Delegated PR-Agent recovery dispatch failed transiently for one verified child after bounded retries; fan-out continues."
+                fi
+              fi
             fi
 
             if [[ -n "$open_prs" ]]; then
@@ -1062,6 +1123,9 @@ jobs:
           echo "active_wip=$active_wip" >> "$GITHUB_OUTPUT"
           echo "candidate_count=$candidate_count" >> "$GITHUB_OUTPUT"
           echo "Delegated queue: $active_wip active WIP item(s), $candidate_count candidate(s), $review_dispatches review run(s)."
+          if [[ "$pr_agent_dispatch_failures" -gt 0 ]]; then
+            echo "::warning::Delegated PR-Agent recovery fan-out: $pr_agent_dispatch_failures verified child dispatch(es) failed ($pr_agent_transient_failures transient, $pr_agent_deterministic_failures deterministic) after bounded retries; remaining children were still processed and transient targets retry on the next pass."
+          fi
           if [[ "$invalid" -gt 0 ]]; then
             echo "::error::$invalid configured child relationship(s) failed bidirectional verification."
             exit 2
