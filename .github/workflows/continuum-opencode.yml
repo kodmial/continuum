@@ -1666,7 +1666,7 @@ jobs:
 
               if [[ "$REMOTE_HEAD" != "$REPAIR_BASE_SHA" ]]; then
                 echo "PR head advanced from $REPAIR_BASE_SHA to $REMOTE_HEAD while repairing; replaying workflow-owned repair commit (attempt $publish_attempt/3)."
-                if ! git rebase --onto "$REMOTE_HEAD" "$REPAIR_BASE_SHA" HEAD; then
+                if ! git rebase --onto "$REMOTE_HEAD" "$REPAIR_BASE_SHA"; then
                   git rebase --abort >/dev/null 2>&1 || true
                   echo "::error::OpenCode repair cannot be replayed cleanly onto current PR HEAD $REMOTE_HEAD; refusing to overwrite concurrent changes."
                   exit 1
