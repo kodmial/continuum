@@ -181,6 +181,8 @@ jobs:
             // same workflow run so GitHub preserves its original event/inputs,
             // while all jobs are scheduled again on fresh hosted runners.
             const rateLimitMarker = 'CONTINUUM_OPENCODE_429_RESTART_REQUIRED';
+            const publishRaceMarker =
+              'CONTINUUM_OPENCODE_PUBLISH_RACE_RETRY_REQUIRED';
             const max429Restarts = Number.parseInt(
               process.env.MAX_429_RUNNER_RESTARTS || '3',
               10
@@ -202,6 +204,7 @@ jobs:
               }
             );
             let runnerRestartRequired = false;
+            let publishRaceRestartRequired = false;
             const apiBase = String(process.env.GITHUB_API_URL || 'https://api.github.com')
               .replace(/\/+$/, '');
             for (const job of jobs) {
@@ -227,8 +230,11 @@ jobs:
               const logText = await response.text();
               if (logText.includes(rateLimitMarker)) {
                 runnerRestartRequired = true;
-                break;
               }
+              if (logText.includes(publishRaceMarker)) {
+                publishRaceRestartRequired = true;
+              }
+              if (runnerRestartRequired || publishRaceRestartRequired) break;
             }
             if (runnerRestartRequired) {
               const attempt = Number(run.run_attempt || 1);
@@ -247,6 +253,35 @@ jobs:
                 core.warning(
                   'OpenCode 429 fresh-runner recovery exhausted after ' +
                   max429Restarts + ' restart(s) for run ' + run.id + '.'
+                );
+              }
+              return;
+            }
+
+            // A CodeRabbit repair can finish all code edits and still lose a
+            // non-fast-forward race when auto-merge advances the PR branch.
+            // Re-run the same workflow run so GitHub preserves the original
+            // workflow_dispatch inputs (mode/pr/head_ref/review_id). This path
+            // runs before issue-number routing because repair runs are PR work,
+            // not issue implementation runs.
+            if (publishRaceRestartRequired) {
+              const attempt = Number(run.run_attempt || 1);
+              const maxPublishRaceRestarts = 3;
+              if (attempt <= maxPublishRaceRestarts) {
+                await readGithub.rest.actions.reRunWorkflow({
+                  owner,
+                  repo,
+                  run_id: run.id,
+                });
+                core.notice(
+                  'OpenCode publish race: restarted workflow run ' + run.id +
+                  ' with preserved inputs, attempt ' + (attempt + 1) +
+                  '/' + (maxPublishRaceRestarts + 1) + '.'
+                );
+              } else {
+                core.warning(
+                  'OpenCode publish-race recovery exhausted after ' +
+                  maxPublishRaceRestarts + ' restart(s) for run ' + run.id + '.'
                 );
               }
               return;
