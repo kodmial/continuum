@@ -204,13 +204,12 @@ class PrivacyAndExactHeadTests(unittest.TestCase):
                 body = read(path)
                 self.assertNotIn("target_child_id", body)
                 self.assertNotIn("CONTINUUM_PR_AGENT_TARGET", body)
+                self.assertNotIn("CONTINUUM_ROLE", body)
 
-        # CodeRabbit retry now shares the zero-private-child-runner invariant,
-        # but it must not inherit any PR-Agent target-routing semantics.
-        retry = read(".github/workflows/continuum-coderabbit-retry.yml")
-        self.assertIn("vars.CONTINUUM_ROLE != 'child'", retry)
-        unresolved = read(".github/workflows/continuum-coderabbit-unresolved.yml")
-        self.assertNotIn("CONTINUUM_ROLE", unresolved)
+        # The zero-private-child-runner guard is caller-owned, keeping the
+        # reusable CodeRabbit engine consumer-neutral.
+        stub = read(".github/caller-stubs/continuum-coderabbit-retry.yml")
+        self.assertIn("vars.CONTINUUM_ROLE != 'child'", stub)
 
 
 if __name__ == "__main__":
