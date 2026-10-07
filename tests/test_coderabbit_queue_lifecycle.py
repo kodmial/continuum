@@ -579,14 +579,15 @@ class WorkflowBindingTests(unittest.TestCase):
             "await new Promise",
         ):
             self.assertNotIn(forbidden, self.workflow)
-        # Queue liveness is repository-local; it must not depend on a
-        # separate auto-merge cron.
-        self.assertNotIn("auto-merge safety-net", self.workflow)
-        self.assertIn("scheduled safety-net", self.workflow)
+        # The controller itself never sleeps and introduces no dedicated
+        # CodeRabbit polling cron; existing stable controller wakeups provide
+        # the periodic backstop.
+        self.assertIn("recovery-controller wake-ups", self.workflow)
+        self.assertIn("no dedicated CodeRabbit polling cron", self.workflow)
 
-    def test_disabled_consumers_stay_noop_on_safety_net_ticks(self):
-        # The schedule event must sit inside the coderabbit provider gate, so
-        # a tick in a disabled/non-CodeRabbit repository still exits as no-op.
+    def test_legacy_schedule_wake_stays_inside_provider_gate(self):
+        # The reusable workflow still accepts schedule from stale callers
+        # during migration, but it must remain inside the provider gate.
         self.assertIn("github.event_name == 'schedule'", self.workflow)
         gate = self.workflow.index("== 'coderabbit'")
         schedule = self.workflow.index("github.event_name == 'schedule'")
