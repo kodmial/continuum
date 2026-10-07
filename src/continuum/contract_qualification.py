@@ -421,7 +421,11 @@ def evaluate_canary(state: CanaryState) -> CanaryVerdict:
         elapsed = deadline + 1
     if elapsed <= deadline:
         return CanaryVerdict(CANARY_PROGRESS, "forward-progress-within-deadline", identity)
-    if int(state.recovery_attempts or 0) < MAX_CANARY_RECOVERY_ATTEMPTS:
+    try:
+        attempts = int(state.recovery_attempts or 0)
+    except (TypeError, ValueError):
+        attempts = MAX_CANARY_RECOVERY_ATTEMPTS
+    if attempts < MAX_CANARY_RECOVERY_ATTEMPTS:
         return CanaryVerdict(
             CANARY_STALLED_RECOVERABLE,
             "no-progress-past-deadline-bounded-recovery",
