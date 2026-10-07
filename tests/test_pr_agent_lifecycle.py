@@ -1306,9 +1306,10 @@ class UpstreamVersionTests(unittest.TestCase):
 
 
 class ReviewOutputTests(unittest.TestCase):
-    def test_machine_state_comes_from_step_outputs_review(self):
+    def test_machine_state_comes_from_runner_local_review_file(self):
         body = read_repo(".github/workflows/continuum-pr-agent.yml")
-        self.assertIn("steps.pragent.outputs.review", body)
+        self.assertIn("steps.pragent.outputs.review_file", body)
+        self.assertNotIn("REVIEW_JSON: ${{ steps.pragent.outputs.review }}", body)
         import sys
 
         sys.path.insert(0, SRC)
@@ -1316,7 +1317,7 @@ class ReviewOutputTests(unittest.TestCase):
             from continuum import pr_agent_lifecycle as life
         finally:
             sys.path.remove(SRC)
-        self.assertEqual(life.REVIEW_OUTPUT_REF, "steps.pragent.outputs.review")
+        self.assertEqual(life.REVIEW_OUTPUT_REF, "steps.pragent.outputs.review_file")
 
     def test_invalid_or_missing_review_json_blocks(self):
         import sys
@@ -2031,9 +2032,10 @@ class IsolationTests(unittest.TestCase):
         self.assertIn("- CI", caller)
         self.assertIn("- PR Agent (OpenCode backend)", caller)
         body = read_repo(".github/workflows/continuum-pr-agent.yml")
-        self.assertIn("review_json:", body)
-        self.assertIn("improve_jsonl:", body)
-        self.assertIn("steps.pragent.outputs.review", body)
+        self.assertIn("repair_batch_comment_id:", body)
+        self.assertIn("steps.pragent.outputs.review_file", body)
+        self.assertNotIn("review_json: ${{ needs.pr_agent.outputs.review_json }}", body)
+        self.assertNotIn("improve_jsonl: ${{ needs.pr_agent.outputs.improve_jsonl }}", body)
         self.assertNotIn("CONTINUUM_PR_AGENT_ENABLED", body)
         self.assertNotIn("CONTINUUM_REQUIRE_CODERABBIT", body)
         self.assertIn("Install pinned OpenCode CLI for the PR-Agent backend", body)
@@ -3965,10 +3967,15 @@ class FallbackPersistentStateTests(unittest.TestCase):
         review = read_repo(".github/workflows/continuum-pr-agent.yml")
         repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
         merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
-        # Repair still consumes the canonical review/improve outputs and
-        # publishes a new HEAD when changes are required.
-        self.assertIn("review_json: ${{ needs.pr_agent.outputs.review_json }}", review)
-        self.assertIn("REVIEW_JSON: ${{ inputs.review_json }}", repair)
+        # Repair consumes a private target-repository handoff id instead of
+        # raw review/improve job outputs, then publishes a new HEAD.
+        self.assertIn(
+            "repair_batch_comment_id: ${{ needs.pr_agent.outputs.repair_batch_comment_id }}",
+            review,
+        )
+        self.assertNotIn("review_json: ${{ needs.pr_agent.outputs.review_json }}", review)
+        self.assertIn("REPAIR_BATCH_COMMENT_ID: ${{ inputs.repair_batch_comment_id }}", repair)
+        self.assertIn("continuum-pr-agent-repair-batch:v1", repair)
         self.assertIn("git push", repair)
         # Merge evidence is now fully evaluated while raw review/state remain
         # runner-local. Only a safe scalar crosses the job boundary, avoiding
