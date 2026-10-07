@@ -712,6 +712,15 @@ jobs:
               return latestWorkflowForHead(pr, pr.head.sha, 'Packaging smoke');
             }
 
+            // Contract qualification gate (kodmial/continuum#286): the
+            // merge-blocking regression + lifecycle + canary contract must be
+            // green on the exact current HEAD. Absent, stale, or red
+            // evidence blocks every merge path, including this generic
+            // auto-merge reconciler. Fail closed, never bypass.
+            async function latestCurrentHeadContractQualification(pr) {
+              return latestWorkflowForHead(pr, pr.head.sha, 'Contract qualification');
+            }
+
             async function requiredWorkflowGate(pr, headSha = pr.head.sha) {
               if (
                 !requiredWorkflowGateLabel ||
@@ -2589,6 +2598,21 @@ jobs:
                 continue;
               }
 
+              // Contract qualification gate (kodmial/continuum#286): no
+              // merge path may bypass the exact-HEAD contract evidence,
+              // including this generic auto-merge reconciler.
+              const contractGate = await latestCurrentHeadContractQualification(pr);
+              if (
+                !contractGate ||
+                contractGate.status !== 'completed' ||
+                contractGate.conclusion !== 'success'
+              ) {
+                core.info(
+                  `PR #${pr.number}: waiting for successful Contract qualification on head ${pr.head.sha}; current state=${contractGate ? `${contractGate.status}/${contractGate.conclusion || 'pending'}` : 'missing'}.`
+                );
+                continue;
+              }
+
               // A clean controller-generated merge of main can reuse a prior
               // completed APPROVED review. Any other new HEAD must have its own
               // CodeRabbit review. Without CodeRabbit there is no review basis
@@ -2758,6 +2782,8 @@ jobs:
                 await latestCurrentHeadPackagingSmoke(pr);
               const finalExtraWorkflowGate =
                 await requiredWorkflowGate(pr, pr.head.sha);
+              const finalContractGate =
+                await latestCurrentHeadContractQualification(pr);
               const finalReviewBasis = requireCodeRabbit
                 ? await codeRabbitReviewBasis(pr, pr.head.sha)
                 : null;
@@ -2776,6 +2802,9 @@ jobs:
                  (!finalContinuumContractGate ||
                   finalContinuumContractGate.status !== 'completed' ||
                   finalContinuumContractGate.conclusion !== 'success')) ||
+                !finalContractGate ||
+                finalContractGate.status !== 'completed' ||
+                finalContractGate.conclusion !== 'success' ||
                 (finalPackagingSmoke &&
                  (finalPackagingSmoke.status !== 'completed' ||
                   finalPackagingSmoke.conclusion !== 'success')) ||
