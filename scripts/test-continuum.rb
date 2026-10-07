@@ -4986,39 +4986,44 @@ class ContinuumTest < Minitest::Test
     refute_includes body, "workflow_id: 'continuum-auto-merge.yml'"
   end
 
-  # A queue deferred to a future dueAt must be woken by a repository-local
-  # bounded tick even when no review/comment/status event arrives. The stub
-  # carries the periodic trigger and the controller accepts the schedule
-  # event inside the coderabbit provider gate, so disabled consumers stay
-  # no-op and parity cannot silently drift.
-  def test_coderabbit_retry_has_a_bounded_scheduled_safety_net
+  # A queue deferred to a future dueAt must be woken without introducing a
+  # second repository-local cron. The caller reuses existing periodic
+  # PR-Agent recovery / auto-merge completions, both of which run only after
+  # the PR HEAD has settled. This avoids review/main-sync races and keeps Child
+  # and non-CodeRabbit consumers at zero runner cost.
+  def test_coderabbit_retry_reuses_stable_existing_recovery_wakes
     body = workflow_body('continuum-coderabbit-retry.yml')
     stub_body = File.read(
       File.join(ROOT, '.github/caller-stubs/continuum-coderabbit-retry.yml')
     )
     stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-coderabbit-retry.yml'))
 
-    schedule = events(stub).fetch('schedule')
-    crons = schedule.map { |entry| entry.fetch('cron') }
-    assert_equal ['3,13,23,33,43,53 * * * *'], crons,
-                 'the retry caller must wake every 10 minutes on a non-hour-boundary offset'
-    assert_includes stub_body, 'scheduled safety-net tick'
+    refute events(stub).key?('schedule'),
+           'the retry caller must not add a dedicated polling cron'
+    workflow_run = events(stub).fetch('workflow_run')
+    assert_equal ['PR-Agent recovery', 'Auto-merge reviewed pull requests'],
+                 workflow_run.fetch('workflows')
+    assert_equal ['completed'], workflow_run.fetch('types')
+    refute_includes stub_body, '- Issue scheduler'
+    refute_includes stub_body, "\n  push:\n"
 
-    # The controller stays non-blocking: due time is derived from durable
-    # timestamps, future slots exit without sleeping, and the schedule event
-    # flows through the same serialized single-command reconciler.
+    # Caller-side admission prevents even the reusable-workflow runner from
+    # starting in private Child repositories or non-CodeRabbit consumers.
+    assert_includes stub_body, "vars.CONTINUUM_ROLE != 'child'"
+    assert_includes stub_body, 'vars.CONTINUUM_REVIEW_PROVIDER'
+    assert_includes stub_body, "== 'coderabbit'"
+
+    # The controller remains backward-compatible with stale callers that can
+    # still emit a schedule event while consumers converge, and all wake types
+    # share the same non-blocking single-slot reconciler.
+    assert_includes body, "github.event_name == 'workflow_run'"
     assert_includes body, "github.event_name == 'schedule'"
-    provider_gate = body.index("== 'coderabbit'")
-    schedule_gate = body.index("github.event_name == 'schedule'")
-    assert_operator provider_gate, :<, schedule_gate,
-                    'the schedule wake-up must sit inside the coderabbit provider gate'
     assert_includes body, 'chooseDueCandidate(state)'
     assert_includes body, 'no second review command will be emitted'
     assert_includes body, 'candidate.effectiveDueAt <= now'
-    refute_includes body, 'auto-merge safety-net'
+    refute_includes body, "github.event_name == 'push'"
 
-    # Parity: the trigger the stub produces is the trigger the controller
-    # accepts. No new secret and no consumer repository literal may ride along.
+    # No new secret and no consumer repository literal may ride along.
     %w[OPENCODE_API_KEY ANTHROPIC_API_KEY GROQ_API_KEY].each do |secret|
       refute_includes stub_body, secret
       refute_includes body, secret
