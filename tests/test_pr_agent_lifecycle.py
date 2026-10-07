@@ -3939,19 +3939,29 @@ class FallbackPersistentStateTests(unittest.TestCase):
         review = read_repo(".github/workflows/continuum-pr-agent.yml")
         repair = read_repo(".github/workflows/continuum-pr-agent-repair.yml")
         merge = read_repo(".github/workflows/continuum-pr-agent-auto-merge.yml")
-        # Repair consumes the canonical review/improve outputs and publishes
-        # a new HEAD when changes are required.
+        # Repair still consumes the canonical review/improve outputs and
+        # publishes a new HEAD when changes are required.
         self.assertIn("review_json: ${{ needs.pr_agent.outputs.review_json }}", review)
         self.assertIn("REVIEW_JSON: ${{ inputs.review_json }}", repair)
         self.assertIn("git push", repair)
-        # The merge gate still requires persistent state for the exact HEAD
-        # and stays closed until a clean exact-HEAD review.
+        # Merge evidence is now fully evaluated while raw review/state remain
+        # runner-local. Only a safe scalar crosses the job boundary, avoiding
+        # GitHub secret-output suppression when delegated target identifiers
+        # are masked.
         self.assertIn(
-            "persistent_state_json: ${{ needs.pr_agent.outputs.persistent_state_json }}",
+            "merge_gate_verified: ${{ steps.merge_evidence.outputs.green }}",
             review,
         )
-        self.assertIn("PR-Agent gate requires native persistent finding state", merge)
-        self.assertIn("safe_to_merge", merge)
+        merge_job = review[review.index("\n  merge:"):]
+        self.assertIn(
+            "gate_verified: ${{ needs.pr_agent.outputs.merge_gate_verified }}",
+            merge_job,
+        )
+        self.assertNotIn("review_json: ${{ needs.pr_agent.outputs.review_json }}", merge_job)
+        self.assertNotIn("persistent_state_json: ${{ needs.pr_agent.outputs.persistent_state_json }}", merge_job)
+        self.assertIn("PR-Agent gate requires native persistent finding state", review)
+        self.assertIn("safe_to_merge", review)
+        self.assertIn("Validate upstream exact-head merge attestation", merge)
 
 
 class SchedulingSemanticsTests(unittest.TestCase):
