@@ -29,7 +29,7 @@ concurrency:
   # The controller is a short latest-state reconciler. When the next legal
   # review slot is in the future it exits immediately; durable CodeRabbit
   # comments/review timestamps retain the due time and existing event and
-  # scheduled safety-net wake-ups reconcile again later. Newer wake-ups
+  # event-driven and recovery-controller wake-ups reconcile again later. Newer wake-ups
   # supersede stale scans.
   cancel-in-progress: true
 
@@ -1185,7 +1185,7 @@ jobs:
                 .join(', ');
 
               core.notice(
-                `CodeRabbit queue: ${queue}. Deferred until ${new Date(nextAt).toISOString()}; no runner sleep. Existing review/status events and this caller's scheduled safety-net tick will wake the controller again.`
+                `CodeRabbit queue: ${queue}. Deferred until ${new Date(nextAt).toISOString()}; no runner sleep. Existing review/status and stable controller wake-ups will reconcile the queue again.`
               );
               return false;
             }
@@ -1193,8 +1193,8 @@ jobs:
             // Reconcile once. If the earliest legal shared-quota slot is still
             // in the future, leave the runner immediately; the due time is
             // derived from durable review/comment timestamps and will be
-            // re-evaluated by existing event and scheduled safety-net wake-ups.
-            // The queue never depends on a separate auto-merge cron for liveness.
+            // re-evaluated by existing event-driven and recovery-controller wake-ups.
+            // The queue introduces no dedicated CodeRabbit polling cron.
             let state = await collectState();
 
             if (state.latestInFlightCommand) {
