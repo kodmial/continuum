@@ -455,6 +455,20 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
         repair = read(".github/workflows/continuum-pr-agent-repair.yml")
         self.assertIn("target_child_id:", repair)
 
+    def test_delegated_repair_uses_private_comment_handoff_not_raw_outputs(self):
+        review = read(".github/workflows/continuum-pr-agent.yml")
+        repair = read(".github/workflows/continuum-pr-agent-repair.yml")
+        repair_job = review[review.index("\n  repair:"):review.index("\n  merge:")]
+        self.assertIn("repair_batch_comment_id: ${{ needs.pr_agent.outputs.repair_batch_comment_id }}", repair_job)
+        self.assertNotIn("review_json: ${{ needs.pr_agent.outputs.review_json }}", repair_job)
+        self.assertNotIn("improve_jsonl: ${{ needs.pr_agent.outputs.improve_jsonl }}", repair_job)
+        self.assertIn("Publish private exact-head repair handoff", review)
+        self.assertIn("continuum-pr-agent-repair-batch:v1", review)
+        self.assertIn("REPAIR_BATCH_COMMENT_ID: ${{ inputs.repair_batch_comment_id }}", repair)
+        self.assertIn("getComment", repair)
+        self.assertIn("logicalFingerprint", repair)
+        self.assertNotIn("REVIEW_JSON: ${{ steps.pragent.outputs.review }}", review)
+
     def test_delegated_merge_uses_scalar_attestation_not_raw_outputs(self):
         review = read(".github/workflows/continuum-pr-agent.yml")
         merge = read(".github/workflows/continuum-pr-agent-auto-merge.yml")
