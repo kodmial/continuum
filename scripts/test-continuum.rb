@@ -4827,6 +4827,27 @@ class ContinuumTest < Minitest::Test
 
   # CodeRabbit can submit CHANGES_REQUESTED for a policy/pre-merge failure with
   # no code finding at all. That state is not a coding-agent repair request.
+  # Auto-merge may advance a PR from main while a CodeRabbit repair is
+  # running. The repair must not be discarded by a non-fast-forward push:
+  # replay only the workflow-owned repair commit onto the latest remote head,
+  # with bounded retries and no force-push.
+  def test_coderabbit_fix_survives_concurrent_pr_head_advance
+    body = workflow_body('continuum-opencode.yml')
+    step = body[/^- name: Fix CodeRabbit review findings\n(.*?)(?=^\s*- name: Ask CodeRabbit to verify every original finding)/m, 1]
+    refute_nil step, 'CodeRabbit fix step is missing'
+
+    assert_includes step, 'REPAIR_BASE_SHA="$(git rev-parse HEAD)"'
+    assert_includes step, 'for publish_attempt in 1 2 3'
+    assert_includes step, 'git fetch --no-tags origin "${HEAD_REF}"'
+    assert_includes step, 'REMOTE_HEAD="$(git rev-parse "origin/${HEAD_REF}")"'
+    assert_includes step, 'git rebase --onto "$REMOTE_HEAD" "$REPAIR_BASE_SHA"'
+    assert_includes step, 'git rebase --abort'
+    assert_includes step, 'git push origin "HEAD:${HEAD_REF}"'
+    assert_includes step, 'publication exhausted 3 race retries'
+    refute_includes step, '--force'
+    refute_includes step, '--force-with-lease'
+  end
+
   def test_coderabbit_policy_blocker_is_classified_before_opencode_dispatch
     body = workflow_body('continuum-opencode.yml')
     job = body[/^  dispatch-coderabbit-fix:\n(.*?)(?=^  opencode:)/m, 1]
