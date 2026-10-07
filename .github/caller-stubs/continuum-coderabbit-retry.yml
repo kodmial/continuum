@@ -27,19 +27,14 @@ on:
     - cron: '3,13,23,33,43,53 * * * *'
 
   # Redundant liveness wakes. GitHub may delay or drop an individual scheduled
-  # event under load; any completion of the other independent control-plane
-  # reconcilers re-checks the shared CodeRabbit queue without emitting a review
-  # unless the durable not-before has actually expired.
+  # event under load. Wake only after controllers that run on a stable PR HEAD:
+  # direct main-push / issue-scheduler wakes can race auto-merge's update-branch
+  # synchronization and make CodeRabbit abort with "Head commit changed".
   workflow_run:
     workflows:
       - PR-Agent recovery
-      - Issue scheduler
       - Auto-merge reviewed pull requests
     types: [completed]
-
-  # A trusted control-plane change on main should reconcile immediately too.
-  push:
-    branches: [main]
 
   # Manual/safety-net reconciliation.
   workflow_dispatch:
