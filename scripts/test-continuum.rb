@@ -5044,6 +5044,14 @@ class ContinuumTest < Minitest::Test
   # project without CodeRabbit wait forever for an approval nobody will give,
   # and would dispatch a workflow it does not have. The enabling value belongs
   # in the one repository that asked for CodeRabbit.
+  def test_auto_merge_caller_wakes_on_coderabbit_finding_verdict
+    stub = File.read(
+      File.join(ROOT, '.github/caller-stubs/continuum-auto-merge.yml')
+    )
+    assert_includes stub, 'pull_request_review_comment:'
+    assert_includes stub, 'types: [created, edited]'
+  end
+
   def test_review_provider_defaults_to_none_and_is_variable_driven
     inputs = events(yaml(File.join(ROOT, '.github/workflows/continuum-auto-merge.yml')))
              .fetch('workflow_call').fetch('inputs')
