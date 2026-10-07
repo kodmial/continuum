@@ -9,15 +9,9 @@ on:
       head_sha:
         description: Exact PR HEAD reviewed by upstream PR-Agent.
         value: ${{ jobs.pr_agent.outputs.head_sha }}
-      review_json:
-        description: Native upstream PR-Agent structured review JSON for head_sha.
-        value: ${{ jobs.pr_agent.outputs.review_json }}
-      improve_jsonl:
-        description: Native upstream /improve push_outputs JSONL for head_sha.
-        value: ${{ jobs.pr_agent.outputs.improve_jsonl }}
-      persistent_state_json:
-        description: Native upstream persistent finding state for head_sha.
-        value: ${{ jobs.pr_agent.outputs.persistent_state_json }}
+      repair_batch_comment_id:
+        description: Safe target-repository comment id carrying private exact-HEAD repair evidence.
+        value: ${{ jobs.pr_agent.outputs.repair_batch_comment_id }}
       needs_repair:
         description: Whether current native review/improve output requires repair.
         value: ${{ jobs.pr_agent.outputs.needs_repair }}
