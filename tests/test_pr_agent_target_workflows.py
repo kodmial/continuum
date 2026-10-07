@@ -67,6 +67,16 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
         self.assertIn("format('pr-agent-{0}'", body)
         self.assertNotIn("target_repository", body.lower().replace("continuum_pr_agent_target_repository", ""))
 
+    def test_persistent_state_uses_runner_local_review_file(self):
+        body = read(".github/workflows/continuum-pr-agent.yml")
+        start = body.index("Export native persistent finding state for the reviewed HEAD")
+        end = body.index("\n      - name: ", start + 1)
+        block = body[start:end]
+        self.assertIn("REVIEW_FILE: ${{ steps.pragent.outputs.review_file }}", block)
+        self.assertIn("review_file = os.environ.get(\"REVIEW_FILE\", \"\").strip()", block)
+        self.assertIn("current_review = load_current_review()", block)
+        self.assertNotIn("os.environ.get(\"REVIEW_JSON\"", block)
+
     def test_repair_targets_child_branch_and_stays_pat_backed_for_push(self):
         body = read(".github/workflows/continuum-pr-agent-repair.yml")
         self.assertIn("CONTINUUM_PR_AGENT_TARGET_REPOSITORY", body)
