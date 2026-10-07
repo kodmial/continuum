@@ -4944,23 +4944,25 @@ class ContinuumTest < Minitest::Test
     assert_includes body, 'await commentGithub.rest.issues.removeLabel({'
   end
 
-  # GitHub schedule is best-effort and can arrive hours late. One serialized
-  # controller therefore waits inside the durable quota window, and any newer
-  # lifecycle event cancels that waiter and recomputes latest state.
-  def test_coderabbit_review_queue_uses_bounded_due_waiter
+  # GitHub schedule is best-effort and can arrive hours late. Public consumers
+  # therefore keep at most one bounded serialized waiter until the durable
+  # CodeRabbit dueAt; private repositories remain event-driven.
+  def test_coderabbit_review_queue_uses_bounded_public_due_waiter
     body = workflow_body('continuum-coderabbit-retry.yml')
 
-    assert_includes body, 'async function waitUntil(whenMs, reason)'
-    assert_includes body, 'MAX_CONTROLLER_WAIT_MS = 70 * 60_000'
+    assert_includes body, 'async function waitUntilNextCandidate(state)'
+    assert_includes body, 'MAX_PUBLIC_DEFER_WAIT_MS = 70 * 60_000'
+    assert_includes body, 'context.payload.repository?.private === false'
     assert_includes body, 'await new Promise(resolve => setTimeout(resolve, waitMs))'
     assert_includes body, 'while (!selected)'
     assert_includes body, 'state = await collectState()'
-    assert_includes body, "await waitUntil(nextAt, 'shared CodeRabbit quota window')"
-    assert_includes body, 'timeout-minutes: 90'
+    assert_includes body, 'await waitUntilNextCandidate(state)'
+    assert_includes body, 'timeout-minutes: 85'
     assert_includes body, 'cancel-in-progress: true'
     assert_includes body, "vars.CONTINUUM_ROLE != 'child'"
-    assert_includes body, 'scheduled events can be'
-    assert_includes body, 'delayed for hours'
+    assert_includes body, 'GitHub schedule is best-effort and can be delayed for hours'
+    assert_includes body, 'private repository or wait exceeds cap'
+    assert_includes body, 'no second review command will be emitted'
   end
 
   # RESOLVED/UNRESOLVED replies are lifecycle events. They must wake the queue
