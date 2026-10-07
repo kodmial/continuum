@@ -561,29 +561,23 @@ class WorkflowBindingTests(unittest.TestCase):
             self.workflow,
         )
 
-    def test_safety_net_tick_is_non_blocking_and_never_sleeps(self):
+    def test_public_due_waiter_is_bounded_serialized_and_revalidated(self):
         for contract in (
-            "function deferUntilNextCandidate(state)",
+            "async function waitUntilNextCandidate(state)",
             "function chooseDueCandidate(state)",
-            "no runner sleep",
-            "timeout-minutes: 15",
+            "MAX_PUBLIC_DEFER_WAIT_MS = 70 * 60_000",
+            "context.payload.repository?.private === false",
+            "await new Promise(resolve => setTimeout(resolve, waitMs))",
+            "timeout-minutes: 85",
             "cancel-in-progress: true",
+            "state = await collectState()",
             "latestInFlightCommand",
             "no second review command will be emitted",
         ):
             self.assertIn(contract, self.workflow)
-        for forbidden in (
-            "MAX_WAIT_MS",
-            "Sleeping until",
-            "setTimeout(resolve, waitMs)",
-            "await new Promise",
-        ):
-            self.assertNotIn(forbidden, self.workflow)
-        # The controller itself never sleeps and introduces no dedicated
-        # CodeRabbit polling cron; existing stable controller wakeups provide
-        # the periodic backstop.
-        self.assertIn("recovery-controller wake-ups", self.workflow)
-        self.assertIn("no dedicated CodeRabbit polling cron", self.workflow)
+        self.assertIn("private repository or wait exceeds cap", self.workflow)
+        self.assertIn("any newer wake cancels and recomputes it", self.workflow)
+
 
     def test_legacy_schedule_wake_stays_inside_provider_gate(self):
         # The reusable workflow still accepts schedule from stale callers
