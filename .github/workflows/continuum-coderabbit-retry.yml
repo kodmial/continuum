@@ -1212,7 +1212,7 @@ jobs:
               }
 
               core.notice(
-                `CodeRabbit controller waiting ${Math.ceil(waitMs / 1000)}s until ${new Date(nextAt).toISOString()} (${reason}); any newer wake cancels and recomputes it.`
+                `CodeRabbit controller waiting ${Math.ceil(waitMs / 1000)}s until ${new Date(nextAt).toISOString()} (${reason}); no second review command will be emitted; any newer wake cancels and recomputes it.`
               );
               await new Promise(resolve => setTimeout(resolve, waitMs));
               return true;
