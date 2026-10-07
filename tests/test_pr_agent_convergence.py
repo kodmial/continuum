@@ -265,7 +265,7 @@ class WorkflowWiringTests(unittest.TestCase):
             "continuum-pr-agent-no-progress head=' + headSha +",
             self.workflow,
         )
-        self.assertIn("const fingerprint = batch.fingerprint;", self.workflow)
+        self.assertIn("fingerprint = batch.fingerprint;", self.workflow)
         self.assertIn("policy.buildRepairBatch(review, raw)", self.workflow)
 
     def test_no_upstream_resolution_is_written(self):
