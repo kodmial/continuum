@@ -2,10 +2,16 @@ name: Auto-merge reviewed pull requests
 
 on:
   # Successful PR CI explicitly dispatches this reconciler from
-  # mark-ready-for-coderabbit. CodeRabbit status/review and main pushes are
-  # additional event-driven wake-ups; no critical transition depends on cron.
+  # mark-ready-for-coderabbit. CodeRabbit status/review, finding-verdict
+  # comments, and main pushes are additional event-driven wake-ups; no critical
+  # transition depends on cron.
   pull_request_review:
     types: [submitted, dismissed]
+  # A CodeRabbit finding verification (including semantic RESOLVED/UNRESOLVED)
+  # is a lifecycle transition. Reconcile immediately instead of waiting for an
+  # unrelated event or the safety-net cron.
+  pull_request_review_comment:
+    types: [created, edited]
   status:
   push:
     branches: [main]
