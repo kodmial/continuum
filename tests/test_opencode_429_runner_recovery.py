@@ -69,9 +69,11 @@ class OpenCode429RunnerRecoveryContractTest(unittest.TestCase):
             self.body,
         )
         self.assertIn("exit 76", self.body)
-        self.assertIn("for publish_attempt in 1 2 3", self.body)
-        self.assertIn('git rebase --onto "$REMOTE_HEAD" "$REPAIR_BASE_SHA"', self.body)
-        self.assertNotIn('git rebase --onto "$REMOTE_HEAD" "$REPAIR_BASE_SHA" HEAD', self.body)
+        self.assertIn('REPAIR_BASE_SHA="$(git rev-parse HEAD)"', self.body)
+        self.assertIn('git fetch --no-tags origin "${HEAD_REF}"', self.body)
+        self.assertIn('REMOTE_HEAD="$(git rev-parse "origin/${HEAD_REF}")"', self.body)
+        self.assertIn('git push origin "HEAD:${HEAD_REF}"', self.body)
+        self.assertNotIn("git rebase", self.body)
 
     def test_429_recovery_is_bounded_and_does_not_release_task_locks(self):
         self.assertIn(
