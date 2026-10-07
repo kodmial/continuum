@@ -534,7 +534,8 @@ class WorkflowBindingTests(unittest.TestCase):
         for contract in (
             "let latestRateLimitAt = 0",
             "let globalRateLimitNotBefore = 0",
-            "globalRateLimitNotBefore = Math.max(",
+            "if (at > latestRateLimitAt)",
+            "globalRateLimitNotBefore =",
             "latestRateLimitAt > latestCompletedReviewAt",
             "const globalNotBefore = Math.max(",
             "completedReviewNotBefore",
