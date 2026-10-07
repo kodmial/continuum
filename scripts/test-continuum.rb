@@ -7271,6 +7271,20 @@ class ContinuumTest < Minitest::Test
     assert_includes qualification, 'only re-read when it never ran'
   end
 
+  def test_coderabbit_unresolved_batches_auto_merge_verification_markers
+    body = workflow_body('continuum-coderabbit-unresolved.yml')
+
+    assert_includes body, 'opencodeVerificationPattern'
+    assert_includes body, 'autoMergeVerificationPattern'
+    assert_includes body, 'auto-merge-coderabbit-verification finding='
+    assert_includes body, 'originalReviewIdForFinding'
+    assert_includes body, 'pull_request_review_id'
+    assert_includes body, 'github.rest.pulls.getReviewComment'
+    assert_includes body, 'comment_id: findingId'
+    assert_includes body, 'getRootId(comment) !== findingId'
+    assert_includes body, 'await originalReviewIdForFinding(findingId)'
+  end
+
   def test_api_budget_coderabbit_unresolved_scans_newest_first_and_bounded
     body = workflow_body('continuum-coderabbit-unresolved.yml')
 
