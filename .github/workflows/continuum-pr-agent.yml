@@ -177,9 +177,7 @@ jobs:
       pr_number: ${{ steps.stack.outputs.pr_number }}
       review_provider: ${{ steps.stack.outputs.stack }}
       head_sha: ${{ steps.result.outputs.head_sha }}
-      review_json: ${{ steps.pragent.outputs.review }}
-      improve_jsonl: ${{ steps.improve_output.outputs.improve_jsonl }}
-      persistent_state_json: ${{ steps.persistent.outputs.persistent_state_json }}
+      repair_batch_comment_id: ${{ steps.repair_handoff.outputs.comment_id }}
       needs_repair: ${{ steps.route.outputs.needs_repair }}
       ready_to_merge: ${{ steps.route.outputs.ready_to_merge }}
       merge_gate_verified: ${{ steps.merge_evidence.outputs.green }}
@@ -1004,17 +1002,72 @@ jobs:
           else
             run_review
           fi
-          # Canonical machine source: the structured review JSON is exported
-          # as the step output `review` (steps.pragent.outputs.review) for
-          # the repair and merge workflows. Prose comments are presentation
-          # only and are never the primary protocol.
+          # Raw native review evidence must never cross a public parent
+          # step/job boundary as a GitHub output: delegated target identifiers
+          # are masked and GitHub may suppress such outputs, while step env
+          # rendering would expose Child issue/review text in public logs.
+          # Consume PR-Agent's just-written GITHUB_OUTPUT in-process, move the
+          # structured review into a mode-0600 runner-local file, scrub the
+          # raw `review` entry, and export only the safe file path.
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          output_path = Path(os.environ["GITHUB_OUTPUT"])
+          lines = output_path.read_text(encoding="utf-8").splitlines()
+          kept = []
+          review = None
+          i = 0
+          while i < len(lines):
+              line = lines[i]
+              if "<<" in line:
+                  key, delimiter = line.split("<<", 1)
+                  block = [line]
+                  values = []
+                  i += 1
+                  while i < len(lines) and lines[i] != delimiter:
+                      values.append(lines[i])
+                      block.append(lines[i])
+                      i += 1
+                  if i < len(lines):
+                      block.append(lines[i])
+                  if key == "review":
+                      review = "\n".join(values)
+                  else:
+                      kept.extend(block)
+              elif "=" in line:
+                  key, value = line.split("=", 1)
+                  if key == "review":
+                      review = value
+                  else:
+                      kept.append(line)
+              else:
+                  kept.append(line)
+              i += 1
+
+          if not review:
+              raise SystemExit("PR-Agent produced no structured review output.")
+          parsed = json.loads(review)
+          if not isinstance(parsed, dict):
+              raise SystemExit("PR-Agent structured review output is not a JSON object.")
+
+          review_path = Path(os.environ["RUNNER_TEMP"]) / "continuum-pr-agent-review.json"
+          review_path.write_text(review, encoding="utf-8")
+          review_path.chmod(0o600)
+
+          # Defense in depth for any accidental subsequent rendering.
+          for value in review.splitlines():
+              if value:
+                  print(f"::add-mask::{value}")
+
+          kept.append(f"review_file={review_path}")
+          output_path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+          PY
           echo "review_head=$REVIEWED_SHA" >> "$GITHUB_OUTPUT"
           echo "improve_repair_threshold=$IMPROVE_REPAIR_THRESHOLD" >> "$GITHUB_OUTPUT"
-          # Persist the push_outputs file payload for the repair workflow.
-          # The improve payload is consumed only from this runner-local file
-          # channel, never by scraping comments.
-          echo "improve_file=pr-agent-outputs/continuum.jsonl" >> "$GITHUB_OUTPUT"
-          echo "Upstream review completed for $REVIEWED_SHA; improve is gated below."
+          echo "improve_file=$CONTINUUM_PR_AGENT_WORKTREE/pr-agent-outputs/continuum.jsonl" >> "$GITHUB_OUTPUT"
+          echo "Upstream review completed for $REVIEWED_SHA; raw review evidence remains runner-local."
 
       - name: Revalidate the PR head and native review output after review
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
@@ -1023,7 +1076,7 @@ jobs:
         env:
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           REVIEWED_SHA: ${{ steps.before.outputs.sha }}
-          REVIEW_JSON: ${{ steps.pragent.outputs.review }}
+          REVIEW_FILE: ${{ steps.pragent.outputs.review_file }}
           TAP_PAT: ${{ secrets.TAP_PAT }}
           POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
         with:
@@ -1057,14 +1110,15 @@ jobs:
               );
               return;
             }
-            const raw = String(process.env.REVIEW_JSON || '').trim();
-            if (!raw) {
-              core.setFailed('Upstream PR-Agent produced no structured review output.');
+            const fs = require('fs');
+            const reviewFile = String(process.env.REVIEW_FILE || '').trim();
+            if (!reviewFile || !fs.existsSync(reviewFile)) {
+              core.setFailed('Runner-local PR-Agent review file is missing.');
               return;
             }
             let review;
             try {
-              review = JSON.parse(raw);
+              review = JSON.parse(fs.readFileSync(reviewFile, 'utf8'));
             } catch (err) {
               core.setFailed(`Upstream PR-Agent review output is invalid JSON: ${err.message}`);
               return;
@@ -1093,7 +1147,7 @@ jobs:
           TAP_PAT: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           REVIEWED_SHA: ${{ steps.result.outputs.head_sha }}
-          REVIEW_JSON: ${{ steps.pragent.outputs.review }}
+          REVIEW_FILE: ${{ steps.pragent.outputs.review_file }}
           FALLBACK_PYTHONPATH: ${{ steps.runtime.outputs.fallback_pythonpath }}
         run: |
           set -euo pipefail
@@ -1320,8 +1374,12 @@ jobs:
                       f"finding(s) absent from the complete current structured review {reviewed}."
                   )
           compact = json.dumps(state, separators=(",", ":"), ensure_ascii=False)
+          state_path = os.path.join(os.environ["RUNNER_TEMP"], "continuum-pr-agent-persistent-state.json")
+          with open(state_path, "w", encoding="utf-8") as out:
+              out.write(compact)
+          os.chmod(state_path, 0o600)
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
-              out.write(f"persistent_state_json={compact}\n")
+              out.write(f"persistent_state_file={state_path}\n")
           PY
 
       - name: Decide whether automatic improve can be skipped
@@ -1333,8 +1391,8 @@ jobs:
         id: improve_gate
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
-          REVIEW_JSON: ${{ steps.pragent.outputs.review }}
-          PERSISTENT_STATE_JSON: ${{ steps.persistent.outputs.persistent_state_json }}
+          REVIEW_FILE: ${{ steps.pragent.outputs.review_file }}
+          PERSISTENT_STATE_FILE: ${{ steps.persistent.outputs.persistent_state_file }}
           HEAD_SHA: ${{ steps.result.outputs.head_sha }}
           REVIEWED_SHA: ${{ steps.before.outputs.sha }}
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
@@ -1353,7 +1411,16 @@ jobs:
             // and never skips. Explicit manual improve remains available by
             // invoking the improve tool directly; this gate only governs the
             // automatic pass.
+            const fs = require('fs');
             const policy = require(process.env.POLICY_SCRIPT);
+            const reviewFile = String(process.env.REVIEW_FILE || '').trim();
+            const persistentFile = String(process.env.PERSISTENT_STATE_FILE || '').trim();
+            if (!reviewFile || !persistentFile || !fs.existsSync(reviewFile) || !fs.existsSync(persistentFile)) {
+              core.setFailed('Improve gate requires runner-local review and persistent-state files.');
+              return;
+            }
+            const reviewJson = fs.readFileSync(reviewFile, 'utf8');
+            const persistentStateJson = fs.readFileSync(persistentFile, 'utf8');
             const headSha = String(process.env.HEAD_SHA || '').trim().toLowerCase();
             const reviewedSha = String(process.env.REVIEWED_SHA || '').trim().toLowerCase();
             if (!headSha || !reviewedSha) {
@@ -1402,14 +1469,14 @@ jobs:
             }
             let review;
             try {
-              review = JSON.parse(String(process.env.REVIEW_JSON || ''));
+              review = JSON.parse(String(reviewJson || ''));
             } catch (err) {
               core.setFailed(`Invalid PR-Agent review JSON: ${err.message}`);
               return;
             }
             let persistentState;
             try {
-              persistentState = JSON.parse(String(process.env.PERSISTENT_STATE_JSON || ''));
+              persistentState = JSON.parse(String(persistentStateJson || ''));
             } catch (err) {
               core.setFailed(`Invalid PR-Agent persistent state JSON: ${err.message}`);
               return;
@@ -1644,12 +1711,9 @@ jobs:
             echo "::error::Native PR-Agent improve output file is missing."
             exit 1
           }
-          DELIMITER="__CONTINUUM_PR_AGENT_IMPROVE_EOF__"
-          {
-            echo "improve_jsonl<<$DELIMITER"
-            cat pr-agent-outputs/continuum.jsonl
-            echo "$DELIMITER"
-          } >> "$GITHUB_OUTPUT"
+          IMPROVE_FILE="$CONTINUUM_PR_AGENT_WORKTREE/pr-agent-outputs/continuum.jsonl"
+          chmod 600 "$IMPROVE_FILE"
+          echo "improve_file=$IMPROVE_FILE" >> "$GITHUB_OUTPUT"
 
       - name: Normalize persistent improve presentation
         if: >-
@@ -1660,14 +1724,20 @@ jobs:
         env:
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
-          IMPROVE_JSONL: ${{ steps.improve_output.outputs.improve_jsonl }}
+          IMPROVE_FILE: ${{ steps.improve_output.outputs.improve_file }}
         with:
           github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           script: |
+            const fs = require('fs');
             const policy = require(process.env.POLICY_SCRIPT);
             const prNumber = Number(process.env.PR_NUMBER);
+            const improveFile = String(process.env.IMPROVE_FILE || '').trim();
+            if (!improveFile || !fs.existsSync(improveFile)) {
+              core.setFailed('Runner-local PR-Agent improve file is missing.');
+              return;
+            }
             const qualifying = policy.qualifyingImproveSuggestions(
-              String(process.env.IMPROVE_JSONL || '')
+              fs.readFileSync(improveFile, 'utf8')
             );
             // Bounded scan (#254): improve presentation is rewritten every
             // run, so the newest five pages cover live state; older leftovers are
@@ -1757,15 +1827,23 @@ jobs:
         id: route
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
-          REVIEW_JSON: ${{ steps.pragent.outputs.review }}
-          IMPROVE_JSONL: ${{ steps.improve_output.outputs.improve_jsonl }}
+          REVIEW_FILE: ${{ steps.pragent.outputs.review_file }}
+          IMPROVE_FILE: ${{ steps.improve_output.outputs.improve_file }}
           IMPROVE_SKIPPED: ${{ steps.improve_skipped.outcome == 'success' }}
           POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
         with:
           github-token: ${{ github.token }}
           script: |
+            const fs = require('fs');
             const policy = require(process.env.POLICY_SCRIPT);
-            const review = JSON.parse(String(process.env.REVIEW_JSON || ''));
+            const reviewFile = String(process.env.REVIEW_FILE || '').trim();
+            const improveFile = String(process.env.IMPROVE_FILE || '').trim();
+            if (!reviewFile || !improveFile || !fs.existsSync(reviewFile) || !fs.existsSync(improveFile)) {
+              core.setFailed('PR-Agent routing requires runner-local review and improve files.');
+              return;
+            }
+            const review = JSON.parse(fs.readFileSync(reviewFile, 'utf8'));
+            const improveJsonl = fs.readFileSync(improveFile, 'utf8');
             // Split envelopes share the merged helper: checking only one
             // side would miss nested findings or nested blocking security.
             let inner;
@@ -1779,7 +1857,7 @@ jobs:
               ? inner.key_issues_to_review
               : [];
             const suggestions = policy.qualifyingImproveSuggestions(
-              String(process.env.IMPROVE_JSONL || '')
+              improveJsonl
             );
             // The authoritative review owns repair/merge disposition.
             // /improve is auxiliary input to an already-required repair and
@@ -1795,7 +1873,7 @@ jobs:
             // One canonical policy owns repair/merge/re-review routing.
             const disposition = policy.reviewDisposition(
               review,
-              String(process.env.IMPROVE_JSONL || '')
+              improveJsonl
             );
             const needsRepair = disposition.action === 'repair';
             const readyToMerge = disposition.action === 'merge';
@@ -1810,6 +1888,94 @@ jobs:
               'PR-Agent disposition=' + disposition.action + ': ' + disposition.reason
             );
 
+      - name: Publish private exact-head repair handoff
+        if: steps.route.outcome == 'success' && steps.route.outputs.needs_repair == 'true'
+        id: repair_handoff
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.result.outputs.head_sha }}
+          REVIEW_FILE: ${{ steps.pragent.outputs.review_file }}
+          IMPROVE_FILE: ${{ steps.improve_output.outputs.improve_file }}
+          POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
+          TAP_PAT: ${{ secrets.TAP_PAT }}
+        with:
+          github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
+          script: |
+            const fs = require('fs');
+            if (
+              process.env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED === 'true' &&
+              !String(process.env.TAP_PAT || '').trim()
+            ) {
+              core.setFailed(
+                'Delegated PR-Agent repair handoff requires TAP_PAT; refusing to fall back to github.token.'
+              );
+              return;
+            }
+            const prNumber = Number(process.env.PR_NUMBER);
+            const headSha = String(process.env.HEAD_SHA || '').trim().toLowerCase();
+            const reviewFile = String(process.env.REVIEW_FILE || '').trim();
+            const improveFile = String(process.env.IMPROVE_FILE || '').trim();
+            if (!Number.isInteger(prNumber) || prNumber < 1 || !/^[0-9a-f]{40,64}$/.test(headSha)) {
+              core.setFailed('PR-Agent repair handoff requires pr_number and exact full HEAD.');
+              return;
+            }
+            if (!reviewFile || !improveFile || !fs.existsSync(reviewFile) || !fs.existsSync(improveFile)) {
+              core.setFailed('PR-Agent repair handoff requires runner-local review and improve files.');
+              return;
+            }
+            const owner = process.env.CONTINUUM_PR_AGENT_TARGET_OWNER;
+            const repo = process.env.CONTINUUM_PR_AGENT_TARGET_REPO;
+            const { data: pr } = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number: prNumber,
+            });
+            if (String(pr.head.sha || '').trim().toLowerCase() !== headSha) {
+              core.setFailed('PR head moved before repair handoff publication.');
+              return;
+            }
+
+            const policy = require(process.env.POLICY_SCRIPT);
+            const review = JSON.parse(fs.readFileSync(reviewFile, 'utf8'));
+            const improve = fs.readFileSync(improveFile, 'utf8');
+            const batch = policy.buildRepairBatch(review, improve);
+            if (!Array.isArray(batch.items) || batch.items.length === 0) {
+              core.setFailed('Repair was requested but the runner-local repair batch is empty.');
+              return;
+            }
+            const payloadObject = {
+              schema_version: 1,
+              pr_number: prNumber,
+              head_sha: headSha,
+              fingerprint: batch.fingerprint,
+              items: batch.items,
+            };
+            const payloadJson = JSON.stringify(payloadObject);
+            const payload = Buffer.from(payloadJson, 'utf8').toString('base64url');
+            const body = [
+              '<!-- continuum-pr-agent-repair-batch:v1 head=' + headSha +
+                ' fingerprint=' + batch.fingerprint + ' payload=' + payload + ' -->',
+              '⚡ **Continuum · pr-agent-repair**',
+              '<!-- continuum-origin role=continuum component=pr-agent-repair-handoff -->',
+              'Runner-local repair evidence staged for exact HEAD `' + headSha + '`.',
+            ].join('\n');
+            if (Buffer.byteLength(body, 'utf8') > 60000) {
+              core.setFailed('PR-Agent repair handoff exceeds the bounded comment payload size.');
+              return;
+            }
+            const created = await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number: prNumber,
+              body,
+            });
+            core.setOutput('comment_id', String(created.data.id));
+            core.notice(
+              'Staged ' + batch.items.length + ' repair finding(s) for PR #' +
+              prNumber + ' exact HEAD ' + headSha + ' in the target repository.'
+            );
+
       - name: Attest exact-head merge evidence before job boundary
         if: steps.route.outcome == 'success' && steps.route.outputs.ready_to_merge == 'true'
         id: merge_evidence
@@ -1817,9 +1983,9 @@ jobs:
         env:
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           HEAD_SHA: ${{ steps.result.outputs.head_sha }}
-          REVIEW_JSON: ${{ steps.pragent.outputs.review }}
-          IMPROVE_JSONL: ${{ steps.improve_output.outputs.improve_jsonl }}
-          PERSISTENT_STATE_JSON: ${{ steps.persistent.outputs.persistent_state_json }}
+          REVIEW_FILE: ${{ steps.pragent.outputs.review_file }}
+          IMPROVE_FILE: ${{ steps.improve_output.outputs.improve_file }}
+          PERSISTENT_STATE_FILE: ${{ steps.persistent.outputs.persistent_state_file }}
           POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
         with:
           github-token: ${{ github.token }}
@@ -1849,6 +2015,18 @@ jobs:
             // Inline presentation (inline_key_issues) never decides the gate:
             // absence of inline comments cannot produce green while summary
             // or output findings remain.
+            const fs = require('fs');
+            const reviewFile = String(process.env.REVIEW_FILE || '').trim();
+            const improveFile = String(process.env.IMPROVE_FILE || '').trim();
+            const persistentFile = String(process.env.PERSISTENT_STATE_FILE || '').trim();
+            if (!reviewFile || !improveFile || !persistentFile ||
+                !fs.existsSync(reviewFile) || !fs.existsSync(improveFile) || !fs.existsSync(persistentFile)) {
+              core.setFailed('PR-Agent merge attestation requires runner-local evidence files.');
+              return;
+            }
+            const reviewJson = fs.readFileSync(reviewFile, 'utf8');
+            const improveJsonl = fs.readFileSync(improveFile, 'utf8');
+            const persistentStateJson = fs.readFileSync(persistentFile, 'utf8');
             const prNumber = Number(process.env.PR_NUMBER);
             const headSha = String(process.env.HEAD_SHA || '').trim().toLowerCase();
             if (!prNumber || !headSha) {
@@ -1857,7 +2035,7 @@ jobs:
             }
             let review;
             try {
-              review = JSON.parse(String(process.env.REVIEW_JSON || ''));
+              review = JSON.parse(String(reviewJson || ''));
             } catch (err) {
               core.setFailed(`Invalid PR-Agent review JSON: ${err.message}`);
               return;
@@ -1880,7 +2058,7 @@ jobs:
               core.setFailed('PR-Agent review has no merge_recommendation (require_merge_recommendation).');
               return;
             }
-            const raw = String(process.env.IMPROVE_JSONL || '').trim();
+            const raw = String(improveJsonl || '').trim();
             let qualifying;
             try {
               qualifying = policy.qualifyingImproveSuggestions(raw);
@@ -1916,7 +2094,7 @@ jobs:
               core.setFailed(err.message);
               return;
             }
-            const stateRaw = String(process.env.PERSISTENT_STATE_JSON || '').trim();
+            const stateRaw = String(persistentStateJson || '').trim();
             if (!stateRaw) {
               core.setFailed('PR-Agent gate requires native persistent finding state for the exact reviewed HEAD.');
               return;
@@ -2574,8 +2752,7 @@ jobs:
       review_provider: ${{ needs.pr_agent.outputs.review_provider }}
       pr_number: ${{ needs.pr_agent.outputs.pr_number }}
       head_sha: ${{ needs.pr_agent.outputs.head_sha }}
-      review_json: ${{ needs.pr_agent.outputs.review_json }}
-      improve_jsonl: ${{ needs.pr_agent.outputs.improve_jsonl }}
+      repair_batch_comment_id: ${{ needs.pr_agent.outputs.repair_batch_comment_id }}
       retry_attempt: ${{ needs.pr_agent.outputs.recovery_kind == 'repair' && needs.pr_agent.outputs.retry_attempt || '0' }}
       retry_workflow: ${{ needs.pr_agent.outputs.retry_workflow }}
       target_child_id: ${{ inputs.target_child_id }}
