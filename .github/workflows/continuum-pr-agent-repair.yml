@@ -30,6 +30,14 @@ on:
         type: string
         default: ''
         required: false
+      repair_batch_comment_id:
+        description: >-
+          Target-repository issue-comment id containing the private exact-HEAD
+          repair batch. The main PR-Agent orchestration uses this safe scalar
+          instead of forwarding raw review/improve payloads across jobs.
+        type: string
+        default: ''
+        required: false
       review_json:
         description: >-
           Canonical upstream review JSON (steps.pragent.outputs.review) for the
@@ -246,57 +254,131 @@ jobs:
           '
           echo "policy_script=$POLICY_SCRIPT" >> "$GITHUB_OUTPUT"
 
-      - name: Build one bounded repair batch from native outputs
+      - name: Build one bounded repair batch from private handoff
         id: batch
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           PR_NUMBER: ${{ inputs.pr_number }}
           HEAD_SHA: ${{ inputs.head_sha }}
+          REPAIR_BATCH_COMMENT_ID: ${{ inputs.repair_batch_comment_id }}
           REVIEW_JSON: ${{ inputs.review_json }}
           IMPROVE_JSONL: ${{ inputs.improve_jsonl }}
           POLICY_SCRIPT: ${{ steps.policy.outputs.policy_script }}
+          TAP_PAT: ${{ secrets.TAP_PAT }}
         with:
-          github-token: ${{ secrets.TAP_PAT }}
+          github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
           script: |
-            // Canonical inputs only:
-            //   review: steps.pragent.outputs.review (key_issues_to_review)
-            //   improve: runner-local push_outputs file payload
-            //            (pr-agent-outputs/continuum.jsonl payload.code_suggestions)
-            // Comment prose is never scraped. Every current review finding and
-            // every high-signal improve suggestion enters one bounded OpenCode
-            // pass. Overlap emitted by both upstream tools is conservatively
-            // deduplicated by the centralized provider policy, preferring the
-            // review finding while preserving native source data for diagnostics.
-            const prNumber = String(process.env.PR_NUMBER || '').trim();
-            const headSha = String(process.env.HEAD_SHA || '').trim();
-            if (!prNumber || !headSha) {
-              core.setFailed('PR-Agent repair requires pr_number and head_sha for the exact reviewed HEAD.');
+            const prNumber = Number(process.env.PR_NUMBER);
+            const headSha = String(process.env.HEAD_SHA || '').trim().toLowerCase();
+            if (!Number.isInteger(prNumber) || prNumber < 1 || !/^[0-9a-f]{40,64}$/.test(headSha)) {
+              core.setFailed('PR-Agent repair requires pr_number and exact full HEAD.');
               return;
             }
-            let review;
-            try {
-              review = JSON.parse(String(process.env.REVIEW_JSON || ''));
-            } catch (err) {
-              core.setFailed(`Invalid PR-Agent review JSON: ${err.message}`);
+            if (
+              process.env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED === 'true' &&
+              !String(process.env.TAP_PAT || '').trim()
+            ) {
+              core.setFailed(
+                'Delegated PR-Agent repair handoff read requires TAP_PAT; refusing to fall back to github.token.'
+              );
               return;
             }
-            // Centralized Work Lock #37 policy owns the autonomous /improve
-            // threshold, conservative review/improve deduplication, and the
-            // logical fingerprint used by no-progress suppression.
+
             const policy = require(process.env.POLICY_SCRIPT);
-            const raw = String(process.env.IMPROVE_JSONL || '').trim();
-            let batch;
-            try {
-              batch = policy.buildRepairBatch(review, raw);
-            } catch (err) {
-              core.setFailed(err.message);
-              return;
+            let items;
+            let fingerprint;
+            let qualifyingCount = 0;
+            let deduplicatedCount = 0;
+            let truncated = false;
+
+            const commentIdRaw = String(process.env.REPAIR_BATCH_COMMENT_ID || '').trim();
+            if (commentIdRaw) {
+              if (!/^\d+$/.test(commentIdRaw)) {
+                core.setFailed('Invalid PR-Agent repair handoff comment id.');
+                return;
+              }
+              const owner = process.env.CONTINUUM_PR_AGENT_TARGET_OWNER;
+              const repo = process.env.CONTINUUM_PR_AGENT_TARGET_REPO;
+              const { data: comment } = await github.rest.issues.getComment({
+                owner,
+                repo,
+                comment_id: Number(commentIdRaw),
+              });
+              const body = String(comment.body || '');
+              if (!body.includes('<!-- continuum-origin role=continuum component=pr-agent-repair-handoff -->')) {
+                core.setFailed('PR-Agent repair handoff comment lacks trusted Continuum attribution.');
+                return;
+              }
+              const marker = body.match(
+                /<!-- continuum-pr-agent-repair-batch:v1 head=([0-9a-f]{40,64}) fingerprint=([0-9a-f]{64}) payload=([A-Za-z0-9_-]+) -->/i
+              );
+              if (!marker) {
+                core.setFailed('PR-Agent repair handoff marker is malformed or missing.');
+                return;
+              }
+              const markerHead = marker[1].toLowerCase();
+              if (markerHead !== headSha) {
+                core.setFailed('PR-Agent repair handoff HEAD does not match the requested repair HEAD.');
+                return;
+              }
+              let payload;
+              try {
+                payload = JSON.parse(Buffer.from(marker[3], 'base64url').toString('utf8'));
+              } catch (err) {
+                core.setFailed('PR-Agent repair handoff payload is invalid JSON: ' + err.message);
+                return;
+              }
+              if (
+                !payload ||
+                payload.schema_version !== 1 ||
+                Number(payload.pr_number) !== prNumber ||
+                String(payload.head_sha || '').toLowerCase() !== headSha ||
+                !Array.isArray(payload.items) ||
+                payload.items.length === 0
+              ) {
+                core.setFailed('PR-Agent repair handoff payload does not match the exact PR/HEAD contract.');
+                return;
+              }
+              items = payload.items;
+              fingerprint = policy.logicalFingerprint(items);
+              if (
+                fingerprint !== String(payload.fingerprint || '') ||
+                fingerprint !== marker[2].toLowerCase()
+              ) {
+                core.setFailed('PR-Agent repair handoff fingerprint verification failed.');
+                return;
+              }
+              core.notice(
+                'Loaded ' + items.length + ' private repair finding(s) for PR #' +
+                prNumber + ' exact HEAD ' + headSha + '.'
+              );
+            } else {
+              // Backward-compatible direct/manual caller path. The main
+              // orchestration never uses this because raw GitHub job outputs
+              // may be secret-suppressed and may expose Child text in public
+              // execution logs.
+              let review;
+              try {
+                review = JSON.parse(String(process.env.REVIEW_JSON || ''));
+              } catch (err) {
+                core.setFailed('Invalid PR-Agent review JSON: ' + err.message);
+                return;
+              }
+              const raw = String(process.env.IMPROVE_JSONL || '').trim();
+              let batch;
+              try {
+                batch = policy.buildRepairBatch(review, raw);
+              } catch (err) {
+                core.setFailed(err.message);
+                return;
+              }
+              items = batch.items;
+              fingerprint = batch.fingerprint;
+              qualifyingCount = batch.qualifyingSuggestionCount;
+              deduplicatedCount = batch.deduplicatedSuggestions;
+              truncated = batch.truncated;
             }
-            const items = batch.items;
-            const fingerprint = batch.fingerprint;
-            const truncated = batch.truncated;
-            const qualifyingCount = batch.qualifyingSuggestionCount;
-            const deduplicatedCount = batch.deduplicatedSuggestions;
+
             const crypto = require('crypto');
             const logicalVolatileKeys = new Set([
               'index', 'line', 'line_number', 'start_line', 'end_line',
@@ -324,7 +406,10 @@ jobs:
             const findingIds = [...new Set(identified.map(entry => entry.id))].sort();
             if (items.length === 0) {
               core.setOutput('empty', 'true');
-              core.notice(`PR #${prNumber} HEAD ${headSha}: no current high-signal findings; no repair to dispatch.`);
+              core.notice(
+                'PR #' + prNumber + ' HEAD ' + headSha +
+                ': no current high-signal findings; no repair to dispatch.'
+              );
               return;
             }
             core.setOutput('empty', 'false');
@@ -336,9 +421,10 @@ jobs:
             core.setOutput('batch', JSON.stringify(items));
             core.setOutput('deduplicated_suggestions', String(deduplicatedCount));
             core.notice(
-              `PR #${prNumber} HEAD ${headSha}: batching ${batch.reviewCount} review finding(s) ` +
-              `and ${qualifyingCount - deduplicatedCount} unique high-signal improve suggestion(s); ` +
-              `${deduplicatedCount} overlapping suggestion(s) deduplicated.`
+              'PR #' + prNumber + ' HEAD ' + headSha + ': repair batch contains ' +
+              items.length + ' finding(s)' +
+              (qualifyingCount ? ', including ' + (qualifyingCount - deduplicatedCount) +
+                ' unique improve suggestion(s)' : '') + '.'
             );
 
       - name: Fail closed when delegated no-progress check lacks PAT
