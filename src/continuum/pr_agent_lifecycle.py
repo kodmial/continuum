@@ -53,7 +53,7 @@ UPSTREAM_FINDING_STATE_VERSION = "0.46.0"
 
 UPSTREAM_ACTION_REF = "docker://pragent/pr-agent:0.46.0-github_action"
 
-REVIEW_OUTPUT_REF = "steps.pragent.outputs.review"
+REVIEW_OUTPUT_REF = "steps.pragent.outputs.review_file"
 
 PUSH_OUTPUTS_FILE_PATH = "pr-agent-outputs/continuum.jsonl"
 
