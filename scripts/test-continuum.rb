@@ -4267,6 +4267,7 @@ class ContinuumTest < Minitest::Test
     %w[SubTask].each { |name| assert_includes workflow_names, name }
     assert_includes workflow_names, 'SubTask review'
     assert_includes workflow_names, 'SubTask PR review'
+    assert_includes workflow_names, 'PR Agent (OpenCode backend)'
   end
 
   # A manual owner `/oc` is real in-flight work: reserve it at once, and keep a
