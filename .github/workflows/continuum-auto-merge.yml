@@ -712,12 +712,12 @@ jobs:
               return latestWorkflowForHead(pr, pr.head.sha, 'Packaging smoke');
             }
 
-            // Contract qualification gate (kodmial/continuum#286): the
-            // merge-blocking regression + lifecycle + canary contract must be
-            // green on the exact current HEAD. Absent, stale, or red
-            // evidence blocks every merge path, including this generic
-            // auto-merge reconciler. Fail closed, never bypass.
+            // Contract qualification (kodmial/continuum#286) validates
+            // changes to Continuum itself: its runner executes Continuum's
+            // own contract suite. Consumer/Child repositories must never be
+            // blocked on or asked to execute this Continuum-only workflow.
             async function latestCurrentHeadContractQualification(pr) {
+              if (repoFullName !== 'kodmial/continuum') return null;
               return latestWorkflowForHead(pr, pr.head.sha, 'Contract qualification');
             }
 
@@ -2598,14 +2598,16 @@ jobs:
                 continue;
               }
 
-              // Contract qualification gate (kodmial/continuum#286): no
-              // merge path may bypass the exact-HEAD contract evidence,
-              // including this generic auto-merge reconciler.
+              // Continuum-only contract qualification. Consumer repositories
+              // retain their own CI/packaging/configured required gates.
               const contractGate = await latestCurrentHeadContractQualification(pr);
               if (
-                !contractGate ||
-                contractGate.status !== 'completed' ||
-                contractGate.conclusion !== 'success'
+                repoFullName === 'kodmial/continuum' &&
+                (
+                  !contractGate ||
+                  contractGate.status !== 'completed' ||
+                  contractGate.conclusion !== 'success'
+                )
               ) {
                 core.info(
                   `PR #${pr.number}: waiting for successful Contract qualification on head ${pr.head.sha}; current state=${contractGate ? `${contractGate.status}/${contractGate.conclusion || 'pending'}` : 'missing'}.`
@@ -2802,9 +2804,10 @@ jobs:
                  (!finalContinuumContractGate ||
                   finalContinuumContractGate.status !== 'completed' ||
                   finalContinuumContractGate.conclusion !== 'success')) ||
-                !finalContractGate ||
-                finalContractGate.status !== 'completed' ||
-                finalContractGate.conclusion !== 'success' ||
+                (repoFullName === 'kodmial/continuum' &&
+                 (!finalContractGate ||
+                  finalContractGate.status !== 'completed' ||
+                  finalContractGate.conclusion !== 'success')) ||
                 (finalPackagingSmoke &&
                  (finalPackagingSmoke.status !== 'completed' ||
                   finalPackagingSmoke.conclusion !== 'success')) ||
