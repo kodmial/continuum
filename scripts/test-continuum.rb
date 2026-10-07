@@ -4944,22 +4944,22 @@ class ContinuumTest < Minitest::Test
     assert_includes body, 'await commentGithub.rest.issues.removeLabel({'
   end
 
-  # Hour-scale CodeRabbit quota waits must never pin a GitHub runner. The
-  # controller keeps the due time in durable review/comment timestamps and
-  # exits; existing event-driven and stable recovery-controller wake-ups
-  # reconcile the queue later without a dedicated CodeRabbit polling cron.
-  def test_coderabbit_review_queue_defers_without_sleeping_runner
+  # GitHub schedule is best-effort and can arrive hours late. Public consumers
+  # therefore keep at most one bounded serialized waiter until the durable
+  # CodeRabbit dueAt, then fully revalidate current state before emitting.
+  # Private repositories never pay the waiter runner cost.
+  def test_coderabbit_review_queue_uses_bounded_public_due_waiter
     body = workflow_body('continuum-coderabbit-retry.yml')
 
-    assert_includes body, 'function deferUntilNextCandidate(state)'
-    assert_includes body, 'no runner sleep'
-    assert_includes body, 'stable controller wake-ups will reconcile the queue again'
-    assert_includes body, 'no dedicated CodeRabbit polling cron'
-    assert_includes body, 'timeout-minutes: 15'
+    assert_includes body, 'async function waitUntilNextCandidate(state)'
+    assert_includes body, 'MAX_PUBLIC_DEFER_WAIT_MS = 70 * 60_000'
+    assert_includes body, 'context.payload.repository?.private === false'
+    assert_includes body, 'await new Promise(resolve => setTimeout(resolve, waitMs))'
+    assert_includes body, 'state = await collectState()'
+    assert_includes body, 'timeout-minutes: 85'
     assert_includes body, 'cancel-in-progress: true'
-    refute_includes body, 'MAX_WAIT_MS'
-    refute_includes body, 'Sleeping until'
-    refute_includes body, 'setTimeout(resolve, waitMs)'
+    assert_includes body, 'private repository or wait exceeds cap'
+    assert_includes body, 'any newer wake cancels and recomputes it'
   end
 
   # RESOLVED/UNRESOLVED replies are lifecycle events. They must wake the queue
