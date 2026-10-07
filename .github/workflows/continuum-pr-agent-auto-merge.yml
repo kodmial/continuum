@@ -30,6 +30,15 @@ on:
         type: string
         default: ''
         required: false
+      gate_verified:
+        description: >-
+          Safe scalar attestation produced after the full runner-local
+          PR-Agent review/persistent-state gate. Avoids forwarding raw review
+          payloads across a GitHub Actions job boundary where masked target
+          identities can trigger secret-output suppression.
+        type: string
+        default: 'false'
+        required: false
       review_json:
         description: >-
           Canonical upstream review JSON (steps.pragent.outputs.review) for the
@@ -194,7 +203,84 @@ jobs:
           CONTINUUM_ENGINE_ROOT="$RUNTIME_ROOT" PARENT_CONFIG="$PARENT_CONFIG_FILE" \
             bash "$RUNTIME_ROOT/.github/scripts/pr_agent_target.sh" "$TARGET_CHILD_ID"
 
+      - name: Validate upstream exact-head merge attestation
+        if: inputs.gate_verified == 'true'
+        id: attested_gate
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          GATE_VERIFIED: ${{ inputs.gate_verified }}
+          TAP_PAT: ${{ secrets.TAP_PAT }}
+        with:
+          github-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
+          script: |
+            if (
+              process.env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED === 'true' &&
+              !String(process.env.TAP_PAT || '').trim()
+            ) {
+              core.setFailed(
+                'Delegated PR-Agent merge attestation requires TAP_PAT; refusing to fall back to github.token.'
+              );
+              return;
+            }
+            const prNumber = Number(process.env.PR_NUMBER);
+            const headSha = String(process.env.HEAD_SHA || '').trim().toLowerCase();
+            if (
+              String(process.env.GATE_VERIFIED || '').trim().toLowerCase() !== 'true' ||
+              !Number.isInteger(prNumber) ||
+              prNumber < 1 ||
+              !/^[0-9a-f]{40}$/.test(headSha)
+            ) {
+              core.setFailed(
+                'PR-Agent merge requires a verified runner-local gate, pr_number, and exact 40-char HEAD.'
+              );
+              return;
+            }
+            const owner = process.env.CONTINUUM_PR_AGENT_TARGET_OWNER;
+            const repo = process.env.CONTINUUM_PR_AGENT_TARGET_REPO;
+            if (!owner || !repo) {
+              core.setFailed('PR-Agent merge target context is missing.');
+              return;
+            }
+            const { data } = await github.rest.repos.getCombinedStatusForRef({
+              owner,
+              repo,
+              ref: headSha,
+              per_page: 100,
+              page: 1,
+            });
+            const reviewStatuses = (data.statuses || [])
+              .filter(status => status.context === 'continuum/pr-agent-review')
+              .sort((a, b) => {
+                const at = new Date(a.updated_at || a.created_at || 0).getTime();
+                const bt = new Date(b.updated_at || b.created_at || 0).getTime();
+                if (bt !== at) return bt - at;
+                return Number(b.id || 0) - Number(a.id || 0);
+              });
+            const latest = reviewStatuses[0];
+            const expectedTargetPrefix =
+              context.serverUrl + '/' + context.repo.owner + '/' +
+              context.repo.repo + '/actions/runs/';
+            if (
+              !latest ||
+              latest.state !== 'success' ||
+              String(latest.description || '') !== 'PR-Agent review complete: clean' ||
+              !String(latest.target_url || '').startsWith(expectedTargetPrefix)
+            ) {
+              core.setFailed(
+                'PR-Agent merge attestation is not backed by a durable clean exact-HEAD review status from this control plane.'
+              );
+              return;
+            }
+            core.setOutput('green', 'true');
+            core.setOutput('head_sha', headSha);
+            core.notice(
+              'PR #' + prNumber + ' durable clean review attestation verified at ' + headSha + '.'
+            );
+
       - name: Resolve PR-Agent signal policy
+        if: inputs.gate_verified != 'true'
         id: policy
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
@@ -257,6 +343,7 @@ jobs:
           echo "policy_script=$POLICY_SCRIPT" >> "$GITHUB_OUTPUT"
 
       - name: Evaluate the exact-head PR-Agent gate
+        if: inputs.gate_verified != 'true'
         id: gate
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
@@ -553,7 +640,7 @@ jobs:
 
 
       - name: Reconcile current PR state and merge only the exact reviewed HEAD
-        if: steps.gate.outputs.green == 'true'
+        if: steps.attested_gate.outputs.green == 'true' || steps.gate.outputs.green == 'true'
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           PR_NUMBER: ${{ inputs.pr_number }}
