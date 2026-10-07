@@ -355,6 +355,10 @@ jobs:
             }
             const AUTO_MERGE_BLOCK_LABEL = 'no-auto-merge';
             const NO_PROGRESS_MAX_REVIEWS = 3;
+            // A lost CodeRabbit thread-verification reply must never strand a PR forever.
+            // Reconcile at a bounded cadence; the existing 17/47 safety-net wakeups will
+            // retry only after this timeout instead of spamming the external reviewer.
+            const CODERABBIT_THREAD_VERIFICATION_TIMEOUT_MS = 30 * 60_000;
             const CONFLICT_LOCK_LABEL = 'opencode-conflict-repair';
             // Self-healing conflict recovery (issue #246). Every
             // reconciliation pass rediscovers every open dirty PR, including
@@ -1365,11 +1369,42 @@ jobs:
                 const marker =
                   `<!-- auto-merge-coderabbit-verification finding=${thread.commentId} head=${pr.head.sha} -->`;
 
-                const duplicate = comments.some(comment =>
-                  comment.in_reply_to_id === thread.commentId &&
-                  comment.body?.includes(marker)
-                );
-                if (duplicate) continue;
+                const verificationRequests = comments
+                  .filter(comment =>
+                    comment.in_reply_to_id === thread.commentId &&
+                    comment.body?.includes(marker)
+                  )
+                  .sort(
+                    (a, b) =>
+                      new Date(b.created_at || 0).getTime() -
+                      new Date(a.created_at || 0).getTime()
+                  );
+                const latestVerification = verificationRequests[0] || null;
+                if (latestVerification) {
+                  const verificationAt =
+                    new Date(latestVerification.created_at || 0).getTime();
+                  const verdictAfter = comments.some(comment =>
+                    comment.in_reply_to_id === thread.commentId &&
+                    comment.user?.login?.startsWith('coderabbitai') &&
+                    new Date(comment.created_at || 0).getTime() > verificationAt &&
+                    /\b(?:RESOLVED|UNRESOLVED)\b/i.test(comment.body || '')
+                  );
+
+                  // A real verdict owns the next transition. Otherwise the
+                  // request is an in-flight lease only for a bounded interval;
+                  // after that interval recovery is allowed to re-ask the same
+                  // exact-HEAD question.
+                  if (verdictAfter) continue;
+                  if (
+                    Date.now() - verificationAt <
+                    CODERABBIT_THREAD_VERIFICATION_TIMEOUT_MS
+                  ) {
+                    continue;
+                  }
+                  core.warning(
+                    `PR #${pr.number}: CodeRabbit did not answer thread verification #${thread.commentId} within the bounded timeout; retrying the same exact-HEAD verification.`
+                  );
+                }
 
                 const body = [
                   marker,
@@ -2696,19 +2731,12 @@ jobs:
                 continue;
               }
 
-              if (
-                requireCodeRabbit &&
-                waitingForCompletedCodeRabbitReview(reviewBasis, rabbitStatus)
-              ) {
-                core.info(
-                  `PR #${pr.number}: waiting for completed CodeRabbit review on current head.`
-                );
-                continue;
-              }
-
               // Never lose an old CodeRabbit finding just because its diff is
-              // now outdated. Every CodeRabbit-authored inline thread must be
-              // resolved by CodeRabbit before merge.
+              // now outdated. Thread convergence must run before the generic
+              // "completed review" status wait: CodeRabbit can overwrite a
+              // completed-review status with "Review skipped" while an
+              // exact-head finding still needs verification. Waiting first
+              // creates a deadlock where no verifier is ever re-requested.
               const unresolvedThreads = requireCodeRabbit
                 ? await unresolvedCodeRabbitThreads(pr)
                 : [];
@@ -2724,6 +2752,16 @@ jobs:
                       `#${thread.commentId || thread.id} ${thread.path}${thread.outdated ? ' (outdated)' : ''}`
                     )
                     .join(', ')
+                );
+                continue;
+              }
+
+              if (
+                requireCodeRabbit &&
+                waitingForCompletedCodeRabbitReview(reviewBasis, rabbitStatus)
+              ) {
+                core.info(
+                  `PR #${pr.number}: waiting for completed CodeRabbit review on current head.`
                 );
                 continue;
               }
