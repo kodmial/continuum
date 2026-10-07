@@ -530,6 +530,18 @@ class WorkflowBindingTests(unittest.TestCase):
             "thread convergence must happen before the generic completed-review wait",
         )
 
+    def test_provider_rate_limit_is_a_global_queue_floor(self):
+        for contract in (
+            "let latestRateLimitAt = 0",
+            "let globalRateLimitNotBefore = 0",
+            "globalRateLimitNotBefore = Math.max(",
+            "latestRateLimitAt > latestCompletedReviewAt",
+            "const globalNotBefore = Math.max(",
+            "completedReviewNotBefore",
+            "activeGlobalRateLimitNotBefore",
+        ):
+            self.assertIn(contract, self.workflow)
+
     def test_in_flight_review_commands_are_exact_head_scoped(self):
         self.assertIn(
             "FULL_REVIEW_COMMAND_HEAD_RE",
