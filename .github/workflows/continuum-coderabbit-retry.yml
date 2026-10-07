@@ -691,6 +691,8 @@ jobs:
 
               let latestCompletedReviewAt = 0;
               let latestInFlightCommand = null;
+              let latestRateLimitAt = 0;
+              let globalRateLimitNotBefore = 0;
               const candidates = [];
 
               for (const listed of pulls) {
@@ -781,6 +783,30 @@ jobs:
                     core.warning(`PR #${pr.number}: comment/review scan hit budget and newest-window recovery failed; skipping this pass.`);
                     continue;
                   }
+                }
+
+                // CodeRabbit's included-review quota is repository/account
+                // shared, not per PR. A provider rate-limit reply on any open
+                // PR therefore creates one global not-before floor for the
+                // whole queue. Without this, the controller can immediately
+                // hammer the next PR and receive the same limit again.
+                for (const comment of comments) {
+                  if (
+                    comment.user?.login !== 'coderabbitai[bot]' ||
+                    !RATE_LIMIT_RE.test(comment.body || '')
+                  ) {
+                    continue;
+                  }
+                  const delayMs = parseRetryDelayMs(comment.body || '');
+                  if (delayMs === null) continue;
+                  const at = new Date(
+                    comment.updated_at || comment.created_at
+                  ).getTime();
+                  latestRateLimitAt = Math.max(latestRateLimitAt, at);
+                  globalRateLimitNotBefore = Math.max(
+                    globalRateLimitNotBefore,
+                    at + delayMs + SAFETY_MARGIN_MS
+                  );
                 }
 
                 const carriedApprovalMarker = comments.some(comment =>
@@ -1075,11 +1101,22 @@ jobs:
                 }
               }
 
-              const globalNotBefore = latestCompletedReviewAt
+              const completedReviewNotBefore = latestCompletedReviewAt
                 ? latestCompletedReviewAt +
                   REVIEW_COOLDOWN_MS +
                   SAFETY_MARGIN_MS
                 : 0;
+              // A later completed full review supersedes an older limit reply;
+              // otherwise the newest parsed provider reset is authoritative for
+              // every PR in this shared queue.
+              const activeGlobalRateLimitNotBefore =
+                latestRateLimitAt > latestCompletedReviewAt
+                  ? globalRateLimitNotBefore
+                  : 0;
+              const globalNotBefore = Math.max(
+                completedReviewNotBefore,
+                activeGlobalRateLimitNotBefore
+              );
 
               for (const candidate of candidates) {
                 candidate.effectiveDueAt = Math.max(
@@ -1091,6 +1128,8 @@ jobs:
               return {
                 candidates,
                 latestCompletedReviewAt,
+                latestRateLimitAt,
+                globalRateLimitNotBefore: activeGlobalRateLimitNotBefore,
                 globalNotBefore,
                 latestInFlightCommand,
               };
