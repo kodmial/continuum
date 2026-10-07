@@ -1627,7 +1627,7 @@ jobs:
           )
           # Snapshot the exact PR head inspected by this repair. If trusted
           # automation advances the branch while OpenCode runs, publication
-          # replays only the workflow-owned repair commit onto the new head.
+          # fails closed and the watchdog reruns coderabbit-fix on the new head.
           REPAIR_BASE_SHA="$(git rev-parse HEAD)"
           OPENCODE_RUN_LOG="$(mktemp)"
           set +e
