@@ -4833,7 +4833,7 @@ class ContinuumTest < Minitest::Test
   # with bounded retries and no force-push.
   def test_coderabbit_fix_survives_concurrent_pr_head_advance
     body = workflow_body('continuum-opencode.yml')
-    step = body[/^- name: Fix CodeRabbit review findings\n(.*?)(?=^\s*- name: Ask CodeRabbit to verify every original finding)/m, 1]
+    step = body[/^\s+- name: Fix CodeRabbit review findings\n(.*?)(?=^\s+- name: Ask CodeRabbit to verify every original finding)/m, 1]
     refute_nil step, 'CodeRabbit fix step is missing'
 
     assert_includes step, 'REPAIR_BASE_SHA="$(git rev-parse HEAD)"'
