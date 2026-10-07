@@ -3426,7 +3426,7 @@ class ImproveSkipWorkflowTests(unittest.TestCase):
         gate = body.index("Decide whether automatic improve can be skipped")
         self.assertLess(persistent, gate)
         gate_window = body[gate:gate + 6000]
-        self.assertIn("PERSISTENT_STATE_JSON", gate_window)
+        self.assertIn("PERSISTENT_STATE_FILE", gate_window)
         self.assertIn("last_run", gate_window)
 
     def test_improve_gate_is_exact_head_safe(self):
