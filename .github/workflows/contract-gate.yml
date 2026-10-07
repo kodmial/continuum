@@ -1,9 +1,8 @@
-name: CI
+name: Continuum Contract Gate
 
 on:
-  push:
-    branches: [main]
   pull_request:
+    branches: [main]
 
 permissions:
   actions: write
@@ -12,10 +11,11 @@ permissions:
   statuses: write
 
 jobs:
-  validate:
+  contract:
     uses: ./.github/workflows/continuum-validation.yml
     secrets: inherit
     with:
       auto_detect: ${{ 'false' }}
       dispatch_repair: ${{ 'false' }}
+      status_context: continuum/contract-gate
       validation_command: bash scripts/validate-continuum.sh
