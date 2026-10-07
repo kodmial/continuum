@@ -283,6 +283,15 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
                     body,
                 )
 
+    def test_recovery_replays_clean_review_when_source_run_failed(self):
+        body = read(".github/workflows/continuum-pr-agent-recovery.yml")
+        self.assertIn("let cleanReviewRun = null", body)
+        self.assertIn("cleanReviewRun = await statusRunMetadata(reviewStatus)", body)
+        self.assertIn("retryableConclusions.has(cleanRunConclusion)", body)
+        self.assertIn("clean review belongs to an incomplete orchestration run", body)
+        self.assertIn("PR-Agent clean review lifecycle incomplete: recovery eligible", body)
+        self.assertIn("cleanReviewRun || await statusRunMetadata(reviewStatus)", body)
+
     def test_recovery_read_fallback_covers_inaccessible_repo_404(self):
         body = read(".github/workflows/continuum-pr-agent-recovery.yml")
         # Cross-repository target reads with a repository-scoped token
