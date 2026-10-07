@@ -1280,10 +1280,6 @@ jobs:
           - Before finishing, write exactly one run record at ${KNOWLEDGE_RECORDS_DIR}/issue-${ISSUE_NUMBER}-run-${GITHUB_RUN_ID}.md following the protocol. Never include secrets. The workflow validates this record and fails closed if it is missing."
           fi
 
-          # Snapshot the exact branch head the agent inspected. If automation
-          # advances the PR while the agent is working, publish will replay only
-          # this workflow-owned repair commit onto the newer remote head.
-          REPAIR_BASE_SHA="$(git rev-parse HEAD)"
           OPENCODE_RUN_LOG="$(mktemp)"
           set +e
           continuum-opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
@@ -1658,38 +1654,23 @@ jobs:
           fi
 
           # Main-sync and other trusted automation may advance the PR branch
-          # while OpenCode is working. A plain push then fails non-fast-forward
-          # and discards an otherwise valid repair. Publish with a bounded
-          # compare-and-replay loop: fetch the latest PR head and replay only
-          # the workflow-owned commit(s) created after REPAIR_BASE_SHA.
+          # while OpenCode is working. Never rewrite developer history to replay
+          # a repair. If the remote HEAD moved, fail with a dedicated recovery
+          # marker; the watchdog re-runs this same workflow with preserved
+          # coderabbit-fix inputs against the latest PR HEAD.
           if [[ "$(git rev-list --count "${REPAIR_BASE_SHA}"..HEAD)" -gt 0 ]]; then
-            published=false
-            for publish_attempt in 1 2 3; do
-              git fetch --no-tags origin "${HEAD_REF}"
-              REMOTE_HEAD="$(git rev-parse "origin/${HEAD_REF}")"
+            git fetch --no-tags origin "${HEAD_REF}"
+            REMOTE_HEAD="$(git rev-parse "origin/${HEAD_REF}")"
 
-              if [[ "$REMOTE_HEAD" != "$REPAIR_BASE_SHA" ]]; then
-                echo "PR head advanced from $REPAIR_BASE_SHA to $REMOTE_HEAD while repairing; replaying workflow-owned repair commit (attempt $publish_attempt/3)."
-                if ! git rebase --onto "$REMOTE_HEAD" "$REPAIR_BASE_SHA"; then
-                  git rebase --abort >/dev/null 2>&1 || true
-                  echo "::error::CONTINUUM_OPENCODE_PUBLISH_RACE_RETRY_REQUIRED"
-                  echo "::error::OpenCode repair cannot be replayed cleanly onto current PR HEAD $REMOTE_HEAD; rerun the same coderabbit-fix against the latest branch state."
-                  exit 76
-                fi
-                REPAIR_BASE_SHA="$REMOTE_HEAD"
-              fi
-
-              if git push origin "HEAD:${HEAD_REF}"; then
-                published=true
-                break
-              fi
-
-              echo "::warning::PR head moved during OpenCode repair publication; refreshing and retrying ($publish_attempt/3)."
-            done
-
-            if [[ "$published" != true ]]; then
+            if [[ "$REMOTE_HEAD" != "$REPAIR_BASE_SHA" ]]; then
               echo "::error::CONTINUUM_OPENCODE_PUBLISH_RACE_RETRY_REQUIRED"
-              echo "::error::OpenCode repair publication exhausted 3 race retries; rerun the same coderabbit-fix on the latest PR HEAD."
+              echo "::error::PR head advanced from $REPAIR_BASE_SHA to $REMOTE_HEAD while repairing; restarting coderabbit-fix on the latest branch state."
+              exit 76
+            fi
+
+            if ! git push origin "HEAD:${HEAD_REF}"; then
+              echo "::error::CONTINUUM_OPENCODE_PUBLISH_RACE_RETRY_REQUIRED"
+              echo "::error::OpenCode repair publication raced with another PR update; restarting coderabbit-fix on the latest branch state."
               exit 76
             fi
           fi
