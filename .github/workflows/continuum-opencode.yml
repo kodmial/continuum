@@ -1668,8 +1668,9 @@ jobs:
                 echo "PR head advanced from $REPAIR_BASE_SHA to $REMOTE_HEAD while repairing; replaying workflow-owned repair commit (attempt $publish_attempt/3)."
                 if ! git rebase --onto "$REMOTE_HEAD" "$REPAIR_BASE_SHA"; then
                   git rebase --abort >/dev/null 2>&1 || true
-                  echo "::error::OpenCode repair cannot be replayed cleanly onto current PR HEAD $REMOTE_HEAD; refusing to overwrite concurrent changes."
-                  exit 1
+                  echo "::error::CONTINUUM_OPENCODE_PUBLISH_RACE_RETRY_REQUIRED"
+                  echo "::error::OpenCode repair cannot be replayed cleanly onto current PR HEAD $REMOTE_HEAD; rerun the same coderabbit-fix against the latest branch state."
+                  exit 76
                 fi
                 REPAIR_BASE_SHA="$REMOTE_HEAD"
               fi
@@ -1683,8 +1684,9 @@ jobs:
             done
 
             if [[ "$published" != true ]]; then
-              echo "::error::OpenCode repair publication exhausted 3 race retries without overwriting the remote PR branch."
-              exit 1
+              echo "::error::CONTINUUM_OPENCODE_PUBLISH_RACE_RETRY_REQUIRED"
+              echo "::error::OpenCode repair publication exhausted 3 race retries; rerun the same coderabbit-fix on the latest PR HEAD."
+              exit 76
             fi
           fi
 
