@@ -1849,7 +1849,8 @@ class ContinuumTest < Minitest::Test
     assert_includes pr_agent, 'Stale admission ignored:'
     refute_includes pr_agent, 'Stale admission: caller observed'
 
-    assert_includes pr_agent, 'REVIEW_JSON: ${{ steps.pragent.outputs.review }}'
+    assert_includes pr_agent, 'REVIEW_FILE: ${{ steps.pragent.outputs.review_file }}'
+    refute_includes pr_agent, 'REVIEW_JSON: ${{ steps.pragent.outputs.review }}'
     # The runtime loads the canonical fallback helper from Continuum itself,
     # so old PR heads cannot keep the broken inline implementation alive.
     assert_includes pr_agent, 'contents/src/continuum/pr_agent_fallback_state.py'
@@ -3902,7 +3903,7 @@ class ContinuumTest < Minitest::Test
       expected_head_sha
     ],
     'continuum-pr-agent-repair.yml' => %w[
-      continuum_ref pr_number target_child_id head_sha review_json improve_jsonl
+      continuum_ref pr_number target_child_id head_sha repair_batch_comment_id review_json improve_jsonl
       retry_attempt retry_workflow
     ],
     'continuum-pr-agent-auto-merge.yml' => %w[
