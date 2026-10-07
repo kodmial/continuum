@@ -15,7 +15,7 @@ class ContinuumTest < Minitest::Test
   # Project-owned entry workflows used only by the Continuum repository itself.
   # They deliberately stay outside the `continuum-` namespace so installer
   # ownership and reusable-engine ownership remain unambiguous.
-  PROJECT_ENTRY_WORKFLOWS = %w[automation.yml ci.yml opencode.yml pr-agent.yml pr-agent-recovery.yml pr-agent-router.yml].freeze
+  PROJECT_ENTRY_WORKFLOWS = %w[automation.yml ci.yml contract-gate.yml opencode.yml pr-agent.yml pr-agent-recovery.yml pr-agent-router.yml].freeze
   # Every caller stub in every layer, for the checks that must not care which
   # layer a file belongs to.
   ALL_STUBS = (CORE_STUBS + TECH_STUBS + PARENT_STUBS).sort
@@ -1420,6 +1420,7 @@ class ContinuumTest < Minitest::Test
   REPO_OWNED_WORKFLOWS = %w[
     automation.yml
     ci.yml
+    contract-gate.yml
     opencode.yml
     pr-agent.yml
     pr-agent-recovery.yml
@@ -7954,6 +7955,30 @@ class ContinuumTest < Minitest::Test
     pr_agent = File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent-auto-merge.yml'))
     assert_match(/Contract qualification is .*for the exact HEAD/m, pr_agent,
                  'PR-Agent merge must fail closed on absent/stale/red contract evidence')
+  end
+
+  # The Continuum repository's contract gate is intentionally project-owned,
+  # but it is a mandatory exact-HEAD prerequisite in every automated merge path.
+  # This prevents a regression in one merge controller from silently bypassing
+  # the repository-level stabilization barrier.
+  def test_continuum_contract_gate_is_project_owned_and_merge_blocking
+    gate_path = File.join(ROOT, '.github/workflows', 'contract-gate.yml')
+    assert File.exist?(gate_path), 'project-owned contract-gate.yml must exist'
+    gate = yaml(gate_path)
+    assert_equal 'Continuum Contract Gate', gate.fetch('name')
+    assert_includes PROJECT_ENTRY_WORKFLOWS, 'contract-gate.yml'
+    assert_includes REPO_OWNED_WORKFLOWS, 'contract-gate.yml'
+
+    generic = workflow_body('continuum-auto-merge.yml')
+    assert_includes generic, 'latestContinuumContractGate',
+                    'generic auto-merge must resolve the exact-head Continuum Contract Gate'
+    assert_includes generic, 'waiting for successful Continuum Contract Gate',
+                    'generic auto-merge must fail closed while the contract gate is absent or red'
+
+    pr_agent = workflow_body('continuum-pr-agent-auto-merge.yml')
+    assert_includes pr_agent, 'Continuum Contract Gate'
+    assert_includes pr_agent, 'Continuum Contract Gate is not successful',
+                    'PR-Agent auto-merge must fail closed while the contract gate is absent or red'
   end
 
   end
