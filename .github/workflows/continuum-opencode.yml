@@ -1629,6 +1629,10 @@ jobs:
           - Keep all comments and commit messages in English.
           EOF
           )
+          # Snapshot the exact PR head inspected by this repair. If trusted
+          # automation advances the branch while OpenCode runs, publication
+          # replays only the workflow-owned repair commit onto the new head.
+          REPAIR_BASE_SHA="$(git rev-parse HEAD)"
           OPENCODE_RUN_LOG="$(mktemp)"
           set +e
           continuum-opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
