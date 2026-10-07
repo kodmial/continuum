@@ -82,7 +82,7 @@ MUTATION_COUNTS = {
     "continuum-pr-agent-canary.yml": 4,
     "continuum-pr-agent-recovery.yml": 4,
     "continuum-pr-agent-repair.yml": 6,
-    "continuum-pr-agent.yml": 2,
+    "continuum-pr-agent.yml": 3,
     "continuum-render-executor.yml": 17,
 }
 
@@ -105,8 +105,14 @@ EXPECTED_IDENTITIES = {
     "continuum-pr-agent-auto-merge.yml": {("continuum", "pr-agent-auto-merge")},
     "continuum-pr-agent-canary.yml": {("continuum", "pr-agent-canary")},
     "continuum-pr-agent-recovery.yml": {("continuum", "pr-agent-recovery")},
-    "continuum-pr-agent-repair.yml": {("continuum", "pr-agent-repair")},
-    "continuum-pr-agent.yml": {("continuum", "pr-agent-review")},
+    "continuum-pr-agent-repair.yml": {
+        ("continuum", "pr-agent-repair"),
+        ("continuum", "pr-agent-repair-handoff"),
+    },
+    "continuum-pr-agent.yml": {
+        ("continuum", "pr-agent-review"),
+        ("continuum", "pr-agent-repair-handoff"),
+    },
     "continuum-render-executor.yml": {
         ("continuum", "render-executor"),
         ("project", "qualification"),
@@ -197,7 +203,10 @@ FUNCTIONAL_ANCHORS = {
         "policy.controllerStateBody",
         "printf -v BODY",
     ),
-    "continuum-pr-agent.yml": ("policy.controllerStateBody",),
+    "continuum-pr-agent.yml": (
+        "policy.controllerStateBody",
+        "continuum-pr-agent-repair-batch:v1",
+    ),
     "continuum-render-executor.yml": (
         '"$QUALIFICATION_MARKER" "$BODY"',
         "Mandatory Render cleanup failed",
@@ -241,6 +250,7 @@ KNOWN_COMPONENTS = {
     "pr-agent-canary",
     "pr-agent-recovery",
     "pr-agent-repair",
+    "pr-agent-repair-handoff",
     "pr-agent-review",
     "qualification",
     "render-executor",
