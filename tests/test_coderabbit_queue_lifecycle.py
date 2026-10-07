@@ -500,6 +500,36 @@ class WorkflowBindingTests(unittest.TestCase):
             self.auto_merge,
         )
 
+    def test_auto_merge_recovers_unanswered_thread_verification_before_status_wait(self):
+        self.assertIn(
+            "CODERABBIT_THREAD_VERIFICATION_TIMEOUT_MS = 30 * 60_000",
+            self.auto_merge,
+        )
+        self.assertIn(
+            "CodeRabbit did not answer thread verification",
+            self.auto_merge,
+        )
+        self.assertIn(
+            "/\\b(?:RESOLVED|UNRESOLVED)\\b/i.test(comment.body || '')",
+            self.auto_merge,
+        )
+        self.assertIn(
+            "Date.now() - verificationAt <",
+            self.auto_merge,
+        )
+
+        unresolved = self.auto_merge.rindex(
+            "const unresolvedThreads = requireCodeRabbit"
+        )
+        completed_wait = self.auto_merge.rindex(
+            "waitingForCompletedCodeRabbitReview(reviewBasis, rabbitStatus)"
+        )
+        self.assertLess(
+            unresolved,
+            completed_wait,
+            "thread convergence must happen before the generic completed-review wait",
+        )
+
     def test_safety_net_tick_is_non_blocking_and_never_sleeps(self):
         for contract in (
             "function deferUntilNextCandidate(state)",
