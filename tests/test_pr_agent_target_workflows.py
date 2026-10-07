@@ -446,6 +446,20 @@ class PrAgentTargetWorkflowContractTests(unittest.TestCase):
         repair = read(".github/workflows/continuum-pr-agent-repair.yml")
         self.assertIn("target_child_id:", repair)
 
+    def test_delegated_merge_uses_scalar_attestation_not_raw_outputs(self):
+        review = read(".github/workflows/continuum-pr-agent.yml")
+        merge = read(".github/workflows/continuum-pr-agent-auto-merge.yml")
+        merge_job = review[review.index("\n  merge:"):]
+        self.assertIn("merge_gate_verified: ${{ steps.merge_evidence.outputs.green }}", review)
+        self.assertIn("needs.pr_agent.outputs.merge_gate_verified == 'true'", merge_job)
+        self.assertIn("gate_verified: ${{ needs.pr_agent.outputs.merge_gate_verified }}", merge_job)
+        self.assertNotIn("review_json: ${{ needs.pr_agent.outputs.review_json }}", merge_job)
+        self.assertNotIn("persistent_state_json: ${{ needs.pr_agent.outputs.persistent_state_json }}", merge_job)
+        self.assertIn("Validate upstream exact-head merge attestation", merge)
+        self.assertIn("PR-Agent review complete: clean", merge)
+        self.assertIn("continuum/pr-agent-review", merge)
+        self.assertIn("inputs.gate_verified != 'true'", merge)
+
     def test_auto_merge_exact_head_and_privacy(self):
         body = read(".github/workflows/continuum-pr-agent-auto-merge.yml")
         # Exact-HEAD: only the reviewed SHA may merge; any moved HEAD fails.
