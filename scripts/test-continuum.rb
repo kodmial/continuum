@@ -447,6 +447,7 @@ class ContinuumTest < Minitest::Test
 
     expected_identity_pairs = {
       'ci.yml' => 'continuum-validation.yml',
+      'contract-qualification.yml' => 'continuum-contract-qualification.yml',
       'opencode.yml' => 'continuum-opencode.yml'
     }
     expected_identity_pairs.each do |entry, engine|
@@ -457,9 +458,9 @@ class ContinuumTest < Minitest::Test
 
     engine_names = engine_workflows.map { |path| yaml(path).fetch('name') }
     entry_names = project_entries.map { |path| yaml(path).fetch('name') }
-    assert_equal %w[CI OpenCode\ agent].sort,
+    assert_equal ['CI', 'Contract qualification', 'OpenCode agent'].sort,
                  (engine_names & entry_names).sort,
-                 'only CI and OpenCode may deliberately share engine/entry workflow identities'
+                 'only project-owned self entries may deliberately share engine/entry workflow identities'
   end
 
   # A workflow must never watch its own `name:`. Within a layer the names are
@@ -1000,7 +1001,7 @@ class ContinuumTest < Minitest::Test
   # three sets are independent files in one directory, so a one-line edit to the
   # prune candidate list — or a future edit to `"${STUBS[@]}"` — could delete a
   # consumer's whole tech or parent layer with no warning. The growth
-  # 19 -> 20 -> 24 -> 25 is the observable form of that guarantee.
+  # 19 -> 20 -> 24 is the observable form of that guarantee.
   def test_installing_one_set_does_not_delete_another_sets_callers
     fixture do |dir|
       target = File.join(dir, 'consumer')
@@ -1025,12 +1026,12 @@ class ContinuumTest < Minitest::Test
           PARENT_STUBS.each { |stub| assert_includes installed, File.basename(stub) }
         end
       end
-      # Each set adds exactly its own files: 20 core, +1 tech, +4 parent.
+      # Each set adds exactly its own files: 19 core, +1 tech, +4 parent.
       assert_equal CORE_STUBS.size, counts['core']
       assert_equal CORE_STUBS.size + TECH_STUBS.size, counts['tech']
       assert_equal ALL_STUBS.size, counts['parent']
-      assert_equal 25, ALL_STUBS.size,
-                   'every caller Continuum ships, across all three layers'
+      assert_equal 24, ALL_STUBS.size,
+                   'every install-managed caller Continuum ships, across all three layers'
     end
   end
 
