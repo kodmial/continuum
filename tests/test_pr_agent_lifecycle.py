@@ -2340,8 +2340,22 @@ class StabilizationParityTests(unittest.TestCase):
             merge,
         )
         self.assertIn("required workflow ", merge)
-        self.assertNotIn("getCombinedStatusForRef", merge)
-        self.assertNotIn("combined status is ", merge)
+        # Aggregate combined status must never become a quality gate: stale
+        # lifecycle contexts (for example an earlier failed repair) are
+        # historical. The scalar-attestation path may read the combined
+        # status endpoint only to select the exact
+        # continuum/pr-agent-review context for this HEAD.
+        gates_start = merge.index("async function currentHeadGates")
+        gates_end = merge.index("function isNonMergeCriticalMainPath", gates_start)
+        gate_window = merge[gates_start:gates_end]
+        self.assertNotIn("getCombinedStatusForRef", gate_window)
+        self.assertNotIn("combined status is ", gate_window)
+        attest_start = merge.index("Validate upstream exact-head merge attestation")
+        attest_end = merge.index("Resolve PR-Agent signal policy", attest_start)
+        attest = merge[attest_start:attest_end]
+        self.assertIn("getCombinedStatusForRef", attest)
+        self.assertIn("continuum/pr-agent-review", attest)
+        self.assertIn("PR-Agent review complete: clean", attest)
 
     def test_finding_fingerprint_is_order_independent(self):
         first = issue_entry(n=0)
