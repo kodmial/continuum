@@ -594,16 +594,9 @@ class WorkflowBindingTests(unittest.TestCase):
         self.assertIn("workflow_dispatch", self.workflow)
 
     def test_caller_stub_trigger_parity_for_safety_net(self):
-        # The managed caller must carry the bounded periodic trigger; the
-        # controller must accept the event it produces.
-        self.assertIn("schedule:", self.stub)
-        self.assertIn("3,13,23,33,43,53 * * * *", self.stub)
-        self.assertIn("github.event_name == 'schedule'", self.workflow)
-
-        # Redundant liveness wakes must happen only after controllers that
-        # observe a stable PR HEAD. A direct main push or issue-scheduler
-        # completion can race auto-merge's update-branch synchronization and
-        # make CodeRabbit abort a paid/included review with "Head commit changed".
+        # Reuse the already-existing periodic recovery/auto-merge workflows as
+        # stable-head wake sources instead of introducing another cron.
+        self.assertNotIn("\n  schedule:\n", self.stub)
         self.assertIn("workflow_run:", self.stub)
         self.assertIn("- PR-Agent recovery", self.stub)
         self.assertIn("- Auto-merge reviewed pull requests", self.stub)
@@ -611,6 +604,16 @@ class WorkflowBindingTests(unittest.TestCase):
         self.assertNotIn("\n  push:\n", self.stub)
         self.assertIn("github.event_name == 'workflow_run'", self.workflow)
         self.assertNotIn("github.event_name == 'push'", self.workflow)
+
+        # Caller-side gating is what keeps private Child repositories and
+        # non-CodeRabbit consumers at zero runner cost for these wakeups.
+        self.assertIn("vars.CONTINUUM_ROLE != 'child'", self.stub)
+        self.assertIn("vars.CONTINUUM_REVIEW_PROVIDER", self.stub)
+        self.assertIn("== 'coderabbit'", self.stub)
+
+        # The reusable controller remains backward-compatible with stale callers
+        # that still emit schedule events while consumers converge.
+        self.assertIn("github.event_name == 'schedule'", self.workflow)
         # No new credential and no consumer repository literal may ride along.
         for secret in (
             "OPENCODE_API_KEY",
