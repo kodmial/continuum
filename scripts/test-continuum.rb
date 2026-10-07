@@ -4946,16 +4946,15 @@ class ContinuumTest < Minitest::Test
 
   # Hour-scale CodeRabbit quota waits must never pin a GitHub runner. The
   # controller keeps the due time in durable review/comment timestamps and
-  # exits; existing event-driven and scheduled safety-net wake-ups reconcile
-  # the queue later. Queue liveness never depends on a separate auto-merge
-  # cron.
+  # exits; existing event-driven and stable recovery-controller wake-ups
+  # reconcile the queue later without a dedicated CodeRabbit polling cron.
   def test_coderabbit_review_queue_defers_without_sleeping_runner
     body = workflow_body('continuum-coderabbit-retry.yml')
 
     assert_includes body, 'function deferUntilNextCandidate(state)'
     assert_includes body, 'no runner sleep'
-    assert_includes body, "this caller's scheduled safety-net tick will wake the controller again"
-    refute_includes body, 'auto-merge safety-net'
+    assert_includes body, 'stable controller wake-ups will reconcile the queue again'
+    assert_includes body, 'no dedicated CodeRabbit polling cron'
     assert_includes body, 'timeout-minutes: 15'
     assert_includes body, 'cancel-in-progress: true'
     refute_includes body, 'MAX_WAIT_MS'
