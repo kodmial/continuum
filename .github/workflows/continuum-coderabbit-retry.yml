@@ -34,7 +34,6 @@ concurrency:
 jobs:
   controller:
     if: >-
-      vars.CONTINUUM_ROLE != 'child' &&
       (inputs.review_provider || vars.CONTINUUM_REVIEW_PROVIDER || 'none') == 'coderabbit' &&
       (github.event_name == 'workflow_dispatch' ||
       github.event_name == 'schedule' ||
