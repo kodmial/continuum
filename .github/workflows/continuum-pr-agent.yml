@@ -1950,7 +1950,7 @@ jobs:
             const body = [
               '<!-- continuum-pr-agent-repair-batch:v1 head=' + headSha +
                 ' fingerprint=' + batch.fingerprint + ' payload=' + payload + ' -->',
-              '⚡ **Continuum · pr-agent-repair**',
+              '⚡ **Continuum · pr-agent-repair-handoff**',
               '<!-- continuum-origin role=continuum component=pr-agent-repair-handoff -->',
               'Runner-local repair evidence staged for exact HEAD `' + headSha + '`.',
             ].join('\n');
