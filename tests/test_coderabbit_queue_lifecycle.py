@@ -599,6 +599,18 @@ class WorkflowBindingTests(unittest.TestCase):
         self.assertIn("schedule:", self.stub)
         self.assertIn("3,13,23,33,43,53 * * * *", self.stub)
         self.assertIn("github.event_name == 'schedule'", self.workflow)
+
+        # Redundant liveness wakes must happen only after controllers that
+        # observe a stable PR HEAD. A direct main push or issue-scheduler
+        # completion can race auto-merge's update-branch synchronization and
+        # make CodeRabbit abort a paid/included review with "Head commit changed".
+        self.assertIn("workflow_run:", self.stub)
+        self.assertIn("- PR-Agent recovery", self.stub)
+        self.assertIn("- Auto-merge reviewed pull requests", self.stub)
+        self.assertNotIn("- Issue scheduler", self.stub)
+        self.assertNotIn("\n  push:\n", self.stub)
+        self.assertIn("github.event_name == 'workflow_run'", self.workflow)
+        self.assertNotIn("github.event_name == 'push'", self.workflow)
         # No new credential and no consumer repository literal may ride along.
         for secret in (
             "OPENCODE_API_KEY",
