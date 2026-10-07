@@ -572,13 +572,14 @@ class WorkflowBindingTests(unittest.TestCase):
             "while (!selected)",
             "state = await collectState()",
             "GitHub schedule is best-effort and can be delayed for hours",
-            "vars.CONTINUUM_ROLE != 'child'",
         ):
             self.assertIn(contract, self.workflow)
         self.assertIn("selected = await chooseDueCandidate(state)", self.workflow)
         self.assertIn("await waitUntilNextCandidate(state)", self.workflow)
         self.assertIn("private repository or wait exceeds cap", self.workflow)
         self.assertIn("no second review command will be emitted", self.workflow)
+        self.assertNotIn("CONTINUUM_ROLE", self.workflow)
+        self.assertIn("vars.CONTINUUM_ROLE != 'child'", self.stub)
 
 
     def test_legacy_schedule_wake_stays_inside_provider_gate(self):
