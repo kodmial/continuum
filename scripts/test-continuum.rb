@@ -4959,10 +4959,10 @@ class ContinuumTest < Minitest::Test
     assert_includes body, 'await waitUntilNextCandidate(state)'
     assert_includes body, 'timeout-minutes: 85'
     assert_includes body, 'cancel-in-progress: true'
-    assert_includes body, "vars.CONTINUUM_ROLE != 'child'"
     assert_includes body, 'GitHub schedule is best-effort and can be delayed for hours'
     assert_includes body, 'private repository or wait exceeds cap'
     assert_includes body, 'no second review command will be emitted'
+    refute_includes body, 'CONTINUUM_ROLE'
   end
 
   # RESOLVED/UNRESOLVED replies are lifecycle events. They must wake the queue
