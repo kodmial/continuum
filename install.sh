@@ -53,7 +53,6 @@ CORE_STUBS=(
   continuum-bootstrap-runtime-secret.yml
   continuum-coderabbit-retry.yml
   continuum-coderabbit-unresolved.yml
-  continuum-contract-qualification.yml
   continuum-docker-qualification.yml
   continuum-issue-scheduler.yml
   continuum-opencode-repair.yml
