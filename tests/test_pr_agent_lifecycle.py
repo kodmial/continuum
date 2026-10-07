@@ -361,6 +361,44 @@ APPROVED_CODERABBIT_NO_PROGRESS_PAT_ADDED_LINES = (
 )
 
 
+# CodeRabbit repair publication race recovery. This is intentionally narrow:
+# a repair snapshots the exact PR HEAD it inspected, refuses to rewrite any
+# developer commit when that HEAD moves, emits the dedicated recovery marker,
+# and lets the watchdog rerun the same workflow inputs on the fresh HEAD.
+APPROVED_CODERABBIT_PUBLISH_RACE_REMOVED_LINES = (
+    '          if [[ "$(git rev-list --count "origin/${HEAD_REF}"..HEAD)" -gt 0 ]]; then',
+    '            git push origin "HEAD:${HEAD_REF}"',
+)
+
+APPROVED_CODERABBIT_PUBLISH_RACE_ADDED_LINES = (
+    "          # Snapshot the exact PR head inspected by this repair. If trusted",
+    "          # automation advances the branch while OpenCode runs, publication",
+    "          # fails closed and the watchdog reruns coderabbit-fix on the new head.",
+    '          REPAIR_BASE_SHA="$(git rev-parse HEAD)"',
+    "",
+    "          # Main-sync and other trusted automation may advance the PR branch",
+    "          # while OpenCode is working. Never rewrite developer history to replay",
+    "          # a repair. If the remote HEAD moved, fail with a dedicated recovery",
+    "          # marker; the watchdog re-runs this same workflow with preserved",
+    "          # coderabbit-fix inputs against the latest PR HEAD.",
+    '          if [[ "$(git rev-list --count "${REPAIR_BASE_SHA}"..HEAD)" -gt 0 ]]; then',
+    '            git fetch --no-tags origin "${HEAD_REF}"',
+    '            REMOTE_HEAD="$(git rev-parse "origin/${HEAD_REF}")"',
+    "",
+    '            if [[ "$REMOTE_HEAD" != "$REPAIR_BASE_SHA" ]]; then',
+    '              echo "::error::CONTINUUM_OPENCODE_PUBLISH_RACE_RETRY_REQUIRED"',
+    '              echo "::error::PR head advanced from $REPAIR_BASE_SHA to $REMOTE_HEAD while repairing; restarting coderabbit-fix on the latest branch state."',
+    "              exit 76",
+    "            fi",
+    "",
+    '            if ! git push origin "HEAD:${HEAD_REF}"; then',
+    '              echo "::error::CONTINUUM_OPENCODE_PUBLISH_RACE_RETRY_REQUIRED"',
+    '              echo "::error::OpenCode repair publication raced with another PR update; restarting coderabbit-fix on the latest branch state."',
+    "              exit 76",
+    "            fi",
+)
+
+
 # Systemic qualification isolation / interruption recovery. This allowlist is
 # generated from the exact protected-workflow diff for the change: validation
 # dispatch comments cannot enter generic implementation, validation-only
@@ -811,13 +849,17 @@ class ProtectedBaselineTests(unittest.TestCase):
                         # for replacement. Any other deletion still fails.
                         self.assertEqual(
                             _Counter(deleted),
-                            _Counter(APPROVED_QUALIFICATION_ISOLATION_CHECKPOINT_REMOVED_LINES),
+                            _Counter(
+                                APPROVED_QUALIFICATION_ISOLATION_CHECKPOINT_REMOVED_LINES
+                                + APPROVED_CODERABBIT_PUBLISH_RACE_REMOVED_LINES
+                            ),
                             f"{path} must not delete or modify lines beyond the exact "
                             "qualification-isolation/checkpoint allowlist",
                         )
                         actual = _Counter(added)
                         expected = _Counter(
                             APPROVED_QUALIFICATION_ISOLATION_CHECKPOINT_ADDED_LINES
+                            + APPROVED_CODERABBIT_PUBLISH_RACE_ADDED_LINES
                         )
                         self.assertEqual(
                             actual,
