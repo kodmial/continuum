@@ -26,16 +26,15 @@ concurrency:
   # Do not derive this from github.workflow; a second caller name must not create
   # an independent CodeRabbit slot.
   group: coderabbit-rate-limit-controller-${{ github.repository }}
-  # The controller is a short latest-state reconciler. When the next legal
-  # review slot is in the future it exits immediately; durable CodeRabbit
-  # comments/review timestamps retain the due time and existing event and
-  # event-driven and recovery-controller wake-ups reconcile again later. Newer wake-ups
-  # supersede stale scans.
+  # Exactly one controller owns the shared slot. If the next legal transition
+  # is in the future it waits inside this serialized run; any newer lifecycle
+  # event cancels the sleeper and starts a fresh latest-state reconciliation.
   cancel-in-progress: true
 
 jobs:
   controller:
     if: >-
+      vars.CONTINUUM_ROLE != 'child' &&
       (inputs.review_provider || vars.CONTINUUM_REVIEW_PROVIDER || 'none') == 'coderabbit' &&
       (github.event_name == 'workflow_dispatch' ||
       github.event_name == 'schedule' ||
@@ -52,7 +51,7 @@ jobs:
        startsWith(github.event.comment.user.login, 'coderabbitai') &&
        github.event.pull_request.state == 'open'))
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 90
 
     permissions:
       actions: read
@@ -254,6 +253,10 @@ jobs:
             const NO_PROGRESS_MAX_REVIEWS = 3;
             const SAFETY_MARGIN_MS = 30_000;
             const IN_FLIGHT_TIMEOUT_MS = 30 * 60_000;
+            // CodeRabbit's observed/fallback quota window is <=65 minutes.
+            // Keep one serialized waiter alive rather than depending on GitHub
+            // scheduled-event delivery, which can be delayed for hours.
+            const MAX_CONTROLLER_WAIT_MS = 70 * 60_000;
 
             function retryWindowText(body = '') {
               const patterns = [
@@ -1166,17 +1169,56 @@ jobs:
                 .sort(candidateOrder)[0] || null;
             }
 
-            function deferUntilNextCandidate(state) {
+            async function waitUntil(whenMs, reason) {
+              const now = Date.now();
+              if (whenMs <= now) return;
+              const waitMs = whenMs - now;
+              if (waitMs > MAX_CONTROLLER_WAIT_MS) {
+                throw new Error(
+                  `CodeRabbit wait ${Math.ceil(waitMs / 60_000)} minutes exceeds the bounded controller contract (${MAX_CONTROLLER_WAIT_MS / 60_000} minutes): ${reason}`
+                );
+              }
+              core.notice(
+                `CodeRabbit controller waiting ${Math.ceil(waitMs / 1000)}s until ${new Date(whenMs).toISOString()} (${reason}). Newer lifecycle events cancel this waiter and revalidate latest state.`
+              );
+              await new Promise(resolve => setTimeout(resolve, waitMs));
+            }
+
+            // One serialized controller owns future liveness. This deliberately
+            // does not rely on GitHub cron delivery: scheduled events can be
+            // delayed for hours. Any new review/comment/controller event cancels
+            // this run via concurrency and starts a fresh reconciliation.
+            let state;
+            let selected = null;
+            while (!selected) {
+              state = await collectState();
+
+              if (state.latestInFlightCommand) {
+                const ageMs = Date.now() - state.latestInFlightCommand.at;
+                if (ageMs < IN_FLIGHT_TIMEOUT_MS) {
+                  await waitUntil(
+                    state.latestInFlightCommand.at + IN_FLIGHT_TIMEOUT_MS,
+                    `in-flight review slot for PR #${state.latestInFlightCommand.prNumber}`
+                  );
+                  continue;
+                }
+                core.warning(
+                  `CodeRabbit command for PR #${state.latestInFlightCommand.prNumber} has had no rate-limit response or full review for ${Math.ceil(ageMs / 60_000)} minutes; treating the slot lock as stale.`
+                );
+              }
+
+              selected = await chooseDueCandidate(state);
+              if (selected) break;
+
               if (state.candidates.length === 0) {
                 core.notice('No CodeRabbit review is currently queued.');
-                return false;
+                reportBudget();
+                return;
               }
 
               const nextAt = Math.min(
                 ...state.candidates.map(candidate => candidate.effectiveDueAt)
               );
-              if (nextAt <= Date.now()) return true;
-
               const queue = [...state.candidates]
                 .sort(candidateOrder)
                 .map(candidate =>
@@ -1185,63 +1227,9 @@ jobs:
                 .join(', ');
 
               core.notice(
-                `CodeRabbit queue: ${queue}. Deferred until ${new Date(nextAt).toISOString()}; no runner sleep. Existing review/status and stable controller wake-ups will reconcile the queue again.`
+                `CodeRabbit queue: ${queue}. Earliest legal slot is ${new Date(nextAt).toISOString()}.`
               );
-              return false;
-            }
-
-            // Reconcile once. If the earliest legal shared-quota slot is still
-            // in the future, leave the runner immediately; the due time is
-            // derived from durable review/comment timestamps and will be
-            // re-evaluated by existing event-driven and recovery-controller wake-ups.
-            // The queue introduces no dedicated CodeRabbit polling cron.
-            let state = await collectState();
-
-            if (state.latestInFlightCommand) {
-              const ageMs =
-                Date.now() - state.latestInFlightCommand.at;
-              if (ageMs < IN_FLIGHT_TIMEOUT_MS) {
-                core.notice(
-                  `CodeRabbit slot is already in flight for PR #${state.latestInFlightCommand.prNumber} at head ${state.latestInFlightCommand.headSha}; no second review command will be emitted.`
-                );
-                reportBudget();
-                return;
-              }
-              core.warning(
-                `CodeRabbit command for PR #${state.latestInFlightCommand.prNumber} has had no rate-limit response or full review for ${Math.ceil(ageMs / 60_000)} minutes; treating the slot lock as stale.`
-              );
-            }
-
-            let selected = await chooseDueCandidate(state);
-
-            if (!selected) {
-              if (!deferUntilNextCandidate(state)) {
-                reportBudget();
-                return;
-              }
-              state = await collectState();
-
-              if (state.latestInFlightCommand) {
-                const ageMs =
-                  Date.now() - state.latestInFlightCommand.at;
-                if (ageMs < IN_FLIGHT_TIMEOUT_MS) {
-                  core.notice(
-                    `CodeRabbit slot became occupied by PR #${state.latestInFlightCommand.prNumber} while this controller was waiting; no second command will be emitted.`
-                  );
-                  reportBudget();
-                  return;
-                }
-              }
-
-              selected = await chooseDueCandidate(state);
-            }
-
-            if (!selected) {
-              core.notice(
-                'Queue changed during final revalidation; a newer event will reconcile it.'
-              );
-              reportBudget();
-              return;
+              await waitUntil(nextAt, 'shared CodeRabbit quota window');
             }
 
             // Final exact-head/status/comment revalidation is implicit in the
