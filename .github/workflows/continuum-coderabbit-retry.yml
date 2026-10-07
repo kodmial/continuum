@@ -253,6 +253,11 @@ jobs:
             const NO_PROGRESS_MAX_REVIEWS = 3;
             const SAFETY_MARGIN_MS = 30_000;
             const IN_FLIGHT_TIMEOUT_MS = 30 * 60_000;
+            // GitHub scheduled events are best-effort and have been observed
+            // arriving hours late. Public repositories therefore keep one
+            // serialized bounded waiter for the normal hourly CodeRabbit
+            // quota window. Private repositories never pay this runner cost.
+            const MAX_PUBLIC_DEFER_WAIT_MS = 70 * 60_000;
             // CodeRabbit's observed/fallback quota window is <=65 minutes.
             // Keep one serialized waiter alive rather than depending on GitHub
             // scheduled-event delivery, which can be delayed for hours.
