@@ -7,15 +7,17 @@ the executable gate is the reusable workflow
 qualification** check); the merge enforcement lives in both merge
 reconcilers.
 
-## Layer 1 — deterministic regression gate (every PR)
+## Layer 1 — deterministic regression gate (every Continuum PR)
 
 - The `Contract qualification` workflow checks out the exact PR HEAD and
   runs the full Continuum CI/contract suite on it: `scripts/test-continuum.rb`,
   the Python engine suite (`tests/`), and the delegation runtime suite.
 - Gate evidence must belong to the exact current PR HEAD. A run for any
   other SHA is stale and never satisfies the gate.
-- Fail closed: absent, stale, or red evidence blocks every merge path,
-  including generic auto-merge and PR-Agent merge. There is no bypass.
+- Fail closed inside the `kodmial/continuum` repository: absent, stale, or
+  red evidence blocks both Continuum merge paths (generic auto-merge and
+  PR-Agent merge). Consumer/Child repositories do not run this gate; they
+  retain their own CI, packaging, and configured required-workflow gates.
 
 ## Layer 2 — lifecycle integration qualification (lifecycle changes)
 
@@ -42,9 +44,11 @@ The probe explicitly verifies:
 
 ## Layer 3 — live canary (scheduled)
 
-- The installed `continuum-contract-qualification.yml` caller also runs on
-  a daily schedule (`23 5 * * *`) plus `workflow_dispatch` with
-  `mode: canary`.
+- The project-owned `contract-qualification.yml` caller in the Continuum
+  repository runs on a daily schedule (`23 5 * * *`) plus
+  `workflow_dispatch` with `mode: canary`. It is intentionally not installed
+  into consumers because its regression layer executes Continuum's own test
+  suite.
 - The canary probe checks forward progress against bounded per-stage
   lifecycle deadlines (see `CANARY_STAGE_DEADLINES`).
 - A stage past its deadline records the exact canary/issue/PR/run IDs and
