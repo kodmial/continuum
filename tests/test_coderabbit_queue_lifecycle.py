@@ -561,23 +561,24 @@ class WorkflowBindingTests(unittest.TestCase):
             self.workflow,
         )
 
-    def test_due_waiter_is_bounded_serialized_and_revalidated(self):
+    def test_public_due_waiter_is_bounded_serialized_and_revalidated(self):
         for contract in (
-            "async function waitUntil(whenMs, reason)",
-            "MAX_CONTROLLER_WAIT_MS = 70 * 60_000",
+            "async function waitUntilNextCandidate(state)",
+            "MAX_PUBLIC_DEFER_WAIT_MS = 70 * 60_000",
+            "context.payload.repository?.private === false",
             "await new Promise(resolve => setTimeout(resolve, waitMs))",
-            "timeout-minutes: 90",
+            "timeout-minutes: 85",
             "cancel-in-progress: true",
             "while (!selected)",
             "state = await collectState()",
-            "scheduled events can be delayed for hours",
+            "GitHub schedule is best-effort and can be delayed for hours",
             "vars.CONTINUUM_ROLE != 'child'",
         ):
             self.assertIn(contract, self.workflow)
-        # Every wake recomputes current state; no stale HEAD/quota decision is
-        # carried across the bounded wait.
         self.assertIn("selected = await chooseDueCandidate(state)", self.workflow)
-        self.assertIn("await waitUntil(nextAt, 'shared CodeRabbit quota window')", self.workflow)
+        self.assertIn("await waitUntilNextCandidate(state)", self.workflow)
+        self.assertIn("private repository or wait exceeds cap", self.workflow)
+        self.assertIn("no second review command will be emitted", self.workflow)
 
 
     def test_legacy_schedule_wake_stays_inside_provider_gate(self):
