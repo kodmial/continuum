@@ -23,6 +23,7 @@ class QueueState:
     unresolved_threads: int = 0
     current_head_decision: str | None = None
     no_progress_blocked: bool = False
+    no_progress_retry: bool = False
     prior_full_reviews: int = 0
     prior_changes_requested: bool = False
     requested_lock: bool = False
@@ -100,8 +101,10 @@ def can_merge(state: QueueState) -> bool:
 def order_key(state: QueueState):
     _, rank = queue_priority(state)
     _, stage_rank = review_stage(state)
+    no_progress_rank = 1 if state.no_progress_retry else 0
     issue = state.issue_number if state.issue_number is not None else 2**63 - 1
     return (
+        no_progress_rank,
         rank,
         stage_rank,
         state.prior_full_reviews,
@@ -299,6 +302,29 @@ class CodeRabbitQueueLifecycleTests(unittest.TestCase):
         )
         self.assertLess(order_key(p2_final), order_key(p2_initial))
 
+    def test_no_progress_retry_cannot_starve_ordinary_review_work(self):
+        p0_no_progress = QueueState(
+            priority="priority:p0",
+            no_progress_retry=True,
+            prior_full_reviews=4,
+            prior_changes_requested=True,
+            pr_number=10,
+        )
+        p2_final = QueueState(
+            priority="priority:p2",
+            prior_full_reviews=1,
+            prior_changes_requested=True,
+            pr_number=11,
+        )
+        self.assertLess(order_key(p2_final), order_key(p0_no_progress))
+
+        p0_normal = QueueState(
+            priority="priority:p0",
+            prior_full_reviews=0,
+            pr_number=12,
+        )
+        self.assertLess(order_key(p0_normal), order_key(p2_final))
+
     def test_unprioritized_is_explicit_p2_fallback_and_oldest_breaks_ties(self):
         old_unprioritized = QueueState(
             priority=None,
@@ -475,8 +501,10 @@ class WorkflowBindingTests(unittest.TestCase):
             "continuum-coderabbit-no-progress head=",
             "stage: finalReview ? 'final-review' : 'initial-review'",
             "stageRank: finalReview ? 0 : 1",
+            "noProgressRank: kind === 'no-progress-retry' ? 1 : 0",
             "priority: 'unprioritized:p2-fallback'",
             "rank: priorityRank.get('priority:p2')",
+            "a.noProgressRank - b.noProgressRank",
             "a.stageRank - b.stageRank",
             "a.createdAt - b.createdAt",
         ):
