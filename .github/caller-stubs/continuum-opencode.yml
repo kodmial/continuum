@@ -123,6 +123,26 @@ on:
         description: "Exact main SHA a qualification run must test"
         required: false
         type: string
+      recovery_operation_id:
+        description: "Stable 429 recovery operation identity for a fresh-VM resumption"
+        required: false
+        type: string
+      recovery_checkpoint_ref:
+        description: "Workflow-owned durable 429 checkpoint ref to restore"
+        required: false
+        type: string
+      recovery_checkpoint_sha:
+        description: "Exact 429 checkpoint commit SHA to restore"
+        required: false
+        type: string
+      recovery_stage:
+        description: "Lifecycle stage the 429 checkpoint completed"
+        required: false
+        type: string
+      recovery_generation:
+        description: "Recovery generation of the 429 checkpoint"
+        required: false
+        type: string
 
 permissions:
   actions: write
@@ -161,3 +181,8 @@ jobs:
       capability_number: "${{ inputs.capability_number }}"
       qualification_number: "${{ inputs.qualification_number }}"
       required_sha: "${{ inputs.required_sha }}"
+      recovery_operation_id: "${{ inputs.recovery_operation_id }}"
+      recovery_checkpoint_ref: "${{ inputs.recovery_checkpoint_ref }}"
+      recovery_checkpoint_sha: "${{ inputs.recovery_checkpoint_sha }}"
+      recovery_stage: "${{ inputs.recovery_stage }}"
+      recovery_generation: "${{ inputs.recovery_generation }}"

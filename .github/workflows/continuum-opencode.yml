@@ -169,6 +169,45 @@ on:
         type: string
         default: main
         required: false
+      recovery_operation_id:
+        description: >-
+          Stable 429 recovery operation identity (for example
+          `opencode-429-issue-issue290`). Empty means this is not a
+          fresh-VM 429 resumption.
+        required: false
+        type: string
+        default: ''
+      recovery_checkpoint_ref:
+        description: >-
+          Workflow-owned durable checkpoint ref a burned runner evacuated
+          (for example `opencode/429-checkpoint-<operation>-gen-1`). Empty
+          means this is not a fresh-VM 429 resumption.
+        required: false
+        type: string
+        default: ''
+      recovery_checkpoint_sha:
+        description: >-
+          Exact checkpoint commit SHA the fresh run must restore. Empty
+          falls back to the tip of recovery_checkpoint_ref.
+        required: false
+        type: string
+        default: ''
+      recovery_stage:
+        description: >-
+          Lifecycle stage the checkpoint completed (for example
+          `implementation-incomplete`, `tests-passed`, `review-repair`,
+          `qualification`). The fresh run continues from this stage and
+          never repeats completed stages.
+        required: false
+        type: string
+        default: ''
+      recovery_generation:
+        description: >-
+          Recovery generation of the checkpoint. Each fresh-VM resumption
+          evacuates generation N+1. Empty means generation 0.
+        required: false
+        type: string
+        default: ''
 
 permissions: {}
 
@@ -393,6 +432,55 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # kodmial/continuum#290: a fresh-VM 429 resumption restores the exact
+      # checkpoint before doing any work. Shell/workflow code — never the
+      # model — fetches the workflow-owned checkpoint ref and checks out the
+      # exact checkpoint SHA. Completed stages are never repeated: a
+      # tests-passed/publish-pr checkpoint sets skip_opencode so the new run
+      # proceeds directly to workflow-owned commit/push/PR publication.
+      - name: Restore 429 recovery checkpoint
+        id: recovery_restore
+        if: inputs.recovery_checkpoint_ref != ''
+        env:
+          RECOVERY_OPERATION_ID: ${{ inputs.recovery_operation_id }}
+          RECOVERY_CHECKPOINT_REF: ${{ inputs.recovery_checkpoint_ref }}
+          RECOVERY_CHECKPOINT_SHA: ${{ inputs.recovery_checkpoint_sha }}
+          RECOVERY_STAGE: ${{ inputs.recovery_stage }}
+          RECOVERY_GENERATION: ${{ inputs.recovery_generation }}
+        run: |
+          set -euo pipefail
+          [[ -n "$RECOVERY_OPERATION_ID" ]] || { echo "::error::429 recovery without operation identity."; exit 1; }
+          [[ "$RECOVERY_CHECKPOINT_REF" == opencode/429-checkpoint-* ]] || {
+            echo "::error::Malformed 429 checkpoint ref '$RECOVERY_CHECKPOINT_REF'."
+            exit 1
+          }
+          case "${RECOVERY_STAGE:-implementation-incomplete}" in
+            implementation-incomplete|implementation-complete|tests-running|tests-passed|publish-pr|review-repair|qualification) ;;
+            *) echo "::error::Unknown 429 recovery stage '$RECOVERY_STAGE'."; exit 1 ;;
+          esac
+          git fetch --no-tags origin "$RECOVERY_CHECKPOINT_REF" --quiet
+          if [[ -n "$RECOVERY_CHECKPOINT_SHA" ]]; then
+            [[ "$RECOVERY_CHECKPOINT_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::Malformed 429 checkpoint SHA."; exit 1; }
+            FETCHED_SHA="$(git rev-parse FETCH_HEAD)"
+            [[ "${FETCHED_SHA,,}" == "${RECOVERY_CHECKPOINT_SHA,,}" ]] || {
+              echo "::error::Checkpoint ref tip $FETCHED_SHA does not match recovery SHA $RECOVERY_CHECKPOINT_SHA."
+              exit 1
+            }
+          fi
+          CHECKPOINT_SHA="$(git rev-parse FETCH_HEAD)"
+          git switch --detach FETCH_HEAD
+          echo "Restored 429 checkpoint $RECOVERY_CHECKPOINT_REF at exact SHA $CHECKPOINT_SHA (operation $RECOVERY_OPERATION_ID, stage ${RECOVERY_STAGE:-implementation-incomplete}, generation ${RECOVERY_GENERATION:-0})."
+          {
+            echo "resumed=true"
+            echo "checkpoint_sha=$CHECKPOINT_SHA"
+            echo "stage=${RECOVERY_STAGE:-implementation-incomplete}"
+            echo "generation=${RECOVERY_GENERATION:-0}"
+            case "${RECOVERY_STAGE:-implementation-incomplete}" in
+              tests-passed|publish-pr) echo "skip_opencode=true" ;;
+              *) echo "skip_opencode=false" ;;
+            esac
+          } >> "$GITHUB_OUTPUT"
 
       # One authoritative task-context resolver is shared by initial issue
       # implementation and later CI repair. PR metadata and failing logs are
@@ -1040,6 +1128,14 @@ jobs:
           cat > "$wrapper" <<'SH'
           #!/usr/bin/env bash
           set -uo pipefail
+          # kodmial/continuum#290: a 429 burns the current VM immediately. A
+          # burned runner must never invoke the model again, so any second
+          # invocation on this runner fails fast with the dedicated
+          # infrastructure outcome (exit 75) without touching the model.
+          if [[ -f "${RUNNER_TEMP:-/tmp}/continuum-opencode-429" ]]; then
+            echo "::error::CONTINUUM_OPENCODE_429_RESTART_REQUIRED (runner already burned; refusing a second model invocation on this VM)."
+            exit 75
+          fi
           log="$(mktemp)"
           set +e
           opencode "$@" 2>&1 | tee "$log"
@@ -1056,6 +1152,107 @@ jobs:
           SH
           chmod +x "$wrapper"
           echo "${RUNNER_TEMP:-/tmp}" >> "$GITHUB_PATH"
+
+      # kodmial/continuum#290: workflow-owned 429 evacuation. Shell/workflow
+      # code — never the model — persists all recoverable state before the
+      # burned runner terminates: working-tree changes, commits already
+      # created, source/base/head SHAs, exact operation identity, mode,
+      # issue/PR number, recovery generation, lifecycle stage, and exact-SHA
+      # evidence. The checkpoint is pushed to a private durable recovery ref
+      # (`opencode/429-checkpoint-<operation>-gen-<N>`); no LLM call is
+      # needed to create it. The runner is marked burned (the rate-limit
+      # wrapper refuses any second model invocation on this VM) and the step
+      # exits through the dedicated infrastructure outcome (exit 75) with no
+      # sleep/backoff retry of the model on the same VM.
+      - name: Install 429 checkpoint evacuator
+        if: steps.issue_readiness.outputs.ready != 'false'
+        shell: bash
+        env:
+          RECOVERY_GENERATION_IN: ${{ inputs.recovery_generation }}
+        run: |
+          set -euo pipefail
+          helper="${RUNNER_TEMP:-/tmp}/continuum-429-evacuate.sh"
+          cat > "$helper" <<'SH'
+          #!/usr/bin/env bash
+          # continuum_429_evacuate <operation-id> <stage> <mode> <issue-number> <pr-number> <base-sha>
+          # Evacuates workflow-owned state to the durable 429 checkpoint ref,
+          # marks this runner burned, and exits 75. Never invokes the model,
+          # never sleeps, never asks the model to commit.
+          continuum_429_evacuate() {
+            local operation="$1" stage="$2" mode="$3" issue_number="$4" pr_number="$5" base_sha="$6"
+            operation="$(printf '%s' "$operation" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]+/-/g; s/-{2,}/-/g; s/^-//; s/-$//')"
+            [[ -n "$operation" ]] || operation="unknown"
+            case "$stage" in
+              implementation-incomplete|implementation-complete|tests-running|tests-passed|publish-pr|review-repair|qualification) ;;
+              *) stage="implementation-incomplete" ;;
+            esac
+            local gen="${RECOVERY_GENERATION_IN:-0}"
+            [[ "$gen" =~ ^[0-9]+$ ]] || gen=0
+            local next_gen=$((gen + 1))
+            local checkpoint_ref="opencode/429-checkpoint-${operation}-gen-${next_gen}"
+            local head_sha="" current_branch=""
+            current_branch="$(git branch --show-current 2>/dev/null || true)"
+            find . -type d -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true
+            find . -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete 2>/dev/null || true
+            if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
+              git add -A
+              git commit -m "chore: checkpoint 429-interrupted ${mode} work" \
+                -m "Continuum-Checkpoint-429-Operation: ${operation}" \
+                -m "Continuum-Component: opencode" || true
+            fi
+            head_sha="$(git rev-parse HEAD 2>/dev/null || true)"
+            local metadata=".continuum-429-recovery.json"
+            python3 - "$metadata" "$operation" "$next_gen" "$stage" "$mode" "$issue_number" "$pr_number" "$base_sha" "$head_sha" "$current_branch" <<'PY' || true
+          import json, os, sys
+          path, operation, gen, stage, mode, issue, pr, base, head, branch = sys.argv[1:10]
+          with open(path, "w", encoding="utf-8") as handle:
+              json.dump({
+                  "operation_id": operation,
+                  "generation": int(gen),
+                  "stage": stage,
+                  "mode": mode,
+                  "issue_number": issue,
+                  "pr_number": pr,
+                  "head_ref": os.environ.get("HEAD_REF", "") or branch,
+                  "review_id": os.environ.get("REVIEW_ID", ""),
+                  "run_id": os.environ.get("RUN_ID", ""),
+                  "base_ref": os.environ.get("BASE_REF", ""),
+                  "capability_number": os.environ.get("CAPABILITY_NUMBER", ""),
+                  "qualification_number": os.environ.get("QUALIFICATION_NUMBER", ""),
+                  "required_sha": os.environ.get("REQUIRED_SHA", ""),
+                  "base_sha": base,
+                  "head_sha": head,
+                  "branch": branch,
+              }, handle, indent=2, sort_keys=True)
+          PY
+            if [[ -f "$metadata" ]]; then
+              git add "$metadata"
+              git commit -m "chore: record 429 recovery identity ${operation} gen ${next_gen}" \
+                -m "Continuum-Checkpoint-429-Operation: ${operation}" \
+                -m "Continuum-Component: opencode" || true
+              head_sha="$(git rev-parse HEAD 2>/dev/null || true)"
+            fi
+            if [[ -n "$head_sha" ]]; then
+              git push --force origin "HEAD:refs/heads/${checkpoint_ref}" || true
+              echo "::warning::Evacuated 429 checkpoint ${checkpoint_ref} at exact SHA ${head_sha} (operation ${operation}, stage ${stage}, generation ${next_gen}, mode ${mode}, issue ${issue_number}, pr ${pr_number}, branch ${current_branch})."
+              # Optional legacy-branch mirror so scheduler-native resume
+              # keeps working after infrastructure cooldown even without a
+              # recovery dispatch (best effort; never fails the evacuation).
+              if [[ -n "${CONTINUUM_429_LEGACY_REF:-}" ]]; then
+                git push --force origin "HEAD:refs/heads/${CONTINUUM_429_LEGACY_REF}" || true
+              fi
+            else
+              echo "::warning::429 evacuation had no committable state; recording the marker without a checkpoint ref."
+            fi
+            : > "${RUNNER_TEMP:-/tmp}/continuum-opencode-429"
+            echo "CONTINUUM_429_CHECKPOINT_REF=${checkpoint_ref}" >> "${GITHUB_ENV:-/dev/null}"
+            echo "CONTINUUM_429_OPERATION=${operation}" >> "${GITHUB_ENV:-/dev/null}"
+            echo "::error::CONTINUUM_OPENCODE_429_RESTART_REQUIRED"
+            exit 75
+          }
+          SH
+          chmod +x "$helper"
+          echo "Installed 429 checkpoint evacuator at $helper."
 
       # Interactive OpenCode remains available for PR/review comments. A /oc
       # comment on a plain issue is an implementation command and is routed
@@ -1190,8 +1387,14 @@ jobs:
           PAUSE_LABEL: ${{ inputs.pause_marker || vars.AUTOMATION_PAUSE_LABEL || 'automation:paused' }}
           PAUSE_ON_FAILURE: ${{ inputs.pause_on_failure || vars.AUTOMATION_PAUSE_ON_FAILURE || 'true' }}
           CI_WORKFLOW_ID: ${{ inputs.ci_workflow_id }}
+          RECOVERY_RESUMED: ${{ steps.recovery_restore.outputs.resumed }}
+          RECOVERY_SKIP_OPENCODE: ${{ steps.recovery_restore.outputs.skip_opencode }}
+          RECOVERY_STAGE_IN: ${{ steps.recovery_restore.outputs.stage }}
+          RECOVERY_GENERATION_IN: ${{ inputs.recovery_generation }}
         run: |
           set -euo pipefail
+          # shellcheck disable=SC1091
+          source "${RUNNER_TEMP:-/tmp}/continuum-429-evacuate.sh" 2>/dev/null || true
           [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::Missing or invalid issue number for issue mode: '${ISSUE_NUMBER}'."; exit 1; }
           [[ "$TASK_CONTEXT_PRESENT" == "true" ]] || { echo "::error::Authoritative task context was not resolved."; exit 1; }
           [[ "${TASK_REPO,,}" == "${GITHUB_REPOSITORY,,}" && "$TASK_NUMBER" == "$ISSUE_NUMBER" ]] || {
@@ -1204,9 +1407,16 @@ jobs:
           BRANCH="opencode/issue${ISSUE_NUMBER}-${GITHUB_RUN_ID}"
           CHECKPOINT_BRANCH="opencode/checkpoint-issue${ISSUE_NUMBER}"
 
-          # Resume the latest interruption checkpoint if one exists. This
-          # branch is workflow-owned and is deleted after a PR is published.
-          if git ls-remote --exit-code --heads origin "refs/heads/$CHECKPOINT_BRANCH" >/dev/null 2>&1; then
+          # kodmial/continuum#290: a fresh-VM 429 resumption already restored
+          # the exact checkpoint (see Restore 429 recovery checkpoint). Base
+          # the task branch on the restored HEAD instead of the base or the
+          # legacy interruption checkpoint, so no validated work is discarded.
+          if [[ "${RECOVERY_RESUMED:-}" == "true" ]]; then
+            git switch -c "$BRANCH"
+            echo "Continuing issue #$ISSUE_NUMBER on fresh VM from 429 checkpoint stage '${RECOVERY_STAGE_IN:-implementation-incomplete}'."
+          elif git ls-remote --exit-code --heads origin "refs/heads/$CHECKPOINT_BRANCH" >/dev/null 2>&1; then
+            # Resume the latest interruption checkpoint if one exists. This
+            # branch is workflow-owned and is deleted after a PR is published.
             git fetch origin "$CHECKPOINT_BRANCH" --quiet
             git switch -c "$BRANCH" FETCH_HEAD
             echo "Resuming issue #$ISSUE_NUMBER from interruption checkpoint $CHECKPOINT_BRANCH."
@@ -1281,10 +1491,20 @@ jobs:
           fi
 
           OPENCODE_RUN_LOG="$(mktemp)"
-          set +e
-          continuum-opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
-          OPENCODE_RUN_RC=${PIPESTATUS[0]}
-          set -e
+          # kodmial/continuum#290: a tests-passed/publish-pr checkpoint carries
+          # exact-SHA evidence, so the fresh run must NOT call OpenCode again
+          # merely to "finish". Skip the agent and proceed directly to
+          # workflow-owned commit/push/PR publication below.
+          if [[ "${RECOVERY_SKIP_OPENCODE:-}" == "true" ]]; then
+            echo "429 checkpoint stage '${RECOVERY_STAGE_IN:-}' already carries exact-SHA evidence; skipping OpenCode and publishing directly."
+            OPENCODE_RUN_RC=0
+            rm -f "$OPENCODE_RUN_LOG"
+          else
+            set +e
+            continuum-opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
+            OPENCODE_RUN_RC=${PIPESTATUS[0]}
+            set -e
+          fi
           if [[ "$OPENCODE_RUN_RC" -eq 143 || "$OPENCODE_RUN_RC" -eq 130 || "$OPENCODE_RUN_RC" -eq 129 ]]; then
             rm -f "$OPENCODE_RUN_LOG"
             checkpoint_issue_progress "$OPENCODE_RUN_RC"
@@ -1292,9 +1512,15 @@ jobs:
           trap - TERM INT HUP
           if grep -Eiq 'FreeUsageLimitError' "$OPENCODE_RUN_LOG" || \
              { [[ "$OPENCODE_RUN_RC" -ne 0 ]] && grep -Eiq 'APIError.*429|HTTP[^0-9]*429([^0-9]|$)|429[[:space:]]+Too[[:space:]]+Many[[:space:]]+Requests|statusCode[^0-9]*429([^0-9]|$)' "$OPENCODE_RUN_LOG"; }; then
-            echo "::error::CONTINUUM_OPENCODE_429_RESTART_REQUIRED"
+            # kodmial/continuum#290: 429 burns this VM. Workflow-owned
+            # evacuation persists working-tree changes, commits, SHAs,
+            # operation identity, stage, and evidence to the durable
+            # recovery ref, marks the runner burned (no second model call on
+            # this VM), and exits 75. Never sleeps/retries the model here.
             rm -f "$OPENCODE_RUN_LOG"
-            checkpoint_issue_progress 75
+            trap - TERM INT HUP
+            export CONTINUUM_429_LEGACY_REF="$CHECKPOINT_BRANCH"
+            continuum_429_evacuate "opencode-429-issue-issue${ISSUE_NUMBER}" "implementation-incomplete" "issue" "$ISSUE_NUMBER" "" "$BASE_START_SHA"
           fi
           rm -f "$OPENCODE_RUN_LOG"
           if [[ "$OPENCODE_RUN_RC" -ne 0 ]]; then
@@ -1470,8 +1696,13 @@ jobs:
           QUALIFICATION_NUMBER: ${{ steps.qualification_identity.outputs.qualification_number || inputs.qualification_number || inputs.issue_number || github.event.issue.number }}
           REQUIRED_SHA: ${{ steps.qualification_identity.outputs.required_sha || inputs.required_sha }}
           IN_PROGRESS_LABEL: ${{ inputs.in_progress_label || vars.AUTOMATION_IN_PROGRESS_LABEL || 'automation:in-progress' }}
+          RECOVERY_SKIP_OPENCODE: ${{ steps.recovery_restore.outputs.skip_opencode }}
+          RECOVERY_STAGE_IN: ${{ steps.recovery_restore.outputs.stage }}
+          RECOVERY_GENERATION_IN: ${{ inputs.recovery_generation }}
         run: |
           set -euo pipefail
+          # shellcheck disable=SC1091
+          source "${RUNNER_TEMP:-/tmp}/continuum-429-evacuate.sh" 2>/dev/null || true
           [[ "$QUALIFICATION_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::Missing qualification issue number."; exit 2; }
           [[ "$REQUIRED_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::Missing exact required SHA for qualification."; exit 2; }
           [[ "$CAPABILITY_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::Missing capability number for qualification run identity."; exit 2; }
@@ -1514,16 +1745,28 @@ jobs:
           - Do not perform git commits, pushes, branch switches, rebases, resets, merges, or PR creation; the workflow owns Git state.
           EOF
           )"
-          OPENCODE_RUN_LOG="$(mktemp)"
-          set +e
-          continuum-opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
-          OPENCODE_RUN_RC=${PIPESTATUS[0]}
-          set -e
+          # kodmial/continuum#290: a tests-passed/publish-pr checkpoint carries
+          # exact-SHA evidence, so the fresh run must NOT call OpenCode again
+          # merely to "finish". Skip the agent and verify the trusted evidence
+          # for the exact SHA directly below.
+          if [[ "${RECOVERY_SKIP_OPENCODE:-}" == "true" ]]; then
+            echo "429 checkpoint stage '${RECOVERY_STAGE_IN:-}' already carries exact-SHA evidence; skipping OpenCode qualification agent."
+            OPENCODE_RUN_RC=0
+            rm -f "$OPENCODE_RUN_LOG"
+          else
+            set +e
+            continuum-opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
+            OPENCODE_RUN_RC=${PIPESTATUS[0]}
+            set -e
+          fi
           if grep -Eiq 'FreeUsageLimitError' "$OPENCODE_RUN_LOG" || \
              { [[ "$OPENCODE_RUN_RC" -ne 0 ]] && grep -Eiq 'APIError.*429|HTTP[^0-9]*429([^0-9]|$)|429[[:space:]]+Too[[:space:]]+Many[[:space:]]+Requests|statusCode[^0-9]*429([^0-9]|$)' "$OPENCODE_RUN_LOG"; }; then
-            echo "::error::CONTINUUM_OPENCODE_429_RESTART_REQUIRED"
+            # kodmial/continuum#290: 429 burns this VM. Workflow-owned
+            # evacuation persists the exact required SHA, operation identity,
+            # and qualification stage to the durable recovery ref, marks the
+            # runner burned (no second model call on this VM), and exits 75.
             rm -f "$OPENCODE_RUN_LOG"
-            exit 75
+            continuum_429_evacuate "opencode-429-qualification-qual${QUALIFICATION_NUMBER}-sha${REQUIRED_SHA:0:12}" "qualification" "qualification" "" "$QUALIFICATION_NUMBER" "$REQUIRED_SHA"
           fi
           rm -f "$OPENCODE_RUN_LOG"
           if [[ "$OPENCODE_RUN_RC" -ne 0 ]]; then
@@ -1588,7 +1831,7 @@ jobs:
           echo "Qualification execution succeeded with valid evidence; leaving the qualification issue open for the scheduler."
 
       - name: Fix CodeRabbit review findings
-        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'coderabbit-fix'
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'coderabbit-fix' && steps.recovery_restore.outputs.skip_opencode != 'true'
         env:
           OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
           GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
@@ -1596,8 +1839,11 @@ jobs:
           PR_NUMBER: ${{ inputs.pr_number }}
           REVIEW_ID: ${{ inputs.review_id }}
           HEAD_REF: ${{ inputs.head_ref }}
+          RECOVERY_GENERATION_IN: ${{ inputs.recovery_generation }}
         run: |
           set -euo pipefail
+          # shellcheck disable=SC1091
+          source "${RUNNER_TEMP:-/tmp}/continuum-429-evacuate.sh" 2>/dev/null || true
           PROMPT=$(cat <<EOF
           Fix every CodeRabbit review finding on pull request #${PR_NUMBER}.
 
@@ -1629,6 +1875,12 @@ jobs:
           # automation advances the branch while OpenCode runs, publication
           # fails closed and the watchdog reruns coderabbit-fix on the new head.
           REPAIR_BASE_SHA="$(git rev-parse HEAD)"
+          # kodmial/continuum#290: a fresh-VM resumption already restored the
+          # exact 429 checkpoint before any work, so repair resumes from the
+          # preserved PR HEAD identity instead of re-inspecting from scratch.
+          if [[ -n "${{ inputs.recovery_checkpoint_ref }}" ]]; then
+            echo "Continuing CodeRabbit repair for PR #${PR_NUMBER} on fresh VM from 429 checkpoint ${{ inputs.recovery_checkpoint_ref }}."
+          fi
           OPENCODE_RUN_LOG="$(mktemp)"
           set +e
           continuum-opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
@@ -1636,9 +1888,13 @@ jobs:
           set -e
           if grep -Eiq 'FreeUsageLimitError' "$OPENCODE_RUN_LOG" || \
              { [[ "$OPENCODE_RUN_RC" -ne 0 ]] && grep -Eiq 'APIError.*429|HTTP[^0-9]*429([^0-9]|$)|429[[:space:]]+Too[[:space:]]+Many[[:space:]]+Requests|statusCode[^0-9]*429([^0-9]|$)' "$OPENCODE_RUN_LOG"; }; then
-            echo "::error::CONTINUUM_OPENCODE_429_RESTART_REQUIRED"
+            # kodmial/continuum#290: 429 burns this VM. Workflow-owned
+            # evacuation preserves the working tree, the exact PR HEAD
+            # identity (REPAIR_BASE_SHA), and the review-repair stage to the
+            # durable recovery ref; repair resumes on a new run without losing
+            # the PR HEAD. No second model call on this VM; exit 75.
             rm -f "$OPENCODE_RUN_LOG"
-            exit 75
+            continuum_429_evacuate "opencode-429-coderabbit-fix-pr${PR_NUMBER}-review${REVIEW_ID}" "review-repair" "coderabbit-fix" "" "$PR_NUMBER" "$REPAIR_BASE_SHA"
           fi
           rm -f "$OPENCODE_RUN_LOG"
           if [[ "$OPENCODE_RUN_RC" -ne 0 ]]; then
@@ -1816,7 +2072,7 @@ jobs:
             }
 
       - name: Resolve merge conflict with main
-        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'resolve-conflict'
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'resolve-conflict' && steps.recovery_restore.outputs.skip_opencode != 'true'
         env:
           OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
           GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
@@ -1824,8 +2080,11 @@ jobs:
           PR_NUMBER: ${{ inputs.pr_number }}
           HEAD_REF: ${{ inputs.head_ref }}
           CONFLICT_STRATEGY: ${{ inputs.conflict_strategy || 'merge' }}
+          RECOVERY_GENERATION_IN: ${{ inputs.recovery_generation }}
         run: |
           set -euo pipefail
+          # shellcheck disable=SC1091
+          source "${RUNNER_TEMP:-/tmp}/continuum-429-evacuate.sh" 2>/dev/null || true
           # `workflow_call` cannot declare an enumerated input, so validate the
           # strategy here rather than interpolating an unvalidated value.
           case "$CONFLICT_STRATEGY" in
@@ -1892,9 +2151,13 @@ jobs:
           set -e
           if grep -Eiq 'FreeUsageLimitError' "$OPENCODE_RUN_LOG" || \
              { [[ "$OPENCODE_RUN_RC" -ne 0 ]] && grep -Eiq 'APIError.*429|HTTP[^0-9]*429([^0-9]|$)|429[[:space:]]+Too[[:space:]]+Many[[:space:]]+Requests|statusCode[^0-9]*429([^0-9]|$)' "$OPENCODE_RUN_LOG"; }; then
-            echo "::error::CONTINUUM_OPENCODE_429_RESTART_REQUIRED"
+            # kodmial/continuum#290: 429 burns this VM. Workflow-owned
+            # evacuation preserves the conflict-repair working tree, the exact
+            # PR HEAD identity, and the review-repair stage to the durable
+            # recovery ref. No second model call on this VM; exit 75.
             rm -f "$OPENCODE_RUN_LOG"
-            exit 75
+            CONFLICT_BASE_SHA="$(git rev-parse HEAD)"
+            continuum_429_evacuate "opencode-429-resolve-conflict-pr${PR_NUMBER}" "review-repair" "resolve-conflict" "" "$PR_NUMBER" "$CONFLICT_BASE_SHA"
           fi
           rm -f "$OPENCODE_RUN_LOG"
           if [[ "$OPENCODE_RUN_RC" -ne 0 ]]; then
@@ -1913,7 +2176,7 @@ jobs:
           fi
 
       - name: Fix failed blocking workflow
-        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'ci-fix'
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'ci-fix' && steps.recovery_restore.outputs.skip_opencode != 'true'
         env:
           OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
           GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
@@ -1930,8 +2193,11 @@ jobs:
           TASK_URL: ${{ steps.task_context.outputs.task_url }}
           PR_TITLE: ${{ steps.task_context.outputs.pr_title }}
           PR_BODY: ${{ steps.task_context.outputs.pr_body }}
+          RECOVERY_GENERATION_IN: ${{ inputs.recovery_generation }}
         run: |
           set -euo pipefail
+          # shellcheck disable=SC1091
+          source "${RUNNER_TEMP:-/tmp}/continuum-429-evacuate.sh" 2>/dev/null || true
 
           if [[ "$TASK_CONTEXT_PRESENT" == "true" ]]; then
             TASK_CONTEXT_BLOCK="$(cat <<EOF
@@ -1987,9 +2253,13 @@ jobs:
           set -e
           if grep -Eiq 'FreeUsageLimitError' "$OPENCODE_RUN_LOG" || \
              { [[ "$OPENCODE_RUN_RC" -ne 0 ]] && grep -Eiq 'APIError.*429|HTTP[^0-9]*429([^0-9]|$)|429[[:space:]]+Too[[:space:]]+Many[[:space:]]+Requests|statusCode[^0-9]*429([^0-9]|$)' "$OPENCODE_RUN_LOG"; }; then
-            echo "::error::CONTINUUM_OPENCODE_429_RESTART_REQUIRED"
+            # kodmial/continuum#290: 429 burns this VM. Workflow-owned
+            # evacuation preserves the CI-repair working tree, the exact PR
+            # HEAD identity, and the review-repair stage to the durable
+            # recovery ref. No second model call on this VM; exit 75.
             rm -f "$OPENCODE_RUN_LOG"
-            exit 75
+            CI_BASE_SHA="$(git rev-parse HEAD)"
+            continuum_429_evacuate "opencode-429-ci-fix-pr${PR_NUMBER}-run${RUN_ID}" "review-repair" "ci-fix" "" "$PR_NUMBER" "$CI_BASE_SHA"
           fi
           rm -f "$OPENCODE_RUN_LOG"
           if [[ "$OPENCODE_RUN_RC" -ne 0 ]]; then

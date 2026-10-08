@@ -3884,6 +3884,8 @@ class ContinuumTest < Minitest::Test
       knowledge_records_dir issue_commit_prefix
       pause_marker max_dispatch_attempts pause_on_failure ci_repair_label
       packaging_repair_label capability_number qualification_number required_sha
+      recovery_operation_id recovery_checkpoint_ref recovery_checkpoint_sha
+      recovery_stage recovery_generation
     ],
     'continuum-opencode-repair.yml' => %w[
       continuum_ref pr_number head_sha conclusion run_id ci_repair_label

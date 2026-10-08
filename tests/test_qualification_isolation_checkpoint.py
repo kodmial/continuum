@@ -84,7 +84,11 @@ class InterruptedIssueCheckpointTests(unittest.TestCase):
             'git ls-remote --exit-code --heads origin "refs/heads/$CHECKPOINT_BRANCH"',
             "checkpoint_issue_progress()",
             "trap 'checkpoint_issue_progress 143' TERM",
-            "checkpoint_issue_progress 75",
+            # kodmial/continuum#290: a model 429 burns the runner, so the
+            # 429 path evacuates through the workflow-owned durable
+            # recovery ref (never a second model call on the same VM)
+            # instead of the bare interruption exit.
+            'continuum_429_evacuate "opencode-429-issue-issue${ISSUE_NUMBER}"',
             'git push --force origin "HEAD:refs/heads/$CHECKPOINT_BRANCH"',
             'COMMITS_FROM_START="$(git rev-list --count "$BASE_START_SHA..HEAD"',
         ):
