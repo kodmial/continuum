@@ -4939,6 +4939,8 @@ class ContinuumTest < Minitest::Test
     assert_includes retry_body, 'continuum-coderabbit-no-progress head='
     assert_includes retry_body, 'noProgressAt + REVIEW_COOLDOWN_MS'
     assert_includes retry_body, "kind = 'no-progress-retry'"
+    assert_includes retry_body, "noProgressRank: kind === 'no-progress-retry' ? 1 : 0"
+    assert_match(/a\.noProgressRank - b\.noProgressRank \|\|\s*a\.rank - b\.rank/m, retry_body)
     assert_includes retry_body, 'must never become'
     refute_includes retry_body, 'NO_PROGRESS_MAX_REVIEWS'
     refute_includes retry_body, 'exhausted bounded non-code CodeRabbit re-review budget'
@@ -4950,6 +4952,19 @@ class ContinuumTest < Minitest::Test
     assert_includes merge_body, 'must never become a'
     refute_includes merge_body, 'NO_PROGRESS_MAX_REVIEWS'
     refute_includes merge_body, 'bounded non-code CodeRabbit re-review budget is exhausted.'
+  end
+
+  def test_clean_no_progress_rereview_can_converge_without_carrying_to_new_head
+    body = auto_merge_body
+
+    assert_includes body, 'cleanNoProgressCodeRabbitReviewBasis'
+    assert_includes body, 'continuum-coderabbit-no-progress head='
+    assert_includes body, 'Full review finished'
+    assert_includes body, '/Review completed/i.test(rabbitStatus.description || \'\')'
+    assert_includes body, 'Number(decision.id) !== marker.reviewId'
+    assert_includes body, 'latestDecisionAt > marker.at'
+    assert_includes body, 'convergedNoProgress: true'
+    assert_includes body, 'await directCodeRabbitReviewBasis(pr, oldHead)'
   end
 
   # Inline findings already have an independent thread-verification protocol.
@@ -4998,7 +5013,8 @@ class ContinuumTest < Minitest::Test
     assert_includes body, 'labelConfigured !== nameConfigured'
     assert_includes body, "stage: finalReview ? 'final-review' : 'initial-review'"
     assert_includes body, 'stageRank: finalReview ? 0 : 1'
-    assert_match(/a\.rank - b\.rank \|\|\s*a\.stageRank - b\.stageRank/m, body)
+    assert_includes body, "noProgressRank: kind === 'no-progress-retry' ? 1 : 0"
+    assert_match(/a\.noProgressRank - b\.noProgressRank \|\|\s*a\.rank - b\.rank \|\|\s*a\.stageRank - b\.stageRank/m, body)
 
     # The requested label remains the exact-head/idempotency lock and there is
     # still one authoritative command emission site in the serialized queue.
@@ -5398,14 +5414,18 @@ class ContinuumTest < Minitest::Test
     assert_match(/const finalUnresolvedThreads = requireCodeRabbit\s*\n\s*\? await unresolvedCodeRabbitThreads/, body)
     assert_match(/const finalCurrentHeadNitpicks = requireCodeRabbit\s*\n\s*\? await codeRabbitNitpickReviews/, body)
 
-    # The merge log must not read `null.sourceSha` when the flag is off.
-    assert_match(/requireCodeRabbit\s*\n\s*\? `CodeRabbit approval from \$\{finalReviewBasis\.sourceSha\}`\s*\n\s*: 'CI only; CodeRabbit is disabled/, body)
+    # The merge log must not read `null.sourceSha` when the flag is off,
+    # and must distinguish literal APPROVED from clean no-progress convergence.
+    assert_includes body, 'finalReviewBasis.convergedNoProgress'
+    assert_includes body, 'clean CodeRabbit full review after summary-only blocker'
+    assert_includes body, 'CodeRabbit approval from ${finalReviewBasis.sourceSha}'
+    assert_includes body, "'CI only; CodeRabbit is disabled for this repository'"
 
     # updateFromMain writes a carry marker only from a CodeRabbit review basis.
     # With the flag off there is no approval to carry, so no marker and no
     # GraphQL thread queries.
     assert_match(/const unresolvedBeforeSync = requireCodeRabbit\s*\n\s*\? await unresolvedCodeRabbitThreads\(pr\)\s*\n\s*: \[\];/, body)
-    assert_match(/const reviewBasis =\s*\n\s*requireCodeRabbit && unresolvedBeforeSync\.length === 0\s*\n\s*\? await codeRabbitReviewBasis\(pr, oldHead\)\s*\n\s*: null;/, body)
+    assert_match(/const reviewBasis =\s*\n\s*requireCodeRabbit && unresolvedBeforeSync\.length === 0[\s\S]{0,320}?\? await directCodeRabbitReviewBasis\(pr, oldHead\)\s*\n\s*: null;/, body)
   end
 
   # With the flag ON the previous behaviour must be exactly preserved: the
