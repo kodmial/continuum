@@ -8041,7 +8041,7 @@ class ContinuumTest < Minitest::Test
 
   def test_contract_qualification_gate_is_a_first_class_lifecycle
     body = File.read(File.join(ROOT, '.github/workflows/continuum-contract-qualification.yml'))
-    assert_includes body, 'scripts/test-continuum.rb', 'Layer 1 regression gate must run the contract tests'
+    assert_includes body, 'bash scripts/validate-continuum.sh', 'Layer 1 regression gate must use the canonical validation entrypoint'
     assert_includes body, 'contract_qualification', 'Layer 2 lifecycle probe must exercise the contract module'
     assert_includes body, 'canary', 'Layer 3 live-canary probe must exist'
     assert_includes body, 'continuum/contract-qualification', 'contract status context must be published'
