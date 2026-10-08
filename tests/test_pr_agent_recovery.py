@@ -1273,10 +1273,13 @@ class CodeRabbitDeadlockWiringTests(unittest.TestCase):
         # exact-head APPROVED basis whenever an auto-review-disabled event
         # overwrote the status with "Review skipped".
         self.assertRegex(gate, r"!reviewBasis[\s\S]{0,400}Review completed")
-        # Do not pin the total number of "Review completed" mentions:
-        # other non-authorization wait/recovery paths may legitimately use the
-        # same status text. The structural assertions above and below enforce
-        # the actual invariant: durable exact-head approval is status-independent.
+        # Exactly three mentions exist: the status-independence comment in
+        # directCodeRabbitReviewBasis and the two guarded status reads in
+        # waitingForCompletedCodeRabbitReview and
+        # cleanNoProgressCodeRabbitReviewBasis. A reintroduced hard
+        # Review-completed authorization check adds a fourth and fails here.
+        self.assertEqual(gate.count("Review completed"), 3)
+        self.assertEqual(gate.count("/Review completed/i"), 2)
         basis_src = self._extract_js_function(gate, "directCodeRabbitReviewBasis")
         # The basis is review+CI+nitpick only: it must never read a commit
         # status description. (Its explanatory comment mentions the status
