@@ -10,6 +10,9 @@ permissions:
 
 jobs:
   call:
+    if: >-
+      vars.CONTINUUM_ROLE != 'child' &&
+      (vars.CONTINUUM_REVIEW_PROVIDER || 'none') == 'coderabbit'
     uses: kodmial/continuum/.github/workflows/continuum-coderabbit-unresolved.yml@main
     secrets: inherit
     with:
