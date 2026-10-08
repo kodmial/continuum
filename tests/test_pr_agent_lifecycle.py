@@ -429,7 +429,6 @@ APPROVED_CODERABBIT_PUBLISHED_HEAD_ADDED_LINES = (
     "                `PR #${pullNumber}: pull metadata still reports stale HEAD ${pr.data.head.sha}; verifying published branch HEAD ${headSha}.`",
     "              );",
     "            }",
-    "",
 )
 
 # Systemic qualification isolation / interruption recovery. This allowlist is
