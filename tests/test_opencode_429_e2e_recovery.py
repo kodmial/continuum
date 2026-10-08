@@ -29,6 +29,7 @@ from continuum.opencode_429_recovery import (
     operation_id,
     parse_checkpoint_ref,
     recovery_dispatch_inputs,
+    resolve_evacuation_stage,
     resumption_marker,
     should_enter_infra_cooldown,
     should_skip_opencode,
@@ -86,7 +87,16 @@ class FakeModel:
 
 
 def evacuate(repo, operation, generation, stage, mode, issue, pr, base_sha):
-    """Mirror of the workflow-owned 429 evacuator (shell in the workflow)."""
+    """Mirror of the workflow-owned 429 evacuator (shell in the workflow).
+
+    ``stage`` is the caller default; when the agent maintained its
+    ``.continuum-429-stage`` progress file (as the issue prompt requires),
+    the recorded stage wins for modes with a no-agent fresh-run path, via
+    the same :func:`resolve_evacuation_stage` contract the shell mirrors.
+    """
+    stage_file = Path(str(repo)) / ".continuum-429-stage"
+    recorded = stage_file.read_text(encoding="utf-8") if stage_file.exists() else None
+    stage = resolve_evacuation_stage(stage, mode, recorded)
     status = run_git(repo, "status", "--porcelain")
     if status:
         run_git(repo, "add", "-A")
@@ -315,6 +325,51 @@ class OpenCode429EndToEndTest(unittest.TestCase):
         self.assertEqual(run_git(self.new_vm, "rev-parse", "HEAD"), pr_head_at_429)
         self.assertFalse(should_skip_opencode("review-repair", False))
         self.assertEqual(metadata["pr_number"], "12")
+
+    def test_agent_progress_file_drives_skip_without_repeating_stages(self):
+        # The agent completes implementation AND tests, records tests-passed
+        # in its progress file, then a later model call returns 429. The
+        # evacuation must record the honest stage so the fresh run skips
+        # the model entirely and publishes directly.
+        (self.old_vm / "app.py").write_text("VALUE = 5\n", encoding="utf-8")
+        (self.old_vm / ".continuum-429-stage").write_text(
+            "tests-passed\n", encoding="utf-8"
+        )
+        rc, log = self.model.run(self.burned)
+        self.assertEqual(classify_agent_error(log, rc), "runner-death-429")
+        operation = operation_id("issue", issue_number="294")
+        ref, checkpoint_sha, metadata = evacuate(
+            self.old_vm,
+            operation,
+            1,
+            "implementation-incomplete",
+            "issue",
+            "294",
+            "",
+            self.base_sha,
+        )
+        # The hardcoded caller default loses to the recorded progress.
+        self.assertEqual(metadata["stage"], "tests-passed")
+        self.burned = True
+        rc2, _ = self.model.run(self.burned)
+        self.assertEqual(rc2, 75)
+        self.assertEqual(self.model.invocations, 1)
+
+        subprocess.run(
+            ["git", "clone", str(self.origin), str(self.new_vm)],
+            check=True,
+            capture_output=True,
+        )
+        run_git(self.new_vm, "fetch", "--no-tags", "origin", ref)
+        run_git(self.new_vm, "switch", "--detach", "FETCH_HEAD")
+        self.assertEqual(run_git(self.new_vm, "rev-parse", "HEAD"), checkpoint_sha)
+        # Exact-SHA evidence stage: no second model invocation anywhere.
+        self.assertTrue(should_skip_opencode(metadata["stage"], True))
+        invocations_before = self.model.invocations
+        run_git(self.new_vm, "switch", "-c", "opencode/issue294-new")
+        run_git(self.new_vm, "push", "-u", "origin", "opencode/issue294-new")
+        self.assertEqual(self.model.invocations, invocations_before)
+        self.assertFalse(consumes_task_budget(True))
 
     def test_consecutive_429s_enter_backoff_without_pause(self):
         operation = operation_id("issue", issue_number="293")

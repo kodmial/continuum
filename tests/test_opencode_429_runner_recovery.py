@@ -56,6 +56,47 @@ class OpenCode429RunnerRecoveryContractTest(unittest.TestCase):
         # runner exits through the dedicated infrastructure outcome.
         self.assertIn("CONTINUUM_OPENCODE_429_RESTART_REQUIRED", self.body)
 
+    def test_wrapper_classification_mirrors_engine_contract(self):
+        # FreeUsageLimitError always burns; any other 429 signal burns only
+        # when the invocation actually failed, so a passing run whose log
+        # merely mentions 429 in prose never retires a healthy runner.
+        self.assertIn("is_opencode_429", self.body)
+        self.assertIn('grep -Eiq \'FreeUsageLimitError\' "$log"', self.body)
+        self.assertIn('[ "$status" -ne 0 ]', self.body)
+        self.assertIn("burned=true", self.body)
+        self.assertIn("burned=false", self.body)
+
+    def test_agent_progress_file_drives_honest_checkpoint_stage(self):
+        # The issue agent tracks lifecycle progress in .continuum-429-stage;
+        # the evacuator prefers the recorded stage for modes with a no-agent
+        # fresh-run path, and the restore step drops the stale file so only
+        # current-run progress can authorize a later skip.
+        for marker in (
+            ".continuum-429-stage",
+            "file_stage",
+            "Track lifecycle progress for crash recovery",
+            "rm -f .continuum-429-stage",
+        ):
+            self.assertIn(marker, self.body)
+
+    def test_qualification_resumption_prefers_exact_sha_evidence(self):
+        # A fresh-VM qualification resumption re-reads trusted exact-SHA
+        # evidence before invoking the model and skips the agent when the
+        # burned runner already published a canonical marker.
+        for marker in (
+            "QUAL_PRIOR_EVIDENCE",
+            "continuum-qualification-result",
+            "skipping OpenCode qualification agent",
+        ):
+            self.assertIn(marker, self.body)
+        # The qualification step must own its run log (mktemp) before the
+        # 429 inline check reads it; an unset log under `set -u` would fail
+        # the step before any evacuation could run.
+        qual_block = self.body.split(
+            "Run mandatory qualification at the exact required SHA"
+        )[-1].split("Qualification mode cannot push product changes")[0]
+        self.assertIn('OPENCODE_RUN_LOG="$(mktemp)"', qual_block)
+
     def test_workflow_owned_evacuation_without_llm(self):
         # Shell/workflow code — not the model — persists recoverable state.
         for marker in (

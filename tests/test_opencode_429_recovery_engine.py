@@ -9,7 +9,9 @@ deduplication, Parent-log opacity, and recovery-input validation.
 import unittest
 
 from continuum.opencode_429_recovery import (
+    MODES_HONORING_STAGE_FILE,
     RECOVERY_IDENTITY_FIELDS,
+    STAGE_FILE_NAME,
     already_resumed,
     checkpoint_ref,
     classify_agent_error,
@@ -22,8 +24,10 @@ from continuum.opencode_429_recovery import (
     operation_id,
     pack_recovery_identity,
     parse_checkpoint_ref,
+    parse_stage_file,
     recovery_dispatch_inputs,
     redact_child_identity,
+    resolve_evacuation_stage,
     resume_stage,
     resumption_dedupe_key,
     resumption_marker,
@@ -111,6 +115,65 @@ class StageResumeTest(unittest.TestCase):
     def test_unknown_stage_resumes_from_start(self):
         self.assertEqual(resume_stage("bogus"), "implementation-incomplete")
         self.assertEqual(resume_stage("review-repair"), "review-repair")
+
+
+class EvacuationStageFileTest(unittest.TestCase):
+    def test_stage_file_name_is_fixed(self):
+        self.assertEqual(STAGE_FILE_NAME, ".continuum-429-stage")
+        self.assertEqual(
+            MODES_HONORING_STAGE_FILE, frozenset({"issue", "qualification"})
+        )
+
+    def test_parse_stage_file_honors_exact_stages_only(self):
+        self.assertEqual(parse_stage_file("tests-passed\n"), "tests-passed")
+        self.assertEqual(
+            parse_stage_file("  publish-pr  \n"), "publish-pr"
+        )
+        self.assertIsNone(parse_stage_file(""))
+        self.assertIsNone(parse_stage_file("   \n"))
+        self.assertIsNone(parse_stage_file("done\n"))
+        self.assertIsNone(parse_stage_file(None))
+        self.assertIsNone(parse_stage_file(42))
+        # Only the first line matters; garbage elsewhere is ignored only
+        # when the first line itself is a known stage.
+        self.assertEqual(
+            parse_stage_file("tests-passed\ngarbage\n"), "tests-passed"
+        )
+        self.assertIsNone(parse_stage_file("garbage\ntests-passed\n"))
+
+    def test_recorded_stage_wins_for_no_agent_path_modes(self):
+        for mode in ("issue", "qualification"):
+            self.assertEqual(
+                resolve_evacuation_stage(
+                    "implementation-incomplete", mode, "tests-passed\n"
+                ),
+                "tests-passed",
+                mode,
+            )
+
+    def test_repair_modes_ignore_stage_file(self):
+        for mode in ("coderabbit-fix", "resolve-conflict", "ci-fix", "future"):
+            self.assertEqual(
+                resolve_evacuation_stage(
+                    "review-repair", mode, "tests-passed\n"
+                ),
+                "review-repair",
+                mode,
+            )
+
+    def test_garbage_falls_back_to_normalized_default(self):
+        self.assertEqual(
+            resolve_evacuation_stage("review-repair", "issue", "bogus\n"),
+            "review-repair",
+        )
+        self.assertEqual(
+            resolve_evacuation_stage("bogus-default", "issue", None),
+            "implementation-incomplete",
+        )
+        self.assertEqual(
+            resolve_evacuation_stage("review-repair", "coderabbit-fix", None),
+            "review-repair",
+        )
 
 
 class OperationIdentityTest(unittest.TestCase):

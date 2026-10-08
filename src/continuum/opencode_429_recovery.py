@@ -106,6 +106,25 @@ DEFAULT_MAX_429_RUNNER_RESTARTS = 3
 #: Prefix for workflow-owned durable checkpoint refs.
 CHECKPOINT_REF_PREFIX = "opencode/429-checkpoint-"
 
+#: Workflow-owned progress file an agent maintains while it works. The agent
+#: writes a single lifecycle stage name (see :data:`STAGES`) as it completes
+#: each phase; the workflow-owned 429 evacuator reads it back (no LLM call)
+#: so the checkpoint records the honest current stage instead of a hardcoded
+#: default. The file is progress metadata, never product code: the evacuator
+#: commits it into the checkpoint, normal publication paths delete it before
+#: staging task commits, and a fresh-VM restore deletes it so only progress
+#: made on the current run can authorize a skip.
+STAGE_FILE_NAME = ".continuum-429-stage"
+
+#: Modes whose fresh-run path can continue without the agent, so an honest
+#: recorded stage may skip it. Issue mode publishes workflow-side and
+#: qualification mode verifies exact-SHA evidence workflow-side; repair modes
+#: (coderabbit-fix, resolve-conflict, ci-fix, future repair-like modes) always
+#: resume the agent because unaddressed review findings cannot be published
+#: around, so the evacuator ignores the stage file for them and keeps the
+#: repair stage.
+MODES_HONORING_STAGE_FILE = frozenset({"issue", "qualification"})
+
 _FREE_USAGE_RE = re.compile(r"FreeUsageLimitError", re.IGNORECASE)
 _429_SIGNAL_RE = re.compile(
     r"APIError.*429"
@@ -195,6 +214,42 @@ def resume_stage(stage: Any) -> str:
     if is_valid_stage(stage):
         return str(stage)
     return "implementation-incomplete"
+
+
+def parse_stage_file(content: Any) -> Optional[str]:
+    """Read an agent-maintained stage file. Returns the stage or None.
+
+    Only the first line matters and only an exact known stage is honored;
+    blank, multi-line, or unknown content is ignored so a confused agent
+    can never authorize a skip with garbage.
+    """
+
+    if not isinstance(content, str):
+        return None
+    first = content.splitlines()[0] if content.splitlines() else ""
+    stage = first.strip()
+    return stage if is_valid_stage(stage) else None
+
+
+def resolve_evacuation_stage(
+    default_stage: Any, mode: Any, stage_file_content: Any = None
+) -> str:
+    """Resolve the stage a 429 evacuation records.
+
+    For modes with a no-agent fresh-run path (see
+    :data:`MODES_HONORING_STAGE_FILE`) an honest agent-recorded stage wins
+    so a ``tests-passed`` checkpoint lets the fresh run skip the model and
+    publish directly. Every other mode keeps its caller default (repair
+    lifecycles always resume the agent), and garbage input falls back to
+    the normalized default instead of failing the evacuation.
+    """
+
+    mode_text = str(mode or "").strip().lower()
+    if mode_text in MODES_HONORING_STAGE_FILE:
+        recorded = parse_stage_file(stage_file_content)
+        if recorded is not None:
+            return recorded
+    return resume_stage(default_stage)
 
 
 def _safe_token(value: Any) -> str:
@@ -539,12 +594,14 @@ __all__ = [
     "DEFAULT_MAX_429_RUNNER_RESTARTS",
     "FAIL_CLOSED_STATUSES",
     "INFRA_BACKOFF_SCHEDULE",
+    "MODES_HONORING_STAGE_FILE",
     "PUBLISH_RACE_MARKER",
     "RESTART_REQUIRED_MARKER",
     "RECOVERY_IDENTITY_FIELDS",
     "RUNNER_DEATH_EXIT_CODE",
     "SKIP_AGENT_STAGES",
     "STAGES",
+    "STAGE_FILE_NAME",
     "already_resumed",
     "checkpoint_ref",
     "classify_agent_error",
@@ -556,9 +613,11 @@ __all__ = [
     "next_generation",
     "operation_id",
     "parse_checkpoint_ref",
+    "parse_stage_file",
     "pack_recovery_identity",
     "recovery_dispatch_inputs",
     "redact_child_identity",
+    "resolve_evacuation_stage",
     "resume_stage",
     "resumption_dedupe_key",
     "resumption_marker",

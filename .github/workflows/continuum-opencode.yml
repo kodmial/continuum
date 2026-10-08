@@ -470,6 +470,11 @@ jobs:
           fi
           CHECKPOINT_SHA="$(git rev-parse FETCH_HEAD)"
           git switch --detach FETCH_HEAD
+          # kodmial/continuum#290: drop any stage-progress file carried by
+          # the checkpoint. The dispatch recovery_stage above is
+          # authoritative for this run; only progress the agent makes on
+          # THIS run may authorize a later skip, never a stale file.
+          rm -f .continuum-429-stage
           echo "Restored 429 checkpoint $RECOVERY_CHECKPOINT_REF at exact SHA $CHECKPOINT_SHA (operation $RECOVERY_OPERATION_ID, stage ${RECOVERY_STAGE:-implementation-incomplete}, generation ${RECOVERY_GENERATION:-0})."
           {
             echo "resumed=true"
@@ -1141,7 +1146,20 @@ jobs:
           opencode "$@" 2>&1 | tee "$log"
           status=${PIPESTATUS[0]}
           set -e
-          if grep -Eiq 'FreeUsageLimitError|APIError.*429|HTTP[^0-9]*429([^0-9]|$)|429[[:space:]]+Too[[:space:]]+Many[[:space:]]+Requests|statusCode[^0-9]*429([^0-9]|$)' "$log"; then
+          # kodmial/continuum#290: classification mirrors the
+          # is_opencode_429 engine contract exactly. FreeUsageLimitError
+          # always burns the runner (the provider refused usage even when
+          # the CLI exits 0); any other 429 signal burns only when the
+          # invocation actually failed, so a passing run whose log merely
+          # mentions 429 in prose (prompts and agent output routinely do)
+          # never retires a healthy runner.
+          burned=false
+          if grep -Eiq 'FreeUsageLimitError' "$log"; then
+            burned=true
+          elif [[ "$status" -ne 0 ]] && grep -Eiq 'APIError.*429|HTTP[^0-9]*429([^0-9]|$)|429[[:space:]]+Too[[:space:]]+Many[[:space:]]+Requests|statusCode[^0-9]*429([^0-9]|$)' "$log"; then
+            burned=true
+          fi
+          if [[ "$burned" == "true" ]]; then
             : > "${RUNNER_TEMP:-/tmp}/continuum-opencode-429"
             rm -f "$log"
             echo "::error::OpenCode 429: retire this runner and recover on a fresh runner."
@@ -1186,6 +1204,21 @@ jobs:
               implementation-incomplete|implementation-complete|tests-running|tests-passed|publish-pr|review-repair|qualification) ;;
               *) stage="implementation-incomplete" ;;
             esac
+            # kodmial/continuum#290: the agent tracks honest lifecycle
+            # progress in .continuum-429-stage (see the issue-mode prompt).
+            # For modes with a no-agent fresh-run path (issue,
+            # qualification) the recorded stage wins, so a tests-passed
+            # checkpoint lets the fresh run skip the model and publish
+            # directly instead of repeating completed stages. Repair modes
+            # always resume the agent (unaddressed findings cannot be
+            # published around), so the file is ignored for them. Unknown
+            # content falls back to the caller default above.
+            if [[ "$mode" == "issue" || "$mode" == "qualification" ]] && [[ -f ".continuum-429-stage" ]]; then
+              file_stage="$(head -n 1 ".continuum-429-stage" 2>/dev/null | tr -d '[:space:]')"
+              case "$file_stage" in
+                implementation-incomplete|implementation-complete|tests-running|tests-passed|publish-pr|review-repair|qualification) stage="$file_stage" ;;
+              esac
+            fi
             local gen="${RECOVERY_GENERATION_IN:-0}"
             [[ "$gen" =~ ^[0-9]+$ ]] || gen=0
             local next_gen=$((gen + 1))
@@ -1473,6 +1506,7 @@ jobs:
           - You may modify .github/workflows/** when the issue requires it. Workflow changes must be published only on the task branch and reviewed through a pull request; never update main directly.
           - You may use GitHub CLI/API and dispatch existing repository workflows when required by the issue. Treat specialized workflows as tools: inspect their outputs, wait for completion, and use their evidence to satisfy the Definition of Done; the scheduler will not reroute the issue for you.
           - If the Definition of Done is fully satisfied without repository changes, post the required evidence on the issue and close the issue yourself only after every Definition of Done item is verified. Never close an implementation task that still requires code changes.
+          - Track lifecycle progress for crash recovery: keep a one-line progress file at .continuum-429-stage in the repository root containing exactly one of: implementation-incomplete, implementation-complete, tests-running, tests-passed, publish-pr. Update it as you complete each phase (write tests-passed only after the full validation actually passes on the current tree). It is workflow-owned recovery metadata, never product code: never commit it, never include secrets, and never let its absence block the task.
           - Do not perform git commits, pushes, branch switches, rebases, resets, merges, or PR creation; the workflow owns Git state.
           EOF
           )"
@@ -1572,6 +1606,11 @@ jobs:
           # cache files; this also removes any tracked leftovers.
           find . -type d -name '__pycache__' -prune -exec rm -rf {} +
           find . -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
+          # kodmial/continuum#290: the 429 stage-progress file is
+          # workflow-owned recovery metadata, never product code. The
+          # evacuator commits it into checkpoints when present; the task
+          # commit below must not carry it into the PR.
+          rm -f .continuum-429-stage
 
           if [[ -n "$(git status --porcelain)" ]]; then
             git add -A
@@ -1696,6 +1735,7 @@ jobs:
           QUALIFICATION_NUMBER: ${{ steps.qualification_identity.outputs.qualification_number || inputs.qualification_number || inputs.issue_number || github.event.issue.number }}
           REQUIRED_SHA: ${{ steps.qualification_identity.outputs.required_sha || inputs.required_sha }}
           IN_PROGRESS_LABEL: ${{ inputs.in_progress_label || vars.AUTOMATION_IN_PROGRESS_LABEL || 'automation:in-progress' }}
+          RECOVERY_RESUMED: ${{ steps.recovery_restore.outputs.resumed }}
           RECOVERY_SKIP_OPENCODE: ${{ steps.recovery_restore.outputs.skip_opencode }}
           RECOVERY_STAGE_IN: ${{ steps.recovery_restore.outputs.stage }}
           RECOVERY_GENERATION_IN: ${{ inputs.recovery_generation }}
@@ -1749,6 +1789,30 @@ jobs:
           # exact-SHA evidence, so the fresh run must NOT call OpenCode again
           # merely to "finish". Skip the agent and verify the trusted evidence
           # for the exact SHA directly below.
+          OPENCODE_RUN_LOG="$(mktemp)"
+          # kodmial/continuum#290: a fresh-VM 429 resumption re-reads trusted
+          # exact-SHA evidence before invoking the model. When the burned
+          # runner's agent already published a canonical pass/fail marker
+          # for REQUIRED_SHA, the new run skips OpenCode and proceeds
+          # directly to the workflow-owned verification below. The read is
+          # fail-closed: an unreadable API response runs the agent instead
+          # of skipping on unproven state.
+          if [[ "${RECOVERY_SKIP_OPENCODE:-}" != "true" && "${RECOVERY_RESUMED:-}" == "true" ]]; then
+            QUAL_PRIOR_EVIDENCE="$(gh api "repos/$GITHUB_REPOSITORY/issues/$QUALIFICATION_NUMBER/comments?per_page=100" --jq '
+              [ .[] |
+                select(
+                  ( .author_association == "OWNER" or .author_association == "MEMBER" or
+                    .author_association == "COLLABORATOR" or .user.login == "github-actions[bot]" or .author.login == "github-actions[bot]" )
+                  and ( (.body // "") | contains("continuum-qualification-dispatch") | not )
+                  and ( (.body // "") | test("<!--[ \\t]*continuum-qualification-result[ \\t>]") )
+                ) | .body
+              ] | join("\n---\n")
+            ' 2>/dev/null || true)"
+            if grep -Eqi "<!--[[:space:]]*continuum-qualification-result[^>]*sha[[:space:]]*=[[:space:]]*${REQUIRED_SHA}[^>]*result[[:space:]]*=[[:space:]]*(pass|fail)" <<<"${QUAL_PRIOR_EVIDENCE:-}"; then
+              echo "429 resumption: trusted exact-SHA qualification evidence already exists for $REQUIRED_SHA; skipping OpenCode qualification agent."
+              RECOVERY_SKIP_OPENCODE="true"
+            fi
+          fi
           if [[ "${RECOVERY_SKIP_OPENCODE:-}" == "true" ]]; then
             echo "429 checkpoint stage '${RECOVERY_STAGE_IN:-}' already carries exact-SHA evidence; skipping OpenCode qualification agent."
             OPENCODE_RUN_RC=0
