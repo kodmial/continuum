@@ -2310,9 +2310,9 @@ jobs:
                 // pull metadata behind the actual same-repository branch ref,
                 // causing expected_head_sha to reject the authoritative HEAD.
                 // When that specific 422 occurs, revalidate the branch ref and
-                // perform one safe update-branch call without the stale cached
-                // expected field. update-branch only merges main into the
-                // current branch; review carry below is still granted only when
+                // merge the exact main SHA directly into the same-repository
+                // branch. This bypasses only stale PR metadata; it never rewrites
+                // branch history. Review carry below is still granted only when
                 // the resulting commit has exactly oldHead + mainHead as parents.
                 let updateSucceeded = false;
                 try {
@@ -2345,16 +2345,23 @@ jobs:
                   }
 
                   core.notice(
-                    `PR #${pr.number}: pull metadata rejected authoritative HEAD ${oldHead}; retrying update-branch once after direct branch-ref revalidation.`
+                    `PR #${pr.number}: pull metadata rejected authoritative HEAD ${oldHead}; merging main directly into branch ${pr.head.ref} after branch-ref revalidation.`
                   );
-                  await github.request(
-                    'PUT /repos/{owner}/{repo}/pulls/{pull_number}/update-branch',
+                  const { data: directMerge } = await github.request(
+                    'POST /repos/{owner}/{repo}/merges',
                     {
                       owner,
                       repo,
-                      pull_number: pr.number,
+                      base: pr.head.ref,
+                      head: mainHead,
+                      commit_message: `Merge branch 'main' into ${pr.head.ref}`,
                     }
                   );
+                  if (!directMerge?.sha) {
+                    throw new Error(
+                      `PR #${pr.number}: direct main-sync merge returned no commit SHA.`
+                    );
+                  }
                   updateSucceeded = true;
                 }
                 if (!updateSucceeded) {
