@@ -5249,9 +5249,10 @@ class ContinuumTest < Minitest::Test
     assert_includes automerge, 'pull metadata HEAD'
     assert_includes automerge, 'getPullWithAuthoritativeHead'
     assert_includes automerge, 'holding stale reconciliation'
-    assert_includes automerge, 'transient expected_head_sha race'
-    assert_includes automerge, 'for (let attempt = 0; attempt < 3; attempt += 1)'
-    assert_includes automerge, 'retrying update-branch'
+    assert_includes automerge, 'pull metadata rejected authoritative HEAD'
+    assert_includes automerge, 'retrying update-branch once after direct branch-ref revalidation'
+    assert_includes automerge, 'expected_head_sha: oldHead'
+    assert_match(/pull metadata rejected authoritative HEAD[\s\S]{0,1200}pull_number: pr\.number,[\s\S]{0,1200}\n\s*\}/m, automerge)
     assert_includes automerge, 'sha: pr.head.sha'
     # Exact-HEAD isolation: short-SHA markers are ignored entirely so an
     # old HEAD sharing a 7-char prefix can never strand a new HEAD. No
