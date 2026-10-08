@@ -1205,7 +1205,7 @@ jobs:
               }
 
               core.notice(
-                `CodeRabbit controller waiting ${Math.ceil(waitMs / 1000)}s until ${new Date(nextAt).toISOString()} (${reason}); no second review command will be emitted; any newer wake cancels and recomputes it.`
+                `CodeRabbit controller waiting ${Math.ceil(waitMs / 1000)}s until ${new Date(nextAt).toISOString()} (${reason}); no second review command will be emitted; newer wakes coalesce behind this waiter.`
               );
               await new Promise(resolve => setTimeout(resolve, waitMs));
               return true;
@@ -1213,9 +1213,9 @@ jobs:
 
             // GitHub schedule is best-effort and can be delayed for hours.
             // Public consumers therefore keep at most one bounded serialized
-            // waiter; private repositories stay event-driven. Concurrency
-            // cancellation ensures every new lifecycle event recomputes latest
-            // state instead of allowing a stale sleeper to emit a command.
+            // waiter; private repositories stay event-driven. New lifecycle
+            // events coalesce into the single pending slot while the running
+            // waiter revalidates latest state before it emits any command.
             let state = await collectState();
             let selected = null;
             while (!selected) {
