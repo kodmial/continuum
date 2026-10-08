@@ -1963,7 +1963,27 @@ jobs:
               repo,
               pull_number: pullNumber,
             });
-            const headSha = pr.data.head.sha;
+            if (pr.data.head.repo?.full_name !== `${owner}/${repo}`) {
+              core.setFailed(
+                `PR #${pullNumber}: CodeRabbit repair verification requires a same-repository head branch.`
+              );
+              return;
+            }
+
+            // pulls.get can lag immediately after the repair push. Resolve the
+            // authoritative branch ref directly so verification is always
+            // pinned to the commit that was actually published.
+            const headRef = await github.rest.git.getRef({
+              owner,
+              repo,
+              ref: `heads/${pr.data.head.ref}`,
+            });
+            const headSha = headRef.data.object.sha;
+            if (pr.data.head.sha !== headSha) {
+              core.notice(
+                `PR #${pullNumber}: pull metadata still reports stale HEAD ${pr.data.head.sha}; verifying published branch HEAD ${headSha}.`
+              );
+            }
 
             const comments = await github.paginate(
               github.rest.pulls.listReviewComments,

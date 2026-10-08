@@ -354,7 +354,6 @@ jobs:
               ownedLeases.delete(leaseKey(prNumber, headSha));
             }
             const AUTO_MERGE_BLOCK_LABEL = 'no-auto-merge';
-            const NO_PROGRESS_MAX_REVIEWS = 3;
             // A lost CodeRabbit thread-verification reply must never strand a PR forever.
             // Reconcile at a bounded cadence; the existing 17/47 safety-net wakeups will
             // retry only after this timeout instead of spamming the external reviewer.
@@ -570,6 +569,41 @@ jobs:
                 })
               );
               return data;
+            }
+
+            async function withAuthoritativeHead(pr) {
+              if (!pr?.head?.ref) {
+                return pr;
+              }
+              const headRepoFullName = pr.head.repo?.full_name;
+              if (headRepoFullName && headRepoFullName !== repoFullName) {
+                return pr;
+              }
+              const { data: ref } = await withReadFallback(client =>
+                client.rest.git.getRef({
+                  owner,
+                  repo,
+                  ref: `heads/${pr.head.ref}`,
+                })
+              );
+              const refSha = ref?.object?.sha;
+              if (!refSha || refSha === pr.head.sha) {
+                return pr;
+              }
+              core.notice(
+                `PR #${pr.number}: pull metadata HEAD ${pr.head.sha} lags authoritative branch ref ${refSha}; reconciling the branch ref.`
+              );
+              return {
+                ...pr,
+                head: {
+                  ...pr.head,
+                  sha: refSha,
+                },
+              };
+            }
+
+            async function getPullWithAuthoritativeHead(pullNumber) {
+              return withAuthoritativeHead(await getPull(pullNumber));
             }
 
             async function compareWithMain(headSha) {
@@ -794,7 +828,9 @@ jobs:
               ) {
                 return false;
               }
-              return markers.length >= NO_PROGRESS_MAX_REVIEWS;
+              // Summary-only CHANGES_REQUESTED is not a terminal state.
+              // The serialized CodeRabbit queue owns cooldown and re-review.
+              return false;
             }
 
             function retryWindowText(body = '') {
@@ -2233,7 +2269,7 @@ jobs:
               // the caller reconciles from a snapshot taken earlier in a long
               // loop. If the HEAD moved since, hold instead of syncing stale
               // state: the next wakeup reconciles the new HEAD from latest.
-              const liveBeforeSync = await getPull(pr.number);
+              const liveBeforeSync = await getPullWithAuthoritativeHead(pr.number);
               if (
                 liveBeforeSync.state !== 'open' ||
                 liveBeforeSync.head.sha !== oldHead
@@ -2270,19 +2306,73 @@ jobs:
                   : null;
 
               try {
-                await github.request(
-                  'PUT /repos/{owner}/{repo}/pulls/{pull_number}/update-branch',
-                  {
-                    owner,
-                    repo,
-                    pull_number: pr.number,
-                    expected_head_sha: oldHead,
+                // Prefer exact-HEAD protection. GitHub can temporarily keep
+                // pull metadata behind the actual same-repository branch ref,
+                // causing expected_head_sha to reject the authoritative HEAD.
+                // When that specific 422 occurs, revalidate the branch ref and
+                // merge the exact main SHA directly into the same-repository
+                // branch. This bypasses only stale PR metadata; it never rewrites
+                // branch history. Review carry below is still granted only when
+                // the resulting commit has exactly oldHead + mainHead as parents.
+                let updateSucceeded = false;
+                try {
+                  await github.request(
+                    'PUT /repos/{owner}/{repo}/pulls/{pull_number}/update-branch',
+                    {
+                      owner,
+                      repo,
+                      pull_number: pr.number,
+                      expected_head_sha: oldHead,
+                    }
+                  );
+                  updateSucceeded = true;
+                } catch (updateErr) {
+                  const updateMessage = String(updateErr.message || updateErr);
+                  const expectedHeadRace =
+                    updateErr.status === 422 &&
+                    /expected head sha.*current head ref/i.test(updateMessage);
+                  if (!expectedHeadRace) throw updateErr;
+
+                  const refreshed = await getPullWithAuthoritativeHead(pr.number);
+                  if (refreshed.state !== 'open') {
+                    return false;
                   }
-                );
+                  if (refreshed.head.sha !== oldHead) {
+                    core.info(
+                      `PR #${pr.number}: authoritative HEAD moved ${oldHead} -> ${refreshed.head.sha} during update-branch; the next reconciliation will evaluate it.`
+                    );
+                    return false;
+                  }
+
+                  core.notice(
+                    `PR #${pr.number}: pull metadata rejected authoritative HEAD ${oldHead}; merging main directly into branch ${pr.head.ref} after branch-ref revalidation.`
+                  );
+                  const { data: directMerge } = await github.request(
+                    'POST /repos/{owner}/{repo}/merges',
+                    {
+                      owner,
+                      repo,
+                      base: pr.head.ref,
+                      head: mainHead,
+                      commit_message: `Merge branch 'main' into ${pr.head.ref}`,
+                    }
+                  );
+                  if (!directMerge?.sha) {
+                    throw new Error(
+                      `PR #${pr.number}: direct main-sync merge returned no commit SHA.`
+                    );
+                  }
+                  updateSucceeded = true;
+                }
+                if (!updateSucceeded) {
+                  throw new Error(
+                    `PR #${pr.number}: update-branch exited without success for HEAD ${oldHead}.`
+                  );
+                }
 
                 let fresh = null;
                 for (let attempt = 0; attempt < 6; attempt += 1) {
-                  fresh = await getPull(pr.number);
+                  fresh = await getPullWithAuthoritativeHead(pr.number);
                   if (fresh.head.sha !== oldHead) break;
                   await new Promise(resolve => setTimeout(resolve, 1000));
                 }
@@ -2342,7 +2432,7 @@ jobs:
                 // GitHub returns 422 when expected_head_sha became stale. That is
                 // a normal race with OpenCode/CI/main-sync, not a merge conflict.
                 // Re-read before deciding whether a repair agent is warranted.
-                const fresh = await getPull(pr.number);
+                const fresh = await getPullWithAuthoritativeHead(pr.number);
                 if (fresh.head.sha !== oldHead) {
                   core.info(
                     `PR #${pr.number}: head advanced from ${oldHead} to ${fresh.head.sha} during update; no conflict repair needed.`
@@ -2473,8 +2563,20 @@ jobs:
               // pre-lease filter, so only one authoritative pulls.get follows
               // lease acquisition. A second pulls.get per PR would double
               // read load (~2N) on every wakeup during quota exhaustion.
-              const listedHead = listed.head && listed.head.sha;
-              const listedFork = listed.head && listed.head.repo && listed.head.repo.full_name;
+              let authoritativeListed = listed;
+              try {
+                authoritativeListed = await withAuthoritativeHead(listed);
+              } catch (err) {
+                if (isTransientApiError(err)) {
+                  core.warning(
+                    `PR #${listed.number}: authoritative HEAD lookup hit a transient error; deferred to next wakeup: ${err.message || err}`
+                  );
+                  continue;
+                }
+                throw err;
+              }
+              const listedHead = authoritativeListed.head && authoritativeListed.head.sha;
+              const listedFork = authoritativeListed.head && authoritativeListed.head.repo && authoritativeListed.head.repo.full_name;
               if (
                 (listed.state && listed.state !== 'open') ||
                 listed.draft ||
@@ -2505,7 +2607,7 @@ jobs:
               // healthy PRs behind a single bad PR.
               let pr;
               try {
-                pr = await getPull(listed.number);
+                pr = await getPullWithAuthoritativeHead(listed.number);
               } catch (err) {
                 if (isTransientApiError(err)) {
                   core.warning(`PR #${listed.number}: transient fetch error; deferred to next wakeup: ` + (err.message || err));
@@ -2666,14 +2768,13 @@ jobs:
                   : false;
 
               // A policy/task-contract verdict with no actionable code finding
-              // is not a coding-agent repair request, but it is also not
-              // terminal after one review. The global CodeRabbit controller
-              // gets a bounded same-HEAD re-review budget after cooldown.
-              // Only exhaustion of that budget blocks until a new HEAD or a
-              // later explicit APPROVED decision.
+              // is not a coding-agent repair request and must never become a
+              // human-required terminal state. The global CodeRabbit controller
+              // keeps the exact HEAD queued behind the provider cooldown until
+              // approval or an actionable finding appears.
               if (reviewNoProgressBlocked) {
                 core.warning(
-                  `PR #${pr.number}: exact HEAD ${pr.head.sha} is blocked by a non-code CodeRabbit verdict; bounded non-code CodeRabbit re-review budget is exhausted.`
+                  `PR #${pr.number}: exact HEAD ${pr.head.sha} has a summary-only CodeRabbit verdict; keeping it in the autonomous re-review queue.`
                 );
                 continue;
               }
@@ -2794,7 +2895,7 @@ jobs:
               }
 
               // Re-read every merge-critical fact immediately before the write.
-              pr = await getPull(pr.number);
+              pr = await getPullWithAuthoritativeHead(pr.number);
               if (
                 pr.state !== 'open' ||
                 pr.draft ||

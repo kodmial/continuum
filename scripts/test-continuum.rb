@@ -4850,6 +4850,18 @@ class ContinuumTest < Minitest::Test
     refute_includes step, '--force-with-lease'
   end
 
+  def test_coderabbit_fix_verification_uses_published_branch_ref
+    body = workflow_body('continuum-opencode.yml')
+    step = body[/^\s+- name: Ask CodeRabbit to verify every original finding\n(.*?)(?=^\s+- name: Resolve merge conflict with main)/m, 1]
+    refute_nil step, 'CodeRabbit verification step is missing'
+
+    assert_includes step, 'github.rest.git.getRef({'
+    assert_includes step, 'ref: `heads/${pr.data.head.ref}`'
+    assert_includes step, 'const headSha = headRef.data.object.sha;'
+    assert_includes step, 'pull metadata still reports stale HEAD'
+    refute_includes step, 'const headSha = pr.data.head.sha;'
+  end
+
   def test_coderabbit_policy_blocker_is_classified_before_opencode_dispatch
     body = workflow_body('continuum-opencode.yml')
     job = body[/^  dispatch-coderabbit-fix:\n(.*?)(?=^  opencode:)/m, 1]
@@ -4883,25 +4895,27 @@ class ContinuumTest < Minitest::Test
   end
 
   # A summary-only CHANGES_REQUESTED verdict has no coding-agent repair
-  # value, but one such verdict must not permanently strand an exact HEAD.
-  # Retry is bounded and cooldown-driven; only budget exhaustion is terminal.
-  def test_coderabbit_no_progress_marker_has_bounded_same_head_requeue
+  # value and must never permanently strand an exact HEAD. The serialized
+  # CodeRabbit queue retries it after cooldown until approval or until a real
+  # actionable finding appears for OpenCode to repair.
+  def test_coderabbit_no_progress_marker_stays_in_autonomous_same_head_queue
     retry_body = workflow_body('continuum-coderabbit-retry.yml')
     merge_body = auto_merge_body
 
     assert_includes retry_body, 'continuum-coderabbit-no-progress head='
-    assert_includes retry_body, 'NO_PROGRESS_MAX_REVIEWS = 3'
-    assert_includes retry_body, 'noProgressMarkers.length >= NO_PROGRESS_MAX_REVIEWS'
     assert_includes retry_body, 'noProgressAt + REVIEW_COOLDOWN_MS'
     assert_includes retry_body, "kind = 'no-progress-retry'"
-    assert_includes retry_body, 'exhausted bounded non-code CodeRabbit re-review budget'
+    assert_includes retry_body, 'must never become'
+    refute_includes retry_body, 'NO_PROGRESS_MAX_REVIEWS'
+    refute_includes retry_body, 'exhausted bounded non-code CodeRabbit re-review budget'
 
     assert_includes merge_body, 'continuum-coderabbit-no-progress head='
-    assert_includes merge_body, 'NO_PROGRESS_MAX_REVIEWS = 3'
-    assert_includes merge_body, 'return markers.length >= NO_PROGRESS_MAX_REVIEWS'
     assert_includes merge_body, 'codeRabbitNoProgressBlocked'
     assert_includes merge_body, 'reviewNoProgressBlocked'
-    assert_includes merge_body, 'bounded non-code CodeRabbit re-review budget is exhausted.'
+    assert_includes merge_body, 'return false;'
+    assert_includes merge_body, 'must never become a'
+    refute_includes merge_body, 'NO_PROGRESS_MAX_REVIEWS'
+    refute_includes merge_body, 'bounded non-code CodeRabbit re-review budget is exhausted.'
   end
 
   # Inline findings already have an independent thread-verification protocol.
@@ -4981,7 +4995,8 @@ class ContinuumTest < Minitest::Test
     assert_includes body, 'state = await collectState()'
     assert_includes body, 'await waitUntilNextCandidate(state)'
     assert_includes body, 'timeout-minutes: 85'
-    assert_includes body, 'cancel-in-progress: true'
+    assert_includes body, 'cancel-in-progress: false'
+    assert_includes body, 'provider cooldown progress is never reset'
     assert_includes body, 'GitHub schedule is best-effort and can be delayed for hours'
     assert_includes body, 'private repository or wait exceeds cap'
     assert_includes body, 'no second review command will be emitted'
@@ -5232,7 +5247,17 @@ class ContinuumTest < Minitest::Test
     assert_includes recovery, 'skipping PR but continuing run'
     assert_includes recovery, 'core.setFailed('
     assert_includes automerge, 'liveBeforeSync'
+    assert_includes automerge, 'withAuthoritativeHead'
+    assert_includes automerge, 'client.rest.git.getRef'
+    assert_includes automerge, 'pull metadata HEAD'
+    assert_includes automerge, 'getPullWithAuthoritativeHead'
     assert_includes automerge, 'holding stale reconciliation'
+    assert_includes automerge, 'pull metadata rejected authoritative HEAD'
+    assert_includes automerge, "'POST /repos/{owner}/{repo}/merges'"
+    assert_includes automerge, 'base: pr.head.ref'
+    assert_includes automerge, 'head: mainHead'
+    assert_includes automerge, 'direct main-sync merge returned no commit SHA'
+    assert_includes automerge, 'expected_head_sha: oldHead'
     assert_includes automerge, 'sha: pr.head.sha'
     # Exact-HEAD isolation: short-SHA markers are ignored entirely so an
     # old HEAD sharing a 7-char prefix can never strand a new HEAD. No

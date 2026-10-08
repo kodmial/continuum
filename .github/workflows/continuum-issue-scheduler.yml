@@ -3155,8 +3155,9 @@ jobs:
                 );
               }
               if (wipWaiters.length > 0) {
-                core.setFailed(
-                  'Issue scheduler WIP exhausted with eligible backlog waiting.'
+                core.notice(
+                  'WIP is saturated; ' + wipWaiters.length +
+                  ' eligible issue(s) remain queued and will be retried by the next lifecycle or scheduled wake.'
                 );
               } else {
                 core.info('No free WIP slots; nothing will be dispatched.');
