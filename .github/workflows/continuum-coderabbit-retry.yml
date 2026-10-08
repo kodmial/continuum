@@ -1091,6 +1091,12 @@ jobs:
                   kind,
                   stage: finalReview ? 'final-review' : 'initial-review',
                   stageRank: finalReview ? 0 : 1,
+                  // A summary-only CHANGES_REQUESTED has already consumed a
+                  // review slot without producing repairable work. Keep it
+                  // autonomous, but let every ordinary ready candidate take a
+                  // slot first so one high-priority policy/no-progress PR cannot
+                  // starve the repository-wide review queue forever.
+                  noProgressRank: kind === 'no-progress-retry' ? 1 : 0,
                   createdAt: new Date(pr.created_at || 0).getTime(),
                   fullReviewCount,
                   ...priority,
@@ -1138,15 +1144,13 @@ jobs:
             }
 
             function candidateOrder(a, b) {
-              // Priority is the hard primary key and must never be bypassed:
-              // P0 > P1 > P2. PRs without a source issue use the explicit P2
-              // fallback above so they cannot silently starve forever.
-              //
-              // Within one priority class, a merge-ready final review beats a
-              // first review. Oldest PR then wins among otherwise equivalent
-              // candidates, which prevents a constant stream of new work from
-              // starving an older candidate.
+              // Ordinary actionable/initial/final review work always outranks
+              // a repeated summary-only no-progress re-review. Within each
+              // class, P0 > P1 > P2 remains the hard priority contract.
+              // This preserves task priority without allowing one P0 policy
+              // verdict to consume every repository-wide provider slot.
               return (
+                a.noProgressRank - b.noProgressRank ||
                 a.rank - b.rank ||
                 a.stageRank - b.stageRank ||
                 a.fullReviewCount - b.fullReviewCount ||
