@@ -4848,6 +4848,18 @@ class ContinuumTest < Minitest::Test
     refute_includes step, '--force-with-lease'
   end
 
+  def test_coderabbit_fix_verification_uses_published_branch_ref
+    body = workflow_body('continuum-opencode.yml')
+    step = body[/^\s+- name: Ask CodeRabbit to verify every original finding\n(.*?)(?=^\s+- name: Resolve merge conflict with main)/m, 1]
+    refute_nil step, 'CodeRabbit verification step is missing'
+
+    assert_includes step, 'github.rest.git.getRef({'
+    assert_includes step, 'ref: `heads/${pr.data.head.ref}`'
+    assert_includes step, 'const headSha = headRef.data.object.sha;'
+    assert_includes step, 'pull metadata still reports stale HEAD'
+    refute_includes step, 'const headSha = pr.data.head.sha;'
+  end
+
   def test_coderabbit_policy_blocker_is_classified_before_opencode_dispatch
     body = workflow_body('continuum-opencode.yml')
     job = body[/^  dispatch-coderabbit-fix:\n(.*?)(?=^  opencode:)/m, 1]
