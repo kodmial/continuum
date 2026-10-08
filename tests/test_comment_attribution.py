@@ -76,7 +76,7 @@ MUTATION_COUNTS = {
     "continuum-consumer-child-worker.yml": 4,
     "continuum-docker-qualification.yml": 1,
     "continuum-issue-scheduler.yml": 11,
-    "continuum-opencode-watchdog.yml": 2,
+    "continuum-opencode-watchdog.yml": 5,
     "continuum-opencode.yml": 6,
     "continuum-pr-agent-auto-merge.yml": 1,
     "continuum-pr-agent-canary.yml": 4,
@@ -178,6 +178,8 @@ FUNCTIONAL_ANCHORS = {
     "continuum-opencode-watchdog.yml": (
         "OpenCode automation paused after ",
         "Automatic recovery retry ",
+        "fresh-VM resumption for operation",
+        "bounded infrastructure backoff",
     ),
     "continuum-opencode.yml": (
         "Continuum classified this CodeRabbit",

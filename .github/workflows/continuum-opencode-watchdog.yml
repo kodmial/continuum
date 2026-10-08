@@ -176,13 +176,29 @@ jobs:
               );
             }
             // 429 is a runner-lifecycle failure, not an issue/task failure.
-            // The OpenCode workflow emits this exact marker only when its CLI
-            // invocation itself failed with provider rate limiting. Re-run the
-            // same workflow run so GitHub preserves its original event/inputs,
-            // while all jobs are scheduled again on fresh hosted runners.
+            // kodmial/continuum#290: the burned runner already evacuated
+            // workflow-owned state to a durable checkpoint ref and terminated
+            // (exit 75) without invoking the model again on that VM. The
+            // watchdog never uses reRunWorkflow for 429 recovery: re-running
+            // the same run would replay completed stages and re-spend
+            // task-failure budgets. Instead it dispatches a NEW
+            // workflow_dispatch carrying the explicit recovery identity
+            // (operation id + checkpoint ref/SHA + stage + generation) onto
+            // a fresh VM, which restores the exact checkpoint and continues
+            // from the last completed stage. Deduplication is by stable
+            // operation identity; 429 never consumes task/review/
+            // qualification budgets, never applies automation:paused, and
+            // never requires manual /oc. Repeated fresh-VM 429s enter
+            // bounded infrastructure backoff and resume automatically.
             const rateLimitMarker = 'CONTINUUM_OPENCODE_429_RESTART_REQUIRED';
             const publishRaceMarker =
               'CONTINUUM_OPENCODE_PUBLISH_RACE_RETRY_REQUIRED';
+            // Evacuation line written by the workflow-owned 429 evacuator:
+            // "Evacuated 429 checkpoint <ref> at exact SHA <sha> (operation
+            // <op>, stage <stage>, generation <gen>, mode <mode>, issue <i>,
+            // pr <p>, branch <b>)."
+            const evacuatedRe =
+              /Evacuated 429 checkpoint (\S+) at exact SHA ([0-9a-f]{40}) \(operation (\S+), stage (\S+), generation (\d+), mode (\S+), issue ([^,]*), pr ([^,]*), branch ([^)]*)\)/;
             const max429Restarts = Number.parseInt(
               process.env.MAX_429_RUNNER_RESTARTS || '3',
               10
@@ -192,6 +208,362 @@ jobs:
                 'Invalid MAX_429_RUNNER_RESTARTS: ' +
                 process.env.MAX_429_RUNNER_RESTARTS
               );
+            }
+
+            // kodmial/continuum#290: fresh-VM 429 resumption. Dispatches a NEW
+            // workflow_dispatch carrying the explicit recovery identity onto
+            // a fresh VM. Never reRunWorkflow (that would replay completed
+            // stages on the same run), never consumes task/review/
+            // qualification budgets, never applies automation:paused, never
+            // requires manual /oc. Identity and numbers only: repository
+            // names never enter logs or comments, so public Parent logs keep
+            // Child identities opaque.
+            async function recoverFrom429OnFreshVm({
+              owner, repo, run, evacuated429,
+              max429Restarts,
+            }) {
+              if (!evacuated429) {
+                core.notice(
+                  'OpenCode 429 marker without a workflow-owned evacuation ' +
+                  'pointer in run ' + run.id + '; keeping the automation ' +
+                  'reservation so the scheduler lease retries it. No task ' +
+                  'budget was consumed and no pause was applied.'
+                );
+                return;
+              }
+              const operation = String(evacuated429.operationId || '').trim();
+              const checkpointRef = String(evacuated429.checkpointRef || '').trim();
+              let generation = Number(evacuated429.generation || 0);
+              if (!Number.isInteger(generation) || generation < 0) generation = 0;
+              if (!operation || !checkpointRef.startsWith('opencode/429-checkpoint-')) {
+                core.warning(
+                  'OpenCode 429 evacuation identity is malformed in run ' +
+                  run.id + '; keeping the reservation for scheduler retry.'
+                );
+                return;
+              }
+
+              // The durable checkpoint metadata is the source of truth for
+              // the full recovery identity (mode, issue/PR, SHAs, stage).
+              let identity;
+              try {
+                const content = await readGithub.rest.repos.getContent({
+                  owner,
+                  repo,
+                  path: '.continuum-429-recovery.json',
+                  ref: checkpointRef,
+                });
+                if (Array.isArray(content.data) || content.data.type !== 'file') {
+                  throw new Error('recovery metadata is not a file');
+                }
+                identity = JSON.parse(
+                  Buffer.from(content.data.content, 'base64').toString('utf8')
+                );
+              } catch (err) {
+                core.warning(
+                  'OpenCode 429 checkpoint ' + checkpointRef +
+                  ' metadata is not readable yet (' + (err.message || err) +
+                  '); keeping the reservation for a later watchdog pass. ' +
+                  'No pause was applied.'
+                );
+                return;
+              }
+              // The durable checkpoint ref tip is the recovery-metadata
+              // commit on top of the working-tree HEAD recorded inside the
+              // metadata file, so identity.head_sha (working-tree HEAD) is
+              // the parent of the evacuated tip, not the tip itself.
+              // Identity match is operation + generation; the exact
+              // checkpoint SHA dispatched is the evacuated ref tip from the
+              // workflow-owned evacuation pointer (falling back to the
+              // metadata working-tree HEAD only when the pointer SHA is
+              // malformed).
+              if (
+                String(identity.operation_id || '') !== operation ||
+                Number(identity.generation || 0) !== generation
+              ) {
+                core.warning(
+                  'OpenCode 429 checkpoint metadata does not match the ' +
+                  'evacuation pointer for operation ' + operation + '; ' +
+                  'keeping the reservation for a later watchdog pass.'
+                );
+                return;
+              }
+              const stage = String(identity.stage || 'implementation-incomplete');
+              const pointerSha = String(evacuated429.checkpointSha || '');
+              const checkpointSha = /^[0-9a-f]{40}$/i.test(pointerSha)
+                ? pointerSha.toLowerCase()
+                : String(identity.head_sha || '').toLowerCase();
+              const mode = String(identity.mode || '');
+              if (!['issue', 'qualification', 'coderabbit-fix', 'resolve-conflict', 'ci-fix'].includes(mode)) {
+                core.warning(
+                  'OpenCode 429 checkpoint has unknown mode for operation ' + operation +
+                  '; keeping reservation for later pass.'
+                );
+                return;
+              }
+              const issueText = String(identity.issue_number || '').trim();
+              const prText = String(identity.pr_number || '').trim();
+              const qualText = String(identity.qualification_number || '').trim();
+              const threadNumber = Number(issueText || prText || qualText || 0);
+              if (!/^[0-9]+$/.test(String(threadNumber)) || threadNumber <= 0) {
+                // No issue/PR thread owns this operation (or the number is
+                // not trustworthy): dispatch the resumption without a
+                // marker thread, but still never pause and never consume
+                // task budgets.
+                core.notice(
+                  'OpenCode 429 operation ' + operation + ' has no numeric ' +
+                  'thread; resuming without a dedupe comment.'
+                );
+              }
+
+              const resumptionMarker =
+                '<!-- continuum-429-resumption op=' + operation +
+                ' gen=' + generation + ' -->';
+              if (Number.isInteger(threadNumber) && threadNumber > 0) {
+                const comments = await readGithub.paginate(
+                  readGithub.rest.issues.listComments,
+                  { owner, repo, issue_number: threadNumber, per_page: 100 }
+                );
+                if (comments.some(comment => (comment.body || '').includes(resumptionMarker))) {
+                  core.notice(
+                    'OpenCode 429 operation ' + operation + ' generation ' +
+                    generation + ' was already resumed; watchdog will not ' +
+                    'create a competing resumption.'
+                  );
+                  return;
+                }
+              }
+
+              // Repeated fresh-VM 429s enter bounded infrastructure
+              // backoff: the checkpoint is preserved, the reservation is
+              // kept, and the scheduler/cron resumes automatically with the
+              // same checkpoint/operation identity. Never paused, never /oc.
+              if (generation > max429Restarts) {
+                const backoffMarker =
+                  '<!-- continuum-429-backoff op=' + operation +
+                  ' gen=' + generation + ' -->';
+                if (Number.isInteger(threadNumber) && threadNumber > 0) {
+                  const comments = await readGithub.paginate(
+                    readGithub.rest.issues.listComments,
+                    { owner, repo, issue_number: threadNumber, per_page: 100 }
+                  );
+                  if (!comments.some(comment => (comment.body || '').includes(backoffMarker))) {
+                    await github.rest.issues.createComment({
+                      owner,
+                      repo,
+                      issue_number: threadNumber,
+                      body: [
+                        backoffMarker,
+                        '⚡ **Continuum · opencode-watchdog**',
+                        '<!-- continuum-origin role=continuum component=opencode-watchdog -->',
+                        'Model 429 burned fresh runners repeatedly (generation ' + generation +
+                          ', operation `' + operation + '`, stage `' + stage + '`): ' +
+                          'entering bounded infrastructure backoff.',
+                        '',
+                        'This is infrastructure exhaustion, not a task failure: no ' +
+                          'task/review/qualification budget was consumed and no pause was applied.',
+                        '',
+                        'Checkpoint `' + checkpointRef + '` at exact SHA `' + checkpointSha + '` is preserved. ' +
+                          'The scheduler resumes this operation automatically with the same ' +
+                          'checkpoint/operation identity; no manual `/oc` is required.',
+                      ].join('\n'),
+                    });
+                  }
+                }
+                core.warning(
+                  'OpenCode 429 operation ' + operation + ' entered bounded ' +
+                  'infrastructure backoff after ' + generation +
+                  ' fresh-runner generation(s); checkpoint ' + checkpointRef +
+                  ' preserved for automatic resume.'
+                );
+                return;
+              }
+
+              // kodmial/continuum#290: the caller stub's workflow_dispatch
+              // accepts at most 25 inputs, so the explicit recovery identity
+              // (operation id + checkpoint ref/SHA + stage + generation)
+              // travels packed into the single recovery_identity input. The
+              // stub unpacks it into the reusable workflow's explicit
+              // recovery inputs; every field stays explicit, none is elided.
+              const dispatchInputs = {
+                mode: mode,
+                issue_number: String(identity.issue_number || ''),
+                pr_number: String(identity.pr_number || ''),
+                head_ref: String(identity.head_ref || identity.branch || ''),
+                review_id: String(identity.review_id || ''),
+                run_id: String(identity.run_id || ''),
+                base_ref: String(identity.base_ref || ''),
+                capability_number: String(identity.capability_number || ''),
+                qualification_number: String(identity.qualification_number || ''),
+                required_sha: String(identity.required_sha || ''),
+                recovery_identity: JSON.stringify({
+                  recovery_operation_id: operation,
+                  recovery_checkpoint_ref: checkpointRef,
+                  recovery_checkpoint_sha: checkpointSha,
+                  recovery_stage: stage,
+                  recovery_generation: String(generation),
+                }),
+              };
+              // Exactly-once resumption claim: the durable resumption
+              // marker is recorded BEFORE createWorkflowDispatch via a
+              // fresh createComment, so two concurrent watchdog passes for
+              // the same operation/generation cannot both observe an empty
+              // marker and both dispatch competing resumptions. The loser
+              // of the claim race deletes its own claim and stands down;
+              // a dispatch failure deletes the claim so a retry that never
+              // dispatched is never mistaken for a completed resumption.
+              let resumptionClaim = null;
+              if (Number.isInteger(threadNumber) && threadNumber > 0) {
+                const claimBody = [
+                  resumptionMarker,
+                  '⚡ **Continuum · opencode-watchdog**',
+                  '<!-- continuum-origin role=continuum component=opencode-watchdog -->',
+                  'Model 429 burned the previous runner (infrastructure failure, not a task failure).',
+                  '',
+                  'Resumption claim for operation `' + operation + '` ' +
+                    'from checkpoint `' + checkpointRef + '` at exact SHA `' + checkpointSha + '` ' +
+                    '(stage `' + stage + '`, generation ' + generation + '); ' +
+                    'dispatch in progress.',
+                ].join('\n');
+                try {
+                  const created = await github.rest.issues.createComment({
+                    owner,
+                    repo,
+                    issue_number: threadNumber,
+                    body: claimBody,
+                  });
+                  resumptionClaim = created.data;
+                } catch (claimErr) {
+                  core.warning(
+                    'OpenCode 429 operation ' + operation + ' generation ' +
+                    generation + ' could not record the resumption claim (' +
+                    (claimErr.message || claimErr) +
+                    '); keeping the reservation for a later watchdog pass.'
+                  );
+                  return;
+                }
+                try {
+                  const recheck = await readGithub.paginate(
+                    readGithub.rest.issues.listComments,
+                    { owner, repo, issue_number: threadNumber, per_page: 100 }
+                  );
+                  const markers = recheck
+                    .filter(comment => (comment.body || '').includes(resumptionMarker))
+                    .sort((a, b) => Number(a.id || 0) - Number(b.id || 0));
+                  if (markers.length > 0 && markers[0].id !== resumptionClaim.id) {
+                    try {
+                      await github.rest.issues.deleteComment({
+                        owner,
+                        repo,
+                        comment_id: resumptionClaim.id,
+                      });
+                    } catch (pruneErr) {
+                      core.warning(
+                        'OpenCode 429 operation ' + operation +
+                        ': duplicate resumption claim prune failed: ' +
+                        (pruneErr.message || pruneErr)
+                      );
+                    }
+                    core.notice(
+                      'OpenCode 429 operation ' + operation + ' generation ' +
+                      generation + ' was already claimed; watchdog will not ' +
+                      'create a competing resumption.'
+                    );
+                    return;
+                  }
+                } catch (recheckErr) {
+                  try {
+                    await github.rest.issues.deleteComment({
+                      owner,
+                      repo,
+                      comment_id: resumptionClaim.id,
+                    });
+                  } catch (cleanupErr) {
+                    core.warning(
+                      'OpenCode 429 operation ' + operation +
+                      ': pre-dispatch claim cleanup failed: ' +
+                      (cleanupErr.message || cleanupErr)
+                    );
+                  }
+                  resumptionClaim = null;
+                  core.warning(
+                    'OpenCode 429 operation ' + operation + ' generation ' +
+                    generation + ' could not verify the resumption claim (' +
+                    (recheckErr.message || recheckErr) +
+                    '); keeping the reservation for a later watchdog pass.'
+                  );
+                  return;
+                }
+              }
+              try {
+                await github.rest.actions.createWorkflowDispatch({
+                  owner,
+                  repo,
+                  workflow_id: 'continuum-opencode.yml',
+                  ref: 'main',
+                  inputs: dispatchInputs,
+                });
+              } catch (dispatchErr) {
+                if (resumptionClaim) {
+                  try {
+                    await github.rest.issues.deleteComment({
+                      owner,
+                      repo,
+                      comment_id: resumptionClaim.id,
+                    });
+                  } catch (cleanupErr) {
+                    core.warning(
+                      'OpenCode 429 operation ' + operation +
+                      ': pre-dispatch claim cleanup failed: ' +
+                      (cleanupErr.message || cleanupErr)
+                    );
+                  }
+                }
+                core.warning(
+                  'OpenCode 429 operation ' + operation + ' generation ' +
+                  generation + ' dispatch failed (' +
+                  (dispatchErr.message || dispatchErr) +
+                  '); keeping the reservation for a later watchdog pass. ' +
+                  'No pause was applied.'
+                );
+                return;
+              }
+              core.notice(
+                'OpenCode 429: dispatched fresh-VM resumption for operation ' +
+                operation + ' generation ' + generation + ' stage ' + stage +
+                ' from checkpoint ' + checkpointRef + ' at exact SHA ' +
+                checkpointSha + '.'
+              );
+              if (Number.isInteger(threadNumber) && threadNumber > 0) {
+                const resumptionBody = [
+                  resumptionMarker,
+                  '⚡ **Continuum · opencode-watchdog**',
+                  '<!-- continuum-origin role=continuum component=opencode-watchdog -->',
+                  'Model 429 burned the previous runner (infrastructure failure, not a task failure).',
+                  '',
+                  'Dispatched a fresh-VM resumption for operation `' + operation + '` ' +
+                    'from checkpoint `' + checkpointRef + '` at exact SHA `' + checkpointSha + '` ' +
+                    '(stage `' + stage + '`, generation ' + generation + ').',
+                  '',
+                  'Completed stages are not repeated; no task/review/qualification budget was consumed.',
+                ].join('\n');
+                if (resumptionClaim) {
+                  try {
+                    await github.rest.issues.updateComment({
+                      owner,
+                      repo,
+                      comment_id: resumptionClaim.id,
+                      body: resumptionBody,
+                    });
+                  } catch (updateErr) {
+                    core.warning(
+                      'OpenCode 429 operation ' + operation +
+                      ': resumption marker update failed: ' +
+                      (updateErr.message || updateErr)
+                    );
+                  }
+                }
+              }
             }
             const jobs = await readGithub.paginate(
               readGithub.rest.actions.listJobsForWorkflowRun,
@@ -205,6 +577,7 @@ jobs:
             );
             let runnerRestartRequired = false;
             let publishRaceRestartRequired = false;
+            let evacuated429 = null;
             const apiBase = String(process.env.GITHUB_API_URL || 'https://api.github.com')
               .replace(/\/+$/, '');
             for (const job of jobs) {
@@ -230,31 +603,31 @@ jobs:
               const logText = await response.text();
               if (logText.includes(rateLimitMarker)) {
                 runnerRestartRequired = true;
+                const evacuated = logText.match(evacuatedRe);
+                if (evacuated) {
+                  evacuated429 = {
+                    checkpointRef: evacuated[1],
+                    checkpointSha: evacuated[2],
+                    operationId: evacuated[3],
+                    stage: evacuated[4],
+                    generation: Number.parseInt(evacuated[5], 10),
+                    mode: evacuated[6],
+                    issueNumber: (evacuated[7] || '').trim(),
+                    prNumber: (evacuated[8] || '').trim(),
+                    branch: (evacuated[9] || '').trim(),
+                  };
+                }
               }
               if (logText.includes(publishRaceMarker)) {
                 publishRaceRestartRequired = true;
               }
-              if (runnerRestartRequired || publishRaceRestartRequired) break;
+              if ((runnerRestartRequired && evacuated429) || publishRaceRestartRequired) break;
             }
             if (runnerRestartRequired) {
-              const attempt = Number(run.run_attempt || 1);
-              if (attempt <= max429Restarts) {
-                await readGithub.rest.actions.reRunWorkflow({
-                  owner,
-                  repo,
-                  run_id: run.id,
-                });
-                core.notice(
-                  'OpenCode 429: restarted workflow run ' + run.id +
-                  ' on fresh runner(s), attempt ' + (attempt + 1) +
-                  '/' + (max429Restarts + 1) + '.'
-                );
-              } else {
-                core.warning(
-                  'OpenCode 429 fresh-runner recovery exhausted after ' +
-                  max429Restarts + ' restart(s) for run ' + run.id + '.'
-                );
-              }
+              await recoverFrom429OnFreshVm({
+                owner, repo, run, evacuated429,
+                max429Restarts,
+              });
               return;
             }
 
