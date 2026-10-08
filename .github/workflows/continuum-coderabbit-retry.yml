@@ -245,11 +245,10 @@ jobs:
             const requiredWorkflowGateName =
               String(process.env.REQUIRED_WORKFLOW_GATE_NAME || '').trim();
 
-            // CodeRabbit currently provides one included full review per hour.
-            // A completed full review therefore moves the shared controller
-            // window for every other PR, even if their old per-PR timer expired.
-            const REVIEW_COOLDOWN_MS = 60 * 60_000;
-            const NO_PROGRESS_MAX_REVIEWS = 3;
+            // CodeRabbit currently reports a 30-minute included-review reset.
+            // Provider rate-limit replies remain authoritative and may extend
+            // this baseline for every PR in the shared queue.
+            const REVIEW_COOLDOWN_MS = 30 * 60_000;
             const SAFETY_MARGIN_MS = 30_000;
             const IN_FLIGHT_TIMEOUT_MS = 30 * 60_000;
             // GitHub scheduled events are best-effort and have been observed
@@ -944,16 +943,10 @@ jobs:
                   latestNoProgress && !laterApproval
                     ? noProgressAt + REVIEW_COOLDOWN_MS
                     : 0;
-                if (
-                  latestNoProgress &&
-                  !laterApproval &&
-                  noProgressMarkers.length >= NO_PROGRESS_MAX_REVIEWS
-                ) {
-                  core.warning(
-                    `PR #${pr.number}: exact HEAD ${pr.head.sha} exhausted bounded non-code CodeRabbit re-review budget (${noProgressMarkers.length}/${NO_PROGRESS_MAX_REVIEWS}); waiting for a new HEAD or later explicit approval.`
-                  );
-                  continue;
-                }
+                // A summary-only CHANGES_REQUESTED verdict must never become
+                // a terminal human-required state. Keep the exact HEAD queued
+                // after the provider cooldown until CodeRabbit either approves
+                // it or produces an actionable finding that OpenCode can repair.
 
                 const labels = new Set(
                   (pr.labels || []).map(label =>
