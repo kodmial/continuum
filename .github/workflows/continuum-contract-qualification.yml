@@ -131,17 +131,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p .opencode-tmp
-          export TMPDIR="$PWD/.opencode-tmp"
-          echo "::group::Contract tests"
-          ruby -E UTF-8 scripts/test-continuum.rb
-          echo "::endgroup::"
-          echo "::group::Python engine suite"
-          PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests
-          echo "::endgroup::"
-          echo "::group::Delegation runtime suite"
-          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s .github/scripts -p 'test_delegation_runtime.py'
-          echo "::endgroup::"
+          bash scripts/validate-continuum.sh
           echo "regression=pass" >> "$GITHUB_OUTPUT"
 
       - name: Run Layer 2 lifecycle integration probe
