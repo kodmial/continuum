@@ -120,6 +120,12 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Install Python qualification dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check PyYAML
+
       - name: Run Layer 1 regression gate on the exact HEAD
         id: regression
         shell: bash
