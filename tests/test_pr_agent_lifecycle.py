@@ -567,6 +567,7 @@ APPROVED_429_RUNNER_RECOVERY_ADDED_LINES = (
     "        required: false",
     "        type: string",
     "        default: ''",
+    "          if grep -Eiq 'FreeUsageLimitError|APIError.*429|HTTP[^0-9]*429([^0-9]|$)|429[[:space:]]+Too[[:space:]]+Many[[:space:]]+Requests|statusCode[^0-9]*429([^0-9]|$)' \"$log\"; then",
     "      # kodmial/continuum#290: a fresh-VM 429 resumption restores the exact",
     "      # checkpoint before doing any work. Shell/workflow code — never the",
     "      # model — fetches the workflow-owned checkpoint ref and checks out the",
@@ -826,6 +827,7 @@ APPROVED_429_RUNNER_RECOVERY_ADDED_LINES = (
 )
 
 APPROVED_429_RUNNER_RECOVERY_REMOVED_LINES = (
+    "          if grep -Eiq 'FreeUsageLimitError|HTTP[[:space:]]*429|http[[:space:]]*=[[:space:]]*429|statusCode[^0-9]*429|\"status\"[^0-9]*429|429[^[:alnum:]]+.*rate[ -]?limit' \"$log\"; then",
     "          set +e",
     "          continuum-opencode run --auto --model \"$OPENCODE_MODEL\" \"$PROMPT\" 2>&1 | tee \"$OPENCODE_RUN_LOG\"",
     "          OPENCODE_RUN_RC=${PIPESTATUS[0]}",

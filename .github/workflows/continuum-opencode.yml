@@ -1141,7 +1141,7 @@ jobs:
           opencode "$@" 2>&1 | tee "$log"
           status=${PIPESTATUS[0]}
           set -e
-          if grep -Eiq 'FreeUsageLimitError|HTTP[[:space:]]*429|http[[:space:]]*=[[:space:]]*429|statusCode[^0-9]*429|"status"[^0-9]*429|429[^[:alnum:]]+.*rate[ -]?limit' "$log"; then
+          if grep -Eiq 'FreeUsageLimitError|APIError.*429|HTTP[^0-9]*429([^0-9]|$)|429[[:space:]]+Too[[:space:]]+Many[[:space:]]+Requests|statusCode[^0-9]*429([^0-9]|$)' "$log"; then
             : > "${RUNNER_TEMP:-/tmp}/continuum-opencode-429"
             rm -f "$log"
             echo "::error::OpenCode 429: retire this runner and recover on a fresh runner."

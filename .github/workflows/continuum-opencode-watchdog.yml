@@ -268,11 +268,18 @@ jobs:
                 );
                 return;
               }
+              // The durable checkpoint ref tip is the recovery-metadata
+              // commit on top of the working-tree HEAD recorded inside the
+              // metadata file, so identity.head_sha (working-tree HEAD) is
+              // the parent of the evacuated tip, not the tip itself.
+              // Identity match is operation + generation; the exact
+              // checkpoint SHA dispatched is the evacuated ref tip from the
+              // workflow-owned evacuation pointer (falling back to the
+              // metadata working-tree HEAD only when the pointer SHA is
+              // malformed).
               if (
                 String(identity.operation_id || '') !== operation ||
-                Number(identity.generation || 0) !== generation ||
-                String(identity.head_sha || '').toLowerCase() !==
-                  String(evacuated429.checkpointSha || '').toLowerCase()
+                Number(identity.generation || 0) !== generation
               ) {
                 core.warning(
                   'OpenCode 429 checkpoint metadata does not match the ' +
@@ -282,7 +289,10 @@ jobs:
                 return;
               }
               const stage = String(identity.stage || 'implementation-incomplete');
-              const checkpointSha = String(identity.head_sha || '');
+              const pointerSha = String(evacuated429.checkpointSha || '');
+              const checkpointSha = /^[0-9a-f]{40}$/i.test(pointerSha)
+                ? pointerSha.toLowerCase()
+                : String(identity.head_sha || '').toLowerCase();
               const mode = String(identity.mode || '');
               const issueText = String(identity.issue_number || '').trim();
               const prText = String(identity.pr_number || '').trim();
