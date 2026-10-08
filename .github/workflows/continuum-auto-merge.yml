@@ -1351,7 +1351,16 @@ jobs:
                 new Date(completion.updated_at || completion.created_at || 0).getTime();
               const statusAt =
                 new Date(rabbitStatus.updated_at || rabbitStatus.created_at || 0).getTime();
-              if (statusAt < completionAt) return null;
+              // CodeRabbit publishes status and completion reply independently;
+              // either timestamp may win by a second. Both must postdate the
+              // exact-HEAD command, but ordering them against each other would
+              // create a false permanent block.
+              if (
+                !Number.isFinite(completionAt) ||
+                !Number.isFinite(statusAt) ||
+                completionAt < commandAt ||
+                statusAt < commandAt
+              ) return null;
 
               // A later decisive review supersedes this evidence. In particular,
               // never reinterpret a new CHANGES_REQUESTED as clean convergence.
