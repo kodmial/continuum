@@ -2271,15 +2271,55 @@ jobs:
                   : null;
 
               try {
-                await github.request(
-                  'PUT /repos/{owner}/{repo}/pulls/{pull_number}/update-branch',
-                  {
-                    owner,
-                    repo,
-                    pull_number: pr.number,
-                    expected_head_sha: oldHead,
+                // GitHub can briefly reject update-branch with a stale
+                // expected_head_sha even when a live re-read still reports the
+                // same PR HEAD. Retry that exact same-head race a bounded number
+                // of times; a genuinely moved HEAD is held for the next fresh
+                // reconciliation and never mutated from stale state.
+                let updateSucceeded = false;
+                for (let attempt = 0; attempt < 3; attempt += 1) {
+                  try {
+                    await github.request(
+                      'PUT /repos/{owner}/{repo}/pulls/{pull_number}/update-branch',
+                      {
+                        owner,
+                        repo,
+                        pull_number: pr.number,
+                        expected_head_sha: oldHead,
+                      }
+                    );
+                    updateSucceeded = true;
+                    break;
+                  } catch (updateErr) {
+                    const updateMessage = String(updateErr.message || updateErr);
+                    const expectedHeadRace =
+                      updateErr.status === 422 &&
+                      /expected head sha.*current head ref/i.test(updateMessage);
+                    if (!expectedHeadRace) throw updateErr;
+
+                    const refreshed = await getPull(pr.number);
+                    if (
+                      refreshed.state !== 'open' ||
+                      refreshed.head.sha !== oldHead
+                    ) {
+                      core.info(
+                        `PR #${pr.number}: HEAD moved ${oldHead} -> ${refreshed.head.sha} during update-branch retry; holding stale reconciliation.`
+                      );
+                      return false;
+                    }
+
+                    if (attempt >= 2) throw updateErr;
+                    core.notice(
+                      `PR #${pr.number}: GitHub reported a transient expected_head_sha race for unchanged HEAD ${oldHead}; retrying update-branch (${attempt + 2}/3).`
+                    );
+                    await new Promise(resolve => setTimeout(resolve, 1000));
                   }
-                );
+                }
+                if (!updateSucceeded) {
+                  throw new Error(
+                    `PR #${pr.number}: update-branch retry loop exited without success for HEAD ${oldHead}.`
+                  );
+                }
 
                 let fresh = null;
                 for (let attempt = 0; attempt < 6; attempt += 1) {
