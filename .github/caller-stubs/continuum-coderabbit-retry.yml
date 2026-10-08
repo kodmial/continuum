@@ -17,15 +17,10 @@ on:
   pull_request_review_comment:
     types: [created, edited]
 
-  # Reuse existing periodic control-plane wakes instead of introducing another
-  # cron. Wake only after controllers that observe a stable PR HEAD: direct
-  # main-push / issue-scheduler wakes can race auto-merge's update-branch sync
-  # and make CodeRabbit abort with "Head commit changed".
-  workflow_run:
-    workflows:
-      - PR-Agent recovery
-      - Auto-merge reviewed pull requests
-    types: [completed]
+  # Provider-owned safety net: CodeRabbit recovery must not depend on any
+  # PR-Agent workflow or generic merge-controller completion.
+  schedule:
+    - cron: "3,13,23,33,43,53 * * * *"
 
   # Manual/safety-net reconciliation.
   workflow_dispatch:
