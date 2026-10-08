@@ -76,7 +76,7 @@ MUTATION_COUNTS = {
     "continuum-consumer-child-worker.yml": 4,
     "continuum-docker-qualification.yml": 1,
     "continuum-issue-scheduler.yml": 11,
-    "continuum-opencode-watchdog.yml": 4,
+    "continuum-opencode-watchdog.yml": 5,
     "continuum-opencode.yml": 6,
     "continuum-pr-agent-auto-merge.yml": 1,
     "continuum-pr-agent-canary.yml": 4,
