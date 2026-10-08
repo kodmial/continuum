@@ -5233,6 +5233,9 @@ class ContinuumTest < Minitest::Test
     assert_includes recovery, 'core.setFailed('
     assert_includes automerge, 'liveBeforeSync'
     assert_includes automerge, 'holding stale reconciliation'
+    assert_includes automerge, 'transient expected_head_sha race'
+    assert_includes automerge, 'for (let attempt = 0; attempt < 3; attempt += 1)'
+    assert_includes automerge, 'retrying update-branch'
     assert_includes automerge, 'sha: pr.head.sha'
     # Exact-HEAD isolation: short-SHA markers are ignored entirely so an
     # old HEAD sharing a 7-char prefix can never strand a new HEAD. No
