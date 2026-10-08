@@ -245,10 +245,10 @@ jobs:
             const requiredWorkflowGateName =
               String(process.env.REQUIRED_WORKFLOW_GATE_NAME || '').trim();
 
-            // CodeRabbit currently reports a 30-minute included-review reset.
+            // CodeRabbit provides up to one included full review per hour.
             // Provider rate-limit replies remain authoritative and may extend
-            // this baseline for every PR in the shared queue.
-            const REVIEW_COOLDOWN_MS = 30 * 60_000;
+            // or precisely locate the remaining window for every PR in the shared queue.
+            const REVIEW_COOLDOWN_MS = 60 * 60_000;
             const SAFETY_MARGIN_MS = 30_000;
             const IN_FLIGHT_TIMEOUT_MS = 30 * 60_000;
             // GitHub scheduled events are best-effort and have been observed
