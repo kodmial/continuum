@@ -571,6 +571,40 @@ jobs:
               return data;
             }
 
+            async function withAuthoritativeHead(pr) {
+              if (
+                !pr?.head?.ref ||
+                pr.head.repo?.full_name !== repoFullName
+              ) {
+                return pr;
+              }
+              const { data: ref } = await withReadFallback(client =>
+                client.rest.git.getRef({
+                  owner,
+                  repo,
+                  ref: `heads/${pr.head.ref}`,
+                })
+              );
+              const refSha = ref?.object?.sha;
+              if (!refSha || refSha === pr.head.sha) {
+                return pr;
+              }
+              core.notice(
+                `PR #${pr.number}: pull metadata HEAD ${pr.head.sha} lags authoritative branch ref ${refSha}; reconciling the branch ref.`
+              );
+              return {
+                ...pr,
+                head: {
+                  ...pr.head,
+                  sha: refSha,
+                },
+              };
+            }
+
+            async function getPullWithAuthoritativeHead(pullNumber) {
+              return withAuthoritativeHead(await getPull(pullNumber));
+            }
+
             async function compareWithMain(headSha) {
               const { data } = await withReadFallback(client =>
                 client.request(
@@ -2234,7 +2268,7 @@ jobs:
               // the caller reconciles from a snapshot taken earlier in a long
               // loop. If the HEAD moved since, hold instead of syncing stale
               // state: the next wakeup reconciles the new HEAD from latest.
-              const liveBeforeSync = await getPull(pr.number);
+              const liveBeforeSync = await getPullWithAuthoritativeHead(pr.number);
               if (
                 liveBeforeSync.state !== 'open' ||
                 liveBeforeSync.head.sha !== oldHead
@@ -2323,7 +2357,7 @@ jobs:
 
                 let fresh = null;
                 for (let attempt = 0; attempt < 6; attempt += 1) {
-                  fresh = await getPull(pr.number);
+                  fresh = await getPullWithAuthoritativeHead(pr.number);
                   if (fresh.head.sha !== oldHead) break;
                   await new Promise(resolve => setTimeout(resolve, 1000));
                 }
@@ -2383,7 +2417,7 @@ jobs:
                 // GitHub returns 422 when expected_head_sha became stale. That is
                 // a normal race with OpenCode/CI/main-sync, not a merge conflict.
                 // Re-read before deciding whether a repair agent is warranted.
-                const fresh = await getPull(pr.number);
+                const fresh = await getPullWithAuthoritativeHead(pr.number);
                 if (fresh.head.sha !== oldHead) {
                   core.info(
                     `PR #${pr.number}: head advanced from ${oldHead} to ${fresh.head.sha} during update; no conflict repair needed.`
@@ -2514,8 +2548,20 @@ jobs:
               // pre-lease filter, so only one authoritative pulls.get follows
               // lease acquisition. A second pulls.get per PR would double
               // read load (~2N) on every wakeup during quota exhaustion.
-              const listedHead = listed.head && listed.head.sha;
-              const listedFork = listed.head && listed.head.repo && listed.head.repo.full_name;
+              let authoritativeListed = listed;
+              try {
+                authoritativeListed = await withAuthoritativeHead(listed);
+              } catch (err) {
+                if (isTransientApiError(err)) {
+                  core.warning(
+                    `PR #${listed.number}: authoritative HEAD lookup hit a transient error; deferred to next wakeup: ${err.message || err}`
+                  );
+                  continue;
+                }
+                throw err;
+              }
+              const listedHead = authoritativeListed.head && authoritativeListed.head.sha;
+              const listedFork = authoritativeListed.head && authoritativeListed.head.repo && authoritativeListed.head.repo.full_name;
               if (
                 (listed.state && listed.state !== 'open') ||
                 listed.draft ||
@@ -2546,7 +2592,7 @@ jobs:
               // healthy PRs behind a single bad PR.
               let pr;
               try {
-                pr = await getPull(listed.number);
+                pr = await getPullWithAuthoritativeHead(listed.number);
               } catch (err) {
                 if (isTransientApiError(err)) {
                   core.warning(`PR #${listed.number}: transient fetch error; deferred to next wakeup: ` + (err.message || err));
@@ -2834,7 +2880,7 @@ jobs:
               }
 
               // Re-read every merge-critical fact immediately before the write.
-              pr = await getPull(pr.number);
+              pr = await getPullWithAuthoritativeHead(pr.number);
               if (
                 pr.state !== 'open' ||
                 pr.draft ||
