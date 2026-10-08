@@ -354,7 +354,6 @@ jobs:
               ownedLeases.delete(leaseKey(prNumber, headSha));
             }
             const AUTO_MERGE_BLOCK_LABEL = 'no-auto-merge';
-            const NO_PROGRESS_MAX_REVIEWS = 3;
             // A lost CodeRabbit thread-verification reply must never strand a PR forever.
             // Reconcile at a bounded cadence; the existing 17/47 safety-net wakeups will
             // retry only after this timeout instead of spamming the external reviewer.
@@ -794,7 +793,9 @@ jobs:
               ) {
                 return false;
               }
-              return markers.length >= NO_PROGRESS_MAX_REVIEWS;
+              // Summary-only CHANGES_REQUESTED is not a terminal state.
+              // The serialized CodeRabbit queue owns cooldown and re-review.
+              return false;
             }
 
             function retryWindowText(body = '') {
@@ -2666,14 +2667,13 @@ jobs:
                   : false;
 
               // A policy/task-contract verdict with no actionable code finding
-              // is not a coding-agent repair request, but it is also not
-              // terminal after one review. The global CodeRabbit controller
-              // gets a bounded same-HEAD re-review budget after cooldown.
-              // Only exhaustion of that budget blocks until a new HEAD or a
-              // later explicit APPROVED decision.
+              // is not a coding-agent repair request and must never become a
+              // human-required terminal state. The global CodeRabbit controller
+              // keeps the exact HEAD queued behind the provider cooldown until
+              // approval or an actionable finding appears.
               if (reviewNoProgressBlocked) {
                 core.warning(
-                  `PR #${pr.number}: exact HEAD ${pr.head.sha} is blocked by a non-code CodeRabbit verdict; bounded non-code CodeRabbit re-review budget is exhausted.`
+`PR #${pr.number}: exact HEAD ${pr.head.sha} has a summary-only CodeRabbit verdict; keeping it in the autonomous re-review queue.`
                 );
                 continue;
               }
