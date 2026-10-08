@@ -1273,10 +1273,11 @@ class CodeRabbitDeadlockWiringTests(unittest.TestCase):
         # exact-head APPROVED basis whenever an auto-review-disabled event
         # overwrote the status with "Review skipped".
         self.assertRegex(gate, r"!reviewBasis[\s\S]{0,400}Review completed")
-        # Exactly two mentions exist: the status-independence comment and
-        # the single guarded wait. A reintroduced hard Review-completed
-        # authorization check adds a third and fails here.
-        self.assertEqual(gate.count("Review completed"), 2)
+        # Literal APPROVED remains status-independent. The separate
+        # clean-no-progress convergence path is intentionally allowed to use
+        # a later exact-head "Review completed" status, but only together with
+        # its durable no-progress marker, later full-review command/completion,
+        # green CI and zero current nitpicks.
         basis_src = self._extract_js_function(gate, "directCodeRabbitReviewBasis")
         # The basis is review+CI+nitpick only: it must never read a commit
         # status description. (Its explanatory comment mentions the status
@@ -1296,6 +1297,15 @@ class CodeRabbitDeadlockWiringTests(unittest.TestCase):
             basis_src,
             "review basis must not authorize on a status description",
         )
+        converged_src = self._extract_js_function(
+            gate, "cleanNoProgressCodeRabbitReviewBasis"
+        )
+        self.assertIn("latestCodeRabbitStatus", converged_src)
+        self.assertIn("Review completed", converged_src)
+        self.assertIn("continuum-coderabbit-no-progress", converged_src)
+        self.assertIn("Full review finished", converged_src)
+        self.assertIn("latestCiForHead", converged_src)
+        self.assertIn("codeRabbitNitpickReviews", converged_src)
 
     def test_nitpick_supersession(self):
         gate = self.read(".github/workflows/continuum-auto-merge.yml")
