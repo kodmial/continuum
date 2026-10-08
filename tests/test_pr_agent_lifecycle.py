@@ -399,6 +399,39 @@ APPROVED_CODERABBIT_PUBLISH_RACE_ADDED_LINES = (
 )
 
 
+# CodeRabbit post-repair verification must use the authoritative published
+# branch ref because pulls.get may briefly lag after a successful repair push.
+# Keep this as a one-line replacement allowlist so unrelated OpenCode workflow
+# drift remains fail-closed.
+APPROVED_CODERABBIT_PUBLISHED_HEAD_REMOVED_LINES = (
+    "            const headSha = pr.data.head.sha;",
+)
+
+APPROVED_CODERABBIT_PUBLISHED_HEAD_ADDED_LINES = (
+    "            if (pr.data.head.repo?.full_name !== `${owner}/${repo}`) {",
+    "              core.setFailed(",
+    "                `PR #${pullNumber}: CodeRabbit repair verification requires a same-repository head branch.`",
+    "              );",
+    "              return;",
+    "            }",
+    "",
+    "            // pulls.get can lag immediately after the repair push. Resolve the",
+    "            // authoritative branch ref directly so verification is always",
+    "            // pinned to the commit that was actually published.",
+    "            const headRef = await github.rest.git.getRef({",
+    "              owner,",
+    "              repo,",
+    "              ref: `heads/${pr.data.head.ref}`,",
+    "            });",
+    "            const headSha = headRef.data.object.sha;",
+    "            if (pr.data.head.sha !== headSha) {",
+    "              core.notice(",
+    "                `PR #${pullNumber}: pull metadata still reports stale HEAD ${pr.data.head.sha}; verifying published branch HEAD ${headSha}.`",
+    "              );",
+    "            }",
+    "",
+)
+
 # Systemic qualification isolation / interruption recovery. This allowlist is
 # generated from the exact protected-workflow diff for the change: validation
 # dispatch comments cannot enter generic implementation, validation-only
@@ -852,6 +885,7 @@ class ProtectedBaselineTests(unittest.TestCase):
                             _Counter(
                                 APPROVED_QUALIFICATION_ISOLATION_CHECKPOINT_REMOVED_LINES
                                 + APPROVED_CODERABBIT_PUBLISH_RACE_REMOVED_LINES
+                                + APPROVED_CODERABBIT_PUBLISHED_HEAD_REMOVED_LINES
                             ),
                             f"{path} must not delete or modify lines beyond the exact "
                             "qualification-isolation/checkpoint allowlist",
@@ -860,6 +894,7 @@ class ProtectedBaselineTests(unittest.TestCase):
                         expected = _Counter(
                             APPROVED_QUALIFICATION_ISOLATION_CHECKPOINT_ADDED_LINES
                             + APPROVED_CODERABBIT_PUBLISH_RACE_ADDED_LINES
+                            + APPROVED_CODERABBIT_PUBLISHED_HEAD_ADDED_LINES
                         )
                         self.assertEqual(
                             actual,
