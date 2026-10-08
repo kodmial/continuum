@@ -59,7 +59,9 @@ permissions:
 
 jobs:
   call:
-    if: github.event_name == 'workflow_dispatch'
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      (vars.CONTINUUM_REVIEW_PROVIDER || 'none') == 'pr-agent'
     uses: kodmial/continuum/.github/workflows/continuum-pr-agent.yml@main
     secrets: inherit
     with:
