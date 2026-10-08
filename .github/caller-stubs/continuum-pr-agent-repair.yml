@@ -44,6 +44,7 @@ permissions:
 
 jobs:
   call:
+    if: (vars.CONTINUUM_REVIEW_PROVIDER || 'none') == 'pr-agent'
     uses: kodmial/continuum/.github/workflows/continuum-pr-agent-repair.yml@main
     secrets: inherit
     with:
