@@ -1625,6 +1625,10 @@ jobs:
           - Keep all comments and commit messages in English.
           EOF
           )
+          # Snapshot the exact PR head inspected by this repair. If trusted
+          # automation advances the branch while OpenCode runs, publication
+          # fails closed and the watchdog reruns coderabbit-fix on the new head.
+          REPAIR_BASE_SHA="$(git rev-parse HEAD)"
           OPENCODE_RUN_LOG="$(mktemp)"
           set +e
           continuum-opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
@@ -1648,8 +1652,27 @@ jobs:
             git add -A
             git commit -m "fix: address CodeRabbit review findings for PR #${PR_NUMBER}" -m "Continuum-Component: opencode"
           fi
-          if [[ "$(git rev-list --count "origin/${HEAD_REF}"..HEAD)" -gt 0 ]]; then
-            git push origin "HEAD:${HEAD_REF}"
+
+          # Main-sync and other trusted automation may advance the PR branch
+          # while OpenCode is working. Never rewrite developer history to replay
+          # a repair. If the remote HEAD moved, fail with a dedicated recovery
+          # marker; the watchdog re-runs this same workflow with preserved
+          # coderabbit-fix inputs against the latest PR HEAD.
+          if [[ "$(git rev-list --count "${REPAIR_BASE_SHA}"..HEAD)" -gt 0 ]]; then
+            git fetch --no-tags origin "${HEAD_REF}"
+            REMOTE_HEAD="$(git rev-parse "origin/${HEAD_REF}")"
+
+            if [[ "$REMOTE_HEAD" != "$REPAIR_BASE_SHA" ]]; then
+              echo "::error::CONTINUUM_OPENCODE_PUBLISH_RACE_RETRY_REQUIRED"
+              echo "::error::PR head advanced from $REPAIR_BASE_SHA to $REMOTE_HEAD while repairing; restarting coderabbit-fix on the latest branch state."
+              exit 76
+            fi
+
+            if ! git push origin "HEAD:${HEAD_REF}"; then
+              echo "::error::CONTINUUM_OPENCODE_PUBLISH_RACE_RETRY_REQUIRED"
+              echo "::error::OpenCode repair publication raced with another PR update; restarting coderabbit-fix on the latest branch state."
+              exit 76
+            fi
           fi
 
       - name: Ask CodeRabbit to verify every original finding
@@ -1684,7 +1707,27 @@ jobs:
               repo,
               pull_number: pullNumber,
             });
-            const headSha = pr.data.head.sha;
+            if (pr.data.head.repo?.full_name !== `${owner}/${repo}`) {
+              core.setFailed(
+                `PR #${pullNumber}: CodeRabbit repair verification requires a same-repository head branch.`
+              );
+              return;
+            }
+
+            // pulls.get can lag immediately after the repair push. Resolve the
+            // authoritative branch ref directly so verification is always
+            // pinned to the commit that was actually published.
+            const headRef = await github.rest.git.getRef({
+              owner,
+              repo,
+              ref: `heads/${pr.data.head.ref}`,
+            });
+            const headSha = headRef.data.object.sha;
+            if (pr.data.head.sha !== headSha) {
+              core.notice(
+                `PR #${pullNumber}: pull metadata still reports stale HEAD ${pr.data.head.sha}; verifying published branch HEAD ${headSha}.`
+              );
+            }
 
             const comments = await github.paginate(
               github.rest.pulls.listReviewComments,

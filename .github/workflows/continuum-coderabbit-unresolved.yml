@@ -58,8 +58,10 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const pullNumber = context.payload.pull_request.number;
-            const verificationPattern =
+            const opencodeVerificationPattern =
               /<!-- opencode-coderabbit-verification review=(\d+) finding=(\d+) head=([0-9a-f]{40}) -->/;
+            const autoMergeVerificationPattern =
+              /<!-- auto-merge-coderabbit-verification finding=(\d+) head=([0-9a-f]{40}) -->/;
 
             // Bounded newest-first scan (#254): batching only needs the
             // latest verification per finding and replies newer than it,
@@ -115,18 +117,56 @@ jobs:
               return current?.id ?? null;
             };
 
+            // Both repair-owned and auto-merge-owned exact-HEAD verification
+            // requests feed this same batcher. Auto-merge markers intentionally
+            // carry no review id, so recover the ORIGINAL CodeRabbit review id
+            // from the root finding (never from the verification reply's own
+            // synthetic review id). If the bounded newest window omitted that
+            // root, fetch exactly the one known finding id instead of widening
+            // pagination.
+            async function originalReviewIdForFinding(findingId) {
+              let root = byId.get(findingId);
+              if (!root) {
+                const { data } = await github.rest.pulls.getReviewComment({
+                  owner,
+                  repo,
+                  comment_id: findingId,
+                });
+                root = data;
+                if (root?.id) byId.set(root.id, root);
+              }
+              const reviewId = Number(root?.pull_request_review_id);
+              return Number.isInteger(reviewId) && reviewId > 0
+                ? reviewId
+                : null;
+            }
+
             // Keep only the newest verification request for each original
             // finding. An older UNRESOLVED must never override a newer
             // verification request that is still awaiting CodeRabbit.
             const latestVerification = new Map();
             for (const comment of comments) {
-              const match = comment.body?.match(verificationPattern);
-              if (!match) continue;
+              const body = comment.body ?? '';
+              const opencodeMatch = body.match(opencodeVerificationPattern);
+              const autoMergeMatch = body.match(autoMergeVerificationPattern);
+              if (!opencodeMatch && !autoMergeMatch) continue;
 
-              const reviewId = Number(match[1]);
-              const findingId = Number(match[2]);
-              const verifiedHead = match[3];
+              const findingId = Number(
+                opencodeMatch ? opencodeMatch[2] : autoMergeMatch[1]
+              );
+              const verifiedHead =
+                opencodeMatch ? opencodeMatch[3] : autoMergeMatch[2];
               if (getRootId(comment) !== findingId) continue;
+
+              const reviewId = opencodeMatch
+                ? Number(opencodeMatch[1])
+                : await originalReviewIdForFinding(findingId);
+              if (!Number.isInteger(reviewId) || reviewId <= 0) {
+                core.warning(
+                  `PR #${pullNumber}: could not recover original CodeRabbit review id for finding #${findingId}; skipping this finding for the current pass.`
+                );
+                continue;
+              }
 
               const previous = latestVerification.get(findingId);
               if (!previous || comment.id > previous.comment.id) {
@@ -182,10 +222,20 @@ jobs:
             core.notice(
               `Batching ${active.length} unresolved CodeRabbit finding(s) in one OpenCode run.`
             );
+            let headSha = pr.data.head.sha;
+            if (pr.data.head.repo?.full_name === `${owner}/${repo}`) {
+              const { data: headRef } = await github.rest.git.getRef({
+                owner,
+                repo,
+                ref: `heads/${pr.data.head.ref}`,
+              });
+              if (headRef?.object?.sha) headSha = headRef.object.sha;
+            }
+
             core.setOutput('should_run', 'true');
             core.setOutput('pr_number', String(pullNumber));
             core.setOutput('head_ref', pr.data.head.ref);
-            core.setOutput('head_sha', pr.data.head.sha);
+            core.setOutput('head_sha', headSha);
             core.setOutput('items_json', JSON.stringify(active));
 
       - name: Checkout current PR branch
@@ -367,7 +417,23 @@ jobs:
               repo,
               pull_number: pullNumber,
             });
-            const headSha = pr.data.head.sha;
+            if (pr.data.head.repo?.full_name !== `${owner}/${repo}`) {
+              core.setFailed(
+                `PR #${pullNumber}: batched CodeRabbit verification requires a same-repository head branch.`
+              );
+              return;
+            }
+            const { data: publishedRef } = await github.rest.git.getRef({
+              owner,
+              repo,
+              ref: `heads/${pr.data.head.ref}`,
+            });
+            const headSha = publishedRef.data.object.sha;
+            if (pr.data.head.sha !== headSha) {
+              core.notice(
+                `PR #${pullNumber}: pull metadata still reports stale HEAD ${pr.data.head.sha}; verifying published batch-repair HEAD ${headSha}.`
+              );
+            }
 
             // Bounded newest-first duplicate check (#254): the marker being
             // checked carries the just-pushed HEAD, so the three newest

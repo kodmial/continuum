@@ -53,6 +53,28 @@ class OpenCode429RunnerRecoveryContractTest(unittest.TestCase):
         ):
             self.assertIn(marker, self.watchdog)
 
+    def test_publish_race_recovery_reruns_same_workflow_with_preserved_inputs(self):
+        for marker in (
+            "CONTINUUM_OPENCODE_PUBLISH_RACE_RETRY_REQUIRED",
+            "publishRaceRestartRequired",
+            "maxPublishRaceRestarts = 3",
+            "reRunWorkflow",
+            "with preserved inputs",
+            "before issue-number routing",
+        ):
+            self.assertIn(marker, self.watchdog)
+
+        self.assertIn(
+            "CONTINUUM_OPENCODE_PUBLISH_RACE_RETRY_REQUIRED",
+            self.body,
+        )
+        self.assertIn("exit 76", self.body)
+        self.assertIn('REPAIR_BASE_SHA="$(git rev-parse HEAD)"', self.body)
+        self.assertIn('git fetch --no-tags origin "${HEAD_REF}"', self.body)
+        self.assertIn('REMOTE_HEAD="$(git rev-parse "origin/${HEAD_REF}")"', self.body)
+        self.assertIn('git push origin "HEAD:${HEAD_REF}"', self.body)
+        self.assertNotIn("git rebase", self.body)
+
     def test_429_recovery_is_bounded_and_does_not_release_task_locks(self):
         self.assertIn(
             "const max429Restarts = Number.parseInt(",

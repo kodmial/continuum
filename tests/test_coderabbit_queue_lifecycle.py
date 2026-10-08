@@ -561,29 +561,27 @@ class WorkflowBindingTests(unittest.TestCase):
             self.workflow,
         )
 
-    def test_safety_net_tick_is_non_blocking_and_never_sleeps(self):
+    def test_public_due_waiter_is_bounded_serialized_and_revalidated(self):
         for contract in (
-            "function deferUntilNextCandidate(state)",
-            "function chooseDueCandidate(state)",
-            "no runner sleep",
-            "timeout-minutes: 15",
-            "cancel-in-progress: true",
-            "latestInFlightCommand",
-            "no second review command will be emitted",
+            "async function waitUntilNextCandidate(state)",
+            "MAX_PUBLIC_DEFER_WAIT_MS = 70 * 60_000",
+            "context.payload.repository?.private === false",
+            "await new Promise(resolve => setTimeout(resolve, waitMs))",
+            "timeout-minutes: 85",
+            "cancel-in-progress: false",
+            "provider cooldown progress is never reset",
+            "while (!selected)",
+            "state = await collectState()",
+            "GitHub schedule is best-effort and can be delayed for hours",
         ):
             self.assertIn(contract, self.workflow)
-        for forbidden in (
-            "MAX_WAIT_MS",
-            "Sleeping until",
-            "setTimeout(resolve, waitMs)",
-            "await new Promise",
-        ):
-            self.assertNotIn(forbidden, self.workflow)
-        # The controller itself never sleeps and introduces no dedicated
-        # CodeRabbit polling cron; existing stable controller wakeups provide
-        # the periodic backstop.
-        self.assertIn("recovery-controller wake-ups", self.workflow)
-        self.assertIn("no dedicated CodeRabbit polling cron", self.workflow)
+        self.assertIn("selected = await chooseDueCandidate(state)", self.workflow)
+        self.assertIn("await waitUntilNextCandidate(state)", self.workflow)
+        self.assertIn("private repository or wait exceeds cap", self.workflow)
+        self.assertIn("no second review command will be emitted", self.workflow)
+        self.assertNotIn("CONTINUUM_ROLE", self.workflow)
+        self.assertIn("vars.CONTINUUM_ROLE != 'child'", self.stub)
+
 
     def test_legacy_schedule_wake_stays_inside_provider_gate(self):
         # The reusable workflow still accepts schedule from stale callers

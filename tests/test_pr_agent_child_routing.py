@@ -195,7 +195,7 @@ class PrivacyAndExactHeadTests(unittest.TestCase):
         merge = read(".github/workflows/continuum-pr-agent-auto-merge.yml")
         self.assertIn("pr.head.sha.toLowerCase() !== reviewedHead", merge)
 
-    def test_coderabbit_remains_untouched(self):
+    def test_coderabbit_remains_free_of_pr_agent_target_routing(self):
         for path in (
             ".github/workflows/continuum-coderabbit-retry.yml",
             ".github/workflows/continuum-coderabbit-unresolved.yml",
@@ -205,6 +205,11 @@ class PrivacyAndExactHeadTests(unittest.TestCase):
                 self.assertNotIn("target_child_id", body)
                 self.assertNotIn("CONTINUUM_PR_AGENT_TARGET", body)
                 self.assertNotIn("CONTINUUM_ROLE", body)
+
+        # The zero-private-child-runner guard is caller-owned, keeping the
+        # reusable CodeRabbit engine consumer-neutral.
+        stub = read(".github/caller-stubs/continuum-coderabbit-retry.yml")
+        self.assertIn("vars.CONTINUUM_ROLE != 'child'", stub)
 
 
 if __name__ == "__main__":

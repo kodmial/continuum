@@ -4827,6 +4827,39 @@ class ContinuumTest < Minitest::Test
 
   # CodeRabbit can submit CHANGES_REQUESTED for a policy/pre-merge failure with
   # no code finding at all. That state is not a coding-agent repair request.
+  # Auto-merge may advance a PR from main while a CodeRabbit repair is
+  # running. Never rewrite developer history to replay the repair: fail with a
+  # dedicated marker and let the watchdog rerun the same coderabbit-fix inputs
+  # against the latest PR HEAD.
+  def test_coderabbit_fix_survives_concurrent_pr_head_advance
+    body = workflow_body('continuum-opencode.yml')
+    step = body[/^\s+- name: Fix CodeRabbit review findings\n(.*?)(?=^\s+- name: Ask CodeRabbit to verify every original finding)/m, 1]
+    refute_nil step, 'CodeRabbit fix step is missing'
+
+    assert_includes step, 'REPAIR_BASE_SHA="$(git rev-parse HEAD)"'
+    assert_includes step, 'git fetch --no-tags origin "${HEAD_REF}"'
+    assert_includes step, 'REMOTE_HEAD="$(git rev-parse "origin/${HEAD_REF}")"'
+    assert_includes step, 'CONTINUUM_OPENCODE_PUBLISH_RACE_RETRY_REQUIRED'
+    assert_includes step, 'exit 76'
+    assert_includes step, 'git push origin "HEAD:${HEAD_REF}"'
+    assert_includes step, 'watchdog reruns coderabbit-fix on the new head'
+    refute_includes step, 'git rebase'
+    refute_includes step, '--force'
+    refute_includes step, '--force-with-lease'
+  end
+
+  def test_coderabbit_fix_verification_uses_published_branch_ref
+    body = workflow_body('continuum-opencode.yml')
+    step = body[/^\s+- name: Ask CodeRabbit to verify every original finding\n(.*?)(?=^\s+- name: Resolve merge conflict with main)/m, 1]
+    refute_nil step, 'CodeRabbit verification step is missing'
+
+    assert_includes step, 'github.rest.git.getRef({'
+    assert_includes step, 'ref: `heads/${pr.data.head.ref}`'
+    assert_includes step, 'const headSha = headRef.data.object.sha;'
+    assert_includes step, 'pull metadata still reports stale HEAD'
+    refute_includes step, 'const headSha = pr.data.head.sha;'
+  end
+
   def test_coderabbit_policy_blocker_is_classified_before_opencode_dispatch
     body = workflow_body('continuum-opencode.yml')
     job = body[/^  dispatch-coderabbit-fix:\n(.*?)(?=^  opencode:)/m, 1]
@@ -4860,25 +4893,27 @@ class ContinuumTest < Minitest::Test
   end
 
   # A summary-only CHANGES_REQUESTED verdict has no coding-agent repair
-  # value, but one such verdict must not permanently strand an exact HEAD.
-  # Retry is bounded and cooldown-driven; only budget exhaustion is terminal.
-  def test_coderabbit_no_progress_marker_has_bounded_same_head_requeue
+  # value and must never permanently strand an exact HEAD. The serialized
+  # CodeRabbit queue retries it after cooldown until approval or until a real
+  # actionable finding appears for OpenCode to repair.
+  def test_coderabbit_no_progress_marker_stays_in_autonomous_same_head_queue
     retry_body = workflow_body('continuum-coderabbit-retry.yml')
     merge_body = auto_merge_body
 
     assert_includes retry_body, 'continuum-coderabbit-no-progress head='
-    assert_includes retry_body, 'NO_PROGRESS_MAX_REVIEWS = 3'
-    assert_includes retry_body, 'noProgressMarkers.length >= NO_PROGRESS_MAX_REVIEWS'
     assert_includes retry_body, 'noProgressAt + REVIEW_COOLDOWN_MS'
     assert_includes retry_body, "kind = 'no-progress-retry'"
-    assert_includes retry_body, 'exhausted bounded non-code CodeRabbit re-review budget'
+    assert_includes retry_body, 'must never become'
+    refute_includes retry_body, 'NO_PROGRESS_MAX_REVIEWS'
+    refute_includes retry_body, 'exhausted bounded non-code CodeRabbit re-review budget'
 
     assert_includes merge_body, 'continuum-coderabbit-no-progress head='
-    assert_includes merge_body, 'NO_PROGRESS_MAX_REVIEWS = 3'
-    assert_includes merge_body, 'return markers.length >= NO_PROGRESS_MAX_REVIEWS'
     assert_includes merge_body, 'codeRabbitNoProgressBlocked'
     assert_includes merge_body, 'reviewNoProgressBlocked'
-    assert_includes merge_body, 'bounded non-code CodeRabbit re-review budget is exhausted.'
+    assert_includes merge_body, 'return false;'
+    assert_includes merge_body, 'must never become a'
+    refute_includes merge_body, 'NO_PROGRESS_MAX_REVIEWS'
+    refute_includes merge_body, 'bounded non-code CodeRabbit re-review budget is exhausted.'
   end
 
   # Inline findings already have an independent thread-verification protocol.
@@ -4944,22 +4979,26 @@ class ContinuumTest < Minitest::Test
     assert_includes body, 'await commentGithub.rest.issues.removeLabel({'
   end
 
-  # Hour-scale CodeRabbit quota waits must never pin a GitHub runner. The
-  # controller keeps the due time in durable review/comment timestamps and
-  # exits; existing event-driven and stable recovery-controller wake-ups
-  # reconcile the queue later without a dedicated CodeRabbit polling cron.
-  def test_coderabbit_review_queue_defers_without_sleeping_runner
+  # GitHub schedule is best-effort and can arrive hours late. Public consumers
+  # therefore keep at most one bounded serialized waiter until the durable
+  # CodeRabbit dueAt; private repositories remain event-driven.
+  def test_coderabbit_review_queue_uses_bounded_public_due_waiter
     body = workflow_body('continuum-coderabbit-retry.yml')
 
-    assert_includes body, 'function deferUntilNextCandidate(state)'
-    assert_includes body, 'no runner sleep'
-    assert_includes body, 'stable controller wake-ups will reconcile the queue again'
-    assert_includes body, 'no dedicated CodeRabbit polling cron'
-    assert_includes body, 'timeout-minutes: 15'
-    assert_includes body, 'cancel-in-progress: true'
-    refute_includes body, 'MAX_WAIT_MS'
-    refute_includes body, 'Sleeping until'
-    refute_includes body, 'setTimeout(resolve, waitMs)'
+    assert_includes body, 'async function waitUntilNextCandidate(state)'
+    assert_includes body, 'MAX_PUBLIC_DEFER_WAIT_MS = 70 * 60_000'
+    assert_includes body, 'context.payload.repository?.private === false'
+    assert_includes body, 'await new Promise(resolve => setTimeout(resolve, waitMs))'
+    assert_includes body, 'while (!selected)'
+    assert_includes body, 'state = await collectState()'
+    assert_includes body, 'await waitUntilNextCandidate(state)'
+    assert_includes body, 'timeout-minutes: 85'
+    assert_includes body, 'cancel-in-progress: false'
+    assert_includes body, 'provider cooldown progress is never reset'
+    assert_includes body, 'GitHub schedule is best-effort and can be delayed for hours'
+    assert_includes body, 'private repository or wait exceeds cap'
+    assert_includes body, 'no second review command will be emitted'
+    refute_includes body, 'CONTINUUM_ROLE'
   end
 
   # RESOLVED/UNRESOLVED replies are lifecycle events. They must wake the queue
@@ -5014,11 +5053,11 @@ class ContinuumTest < Minitest::Test
 
     # The controller remains backward-compatible with stale callers that can
     # still emit a schedule event while consumers converge, and all wake types
-    # share the same non-blocking single-slot reconciler.
+    # share the same serialized wait-loop reconciler.
     assert_includes body, "github.event_name == 'workflow_run'"
     assert_includes body, "github.event_name == 'schedule'"
     assert_includes body, 'chooseDueCandidate(state)'
-    assert_includes body, 'no second review command will be emitted'
+    assert_includes body, 'while (!selected)'
     assert_includes body, 'candidate.effectiveDueAt <= now'
     refute_includes body, "github.event_name == 'push'"
 
@@ -5206,7 +5245,17 @@ class ContinuumTest < Minitest::Test
     assert_includes recovery, 'skipping PR but continuing run'
     assert_includes recovery, 'core.setFailed('
     assert_includes automerge, 'liveBeforeSync'
+    assert_includes automerge, 'withAuthoritativeHead'
+    assert_includes automerge, 'client.rest.git.getRef'
+    assert_includes automerge, 'pull metadata HEAD'
+    assert_includes automerge, 'getPullWithAuthoritativeHead'
     assert_includes automerge, 'holding stale reconciliation'
+    assert_includes automerge, 'pull metadata rejected authoritative HEAD'
+    assert_includes automerge, "'POST /repos/{owner}/{repo}/merges'"
+    assert_includes automerge, 'base: pr.head.ref'
+    assert_includes automerge, 'head: mainHead'
+    assert_includes automerge, 'direct main-sync merge returned no commit SHA'
+    assert_includes automerge, 'expected_head_sha: oldHead'
     assert_includes automerge, 'sha: pr.head.sha'
     # Exact-HEAD isolation: short-SHA markers are ignored entirely so an
     # old HEAD sharing a 7-char prefix can never strand a new HEAD. No
@@ -7245,6 +7294,20 @@ class ContinuumTest < Minitest::Test
     qualification = workflow_body('continuum-docker-qualification.yml')
     assert_includes qualification, 'issue.md'
     assert_includes qualification, 'only re-read when it never ran'
+  end
+
+  def test_coderabbit_unresolved_batches_auto_merge_verification_markers
+    body = workflow_body('continuum-coderabbit-unresolved.yml')
+
+    assert_includes body, 'opencodeVerificationPattern'
+    assert_includes body, 'autoMergeVerificationPattern'
+    assert_includes body, 'auto-merge-coderabbit-verification finding='
+    assert_includes body, 'originalReviewIdForFinding'
+    assert_includes body, 'pull_request_review_id'
+    assert_includes body, 'github.rest.pulls.getReviewComment'
+    assert_includes body, 'comment_id: findingId'
+    assert_includes body, 'getRootId(comment) !== findingId'
+    assert_includes body, 'await originalReviewIdForFinding(findingId)'
   end
 
   def test_api_budget_coderabbit_unresolved_scans_newest_first_and_bounded

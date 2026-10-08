@@ -325,10 +325,12 @@ class WorkflowContractPinTests(unittest.TestCase):
         self.assertIn("waiting for a free WIP slot", body)
         self.assertIn("active local issues", body)
 
-    def test_wip_starvation_cannot_report_success(self):
+    def test_wip_saturation_keeps_backlog_queued_without_failing(self):
         body = SCHEDULER.read_text(encoding="utf-8")
-        self.assertIn("core.setFailed(", body)
-        self.assertIn(
+        self.assertIn("waiting for a free WIP slot", body)
+        self.assertIn("WIP is saturated;", body)
+        self.assertIn("eligible issue(s) remain queued", body)
+        self.assertNotIn(
             "Issue scheduler WIP exhausted with eligible backlog waiting.", body
         )
 
