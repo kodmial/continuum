@@ -1261,9 +1261,122 @@ jobs:
               };
             }
 
+            async function cleanNoProgressCodeRabbitReviewBasis(pr, headSha) {
+              const [ci, decision, rabbitStatus, comments] = await Promise.all([
+                latestCiForHead(pr, headSha),
+                latestCodeRabbitDecision(pr, headSha),
+                latestCodeRabbitStatus(headSha),
+                withReadFallback(client =>
+                  client.paginate(
+                    client.rest.issues.listComments,
+                    {
+                      owner,
+                      repo,
+                      issue_number: pr.number,
+                      per_page: 100,
+                    }
+                  )
+                ),
+              ]);
+
+              if (
+                !ci ||
+                ci.status !== 'completed' ||
+                ci.conclusion !== 'success' ||
+                !decision ||
+                decision.state !== 'CHANGES_REQUESTED' ||
+                !rabbitStatus ||
+                rabbitStatus.state !== 'success' ||
+                !/Review completed/i.test(rabbitStatus.description || '')
+              ) {
+                return null;
+              }
+
+              const markerPattern = new RegExp(
+                `<!-- continuum-coderabbit-no-progress head=${headSha} review=(\\d+) kind=non-code -->`,
+                'i'
+              );
+              const marker = comments
+                .filter(comment => {
+                  const login = comment.user?.login || '';
+                  return login === 'github-actions[bot]' || login === owner;
+                })
+                .map(comment => {
+                  const match = (comment.body || '').match(markerPattern);
+                  if (!match) return null;
+                  return {
+                    reviewId: Number(match[1]),
+                    at: new Date(comment.created_at || 0).getTime(),
+                  };
+                })
+                .filter(Boolean)
+                .sort((a, b) => b.at - a.at)[0] || null;
+              if (!marker || Number(decision.id) !== marker.reviewId) {
+                return null;
+              }
+
+              const commandMarker =
+                `<!-- continuum-coderabbit-command head=${headSha} -->`;
+              const command = comments
+                .filter(comment =>
+                  comment.user?.login !== 'coderabbitai[bot]' &&
+                  /^@coderabbitai\\s+(?:full\\s+)?review/m.test(comment.body || '') &&
+                  (comment.body || '').includes(commandMarker) &&
+                  new Date(comment.created_at || 0).getTime() > marker.at
+                )
+                .sort(
+                  (a, b) =>
+                    new Date(b.created_at || 0).getTime() -
+                    new Date(a.created_at || 0).getTime()
+                )[0] || null;
+              if (!command) return null;
+
+              const commandAt = new Date(command.created_at || 0).getTime();
+              const completion = comments
+                .filter(comment =>
+                  comment.user?.login === 'coderabbitai[bot]' &&
+                  /Action performed/i.test(comment.body || '') &&
+                  /Full review finished/i.test(comment.body || '') &&
+                  new Date(comment.updated_at || comment.created_at || 0).getTime() >
+                    commandAt
+                )
+                .sort(
+                  (a, b) =>
+                    new Date(b.updated_at || b.created_at || 0).getTime() -
+                    new Date(a.updated_at || a.created_at || 0).getTime()
+                )[0] || null;
+              if (!completion) return null;
+
+              const completionAt =
+                new Date(completion.updated_at || completion.created_at || 0).getTime();
+              const statusAt =
+                new Date(rabbitStatus.updated_at || rabbitStatus.created_at || 0).getTime();
+              if (statusAt < completionAt) return null;
+
+              // A later decisive review supersedes this evidence. In particular,
+              // never reinterpret a new CHANGES_REQUESTED as clean convergence.
+              const latestDecisionAt =
+                new Date(decision.submitted_at || 0).getTime();
+              if (latestDecisionAt > marker.at) return null;
+
+              const nitpicks = await codeRabbitNitpickReviews(pr, headSha);
+              if (nitpicks.length !== 0) return null;
+
+              return {
+                sourceSha: headSha,
+                carried: false,
+                decision,
+                convergedNoProgress: true,
+                completedAt: completionAt,
+              };
+            }
+
             async function codeRabbitReviewBasis(pr, headSha = pr.head.sha) {
               const direct = await directCodeRabbitReviewBasis(pr, headSha);
               if (direct) return direct;
+              const converged =
+                await cleanNoProgressCodeRabbitReviewBasis(pr, headSha);
+              if (converged) return converged;
               return carriedCodeRabbitReviewBasis(pr, headSha);
             }
 
@@ -2302,7 +2415,11 @@ jobs:
                 : [];
               const reviewBasis =
                 requireCodeRabbit && unresolvedBeforeSync.length === 0
-                  ? await codeRabbitReviewBasis(pr, oldHead)
+                  // Only a literal APPROVED decision may be carried across a
+                  // controller-generated main sync. A clean post-no-progress
+                  // completion is exact-HEAD evidence and must be re-reviewed
+                  // after any HEAD change.
+                  ? await directCodeRabbitReviewBasis(pr, oldHead)
                   : null;
 
               try {
@@ -3018,7 +3135,11 @@ jobs:
               core.notice(
                 `PR #${pr.number}: auto-merged head ${pr.head.sha} using ${
                   requireCodeRabbit
-                    ? `CodeRabbit approval from ${finalReviewBasis.sourceSha}`
+                    ? (
+                      finalReviewBasis.convergedNoProgress
+                        ? `clean CodeRabbit full review after summary-only blocker on ${finalReviewBasis.sourceSha}`
+                        : `CodeRabbit approval from ${finalReviewBasis.sourceSha}`
+                    )
                     : 'CI only; CodeRabbit is disabled for this repository'
                 }; merge commit ${result.sha}.`
               );
