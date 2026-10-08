@@ -27,9 +27,10 @@ concurrency:
   # an independent CodeRabbit slot.
   group: coderabbit-rate-limit-controller-${{ github.repository }}
   # Exactly one controller owns the shared slot. If the next legal transition
-  # is in the future it waits inside this serialized run; any newer lifecycle
-  # event cancels the sleeper and starts a fresh latest-state reconciliation.
-  cancel-in-progress: true
+  # is in the future it waits inside this serialized run. New lifecycle wakes
+  # coalesce into GitHub's single pending run instead of cancelling the sleeper,
+  # so provider cooldown progress is never reset by status/comment storms.
+  cancel-in-progress: false
 
 jobs:
   controller:
