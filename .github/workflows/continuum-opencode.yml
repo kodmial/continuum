@@ -1265,8 +1265,10 @@ jobs:
                 -m "Continuum-Component: opencode" || true
               head_sha="$(git rev-parse HEAD 2>/dev/null || true)"
             fi
+            local evacuated_ok=false
             if [[ -n "$head_sha" ]]; then
               if git push --force origin "HEAD:refs/heads/${checkpoint_ref}"; then
+                evacuated_ok=true
                 echo "::warning::Evacuated 429 checkpoint ${checkpoint_ref} at exact SHA ${head_sha} (operation ${operation}, stage ${stage}, generation ${next_gen}, mode ${mode}, issue ${issue_number}, pr ${pr_number}, branch ${current_branch})."
                 # Optional legacy-branch mirror so scheduler-native resume
                 # keeps working after infrastructure cooldown even without a
@@ -1281,7 +1283,11 @@ jobs:
               echo "::warning::429 evacuation had no committable state; recording the marker without a checkpoint ref."
             fi
             : > "${RUNNER_TEMP:-/tmp}/continuum-opencode-429"
-            echo "CONTINUUM_429_CHECKPOINT_REF=${checkpoint_ref}" >> "${GITHUB_ENV:-/dev/null}"
+            if [[ "$evacuated_ok" == "true" ]]; then
+              echo "CONTINUUM_429_CHECKPOINT_REF=${checkpoint_ref}" >> "${GITHUB_ENV:-/dev/null}"
+            else
+              echo "CONTINUUM_429_CHECKPOINT_REF=" >> "${GITHUB_ENV:-/dev/null}"
+            fi
             echo "CONTINUUM_429_OPERATION=${operation}" >> "${GITHUB_ENV:-/dev/null}"
             echo "::error::CONTINUUM_OPENCODE_429_RESTART_REQUIRED"
             exit 75
@@ -1811,7 +1817,7 @@ jobs:
                 ) | .body
               ] | join("\n---\n")
             ' 2>/dev/null || true)"
-            if grep -Eqi "<!--[[:space:]]*continuum-qualification-result[^>]*sha[[:space:]]*=[[:space:]]*${REQUIRED_SHA}[^>]*result[[:space:]]*=[[:space:]]*(pass|fail)" <<<"${QUAL_PRIOR_EVIDENCE:-}"; then
+            if [[ -n "${REQUIRED_SHA:-}" ]] && grep -Eqi "<!--[[:space:]]*continuum-qualification-result[^>]*sha[[:space:]]*=[[:space:]]*${REQUIRED_SHA}[^>]*result[[:space:]]*=[[:space:]]*(pass|fail)" <<<"${QUAL_PRIOR_EVIDENCE:-}"; then
               echo "429 resumption: trusted exact-SHA qualification evidence already exists for $REQUIRED_SHA; skipping OpenCode qualification agent."
               RECOVERY_SKIP_OPENCODE="true"
             fi
