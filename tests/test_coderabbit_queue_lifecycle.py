@@ -621,15 +621,15 @@ class WorkflowBindingTests(unittest.TestCase):
         self.assertIn("workflow_dispatch", self.workflow)
 
     def test_caller_stub_trigger_parity_for_safety_net(self):
-        # Reuse the already-existing periodic recovery/auto-merge workflows as
-        # stable-head wake sources instead of introducing another cron.
-        self.assertNotIn("\n  schedule:\n", self.stub)
-        self.assertIn("workflow_run:", self.stub)
-        self.assertIn("- PR-Agent recovery", self.stub)
-        self.assertIn("- Auto-merge reviewed pull requests", self.stub)
+        # CodeRabbit owns its recovery wake. A PR-Agent workflow must never be
+        # part of the CodeRabbit liveness graph.
+        self.assertIn("\n  schedule:\n", self.stub)
+        self.assertIn('cron: "3,13,23,33,43,53 * * * *"', self.stub)
+        self.assertNotIn("workflow_run:", self.stub)
+        self.assertNotIn("PR-Agent recovery", self.stub)
+        self.assertNotIn("Auto-merge reviewed pull requests", self.stub)
         self.assertNotIn("- Issue scheduler", self.stub)
         self.assertNotIn("\n  push:\n", self.stub)
-        self.assertIn("github.event_name == 'workflow_run'", self.workflow)
         self.assertNotIn("github.event_name == 'push'", self.workflow)
 
         # Caller-side gating is what keeps private Child repositories and
@@ -638,8 +638,6 @@ class WorkflowBindingTests(unittest.TestCase):
         self.assertIn("vars.CONTINUUM_REVIEW_PROVIDER", self.stub)
         self.assertIn("== 'coderabbit'", self.stub)
 
-        # The reusable controller remains backward-compatible with stale callers
-        # that still emit schedule events while consumers converge.
         self.assertIn("github.event_name == 'schedule'", self.workflow)
         # No new credential and no consumer repository literal may ride along.
         for secret in (
