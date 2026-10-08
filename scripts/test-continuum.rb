@@ -4963,6 +4963,9 @@ class ContinuumTest < Minitest::Test
     assert_includes body, '/Review completed/i.test(rabbitStatus.description || \'\')'
     assert_includes body, 'Number(decision.id) !== marker.reviewId'
     assert_includes body, 'latestDecisionAt > marker.at'
+    assert_includes body, 'completionAt < commandAt'
+    assert_includes body, 'statusAt < commandAt'
+    refute_includes body, 'statusAt < completionAt'
     assert_includes body, 'convergedNoProgress: true'
     assert_includes body, 'await directCodeRabbitReviewBasis(pr, oldHead)'
   end
@@ -5053,6 +5056,39 @@ class ContinuumTest < Minitest::Test
     refute_includes body, 'CONTINUUM_ROLE'
   end
 
+  # Review-provider caller isolation is a consumer compatibility boundary.
+  # Selecting CodeRabbit must prevent autonomous PR-Agent reusable execution,
+  # while PR-Agent selection must prevent CodeRabbit repair execution.
+  def test_review_provider_callers_are_hard_isolated
+    cr_retry = File.read(File.join(ROOT, '.github/caller-stubs/continuum-coderabbit-retry.yml'))
+    cr_unresolved = File.read(File.join(ROOT, '.github/caller-stubs/continuum-coderabbit-unresolved.yml'))
+    pr_files = %w[
+      continuum-pr-agent-recovery.yml
+      continuum-pr-agent.yml
+      continuum-pr-agent-router.yml
+      continuum-pr-agent-repair.yml
+      continuum-pr-agent-auto-merge.yml
+    ].map { |name| File.read(File.join(ROOT, '.github/caller-stubs', name)) }
+
+    assert_includes cr_retry, "== 'coderabbit'"
+    assert_includes cr_unresolved, "== 'coderabbit'"
+    refute_includes cr_retry, 'PR-Agent recovery'
+    pr_files.each do |body|
+      assert_includes body, "'pr-agent'",
+                      'every PR-Agent caller must be gated by the selected provider'
+    end
+
+    generic = auto_merge_body
+    assert_includes generic, "const prAgentSyncOnly = reviewProvider === 'pr-agent';"
+    assert_includes generic, "const requireCodeRabbit = reviewProvider === 'coderabbit';"
+    sync_stop = generic.index('PR-Agent owns review/merge; generic reconciler stops after main-sync evaluation.')
+    rabbit_gate = generic.index('const reviewBasis = requireCodeRabbit')
+    refute_nil sync_stop
+    refute_nil rabbit_gate
+    assert_operator sync_stop, :<, rabbit_gate,
+                    'PR-Agent mode must exit generic merge admission before CodeRabbit gates'
+  end
+
   # RESOLVED/UNRESOLVED replies are lifecycle events. They must wake the queue
   # without relying on cron. A PR lacking a source issue gets an explicit P2
   # fallback instead of an infinite rank that can starve forever.
@@ -5076,24 +5112,22 @@ class ContinuumTest < Minitest::Test
     refute_includes body, "workflow_id: 'continuum-auto-merge.yml'"
   end
 
-  # A queue deferred to a future dueAt must be woken without introducing a
-  # second repository-local cron. The caller reuses existing periodic
-  # PR-Agent recovery / auto-merge completions, both of which run only after
-  # the PR HEAD has settled. This avoids review/main-sync races and keeps Child
-  # and non-CodeRabbit consumers at zero runner cost.
-  def test_coderabbit_retry_reuses_stable_existing_recovery_wakes
+  # A deferred CodeRabbit queue owns its own recovery clock. No review
+  # provider may depend on another provider's workflow completion for liveness.
+  def test_coderabbit_retry_has_provider_owned_recovery_tick
     body = workflow_body('continuum-coderabbit-retry.yml')
     stub_body = File.read(
       File.join(ROOT, '.github/caller-stubs/continuum-coderabbit-retry.yml')
     )
     stub = yaml(File.join(ROOT, '.github/caller-stubs/continuum-coderabbit-retry.yml'))
 
-    refute events(stub).key?('schedule'),
-           'the retry caller must not add a dedicated polling cron'
-    workflow_run = events(stub).fetch('workflow_run')
-    assert_equal ['PR-Agent recovery', 'Auto-merge reviewed pull requests'],
-                 workflow_run.fetch('workflows')
-    assert_equal ['completed'], workflow_run.fetch('types')
+    schedule = events(stub).fetch('schedule')
+    assert_equal ['3,13,23,33,43,53 * * * *'],
+                 schedule.map { |entry| entry.fetch('cron') }
+    refute events(stub).key?('workflow_run'),
+           'CodeRabbit recovery must not depend on PR-Agent or generic merge completion'
+    refute_includes stub_body, 'PR-Agent recovery'
+    refute_includes stub_body, 'Auto-merge reviewed pull requests'
     refute_includes stub_body, '- Issue scheduler'
     refute_includes stub_body, "\n  push:\n"
 
@@ -5103,9 +5137,7 @@ class ContinuumTest < Minitest::Test
     assert_includes stub_body, 'vars.CONTINUUM_REVIEW_PROVIDER'
     assert_includes stub_body, "== 'coderabbit'"
 
-    # The controller remains backward-compatible with stale callers that can
-    # still emit a schedule event while consumers converge, and all wake types
-    # share the same serialized wait-loop reconciler.
+    # All wake types share the same serialized wait-loop reconciler.
     assert_includes body, "github.event_name == 'workflow_run'"
     assert_includes body, "github.event_name == 'schedule'"
     assert_includes body, 'chooseDueCandidate(state)'
