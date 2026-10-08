@@ -9,6 +9,7 @@ deduplication, Parent-log opacity, and recovery-input validation.
 import unittest
 
 from continuum.opencode_429_recovery import (
+    RECOVERY_IDENTITY_FIELDS,
     already_resumed,
     checkpoint_ref,
     classify_agent_error,
@@ -19,6 +20,7 @@ from continuum.opencode_429_recovery import (
     is_valid_stage,
     next_generation,
     operation_id,
+    pack_recovery_identity,
     parse_checkpoint_ref,
     recovery_dispatch_inputs,
     redact_child_identity,
@@ -28,6 +30,7 @@ from continuum.opencode_429_recovery import (
     should_enter_infra_cooldown,
     should_skip_opencode,
     stage_index,
+    unpack_recovery_identity,
     validate_recovery_inputs,
     DEFAULT_MAX_429_RUNNER_RESTARTS,
     RUNNER_DEATH_EXIT_CODE,
@@ -269,6 +272,62 @@ class DispatchIdentityTest(unittest.TestCase):
         # No recovery requested is a valid plain run.
         ok, _ = validate_recovery_inputs({})
         self.assertTrue(ok)
+
+    def test_recovery_identity_packs_into_one_dispatch_input(self):
+        # A caller-stub workflow_dispatch accepts at most 25 inputs, so the
+        # stub cannot declare one input per recovery field: the watchdog
+        # packs the explicit identity into one JSON string and the stub
+        # unpacks it. No field may be elided in transit.
+        operation = operation_id("issue", issue_number="290")
+        ref = checkpoint_ref(operation, 2)
+        dispatch = recovery_dispatch_inputs(
+            operation=operation,
+            checkpoint=ref,
+            checkpoint_sha="e" * 40,
+            stage="tests-passed",
+            generation=2,
+            mode="issue",
+            issue_number="290",
+        )
+        packed = pack_recovery_identity(dispatch)
+        self.assertTrue(packed)
+        unpacked = unpack_recovery_identity(packed)
+        self.assertEqual(
+            sorted(unpacked),
+            sorted(
+                [
+                    "recovery_operation_id",
+                    "recovery_checkpoint_ref",
+                    "recovery_checkpoint_sha",
+                    "recovery_stage",
+                    "recovery_generation",
+                ]
+            ),
+        )
+        for field in (
+            "recovery_operation_id",
+            "recovery_checkpoint_ref",
+            "recovery_checkpoint_sha",
+            "recovery_stage",
+            "recovery_generation",
+        ):
+            self.assertEqual(unpacked[field], dispatch[field])
+        ok, _ = validate_recovery_inputs(unpacked)
+        self.assertTrue(ok)
+
+    def test_recovery_identity_pack_empty_means_no_recovery(self):
+        self.assertEqual(pack_recovery_identity({}), "")
+        self.assertEqual(
+            unpack_recovery_identity(""),
+            {field: "" for field in RECOVERY_IDENTITY_FIELDS},
+        )
+        ok, _ = validate_recovery_inputs(unpack_recovery_identity(""))
+        self.assertTrue(ok)
+
+    def test_recovery_identity_malformed_fails_closed(self):
+        for bad in ("{not json", "[1,2]", "42", '"str"', 42):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                unpack_recovery_identity(bad)
 
 
 class OpacityTest(unittest.TestCase):

@@ -123,24 +123,14 @@ on:
         description: "Exact main SHA a qualification run must test"
         required: false
         type: string
-      recovery_operation_id:
-        description: "Stable 429 recovery operation identity for a fresh-VM resumption"
-        required: false
-        type: string
-      recovery_checkpoint_ref:
-        description: "Workflow-owned durable 429 checkpoint ref to restore"
-        required: false
-        type: string
-      recovery_checkpoint_sha:
-        description: "Exact 429 checkpoint commit SHA to restore"
-        required: false
-        type: string
-      recovery_stage:
-        description: "Lifecycle stage the 429 checkpoint completed"
-        required: false
-        type: string
-      recovery_generation:
-        description: "Recovery generation of the 429 checkpoint"
+      recovery_identity:
+        description: >-
+          Packed 429 recovery identity JSON for a fresh-VM resumption
+          (operation id + checkpoint ref/SHA + stage + generation). Empty
+          means this is not a 429 resumption. One packed input (instead of
+          one per recovery field) keeps this workflow_dispatch at or below
+          the 25-input limit; the call below unpacks it into the reusable
+          workflow's explicit recovery inputs.
         required: false
         type: string
 
@@ -181,8 +171,14 @@ jobs:
       capability_number: "${{ inputs.capability_number }}"
       qualification_number: "${{ inputs.qualification_number }}"
       required_sha: "${{ inputs.required_sha }}"
-      recovery_operation_id: "${{ inputs.recovery_operation_id }}"
-      recovery_checkpoint_ref: "${{ inputs.recovery_checkpoint_ref }}"
-      recovery_checkpoint_sha: "${{ inputs.recovery_checkpoint_sha }}"
-      recovery_stage: "${{ inputs.recovery_stage }}"
-      recovery_generation: "${{ inputs.recovery_generation }}"
+      # kodmial/continuum#290: the watchdog packs the explicit 429 recovery
+      # identity (operation id + checkpoint ref/SHA + stage + generation)
+      # into the single recovery_identity dispatch input above, and the stub
+      # unpacks it here into the reusable workflow's explicit recovery
+      # inputs. The empty-string guard short-circuits before fromJSON so a
+      # plain (non-resumption) run passes empty recovery inputs through.
+      recovery_operation_id: "${{ inputs.recovery_identity && fromJSON(inputs.recovery_identity).recovery_operation_id || '' }}"
+      recovery_checkpoint_ref: "${{ inputs.recovery_identity && fromJSON(inputs.recovery_identity).recovery_checkpoint_ref || '' }}"
+      recovery_checkpoint_sha: "${{ inputs.recovery_identity && fromJSON(inputs.recovery_identity).recovery_checkpoint_sha || '' }}"
+      recovery_stage: "${{ inputs.recovery_identity && fromJSON(inputs.recovery_identity).recovery_stage || '' }}"
+      recovery_generation: "${{ inputs.recovery_identity && fromJSON(inputs.recovery_identity).recovery_generation || '' }}"

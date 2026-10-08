@@ -179,7 +179,26 @@ class OpenCode429RunnerRecoveryContractTest(unittest.TestCase):
         ):
             self.assertIn(name, self.body)
             self.assertIn(name, self.stub)
-            self.assertIn("inputs.{}".format(name), self.stub)
+        # A caller-stub workflow_dispatch accepts at most 25 inputs, so the
+        # stub carries the explicit identity packed into one
+        # recovery_identity JSON input and unpacks it into the reusable
+        # workflow's explicit recovery inputs; the watchdog packs it with
+        # JSON.stringify on dispatch.
+        self.assertIn("recovery_identity", self.stub)
+        self.assertIn("inputs.recovery_identity", self.stub)
+        self.assertIn("fromJSON(inputs.recovery_identity)", self.stub)
+        for name in (
+            "recovery_operation_id",
+            "recovery_checkpoint_ref",
+            "recovery_checkpoint_sha",
+            "recovery_stage",
+            "recovery_generation",
+        ):
+            self.assertIn(
+                "fromJSON(inputs.recovery_identity).{}".format(name), self.stub
+            )
+        self.assertIn("recovery_identity", self.watchdog)
+        self.assertIn("JSON.stringify", self.watchdog)
 
 
 if __name__ == "__main__":

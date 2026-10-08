@@ -372,6 +372,12 @@ jobs:
                 return;
               }
 
+              // kodmial/continuum#290: the caller stub's workflow_dispatch
+              // accepts at most 25 inputs, so the explicit recovery identity
+              // (operation id + checkpoint ref/SHA + stage + generation)
+              // travels packed into the single recovery_identity input. The
+              // stub unpacks it into the reusable workflow's explicit
+              // recovery inputs; every field stays explicit, none is elided.
               const dispatchInputs = {
                 mode: mode,
                 issue_number: String(identity.issue_number || ''),
@@ -383,11 +389,13 @@ jobs:
                 capability_number: String(identity.capability_number || ''),
                 qualification_number: String(identity.qualification_number || ''),
                 required_sha: String(identity.required_sha || ''),
-                recovery_operation_id: operation,
-                recovery_checkpoint_ref: checkpointRef,
-                recovery_checkpoint_sha: checkpointSha,
-                recovery_stage: stage,
-                recovery_generation: String(generation),
+                recovery_identity: JSON.stringify({
+                  recovery_operation_id: operation,
+                  recovery_checkpoint_ref: checkpointRef,
+                  recovery_checkpoint_sha: checkpointSha,
+                  recovery_stage: stage,
+                  recovery_generation: String(generation),
+                }),
               };
               await github.rest.actions.createWorkflowDispatch({
                 owner,

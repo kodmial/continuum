@@ -42,6 +42,7 @@ Standard library only.
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Dict, Mapping, Optional, Tuple
 
@@ -425,6 +426,64 @@ def recovery_dispatch_inputs(
     }
 
 
+#: The five explicit recovery fields carried through the caller stub's
+#: single ``recovery_identity`` workflow_dispatch input. A caller stub
+#: workflow_dispatch accepts at most 25 inputs, so the stub cannot declare
+#: one input per recovery field on top of its existing dispatch surface;
+#: the watchdog therefore packs exactly these fields (as produced by
+#: :func:`recovery_dispatch_inputs`) into one JSON string, and the stub
+#: unpacks them back into the five workflow_call inputs of the reusable
+#: workflow. The JSON always carries every field explicitly: no stage,
+#: SHA, or generation is ever elided.
+RECOVERY_IDENTITY_FIELDS = (
+    "recovery_operation_id",
+    "recovery_checkpoint_ref",
+    "recovery_checkpoint_sha",
+    "recovery_stage",
+    "recovery_generation",
+)
+
+
+def pack_recovery_identity(inputs: Mapping[str, Any]) -> str:
+    """Pack the explicit recovery identity into one dispatch input string.
+
+    Returns compact JSON carrying exactly :data:`RECOVERY_IDENTITY_FIELDS`
+    (missing fields become empty strings), or ``""`` when no recovery was
+    requested (no operation identity and no checkpoint ref).
+    """
+
+    if not isinstance(inputs, Mapping):
+        return ""
+    packed = {field: str(inputs.get(field) or "") for field in RECOVERY_IDENTITY_FIELDS}
+    if not packed["recovery_operation_id"] and not packed["recovery_checkpoint_ref"]:
+        return ""
+    return json.dumps(packed, sort_keys=True, separators=(",", ":"))
+
+
+def unpack_recovery_identity(payload: Any) -> Dict[str, str]:
+    """Unpack one dispatch ``recovery_identity`` string into recovery fields.
+
+    Returns the five :data:`RECOVERY_IDENTITY_FIELDS` (absent fields become
+    empty strings; an empty payload means no recovery was requested).
+    Raises :class:`ValueError` on malformed JSON or a non-object payload so
+    callers fail closed instead of resuming from a truncated identity.
+    """
+
+    if payload is None or (isinstance(payload, str) and not payload.strip()):
+        return {field: "" for field in RECOVERY_IDENTITY_FIELDS}
+    if not isinstance(payload, str):
+        raise ValueError("recovery identity must be a JSON string")
+    try:
+        parsed = json.loads(payload)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError("recovery identity is not valid JSON") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("recovery identity must be a JSON object")
+    return {
+        field: str(parsed.get(field) or "") for field in RECOVERY_IDENTITY_FIELDS
+    }
+
+
 def redact_child_identity(text: Any) -> str:
     """Redact ``owner/repo`` identities so Parent logs stay opaque.
 
@@ -482,6 +541,7 @@ __all__ = [
     "INFRA_BACKOFF_SCHEDULE",
     "PUBLISH_RACE_MARKER",
     "RESTART_REQUIRED_MARKER",
+    "RECOVERY_IDENTITY_FIELDS",
     "RUNNER_DEATH_EXIT_CODE",
     "SKIP_AGENT_STAGES",
     "STAGES",
@@ -496,6 +556,7 @@ __all__ = [
     "next_generation",
     "operation_id",
     "parse_checkpoint_ref",
+    "pack_recovery_identity",
     "recovery_dispatch_inputs",
     "redact_child_identity",
     "resume_stage",
@@ -504,5 +565,6 @@ __all__ = [
     "should_enter_infra_cooldown",
     "should_skip_opencode",
     "stage_index",
+    "unpack_recovery_identity",
     "validate_recovery_inputs",
 ]

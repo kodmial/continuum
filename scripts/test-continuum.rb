@@ -375,13 +375,35 @@ class ContinuumTest < Minitest::Test
   end
 
   def test_callable_contracts_and_dispatch_inputs
-    each_pair do |caller, callee|
+    each_pair do |caller, callee, path|
       assert_equal ['workflow_call'], events(callee).keys
       call = events(callee).fetch('workflow_call')
       assert(call['secrets'].nil? || call['secrets'].is_a?(Hash))
       assert_equal callee['name'], caller['name']
       job = caller.fetch('jobs').fetch('call')
       events(caller).fetch('workflow_dispatch', nil).to_h.fetch('inputs', {}).each do |key, value|
+        # kodmial/continuum#290: the opencode stub packs the explicit 429
+        # recovery identity (operation id + checkpoint ref/SHA + stage +
+        # generation) into the single recovery_identity dispatch input —
+        # one input per recovery field would push the stub past the 25-input
+        # workflow_dispatch limit. The stub unpacks it into the callee's
+        # five explicit recovery_* inputs (asserted in
+        # test_stubs_never_pin_a_consumer_knob), so the identity still
+        # reaches the callee with no field elided; only the transport is
+        # packed. Every other dispatch input keeps the 1:1 contract below.
+        if key == 'recovery_identity' &&
+           File.basename(path) == 'continuum-opencode.yml'
+          assert_equal 'string', value.fetch('type')
+          %w[
+            recovery_operation_id recovery_checkpoint_ref recovery_checkpoint_sha
+            recovery_stage recovery_generation
+          ].each do |packed|
+            assert_includes job.fetch('with').fetch(packed),
+                            'inputs.recovery_identity',
+                            "continuum-opencode.yml: `#{packed}` must unpack the packed recovery identity"
+          end
+          next
+        end
         expected = value['type'] == 'choice' ? 'string' : value['type']
         assert_equal expected, call.fetch('inputs').fetch(key).fetch('type')
         # continuum_ref is accepted by dispatch callers so isolated retries can
@@ -3953,6 +3975,18 @@ class ContinuumTest < Minitest::Test
         # consumer knob: it binds github.* rather than inputs.* by design.
         next if base == 'continuum-issue-scheduler.yml' &&
                 %w[caller_event_name caller_issue_number].include?(key)
+        # kodmial/continuum#290: the 429 recovery keys are watchdog-owned
+        # dispatch identity, not consumer knobs (they never read a vars.
+        # fallback). A caller-stub workflow_dispatch accepts at most 25
+        # inputs, so the stub packs the explicit identity into the single
+        # recovery_identity input and unpacks each field here; assert that
+        # derivation instead of the bare passthrough.
+        if base == 'continuum-opencode.yml' && key.start_with?('recovery_')
+          assert_match(/\A\$\{\{ inputs\.recovery_identity && fromJSON\(inputs\.recovery_identity\)\.#{key} \|\| '' \}\}\z/,
+                       value.to_s,
+                       "#{base}: `#{key}` must unpack inputs.recovery_identity, got #{value.inspect}")
+          next
+        end
 
         assert_match(/\A\$\{\{ inputs\.#{key}/, value.to_s,
                      "#{base}: `#{key}` must be a bare inputs.* passthrough, got #{value.inspect} — " \
