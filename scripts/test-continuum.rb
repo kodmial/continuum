@@ -4881,25 +4881,27 @@ class ContinuumTest < Minitest::Test
   end
 
   # A summary-only CHANGES_REQUESTED verdict has no coding-agent repair
-  # value, but one such verdict must not permanently strand an exact HEAD.
-  # Retry is bounded and cooldown-driven; only budget exhaustion is terminal.
-  def test_coderabbit_no_progress_marker_has_bounded_same_head_requeue
+  # value and must never permanently strand an exact HEAD. The serialized
+  # CodeRabbit queue retries it after cooldown until approval or until a real
+  # actionable finding appears for OpenCode to repair.
+  def test_coderabbit_no_progress_marker_stays_in_autonomous_same_head_queue
     retry_body = workflow_body('continuum-coderabbit-retry.yml')
     merge_body = auto_merge_body
 
     assert_includes retry_body, 'continuum-coderabbit-no-progress head='
-    assert_includes retry_body, 'NO_PROGRESS_MAX_REVIEWS = 3'
-    assert_includes retry_body, 'noProgressMarkers.length >= NO_PROGRESS_MAX_REVIEWS'
     assert_includes retry_body, 'noProgressAt + REVIEW_COOLDOWN_MS'
     assert_includes retry_body, "kind = 'no-progress-retry'"
-    assert_includes retry_body, 'exhausted bounded non-code CodeRabbit re-review budget'
+    assert_includes retry_body, 'must never become'
+    refute_includes retry_body, 'NO_PROGRESS_MAX_REVIEWS'
+    refute_includes retry_body, 'exhausted bounded non-code CodeRabbit re-review budget'
 
     assert_includes merge_body, 'continuum-coderabbit-no-progress head='
-    assert_includes merge_body, 'NO_PROGRESS_MAX_REVIEWS = 3'
-    assert_includes merge_body, 'return markers.length >= NO_PROGRESS_MAX_REVIEWS'
     assert_includes merge_body, 'codeRabbitNoProgressBlocked'
     assert_includes merge_body, 'reviewNoProgressBlocked'
-    assert_includes merge_body, 'bounded non-code CodeRabbit re-review budget is exhausted.'
+    assert_includes merge_body, 'return false;'
+    assert_includes merge_body, 'must never become a'
+    refute_includes merge_body, 'NO_PROGRESS_MAX_REVIEWS'
+    refute_includes merge_body, 'bounded non-code CodeRabbit re-review budget is exhausted.'
   end
 
   # Inline findings already have an independent thread-verification protocol.
