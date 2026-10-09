@@ -329,13 +329,25 @@ jobs:
           )
           PR_LABELS="$(jq -r '[.labels[]?.name? // empty][]?' <<<"$PR_JSON" 2>/dev/null || true)"
 
-          # Unchanged on purpose: the workflow_run path has always accepted any
-          # `opencode/*` branch. The stricter OpenCode issue-branch pattern is
-          # the dispatch path's default, and applying it here would silently
-          # stop repairing a head this job repaired before.
-          if [[ "$head_repo" != "$GITHUB_REPOSITORY" || "$head_ref" != opencode/* ]]; then
-            echo "PR #$pr is not a same-repository OpenCode PR; ignoring."
+          # Generated OpenCode PRs use opencode/*; some existing Continuum
+          # implementation PRs use other branch names. Recognize those by the
+          # authoritative task-context marker, not by a mutable branch prefix.
+          # Keep the same-repository and exact-head guards below.
+          if [[ "$head_repo" != "$GITHUB_REPOSITORY" ]]; then
+            echo "PR #$pr is from a different repository; ignoring."
             exit 0
+          fi
+          if [[ "$head_ref" != opencode/* ]]; then
+            task_marker_valid="$(jq -r --arg repo "$GITHUB_REPOSITORY" '
+              (.body // "") as $body |
+              ($body | capture("<!--\\\\s*continuum-task-context\\\\s+repo=(?<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)\\\\s+issue=(?<issue>[0-9]+)\\\\s*-->")? // {}) as $marker |
+              if $marker.repo == $repo and (($marker.issue // "0" | tonumber) > 0)
+              then "true" else "false" end
+            ' <<<"$PR_JSON")"
+            if [[ "$task_marker_valid" != "true" ]]; then
+              echo "PR #$pr has neither an OpenCode branch nor a valid same-repository Continuum task marker; ignoring."
+              exit 0
+            fi
           fi
 
           if [[ "$head_sha" != "$RUN_HEAD_SHA" ]]; then
