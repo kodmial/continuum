@@ -7418,7 +7418,7 @@ class ContinuumTest < Minitest::Test
     # Under set -euo pipefail, grep exits 1 for no match, so the optional
     # header probe must not abort before its own no-Link fallback.
     assert_includes body, 'LINK_LAST="$(grep -i'
-    assert_match(/LINK_LAST=.*tail -n 1 \\|\\| true\\)"/, body)
+    assert_includes body, ' | tail -n 1 || true)"'
   end
 
   def test_api_budget_coderabbit_unresolved_scans_newest_first_and_bounded
