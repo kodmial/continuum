@@ -277,6 +277,26 @@ class RecoveryDecisionTests(unittest.TestCase):
         # Consistent 10-execution contract: first execution is index 0.
         self.assertEqual(decision.attempt, 0)
 
+    def test_clean_success_with_incomplete_lifecycle_replays(self):
+        decision = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="success",
+            lifecycle_complete=False,
+        )
+        self.assertEqual(decision.action, "dispatch")
+        self.assertEqual(decision.attempt, 0)
+
+    def test_clean_mergeability_wait_is_wired_to_recovery(self):
+        with open(
+            os.path.join(ROOT, ".github/workflows/continuum-pr-agent-recovery.yml"),
+            encoding="utf-8",
+        ) as handle:
+            body = handle.read()
+
+        self.assertIn("cleanMergeabilityPending", body)
+        self.assertIn("mergeability is still computing; recovery eligible", body)
+        self.assertIn("lifecycleComplete: !cleanMergeabilityPending", body)
+
     def test_active_exact_run_coalesces_duplicate_wakeup(self):
         decision = recovery.decide_recovery(
             ci_green=True,
