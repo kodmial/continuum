@@ -277,6 +277,26 @@ class RecoveryDecisionTests(unittest.TestCase):
         # Consistent 10-execution contract: first execution is index 0.
         self.assertEqual(decision.attempt, 0)
 
+    def test_clean_success_with_incomplete_lifecycle_replays(self):
+        decision = recovery.decide_recovery(
+            ci_green=True,
+            operation_state="success",
+            lifecycle_complete=False,
+        )
+        self.assertEqual(decision.action, "dispatch")
+        self.assertEqual(decision.attempt, 0)
+
+    def test_clean_mergeability_wait_is_wired_to_recovery(self):
+        with open(
+            os.path.join(ROOT, ".github/workflows/continuum-pr-agent-recovery.yml"),
+            encoding="utf-8",
+        ) as handle:
+            body = handle.read()
+
+        self.assertIn("cleanMergeabilityPending", body)
+        self.assertIn("mergeability is still computing; recovery eligible", body)
+        self.assertIn("lifecycleComplete: !cleanMergeabilityPending", body)
+
     def test_active_exact_run_coalesces_duplicate_wakeup(self):
         decision = recovery.decide_recovery(
             ci_green=True,
@@ -701,14 +721,11 @@ class RecoveryWiringTests(unittest.TestCase):
         self.assertIn("const owner = process.env.CONTINUUM_PR_AGENT_TARGET_OWNER;", body)
         self.assertIn("client.rest.repos.get({ owner: executionOwner, repo: executionRepo })", body)
 
-        # One helper definition plus thirteen guarded read sites.
-        # Controller-state upsert also reads comments through the
-        # repository-scoped token, both post-dispatch prune paths re-read
-        # fresh (grace-coalesce and coalesce-failure) so an interleaved
-        # controller write is never pruned from a stale pre-dispatch
-        # snapshot, and the bounded CI snapshot (Work-Lock #58 item 6 B3)
-        # reads through the same guarded client with per-PR exact fallback.
-        self.assertEqual(body.count("withReadFallback("), 14)
+        # Guarded read sites may grow as recovery gains new exact-state
+        # revalidation (for example the mergeability re-read in #63).
+        # The invariant is that reads stay behind the repository-token helper;
+        # the mutation-only regex below proves PAT is not used for reads.
+        self.assertGreaterEqual(body.count("withReadFallback("), 14)
 
         # Item 1 keeps all mutation/dispatch calls on the PAT-authenticated
         # action client, preserving actor and event fan-out semantics.

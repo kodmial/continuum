@@ -77,6 +77,55 @@ class CronOnlyRecoveryTests(unittest.TestCase):
         # Every non-dispatched issue would carry a reason; here nothing waits.
         self.assertEqual(first.skip_reasons, {})
 
+    def test_active_run_suppresses_dispatch_across_repeated_reconciles(self):
+        config = SchedulerConfig()
+        issues = {156: p0_issue()}
+        comments: dict = {}
+        now = utcnow()
+
+        for offset in (0, 1):
+            result = reconcile(
+                now + timedelta(minutes=offset),
+                issues,
+                set(),
+                {156},
+                comments,
+                {},
+                {},
+                set(),
+                config,
+            )
+            self.assertEqual(result.dispatched, [])
+            self.assertIn(config.in_progress_label, issues[156].labels)
+            self.assertFalse(result.failed)
+
+        self.assertEqual(comments.get(156, []), [])
+
+    def test_open_pr_suppresses_dispatch_across_repeated_reconciles(self):
+        config = SchedulerConfig(count_open_prs_as_wip=False)
+        issues = {156: p0_issue()}
+        comments: dict = {}
+        now = utcnow()
+
+        for offset in (0, 1):
+            result = reconcile(
+                now + timedelta(minutes=offset),
+                issues,
+                {156},
+                set(),
+                comments,
+                {},
+                {},
+                set(),
+                config,
+            )
+            self.assertEqual(result.dispatched, [])
+            self.assertIn(config.in_progress_label, issues[156].labels)
+            self.assertIn("open implementation PR must not be duplicated", result.skip_reasons[156])
+            self.assertFalse(result.failed)
+
+        self.assertEqual(comments.get(156, []), [])
+
     def test_second_reconcile_is_idempotent(self):
         config = SchedulerConfig()
         issues = {156: p0_issue()}
@@ -146,6 +195,38 @@ class StaleReservationAndRetryTests(unittest.TestCase):
         # Released stale state makes the issue dispatchable again: the same
         # pass releases the stale lease and redispatches (both are logged).
         self.assertEqual(result.dispatched, [156])
+
+    def test_dead_reservation_recovers_then_replay_is_idempotent(self):
+        config = SchedulerConfig()
+        now = utcnow()
+        issues = {156: p0_issue()}
+        issues[156].labels.add(config.in_progress_label)
+        comments: dict = {}
+
+        recovered = reconcile(
+            now, issues, set(), set(), comments, {}, {}, set(), config
+        )
+        self.assertIn(156, recovered.reservations_removed)
+        self.assertEqual(recovered.dispatched, [156])
+        self.assertIn(config.in_progress_label, issues[156].labels)
+
+        replay = reconcile(
+            now + timedelta(minutes=1),
+            issues,
+            set(),
+            set(),
+            comments,
+            {},
+            {},
+            set(),
+            config,
+        )
+        self.assertEqual(replay.dispatched, [])
+        markers = [
+            c for c in comments[156] if config.dispatch_marker in c.body
+        ]
+        self.assertEqual(len(markers), 1)
+        self.assertIn("WIP slot held", replay.skip_reasons[156])
 
     def test_exhausted_attempts_pause_only_when_configured(self):
         now = utcnow()

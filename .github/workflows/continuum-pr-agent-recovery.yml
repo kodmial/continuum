@@ -1126,13 +1126,14 @@ jobs:
               evidence,
               failureTransient,
               operationContext,
+              lifecycleComplete = true,
             }) {
               const state = String(operationStatus?.state || '').toLowerCase() || null;
               const description = String(operationStatus?.description || '');
               // Settled dominates every wait/hold below so a success clears
               // obsolete durable state (exhaustion markers, stale leases,
               // not-before waits) via the success path.
-              if (state === 'success') {
+              if (state === 'success' && lifecycleComplete) {
                 return { action: 'settled', reason: 'operation already settled' };
               }
               if (!ciGreen) return { action: 'wait', reason: 'exact HEAD CI is not green' };
@@ -1207,7 +1208,11 @@ jobs:
               if (state === null) {
                 recoverable = true;
               } else if (state === 'success') {
-                return { action: 'settled', reason: 'operation already settled' };
+                // The provider operation succeeded but the enclosing PR
+                // lifecycle is still incomplete (for example mergeability is
+                // still computing). Replay through the same bounded exact-HEAD
+                // recovery identity instead of silently settling the open PR.
+                recoverable = true;
               } else if (state === 'failure') {
                 // Explicit classifier verdicts dominate the token gate,
                 // mirroring src/continuum/pr_agent_recovery.py: a proven
@@ -2009,6 +2014,7 @@ jobs:
               // orchestration so the current merge path gets fresh,
               // runner-local evidence instead of stranding a clean PR.
               let cleanReviewRun = null;
+              let cleanMergeabilityPending = false;
               if (reviewStatus?.state === 'success') {
                 const cleanDescription = String(reviewStatus.description || '');
                 if (!/actionable/i.test(cleanDescription) && !/blocking; recovery eligible/i.test(cleanDescription)) {
@@ -2016,11 +2022,44 @@ jobs:
                   const cleanRunConclusion =
                     String(cleanReviewRun.conclusion || '').toLowerCase();
                   if (!retryableConclusions.has(cleanRunConclusion)) {
+                    const explicitMergeHold = (pr.labels || []).some(label =>
+                      String(label?.name || label || '') === 'no-auto-merge'
+                    );
+                    if (explicitMergeHold) {
+                      core.info(
+                        'PR #' + pr.number + ' HEAD ' + head +
+                        ': review is settled clean under explicit no-auto-merge hold.'
+                      );
+                      continue;
+                    }
+                    const freshPr = await withReadFallback(async client => (
+                      await client.rest.pulls.get({
+                        owner,
+                        repo,
+                        pull_number: pr.number,
+                      })
+                    ).data);
+                    const freshHead = String(freshPr.head?.sha || '').toLowerCase();
+                    if (freshHead !== head) {
+                      core.info(
+                        'PR #' + pr.number + ' moved from ' + head + ' to ' +
+                        (freshHead || '<missing>') +
+                        ' while checking mergeability; stale recovery wakeup ignored.'
+                      );
+                      continue;
+                    }
+                    cleanMergeabilityPending = freshPr.mergeable === null;
+                    if (!cleanMergeabilityPending) {
+                      core.info(
+                        'PR #' + pr.number + ' HEAD ' + head +
+                        ': review is settled clean; recovery has nothing to do.'
+                      );
+                      continue;
+                    }
                     core.info(
                       'PR #' + pr.number + ' HEAD ' + head +
-                      ': review is settled clean; recovery has nothing to do.'
+                      ': mergeability is still computing; recovery eligible.'
                     );
-                    continue;
                   }
                   core.warning(
                     'PR #' + pr.number + ' HEAD ' + head +
@@ -2131,6 +2170,7 @@ jobs:
                 runConclusion: operationRun.conclusion,
                 evidence,
                 operationContext: String(operationStatus?.context || ''),
+                lifecycleComplete: !cleanMergeabilityPending,
               });
 
               core.info(
