@@ -560,7 +560,7 @@ def select_snapshot(
             continue
         if parsed.generation != generation_number:
             continue
-        created = _parse_time(comment.get("updated_at") or comment.get("created_at"))
+        created = _parse_time(comment.get("created_at"))
         candidates.append((created, comment.get("id"), parsed))
         if parsed.tampered and tampered is None:
             tampered = parsed
@@ -574,7 +574,12 @@ def select_snapshot(
         # A tampered record from an untrusted author is not authoritative
         # state at all: report absent so a trusted pin can still be created.
         # Check for any marker-shaped body to distinguish tamper evidence.
+        # Only trusted authors can produce authoritative tamper evidence:
+        # untrusted marker lookalikes are ignored as absent so a fork user
+        # can never block a trusted pin (denial-of-service).
         for comment in comments or []:
+            if not is_trusted_snapshot_comment(comment, owner_login=owner_login):
+                continue
             parsed = parse_snapshot_comment(comment.get("body", ""))
             if (
                 parsed is not None

@@ -353,8 +353,16 @@ jobs:
           git push -u origin "HEAD:$branch" >/dev/null 2>&1
           # kodmial/continuum#295: carry the pinned snapshot reference in
           # the child PR body so review and merge gates validate the same
-          # frozen contract.
-          child_snapshot_ref="$(python3 "$SNAPSHOT_ADMISSION" render-pr-ref --record-file "$CHILD_SNAPSHOT_RECORD" 2>/dev/null || echo "")"
+          # frozen contract. Fail closed: an empty or unreadable reference
+          # must never become a legacy_unpinned PR that proceeds unprotected.
+          if ! child_snapshot_ref="$(python3 "$SNAPSHOT_ADMISSION" render-pr-ref --record-file "$CHILD_SNAPSHOT_RECORD" 2>/dev/null)"; then
+            echo "::error::Could not render the task snapshot reference for child task #$TASK_NUMBER; refusing to open an unprotected PR." >&2
+            exit 1
+          fi
+          if [[ -z "$child_snapshot_ref" || "$child_snapshot_ref" != *"continuum-task-snapshot-ref"* ]]; then
+            echo "::error::Task snapshot reference is missing for child task #$TASK_NUMBER; refusing to open an unprotected PR." >&2
+            exit 1
+          fi
           pr_body="$(cat <<EOF
           Delegated implementation for #$TASK_NUMBER executed by the configured Continuum parent.
 

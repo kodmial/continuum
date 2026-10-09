@@ -804,7 +804,7 @@ jobs:
                 titleSha: match[4].toLowerCase(),
                 bodySha: match[5].toLowerCase(),
                 specSha: match[6].toLowerCase(),
-                createdAt: comment.created_at || comment.updated_at || '',
+                createdAt: comment.created_at || '',
                 id: comment.id || 0,
                 record: null,
                 tampered: false,
@@ -864,7 +864,6 @@ jobs:
               if (parsed.repo !== taskRepo || parsed.issue !== taskNumber) continue;
               if (parsed.generation !== generation) continue;
               if (!trusted(comment)) {
-                tamperedEvidence = tamperedEvidence || parsed;
                 continue;
               }
               candidates.push(parsed);
@@ -967,6 +966,39 @@ jobs:
                   (details ? `: ${details}` : '') +
                   '; the agent must not implement live mutable text.'
                 );
+                return;
+              }
+              // First-writer-wins convergence: two concurrent admissions can
+              // both see zero candidates and both POST. Re-list and converge
+              // on the earliest trusted pin instead of proceeding on our own
+              // record, mirroring the child worker re-verify.
+              let rechecked = [];
+              try {
+                rechecked = await github.paginate(
+                  github.rest.issues.listComments,
+                  { owner, repo, issue_number: taskNumber, per_page: 100 }
+                );
+              } catch (err) {
+                fail(`Task snapshot: could not re-verify the pinned snapshot: ${err.message || err}`);
+                return;
+              }
+              const winners = [];
+              for (const comment of rechecked) {
+                const parsed = parseComment(comment);
+                if (!parsed) continue;
+                if (parsed.repo !== taskRepo || parsed.issue !== taskNumber) continue;
+                if (parsed.generation !== generation) continue;
+                if (!trusted(comment) || parsed.tampered) continue;
+                winners.push(parsed);
+              }
+              winners.sort((a, b) => {
+                const at = a.createdAt || '';
+                const bt = b.createdAt || '';
+                if (at !== bt) return at < bt ? -1 : 1;
+                return (a.id || 0) - (b.id || 0);
+              });
+              if (winners.length > 0 && winners[0].specSha !== liveSpecSha) {
+                fail(driftMessage('title and body', winners[0].specSha));
                 return;
               }
               core.notice(`Pinned task snapshot for ${taskRepo}#${taskNumber} generation ${generation} (spec ${liveSpecSha}).`);
@@ -2295,7 +2327,10 @@ jobs:
           # legacy (created before the guard) and proceeds explicitly
           # without drift protection.
           if [[ -n "${PR_NUMBER:-}" ]]; then
-            REPAIR_PR_BODY="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json body --jq '.body // ""' 2>/dev/null || echo "")"
+            if ! REPAIR_PR_BODY="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json body --jq '.body // ""' 2>/dev/null)"; then
+              echo "::error::Could not fetch PR #$PR_NUMBER body for snapshot verification; refusing repair."
+              exit 1
+            fi
             REPAIR_SNAPSHOT_REF="$(grep -oE '<!--[[:space:]]*continuum-task-snapshot-ref[^>]*-->' <<<"$REPAIR_PR_BODY" | head -n 1 || true)"
             if [[ -z "$REPAIR_SNAPSHOT_REF" ]]; then
               echo "::notice::PR #$PR_NUMBER carries no task snapshot reference (legacy, pre-guard PR); repair proceeds explicitly without drift protection."
@@ -2304,19 +2339,29 @@ jobs:
               REF_ISSUE="$(sed -nE 's/.*issue=([0-9]+).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1)"
               REF_TITLE_SHA="$(sed -nE 's/.*title-sha256=([0-9a-fA-F]{64}).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1 | tr 'A-F' 'a-f')"
               REF_BODY_SHA="$(sed -nE 's/.*body-sha256=([0-9a-fA-F]{64}).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1 | tr 'A-F' 'a-f')"
-              if [[ -z "$REF_REPO" || -z "$REF_ISSUE" || -z "$REF_TITLE_SHA" || -z "$REF_BODY_SHA" ]]; then
+              REF_GENERATION="$(sed -nE 's/.*generation=([0-9]+).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1)"
+              REF_SPEC_SHA="$(sed -nE 's/.*spec-sha256=([0-9a-fA-F]{64}).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1 | tr 'A-F' 'a-f')"
+              if [[ -z "$REF_REPO" || -z "$REF_ISSUE" || -z "$REF_GENERATION" || -z "$REF_TITLE_SHA" || -z "$REF_BODY_SHA" || -z "$REF_SPEC_SHA" ]]; then
                 echo "::error::PR #$PR_NUMBER snapshot reference is malformed; refusing repair without a verifiable contract."
                 exit 1
               fi
-              REPAIR_LIVE_JSON="$(gh issue view "$REF_ISSUE" --repo "$REF_REPO" --json title,body 2>/dev/null || echo "")"
+              if [[ "$REF_GENERATION" != "1" ]]; then
+                echo "::error::PR #$PR_NUMBER snapshot reference is for generation $REF_GENERATION, expected generation 1 (stale contract); refusing repair."
+                exit 1
+              fi
+              if ! REPAIR_LIVE_JSON="$(gh issue view "$REF_ISSUE" --repo "$REF_REPO" --json title,body 2>/dev/null)"; then
+                echo "::error::Could not fetch live task $REF_REPO#$REF_ISSUE for snapshot verification; refusing repair."
+                exit 1
+              fi
               if [[ -z "$REPAIR_LIVE_JSON" ]]; then
                 echo "::error::Could not fetch live task $REF_REPO#$REF_ISSUE for snapshot verification; refusing repair."
                 exit 1
               fi
-              REPAIR_DIGESTS="$(REPAIR_TITLE="$(jq -r '.title // ""' <<<"$REPAIR_LIVE_JSON")" REPAIR_BODY="$(jq -r '.body // ""' <<<"$REPAIR_LIVE_JSON")" python3 -c 'import hashlib,os,unicodedata; norm=lambda v: unicodedata.normalize("NFC", v.replace("\r\n","\n").replace("\r","\n")); title=norm(os.environ.get("REPAIR_TITLE") or ""); body=norm(os.environ.get("REPAIR_BODY") or ""); print(hashlib.sha256(title.encode("utf-8")).hexdigest()); print(hashlib.sha256(body.encode("utf-8")).hexdigest())')"
+              REPAIR_DIGESTS="$(REPAIR_LIVE_JSON="$REPAIR_LIVE_JSON" python3 -c 'import hashlib,json,os,unicodedata; norm=lambda v: unicodedata.normalize("NFC", v.replace("\r\n","\n").replace("\r","\n")); data=json.loads(os.environ.get("REPAIR_LIVE_JSON") or "{}"); title=norm(data.get("title") or ""); body=norm(data.get("body") or ""); title_sha=hashlib.sha256(title.encode("utf-8")).hexdigest(); body_sha=hashlib.sha256(body.encode("utf-8")).hexdigest(); spec_sha=hashlib.sha256((title_sha+":"+body_sha).encode("ascii")).hexdigest(); print(title_sha); print(body_sha); print(spec_sha)')"
               LIVE_TITLE_SHA="$(sed -n '1p' <<<"$REPAIR_DIGESTS")"
               LIVE_BODY_SHA="$(sed -n '2p' <<<"$REPAIR_DIGESTS")"
-              if [[ "$LIVE_TITLE_SHA" != "$REF_TITLE_SHA" || "$LIVE_BODY_SHA" != "$REF_BODY_SHA" ]]; then
+              LIVE_SPEC_SHA="$(sed -n '3p' <<<"$REPAIR_DIGESTS")"
+              if [[ "$LIVE_TITLE_SHA" != "$REF_TITLE_SHA" || "$LIVE_BODY_SHA" != "$REF_BODY_SHA" || "$LIVE_SPEC_SHA" != "$REF_SPEC_SHA" ]]; then
                 gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
                   --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-task-snapshot-drift -->' '⚡ **Continuum · opencode**' '<!-- continuum-origin role=continuum component=opencode -->' "Task contract drift detected for $REF_REPO#$REF_ISSUE: the live issue no longer matches the PR's pinned snapshot. Repair is stopped for this generation; open a new follow-up issue with an explicit dependency instead of editing the working issue.")" >/dev/null 2>&1 || true
                 echo "::error::Task contract drift detected for $REF_REPO#$REF_ISSUE (PR #$PR_NUMBER). Repair stopped; open a new follow-up issue instead of editing the working issue."
@@ -2592,7 +2637,10 @@ jobs:
           # drift stops the repair, legacy PRs proceed explicitly
           # unprotected.
           if [[ -n "${PR_NUMBER:-}" ]]; then
-            REPAIR_PR_BODY="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json body --jq '.body // ""' 2>/dev/null || echo "")"
+            if ! REPAIR_PR_BODY="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json body --jq '.body // ""' 2>/dev/null)"; then
+              echo "::error::Could not fetch PR #$PR_NUMBER body for snapshot verification; refusing repair."
+              exit 1
+            fi
             REPAIR_SNAPSHOT_REF="$(grep -oE '<!--[[:space:]]*continuum-task-snapshot-ref[^>]*-->' <<<"$REPAIR_PR_BODY" | head -n 1 || true)"
             if [[ -z "$REPAIR_SNAPSHOT_REF" ]]; then
               echo "::notice::PR #$PR_NUMBER carries no task snapshot reference (legacy, pre-guard PR); conflict repair proceeds explicitly without drift protection."
@@ -2601,19 +2649,29 @@ jobs:
               REF_ISSUE="$(sed -nE 's/.*issue=([0-9]+).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1)"
               REF_TITLE_SHA="$(sed -nE 's/.*title-sha256=([0-9a-fA-F]{64}).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1 | tr 'A-F' 'a-f')"
               REF_BODY_SHA="$(sed -nE 's/.*body-sha256=([0-9a-fA-F]{64}).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1 | tr 'A-F' 'a-f')"
-              if [[ -z "$REF_REPO" || -z "$REF_ISSUE" || -z "$REF_TITLE_SHA" || -z "$REF_BODY_SHA" ]]; then
+              REF_GENERATION="$(sed -nE 's/.*generation=([0-9]+).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1)"
+              REF_SPEC_SHA="$(sed -nE 's/.*spec-sha256=([0-9a-fA-F]{64}).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1 | tr 'A-F' 'a-f')"
+              if [[ -z "$REF_REPO" || -z "$REF_ISSUE" || -z "$REF_GENERATION" || -z "$REF_TITLE_SHA" || -z "$REF_BODY_SHA" || -z "$REF_SPEC_SHA" ]]; then
                 echo "::error::PR #$PR_NUMBER snapshot reference is malformed; refusing conflict repair without a verifiable contract."
                 exit 1
               fi
-              REPAIR_LIVE_JSON="$(gh issue view "$REF_ISSUE" --repo "$REF_REPO" --json title,body 2>/dev/null || echo "")"
+              if [[ "$REF_GENERATION" != "1" ]]; then
+                echo "::error::PR #$PR_NUMBER snapshot reference is for generation $REF_GENERATION, expected generation 1 (stale contract); refusing repair."
+                exit 1
+              fi
+              if ! REPAIR_LIVE_JSON="$(gh issue view "$REF_ISSUE" --repo "$REF_REPO" --json title,body 2>/dev/null)"; then
+                echo "::error::Could not fetch live task $REF_REPO#$REF_ISSUE for snapshot verification; refusing repair."
+                exit 1
+              fi
               if [[ -z "$REPAIR_LIVE_JSON" ]]; then
                 echo "::error::Could not fetch live task $REF_REPO#$REF_ISSUE for snapshot verification; refusing conflict repair."
                 exit 1
               fi
-              REPAIR_DIGESTS="$(REPAIR_TITLE="$(jq -r '.title // ""' <<<"$REPAIR_LIVE_JSON")" REPAIR_BODY="$(jq -r '.body // ""' <<<"$REPAIR_LIVE_JSON")" python3 -c 'import hashlib,os,unicodedata; norm=lambda v: unicodedata.normalize("NFC", v.replace("\r\n","\n").replace("\r","\n")); title=norm(os.environ.get("REPAIR_TITLE") or ""); body=norm(os.environ.get("REPAIR_BODY") or ""); print(hashlib.sha256(title.encode("utf-8")).hexdigest()); print(hashlib.sha256(body.encode("utf-8")).hexdigest())')"
+              REPAIR_DIGESTS="$(REPAIR_LIVE_JSON="$REPAIR_LIVE_JSON" python3 -c 'import hashlib,json,os,unicodedata; norm=lambda v: unicodedata.normalize("NFC", v.replace("\r\n","\n").replace("\r","\n")); data=json.loads(os.environ.get("REPAIR_LIVE_JSON") or "{}"); title=norm(data.get("title") or ""); body=norm(data.get("body") or ""); title_sha=hashlib.sha256(title.encode("utf-8")).hexdigest(); body_sha=hashlib.sha256(body.encode("utf-8")).hexdigest(); spec_sha=hashlib.sha256((title_sha+":"+body_sha).encode("ascii")).hexdigest(); print(title_sha); print(body_sha); print(spec_sha)')"
               LIVE_TITLE_SHA="$(sed -n '1p' <<<"$REPAIR_DIGESTS")"
               LIVE_BODY_SHA="$(sed -n '2p' <<<"$REPAIR_DIGESTS")"
-              if [[ "$LIVE_TITLE_SHA" != "$REF_TITLE_SHA" || "$LIVE_BODY_SHA" != "$REF_BODY_SHA" ]]; then
+              LIVE_SPEC_SHA="$(sed -n '3p' <<<"$REPAIR_DIGESTS")"
+              if [[ "$LIVE_TITLE_SHA" != "$REF_TITLE_SHA" || "$LIVE_BODY_SHA" != "$REF_BODY_SHA" || "$LIVE_SPEC_SHA" != "$REF_SPEC_SHA" ]]; then
                 gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
                   --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-task-snapshot-drift -->' '⚡ **Continuum · opencode**' '<!-- continuum-origin role=continuum component=opencode -->' "Task contract drift detected for $REF_REPO#$REF_ISSUE: the live issue no longer matches the PR's pinned snapshot. Conflict repair is stopped for this generation; open a new follow-up issue with an explicit dependency instead of editing the working issue.")" >/dev/null 2>&1 || true
                 echo "::error::Task contract drift detected for $REF_REPO#$REF_ISSUE (PR #$PR_NUMBER). Conflict repair stopped; open a new follow-up issue instead of editing the working issue."
@@ -2743,7 +2801,10 @@ jobs:
           # reference is pinned, the live issue is re-read, drift stops the
           # repair, legacy PRs proceed explicitly unprotected.
           if [[ -n "${PR_NUMBER:-}" ]]; then
-            REPAIR_PR_BODY="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json body --jq '.body // ""' 2>/dev/null || echo "")"
+            if ! REPAIR_PR_BODY="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json body --jq '.body // ""' 2>/dev/null)"; then
+              echo "::error::Could not fetch PR #$PR_NUMBER body for snapshot verification; refusing repair."
+              exit 1
+            fi
             REPAIR_SNAPSHOT_REF="$(grep -oE '<!--[[:space:]]*continuum-task-snapshot-ref[^>]*-->' <<<"$REPAIR_PR_BODY" | head -n 1 || true)"
             if [[ -z "$REPAIR_SNAPSHOT_REF" ]]; then
               echo "::notice::PR #$PR_NUMBER carries no task snapshot reference (legacy, pre-guard PR); CI repair proceeds explicitly without drift protection."
@@ -2752,19 +2813,39 @@ jobs:
               REF_ISSUE="$(sed -nE 's/.*issue=([0-9]+).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1)"
               REF_TITLE_SHA="$(sed -nE 's/.*title-sha256=([0-9a-fA-F]{64}).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1 | tr 'A-F' 'a-f')"
               REF_BODY_SHA="$(sed -nE 's/.*body-sha256=([0-9a-fA-F]{64}).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1 | tr 'A-F' 'a-f')"
-              if [[ -z "$REF_REPO" || -z "$REF_ISSUE" || -z "$REF_TITLE_SHA" || -z "$REF_BODY_SHA" ]]; then
+              REF_GENERATION="$(sed -nE 's/.*generation=([0-9]+).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1)"
+              REF_SPEC_SHA="$(sed -nE 's/.*spec-sha256=([0-9a-fA-F]{64}).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1 | tr 'A-F' 'a-f')"
+              if [[ -z "$REF_REPO" || -z "$REF_ISSUE" || -z "$REF_GENERATION" || -z "$REF_TITLE_SHA" || -z "$REF_BODY_SHA" || -z "$REF_SPEC_SHA" ]]; then
                 echo "::error::PR #$PR_NUMBER snapshot reference is malformed; refusing CI repair without a verifiable contract."
                 exit 1
               fi
-              REPAIR_LIVE_JSON="$(gh issue view "$REF_ISSUE" --repo "$REF_REPO" --json title,body 2>/dev/null || echo "")"
+              if [[ "$REF_GENERATION" != "1" ]]; then
+                echo "::error::PR #$PR_NUMBER snapshot reference is for generation $REF_GENERATION, expected generation 1 (stale contract); refusing repair."
+                exit 1
+              fi
+              if [[ "${TASK_CONTEXT_PRESENT:-}" == "true" ]]; then
+                if [[ -n "${TASK_REPO:-}" && "$(tr '[:upper:]' '[:lower:]' <<<"$REF_REPO")" != "$(tr '[:upper:]' '[:lower:]' <<<"$TASK_REPO")" ]]; then
+                  echo "::error::PR #$PR_NUMBER snapshot reference $REF_REPO#$REF_ISSUE does not match expected task $TASK_REPO#${TASK_NUMBER:-} (wrong issue); refusing repair."
+                  exit 1
+                fi
+                if [[ -n "${TASK_NUMBER:-}" && "$REF_ISSUE" != "$TASK_NUMBER" ]]; then
+                  echo "::error::PR #$PR_NUMBER snapshot reference #$REF_ISSUE does not match expected task #${TASK_NUMBER} on $REF_REPO (wrong issue); refusing repair."
+                  exit 1
+                fi
+              fi
+              if ! REPAIR_LIVE_JSON="$(gh issue view "$REF_ISSUE" --repo "$REF_REPO" --json title,body 2>/dev/null)"; then
+                echo "::error::Could not fetch live task $REF_REPO#$REF_ISSUE for snapshot verification; refusing repair."
+                exit 1
+              fi
               if [[ -z "$REPAIR_LIVE_JSON" ]]; then
                 echo "::error::Could not fetch live task $REF_REPO#$REF_ISSUE for snapshot verification; refusing CI repair."
                 exit 1
               fi
-              REPAIR_DIGESTS="$(REPAIR_TITLE="$(jq -r '.title // ""' <<<"$REPAIR_LIVE_JSON")" REPAIR_BODY="$(jq -r '.body // ""' <<<"$REPAIR_LIVE_JSON")" python3 -c 'import hashlib,os,unicodedata; norm=lambda v: unicodedata.normalize("NFC", v.replace("\r\n","\n").replace("\r","\n")); title=norm(os.environ.get("REPAIR_TITLE") or ""); body=norm(os.environ.get("REPAIR_BODY") or ""); print(hashlib.sha256(title.encode("utf-8")).hexdigest()); print(hashlib.sha256(body.encode("utf-8")).hexdigest())')"
+              REPAIR_DIGESTS="$(REPAIR_LIVE_JSON="$REPAIR_LIVE_JSON" python3 -c 'import hashlib,json,os,unicodedata; norm=lambda v: unicodedata.normalize("NFC", v.replace("\r\n","\n").replace("\r","\n")); data=json.loads(os.environ.get("REPAIR_LIVE_JSON") or "{}"); title=norm(data.get("title") or ""); body=norm(data.get("body") or ""); title_sha=hashlib.sha256(title.encode("utf-8")).hexdigest(); body_sha=hashlib.sha256(body.encode("utf-8")).hexdigest(); spec_sha=hashlib.sha256((title_sha+":"+body_sha).encode("ascii")).hexdigest(); print(title_sha); print(body_sha); print(spec_sha)')"
               LIVE_TITLE_SHA="$(sed -n '1p' <<<"$REPAIR_DIGESTS")"
               LIVE_BODY_SHA="$(sed -n '2p' <<<"$REPAIR_DIGESTS")"
-              if [[ "$LIVE_TITLE_SHA" != "$REF_TITLE_SHA" || "$LIVE_BODY_SHA" != "$REF_BODY_SHA" ]]; then
+              LIVE_SPEC_SHA="$(sed -n '3p' <<<"$REPAIR_DIGESTS")"
+              if [[ "$LIVE_TITLE_SHA" != "$REF_TITLE_SHA" || "$LIVE_BODY_SHA" != "$REF_BODY_SHA" || "$LIVE_SPEC_SHA" != "$REF_SPEC_SHA" ]]; then
                 gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
                   --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-task-snapshot-drift -->' '⚡ **Continuum · opencode**' '<!-- continuum-origin role=continuum component=opencode -->' "Task contract drift detected for $REF_REPO#$REF_ISSUE: the live issue no longer matches the PR's pinned snapshot. CI repair is stopped for this generation; open a new follow-up issue with an explicit dependency instead of editing the working issue.")" >/dev/null 2>&1 || true
                 echo "::error::Task contract drift detected for $REF_REPO#$REF_ISSUE (PR #$PR_NUMBER). CI repair stopped; open a new follow-up issue instead of editing the working issue."

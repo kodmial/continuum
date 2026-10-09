@@ -3128,9 +3128,28 @@ jobs:
               // existing gates. Canonical digests mirror
               // src/continuum/task_snapshot.py (UTF-8, NFC, LF, SHA-256).
               {
-                const snapshotRefMatch = String(pr.body || '').match(
-                  /<!--\s*continuum-task-snapshot-ref\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+title-sha256=([0-9a-fA-F]{64})\s+body-sha256=([0-9a-fA-F]{64})\s+spec-sha256=([0-9a-fA-F]{64})\s*-->/i
+                const snapshotRefBlock = String(pr.body || '').match(
+                  /<!--\s*continuum-task-snapshot-ref\b[^>]*-->/i
                 );
+                const attr = (name) => {
+                  if (!snapshotRefBlock) return null;
+                  const m = snapshotRefBlock[0].match(new RegExp(`${name}=([^\\s>]+)`, 'i'));
+                  return m ? m[1] : null;
+                };
+                const snapshotRefMatch = (() => {
+                  if (!snapshotRefBlock) return null;
+                  const repoAttr = attr('repo');
+                  const issueAttr = attr('issue');
+                  const generationAttr = attr('generation');
+                  const titleAttr = attr('title-sha256');
+                  const bodyAttr = attr('body-sha256');
+                  const specAttr = attr('spec-sha256');
+                  if (!repoAttr || !issueAttr || !generationAttr || !titleAttr || !bodyAttr || !specAttr) return null;
+                  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repoAttr)) return null;
+                  if (!/^\d+$/.test(generationAttr)) return null;
+                  if (!/^[0-9a-fA-F]{64}$/.test(titleAttr) || !/^[0-9a-fA-F]{64}$/.test(bodyAttr) || !/^[0-9a-fA-F]{64}$/.test(specAttr)) return null;
+                  return [snapshotRefBlock[0], repoAttr, issueAttr, generationAttr, titleAttr, bodyAttr, specAttr];
+                })();
                 if (snapshotRefMatch) {
                   const { createHash } = require('crypto');
                   const taskRepoFull = snapshotRefMatch[1];
