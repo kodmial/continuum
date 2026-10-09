@@ -18,7 +18,7 @@ class CodeRabbitControllerLifetimeContract(unittest.TestCase):
         self.assertIn("waitMs + 5_000 >= remainingLifetimeMs", body)
         self.assertIn("return false;", body.split("remainingLifetimeMs", 1)[1])
         self.assertIn("Date.now() - controllerStartedAt >= MAX_CONTROLLER_LIFETIME_MS", body)
-        self.assertIn("release", body.split("Date.now() - controllerStartedAt", 1)[1])
+        self.assertIn("releasing global lease", body.split("Date.now() - controllerStartedAt", 1)[1])
 
     def test_serialized_review_queue_unchanged(self):
         body = WORKFLOW.read_text(encoding="utf-8")
