@@ -790,6 +790,60 @@ jobs:
                 )[0] || null;
             }
 
+            // A running PR-Agent review/repair is a live Work Lock on this
+            // exact source HEAD. An automatic main-sync during the agent run
+            // discards minutes of valid repair work; do not mutate that branch
+            // until its authoritative GitHub Actions run finishes.
+            // Pending statuses are not permanent locks: validate the linked
+            // run's live status so a crashed/completed old run cannot strand
+            // the queue. Only invoked when a merge-critical sync is required.
+            async function activePrAgentHeadOperation(pr) {
+              const { data } = await withReadFallback(client =>
+                client.rest.repos.getCombinedStatusForRef({
+                  owner, repo, ref: pr.head.sha,
+                })
+              );
+              const contexts = new Set([
+                'continuum/pr-agent-review',
+                'continuum/pr-agent-repair',
+              ]);
+              const latestByContext = new Map();
+              for (const status of data.statuses || []) {
+                if (!contexts.has(status.context)) continue;
+                const earlier = latestByContext.get(status.context);
+                if (!earlier ||
+                    new Date(status.updated_at || status.created_at || 0).getTime() >
+                    new Date(earlier.updated_at || earlier.created_at || 0).getTime() ||
+                    ((status.updated_at || status.created_at) === (earlier.updated_at || earlier.created_at) &&
+                     Number(status.id || 0) > Number(earlier.id || 0))) {
+                  latestByContext.set(status.context, status);
+                }
+              }
+              for (const status of latestByContext.values()) {
+                if (status.state !== 'pending') continue;
+                const runRef = String(status.target_url || '').match(
+                  /^https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/actions\/runs\/([0-9]+)(?:\/.*)?$/
+                );
+                if (!runRef) {
+                  core.warning(
+                    `PR #${pr.number}: pending ${status.context} has no verifiable run URL; holding main sync rather than racing an unknown repair.`
+                  );
+                  return { active: true, reason: `unverifiable ${status.context} run` };
+                }
+                const { data: run } = await withReadFallback(client =>
+                  client.rest.actions.getWorkflowRun({
+                    owner: runRef[1], repo: runRef[2], run_id: Number(runRef[3]),
+                  })
+                );
+                if (ACTIVE_REPAIR_STATUSES.has(String(run.status || '').toLowerCase())) {
+                  return { active: true, reason: `${status.context} run ${run.id || runRef[3]} is ${run.status}` };
+                }
+                // An old pending commit status whose run finished is not a
+                // lease; normal exact-HEAD CI and reviewer gates still apply.
+              }
+              return { active: false, reason: '' };
+            }
+
             async function codeRabbitNoProgressBlocked(pr, headSha) {
               const comments = await withReadFallback(client =>
                 client.paginate(
@@ -2440,6 +2494,14 @@ jobs:
                 // branch. This bypasses only stale PR metadata; it never rewrites
                 // branch history. Review carry below is still granted only when
                 // the resulting commit has exactly oldHead + mainHead as parents.
+                // Recheck immediately before GitHub's update-branch mutation
+                // (not only in the caller) to narrow review/repair startup
+                // races during the API work above.
+                const liveOperation = await activePrAgentHeadOperation(pr);
+                if (liveOperation.active) {
+                  core.notice(`PR #${pr.number}: deferring main sync: ${liveOperation.reason}.`);
+                  return false;
+                }
                 let updateSucceeded = false;
                 try {
                   await github.request(
@@ -2780,6 +2842,13 @@ jobs:
               const comparison = await compareWithMain(pr.head.sha);
               const mainSync = await shouldSyncFromMain(pr, comparison);
               if (mainSync.required) {
+                const agentOperation = await activePrAgentHeadOperation(pr);
+                if (agentOperation.active) {
+                  core.notice(
+                    `PR #${pr.number}: preserving current HEAD while ${agentOperation.reason}; exact-HEAD review/repair keeps its Work Lock.`
+                  );
+                  continue;
+                }
                 core.notice(
                   `PR #${pr.number}: main advanced in merge-critical files; synchronizing before merge: ${mainSync.criticalFiles.join(', ') || mainSync.reason}.`
                 );
