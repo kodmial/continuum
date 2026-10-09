@@ -201,8 +201,36 @@ jobs:
             const baseRef = process.env.BASE_REF || 'main';
             const sh = (cmd) => execSync(cmd, { encoding: 'utf8' }).trim();
 
+            // kodmial/continuum#302: canonical fail-closed branch safety
+            // for every disposable-branch push/delete below. The canary
+            // branch must be a proven non-default ref; the default branch
+            // is discovered from repository metadata, never hardcoded.
+            // Only the PR merge operation may update the default branch,
+            // and there is no bypass.
+            const repoInfo = (await github.rest.repos.get({ owner, repo })).data;
+            const default_branch = String(repoInfo.default_branch || '').replace(/^refs\/heads\//, '').trim();
+            if (!default_branch) {
+              throw new Error('Continuum branch safety: repository default branch is undiscoverable; refusing canary push.');
+            }
+            const continuumAssertSafePush = (dest) => {
+              const norm = String(dest || '').replace(/^refs\/heads\//, '').trim();
+              if (!norm) {
+                throw new Error('Continuum branch safety: refusing code push with an empty destination.');
+              }
+              if (['HEAD', '@', 'FETCH_HEAD', 'ORIG_HEAD', 'MERGE_HEAD'].includes(norm)) {
+                throw new Error(`Continuum branch safety: refusing ambiguous push destination '${norm}'.`);
+              }
+              if (/(\.\.|~|\^|\?|\*|\[|\s|@\{|^[-/.]|[/.]$|\/\/|\.lock$)/.test(norm)) {
+                throw new Error(`Continuum branch safety: refusing ambiguous push destination '${norm}'.`);
+              }
+              if (norm === default_branch) {
+                throw new Error(`Continuum branch safety: refusing code push to the default branch '${norm}'. Only the PR merge operation may update the default branch.`);
+              }
+            };
+
             const mainSha = sh('git rev-parse HEAD');
             const branch = `continuum-pr-agent-canary/${context.runId}`;
+            continuumAssertSafePush(branch);
             const defectPath = 'canary/blocking-fixture.py';
             core.setOutput('main_sha', mainSha);
             core.setOutput('branch', branch);
@@ -411,6 +439,9 @@ jobs:
                 + '-c user.email="41898282+github-actions[bot]@users.noreply.github.com" '
                 + 'commit -m "test: correct disposable PR-Agent canary defect" '
                 + '-m "Continuum-Component: pr-agent-canary"');
+              // kodmial/continuum#302: re-assert the proven non-default
+              // disposable branch immediately before mutation.
+              continuumAssertSafePush(branch);
               sh(`git push origin "${branch}"`);
               head = (await github.rest.pulls.get({ owner, repo, pull_number: prNumber })).data.head.sha;
               core.setOutput('fixed_sha', head);
@@ -529,12 +560,15 @@ jobs:
                   core.warning(`Could not close canary PR #${prNumber}: ${err.message}`);
                 }
                 try {
+                  // kodmial/continuum#302: branch deletion must never target
+                  // the default branch, even during canary cleanup.
+                  continuumAssertSafePush(branch);
                   sh(`git push origin --delete "${branch}"`);
                 } catch (err) {
                   core.warning(`Could not delete canary branch ${branch}: ${err.message}`);
                 }
               } else {
-                try { sh(`git push origin --delete "${branch}"`); } catch (err) { void err; }
+                try { continuumAssertSafePush(branch); sh(`git push origin --delete "${branch}"`); } catch (err) { void err; }
                 try { sh(`git checkout "${baseRef}"`); } catch (err) { void err; }
                 try { sh(`git branch -D "${branch}"`); } catch (err) { void err; }
               }
