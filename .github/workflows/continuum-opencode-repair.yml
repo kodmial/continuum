@@ -340,7 +340,7 @@ jobs:
           if [[ "$head_ref" != opencode/* ]]; then
             task_marker_valid="$(jq -r --arg repo "$GITHUB_REPOSITORY" '
               (.body // "") as $body |
-              ($body | capture("<!--\\\\s*continuum-task-context\\\\s+repo=(?<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)\\\\s+issue=(?<issue>[0-9]+)\\\\s*-->")? // {}) as $marker |
+              ($body | capture("<!--\\s*continuum-task-context\\s+repo=(?<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)\\s+issue=(?<issue>[0-9]+)\\s*-->")? // {}) as $marker |
               if $marker.repo == $repo and (($marker.issue // "0" | tonumber) > 0)
               then "true" else "false" end
             ' <<<"$PR_JSON")"
