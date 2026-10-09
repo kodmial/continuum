@@ -1541,6 +1541,28 @@ jobs:
           # Evacuates workflow-owned state to the durable 429 checkpoint ref,
           # marks this runner burned, and exits 75. Never invokes the model,
           # never sleeps, never asks the model to commit.
+          # kodmial/continuum#302: canonical fail-closed branch safety for
+          # every code push in this helper. The destination must be a proven
+          # non-default ref; the default branch is discovered from repository
+          # metadata, never hardcoded. Only the PR merge operation may update
+          # the default branch. There is no bypass.
+          continuum_assert_safe_push() {
+            local dest="${1:-}"
+            local repo="${2:-$GITHUB_REPOSITORY}"
+            dest="${dest#refs/heads/}"
+            dest="$(printf '%s' "$dest" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            if [[ -z "$dest" ]]; then echo "::error::Continuum branch safety: refusing code push with an empty destination." >&2; return 1; fi
+            case "$dest" in HEAD|@|FETCH_HEAD|ORIG_HEAD|MERGE_HEAD) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
+            case "$dest" in *".."*|*"~"*|*"^"*|*"?"*|*"*"*|*"["*|*" "*|*"@{"*) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
+            case "$dest" in -*|/*|*/|*.lock) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
+            if [[ "$dest" == *"//"* ]]; then echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1; fi
+            local default_branch=""
+            default_branch="$(gh api "repos/$repo" --jq .default_branch 2>/dev/null || true)"
+            default_branch="${default_branch#refs/heads/}"
+            default_branch="$(printf '%s' "$default_branch" | tr -d '[:space:]')"
+            if [[ -z "$default_branch" ]]; then echo "::error::Continuum branch safety: repository default branch is undiscoverable for '$repo'; refusing code push to '$dest'." >&2; return 1; fi
+            if [[ "$dest" == "$default_branch" ]]; then echo "::error::Continuum branch safety: refusing code push to the default branch '$dest'. Recovery resumes the same PR branch; only the PR merge operation may update the default branch." >&2; return 1; fi
+          }
           continuum_429_evacuate() {
             local operation="$1" stage="$2" mode="$3" issue_number="$4" pr_number="$5" base_sha="$6"
             operation="$(printf '%s' "$operation" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]+/-/g; s/-{2,}/-/g; s/^-//; s/-$//')"
@@ -1612,12 +1634,24 @@ jobs:
             fi
             local evacuated_ok=false
             if [[ -n "$head_sha" ]]; then
+              # kodmial/continuum#302: checkpoint refs are permitted only as
+              # proven non-default refs; fail closed before any mutation
+              # when the destination is empty, ambiguous, or the discovered
+              # default branch.
+              continuum_assert_safe_push "$checkpoint_ref" || exit 1
               if git push --force origin "HEAD:refs/heads/${checkpoint_ref}"; then
                 evacuated_ok=true
                 echo "::warning::Evacuated 429 checkpoint ${checkpoint_ref} at exact SHA ${head_sha} (operation ${operation}, stage ${stage}, generation ${next_gen}, mode ${mode}, issue ${issue_number}, pr ${pr_number}, branch ${current_branch})."
                 # Optional legacy-branch mirror so scheduler-native resume
                 # keeps working after infrastructure cooldown even without a
                 # recovery dispatch (best effort; never fails the evacuation).
+                # kodmial/continuum#302: the mirror must still never alias
+                # the default branch; a refused mirror is cleared and
+                # skipped while the primary checkpoint still evacuates.
+                continuum_assert_safe_push "${CONTINUUM_429_LEGACY_REF}" || {
+                  echo "::error::Continuum branch safety: refusing legacy checkpoint mirror to '${CONTINUUM_429_LEGACY_REF}'." >&2
+                  CONTINUUM_429_LEGACY_REF=""
+                }
                 if [[ -n "${CONTINUUM_429_LEGACY_REF:-}" ]]; then
                   git push --force origin "HEAD:refs/heads/${CONTINUUM_429_LEGACY_REF}" || true
                 fi
@@ -1700,6 +1734,28 @@ jobs:
         run: |
           set -euo pipefail
 
+          # kodmial/continuum#302: canonical fail-closed branch safety (see
+          # the 429 evacuator helper for the full contract). The recovered
+          # branch must be a proven non-default ref; only the PR merge
+          # operation may update the default branch.
+          continuum_assert_safe_push() {
+            local dest="${1:-}"
+            local repo="${2:-$GITHUB_REPOSITORY}"
+            dest="${dest#refs/heads/}"
+            dest="$(printf '%s' "$dest" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            if [[ -z "$dest" ]]; then echo "::error::Continuum branch safety: refusing code push with an empty destination." >&2; return 1; fi
+            case "$dest" in HEAD|@|FETCH_HEAD|ORIG_HEAD|MERGE_HEAD) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
+            case "$dest" in *".."*|*"~"*|*"^"*|*"?"*|*"*"*|*"["*|*" "*|*"@{"*) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
+            case "$dest" in -*|/*|*/|*.lock) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
+            if [[ "$dest" == *"//"* ]]; then echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1; fi
+            local default_branch=""
+            default_branch="$(gh api "repos/$repo" --jq .default_branch 2>/dev/null || true)"
+            default_branch="${default_branch#refs/heads/}"
+            default_branch="$(printf '%s' "$default_branch" | tr -d '[:space:]')"
+            if [[ -z "$default_branch" ]]; then echo "::error::Continuum branch safety: repository default branch is undiscoverable for '$repo'; refusing code push to '$dest'." >&2; return 1; fi
+            if [[ "$dest" == "$default_branch" ]]; then echo "::error::Continuum branch safety: refusing code push to the default branch '$dest'. Recovery resumes the same PR branch; only the PR merge operation may update the default branch." >&2; return 1; fi
+          }
+
           CURRENT_BRANCH="$(git branch --show-current)"
           if [[ "$CURRENT_BRANCH" != opencode/* ]]; then
             echo "Current branch '$CURRENT_BRANCH' is not an OpenCode issue branch; nothing to recover."
@@ -1731,6 +1787,9 @@ jobs:
             exit 0
           fi
 
+          # kodmial/continuum#302: fail closed before mutation when the
+          # recovered branch is empty, ambiguous, or the default branch.
+          continuum_assert_safe_push "$CURRENT_BRANCH" || exit 1
           git push -u origin "HEAD:$CURRENT_BRANCH"
 
           TITLE="$(git log -1 --format=%s)"
@@ -1796,6 +1855,28 @@ jobs:
           set -euo pipefail
           # shellcheck disable=SC1091
           source "${RUNNER_TEMP:-/tmp}/continuum-429-evacuate.sh" 2>/dev/null || true
+          # kodmial/continuum#302: the evacuator helper already defines
+          # continuum_assert_safe_push; define it here as well so this step
+          # stays fail-closed even when the helper failed to install.
+          if ! declare -F continuum_assert_safe_push >/dev/null 2>&1; then
+            continuum_assert_safe_push() {
+              local dest="${1:-}"
+              local repo="${2:-$GITHUB_REPOSITORY}"
+              dest="${dest#refs/heads/}"
+              dest="$(printf '%s' "$dest" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+              if [[ -z "$dest" ]]; then echo "::error::Continuum branch safety: refusing code push with an empty destination." >&2; return 1; fi
+              case "$dest" in HEAD|@|FETCH_HEAD|ORIG_HEAD|MERGE_HEAD) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
+              case "$dest" in *".."*|*"~"*|*"^"*|*"?"*|*"*"*|*"["*|*" "*|*"@{"*) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
+              case "$dest" in -*|/*|*/|*.lock) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
+              if [[ "$dest" == *"//"* ]]; then echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1; fi
+              local default_branch=""
+              default_branch="$(gh api "repos/$repo" --jq .default_branch 2>/dev/null || true)"
+              default_branch="${default_branch#refs/heads/}"
+              default_branch="$(printf '%s' "$default_branch" | tr -d '[:space:]')"
+              if [[ -z "$default_branch" ]]; then echo "::error::Continuum branch safety: repository default branch is undiscoverable for '$repo'; refusing code push to '$dest'." >&2; return 1; fi
+              if [[ "$dest" == "$default_branch" ]]; then echo "::error::Continuum branch safety: refusing code push to the default branch '$dest'. Recovery resumes the same PR branch; only the PR merge operation may update the default branch." >&2; return 1; fi
+            }
+          fi
           [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::Missing or invalid issue number for issue mode: '${ISSUE_NUMBER}'."; exit 1; }
           [[ "$TASK_CONTEXT_PRESENT" == "true" ]] || { echo "::error::Authoritative task context was not resolved."; exit 1; }
           [[ "${TASK_REPO,,}" == "${GITHUB_REPOSITORY,,}" && "$TASK_NUMBER" == "$ISSUE_NUMBER" ]] || {
@@ -1876,6 +1957,10 @@ jobs:
                   -m "Continuum-Component: opencode" || true
               fi
               if [[ "$(git rev-parse HEAD)" != "$BASE_START_SHA" ]]; then
+                # kodmial/continuum#302: interruption checkpoints are
+                # permitted only as proven non-default refs; fail closed
+                # before mutation instead of pushing to the default branch.
+                continuum_assert_safe_push "$CHECKPOINT_BRANCH" || exit "$exit_code"
                 git push --force origin "HEAD:refs/heads/$CHECKPOINT_BRANCH" || true
                 echo "::warning::Checkpointed issue #$ISSUE_NUMBER progress before runner exit."
               fi
@@ -2041,6 +2126,12 @@ jobs:
           # ordinary conflict into a failed task.
           BASE_SHA="$(git rev-parse "$TASK_COMMIT^")"
           [[ -n "$BASE_SHA" ]] || { echo "::error::Could not resolve task base SHA"; exit 1; }
+
+          # kodmial/continuum#302: new issue implementation creates a task
+          # branch plus PR. The branch must be a proven non-default ref
+          # before any ref creation or push; recovery resumes this same
+          # branch and never falls back to the default branch.
+          continuum_assert_safe_push "$BRANCH" || exit 1
 
           gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
             -f ref="refs/heads/$BRANCH" \
@@ -2405,6 +2496,29 @@ jobs:
           fi
           # shellcheck disable=SC1091
           source "${RUNNER_TEMP:-/tmp}/continuum-429-evacuate.sh" 2>/dev/null || true
+          # kodmial/continuum#302: repair updates only the exact current PR
+          # head. HEAD_REF must be a proven non-default ref before the agent
+          # runs; the push below re-asserts it after the exact-head race
+          # check. Missing/moved/ambiguous identity fails closed, and only
+          # the PR merge operation may update the default branch.
+          continuum_assert_safe_push() {
+            local dest="${1:-}"
+            local repo="${2:-$GITHUB_REPOSITORY}"
+            dest="${dest#refs/heads/}"
+            dest="$(printf '%s' "$dest" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            if [[ -z "$dest" ]]; then echo "::error::Continuum branch safety: refusing code push with an empty destination." >&2; return 1; fi
+            case "$dest" in HEAD|@|FETCH_HEAD|ORIG_HEAD|MERGE_HEAD) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
+            case "$dest" in *".."*|*"~"*|*"^"*|*"?"*|*"*"*|*"["*|*" "*|*"@{"*) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
+            case "$dest" in -*|/*|*/|*.lock) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
+            if [[ "$dest" == *"//"* ]]; then echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1; fi
+            local default_branch=""
+            default_branch="$(gh api "repos/$repo" --jq .default_branch 2>/dev/null || true)"
+            default_branch="${default_branch#refs/heads/}"
+            default_branch="$(printf '%s' "$default_branch" | tr -d '[:space:]')"
+            if [[ -z "$default_branch" ]]; then echo "::error::Continuum branch safety: repository default branch is undiscoverable for '$repo'; refusing code push to '$dest'." >&2; return 1; fi
+            if [[ "$dest" == "$default_branch" ]]; then echo "::error::Continuum branch safety: refusing code push to the default branch '$dest'. Recovery resumes the same PR branch; only the PR merge operation may update the default branch." >&2; return 1; fi
+          }
+          continuum_assert_safe_push "$HEAD_REF" || exit 1
           PROMPT=$(cat <<EOF
           Fix every CodeRabbit review finding on pull request #${PR_NUMBER}.
 
@@ -2485,6 +2599,9 @@ jobs:
               exit 76
             fi
 
+            # kodmial/continuum#302: exact-head race check passed; the push
+            # must still target a proven non-default ref.
+            continuum_assert_safe_push "${HEAD_REF}" || exit 1
             if ! git push origin "HEAD:${HEAD_REF}"; then
               echo "::error::CONTINUUM_OPENCODE_PUBLISH_RACE_RETRY_REQUIRED"
               echo "::error::OpenCode repair publication raced with another PR update; restarting coderabbit-fix on the latest branch state."
@@ -2748,6 +2865,27 @@ jobs:
           fi
           # shellcheck disable=SC1091
           source "${RUNNER_TEMP:-/tmp}/continuum-429-evacuate.sh" 2>/dev/null || true
+          # kodmial/continuum#302: conflict repair updates only the exact
+          # current PR head. HEAD_REF must be a proven non-default ref
+          # before the agent runs and again before the push below.
+          continuum_assert_safe_push() {
+            local dest="${1:-}"
+            local repo="${2:-$GITHUB_REPOSITORY}"
+            dest="${dest#refs/heads/}"
+            dest="$(printf '%s' "$dest" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            if [[ -z "$dest" ]]; then echo "::error::Continuum branch safety: refusing code push with an empty destination." >&2; return 1; fi
+            case "$dest" in HEAD|@|FETCH_HEAD|ORIG_HEAD|MERGE_HEAD) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
+            case "$dest" in *".."*|*"~"*|*"^"*|*"?"*|*"*"*|*"["*|*" "*|*"@{"*) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
+            case "$dest" in -*|/*|*/|*.lock) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
+            if [[ "$dest" == *"//"* ]]; then echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1; fi
+            local default_branch=""
+            default_branch="$(gh api "repos/$repo" --jq .default_branch 2>/dev/null || true)"
+            default_branch="${default_branch#refs/heads/}"
+            default_branch="$(printf '%s' "$default_branch" | tr -d '[:space:]')"
+            if [[ -z "$default_branch" ]]; then echo "::error::Continuum branch safety: repository default branch is undiscoverable for '$repo'; refusing code push to '$dest'." >&2; return 1; fi
+            if [[ "$dest" == "$default_branch" ]]; then echo "::error::Continuum branch safety: refusing code push to the default branch '$dest'. Recovery resumes the same PR branch; only the PR merge operation may update the default branch." >&2; return 1; fi
+          }
+          continuum_assert_safe_push "$HEAD_REF" || exit 1
           # `workflow_call` cannot declare an enumerated input, so validate the
           # strategy here rather than interpolating an unvalidated value.
           case "$CONFLICT_STRATEGY" in
@@ -2835,6 +2973,9 @@ jobs:
             git commit -m "fix: resolve merge conflict with main for PR #${PR_NUMBER}" -m "Continuum-Component: opencode"
           fi
           if [[ "$(git rev-list --count "origin/${HEAD_REF}"..HEAD)" -gt 0 ]]; then
+            # kodmial/continuum#302: conflict repair publishes only to the
+            # proven non-default PR head asserted on entry.
+            continuum_assert_safe_push "${HEAD_REF}" || exit 1
             git push origin "HEAD:${HEAD_REF}"
           fi
 
@@ -2861,6 +3002,27 @@ jobs:
           set -euo pipefail
           # shellcheck disable=SC1091
           source "${RUNNER_TEMP:-/tmp}/continuum-429-evacuate.sh" 2>/dev/null || true
+          # kodmial/continuum#302: CI repair updates only the exact current
+          # PR head. HEAD_REF must be a proven non-default ref before the
+          # agent runs and again before the push below.
+          continuum_assert_safe_push() {
+            local dest="${1:-}"
+            local repo="${2:-$GITHUB_REPOSITORY}"
+            dest="${dest#refs/heads/}"
+            dest="$(printf '%s' "$dest" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            if [[ -z "$dest" ]]; then echo "::error::Continuum branch safety: refusing code push with an empty destination." >&2; return 1; fi
+            case "$dest" in HEAD|@|FETCH_HEAD|ORIG_HEAD|MERGE_HEAD) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
+            case "$dest" in *".."*|*"~"*|*"^"*|*"?"*|*"*"*|*"["*|*" "*|*"@{"*) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
+            case "$dest" in -*|/*|*/|*.lock) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
+            if [[ "$dest" == *"//"* ]]; then echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1; fi
+            local default_branch=""
+            default_branch="$(gh api "repos/$repo" --jq .default_branch 2>/dev/null || true)"
+            default_branch="${default_branch#refs/heads/}"
+            default_branch="$(printf '%s' "$default_branch" | tr -d '[:space:]')"
+            if [[ -z "$default_branch" ]]; then echo "::error::Continuum branch safety: repository default branch is undiscoverable for '$repo'; refusing code push to '$dest'." >&2; return 1; fi
+            if [[ "$dest" == "$default_branch" ]]; then echo "::error::Continuum branch safety: refusing code push to the default branch '$dest'. Recovery resumes the same PR branch; only the PR merge operation may update the default branch." >&2; return 1; fi
+          }
+          continuum_assert_safe_push "$HEAD_REF" || exit 1
 
           # kodmial/continuum#295: frozen task-spec guard for CI repair.
           # Same contract as the CodeRabbit repair guard: the PR's snapshot
@@ -3015,6 +3177,9 @@ jobs:
           if [[ -n "$(git status --porcelain)" ]]; then
             git add -A
             git commit -m "fix: repair blocking workflow for PR #${PR_NUMBER}" -m "Continuum-Component: opencode"
+            # kodmial/continuum#302: CI repair publishes only to the proven
+            # non-default PR head asserted on entry.
+            continuum_assert_safe_push "${HEAD_REF}" || exit 1
             git push origin "HEAD:${HEAD_REF}"
           fi
           AFTER_SHA=$(git rev-parse HEAD)

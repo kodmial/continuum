@@ -150,6 +150,31 @@ jobs:
             exit 3
           fi
 
+          # kodmial/continuum#302: canonical fail-closed branch safety.
+          # Delegated repair publishes only to the automation-owned PR head,
+          # which must additionally be a proven non-default ref of the child
+          # repository (discovered from child metadata, never hardcoded).
+          # Only the child PR merge operation below may update the child
+          # default branch.
+          continuum_assert_safe_push() {
+            local dest="${1:-}"
+            local repo="${2:-$child_repo}"
+            dest="${dest#refs/heads/}"
+            dest="$(printf '%s' "$dest" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            if [[ -z "$dest" ]]; then echo "::error::Continuum branch safety: refusing code push with an empty destination." >&2; return 1; fi
+            case "$dest" in HEAD|@|FETCH_HEAD|ORIG_HEAD|MERGE_HEAD) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
+            case "$dest" in *".."*|*"~"*|*"^"*|*"?"*|*"*"*|*"["*|*" "*|*"@{"*) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
+            case "$dest" in -*|/*|*/|*.lock) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
+            if [[ "$dest" == *"//"* ]]; then echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1; fi
+            local default_branch=""
+            default_branch="$(gh api "repos/$repo" --jq .default_branch 2>/dev/null || true)"
+            default_branch="${default_branch#refs/heads/}"
+            default_branch="$(printf '%s' "$default_branch" | tr -d '[:space:]')"
+            if [[ -z "$default_branch" ]]; then echo "::error::Continuum branch safety: repository default branch is undiscoverable for '$repo'; refusing code push to '$dest'." >&2; return 1; fi
+            if [[ "$dest" == "$default_branch" ]]; then echo "::error::Continuum branch safety: refusing code push to the default branch '$dest'. Recovery resumes the same PR branch; only the PR merge operation may update the default branch." >&2; return 1; fi
+          }
+          continuum_assert_safe_push "$head_ref" "$child_repo" || exit 1
+
           gh auth setup-git >/dev/null 2>&1
           rm -rf "$workdir"
           gh repo clone "$child_repo" "$workdir" -- --quiet >/dev/null 2>&1
@@ -396,6 +421,9 @@ jobs:
             git commit -m "task #$TASK_NUMBER: delegated independent review" -m "Continuum-Component: delegation-review" >/dev/null 2>&1
           fi
           if [[ "$(git rev-list --count "origin/$head_ref"..HEAD)" -gt 0 ]]; then
+            # kodmial/continuum#302: re-assert the proven non-default PR
+            # head immediately before mutation.
+            continuum_assert_safe_push "$head_ref" "$child_repo" || exit 1
             git push origin "HEAD:$head_ref" >/dev/null 2>&1
           fi
 
@@ -415,6 +443,10 @@ jobs:
             fi
 
             set +e
+            # kodmial/continuum#302: the squash merge below is the single
+            # allowed updater of the child default branch (after exact-HEAD
+            # gates and delegated review). Direct pushes to the default
+            # branch remain prohibited by continuum_assert_safe_push above.
             gh pr merge "$PR_NUMBER" --repo "$child_repo" --squash --delete-branch >/dev/null 2>&1
             merge_rc=$?
             if [[ "$merge_rc" -ne 0 ]]; then
@@ -429,6 +461,9 @@ jobs:
 
             live_head="$(jq -r '.headRefOid // ""' <<<"$live_pr" 2>/dev/null || true)"
             if [[ -n "$live_head" ]]; then
+              # kodmial/continuum#302: main-sync targets the PR branch, never
+              # the default branch; the guarded head above still applies.
+              continuum_assert_safe_push "$head_ref" "$child_repo" || exit 1
               gh api --method PUT \
                 "repos/$child_repo/pulls/$PR_NUMBER/update-branch" \
                 -f "expected_head_sha=$live_head" >/dev/null 2>&1 || true

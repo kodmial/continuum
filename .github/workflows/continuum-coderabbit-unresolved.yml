@@ -318,6 +318,30 @@ jobs:
         run: |
           set -euo pipefail
 
+          # kodmial/continuum#302: canonical fail-closed branch safety. The
+          # batch repair pushes only to the live-read PR head, which must be
+          # a proven non-default ref; only the PR merge operation may update
+          # the default branch. Missing/moved/ambiguous identity fails
+          # closed before mutation.
+          continuum_assert_safe_push() {
+            local dest="${1:-}"
+            local repo="${2:-$GITHUB_REPOSITORY}"
+            dest="${dest#refs/heads/}"
+            dest="$(printf '%s' "$dest" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            if [[ -z "$dest" ]]; then echo "::error::Continuum branch safety: refusing code push with an empty destination." >&2; return 1; fi
+            case "$dest" in HEAD|@|FETCH_HEAD|ORIG_HEAD|MERGE_HEAD) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
+            case "$dest" in *".."*|*"~"*|*"^"*|*"?"*|*"*"*|*"["*|*" "*|*"@{"*) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
+            case "$dest" in -*|/*|*/|*.lock) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
+            if [[ "$dest" == *"//"* ]]; then echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1; fi
+            local default_branch=""
+            default_branch="$(gh api "repos/$repo" --jq .default_branch 2>/dev/null || true)"
+            default_branch="${default_branch#refs/heads/}"
+            default_branch="$(printf '%s' "$default_branch" | tr -d '[:space:]')"
+            if [[ -z "$default_branch" ]]; then echo "::error::Continuum branch safety: repository default branch is undiscoverable for '$repo'; refusing code push to '$dest'." >&2; return 1; fi
+            if [[ "$dest" == "$default_branch" ]]; then echo "::error::Continuum branch safety: refusing code push to the default branch '$dest'. Recovery resumes the same PR branch; only the PR merge operation may update the default branch." >&2; return 1; fi
+          }
+          continuum_assert_safe_push "$HEAD_REF" || exit 1
+
           CURRENT_HEAD="$(git rev-parse HEAD)"
           echo "started_head=$CURRENT_HEAD" >> "$GITHUB_OUTPUT"
 
@@ -382,6 +406,9 @@ jobs:
           # kodmial/continuum#260: workflow-owned repair commit uses the bot
           # identity (see Configure Git identity) plus the component trailer.
           git commit -m "fix: address unresolved CodeRabbit findings" -m "Continuum-Component: coderabbit-unresolved"
+          # kodmial/continuum#302: the live-read PR head was asserted on
+          # entry; re-assert it immediately before mutation.
+          continuum_assert_safe_push "${HEAD_REF}" || exit 1
           git push origin "HEAD:${HEAD_REF}"
           echo "changed=true" >> "$GITHUB_OUTPUT"
           echo "verify=true" >> "$GITHUB_OUTPUT"

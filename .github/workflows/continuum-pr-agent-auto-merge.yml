@@ -915,6 +915,48 @@ jobs:
               }
               return cachedDefaultBranch;
             }
+            // kodmial/continuum#302: strict default-branch discovery for
+            // code-mutation decisions. Unlike getDefaultBranch (whose main
+            // fallback serves read-only compares and workflow-dispatch
+            // refs), this returns '' when the default is undiscoverable so
+            // main-sync mutations fail closed instead of assuming main.
+            async function getStrictDefaultBranch() {
+              try {
+                const { data: repoInfo } = await github.rest.repos.get({
+                  owner, repo,
+                });
+                const name = String(repoInfo.default_branch || '')
+                  .replace(/^refs\/heads\//, '').trim();
+                if (!name) return '';
+                if (['HEAD', '@', 'FETCH_HEAD', 'ORIG_HEAD', 'MERGE_HEAD'].includes(name)) return '';
+                if (/(\.\.|~|\^|\?|\*|\[|\s|@\{|^[-/.]|[/.]$|\/\/|\.lock$)/.test(name)) return '';
+                return name;
+              } catch (err) {
+                return '';
+              }
+            }
+            // kodmial/continuum#302: canonical fail-closed branch safety
+            // for the main-sync mutation below. The PR head must be a proven
+            // non-default ref; only the PR merge operation may update the
+            // default branch, and there is no bypass.
+            const continuumAssertSafePush = (dest, default_branch) => {
+              const norm = String(dest || '').replace(/^refs\/heads\//, '').trim();
+              if (!norm) {
+                throw new Error('Continuum branch safety: refusing main sync with an empty PR head ref.');
+              }
+              if (['HEAD', '@', 'FETCH_HEAD', 'ORIG_HEAD', 'MERGE_HEAD'].includes(norm)) {
+                throw new Error(`Continuum branch safety: refusing ambiguous main-sync destination '${norm}'.`);
+              }
+              if (/(\.\.|~|\^|\?|\*|\[|\s|@\{|^[-/.]|[/.]$|\/\/|\.lock$)/.test(norm)) {
+                throw new Error(`Continuum branch safety: refusing ambiguous main-sync destination '${norm}'.`);
+              }
+              if (!default_branch) {
+                throw new Error('Continuum branch safety: repository default branch is undiscoverable; refusing main sync.');
+              }
+              if (norm === default_branch) {
+                throw new Error(`Continuum branch safety: refusing main sync for a PR headed at the default branch '${norm}'. Only the PR merge operation may update the default branch.`);
+              }
+            };
 
             async function mainSyncDecision(pr) {
               const defaultBranch = await getDefaultBranch();
@@ -1178,6 +1220,15 @@ jobs:
 
             async function syncFromMain(pr, reason) {
               const oldHead = pr.head.sha;
+              // kodmial/continuum#302: fail closed before any sync mutation
+              // when the PR head is empty, ambiguous, undiscoverable, or
+              // the default branch itself.
+              try {
+                continuumAssertSafePush(pr.head.ref, await getStrictDefaultBranch());
+              } catch (safetyErr) {
+                core.setFailed('PR #' + prNumber + ': ' + (safetyErr.message || safetyErr));
+                return false;
+              }
               try {
                 await github.request(
                   'PUT /repos/{owner}/{repo}/pulls/{pull_number}/update-branch',

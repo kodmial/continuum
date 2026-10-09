@@ -820,6 +820,29 @@ jobs:
           OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
         run: |
           set -euo pipefail
+          # kodmial/continuum#302: canonical fail-closed branch safety.
+          # Repair publishes only to the resolved writable PR source branch,
+          # which must be a proven non-default ref of the resolved target
+          # repository (same-repository or delegated child). The default
+          # branch is discovered from target metadata, never hardcoded;
+          # only the PR merge operation may update it.
+          continuum_assert_safe_push() {
+            local dest="${1:-}"
+            local repo="${2:-${CONTINUUM_PR_AGENT_TARGET_REPOSITORY:-$GITHUB_REPOSITORY}}"
+            dest="${dest#refs/heads/}"
+            dest="$(printf '%s' "$dest" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            if [[ -z "$dest" ]]; then echo "::error::Continuum branch safety: refusing code push with an empty destination." >&2; return 1; fi
+            case "$dest" in HEAD|@|FETCH_HEAD|ORIG_HEAD|MERGE_HEAD) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
+            case "$dest" in *".."*|*"~"*|*"^"*|*"?"*|*"*"*|*"["*|*" "*|*"@{"*) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
+            case "$dest" in -*|/*|*/|*.lock) echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1;; esac
+            if [[ "$dest" == *"//"* ]]; then echo "::error::Continuum branch safety: refusing ambiguous push destination '$dest'." >&2; return 1; fi
+            local default_branch=""
+            default_branch="$(gh api "repos/$repo" --jq .default_branch 2>/dev/null || true)"
+            default_branch="${default_branch#refs/heads/}"
+            default_branch="$(printf '%s' "$default_branch" | tr -d '[:space:]')"
+            if [[ -z "$default_branch" ]]; then echo "::error::Continuum branch safety: repository default branch is undiscoverable for '$repo'; refusing code push to '$dest'." >&2; return 1; fi
+            if [[ "$dest" == "$default_branch" ]]; then echo "::error::Continuum branch safety: refusing code push to the default branch '$dest'. Recovery resumes the same PR branch; only the PR merge operation may update the default branch." >&2; return 1; fi
+          }
           # OpenCode is repairer only: it receives every current native review
           # finding and qualifying improve suggestion in one bounded pass.
           # The workflow, not OpenCode, owns commit/push so publication always
@@ -1085,6 +1108,15 @@ jobs:
             fi
           fi
 
+          # kodmial/continuum#302: the exact-HEAD lease above passed; the
+          # push must still target a proven non-default ref of the resolved
+          # target repository. Missing/ambiguous/default identity fails
+          # closed before mutation.
+          if ! continuum_assert_safe_push "$HEAD_REF"; then
+            echo "classification=deterministic" >> "$GITHUB_OUTPUT"
+            echo "::error::PR source branch failed branch-safety validation; discarding repair."
+            exit 1
+          fi
           if ! git push --force-with-lease="refs/heads/$HEAD_REF:$HEAD_SHA" origin "HEAD:refs/heads/$HEAD_REF"; then
             if ! CURRENT_AFTER="$(gh pr view "$PR_NUMBER" --repo "$CONTINUUM_PR_AGENT_TARGET_REPOSITORY" --json headRefOid --jq .headRefOid)"; then
               echo "classification=transient" >> "$GITHUB_OUTPUT"
