@@ -523,6 +523,7 @@ def decide_recovery(
     operation_context: Optional[str] = None,
     failure_transient: Optional[bool] = None,
     active_exact_run: bool = False,
+    lifecycle_complete: bool = True,
     run_conclusion: Optional[str] = None,
     status_age_seconds: Optional[int] = None,
     evidence: RetryEvidence = RetryEvidence(),
@@ -553,6 +554,12 @@ def decide_recovery(
     context) or an explicit ``failure_transient`` verdict; a token-bearing
     description without either holds.
 
+    ``lifecycle_complete=False`` is reserved for a provider operation that
+    succeeded but did not finish the enclosing PR lifecycle (for example an
+    exact-head clean review whose mergeability is still computing). Such a
+    state re-enters the same bounded recovery identity rather than silently
+    settling an open PR.
+
     Budget pairing: ``max_executions`` must be the same resolved value
     passed to :func:`decide_recovery` for the same reconciliation. Resolve
     once with :func:`resolve_max_executions` and pass it to both: the
@@ -576,7 +583,7 @@ def decide_recovery(
     # Settled dominates every wait/hold below so a success clears obsolete
     # durable state (exhaustion markers, stale leases, not-before waits)
     # via the success path instead of holding on stale evidence.
-    if state == "success":
+    if state == "success" and lifecycle_complete:
         return RecoveryDecision("settled", None, "operation already settled")
     if not ci_green:
         return RecoveryDecision("wait", None, "exact HEAD CI is not green")
@@ -666,7 +673,11 @@ def decide_recovery(
             )
         recoverable = True
     elif state == "success":
-        return RecoveryDecision("settled", None, "operation already settled")
+        # A successful provider operation can still leave the PR lifecycle
+        # incomplete (for example GitHub mergeability is still computing).
+        # Re-run the same bounded exact-HEAD orchestration instead of treating
+        # the open PR as terminally settled.
+        recoverable = True
     elif state == "failure":
         if failure_transient is True:
             recoverable = True
