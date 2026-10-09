@@ -99,8 +99,8 @@ def cmd_decide(args: argparse.Namespace) -> int:
             repo=args.repo,
             issue=args.issue,
             generation=args.generation,
-            live_title=issue.get("title", ""),
-            live_body=issue.get("body", ""),
+            live_title=issue.get("title") or "",
+            live_body=issue.get("body") or "",
             comments=comments,
             owner_login=args.owner or "",
         )
@@ -112,8 +112,8 @@ def cmd_decide(args: argparse.Namespace) -> int:
             record = build_snapshot(
                 args.repo,
                 args.issue,
-                issue.get("title", ""),
-                issue.get("body", ""),
+                issue.get("title") or "",
+                issue.get("body") or "",
                 generation=args.generation,
                 created_by="github-actions[bot]",
                 created_at="",
@@ -131,8 +131,8 @@ def cmd_decide(args: argparse.Namespace) -> int:
                 record = build_snapshot(
                     selection.snapshot.repo,
                     selection.snapshot.issue,
-                    stored.get("title", ""),
-                    stored.get("body", ""),
+                    stored.get("title") or "",
+                    stored.get("body") or "",
                     generation=selection.snapshot.generation,
                     created_by=str(stored.get("created_by", "")),
                     created_at=str(stored.get("created_at", "")),

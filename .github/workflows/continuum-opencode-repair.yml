@@ -234,9 +234,10 @@ jobs:
           fi
 
           # kodmial/continuum#295: frozen task-spec guard before repair
-          # dispatch. The PR's snapshot reference is the pinned contract;
-          # the live issue is re-read and compared. On drift (or when the
-          # contract cannot be verified), hold with a deduplicated
+          # dispatch. The durable record is the bot-owned snapshot comment
+          # on the issue; the PR's snapshot reference must match it exactly
+          # and the live issue is re-read and compared. On drift (or when
+          # the contract cannot be verified), hold with a deduplicated
           # diagnostic: no dispatch, no blind retry loop. A PR without a
           # snapshot reference is legacy and proceeds explicitly
           # unprotected. Canonical digests mirror
@@ -256,6 +257,26 @@ jobs:
             fi
             if [[ "$SNAP_REF_GENERATION" != "1" ]]; then
               echo "PR #$PR_NUMBER snapshot reference is for generation $SNAP_REF_GENERATION, expected generation 1 (stale contract); holding repair."
+              exit 0
+            fi
+            # The PR body is mutable, so the reference alone never defines
+            # the contract: require it to match the durable snapshot comment
+            # before comparing live text. A PR-body edit that retargets the
+            # ref shas to an edited issue otherwise passes verification.
+            if ! SNAP_COMMENTS_JSON="$(gh api "repos/$SNAP_REF_REPO/issues/$SNAP_REF_ISSUE/comments?per_page=100&page=1" 2>/dev/null)"; then
+              echo "Could not list task snapshot comments for $SNAP_REF_REPO#$SNAP_REF_ISSUE; holding repair instead of dispatching blind."
+              exit 0
+            fi
+            SNAP_PINNED="$(SNAP_COMMENTS_JSON="$SNAP_COMMENTS_JSON" SNAP_REF_REPO="$SNAP_REF_REPO" SNAP_REF_ISSUE="$SNAP_REF_ISSUE" SNAP_REF_GENERATION="$SNAP_REF_GENERATION" python3 -c 'import json,os,re; data=json.loads(os.environ.get("SNAP_COMMENTS_JSON") or "[]"); repo=(os.environ.get("SNAP_REF_REPO") or "").lower(); issue=os.environ.get("SNAP_REF_ISSUE") or ""; gen=os.environ.get("SNAP_REF_GENERATION") or ""; pat=re.compile(r"<!--\s*continuum-task-snapshot\s+repo=([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+)\s+issue=(\d+)\s+generation=(\d+)\s+title-sha256=([0-9a-fA-F]{64})\s+body-sha256=([0-9a-fA-F]{64})\s+spec-sha256=([0-9a-fA-F]{64})\s*-->"); trusted={"OWNER","MEMBER","COLLABORATOR"}; out=[(m.group(4).lower(),m.group(5).lower(),m.group(6).lower()) for c in data if isinstance(c,dict) for u in [c.get("user") if isinstance(c.get("user"),dict) else {}] for m in [pat.search(str(c.get("body") or ""))] if m and m.group(1).lower()==repo and m.group(2)==issue and m.group(3)==gen and (str(c.get("author_association") or "").upper() in trusted or str(u.get("login") or "").lower()=="github-actions[bot]")]; print("\n".join(out[0]) if out else "",end="")')"
+            SNAP_PINNED_TITLE_SHA="$(sed -n '1p' <<<"$SNAP_PINNED")"
+            SNAP_PINNED_BODY_SHA="$(sed -n '2p' <<<"$SNAP_PINNED")"
+            SNAP_PINNED_SPEC_SHA="$(sed -n '3p' <<<"$SNAP_PINNED")"
+            if [[ -z "$SNAP_PINNED_TITLE_SHA" || -z "$SNAP_PINNED_BODY_SHA" || -z "$SNAP_PINNED_SPEC_SHA" ]]; then
+              echo "No trusted task snapshot comment found for $SNAP_REF_REPO#$SNAP_REF_ISSUE generation $SNAP_REF_GENERATION; holding repair without a verifiable contract."
+              exit 0
+            fi
+            if [[ "$SNAP_PINNED_TITLE_SHA" != "$SNAP_REF_TITLE_SHA" || "$SNAP_PINNED_BODY_SHA" != "$SNAP_REF_BODY_SHA" || "$SNAP_PINNED_SPEC_SHA" != "$SNAP_REF_SPEC_SHA" ]]; then
+              echo "PR #$PR_NUMBER snapshot reference does not match the durable task snapshot comment for $SNAP_REF_REPO#$SNAP_REF_ISSUE; holding repair without a verifiable contract."
               exit 0
             fi
             if ! SNAP_LIVE_JSON="$(gh api "repos/$SNAP_REF_REPO/issues/$SNAP_REF_ISSUE" --jq '{title: (.title // ""), body: (.body // "")}' 2>/dev/null)"; then
@@ -403,11 +424,11 @@ jobs:
           fi
 
           # kodmial/continuum#295: frozen task-spec guard before repair
-          # dispatch. Same contract as the reporter path above: the PR's
-          # snapshot reference is pinned, the live issue is re-read, drift
-          # (or an unverifiable contract) holds the dispatch with a
-          # deduplicated diagnostic, and legacy PRs proceed explicitly
-          # unprotected.
+          # dispatch. Same contract as the reporter path above: the durable
+          # snapshot comment is authoritative, the PR reference must match
+          # it, and the live issue is re-read. Drift (or an unverifiable
+          # contract) holds the dispatch with a deduplicated diagnostic,
+          # and legacy PRs proceed explicitly unprotected.
           SNAPSHOT_PR_BODY="$(jq -r '.body // ""' <<<"$PR_JSON")"
           SNAPSHOT_REF="$(grep -oE '<!--[[:space:]]*continuum-task-snapshot-ref[^>]*-->' <<<"$SNAPSHOT_PR_BODY" | head -n 1 || true)"
           if [[ -n "$SNAPSHOT_REF" ]]; then
@@ -423,6 +444,25 @@ jobs:
             fi
             if [[ "$SNAP_REF_GENERATION" != "1" ]]; then
               echo "PR #$pr snapshot reference is for generation $SNAP_REF_GENERATION, expected generation 1 (stale contract); holding repair."
+              exit 0
+            fi
+            # The PR body is mutable, so the reference alone never defines
+            # the contract: require it to match the durable snapshot comment
+            # before comparing live text.
+            if ! SNAP_COMMENTS_JSON="$(gh api "repos/$SNAP_REF_REPO/issues/$SNAP_REF_ISSUE/comments?per_page=100&page=1" 2>/dev/null)"; then
+              echo "Could not list task snapshot comments for $SNAP_REF_REPO#$SNAP_REF_ISSUE; holding repair instead of dispatching blind."
+              exit 0
+            fi
+            SNAP_PINNED="$(SNAP_COMMENTS_JSON="$SNAP_COMMENTS_JSON" SNAP_REF_REPO="$SNAP_REF_REPO" SNAP_REF_ISSUE="$SNAP_REF_ISSUE" SNAP_REF_GENERATION="$SNAP_REF_GENERATION" python3 -c 'import json,os,re; data=json.loads(os.environ.get("SNAP_COMMENTS_JSON") or "[]"); repo=(os.environ.get("SNAP_REF_REPO") or "").lower(); issue=os.environ.get("SNAP_REF_ISSUE") or ""; gen=os.environ.get("SNAP_REF_GENERATION") or ""; pat=re.compile(r"<!--\s*continuum-task-snapshot\s+repo=([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+)\s+issue=(\d+)\s+generation=(\d+)\s+title-sha256=([0-9a-fA-F]{64})\s+body-sha256=([0-9a-fA-F]{64})\s+spec-sha256=([0-9a-fA-F]{64})\s*-->"); trusted={"OWNER","MEMBER","COLLABORATOR"}; out=[(m.group(4).lower(),m.group(5).lower(),m.group(6).lower()) for c in data if isinstance(c,dict) for u in [c.get("user") if isinstance(c.get("user"),dict) else {}] for m in [pat.search(str(c.get("body") or ""))] if m and m.group(1).lower()==repo and m.group(2)==issue and m.group(3)==gen and (str(c.get("author_association") or "").upper() in trusted or str(u.get("login") or "").lower()=="github-actions[bot]")]; print("\n".join(out[0]) if out else "",end="")')"
+            SNAP_PINNED_TITLE_SHA="$(sed -n '1p' <<<"$SNAP_PINNED")"
+            SNAP_PINNED_BODY_SHA="$(sed -n '2p' <<<"$SNAP_PINNED")"
+            SNAP_PINNED_SPEC_SHA="$(sed -n '3p' <<<"$SNAP_PINNED")"
+            if [[ -z "$SNAP_PINNED_TITLE_SHA" || -z "$SNAP_PINNED_BODY_SHA" || -z "$SNAP_PINNED_SPEC_SHA" ]]; then
+              echo "No trusted task snapshot comment found for $SNAP_REF_REPO#$SNAP_REF_ISSUE generation $SNAP_REF_GENERATION; holding repair without a verifiable contract."
+              exit 0
+            fi
+            if [[ "$SNAP_PINNED_TITLE_SHA" != "$SNAP_REF_TITLE_SHA" || "$SNAP_PINNED_BODY_SHA" != "$SNAP_REF_BODY_SHA" || "$SNAP_PINNED_SPEC_SHA" != "$SNAP_REF_SPEC_SHA" ]]; then
+              echo "PR #$pr snapshot reference does not match the durable task snapshot comment for $SNAP_REF_REPO#$SNAP_REF_ISSUE; holding repair without a verifiable contract."
               exit 0
             fi
             if ! SNAP_LIVE_JSON="$(gh api "repos/$SNAP_REF_REPO/issues/$SNAP_REF_ISSUE" --jq '{title: (.title // ""), body: (.body // "")}' 2>/dev/null)"; then

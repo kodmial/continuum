@@ -3188,8 +3188,9 @@ jobs:
 
               // kodmial/continuum#295: frozen task-spec revalidation right
               // before merge closes every time-of-check/time-of-use gap.
-              // The PR's snapshot reference pins the exact issue title/body
-              // accepted at admission; the live issue is re-read here so a
+              // The durable record is the bot-owned snapshot comment on
+              // the issue: the PR's snapshot reference must match it
+              // exactly, and the live issue is re-read here so a
               // last-second edit cannot slip through the earlier gates.
               // Drift (or an unverifiable read) holds the merge with an
               // actionable diagnostic instead of merging a stale contract.
@@ -3238,6 +3239,88 @@ jobs:
                   const normText = (value) =>
                     String(value ?? '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').normalize('NFC');
                   const shaHex = (text) => createHash('sha256').update(text, 'utf8').digest('hex');
+                  // The PR body is mutable, so the reference alone never
+                  // defines the contract: fetch the durable snapshot
+                  // comment and require the reference to match it. A
+                  // PR-body edit that retargets the ref shas to an edited
+                  // issue otherwise bypasses the drift hold.
+                  const snapshotMarkerRe =
+                    /<!--\s*continuum-task-snapshot\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+title-sha256=([0-9a-fA-F]{64})\s+body-sha256=([0-9a-fA-F]{64})\s+spec-sha256=([0-9a-fA-F]{64})\s*-->/;
+                  const isTrustedSnapshotComment = (comment) => {
+                    const association = String(comment.author_association || '').toUpperCase();
+                    if (['OWNER', 'MEMBER', 'COLLABORATOR'].includes(association)) return true;
+                    const login = String((comment.user && comment.user.login) || '').toLowerCase();
+                    return login === 'github-actions[bot]';
+                  };
+                  let snapshotComments = [];
+                  try {
+                    if (taskRepoFull.toLowerCase() === repoFullName.toLowerCase()) {
+                      snapshotComments = await withReadFallback((client) =>
+                        client.paginate(client.rest.issues.listComments, {
+                          owner: taskOwner,
+                          repo: taskRepoName,
+                          issue_number: taskIssue,
+                          per_page: 100,
+                        })
+                      );
+                    } else {
+                      // Cross-repository snapshot comments are read with the
+                      // PAT-backed client (mirroring the live-issue fetch
+                      // below); the repository token is never installed on
+                      // the task repository. Bounded to three pages without
+                      // the paginate helper, which stays reserved for
+                      // repository-token scans.
+                      snapshotComments = [];
+                      for (let snapshotPage = 1; snapshotPage <= 3; snapshotPage++) {
+                        const { data: snapshotPageComments } = await github.rest.issues.listComments({
+                          owner: taskOwner,
+                          repo: taskRepoName,
+                          issue_number: taskIssue,
+                          per_page: 100,
+                          page: snapshotPage,
+                        });
+                        snapshotComments = snapshotComments.concat(snapshotPageComments || []);
+                        if ((snapshotPageComments || []).length < 100) break;
+                      }
+                    }
+                  } catch (err) {
+                    core.warning(
+                      `PR #${pr.number}: task snapshot verification failed (${err.message || err}); holding merge instead of merging blind.`
+                    );
+                    continue;
+                  }
+                  let durableSnapshot = null;
+                  for (const comment of snapshotComments || []) {
+                    const text = String((comment && comment.body) || '');
+                    const match = text.match(snapshotMarkerRe);
+                    if (!match) continue;
+                    if (match[1].toLowerCase() !== taskRepoFull.toLowerCase()) continue;
+                    if (Number(match[2]) !== taskIssue) continue;
+                    if (String(match[3]) !== String(refGeneration)) continue;
+                    if (!isTrustedSnapshotComment(comment || {})) continue;
+                    durableSnapshot = {
+                      titleSha: match[4].toLowerCase(),
+                      bodySha: match[5].toLowerCase(),
+                      specSha: match[6].toLowerCase(),
+                    };
+                    break;
+                  }
+                  if (!durableSnapshot) {
+                    core.warning(
+                      `PR #${pr.number}: no trusted task snapshot comment found for ${taskRepoFull}#${taskIssue} generation ${refGeneration}; merge held.`
+                    );
+                    continue;
+                  }
+                  if (
+                    durableSnapshot.titleSha !== pinnedTitleSha ||
+                    durableSnapshot.bodySha !== pinnedBodySha ||
+                    durableSnapshot.specSha !== pinnedSpecSha
+                  ) {
+                    core.warning(
+                      `PR #${pr.number}: task snapshot reference does not match the durable snapshot comment for ${taskRepoFull}#${taskIssue}; merge held.`
+                    );
+                    continue;
+                  }
                   let liveIssue = null;
                   try {
                     if (taskRepoFull.toLowerCase() === repoFullName.toLowerCase()) {
@@ -3263,7 +3346,8 @@ jobs:
                   }
                   const liveTitleSha = shaHex(normText(liveIssue.data.title || ''));
                   const liveBodySha = shaHex(normText(liveIssue.data.body || ''));
-                  if (liveTitleSha !== pinnedTitleSha || liveBodySha !== pinnedBodySha) {
+                  const liveSpecSha = shaHex(`${liveTitleSha}:${liveBodySha}`);
+                  if (liveTitleSha !== pinnedTitleSha || liveBodySha !== pinnedBodySha || liveSpecSha !== pinnedSpecSha) {
                     const driftMarker =
                       `<!-- continuum-task-snapshot-drift spec=${pinnedSpecSha} -->`;
                     let alreadyNoted = false;

@@ -159,7 +159,14 @@ jobs:
             fi
             echo "Pinned child task snapshot for $child_repo#$TASK_NUMBER."
             # Re-verify after pinning so simultaneous wakeups converge on
-            # the earliest writer instead of overwriting it.
+            # the earliest writer instead of overwriting it. Re-read the
+            # live issue (not just comments) so a title/body edit between
+            # the first live read and the pin is observed by the second
+            # decide call.
+            if ! gh api "repos/$child_repo/issues/$TASK_NUMBER" > "$CHILD_ISSUE_JSON" 2>/dev/null; then
+              echo "::error::Could not re-read child task #$TASK_NUMBER for snapshot re-verification; refusing delegated work."
+              exit 4
+            fi
             fetch_snapshot_comments || exit 4
             if ! snapshot_action="$(python3 "$SNAPSHOT_ADMISSION" decide --issue-json "$CHILD_ISSUE_JSON" --comments-json "$CHILD_COMMENTS_JSON" --repo "$child_repo" --issue "$TASK_NUMBER" --owner "$CHILD_OWNER" --record-out "$CHILD_SNAPSHOT_RECORD" --decision-out "$CHILD_SNAPSHOT_DECISION")"; then
               echo "::error::Child task snapshot re-verification failed; refusing delegated work."

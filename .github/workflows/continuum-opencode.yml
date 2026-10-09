@@ -2316,6 +2316,9 @@ jobs:
           PR_NUMBER: ${{ inputs.pr_number }}
           REVIEW_ID: ${{ inputs.review_id }}
           HEAD_REF: ${{ inputs.head_ref }}
+          TASK_CONTEXT_PRESENT: ${{ steps.task_context.outputs.present }}
+          TASK_REPO: ${{ steps.task_context.outputs.task_repo }}
+          TASK_NUMBER: ${{ steps.task_context.outputs.task_number }}
           RECOVERY_GENERATION_IN: ${{ inputs.recovery_generation }}
         run: |
           set -euo pipefail
@@ -2348,6 +2351,16 @@ jobs:
               if [[ "$REF_GENERATION" != "1" ]]; then
                 echo "::error::PR #$PR_NUMBER snapshot reference is for generation $REF_GENERATION, expected generation 1 (stale contract); refusing repair."
                 exit 1
+              fi
+              if [[ "${TASK_CONTEXT_PRESENT:-}" == "true" ]]; then
+                if [[ -n "${TASK_REPO:-}" && "$(tr '[:upper:]' '[:lower:]' <<<"$REF_REPO")" != "$(tr '[:upper:]' '[:lower:]' <<<"$TASK_REPO")" ]]; then
+                  echo "::error::PR #$PR_NUMBER snapshot reference $REF_REPO#$REF_ISSUE does not match expected task $TASK_REPO#${TASK_NUMBER:-} (wrong issue); refusing repair."
+                  exit 1
+                fi
+                if [[ -n "${TASK_NUMBER:-}" && "$REF_ISSUE" != "$TASK_NUMBER" ]]; then
+                  echo "::error::PR #$PR_NUMBER snapshot reference #$REF_ISSUE does not match expected task #${TASK_NUMBER} on $REF_REPO (wrong issue); refusing repair."
+                  exit 1
+                fi
               fi
               if ! REPAIR_LIVE_JSON="$(gh issue view "$REF_ISSUE" --repo "$REF_REPO" --json title,body 2>/dev/null)"; then
                 echo "::error::Could not fetch live task $REF_REPO#$REF_ISSUE for snapshot verification; refusing repair."
@@ -2628,6 +2641,9 @@ jobs:
           PR_NUMBER: ${{ inputs.pr_number }}
           HEAD_REF: ${{ inputs.head_ref }}
           CONFLICT_STRATEGY: ${{ inputs.conflict_strategy || 'merge' }}
+          TASK_CONTEXT_PRESENT: ${{ steps.task_context.outputs.present }}
+          TASK_REPO: ${{ steps.task_context.outputs.task_repo }}
+          TASK_NUMBER: ${{ steps.task_context.outputs.task_number }}
           RECOVERY_GENERATION_IN: ${{ inputs.recovery_generation }}
         run: |
           set -euo pipefail
@@ -2658,6 +2674,16 @@ jobs:
               if [[ "$REF_GENERATION" != "1" ]]; then
                 echo "::error::PR #$PR_NUMBER snapshot reference is for generation $REF_GENERATION, expected generation 1 (stale contract); refusing repair."
                 exit 1
+              fi
+              if [[ "${TASK_CONTEXT_PRESENT:-}" == "true" ]]; then
+                if [[ -n "${TASK_REPO:-}" && "$(tr '[:upper:]' '[:lower:]' <<<"$REF_REPO")" != "$(tr '[:upper:]' '[:lower:]' <<<"$TASK_REPO")" ]]; then
+                  echo "::error::PR #$PR_NUMBER snapshot reference $REF_REPO#$REF_ISSUE does not match expected task $TASK_REPO#${TASK_NUMBER:-} (wrong issue); refusing repair."
+                  exit 1
+                fi
+                if [[ -n "${TASK_NUMBER:-}" && "$REF_ISSUE" != "$TASK_NUMBER" ]]; then
+                  echo "::error::PR #$PR_NUMBER snapshot reference #$REF_ISSUE does not match expected task #${TASK_NUMBER} on $REF_REPO (wrong issue); refusing repair."
+                  exit 1
+                fi
               fi
               if ! REPAIR_LIVE_JSON="$(gh issue view "$REF_ISSUE" --repo "$REF_REPO" --json title,body 2>/dev/null)"; then
                 echo "::error::Could not fetch live task $REF_REPO#$REF_ISSUE for snapshot verification; refusing repair."
