@@ -290,6 +290,50 @@ jobs:
           issue_title="$(jq -r '.title' <<<"$issue_json")"
           issue_body="$(jq -r '.body // ""' <<<"$issue_json")"
 
+          # kodmial/continuum#295: review-as-task validates the frozen
+          # contract, never a later live body. The worker owns admission;
+          # review only verifies. Drift stops the review with a
+          # deduplicated diagnostic (deterministic hold, no verdict).
+          # Legacy child work without a snapshot is reviewed explicitly
+          # unprotected.
+          CHILD_REVIEW_OWNER="${child_repo%%/*}"
+          CHILD_REVIEW_COMMENTS_PAGES="$RUNNER_TEMP/continuum-child-review-snapshot-pages.jsonl"
+          CHILD_REVIEW_COMMENTS_JSON="$RUNNER_TEMP/continuum-child-review-snapshot-comments.json"
+          CHILD_REVIEW_RECORD="$RUNNER_TEMP/continuum-child-review-snapshot-record.json"
+          CHILD_REVIEW_DECISION="$RUNNER_TEMP/continuum-child-review-snapshot-decision.json"
+          REVIEW_SNAPSHOT_ADMISSION="$CONTINUUM_ENGINE_ROOT/.github/scripts/task_snapshot_admission.py"
+          : > "$CHILD_REVIEW_COMMENTS_PAGES"
+          for review_snapshot_page in 1 2 3; do
+            if ! review_snapshot_page_json="$(gh api "repos/$child_repo/issues/$TASK_NUMBER/comments?per_page=100&page=$review_snapshot_page" 2>/dev/null)"; then
+              echo "::error::Could not list child task #$TASK_NUMBER comments for snapshot verification; refusing review."
+              exit 4
+            fi
+            echo "$review_snapshot_page_json" >> "$CHILD_REVIEW_COMMENTS_PAGES"
+            review_snapshot_count="$(jq 'length' <<<"$review_snapshot_page_json" 2>/dev/null || echo 0)"
+            [[ "$review_snapshot_count" == "100" ]] || break
+          done
+          jq -s 'add' "$CHILD_REVIEW_COMMENTS_PAGES" > "$CHILD_REVIEW_COMMENTS_JSON"
+          if ! review_snapshot_action="$(python3 "$REVIEW_SNAPSHOT_ADMISSION" decide --issue-json <(jq '{title, body}' <<<"$issue_json") --comments-json "$CHILD_REVIEW_COMMENTS_JSON" --repo "$child_repo" --issue "$TASK_NUMBER" --owner "$CHILD_REVIEW_OWNER" --record-out "$CHILD_REVIEW_RECORD" --decision-out "$CHILD_REVIEW_DECISION")"; then
+            echo "::error::Child task snapshot verification failed; refusing review."
+            exit 4
+          fi
+          if [[ "$review_snapshot_action" == "proceed" ]]; then
+            issue_title="$(jq -r '.title' "$CHILD_REVIEW_RECORD")"
+            issue_body="$(jq -r '.body' "$CHILD_REVIEW_RECORD")"
+            echo "Child task snapshot verified for $child_repo#$TASK_NUMBER before review."
+          elif [[ "$review_snapshot_action" == "pin" ]]; then
+            echo "::notice::Child task $child_repo#$TASK_NUMBER has no pinned snapshot (legacy, pre-guard work); review proceeds explicitly without drift protection."
+          else
+            review_snapshot_diagnostic="$(jq -r '.diagnostic // "Task snapshot verification failed."' "$CHILD_REVIEW_DECISION" 2>/dev/null || echo "Task snapshot verification failed.")"
+            if ! jq -r '.[].body' "$CHILD_REVIEW_COMMENTS_JSON" 2>/dev/null | grep -Fq '<!-- continuum-child-task-snapshot-drift -->'; then
+              gh issue comment "$TASK_NUMBER" --repo "$child_repo" \
+                --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-task-snapshot-drift -->' '⚡ **Continuum · delegation-review**' '<!-- continuum-origin role=continuum component=delegation-review -->' "$review_snapshot_diagnostic")" \
+                >/dev/null 2>&1 || true
+            fi
+            echo "::notice::Child task $child_repo#$TASK_NUMBER snapshot guard held review ($review_snapshot_action); no verdict recorded."
+            exit 0
+          fi
+
           mkdir -p "$(dirname "$review_file")"
           prompt="$RUNNER_TEMP/continuum-child-review.txt"
           cat >"$prompt" <<EOF

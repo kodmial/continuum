@@ -259,6 +259,74 @@ jobs:
             exit 0
           fi
 
+          # kodmial/continuum#295: frozen task-spec guard before repair
+          # dispatch. The durable record is the bot-owned snapshot comment
+          # on the issue; the PR's snapshot reference must match it exactly
+          # and the live issue is re-read and compared. On drift (or when
+          # the contract cannot be verified), hold with a deduplicated
+          # diagnostic: no dispatch, no blind retry loop. A PR without a
+          # snapshot reference is legacy and proceeds explicitly
+          # unprotected. Canonical digests mirror
+          # src/continuum/task_snapshot.py (UTF-8, NFC, LF, SHA-256).
+          SNAPSHOT_PR_BODY="$(jq -r '.body // ""' <<<"$PR_JSON")"
+          SNAPSHOT_REF="$(grep -oE '<!--[[:space:]]*continuum-task-snapshot-ref[^>]*-->' <<<"$SNAPSHOT_PR_BODY" | head -n 1 || true)"
+          if [[ -n "$SNAPSHOT_REF" ]]; then
+            SNAP_REF_REPO="$(sed -nE 's/.*repo=([A-Za-z0-9_.\-]+\/[A-Za-z0-9_.\-]+).*/\1/p' <<<"$SNAPSHOT_REF" | head -n 1)"
+            SNAP_REF_ISSUE="$(sed -nE 's/.*issue=([0-9]+).*/\1/p' <<<"$SNAPSHOT_REF" | head -n 1)"
+            SNAP_REF_TITLE_SHA="$(sed -nE 's/.*title-sha256=([0-9a-fA-F]{64}).*/\1/p' <<<"$SNAPSHOT_REF" | head -n 1 | tr 'A-F' 'a-f')"
+            SNAP_REF_BODY_SHA="$(sed -nE 's/.*body-sha256=([0-9a-fA-F]{64}).*/\1/p' <<<"$SNAPSHOT_REF" | head -n 1 | tr 'A-F' 'a-f')"
+            SNAP_REF_SPEC_SHA="$(sed -nE 's/.*spec-sha256=([0-9a-fA-F]{64}).*/\1/p' <<<"$SNAPSHOT_REF" | head -n 1 | tr 'A-F' 'a-f')"
+            SNAP_REF_GENERATION="$(sed -nE 's/.*generation=([0-9]+).*/\1/p' <<<"$SNAPSHOT_REF" | head -n 1)"
+            if [[ -z "$SNAP_REF_REPO" || -z "$SNAP_REF_ISSUE" || -z "$SNAP_REF_TITLE_SHA" || -z "$SNAP_REF_BODY_SHA" || -z "$SNAP_REF_SPEC_SHA" || -z "$SNAP_REF_GENERATION" ]]; then
+              echo "PR #$PR_NUMBER snapshot reference is malformed; holding repair without a verifiable contract."
+              exit 0
+            fi
+            if [[ "$SNAP_REF_GENERATION" != "1" ]]; then
+              echo "PR #$PR_NUMBER snapshot reference is for generation $SNAP_REF_GENERATION, expected generation 1 (stale contract); holding repair."
+              exit 0
+            fi
+            # The PR body is mutable, so the reference alone never defines
+            # the contract: require it to match the durable snapshot comment
+            # before comparing live text. A PR-body edit that retargets the
+            # ref shas to an edited issue otherwise passes verification.
+            if ! SNAP_COMMENTS_JSON="$(gh api "repos/$SNAP_REF_REPO/issues/$SNAP_REF_ISSUE/comments?per_page=100&page=1" 2>/dev/null)"; then
+              echo "Could not list task snapshot comments for $SNAP_REF_REPO#$SNAP_REF_ISSUE; holding repair instead of dispatching blind."
+              exit 0
+            fi
+            SNAP_PINNED="$(SNAP_COMMENTS_JSON="$SNAP_COMMENTS_JSON" SNAP_REF_REPO="$SNAP_REF_REPO" SNAP_REF_ISSUE="$SNAP_REF_ISSUE" SNAP_REF_GENERATION="$SNAP_REF_GENERATION" python3 -c 'import json,os,re; data=json.loads(os.environ.get("SNAP_COMMENTS_JSON") or "[]"); repo=(os.environ.get("SNAP_REF_REPO") or "").lower(); issue=os.environ.get("SNAP_REF_ISSUE") or ""; gen=os.environ.get("SNAP_REF_GENERATION") or ""; pat=re.compile(r"<!--\s*continuum-task-snapshot\s+repo=([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+)\s+issue=(\d+)\s+generation=(\d+)\s+title-sha256=([0-9a-fA-F]{64})\s+body-sha256=([0-9a-fA-F]{64})\s+spec-sha256=([0-9a-fA-F]{64})\s*-->"); trusted={"OWNER","MEMBER","COLLABORATOR"}; out=[(m.group(4).lower(),m.group(5).lower(),m.group(6).lower()) for c in data if isinstance(c,dict) for u in [c.get("user") if isinstance(c.get("user"),dict) else {}] for m in [pat.search(str(c.get("body") or ""))] if m and m.group(1).lower()==repo and m.group(2)==issue and m.group(3)==gen and (str(c.get("author_association") or "").upper() in trusted or str(u.get("login") or "").lower()=="github-actions[bot]")]; print("\n".join(out[0]) if out else "",end="")')"
+            SNAP_PINNED_TITLE_SHA="$(sed -n '1p' <<<"$SNAP_PINNED")"
+            SNAP_PINNED_BODY_SHA="$(sed -n '2p' <<<"$SNAP_PINNED")"
+            SNAP_PINNED_SPEC_SHA="$(sed -n '3p' <<<"$SNAP_PINNED")"
+            if [[ -z "$SNAP_PINNED_TITLE_SHA" || -z "$SNAP_PINNED_BODY_SHA" || -z "$SNAP_PINNED_SPEC_SHA" ]]; then
+              echo "No trusted task snapshot comment found for $SNAP_REF_REPO#$SNAP_REF_ISSUE generation $SNAP_REF_GENERATION; holding repair without a verifiable contract."
+              exit 0
+            fi
+            if [[ "$SNAP_PINNED_TITLE_SHA" != "$SNAP_REF_TITLE_SHA" || "$SNAP_PINNED_BODY_SHA" != "$SNAP_REF_BODY_SHA" || "$SNAP_PINNED_SPEC_SHA" != "$SNAP_REF_SPEC_SHA" ]]; then
+              echo "PR #$PR_NUMBER snapshot reference does not match the durable task snapshot comment for $SNAP_REF_REPO#$SNAP_REF_ISSUE; holding repair without a verifiable contract."
+              exit 0
+            fi
+            if ! SNAP_LIVE_JSON="$(gh api "repos/$SNAP_REF_REPO/issues/$SNAP_REF_ISSUE" --jq '{title: (.title // ""), body: (.body // "")}' 2>/dev/null)"; then
+              echo "Could not verify the task snapshot for $SNAP_REF_REPO#$SNAP_REF_ISSUE; holding repair instead of dispatching blind."
+              exit 0
+            fi
+            SNAP_DIGESTS="$(SNAP_LIVE_JSON="$SNAP_LIVE_JSON" python3 -c 'import hashlib,json,os,unicodedata; norm=lambda v: unicodedata.normalize("NFC", v.replace("\r\n","\n").replace("\r","\n")); data=json.loads(os.environ.get("SNAP_LIVE_JSON") or "{}"); title=norm(data.get("title") or ""); body=norm(data.get("body") or ""); title_sha=hashlib.sha256(title.encode("utf-8")).hexdigest(); body_sha=hashlib.sha256(body.encode("utf-8")).hexdigest(); spec_sha=hashlib.sha256((title_sha+":"+body_sha).encode("ascii")).hexdigest(); print(title_sha); print(body_sha); print(spec_sha)')"
+            SNAP_LIVE_TITLE_SHA="$(sed -n '1p' <<<"$SNAP_DIGESTS")"
+            SNAP_LIVE_BODY_SHA="$(sed -n '2p' <<<"$SNAP_DIGESTS")"
+            SNAP_LIVE_SPEC_SHA="$(sed -n '3p' <<<"$SNAP_DIGESTS")"
+            if [[ "$SNAP_LIVE_TITLE_SHA" != "$SNAP_REF_TITLE_SHA" || "$SNAP_LIVE_BODY_SHA" != "$SNAP_REF_BODY_SHA" || "$SNAP_LIVE_SPEC_SHA" != "$SNAP_REF_SPEC_SHA" ]]; then
+              SNAP_DRIFT_MARKER="<!-- continuum-task-snapshot-drift spec=$SNAP_REF_SPEC_SHA -->"
+              if ! gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments?per_page=30&page=1" --jq '.[].body' 2>/dev/null | grep -Fq "$SNAP_DRIFT_MARKER"; then
+                gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                  --body "$(printf '%s\n%s\n%s\n%s' "$SNAP_DRIFT_MARKER" '⚡ **Continuum · opencode-repair**' '<!-- continuum-origin role=continuum component=opencode-repair -->' "Task contract drift detected for $SNAP_REF_REPO#$SNAP_REF_ISSUE: the live issue no longer matches this PR's pinned snapshot. Repair is held for this generation; open a new follow-up issue with an explicit dependency instead of editing the working issue.")" >/dev/null 2>&1 || true
+              fi
+              echo "Task contract drift detected for $SNAP_REF_REPO#$SNAP_REF_ISSUE (PR #$PR_NUMBER); repair held."
+              exit 0
+            fi
+            echo "Task snapshot verified for $SNAP_REF_REPO#$SNAP_REF_ISSUE before repair dispatch for PR #$PR_NUMBER."
+          else
+            echo "PR #$PR_NUMBER carries no task snapshot reference (legacy, pre-guard PR); repair proceeds explicitly without drift protection."
+          fi
+
           gh label create "$CI_REPAIR_LABEL" --repo "$GITHUB_REPOSITORY" --color FBCA04 \
             --description "One automatic OpenCode CI repair attempt per failing PR head." \
             --force >/dev/null
@@ -379,6 +447,70 @@ jobs:
           if [[ "$head_sha" != "$RUN_HEAD_SHA" ]]; then
             echo "$RUN_NAME run $RUN_ID is stale; PR #$pr has already advanced to $head_sha."
             exit 0
+          fi
+
+          # kodmial/continuum#295: frozen task-spec guard before repair
+          # dispatch. Same contract as the reporter path above: the durable
+          # snapshot comment is authoritative, the PR reference must match
+          # it, and the live issue is re-read. Drift (or an unverifiable
+          # contract) holds the dispatch with a deduplicated diagnostic,
+          # and legacy PRs proceed explicitly unprotected.
+          SNAPSHOT_PR_BODY="$(jq -r '.body // ""' <<<"$PR_JSON")"
+          SNAPSHOT_REF="$(grep -oE '<!--[[:space:]]*continuum-task-snapshot-ref[^>]*-->' <<<"$SNAPSHOT_PR_BODY" | head -n 1 || true)"
+          if [[ -n "$SNAPSHOT_REF" ]]; then
+            SNAP_REF_REPO="$(sed -nE 's/.*repo=([A-Za-z0-9_.\-]+\/[A-Za-z0-9_.\-]+).*/\1/p' <<<"$SNAPSHOT_REF" | head -n 1)"
+            SNAP_REF_ISSUE="$(sed -nE 's/.*issue=([0-9]+).*/\1/p' <<<"$SNAPSHOT_REF" | head -n 1)"
+            SNAP_REF_TITLE_SHA="$(sed -nE 's/.*title-sha256=([0-9a-fA-F]{64}).*/\1/p' <<<"$SNAPSHOT_REF" | head -n 1 | tr 'A-F' 'a-f')"
+            SNAP_REF_BODY_SHA="$(sed -nE 's/.*body-sha256=([0-9a-fA-F]{64}).*/\1/p' <<<"$SNAPSHOT_REF" | head -n 1 | tr 'A-F' 'a-f')"
+            SNAP_REF_SPEC_SHA="$(sed -nE 's/.*spec-sha256=([0-9a-fA-F]{64}).*/\1/p' <<<"$SNAPSHOT_REF" | head -n 1 | tr 'A-F' 'a-f')"
+            SNAP_REF_GENERATION="$(sed -nE 's/.*generation=([0-9]+).*/\1/p' <<<"$SNAPSHOT_REF" | head -n 1)"
+            if [[ -z "$SNAP_REF_REPO" || -z "$SNAP_REF_ISSUE" || -z "$SNAP_REF_TITLE_SHA" || -z "$SNAP_REF_BODY_SHA" || -z "$SNAP_REF_SPEC_SHA" || -z "$SNAP_REF_GENERATION" ]]; then
+              echo "PR #$pr snapshot reference is malformed; holding repair without a verifiable contract."
+              exit 0
+            fi
+            if [[ "$SNAP_REF_GENERATION" != "1" ]]; then
+              echo "PR #$pr snapshot reference is for generation $SNAP_REF_GENERATION, expected generation 1 (stale contract); holding repair."
+              exit 0
+            fi
+            # The PR body is mutable, so the reference alone never defines
+            # the contract: require it to match the durable snapshot comment
+            # before comparing live text.
+            if ! SNAP_COMMENTS_JSON="$(gh api "repos/$SNAP_REF_REPO/issues/$SNAP_REF_ISSUE/comments?per_page=100&page=1" 2>/dev/null)"; then
+              echo "Could not list task snapshot comments for $SNAP_REF_REPO#$SNAP_REF_ISSUE; holding repair instead of dispatching blind."
+              exit 0
+            fi
+            SNAP_PINNED="$(SNAP_COMMENTS_JSON="$SNAP_COMMENTS_JSON" SNAP_REF_REPO="$SNAP_REF_REPO" SNAP_REF_ISSUE="$SNAP_REF_ISSUE" SNAP_REF_GENERATION="$SNAP_REF_GENERATION" python3 -c 'import json,os,re; data=json.loads(os.environ.get("SNAP_COMMENTS_JSON") or "[]"); repo=(os.environ.get("SNAP_REF_REPO") or "").lower(); issue=os.environ.get("SNAP_REF_ISSUE") or ""; gen=os.environ.get("SNAP_REF_GENERATION") or ""; pat=re.compile(r"<!--\s*continuum-task-snapshot\s+repo=([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+)\s+issue=(\d+)\s+generation=(\d+)\s+title-sha256=([0-9a-fA-F]{64})\s+body-sha256=([0-9a-fA-F]{64})\s+spec-sha256=([0-9a-fA-F]{64})\s*-->"); trusted={"OWNER","MEMBER","COLLABORATOR"}; out=[(m.group(4).lower(),m.group(5).lower(),m.group(6).lower()) for c in data if isinstance(c,dict) for u in [c.get("user") if isinstance(c.get("user"),dict) else {}] for m in [pat.search(str(c.get("body") or ""))] if m and m.group(1).lower()==repo and m.group(2)==issue and m.group(3)==gen and (str(c.get("author_association") or "").upper() in trusted or str(u.get("login") or "").lower()=="github-actions[bot]")]; print("\n".join(out[0]) if out else "",end="")')"
+            SNAP_PINNED_TITLE_SHA="$(sed -n '1p' <<<"$SNAP_PINNED")"
+            SNAP_PINNED_BODY_SHA="$(sed -n '2p' <<<"$SNAP_PINNED")"
+            SNAP_PINNED_SPEC_SHA="$(sed -n '3p' <<<"$SNAP_PINNED")"
+            if [[ -z "$SNAP_PINNED_TITLE_SHA" || -z "$SNAP_PINNED_BODY_SHA" || -z "$SNAP_PINNED_SPEC_SHA" ]]; then
+              echo "No trusted task snapshot comment found for $SNAP_REF_REPO#$SNAP_REF_ISSUE generation $SNAP_REF_GENERATION; holding repair without a verifiable contract."
+              exit 0
+            fi
+            if [[ "$SNAP_PINNED_TITLE_SHA" != "$SNAP_REF_TITLE_SHA" || "$SNAP_PINNED_BODY_SHA" != "$SNAP_REF_BODY_SHA" || "$SNAP_PINNED_SPEC_SHA" != "$SNAP_REF_SPEC_SHA" ]]; then
+              echo "PR #$pr snapshot reference does not match the durable task snapshot comment for $SNAP_REF_REPO#$SNAP_REF_ISSUE; holding repair without a verifiable contract."
+              exit 0
+            fi
+            if ! SNAP_LIVE_JSON="$(gh api "repos/$SNAP_REF_REPO/issues/$SNAP_REF_ISSUE" --jq '{title: (.title // ""), body: (.body // "")}' 2>/dev/null)"; then
+              echo "Could not verify the task snapshot for $SNAP_REF_REPO#$SNAP_REF_ISSUE; holding repair instead of dispatching blind."
+              exit 0
+            fi
+            SNAP_DIGESTS="$(SNAP_LIVE_JSON="$SNAP_LIVE_JSON" python3 -c 'import hashlib,json,os,unicodedata; norm=lambda v: unicodedata.normalize("NFC", v.replace("\r\n","\n").replace("\r","\n")); data=json.loads(os.environ.get("SNAP_LIVE_JSON") or "{}"); title=norm(data.get("title") or ""); body=norm(data.get("body") or ""); title_sha=hashlib.sha256(title.encode("utf-8")).hexdigest(); body_sha=hashlib.sha256(body.encode("utf-8")).hexdigest(); spec_sha=hashlib.sha256((title_sha+":"+body_sha).encode("ascii")).hexdigest(); print(title_sha); print(body_sha); print(spec_sha)')"
+            SNAP_LIVE_TITLE_SHA="$(sed -n '1p' <<<"$SNAP_DIGESTS")"
+            SNAP_LIVE_BODY_SHA="$(sed -n '2p' <<<"$SNAP_DIGESTS")"
+            SNAP_LIVE_SPEC_SHA="$(sed -n '3p' <<<"$SNAP_DIGESTS")"
+            if [[ "$SNAP_LIVE_TITLE_SHA" != "$SNAP_REF_TITLE_SHA" || "$SNAP_LIVE_BODY_SHA" != "$SNAP_REF_BODY_SHA" || "$SNAP_LIVE_SPEC_SHA" != "$SNAP_REF_SPEC_SHA" ]]; then
+              SNAP_DRIFT_MARKER="<!-- continuum-task-snapshot-drift spec=$SNAP_REF_SPEC_SHA -->"
+              if ! gh api "repos/$GITHUB_REPOSITORY/issues/$pr/comments?per_page=30&page=1" --jq '.[].body' 2>/dev/null | grep -Fq "$SNAP_DRIFT_MARKER"; then
+                gh pr comment "$pr" --repo "$GITHUB_REPOSITORY" \
+                  --body "$(printf '%s\n%s\n%s\n%s' "$SNAP_DRIFT_MARKER" '⚡ **Continuum · opencode-repair**' '<!-- continuum-origin role=continuum component=opencode-repair -->' "Task contract drift detected for $SNAP_REF_REPO#$SNAP_REF_ISSUE: the live issue no longer matches this PR's pinned snapshot. Repair is held for this generation; open a new follow-up issue with an explicit dependency instead of editing the working issue.")" >/dev/null 2>&1 || true
+              fi
+              echo "Task contract drift detected for $SNAP_REF_REPO#$SNAP_REF_ISSUE (PR #$pr); repair held."
+              exit 0
+            fi
+            echo "Task snapshot verified for $SNAP_REF_REPO#$SNAP_REF_ISSUE before repair dispatch for PR #$pr."
+          else
+            echo "PR #$pr carries no task snapshot reference (legacy, pre-guard PR); repair proceeds explicitly without drift protection."
           fi
 
           gh label create "$lock_label" --repo "$GITHUB_REPOSITORY" --color FBCA04 \

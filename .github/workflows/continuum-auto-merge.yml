@@ -3230,6 +3230,253 @@ jobs:
                 continue;
               }
 
+              // kodmial/continuum#295: frozen task-spec revalidation right
+              // before merge closes every time-of-check/time-of-use gap.
+              // The durable record is the bot-owned snapshot comment on
+              // the issue: the PR's snapshot reference must match it
+              // exactly, and the live issue is re-read here so a
+              // last-second edit cannot slip through the earlier gates.
+              // Drift (or an unverifiable read) holds the merge with an
+              // actionable diagnostic instead of merging a stale contract.
+              // PRs without a reference are legacy and merge under the
+              // existing gates. Canonical digests mirror
+              // src/continuum/task_snapshot.py (UTF-8, NFC, LF, SHA-256).
+              {
+                const snapshotRefBlock = String(pr.body || '').match(
+                  /<!--\s*continuum-task-snapshot-ref\b[^>]*-->/i
+                );
+                const attr = (name) => {
+                  if (!snapshotRefBlock) return null;
+                  const m = snapshotRefBlock[0].match(new RegExp(`${name}=([^\\s>]+)`, 'i'));
+                  return m ? m[1] : null;
+                };
+                const snapshotRefMatch = (() => {
+                  if (!snapshotRefBlock) return null;
+                  const repoAttr = attr('repo');
+                  const issueAttr = attr('issue');
+                  const generationAttr = attr('generation');
+                  const titleAttr = attr('title-sha256');
+                  const bodyAttr = attr('body-sha256');
+                  const specAttr = attr('spec-sha256');
+                  if (!repoAttr || !issueAttr || !generationAttr || !titleAttr || !bodyAttr || !specAttr) return null;
+                  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repoAttr)) return null;
+                  if (!/^\d+$/.test(generationAttr)) return null;
+                  if (!/^[0-9a-fA-F]{64}$/.test(titleAttr) || !/^[0-9a-fA-F]{64}$/.test(bodyAttr) || !/^[0-9a-fA-F]{64}$/.test(specAttr)) return null;
+                  return [snapshotRefBlock[0], repoAttr, issueAttr, generationAttr, titleAttr, bodyAttr, specAttr];
+                })();
+                if (snapshotRefMatch) {
+                  const { createHash } = require('crypto');
+                  const taskRepoFull = snapshotRefMatch[1];
+                  const taskOwner = taskRepoFull.split('/')[0];
+                  const taskRepoName = taskRepoFull.split('/')[1];
+                  const taskIssue = Number(snapshotRefMatch[2]);
+                  const refGeneration = snapshotRefMatch[3];
+                  const pinnedTitleSha = snapshotRefMatch[4].toLowerCase();
+                  const pinnedBodySha = snapshotRefMatch[5].toLowerCase();
+                  const pinnedSpecSha = snapshotRefMatch[6].toLowerCase();
+                  if (refGeneration !== '1') {
+                    core.warning(
+                      `PR #${pr.number}: task snapshot reference is for generation ${refGeneration}, expected generation 1 (stale contract); merge held.`
+                    );
+                    continue;
+                  }
+                  const normText = (value) =>
+                    String(value ?? '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').normalize('NFC');
+                  const shaHex = (text) => createHash('sha256').update(text, 'utf8').digest('hex');
+                  // The PR body is mutable, so the reference alone never
+                  // defines the contract: fetch the durable snapshot
+                  // comment and require the reference to match it. A
+                  // PR-body edit that retargets the ref shas to an edited
+                  // issue otherwise bypasses the drift hold.
+                  const snapshotMarkerRe =
+                    /<!--\s*continuum-task-snapshot\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+title-sha256=([0-9a-fA-F]{64})\s+body-sha256=([0-9a-fA-F]{64})\s+spec-sha256=([0-9a-fA-F]{64})\s*-->/;
+                  const isTrustedSnapshotComment = (comment) => {
+                    const association = String(comment.author_association || '').toUpperCase();
+                    if (['OWNER', 'MEMBER', 'COLLABORATOR'].includes(association)) return true;
+                    const login = String((comment.user && comment.user.login) || '').toLowerCase();
+                    return login === 'github-actions[bot]';
+                  };
+                  let snapshotComments = [];
+                  try {
+                    if (taskRepoFull.toLowerCase() === repoFullName.toLowerCase()) {
+                      snapshotComments = await withReadFallback((client) =>
+                        client.paginate(client.rest.issues.listComments, {
+                          owner: taskOwner,
+                          repo: taskRepoName,
+                          issue_number: taskIssue,
+                          per_page: 100,
+                        })
+                      );
+                    } else {
+                      // Cross-repository snapshot comments are read with the
+                      // PAT-backed client (mirroring the live-issue fetch
+                      // below); the repository token is never installed on
+                      // the task repository. Bounded to three pages without
+                      // the paginate helper, which stays reserved for
+                      // repository-token scans.
+                      snapshotComments = [];
+                      for (let snapshotPage = 1; snapshotPage <= 3; snapshotPage++) {
+                        const { data: snapshotPageComments } = await github.rest.issues.listComments({
+                          owner: taskOwner,
+                          repo: taskRepoName,
+                          issue_number: taskIssue,
+                          per_page: 100,
+                          page: snapshotPage,
+                        });
+                        snapshotComments = snapshotComments.concat(snapshotPageComments || []);
+                        if ((snapshotPageComments || []).length < 100) break;
+                      }
+                    }
+                  } catch (err) {
+                    core.warning(
+                      `PR #${pr.number}: task snapshot verification failed (${err.message || err}); holding merge instead of merging blind.`
+                    );
+                    continue;
+                  }
+                  let durableSnapshot = null;
+                  for (const comment of snapshotComments || []) {
+                    const text = String((comment && comment.body) || '');
+                    const match = text.match(snapshotMarkerRe);
+                    if (!match) continue;
+                    if (match[1].toLowerCase() !== taskRepoFull.toLowerCase()) continue;
+                    if (Number(match[2]) !== taskIssue) continue;
+                    if (String(match[3]) !== String(refGeneration)) continue;
+                    if (!isTrustedSnapshotComment(comment || {})) continue;
+                    durableSnapshot = {
+                      titleSha: match[4].toLowerCase(),
+                      bodySha: match[5].toLowerCase(),
+                      specSha: match[6].toLowerCase(),
+                    };
+                    break;
+                  }
+                  if (!durableSnapshot) {
+                    core.warning(
+                      `PR #${pr.number}: no trusted task snapshot comment found for ${taskRepoFull}#${taskIssue} generation ${refGeneration}; merge held.`
+                    );
+                    continue;
+                  }
+                  if (
+                    durableSnapshot.titleSha !== pinnedTitleSha ||
+                    durableSnapshot.bodySha !== pinnedBodySha ||
+                    durableSnapshot.specSha !== pinnedSpecSha
+                  ) {
+                    core.warning(
+                      `PR #${pr.number}: task snapshot reference does not match the durable snapshot comment for ${taskRepoFull}#${taskIssue}; merge held.`
+                    );
+                    continue;
+                  }
+                  let liveIssue = null;
+                  try {
+                    if (taskRepoFull.toLowerCase() === repoFullName.toLowerCase()) {
+                      liveIssue = await withReadFallback((client) =>
+                        client.rest.issues.get({
+                          owner: taskOwner,
+                          repo: taskRepoName,
+                          issue_number: taskIssue,
+                        })
+                      );
+                    } else {
+                      liveIssue = await github.rest.issues.get({
+                        owner: taskOwner,
+                        repo: taskRepoName,
+                        issue_number: taskIssue,
+                      });
+                    }
+                  } catch (err) {
+                    core.warning(
+                      `PR #${pr.number}: task snapshot verification failed (${err.message || err}); holding merge instead of merging blind.`
+                    );
+                    continue;
+                  }
+                  const liveTitleSha = shaHex(normText(liveIssue.data.title || ''));
+                  const liveBodySha = shaHex(normText(liveIssue.data.body || ''));
+                  const liveSpecSha = shaHex(`${liveTitleSha}:${liveBodySha}`);
+                  if (liveTitleSha !== pinnedTitleSha || liveBodySha !== pinnedBodySha || liveSpecSha !== pinnedSpecSha) {
+                    const driftMarker =
+                      `<!-- continuum-task-snapshot-drift spec=${pinnedSpecSha} -->`;
+                    let alreadyNoted = false;
+                    try {
+                      const noted = await withReadFallback((client) =>
+                        client.rest.issues.listComments({
+                          owner, repo, issue_number: pr.number, per_page: 30, page: 1,
+                        })
+                      );
+                      alreadyNoted = (noted.data || []).some((comment) =>
+                        String(comment.body || '').includes(driftMarker)
+                      );
+                    } catch (err) {
+                      core.warning(`PR #${pr.number}: drift-note dedupe read failed; posting once.`);
+                    }
+                    if (!alreadyNoted) {
+                      try {
+                        await github.rest.issues.createComment({
+                          owner,
+                          repo,
+                          issue_number: pr.number,
+                          body: [
+                            driftMarker,
+                            '⚡ **Continuum · auto-merge**',
+                            '<!-- continuum-origin role=continuum component=auto-merge -->',
+                            `Task contract drift detected for ${taskRepoFull}#${taskIssue}: the live issue no longer matches this PR's pinned snapshot (spec ${pinnedSpecSha}).`,
+                            '',
+                            'Merge is held for this generation. Open a new follow-up issue with an explicit dependency instead of editing the working issue.',
+                          ].join('\n'),
+                        });
+                      } catch (err) {
+                        core.warning(`PR #${pr.number}: could not post drift diagnostic: ${err.message || err}`);
+                      }
+                    }
+                    core.warning(
+                      `PR #${pr.number}: task contract drift for ${taskRepoFull}#${taskIssue}; merge held.`
+                    );
+                    continue;
+                  }
+                } else if (snapshotRefBlock) {
+                  // The marker is present but malformed (truncated,
+                  // hand-edited, or tampered): the contract is unverifiable,
+                  // so hold the merge with a diagnostic. Only a truly absent
+                  // marker is legacy.
+                  const unverifiableMarker =
+                    '<!-- continuum-task-snapshot-unverifiable -->';
+                  let alreadyNoted = false;
+                  try {
+                    const noted = await withReadFallback((client) =>
+                      client.rest.issues.listComments({
+                        owner, repo, issue_number: pr.number, per_page: 30, page: 1,
+                      })
+                    );
+                    alreadyNoted = (noted.data || []).some((comment) =>
+                      String(comment.body || '').includes(unverifiableMarker)
+                    );
+                  } catch (err) {
+                    core.warning(`PR #${pr.number}: unverifiable-note dedupe read failed; posting once.`);
+                  }
+                  if (!alreadyNoted) {
+                    try {
+                      await github.rest.issues.createComment({
+                        owner,
+                        repo,
+                        issue_number: pr.number,
+                        body: [
+                          unverifiableMarker,
+                          '⚡ **Continuum · auto-merge**',
+                          '<!-- continuum-origin role=continuum component=auto-merge -->',
+                          `Task snapshot reference on PR #${pr.number} is present but malformed, so the task contract cannot be verified.`,
+                          '',
+                          'Merge is held until a verifiable snapshot reference is present. Open a new follow-up issue with an explicit dependency instead of editing the working issue.',
+                        ].join('\n'),
+                      });
+                    } catch (err) {
+                      core.warning(`PR #${pr.number}: could not post unverifiable diagnostic: ${err.message || err}`);
+                    }
+                  }
+                  core.warning(
+                    `PR #${pr.number}: task snapshot reference is malformed and unverifiable; merge held.`
+                  );
+                  continue;
+                }
+              }
+
               // release-please parses the squash commit on main, not the PR
               // title separately. Keep PR titles human-friendly and normalize
               // the generated squash commit here so contributors never need to
