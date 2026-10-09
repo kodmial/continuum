@@ -1727,6 +1727,7 @@ jobs:
           PR_NUMBER: ${{ steps.stack.outputs.pr_number }}
           REVIEWED_SHA: ${{ steps.before.outputs.sha }}
           POLICY_SCRIPT: ${{ steps.runtime.outputs.policy_script }}
+          TARGETED_VERIFICATION_FILE: ${{ steps.targeted_verify.outputs.scope_file }}
         run: |
           set -euo pipefail
           if [[ "${CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED:-false}" == "true" && -z "${TAP_PAT:-}" ]]; then
@@ -1747,6 +1748,13 @@ jobs:
           [[ "$IMPROVE_REPAIR_THRESHOLD" =~ ^[0-9]+$ ]] || { echo "::error::Invalid centralized PR-Agent improve threshold."; exit 1; }
           mkdir -p pr-agent-outputs
           : > pr-agent-outputs/continuum.jsonl
+          if [[ -n "${TARGETED_VERIFICATION_FILE:-}" ]]; then
+            [[ -s "$TARGETED_VERIFICATION_FILE" ]] || {
+              echo "::error::Targeted improve scope is unavailable."; exit 1;
+            }
+            export PR_CODE_SUGGESTIONS__EXTRA_INSTRUCTIONS="$(cat "$TARGETED_VERIFICATION_FILE")"
+            echo "Restricting optional improve suggestions to the original repair findings."
+          fi
           # The authoritative review carried actionable findings, so run one
           # bounded upstream improve pass for additional repair suggestions.
           # The improve payload is consumed only from the runner-local file
