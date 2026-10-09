@@ -974,12 +974,13 @@ jobs:
               jq -r --arg pause "$PAUSE_LABEL" '
                 .[] | select(.pull_request == null)
                 | select(any(.labels[]?.name; . == $pause))
+                | select((.body // "" | contains("<!-- review-hold: owner-approval-required -->")) | not)
                 | .number
               ' <<<"$issues_json"
             )
             issues_json="$(
               jq --arg pause "$PAUSE_LABEL" '
-                map(if .pull_request == null
+                map(if .pull_request == null and ((.body // "" | contains("<!-- review-hold: owner-approval-required -->")) | not)
                     then .labels = [(.labels[]? | select(.name != $pause))]
                     else . end)
               ' <<<"$issues_json"
@@ -1085,6 +1086,7 @@ jobs:
               jq -r --arg ready "$READY_LABEL" '
                 map(
                   select(.pull_request == null)
+                  | select((.body // "" | contains("<!-- review-hold: owner-approval-required -->")) | not)
                   | select($ready == "" or ([.labels[]?.name] | index($ready) != null))
                   | . + {
                       _label_priority:
