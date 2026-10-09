@@ -934,8 +934,14 @@ jobs:
               core.setOutput('mode', 'full');
               return;
             }
-            // Find the original repair handoff at the exact parent SHA. Never
-            // accept a user-supplied marker; only workflow-bot provenance.
+            // Authenticate the handoff publisher: local actions use the
+            // GitHub bot, while delegated parent -> child handoffs use TAP_PAT.
+            // Never accept an arbitrary comment with a spoofed HTML marker.
+            const isDelegated = process.env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED === 'true';
+            const trustedActor = isDelegated
+              ? (await github.rest.users.getAuthenticated()).data.login
+              : 'github-actions[bot]';
+            // Find the original repair handoff at the exact parent SHA.
             const marker = /<!-- continuum-pr-agent-repair-batch:v1 head=([0-9a-f]{40}) fingerprint=([0-9a-f]{64}) payload=([A-Za-z0-9_-]+) -->/;
             const total = Number(pr.comments || 0);
             const lastPage = Math.max(1, Math.ceil(total / 100));
@@ -946,7 +952,7 @@ jobs:
                 owner, repo, issue_number: prNumber, per_page: 100, page,
               });
               for (const comment of comments) {
-                if (comment.user?.login !== 'github-actions[bot]' ||
+                if (comment.user?.login !== trustedActor ||
                     !String(comment.body || '').includes(
                       '<!-- continuum-origin role=continuum component=pr-agent-repair-handoff -->'
                     )) continue;
