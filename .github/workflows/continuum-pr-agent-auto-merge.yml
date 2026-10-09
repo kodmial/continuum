@@ -653,6 +653,18 @@ jobs:
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
+            // Canonical shared lifecycle (#304): provider-neutral decisions
+            // below mirror src/continuum/merge_lifecycle.py and
+            // .github/scripts/merge_lifecycle.js (PR/HEAD reconciliation,
+            // CI/gates, no-auto-merge, main-sync, conflict plumbing,
+            // packaging/required gates, exact-HEAD validation, atomic merge,
+            // merge titles, post-merge wakeups, idempotency). PR-Agent-only
+            // semantics (review JSON, merge recommendation, improve,
+            // persistent state, no-progress/retry) stay provider-owned in
+            // src/continuum/pr_agent_lifecycle.py and
+            // .github/scripts/pr_agent_policy.js. See
+            // docs/provider-lifecycle-ownership.md and
+            // docs/provider-lifecycle-duplication-matrix.md.
             // Work Lock #33 mirrors the mature provider-neutral mechanics from
             // continuum-auto-merge.yml while keeping CodeRabbit untouched.
             // Target-aware: review, repair, recovery, merge and exact-HEAD

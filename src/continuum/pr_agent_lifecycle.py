@@ -1477,25 +1477,48 @@ def conflict_repair_action(
     the same HEAD); a stranded label with no live run is released so the
     single bounded attempt for the current HEAD can proceed. A changed HEAD
     starts a new episode.
+
+    Canonical delegation (#304): the shared conflict-repair decision lives
+    in :mod:`continuum.conflict_repair` (``decide_conflict_repair`` with
+    the PR-Agent per-HEAD budget of one). This adapter only translates the
+    canonical ``dispatch``/``wait``/``hold`` outcome into the PR-Agent
+    action vocabulary (``release-and-dispatch`` names the reconciling
+    dispatch). No generic lifecycle behavior is duplicated here.
     """
+
+    from .conflict_repair import decide_conflict_repair
 
     if attempts_for_head < 0:
         raise LifecycleError("conflict-repair attempt count cannot be negative")
     if active_repair_runs < 0:
         raise LifecycleError("active repair run count cannot be negative")
-    if active_repair_runs > 0:
+    decision = decide_conflict_repair(
+        mergeable=False,
+        mergeable_state="dirty",
+        has_lock=bool(label_present),
+        active_repair_run=active_repair_runs > 0,
+        dispatches_for_head=int(attempts_for_head),
+        max_dispatches_per_head=CONFLICT_REPAIR_ATTEMPTS_PER_HEAD,
+    )
+    if decision.action == "wait":
+        if active_repair_runs > 0:
+            reason = "conflict repair already active"
+        else:
+            reason = decision.reason
         return {
             "action": "wait",
             "release_lock": False,
-            "reason": "conflict repair already active",
+            "reason": reason,
         }
-    if attempts_for_head >= CONFLICT_REPAIR_ATTEMPTS_PER_HEAD:
+    if decision.action == "hold":
         return {
             "action": "hold",
             "release_lock": True,
             "reason": "a conflict-repair attempt already ran for this HEAD",
         }
-    if label_present:
+    # Canonical ``dispatch`` (with or without lock reconcile) is the
+    # adapter's ``dispatch``/``release-and-dispatch``.
+    if decision.reconcile_lock:
         return {
             "action": "release-and-dispatch",
             "release_lock": True,

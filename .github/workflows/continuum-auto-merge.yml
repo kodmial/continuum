@@ -123,6 +123,17 @@ jobs:
         with:
           github-token: ${{ secrets.TAP_PAT }}
           script: |
+            // Canonical shared lifecycle (#304): provider-neutral decisions
+            // below mirror src/continuum/merge_lifecycle.py and
+            // .github/scripts/merge_lifecycle.js (PR/HEAD reconciliation,
+            // CI/gates, no-auto-merge, main-sync, conflict plumbing,
+            // packaging/required gates, exact-HEAD validation, atomic merge,
+            // merge titles, post-merge wakeups, idempotency). CodeRabbit-only
+            // semantics (approval basis, unresolved/nitpick, quota/rate-limit,
+            // review commands, carried approval) stay provider-owned in
+            // src/continuum/coderabbit_adapter.py. See
+            // docs/provider-lifecycle-ownership.md and
+            // docs/provider-lifecycle-duplication-matrix.md.
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const repoFullName = `${owner}/${repo}`;
