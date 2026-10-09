@@ -895,6 +895,23 @@ def verify_pr_provenance_against_live(
                 "Stop.".format(ref.generation, expected_gen, ref.repo, ref.issue)
             ),
         )
+    bound_spec_hex = sha256_hex(
+        "{}:{}".format(ref.title_sha256.lower(), ref.body_sha256.lower())
+    )
+    if not digests_match(bound_spec_hex, ref.spec_sha256):
+        return GateDecision(
+            action="tampered_fail_closed",
+            reason="PR snapshot reference fails provenance binding",
+            diagnostic=(
+                "PR snapshot reference for {}#{} generation {} carries "
+                "title/body digests that do not bind to its spec digest "
+                "(spec {}); the reference is inconsistent or tampered. "
+                "Stop; never carry an unverifiable provenance identifier "
+                "forward. See {}".format(
+                    ref.repo, ref.issue, ref.generation,
+                    ref.spec_sha256, issue_link(ref.repo, ref.issue))
+            ),
+        )
     live_title_hex = title_digest(live_title)
     live_body_hex = body_digest(live_body)
     if digests_match(live_title_hex, ref.title_sha256) and digests_match(
@@ -949,6 +966,17 @@ def classify_pr(
                 action="tampered_fail_closed", reason="invalid identity",
                 diagnostic=str(exc),
             )
+        if selection.status == "tampered":
+            return GateDecision(
+                action="tampered_fail_closed",
+                reason="snapshot integrity failure",
+                diagnostic=selection.tamper_reason,
+            )
+        if selection.status == "found":
+            return GateDecision(
+                action="protected",
+                reason="issue snapshot protects PR without ref",
+            )
         if selection.status == "absent":
             return GateDecision(
                 action="legacy_unpinned",
@@ -970,6 +998,62 @@ def classify_pr(
                 "drift protected."
             ),
         )
+    bound_spec_hex = sha256_hex(
+        "{}:{}".format(ref.title_sha256.lower(), ref.body_sha256.lower())
+    )
+    if not digests_match(bound_spec_hex, ref.spec_sha256):
+        return GateDecision(
+            action="tampered_fail_closed",
+            reason="PR snapshot reference fails provenance binding",
+            diagnostic=(
+                "PR snapshot reference for {}#{} generation {} carries "
+                "title/body digests that do not bind to its spec digest "
+                "(spec {}); the reference is inconsistent or tampered. "
+                "Stop. See {}".format(
+                    ref.repo, ref.issue, ref.generation,
+                    ref.spec_sha256, issue_link(ref.repo, ref.issue))
+            ),
+        )
+    if repo and issue:
+        try:
+            selection = select_snapshot(
+                comments, repo=repo, issue=issue,
+                generation=generation, owner_login=owner_login,
+            )
+        except TaskSnapshotError as exc:
+            return GateDecision(
+                action="tampered_fail_closed", reason="invalid identity",
+                diagnostic=str(exc),
+            )
+        if selection.status == "tampered":
+            return GateDecision(
+                action="tampered_fail_closed",
+                reason="snapshot integrity failure",
+                diagnostic=selection.tamper_reason,
+            )
+        if selection.status == "found":
+            snapshot = selection.snapshot
+            if (
+                snapshot is not None
+                and not snapshot.tampered
+                and digests_match(snapshot.title_sha256, ref.title_sha256)
+                and digests_match(snapshot.body_sha256, ref.body_sha256)
+                and digests_match(snapshot.spec_sha256, ref.spec_sha256)
+            ):
+                return GateDecision(
+                    action="protected", reason="PR carries snapshot provenance"
+                )
+            return GateDecision(
+                action="tampered_fail_closed",
+                reason="PR provenance disagrees with authoritative snapshot",
+                diagnostic=(
+                    "PR snapshot reference for {}#{} generation {} does not "
+                    "match the authoritative issue snapshot; the provenance "
+                    "identifier cannot be carried forward. See {}".format(
+                        ref.repo, ref.issue, ref.generation,
+                        issue_link(ref.repo, ref.issue))
+                ),
+            )
     return GateDecision(action="protected", reason="PR carries snapshot provenance")
 
 

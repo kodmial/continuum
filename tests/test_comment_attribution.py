@@ -67,7 +67,7 @@ MUTATION_RES = (
 #: path must be classified here (role + component) before it can land:
 #: the count pin fails first with instructions.
 MUTATION_COUNTS = {
-    "continuum-auto-merge.yml": 6,
+    "continuum-auto-merge.yml": 7,
     "continuum-coderabbit-retry.yml": 1,
     "continuum-coderabbit-unresolved.yml": 1,
     "continuum-consumer-child-dispatcher.yml": 1,
@@ -133,6 +133,7 @@ FUNCTIONAL_ANCHORS = {
         "auto-main-sync head=${fresh.head.sha}",
         "Merge is held for this generation",
         "continuum-task-snapshot-drift",
+        "continuum-task-snapshot-unverifiable",
     ),
     "continuum-coderabbit-retry.yml": ("@coderabbitai full review",),
     "continuum-coderabbit-unresolved.yml": (

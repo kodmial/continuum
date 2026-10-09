@@ -3225,9 +3225,16 @@ jobs:
                   const taskOwner = taskRepoFull.split('/')[0];
                   const taskRepoName = taskRepoFull.split('/')[1];
                   const taskIssue = Number(snapshotRefMatch[2]);
+                  const refGeneration = snapshotRefMatch[3];
                   const pinnedTitleSha = snapshotRefMatch[4].toLowerCase();
                   const pinnedBodySha = snapshotRefMatch[5].toLowerCase();
                   const pinnedSpecSha = snapshotRefMatch[6].toLowerCase();
+                  if (refGeneration !== '1') {
+                    core.warning(
+                      `PR #${pr.number}: task snapshot reference is for generation ${refGeneration}, expected generation 1 (stale contract); merge held.`
+                    );
+                    continue;
+                  }
                   const normText = (value) =>
                     String(value ?? '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').normalize('NFC');
                   const shaHex = (text) => createHash('sha256').update(text, 'utf8').digest('hex');
@@ -3296,6 +3303,49 @@ jobs:
                     );
                     continue;
                   }
+                } else if (snapshotRefBlock) {
+                  // The marker is present but malformed (truncated,
+                  // hand-edited, or tampered): the contract is unverifiable,
+                  // so hold the merge with a diagnostic. Only a truly absent
+                  // marker is legacy.
+                  const unverifiableMarker =
+                    '<!-- continuum-task-snapshot-unverifiable -->';
+                  let alreadyNoted = false;
+                  try {
+                    const noted = await withReadFallback((client) =>
+                      client.rest.issues.listComments({
+                        owner, repo, issue_number: pr.number, per_page: 30, page: 1,
+                      })
+                    );
+                    alreadyNoted = (noted.data || []).some((comment) =>
+                      String(comment.body || '').includes(unverifiableMarker)
+                    );
+                  } catch (err) {
+                    core.warning(`PR #${pr.number}: unverifiable-note dedupe read failed; posting once.`);
+                  }
+                  if (!alreadyNoted) {
+                    try {
+                      await github.rest.issues.createComment({
+                        owner,
+                        repo,
+                        issue_number: pr.number,
+                        body: [
+                          unverifiableMarker,
+                          '⚡ **Continuum · auto-merge**',
+                          '<!-- continuum-origin role=continuum component=auto-merge -->',
+                          `Task snapshot reference on PR #${pr.number} is present but malformed, so the task contract cannot be verified.`,
+                          '',
+                          'Merge is held until a verifiable snapshot reference is present. Open a new follow-up issue with an explicit dependency instead of editing the working issue.',
+                        ].join('\n'),
+                      });
+                    } catch (err) {
+                      core.warning(`PR #${pr.number}: could not post unverifiable diagnostic: ${err.message || err}`);
+                    }
+                  }
+                  core.warning(
+                    `PR #${pr.number}: task snapshot reference is malformed and unverifiable; merge held.`
+                  );
+                  continue;
                 }
               }
 
