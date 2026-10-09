@@ -15,6 +15,7 @@ secret, variable, label, permission, or workflow-name changes.
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 import unittest
@@ -541,6 +542,8 @@ class SharedJsMirrorTests(unittest.TestCase):
         self.assertNotIn("controllerState", bundle)
 
     def test_shared_js_bundle_parses_and_runs_vectors(self):
+        if shutil.which("node") is None:
+            self.skipTest("node is not available")
         script = os.path.join(ROOT, SHARED_JS)
         probe = (
             "const m=require(%r);"

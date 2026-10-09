@@ -109,16 +109,23 @@ function decideMainSync(behindBy, files) {
   };
 }
 
-function sanitizeBranch(name, fallback = 'main') {
-  let value = String(name || '').trim() || String(fallback || '').trim() || 'main';
-  if (!BRANCH_SANITIZE_RE.test(value)) return 'main';
-  if (value.includes('..') || value.includes('//') || value.includes('@{')) return 'main';
-  if (value.endsWith('/') || value.endsWith('.') || value.endsWith('.lock')) return 'main';
-  if (value === 'HEAD' || value === '@') return 'main';
-  if (value.startsWith('refs/') || value.startsWith('-') || value.startsWith('.')) return 'main';
+function isBranchInvalid(value) {
+  if (!BRANCH_SANITIZE_RE.test(value)) return true;
+  if (value.includes('..') || value.includes('//') || value.includes('@{')) return true;
+  if (value.endsWith('/') || value.endsWith('.') || value.endsWith('.lock')) return true;
+  if (value === 'HEAD' || value === '@') return true;
+  if (value.startsWith('refs/') || value.startsWith('-') || value.startsWith('.')) return true;
   if (value.split('/').some((part) => part.startsWith('.') || part.endsWith('.lock'))) {
-    return 'main';
+    return true;
   }
+  return false;
+}
+
+function sanitizeBranch(name, fallback = 'main') {
+  const rawFallback = String(fallback || '').trim() || 'main';
+  const safeFallback = isBranchInvalid(rawFallback) ? 'main' : rawFallback;
+  const value = String(name || '').trim() || safeFallback;
+  if (isBranchInvalid(value)) return safeFallback;
   return value;
 }
 
@@ -206,7 +213,8 @@ function evaluateCurrentHeadGates({
     return { ok: false, reason: 'Current-head CI is not acceptable' };
   }
   const ci = runGateState(ciRun);
-  if (ci.status !== 'completed' || (ci.conclusion !== 'success' && !delegatedSkippedCi)) {
+  const acceptable = delegatedSkippedCi ? ['success', 'skipped'] : ['success'];
+  if (ci.status !== 'completed' || !acceptable.includes(ci.conclusion)) {
     return { ok: false, reason: 'Current-head CI is not acceptable' };
   }
   if (String(repository || '') === 'kodmial/continuum') {

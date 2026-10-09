@@ -190,6 +190,8 @@ def review_command_posted_after(
 def unresolved_blocking(unresolved_count: Any) -> bool:
     """Whether CodeRabbit unresolved threads block the merge."""
 
+    if unresolved_count is None or unresolved_count == "":
+        return True
     try:
         return int(unresolved_count or 0) > 0
     except (TypeError, ValueError):

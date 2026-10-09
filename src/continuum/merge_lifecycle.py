@@ -201,6 +201,24 @@ def decide_main_sync(
     }
 
 
+def _is_invalid_branch(value: str) -> bool:
+    """Whether a branch/ref value violates the shared validation rules."""
+
+    if not _BRANCH_SANITIZE_RE.match(value):
+        return True
+    if ".." in value or "//" in value or "@{" in value:
+        return True
+    if value.endswith("/") or value.endswith(".") or value.endswith(".lock"):
+        return True
+    if value in ("HEAD", "@"):
+        return True
+    if value.startswith("refs/") or value.startswith("-") or value.startswith("."):
+        return True
+    if any(part.startswith(".") or part.endswith(".lock") for part in value.split("/")):
+        return True
+    return False
+
+
 def sanitize_branch(name: Any, fallback: str = "main") -> str:
     """Validate a branch/ref value, falling back to ``fallback``.
 
@@ -210,19 +228,11 @@ def sanitize_branch(name: Any, fallback: str = "main") -> str:
     ``HEAD``/``@``, and ``refs/``/``-``/``.`` prefixes fall back.
     """
 
-    value = str(name or "").strip() or str(fallback or "").strip() or "main"
-    if not _BRANCH_SANITIZE_RE.match(value):
-        return "main"
-    if ".." in value or "//" in value or "@{" in value:
-        return "main"
-    if value.endswith("/") or value.endswith(".") or value.endswith(".lock"):
-        return "main"
-    if value in ("HEAD", "@"):
-        return "main"
-    if value.startswith("refs/") or value.startswith("-") or value.startswith("."):
-        return "main"
-    if any(part.startswith(".") or part.endswith(".lock") for part in value.split("/")):
-        return "main"
+    raw_fallback = str(fallback or "").strip() or "main"
+    safe_fallback = "main" if _is_invalid_branch(raw_fallback) else raw_fallback
+    value = str(name or "").strip() or safe_fallback
+    if _is_invalid_branch(value):
+        return safe_fallback
     return value
 
 
@@ -360,9 +370,8 @@ def evaluate_current_head_gates(
     if ci_run is None:
         return False, "Current-head CI is not acceptable"
     status, conclusion = _run_gate_state(ci_run)
-    if status != "completed" or (
-        conclusion != "success" and not delegated_skipped_ci
-    ):
+    acceptable = ("success", "skipped") if delegated_skipped_ci else ("success",)
+    if status != "completed" or conclusion not in acceptable:
         return False, "Current-head CI is not acceptable"
     if str(repository or "") == "kodmial/continuum":
         for run, gate_name in (
