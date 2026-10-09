@@ -79,6 +79,9 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const repoFullName = `${owner}/${repo}`;
+            // One controller must release its global concurrency lease before
+            // GitHub's 85-minute job timeout, even if quota state keeps moving.
+            const controllerStartedAt = Date.now();
 
             // Request-budget observability (#254): counts only, no secrets.
             const apiBudget = { reads: 0, patReads: 0, mutations: 0, pages: 0, event: 0 };
@@ -257,6 +260,7 @@ jobs:
             // serialized bounded waiter for the normal hourly CodeRabbit
             // quota window. Private repositories never pay this runner cost.
             const MAX_PUBLIC_DEFER_WAIT_MS = 70 * 60_000;
+            const MAX_CONTROLLER_LIFETIME_MS = 55 * 60_000;
 
             function retryWindowText(body = '') {
               const patterns = [
@@ -1199,6 +1203,18 @@ jobs:
               if (nextAt <= now) return true;
 
               const waitMs = nextAt - now;
+              const remainingLifetimeMs =
+                controllerStartedAt + MAX_CONTROLLER_LIFETIME_MS - now;
+              // Never sleep across this run's deadline. A coalesced pending
+              // invocation or the 10-minute cron rechecks the latest state.
+              if (remainingLifetimeMs <= 0 || waitMs + 5_000 >= remainingLifetimeMs) {
+                core.notice(
+                  `CodeRabbit controller releasing global lease before deadline; ` +
+                  `next due ${new Date(nextAt).toISOString()} (${reason}). ` +
+                  `Pending lifecycle wake or cron will resume the queue.`
+                );
+                return false;
+              }
               const publicRepository =
                 context.payload.repository?.private === false;
               if (!publicRepository || waitMs > MAX_PUBLIC_DEFER_WAIT_MS) {
@@ -1223,6 +1239,11 @@ jobs:
             let state = await collectState();
             let selected = null;
             while (!selected) {
+              if (Date.now() - controllerStartedAt >= MAX_CONTROLLER_LIFETIME_MS) {
+                core.notice('CodeRabbit controller lifetime reached; releasing global lease to the next queued or scheduled run.');
+                reportBudget();
+                return;
+              }
               if (state.latestInFlightCommand) {
                 const ageMs = Date.now() - state.latestInFlightCommand.at;
                 if (ageMs < IN_FLIGHT_TIMEOUT_MS) {
