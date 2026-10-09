@@ -70,7 +70,7 @@ jobs:
           HEADERS="$(tr -d '\r' <<<"$INCLUDE" | sed -n '1,/^$/p')"
           # Reuse the probe body for page 1 below instead of refetching it.
           PROBE_BODY="$(tr -d '\r' <<<"$INCLUDE" | sed -n '/^$/,$p' | tail -n +2)"
-          LINK_LAST="$(grep -i '^link:' <<<"$HEADERS" | tr '[:upper:]' '[:lower:]' | sed -nE 's/.*<[^>]*[?&]page=([0-9]+)[^>]*>[[:space:]]*;[[:space:]]*rel="last".*/\1/p' | tail -n 1)"
+          LINK_LAST="$(grep -i '^link:' <<<"$HEADERS" | tr '[:upper:]' '[:lower:]' | sed -nE 's/.*<[^>]*[?&]page=([0-9]+)[^>]*>[[:space:]]*;[[:space:]]*rel="last".*/\1/p' | tail -n 1 || true)"
           if [[ -n "$LINK_LAST" ]]; then
             if [[ "$LINK_LAST" =~ ^[0-9]+$ ]] && [[ "$LINK_LAST" -ge 1 ]]; then
               LAST_PAGE="$LINK_LAST"
