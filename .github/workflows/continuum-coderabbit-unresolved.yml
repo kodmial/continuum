@@ -428,7 +428,7 @@ jobs:
               repo,
               ref: `heads/${pr.data.head.ref}`,
             });
-            const headSha = publishedRef.data.object.sha;
+            const headSha = publishedRef.object.sha;
             if (pr.data.head.sha !== headSha) {
               core.notice(
                 `PR #${pullNumber}: pull metadata still reports stale HEAD ${pr.data.head.sha}; verifying published batch-repair HEAD ${headSha}.`

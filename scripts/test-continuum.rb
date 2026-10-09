@@ -7399,6 +7399,28 @@ class ContinuumTest < Minitest::Test
     assert_includes body, 'await originalReviewIdForFinding(findingId)'
   end
 
+  def test_coderabbit_unresolved_reverification_uses_unwrapped_git_ref_data
+    body = workflow_body('continuum-coderabbit-unresolved.yml')
+
+    # github.rest.git.getRef returns {data: {object: {sha: ...}}}.
+    # The destructuring below has already removed the outer .data layer;
+    # dereferencing .data a second time crashes after a successful repair.
+    assert_includes body, 'const { data: publishedRef } = await github.rest.git.getRef({'
+    assert_includes body, 'const headSha = publishedRef.object.sha;'
+    refute_includes body, 'publishedRef.data.object.sha;',
+                    'batched CodeRabbit verification must not dereference an unwrapped response twice'
+  end
+
+  def test_opencode_unresolved_reply_without_link_header_is_not_a_shell_failure
+    body = workflow_body('continuum-opencode-unresolved.yml')
+
+    # A one-page review-comment response omits the HTTP Link header.
+    # Under set -euo pipefail, grep exits 1 for no match, so the optional
+    # header probe must not abort before its own no-Link fallback.
+    assert_includes body, 'LINK_LAST="$(grep -i'
+    assert_includes body, ' | tail -n 1 || true)"'
+  end
+
   def test_api_budget_coderabbit_unresolved_scans_newest_first_and_bounded
     body = workflow_body('continuum-coderabbit-unresolved.yml')
 
