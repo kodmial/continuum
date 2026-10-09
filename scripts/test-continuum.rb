@@ -7411,6 +7411,16 @@ class ContinuumTest < Minitest::Test
                     'batched CodeRabbit verification must not dereference an unwrapped response twice'
   end
 
+  def test_opencode_unresolved_reply_without_link_header_is_not_a_shell_failure
+    body = workflow_body('continuum-opencode-unresolved.yml')
+
+    # A one-page review-comment response omits the HTTP Link header.
+    # Under set -euo pipefail, grep exits 1 for no match, so the optional
+    # header probe must not abort before its own no-Link fallback.
+    assert_includes body, 'LINK_LAST="$(grep -i'
+    assert_match(/LINK_LAST=.*tail -n 1 \\|\\| true\\)"/, body)
+  end
+
   def test_api_budget_coderabbit_unresolved_scans_newest_first_and_bounded
     body = workflow_body('continuum-coderabbit-unresolved.yml')
 
