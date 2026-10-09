@@ -79,6 +79,23 @@ APPROVED_PAUSE_BASELINE_REMOVED_LINES = (
     "              (process.env.PAUSE_ON_FAILURE || 'false') !== 'false';",
 )
 
+# Exact-scope permission for per-invocation native OpenCode runner routing.
+# Any further drift in the protected workflow still fails the baseline test.
+APPROVED_CONSUMER_RUNNER_REMOVED_LINES = (
+    "    runs-on: ${{ vars.AUTOMATION_OPENCODE_RUNNER || 'ubuntu-latest' }}",
+)
+APPROVED_CONSUMER_RUNNER_ADDED_LINES = (
+    "      runner_os:",
+    "        description: >-",
+    "          Consumer-selected OpenCode execution runner (for example macos-15).",
+    "          Empty preserves AUTOMATION_OPENCODE_RUNNER and the Linux default.",
+    "          Select the host per issue/PR platform, not per repository globally.",
+    "        required: false",
+    "        type: string",
+    "        default: ''",
+    "    runs-on: ${{ inputs.runner_os || vars.AUTOMATION_OPENCODE_RUNNER || 'ubuntu-latest' }}",
+)
+
 PROTECTED_FILES = [
     ".github/workflows/continuum-opencode.yml",
     ".github/workflows/opencode.yml",
@@ -1304,6 +1321,7 @@ class ProtectedBaselineTests(unittest.TestCase):
                                 + APPROVED_CODERABBIT_PUBLISH_RACE_REMOVED_LINES
                                 + APPROVED_429_RUNNER_RECOVERY_REMOVED_LINES
                                 + APPROVED_CODERABBIT_PUBLISHED_HEAD_REMOVED_LINES
+                                + APPROVED_CONSUMER_RUNNER_REMOVED_LINES
                             ),
                             f"{path} must not delete or modify lines beyond the exact "
                             "qualification-isolation/checkpoint allowlist",
@@ -1314,6 +1332,7 @@ class ProtectedBaselineTests(unittest.TestCase):
                             + APPROVED_CODERABBIT_PUBLISH_RACE_ADDED_LINES
                             + APPROVED_429_RUNNER_RECOVERY_ADDED_LINES
                             + APPROVED_CODERABBIT_PUBLISHED_HEAD_ADDED_LINES
+                            + APPROVED_CONSUMER_RUNNER_ADDED_LINES
                         )
                         self.assertEqual(
                             actual,

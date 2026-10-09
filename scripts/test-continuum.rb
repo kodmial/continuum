@@ -2812,7 +2812,8 @@ class ContinuumTest < Minitest::Test
   # AUTOMATION_OPENCODE_RUNNER never tries to install Swift or probe sw_vers.
   def test_opencode_environment_is_consumer_owned
     body = File.read(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
-    assert_includes body, "runs-on: ${{ vars.AUTOMATION_OPENCODE_RUNNER || 'ubuntu-latest' }}"
+    assert_includes body, "runs-on: ${{ inputs.runner_os || vars.AUTOMATION_OPENCODE_RUNNER || 'ubuntu-latest' }}"
+    assert_match(/runner_os:\s*\n\s+description:/, body)
     assert_includes body, 'CONTINUUM_AGENT_PREPARE_COMMAND'
     assert_includes body, 'eval "$PREPARE_COMMAND"'
     refute_includes body, 'swift-actions/setup-swift'

@@ -157,6 +157,14 @@ on:
         required: false
         type: string
         default: ''
+      runner_os:
+        description: >-
+          Consumer-selected OpenCode execution runner (for example macos-15).
+          Empty preserves AUTOMATION_OPENCODE_RUNNER and the Linux default.
+          Select the host per issue/PR platform, not per repository globally.
+        required: false
+        type: string
+        default: ''
       timeout_minutes:
         description: >-
           Maximum OpenCode job runtime in minutes. Empty falls back to
@@ -396,7 +404,7 @@ jobs:
        github.actor == github.repository_owner &&
        (contains(github.event.comment.body, '/oc') ||
         contains(github.event.comment.body, '/opencode')))
-    runs-on: ${{ vars.AUTOMATION_OPENCODE_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runner_os || vars.AUTOMATION_OPENCODE_RUNNER || 'ubuntu-latest' }}
     # Execution environment is a consumer decision. Core defaults to Linux;
     # consumers select another runner and prepare its toolchain explicitly.
     timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || vars.AUTOMATION_OPENCODE_TIMEOUT_MINUTES || '180') }}
