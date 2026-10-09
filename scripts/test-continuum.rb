@@ -4868,6 +4868,25 @@ class ContinuumTest < Minitest::Test
   # running. Never rewrite developer history to replay the repair: fail with a
   # dedicated marker and let the watchdog rerun the same coderabbit-fix inputs
   # against the latest PR HEAD.
+  def test_main_sync_defers_to_active_pr_agent_exact_head_work_lock
+    body = workflow_body('continuum-auto-merge.yml')
+    assert_includes body, 'async function activePrAgentHeadOperation(pr)'
+    assert_includes body, "'continuum/pr-agent-review'"
+    assert_includes body, "'continuum/pr-agent-repair'"
+    assert_includes body, 'client.rest.repos.getCombinedStatusForRef({'
+    assert_includes body, 'client.rest.actions.getWorkflowRun({'
+    assert_includes body, 'ACTIVE_REPAIR_STATUSES.has(String(run.status || \'\').toLowerCase())'
+    assert_includes body, 'const agentOperation = await activePrAgentHeadOperation(pr);'
+    assert_includes body, 'const liveOperation = await activePrAgentHeadOperation(pr);'
+    assert_includes body, 'deferring main sync'
+    assert_operator body.index('const agentOperation = await activePrAgentHeadOperation(pr);'), :<,
+                    body.index('await updateFromMain(pr);'),
+                    'active PR-Agent repair must be checked before main sync'
+    assert_operator body.index('const liveOperation = await activePrAgentHeadOperation(pr);'), :<,
+                    body.index("'PUT /repos/{owner}/{repo}/pulls/{pull_number}/update-branch'"),
+                    'main-sync must revalidate the repair lease before the branch mutation'
+  end
+
   def test_coderabbit_fix_survives_concurrent_pr_head_advance
     body = workflow_body('continuum-opencode.yml')
     step = body[/^\s+- name: Fix CodeRabbit review findings\n(.*?)(?=^\s+- name: Ask CodeRabbit to verify every original finding)/m, 1]
