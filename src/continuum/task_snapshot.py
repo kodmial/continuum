@@ -817,6 +817,8 @@ def verify_pr_provenance_against_live(
     pr_body: Any,
     live_title: Any,
     live_body: Any,
+    comments: Sequence[Mapping[str, Any]] = (),
+    owner_login: str = "",
     expected_repo: Any = "",
     expected_issue: Any = 0,
     expected_generation: Any = DEFAULT_GENERATION,
@@ -828,6 +830,14 @@ def verify_pr_provenance_against_live(
       current generation while fresh admissions pin first.
     * Reference present but live differs -> ``drift_blocked``.
     * Reference present and live matches -> ``proceed``.
+
+    When issue ``comments`` are supplied, the PR reference is additionally
+    bound to the authoritative issue snapshot selected via
+    :func:`select_snapshot` before any live comparison: a coordinated edit
+    of the live issue plus the mutable PR-body reference cannot bypass
+    drift detection, since the durable snapshot comment is the pinned
+    contract. Absent/tampered snapshots or digest disagreement fail closed
+    as ``tampered_fail_closed``.
     """
 
     ref = parse_pr_snapshot_ref(pr_body)
@@ -912,6 +922,55 @@ def verify_pr_provenance_against_live(
                     ref.spec_sha256, issue_link(ref.repo, ref.issue))
             ),
         )
+    if comments:
+        try:
+            selection = select_snapshot(
+                comments, repo=ref.repo, issue=ref.issue,
+                generation=ref.generation, owner_login=owner_login,
+            )
+        except TaskSnapshotError as exc:
+            return GateDecision(
+                action="tampered_fail_closed",
+                reason="invalid snapshot identity",
+                diagnostic=str(exc),
+            )
+        if selection.status == "tampered":
+            return GateDecision(
+                action="tampered_fail_closed",
+                reason="snapshot integrity failure",
+                diagnostic=selection.tamper_reason,
+            )
+        if selection.status != "found" or selection.snapshot is None:
+            return GateDecision(
+                action="tampered_fail_closed",
+                reason="no authoritative issue snapshot to bind PR ref against",
+                diagnostic=(
+                    "PR carries a task snapshot reference for {}#{} "
+                    "generation {} but no authoritative issue snapshot pins "
+                    "that contract; coordinated issue plus PR-reference edits "
+                    "cannot be ruled out. Stop; never trust the mutable "
+                    "PR-body reference alone. See {}".format(
+                        ref.repo, ref.issue, ref.generation,
+                        issue_link(ref.repo, ref.issue))
+                ),
+            )
+        snapshot = selection.snapshot
+        if not (
+            digests_match(snapshot.title_sha256, ref.title_sha256)
+            and digests_match(snapshot.body_sha256, ref.body_sha256)
+            and digests_match(snapshot.spec_sha256, ref.spec_sha256)
+        ):
+            return GateDecision(
+                action="tampered_fail_closed",
+                reason="PR provenance disagrees with authoritative snapshot",
+                diagnostic=(
+                    "PR snapshot reference for {}#{} generation {} does not "
+                    "match the authoritative issue snapshot; the provenance "
+                    "identifier cannot be carried forward. See {}".format(
+                        ref.repo, ref.issue, ref.generation,
+                        issue_link(ref.repo, ref.issue))
+                ),
+            )
     live_title_hex = title_digest(live_title)
     live_body_hex = body_digest(live_body)
     if digests_match(live_title_hex, ref.title_sha256) and digests_match(
