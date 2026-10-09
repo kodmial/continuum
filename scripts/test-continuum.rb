@@ -7890,6 +7890,7 @@ class ContinuumTest < Minitest::Test
     continuum-consumer-child-worker.yml
     continuum-docker-qualification.yml
     continuum-issue-scheduler.yml
+    continuum-opencode-repair.yml
     continuum-opencode-watchdog.yml
     continuum-opencode.yml
     continuum-pr-agent-auto-merge.yml
@@ -8150,7 +8151,122 @@ class ContinuumTest < Minitest::Test
     pr_agent = workflow_body('continuum-pr-agent-auto-merge.yml')
     assert_includes pr_agent, 'Continuum Contract Gate'
     assert_includes pr_agent, 'Continuum Contract Gate is not successful',
-                    'PR-Agent auto-merge must fail closed while the contract gate is absent or red'
+                     'PR-Agent auto-merge must fail closed while the contract gate is absent or red'
+  end
+
+  # kodmial/continuum#295: the issue title/body are frozen at admission.
+  # The canonical digest rules live in the engine; workflow-embedded code
+  # mirrors them and every spec-consuming entry point pins, carries, and
+  # revalidates the snapshot instead of reinterpreting live issue text.
+  def test_task_snapshot_engine_owns_the_canonical_contract
+    engine = File.read(File.join(ROOT, 'src/continuum/task_snapshot.py'))
+    %w[
+      normalize_spec_text title_digest body_digest spec_digest
+      build_snapshot render_snapshot_comment render_pr_snapshot_ref
+      parse_snapshot_comment parse_pr_snapshot_ref select_snapshot
+      verify_live_against_snapshot decide_admission decide_execution_gate
+      verify_pr_provenance_against_live classify_pr
+    ].each do |symbol|
+      assert_includes engine, symbol, "task_snapshot.py must define #{symbol}"
+    end
+    assert_includes engine, 'SNAPSHOT_SCHEMA_VERSION'
+    assert_includes engine, 'continuum-task-snapshot'
+    assert_includes engine, 'continuum-task-snapshot-ref'
+    assert_includes engine, 'legacy_unpinned',
+                     'pre-guard work must be explicitly classified, never falsely protected'
+    assert File.exist?(File.join(ROOT, 'tests/test_task_snapshot.py')),
+                 'the snapshot contract needs deterministic unit tests'
+    assert File.exist?(File.join(ROOT, 'docs/task-snapshot-contract.md')),
+                 'the versioned contract record and migration must be documented'
+    admission = File.read(File.join(ROOT, '.github/scripts/task_snapshot_admission.py'))
+    assert_includes admission, 'decide'
+    assert_includes admission, 'render-comment'
+    assert_includes admission, 'render-pr-ref'
+  end
+
+  def test_opencode_pins_and_verifies_the_task_snapshot_before_implementation
+    body = workflow_body('continuum-opencode.yml')
+    snapshot = step_body(body, 'Pin and verify task specification snapshot')
+    refute_nil snapshot, 'the admission snapshot step is missing'
+    assert_includes snapshot, 'continuum-task-snapshot'
+    assert_includes snapshot, "steps.task_context.outputs.present == 'true'",
+                     'the snapshot step must run on the resolved task context, not on live prose'
+    assert_includes snapshot, 'continuum-task-snapshot.json',
+                     'the exact record must reach the agent job-scoped, not via a later live read'
+    assert_includes snapshot, "core.setFailed",
+                     'drift/tampering must fail the run instead of falling back to live text'
+    assert_includes snapshot, 'follow-up issue',
+                     'the drift diagnostic must point at a new follow-up issue'
+
+    implement = step_body(body, 'Implement issue')
+    refute_nil implement
+    assert_includes implement, 'SNAPSHOT_VERIFIED: ${{ steps.task_snapshot.outputs.snapshot_verified }}'
+    assert_includes implement, 'SNAPSHOT_SPEC: ${{ steps.task_snapshot.outputs.spec_sha256 }}'
+    assert_includes implement, 'refusing to implement live mutable text',
+                     'implementation without a verified snapshot must fail closed'
+    assert_includes implement, 'continuum-task-snapshot.json',
+                     'the agent prompt must come from the pinned file'
+    assert_includes implement, 'verify_snapshot_live "PR publication"',
+                     'publication must revalidate right before creating the PR'
+    assert_includes implement, 'verify_snapshot_live "agent start"',
+                     'the agent must not start against a drifted contract'
+    assert_includes implement, 'continuum-task-snapshot-ref',
+                     'created PRs must carry machine-readable snapshot provenance'
+    assert_includes implement, 'TASK_MARKER="<!-- continuum-task-context repo=${GITHUB_REPOSITORY} issue=${ISSUE_NUMBER} -->"',
+                     'the existing task-context marker must stay intact'
+  end
+
+  def test_opencode_repair_modes_verify_the_snapshot_before_work
+    body = workflow_body('continuum-opencode.yml')
+    {
+      'Fix CodeRabbit review findings' => 'Repair stopped',
+      'Resolve merge conflict with main' => 'Conflict repair stopped',
+      'Fix failed blocking workflow' => 'CI repair stopped'
+    }.each do |step_name, stop_text|
+      step = step_body(body, step_name)
+      refute_nil step, "#{step_name} is missing"
+      assert_includes step, 'continuum-task-snapshot-ref',
+                       "#{step_name}: repair must read the pinned PR provenance"
+      assert_includes step, stop_text,
+                       "#{step_name}: drift must stop the repair, not rebaseline it"
+      assert_includes step, 'legacy, pre-guard PR',
+                       "#{step_name}: legacy PRs must proceed explicitly unprotected"
+    end
+  end
+
+  def test_repair_dispatch_and_merge_hold_on_snapshot_drift
+    repair = workflow_body('continuum-opencode-repair.yml')
+    assert_includes repair, 'continuum-task-snapshot-ref',
+                     'the repair controller must read PR snapshot provenance'
+    assert_includes repair, 'repair held',
+                     'drift must hold the ci-fix dispatch instead of retrying blindly'
+    assert_includes repair, 'legacy, pre-guard PR',
+                     'legacy PRs must stay repairable with an explicit notice'
+
+    merge = workflow_body('continuum-auto-merge.yml')
+    assert_includes merge, 'continuum-task-snapshot-ref',
+                     'auto-merge must revalidate PR snapshot provenance before merging'
+    assert_includes merge, 'holding merge instead of merging blind',
+                     'an unverifiable contract must hold the merge'
+    assert_includes merge, 'merge held',
+                     'drift must hold the merge with a diagnostic, not a retry dispatch'
+    assert_includes merge, 'sha: pr.head.sha',
+                     'the exact-HEAD merge contract must stay intact'
+  end
+
+  def test_delegated_child_paths_pin_with_the_canonical_engine
+    worker = workflow_body('continuum-consumer-child-worker.yml')
+    assert_includes worker, 'task_snapshot_admission.py',
+                     'the child worker must pin through the canonical engine, not a copy'
+    assert_includes worker, 'continuum-child-task-snapshot-drift',
+                     'child drift needs its own deduplicated diagnostic'
+    assert_includes worker, 'render-pr-ref',
+                     'child PRs must carry the snapshot reference'
+    review = workflow_body('continuum-consumer-child-review.yml')
+    assert_includes review, 'task_snapshot_admission.py',
+                     'child review must verify through the canonical engine'
+    assert_includes review, 'no verdict recorded',
+                     'a drifted review must hold without a spurious verdict'
   end
 
   end

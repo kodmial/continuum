@@ -691,6 +691,311 @@ jobs:
             core.setOutput('task_url', String(issue.html_url || ''));
             core.notice(`Resolved authoritative task ${taskRepository}#${taskNumber} via ${source}.`);
 
+      # kodmial/continuum#295: freeze the issue requirements at admission.
+      # The issue title/body are immutable for one implementation
+      # generation once admission starts. This step pins the exact
+      # title/body into a bot-owned hidden-marker snapshot comment on the
+      # issue (first writer wins, never overwritten) before any agent may
+      # implement, writes the exact record to RUNNER_TEMP for this job so
+      # the agent consumes the snapshot instead of a later live body, and
+      # fails closed on drift or tampering. Canonical digest rules live in
+      # src/continuum/task_snapshot.py (UTF-8, NFC, LF, SHA-256); the JS
+      # below mirrors them byte-for-byte for the workflow runtime.
+      - name: Pin and verify task specification snapshot
+        id: task_snapshot
+        if: >-
+          steps.task_context.outputs.present == 'true' &&
+          ((github.event_name == 'workflow_dispatch' && inputs.mode == 'issue') ||
+           (github.event_name == 'issue_comment' &&
+            !github.event.issue.pull_request &&
+            github.actor == github.repository_owner &&
+            (contains(github.event.comment.body, '/oc') ||
+             contains(github.event.comment.body, '/opencode')) &&
+            !contains(github.event.comment.body, '/oc-cancel') &&
+            !contains(github.event.comment.body, 'continuum-qualification-dispatch')))
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          TASK_REPO: ${{ steps.task_context.outputs.task_repo }}
+          TASK_NUMBER: ${{ steps.task_context.outputs.task_number }}
+          TASK_TITLE: ${{ steps.task_context.outputs.task_title }}
+          TASK_BODY: ${{ steps.task_context.outputs.task_body }}
+          TAP_PAT: ${{ secrets.TAP_PAT }}
+          GITHUB_API_URL: ${{ github.api_url }}
+          REPO_OWNER: ${{ github.repository_owner }}
+        with:
+          # Snapshot reads use the repository installation token; only the
+          # one-time snapshot comment write uses TAP_PAT (owner-visible),
+          # mirroring the readiness step's read/write split.
+          github-token: ${{ github.token }}
+          script: |
+            const crypto = require('crypto');
+            const fs = require('fs');
+            const path = require('path');
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const taskRepo = String(process.env.TASK_REPO || '').trim().toLowerCase();
+            const taskNumber = Number(process.env.TASK_NUMBER || 0);
+            const liveTitle = String(process.env.TASK_TITLE ?? '');
+            const liveBody = String(process.env.TASK_BODY ?? '');
+            const tapPat = String(process.env.TAP_PAT || '').trim();
+            const apiBase = String(process.env.GITHUB_API_URL || 'https://api.github.com')
+              .replace(/\/+$/, '');
+            const repositoryOwner = String(process.env.REPO_OWNER || '').trim().toLowerCase();
+            const generation = 1;
+
+            function fail(message) {
+              core.setOutput('snapshot_verified', 'false');
+              core.setFailed(message);
+            }
+
+            if (!taskRepo || !/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(taskRepo)) {
+              fail(`Task snapshot: invalid task repository '${process.env.TASK_REPO || ''}'.`);
+              return;
+            }
+            if (!Number.isInteger(taskNumber) || taskNumber <= 0) {
+              fail('Task snapshot: invalid task issue number.');
+              return;
+            }
+            const sameRepository = taskRepo === `${owner}/${repo}`.toLowerCase();
+            if (!sameRepository) {
+              // Cross-repository snapshots are pinned by the owning
+              // repository's own admission (parent/child worker); this
+              // same-repo job must not invent them.
+              fail(
+                `Task snapshot: cross-repository task ${taskRepo}#${taskNumber} cannot be pinned from ${owner}/${repo}.`
+              );
+              return;
+            }
+
+            // Canonical digests mirror src/continuum/task_snapshot.py.
+            const normalize = (value) =>
+              String(value ?? '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').normalize('NFC');
+            const sha = (text) => crypto.createHash('sha256').update(text, 'utf8').digest('hex');
+            const canonicalTitle = normalize(liveTitle);
+            const canonicalBody = normalize(liveBody);
+            const liveTitleSha = sha(canonicalTitle);
+            const liveBodySha = sha(canonicalBody);
+            const liveSpecSha = sha(`${liveTitleSha}:${liveBodySha}`);
+            const markerLine = (titleSha, bodySha, specSha) =>
+              `<!-- continuum-task-snapshot repo=${taskRepo} issue=${taskNumber} generation=${generation} ` +
+              `title-sha256=${titleSha} body-sha256=${bodySha} spec-sha256=${specSha} -->`;
+            const issueLink = `https://github.com/${taskRepo}/issues/${taskNumber}`;
+
+            const markerRe =
+              /<!--\s*continuum-task-snapshot\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+title-sha256=([0-9a-fA-F]{64})\s+body-sha256=([0-9a-fA-F]{64})\s+spec-sha256=([0-9a-fA-F]{64})\s*-->/;
+            const jsonBlockRe = /```json\s+([\s\S]*?)\s+```/;
+
+            function trusted(comment) {
+              const association = String(comment.author_association || '').toUpperCase();
+              if (['OWNER', 'MEMBER', 'COLLABORATOR'].includes(association)) return true;
+              const login = String((comment.user && comment.user.login) || '').toLowerCase();
+              if (login === 'github-actions[bot]') return true;
+              return Boolean(repositoryOwner) && login === repositoryOwner;
+            }
+
+            function parseComment(comment) {
+              const text = String(comment.body || '');
+              const match = text.match(markerRe);
+              if (!match) return null;
+              const parsed = {
+                repo: match[1].toLowerCase(),
+                issue: Number(match[2]),
+                generation: Number(match[3]),
+                titleSha: match[4].toLowerCase(),
+                bodySha: match[5].toLowerCase(),
+                specSha: match[6].toLowerCase(),
+                createdAt: comment.created_at || comment.updated_at || '',
+                id: comment.id || 0,
+                record: null,
+                tampered: false,
+                tamperReason: '',
+              };
+              const block = text.match(jsonBlockRe);
+              if (!block) {
+                parsed.tampered = true;
+                parsed.tamperReason = 'snapshot marker without recoverable JSON content';
+                return parsed;
+              }
+              let record;
+              try {
+                record = JSON.parse(block[1]);
+              } catch (err) {
+                parsed.tampered = true;
+                parsed.tamperReason = `snapshot JSON is unparseable: ${err.message || err}`;
+                return parsed;
+              }
+              parsed.record = record;
+              const embeddedTitle = normalize(record.title ?? '');
+              const embeddedBody = normalize(record.body ?? '');
+              const problems = [];
+              if (sha(embeddedTitle) !== parsed.titleSha) problems.push('title digest mismatch');
+              if (sha(embeddedBody) !== parsed.bodySha) problems.push('body digest mismatch');
+              if (sha(`${sha(embeddedTitle)}:${sha(embeddedBody)}`) !== parsed.specSha) {
+                problems.push('spec digest mismatch');
+              }
+              if (String(record.repo || '').toLowerCase() !== parsed.repo ||
+                  Number(record.issue) !== parsed.issue ||
+                  Number(record.generation) !== parsed.generation) {
+                problems.push('embedded identity disagrees with marker');
+              }
+              if (problems.length > 0) {
+                parsed.tampered = true;
+                parsed.tamperReason = problems.join('; ');
+              }
+              return parsed;
+            }
+
+            let comments;
+            try {
+              comments = await github.paginate(
+                github.rest.issues.listComments,
+                { owner, repo, issue_number: taskNumber, per_page: 100 }
+              );
+            } catch (err) {
+              fail(`Task snapshot: could not list issue comments for verification: ${err.message || err}`);
+              return;
+            }
+
+            const candidates = [];
+            let tamperedEvidence = null;
+            for (const comment of comments) {
+              const parsed = parseComment(comment);
+              if (!parsed) continue;
+              if (parsed.repo !== taskRepo || parsed.issue !== taskNumber) continue;
+              if (parsed.generation !== generation) continue;
+              if (!trusted(comment)) {
+                tamperedEvidence = tamperedEvidence || parsed;
+                continue;
+              }
+              candidates.push(parsed);
+              if (parsed.tampered && !tamperedEvidence) tamperedEvidence = parsed;
+            }
+            candidates.sort((a, b) => {
+              const at = a.createdAt || '';
+              const bt = b.createdAt || '';
+              if (at !== bt) return at < bt ? -1 : 1;
+              return (a.id || 0) - (b.id || 0);
+            });
+
+            function emitOutputs(status, titleSha, bodySha, specSha, record) {
+              core.setOutput('snapshot_status', status);
+              core.setOutput('snapshot_verified', 'true');
+              core.setOutput('spec_sha256', specSha);
+              core.setOutput('title_sha256', titleSha);
+              core.setOutput('body_sha256', bodySha);
+              core.setOutput('generation', String(generation));
+              const runnerTemp = process.env.RUNNER_TEMP || process.env.RUNNER_TMPDIR || '';
+              if (runnerTemp && record) {
+                fs.writeFileSync(
+                  path.join(runnerTemp, 'continuum-task-snapshot.json'),
+                  JSON.stringify(record),
+                  'utf8'
+                );
+              }
+            }
+
+            const driftMessage = (parts, pinnedSpec) =>
+              `Task contract drift detected for ${taskRepo}#${taskNumber} generation ${generation}: ` +
+              `live ${parts} no longer matches the pinned snapshot (spec ${pinnedSpec}, live spec ${liveSpecSha}). ` +
+              `Stop: this generation keeps the pinned specification. Do not rebaseline silently. ` +
+              `Open a new follow-up issue with an explicit dependency instead of editing the working issue. ` +
+              `See ${issueLink}`;
+
+            if (candidates.length === 0) {
+              if (tamperedEvidence && tamperedEvidence.tampered) {
+                fail(
+                  `Task snapshot for ${taskRepo}#${taskNumber} generation ${generation} failed integrity ` +
+                  `validation (${tamperedEvidence.tamperReason}). Stop: never fall back to live mutable text. ` +
+                  `See ${issueLink}`
+                );
+                return;
+              }
+              // Idempotent one-time admission: pin the exact live content.
+              if (!tapPat) {
+                fail('Task snapshot: TAP_PAT is required to pin the snapshot comment.');
+                return;
+              }
+              const record = {
+                schema_version: 1,
+                repo: taskRepo,
+                issue: taskNumber,
+                generation,
+                title: canonicalTitle,
+                body: canonicalBody,
+                title_sha256: liveTitleSha,
+                body_sha256: liveBodySha,
+                spec_sha256: liveSpecSha,
+                created_by: 'github-actions[bot]',
+                created_at: new Date().toISOString(),
+              };
+              const commentBody = [
+                markerLine(liveTitleSha, liveBodySha, liveSpecSha),
+                '⚡ **Continuum · opencode**',
+                '<!-- continuum-origin role=continuum component=opencode -->',
+                'Continuum task snapshot (machine-owned, do not edit or delete).',
+                'This comment pins the exact issue title/body accepted for this implementation generation. ' +
+                'Later issue edits never change it; they belong in a new follow-up issue.',
+                '',
+                '```json',
+                JSON.stringify(record),
+                '```',
+              ].join('\n');
+              const parts = taskRepo.split('/');
+              let response;
+              try {
+                response = await fetch(
+                  `${apiBase}/repos/${encodeURIComponent(parts[0])}/${encodeURIComponent(parts[1])}/issues/${taskNumber}/comments`,
+                  {
+                    method: 'POST',
+                    headers: {
+                      accept: 'application/vnd.github+json',
+                      authorization: `Bearer ${tapPat}`,
+                      'content-type': 'application/json',
+                      'x-github-api-version': '2022-11-28',
+                    },
+                    body: JSON.stringify({ body: commentBody }),
+                  }
+                );
+              } catch (err) {
+                fail(`Task snapshot: pinning failed and the agent must not implement live text: ${err.message || err}`);
+                return;
+              }
+              if (!response.ok) {
+                const details = (await response.text()).slice(0, 500);
+                fail(
+                  `Task snapshot: pinning failed with HTTP ${response.status}` +
+                  (details ? `: ${details}` : '') +
+                  '; the agent must not implement live mutable text.'
+                );
+                return;
+              }
+              core.notice(`Pinned task snapshot for ${taskRepo}#${taskNumber} generation ${generation} (spec ${liveSpecSha}).`);
+              emitOutputs('pinned', liveTitleSha, liveBodySha, liveSpecSha, record);
+              return;
+            }
+
+            // First writer wins: later duplicates never overwrite the pin.
+            const authoritative = candidates[0];
+            if (authoritative.tampered) {
+              fail(
+                `Task snapshot for ${taskRepo}#${taskNumber} generation ${generation} failed integrity ` +
+                `validation (${authoritative.tamperReason}). Stop: never fall back to live mutable text. ` +
+                `See ${issueLink}`
+              );
+              return;
+            }
+            const mismatches = [];
+            if (liveTitleSha !== authoritative.titleSha) mismatches.push('title');
+            if (liveBodySha !== authoritative.bodySha) mismatches.push('body');
+            if (mismatches.length > 0) {
+              fail(driftMessage(mismatches.join(' and '), authoritative.specSha));
+              return;
+            }
+            core.notice(
+              `Task snapshot verified for ${taskRepo}#${taskNumber} generation ${generation} (spec ${liveSpecSha}).`
+            );
+            emitOutputs('verified', liveTitleSha, liveBodySha, liveSpecSha, authoritative.record);
+
       - name: Check issue Definition of Ready
         id: issue_readiness
         if: >-
@@ -1356,6 +1661,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           ISSUE_NUMBER: ${{ inputs.issue_number || github.event.issue.number }}
+          SNAPSHOT_VERIFIED: ${{ steps.task_snapshot.outputs.snapshot_verified }}
+          SNAPSHOT_SPEC: ${{ steps.task_snapshot.outputs.spec_sha256 }}
+          SNAPSHOT_TITLE_SHA: ${{ steps.task_snapshot.outputs.title_sha256 }}
+          SNAPSHOT_BODY_SHA: ${{ steps.task_snapshot.outputs.body_sha256 }}
         run: |
           set -euo pipefail
 
@@ -1399,10 +1708,16 @@ jobs:
           # body and the gate completes it only on exact-SHA evidence.
           RECOVER_ISSUE_BODY="$(gh issue view "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --json body --jq '.body // ""')"
           TASK_MARKER="<!-- continuum-task-context repo=${GITHUB_REPOSITORY} issue=${ISSUE_NUMBER} -->"
+          # kodmial/continuum#295: carry the pinned snapshot reference into
+          # recovered PRs so drift validation still applies to them.
+          RECOVER_SNAPSHOT_REF=""
+          if [[ "${SNAPSHOT_VERIFIED:-}" == "true" && -n "${SNAPSHOT_SPEC:-}" && -n "${SNAPSHOT_TITLE_SHA:-}" && -n "${SNAPSHOT_BODY_SHA:-}" ]]; then
+            RECOVER_SNAPSHOT_REF="<!-- continuum-task-snapshot-ref repo=${GITHUB_REPOSITORY,,} issue=${ISSUE_NUMBER} generation=1 title-sha256=${SNAPSHOT_TITLE_SHA} body-sha256=${SNAPSHOT_BODY_SHA} spec-sha256=${SNAPSHOT_SPEC} -->"
+          fi
           if grep -Eqi '<!--[[:space:]]*automation-qualification:' <<<"$RECOVER_ISSUE_BODY"; then
-            BODY="$(printf '%s\n\nRecovered automatically after the OpenCode agent changed branches during issue #%s execution.\n\nRelates to #%s\n\nMandatory live qualification is declared on #%s; this PR must not auto-close it. The qualification gate completes it only on exact-SHA pass evidence.' "$TASK_MARKER" "$ISSUE_NUMBER" "$ISSUE_NUMBER" "$ISSUE_NUMBER")"
+            BODY="$(printf '%s\n%s\n\nRecovered automatically after the OpenCode agent changed branches during issue #%s execution.\n\nRelates to #%s\n\nMandatory live qualification is declared on #%s; this PR must not auto-close it. The qualification gate completes it only on exact-SHA pass evidence.' "$TASK_MARKER" "$RECOVER_SNAPSHOT_REF" "$ISSUE_NUMBER" "$ISSUE_NUMBER" "$ISSUE_NUMBER")"
           else
-            BODY="$(printf '%s\n\nRecovered automatically after the OpenCode agent changed branches during issue #%s execution.\n\nCloses #%s' "$TASK_MARKER" "$ISSUE_NUMBER" "$ISSUE_NUMBER")"
+            BODY="$(printf '%s\n%s\n\nRecovered automatically after the OpenCode agent changed branches during issue #%s execution.\n\nCloses #%s' "$TASK_MARKER" "$RECOVER_SNAPSHOT_REF" "$ISSUE_NUMBER" "$ISSUE_NUMBER")"
           fi
           gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$CURRENT_BRANCH" --title "$TITLE" --body "$BODY"
 
@@ -1429,6 +1744,10 @@ jobs:
           ISSUE_TITLE: ${{ steps.task_context.outputs.task_title }}
           ISSUE_BODY: ${{ steps.task_context.outputs.task_body }}
           ISSUE_URL: ${{ steps.task_context.outputs.task_url }}
+          SNAPSHOT_VERIFIED: ${{ steps.task_snapshot.outputs.snapshot_verified }}
+          SNAPSHOT_SPEC: ${{ steps.task_snapshot.outputs.spec_sha256 }}
+          SNAPSHOT_TITLE_SHA: ${{ steps.task_snapshot.outputs.title_sha256 }}
+          SNAPSHOT_BODY_SHA: ${{ steps.task_snapshot.outputs.body_sha256 }}
           BASE_REF: ${{ inputs.base_ref || vars.CONTINUUM_ISSUE_BASE_REF || 'main' }}
           KNOWLEDGE_PROTOCOL_PATH: ${{ inputs.knowledge_protocol_path }}
           KNOWLEDGE_RECORDS_DIR: ${{ inputs.knowledge_records_dir }}
@@ -1450,6 +1769,42 @@ jobs:
           [[ "${TASK_REPO,,}" == "${GITHUB_REPOSITORY,,}" && "$TASK_NUMBER" == "$ISSUE_NUMBER" ]] || {
             echo "::error::Resolved task context $TASK_REPO#$TASK_NUMBER does not match issue mode $GITHUB_REPOSITORY#$ISSUE_NUMBER."
             exit 1
+          }
+
+          # kodmial/continuum#295: the pinned snapshot is the contract. Fail
+          # closed when admission did not pin/verify it; never implement live
+          # mutable text. The exact record lives in RUNNER_TEMP (same job),
+          # so a later live edit cannot redefine the agent's specification.
+          [[ "${SNAPSHOT_VERIFIED:-}" == "true" ]] || { echo "::error::Task snapshot was not pinned and verified for $GITHUB_REPOSITORY#$ISSUE_NUMBER; refusing to implement live mutable text."; exit 1; }
+          [[ -n "${SNAPSHOT_SPEC:-}" && -n "${SNAPSHOT_TITLE_SHA:-}" && -n "${SNAPSHOT_BODY_SHA:-}" ]] || { echo "::error::Task snapshot digests are missing; refusing to implement."; exit 1; }
+          SNAPSHOT_FILE="${RUNNER_TEMP:-/tmp}/continuum-task-snapshot.json"
+          [[ -f "$SNAPSHOT_FILE" ]] || { echo "::error::Pinned task snapshot file is missing ($SNAPSHOT_FILE); refusing to implement."; exit 1; }
+          EFFECTIVE_TITLE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["title"], end="")' "$SNAPSHOT_FILE")"
+          EFFECTIVE_BODY="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["body"], end="")' "$SNAPSHOT_FILE")"
+          FILE_SPEC="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["spec_sha256"], end="")' "$SNAPSHOT_FILE")"
+          [[ "$FILE_SPEC" == "$SNAPSHOT_SPEC" ]] || { echo "::error::Task snapshot file does not match verified digests; refusing to implement."; exit 1; }
+          SNAPSHOT_REF="<!-- continuum-task-snapshot-ref repo=${GITHUB_REPOSITORY,,} issue=${ISSUE_NUMBER} generation=1 title-sha256=${SNAPSHOT_TITLE_SHA} body-sha256=${SNAPSHOT_BODY_SHA} spec-sha256=${SNAPSHOT_SPEC} -->"
+
+          # kodmial/continuum#295: live-vs-pinned verification, used both
+          # before the agent starts and right before PR publication, so a
+          # mid-flight edit stops the generation at the earliest point.
+          # Canonical digests mirror src/continuum/task_snapshot.py
+          # (UTF-8, NFC, LF, SHA-256 over the hex pair). On drift, posts a
+          # diagnostic and fails; never publishes or implements for a
+          # stale contract.
+          verify_snapshot_live() {
+            local phase="$1"
+            local live_json live_title live_body live_spec
+            live_json="$(gh issue view "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --json title,body)" || return 1
+            live_title="$(jq -r '.title // ""' <<<"$live_json")"
+            live_body="$(jq -r '.body // ""' <<<"$live_json")"
+            live_spec="$(TASK_SPEC_TITLE="$live_title" TASK_SPEC_BODY="$live_body" python3 -c 'import hashlib,os,unicodedata; norm=lambda v: unicodedata.normalize("NFC", v.replace("\r\n","\n").replace("\r","\n")); title=norm(os.environ.get("TASK_SPEC_TITLE") or ""); body=norm(os.environ.get("TASK_SPEC_BODY") or ""); title_sha=hashlib.sha256(title.encode("utf-8")).hexdigest(); body_sha=hashlib.sha256(body.encode("utf-8")).hexdigest(); print(hashlib.sha256((title_sha+":"+body_sha).encode("ascii")).hexdigest())')" || return 1
+            if [[ "$live_spec" != "$SNAPSHOT_SPEC" ]]; then
+              gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-task-snapshot-drift -->' '⚡ **Continuum · opencode**' '<!-- continuum-origin role=continuum component=opencode -->' "Task contract drift detected before $phase: the live issue no longer matches the pinned snapshot. This generation is stopped; open a new follow-up issue with an explicit dependency instead of editing the working issue.")" >/dev/null 2>&1 || true
+              echo "::error::Task contract drift detected before $phase for $GITHUB_REPOSITORY#$ISSUE_NUMBER (pinned spec $SNAPSHOT_SPEC, live spec $live_spec). Stopping; open a new follow-up issue instead of editing the working issue."
+              return 1
+            fi
           }
 
           git fetch origin "$BASE_REF" --quiet
@@ -1506,13 +1861,14 @@ jobs:
           ${ISSUE_URL}
 
           Title:
-          ${ISSUE_TITLE}
+          ${EFFECTIVE_TITLE}
 
           Specification / Definition of Done:
-          ${ISSUE_BODY}
+          ${EFFECTIVE_BODY}
 
           Requirements:
           - Treat the issue body and its Definition of Done as authoritative.
+          - The pinned task snapshot (spec ${SNAPSHOT_SPEC}) above is frozen for this generation: implement exactly it. If the live issue now differs, stop and report the drift instead of following the live edit; post-admission changes belong in a new follow-up issue.
           - Inspect the existing repository before changing code.
           - Implement the complete task, not a partial sketch.
           - Do not turn a tracking/umbrella issue or a task with unmet prerequisites into a partial PR. If the complete Definition of Done cannot be satisfied now, leave the repository unchanged and explain the blocker instead of inventing a smaller scope.
@@ -1542,6 +1898,9 @@ jobs:
           fi
 
           OPENCODE_RUN_LOG="$(mktemp)"
+          # kodmial/continuum#295: last live check before the agent starts
+          # (bounds wasted work when the issue was edited after admission).
+          verify_snapshot_live "agent start" || exit 1
           # kodmial/continuum#290: a tests-passed/publish-pr checkpoint carries
           # exact-SHA evidence, so the fresh run must NOT call OpenCode again
           # merely to "finish". Skip the agent and proceed directly to
@@ -1660,20 +2019,25 @@ jobs:
           PR_NUMBER="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --state all \
             --json number --jq '.[0].number // empty')"
           if [[ -z "$PR_NUMBER" ]]; then
+            # kodmial/continuum#295: revalidate the pinned snapshot against
+            # live issue content right before publication to close
+            # time-of-check/time-of-use gaps. On drift, stop with an
+            # actionable diagnostic; never publish a PR for a stale contract.
+            verify_snapshot_live "PR publication" || exit 1
             # A capability with mandatory live qualification must never be
             # auto-closed by PR keywords: `Closes #N` would bypass the
             # qualification gate, so a qualifying issue gets a non-closing
             # body and the gate completes it only on exact-SHA evidence.
             TASK_MARKER="<!-- continuum-task-context repo=${GITHUB_REPOSITORY} issue=${ISSUE_NUMBER} -->"
-            if grep -Eqi '<!--[[:space:]]*automation-qualification:' <<<"$ISSUE_BODY"; then
-              PR_BODY="$(printf '%s\n\nAutomated implementation for #%s.\n\nRelates to #%s\n\nMandatory live qualification is declared on #%s; this PR must not auto-close it. The qualification gate records the merged main SHA and dispatches qualification after merge.' "$TASK_MARKER" "$ISSUE_NUMBER" "$ISSUE_NUMBER" "$ISSUE_NUMBER")"
+            if grep -Eqi '<!--[[:space:]]*automation-qualification:' <<<"$EFFECTIVE_BODY"; then
+              PR_BODY="$(printf '%s\n%s\n\nAutomated implementation for #%s.\n\nRelates to #%s\n\nMandatory live qualification is declared on #%s; this PR must not auto-close it. The qualification gate records the merged main SHA and dispatches qualification after merge.' "$TASK_MARKER" "$SNAPSHOT_REF" "$ISSUE_NUMBER" "$ISSUE_NUMBER" "$ISSUE_NUMBER")"
             else
-              PR_BODY="$(printf '%s\n\nAutomated implementation for #%s.\n\nCloses #%s' "$TASK_MARKER" "$ISSUE_NUMBER" "$ISSUE_NUMBER")"
+              PR_BODY="$(printf '%s\n%s\n\nAutomated implementation for #%s.\n\nCloses #%s' "$TASK_MARKER" "$SNAPSHOT_REF" "$ISSUE_NUMBER" "$ISSUE_NUMBER")"
             fi
             PR_URL="$(gh pr create --repo "$GITHUB_REPOSITORY" \
               --base "$BASE_REF" \
               --head "$BRANCH" \
-              --title "$ISSUE_TITLE" \
+              --title "$EFFECTIVE_TITLE" \
               --body "$PR_BODY")"
             PR_NUMBER="$(gh pr view "$PR_URL" --repo "$GITHUB_REPOSITORY" --json number --jq .number)"
           fi
@@ -1923,6 +2287,44 @@ jobs:
           RECOVERY_GENERATION_IN: ${{ inputs.recovery_generation }}
         run: |
           set -euo pipefail
+          # kodmial/continuum#295: frozen task-spec guard for repair. The
+          # PR's snapshot reference is the pinned contract; the live issue
+          # is re-read and compared before any repair work. On drift, stop
+          # with an actionable diagnostic: no silent rebaseline, no
+          # spurious "fixed" verdict. A PR without a snapshot reference is
+          # legacy (created before the guard) and proceeds explicitly
+          # without drift protection.
+          if [[ -n "${PR_NUMBER:-}" ]]; then
+            REPAIR_PR_BODY="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json body --jq '.body // ""' 2>/dev/null || echo "")"
+            REPAIR_SNAPSHOT_REF="$(grep -oE '<!--[[:space:]]*continuum-task-snapshot-ref[^>]*-->' <<<"$REPAIR_PR_BODY" | head -n 1 || true)"
+            if [[ -z "$REPAIR_SNAPSHOT_REF" ]]; then
+              echo "::notice::PR #$PR_NUMBER carries no task snapshot reference (legacy, pre-guard PR); repair proceeds explicitly without drift protection."
+            else
+              REF_REPO="$(sed -nE 's/.*repo=([A-Za-z0-9_.\-]+\/[A-Za-z0-9_.\-]+).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1)"
+              REF_ISSUE="$(sed -nE 's/.*issue=([0-9]+).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1)"
+              REF_TITLE_SHA="$(sed -nE 's/.*title-sha256=([0-9a-fA-F]{64}).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1 | tr 'A-F' 'a-f')"
+              REF_BODY_SHA="$(sed -nE 's/.*body-sha256=([0-9a-fA-F]{64}).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1 | tr 'A-F' 'a-f')"
+              if [[ -z "$REF_REPO" || -z "$REF_ISSUE" || -z "$REF_TITLE_SHA" || -z "$REF_BODY_SHA" ]]; then
+                echo "::error::PR #$PR_NUMBER snapshot reference is malformed; refusing repair without a verifiable contract."
+                exit 1
+              fi
+              REPAIR_LIVE_JSON="$(gh issue view "$REF_ISSUE" --repo "$REF_REPO" --json title,body 2>/dev/null || echo "")"
+              if [[ -z "$REPAIR_LIVE_JSON" ]]; then
+                echo "::error::Could not fetch live task $REF_REPO#$REF_ISSUE for snapshot verification; refusing repair."
+                exit 1
+              fi
+              REPAIR_DIGESTS="$(REPAIR_TITLE="$(jq -r '.title // ""' <<<"$REPAIR_LIVE_JSON")" REPAIR_BODY="$(jq -r '.body // ""' <<<"$REPAIR_LIVE_JSON")" python3 -c 'import hashlib,os,unicodedata; norm=lambda v: unicodedata.normalize("NFC", v.replace("\r\n","\n").replace("\r","\n")); title=norm(os.environ.get("REPAIR_TITLE") or ""); body=norm(os.environ.get("REPAIR_BODY") or ""); print(hashlib.sha256(title.encode("utf-8")).hexdigest()); print(hashlib.sha256(body.encode("utf-8")).hexdigest())')"
+              LIVE_TITLE_SHA="$(sed -n '1p' <<<"$REPAIR_DIGESTS")"
+              LIVE_BODY_SHA="$(sed -n '2p' <<<"$REPAIR_DIGESTS")"
+              if [[ "$LIVE_TITLE_SHA" != "$REF_TITLE_SHA" || "$LIVE_BODY_SHA" != "$REF_BODY_SHA" ]]; then
+                gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                  --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-task-snapshot-drift -->' '⚡ **Continuum · opencode**' '<!-- continuum-origin role=continuum component=opencode -->' "Task contract drift detected for $REF_REPO#$REF_ISSUE: the live issue no longer matches the PR's pinned snapshot. Repair is stopped for this generation; open a new follow-up issue with an explicit dependency instead of editing the working issue.")" >/dev/null 2>&1 || true
+                echo "::error::Task contract drift detected for $REF_REPO#$REF_ISSUE (PR #$PR_NUMBER). Repair stopped; open a new follow-up issue instead of editing the working issue."
+                exit 1
+              fi
+              echo "Task snapshot verified for $REF_REPO#$REF_ISSUE before repair of PR #$PR_NUMBER."
+            fi
+          fi
           # shellcheck disable=SC1091
           source "${RUNNER_TEMP:-/tmp}/continuum-429-evacuate.sh" 2>/dev/null || true
           PROMPT=$(cat <<EOF
@@ -2184,6 +2586,42 @@ jobs:
           RECOVERY_GENERATION_IN: ${{ inputs.recovery_generation }}
         run: |
           set -euo pipefail
+          # kodmial/continuum#295: frozen task-spec guard for conflict
+          # repair. Same contract as the CodeRabbit repair guard above: the
+          # PR's snapshot reference is pinned, the live issue is re-read,
+          # drift stops the repair, legacy PRs proceed explicitly
+          # unprotected.
+          if [[ -n "${PR_NUMBER:-}" ]]; then
+            REPAIR_PR_BODY="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json body --jq '.body // ""' 2>/dev/null || echo "")"
+            REPAIR_SNAPSHOT_REF="$(grep -oE '<!--[[:space:]]*continuum-task-snapshot-ref[^>]*-->' <<<"$REPAIR_PR_BODY" | head -n 1 || true)"
+            if [[ -z "$REPAIR_SNAPSHOT_REF" ]]; then
+              echo "::notice::PR #$PR_NUMBER carries no task snapshot reference (legacy, pre-guard PR); conflict repair proceeds explicitly without drift protection."
+            else
+              REF_REPO="$(sed -nE 's/.*repo=([A-Za-z0-9_.\-]+\/[A-Za-z0-9_.\-]+).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1)"
+              REF_ISSUE="$(sed -nE 's/.*issue=([0-9]+).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1)"
+              REF_TITLE_SHA="$(sed -nE 's/.*title-sha256=([0-9a-fA-F]{64}).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1 | tr 'A-F' 'a-f')"
+              REF_BODY_SHA="$(sed -nE 's/.*body-sha256=([0-9a-fA-F]{64}).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1 | tr 'A-F' 'a-f')"
+              if [[ -z "$REF_REPO" || -z "$REF_ISSUE" || -z "$REF_TITLE_SHA" || -z "$REF_BODY_SHA" ]]; then
+                echo "::error::PR #$PR_NUMBER snapshot reference is malformed; refusing conflict repair without a verifiable contract."
+                exit 1
+              fi
+              REPAIR_LIVE_JSON="$(gh issue view "$REF_ISSUE" --repo "$REF_REPO" --json title,body 2>/dev/null || echo "")"
+              if [[ -z "$REPAIR_LIVE_JSON" ]]; then
+                echo "::error::Could not fetch live task $REF_REPO#$REF_ISSUE for snapshot verification; refusing conflict repair."
+                exit 1
+              fi
+              REPAIR_DIGESTS="$(REPAIR_TITLE="$(jq -r '.title // ""' <<<"$REPAIR_LIVE_JSON")" REPAIR_BODY="$(jq -r '.body // ""' <<<"$REPAIR_LIVE_JSON")" python3 -c 'import hashlib,os,unicodedata; norm=lambda v: unicodedata.normalize("NFC", v.replace("\r\n","\n").replace("\r","\n")); title=norm(os.environ.get("REPAIR_TITLE") or ""); body=norm(os.environ.get("REPAIR_BODY") or ""); print(hashlib.sha256(title.encode("utf-8")).hexdigest()); print(hashlib.sha256(body.encode("utf-8")).hexdigest())')"
+              LIVE_TITLE_SHA="$(sed -n '1p' <<<"$REPAIR_DIGESTS")"
+              LIVE_BODY_SHA="$(sed -n '2p' <<<"$REPAIR_DIGESTS")"
+              if [[ "$LIVE_TITLE_SHA" != "$REF_TITLE_SHA" || "$LIVE_BODY_SHA" != "$REF_BODY_SHA" ]]; then
+                gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                  --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-task-snapshot-drift -->' '⚡ **Continuum · opencode**' '<!-- continuum-origin role=continuum component=opencode -->' "Task contract drift detected for $REF_REPO#$REF_ISSUE: the live issue no longer matches the PR's pinned snapshot. Conflict repair is stopped for this generation; open a new follow-up issue with an explicit dependency instead of editing the working issue.")" >/dev/null 2>&1 || true
+                echo "::error::Task contract drift detected for $REF_REPO#$REF_ISSUE (PR #$PR_NUMBER). Conflict repair stopped; open a new follow-up issue instead of editing the working issue."
+                exit 1
+              fi
+              echo "Task snapshot verified for $REF_REPO#$REF_ISSUE before conflict repair of PR #$PR_NUMBER."
+            fi
+          fi
           # shellcheck disable=SC1091
           source "${RUNNER_TEMP:-/tmp}/continuum-429-evacuate.sh" 2>/dev/null || true
           # `workflow_call` cannot declare an enumerated input, so validate the
@@ -2299,6 +2737,42 @@ jobs:
           set -euo pipefail
           # shellcheck disable=SC1091
           source "${RUNNER_TEMP:-/tmp}/continuum-429-evacuate.sh" 2>/dev/null || true
+
+          # kodmial/continuum#295: frozen task-spec guard for CI repair.
+          # Same contract as the CodeRabbit repair guard: the PR's snapshot
+          # reference is pinned, the live issue is re-read, drift stops the
+          # repair, legacy PRs proceed explicitly unprotected.
+          if [[ -n "${PR_NUMBER:-}" ]]; then
+            REPAIR_PR_BODY="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json body --jq '.body // ""' 2>/dev/null || echo "")"
+            REPAIR_SNAPSHOT_REF="$(grep -oE '<!--[[:space:]]*continuum-task-snapshot-ref[^>]*-->' <<<"$REPAIR_PR_BODY" | head -n 1 || true)"
+            if [[ -z "$REPAIR_SNAPSHOT_REF" ]]; then
+              echo "::notice::PR #$PR_NUMBER carries no task snapshot reference (legacy, pre-guard PR); CI repair proceeds explicitly without drift protection."
+            else
+              REF_REPO="$(sed -nE 's/.*repo=([A-Za-z0-9_.\-]+\/[A-Za-z0-9_.\-]+).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1)"
+              REF_ISSUE="$(sed -nE 's/.*issue=([0-9]+).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1)"
+              REF_TITLE_SHA="$(sed -nE 's/.*title-sha256=([0-9a-fA-F]{64}).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1 | tr 'A-F' 'a-f')"
+              REF_BODY_SHA="$(sed -nE 's/.*body-sha256=([0-9a-fA-F]{64}).*/\1/p' <<<"$REPAIR_SNAPSHOT_REF" | head -n 1 | tr 'A-F' 'a-f')"
+              if [[ -z "$REF_REPO" || -z "$REF_ISSUE" || -z "$REF_TITLE_SHA" || -z "$REF_BODY_SHA" ]]; then
+                echo "::error::PR #$PR_NUMBER snapshot reference is malformed; refusing CI repair without a verifiable contract."
+                exit 1
+              fi
+              REPAIR_LIVE_JSON="$(gh issue view "$REF_ISSUE" --repo "$REF_REPO" --json title,body 2>/dev/null || echo "")"
+              if [[ -z "$REPAIR_LIVE_JSON" ]]; then
+                echo "::error::Could not fetch live task $REF_REPO#$REF_ISSUE for snapshot verification; refusing CI repair."
+                exit 1
+              fi
+              REPAIR_DIGESTS="$(REPAIR_TITLE="$(jq -r '.title // ""' <<<"$REPAIR_LIVE_JSON")" REPAIR_BODY="$(jq -r '.body // ""' <<<"$REPAIR_LIVE_JSON")" python3 -c 'import hashlib,os,unicodedata; norm=lambda v: unicodedata.normalize("NFC", v.replace("\r\n","\n").replace("\r","\n")); title=norm(os.environ.get("REPAIR_TITLE") or ""); body=norm(os.environ.get("REPAIR_BODY") or ""); print(hashlib.sha256(title.encode("utf-8")).hexdigest()); print(hashlib.sha256(body.encode("utf-8")).hexdigest())')"
+              LIVE_TITLE_SHA="$(sed -n '1p' <<<"$REPAIR_DIGESTS")"
+              LIVE_BODY_SHA="$(sed -n '2p' <<<"$REPAIR_DIGESTS")"
+              if [[ "$LIVE_TITLE_SHA" != "$REF_TITLE_SHA" || "$LIVE_BODY_SHA" != "$REF_BODY_SHA" ]]; then
+                gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                  --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-task-snapshot-drift -->' '⚡ **Continuum · opencode**' '<!-- continuum-origin role=continuum component=opencode -->' "Task contract drift detected for $REF_REPO#$REF_ISSUE: the live issue no longer matches the PR's pinned snapshot. CI repair is stopped for this generation; open a new follow-up issue with an explicit dependency instead of editing the working issue.")" >/dev/null 2>&1 || true
+                echo "::error::Task contract drift detected for $REF_REPO#$REF_ISSUE (PR #$PR_NUMBER). CI repair stopped; open a new follow-up issue instead of editing the working issue."
+                exit 1
+              fi
+              echo "Task snapshot verified for $REF_REPO#$REF_ISSUE before CI repair of PR #$PR_NUMBER."
+            fi
+          fi
 
           if [[ "$TASK_CONTEXT_PRESENT" == "true" ]]; then
             TASK_CONTEXT_BLOCK="$(cat <<EOF

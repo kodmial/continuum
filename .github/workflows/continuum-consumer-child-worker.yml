@@ -106,6 +106,90 @@ jobs:
           gh api "repos/$child_repo/issues/$TASK_NUMBER" > "$CHILD_ISSUE_JSON" 2>/dev/null || true
           issue_state="$(jq -r '.state // ""' <"$CHILD_ISSUE_JSON" 2>/dev/null || echo "")"
           [[ "$issue_state" == "open" ]] || exit 0
+          issue_title="$(jq -r '.title // ""' <"$CHILD_ISSUE_JSON" 2>/dev/null || echo "")"
+          issue_body="$(jq -r '.body // ""' <"$CHILD_ISSUE_JSON" 2>/dev/null || echo "")"
+
+          # kodmial/continuum#295: freeze the child task specification at
+          # admission with the canonical engine
+          # (.github/scripts/task_snapshot_admission.py over
+          # src/continuum/task_snapshot.py), so digests match every other
+          # entry point byte-for-byte. The earliest trusted snapshot wins
+          # and is never overwritten; drift stops the worker with a
+          # deduplicated diagnostic before any agent work, and the exact
+          # pinned record (never a later live body) feeds the prompt below.
+          CHILD_OWNER="${child_repo%%/*}"
+          CHILD_COMMENTS_PAGES="$RUNNER_TEMP/continuum-child-snapshot-pages.jsonl"
+          CHILD_COMMENTS_JSON="$RUNNER_TEMP/continuum-child-snapshot-comments.json"
+          CHILD_SNAPSHOT_RECORD="$RUNNER_TEMP/continuum-child-snapshot-record.json"
+          CHILD_SNAPSHOT_DECISION="$RUNNER_TEMP/continuum-child-snapshot-decision.json"
+          SNAPSHOT_ADMISSION="$CONTINUUM_ENGINE_ROOT/.github/scripts/task_snapshot_admission.py"
+          fetch_snapshot_comments() {
+            : > "$CHILD_COMMENTS_PAGES"
+            for snapshot_page in 1 2 3; do
+              if ! snapshot_page_json="$(gh api "repos/$child_repo/issues/$TASK_NUMBER/comments?per_page=100&page=$snapshot_page" 2>/dev/null)"; then
+                echo "::error::Could not list child task #$TASK_NUMBER comments for snapshot verification; refusing delegated work."
+                return 4
+              fi
+              echo "$snapshot_page_json" >> "$CHILD_COMMENTS_PAGES"
+              snapshot_count="$(jq 'length' <<<"$snapshot_page_json" 2>/dev/null || echo 0)"
+              [[ "$snapshot_count" == "100" ]] || break
+            done
+            jq -s 'add' "$CHILD_COMMENTS_PAGES" > "$CHILD_COMMENTS_JSON"
+          }
+          fetch_snapshot_comments || exit 4
+          if ! snapshot_action="$(python3 "$SNAPSHOT_ADMISSION" decide --issue-json "$CHILD_ISSUE_JSON" --comments-json "$CHILD_COMMENTS_JSON" --repo "$child_repo" --issue "$TASK_NUMBER" --owner "$CHILD_OWNER" --record-out "$CHILD_SNAPSHOT_RECORD" --decision-out "$CHILD_SNAPSHOT_DECISION")"; then
+            echo "::error::Child task snapshot admission failed; refusing delegated work."
+            exit 4
+          fi
+          if [[ "$snapshot_action" == "pin" ]]; then
+            # The snapshot comment body is composed here (not in the driver)
+            # so the attribution header/marker literals stay next to the
+            # mutation call per the comment-attribution contract (#258).
+            # The marker line and exact record come from the canonical
+            # engine; only the presentation wrapper is inline.
+            if ! snapshot_marker_line="$(python3 "$SNAPSHOT_ADMISSION" render-marker --record-file "$CHILD_SNAPSHOT_RECORD")"; then
+              echo "::error::Could not render child task snapshot; refusing delegated work."
+              exit 4
+            fi
+            snapshot_record_json="$(cat "$CHILD_SNAPSHOT_RECORD")"
+            snapshot_comment="$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s' "$snapshot_marker_line" '⚡ **Continuum · delegation-worker**' '<!-- continuum-origin role=continuum component=delegation-worker -->' 'Continuum task snapshot (machine-owned, do not edit or delete). This comment pins the exact issue title/body accepted for this implementation generation. Later issue edits never change it; they belong in a new follow-up issue.' '```json' "$snapshot_record_json" '```')"
+            if ! gh api --method POST "repos/$child_repo/issues/$TASK_NUMBER/comments" -f body="$snapshot_comment" >/dev/null 2>&1; then
+              echo "::error::Could not pin child task snapshot for $child_repo#$TASK_NUMBER; refusing to implement live mutable text."
+              exit 4
+            fi
+            echo "Pinned child task snapshot for $child_repo#$TASK_NUMBER."
+            # Re-verify after pinning so simultaneous wakeups converge on
+            # the earliest writer instead of overwriting it.
+            fetch_snapshot_comments || exit 4
+            if ! snapshot_action="$(python3 "$SNAPSHOT_ADMISSION" decide --issue-json "$CHILD_ISSUE_JSON" --comments-json "$CHILD_COMMENTS_JSON" --repo "$child_repo" --issue "$TASK_NUMBER" --owner "$CHILD_OWNER" --record-out "$CHILD_SNAPSHOT_RECORD" --decision-out "$CHILD_SNAPSHOT_DECISION")"; then
+              echo "::error::Child task snapshot re-verification failed; refusing delegated work."
+              exit 4
+            fi
+          fi
+          if [[ "$snapshot_action" == "drift_blocked" || "$snapshot_action" == "tampered_fail_closed" ]]; then
+            snapshot_diagnostic="$(jq -r '.diagnostic // "Task snapshot verification failed."' "$CHILD_SNAPSHOT_DECISION" 2>/dev/null || echo "Task snapshot verification failed.")"
+            if ! jq -r '.[].body' "$CHILD_COMMENTS_JSON" 2>/dev/null | grep -Fq '<!-- continuum-child-task-snapshot-drift -->'; then
+              gh issue comment "$TASK_NUMBER" --repo "$child_repo" \
+                --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-task-snapshot-drift -->' '⚡ **Continuum · delegation-worker**' '<!-- continuum-origin role=continuum component=delegation-worker -->' "$snapshot_diagnostic")" \
+                >/dev/null 2>&1 || true
+            fi
+            # Deterministic hold, not a failure: scheduler passes keep
+            # holding cheaply (no agent work started) until a human opens a
+            # follow-up issue. Never a blind agent retry loop.
+            echo "::notice::Child task $child_repo#$TASK_NUMBER snapshot guard held this generation ($snapshot_action); no agent work started."
+            exit 0
+          fi
+          if [[ "$snapshot_action" != "proceed" ]]; then
+            echo "::error::Unexpected child task snapshot action '$snapshot_action'; refusing delegated work."
+            exit 4
+          fi
+          echo "Child task snapshot verified for $child_repo#$TASK_NUMBER."
+          # kodmial/continuum#295: the agent prompt below consumes the frozen
+          # snapshot record, never a later live body. The live read above
+          # stays the single coalesced API fetch for the open gate.
+          issue_title="$(jq -r '.title' "$CHILD_SNAPSHOT_RECORD" 2>/dev/null || echo "")"
+          issue_body="$(jq -r '.body' "$CHILD_SNAPSHOT_RECORD" 2>/dev/null || echo "")"
+          [[ -n "$issue_title" ]] || { echo "::error::Pinned child task snapshot has no title; refusing delegated work."; exit 4; }
 
           workdir="$RUNNER_TEMP/continuum-child-target"
           transcript="$RUNNER_TEMP/continuum-child-agent.log"
@@ -193,9 +277,6 @@ jobs:
           python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/opencode_instructions.py" install \
             --source "$CONTINUUM_ENGINE_ROOT/.github/agents/AGENTS.md"
 
-          issue_title="$(jq -r '.title // ""' <"$CHILD_ISSUE_JSON" 2>/dev/null || echo "")"
-          issue_body="$(jq -r '.body // ""' <"$CHILD_ISSUE_JSON" 2>/dev/null || echo "")"
-
           mkdir -p "$(dirname "$result_file")"
           prompt="$RUNNER_TEMP/continuum-child-task.txt"
           cat >"$prompt" <<EOF
@@ -270,11 +351,16 @@ jobs:
           [[ "$(git rev-list --count "$base_sha"..HEAD)" -gt 0 ]] || exit 32
 
           git push -u origin "HEAD:$branch" >/dev/null 2>&1
+          # kodmial/continuum#295: carry the pinned snapshot reference in
+          # the child PR body so review and merge gates validate the same
+          # frozen contract.
+          child_snapshot_ref="$(python3 "$SNAPSHOT_ADMISSION" render-pr-ref --record-file "$CHILD_SNAPSHOT_RECORD" 2>/dev/null || echo "")"
           pr_body="$(cat <<EOF
           Delegated implementation for #$TASK_NUMBER executed by the configured Continuum parent.
-          
+
           Child source, issue text, test logs, and agent transcript were not uploaded to the parent repository.
-          
+
+          $child_snapshot_ref
           <!-- continuum-child-accepted -->
           Closes #$TASK_NUMBER
           EOF
