@@ -1013,16 +1013,26 @@ function isSkippedCleanImprovePayload(raw) {
 }
 
 function nonActionableCautionIsMergeable(review) {
-  // A complete review can legitimately choose merge_with_caution solely for
-  // external/live verification that cannot be repaired on this HEAD. Re-running
-  // the same review cannot create new machine evidence and previously caused an
-  // endless rereview loop. Only accept that caution when the structured review
-  // explicitly proves there is no security concern and no ticket non-compliance.
-  const security = String(review && review.security_concerns || '').trim().toLowerCase();
-  if (!['no', 'none', 'false', 'n/a', 'na', '-'].includes(security)) return false;
+  // Upstream can legitimately choose merge_with_caution for risk/advisory
+  // prose even when its exact-HEAD review found no actionable issues.
+  // Re-reviewing an unchanged clean HEAD cannot fix that recommendation.
+  // Require an explicit clean security signal, and reject *all* known
+  // structural failure signals before treating such caution as non-actionable.
+  // Reuse the canonical clean-security parser: upstream writes natural-language
+  // negations ("No security concerns identified"), not just "no"/"none".
+  const security = review && review.security_concerns;
+  if (security === undefined || security === null || security === '') return false;
+  if (hasBlockingSecuritySignal(review) ||
+      hasToolErrorSignal(review) ||
+      hasIncompleteCoverageSignal(review)) return false;
 
+  // An issue-less PR legitimately has no ticket_compliance_check entry.
+  // Missing/empty ticket checks are not positive non-compliance. But an
+  // explicitly supplied ticket result must prove no non-compliant requirements;
+  // malformed or nonempty non-compliance keeps the merge gate closed.
   const ticket = review && review.ticket_compliance_check;
-  if (!Array.isArray(ticket) || ticket.length === 0) return false;
+  if (ticket === undefined || ticket === null) return true;
+  if (!Array.isArray(ticket)) return false;
   const empty = new Set(['', '-', 'none', 'n/a', 'na', 'no']);
   for (const entry of ticket) {
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
