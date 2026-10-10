@@ -452,19 +452,32 @@ jobs:
 
               # kodmial/continuum#309: terminal generation-stop gate. A
               # stopped generation is never redispatched; successors stay
-              # schedulable. One bounded first-page read per
-              # otherwise-eligible task; a fetch failure keeps the task
-              # eligible (worker admission still fails closed).
+              # schedulable. Trusted, generation-keyed, paginated check
+              # (up to 3 pages) so a stop beyond the first 100 comments
+              # still holds; a fetch failure keeps the task eligible
+              # (worker admission still fails closed).
               legacy_stop_state="active"
-              if legacy_stop_comments="$(gh api "repos/$child_repo/issues/$task_number/comments?per_page=100&page=1" 2>/dev/null)"; then
-                legacy_stop_file="${RUNNER_TEMP:-/tmp}/continuum-legacy-stop-$task_number.json"
-                if printf '%s' "$legacy_stop_comments" >"$legacy_stop_file" 2>/dev/null; then
-                  legacy_stop_state="$(python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/task_snapshot_admission.py" has-stop --comments-json "$legacy_stop_file" --repo "$child_repo" --issue "$task_number" 2>/dev/null || echo active)"
-                  rm -f "$legacy_stop_file"
+              legacy_stop_pages="${RUNNER_TEMP:-/tmp}/continuum-legacy-stop-pages-$task_number.jsonl"
+              legacy_stop_file="${RUNNER_TEMP:-/tmp}/continuum-legacy-stop-$task_number.json"
+              : > "$legacy_stop_pages"
+              legacy_stop_ok=true
+              for legacy_stop_page in 1 2 3; do
+                if ! legacy_stop_json="$(gh api "repos/$child_repo/issues/$task_number/comments?per_page=100&page=$legacy_stop_page" 2>/dev/null)"; then
+                  echo "::warning::Terminal-stop lookup failed for delegated task #$task_number; keeping it eligible for this pass."
+                  legacy_stop_ok=false
+                  break
                 fi
-              else
-                echo "::warning::Terminal-stop lookup failed for delegated task #$task_number; keeping it eligible for this pass."
+                echo "$legacy_stop_json" >> "$legacy_stop_pages"
+                legacy_stop_count="$(jq 'length' <<<"$legacy_stop_json" 2>/dev/null || echo 0)"
+                [[ "$legacy_stop_count" == "100" ]] || break
+              done
+              if [[ "$legacy_stop_ok" == "true" ]]; then
+                if jq -s 'add' "$legacy_stop_pages" > "$legacy_stop_file" 2>/dev/null; then
+                  legacy_stop_state="$(python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/task_snapshot_admission.py" has-stop --comments-json "$legacy_stop_file" --repo "$child_repo" --issue "$task_number" --owner "$child_owner" --generation 1 2>/dev/null || echo active)"
+                fi
+                rm -f "$legacy_stop_file"
               fi
+              rm -f "$legacy_stop_pages"
               if [[ "$legacy_stop_state" == "stopped" ]]; then
                 echo "Skipping child task #$task_number: terminal generation stop; open a successor issue with an explicit dependency or start an explicit new generation instead of redispatching."
                 continue

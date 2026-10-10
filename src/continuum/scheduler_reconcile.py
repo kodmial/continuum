@@ -36,7 +36,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import re
-from typing import Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from .delegation_priority import effective_priority
 
@@ -130,13 +130,51 @@ def _latest_relevant_dispatch(
     return max(relevant, key=lambda c: c.created_at)
 
 
-def terminal_stop_skip_reason(number: int) -> str:
+def terminal_stop_skip_reason(number: int, generation: int = 1) -> str:
     """Auditable stable skip reason for a terminally stopped generation."""
+    try:
+        generation_number = int(generation)
+    except (TypeError, ValueError):
+        generation_number = 1
+    if generation_number < 1:
+        generation_number = 1
     return (
-        "terminal generation stop: issue #%d generation 1 is stopped; "
+        "terminal generation stop: issue #%d generation %d is stopped; "
         "open a successor issue with an explicit dependency or start an "
-        "explicit new generation instead of redispatching" % number
+        "explicit new generation instead of redispatching"
+        % (number, generation_number)
     )
+
+
+def _normalize_terminal_stopped(
+    terminal_stopped: Optional[Set[Any]],
+) -> Set[Tuple[int, int]]:
+    """Normalize the stopped set to generation-keyed ``(issue, generation)``.
+
+    Plain issue numbers keep their legacy meaning (generation 1 stopped)
+    so existing callers stay schedulable; ``(issue, generation)`` tuples
+    stop exactly one generation while an explicit new generation for the
+    same issue remains eligible.
+    """
+    normalized: Set[Tuple[int, int]] = set()
+    for entry in terminal_stopped or set():
+        try:
+            if isinstance(entry, (tuple, list)) and len(entry) == 2:
+                normalized.add((int(entry[0]), int(entry[1])))
+            else:
+                normalized.add((int(entry), 1))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+    return {(n, g) for (n, g) in normalized if n >= 1 and g >= 1}
+
+
+def _active_generation(number: int, generations: Optional[Dict[int, int]]) -> int:
+    """Active generation scheduled for an issue (default 1)."""
+    try:
+        generation = int((generations or {}).get(number, 1))
+    except (TypeError, ValueError):
+        return 1
+    return generation if generation >= 1 else 1
 
 
 def reconcile(
@@ -150,7 +188,8 @@ def reconcile(
     qualification_trackers: Set[int],
     config: SchedulerConfig,
     dispatch_hook: Optional[Callable[[int], None]] = None,
-    terminal_stopped: Optional[Set[int]] = None,
+    terminal_stopped: Optional[Set[Any]] = None,
+    generations: Optional[Dict[int, int]] = None,
 ) -> ReconcileResult:
     """Run one deterministic scheduled reconcile pass (cron, no event).
 
@@ -274,19 +313,23 @@ def reconcile(
         priority, rank = effective_priority(sorted(issue.labels), issue.title)
         return priority, rank
 
-    stopped = set(terminal_stopped or set())
+    stopped = _normalize_terminal_stopped(terminal_stopped)
 
     for number in sorted(issues):
         issue = issues[number]
         if not issue.is_open:
             continue
-        if number in stopped:
+        active_generation = _active_generation(number, generations)
+        if (number, active_generation) in stopped:
             # Terminal generation stops never consume WIP, never count
             # as waiters, and never fail the pass: the generation is
-            # closed by design while successors remain schedulable.
+            # closed by design while successors and explicit new
+            # generations remain schedulable.
             # automation:blocked semantics are untouched: this is a
             # dedicated stop identity, not a dependency marker.
-            result.skip_reasons[number] = terminal_stop_skip_reason(number)
+            result.skip_reasons[number] = terminal_stop_skip_reason(
+                number, active_generation
+            )
             continue
         if number in active:
             _, rank = priority_of(issue)
@@ -378,8 +421,10 @@ def reconcile(
     for number in selected:
         issue = issues[number]
         labels = issue.labels
-        if number in stopped:
-            result.skip_reasons[number] = terminal_stop_skip_reason(number)
+        if (number, _active_generation(number, generations)) in stopped:
+            result.skip_reasons[number] = terminal_stop_skip_reason(
+                number, _active_generation(number, generations)
+            )
             continue
         if (
             not issue.is_open

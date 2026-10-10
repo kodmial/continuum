@@ -164,7 +164,7 @@ jobs:
           # stopped generation holds here without agent work and without
           # another comment; only an explicit owner recovery marker, a
           # successor issue, or an explicit new generation re-arms it.
-          if [[ "$(python3 "$SNAPSHOT_ADMISSION" has-stop --comments-json "$CHILD_COMMENTS_JSON" --repo "$child_repo" --issue "$TASK_NUMBER" --owner "$CHILD_OWNER" 2>/dev/null || echo active)" == "stopped" ]]; then
+          if [[ "$(python3 "$SNAPSHOT_ADMISSION" has-stop --comments-json "$CHILD_COMMENTS_JSON" --repo "$child_repo" --issue "$TASK_NUMBER" --owner "$CHILD_OWNER" --generation 1 2>/dev/null || echo active)" == "stopped" ]]; then
             echo "::notice::Child task $child_repo#$TASK_NUMBER generation 1 is terminally stopped; holding without agent work or further comments."
             exit 0
           fi
@@ -216,15 +216,28 @@ jobs:
             # digests only, never task text) so later scheduler ticks,
             # event wakeups, and lease reclaims hold silently instead of
             # posting endless drift pairs. Later runs converge on the
-            # first stop; the pinned snapshot is never rewritten and a
-            # successor issue stays schedulable.
-            if [[ "$(python3 "$SNAPSHOT_ADMISSION" has-stop --comments-json "$CHILD_COMMENTS_JSON" --repo "$child_repo" --issue "$TASK_NUMBER" --owner "$CHILD_OWNER" 2>/dev/null || echo active)" != "stopped" ]]; then
+            # first stop via first-writer-wins selection; the pinned
+            # snapshot is never rewritten and a successor issue stays
+            # schedulable. A fresh re-read immediately before
+            # publication narrows the concurrent-admission race so the
+            # second writer observes the first stop and skips its own.
+            if [[ "$(python3 "$SNAPSHOT_ADMISSION" has-stop --comments-json "$CHILD_COMMENTS_JSON" --repo "$child_repo" --issue "$TASK_NUMBER" --owner "$CHILD_OWNER" --generation 1 2>/dev/null || echo active)" != "stopped" ]]; then
               stop_pinned="$(jq -r '.pinned_spec_sha256 // ""' "$CHILD_SNAPSHOT_DECISION" 2>/dev/null || echo "")"
               stop_live="$(jq -r '.live_spec_sha256 // ""' "$CHILD_SNAPSHOT_DECISION" 2>/dev/null || echo "")"
               stop_reason="$(jq -r '.stop_reason // "drift"' "$CHILD_SNAPSHOT_DECISION" 2>/dev/null || echo drift)"
               [[ "$stop_reason" == "drift" || "$stop_reason" == "tampered" ]] || stop_reason="drift"
               if [[ "$stop_pinned" =~ ^[0-9a-f]{64}$ && "$stop_live" =~ ^[0-9a-f]{64}$ ]]; then
-                if stop_marker="$(python3 "$SNAPSHOT_ADMISSION" render-stop --repo "$child_repo" --issue "$TASK_NUMBER" --pinned-spec "$stop_pinned" --live-spec "$stop_live" --reason "$stop_reason" 2>/dev/null)"; then
+                stop_marker=""
+                if fetch_snapshot_comments 2>/dev/null; then
+                  if [[ "$(python3 "$SNAPSHOT_ADMISSION" has-stop --comments-json "$CHILD_COMMENTS_JSON" --repo "$child_repo" --issue "$TASK_NUMBER" --owner "$CHILD_OWNER" --generation 1 2>/dev/null || echo active)" == "stopped" ]]; then
+                    echo "::notice::Child task $child_repo#$TASK_NUMBER converges on the earlier terminal generation stop; skipping duplicate publication."
+                  else
+                    stop_marker="$(python3 "$SNAPSHOT_ADMISSION" render-stop --repo "$child_repo" --issue "$TASK_NUMBER" --pinned-spec "$stop_pinned" --live-spec "$stop_live" --reason "$stop_reason" 2>/dev/null || echo "")"
+                  fi
+                else
+                  stop_marker="$(python3 "$SNAPSHOT_ADMISSION" render-stop --repo "$child_repo" --issue "$TASK_NUMBER" --pinned-spec "$stop_pinned" --live-spec "$stop_live" --reason "$stop_reason" 2>/dev/null || echo "")"
+                fi
+                if [[ -n "$stop_marker" ]]; then
                   gh issue comment "$TASK_NUMBER" --repo "$child_repo" \
                     --body "$(printf '%s\n%s\n%s' "$stop_marker" '⚡ **Continuum · delegation-worker**' '<!-- continuum-origin role=continuum component=delegation-worker -->')" \
                     >/dev/null 2>&1 || true

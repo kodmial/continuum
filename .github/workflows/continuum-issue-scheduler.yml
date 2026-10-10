@@ -1078,23 +1078,36 @@ jobs:
               # kodmial/continuum#309: terminal generation-stop gate. A
               # truly drifted/tampered generation publishes one typed stop
               # comment (digests only); the queue must never resurface it
-              # on later ticks. The stop is early-lifecycle state, so one
-              # bounded first-page read per otherwise-eligible task is the
-              # complete check; a fetch failure keeps the task eligible
-              # (the worker admission still fails closed) so a transient
-              # outage cannot strand work. automation:blocked semantics
-              # are untouched: this is a dedicated stop identity, never a
-              # dependency marker, and successors stay schedulable.
+              # on later ticks. The check is trusted, generation-keyed,
+              # and paginated (up to 3 pages) so a stop beyond the first
+              # 100 comments still holds; a fetch failure keeps the task
+              # eligible (the worker admission still fails closed) so a
+              # transient outage cannot strand work. automation:blocked
+              # semantics are untouched: this is a dedicated stop
+              # identity, never a dependency marker, and successors stay
+              # schedulable.
               stop_state="active"
-              if stop_comments="$(gh api "repos/$child_repo/issues/$task_number/comments?per_page=100&page=1" 2>/dev/null)"; then
-                stop_file="$RUNNER_TEMP/continuum-stop-$task_number.json"
-                if printf '%s' "$stop_comments" >"$stop_file" 2>/dev/null; then
-                  stop_state="$(python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/task_snapshot_admission.py" has-stop --comments-json "$stop_file" --repo "$child_repo" --issue "$task_number" 2>/dev/null || echo active)"
-                  rm -f "$stop_file"
+              stop_pages="$RUNNER_TEMP/continuum-stop-pages-$task_number.jsonl"
+              stop_file="$RUNNER_TEMP/continuum-stop-$task_number.json"
+              : > "$stop_pages"
+              stop_ok=true
+              for stop_page in 1 2 3; do
+                if ! stop_comments="$(gh api "repos/$child_repo/issues/$task_number/comments?per_page=100&page=$stop_page" 2>/dev/null)"; then
+                  echo "::warning::Terminal-stop lookup failed for delegated task #$task_number; keeping it eligible for this pass."
+                  stop_ok=false
+                  break
                 fi
-              else
-                echo "::warning::Terminal-stop lookup failed for delegated task #$task_number; keeping it eligible for this pass."
+                echo "$stop_comments" >> "$stop_pages"
+                stop_count="$(jq 'length' <<<"$stop_comments" 2>/dev/null || echo 0)"
+                [[ "$stop_count" == "100" ]] || break
+              done
+              if [[ "$stop_ok" == "true" ]]; then
+                if jq -s 'add' "$stop_pages" > "$stop_file" 2>/dev/null; then
+                  stop_state="$(python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/task_snapshot_admission.py" has-stop --comments-json "$stop_file" --repo "$child_repo" --issue "$task_number" --owner "${child_repo%%/*}" --generation 1 2>/dev/null || echo active)"
+                fi
+                rm -f "$stop_file"
               fi
+              rm -f "$stop_pages"
               if [[ "$stop_state" == "stopped" ]]; then
                 echo "Skipping delegated task #$task_number: terminal generation stop; open a successor issue with an explicit dependency or start an explicit new generation instead of redispatching."
                 continue
@@ -1498,10 +1511,11 @@ jobs:
               return (entry.created_at || '') + '#' + String(entry.id || 0).padStart(12, '0');
             }
             async function terminalGenerationStop(
-              targetOwner, targetRepo, issueNumber, client
+              targetOwner, targetRepo, issueNumber, client, generation = 1
             ) {
               const idle = { stopped: false };
               const wantedRepo = (targetOwner + '/' + targetRepo).toLowerCase();
+              const wantedGeneration = Number(generation) || 1;
               let first;
               try {
                 const response = await client.rest.issues.listComments({
@@ -1529,11 +1543,12 @@ jobs:
                     stopMatch &&
                     stopMatch[1].toLowerCase() === wantedRepo &&
                     Number(stopMatch[2]) === issueNumber &&
-                    Number(stopMatch[3]) === 1
+                    Number(stopMatch[3]) === wantedGeneration
                   ) {
                     stops.push({
                       created_at: comment.created_at || '',
                       id: comment.id || 0,
+                      generation: wantedGeneration,
                       pinnedSpec: stopMatch[4].toLowerCase(),
                       liveSpec: stopMatch[5].toLowerCase(),
                       reason: stopMatch[6].toLowerCase(),
@@ -1545,7 +1560,7 @@ jobs:
                     recoverMatch &&
                     recoverMatch[1].toLowerCase() === wantedRepo &&
                     Number(recoverMatch[2]) === issueNumber &&
-                    Number(recoverMatch[3]) === 1
+                    Number(recoverMatch[3]) === wantedGeneration
                   ) {
                     recovers.push({
                       created_at: comment.created_at || '',
@@ -1578,6 +1593,7 @@ jobs:
                 const earliest = found.stops[0];
                 return {
                   stopped: true,
+                  generation: wantedGeneration,
                   pinnedSpec: earliest.pinnedSpec,
                   liveSpec: earliest.liveSpec,
                   reason: earliest.reason,
@@ -1593,14 +1609,16 @@ jobs:
               const earliest = found.stops[0];
               return {
                 stopped: true,
+                generation: wantedGeneration,
                 pinnedSpec: earliest.pinnedSpec,
                 liveSpec: earliest.liveSpec,
                 reason: earliest.reason,
               };
             }
             function terminalStopSkipReason(issueNumber, stop) {
+              const stopGeneration = Number(stop.generation) || 1;
               return 'terminal generation stop: #' + issueNumber +
-                ' generation 1 is stopped (' + (stop.reason || 'drift') +
+                ' generation ' + stopGeneration + ' is stopped (' + (stop.reason || 'drift') +
                 ' pinned ' + String(stop.pinnedSpec || 'unknown').slice(0, 12) +
                 ' live ' + String(stop.liveSpec || 'unknown').slice(0, 12) +
                 '); open a successor issue with an explicit dependency or ' +
