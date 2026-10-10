@@ -17,7 +17,7 @@ continuum_checkpoint_restore() {
   local checkpoint_ref="$1" branch="$2" spec="$3"
   local remote_line
   CONTINUUM_CHECKPOINT_RESTORED=false
-  if ! remote_line="$(git ls-remote --heads origin "refs/heads/$checkpoint_ref")"; then
+  if ! remote_line="$(git ls-remote --heads origin "refs/heads/$checkpoint_ref" 2>/dev/null)"; then
     echo "::error::Delegated checkpoint lookup unavailable; refusing a fresh start." >&2
     return 4
   fi
@@ -26,7 +26,7 @@ continuum_checkpoint_restore() {
     return 0
   fi
 
-  git fetch --quiet origin "refs/heads/$checkpoint_ref" || return 4
+  git fetch --quiet origin "refs/heads/$checkpoint_ref" >/dev/null 2>&1 || return 4
   if ! git log -1 --format=%B FETCH_HEAD | grep -Fxq "Continuum-Checkpoint: $spec"; then
     echo "::error::Delegated checkpoint has no matching frozen task specification." >&2
     return 4
@@ -59,7 +59,7 @@ continuum_checkpoint_save() {
     -m "Continuum-Component: delegation-worker" \
     -m "Continuum-Checkpoint: $spec" >/dev/null || return 4
   continuum_assert_safe_push "$checkpoint_ref" "$child_repo" || return 4
-  git push origin "HEAD:refs/heads/$checkpoint_ref" >/dev/null || return 4
+  git push origin "HEAD:refs/heads/$checkpoint_ref" >/dev/null 2>&1 || return 4
   echo "::notice::Saved delegated work checkpoint on the child repository; not accepted and no PR created."
 }
 
