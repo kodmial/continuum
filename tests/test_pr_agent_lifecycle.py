@@ -2141,6 +2141,20 @@ APPROVED_309_SNAPSHOT_FRESH_READ_ADDED_LINES = (
     "                  gh issue comment \"$ISSUE_NUMBER\" --repo \"$GITHUB_REPOSITORY\" \\",
     "                    --body \"$(printf '%s\\n%s\\n%s\\n%s' \"<!-- continuum-task-generation-stop repo=${GITHUB_REPOSITORY,,} issue=${ISSUE_NUMBER} generation=1 pinned-spec=${SNAPSHOT_SPEC} live-spec=${live_spec} reason=drift -->\" '⚡ **Continuum · opencode**' '<!-- continuum-origin role=continuum component=opencode -->' \"Continuum terminal generation stop for ${GITHUB_REPOSITORY}#${ISSUE_NUMBER} generation 1 (drift; pinned spec ${SNAPSHOT_SPEC}, live spec ${live_spec}). This generation will not be redispatched.\")\" >/dev/null 2>&1 || true",
 )
+# Narrow P0 correction: jq -r plus Bash command substitution stripped terminal
+# issue-body newlines in the post-pin verification (false snapshot-drift).
+# Only these exact 3 approved added lines are replaced. No bypass of pin,
+# trust, integrity, generation stop or genuine drift checks is allowed.
+APPROVED_SNAPSHOT_NEWLINE_FIX_REMOVED_LINES = (
+    "            live_title=\"$(jq -r '.title // \"\"' <<<\"$live_json\")\"",
+    "            live_body=\"$(jq -r '.body // \"\"' <<<\"$live_json\")\"",
+    "            live_spec=\"$(TASK_SPEC_TITLE=\"$live_title\" TASK_SPEC_BODY=\"$live_body\" python3 -c 'import hashlib,os,unicodedata; norm=lambda v: unicodedata.normalize(\"NFC\", v.replace(\"\\r\\n\",\"\\n\").replace(\"\\r\",\"\\n\")); title=norm(os.environ.get(\"TASK_SPEC_TITLE\") or \"\"); body=norm(os.environ.get(\"TASK_SPEC_BODY\") or \"\"); title_sha=hashlib.sha256(title.encode(\"utf-8\")).hexdigest(); body_sha=hashlib.sha256(body.encode(\"utf-8\")).hexdigest(); print(hashlib.sha256((title_sha+\":\"+body_sha).encode(\"ascii\")).hexdigest())')\" || return 1",
+)
+APPROVED_SNAPSHOT_NEWLINE_FIX_ADDED_LINES = (
+    "            # Keep trailing newlines in title/body: Bash $(...) strips them.",
+    "            # Decode the authoritative JSON within Python before hashing.",
+    "            live_spec=\"$(printf '%s' \"$live_json\" | python3 -c 'import hashlib,json,sys,unicodedata; data=json.load(sys.stdin); norm=lambda v: unicodedata.normalize(\"NFC\", str(v or \"\").replace(\"\\r\\n\",\"\\n\").replace(\"\\r\",\"\\n\")); title=norm(data.get(\"title\")); body=norm(data.get(\"body\")); title_sha=hashlib.sha256(title.encode(\"utf-8\")).hexdigest(); body_sha=hashlib.sha256(body.encode(\"utf-8\")).hexdigest(); print(hashlib.sha256((title_sha+\":\"+body_sha).encode(\"ascii\")).hexdigest())')\" || return 1",
+)
 APPROVED_309_SNAPSHOT_FRESH_READ_REMOVED_LINES = (
     "          TASK_TITLE: ${{ steps.task_context.outputs.task_title }}",
     "          TASK_BODY: ${{ steps.task_context.outputs.task_body }}",
@@ -2370,6 +2384,40 @@ class StampDetectorTests(unittest.TestCase):
 
 
 class ProtectedBaselineTests(unittest.TestCase):
+    def test_snapshot_check_preserves_trailing_issue_body_newlines(self):
+        import json
+        import re
+
+        from continuum.task_snapshot import spec_digest
+
+        workflow = open(
+            os.path.join(ROOT, ".github/workflows/continuum-opencode.yml"),
+            encoding="utf-8",
+        ).read()
+        self.assertNotIn('live_body="$(jq -r', workflow)
+        self.assertNotIn('live_title="$(jq -r', workflow)
+        match = re.search(
+            r"""live_spec="\$\(printf '%s' "\$live_json" \| python3 -c '([^']+)'\)" \|\| return 1""",
+            workflow,
+        )
+        self.assertIsNotNone(match, "must hash untrimmed GitHub JSON fields")
+        for body in (
+            "normal body",
+            "body ending with one newline\n",
+            "body ending with two newlines\n\n",
+            "Cyrillic text: задача\r\n\r\n",
+        ):
+            with self.subTest(body_repr=repr(body)):
+                record = {"title": "Квалификация", "body": body}
+                actual = subprocess.run(
+                    ["python3", "-c", match.group(1)],
+                    input=json.dumps(record, ensure_ascii=False),
+                    text=True,
+                    capture_output=True,
+                    check=True,
+                ).stdout.strip()
+                self.assertEqual(actual, spec_digest(record["title"], record["body"]))
+
     def test_every_protected_coderabbit_file_has_zero_diff_from_baseline(self):
         # The validation workflow checks out with fetch-depth 1, so the
         # baseline objects may be absent ("fatal: bad object"). Fetch each
@@ -2534,6 +2582,12 @@ class ProtectedBaselineTests(unittest.TestCase):
                                 APPROVED_309_SNAPSHOT_FRESH_READ_REMOVED_LINES
                             )
                         )
+                        # Terminal-newline-safe verification keeps exactly the
+                        # same snapshot trust boundary; remove only the old
+                        # lossy command-substitution lines from the approved
+                        # added-line multiset and insert exact replacement.
+                        expected.subtract(_Counter(APPROVED_SNAPSHOT_NEWLINE_FIX_REMOVED_LINES))
+                        expected.update(_Counter(APPROVED_SNAPSHOT_NEWLINE_FIX_ADDED_LINES))
                         expected = +expected
                         self.assertEqual(
                             actual,
