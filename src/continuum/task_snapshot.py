@@ -1293,7 +1293,7 @@ def is_generation_terminally_stopped(
 
     A generation is stopped when a trusted stop marker exists for its
     exact identity and no trusted recovery marker for the same identity
-    was created strictly after the earliest stop. Recovery is the only
+    was created strictly after the latest stop. Recovery is the only
     in-place re-arm; a successor issue or a new generation number needs
     no recovery marker because neither rewrites the stopped record.
     """
@@ -1330,9 +1330,9 @@ def is_generation_terminally_stopped(
     if not recovers:
         return True
     # A recovery re-arms only when it is strictly later than the
-    # earliest stop (timestamp, then comment id). Equal/earlier
+    # latest stop (timestamp, then comment id). Equal/earlier
     # recovery markers never cancel an existing stop.
-    return _stop_sort_key(recovers[-1]) <= _stop_sort_key(stops[0])
+    return _stop_sort_key(recovers[-1]) <= _stop_sort_key(stops[-1])
 
 
 def render_generation_stop(

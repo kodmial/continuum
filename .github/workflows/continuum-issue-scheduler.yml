@@ -1485,10 +1485,11 @@ jobs:
             // never redispatched, never consumes WIP, and never emits
             // another /oc comment. Trust mirrors the snapshot contract
             // (OWNER/MEMBER/COLLABORATOR, github-actions[bot], or the
-            // repository owner login). The stop is early-lifecycle state,
-            // so the first page is the complete check; only when a stop
-            // is found does the lookup paginate further for a strictly
-            // later explicit owner recovery marker
+            // repository owner login). The stop is evaluated over the
+            // full comment history via pagination: a stop beyond the
+            // first page still gates, mirroring the bash
+            // delegated/legacy gates. A strictly later explicit owner
+            // recovery marker
             // (continuum-task-generation-recover), which is the sole
             // in-place re-arm. A successor issue or an explicit new
             // generation needs no recovery marker. automation:blocked
@@ -1498,14 +1499,14 @@ jobs:
               /<!--\s*continuum-task-generation-stop\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+pinned-spec=([0-9a-fA-F]{64})\s+live-spec=([0-9a-fA-F]{64})\s+reason=(drift|tampered)\s*-->/;
             const generationRecoverMarkerRe =
               /<!--\s*continuum-task-generation-recover\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s*-->/;
-            function isTrustedStopComment(comment) {
+            function isTrustedStopComment(comment, trustedOwner = owner) {
               const association = String(
                 comment.author_association || ''
               ).toUpperCase();
               if (['OWNER', 'MEMBER', 'COLLABORATOR'].includes(association)) return true;
               const login = String(comment.user?.login || '').toLowerCase();
               if (login === 'github-actions[bot]') return true;
-              return login === owner.toLowerCase();
+              return login === String(trustedOwner || '').toLowerCase();
             }
             function stopOrderKey(entry) {
               return (entry.created_at || '') + '#' + String(entry.id || 0).padStart(12, '0');
@@ -1537,7 +1538,7 @@ jobs:
                 const stops = [];
                 const recovers = [];
                 for (const comment of list || []) {
-                  if (!isTrustedStopComment(comment)) continue;
+                  if (!isTrustedStopComment(comment, targetOwner)) continue;
                   const stopMatch = String(comment.body || '').match(generationStopMarkerRe);
                   if (
                     stopMatch &&
@@ -1571,9 +1572,12 @@ jobs:
                 return { stops, recovers };
               };
               let found = scan(first);
-              if (found.stops.length === 0) return idle;
               found.stops.sort((a, b) => (stopOrderKey(a) < stopOrderKey(b) ? -1 : 1));
-              let recovers = found.recovers;
+              found.recovers.sort((a, b) => (stopOrderKey(a) < stopOrderKey(b) ? -1 : 1));
+              // A stop beyond the first page must still gate: always
+              // evaluate the full history below instead of returning
+              // idle when the first page carries no stop.
+              let scanned;
               try {
                 const all = await client.paginate(
                   client.rest.issues.listComments,
@@ -1584,8 +1588,15 @@ jobs:
                     per_page: 100,
                   }
                 );
-                recovers = scan(all).recovers;
+                scanned = scan(all);
               } catch (err) {
+                if (found.stops.length === 0) {
+                  core.warning(
+                    'Terminal-stop lookup failed for #' + issueNumber +
+                    '; keeping it eligible for this pass.'
+                  );
+                  return idle;
+                }
                 core.warning(
                   'Terminal-stop recovery lookup failed for #' + issueNumber +
                   '; treating the generation as stopped.'
@@ -1599,14 +1610,16 @@ jobs:
                   reason: earliest.reason,
                 };
               }
-              recovers.sort((a, b) => (stopOrderKey(a) < stopOrderKey(b) ? -1 : 1));
+              scanned.stops.sort((a, b) => (stopOrderKey(a) < stopOrderKey(b) ? -1 : 1));
+              scanned.recovers.sort((a, b) => (stopOrderKey(a) < stopOrderKey(b) ? -1 : 1));
+              if (scanned.stops.length === 0) return idle;
               if (
-                recovers.length > 0 &&
-                stopOrderKey(recovers[recovers.length - 1]) > stopOrderKey(found.stops[0])
+                scanned.recovers.length > 0 &&
+                stopOrderKey(scanned.recovers[scanned.recovers.length - 1]) > stopOrderKey(scanned.stops[scanned.stops.length - 1])
               ) {
                 return idle;
               }
-              const earliest = found.stops[0];
+              const earliest = scanned.stops[0];
               return {
                 stopped: true,
                 generation: wantedGeneration,
