@@ -31,7 +31,7 @@ continuum_checkpoint_restore() {
     echo "::error::Delegated checkpoint has no matching frozen task specification." >&2
     return 4
   fi
-  if ! git merge-base FETCH_HEAD origin/main >/dev/null; then
+  if ! git merge-base --is-ancestor origin/main FETCH_HEAD >/dev/null 2>&1; then
     echo "::error::Delegated checkpoint history is unrelated to the target default branch." >&2
     return 4
   fi
@@ -77,13 +77,22 @@ continuum_checkpoint_save() {
       echo "::error::Delegated checkpoint changed to an untrusted revision; refusing to overwrite." >&2
       return 4
     fi
-    if ! git merge-base FETCH_HEAD origin/main >/dev/null; then
+    if ! git merge-base --is-ancestor origin/main FETCH_HEAD >/dev/null 2>&1; then
       echo "::error::Delegated checkpoint history is unrelated to the target default branch." >&2
       return 4
     fi
     if ! git rebase FETCH_HEAD >/dev/null 2>&1; then
       git rebase --abort >/dev/null 2>&1 || true
-      echo "::error::Delegated checkpoint update conflicts with concurrent work; refusing to overwrite." >&2
+      # The losing runner's delta is still only local; the ephemeral workdir
+      # is discarded on exit, so preserve it on a side ref instead of
+      # silently dropping one side of the conflict. The winner checkpoint
+      # is left untouched for fail-closed manual reconciliation.
+      conflict_sha="$(git rev-parse --short HEAD 2>/dev/null || echo local)"
+      conflict_ref="${checkpoint_ref}-conflict-${conflict_sha}"
+      if continuum_assert_safe_push "$conflict_ref" "$child_repo"; then
+        git push origin "HEAD:refs/heads/$conflict_ref" >/dev/null 2>&1 || true
+      fi
+      echo "::error::Delegated checkpoint update conflicts with concurrent work; losing delta preserved at $conflict_ref; refusing to overwrite." >&2
       return 4
     fi
   done
