@@ -2156,9 +2156,9 @@ jobs:
             local phase="$1"
             local live_json live_title live_body live_spec
             live_json="$(gh issue view "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --json title,body)" || return 1
-            live_title="$(jq -r '.title // ""' <<<"$live_json")"
-            live_body="$(jq -r '.body // ""' <<<"$live_json")"
-            live_spec="$(TASK_SPEC_TITLE="$live_title" TASK_SPEC_BODY="$live_body" python3 -c 'import hashlib,os,unicodedata; norm=lambda v: unicodedata.normalize("NFC", v.replace("\r\n","\n").replace("\r","\n")); title=norm(os.environ.get("TASK_SPEC_TITLE") or ""); body=norm(os.environ.get("TASK_SPEC_BODY") or ""); title_sha=hashlib.sha256(title.encode("utf-8")).hexdigest(); body_sha=hashlib.sha256(body.encode("utf-8")).hexdigest(); print(hashlib.sha256((title_sha+":"+body_sha).encode("ascii")).hexdigest())')" || return 1
+            # Keep trailing newlines in title/body: Bash $(...) strips them.
+            # Decode the authoritative JSON within Python before hashing.
+            live_spec="$(printf '%s' "$live_json" | python3 -c 'import hashlib,json,sys,unicodedata; data=json.load(sys.stdin); norm=lambda v: unicodedata.normalize("NFC", str(v or "").replace("\r\n","\n").replace("\r","\n")); title=norm(data.get("title")); body=norm(data.get("body")); title_sha=hashlib.sha256(title.encode("utf-8")).hexdigest(); body_sha=hashlib.sha256(body.encode("utf-8")).hexdigest(); print(hashlib.sha256((title_sha+":"+body_sha).encode("ascii")).hexdigest())')" || return 1
             if [[ "$live_spec" != "$SNAPSHOT_SPEC" ]]; then
               # kodmial/continuum#309: one deterministic terminal stop,
               # never endless identical drift comments. The check is
