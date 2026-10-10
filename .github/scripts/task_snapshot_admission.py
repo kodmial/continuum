@@ -16,6 +16,11 @@ Usage::
     task_snapshot_admission.py render-comment --record-file record.json
     task_snapshot_admission.py render-pr-ref --record-file record.json
     task_snapshot_admission.py render-marker --record-file record.json
+    task_snapshot_admission.py render-stop --repo o/n --issue 1
+        --pinned-spec <hex> --live-spec <hex> --reason drift
+    task_snapshot_admission.py render-recover --repo o/n --issue 1
+    task_snapshot_admission.py has-stop --comments-json comments.json
+        --repo o/n --issue 1
     task_snapshot_admission.py digests --title-file title.txt --body-file body.txt
 
 ``decide`` prints exactly one of ``pin``, ``proceed``,
@@ -54,6 +59,9 @@ from continuum.task_snapshot import (  # noqa: E402
     body_digest,
     build_snapshot,
     decide_admission,
+    is_generation_terminally_stopped,
+    render_generation_recover,
+    render_generation_stop,
     render_pr_snapshot_ref,
     render_snapshot_comment,
     select_snapshot,
@@ -144,6 +152,39 @@ def cmd_decide(args: argparse.Namespace) -> int:
             _write_json_file(args.record_out, record)
         except TaskSnapshotError as exc:
             return _fail(str(exc))
+    if decision.action in ("drift_blocked", "tampered_fail_closed"):
+        # Terminal-stop evidence for workflow publishers: the pinned and
+        # live digests plus a closed reason vocabulary word, without any
+        # title/body text. Never leaks prompt or user content.
+        try:
+            stop_selection = select_snapshot(
+                comments,
+                repo=args.repo,
+                issue=args.issue,
+                generation=args.generation,
+                owner_login=args.owner or "",
+            )
+            live_title = issue.get("title") or ""
+            live_body = issue.get("body") or ""
+            payload_stop = {
+                "pinned_spec_sha256": (
+                    stop_selection.snapshot.spec_sha256
+                    if stop_selection.snapshot is not None
+                    else ""
+                ),
+                "live_spec_sha256": spec_digest(live_title, live_body),
+                "live_title_sha256": title_digest(live_title),
+                "live_body_sha256": body_digest(live_body),
+                "stop_reason": (
+                    "tampered"
+                    if decision.action == "tampered_fail_closed"
+                    else "drift"
+                ),
+            }
+        except TaskSnapshotError:
+            payload_stop = {}
+    else:
+        payload_stop = {}
     payload = {
         "action": decision.action,
         "reason": decision.reason,
@@ -152,6 +193,7 @@ def cmd_decide(args: argparse.Namespace) -> int:
         "issue": args.issue,
         "generation": args.generation,
     }
+    payload.update(payload_stop)
     if record is not None:
         payload["spec_sha256"] = record["spec_sha256"]
         payload["title_sha256"] = record["title_sha256"]
@@ -200,6 +242,56 @@ def cmd_render_marker(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_render_stop(args: argparse.Namespace) -> int:
+    try:
+        print(
+            render_generation_stop(
+                args.repo,
+                args.issue,
+                generation=args.generation,
+                pinned_spec=args.pinned_spec,
+                live_spec=args.live_spec,
+                reason=args.reason,
+            )
+        )
+    except TaskSnapshotError as exc:
+        return _fail(str(exc))
+    return 0
+
+
+def cmd_render_recover(args: argparse.Namespace) -> int:
+    try:
+        print(
+            render_generation_recover(
+                args.repo, args.issue, generation=args.generation
+            )
+        )
+    except TaskSnapshotError as exc:
+        return _fail(str(exc))
+    return 0
+
+
+def cmd_has_stop(args: argparse.Namespace) -> int:
+    try:
+        comments = _read_json_file(args.comments_json)
+    except TaskSnapshotError as exc:
+        return _fail(str(exc))
+    if not isinstance(comments, list):
+        return _fail(f"comments file {args.comments_json!r} is not a JSON array")
+    try:
+        stopped = is_generation_terminally_stopped(
+            comments,
+            repo=args.repo,
+            issue=args.issue,
+            generation=args.generation,
+            owner_login=args.owner or "",
+        )
+    except TaskSnapshotError as exc:
+        return _fail(str(exc))
+    print("stopped" if stopped else "active")
+    return 0
+
+
 def cmd_digests(args: argparse.Namespace) -> int:
     try:
         with open(args.title_file, "r", encoding="utf-8") as handle:
@@ -240,6 +332,29 @@ def build_parser() -> argparse.ArgumentParser:
     render_marker = sub.add_parser("render-marker", help="render snapshot marker line")
     render_marker.add_argument("--record-file", required=True)
     render_marker.set_defaults(func=cmd_render_marker)
+
+    render_stop = sub.add_parser("render-stop", help="render terminal generation stop")
+    render_stop.add_argument("--repo", required=True)
+    render_stop.add_argument("--issue", required=True, type=int)
+    render_stop.add_argument("--generation", default=DEFAULT_GENERATION, type=int)
+    render_stop.add_argument("--pinned-spec", required=True)
+    render_stop.add_argument("--live-spec", required=True)
+    render_stop.add_argument("--reason", default="drift")
+    render_stop.set_defaults(func=cmd_render_stop)
+
+    render_recover = sub.add_parser("render-recover", help="render explicit owner recovery")
+    render_recover.add_argument("--repo", required=True)
+    render_recover.add_argument("--issue", required=True, type=int)
+    render_recover.add_argument("--generation", default=DEFAULT_GENERATION, type=int)
+    render_recover.set_defaults(func=cmd_render_recover)
+
+    has_stop = sub.add_parser("has-stop", help="print stopped or active")
+    has_stop.add_argument("--comments-json", required=True)
+    has_stop.add_argument("--repo", required=True)
+    has_stop.add_argument("--issue", required=True, type=int)
+    has_stop.add_argument("--owner", default="")
+    has_stop.add_argument("--generation", default=DEFAULT_GENERATION, type=int)
+    has_stop.set_defaults(func=cmd_has_stop)
 
     digests = sub.add_parser("digests", help="print title/body/spec digests")
     digests.add_argument("--title-file", required=True)

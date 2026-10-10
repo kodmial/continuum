@@ -4354,11 +4354,13 @@ class ContinuumTest < Minitest::Test
       'qualification tracker needs explicit dispatch, not generic implementation.',
       'const freshDeclaredBlockers = await openDeclaredBlockers(freshIssue);',
       'freshOpenBlockers.length > 0',
-      'if (commandAgeMs < commandGraceMs) {'
+      'if (commandAgeMs < commandGraceMs) {',
+      'const freshStop = await terminalGenerationStop(',
+      'terminalStopSkipReason(issue.number, freshStop)'
     ].each { |guard| assert_includes dispatch, guard, "missing just-in-time guard: #{guard}" }
     local_dispatch = dispatch[/\/\/ Re-check mutable state immediately before dispatch\..*\z/m]
     refute_nil local_dispatch, 'the local just-in-time re-check block is gone'
-    assert_equal 6, local_dispatch.scan(/^\s+continue;\s*$/).size,
+    assert_equal 7, local_dispatch.scan(/^\s+continue;\s*$/).size,
                  'every local just-in-time guard must be a skip, not a fall-through'
   end
 
@@ -8308,6 +8310,61 @@ class ContinuumTest < Minitest::Test
                      'child review must verify through the canonical engine'
     assert_includes review, 'no verdict recorded',
                      'a drifted review must hold without a spurious verdict'
+  end
+
+  # kodmial/continuum#309: false long-spec drift plus repeated dispatch
+  # of terminal generations. Admission must hash a fresh authoritative
+  # issue read (never prior step outputs/env), and every scheduler path
+  # must honor the one-time terminal generation-stop state.
+  def test_snapshot_admission_uses_a_fresh_authoritative_read
+    body = workflow_body('continuum-opencode.yml')
+    snapshot = step_body(body, 'Pin and verify task specification snapshot')
+    refute_nil snapshot, 'the admission snapshot step is missing'
+    assert_includes snapshot, 'fresh authoritative',
+                     'admission must document the fresh-read rule'
+    assert_includes snapshot, 'github.rest.issues.get',
+                     'admission must re-fetch the live issue inside the verification step'
+    refute_includes snapshot, 'process.env.TASK_TITLE',
+                     'admission must not trust title text passed via prior step outputs/env'
+    refute_includes snapshot, 'process.env.TASK_BODY',
+                     'admission must not trust body text passed via prior step outputs/env'
+    assert_includes snapshot, 'continuum-task-generation-stop',
+                     'true drift must publish the deterministic terminal stop state'
+  end
+
+  def test_terminal_generation_stop_gates_every_scheduler_path
+    engine = File.read(File.join(ROOT, 'src/continuum/task_snapshot.py'))
+    %w[
+      GENERATION_STOP_MARKER GENERATION_RECOVER_MARKER
+      parse_generation_stop parse_generation_recover
+      select_generation_stop is_generation_terminally_stopped
+      render_generation_stop render_generation_recover
+      generation_stop_skip_reason
+    ].each do |symbol|
+      assert_includes engine, symbol, "task_snapshot.py must define #{symbol}"
+    end
+    scheduler = workflow_body('continuum-issue-scheduler.yml')
+    assert_includes scheduler, 'terminal generation stop',
+                     'every scheduler path must skip stopped generations with an auditable reason'
+    assert_includes scheduler, 'continuum-task-generation-stop',
+                     'the scheduler must recognize the terminal stop marker'
+    assert_includes scheduler, 'continuum-task-generation-recover',
+                     'only an explicit owner recovery marker may re-arm a stopped generation'
+    worker = workflow_body('continuum-consumer-child-worker.yml')
+    assert_includes worker, 'has-stop',
+                     'the child worker must hold silently on a stopped generation'
+    assert_includes worker, 'render-stop',
+                     'the child worker must publish the one-time terminal stop'
+    dispatcher = workflow_body('continuum-consumer-child-dispatcher.yml')
+    assert_includes dispatcher, 'terminal generation stop',
+                     'the legacy dispatcher queue must not resurface stopped generations'
+    admission = File.read(File.join(ROOT, '.github/scripts/task_snapshot_admission.py'))
+    assert_includes admission, 'render-stop',
+                     'the admission helper must render the terminal stop through the canonical engine'
+    assert_includes admission, 'has-stop',
+                     'the admission helper must answer the scheduler stop gate'
+    assert File.exist?(File.join(ROOT, 'tests/test_task_snapshot_longbody_stop.py')),
+                 'the long-spec false-drift and terminal-stop regressions need hermetic tests'
   end
 
   end

@@ -1116,16 +1116,339 @@ def classify_pr(
     return GateDecision(action="protected", reason="PR carries snapshot provenance")
 
 
+# ---------------------------------------------------------------------------
+# Terminal generation-stop state (kodmial/continuum#309).
+#
+# A truly drifted/tampered generation must stop exactly once and must
+# never be redispatched by scheduler cron, event wakeups, lease reclaim,
+# retries, or manual ``/oc``. The stop is a deterministic typed issue
+# comment keyed by (repo, issue, generation, pinned/live hashes, reason)
+# carrying digests only -- never prompt or task text -- so repeated
+# ``/oc`` + drift pairs, repeated API calls, and ghost WIP leases are
+# impossible. A genuine successor issue, or an explicit new generation
+# number, remains schedulable without rewriting the earlier pinned
+# snapshot. An explicit owner recovery marker posted *after* the stop
+# re-arms exactly that generation; nothing else does.
+#
+# Fresh-read rule (same issue): callers must pass live title/body taken
+# from a fresh authoritative GitHub issue API response fetched inside
+# the exact verification step. Title/body text carried through prior
+# GitHub Actions step outputs or environment variables is NOT an
+# authoritative live source: long bodies (~55k characters) can be
+# altered/truncated/interpolated in transit and read back as false
+# drift. All workflow admission paths re-fetch before hashing.
+# ---------------------------------------------------------------------------
+
+#: Typed terminal stop marker for one stopped implementation generation.
+GENERATION_STOP_MARKER = "continuum-task-generation-stop"
+
+#: Explicit owner recovery marker re-arming one stopped generation.
+GENERATION_RECOVER_MARKER = "continuum-task-generation-recover"
+
+#: Allowed stop reasons (privacy-safe, no free-form text).
+GENERATION_STOP_REASONS = frozenset({"drift", "tampered"})
+
+_GENERATION_STOP_RE = re.compile(
+    r"<!--\s*continuum-task-generation-stop\s+"
+    r"repo=([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+)\s+"
+    r"issue=(\d+)\s+"
+    r"generation=(\d+)\s+"
+    r"pinned-spec=([0-9a-fA-F]{64})\s+"
+    r"live-spec=([0-9a-fA-F]{64})\s+"
+    r"reason=(drift|tampered)\s*-->"
+)
+
+_GENERATION_RECOVER_RE = re.compile(
+    r"<!--\s*continuum-task-generation-recover\s+"
+    r"repo=([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+)\s+"
+    r"issue=(\d+)\s+"
+    r"generation=(\d+)\s*-->"
+)
+
+
+@dataclass(frozen=True)
+class ParsedGenerationStop:
+    """A parsed terminal generation-stop record (digests only)."""
+
+    repo: str
+    issue: int
+    generation: int
+    pinned_spec: str
+    live_spec: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class ParsedGenerationRecover:
+    """A parsed explicit owner recovery record for one generation."""
+
+    repo: str
+    issue: int
+    generation: int
+
+
+def parse_generation_stop(body: Any) -> Optional[ParsedGenerationStop]:
+    """Parse one comment body as a terminal generation-stop, or None."""
+
+    match = _GENERATION_STOP_RE.search(str(body or ""))
+    if not match:
+        return None
+    repo_text, issue_text, generation_text, pinned_hex, live_hex, reason = match.groups()
+    try:
+        repository = normalize_repo(repo_text)
+        number = normalize_issue_number(issue_text)
+        generation_number = normalize_generation(generation_text)
+    except TaskSnapshotError:
+        return None
+    if reason not in GENERATION_STOP_REASONS:
+        return None
+    return ParsedGenerationStop(
+        repo=repository,
+        issue=number,
+        generation=generation_number,
+        pinned_spec=pinned_hex.lower(),
+        live_spec=live_hex.lower(),
+        reason=reason,
+    )
+
+
+def parse_generation_recover(body: Any) -> Optional[ParsedGenerationRecover]:
+    """Parse one comment body as an explicit generation recovery, or None."""
+
+    match = _GENERATION_RECOVER_RE.search(str(body or ""))
+    if not match:
+        return None
+    repo_text, issue_text, generation_text = match.groups()
+    try:
+        repository = normalize_repo(repo_text)
+        number = normalize_issue_number(issue_text)
+        generation_number = normalize_generation(generation_text)
+    except TaskSnapshotError:
+        return None
+    return ParsedGenerationRecover(
+        repo=repository, issue=number, generation=generation_number
+    )
+
+
+def _stop_sort_key(item: Any) -> Any:
+    created, comment_id, _parsed = item
+    try:
+        numeric_id = int(comment_id) if comment_id is not None else 0
+    except (TypeError, ValueError):
+        numeric_id = 0
+    return (
+        created is None,
+        created or datetime.min.replace(tzinfo=timezone.utc),
+        numeric_id,
+    )
+
+
+def select_generation_stop(
+    comments: Sequence[Mapping[str, Any]],
+    *,
+    repo: Any,
+    issue: Any,
+    generation: Any = DEFAULT_GENERATION,
+    owner_login: str = "",
+) -> Optional[ParsedGenerationStop]:
+    """Return the earliest trusted terminal stop for a generation, if any.
+
+    Later duplicate stops never overwrite the first: selection is
+    first-writer-wins, mirroring snapshot selection. Untrusted
+    marker-lookalikes are ignored.
+    """
+
+    repository = normalize_repo(repo)
+    number = normalize_issue_number(issue)
+    generation_number = normalize_generation(generation)
+    candidates = []
+    for comment in comments or []:
+        if not is_trusted_snapshot_comment(comment, owner_login=owner_login):
+            continue
+        parsed = parse_generation_stop(comment.get("body", ""))
+        if parsed is None:
+            continue
+        if (
+            parsed.repo != repository
+            or parsed.issue != number
+            or parsed.generation != generation_number
+        ):
+            continue
+        candidates.append((_parse_time(comment.get("created_at")), comment.get("id"), parsed))
+    if not candidates:
+        return None
+    candidates.sort(key=_stop_sort_key)
+    return candidates[0][2]
+
+
+def is_generation_terminally_stopped(
+    comments: Sequence[Mapping[str, Any]],
+    *,
+    repo: Any,
+    issue: Any,
+    generation: Any = DEFAULT_GENERATION,
+    owner_login: str = "",
+) -> bool:
+    """Whether a generation is terminally stopped without later recovery.
+
+    A generation is stopped when a trusted stop marker exists for its
+    exact identity and no trusted recovery marker for the same identity
+    was created strictly after the latest stop. Recovery is the only
+    in-place re-arm; a successor issue or a new generation number needs
+    no recovery marker because neither rewrites the stopped record.
+    """
+
+    repository = normalize_repo(repo)
+    number = normalize_issue_number(issue)
+    generation_number = normalize_generation(generation)
+    stops = []
+    recovers = []
+    for comment in comments or []:
+        if not is_trusted_snapshot_comment(comment, owner_login=owner_login):
+            continue
+        stop = parse_generation_stop(comment.get("body", ""))
+        if (
+            stop is not None
+            and stop.repo == repository
+            and stop.issue == number
+            and stop.generation == generation_number
+        ):
+            stops.append((_parse_time(comment.get("created_at")), comment.get("id"), stop))
+            continue
+        recover = parse_generation_recover(comment.get("body", ""))
+        if (
+            recover is not None
+            and recover.repo == repository
+            and recover.issue == number
+            and recover.generation == generation_number
+        ):
+            recovers.append((_parse_time(comment.get("created_at")), comment.get("id"), recover))
+    if not stops:
+        return False
+    stops.sort(key=_stop_sort_key)
+    recovers.sort(key=_stop_sort_key)
+    if not recovers:
+        return True
+    # A recovery re-arms only when it is strictly later than the
+    # latest stop (timestamp, then comment id). Equal/earlier
+    # recovery markers never cancel an existing stop.
+    return _stop_sort_key(recovers[-1]) <= _stop_sort_key(stops[-1])
+
+
+def render_generation_stop(
+    repo: Any,
+    issue: Any,
+    *,
+    generation: Any = DEFAULT_GENERATION,
+    pinned_spec: str = "",
+    live_spec: str = "",
+    reason: str = "drift",
+) -> str:
+    """Render the deterministic terminal stop comment body.
+
+    The body carries digests only -- never title/body text -- so the
+    stop state cannot leak prompt or user content. Raises
+    :class:`TaskSnapshotError` on malformed identity, digests, or
+    reason so callers fail closed instead of publishing unparseable
+    state.
+    """
+
+    repository = normalize_repo(repo)
+    number = normalize_issue_number(issue)
+    generation_number = normalize_generation(generation)
+    pinned = str(pinned_spec or "").strip().lower()
+    live = str(live_spec or "").strip().lower()
+    why = str(reason or "").strip().lower()
+    if not _HEX64_RE.fullmatch(pinned):
+        raise TaskSnapshotError("pinned-spec must be a 64-hex digest")
+    if not _HEX64_RE.fullmatch(live):
+        raise TaskSnapshotError("live-spec must be a 64-hex digest")
+    if why not in GENERATION_STOP_REASONS:
+        raise TaskSnapshotError("reason must be one of: drift, tampered")
+    marker = (
+        "<!-- {} repo={} issue={} generation={} "
+        "pinned-spec={} live-spec={} reason={} -->".format(
+            GENERATION_STOP_MARKER, repository, number, generation_number,
+            pinned, live, why,
+        )
+    )
+    return "\n".join(
+        [
+            marker,
+            "Continuum terminal generation stop (machine-owned, do not edit or delete).",
+            "This generation is stopped: open a successor issue with an explicit "
+            "dependency, start an explicit new generation, or post an explicit "
+            "owner recovery marker. Scheduler, retry, lease-reclaim, and manual "
+            "/oc paths must not redispatch this generation.",
+        ]
+    )
+
+
+def render_generation_recover(
+    repo: Any,
+    issue: Any,
+    *,
+    generation: Any = DEFAULT_GENERATION,
+) -> str:
+    """Render the explicit owner recovery comment body for one generation."""
+
+    repository = normalize_repo(repo)
+    number = normalize_issue_number(issue)
+    generation_number = normalize_generation(generation)
+    marker = "<!-- {} repo={} issue={} generation={} -->".format(
+        GENERATION_RECOVER_MARKER, repository, number, generation_number
+    )
+    return "\n".join(
+        [
+            marker,
+            "Continuum explicit owner recovery for one stopped generation.",
+        ]
+    )
+
+
+def generation_stop_skip_reason(
+    repo: Any,
+    issue: Any,
+    *,
+    generation: Any = DEFAULT_GENERATION,
+    pinned_spec: str = "",
+    live_spec: str = "",
+    reason: str = "drift",
+) -> str:
+    """Auditable stable scheduler skip reason for a stopped generation."""
+
+    try:
+        repository = normalize_repo(repo)
+        number = normalize_issue_number(issue)
+        generation_number = normalize_generation(generation)
+    except TaskSnapshotError:
+        return "terminal generation stop: invalid generation identity"
+    pinned = str(pinned_spec or "").strip().lower()[:12] or "unknown"
+    live = str(live_spec or "").strip().lower()[:12] or "unknown"
+    why = str(reason or "drift").strip().lower()
+    return (
+        "terminal generation stop: {}#{} generation {} is stopped "
+        "({} pinned {} live {}); open a successor issue with an explicit "
+        "dependency or start an explicit new generation instead of "
+        "redispatching".format(repository, number, generation_number, why, pinned, live)
+    )
+
+
 __all__ = [
     "SNAPSHOT_SCHEMA_VERSION",
     "SNAPSHOT_MARKER",
     "SNAPSHOT_REF_MARKER",
+    "GENERATION_STOP_MARKER",
+    "GENERATION_RECOVER_MARKER",
+    "GENERATION_STOP_REASONS",
     "DEFAULT_GENERATION",
     "TRUSTED_COMMENT_ASSOCIATIONS",
     "TRUSTED_AUTOMATION_LOGINS",
     "TaskSnapshotError",
     "ParsedSnapshot",
     "ParsedSnapshotRef",
+    "ParsedGenerationStop",
+    "ParsedGenerationRecover",
     "SnapshotSelection",
     "DriftVerdict",
     "GateDecision",
@@ -1151,6 +1474,13 @@ __all__ = [
     "decide_execution_gate",
     "verify_pr_provenance_against_live",
     "classify_pr",
+    "parse_generation_stop",
+    "parse_generation_recover",
+    "select_generation_stop",
+    "is_generation_terminally_stopped",
+    "render_generation_stop",
+    "render_generation_recover",
+    "generation_stop_skip_reason",
     "issue_link",
     "pr_link",
 ]

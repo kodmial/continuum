@@ -1075,6 +1075,45 @@ jobs:
               )"
               [[ -z "$native_blockers" ]] || continue
 
+              # kodmial/continuum#309: terminal generation-stop gate. A
+              # truly drifted/tampered generation publishes one typed stop
+              # comment (digests only); the queue must never resurface it
+              # on later ticks. The check is trusted, generation-keyed,
+              # and scans the bounded full history (up to 50 pages) so a
+              # stop beyond the first 100 comments still holds, mirroring
+              # the JS gates; a fetch failure keeps the task
+              # eligible (the worker admission still fails closed) so a
+              # transient outage cannot strand work. automation:blocked
+              # semantics are untouched: this is a dedicated stop
+              # identity, never a dependency marker, and successors stay
+              # schedulable.
+              stop_state="active"
+              stop_pages="$RUNNER_TEMP/continuum-stop-pages-$task_number.jsonl"
+              stop_file="$RUNNER_TEMP/continuum-stop-$task_number.json"
+              : > "$stop_pages"
+              stop_ok=true
+              for stop_page in $(seq 1 50); do
+                if ! stop_comments="$(gh api "repos/$child_repo/issues/$task_number/comments?per_page=100&page=$stop_page" 2>/dev/null)"; then
+                  echo "::warning::Terminal-stop lookup failed for delegated task #$task_number; keeping it eligible for this pass."
+                  stop_ok=false
+                  break
+                fi
+                echo "$stop_comments" >> "$stop_pages"
+                stop_count="$(jq 'length' <<<"$stop_comments" 2>/dev/null || echo 0)"
+                [[ "$stop_count" == "100" ]] || break
+              done
+              if [[ "$stop_ok" == "true" ]]; then
+                if jq -s 'add' "$stop_pages" > "$stop_file" 2>/dev/null; then
+                  stop_state="$(python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/task_snapshot_admission.py" has-stop --comments-json "$stop_file" --repo "$child_repo" --issue "$task_number" --owner "${child_repo%%/*}" --generation 1 2>/dev/null || echo active)"
+                fi
+                rm -f "$stop_file"
+              fi
+              rm -f "$stop_pages"
+              if [[ "$stop_state" == "stopped" ]]; then
+                echo "Skipping delegated task #$task_number: terminal generation stop; open a successor issue with an explicit dependency or start an explicit new generation instead of redispatching."
+                continue
+              fi
+
               jq -cn \
                 --arg child_id "$child_id" --arg repository "$child_repo" \
                 --argjson task_number "$task_number" --arg title "$title" \
@@ -1437,6 +1476,167 @@ jobs:
                     new Date(b.created_at).getTime()
                 )
                 .at(-1) || null;
+            }
+
+            // Terminal generation-stop gate (kodmial/continuum#309). A
+            // truly drifted/tampered generation publishes one typed stop
+            // comment keyed by (repo, issue, generation, pinned/live
+            // hashes, reason) carrying digests only. Every scheduler path
+            // checks it before dispatching so a stopped generation is
+            // never redispatched, never consumes WIP, and never emits
+            // another /oc comment. Trust mirrors the snapshot contract
+            // (OWNER/MEMBER/COLLABORATOR, github-actions[bot], or the
+            // repository owner login). The stop is evaluated over the
+            // full comment history via pagination: a stop beyond the
+            // first page still gates, mirroring the bash
+            // delegated/legacy gates. A strictly later explicit owner
+            // recovery marker
+            // (continuum-task-generation-recover), which is the sole
+            // in-place re-arm. A successor issue or an explicit new
+            // generation needs no recovery marker. automation:blocked
+            // semantics are untouched: this is a dedicated stop identity,
+            // never a dependency marker.
+            const generationStopMarkerRe =
+              /<!--\s*continuum-task-generation-stop\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+pinned-spec=([0-9a-fA-F]{64})\s+live-spec=([0-9a-fA-F]{64})\s+reason=(drift|tampered)\s*-->/;
+            const generationRecoverMarkerRe =
+              /<!--\s*continuum-task-generation-recover\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s*-->/;
+            function isTrustedStopComment(comment, trustedOwner = owner) {
+              const association = String(
+                comment.author_association || ''
+              ).toUpperCase();
+              if (['OWNER', 'MEMBER', 'COLLABORATOR'].includes(association)) return true;
+              const login = String(comment.user?.login || '').toLowerCase();
+              if (login === 'github-actions[bot]') return true;
+              return login === String(trustedOwner || '').toLowerCase();
+            }
+            function stopOrderKey(entry) {
+              return (entry.created_at || '') + '#' + String(entry.id || 0).padStart(12, '0');
+            }
+            async function terminalGenerationStop(
+              targetOwner, targetRepo, issueNumber, client, generation = 1
+            ) {
+              const idle = { stopped: false };
+              const wantedRepo = (targetOwner + '/' + targetRepo).toLowerCase();
+              const wantedGeneration = Number(generation) || 1;
+              let first;
+              try {
+                const response = await client.rest.issues.listComments({
+                  owner: targetOwner,
+                  repo: targetRepo,
+                  issue_number: issueNumber,
+                  per_page: 100,
+                  page: 1,
+                });
+                first = response.data;
+              } catch (err) {
+                core.warning(
+                  'Terminal-stop lookup failed for #' + issueNumber +
+                  '; keeping it eligible for this pass.'
+                );
+                return idle;
+              }
+              const scan = (list) => {
+                const stops = [];
+                const recovers = [];
+                for (const comment of list || []) {
+                  if (!isTrustedStopComment(comment, targetOwner)) continue;
+                  const stopMatch = String(comment.body || '').match(generationStopMarkerRe);
+                  if (
+                    stopMatch &&
+                    stopMatch[1].toLowerCase() === wantedRepo &&
+                    Number(stopMatch[2]) === issueNumber &&
+                    Number(stopMatch[3]) === wantedGeneration
+                  ) {
+                    stops.push({
+                      created_at: comment.created_at || '',
+                      id: comment.id || 0,
+                      generation: wantedGeneration,
+                      pinnedSpec: stopMatch[4].toLowerCase(),
+                      liveSpec: stopMatch[5].toLowerCase(),
+                      reason: stopMatch[6].toLowerCase(),
+                    });
+                    continue;
+                  }
+                  const recoverMatch = String(comment.body || '').match(generationRecoverMarkerRe);
+                  if (
+                    recoverMatch &&
+                    recoverMatch[1].toLowerCase() === wantedRepo &&
+                    Number(recoverMatch[2]) === issueNumber &&
+                    Number(recoverMatch[3]) === wantedGeneration
+                  ) {
+                    recovers.push({
+                      created_at: comment.created_at || '',
+                      id: comment.id || 0,
+                    });
+                  }
+                }
+                return { stops, recovers };
+              };
+              let found = scan(first);
+              found.stops.sort((a, b) => (stopOrderKey(a) < stopOrderKey(b) ? -1 : 1));
+              found.recovers.sort((a, b) => (stopOrderKey(a) < stopOrderKey(b) ? -1 : 1));
+              // A stop beyond the first page must still gate: always
+              // evaluate the full history below instead of returning
+              // idle when the first page carries no stop.
+              let scanned;
+              try {
+                const all = await client.paginate(
+                  client.rest.issues.listComments,
+                  {
+                    owner: targetOwner,
+                    repo: targetRepo,
+                    issue_number: issueNumber,
+                    per_page: 100,
+                  }
+                );
+                scanned = scan(all);
+              } catch (err) {
+                if (found.stops.length === 0) {
+                  core.warning(
+                    'Terminal-stop lookup failed for #' + issueNumber +
+                    '; keeping it eligible for this pass.'
+                  );
+                  return idle;
+                }
+                core.warning(
+                  'Terminal-stop recovery lookup failed for #' + issueNumber +
+                  '; treating the generation as stopped.'
+                );
+                const earliest = found.stops[0];
+                return {
+                  stopped: true,
+                  generation: wantedGeneration,
+                  pinnedSpec: earliest.pinnedSpec,
+                  liveSpec: earliest.liveSpec,
+                  reason: earliest.reason,
+                };
+              }
+              scanned.stops.sort((a, b) => (stopOrderKey(a) < stopOrderKey(b) ? -1 : 1));
+              scanned.recovers.sort((a, b) => (stopOrderKey(a) < stopOrderKey(b) ? -1 : 1));
+              if (scanned.stops.length === 0) return idle;
+              if (
+                scanned.recovers.length > 0 &&
+                stopOrderKey(scanned.recovers[scanned.recovers.length - 1]) > stopOrderKey(scanned.stops[scanned.stops.length - 1])
+              ) {
+                return idle;
+              }
+              const earliest = scanned.stops[0];
+              return {
+                stopped: true,
+                generation: wantedGeneration,
+                pinnedSpec: earliest.pinnedSpec,
+                liveSpec: earliest.liveSpec,
+                reason: earliest.reason,
+              };
+            }
+            function terminalStopSkipReason(issueNumber, stop) {
+              const stopGeneration = Number(stop.generation) || 1;
+              return 'terminal generation stop: #' + issueNumber +
+                ' generation ' + stopGeneration + ' is stopped (' + (stop.reason || 'drift') +
+                ' pinned ' + String(stop.pinnedSpec || 'unknown').slice(0, 12) +
+                ' live ' + String(stop.liveSpec || 'unknown').slice(0, 12) +
+                '); open a successor issue with an explicit dependency or ' +
+                'start an explicit new generation instead of redispatching.';
             }
 
             async function openDeclaredBlockers(
@@ -3308,6 +3508,19 @@ jobs:
                 continue;
               }
 
+              // Terminal generation stops never enter the queue: no WIP,
+              // no /oc, no redispatch. Successors stay schedulable.
+              const localStop = await terminalGenerationStop(
+                owner, repo, issue.number, readGithub
+              );
+              if (localStop.stopped) {
+                core.info(
+                  'Skipping #' + issue.number + ': ' +
+                  terminalStopSkipReason(issue.number, localStop)
+                );
+                continue;
+              }
+
               candidates.push({ source: 'local', issue, priority, rank });
             }
 
@@ -3515,6 +3728,17 @@ jobs:
                   continue;
                 }
 
+                const childStop = await terminalGenerationStop(
+                  childOwner, childRepo, child.task_number, github
+                );
+                if (childStop.stopped) {
+                  core.info(
+                    'Skipping SubTask #' + child.task_number + ': ' +
+                    terminalStopSkipReason(child.task_number, childStop)
+                  );
+                  continue;
+                }
+
                 await dispatchWorkflow(childWorkerWorkflow, {
                   child_id: child.child_id,
                   task_number: String(child.task_number),
@@ -3559,6 +3783,19 @@ jobs:
                 core.info(
                   'Skipping #' + issue.number +
                   ': missing required ready label `' + readyLabel + '`.'
+                );
+                continue;
+              }
+
+              // Terminal generation stops hold through dispatch: a stop
+              // published after selection still prevents this run.
+              const freshStop = await terminalGenerationStop(
+                owner, repo, issue.number, readGithub
+              );
+              if (freshStop.stopped) {
+                core.info(
+                  'Skipping #' + issue.number + ': ' +
+                  terminalStopSkipReason(issue.number, freshStop)
                 );
                 continue;
               }
