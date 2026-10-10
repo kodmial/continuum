@@ -50,6 +50,66 @@ of rebasing silently. Comment creation is atomic at the GitHub API
 level: pin persistence failure fails closed and the agent must not
 implement live mutable text.
 
+## Fresh authoritative live reads (kodmial/continuum#309)
+
+The live title/body compared against the pinned snapshot must come
+from a **fresh authoritative GitHub issue API response fetched inside
+the exact verification step**. Title/body text carried through prior
+GitHub Actions step outputs or environment variables is not an
+authoritative live source: long bodies (~55,021 characters, as in the
+AA #315 incident) can be altered, truncated, or interpolated in
+transit and read back as false contract drift, stopping a generation
+whose live issue is byte-identical to its pinned snapshot.
+
+* `continuum-opencode.yml` → Pin and verify task specification
+  snapshot re-fetches the issue with the repository installation token
+  (TAP_PAT only as a bounded 401/403/429 liveness fallback) and hashes
+  that response. The previous step's `task_title`/`task_body` outputs
+  are not consumed by admission at all.
+* The delegated child worker already re-reads the live issue
+  immediately before `task_snapshot_admission.py decide`, and re-reads
+  it again after pinning so a concurrent edit is observed.
+* Every digest uses the same normalized source (UTF-8, NFC, LF) for
+  the pinned record, the live comparison, and the exact agent input in
+  `RUNNER_TEMP/continuum-task-snapshot.json`. A hermetic ~55k
+  regression fixture (Cyrillic, Markdown tables, JSON, newlines,
+  XML-like tags) proves an identical long body admits exactly once
+  with zero false drift while a one-codepoint edit fails closed.
+
+## Terminal generation-stop state (kodmial/continuum#309)
+
+A truly drifted or tampered generation stops **exactly once** and is
+never redispatched. The stop is a deterministic typed issue comment:
+
+`<!-- continuum-task-generation-stop repo=… issue=… generation=… pinned-spec=… live-spec=… reason=drift|tampered -->`
+
+* **Key:** `(repo, issue, generation, pinned/live hashes, reason)`.
+  Digests only — never title/body text — so the record cannot leak
+  prompt or user content.
+* **Publisher:** the first run that observes true drift/tampering
+  (same-repo admission, pre-agent and pre-publication revalidation,
+  delegated child worker) publishes the single stop comment, then
+  fails/holds. Later runs see the stop and publish nothing further:
+  no endless identical `/oc`/drift pairs, no repeated worker
+  dispatches, no ghost WIP leases.
+* **Gates:** the parent delegated child queue, the legacy child
+  dispatcher queue, the same-repo scheduler (candidate selection and
+  just-in-time pre-dispatch), event-wake/cron/retry/lease-reclaim
+  paths, the delegated child worker and review, and manual `/oc`
+  admission all check the stop before dispatching, with the auditable
+  skip reason `terminal generation stop: …`. Stopped generations never
+  consume WIP and never fail the pass; unrelated tasks keep flowing.
+* **Recovery (bounded, deterministic):** a successor issue with an
+  explicit dependency, or an explicit new generation number, is a
+  different key and stays schedulable without touching the stopped
+  record. The only in-place re-arm is an explicit trusted owner/bot
+  recovery comment posted strictly after the stop:
+  `<!-- continuum-task-generation-recover repo=… issue=… generation=… -->`.
+  No speculative auto-repair, no silent rebaseline, no reuse of a stale
+  body across generations. `automation:blocked` dependency semantics
+  are unchanged: the stop is a dedicated identity, never a way to
+  bypass authorized dependent work.
+
 | Gate | Location | Behavior |
 |---|---|---|
 | Admission pin/verify | `continuum-opencode.yml` → Pin and verify task specification snapshot | Pins before any agent work; writes the exact record to `RUNNER_TEMP` for the job; `setFailed` on drift/tamper |

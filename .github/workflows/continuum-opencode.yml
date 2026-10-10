@@ -717,8 +717,12 @@ jobs:
         env:
           TASK_REPO: ${{ steps.task_context.outputs.task_repo }}
           TASK_NUMBER: ${{ steps.task_context.outputs.task_number }}
-          TASK_TITLE: ${{ steps.task_context.outputs.task_title }}
-          TASK_BODY: ${{ steps.task_context.outputs.task_body }}
+          # kodmial/continuum#309: the live title/body are NEVER passed
+          # through prior step outputs/env here. Long bodies (~55k
+          # characters) can be altered/truncated/interpolated in transit
+          # and read back as false contract drift. The script below
+          # fetches a fresh authoritative issue API response inside this
+          # exact verification step and hashes that instead.
           TAP_PAT: ${{ secrets.TAP_PAT }}
           GITHUB_API_URL: ${{ github.api_url }}
           REPO_OWNER: ${{ github.repository_owner }}
@@ -735,8 +739,6 @@ jobs:
             const repo = context.repo.repo;
             const taskRepo = String(process.env.TASK_REPO || '').trim().toLowerCase();
             const taskNumber = Number(process.env.TASK_NUMBER || 0);
-            const liveTitle = String(process.env.TASK_TITLE ?? '');
-            const liveBody = String(process.env.TASK_BODY ?? '');
             const tapPat = String(process.env.TAP_PAT || '').trim();
             const apiBase = String(process.env.GITHUB_API_URL || 'https://api.github.com')
               .replace(/\/+$/, '');
@@ -767,6 +769,70 @@ jobs:
               return;
             }
 
+            // kodmial/continuum#309: fresh authoritative live read in
+            // this exact verification step. The live title/body used for
+            // hashing, pinning, and the agent input below come from this
+            // response only -- never from prior step outputs/env, which
+            // can alter/truncate long bodies and report false drift.
+            // Authorization mirrors the task-context step: the repository
+            // installation token first, TAP_PAT only as a bounded
+            // liveness fallback (401/403/429). Any other failure fails
+            // closed; the agent must never implement unverified text.
+            let liveTitle = '';
+            let liveBody = '';
+            try {
+              const fresh = await github.rest.issues.get({
+                owner, repo, issue_number: taskNumber,
+              });
+              if (fresh.data.pull_request) {
+                fail(`Task snapshot: ${taskRepo}#${taskNumber} is a pull request, not an issue.`);
+                return;
+              }
+              liveTitle = String(fresh.data.title ?? '');
+              liveBody = String(fresh.data.body ?? '');
+            } catch (err) {
+              const status = err ? (err.status ?? err.response?.status) : undefined;
+              if (![401, 403, 429].includes(status) || !tapPat) {
+                fail(`Task snapshot: fresh authoritative issue read failed for ${taskRepo}#${taskNumber}: ${err.message || err}`);
+                return;
+              }
+              core.warning(
+                `Repository-token snapshot read failed (${status}); falling back to TAP_PAT for liveness.`
+              );
+              const parts0 = taskRepo.split('/');
+              let fallback;
+              try {
+                fallback = await fetch(
+                  `${apiBase}/repos/${encodeURIComponent(parts0[0])}/${encodeURIComponent(parts0[1])}/issues/${taskNumber}`,
+                  {
+                    headers: {
+                      accept: 'application/vnd.github+json',
+                      authorization: `Bearer ${tapPat}`,
+                      'x-github-api-version': '2022-11-28',
+                    },
+                  }
+                );
+              } catch (fallbackErr) {
+                fail(`Task snapshot: fresh authoritative issue read failed for ${taskRepo}#${taskNumber}: ${fallbackErr.message || fallbackErr}`);
+                return;
+              }
+              if (!fallback.ok) {
+                const details = (await fallback.text()).slice(0, 500);
+                fail(
+                  `Task snapshot: fresh authoritative issue read failed with HTTP ${fallback.status}` +
+                  (details ? `: ${details}` : '')
+                );
+                return;
+              }
+              const freshJson = await fallback.json();
+              if (freshJson.pull_request) {
+                fail(`Task snapshot: ${taskRepo}#${taskNumber} is a pull request, not an issue.`);
+                return;
+              }
+              liveTitle = String(freshJson.title ?? '');
+              liveBody = String(freshJson.body ?? '');
+            }
+
             // Canonical digests mirror src/continuum/task_snapshot.py.
             const normalize = (value) =>
               String(value ?? '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').normalize('NFC');
@@ -784,6 +850,19 @@ jobs:
             const markerRe =
               /<!--\s*continuum-task-snapshot\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+title-sha256=([0-9a-fA-F]{64})\s+body-sha256=([0-9a-fA-F]{64})\s+spec-sha256=([0-9a-fA-F]{64})\s*-->/;
             const jsonBlockRe = /```json\s+([\s\S]*?)\s+```/;
+            // kodmial/continuum#309: deterministic typed terminal
+            // generation-stop state, keyed by
+            // (repo, issue, generation, pinned/live hashes, reason).
+            // Digests only -- never prompt or task text -- so the stop
+            // record cannot leak content. Mirrors
+            // src/continuum/task_snapshot.py render/parse_generation_stop.
+            const stopMarkerRe =
+              /<!--\s*continuum-task-generation-stop\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s+pinned-spec=([0-9a-fA-F]{64})\s+live-spec=([0-9a-fA-F]{64})\s+reason=(drift|tampered)\s*-->/;
+            const recoverMarkerRe =
+              /<!--\s*continuum-task-generation-recover\s+repo=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+issue=(\d+)\s+generation=(\d+)\s*-->/;
+            const stopMarkerLine = (pinnedSpec, liveSpec, reason) =>
+              `<!-- continuum-task-generation-stop repo=${taskRepo} issue=${taskNumber} generation=${generation} ` +
+              `pinned-spec=${pinnedSpec} live-spec=${liveSpec} reason=${reason} -->`;
 
             function trusted(comment) {
               const association = String(comment.author_association || '').toUpperCase();
@@ -856,6 +935,112 @@ jobs:
               return;
             }
 
+            function parseStop(comment) {
+              const text = String(comment.body || '');
+              const match = text.match(stopMarkerRe);
+              if (!match) return null;
+              return {
+                repo: match[1].toLowerCase(),
+                issue: Number(match[2]),
+                generation: Number(match[3]),
+                pinnedSpec: match[4].toLowerCase(),
+                liveSpec: match[5].toLowerCase(),
+                reason: match[6].toLowerCase(),
+                createdAt: comment.created_at || '',
+                id: comment.id || 0,
+              };
+            }
+
+            function parseRecover(comment) {
+              const text = String(comment.body || '');
+              const match = text.match(recoverMarkerRe);
+              if (!match) return null;
+              return {
+                repo: match[1].toLowerCase(),
+                issue: Number(match[2]),
+                generation: Number(match[3]),
+                createdAt: comment.created_at || '',
+                id: comment.id || 0,
+              };
+            }
+
+            const orderKey = (entry) => `${entry.createdAt || ''}#${String(entry.id || 0).padStart(12, '0')}`;
+
+            // Terminal stop gate: a trusted stop with no strictly later
+            // trusted recovery closes this generation. Manual /oc for the
+            // same generation stops here too; only an explicit owner
+            // recovery marker (continuum-task-generation-recover),
+            // a successor issue, or an explicit new generation re-arms.
+            const stops = [];
+            const recovers = [];
+            for (const comment of comments) {
+              if (!trusted(comment)) continue;
+              const stop = parseStop(comment);
+              if (stop && stop.repo === taskRepo && stop.issue === taskNumber && stop.generation === generation) {
+                stops.push(stop);
+                continue;
+              }
+              const recover = parseRecover(comment);
+              if (recover && recover.repo === taskRepo && recover.issue === taskNumber && recover.generation === generation) {
+                recovers.push(recover);
+              }
+            }
+            stops.sort((a, b) => (orderKey(a) < orderKey(b) ? -1 : orderKey(a) > orderKey(b) ? 1 : 0));
+            recovers.sort((a, b) => (orderKey(a) < orderKey(b) ? -1 : orderKey(a) > orderKey(b) ? 1 : 0));
+            const terminallyStopped = stops.length > 0 &&
+              !(recovers.length > 0 && orderKey(recovers[recovers.length - 1]) > orderKey(stops[0]));
+
+            async function publishTerminalStopOnce(pinnedSpec, liveSpec, reason) {
+              if (stops.length > 0) return;
+              if (!tapPat) return;
+              const commentBody = [
+                stopMarkerLine(pinnedSpec, liveSpec, reason),
+                '⚡ **Continuum · opencode**',
+                '<!-- continuum-origin role=continuum component=opencode -->',
+                `Continuum terminal generation stop for ${taskRepo}#${taskNumber} generation ${generation} ` +
+                `(${reason}; pinned spec ${pinnedSpec}, live spec ${liveSpec}). ` +
+                'This generation will not be redispatched. Open a successor issue with an explicit ' +
+                'dependency, start an explicit new generation, or post an explicit owner recovery marker.',
+              ].join('\n');
+              const parts = taskRepo.split('/');
+              try {
+                await fetch(
+                  `${apiBase}/repos/${encodeURIComponent(parts[0])}/${encodeURIComponent(parts[1])}/issues/${taskNumber}/comments`,
+                  {
+                    method: 'POST',
+                    headers: {
+                      accept: 'application/vnd.github+json',
+                      authorization: `Bearer ${tapPat}`,
+                      'content-type': 'application/json',
+                      'x-github-api-version': '2022-11-28',
+                    },
+                    body: JSON.stringify({ body: commentBody }),
+                  }
+                );
+              } catch (err) {
+                core.warning(`Terminal generation-stop publication failed: ${err.message || err}`);
+                return;
+              }
+              // Privacy-safe one-time incident log: action path plus exact
+              // hashes only, never title/body content.
+              core.notice(
+                `Terminal generation stop published for ${taskRepo}#${taskNumber} generation ${generation} ` +
+                `via snapshot-admission (${reason}; pinned ${pinnedSpec}, live ${liveSpec}).`
+              );
+            }
+
+            if (terminallyStopped) {
+              fail(
+                `Terminal generation stop for ${taskRepo}#${taskNumber} generation ${generation} ` +
+                `(${stops[0].reason}; pinned spec ${stops[0].pinnedSpec}, live spec ${stops[0].liveSpec}). ` +
+                `This generation will not be redispatched: open a successor issue with an explicit dependency, ` +
+                `start an explicit new generation, or post an explicit owner recovery marker ` +
+                `(<!-- continuum-task-generation-recover repo=${taskRepo} issue=${taskNumber} generation=${generation} -->). ` +
+                `See ${issueLink}`
+              );
+              return;
+            }
+
             const candidates = [];
             let tamperedEvidence = null;
             for (const comment of comments) {
@@ -902,6 +1087,10 @@ jobs:
 
             if (candidates.length === 0) {
               if (tamperedEvidence && tamperedEvidence.tampered) {
+                const pinnedForStop = /^[0-9a-f]{64}$/.test(tamperedEvidence.specSha || '')
+                  ? tamperedEvidence.specSha.toLowerCase()
+                  : liveSpecSha;
+                await publishTerminalStopOnce(pinnedForStop, liveSpecSha, 'tampered');
                 fail(
                   `Task snapshot for ${taskRepo}#${taskNumber} generation ${generation} failed integrity ` +
                   `validation (${tamperedEvidence.tamperReason}). Stop: never fall back to live mutable text. ` +
@@ -998,6 +1187,7 @@ jobs:
                 return (a.id || 0) - (b.id || 0);
               });
               if (winners.length > 0 && winners[0].specSha !== liveSpecSha) {
+                await publishTerminalStopOnce(winners[0].specSha, liveSpecSha, 'drift');
                 fail(driftMessage('title and body', winners[0].specSha));
                 return;
               }
@@ -1009,6 +1199,10 @@ jobs:
             // First writer wins: later duplicates never overwrite the pin.
             const authoritative = candidates[0];
             if (authoritative.tampered) {
+              const pinnedForStop = /^[0-9a-f]{64}$/.test(authoritative.specSha || '')
+                ? authoritative.specSha.toLowerCase()
+                : liveSpecSha;
+              await publishTerminalStopOnce(pinnedForStop, liveSpecSha, 'tampered');
               fail(
                 `Task snapshot for ${taskRepo}#${taskNumber} generation ${generation} failed integrity ` +
                 `validation (${authoritative.tamperReason}). Stop: never fall back to live mutable text. ` +
@@ -1020,6 +1214,7 @@ jobs:
             if (liveTitleSha !== authoritative.titleSha) mismatches.push('title');
             if (liveBodySha !== authoritative.bodySha) mismatches.push('body');
             if (mismatches.length > 0) {
+              await publishTerminalStopOnce(authoritative.specSha, liveSpecSha, 'drift');
               fail(driftMessage(mismatches.join(' and '), authoritative.specSha));
               return;
             }
@@ -1913,8 +2108,17 @@ jobs:
             live_body="$(jq -r '.body // ""' <<<"$live_json")"
             live_spec="$(TASK_SPEC_TITLE="$live_title" TASK_SPEC_BODY="$live_body" python3 -c 'import hashlib,os,unicodedata; norm=lambda v: unicodedata.normalize("NFC", v.replace("\r\n","\n").replace("\r","\n")); title=norm(os.environ.get("TASK_SPEC_TITLE") or ""); body=norm(os.environ.get("TASK_SPEC_BODY") or ""); title_sha=hashlib.sha256(title.encode("utf-8")).hexdigest(); body_sha=hashlib.sha256(body.encode("utf-8")).hexdigest(); print(hashlib.sha256((title_sha+":"+body_sha).encode("ascii")).hexdigest())')" || return 1
             if [[ "$live_spec" != "$SNAPSHOT_SPEC" ]]; then
-              gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
-                --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-task-snapshot-drift -->' '⚡ **Continuum · opencode**' '<!-- continuum-origin role=continuum component=opencode -->' "Task contract drift detected before $phase: the live issue no longer matches the pinned snapshot. This generation is stopped; open a new follow-up issue with an explicit dependency instead of editing the working issue.")" >/dev/null 2>&1 || true
+              # kodmial/continuum#309: one deterministic terminal stop,
+              # never endless identical drift comments. When the stop
+              # marker already exists this run only fails; it posts
+              # nothing more and leaks no WIP.
+              existing_stops="$(gh api "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER/comments?per_page=100&page=1" --jq '[.[] | select((.body // "") | contains("continuum-task-generation-stop"))] | length' 2>/dev/null || echo 0)"
+              if [[ "$existing_stops" == "0" ]]; then
+                gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                  --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-task-snapshot-drift -->' '⚡ **Continuum · opencode**' '<!-- continuum-origin role=continuum component=opencode -->' "Task contract drift detected before $phase: the live issue no longer matches the pinned snapshot. This generation is stopped; open a new follow-up issue with an explicit dependency instead of editing the working issue.")" >/dev/null 2>&1 || true
+                gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+                  --body "$(printf '%s\n%s\n%s\n%s' "<!-- continuum-task-generation-stop repo=${GITHUB_REPOSITORY,,} issue=${ISSUE_NUMBER} generation=1 pinned-spec=${SNAPSHOT_SPEC} live-spec=${live_spec} reason=drift -->" '⚡ **Continuum · opencode**' '<!-- continuum-origin role=continuum component=opencode -->' "Continuum terminal generation stop for ${GITHUB_REPOSITORY}#${ISSUE_NUMBER} generation 1 (drift; pinned spec ${SNAPSHOT_SPEC}, live spec ${live_spec}). This generation will not be redispatched.")" >/dev/null 2>&1 || true
+              fi
               echo "::error::Task contract drift detected before $phase for $GITHUB_REPOSITORY#$ISSUE_NUMBER (pinned spec $SNAPSHOT_SPEC, live spec $live_spec). Stopping; open a new follow-up issue instead of editing the working issue."
               return 1
             fi

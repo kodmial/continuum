@@ -313,6 +313,13 @@ jobs:
             [[ "$review_snapshot_count" == "100" ]] || break
           done
           jq -s 'add' "$CHILD_REVIEW_COMMENTS_PAGES" > "$CHILD_REVIEW_COMMENTS_JSON"
+          # kodmial/continuum#309: a terminally stopped generation holds
+          # the review silently (no verdict, no further comment); the
+          # worker owns the single stop publication.
+          if [[ "$(python3 "$REVIEW_SNAPSHOT_ADMISSION" has-stop --comments-json "$CHILD_REVIEW_COMMENTS_JSON" --repo "$child_repo" --issue "$TASK_NUMBER" --owner "$CHILD_REVIEW_OWNER" 2>/dev/null || echo active)" == "stopped" ]]; then
+            echo "::notice::Child task $child_repo#$TASK_NUMBER generation 1 is terminally stopped; holding review without verdict or further comments."
+            exit 0
+          fi
           if ! review_snapshot_action="$(python3 "$REVIEW_SNAPSHOT_ADMISSION" decide --issue-json <(jq '{title, body}' <<<"$issue_json") --comments-json "$CHILD_REVIEW_COMMENTS_JSON" --repo "$child_repo" --issue "$TASK_NUMBER" --owner "$CHILD_REVIEW_OWNER" --record-out "$CHILD_REVIEW_RECORD" --decision-out "$CHILD_REVIEW_DECISION")"; then
             echo "::error::Child task snapshot verification failed; refusing review."
             exit 4

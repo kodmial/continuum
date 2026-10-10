@@ -130,6 +130,15 @@ def _latest_relevant_dispatch(
     return max(relevant, key=lambda c: c.created_at)
 
 
+def terminal_stop_skip_reason(number: int) -> str:
+    """Auditable stable skip reason for a terminally stopped generation."""
+    return (
+        "terminal generation stop: issue #%d generation 1 is stopped; "
+        "open a successor issue with an explicit dependency or start an "
+        "explicit new generation instead of redispatching" % number
+    )
+
+
 def reconcile(
     now: datetime,
     issues: Dict[int, IssueState],
@@ -141,6 +150,7 @@ def reconcile(
     qualification_trackers: Set[int],
     config: SchedulerConfig,
     dispatch_hook: Optional[Callable[[int], None]] = None,
+    terminal_stopped: Optional[Set[int]] = None,
 ) -> ReconcileResult:
     """Run one deterministic scheduled reconcile pass (cron, no event).
 
@@ -264,9 +274,19 @@ def reconcile(
         priority, rank = effective_priority(sorted(issue.labels), issue.title)
         return priority, rank
 
+    stopped = set(terminal_stopped or set())
+
     for number in sorted(issues):
         issue = issues[number]
         if not issue.is_open:
+            continue
+        if number in stopped:
+            # Terminal generation stops never consume WIP, never count
+            # as waiters, and never fail the pass: the generation is
+            # closed by design while successors remain schedulable.
+            # automation:blocked semantics are untouched: this is a
+            # dedicated stop identity, not a dependency marker.
+            result.skip_reasons[number] = terminal_stop_skip_reason(number)
             continue
         if number in active:
             _, rank = priority_of(issue)
@@ -358,6 +378,9 @@ def reconcile(
     for number in selected:
         issue = issues[number]
         labels = issue.labels
+        if number in stopped:
+            result.skip_reasons[number] = terminal_stop_skip_reason(number)
+            continue
         if (
             not issue.is_open
             or (config.pause_on_failure and config.pause_label in labels)
