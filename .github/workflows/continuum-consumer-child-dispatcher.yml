@@ -452,8 +452,8 @@ jobs:
 
               # kodmial/continuum#309: terminal generation-stop gate. A
               # stopped generation is never redispatched; successors stay
-              # schedulable. Trusted, generation-keyed, paginated check
-              # (up to 3 pages) so a stop beyond the first 100 comments
+              # schedulable. Trusted, generation-keyed, bounded full-history
+              # check (up to 50 pages) so a stop beyond the first 100 comments
               # still holds; a fetch failure keeps the task eligible
               # (worker admission still fails closed).
               legacy_stop_state="active"
@@ -461,7 +461,7 @@ jobs:
               legacy_stop_file="${RUNNER_TEMP:-/tmp}/continuum-legacy-stop-$task_number.json"
               : > "$legacy_stop_pages"
               legacy_stop_ok=true
-              for legacy_stop_page in 1 2 3; do
+              for legacy_stop_page in $(seq 1 50); do
                 if ! legacy_stop_json="$(gh api "repos/$child_repo/issues/$task_number/comments?per_page=100&page=$legacy_stop_page" 2>/dev/null)"; then
                   echo "::warning::Terminal-stop lookup failed for delegated task #$task_number; keeping it eligible for this pass."
                   legacy_stop_ok=false

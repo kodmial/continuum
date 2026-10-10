@@ -1079,8 +1079,9 @@ jobs:
               # truly drifted/tampered generation publishes one typed stop
               # comment (digests only); the queue must never resurface it
               # on later ticks. The check is trusted, generation-keyed,
-              # and paginated (up to 3 pages) so a stop beyond the first
-              # 100 comments still holds; a fetch failure keeps the task
+              # and scans the bounded full history (up to 50 pages) so a
+              # stop beyond the first 100 comments still holds, mirroring
+              # the JS gates; a fetch failure keeps the task
               # eligible (the worker admission still fails closed) so a
               # transient outage cannot strand work. automation:blocked
               # semantics are untouched: this is a dedicated stop
@@ -1091,7 +1092,7 @@ jobs:
               stop_file="$RUNNER_TEMP/continuum-stop-$task_number.json"
               : > "$stop_pages"
               stop_ok=true
-              for stop_page in 1 2 3; do
+              for stop_page in $(seq 1 50); do
                 if ! stop_comments="$(gh api "repos/$child_repo/issues/$task_number/comments?per_page=100&page=$stop_page" 2>/dev/null)"; then
                   echo "::warning::Terminal-stop lookup failed for delegated task #$task_number; keeping it eligible for this pass."
                   stop_ok=false

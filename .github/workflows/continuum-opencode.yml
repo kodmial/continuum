@@ -991,7 +991,27 @@ jobs:
               !(recovers.length > 0 && orderKey(recovers[recovers.length - 1]) > orderKey(stops[stops.length - 1]));
 
             async function publishTerminalStopOnce(pinnedSpec, liveSpec, reason) {
-              if (stops.length > 0) return;
+              const wantPinned = String(pinnedSpec || '').toLowerCase();
+              const wantLive = String(liveSpec || '').toLowerCase();
+              const wantReason = String(reason || '').toLowerCase();
+              // Dedup is keyed by (pinned, live, reason) and honors a
+              // strictly later trusted recovery: an old stop superseded
+              // by recovery must not suppress a new stop for a later
+              // drift, and a new key must not be suppressed by an
+              // unrelated earlier stop. Only an effective same-key stop
+              // (no recovery strictly after it) suppresses publication.
+              const hasEffectiveSameKey = (stopList, recoverList) => {
+                const latestRecover = recoverList.length > 0
+                  ? orderKey(recoverList[recoverList.length - 1])
+                  : null;
+                return stopList.some((entry) =>
+                  entry.pinnedSpec === wantPinned &&
+                  entry.liveSpec === wantLive &&
+                  entry.reason === wantReason &&
+                  (latestRecover === null || orderKey(entry) > latestRecover)
+                );
+              };
+              if (hasEffectiveSameKey(stops, recovers)) return;
               if (!tapPat) return;
               // Fresh re-read before publication narrows the
               // concurrent-publish race: two drift detections that both
@@ -1003,12 +1023,24 @@ jobs:
                   github.rest.issues.listComments,
                   { owner, repo, issue_number: taskNumber, per_page: 100 }
                 );
+                const freshStops = [];
+                const freshRecovers = [];
                 for (const comment of fresh) {
                   if (!trusted(comment)) continue;
                   const seen = parseStop(comment);
                   if (seen && seen.repo === taskRepo && seen.issue === taskNumber && seen.generation === generation) {
-                    return;
+                    freshStops.push(seen);
+                    continue;
                   }
+                  const seenRecover = parseRecover(comment);
+                  if (seenRecover && seenRecover.repo === taskRepo && seenRecover.issue === taskNumber && seenRecover.generation === generation) {
+                    freshRecovers.push(seenRecover);
+                  }
+                }
+                freshStops.sort((a, b) => (orderKey(a) < orderKey(b) ? -1 : orderKey(a) > orderKey(b) ? 1 : 0));
+                freshRecovers.sort((a, b) => (orderKey(a) < orderKey(b) ? -1 : orderKey(a) > orderKey(b) ? 1 : 0));
+                if (hasEffectiveSameKey(freshStops, freshRecovers)) {
+                  return;
                 }
               } catch (err) {
                 core.warning(`Terminal generation-stop re-read failed; proceeding with publication: ${err.message || err}`);
@@ -2130,23 +2162,27 @@ jobs:
             if [[ "$live_spec" != "$SNAPSHOT_SPEC" ]]; then
               # kodmial/continuum#309: one deterministic terminal stop,
               # never endless identical drift comments. The check is
-              # trusted, generation-keyed, and paginated (up to 5
-              # pages): only a trusted stop marker for this exact
-              # (repo, issue, generation) suppresses publication, so an
-              # untrusted lookalike never blocks a legitimate first
-              # stop and a stop beyond 100 comments is never reposted.
+              # trusted, generation-keyed, and scans the bounded full
+              # history (up to 50 pages): only a trusted stop marker
+              # for this exact (repo, issue, generation) suppresses
+              # publication, so an untrusted lookalike never blocks a
+              # legitimate first stop and a stop beyond 100 comments
+              # is never reposted. Page arrays are merged with
+              # jq -s 'add' before parsing so pretty-printed multi-line
+              # gh api output never degrades to a false "active".
               # A fresh re-read before the terminal publication narrows
               # the concurrent-publish race; simultaneous writers still
               # converge on the earliest stop via first-writer-wins
               # selection. When the stop already exists this run only
               # fails; it posts nothing more and leaks no WIP.
               continuum_trusted_stop_state() {
-                local stop_page stop_json stop_count stop_pages
+                local stop_page stop_json stop_count stop_pages stop_file
                 stop_pages="$(mktemp)"
+                stop_file="$(mktemp)"
                 : > "$stop_pages"
-                for stop_page in 1 2 3 4 5; do
+                for stop_page in $(seq 1 50); do
                   if ! stop_json="$(gh api "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER/comments?per_page=100&page=$stop_page" 2>/dev/null)"; then
-                    rm -f "$stop_pages"
+                    rm -f "$stop_pages" "$stop_file"
                     echo "active"
                     return 0
                   fi
@@ -2154,8 +2190,14 @@ jobs:
                   stop_count="$(jq 'length' <<<"$stop_json" 2>/dev/null || echo 0)"
                   [[ "$stop_count" == "100" ]] || break
                 done
-                CONTINUUM_STOP_PAGES="$stop_pages" CONTINUUM_STOP_REPO="${GITHUB_REPOSITORY,,}" CONTINUUM_STOP_ISSUE="$ISSUE_NUMBER" python3 -c 'import json,os,re; pages=os.environ.get("CONTINUUM_STOP_PAGES") or ""; repo=(os.environ.get("CONTINUUM_STOP_REPO") or "").lower(); issue=os.environ.get("CONTINUUM_STOP_ISSUE") or ""; data=[]; [data.extend(json.loads(l)) for l in open(pages,encoding="utf-8") if l.strip()]; pat=re.compile(r"<!--\s*continuum-task-generation-stop\s+repo=([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+)\s+issue=(\d+)\s+generation=(\d+)\s+pinned-spec=([0-9a-fA-F]{64})\s+live-spec=([0-9a-fA-F]{64})\s+reason=(drift|tampered)\s*-->"); rec=re.compile(r"<!--\s*continuum-task-generation-recover\s+repo=([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+)\s+issue=(\d+)\s+generation=(\d+)\s*-->"); owner=(repo.split("/")[0] if "/" in repo else ""); stops=[]; recs=[]; [((stops.append(((c.get("created_at") or ""),int(c.get("id") or 0)))) if (m and m.group(1).lower()==repo and m.group(2)==issue and m.group(3)=="1") else (recs.append(((c.get("created_at") or ""),int(c.get("id") or 0)))) if (r and r.group(1).lower()==repo and r.group(2)==issue and r.group(3)=="1") else None) for c in data if isinstance(c,dict) for u in [c.get("user") if isinstance(c.get("user"),dict) else {}] if (str(c.get("author_association") or "").upper() in ("OWNER","MEMBER","COLLABORATOR") or str(u.get("login") or "").lower() in ("github-actions[bot]",owner)) for m in [pat.search(str(c.get("body") or ""))] for r in [rec.search(str(c.get("body") or ""))]]; stops.sort(); recs.sort(); print("stopped" if (stops and not (recs and recs[-1]>stops[-1])) else "active",end="")' 2>/dev/null || echo "active"
+                if ! jq -s 'add // []' "$stop_pages" > "$stop_file" 2>/dev/null; then
+                  rm -f "$stop_pages" "$stop_file"
+                  echo "active"
+                  return 0
+                fi
                 rm -f "$stop_pages"
+                CONTINUUM_STOP_FILE="$stop_file" CONTINUUM_STOP_REPO="${GITHUB_REPOSITORY,,}" CONTINUUM_STOP_ISSUE="$ISSUE_NUMBER" python3 -c 'import json,os,re; path=os.environ.get("CONTINUUM_STOP_FILE") or ""; repo=(os.environ.get("CONTINUUM_STOP_REPO") or "").lower(); issue=os.environ.get("CONTINUUM_STOP_ISSUE") or ""; data=json.load(open(path,encoding="utf-8")) if path else []; data=[data] if isinstance(data,dict) else (data if isinstance(data,list) else []); pat=re.compile(r"<!--\s*continuum-task-generation-stop\s+repo=([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+)\s+issue=(\d+)\s+generation=(\d+)\s+pinned-spec=([0-9a-fA-F]{64})\s+live-spec=([0-9a-fA-F]{64})\s+reason=(drift|tampered)\s*-->"); rec=re.compile(r"<!--\s*continuum-task-generation-recover\s+repo=([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+)\s+issue=(\d+)\s+generation=(\d+)\s*-->"); owner=(repo.split("/")[0] if "/" in repo else ""); stops=[]; recs=[]; [((stops.append(((c.get("created_at") or ""),int(c.get("id") or 0)))) if (m and m.group(1).lower()==repo and m.group(2)==issue and m.group(3)=="1") else (recs.append(((c.get("created_at") or ""),int(c.get("id") or 0)))) if (r and r.group(1).lower()==repo and r.group(2)==issue and r.group(3)=="1") else None) for c in data if isinstance(c,dict) for u in [c.get("user") if isinstance(c.get("user"),dict) else {}] if (str(c.get("author_association") or "").upper() in ("OWNER","MEMBER","COLLABORATOR") or str(u.get("login") or "").lower() in ("github-actions[bot]",owner)) for m in [pat.search(str(c.get("body") or ""))] for r in [rec.search(str(c.get("body") or ""))]]; stops.sort(); recs.sort(); print("stopped" if (stops and not (recs and recs[-1]>stops[-1])) else "active",end="")' 2>/dev/null || echo "active"
+                rm -f "$stop_file"
               }
               if [[ "$(continuum_trusted_stop_state)" != "stopped" ]]; then
                 gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
