@@ -30,10 +30,10 @@ class CodeRabbitControllerLifetimeContract(unittest.TestCase):
             self.assertIsNotNone(match, pattern)
             return int(match.group(1))
 
-        quota = minutes(r"const REVIEW_COOLDOWN_MS = (\\d+) \\* 60_000;")
-        defer_cap = minutes(r"const MAX_PUBLIC_DEFER_WAIT_MS = (\\d+) \\* 60_000;")
-        lifetime = minutes(r"const MAX_CONTROLLER_LIFETIME_MS = (\\d+) \\* 60_000;")
-        job_timeout = minutes(r"timeout-minutes: (\\d+)")
+        quota = minutes(r"const REVIEW_COOLDOWN_MS = (\d+) \* 60_000;")
+        defer_cap = minutes(r"const MAX_PUBLIC_DEFER_WAIT_MS = (\d+) \* 60_000;")
+        lifetime = minutes(r"const MAX_CONTROLLER_LIFETIME_MS = (\d+) \* 60_000;")
+        job_timeout = minutes(r"timeout-minutes: (\d+)")
 
         self.assertGreater(lifetime, quota + 1)
         self.assertGreater(lifetime, defer_cap + 5)
