@@ -433,7 +433,7 @@ jobs:
             exit 30
           fi
 
-          if git diff --no-ext-diff -- . | grep -Eiq '(github_pat_[A-Za-z0-9_]+|ghp_[A-Za-z0-9]+|rnd_[A-Za-z0-9]+)'; then
+          if git diff --no-ext-diff -- . | grep -Eiq '(github_pat_[A-Za-z0-9_]+|ghp_[A-Za-z0-9]+|rnd_[A-Za-z0-9]+|-----BEGIN [A-Z ]*PRIVATE KEY-----)' || git diff --no-ext-diff "origin/main"...HEAD -- . | grep -Eiq '(github_pat_[A-Za-z0-9_]+|ghp_[A-Za-z0-9]+|rnd_[A-Za-z0-9]+|-----BEGIN [A-Z ]*PRIVATE KEY-----)'; then
             gh issue comment "$TASK_NUMBER" --repo "$child_repo"               --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-security -->' '⚡ **Continuum · delegation-worker**' '<!-- continuum-origin role=continuum component=delegation-worker -->' "Child task #$TASK_NUMBER produced token-like material; publication was blocked.")"               >/dev/null 2>&1 || true
             exit 31
           fi

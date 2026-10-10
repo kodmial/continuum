@@ -35,6 +35,10 @@ continuum_checkpoint_restore() {
     echo "::error::Delegated checkpoint history is unrelated to the target default branch." >&2
     return 4
   fi
+  if git diff --no-ext-diff "origin/main...FETCH_HEAD" -- . | grep -Eiq '(github_pat_[A-Za-z0-9_]+|ghp_[A-Za-z0-9]+|rnd_[A-Za-z0-9]+|-----BEGIN [A-Z ]*PRIVATE KEY-----)'; then
+    echo "::error::Token-like content detected; checkpoint restore refused." >&2
+    return 31
+  fi
   git switch -c "$branch" FETCH_HEAD >/dev/null 2>&1 || return 4
   CONTINUUM_CHECKPOINT_RESTORED=true
   echo "::notice::Resumed verified generation-scoped delegated work checkpoint."
