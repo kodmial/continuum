@@ -275,9 +275,16 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+          # Work is committed only on a private, generation-and-snapshot-scoped
+          # checkpoint ref until the agent passes real acceptance. A new runner
+          # must resume it rather than silently restarting from clean main.
+          source "$CONTINUUM_ENGINE_ROOT/.github/scripts/delegated_checkpoint.sh"
+          checkpoint_spec="$(jq -r '.spec_sha256 // ""' "$CHILD_SNAPSHOT_RECORD")"
+          checkpoint_generation="$(jq -r '.generation // ""' "$CHILD_SNAPSHOT_RECORD")"
+          checkpoint_ref="$(continuum_checkpoint_ref "$TASK_NUMBER" "$checkpoint_generation" "$checkpoint_spec")" || exit 4
           branch="continuum-child/task-${TASK_NUMBER}-${GITHUB_RUN_ID}"
-          git switch -c "$branch" origin/main >/dev/null 2>&1
-          base_sha="$(git rev-parse HEAD)"
+          base_sha="$(git rev-parse origin/main)"
+          continuum_checkpoint_restore "$checkpoint_ref" "$branch" "$checkpoint_spec" || exit 4
 
           # Continuum #179 prepared agent runtime: the immutable golden image
           # (or its provider-native cache equivalent) already carries pinned
@@ -405,11 +412,28 @@ jobs:
           done
 
           if [[ "$accepted" != true ]]; then
-            gh issue comment "$TASK_NUMBER" --repo "$child_repo"               --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-needs-retry -->' '⚡ **Continuum · delegation-worker**' '<!-- continuum-origin role=continuum component=delegation-worker -->' "Child task #$TASK_NUMBER exhausted this runner cycle without verified acceptance.")"               >/dev/null 2>&1 || true
+            checkpoint_state="no-code-delta"
+            if [[ -n "$(git status --porcelain)" ]]; then
+              # Save partial code only to the private child repository and
+              # only after the same token and branch-safety guards as PR push.
+              # Never claim acceptance or open a PR for a checkpoint.
+              continuum_checkpoint_save "$checkpoint_ref" "$checkpoint_spec" "$child_repo" "$TASK_NUMBER" || exit $?
+              checkpoint_state="saved"
+            elif [[ "$CONTINUUM_CHECKPOINT_RESTORED" == true ]]; then
+              checkpoint_state="resumed-no-new-delta"
+            fi
+            result_state="missing"
+            [[ -f "$result_file" ]] && result_state="present-without-PASS"
+            # Only bounded structural telemetry is exposed. The private source,
+            # the agent transcript and the issue snapshot remain off the public
+            # parent logs and out of this machine-readable child issue comment.
+            gh issue comment "$TASK_NUMBER" --repo "$child_repo" \
+              --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-needs-retry -->' '⚡ **Continuum · delegation-worker**' '<!-- continuum-origin role=continuum component=delegation-worker -->' "Child task #$TASK_NUMBER: acceptance not verified after $MAX_AGENT_PASSES passes; last agent exit=$rc; result=$result_state; checkpoint=$checkpoint_state; run=$GITHUB_RUN_ID. Next run must resume the same frozen generation if a checkpoint was saved.")" \
+              >/dev/null 2>&1 || true
             exit 30
           fi
 
-          if git diff --no-ext-diff -- . | grep -Eiq '(github_pat_[A-Za-z0-9_]+|ghp_[A-Za-z0-9]+|rnd_[A-Za-z0-9]+)'; then
+          if git diff --no-ext-diff -- . | grep -Eiq '(github_pat_[A-Za-z0-9_]+|ghp_[A-Za-z0-9]+|rnd_[A-Za-z0-9]+|-----BEGIN [A-Z ]*PRIVATE KEY-----)' || git diff --no-ext-diff "origin/main"...HEAD -- . | grep -Eiq '(github_pat_[A-Za-z0-9_]+|ghp_[A-Za-z0-9]+|rnd_[A-Za-z0-9]+|-----BEGIN [A-Z ]*PRIVATE KEY-----)'; then
             gh issue comment "$TASK_NUMBER" --repo "$child_repo"               --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-security -->' '⚡ **Continuum · delegation-worker**' '<!-- continuum-origin role=continuum component=delegation-worker -->' "Child task #$TASK_NUMBER produced token-like material; publication was blocked.")"               >/dev/null 2>&1 || true
             exit 31
           fi
@@ -451,5 +475,8 @@ jobs:
           pr_url="$(
             gh pr create --repo "$child_repo" --base main --head "$branch"               --title "$issue_title" --body "$pr_body" 2>/dev/null
           )"
+          if [[ "$CONTINUUM_CHECKPOINT_RESTORED" == true ]]; then
+            continuum_checkpoint_cleanup "$checkpoint_ref" "$child_repo" || true
+          fi
           gh issue comment "$TASK_NUMBER" --repo "$child_repo"             --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-pr -->' '🦾 **Agent Coder · delegation-worker**' '<!-- continuum-origin role=agent-coder component=delegation-worker -->' "Child task #$TASK_NUMBER produced an accepted implementation PR: $pr_url")"             >/dev/null 2>&1 || true
           echo "SubTask #$TASK_NUMBER produced an implementation PR."
