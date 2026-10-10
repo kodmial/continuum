@@ -51,7 +51,7 @@ jobs:
        startsWith(github.event.comment.user.login, 'coderabbitai') &&
        github.event.pull_request.state == 'open'))
     runs-on: ubuntu-latest
-    timeout-minutes: 85
+    timeout-minutes: 90
 
     permissions:
       actions: read
@@ -80,7 +80,7 @@ jobs:
             const repo = context.repo.repo;
             const repoFullName = `${owner}/${repo}`;
             // One controller must release its global concurrency lease before
-            // GitHub's 85-minute job timeout, even if quota state keeps moving.
+            // GitHub's 90-minute job timeout, even if quota state keeps moving.
             const controllerStartedAt = Date.now();
 
             // Request-budget observability (#254): counts only, no secrets.
@@ -255,12 +255,14 @@ jobs:
             const REVIEW_COOLDOWN_MS = 60 * 60_000;
             const SAFETY_MARGIN_MS = 30_000;
             const IN_FLIGHT_TIMEOUT_MS = 30 * 60_000;
-            // GitHub scheduled events are best-effort and have been observed
-            // arriving hours late. Public repositories therefore keep one
-            // serialized bounded waiter for the normal hourly CodeRabbit
-            // quota window. Private repositories never pay this runner cost.
+            // Scheduled events can arrive hours late. Keep the public
+            // controller alive beyond the 60-minute quota and 70-minute
+            // maximum defer window; its 90-minute job timeout leaves 10
+            // minutes for final state reads and a safe lease release.
+            // This lets the next review start without depending on cron.
+            // Private repositories never pay this runner cost.
             const MAX_PUBLIC_DEFER_WAIT_MS = 70 * 60_000;
-            const MAX_CONTROLLER_LIFETIME_MS = 55 * 60_000;
+            const MAX_CONTROLLER_LIFETIME_MS = 80 * 60_000;
 
             function retryWindowText(body = '') {
               const patterns = [
