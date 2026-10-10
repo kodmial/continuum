@@ -44,6 +44,7 @@ continuum_checkpoint_restore() {
 # canonical non-default-branch guard and only invokes this after snapshot admission.
 continuum_checkpoint_save() {
   local checkpoint_ref="$1" spec="$2" child_repo="$3" task="$4"
+  local attempt=0
   if [[ -z "$(git status --porcelain)" ]]; then
     return 0
   fi
@@ -59,7 +60,33 @@ continuum_checkpoint_save() {
     -m "Continuum-Component: delegation-worker" \
     -m "Continuum-Checkpoint: $spec" >/dev/null || return 4
   continuum_assert_safe_push "$checkpoint_ref" "$child_repo" || return 4
-  git push origin "HEAD:refs/heads/$checkpoint_ref" >/dev/null 2>&1 || return 4
+  # Concurrent runners share one ref per frozen generation. A plain push
+  # loses the race: the loser fails non-fast-forward and discards its
+  # delta. Fetch the winner and replay locally, then retry, so both
+  # deltas survive when they do not conflict.
+  while true; do
+    if git push origin "HEAD:refs/heads/$checkpoint_ref" >/dev/null 2>&1; then
+      break
+    fi
+    attempt=$((attempt + 1))
+    if [[ "$attempt" -ge 3 ]]; then
+      return 4
+    fi
+    git fetch --quiet origin "refs/heads/$checkpoint_ref" >/dev/null 2>&1 || continue
+    if ! git log -1 --format=%B FETCH_HEAD | grep -Fxq "Continuum-Checkpoint: $spec"; then
+      echo "::error::Delegated checkpoint changed to an untrusted revision; refusing to overwrite." >&2
+      return 4
+    fi
+    if ! git merge-base FETCH_HEAD origin/main >/dev/null; then
+      echo "::error::Delegated checkpoint history is unrelated to the target default branch." >&2
+      return 4
+    fi
+    if ! git rebase FETCH_HEAD >/dev/null 2>&1; then
+      git rebase --abort >/dev/null 2>&1 || true
+      echo "::error::Delegated checkpoint update conflicts with concurrent work; refusing to overwrite." >&2
+      return 4
+    fi
+  done
   echo "::notice::Saved delegated work checkpoint on the child repository; not accepted and no PR created."
 }
 
@@ -68,5 +95,5 @@ continuum_checkpoint_cleanup() {
   continuum_assert_safe_push "$checkpoint_ref" "$child_repo" || return 4
   # Only called after a successfully created accepted PR, whose own branch
   # contains the accumulated work. A failed cleanup must not invalidate the PR.
-  git push origin --delete "refs/heads/$checkpoint_ref" >/dev/null 2>&1 || true
+  git push origin --delete "$checkpoint_ref" >/dev/null 2>&1 || true
 }
