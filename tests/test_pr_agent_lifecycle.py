@@ -1978,11 +1978,31 @@ APPROVED_309_SNAPSHOT_FRESH_READ_ADDED_LINES = (
     "            stops.sort((a, b) => (orderKey(a) < orderKey(b) ? -1 : orderKey(a) > orderKey(b) ? 1 : 0));",
     "            recovers.sort((a, b) => (orderKey(a) < orderKey(b) ? -1 : orderKey(a) > orderKey(b) ? 1 : 0));",
     "            const terminallyStopped = stops.length > 0 &&",
-    "              !(recovers.length > 0 && orderKey(recovers[recovers.length - 1]) > orderKey(stops[0]));",
+    "              !(recovers.length > 0 && orderKey(recovers[recovers.length - 1]) > orderKey(stops[stops.length - 1]));",
     "",
     "            async function publishTerminalStopOnce(pinnedSpec, liveSpec, reason) {",
     "              if (stops.length > 0) return;",
     "              if (!tapPat) return;",
+    "              // Fresh re-read before publication narrows the",
+    "              // concurrent-publish race: two drift detections that both",
+    "              // observed no stop must converge on the first writer",
+    "              // instead of posting duplicate terminal-stop comments,",
+    "              // mirroring the bash pre-agent guard below.",
+    "              try {",
+    "                const fresh = await github.paginate(",
+    "                  github.rest.issues.listComments,",
+    "                  { owner, repo, issue_number: taskNumber, per_page: 100 }",
+    "                );",
+    "                for (const comment of fresh) {",
+    "                  if (!trusted(comment)) continue;",
+    "                  const seen = parseStop(comment);",
+    "                  if (seen && seen.repo === taskRepo && seen.issue === taskNumber && seen.generation === generation) {",
+    "                    return;",
+    "                  }",
+    "                }",
+    "              } catch (err) {",
+    "                core.warning(`Terminal generation-stop re-read failed; proceeding with publication: ${err.message || err}`);",
+    "              }",
     "              const commentBody = [",
     "                stopMarkerLine(pinnedSpec, liveSpec, reason),",
     "                '⚡ **Continuum · opencode**',",
@@ -2067,7 +2087,7 @@ APPROVED_309_SNAPSHOT_FRESH_READ_ADDED_LINES = (
     "                  stop_count=\"$(jq 'length' <<<\"$stop_json\" 2>/dev/null || echo 0)\"",
     "                  [[ \"$stop_count\" == \"100\" ]] || break",
     "                done",
-    "                CONTINUUM_STOP_PAGES=\"$stop_pages\" CONTINUUM_STOP_REPO=\"${GITHUB_REPOSITORY,,}\" CONTINUUM_STOP_ISSUE=\"$ISSUE_NUMBER\" python3 -c 'import json,os,re; pages=os.environ.get(\"CONTINUUM_STOP_PAGES\") or \"\"; repo=(os.environ.get(\"CONTINUUM_STOP_REPO\") or \"\").lower(); issue=os.environ.get(\"CONTINUUM_STOP_ISSUE\") or \"\"; data=[]; [data.extend(json.loads(l)) for l in open(pages,encoding=\"utf-8\") if l.strip()]; pat=re.compile(r\"<!--\\s*continuum-task-generation-stop\\s+repo=([A-Za-z0-9_.\\-]+/[A-Za-z0-9_.\\-]+)\\s+issue=(\\d+)\\s+generation=(\\d+)\\s+pinned-spec=([0-9a-fA-F]{64})\\s+live-spec=([0-9a-fA-F]{64})\\s+reason=(drift|tampered)\\s*-->\"); rec=re.compile(r\"<!--\\s*continuum-task-generation-recover\\s+repo=([A-Za-z0-9_.\\-]+/[A-Za-z0-9_.\\-]+)\\s+issue=(\\d+)\\s+generation=(\\d+)\\s*-->\"); owner=(repo.split(\"/\")[0] if \"/\" in repo else \"\"); stops=[]; recs=[]; [((stops.append(((c.get(\"created_at\") or \"\"),int(c.get(\"id\") or 0)))) if (m and m.group(1).lower()==repo and m.group(2)==issue and m.group(3)==\"1\") else (recs.append(((c.get(\"created_at\") or \"\"),int(c.get(\"id\") or 0)))) if (r and r.group(1).lower()==repo and r.group(2)==issue and r.group(3)==\"1\") else None) for c in data if isinstance(c,dict) for u in [c.get(\"user\") if isinstance(c.get(\"user\"),dict) else {}] if (str(c.get(\"author_association\") or \"\").upper() in (\"OWNER\",\"MEMBER\",\"COLLABORATOR\") or str(u.get(\"login\") or \"\").lower() in (\"github-actions[bot]\",owner)) for m in [pat.search(str(c.get(\"body\") or \"\"))] for r in [rec.search(str(c.get(\"body\") or \"\"))]]; stops.sort(); recs.sort(); print(\"stopped\" if (stops and not (recs and recs[-1]>stops[0])) else \"active\",end=\"\")' 2>/dev/null || echo \"active\"",
+    "                CONTINUUM_STOP_PAGES=\"$stop_pages\" CONTINUUM_STOP_REPO=\"${GITHUB_REPOSITORY,,}\" CONTINUUM_STOP_ISSUE=\"$ISSUE_NUMBER\" python3 -c 'import json,os,re; pages=os.environ.get(\"CONTINUUM_STOP_PAGES\") or \"\"; repo=(os.environ.get(\"CONTINUUM_STOP_REPO\") or \"\").lower(); issue=os.environ.get(\"CONTINUUM_STOP_ISSUE\") or \"\"; data=[]; [data.extend(json.loads(l)) for l in open(pages,encoding=\"utf-8\") if l.strip()]; pat=re.compile(r\"<!--\\s*continuum-task-generation-stop\\s+repo=([A-Za-z0-9_.\\-]+/[A-Za-z0-9_.\\-]+)\\s+issue=(\\d+)\\s+generation=(\\d+)\\s+pinned-spec=([0-9a-fA-F]{64})\\s+live-spec=([0-9a-fA-F]{64})\\s+reason=(drift|tampered)\\s*-->\"); rec=re.compile(r\"<!--\\s*continuum-task-generation-recover\\s+repo=([A-Za-z0-9_.\\-]+/[A-Za-z0-9_.\\-]+)\\s+issue=(\\d+)\\s+generation=(\\d+)\\s*-->\"); owner=(repo.split(\"/\")[0] if \"/\" in repo else \"\"); stops=[]; recs=[]; [((stops.append(((c.get(\"created_at\") or \"\"),int(c.get(\"id\") or 0)))) if (m and m.group(1).lower()==repo and m.group(2)==issue and m.group(3)==\"1\") else (recs.append(((c.get(\"created_at\") or \"\"),int(c.get(\"id\") or 0)))) if (r and r.group(1).lower()==repo and r.group(2)==issue and r.group(3)==\"1\") else None) for c in data if isinstance(c,dict) for u in [c.get(\"user\") if isinstance(c.get(\"user\"),dict) else {}] if (str(c.get(\"author_association\") or \"\").upper() in (\"OWNER\",\"MEMBER\",\"COLLABORATOR\") or str(u.get(\"login\") or \"\").lower() in (\"github-actions[bot]\",owner)) for m in [pat.search(str(c.get(\"body\") or \"\"))] for r in [rec.search(str(c.get(\"body\") or \"\"))]]; stops.sort(); recs.sort(); print(\"stopped\" if (stops and not (recs and recs[-1]>stops[-1])) else \"active\",end=\"\")' 2>/dev/null || echo \"active\"",
     "                rm -f \"$stop_pages\"",
     "              }",
     "              if [[ \"$(continuum_trusted_stop_state)\" != \"stopped\" ]]; then",
@@ -2459,6 +2479,14 @@ class ProtectedBaselineTests(unittest.TestCase):
                         # the deleted multiset, because none of them exists
                         # in the protected baseline blob; any other
                         # difference still fails exactly.
+                        # The #309 allowlist compares a trusted recovery
+                        # marker against the latest stop (not the earliest):
+                        # stop, recover, then re-drift must stay stopped,
+                        # otherwise a still-drifted generation would be
+                        # redispatched. The pre-publication fresh re-read
+                        # inside publishTerminalStopOnce is the
+                        # first-writer-wins convergence for concurrent
+                        # publishers, so one deterministic stop is posted.
                         expected.subtract(
                             _Counter(
                                 APPROVED_309_SNAPSHOT_FRESH_READ_REMOVED_LINES
