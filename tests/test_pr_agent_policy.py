@@ -193,6 +193,56 @@ class CleanSkipTests(unittest.TestCase):
         )
         self.assertEqual(clean["action"], "merge")
 
+    def test_explicit_clean_merge_with_caution_does_not_rereview_same_head(self):
+        # Real upstream review can report natural-language clean security and
+        # no ticket section for an issue-less PR. Neither can be fixed by
+        # repeating the exact same review on the same commit.
+        for ticket in (None, []):
+            with self.subTest(ticket=ticket):
+                fields = {"security_concerns": "No security concerns identified"}
+                if ticket is not None:
+                    fields["ticket_compliance_check"] = ticket
+                review = make_review([], recommendation="merge_with_caution", extra=fields)
+                result = run_js("disposition", review=review, raw="")
+                self.assertEqual(result["action"], "merge")
+
+        compliant = make_review(
+            [], recommendation="merge_with_caution",
+            extra={"security_concerns": "No security issues detected",
+                   "ticket_compliance_check": [
+                       {"not_compliant_requirements": "None"}]},
+        )
+        self.assertEqual(run_js("disposition", review=compliant, raw="")["action"], "merge")
+
+    def test_caution_still_fails_closed_for_real_issues_or_missing_security_proof(self):
+        base = {"security_concerns": "No security concerns identified"}
+        cases = [
+            {},
+            {"security_concerns": "Secret disclosure"},
+            {**base, "ticket_compliance_check": [
+                {"not_compliant_requirements": "Required live E2E evidence missing"}]},
+            {**base, "ticket_compliance_check": [{"unknown": "not checked"}]},
+            {**base, "ticket_compliance_check": "unknown"},
+            {**base, "tool_errors": "review API call failed"},
+            {**base, "coverage_complete": False},
+        ]
+        for fields in cases:
+            with self.subTest(fields=fields):
+                result = run_js(
+                    "disposition",
+                    review=make_review([], recommendation="merge_with_caution", extra=fields),
+                    raw="",
+                )
+                self.assertEqual(result["action"], "rereview")
+        never_safe = make_review(
+            [], recommendation="changes_required", extra=base,
+        )
+        self.assertEqual(run_js("disposition", review=never_safe, raw="")["action"], "rereview")
+        actionable = make_review(
+            [issue_entry()], recommendation="merge_with_caution", extra=base,
+        )
+        self.assertEqual(run_js("disposition", review=actionable, raw="")["action"], "repair")
+
     def test_clean_review_with_qualifying_improve_still_reaches_merge(self):
         qualifying = (
             '{"payload": {"code_suggestions": ['
