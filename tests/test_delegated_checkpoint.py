@@ -92,6 +92,31 @@ class CheckpointIntegrationTest(unittest.TestCase):
             "unfinished work\nmore work\n",
         )
 
+    def test_two_runners_preserve_both_nonconflicting_deltas(self):
+        # Both workers start before either has published a checkpoint.
+        # The later push must fetch/rebase and preserve both contributions.
+        first = self.clone("race-first")
+        second = self.clone("race-second")
+        self.shell(first, """
+            ref="$(continuum_checkpoint_ref 42 1 "$SPEC")"
+            continuum_checkpoint_restore "$ref" continuum-child/task-42-race1 "$SPEC"
+            printf 'first\n' > first.txt
+        """)
+        self.shell(second, """
+            ref="$(continuum_checkpoint_ref 42 1 "$SPEC")"
+            continuum_checkpoint_restore "$ref" continuum-child/task-42-race2 "$SPEC"
+            printf 'second\n' > second.txt
+        """)
+        for work in (first, second):
+            self.shell(work, """
+                ref="$(continuum_checkpoint_ref 42 1 "$SPEC")"
+                continuum_checkpoint_save "$ref" "$SPEC" child/example 42
+            """)
+        check = self.clone("race-check")
+        self.run_cmd(check, "git", "switch", "-c", "resume", f"origin/{self.ref()}")
+        self.assertEqual((check / "first.txt").read_text(encoding="utf-8"), "first\n")
+        self.assertEqual((check / "second.txt").read_text(encoding="utf-8"), "second\n")
+
     def test_invalid_snapshot_identity_never_produces_ref(self):
         for task, generation, spec in [(0, 1, self.spec), (42, 0, self.spec),
                                        (42, 1, "bad"), ("42/foo", 1, self.spec)]:
