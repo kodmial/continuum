@@ -1827,10 +1827,10 @@ class ContinuumTest < Minitest::Test
 
     # The pinned release runs on the runner (a Docker action cannot reach
     # runner loopback), against the loopback bridge only.
-    assert_includes pr_agent, 'python3 -m pip install',
-                    'pr-agent must install the pinned release on the runner'
-    assert_includes pr_agent, '"pr-agent==${PR_AGENT_VERSION}"',
-                    'pr-agent must install the pinned release on the runner'
+    assert_includes pr_agent, 'components: both',
+                    'PR-Agent review must reuse the shared pinned reviewer and OpenCode runtime'
+    assert_includes pr_agent, 'kodmial/continuum/.github/actions/agent-toolchain@main',
+                    'PR-Agent backend runs on the same cached runner as its loopback bridge'
     assert_includes pr_agent, 'opencode serve --hostname 127.0.0.1',
                     'the OpenCode server must bind loopback only'
     assert_includes pr_agent, 'pr_agent_bridge.py',
@@ -4835,8 +4835,7 @@ class ContinuumTest < Minitest::Test
     assert_includes body, 'Continuum will not create a partial PR for a blocked/umbrella task.'
 
     assert_match(/- name: Implement issue\n\s+if: >-\n\s+steps\.issue_readiness\.outputs\.ready != 'false'/, body)
-    assert_match(/- name: Install OpenCode CLI for automated repair\n\s+if: github\.event_name == 'workflow_dispatch' && steps\.issue_readiness\.outputs\.ready != 'false'/, body)
-    assert_match(/- name: Install OpenCode CLI for interactive agent\n\s+if: github\.event_name != 'workflow_dispatch' && steps\.issue_readiness\.outputs\.ready != 'false'/, body)
+    assert_match(/- name: Restore verified cached OpenCode for coder and repair\n\s+id: cached_opencode\n\s+if: steps\.issue_readiness\.outputs\.ready != 'false'/, body)
     assert_includes body, 'Do not turn a tracking/umbrella issue or a task with unmet prerequisites into a partial PR.'
   end
 
@@ -6270,111 +6269,43 @@ class ContinuumTest < Minitest::Test
   # (warm) execution performs zero bootstrap downloads. The probe must come
   # BEFORE the first installer line: a probe after the download proves
   # nothing about the warm path.
+  # Work Lock #67 replaces the old fake image-digest stamp shortcut on
+  # GitHub-hosted runners with the independently qualified composite cache.
+  # Every active agent path must restore BEFORE running the model; there may
+  # be no unverified curl installer or floating tool version on these paths.
   def test_agent_runtime_probe_precedes_bootstrap_install
-    {
-      'continuum-opencode.yml' => %w[1.18.34],
-      'continuum-pr-agent.yml' => %w[1.18.34 0.46.0],
-      'continuum-pr-agent-repair.yml' => %w[1.18.34],
-      'continuum-coderabbit-unresolved.yml' => %w[1.18.34],
-      'continuum-consumer-child-worker.yml' => %w[1.18.34],
-      'continuum-consumer-child-review.yml' => %w[1.18.34],
-      'continuum-consumer-child-pr-review.yml' => %w[1.18.34],
-    }.each do |name, pins|
+    %w[
+      continuum-opencode.yml
+      continuum-pr-agent.yml
+      continuum-pr-agent-repair.yml
+      continuum-consumer-child-worker.yml
+      continuum-consumer-child-review.yml
+      continuum-consumer-child-pr-review.yml
+    ].each do |name|
       body = workflow_body(name)
-      lines = body.lines
-      assert_includes body, 'command -v opencode',
-                      "#{name}: the prepared-runtime probe must check for the preinstalled CLI"
-      assert_includes body.downcase, 'prepared agent runtime',
-                      "#{name}: the install site must name the prepared agent runtime it probes"
-      assert_includes body, 'CONTINUUM_IMAGE_DIGEST',
-                      "#{name}: the probe must key on the immutable image digest"
-      assert_includes body, 'vars.CONTINUUM_IMAGE_DIGEST',
-                      "#{name}: the image digest must be wired from the repository variable into the shell"
-      pins.each do |pin|
-        assert_includes body, pin, "#{name}: the exact pinned version #{pin} must be enforced"
-      end
-      # Every installer site (not just the first) must sit behind a probe:
-      # each line that downloads or pip-installs the runtime must have an
-      # executable probe (`command -v opencode` / `pr-agent --version`) on
-      # an earlier line, and the warm hit must be digest-gated (a line
-      # carrying both the CONTINUUM_IMAGE_DIGEST gate and a real probe) so
-      # an empty or malformed digest cannot take the hit path and skip the
-      # install. Format-only validation is not identity enforcement.
-      # Comment portions never count: a `#`-leading line (or the `#`
-      # comment tail of a code line) mentioning an installer URL is not an
-      # installer site, and a comment mentioning a probe or
-      # `prepared-runtime hit` is not executable evidence.
-      code_lines = lines.map { |line| code_without_comment(line) }
-      installer_lines = code_lines.each_index.select do |i|
-        installer_site?(code_lines[i])
-      end
-      refute_empty installer_lines, "#{name}: the deterministic reconstruction fallback is missing"
-      probe_lines = code_lines.each_index.select do |i|
-        code_lines[i].include?('command -v opencode') || code_lines[i].include?('pr-agent --version')
-      end
-      refute_empty probe_lines, "#{name}: no executable prepared-runtime probe found"
-      gated_lines = code_lines.each_index.select do |i|
-        code_lines[i].include?('CONTINUUM_IMAGE_DIGEST') &&
-          (code_lines[i].include?('command -v opencode') || code_lines[i].include?('pr-agent --version'))
-      end
-      refute_empty gated_lines, "#{name}: the warm hit must be keyed by the image digest (no digest-gated probe line)"
-      assert_match(/CONTINUUM_IMAGE_DIGEST.*=~\s*\^\[0-9a-f\]\{64\}\$/, body,
-                   "#{name}: the digest gate must enforce the 64-char sha256 shape")
-      hit_lines = code_lines.each_index.select { |i| code_lines[i].include?('prepared-runtime hit') }
-      refute_empty hit_lines, "#{name}: a warm probe hit must be logged before any download"
-      # Per-site enforcement: every installer line needs its own
-      # probe-gated hit. Global minima are not enough: in a multi-site
-      # file the earlier site's probe would otherwise satisfy the check
-      # for a later installer whose own digest-gated probe was deleted.
-      # Each site spans (previous installer, installer): the site probe,
-      # digest-gated probe, hit log, and short-circuit must all sit inside
-      # it, ahead of that site's installer.
-      installer_lines.each do |at|
-        prev = installer_lines.select { |i| i < at }.max || -1
-        site_probes = probe_lines.select { |i| i > prev && i < at }
-        assert_operator site_probes.size, :>, 0,
-                        "#{name}: line #{at + 1} installs the runtime without a preceding probe in its own site (warm path downloads nothing)"
-        site_gated = gated_lines.select { |i| i > prev && i < at }
-        assert_operator site_gated.size, :>, 0,
-                        "#{name}: line #{at + 1} has no digest-gated probe in its own site"
-        site_hits = hit_lines.select { |i| i > prev && i < at }
-        assert_operator site_hits.size, :>, 0,
-                        "#{name}: line #{at + 1} has no prepared-runtime hit in its own site before the installer"
-        # The hit path must actually short-circuit the download: exit-0 style
-        # steps stop before the installer, if/else (consumer-child) steps
-        # skip the download branch on a hit. The comparison runs on the
-        # comment-stripped code so a semantically identical
-        # `exit 0 # warm hit` or `else # cache hit` still matches.
-        if name.start_with?('continuum-consumer-child-')
-          else_between = code_lines.each_index.any? do |i|
-            code_lines[i].strip == 'else' && i > site_hits.min && i < at
-          end
-          assert else_between,
-                 "#{name}: line #{at + 1} warm hit branch must skip the download via if/else (no fall-through install)"
-        else
-          exit_between = code_lines.each_index.any? do |i|
-            code_lines[i].strip == 'exit 0' && i > site_hits.min && i < at
-          end
-          assert exit_between,
-                 "#{name}: line #{at + 1} warm hit must short-circuit with exit 0 before any download"
-        end
-      end
+      assert_includes body, 'kodmial/continuum/.github/actions/agent-toolchain@main',
+                      "#{name}: restore the shared reviewed runtime before running OpenCode"
+      assert_includes body, 'components: opencode' unless name == 'continuum-pr-agent.yml'
+      assert_includes body, 'components: both' if name == 'continuum-pr-agent.yml'
+      assert_includes body, "CONTINUUM_OPENCODE_VERSION",
+                      "#{name}: exact pin override must flow through the shared resolver"
+      refute_match(%r{https://opencode\\.ai/install}, body,
+                   "#{name}: a GitHub-hosted job must not run a parallel ad hoc OpenCode installer")
+      refute_match(/python3 -m pip install --quiet "pr-agent=/, body,
+                   "#{name}: PR-Agent must be installed by the digest-verified shared action")
+      assert_includes body, 'id: cached_opencode' if name.start_with?('continuum-consumer-child-')
     end
-
-    pr_agent = workflow_body('continuum-pr-agent.yml')
-    pr_lines = pr_agent.lines
-    pr_code = pr_lines.map { |line| code_without_comment(line) }
-    pip_lines = pr_code.each_index.select { |i| pr_code[i].include?('pip install') && pr_code[i].include?('pr-agent') }
-    refute_empty pip_lines, 'continuum-pr-agent.yml: the pinned PR-Agent reconstruction is missing'
-    version_probes = pr_code.each_index.select { |i| pr_code[i].include?('pr-agent --version') }
-    refute_empty version_probes, 'continuum-pr-agent.yml: the PR-Agent prepared-runtime probe is missing'
-    pip_lines.each do |at|
-      prev_pip = pip_lines.select { |i| i < at }.max || -1
-      site_probes = version_probes.select { |i| i > prev_pip && i < at }
-      assert_operator site_probes.size, :>, 0,
-                      'continuum-pr-agent.yml: the PR-Agent probe must precede every pip install in its own site'
-    end
-    assert_includes pr_agent, '0.46.0', 'continuum-pr-agent.yml: the exact pinned PR-Agent version must be enforced'
+    reviewer = workflow_body('continuum-pr-agent.yml')
+    assert_match(/id: install_pragent\\n\\s+if:.*\\n\\s+uses: kodmial\\/continuum\\/\\.github\\/actions\\/agent-toolchain@main/, reviewer)
+    assert_includes reviewer, 'id: install_opencode',
+                    'preserve the exact-head retry controller output checks'
+    action = File.read(File.join(ROOT, '.github/actions/agent-toolchain/action.yml'))
+    bootstrap = File.read(File.join(ROOT, '.github/actions/agent-toolchain/bootstrap.sh'))
+    assert_includes action, 'actions/cache@5a3ec84eff668545956fd18022155c47e93e2684'
+    assert_includes bootstrap, 'sha256sum -c'
+    assert_includes bootstrap, 'PR-Agent official PyPI wheel SHA256 mismatch'
+    assert_includes bootstrap, 'OpenCode official release asset SHA256 mismatch'
+    refute_includes action, 'secrets.'
   end
 
   # kodmial/continuum#179: strict ephemeral profiles keep zero live idle
@@ -6463,8 +6394,8 @@ class ContinuumTest < Minitest::Test
     assert_includes engine, 'DEFAULT_RUNTIME_PROVIDER',
                      'engine must define the provider default for CONTINUUM_RUNTIME_PROVIDER'
     body = workflow_body('continuum-opencode.yml')
-    assert_includes body, 'CONTINUUM_IMAGE_DIGEST',
-                    'continuum-opencode.yml: the probe must key on the immutable image digest'
+    assert_includes body, 'agent-toolchain@main',
+                    'continuum-opencode.yml must restore the verified GitHub Actions cache'
   end
 
   # kodmial/continuum#179: golden-image provenance and per-profile digests.
@@ -6502,8 +6433,8 @@ class ContinuumTest < Minitest::Test
   # global variable that a second promotion would evict.
   def test_prepared_runtime_provenance_and_per_profile_digest
     opencode = workflow_body('continuum-opencode.yml')
-    assert_includes opencode, 'never records the stamp',
-                    'continuum-opencode.yml: the no-self-stamp provenance rule must be documented at the install sites'
+    assert_includes opencode, 'Restore verified cached OpenCode for coder and repair',
+                    'the hosted OpenCode agent must restore a checksum-verified toolchain before execution'
 
     # Every agent-runtime workflow: deterministic reconstruction never
     # self-stamps in any spelling (redirect, append, unquoted/braced
