@@ -35,7 +35,7 @@ class ToolchainCacheContractTests(unittest.TestCase):
         self.assertRegex(wheel_hash, r"^[0-9a-f]{64}$")
         shell = (ACTION / "bootstrap.sh").read_text()
         action = (ACTION / "action.yml").read_text()
-        self.assertIn("pr-agent-$CONTINUUM_PR_AGENT_VERSION", shell)
+        self.assertIn("pr_agent-$CONTINUUM_PR_AGENT_VERSION", shell)
         self.assertIn("pip download", shell)
         self.assertIn("PR-Agent official PyPI wheel SHA256 mismatch", shell)
         self.assertIn("sha256sum -c -", shell)
