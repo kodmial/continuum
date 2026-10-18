@@ -29,6 +29,20 @@ class ToolchainCacheContractTests(unittest.TestCase):
         self.assertNotIn("TAP_PAT", action)
         self.assertNotIn("secrets.", action)
 
+    def test_pr_agent_wheel_pin_and_authenticated_metadata(self):
+        manifest = json.loads((ACTION / "toolchain.json").read_text())
+        wheel_hash = manifest["pr_agent_wheel_sha256"][manifest["pr_agent_version"]]
+        self.assertRegex(wheel_hash, r"^[0-9a-f]{64}$")
+        shell = (ACTION / "bootstrap.sh").read_text()
+        action = (ACTION / "action.yml").read_text()
+        self.assertIn("pr-agent-$CONTINUUM_PR_AGENT_VERSION", shell)
+        self.assertIn("pip download", shell)
+        self.assertIn("PR-Agent official PyPI wheel SHA256 mismatch", shell)
+        self.assertIn("sha256sum -c -", shell)
+        self.assertIn('Authorization: Bearer $CONTINUUM_GITHUB_TOKEN', shell)
+        self.assertIn("CONTINUUM_GITHUB_TOKEN: ${{ github.token }}", action)
+        self.assertNotIn("curl -fSL --retry 3 --retry-delay 2 \"$release\"", shell)
+
     def run_resolve(self, components="opencode", version=""):
         with tempfile.TemporaryDirectory() as d:
             output = Path(d) / "out"
