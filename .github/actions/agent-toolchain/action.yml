@@ -1,0 +1,45 @@
+name: Continuum cached OpenCode and PR-Agent
+description: Verified toolchain bootstrap for ephemeral Linux GitHub-hosted runners; never caches authentication or worktrees.
+inputs:
+  components:
+    description: opencode, pr-agent or both
+    required: false
+    default: opencode
+  opencode-version:
+    description: Exact SemVer override; empty uses the immutable action manifest
+    required: false
+    default: ''
+  pr-agent-version:
+    description: Exact SemVer override; empty uses the immutable action manifest
+    required: false
+    default: ''
+outputs:
+  cache-hit:
+    description: "true only if all requested binaries were restored and verified without downloads"
+    value: \${{ steps.bootstrap.outputs.cache_hit }}
+  runtime-version:
+    description: Exact OpenCode version selected
+    value: \${{ steps.resolve.outputs.opencode_version }}
+runs:
+  using: composite
+  steps:
+    - id: resolve
+      shell: bash
+      env:
+        CONTINUUM_COMPONENTS: \${{ inputs.components }}
+        CONTINUUM_OPENCODE_VERSION_OVERRIDE: \${{ inputs.opencode-version }}
+        CONTINUUM_PR_AGENT_VERSION_OVERRIDE: \${{ inputs.pr-agent-version }}
+      run: bash "$GITHUB_ACTION_PATH/resolve.sh"
+    - id: cache
+      uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+      with:
+        path: ~/.cache/continuum/toolchains
+        key: \${{ steps.resolve.outputs.cache_key }}
+    - id: bootstrap
+      shell: bash
+      env:
+        CONTINUUM_COMPONENTS: \${{ inputs.components }}
+        CONTINUUM_OPENCODE_VERSION: \${{ steps.resolve.outputs.opencode_version }}
+        CONTINUUM_PR_AGENT_VERSION: \${{ steps.resolve.outputs.pr_agent_version }}
+        CONTINUUM_CACHED_RESTORE: \${{ steps.cache.outputs.cache-hit }}
+      run: bash "$GITHUB_ACTION_PATH/bootstrap.sh"
