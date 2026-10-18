@@ -12,7 +12,7 @@ This document describes the **new cache bootstrap component under qualification*
 
 ## Configuration
 
-The action's `toolchain.json` is the **action-local bootstrap manifest** (not yet the authoritative manifest for all existing Continuum jobs). Current audited pins on 2026-10-19: `opencode_version=1.19.3`, `pr_agent_version=0.46.0` for compatibility with the existing PR-Agent engine. Both are exact, vetted SemVer values; `latest` and malformed overrides fail immediately. The released PR-Agent is pinned independently; upgrading it must pass compatibility tests against the bridge and persistent review-state schema.
+The action's `toolchain.json` is the **action-local bootstrap manifest** (not yet the authoritative manifest for all existing Continuum jobs). Current audited pins on 2026-10-19: `opencode_version=1.19.3`, `pr_agent_version=0.46.0` for compatibility with the existing PR-Agent engine. Both are exact, vetted SemVer values; `latest` and malformed overrides fail immediately. The PR-Agent **top-level wheel** SHA-256 is pinned in `toolchain.json` to the official PyPI `pr_agent-0.46.0-py3-none-any.whl` SHA-256 (`6a37f507...839f247f5`); an override without a reviewed digest fails closed. This verifies the release wheel, **not the independently resolved transitive dependency graph**, which still needs a full hash-locked dependency manifest before claiming complete supply-chain integrity. The released PR-Agent is pinned independently; upgrading it must pass compatibility tests against the bridge and persistent review-state schema.
 
 Usage once the composite action is published on a trusted Continuum ref:
 
@@ -28,7 +28,7 @@ Usage once the composite action is published on a trusted Continuum ref:
 
 This step is not a drop-in replacement for the existing execution lifecycle until the actual `continuum-opencode.yml`, PR-Agent review/repair/recovery, delegated callers, and applicable Render contracts have been migrated and qualified. Do not set a fake `CONTINUUM_IMAGE_DIGEST` to imitate an image hit.
 
-The cache key includes manifest epoch, OS, architecture, Python minor version, components and both pinned tool versions. A version bump yields a distinct immutable cache; bump `cache_epoch` deliberately after a corruption or supply-chain incident. Restored binaries are verified before execution. Cache miss or failed integrity validation triggers a deterministic pinned install, not a silent unpinned update. Cached Python environments are tied to Python 3.12. The current PR-Agent environment is isolated from application global Python.
+The cache key includes manifest epoch, OS, architecture, Python minor version, components and both pinned tool versions. A version bump yields a distinct immutable cache; bump `cache_epoch` deliberately after a corruption or supply-chain incident. Restored binaries are verified before execution. An OpenCode cold path fetches release metadata with the runner-scoped `github.token` (not an anonymous 60-request/IP call) and verifies the release asset digest. The token is neither cached nor logged. A PR-Agent cold path downloads the exact wheel first, verifies its checked-in SHA-256, then installs that wheel and its dependencies. Cache miss or failed integrity validation triggers a deterministic pinned install, not a silent unpinned update. Cached Python environments are tied to Python 3.12. The current PR-Agent environment is isolated from application global Python.
 
 ## Live qualification evidence (2026-10-19)
 
