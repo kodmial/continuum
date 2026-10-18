@@ -105,7 +105,6 @@ jobs:
       - name: Execute child task
         shell: bash
         env:
-          CACHED_RUNTIME_VERSION: ${{ steps.cached_opencode.outputs.runtime-version }}
           CONTINUUM_IMAGE_DIGEST: ${{ inputs.image_digest || vars.CONTINUUM_IMAGE_DIGEST }}
         run: |
           set -euo pipefail
@@ -308,11 +307,11 @@ jobs:
 
           # Work Lock #67: the trusted composite-action step above restored a
           # verified OpenCode binary (or deterministically installed on cache miss).
+          # SHA/version verification is performed in the shared action for both
+          # fresh installs and restored binaries before this task starts.
+          # Do not duplicate the action's formatting-dependent version parser.
           command -v opencode >/dev/null 2>&1
-          test "$(opencode --version)" = "$CACHED_RUNTIME_VERSION" || {
-            echo "::error::Cached OpenCode version differs from verified action output."
-            exit 1
-          }
+          opencode --version
 
           # Continuum's global OpenCode instructions, before the first pass.
           # The delegated worktree is a different repository from the parent,
