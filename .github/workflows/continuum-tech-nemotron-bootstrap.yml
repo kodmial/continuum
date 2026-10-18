@@ -16,5 +16,5 @@ jobs:
       continuum_ref: fix/model-route-probe-20261018
       review_provider: pr-agent
       pr_number: "316"
-      expected_head_sha: "72238f0ac2c3ddf543e2268cd6dccc65ec4a079a"
+      expected_head_sha: "8d3ca0e3321ac75d2e22c6111353fc6392e95b49"
       opencode_model: opencode/nemotron-3-ultra-free
