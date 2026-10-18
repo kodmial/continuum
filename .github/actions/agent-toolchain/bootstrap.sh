@@ -10,7 +10,8 @@ valid_bin() {
   (cd "$(dirname "$binary")" && sha256sum -c "$(basename "$stamp")" >/dev/null) || return 1
   local got
   got="$("$binary" --version 2>&1)" || return 1
-  [[ "$got" =~ (^|[^0-9.])$version([^0-9.]|$) ]] || return 1
+  local safe="${version//./\\.}"
+  [[ "$got" =~ (^|[^0-9.])${safe}([^0-9.]|$) ]] || return 1
 }
 if [[ "$CONTINUUM_COMPONENTS" == opencode || "$CONTINUUM_COMPONENTS" == both ]]; then
   location="$root/opencode/$CONTINUUM_OPENCODE_VERSION/bin"
