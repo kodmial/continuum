@@ -19,7 +19,7 @@ engine.
 | `src/continuum/` | Dependency-free Python engine (config + YAML subset). |
 | `.github/scripts/` | Delegation resolver/runtime and the global instructions installer. |
 | `scripts/` | Continuum contract tests. Product build/release scripts stay in consumers. |
-| `docs/` | Design documentation (see [parent/child delegation](docs/parent-child-delegation.md)). |
+| `docs/` | Design documentation (see [parent/child delegation](docs/parent-child-delegation.md) and [toolchain cache qualification](docs/agent-toolchain-cache.md)). |
 
 ## Reuse model
 
