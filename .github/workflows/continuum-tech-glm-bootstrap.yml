@@ -9,10 +9,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
-      XDG_CONFIG_HOME: ${{ runner.temp }}/anonymous-config
-      XDG_DATA_HOME: ${{ runner.temp }}/anonymous-data
-      XDG_STATE_HOME: ${{ runner.temp }}/anonymous-state
-      XDG_CACHE_HOME: ${{ runner.temp }}/anonymous-cache
+      XDG_CONFIG_HOME: /tmp/continuum-glm-anonymous/config
+      XDG_DATA_HOME: /tmp/continuum-glm-anonymous/data
+      XDG_STATE_HOME: /tmp/continuum-glm-anonymous/state
+      XDG_CACHE_HOME: /tmp/continuum-glm-anonymous/cache
       OPENCODE_DISABLE_AUTOUPDATE: "1"
     steps:
       - name: Install official pinned OpenCode binary and verify upstream SHA256
