@@ -711,6 +711,21 @@ class WorkflowAttributionTests(unittest.TestCase):
                 self.assertIn(name, EXPECTED_IDENTITIES)
                 self.assertIn(name, FUNCTIONAL_ANCHORS)
 
+    def test_delegated_cache_failure_reports_actual_task_number(self):
+        # Shell single-quoted printf payloads would literally post "$TASK_NUMBER"
+        # rather than expand the issue/PR number. Every delegated failure
+        # message must interpolate the correct validated runtime identifier.
+        sites = {
+            "continuum-consumer-child-worker.yml": '"child task #$TASK_NUMBER could not install the verified agent runtime."',
+            "continuum-consumer-child-review.yml": '"Review for child task #$TASK_NUMBER could not install the verified agent runtime."',
+            "continuum-consumer-child-pr-review.yml": '"Child pull request #$PR_NUMBER could not install the verified agent runtime."',
+        }
+        for name, quoted_text in sites.items():
+            with self.subTest(workflow=name):
+                body = read_workflow(name)
+                self.assertIn(quoted_text, body)
+                self.assertIn("if: failure() && steps.cached_opencode.outcome == 'failure'", body)
+
     def test_no_extra_comment_is_created_for_attribution(self):
         for name, pinned in sorted(MUTATION_COUNTS.items()):
             with self.subTest(workflow=name):
