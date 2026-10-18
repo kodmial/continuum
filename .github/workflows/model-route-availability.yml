@@ -105,8 +105,8 @@ jobs:
                           env={**os.environ, "DO_NOT_TRACK": "1"},
                       )
                       output = proc.stdout + "\n" + proc.stderr
-                      clean = re.sub(r"\\x1b\\[[0-9;]*m", "", proc.stdout)
-                      exact_reply = bool(re.search(r"(?m)^\\s*OK\\s*$", clean, re.IGNORECASE))
+                      clean = re.sub(r"\x1b\[[0-9;]*m", "", proc.stdout)
+                      exact_reply = bool(re.search(r"(?m)^\s*OK\s*$", clean, re.IGNORECASE))
                       state = "PASS" if proc.returncode == 0 and exact_reply else classify(output)
                       if state == "DENIED_CLIENT_OR_AUTH":
                           model_rejected_by_zen = True
