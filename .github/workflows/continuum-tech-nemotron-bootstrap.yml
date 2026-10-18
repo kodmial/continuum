@@ -1,0 +1,20 @@
+name: Emergency PR-Agent model bootstrap
+on:
+  push:
+    branches: [ops/nemotron-review-bootstrap-20261018]
+permissions:
+  actions: write
+  contents: write
+  issues: write
+  pull-requests: write
+  statuses: write
+jobs:
+  review-current-head:
+    uses: kodmial/continuum/.github/workflows/continuum-pr-agent.yml@fix/model-route-probe-20261018
+    secrets: inherit
+    with:
+      continuum_ref: fix/model-route-probe-20261018
+      review_provider: pr-agent
+      pr_number: "316"
+      expected_head_sha: "72238f0ac2c3ddf543e2268cd6dccc65ec4a079a"
+      opencode_model: opencode/nemotron-3-ultra-free
