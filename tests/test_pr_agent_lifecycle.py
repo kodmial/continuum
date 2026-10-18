@@ -2448,9 +2448,6 @@ class ProtectedBaselineTests(unittest.TestCase):
                 if path == ".github/workflows/continuum-opencode.yml":
                     self.assertIn("Restore verified cached OpenCode for coder and repair", read_repo(path))
                     self.assertNotIn("https://opencode.ai/install", read_repo(path))
-                    self.assertNotIn("CONTINUUM_OPENCODE_429_RESTART_REQUIRED", "" if
-                                     "CONTINUUM_OPENCODE_429_RESTART_REQUIRED" not in read_repo(path)
-                                     else "check preserved below") if False else None
                     self.assertIn("CONTINUUM_OPENCODE_429_RESTART_REQUIRED", read_repo(path),
                                   "migration must retain 429 stop-the-runner protection")
                     self.assertIn("Check issue Definition of Ready", read_repo(path),
