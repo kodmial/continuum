@@ -65,14 +65,14 @@ jobs:
           grep -Fq '12 pencils' "$RUNNER_TEMP/glm-answer.txt" || { echo "::error::No meaningful GLM answer found"; exit 1; }
           echo "GLM 5.3 Flash Free anonymous live response: PASS" >> "$GITHUB_STEP_SUMMARY"
 
-  review-pr318:
+  review-pr319:
     needs: glm-anonymous-canary
-    if: contains(github.event.head_commit.message, '[review-pr318]')
+    if: contains(github.event.head_commit.message, '[review-pr319]')
     uses: kodmial/continuum/.github/workflows/continuum-pr-agent.yml@main
     secrets: inherit
     with:
       continuum_ref: main
       review_provider: pr-agent
-      pr_number: "318"
-      expected_head_sha: "e0ee51036a207e752f180dddf2e566dffcf08b35"
+      pr_number: "319"
+      expected_head_sha: "33adb6dcd395d636db3efae47afb565e913d9473"
       opencode_model: opencode/glm-5.3-flash-free
