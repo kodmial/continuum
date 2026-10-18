@@ -1,0 +1,60 @@
+name: One-time anonymous GLM review bootstrap
+on:
+  push:
+    branches: [ops/glm-review-bootstrap-20261019]
+permissions:
+  contents: read
+jobs:
+  glm-anonymous-canary:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      XDG_CONFIG_HOME: ${{ runner.temp }}/anonymous-config
+      XDG_DATA_HOME: ${{ runner.temp }}/anonymous-data
+      XDG_STATE_HOME: ${{ runner.temp }}/anonymous-state
+      XDG_CACHE_HOME: ${{ runner.temp }}/anonymous-cache
+      OPENCODE_DISABLE_AUTOUPDATE: "1"
+    steps:
+      - name: Install official pinned OpenCode binary and verify upstream SHA256
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${RUNNER_OS}/${RUNNER_ARCH}" = "Linux/X64"
+          tag=v1.19.3
+          asset=opencode-linux-x64.tar.gz
+          curl -fsSL --retry 3 "https://api.github.com/repos/anomalyco/opencode/releases/tags/$tag" -o "$RUNNER_TEMP/release.json"
+          digest="$(python3 - "$RUNNER_TEMP/release.json" "$asset" <<'PY'
+          import json,sys
+          assets=[a for a in json.load(open(sys.argv[1]))["assets"] if a["name"]==sys.argv[2]]
+          if len(assets)!=1 or not assets[0].get("digest","").startswith("sha256:"):
+              raise SystemExit("Missing official release SHA256")
+          print(assets[0]["digest"].split(":",1)[1])
+          PY
+          )"
+          curl -fsSL --retry 3 "https://github.com/anomalyco/opencode/releases/download/$tag/$asset" -o "$RUNNER_TEMP/opencode.tar.gz"
+          printf '%s  %s\n' "$digest" "$RUNNER_TEMP/opencode.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xOzf "$RUNNER_TEMP/opencode.tar.gz" opencode > "$RUNNER_TEMP/bin/opencode"
+          chmod 755 "$RUNNER_TEMP/bin/opencode"
+          test "$("$RUNNER_TEMP/bin/opencode" --version)" = "1.19.3"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Prove GLM-5.3-Flash Free responds without account or paid fallback
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          mkdir -p "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME"
+          unset OPENCODE_API_KEY ANTHROPIC_API_KEY OPENAI_API_KEY ZAI_API_KEY
+          echo "Testing exact anonymous OpenCode model: opencode/glm-5.3-flash-free"
+          set +e
+          timeout 120s opencode run --model opencode/glm-5.3-flash-free "There are 3 boxes with 4 pencils in each box. Answer with exactly: 12 pencils." > "$RUNNER_TEMP/glm-answer.txt" 2>&1
+          result=$?
+          set -e
+          # The CLI can exit 0 despite an upstream error; validate the content.
+          sed -E 's/\x1B\[[0-9;]*[[:alpha:]]//g' "$RUNNER_TEMP/glm-answer.txt" | tail -c 2000
+          test "$result" = 0 || { echo "::error::GLM anonymous inference exited $result"; exit 1; }
+          if grep -Eiq '(FreeTierError|Model unavailable|Upstream request failed|Error:|invalid api key|authentication required)' "$RUNNER_TEMP/glm-answer.txt"; then
+            echo "::error::GLM anonymous inference returned provider error"; exit 1
+          fi
+          grep -Fq '12 pencils' "$RUNNER_TEMP/glm-answer.txt" || { echo "::error::No meaningful GLM answer found"; exit 1; }
+          echo "GLM 5.3 Flash Free anonymous live response: PASS" >> "$GITHUB_STEP_SUMMARY"
