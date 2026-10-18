@@ -182,30 +182,30 @@ class AgentRuntimeContractTest(unittest.TestCase):
         self.assertFalse(runtime.workflow_step_has_prepared_runtime_probe(cold_body))
 
     def test_03_integration_workflow_warm_path(self):
-        # Separate integration check over the checked-in workflows. Every
-        # expected file must exist and satisfy the warm-path contract: a
-        # missing or regressed file fails instead of being skipped.
+        # Current hosted workflows do not use provider-native image stamps.
+        # They must use the central cache with pinned manifest/version/hash
+        # checks, and never perform a second unverified installer download.
         names = ("continuum-opencode.yml", "continuum-pr-agent.yml",
                  "continuum-pr-agent-repair.yml")
-        checked = 0
-        missing = []
         for name in names:
             path = os.path.join(os.path.dirname(__file__), "..", ".github", "workflows", name)
-            if not os.path.exists(path):
-                missing.append(name)
-                continue
+            self.assertTrue(os.path.isfile(path), "{} missing".format(name))
             with open(path, encoding="utf-8") as handle:
                 body = handle.read()
             with self.subTest(workflow=name):
-                self.assertFalse(runtime.normal_execution_uses_bootstrap_install(body),
-                                 "{}: warm path must probe the prepared runtime, not bootstrap-install".format(name))
-                self.assertTrue(runtime.workflow_step_has_prepared_runtime_probe(body),
-                                "{}: prepared-runtime probe with pinned versions + image digest required".format(name))
-            checked += 1
-        if missing:
-            self.fail("missing workflow files: {}".format(", ".join(missing)))
-        if checked == 0:
-            self.fail("no workflow files present; checked-in warm-path workflows must exist")
+                self.assertFalse(runtime.normal_execution_uses_bootstrap_install(body))
+                self.assertIn("kodmial/continuum/.github/actions/agent-toolchain@main", body)
+                self.assertIn("CONTINUUM_OPENCODE_VERSION", body)
+                self.assertIn("components: both" if name == "continuum-pr-agent.yml"
+                              else "components: opencode", body)
+        root = os.path.join(os.path.dirname(__file__), "..", ".github", "actions", "agent-toolchain")
+        with open(os.path.join(root, "bootstrap.sh"), encoding="utf-8") as handle:
+            shell = handle.read()
+        with open(os.path.join(root, "action.yml"), encoding="utf-8") as handle:
+            action = handle.read()
+        self.assertIn("sha256sum -c", shell)
+        self.assertIn("PR-Agent official PyPI wheel SHA256 mismatch", shell)
+        self.assertIn("actions/cache@5a3ec84eff668545956fd18022155c47e93e2684", action)
 
     def test_04_queued_demand_creates_fresh_instance(self):
         controller = _controller()
