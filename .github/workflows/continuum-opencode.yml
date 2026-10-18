@@ -1949,7 +1949,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
           ISSUE_NUMBER: ${{ inputs.issue_number }}
           EVENT_ISSUE_NUMBER: ${{ github.event.issue.number }}
-          MODEL: ${{ (vars.OPENCODE_MODEL == 'opencode/muse-spark-1.3-contributor-free' || !vars.OPENCODE_MODEL) && 'opencode/nemotron-3-ultra-free' || vars.OPENCODE_MODEL }}
+          OPENCODE_MODEL: ${{ (vars.OPENCODE_MODEL == 'opencode/muse-spark-1.3-contributor-free' || !vars.OPENCODE_MODEL) && 'opencode/nemotron-3-ultra-free' || vars.OPENCODE_MODEL }}
           USE_GITHUB_TOKEN: "true"
           SHARE: "false"
           OPENCODE_CONFIG_CONTENT: >-

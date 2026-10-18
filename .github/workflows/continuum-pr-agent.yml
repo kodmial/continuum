@@ -281,7 +281,7 @@ jobs:
             const configuredOpenCodeModel = pick(
               process.env.INPUT_OPENCODE_MODEL,
               'CFG_OPENCODE_MODEL',
-              'opencode/nemotron-3-ultra-free'
+              'opencode/muse-spark-1.3-contributor-free'
             );
             // Live qualification 2026-10-18: the former Muse free endpoint
             // returns "Model ... has been deprecated" in Render. Preserve

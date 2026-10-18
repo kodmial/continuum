@@ -2464,10 +2464,9 @@ class ContinuumTest < Minitest::Test
       body = File.read(path)
       refute_includes body, 'big-pickle', File.basename(path)
     end
-    assert_includes File.read(File.join(ROOT, '.github/workflows/continuum-opencode.yml')),
-                    "opencode/nemotron-3-ultra-free"
-    assert_includes File.read(File.join(ROOT, '.github/workflows/continuum-opencode.yml')),
-                    "vars.OPENCODE_MODEL == 'opencode/muse-spark-1.3-contributor-free'"
+    opencode_body = File.read(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
+    assert_equal 6, opencode_body.scan("opencode/nemotron-3-ultra-free").count
+    assert_equal 6, opencode_body.scan("vars.OPENCODE_MODEL == 'opencode/muse-spark-1.3-contributor-free'").count
     assert_includes File.read(File.join(ROOT, '.github/workflows/continuum-pr-agent-repair.yml')),
                     "vars.OPENCODE_MODEL == 'opencode/muse-spark-1.3-contributor-free'"
   end
