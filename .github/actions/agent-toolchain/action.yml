@@ -42,4 +42,5 @@ runs:
         CONTINUUM_OPENCODE_VERSION: ${{ steps.resolve.outputs.opencode_version }}
         CONTINUUM_PR_AGENT_VERSION: ${{ steps.resolve.outputs.pr_agent_version }}
         CONTINUUM_CACHED_RESTORE: ${{ steps.cache.outputs.cache-hit }}
+        CONTINUUM_GITHUB_TOKEN: ${{ github.token }}
       run: bash "$GITHUB_ACTION_PATH/bootstrap.sh"
