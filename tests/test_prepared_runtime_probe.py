@@ -24,14 +24,18 @@ WORKFLOWS_DIR = os.path.join(ROOT, ".github", "workflows")
 # Every agent-runtime install site: file -> one (tool, version) entry per
 # installer line, in file order. This map locks the duplication surface: a
 # new install site without probe coverage fails here until it is added.
+# Legacy, still-supported CodeRabbit diagnostic is the only direct installer.
+# All production OpenCode/PR-Agent paths now use the verified composite cache.
 EXPECTED_SITES = {
-    "continuum-opencode.yml": [("opencode", "1.18.34"), ("opencode", "1.18.34")],
-    "continuum-pr-agent.yml": [("pr-agent", "0.46.0"), ("opencode", "1.18.34")],
-    "continuum-pr-agent-repair.yml": [("opencode", "1.18.34")],
     "continuum-coderabbit-unresolved.yml": [("opencode", "1.18.34")],
-    "continuum-consumer-child-worker.yml": [("opencode", "1.18.34")],
-    "continuum-consumer-child-review.yml": [("opencode", "1.18.34")],
-    "continuum-consumer-child-pr-review.yml": [("opencode", "1.18.34")],
+}
+CACHED_WORKFLOWS = {
+    "continuum-opencode.yml": "opencode",
+    "continuum-pr-agent.yml": "both",
+    "continuum-pr-agent-repair.yml": "opencode",
+    "continuum-consumer-child-worker.yml": "opencode",
+    "continuum-consumer-child-review.yml": "opencode",
+    "continuum-consumer-child-pr-review.yml": "opencode",
 }
 
 DIGEST = "a" * 64
@@ -324,6 +328,18 @@ class PreparedRuntimeProbeTests(unittest.TestCase):
                 "{}: no malformed-digest guard before installer line {}".format(name, at + 1))
             regions.append(lines[warn_at - 1:at + 1])
         return regions
+
+    def test_production_sites_use_one_verified_cache_without_legacy_installers(self):
+        for name, component in CACHED_WORKFLOWS.items():
+            with self.subTest(workflow=name):
+                body = read_workflow(name)
+                self.assertIn(
+                    "uses: kodmial/continuum/.github/actions/agent-toolchain@main",
+                    body, "active runtime must use central reviewed cached action")
+                self.assertIn("components: " + component, body)
+                self.assertIn("CONTINUUM_OPENCODE_VERSION", body)
+                self.assertEqual(installer_indices(body.splitlines()), [],
+                                 "active workflow must never run parallel legacy download/install")
 
     def test_every_install_site_carries_the_full_probe(self):
         # Lock the duplication surface: a new workflow file containing an
