@@ -103,6 +103,14 @@ jobs:
       - name: Report delegated OpenCode bootstrap failure
         if: failure() && steps.cached_opencode.outcome == 'failure'
         shell: bash
+        # Explicit trusted-job context: this step is before the main task
+        # script and must not rely on variables scoped only to that step.
+        env:
+          CHILD_ID: ${{ inputs.child_id }}
+          TASK_NUMBER: ${{ inputs.task_number }}
+          CHILD_REPOSITORIES: ${{ secrets.CHILD_RUNTIME_REPOSITORIES }}
+          GH_TOKEN: ${{ secrets.CHILD_RUNTIME_TOKEN }}
+          CONTINUUM_ENGINE_ROOT: ${{ github.workspace }}/.continuum-engine
         run: |
           set -uo pipefail
           resolver="$CONTINUUM_ENGINE_ROOT/.github/scripts/delegation_repository.sh"
