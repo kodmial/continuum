@@ -15,8 +15,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 8
     env:
-      GROQ_API_KEY: \${{ secrets.GROQ_API_KEY }}
-      OPENROUTER_API_KEY: \${{ secrets.OPENROUTER_API_KEY }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
       CI: "true"
     steps:
       - name: Install official OpenCode CLI
