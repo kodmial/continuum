@@ -6289,14 +6289,14 @@ class ContinuumTest < Minitest::Test
       assert_includes body, 'components: both' if name == 'continuum-pr-agent.yml'
       assert_includes body, "CONTINUUM_OPENCODE_VERSION",
                       "#{name}: exact pin override must flow through the shared resolver"
-      refute_match(%r{https://opencode\\.ai/install}, body,
+      refute_match(%r{https://opencode\.ai/install}, body,
                    "#{name}: a GitHub-hosted job must not run a parallel ad hoc OpenCode installer")
       refute_match(/python3 -m pip install --quiet "pr-agent=/, body,
                    "#{name}: PR-Agent must be installed by the digest-verified shared action")
       assert_includes body, 'id: cached_opencode' if name.start_with?('continuum-consumer-child-')
     end
     reviewer = workflow_body('continuum-pr-agent.yml')
-    assert_match(/id: install_pragent\\n\\s+if:.*\\n\\s+uses: kodmial\\/continuum\\/\\.github\\/actions\\/agent-toolchain@main/, reviewer)
+    assert_match(/id: install_pragent\n\s+if:.*\n\s+uses: kodmial\/continuum\/\.github\/actions\/agent-toolchain@main/, reviewer)
     assert_includes reviewer, 'id: install_opencode',
                     'preserve the exact-head retry controller output checks'
     action = File.read(File.join(ROOT, '.github/actions/agent-toolchain/action.yml'))
