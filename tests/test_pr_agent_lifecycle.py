@@ -2150,6 +2150,27 @@ APPROVED_SNAPSHOT_NEWLINE_FIX_REMOVED_LINES = (
     "            live_body=\"$(jq -r '.body // \"\"' <<<\"$live_json\")\"",
     "            live_spec=\"$(TASK_SPEC_TITLE=\"$live_title\" TASK_SPEC_BODY=\"$live_body\" python3 -c 'import hashlib,os,unicodedata; norm=lambda v: unicodedata.normalize(\"NFC\", v.replace(\"\\r\\n\",\"\\n\").replace(\"\\r\",\"\\n\")); title=norm(os.environ.get(\"TASK_SPEC_TITLE\") or \"\"); body=norm(os.environ.get(\"TASK_SPEC_BODY\") or \"\"); title_sha=hashlib.sha256(title.encode(\"utf-8\")).hexdigest(); body_sha=hashlib.sha256(body.encode(\"utf-8\")).hexdigest(); print(hashlib.sha256((title_sha+\":\"+body_sha).encode(\"ascii\")).hexdigest())')\" || return 1",
 )
+# Exact owner-authorized emergency recovery: change only six model-selection
+# lines from the retired Muse Spark endpoint to independently canary-proven
+# Nemotron 3 Ultra Free. Full protected baseline drift remains exact.
+APPROVED_316_MODEL_RECOVERY_REMOVED_LINES = (
+    "          MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}",
+    "          OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}",
+    "          OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}",
+    "          OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}",
+    "          OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}",
+    "          OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}",
+)
+
+APPROVED_316_MODEL_RECOVERY_ADDED_LINES = (
+    "          MODEL: ${{ (vars.OPENCODE_MODEL == 'opencode/muse-spark-1.3-contributor-free' || !vars.OPENCODE_MODEL) && 'opencode/nemotron-3-ultra-free' || vars.OPENCODE_MODEL }}",
+    "          OPENCODE_MODEL: ${{ (vars.OPENCODE_MODEL == 'opencode/muse-spark-1.3-contributor-free' || !vars.OPENCODE_MODEL) && 'opencode/nemotron-3-ultra-free' || vars.OPENCODE_MODEL }}",
+    "          OPENCODE_MODEL: ${{ (vars.OPENCODE_MODEL == 'opencode/muse-spark-1.3-contributor-free' || !vars.OPENCODE_MODEL) && 'opencode/nemotron-3-ultra-free' || vars.OPENCODE_MODEL }}",
+    "          OPENCODE_MODEL: ${{ (vars.OPENCODE_MODEL == 'opencode/muse-spark-1.3-contributor-free' || !vars.OPENCODE_MODEL) && 'opencode/nemotron-3-ultra-free' || vars.OPENCODE_MODEL }}",
+    "          OPENCODE_MODEL: ${{ (vars.OPENCODE_MODEL == 'opencode/muse-spark-1.3-contributor-free' || !vars.OPENCODE_MODEL) && 'opencode/nemotron-3-ultra-free' || vars.OPENCODE_MODEL }}",
+    "          OPENCODE_MODEL: ${{ (vars.OPENCODE_MODEL == 'opencode/muse-spark-1.3-contributor-free' || !vars.OPENCODE_MODEL) && 'opencode/nemotron-3-ultra-free' || vars.OPENCODE_MODEL }}",
+)
+
 APPROVED_SNAPSHOT_NEWLINE_FIX_ADDED_LINES = (
     "            # Keep trailing newlines in title/body: Bash $(...) strips them.",
     "            # Decode the authoritative JSON within Python before hashing.",
@@ -2547,6 +2568,7 @@ class ProtectedBaselineTests(unittest.TestCase):
                                 + APPROVED_CODERABBIT_PUBLISHED_HEAD_REMOVED_LINES
                                 + APPROVED_CONSUMER_RUNNER_REMOVED_LINES
                                 + APPROVED_295_TASK_SNAPSHOT_REMOVED_LINES
+                                + APPROVED_316_MODEL_RECOVERY_REMOVED_LINES
                             ),
                             f"{path} must not delete or modify lines beyond the exact "
                             "qualification-isolation/checkpoint allowlist",
@@ -2561,6 +2583,7 @@ class ProtectedBaselineTests(unittest.TestCase):
                             + APPROVED_295_TASK_SNAPSHOT_ADDED_LINES
                             + APPROVED_302_BRANCH_SAFETY_ADDED_LINES
                             + APPROVED_309_SNAPSHOT_FRESH_READ_ADDED_LINES
+                            + APPROVED_316_MODEL_RECOVERY_ADDED_LINES
                         )
                         # #309 replaces six previously-approved added lines
                         # (prior-step outputs/env title/body trust plus the
