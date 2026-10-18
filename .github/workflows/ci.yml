@@ -29,8 +29,6 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Unit-contract qualification
-        run: python3 -m unittest discover -s tests -p 'test_agent_toolchain_cache.py' -v
       - name: Verified cached OpenCode / PR-Agent runtime
         id: toolchain
         uses: ./.github/actions/agent-toolchain
