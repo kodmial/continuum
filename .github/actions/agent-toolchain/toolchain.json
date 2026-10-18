@@ -2,5 +2,8 @@
   "schema": 1,
   "opencode_version": "1.19.3",
   "pr_agent_version": "0.46.0",
-  "cache_epoch": "wl68-1"
+  "cache_epoch": "wl68-2",
+  "pr_agent_wheel_sha256": {
+    "0.46.0": "6a37f507cc3bf0cb00be79b8b96e7885bf35b27a905adb1926965af839f247f5"
+  }
 }
