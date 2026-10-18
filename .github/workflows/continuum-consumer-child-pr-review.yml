@@ -92,7 +92,6 @@ jobs:
       - name: Review and repair owner-created child pull request
         shell: bash
         env:
-          CACHED_RUNTIME_VERSION: ${{ steps.cached_opencode.outputs.runtime-version }}
           CONTINUUM_IMAGE_DIGEST: ${{ inputs.image_digest || vars.CONTINUUM_IMAGE_DIGEST }}
         run: |
           set -euo pipefail
@@ -212,11 +211,11 @@ jobs:
             fi
           fi
 
+          # SHA/version verification is performed in the shared action for both
+          # fresh installs and restored binaries before this task starts.
+          # Do not duplicate the action's formatting-dependent version parser.
           command -v opencode >/dev/null 2>&1
-          test "$(opencode --version)" = "$CACHED_RUNTIME_VERSION" || {
-            echo "::error::Cached OpenCode runtime mismatch for delegated PR review."
-            exit 1
-          }
+          opencode --version
 
           python3 "$CONTINUUM_ENGINE_ROOT/.github/scripts/opencode_instructions.py" install             --source "$CONTINUUM_ENGINE_ROOT/.github/agents/AGENTS.md"
 
