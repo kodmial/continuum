@@ -74,5 +74,5 @@ jobs:
       continuum_ref: main
       review_provider: pr-agent
       pr_number: "319"
-      expected_head_sha: "33adb6dcd395d636db3efae47afb565e913d9473"
+      expected_head_sha: "43560e67df8075e19f1f9d6dbf91e06264d8da71"
       opencode_model: opencode/glm-5.3-flash-free
