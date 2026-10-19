@@ -4,4 +4,6 @@
 def can_delete_project(actor_id: str, owner_id: str) -> bool:
     """Return True only when the actor owns the project."""
 
+    if not actor_id or not owner_id:
+        return False
     return actor_id == owner_id
