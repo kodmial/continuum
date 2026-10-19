@@ -115,6 +115,7 @@ jobs:
           gh pr comment "$PR_NUMBER" --repo "$child_repo" --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-pr-review-infra -->' '⚡ **Continuum · delegation-pr-review**' '<!-- continuum-origin role=continuum component=delegation-pr-review -->' "Child pull request #$PR_NUMBER could not install the verified agent runtime.")" >/dev/null 2>&1 || true
 
       - name: Review and repair owner-created child pull request
+        id: actual_child_run
         shell: bash
         env:
           CONTINUUM_IMAGE_DIGEST: ${{ inputs.image_digest || vars.CONTINUUM_IMAGE_DIGEST }}
@@ -302,6 +303,7 @@ jobs:
               set -e
               if [[ "$validation_rc" -eq 0 ]] && ! git diff --name-only --diff-filter=U | grep -q .; then
                 accepted=true
+                echo "accepted_run=true" >> "$GITHUB_OUTPUT"
                 break
               fi
             fi
@@ -376,3 +378,13 @@ jobs:
 
           gh pr comment "$PR_NUMBER" --repo "$child_repo"             --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-pr-review-merged -->' '⚡ **Continuum · delegation-pr-review**' '<!-- continuum-origin role=continuum component=delegation-pr-review -->' "Independent review passed and this owner-created PR was merged.")"             >/dev/null 2>&1 || true
           echo "SubTask PR review #$PR_NUMBER reviewed and merged."
+
+      - name: Record sticky route after accepted delegated task
+        if: steps.actual_child_run.outcome == 'success' && steps.actual_child_run.outputs.accepted_run == 'true'
+        uses: kodmial/continuum/.github/actions/model-select@work-lock-66-model-selection-20261019
+        with:
+          operation: record
+          models: ${{ vars.OPENCODE_MODELS || '' }}
+          selected-model: ${{ steps.model_pick.outputs.model }}
+          profile: child-pr-review-${{ steps.model_scope.outputs.scope }}
+          state-token: ${{ secrets.CHILD_RUNTIME_TOKEN }}
