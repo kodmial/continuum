@@ -49,3 +49,17 @@ and must be qualified independently. Outstanding acceptance includes
 real repeated ephemeral runs with sticky state, cold/warm, invalid version
 and model override, corruption/eviction, fork trust boundaries, provider
 429/5xx simulation, real coding/tool use and Parent/Child full E2E.
+
+## Live qualification checkpoints (2026-10-19)
+
+- GitHub Actions 39270807290: clean hosted runner, exact official CLI,
+  real DeepSeek semantic probe and actual file-editing task; recorded post-task.
+- GitHub Actions 39272596838: a TEST-ONLY command shim deliberately returned
+  synthetic HTTP 503 for the first approved route. The selector skipped it,
+  queried the REAL official GLM 5.3 Flash Free backend, the model completed
+  actual file-editing acceptance, and its successful task was stored.
+  This proves selection/fallback control flow; it does NOT claim the actual
+  DeepSeek upstream returned HTTP 503.
+- A following distinct clean runner must read the stored GLM success, then
+  qualify its own call before any work. These runs test the isolated canary,
+  not yet all production Parent/Child and Render execution paths.
