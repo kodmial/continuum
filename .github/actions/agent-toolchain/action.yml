@@ -20,6 +20,12 @@ outputs:
   runtime-version:
     description: Exact OpenCode version selected
     value: ${{ steps.resolve.outputs.opencode_version }}
+  runtime-sha256:
+    description: SHA256 of the binary actually selected after cache verification
+    value: ${{ steps.bootstrap.outputs.opencode_sha256 }}
+  manifest-sha256:
+    description: Exact reviewed toolchain manifest SHA256
+    value: ${{ steps.resolve.outputs.manifest_sha256 }}
 runs:
   using: composite
   steps:
