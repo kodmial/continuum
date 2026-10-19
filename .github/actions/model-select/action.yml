@@ -1,6 +1,14 @@
 name: Continuum approved OpenCode model selector
 description: Bounded official OpenCode semantic probes and durable scoped model pin
 inputs:
+  operation:
+    description: select (preflight) or record (only after successful task)
+    required: false
+    default: select
+  selected-model:
+    description: Effective route from select output; required for record
+    required: false
+    default: ''
   models:
     description: Ordered model IDs, defaults to reviewed Work Lock 66 approved config
     required: false
@@ -43,6 +51,7 @@ runs:
   steps:
     - name: Probe approved models and persist selected route
       id: choose
+      if: inputs.operation == 'select'
       shell: bash
       env:
         INPUT_OPENCODE_MODELS: ${{ inputs.models }}
@@ -54,3 +63,13 @@ runs:
         INPUT_MODEL_COOLDOWN: ${{ inputs.model-cooldown }}
         INPUT_PROBE_TIMEOUT: ${{ inputs.probe-timeout }}
       run: python3 "$GITHUB_ACTION_PATH/choose.py" choose
+    - name: Mark actual task success for sticky routing
+      if: inputs.operation == 'record'
+      shell: bash
+      env:
+        INPUT_OPENCODE_MODELS: ${{ inputs.models }}
+        INPUT_SELECTED_MODEL: ${{ inputs.selected-model }}
+        INPUT_MODEL_PROFILE: ${{ inputs.profile }}
+        INPUT_MODEL_IDENTITY: ${{ inputs.identity }}
+        INPUT_STATE_TOKEN: ${{ inputs.state-token }}
+      run: python3 "$GITHUB_ACTION_PATH/record.py"
