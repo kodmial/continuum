@@ -33,7 +33,13 @@ execution class/profile, credential scope, pool fingerprint and binary digest.
 Only an existing contents-write token for the repository chosen by the trusted
 caller is used. Private Child state must be written in that Child repository,
 never in a public Parent. CAS updates are non-forced fast-forward writes with
-bounded retry. State separates \`last_successful_probe\` from
+bounded retry. Selection issues a per-run-attempt opaque completion receipt
+(held outside `main`); semantic TTL is checked **at selection**, and a
+real task finishing after that TTL may still be attested within a bounded
+six-hour lifetime of its original run-scoped receipt. Completing another
+run, changing the model, replaying a consumed receipt or recording without
+verified selection all fail closed. Concurrent runs retain separate receipts.
+State separates \`last_successful_probe\` from
 \`last_successful_real_execution\`, with per-route negative cooldowns.
 
 The existing 429 runner-burn file \`$RUNNER_TEMP/continuum-opencode-429\` is
