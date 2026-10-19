@@ -16,7 +16,7 @@ class ContinuumTest < Minitest::Test
   # Project-owned entry workflows used only by the Continuum repository itself.
   # They deliberately stay outside the `continuum-` namespace so installer
   # ownership and reusable-engine ownership remain unambiguous.
-  PROJECT_ENTRY_WORKFLOWS = %w[automation.yml ci.yml contract-gate.yml contract-qualification.yml opencode.yml pr-agent.yml pr-agent-recovery.yml pr-agent-router.yml].freeze
+  PROJECT_ENTRY_WORKFLOWS = %w[automation.yml ci.yml contract-gate.yml contract-qualification.yml opencode.yml pr-agent.yml pr-agent-recovery.yml pr-agent-router.yml work-lock-66-qualification.yml].freeze
   # Every caller stub in every layer, for the checks that must not care which
   # layer a file belongs to.
   ALL_STUBS = (CORE_STUBS + TECH_STUBS + PARENT_STUBS).sort
@@ -2128,7 +2128,7 @@ class ContinuumTest < Minitest::Test
     refute_nil resolve, 'the target-context resolution step is missing'
     assert_includes resolve, 'GH_TOKEN: ${{ secrets.TAP_PAT }}',
                     'target resolution fetches cross-repo child config with TAP_PAT'
-    assert_equal 1, body.scan('state-token: ${{ secrets.TAP_PAT }}').size,
+    assert_equal 2, body.scan('state-token: ${{ secrets.TAP_PAT }}').size,
                  'only the trusted model-state Action has a standalone state PAT'
     assert_equal 1, body.scan('GH_TOKEN: ${{ secrets.TAP_PAT }}').size,
                  'only target resolution may use a bare TAP_PAT credential; every read must use the fail-closed conditional'
@@ -2474,7 +2474,7 @@ class ContinuumTest < Minitest::Test
     assert_equal %w[opencode/deepseek-v4.1-flash-free opencode/glm-5.3-flash-free opencode/nemotron-3-ultra-free],
                  default_models.fetch('approved_models')
     coder = File.read(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
-    assert_equal 6, coder.scan('steps.model_pick.outputs.model').size
+    assert_equal 8, coder.scan('steps.model_pick.outputs.model').size
     assert_includes coder, 'id: model_pick'
     refute_includes coder, "vars.OPENCODE_MODEL || 'opencode/muse-spark-1.3-contributor-free'"
   end
