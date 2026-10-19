@@ -627,7 +627,7 @@ jobs:
           models: ${{ vars.OPENCODE_MODELS || '' }}
           explicit-model: ${{ inputs.opencode_model || vars.OPENCODE_MODEL || '' }}
           profile: pr-agent-review
-          state-token: ${{ secrets.TAP_PAT || github.token }}
+          state-token: ${{ secrets.TAP_PAT }}
 
       - name: Start opencode serve on loopback
         id: start_opencode
