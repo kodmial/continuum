@@ -74,5 +74,8 @@ jobs:
       continuum_ref: main
       review_provider: pr-agent
       pr_number: "319"
-      expected_head_sha: "47ae8d16612346ef5c4e5a46a30dc2f2236ae5b0"
+      expected_head_sha: "00b5c3888bf8b7e405b2d005b936a43faf678789"
+      # Explicit override, independent of retired repo vars.OPENCODE_MODEL.
+      # The reusable PR-Agent stack passes it as OPENCODE_MODEL to the OpenCode bridge.
+      model: openai/continuum-review
       opencode_model: opencode/glm-5.3-flash-free
