@@ -1,0 +1,56 @@
+name: Continuum approved OpenCode model selector
+description: Bounded official OpenCode semantic probes and durable scoped model pin
+inputs:
+  models:
+    description: Ordered model IDs, defaults to reviewed Work Lock 66 approved config
+    required: false
+    default: ''
+  explicit-model:
+    description: Optional explicit one-model pin from legacy OPENCODE_MODEL
+    required: false
+    default: ''
+  profile:
+    description: Non-secret execution scope, stable per-consumer/child profile
+    required: false
+    default: coder
+  identity:
+    description: Anonymous is the only supported credential identity scope
+    required: false
+    default: anonymous
+  state-token:
+    description: Existing token with contents write to the caller's separate state ref
+    required: true
+  probe-ttl:
+    description: Probe freshness in seconds
+    required: false
+    default: '3600'
+  model-cooldown:
+    description: Circuit breaker cooldown in seconds
+    required: false
+    default: '900'
+  probe-timeout:
+    description: Per-model live inference timeout in seconds
+    required: false
+    default: '90'
+outputs:
+  model:
+    value: ${{ steps.choose.outputs.model }}
+    description: Selected exact approved free model ID
+  source:
+    value: ${{ steps.choose.outputs.source }}
+runs:
+  using: composite
+  steps:
+    - name: Probe approved models and persist selected route
+      id: choose
+      shell: bash
+      env:
+        INPUT_OPENCODE_MODELS: ${{ inputs.models }}
+        INPUT_OPENCODE_MODEL: ${{ inputs.explicit-model }}
+        INPUT_MODEL_PROFILE: ${{ inputs.profile }}
+        INPUT_MODEL_IDENTITY: ${{ inputs.identity }}
+        INPUT_STATE_TOKEN: ${{ inputs.state-token }}
+        INPUT_PROBE_TTL: ${{ inputs.probe-ttl }}
+        INPUT_MODEL_COOLDOWN: ${{ inputs.model-cooldown }}
+        INPUT_PROBE_TIMEOUT: ${{ inputs.probe-timeout }}
+      run: python3 "$GITHUB_ACTION_PATH/choose.py" choose
