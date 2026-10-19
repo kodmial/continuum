@@ -41,8 +41,14 @@ def run() -> int:
         raise ConfigError("Unknown durable model state schema")
     try:
         model, state, attempts = select(config, previous or blank_state(config))
-    except NoRoute:
+    except NoRoute as exc:
+        if exc.state is not None and not config.explicit_pin:
+            # Persist negative cooldowns, otherwise next runner would hammer
+            # the exact same failing free routes indefinitely.
+            store.write(path, exc.state, expected_head=expected_head)
         print("::error::No approved OpenCode model passed live semantic qualification.", file=sys.stderr)
+        for attempt in exc.attempts:
+            print("Candidate " + attempt["model"] + ": " + attempt["reason"], file=sys.stderr)
         return 1
     # If this can't be persisted, fail before invoking the stateful coding agent.
     store.write(path, state, expected_head=expected_head)
