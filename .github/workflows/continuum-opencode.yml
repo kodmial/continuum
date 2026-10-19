@@ -1632,6 +1632,17 @@ jobs:
           components: opencode
           opencode-version: ${{ vars.CONTINUUM_OPENCODE_VERSION || '' }}
 
+
+      - name: Choose user-approved OpenCode route before any task changes
+        id: model_pick
+        if: steps.issue_readiness.outputs.ready != 'false'
+        uses: kodmial/continuum/.github/actions/model-select@work-lock-66-model-selection-20261019
+        with:
+          models: ${{ vars.OPENCODE_MODELS || '' }}
+          explicit-model: ${{ vars.OPENCODE_MODEL || '' }}
+          profile: ${{ inputs.mode || 'issue' }}
+          state-token: ${{ secrets.TAP_PAT || github.token }}
+
       - name: Install Continuum OpenCode rate-limit wrapper
         if: steps.issue_readiness.outputs.ready != 'false'
         shell: bash
@@ -1865,7 +1876,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
           ISSUE_NUMBER: ${{ inputs.issue_number }}
           EVENT_ISSUE_NUMBER: ${{ github.event.issue.number }}
-          MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
+          MODEL: ${{ steps.model_pick.outputs.model }}
           USE_GITHUB_TOKEN: "true"
           SHARE: "false"
           OPENCODE_CONFIG_CONTENT: >-
@@ -1990,7 +2001,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
-          OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
+          OPENCODE_MODEL: ${{ steps.model_pick.outputs.model }}
           ISSUE_NUMBER: ${{ inputs.issue_number || github.event.issue.number }}
           TASK_CONTEXT_PRESENT: ${{ steps.task_context.outputs.present }}
           TASK_REPO: ${{ steps.task_context.outputs.task_repo }}
@@ -2442,7 +2453,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
-          OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
+          OPENCODE_MODEL: ${{ steps.model_pick.outputs.model }}
           CAPABILITY_NUMBER: ${{ steps.qualification_identity.outputs.capability_number || inputs.capability_number }}
           QUALIFICATION_NUMBER: ${{ steps.qualification_identity.outputs.qualification_number || inputs.qualification_number || inputs.issue_number || github.event.issue.number }}
           REQUIRED_SHA: ${{ steps.qualification_identity.outputs.required_sha || inputs.required_sha }}
@@ -2609,7 +2620,7 @@ jobs:
       - name: Fix CodeRabbit review findings
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'coderabbit-fix' && steps.recovery_restore.outputs.skip_opencode != 'true'
         env:
-          OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
+          OPENCODE_MODEL: ${{ steps.model_pick.outputs.model }}
           GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ inputs.pr_number }}
@@ -2980,7 +2991,7 @@ jobs:
       - name: Resolve merge conflict with main
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'resolve-conflict' && steps.recovery_restore.outputs.skip_opencode != 'true'
         env:
-          OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
+          OPENCODE_MODEL: ${{ steps.model_pick.outputs.model }}
           GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ inputs.pr_number }}
@@ -3190,7 +3201,7 @@ jobs:
       - name: Fix failed blocking workflow
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'ci-fix' && steps.recovery_restore.outputs.skip_opencode != 'true'
         env:
-          OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
+          OPENCODE_MODEL: ${{ steps.model_pick.outputs.model }}
           GITHUB_TOKEN: ${{ secrets.TAP_PAT }}
           GH_TOKEN: ${{ secrets.TAP_PAT }}
           PR_NUMBER: ${{ inputs.pr_number }}
