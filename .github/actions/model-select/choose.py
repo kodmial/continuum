@@ -27,7 +27,9 @@ def run() -> int:
     )
     if any(model not in approved for model in config.models):
         raise ConfigError("Model is not in the explicitly user-approved model allowlist")
-    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    repo = (os.environ.get("CONTINUUM_MODEL_STATE_REPOSITORY") or
+            os.environ.get("CONTINUUM_PR_AGENT_TARGET_REPOSITORY") or
+            os.environ.get("GITHUB_REPOSITORY", ""))
     token = os.environ.get("INPUT_STATE_TOKEN", "")
     profile = os.environ.get("INPUT_MODEL_PROFILE", "coder")
     identity = os.environ.get("INPUT_MODEL_IDENTITY", "anonymous")
