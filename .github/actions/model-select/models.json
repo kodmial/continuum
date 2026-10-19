@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "approved_models": [
+    "opencode/deepseek-v4.1-flash-free",
+    "opencode/glm-5.3-flash-free",
+    "opencode/nemotron-3-ultra-free"
+  ],
+  "default_order": [
+    "opencode/deepseek-v4.1-flash-free",
+    "opencode/glm-5.3-flash-free",
+    "opencode/nemotron-3-ultra-free"
+  ],
+  "note": "No additional model IDs without explicit user approval"
+}
