@@ -33,14 +33,19 @@ execution class/profile, credential scope, pool fingerprint and binary digest.
 Only an existing contents-write token for the repository chosen by the trusted
 caller is used. Private Child state must be written in that Child repository,
 never in a public Parent. CAS updates are non-forced fast-forward writes with
-bounded retry. State separates \`last_successful_probe\` from
+bounded retry. Selection holds two opaque receipts outside `main`: a
+per-**Actions-run, attempt and job** selection lease (maximum 60 minutes,
+including the 45-minute job budget) and a per-run-attempt completion receipt
+(bounded six-hour lifetime). Semantic TTL is checked **at selection**; a real
+task finishing after that TTL may still be attested while both receipts
+verify. At successful completion, record requires the lease **and** the
+run-scoped receipt, **not** the probe's TTL at completion: that TTL restricts
+freshness when selecting, not the duration of an already running real task.
+Completing another run, changing the model, replaying a consumed receipt or
+recording without verified selection all fail closed, and a missing, expired,
+wrong-model or replayed lease fails closed. Concurrent runs retain separate
+receipts. State separates \`last_successful_probe\` from
 \`last_successful_real_execution\`, with per-route negative cooldowns.
-A per-**Actions-run, attempt and job** opaque, bounded selection lease records
-which qualified model was frozen *before* any side effects. At successful
-completion, record verifies that lease (maximum 60 minutes, including the
-45-minute job budget), **not** the probe's TTL at completion: that TTL
-restricts freshness when selecting, not the duration of an already running
-real task. A missing, expired, wrong-model or replayed lease fails closed.
 
 
 The existing 429 runner-burn file \`$RUNNER_TEMP/continuum-opencode-429\` is

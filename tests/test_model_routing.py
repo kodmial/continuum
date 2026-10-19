@@ -155,6 +155,61 @@ class ProbeTests(unittest.TestCase):
 
 
 
+class CompletionTicketTests(unittest.TestCase):
+    def test_probed_at_selection_and_real_completion_after_ttl(self):
+        """TTL controls admission, never invalidates a task already admitted."""
+        ticket = route.execution_ticket({"GITHUB_RUN_ID": "703", "GITHUB_RUN_ATTEMPT": "1"})
+        state = {"fingerprint": "f", "last_successful_probe": {"model": A, "at": 1000}}
+        state = route.reserve_completion(state, ticket, A, now=1059, probe_at=1000)
+        self.assertEqual(state["last_successful_probe"]["at"], 1000)
+        state = route.attest_completion(
+            state, ticket, A, now=1090, fingerprint="f", ttl=60,
+            execution_id="703/1", head="sha")
+        self.assertEqual(state["last_successful_real_execution"]["model"], A)
+        self.assertEqual(state["last_successful_real_execution"]["head"], "sha")
+        self.assertEqual(state["qualified_selections"], {})
+
+    def test_receipt_rejects_other_model_other_run_and_replay(self):
+        one = route.execution_ticket({"GITHUB_RUN_ID": "703", "GITHUB_RUN_ATTEMPT": "1"})
+        two = route.execution_ticket({"GITHUB_RUN_ID": "703", "GITHUB_RUN_ATTEMPT": "2"})
+        state = route.reserve_completion({"fingerprint": "f"}, one, A, 1010, 1000)
+        for token, model in ((two, A), (one, B)):
+            with self.assertRaisesRegex(route.RouteError, "No qualified selection"):
+                route.attest_completion(state, token, model, 1020, "f", 60, "703/1")
+        state = route.attest_completion(state, one, A, 1020, "f", 60, "703/1")
+        with self.assertRaises(route.RouteError):
+            route.attest_completion(state, one, A, 1021, "f", 60, "703/1")
+
+    def test_receipt_rejects_expired_execution_and_unqualified_admission(self):
+        ticket = route.execution_ticket({"GITHUB_RUN_ID": "705", "GITHUB_RUN_ATTEMPT": "1"})
+        state = route.reserve_completion({"fingerprint": "f"}, ticket, A, 1100, 1000)
+        with self.assertRaisesRegex(route.RouteError, "proof expired"):
+            route.attest_completion(state, ticket, A, 1110, "f", 60, "705/1")
+        state = route.reserve_completion({"fingerprint": "f"}, ticket, A, 1050, 1000)
+        with self.assertRaisesRegex(route.RouteError, "proof expired"):
+            route.attest_completion(
+                state, ticket, A, 1050 + route.MAX_EXECUTION_SECONDS + 1,
+                "f", 60, "705/1")
+
+    def test_two_concurrent_runs_keep_isolated_receipts(self):
+        x = route.execution_ticket({"GITHUB_RUN_ID": "703", "GITHUB_RUN_ATTEMPT": "1"})
+        y = route.execution_ticket({"GITHUB_RUN_ID": "704", "GITHUB_RUN_ATTEMPT": "1"})
+        state = {"fingerprint": "f"}
+        state = route.reserve_completion(state, x, A, 1000, 1000)
+        state = route.reserve_completion(state, y, B, 1001, 1001)
+        state = route.attest_completion(state, x, A, 1050, "f", 60, "703/1")
+        self.assertIn(y, state["qualified_selections"])
+        state = route.attest_completion(state, y, B, 1060, "f", 60, "704/1")
+        self.assertNotIn(x, state["qualified_selections"])
+        self.assertEqual(state["last_successful_real_execution"]["model"], B)
+
+    def test_execution_ticket_requires_valid_actions_identity(self):
+        with self.assertRaises(route.RouteError):
+            route.execution_ticket({"GITHUB_RUN_ID": "", "GITHUB_RUN_ATTEMPT": "1"})
+        with self.assertRaises(route.RouteError):
+            route.execution_ticket({"GITHUB_RUN_ID": "not-numeric", "GITHUB_RUN_ATTEMPT": "1"})
+
+
 class GitRefStoreTests(unittest.TestCase):
     def test_first_write_creates_orphan_ref_not_main(self):
         store = route.GitRefStore("example/private", "fake-token")
