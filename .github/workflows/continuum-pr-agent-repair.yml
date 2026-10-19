@@ -772,7 +772,7 @@ jobs:
           models: ${{ vars.OPENCODE_MODELS || '' }}
           explicit-model: ${{ vars.OPENCODE_MODEL || '' }}
           profile: pr-agent-repair
-          state-token: ${{ secrets.TAP_PAT || github.token }}
+          state-token: ${{ secrets.TAP_PAT }}
 
       - name: Run one bounded OpenCode repair pass over every current item
         id: repair_pass
