@@ -24,6 +24,24 @@ jobs:
         uses: ./.github/actions/agent-toolchain
         with:
           components: opencode
+      - name: Simulate first approved route outage only for bounded failover test
+        if: contains(github.event.head_commit.message, '[wl66-failover]')
+        shell: bash
+        run: |
+          set -euo pipefail
+          upstream="$(command -v opencode)"
+          wrap="$RUNNER_TEMP/model66-route-sim"
+          mkdir -p "$wrap"
+          printf '%s\n' '#!/usr/bin/env bash' \
+            'if [[ "$*" == *"opencode/deepseek-v4.1-flash-free"* ]]; then' \
+            '  echo "HTTP 503 synthetic model outage (test-only)" >&2' \
+            '  exit 1' \
+            'fi' \
+            "exec \"$upstream\" \"\$@\"" > "$wrap/opencode"
+          chmod 755 "$wrap/opencode"
+          echo "$wrap" >> "$GITHUB_PATH"
+          echo "SIMULATED upstream failure: DeepSeek only; fallback still uses REAL official OpenCode" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Probe the approved model and persist an isolated state checkpoint
         id: route
         uses: ./.github/actions/model-select
