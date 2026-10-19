@@ -128,6 +128,7 @@ jobs:
           gh issue comment "$TASK_NUMBER" --repo "$child_repo" --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-infra -->' '⚡ **Continuum · delegation-worker**' '<!-- continuum-origin role=continuum component=delegation-worker -->' "child task #$TASK_NUMBER could not install the verified agent runtime.")" >/dev/null 2>&1 || true
 
       - name: Execute child task
+        id: actual_child_run
         shell: bash
         env:
           CONTINUUM_IMAGE_DIGEST: ${{ inputs.image_digest || vars.CONTINUUM_IMAGE_DIGEST }}
@@ -403,6 +404,7 @@ jobs:
             set -e
             if [[ -f "$result_file" ]] && grep -qx 'Acceptance: PASS' "$result_file"; then
               accepted=true
+              echo "accepted_run=true" >> "$GITHUB_OUTPUT"
               break
             fi
             echo "Child task #$TASK_NUMBER pass $pass incomplete (agent rc=$rc); continuing."
@@ -477,3 +479,13 @@ jobs:
           fi
           gh issue comment "$TASK_NUMBER" --repo "$child_repo"             --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-pr -->' '🦾 **Agent Coder · delegation-worker**' '<!-- continuum-origin role=agent-coder component=delegation-worker -->' "Child task #$TASK_NUMBER produced an accepted implementation PR: $pr_url")"             >/dev/null 2>&1 || true
           echo "SubTask #$TASK_NUMBER produced an implementation PR."
+
+      - name: Record sticky route after verified accepted delegated task
+        if: steps.actual_child_run.outcome == 'success' && steps.actual_child_run.outputs.accepted_run == 'true'
+        uses: kodmial/continuum/.github/actions/model-select@work-lock-66-model-selection-20261019
+        with:
+          operation: record
+          models: ${{ vars.OPENCODE_MODELS || '' }}
+          selected-model: ${{ steps.model_pick.outputs.model }}
+          profile: child-worker-${{ steps.model_scope.outputs.scope }}
+          state-token: ${{ secrets.CHILD_RUNTIME_TOKEN }}
