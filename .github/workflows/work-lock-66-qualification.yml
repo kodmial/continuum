@@ -11,7 +11,7 @@ permissions:
 jobs:
   model-selector-canary:
     # The action writes ONLY its dedicated non-default state ref.
-    if: github.ref == 'refs/heads/work-lock-66-model-selection-20261019' && contains(github.event.head_commit.message, '[wl66-live]')
+    if: github.ref == 'refs/heads/work-lock-66-model-selection-20261019' && (contains(github.event.head_commit.message, '[wl66-live]') || contains(github.event.head_commit.message, '[wl66-failover]'))
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     permissions:
