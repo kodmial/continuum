@@ -2249,6 +2249,10 @@ jobs:
             set +e
             continuum-opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
             OPENCODE_RUN_RC=${PIPESTATUS[0]}
+            if [[ "$OPENCODE_RUN_RC" == 0 ]] &&
+               ! grep -Eiq '(FreeUsageLimitError|FreeTierError|Upstream request failed|Model unavailable|has been deprecated)' "$OPENCODE_RUN_LOG"; then
+              echo "CONTINUUM_MODEL_EXECUTED=true" >> "$GITHUB_ENV"
+            fi
             set -e
           fi
           if [[ "$OPENCODE_RUN_RC" -eq 143 || "$OPENCODE_RUN_RC" -eq 130 || "$OPENCODE_RUN_RC" -eq 129 ]]; then
@@ -2544,6 +2548,10 @@ jobs:
             set +e
             continuum-opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
             OPENCODE_RUN_RC=${PIPESTATUS[0]}
+            if [[ "$OPENCODE_RUN_RC" == 0 ]] &&
+               ! grep -Eiq '(FreeUsageLimitError|FreeTierError|Upstream request failed|Model unavailable|has been deprecated)' "$OPENCODE_RUN_LOG"; then
+              echo "CONTINUUM_MODEL_EXECUTED=true" >> "$GITHUB_ENV"
+            fi
             set -e
           fi
           if grep -Eiq 'FreeUsageLimitError' "$OPENCODE_RUN_LOG" || \
@@ -2779,6 +2787,10 @@ jobs:
           set +e
           continuum-opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
           OPENCODE_RUN_RC=${PIPESTATUS[0]}
+          if [[ "$OPENCODE_RUN_RC" == 0 ]] &&
+             ! grep -Eiq '(FreeUsageLimitError|FreeTierError|Upstream request failed|Model unavailable|has been deprecated)' "$OPENCODE_RUN_LOG"; then
+            echo "CONTINUUM_MODEL_EXECUTED=true" >> "$GITHUB_ENV"
+          fi
           set -e
           if grep -Eiq 'FreeUsageLimitError' "$OPENCODE_RUN_LOG" || \
              { [[ "$OPENCODE_RUN_RC" -ne 0 ]] && grep -Eiq 'APIError.*429|HTTP[^0-9]*429([^0-9]|$)|429[[:space:]]+Too[[:space:]]+Many[[:space:]]+Requests|statusCode[^0-9]*429([^0-9]|$)' "$OPENCODE_RUN_LOG"; }; then
@@ -3168,6 +3180,10 @@ jobs:
           set +e
           continuum-opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
           OPENCODE_RUN_RC=${PIPESTATUS[0]}
+          if [[ "$OPENCODE_RUN_RC" == 0 ]] &&
+             ! grep -Eiq '(FreeUsageLimitError|FreeTierError|Upstream request failed|Model unavailable|has been deprecated)' "$OPENCODE_RUN_LOG"; then
+            echo "CONTINUUM_MODEL_EXECUTED=true" >> "$GITHUB_ENV"
+          fi
           set -e
           if grep -Eiq 'FreeUsageLimitError' "$OPENCODE_RUN_LOG" || \
              { [[ "$OPENCODE_RUN_RC" -ne 0 ]] && grep -Eiq 'APIError.*429|HTTP[^0-9]*429([^0-9]|$)|429[[:space:]]+Too[[:space:]]+Many[[:space:]]+Requests|statusCode[^0-9]*429([^0-9]|$)' "$OPENCODE_RUN_LOG"; }; then
@@ -3373,6 +3389,10 @@ jobs:
           set +e
           continuum-opencode run --auto --model "$OPENCODE_MODEL" "$PROMPT" 2>&1 | tee "$OPENCODE_RUN_LOG"
           OPENCODE_RUN_RC=${PIPESTATUS[0]}
+          if [[ "$OPENCODE_RUN_RC" == 0 ]] &&
+             ! grep -Eiq '(FreeUsageLimitError|FreeTierError|Upstream request failed|Model unavailable|has been deprecated)' "$OPENCODE_RUN_LOG"; then
+            echo "CONTINUUM_MODEL_EXECUTED=true" >> "$GITHUB_ENV"
+          fi
           set -e
           if grep -Eiq 'FreeUsageLimitError' "$OPENCODE_RUN_LOG" || \
              { [[ "$OPENCODE_RUN_RC" -ne 0 ]] && grep -Eiq 'APIError.*429|HTTP[^0-9]*429([^0-9]|$)|429[[:space:]]+Too[[:space:]]+Many[[:space:]]+Requests|statusCode[^0-9]*429([^0-9]|$)' "$OPENCODE_RUN_LOG"; }; then
@@ -3703,3 +3723,22 @@ jobs:
               `Released failed reservation for issue #${issueNumber} after attempt ${attempts}/${maxAttempts}; scheduler will retry from live priority state${attempts >= maxAttempts && !pauseOnFailure ? ' (terminal pause disabled)' : ''}.`
             );
 
+
+      - name: Confirm a successful real OpenCode invocation occurred
+        id: model_execution
+        if: always() && steps.model_pick.outputs.model != ''
+        shell: bash
+        run: |
+          if [[ "${CONTINUUM_MODEL_EXECUTED:-}" == true ]]; then
+            echo 'real_execution=true' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Persist verified sticky route after fully successful coder pass
+        if: success() && steps.model_execution.outputs.real_execution == 'true'
+        uses: kodmial/continuum/.github/actions/model-select@work-lock-66-model-selection-20261019
+        with:
+          operation: record
+          models: ${{ vars.OPENCODE_MODELS || '' }}
+          selected-model: ${{ steps.model_pick.outputs.model }}
+          profile: ${{ inputs.mode || 'issue' }}
+          state-token: ${{ secrets.TAP_PAT }}
