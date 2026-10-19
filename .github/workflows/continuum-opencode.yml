@@ -1641,7 +1641,7 @@ jobs:
           models: ${{ vars.OPENCODE_MODELS || '' }}
           explicit-model: ${{ vars.OPENCODE_MODEL || '' }}
           profile: ${{ inputs.mode || 'issue' }}
-          state-token: ${{ secrets.TAP_PAT || github.token }}
+          state-token: ${{ secrets.TAP_PAT }}
 
       - name: Install Continuum OpenCode rate-limit wrapper
         if: steps.issue_readiness.outputs.ready != 'false'
