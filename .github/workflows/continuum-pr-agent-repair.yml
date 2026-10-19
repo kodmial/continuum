@@ -1105,6 +1105,16 @@ jobs:
           echo "published=true" >> "$GITHUB_OUTPUT"
           echo "Pushed one bounded repair to refs/heads/$HEAD_REF for PR #$PR_NUMBER."
 
+      - name: Record sticky route after successful bounded PR-Agent repair
+        if: steps.repair_pass.outcome == 'success' && steps.model_pick.outputs.model != ''
+        uses: kodmial/continuum/.github/actions/model-select@work-lock-66-model-selection-20261019
+        with:
+          operation: record
+          models: ${{ vars.OPENCODE_MODELS || '' }}
+          selected-model: ${{ steps.model_pick.outputs.model }}
+          profile: pr-agent-repair
+          state-token: ${{ secrets.TAP_PAT }}
+
       - name: Persist PR-Agent no-progress controller state
         if: always() && steps.repair_pass.outputs.no_progress == 'true'
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
