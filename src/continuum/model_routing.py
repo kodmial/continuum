@@ -27,6 +27,10 @@ REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 SEMVER = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 STATE_REF = "continuum-model-state"
 STATE_VERSION = 1
+# Only bound a real-completion receipt to its original Actions run attempt.
+# Long-running consumers may finish after the semantic probe TTL expires.
+MAX_EXECUTION_SECONDS = 6 * 60 * 60
+MAX_PENDING_EXECUTIONS = 128
 
 
 class RouteError(RuntimeError):
@@ -290,6 +294,65 @@ class GitRefStore:
         raise RouteError("Model state CAS budget exhausted")
 
 
+def execution_ticket(environ) -> str:
+    """Privacy-safe, per-run-attempt identifier; no cross-run attestations."""
+    run = environ.get("GITHUB_RUN_ID", "")
+    attempt = environ.get("GITHUB_RUN_ATTEMPT", "")
+    if not (re.fullmatch(r"[0-9]{1,20}", run) and re.fullmatch(r"[0-9]{1,8}", attempt)):
+        raise RouteError("Model route requires a trusted Actions run identity")
+    return hashlib.sha256((run + "/" + attempt).encode()).hexdigest()
+
+
+def reserve_completion(state: dict, ticket: str, model: str, now: int,
+                       probe_at: int) -> dict:
+    """Record qualified-at-selection proof without extending semantic TTL."""
+    if not (0 <= now - probe_at <= 86400):
+        raise RouteError("Invalid qualification timestamp")
+    pending = state.get("qualified_selections") or {}
+    if not isinstance(pending, dict):
+        raise RouteError("Corrupt model selection state")
+    active = {
+        key: value for key, value in pending.items()
+        if isinstance(value, dict) and isinstance(value.get("at"), int)
+        and 0 <= now - value["at"] <= MAX_EXECUTION_SECONDS
+    }
+    active[ticket] = {"model": model, "at": now, "probe_at": probe_at}
+    if len(active) > MAX_PENDING_EXECUTIONS:
+        active = dict(sorted(active.items(), key=lambda kv: kv[1]["at"])
+                      [-MAX_PENDING_EXECUTIONS:])
+    state["qualified_selections"] = active
+    return state
+
+
+def attest_completion(current: dict, ticket: str, model: str, now: int,
+                      fingerprint: str, ttl: int, execution_id: str,
+                      head: str = "") -> dict:
+    """A live success may outlast probe TTL, but never its run-scoped receipt."""
+    if current.get("fingerprint") != fingerprint:
+        raise RouteError("Stale model state fingerprint")
+    pending = current.get("qualified_selections") or {}
+    if not isinstance(pending, dict):
+        raise RouteError("Corrupt model selection state")
+    selected = pending.get(ticket) or {}
+    if selected.get("model") != model:
+        raise RouteError("No qualified selection for this run and model")
+    selected_at = selected.get("at")
+    probe_at = selected.get("probe_at")
+    if not (isinstance(selected_at, int) and isinstance(probe_at, int)
+            and 0 <= selected_at - probe_at <= ttl
+            and 0 <= now - selected_at <= MAX_EXECUTION_SECONDS):
+        raise RouteError("Model selection proof expired or was not qualified")
+    # Never promote the model of a different run, even if it became the
+    # most recent successful probe after this operation was selected.
+    remaining = dict(pending)
+    del remaining[ticket]
+    current["qualified_selections"] = remaining
+    current["last_successful_real_execution"] = {
+        "model": model, "at": now, "run": execution_id, "head": head,
+    }
+    return current
+
+
 def route_key(repo: str, profile: str, credentials: str, config: Configuration,
               binary_sha: str) -> str:
     if not profile or not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", profile):
@@ -337,21 +400,17 @@ def run() -> int:
                     credential_scope, config, digest)
     store = GitRefStore(owner, env.get("CONTINUUM_MODEL_STATE_TOKEN", ""))
     now = int(time.time())
+    ticket = execution_ticket(env)
     if args.operation == "record":
         selected = env.get("CONTINUUM_SELECTED_MODEL", "")
         execution_id = env.get("GITHUB_RUN_ID", "") + "/" + env.get("GITHUB_RUN_ATTEMPT", "")
         if selected not in config.models or not execution_id.strip("/"):
             raise RouteError("Cannot attest unspecified execution")
         def record(current):
-            probe = current.get("last_successful_probe") or {}
-            if current.get("fingerprint") != config.fingerprint(digest, credential_scope) or probe.get("model") != selected:
-                raise RouteError("Stale/unqualified route cannot be promoted")
-            if now - int(probe.get("at", 0)) > config.ttl:
-                raise RouteError("Model probe expired before completion")
-            current["last_successful_real_execution"] = {
-                "model": selected, "at": now, "run": execution_id,
-                "head": env.get("CONTINUUM_TASK_HEAD", "")}
-            return current
+            return attest_completion(
+                current, ticket, selected, now,
+                config.fingerprint(digest, credential_scope), config.ttl,
+                execution_id, env.get("CONTINUUM_TASK_HEAD", ""))
         store.update(key, record)
         return 0
 
@@ -379,7 +438,16 @@ def run() -> int:
                                task_class=config.task_class)
                 if not qualified:
                     current["last_successful_probe"] = {"model": model, "at": now}
-                return current
+                # The proof's TTL is evaluated at selection time. The
+                # trusted run identity, not probe age at completion, is
+                # authoritative for a successful task receipt.
+                chosen_probe = current.get("last_successful_probe") or {}
+                if chosen_probe.get("model") != model:
+                    raise RouteError("Selected route has no qualification")
+                at = int(chosen_probe.get("at", 0))
+                if not 0 <= now - at <= config.ttl:
+                    raise RouteError("Selected probe expired before task start")
+                return reserve_completion(current, ticket, model, now, at)
             store.update(key, save)
             if env.get("GITHUB_OUTPUT"):
                 with open(env["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
