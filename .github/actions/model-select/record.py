@@ -18,7 +18,9 @@ def main():
     model = os.environ.get("INPUT_SELECTED_MODEL", "")
     if model not in config.models:
         raise ConfigError("Recorded task model is not in the approved pool")
-    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    repo = (os.environ.get("CONTINUUM_MODEL_STATE_REPOSITORY") or
+            os.environ.get("CONTINUUM_PR_AGENT_TARGET_REPOSITORY") or
+            os.environ.get("GITHUB_REPOSITORY", ""))
     profile = os.environ.get("INPUT_MODEL_PROFILE", "")
     identity = os.environ.get("INPUT_MODEL_IDENTITY", "anonymous")
     store = GitHubState(repo, os.environ.get("INPUT_STATE_TOKEN", ""))
