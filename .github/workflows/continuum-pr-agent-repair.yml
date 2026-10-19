@@ -764,6 +764,23 @@ jobs:
           components: opencode
           opencode-version: ${{ vars.CONTINUUM_OPENCODE_VERSION || '' }}
 
+      - name: Qualify trusted repair-model route
+        id: model_route
+        if: steps.batch.outputs.empty != 'true' && steps.convergence.outcome == 'success' && steps.convergence.outputs.held != 'true'
+        uses: kodmial/continuum/.github/actions/model-route@main
+        with:
+          models: ${{ vars.OPENCODE_MODELS }}
+          legacy-model: ${{ vars.OPENCODE_MODEL }}
+          task-class: repair
+          profile: pr-repair
+          state-repository: ${{ env.CONTINUUM_PR_AGENT_TARGET_REPOSITORY }}
+          state-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
+          runtime-version: ${{ steps.install_opencode.outputs.runtime-version }}
+          strategy: ${{ vars.OPENCODE_MODEL_STRATEGY || 'sticky-failover' }}
+          probe-ttl: ${{ vars.OPENCODE_PROBE_TTL || '3600' }}
+          cooldown: ${{ vars.OPENCODE_MODEL_COOLDOWN || '900' }}
+          timeout: ${{ vars.OPENCODE_PROBE_TIMEOUT || '90' }}
+
       - name: Run one bounded OpenCode repair pass over every current item
         id: repair_pass
         if: steps.batch.outputs.empty != 'true' && steps.convergence.outcome == 'success' && steps.convergence.outputs.held != 'true'
@@ -775,7 +792,7 @@ jobs:
           BATCH_JSON: ${{ steps.convergence.outputs.eligible_batch }}
           BATCH_FINGERPRINT: ${{ steps.batch.outputs.fingerprint }}
           FINDING_IDS: ${{ steps.convergence.outputs.eligible_findings }}
-          OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
+          OPENCODE_MODEL: ${{ steps.model_route.outputs.model }}
         run: |
           set -euo pipefail
           # kodmial/continuum#302: canonical fail-closed branch safety.
@@ -1094,6 +1111,24 @@ jobs:
           echo "classification=settled" >> "$GITHUB_OUTPUT"
           echo "published=true" >> "$GITHUB_OUTPUT"
           echo "Pushed one bounded repair to refs/heads/$HEAD_REF for PR #$PR_NUMBER."
+
+      - name: Attest successful published OpenCode repair
+        if: steps.model_route.outcome == 'success' && steps.repair_pass.outputs.published == 'true'
+        uses: kodmial/continuum/.github/actions/model-route@main
+        with:
+          operation: record
+          models: ${{ vars.OPENCODE_MODELS }}
+          legacy-model: ${{ vars.OPENCODE_MODEL }}
+          selected-model: ${{ steps.model_route.outputs.model }}
+          task-class: repair
+          profile: pr-repair
+          state-repository: ${{ env.CONTINUUM_PR_AGENT_TARGET_REPOSITORY }}
+          state-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
+          runtime-version: ${{ steps.install_opencode.outputs.runtime-version }}
+          strategy: ${{ vars.OPENCODE_MODEL_STRATEGY || 'sticky-failover' }}
+          probe-ttl: ${{ vars.OPENCODE_PROBE_TTL || '3600' }}
+          cooldown: ${{ vars.OPENCODE_MODEL_COOLDOWN || '900' }}
+          timeout: ${{ vars.OPENCODE_PROBE_TIMEOUT || '90' }}
 
       - name: Persist PR-Agent no-progress controller state
         if: always() && steps.repair_pass.outputs.no_progress == 'true'

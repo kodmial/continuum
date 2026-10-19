@@ -69,7 +69,7 @@ def inference_model(request_model: str) -> str:
     configured = _env("OPENCODE_MODEL", "")
     if configured:
         return configured
-    return (request_model or "").strip() or "opencode/continuum-review"
+    raise BridgeUpstreamError("Frozen OpenCode route was not configured", retryable=False)
 
 
 def split_model(model: str) -> Tuple[str, str]:

@@ -75,9 +75,8 @@ on:
       opencode_model:
         description: >-
           OpenCode provider/model the bridge infers with. Empty falls back to
-          vars.OPENCODE_MODEL, then to the free
-          'opencode/muse-spark-1.3-contributor-free' route. No paid-provider
-          secret is ever required.
+          trusted OPENCODE_MODELS; OPENCODE_MODEL remains single-route legacy
+          when the pool is unset. An explicit model is validated in the pool.
         type: string
         default: ''
         required: false
@@ -280,7 +279,7 @@ jobs:
             core.setOutput('max_tokens', pick(process.env.INPUT_MAX_TOKENS, 'CFG_MAX_TOKENS', '128000'));
             core.setOutput(
               'opencode_model',
-              pick(process.env.INPUT_OPENCODE_MODEL, 'CFG_OPENCODE_MODEL', 'opencode/muse-spark-1.3-contributor-free')
+              pick(process.env.INPUT_OPENCODE_MODEL, 'CFG_OPENCODE_MODEL', '')
             );
             core.setOutput('bridge_port', bridgePort);
             core.setOutput('server_port', pick(process.env.INPUT_SERVER_PORT, 'CFG_SERVER_PORT', '4096'));
@@ -619,11 +618,29 @@ jobs:
           opencode --version
           pr-agent --version
 
+      - name: Qualify trusted review-model route
+        id: model_route
+        if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
+        uses: kodmial/continuum/.github/actions/model-route@main
+        with:
+          models: ${{ vars.OPENCODE_MODELS }}
+          legacy-model: ${{ vars.OPENCODE_MODEL }}
+          explicit-pin: ${{ inputs.opencode_model }}
+          task-class: review
+          profile: pr-review
+          state-repository: ${{ env.CONTINUUM_PR_AGENT_TARGET_REPOSITORY }}
+          state-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
+          runtime-version: ${{ steps.install_pragent.outputs.runtime-version }}
+          strategy: ${{ vars.OPENCODE_MODEL_STRATEGY || 'sticky-failover' }}
+          probe-ttl: ${{ vars.OPENCODE_PROBE_TTL || '3600' }}
+          cooldown: ${{ vars.OPENCODE_MODEL_COOLDOWN || '900' }}
+          timeout: ${{ vars.OPENCODE_PROBE_TIMEOUT || '90' }}
+
       - name: Start opencode serve on loopback
         id: start_opencode
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
         env:
-          OPENCODE_MODEL: ${{ steps.stack.outputs.opencode_model }}
+          OPENCODE_MODEL: ${{ steps.model_route.outputs.model }}
           SERVER_PORT: ${{ steps.stack.outputs.server_port }}
         run: |
           set -euo pipefail
@@ -729,7 +746,7 @@ jobs:
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
         env:
           OPENCODE_SERVER_URL: http://127.0.0.1:${{ steps.stack.outputs.server_port }}
-          OPENCODE_MODEL: ${{ steps.stack.outputs.opencode_model }}
+          OPENCODE_MODEL: ${{ steps.model_route.outputs.model }}
           PR_AGENT_BRIDGE_PORT: ${{ steps.stack.outputs.bridge_port }}
           PR_AGENT_TIMEOUT_SECONDS: '170'
           BRIDGE_SCRIPT: ${{ steps.runtime.outputs.bridge_script }}
@@ -1976,6 +1993,29 @@ jobs:
             core.notice(
               'PR-Agent disposition=' + disposition.action + ': ' + disposition.reason
             );
+
+      - name: Attest successful independent OpenCode review
+        if: >-
+          steps.model_route.outcome == 'success' &&
+          steps.pragent.outcome == 'success' &&
+          steps.result.outcome == 'success' &&
+          steps.admit.outputs.admitted == 'true'
+        uses: kodmial/continuum/.github/actions/model-route@main
+        with:
+          operation: record
+          models: ${{ vars.OPENCODE_MODELS }}
+          legacy-model: ${{ vars.OPENCODE_MODEL }}
+          explicit-pin: ${{ inputs.opencode_model }}
+          selected-model: ${{ steps.model_route.outputs.model }}
+          task-class: review
+          profile: pr-review
+          state-repository: ${{ env.CONTINUUM_PR_AGENT_TARGET_REPOSITORY }}
+          state-token: ${{ env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED == 'true' && secrets.TAP_PAT || (env.CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED != 'true' && github.token || '') }}
+          runtime-version: ${{ steps.install_pragent.outputs.runtime-version }}
+          strategy: ${{ vars.OPENCODE_MODEL_STRATEGY || 'sticky-failover' }}
+          probe-ttl: ${{ vars.OPENCODE_PROBE_TTL || '3600' }}
+          cooldown: ${{ vars.OPENCODE_MODEL_COOLDOWN || '900' }}
+          timeout: ${{ vars.OPENCODE_PROBE_TIMEOUT || '90' }}
 
       - name: Publish private exact-head repair handoff
         if: steps.route.outcome == 'success' && steps.route.outputs.needs_repair == 'true'

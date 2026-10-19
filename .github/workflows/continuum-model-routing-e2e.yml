@@ -1,0 +1,118 @@
+name: Continuum model routing live E2E
+
+on:
+  pull_request:
+    paths:
+      - 'src/continuum/model_routing.py'
+      - '.github/actions/model-route/**'
+      - '.github/workflows/continuum-model-routing-e2e.yml'
+      - 'tests/fixtures/opencode-models-66.json'
+  workflow_dispatch:
+
+# PR-only integration fixture: no PAT, provider API key, paid-model discovery,
+# untrusted fork code, production rollout configuration or default-branch push.
+permissions:
+  contents: write
+
+jobs:
+  first-runner:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      selected_model: ${{ steps.select.outputs.model }}
+    steps:
+      - name: Checkout exact test code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Restore verified pinned OpenCode
+        id: toolchain
+        uses: kodmial/continuum/.github/actions/agent-toolchain@main
+        with:
+          components: opencode
+          opencode-version: ${{ vars.CONTINUUM_OPENCODE_VERSION || '' }}
+      - name: Load user-approved integration fixture
+        id: fixture
+        run: |
+          set -euo pipefail
+          printf 'models=%s\n' "$(python3 -c 'import json; print(",".join(json.load(open("tests/fixtures/opencode-models-66.json"))["ordered_models"]))')" >> "$GITHUB_OUTPUT"
+      - name: Qualify real model and create durable state ref
+        id: select
+        uses: ./.github/actions/model-route
+        with:
+          models: ${{ steps.fixture.outputs.models }}
+          task-class: coder
+          profile: work-lock-66-e2e
+          state-token: ${{ github.token }}
+          runtime-version: ${{ steps.toolchain.outputs.runtime-version }}
+      - name: Complete a real isolated coding task with selected route
+        env:
+          MODEL: ${{ steps.select.outputs.model }}
+        run: |
+          set -euo pipefail
+          : "${MODEL:?model must be selected by verified action}"
+          dir="$(mktemp -d)"
+          trap 'rm -rf "$dir"' EXIT
+          cd "$dir"
+          # No GitHub or provider tokens in the subprocess environment.
+          env -u GH_TOKEN -u GITHUB_TOKEN -u TAP_PAT \
+            opencode run --auto --model "$MODEL" \
+            'Create a file acceptance-proof.txt with exactly ACCEPTANCE_OK and no other text.' \
+            > "$RUNNER_TEMP/work-lock-66-real-coder.log" 2>&1
+          test -f acceptance-proof.txt
+          test "$(cat acceptance-proof.txt)" = "ACCEPTANCE_OK"
+      - name: Attest only the completed real task
+        uses: ./.github/actions/model-route
+        with:
+          operation: record
+          models: ${{ steps.fixture.outputs.models }}
+          selected-model: ${{ steps.select.outputs.model }}
+          task-class: coder
+          profile: work-lock-66-e2e
+          state-token: ${{ github.token }}
+          runtime-version: ${{ steps.toolchain.outputs.runtime-version }}
+
+  fresh-runner:
+    needs: first-runner
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout exact test code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Restore verified pinned OpenCode in a fresh VM
+        id: toolchain
+        uses: kodmial/continuum/.github/actions/agent-toolchain@main
+        with:
+          components: opencode
+          opencode-version: ${{ vars.CONTINUUM_OPENCODE_VERSION || '' }}
+      - name: Load identical approved fixture
+        id: fixture
+        run: |
+          set -euo pipefail
+          printf 'models=%s\n' "$(python3 -c 'import json; print(",".join(json.load(open("tests/fixtures/opencode-models-66.json"))["ordered_models"]))')" >> "$GITHUB_OUTPUT"
+      - name: Re-select from durable real-success state
+        id: selected
+        uses: ./.github/actions/model-route
+        with:
+          models: ${{ steps.fixture.outputs.models }}
+          task-class: coder
+          profile: work-lock-66-e2e
+          state-token: ${{ github.token }}
+          runtime-version: ${{ steps.toolchain.outputs.runtime-version }}
+      - name: Prove real-success sticky route survived ephemeral runner destruction
+        env:
+          ACTUAL: ${{ steps.selected.outputs.model }}
+          EXPECTED: ${{ needs.first-runner.outputs.selected_model }}
+        run: |
+          set -euo pipefail
+          test -n "$ACTUAL"
+          test "$ACTUAL" = "$EXPECTED" || {
+            echo "::error::Route changed between fresh runners; durable state/TTL broken."
+            exit 1
+          }
+          echo "Verified selected model was restored from durable scope state."

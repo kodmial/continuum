@@ -1452,6 +1452,7 @@ class ContinuumTest < Minitest::Test
     continuum-consumer-child-dispatcher.yml
     continuum-contract-qualification.yml
     continuum-validation.yml
+    continuum-model-routing-e2e.yml # Repository-owned live test, not a reusable consumer callee
   ].freeze
 
   # The number of callers Continuum ships in the `tech` and `parent` layers,
@@ -2465,7 +2466,9 @@ class ContinuumTest < Minitest::Test
       refute_includes body, 'big-pickle', File.basename(path)
     end
     assert_includes File.read(File.join(ROOT, '.github/workflows/continuum-opencode.yml')),
-                    "vars.OPENCODE_MODEL || 'opencode/muse-spark-1.3-contributor-free'"
+                    'uses: kodmial/continuum/.github/actions/model-route@main'
+    assert_includes File.read(File.join(ROOT, '.github/workflows/continuum-opencode.yml')),
+                    'vars.OPENCODE_MODELS'
   end
 
   # Automation limits are consumer policy: every hardcoded timeout/runner in a
