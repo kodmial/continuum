@@ -61,12 +61,6 @@ class ModelContract(unittest.TestCase):
             selector.extract_response(correct + "\n" + wrong, expected=FIRST)
 
     def test_semantic_probe_rejects_echo_upstream_errors_and_nonanswer(self):
-        def result(output, code=0, stderr=""):
-            class Process:
-                returncode = code
-                stdout = output
-                stderr = stderr
-            return Process()
         def runner(output, code=0, stderr=""):
             class Process:
                 pass
@@ -88,7 +82,8 @@ class ModelContract(unittest.TestCase):
         self.assertEqual(selected, RESERVE)
         self.assertEqual(seen, [FIRST, SECOND, RESERVE])
         self.assertEqual(len(attempts), 3)
-        self.assertEqual(state["last_good"], RESERVE)
+        self.assertEqual(state["last_probe_model"], RESERVE)
+        self.assertEqual(state["last_good"], "")
         self.assertGreater(state["cooldowns"][FIRST], 100.0)
         selected2, _, _ = selector.select(self.config, state, probe=probe, now=101.0)
         self.assertEqual(selected2, RESERVE)
