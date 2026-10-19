@@ -14,6 +14,7 @@ import os
 import re
 import subprocess
 import time
+import tempfile
 from typing import Callable
 
 IDENTITY = re.compile(r"^[a-z][a-z0-9_-]*/[a-zA-Z0-9][a-zA-Z0-9._-]{1,120}$")
@@ -128,11 +129,25 @@ def real_probe(model: str, timeout: int, *, runner: Callable = subprocess.run) -
     """Probe official CLI before task mutation; never use a catalog-only hit."""
     started = time.monotonic()
     try:
-        finished = runner(
-            ["opencode", "run", "--model", model, "--format", "json", PROMPT],
-            capture_output=True, text=True, timeout=timeout, check=False,
-            cwd=os.environ.get("RUNNER_TEMP", "/tmp"),
-        )
+        # Never forward GitHub state credentials, provider keys, runner-global
+        # sessions or private Child metadata to a model subprocess.
+        with tempfile.TemporaryDirectory(prefix="continuum-model-probe-") as scratch:
+            safe = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                    "HOME": scratch,
+                    "XDG_CONFIG_HOME": scratch + "/config",
+                    "XDG_DATA_HOME": scratch + "/data",
+                    "XDG_STATE_HOME": scratch + "/state",
+                    "XDG_CACHE_HOME": scratch + "/cache",
+                    "OPENCODE_DISABLE_AUTOUPDATE": "1",
+                    "LANG": "C.UTF-8"}
+            for key in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "SSL_CERT_FILE"):
+                if key in os.environ:
+                    safe[key] = os.environ[key]
+            finished = runner(
+                ["opencode", "run", "--model", model, "--format", "json", PROMPT],
+                capture_output=True, text=True, timeout=timeout, check=False,
+                cwd=scratch, env=safe,
+            )
         output = finished.stdout or ""
         error = finished.stderr or ""
         if FAILURE.search(output + "\n" + error):
