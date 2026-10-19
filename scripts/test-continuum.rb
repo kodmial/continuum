@@ -5,6 +5,7 @@ require 'yaml'
 require 'tmpdir'
 require 'fileutils'
 require 'open3'
+require 'json'
 
 class ContinuumTest < Minitest::Test
   ROOT = File.expand_path('..', __dir__)
@@ -2127,12 +2128,17 @@ class ContinuumTest < Minitest::Test
     refute_nil resolve, 'the target-context resolution step is missing'
     assert_includes resolve, 'GH_TOKEN: ${{ secrets.TAP_PAT }}',
                     'target resolution fetches cross-repo child config with TAP_PAT'
+    assert_equal 1, body.scan('state-token: ${{ secrets.TAP_PAT }}').size,
+                 'only the trusted model-state Action has a standalone state PAT'
     assert_equal 1, body.scan('GH_TOKEN: ${{ secrets.TAP_PAT }}').size,
                  'only target resolution may use a bare TAP_PAT credential; every read must use the fail-closed conditional'
     body.each_line.with_index(1) do |line, lineno|
       next unless line.include?('secrets.TAP_PAT')
       allowed = line.include?('CONTINUUM_PR_AGENT_TARGET_IS_DELEGATED') ||
                 line.include?('TAP_PAT: ${{ secrets.TAP_PAT }}') ||
+                # This action mutates ONLY a dedicated non-default model-state
+                # ref and never sends its PAT into the OpenCode subprocess.
+                line.include?('state-token: ${{ secrets.TAP_PAT }}') ||
                 resolve.include?(line.strip)
       assert allowed, "line #{lineno} consumes TAP_PAT outside the gated target-aware contract: #{line.strip}"
     end
