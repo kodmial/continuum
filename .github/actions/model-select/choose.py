@@ -36,7 +36,7 @@ def run() -> int:
     key = state_key(repo=repo, profile=profile, identity_scope=identity, config=config)
     path = state_path(key)
     store = GitHubState(repo, token)
-    previous, _, _ = store.read(path)
+    previous, expected_head, _ = store.read(path)
     if previous and previous.get("schema") != 1:
         raise ConfigError("Unknown durable model state schema")
     try:
@@ -45,7 +45,7 @@ def run() -> int:
         print("::error::No approved OpenCode model passed live semantic qualification.", file=sys.stderr)
         return 1
     # If this can't be persisted, fail before invoking the stateful coding agent.
-    store.write(path, state)
+    store.write(path, state, expected_head=expected_head)
     output = os.environ.get("GITHUB_OUTPUT", "")
     if output:
         with open(output, "a", encoding="utf-8") as handle:
