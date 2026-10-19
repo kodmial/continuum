@@ -2475,7 +2475,7 @@ jobs:
               repo: context.repo.repo,
               issue_number: Number(qualification),
             });
-            const repositoryOwned = /<!--\\s*continuum-qualification-executor\\s*:\\s*repository-owned\\s*-->/i
+            const repositoryOwned = /<!--\s*continuum-qualification-executor\s*:\s*repository-owned\s*-->/i
               .test(String(target.data.body || ''));
             if (repositoryOwned) {
               core.setOutput('active', 'false');
