@@ -33,6 +33,7 @@ if [[ "$CONTINUUM_COMPONENTS" != "opencode" && "$python_tag" != "3.12" ]]; then
   exit 2
 fi
 {
+  echo "manifest_sha256=$(sha256sum "$manifest" | cut -d\x27 \x27 -f1)"
   echo "opencode_version=$oc"
   echo "pr_agent_version=$pa"
   echo "cache_key=continuum-toolchains-$epoch-$RUNNER_OS-$RUNNER_ARCH-py$python_tag-$CONTINUUM_COMPONENTS-oc$oc-pa$pa"
