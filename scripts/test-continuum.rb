@@ -1450,6 +1450,7 @@ class ContinuumTest < Minitest::Test
     pr-agent.yml
     pr-agent-recovery.yml
     pr-agent-router.yml
+    work-lock-66-qualification.yml
     continuum-consumer-child-dispatcher.yml
     continuum-contract-qualification.yml
     continuum-validation.yml
