@@ -81,7 +81,9 @@ class CoverageTests(unittest.TestCase):
         bindings = inventory.scan_workflow_bindings(WORKFLOWS_DIR)
         # Pinned count guards against silent scope drift in either direction:
         # new PAT sites must extend the inventory, removals must shrink it.
-        self.assertEqual(len(bindings), 113)
+        # Work Lock #66 adds seven scoped state-ref bindings (documented
+        # individually in tap_pat_inventory; no unchecked credential drift).
+        self.assertEqual(len(bindings), 120)
         gaps = inventory.coverage_gaps(WORKFLOWS_DIR)
         self.assertEqual(gaps, [], f"uninventoried TAP_PAT bindings: {gaps}")
 
@@ -284,7 +286,10 @@ class SafetyAndContractTests(unittest.TestCase):
         # The canary enforces the no-paid-provider rule by refusing such keys.
         canary = read_workflow("continuum-pr-agent-canary.yml")
         self.assertIn("Canary must not introduce a paid-provider secret", canary)
-        self.assertIn("opencode/muse-spark-1.3-contributor-free", canary)
+        # A canary cannot bind a production route in source code.
+        self.assertIn("uses: kodmial/continuum/.github/actions/model-route@main", canary)
+        self.assertIn("vars.OPENCODE_MODELS", canary)
+        self.assertNotIn("muse-spark-1.3-contributor-free", canary)
 
     def test_pushes_keep_fail_closed_branch_safety(self):
         for name in ("continuum-opencode.yml", "continuum-opencode-repair.yml",

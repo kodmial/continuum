@@ -3,7 +3,7 @@
 Issue #174 audit correction: the offline harness alone is insufficient.
 There must be a durable, opt-in executable canary workflow/caller that
 drives the real GitHub-facing enabled path. These tests pin that path
-without network access: disabled by default, free route only, real
+without network access: disabled by default, trusted caller-approved route only, real
 /review + /verify command path, fail-closed gates, reviewer-only,
 CodeRabbit untouched, and guaranteed cleanup.
 
@@ -21,7 +21,6 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "continuum-pr-agent-canary.yml"
 STUB = ROOT / ".github" / "caller-stubs" / "continuum-pr-agent-canary.yml"
 
-FREE_MODEL = "opencode/muse-spark-1.3-contributor-free"
 CANARY_INPUTS = (
     "canary_enabled",
     "base_ref",
@@ -74,7 +73,9 @@ class ExecutableCanaryContractTests(unittest.TestCase):
 
     def test_free_default_route_and_no_paid_secret(self):
         body = WORKFLOW.read_text(encoding="utf-8")
-        self.assertIn(FREE_MODEL, body)
+        self.assertIn('vars.OPENCODE_MODELS', body)
+        self.assertIn('uses: kodmial/continuum/.github/actions/model-route@main', body)
+        self.assertNotIn('muse-spark-1.3-contributor-free', body)
         self.assertIn("No paid-provider", body)
         self.assertNotIn("secrets.OPENCODE_API_KEY", body)
         self.assertNotIn("secrets.ANTHROPIC_API_KEY", body)

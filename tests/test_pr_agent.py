@@ -254,6 +254,8 @@ class BridgeIsolationTests(unittest.TestCase):
         finally:
             sys.path.remove(script_dir)
         old = os.environ.get("OPENCODE_SERVER_URL", "")
+        old_model = os.environ.get("OPENCODE_MODEL")
+        os.environ["OPENCODE_MODEL"] = "opencode/test-fixture-route"
         os.environ["OPENCODE_SERVER_URL"] = f"http://127.0.0.1:{self.port}"
         bodies_before = len(FakeOpenCodeHandler.bodies)
         deleted_before = len(FakeOpenCodeHandler.deleted)
@@ -271,6 +273,10 @@ class BridgeIsolationTests(unittest.TestCase):
                 os.environ["OPENCODE_SERVER_URL"] = old
             else:
                 os.environ.pop("OPENCODE_SERVER_URL", None)
+            if old_model is None:
+                os.environ.pop("OPENCODE_MODEL", None)
+            else:
+                os.environ["OPENCODE_MODEL"] = old_model
         self.assertEqual(
             first["choices"][0]["message"]["content"], "bridge-probe-ok"
         )
@@ -299,6 +305,8 @@ class BridgeIsolationTests(unittest.TestCase):
         try:
             port = server.server_address[1]
             old = os.environ.get("OPENCODE_SERVER_URL", "")
+            old_model = os.environ.get("OPENCODE_MODEL")
+            os.environ["OPENCODE_MODEL"] = "opencode/test-fixture-route"
             os.environ["OPENCODE_SERVER_URL"] = f"http://127.0.0.1:{self.port}"
             try:
                 payload = json.dumps(
@@ -327,6 +335,10 @@ class BridgeIsolationTests(unittest.TestCase):
                     os.environ["OPENCODE_SERVER_URL"] = old
                 else:
                     os.environ.pop("OPENCODE_SERVER_URL", None)
+                if old_model is None:
+                    os.environ.pop("OPENCODE_MODEL", None)
+                else:
+                    os.environ["OPENCODE_MODEL"] = old_model
         finally:
             server.shutdown()
             thread.join(timeout=10)

@@ -27,9 +27,8 @@ on:
       opencode_model:
         description: >-
           OpenCode provider/model the bridge infers with. Empty falls back to
-          vars.OPENCODE_MODEL, then to the free
-          'opencode/muse-spark-1.3-contributor-free' route. No paid-provider
-          secret is ever required.
+          trusted caller OPENCODE_MODELS with the single-route OPENCODE_MODEL
+          compatibility mode only when no pool is configured.
         type: string
         default: ''
         required: false
@@ -117,12 +116,11 @@ jobs:
             const enabled = ['1', 'true', 'yes'].includes(enabledRaw.toLowerCase()) ? 'true' : 'false';
             const bridgePort = pick(process.env.INPUT_BRIDGE_PORT, 'CFG_BRIDGE_PORT', '18000');
             const opencodeModel = pick(
-              process.env.INPUT_OPENCODE_MODEL, 'CFG_OPENCODE_MODEL',
-              'opencode/muse-spark-1.3-contributor-free'
+              process.env.INPUT_OPENCODE_MODEL, 'CFG_OPENCODE_MODEL', ''
             );
             const requestModel = pick(process.env.INPUT_MODEL, 'CFG_MODEL', 'openai/continuum-review');
-            // No paid-provider route, ever. The free/default OpenCode route is
-            // the only supported canary inference path.
+            // Route authorization is controlled by trusted caller Variables.
+            // The canonical selector verifies this config before inference.
             for (const value of [opencodeModel, requestModel]) {
               const lowered = value.toLowerCase();
               for (const needle of ['groq', 'anthropic', 'openai_api_key']) {
@@ -131,11 +129,6 @@ jobs:
                   return;
                 }
               }
-            }
-            if (opencodeModel !== 'opencode/muse-spark-1.3-contributor-free' &&
-                !opencodeModel.toLowerCase().includes('free')) {
-              core.setFailed(`Canary must use the free/default OpenCode route, got ${opencodeModel!r}.`);
-              return;
             }
             core.setOutput('enabled', enabled);
             core.setOutput('base_ref', pick(process.env.INPUT_BASE_REF, 'CFG_BASE_REF', 'main'));
@@ -183,13 +176,38 @@ jobs:
           done
           echo "No paid-provider credential is configured: free/default route only."
 
+      - name: Restore verified OpenCode runtime for canary
+        id: cached_opencode
+        if: steps.config.outputs.enabled == 'true'
+        uses: kodmial/continuum/.github/actions/agent-toolchain@main
+        with:
+          components: opencode
+          opencode-version: ${{ vars.CONTINUUM_OPENCODE_VERSION || '' }}
+
+      - name: Qualify canary route under the same selector
+        id: model_route
+        if: steps.config.outputs.enabled == 'true'
+        uses: kodmial/continuum/.github/actions/model-route@main
+        with:
+          models: ${{ vars.OPENCODE_MODELS }}
+          legacy-model: ${{ vars.OPENCODE_MODEL }}
+          explicit-pin: ${{ inputs.opencode_model }}
+          task-class: review
+          profile: pr-canary
+          state-token: ${{ secrets.TAP_PAT || github.token }}
+          runtime-version: ${{ steps.cached_opencode.outputs.runtime-version }}
+          strategy: ${{ vars.OPENCODE_MODEL_STRATEGY || 'sticky-failover' }}
+          probe-ttl: ${{ vars.OPENCODE_PROBE_TTL || '3600' }}
+          cooldown: ${{ vars.OPENCODE_MODEL_COOLDOWN || '900' }}
+          timeout: ${{ vars.OPENCODE_PROBE_TIMEOUT || '90' }}
+
       - name: Run the disposable-PR end to end
         if: steps.config.outputs.enabled == 'true'
         id: e2e
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           BASE_REF: ${{ steps.config.outputs.base_ref }}
-          OPENCODE_MODEL: ${{ steps.config.outputs.opencode_model }}
+          OPENCODE_MODEL: ${{ steps.model_route.outputs.model }}
           REQUEST_MODEL: ${{ steps.config.outputs.model }}
           BRIDGE_PORT: ${{ steps.config.outputs.bridge_port }}
         with:

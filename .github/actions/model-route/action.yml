@@ -1,0 +1,92 @@
+name: Continuum OpenCode route selector
+description: Resolve only trusted caller-approved models using verified OpenCode; record separately after real success
+inputs:
+  operation:
+    description: select before work or record after successful real work
+    required: false
+    default: select
+  models:
+    description: Trusted caller repository variable OPENCODE_MODELS
+    required: false
+    default: ''
+  legacy-model:
+    description: Older OPENCODE_MODEL only when the pool is unset
+    required: false
+    default: ''
+  explicit-pin:
+    description: Trusted explicit invocation pin; must be in the pool
+    required: false
+    default: ''
+  selected-model:
+    description: Exact model produced by select; required for record
+    required: false
+    default: ''
+  task-class:
+    description: coder, repair or read-only review
+    required: false
+    default: coder
+  profile:
+    description: Opaque trusted execution profile; never a public child repository name
+    required: false
+    default: default
+  state-repository:
+    description: Private child target repository on delegated tasks, caller repository otherwise
+    required: false
+    default: ''
+  credential-scope:
+    description: Trusted nonsecret credential domain
+    required: false
+    default: anonymous
+  state-token:
+    description: Existing contents-write token scoped to the selected state repository
+    required: true
+  runtime-version:
+    description: Verified OpenCode runtime version from agent-toolchain action
+    required: false
+    default: ''
+  probe-ttl:
+    description: Seconds before semantic qualification expires
+    required: false
+    default: '3600'
+  cooldown:
+    description: Seconds before retrying an unsuccessful route
+    required: false
+    default: '900'
+  timeout:
+    description: Timeout per official OpenCode probe in seconds
+    required: false
+    default: '90'
+  strategy:
+    description: Supported strategy sticky-failover
+    required: false
+    default: sticky-failover
+outputs:
+  model:
+    description: Frozen effective model route
+    value: ${{ steps.route.outputs.model }}
+runs:
+  using: composite
+  steps:
+    - name: Qualify approved OpenCode route or attest successful execution
+      id: route
+      shell: bash
+      env:
+        OPENCODE_MODELS: ${{ inputs.models }}
+        OPENCODE_MODEL: ${{ inputs.legacy-model }}
+        CONTINUUM_EXPLICIT_MODEL: ${{ inputs.explicit-pin }}
+        CONTINUUM_SELECTED_MODEL: ${{ inputs.selected-model }}
+        CONTINUUM_MODEL_TASK_CLASS: ${{ inputs.task-class }}
+        CONTINUUM_MODEL_PROFILE: ${{ inputs.profile }}
+        CONTINUUM_MODEL_STATE_REPOSITORY: ${{ inputs.state-repository }}
+        CONTINUUM_MODEL_CREDENTIAL_SCOPE: ${{ inputs.credential-scope }}
+        CONTINUUM_MODEL_STATE_TOKEN: ${{ inputs.state-token }}
+        CONTINUUM_EXPECTED_OPENCODE_VERSION: ${{ inputs.runtime-version }}
+        OPENCODE_PROBE_TTL: ${{ inputs.probe-ttl }}
+        OPENCODE_MODEL_COOLDOWN: ${{ inputs.cooldown }}
+        OPENCODE_PROBE_TIMEOUT: ${{ inputs.timeout }}
+        OPENCODE_MODEL_STRATEGY: ${{ inputs.strategy }}
+        OPERATION: ${{ inputs.operation }}
+      run: |
+        set -euo pipefail
+        case "$OPERATION" in select|record) ;; *) echo '::error::Invalid model route operation'; exit 2;; esac
+        python3 "$GITHUB_ACTION_PATH/../../../src/continuum/model_routing.py" "$OPERATION"
