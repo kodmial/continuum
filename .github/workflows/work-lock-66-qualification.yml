@@ -1,0 +1,42 @@
+name: Work Lock 66 model selector live qualification
+
+on:
+  push:
+    branches: [work-lock-66-model-selection-20261019]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  model-selector-canary:
+    # The action writes ONLY its dedicated non-default state ref.
+    if: github.ref == 'refs/heads/work-lock-66-model-selection-20261019'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Install official OpenCode from shared verified cache
+        uses: ./.github/actions/agent-toolchain
+        with:
+          components: opencode
+      - name: Probe the approved model and persist an isolated state checkpoint
+        id: route
+        uses: ./.github/actions/model-select
+        with:
+          profile: wip66-canary
+          state-token: ${{ github.token }}
+      - name: Show exact selected route and successful semantic preflight
+        env:
+          SELECTED_MODEL: ${{ steps.route.outputs.model }}
+        run: |
+          set -euo pipefail
+          case "$SELECTED_MODEL" in
+            opencode/deepseek-v4.1-flash-free|opencode/glm-5.3-flash-free|opencode/nemotron-3-ultra-free) ;;
+            *) echo "::error::Unapproved model"; exit 1 ;;
+          esac
+          echo "User-approved model preflight succeeded: $SELECTED_MODEL"
