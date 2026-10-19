@@ -11,7 +11,7 @@ permissions:
 jobs:
   model-selector-canary:
     # The action writes ONLY its dedicated non-default state ref.
-    if: github.ref == 'refs/heads/work-lock-66-model-selection-20261019'
+    if: github.ref == 'refs/heads/work-lock-66-model-selection-20261019' && contains(github.event.head_commit.message, '[wl66-live]')
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     permissions:
@@ -40,3 +40,32 @@ jobs:
             *) echo "::error::Unapproved model"; exit 1 ;;
           esac
           echo "User-approved model preflight succeeded: $SELECTED_MODEL"
+
+      - name: Real free-model coding/tool-use acceptance in a disposable directory
+        env:
+          SELECTED_MODEL: ${{ steps.route.outputs.model }}
+          OPENCODE_DISABLE_AUTOUPDATE: '1'
+        run: |
+          set -euo pipefail
+          workdir="$RUNNER_TEMP/model66-scratch"
+          mkdir -p "$workdir"
+          cd "$workdir"
+          timeout 180s opencode run --auto --model "$SELECTED_MODEL" \
+            "Use your available file editing tools to create ./model66-proof.txt containing exactly: model selector working. Then reply DONE." \
+            > "$RUNNER_TEMP/model66-coding-result.log" 2>&1 || {
+              tail -n 20 "$RUNNER_TEMP/model66-coding-result.log"
+              exit 1
+            }
+          [[ -f ./model66-proof.txt ]] || { echo "::error::No file created by coding agent"; exit 1; }
+          grep -Fxq "model selector working" ./model66-proof.txt || {
+            echo "::error::Incorrect file content from coding agent"; exit 1
+          }
+          echo "Real isolated coding/tool-use acceptance: SUCCESS" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record sticky route only after successful real coding operation
+        uses: ./.github/actions/model-select
+        with:
+          operation: record
+          selected-model: ${{ steps.route.outputs.model }}
+          profile: wip66-canary
+          state-token: ${{ github.token }}
