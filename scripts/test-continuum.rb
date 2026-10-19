@@ -2464,8 +2464,13 @@ class ContinuumTest < Minitest::Test
       body = File.read(path)
       refute_includes body, 'big-pickle', File.basename(path)
     end
-    assert_includes File.read(File.join(ROOT, '.github/workflows/continuum-opencode.yml')),
-                    "vars.OPENCODE_MODEL || 'opencode/muse-spark-1.3-contributor-free'"
+    default_models = JSON.parse(File.read(File.join(ROOT, '.github/actions/model-select/models.json')))
+    assert_equal %w[opencode/deepseek-v4.1-flash-free opencode/glm-5.3-flash-free opencode/nemotron-3-ultra-free],
+                 default_models.fetch('approved_models')
+    coder = File.read(File.join(ROOT, '.github/workflows/continuum-opencode.yml'))
+    assert_equal 6, coder.scan('steps.model_pick.outputs.model').size
+    assert_includes coder, 'id: model_pick'
+    refute_includes coder, "vars.OPENCODE_MODEL || 'opencode/muse-spark-1.3-contributor-free'"
   end
 
   # Automation limits are consumer policy: every hardcoded timeout/runner in a
