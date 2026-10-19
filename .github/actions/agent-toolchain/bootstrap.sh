@@ -76,6 +76,9 @@ PY
     }
     (cd "$location" && sha256sum opencode > opencode.sha256)
   fi
+  selected_sha="$(sha256sum "$exe" | cut -d' ' -f1)"
+  echo "opencode_sha256=$selected_sha" >> "$GITHUB_OUTPUT"
+  echo "Continuum OpenCode exact version=$CONTINUUM_OPENCODE_VERSION sha256=$selected_sha"
   echo "$location" >> "$GITHUB_PATH"
   export PATH="$location:$PATH"
 fi
