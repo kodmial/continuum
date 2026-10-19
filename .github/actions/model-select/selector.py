@@ -131,6 +131,7 @@ def real_probe(model: str, timeout: int, *, runner: Callable = subprocess.run) -
         finished = runner(
             ["opencode", "run", "--model", model, "--format", "json", PROMPT],
             capture_output=True, text=True, timeout=timeout, check=False,
+            cwd=os.environ.get("RUNNER_TEMP", "/tmp"),
         )
         output = finished.stdout or ""
         error = finished.stderr or ""
@@ -226,9 +227,13 @@ class GitHubState:
             raise ConfigError("Invalid durable model state")
         return state, head, tree_sha
 
-    def write(self, path: str, state: dict, *, retries: int = 4) -> None:
+    def write(self, path: str, state: dict, *, expected_head: str | None = None, retries: int = 4) -> None:
         for _ in range(retries):
             current, head, tree_sha = self.read(path)
+            # Optimistic head check: never overwrite an intervening successful
+            # execution's sticky state with a stale probe. Caller must reread.
+            if head != expected_head:
+                raise ConcurrentWrite("State advanced concurrently; re-resolve model safely")
             payload = json.dumps(state, sort_keys=True, separators=(",", ":")) + "\n"
             blob = self.api("POST", "git/blobs", {"content": payload, "encoding": "utf-8"})["sha"]
             tree = self.api("POST", "git/trees", {
@@ -247,7 +252,7 @@ class GitHubState:
                              {"ref": STATE_REF, "sha": commit})
                     return
                 except ConcurrentWrite:
-                    continue
+                    raise
             commit = self.api("POST", "git/commits", {
                 "message": "continuum: update model qualification state",
                 "tree": tree, "parents": [head],
@@ -257,7 +262,7 @@ class GitHubState:
                          {"sha": commit, "force": False})
                 return
             except ConcurrentWrite:
-                continue
+                raise
         raise ConcurrentWrite("Concurrent state writes exceeded bounded retries")
 
 
@@ -278,7 +283,7 @@ def select(config: Config, state: dict, *, probe: Callable = real_probe,
         result = probe(candidate, config.probe_timeout)
         attempts.append({"model": candidate, **result})
         if result["ok"]:
-            data.update(last_good=candidate, last_probe=utc_now())
+            data.update(last_probe_model=candidate, last_probe=utc_now())
             data["cooldowns"].pop(candidate, None)
             return candidate, data, attempts
         # A missing/retired/429 route is cooled down only until later attempts.
