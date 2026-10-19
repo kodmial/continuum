@@ -181,7 +181,13 @@ jobs:
 
     permissions:
       actions: write
-      contents: read
+      # The shared model-route action persists qualified review state to the
+      # caller's dedicated non-main Git ref. A job-level contents:read override
+      # silently downgrades github.token even when its caller grants write,
+      # producing Git data POST 403 (AA run 39309817441). Never fall back to
+      # a cross-repository PAT for local state; delegated Child still requires
+      # TAP_PAT with explicit fail-closed policy.
+      contents: write
       issues: write
       pull-requests: write
       statuses: write

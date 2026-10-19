@@ -1925,6 +1925,14 @@ class ContinuumTest < Minitest::Test
                  'reusable workflow must grant actions:write for bounded same-repo review dispatch'
     assert_equal 'write', workflow.fetch('jobs').fetch('pr_agent').fetch('permissions').fetch('actions'),
                  'pr_agent job must grant actions:write for bounded same-repo review dispatch'
+    # Work Lock #69 (AA live run 39309817441): a job-level contents:read
+    # override drops the caller's write grant, so model-route's Git state
+    # POST fails 403 before independent review. Keep explicit local write
+    # while delegated targets remain PAT-only (tested below).
+    assert_equal 'write', workflow.fetch('jobs').fetch('pr_agent').fetch('permissions').fetch('contents'),
+                 'review model state ref needs contents:write in the executing job'
+    assert_equal 'write', stub.fetch('permissions').fetch('contents'),
+                 'caller must supply contents:write; reusable jobs cannot elevate it'
     assert_equal 'write', stub.fetch('permissions').fetch('actions'),
                  'caller stub must grant actions:write because reusable workflows cannot elevate GITHUB_TOKEN'
     # pull-requests read capability is preserved (write implies read; the
