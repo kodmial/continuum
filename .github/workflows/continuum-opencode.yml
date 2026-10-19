@@ -2464,6 +2464,27 @@ jobs:
               core.setFailed('Invalid immutable qualification run identity.');
               return;
             }
+            // Explicit repository-owned qualifiers (for example a product's
+            // secret-bearing A-F workflow) are the ONLY authoritative evidence
+            // producer. A generic no-secret coding-agent qualification must
+            // neither duplicate the run nor publish a manufactured FAIL.
+            // The scheduler may record the immutable dispatch tuple but only
+            // the repository-owned workflow's exact-SHA marker can settle it.
+            const target = await github.rest.issues.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: Number(qualification),
+            });
+            const repositoryOwned = /<!--\\s*continuum-qualification-executor\\s*:\\s*repository-owned\\s*-->/i
+              .test(String(target.data.body || ''));
+            if (repositoryOwned) {
+              core.setOutput('active', 'false');
+              core.setOutput('repository_owned', 'true');
+              core.notice('Qualification #' + qualification +
+                ' is repository-owned; generic no-secret LLM worker will not run. ' +
+                'Await the authoritative exact-SHA producer result for ' + sha + '.');
+              return;
+            }
             core.setOutput('active', 'true');
             core.setOutput('capability_number', capability);
             core.setOutput('qualification_number', qualification);
