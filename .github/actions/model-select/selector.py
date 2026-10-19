@@ -36,6 +36,11 @@ class ConfigError(ValueError):
 
 class NoRoute(RuntimeError):
     """All explicitly approved models failed qualification."""
+    def __init__(self, message: str, *, state: dict | None = None,
+                 attempts: list[dict] | None = None):
+        super().__init__(message)
+        self.state = state
+        self.attempts = attempts or []
 
 
 @dataclasses.dataclass(frozen=True)
@@ -90,7 +95,13 @@ class Config:
         eligible = [m for m in self.models if m not in blocked]
         sticky = state.get("last_good")
         if sticky in eligible and state.get("fingerprint") == self.fingerprint:
-            return [sticky] + [m for m in eligible if m != sticky]
+            try:
+                stamp = dt.datetime.fromisoformat(state.get("last_execution", ""))
+                age = now - stamp.timestamp()
+                if 0 <= age <= self.ttl_seconds:
+                    return [sticky] + [m for m in eligible if m != sticky]
+            except (TypeError, ValueError):
+                pass
         return eligible
 
 
@@ -150,8 +161,20 @@ def real_probe(model: str, timeout: int, *, runner: Callable = subprocess.run) -
             )
         output = finished.stdout or ""
         error = finished.stderr or ""
-        if FAILURE.search(output + "\n" + error):
-            return {"ok": False, "reason": "provider_error", "seconds": round(time.monotonic()-started, 2)}
+        detail = output + "\\n" + error
+        if FAILURE.search(detail):
+            if re.search(r"(429|FreeUsageLimitError|FreeTierError)", detail, re.I):
+                reason = "quota_or_429"
+            elif re.search(r"(401|403|authentication required|invalid api key)", detail, re.I):
+                reason = "authorization"
+            elif re.search(r"(deprecated|model unavailable|model not found)", detail, re.I):
+                reason = "model_retired"
+            elif re.search(r"(500|502|503|upstream request failed)", detail, re.I):
+                reason = "upstream_5xx"
+            else:
+                reason = "provider_error"
+            return {"ok": False, "reason": reason,
+                    "seconds": round(time.monotonic()-started, 2)}
         if finished.returncode != 0:
             return {"ok": False, "reason": "client_or_provider_exit", "seconds": round(time.monotonic()-started, 2)}
         try:
@@ -304,4 +327,5 @@ def select(config: Config, state: dict, *, probe: Callable = real_probe,
         # A missing/retired/429 route is cooled down only until later attempts.
         if not config.explicit_pin:
             data["cooldowns"][candidate] = now + config.cooldown_seconds
-    raise NoRoute("No approved model passed real anonymous OpenCode inference")
+    raise NoRoute("No approved model passed real anonymous OpenCode inference",
+                  state=data, attempts=attempts)
