@@ -89,6 +89,43 @@ class ModelContract(unittest.TestCase):
         self.assertEqual(selected2, RESERVE)
         self.assertEqual(seen[-1], RESERVE)
 
+    def test_fresh_sticky_only_after_completed_real_task(self):
+        import datetime
+        import time
+        now = time.time()
+        state = selector.blank_state(self.config)
+        state.update(last_good=SECOND,
+                     last_execution=datetime.datetime.fromtimestamp(
+                         now - 10, datetime.timezone.utc).isoformat())
+        self.assertEqual(self.config.order(state, now)[0], SECOND)
+        state["last_execution"] = datetime.datetime.fromtimestamp(
+            now - 7200, datetime.timezone.utc).isoformat()
+        self.assertEqual(self.config.order(state, now)[0], FIRST)
+        state["last_execution"] = ""
+        self.assertEqual(self.config.order(state, now)[0], FIRST)
+
+    def test_exhaustion_returns_bounded_negative_state(self):
+        def fail(*_):
+            return {"ok": False, "reason": "quota_or_429", "seconds": 0}
+        with self.assertRaises(selector.NoRoute) as captured:
+            selector.select(self.config, selector.blank_state(self.config),
+                            probe=fail, now=100)
+        failure = captured.exception
+        self.assertEqual(len(failure.attempts), 3)
+        self.assertEqual(set(failure.state["cooldowns"]), set(self.config.models))
+        self.assertEqual(self.config.order(failure.state, 101), [])
+
+    def test_non_force_state_write_rejects_competing_head(self):
+        class LocalState(selector.GitHubState):
+            def read(self, path):
+                return {}, "a" * 40, "b" * 40
+            def api(self, *args, **kwargs):
+                raise AssertionError("Stale writer must not call GitHub mutation API")
+        store = LocalState("example/repo", "nonempty-only-in-memory")
+        with self.assertRaises(selector.ConcurrentWrite):
+            store.write("scopes/test.json", selector.blank_state(self.config),
+                        expected_head="c" * 40)
+
     def test_exhaustion_fails_closed(self):
         def failed(*_):
             return {"ok": False, "reason": "unavailable", "seconds": 0}
