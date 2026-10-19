@@ -216,5 +216,71 @@ class GitRefStoreTests(unittest.TestCase):
         with self.assertRaises(route.RouteError):
             route.GitRefStore("example/private", "")
 
+
+class SelectionLeaseTests(unittest.TestCase):
+    def test_valid_probe_may_expire_while_real_task_runs(self):
+        # Regression from AA live E2E: real coding succeeded but record failed
+        # when the probe's TTL crossed its boundary during the task.
+        key = route.execution_lease_key({
+            "GITHUB_RUN_ID": "39298309022", "GITHUB_RUN_ATTEMPT": "1",
+            "GITHUB_JOB": "live-aa-task",
+        })
+        state = {"last_successful_probe": {"model": A, "at": 1000}}
+        route.issue_selection(state, key, A, 1059)
+        self.assertEqual(state["last_successful_probe"]["at"], 1000)
+        # Probe TTL=60 expired at 1060, but same job finishes within 45 min.
+        route.attest_execution(state, key, A, 1200)
+        self.assertNotIn(key, state["selection_leases"])
+        # A completed selection receipt cannot be replayed.
+        with self.assertRaisesRegex(route.RouteError, "Missing/mismatched"):
+            route.attest_execution(state, key, A, 1201)
+
+    def test_expired_or_wrong_selection_is_rejected(self):
+        key = route.execution_lease_key({
+            "GITHUB_RUN_ID": "23", "GITHUB_RUN_ATTEMPT": "2",
+            "GITHUB_JOB": "review",
+        })
+        current = {}
+        route.issue_selection(current, key, A, 1000)
+        with self.assertRaises(route.RouteError):
+            route.attest_execution(current, key, B, 1010)
+        with self.assertRaisesRegex(route.RouteError, "expired"):
+            route.attest_execution(current, key, A, 4601)
+        with self.assertRaises(route.RouteError):
+            route.attest_execution(current, key, A, 999)
+
+    def test_receipts_are_bound_to_job_and_attempt(self):
+        source = {"GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "1",
+                  "GITHUB_JOB": "coder"}
+        key = route.execution_lease_key(source)
+        current = {}
+        route.issue_selection(current, key, A, 1000)
+        for different in [
+            {**source, "GITHUB_JOB": "review"},
+            {**source, "GITHUB_RUN_ATTEMPT": "2"},
+            {**source, "GITHUB_RUN_ID": "2"},
+        ]:
+            other = route.execution_lease_key(different)
+            self.assertNotEqual(other, key)
+            with self.assertRaises(route.RouteError):
+                route.attest_execution(current, other, A, 1010)
+        route.attest_execution(current, key, A, 1010)
+
+    def test_receipts_do_not_accumulate_unbounded_or_retain_expired(self):
+        current = {}
+        for i in range(route.MAX_SELECTION_LEASES + 10):
+            route.issue_selection(current, str(i), A, 1000 + i)
+        self.assertLessEqual(len(current["selection_leases"]), route.MAX_SELECTION_LEASES)
+        route.issue_selection(current, "fresh", A,
+                              1000 + route.MAX_SELECTION_AGE + 200)
+        self.assertEqual(list(current["selection_leases"]), ["fresh"])
+
+    def test_missing_github_identity_cannot_attest(self):
+        self.assertEqual(route.execution_lease_key({}), "")
+        self.assertEqual(route.issue_selection({}, "", A, 1000), {})
+        with self.assertRaises(route.RouteError):
+            route.attest_execution({}, "", A, 1001)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -35,6 +35,13 @@ caller is used. Private Child state must be written in that Child repository,
 never in a public Parent. CAS updates are non-forced fast-forward writes with
 bounded retry. State separates \`last_successful_probe\` from
 \`last_successful_real_execution\`, with per-route negative cooldowns.
+A per-**Actions-run, attempt and job** opaque, bounded selection lease records
+which qualified model was frozen *before* any side effects. At successful
+completion, record verifies that lease (maximum 60 minutes, including the
+45-minute job budget), **not** the probe's TTL at completion: that TTL
+restricts freshness when selecting, not the duration of an already running
+real task. A missing, expired, wrong-model or replayed lease fails closed.
+
 
 The existing 429 runner-burn file \`$RUNNER_TEMP/continuum-opencode-429\` is
 respected: on a live 429 the probe marks the VM burned and exits 75 without

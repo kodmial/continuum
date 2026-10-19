@@ -27,6 +27,10 @@ REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 SEMVER = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 STATE_REF = "continuum-model-state"
 STATE_VERSION = 1
+# Max job runtime is 45 minutes; record may safely follow selection after
+# its semantic-probe TTL has expired. Select and record must share a lease.
+MAX_SELECTION_AGE = 3600
+MAX_SELECTION_LEASES = 128
 
 
 class RouteError(RuntimeError):
@@ -315,6 +319,53 @@ def binary_provenance() -> tuple[str, str]:
     return version, digest
 
 
+def execution_lease_key(env: dict) -> str:
+    """Opaque per-job identity; different concurrent jobs never share a receipt."""
+    run = env.get("GITHUB_RUN_ID", "")
+    attempt = env.get("GITHUB_RUN_ATTEMPT", "")
+    if not run.isdecimal() or not attempt.isdecimal():
+        return ""
+    identity = [run, attempt, env.get("GITHUB_JOB", "")]
+    return hashlib.sha256(json.dumps(identity).encode()).hexdigest()
+
+
+def issue_selection(current: dict, key: str, model: str, now: int) -> dict:
+    """Bind a qualified route to an actual job BEFORE task side effects."""
+    if not key:
+        # Local probes without Actions identity cannot claim an execution.
+        return current
+    existing = current.get("selection_leases") or {}
+    leases = {
+        k: v for k, v in existing.items()
+        if isinstance(v, dict) and isinstance(v.get("at"), int)
+        and 0 <= now - v["at"] <= MAX_SELECTION_AGE
+    }
+    leases[key] = {"model": model, "at": now}
+    if len(leases) > MAX_SELECTION_LEASES:
+        excess = len(leases) - MAX_SELECTION_LEASES
+        for obsolete in sorted(leases, key=lambda k: leases[k]["at"])[:excess]:
+            del leases[obsolete]
+    current["selection_leases"] = leases
+    return current
+
+
+def attest_execution(current: dict, key: str, model: str, now: int) -> dict:
+    """Accept an actual success based on SELECT-time qualification.
+
+    The probe TTL only limits selection freshness. It must not invalidate a
+    real 45-minute task whose *validly selected* probe expired mid-execution.
+    A stale, missing, replayed or different-job lease is never accepted.
+    """
+    lease = (current.get("selection_leases") or {}).get(key)
+    if not key or not isinstance(lease, dict) or lease.get("model") != model:
+        raise RouteError("Missing/mismatched qualified route selection for this job")
+    started = lease.get("at")
+    if not isinstance(started, int) or not 0 <= now - started <= MAX_SELECTION_AGE:
+        raise RouteError("Selected execution lease expired")
+    current["selection_leases"].pop(key)
+    return current
+
+
 def run() -> int:
     cli = argparse.ArgumentParser()
     cli.add_argument("operation", choices=("select", "record"))
@@ -342,12 +393,11 @@ def run() -> int:
         execution_id = env.get("GITHUB_RUN_ID", "") + "/" + env.get("GITHUB_RUN_ATTEMPT", "")
         if selected not in config.models or not execution_id.strip("/"):
             raise RouteError("Cannot attest unspecified execution")
+        lease_key = execution_lease_key(env)
         def record(current):
-            probe = current.get("last_successful_probe") or {}
-            if current.get("fingerprint") != config.fingerprint(digest, credential_scope) or probe.get("model") != selected:
+            if current.get("fingerprint") != config.fingerprint(digest, credential_scope):
                 raise RouteError("Stale/unqualified route cannot be promoted")
-            if now - int(probe.get("at", 0)) > config.ttl:
-                raise RouteError("Model probe expired before completion")
+            attest_execution(current, lease_key, selected, now)
             current["last_successful_real_execution"] = {
                 "model": selected, "at": now, "run": execution_id,
                 "head": env.get("CONTINUUM_TASK_HEAD", "")}
@@ -379,6 +429,7 @@ def run() -> int:
                                task_class=config.task_class)
                 if not qualified:
                     current["last_successful_probe"] = {"model": model, "at": now}
+                issue_selection(current, execution_lease_key(env), model, now)
                 return current
             store.update(key, save)
             if env.get("GITHUB_OUTPUT"):
