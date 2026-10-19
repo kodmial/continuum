@@ -79,3 +79,108 @@ jobs:
       # The reusable PR-Agent stack passes it as OPENCODE_MODEL to the OpenCode bridge.
       model: openai/continuum-review
       opencode_model: opencode/glm-5.3-flash-free
+
+
+  # One-time Work Lock #67 diagnostic. This job never modifies production model routing.
+  anonymous-free-model-inventory:
+    if: contains(github.event.head_commit.message, '[catalog-free]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    steps:
+      - name: Restore verified cached official OpenCode binary
+        uses: kodmial/continuum/.github/actions/agent-toolchain@main
+        with:
+          components: opencode
+      - name: Discover and actually query anonymous free models
+        shell: bash
+        env:
+          OPENCODE_DISABLE_AUTOUPDATE: "1"
+        run: |
+          set -euo pipefail
+          # This intentionally hides any runner-global credentials/sessions.
+          export HOME="$RUNNER_TEMP/worklock67-anon-home"
+          export XDG_CONFIG_HOME="$HOME/.config"
+          export XDG_DATA_HOME="$HOME/.local/share"
+          export XDG_STATE_HOME="$HOME/.local/state"
+          export XDG_CACHE_HOME="$HOME/.cache"
+          mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME"
+          unset OPENCODE_API_KEY ANTHROPIC_API_KEY OPENAI_API_KEY ZAI_API_KEY OPENROUTER_API_KEY GROQ_API_KEY
+          unset CLOUDFlARE_API_TOKEN NVIDIA_API_KEY GITHUB_TOKEN GH_TOKEN
+          cd "$RUNNER_TEMP"
+          python3 - <<'PY'
+          import datetime, json, os, re, subprocess, time
+          from pathlib import Path
+
+          def cli(args, timeout=90):
+              start=time.monotonic()
+              try:
+                  proc=subprocess.run(args, capture_output=True, text=True, timeout=timeout,
+                                      check=False, errors="replace")
+                  return proc.returncode,proc.stdout,proc.stderr,round(time.monotonic()-start,1)
+              except subprocess.TimeoutExpired as ex:
+                  return 124,ex.stdout.decode(errors="replace") if isinstance(ex.stdout,bytes) else (ex.stdout or ""), "timeout",round(time.monotonic()-start,1)
+
+          utc=datetime.datetime.now(datetime.timezone.utc).isoformat()
+          vrc,vout,verr,vt=cli(["opencode","--version"],20)
+          version=vout.strip()
+          print("WL67_INVENTORY_START",json.dumps({"timestamp_utc":utc,"version":version,"version_exit":vrc}),flush=True)
+          rc,out,err,elapsed=cli(["opencode","models","opencode","--refresh"],125)
+          print("WL67_DISCOVERY",json.dumps({"exit":rc,"elapsed_s":elapsed,"stderr_excerpt":err[-500:]}),flush=True)
+          if rc!=0:
+              # CLI may have populated an accessible cache even when refresh fails.
+              alt_rc,alt_out,alt_err,alt_t=cli(["opencode","models","opencode"],60)
+              print("WL67_DISCOVERY_FALLBACK",json.dumps({"exit":alt_rc,"elapsed_s":alt_t,"stderr_excerpt":alt_err[-350:]}),flush=True)
+              if alt_rc==0: out=alt_out
+
+          candidates=sorted(set(re.findall(r"(?m)^\s*(opencode/[A-Za-z0-9_.-]+-free)\s*$",re.sub(r"\x1b\[[0-9;]*[a-zA-Z]","",out))))
+          print("WL67_DISCOVERED_MODELS",json.dumps(candidates),flush=True)
+          if not candidates: print("WL67_DISCOVERY_RAW_LAST",repr(out[-800:]),flush=True)
+          prc,verbose,perr,pt=cli(["opencode","models","opencode","--verbose"],120)
+          print("WL67_VERBOSE_DISCOVERY",json.dumps({"exit":prc,"elapsed_s":pt,"size":len(verbose),"stderr_excerpt":perr[-300:]}),flush=True)
+          prompt="There are 3 boxes with 4 pencils in each box. How many pencils are there in total? Explain in one sentence."
+          results=[]
+          max_attempts=24
+          for i,model in enumerate(candidates):
+              if i >= max_attempts:
+                  d={"id":model,"status":"UNKNOWN","elapsed_s":0,"answer":"","error":"Excluded: bounded budget, more than 24 candidates","eligibility":"Suffix only; no live verification"}
+                  results.append(d);print("WL67_MODEL_RESULT",json.dumps(d,ensure_ascii=False),flush=True);continue
+              rc,out,err,elapsed=cli(["opencode","run","--model",model,"--format","json",prompt],85)
+              texts=[]
+              for line in out.splitlines():
+                  try: obj=json.loads(line)
+                  except (ValueError,TypeError): continue
+                  if not isinstance(obj,dict): continue
+                  part=obj.get("part") or {}
+                  if not isinstance(part,dict): part={}
+                  if part.get("type")=="text" and isinstance(part.get("text"),str):
+                      texts.append(part["text"])
+                  elif obj.get("type")=="text" and isinstance(obj.get("text"),str):
+                      texts.append(obj["text"])
+              answer=" ".join(texts).strip()
+              status="UNKNOWN"
+              detail=(err+"\n"+out[-1000:]).lower()
+              if rc==0 and answer and re.search(r"\b12\b",answer) and "pencil" in answer.lower():
+                  status="WORKING_ANONYMOUS"
+              elif rc==124: status="UNKNOWN"
+              elif re.search(r"(401|403|429|model unavailable|authentication required|freetiererror|model not found|not available)",detail):
+                  status="UNAVAILABLE"
+              elif rc==0: status="INVALID_RESPONSE"
+              else: status="UNKNOWN"
+              d={"id":model,"status":status,"exit_code":rc,"elapsed_s":elapsed,
+                 "answer":answer[:280],"error":(err[-550:] if status!="WORKING_ANONYMOUS" else ""),
+                 "eligibility":"No model-provider credentials; explicit opencode/*-free route; actual $0 pricing to confirm against official catalog"}
+              results.append(d)
+              print("WL67_MODEL_RESULT",json.dumps(d,ensure_ascii=False),flush=True)
+          print("WL67_INVENTORY_COMPLETE",json.dumps({"utc":datetime.datetime.now(datetime.timezone.utc).isoformat(),"total":len(candidates),"tested":min(max_attempts,len(candidates)),"working":[d["id"] for d in results if d["status"]=="WORKING_ANONYMOUS"]}),flush=True)
+          p=Path(os.environ["GITHUB_STEP_SUMMARY"])
+          with p.open("a",encoding="utf-8") as f:
+              f.write("## Anonymous OpenCode model probe — Work Lock #67\n\n")
+              f.write(f"UTC {utc}, official OpenCode version {version}, clean HOME/XDG, no model-provider credentials. Real answers only; no fallback.\n\n")
+              f.write("| Model | Result | Seconds | Verbatim assistant answer (truncated) | Error |\n| --- | --- | ---: | --- | --- |\n")
+              for d in results:
+                  clean=lambda t: str(t).replace("|","/").replace("\n"," ")[:240]
+                  f.write(f"| {clean(d['id'])} | {d['status']} | {d['elapsed_s']} | {clean(d['answer'])} | {clean(d['error'])} |\n")
+              f.write("\nEligibility/published price must be cross-checked independently before any model is called zero-cost; anonymous success does not prove ongoing free availability.\n")
+          PY
