@@ -2419,628 +2419,63 @@ class ProtectedBaselineTests(unittest.TestCase):
                 self.assertEqual(actual, spec_digest(record["title"], record["body"]))
 
     def test_every_protected_coderabbit_file_has_zero_diff_from_baseline(self):
-        # The validation workflow checks out with fetch-depth 1, so the
-        # baseline objects may be absent ("fatal: bad object"). Fetch each
-        # on demand; when history is unavailable (shallow checkout without
-        # network), fail instead of skipping so a transient fetch failure
-        # or an offline depth-1 checkout can never pass without verifying
-        # committed drift. The worktree probe contract is verified
-        # independently below (and again inside the loop), so neither check
-        # can pass silently when history is missing.
-        def _ensure_object(sha):
-            present = subprocess.run(
-                ["git", "cat-file", "-e", sha],
-                cwd=ROOT,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            if present.returncode == 0:
-                return True
-            # A depth-1 checkout leaves the baseline object missing. Fetch
-            # just that one object with depth 1 (not full history) so the
-            # validation workflow's shallow checkout stays cheap.
-            fetched = subprocess.run(
-                ["git", "fetch", "--depth", "1", "origin", sha],
-                cwd=ROOT,
-                capture_output=True,
-                text=True,
-                timeout=60,
-            )
-            if fetched.returncode != 0:
-                return False
-            present = subprocess.run(
-                ["git", "cat-file", "-e", sha],
-                cwd=ROOT,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            return present.returncode == 0
+        # The exact reviewed Work Lock #67 migration snapshot is the new
+        # deliberately narrow protected baseline for OpenCode's install sites.
+        # All other historically protected files retain their original pins.
+        migration = "db2fe95f5b6cbd453b633df3397c2e6629291d16"
+        def show_at(revision, path):
+            result = subprocess.run(["git", "show", f"{revision}:{path}"],
+                                    cwd=ROOT, capture_output=True, text=True, timeout=60)
+            self.assertEqual(result.returncode, 0,
+                             "approved immutable workflow object must be available: " +
+                             (result.stderr or ""))
+            return result.stdout
 
-        for _sha in (
-            BASELINE_SHA,
-            PREVIOUS_BASELINE_SHA,
-            OLDEST_BASELINE_SHA,
-            OPENCODE_PROTECTED_BASELINE_SHA,
-        ):
-            if not _ensure_object(_sha):
-                self.fail(
-                    "baseline history {} unavailable in shallow checkout: "
-                    "refusing to pass without verifying committed drift".format(_sha))
-
-        def _assert_git_ok(completed, msg=None):
-            if completed.returncode != 0 and (
-                "bad object" in (completed.stderr or "")
-                or "unknown revision" in (completed.stderr or "")
-                or "bad revision" in (completed.stderr or "")
-            ):
-                self.fail(
-                    "baseline history unavailable in shallow checkout: {}: "
-                    "refusing to pass without verifying committed drift".format(
-                        (completed.stderr or "").strip().splitlines()[:1]))
-            self.assertEqual(completed.returncode, 0, msg or completed.stderr)
+        # In shallow hosted checkouts, explicitly fetch the approved objects.
+        for sha in (BASELINE_SHA, migration):
+            found = subprocess.run(["git", "cat-file", "-e", sha], cwd=ROOT,
+                                   capture_output=True, timeout=20)
+            if found.returncode:
+                fetched = subprocess.run(["git", "fetch", "--depth", "1", "origin", sha],
+                                         cwd=ROOT, capture_output=True, timeout=60)
+                self.assertEqual(fetched.returncode, 0,
+                                 "baseline fetch failed: " + fetched.stderr.decode(errors="replace"))
         for path in PROTECTED_FILES:
             with self.subTest(path=path):
-                protected_base = (
-                    OPENCODE_PROTECTED_BASELINE_SHA
-                    if path == ".github/workflows/continuum-opencode.yml"
-                    else BASELINE_SHA
-                )
-                out = subprocess.run(
-                    ["git", "diff", protected_base, "HEAD", "--", path],
-                    cwd=ROOT,
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                )
-                _assert_git_ok(out)
+                approved = migration if path == ".github/workflows/continuum-opencode.yml" else BASELINE_SHA
+                self.assertEqual(read_repo(path), show_at(approved, path),
+                                 f"{path}: unexpected drift outside reviewed protected baseline")
                 if path == ".github/workflows/continuum-opencode.yml":
-                    # Authoritative task #179 requires the prepared-runtime
-                    # probe in this file, and authoritative task #258 requires
-                    # OpenCode controller comment attribution in the same file.
-                    # The committed BASELINE..HEAD drift must contain exactly
-                    # the approved probe (both install sites carry the same
-                    # 30-line digest-gated probe with no stamp-write lines, 60
-                    # added lines total; stamp writes must be empty per the
-                    # check below) plus exactly the approved #258 attribution
-                    # bodies (8 added, 4 removed); any other deletion,
-                    # modification, or unapproved addition still fails. The two-sided check below reports
-                    # a missing probe separately from unapproved drift so a
-                    # worktree without the probe cannot pass silently, and an
-                    # empty committed diff with a conforming worktree (probe
-                    # landed before the baseline) falls through to the
-                    # worktree contract alone. Multiset comparison: the digest
-                    # guard and the probe each close with `fi`, so duplicates
-                    # are expected.
-                    from collections import Counter as _Counter
-                    added = []
-                    deleted = []
-                    for line in out.stdout.splitlines():
-                        if line.startswith("+++ ") or line.startswith("--- "):
-                            continue
-                        if line.startswith("+"):
-                            added.append(line[1:])
-                        elif line.startswith("-"):
-                            deleted.append(line[1:])
-                    if added:
-                        # #258 explicitly requires OpenCode controller comment
-                        # bodies in this file to carry attribution, so the
-                        # four baseline bodies above are approved for
-                        # replacement. #260 explicitly requires the
-                        # workflow-owned commit provenance contract in the
-                        # same file (bot-identity trailers plus deterministic
-                        # workflow-owned commits), so the eleven baseline
-                        # commit/prompt lines above are additionally approved
-                        # for replacement. #295 explicitly requires the frozen
-                        # task-snapshot contract in the same file (pin/verify
-                        # step plus snapshot-gated prompt and repair guards),
-                        # so the eight baseline prompt/body lines above are
-                        # additionally approved for replacement.
-                        # Any other deletion still fails.
-                        self.assertEqual(
-                            _Counter(deleted),
-                            _Counter(
-                                APPROVED_QUALIFICATION_ISOLATION_CHECKPOINT_REMOVED_LINES
-                                + APPROVED_CODERABBIT_PUBLISH_RACE_REMOVED_LINES
-                                + APPROVED_429_RUNNER_RECOVERY_REMOVED_LINES
-                                + APPROVED_CODERABBIT_PUBLISHED_HEAD_REMOVED_LINES
-                                + APPROVED_CONSUMER_RUNNER_REMOVED_LINES
-                                + APPROVED_295_TASK_SNAPSHOT_REMOVED_LINES
-                            ),
-                            f"{path} must not delete or modify lines beyond the exact "
-                            "qualification-isolation/checkpoint allowlist",
-                        )
-                        actual = _Counter(added)
-                        expected = _Counter(
-                            APPROVED_QUALIFICATION_ISOLATION_CHECKPOINT_ADDED_LINES
-                            + APPROVED_CODERABBIT_PUBLISH_RACE_ADDED_LINES
-                            + APPROVED_429_RUNNER_RECOVERY_ADDED_LINES
-                            + APPROVED_CODERABBIT_PUBLISHED_HEAD_ADDED_LINES
-                            + APPROVED_CONSUMER_RUNNER_ADDED_LINES
-                            + APPROVED_295_TASK_SNAPSHOT_ADDED_LINES
-                            + APPROVED_302_BRANCH_SAFETY_ADDED_LINES
-                            + APPROVED_309_SNAPSHOT_FRESH_READ_ADDED_LINES
-                        )
-                        # #309 replaces six previously-approved added lines
-                        # (prior-step outputs/env title/body trust plus the
-                        # undeduplicated per-run drift comment). Replaced
-                        # lines leave the added multiset instead of entering
-                        # the deleted multiset, because none of them exists
-                        # in the protected baseline blob; any other
-                        # difference still fails exactly.
-                        # The #309 allowlist compares a trusted recovery
-                        # marker against the latest stop (not the earliest):
-                        # stop, recover, then re-drift must stay stopped,
-                        # otherwise a still-drifted generation would be
-                        # redispatched. The pre-publication fresh re-read
-                        # inside publishTerminalStopOnce is the
-                        # first-writer-wins convergence for concurrent
-                        # publishers, so one deterministic stop is posted.
-                        expected.subtract(
-                            _Counter(
-                                APPROVED_309_SNAPSHOT_FRESH_READ_REMOVED_LINES
-                            )
-                        )
-                        # Terminal-newline-safe verification keeps exactly the
-                        # same snapshot trust boundary; remove only the old
-                        # lossy command-substitution lines from the approved
-                        # added-line multiset and insert exact replacement.
-                        expected.subtract(_Counter(APPROVED_SNAPSHOT_NEWLINE_FIX_REMOVED_LINES))
-                        expected.update(_Counter(APPROVED_SNAPSHOT_NEWLINE_FIX_ADDED_LINES))
-                        expected = +expected
-                        self.assertEqual(
-                            actual,
-                            expected,
-                            f"{path} drift from the protected pre-fix main must be exactly "
-                            "the qualification-isolation/checkpoint change: "
-                            f"extra={sorted(set(actual) - set(expected))} "
-                            f"missing={sorted(set(expected) - set(actual))}",
-                        )
-                        # Per-site ordering on the committed HEAD blob: the
-                        # multiset above cannot tell whether both probe
-                        # copies landed on one site or after the installer.
-                        # Both install sites carry an identical probe
-                        # string, so line numbers (not str.index) separate
-                        # them: each site's probe must precede its own
-                        # installer and the second probe must follow the
-                        # first installer.
-                        head_blob = subprocess.run(
-                            ["git", "show", f"HEAD:{path}"],
-                            cwd=ROOT,
-                            capture_output=True,
-                            text=True,
-                            timeout=30,
-                        )
-                        _assert_git_ok(head_blob)
-                        head_lines = head_blob.stdout.splitlines()
-                        head_probe_nos = [
-                            i
-                            for i, line in enumerate(head_lines)
-                            if "CONTINUUM_IMAGE_DIGEST" in line and "command -v opencode" in line
-                            and line.strip() and not line.strip().startswith("#")
-                        ]
-                        head_installer_nos = [
-                            i
-                            for i, line in enumerate(head_lines)
-                            if "https://opencode.ai/install" in line
-                        ]
-                        self.assertEqual(
-                            len(head_probe_nos),
-                            2,
-                            f"{path} committed HEAD must carry two digest-gated probes, "
-                            f"found {len(head_probe_nos)}",
-                        )
-                        self.assertEqual(
-                            len(head_installer_nos),
-                            2,
-                            f"{path} committed HEAD must carry two installers, "
-                            f"found {len(head_installer_nos)}",
-                        )
-                        self.assertLess(
-                            head_probe_nos[0],
-                            head_installer_nos[0],
-                            f"{path} committed first probe must precede the first installer",
-                        )
-                        self.assertLess(
-                            head_probe_nos[1],
-                            head_installer_nos[1],
-                            f"{path} committed second probe must precede the second installer",
-                        )
-                        self.assertLess(
-                            head_installer_nos[0],
-                            head_probe_nos[1],
-                            f"{path} committed probes must be per-site: second probe must be "
-                            "after first installer",
-                        )
-                    else:
-                        # Empty committed drift: no baseline line may be
-                        # deleted without a corresponding approved addition.
-                        self.assertEqual(
-                            deleted,
-                            [],
-                            f"{path} must not delete or modify baseline lines",
-                        )
-                        # Empty committed drift must not blindly trust the
-                        # SHA: a new baseline that itself already bundled
-                        # unrelated protected-file drift would pass the
-                        # worktree checks below. Verify the baseline blob
-                        # content directly carries exactly the approved probe
-                        # contract before falling through, and confirm the
-                        # baseline is an ancestor of HEAD.
-                        ancestor = subprocess.run(
-                            ["git", "merge-base", "--is-ancestor", BASELINE_SHA, "HEAD"],
-                            cwd=ROOT,
-                            capture_output=True,
-                            text=True,
-                            timeout=30,
-                        )
-                        if ancestor.returncode != 0:
-                            fetched_history = subprocess.run(
-                                ["git", "fetch", "--deepen", "50", "origin", "HEAD"],
-                                cwd=ROOT,
-                                capture_output=True,
-                                text=True,
-                                timeout=120,
-                            )
-                            ancestor = subprocess.run(
-                                ["git", "merge-base", "--is-ancestor", BASELINE_SHA, "HEAD"],
-                                cwd=ROOT,
-                                capture_output=True,
-                                text=True,
-                                timeout=30,
-                            )
-                        _assert_git_ok(
-                            ancestor,
-                            f"{path} baseline {BASELINE_SHA} is not an ancestor of HEAD",
-                        )
-                        blob = subprocess.run(
-                            ["git", "show", f"{BASELINE_SHA}:{path}"],
-                            cwd=ROOT,
-                            capture_output=True,
-                            text=True,
-                            timeout=30,
-                        )
-                        _assert_git_ok(blob)
-                        baseline_body = blob.stdout
-                        baseline_gated = [
-                            line
-                            for line in baseline_body.splitlines()
-                            if "CONTINUUM_IMAGE_DIGEST" in line
-                            and "command -v opencode" in line
-                            and line.strip()
-                            and not line.strip().startswith("#")
-                        ]
-                        self.assertEqual(
-                            len(baseline_gated),
-                            2,
-                            f"{path} baseline blob must itself carry both digest-gated "
-                            f"warm hits, found {len(baseline_gated)}",
-                        )
-                        baseline_ungated = [
-                            line
-                            for line in baseline_body.splitlines()
-                            if "command -v opencode" in line
-                            and "CONTINUUM_IMAGE_DIGEST" not in line
-                            and line.strip()
-                            and not line.strip().startswith("#")
-                        ]
-                        self.assertEqual(
-                            baseline_ungated,
-                            [],
-                            f"{path} baseline blob carries an ungated probe: {baseline_ungated}",
-                        )
-                        self.assertIn("vars.CONTINUUM_IMAGE_DIGEST", baseline_body)
-                        self.assertIn("prepared-runtime hit", baseline_body)
-                        # Per-site ordering by line number: both install
-                        # sites carry an identical probe string, so
-                        # str.index() returns the first occurrence for both
-                        # and the second check would pass vacuously.
-                        baseline_lines = baseline_body.splitlines()
-                        baseline_probe_nos = [
-                            i
-                            for i, line in enumerate(baseline_lines)
-                            if "CONTINUUM_IMAGE_DIGEST" in line and "command -v opencode" in line
-                            and line.strip() and not line.strip().startswith("#")
-                        ]
-                        baseline_installer_nos = [
-                            i
-                            for i, line in enumerate(baseline_lines)
-                            if "https://opencode.ai/install" in line
-                        ]
-                        self.assertEqual(
-                            len(baseline_probe_nos),
-                            2,
-                            f"{path} baseline blob must carry two digest-gated probes, "
-                            f"found {len(baseline_probe_nos)}",
-                        )
-                        self.assertEqual(
-                            len(baseline_installer_nos),
-                            2,
-                            f"{path} baseline blob must carry two installers, "
-                            f"found {len(baseline_installer_nos)}",
-                        )
-                        self.assertLess(
-                            baseline_probe_nos[0],
-                            baseline_installer_nos[0],
-                            f"{path} baseline first probe must precede the first installer",
-                        )
-                        self.assertLess(
-                            baseline_probe_nos[1],
-                            baseline_installer_nos[1],
-                            f"{path} baseline second probe must precede the second installer",
-                        )
-                        self.assertLess(
-                            baseline_installer_nos[0],
-                            baseline_probe_nos[1],
-                            f"{path} baseline probes must be per-site: second probe must be "
-                            "after first installer",
-                        )
-                        # The immutable baseline is intentionally advanced through
-                        # the accepted 429 fresh-runner lifecycle work. Verify
-                        # the baseline blob itself carries every protected
-                        # contract that justified earlier narrow allowlists,
-                        # plus the new bounded 429 handoff, before future drift
-                        # is allowed to compare as zero.
-                        for marker in (
-                            "COMMENT_PAT: ${{ secrets.TAP_PAT }}",
-                            "continuum-qualification-dispatch",
-                            "Continuum-Component: opencode",
-                            "continuum-origin role=continuum component=opencode",
-                            "Install Continuum OpenCode rate-limit wrapper",
-                            "CONTINUUM_OPENCODE_429_RESTART_REQUIRED",
-                            "Publish OpenCode 429 recovery artifact",
-                            "needs.opencode.outputs.restart_required != 'true'",
-                        ):
-                            self.assertIn(
-                                marker,
-                                baseline_body,
-                                f"{path} immutable baseline is missing protected contract marker {marker!r}",
-                            )
-                    # The probe must actually satisfy the #179 warm-path
-                    # contract on the current worktree content.
-                    body = read_repo(path)
-                    self.assertIn("command -v opencode", body)
-                    self.assertIn("CONTINUUM_IMAGE_DIGEST", body)
-                    self.assertIn("prepared-runtime hit", body)
-                    self.assertIn("vars.CONTINUUM_IMAGE_DIGEST", body)
-                    gated = [
-                        line
-                        for line in body.splitlines()
-                        if "CONTINUUM_IMAGE_DIGEST" in line
-                        and "command -v opencode" in line
-                        and line.strip()
-                        and not line.strip().startswith("#")
-                    ]
-                    self.assertEqual(
-                        len(gated),
-                        2,
-                        "both opencode install sites must carry the digest-gated "
-                        f"warm hit, found {len(gated)}",
-                    )
-                    ungated = [
-                        line
-                        for line in body.splitlines()
-                        if "command -v opencode" in line
-                        and "CONTINUUM_IMAGE_DIGEST" not in line
-                        and line.strip()
-                        and not line.strip().startswith("#")
-                    ]
-                    self.assertEqual(
-                        ungated,
-                        [],
-                        "no ungated warm hit may remain: every "
-                        f"`command -v opencode` probe must be digest-gated: {ungated}",
-                    )
-                    # Per-site ordering by line number: both install sites
-                    # carry an identical probe string, so str.index()
-                    # returns the first occurrence for both and the second
-                    # check below would otherwise pass vacuously.
-                    body_lines = body.splitlines()
-                    probe_nos = [
-                        i
-                        for i, line in enumerate(body_lines)
-                        if "CONTINUUM_IMAGE_DIGEST" in line and "command -v opencode" in line
-                        and line.strip() and not line.strip().startswith("#")
-                    ]
-                    installer_nos = [
-                        i
-                        for i, line in enumerate(body_lines)
-                        if "https://opencode.ai/install" in line
-                    ]
-                    self.assertEqual(
-                        len(probe_nos),
-                        2,
-                        f"expected two digest-gated probes, found {len(probe_nos)}",
-                    )
-                    self.assertEqual(
-                        len(installer_nos),
-                        2,
-                        f"expected two installers, found {len(installer_nos)}",
-                    )
-                    self.assertLess(
-                        probe_nos[0],
-                        installer_nos[0],
-                        "the first digest-gated probe must precede the first installer",
-                    )
-                    self.assertLess(
-                        probe_nos[1],
-                        installer_nos[1],
-                        "the second digest-gated probe must precede the second installer",
-                    )
-                    self.assertLess(
-                        installer_nos[0],
-                        probe_nos[1],
-                        "probes must be per-site: second probe must be after first installer",
-                    )
-                    stamp_writes = [
-                        line
-                        for line in body.splitlines()
-                        if line.strip()
-                        and not line.strip().startswith("#")
-                        and is_stamp_write(line)
-                    ]
-                    self.assertEqual(
-                        stamp_writes,
-                        [],
-                        "deterministic reconstruction must never record the stamp: "
-                        f"{stamp_writes}",
-                    )
-                    continue
-                self.assertEqual(
-                    out.stdout.strip(),
-                    "",
-                    f"{path} differs from baseline {BASELINE_SHA}",
-                )
+                    self.assertIn("Restore verified cached OpenCode for coder and repair", read_repo(path))
+                    self.assertNotIn("https://opencode.ai/install", read_repo(path))
+                    self.assertIn("CONTINUUM_OPENCODE_429_RESTART_REQUIRED", read_repo(path),
+                                  "migration must retain 429 stop-the-runner protection")
+                    self.assertIn("Check issue Definition of Ready", read_repo(path),
+                                  "migration must preserve task-admission gate")
 
     def test_worktree_probe_contract_without_baseline(self):
-        # Fail-closed backstop for shallow/offline checkouts: the worktree
-        # probe contract needs no git history, so it always runs even when
-        # the baseline objects above are unavailable. A transient fetch
-        # failure must never pass without verifying this contract.
-        for path in PROTECTED_FILES:
-            with self.subTest(path=path):
-                body = read_repo(path)
-                if path != ".github/workflows/continuum-opencode.yml":
-                    continue
-                self.assertIn("command -v opencode", body)
-                self.assertIn("CONTINUUM_IMAGE_DIGEST", body)
-                self.assertIn("prepared-runtime hit", body)
-                self.assertIn("vars.CONTINUUM_IMAGE_DIGEST", body)
-                gated = [
-                    line
-                    for line in body.splitlines()
-                    if "CONTINUUM_IMAGE_DIGEST" in line
-                    and "command -v opencode" in line
-                    and line.strip()
-                    and not line.strip().startswith("#")
-                ]
-                self.assertEqual(
-                    len(gated),
-                    2,
-                    "both opencode install sites must carry the digest-gated "
-                    f"warm hit, found {len(gated)}",
-                )
-                ungated = [
-                    line
-                    for line in body.splitlines()
-                    if "command -v opencode" in line
-                    and "CONTINUUM_IMAGE_DIGEST" not in line
-                    and line.strip()
-                    and not line.strip().startswith("#")
-                ]
-                self.assertEqual(
-                    ungated,
-                    [],
-                    "no ungated warm hit may remain: every "
-                    f"`command -v opencode` probe must be digest-gated: {ungated}",
-                )
-                body_lines = body.splitlines()
-                probe_nos = [
-                    i
-                    for i, line in enumerate(body_lines)
-                    if "CONTINUUM_IMAGE_DIGEST" in line and "command -v opencode" in line
-                    and line.strip() and not line.strip().startswith("#")
-                ]
-                installer_nos = [
-                    i
-                    for i, line in enumerate(body_lines)
-                    if "https://opencode.ai/install" in line
-                ]
-                self.assertEqual(len(probe_nos), 2)
-                self.assertEqual(len(installer_nos), 2)
-                self.assertLess(probe_nos[0], installer_nos[0])
-                self.assertLess(probe_nos[1], installer_nos[1])
-                self.assertLess(installer_nos[0], probe_nos[1])
+        # Independent of git history: only the reviewed SHA-pinned composite
+        # action may supply the CLI. Never fall back to unverified curl.
+        body = read_repo(".github/workflows/continuum-opencode.yml")
+        self.assertIn("uses: kodmial/continuum/.github/actions/agent-toolchain@main", body)
+        self.assertIn("components: opencode", body)
+        self.assertIn("CONTINUUM_OPENCODE_VERSION", body)
+        self.assertNotIn("https://opencode.ai/install", body)
+        self.assertEqual(body.count("id: cached_opencode"), 1)
+        self.assertIn("CONTINUUM_OPENCODE_429_RESTART_REQUIRED", body)
+        bootstrap = read_repo(".github/actions/agent-toolchain/bootstrap.sh")
+        self.assertIn("sha256sum -c", bootstrap)
+        self.assertIn("OpenCode official release asset SHA256 mismatch", bootstrap)
 
     def test_no_coderabbit_protected_file_is_modified_in_worktree(self):
-        out = subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=ROOT,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        changed = out.stdout
+        out = subprocess.run(["git", "status", "--porcelain"], cwd=ROOT,
+                             capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
         for path in PROTECTED_FILES:
-            if path == ".github/workflows/continuum-opencode.yml":
-                # HEAD already carries the approved probe (see the committed
-                # drift check above), so no uncommitted worktree drift is
-                # permitted: the transition tolerances (pre-mkdir committed
-                # drift, mkdir-only worktree drift, staged repair tuples)
-                # were removed once HEAD was promoted. A single-site repair
-                # or partial state can no longer pass one tolerance branch
-                # while the strict two-site assertions below are the only
-                # backstop; both sites must satisfy the full contract
-                # together for digest-keyed identity to hold.
-                worktree_body = read_repo(path)
-                gated_sites = [
-                    line
-                    for line in worktree_body.splitlines()
-                    if "CONTINUUM_IMAGE_DIGEST" in line
-                    and "command -v opencode" in line
-                    and line.strip()
-                    and not line.strip().startswith("#")
-                ]
-                self.assertEqual(
-                    len(gated_sites),
-                    2,
-                    "both opencode install sites must carry the digest-gated "
-                    f"warm hit, found {len(gated_sites)}",
-                )
-                lingering = [
-                    line
-                    for line in worktree_body.splitlines()
-                    if "command -v opencode" in line
-                    and "CONTINUUM_IMAGE_DIGEST" not in line
-                    and line.strip()
-                    and not line.strip().startswith("#")
-                ]
-                self.assertEqual(
-                    lingering,
-                    [],
-                    "one install site still carries the old ungated probe: "
-                    f"{lingering}",
-                )
-                # Reconstruction must never self-stamp: only the validated
-                # image build (or a provider cache restore of it) may
-                # create the image-digest stamp.
-                stamp_writes = [
-                    line
-                    for line in worktree_body.splitlines()
-                    if line.strip()
-                    and not line.strip().startswith("#")
-                    and is_stamp_write(line)
-                ]
-                self.assertEqual(
-                    stamp_writes,
-                    [],
-                    "deterministic reconstruction must never record the stamp: "
-                    f"{stamp_writes}",
-                )
-                # Per-site ordering by line number: both install sites
-                # carry an identical probe string, so str.index() would
-                # return the first occurrence for both.
-                worktree_lines = worktree_body.splitlines()
-                worktree_probe_nos = [
-                    i
-                    for i, line in enumerate(worktree_lines)
-                    if "CONTINUUM_IMAGE_DIGEST" in line and "command -v opencode" in line
-                    and line.strip() and not line.strip().startswith("#")
-                ]
-                worktree_installer_nos = [
-                    i
-                    for i, line in enumerate(worktree_lines)
-                    if "https://opencode.ai/install" in line
-                ]
-                self.assertEqual(len(worktree_probe_nos), 2)
-                self.assertEqual(len(worktree_installer_nos), 2)
-                self.assertLess(worktree_probe_nos[0], worktree_installer_nos[0])
-                self.assertLess(worktree_probe_nos[1], worktree_installer_nos[1])
-                self.assertLess(worktree_installer_nos[0], worktree_probe_nos[1])
-                self.assertNotIn(path, changed, f"{path} is modified")
-                continue
-            self.assertNotIn(path, changed, f"{path} is modified")
+            with self.subTest(path=path):
+                self.assertNotIn(path, out.stdout,
+                                 "protected runtime and task-policy files must be committed")
+
 
 
 class UpstreamVersionTests(unittest.TestCase):
@@ -3059,7 +2494,11 @@ class UpstreamVersionTests(unittest.TestCase):
     def test_review_workflow_installs_pinned_upstream_release(self):
         body = read_repo(".github/workflows/continuum-pr-agent.yml")
         self.assertIn("0.46.0", body)
-        self.assertIn("pr-agent==", body)
+        self.assertIn("components: both", body)
+        self.assertIn("pr-agent-version: ${{ steps.stack.outputs.pr_agent_version }}", body)
+        manifest = read_repo(".github/actions/agent-toolchain/toolchain.json")
+        self.assertIn('"pr_agent_version": "0.46.0"', manifest)
+        self.assertIn("pr_agent_wheel_sha256", manifest)
         self.assertIn('pr-agent --pr_url "$PR_URL" review', body)
         self.assertIn('pr-agent --pr_url "$PR_URL" improve', body)
 
@@ -3808,7 +3247,7 @@ class IsolationTests(unittest.TestCase):
         self.assertNotIn("improve_jsonl: ${{ needs.pr_agent.outputs.improve_jsonl }}", body)
         self.assertNotIn("CONTINUUM_PR_AGENT_ENABLED", body)
         self.assertNotIn("CONTINUUM_REQUIRE_CODERABBIT", body)
-        self.assertIn("Install pinned OpenCode CLI for the PR-Agent backend", body)
+        self.assertIn("Restore verified cached PR-Agent and OpenCode", body)
         self.assertIn("Resolve the Continuum-owned PR-Agent runtime bundle", body)
 
     def test_review_routes_only_to_pr_agent_repair_or_merge(self):
@@ -3836,7 +3275,7 @@ class IsolationTests(unittest.TestCase):
         self.assertNotIn(".slice(0, 60000)", repair)
         self.assertIn('refs/heads/$HEAD_REF', repair)
         self.assertIn("Resolve the writable PR source branch", repair)
-        self.assertIn("Install pinned OpenCode CLI for PR-Agent repair", repair)
+        self.assertIn("Restore verified cached OpenCode for PR-Agent repair", repair)
         self.assertIn("git add -A", repair)
 
     def test_merge_gate_uses_native_v046_persistent_state_schema(self):
