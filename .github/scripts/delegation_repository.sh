@@ -20,6 +20,52 @@ parent_children="${PARENT_CHILDREN:-}"
 # disclose the private child repository name in public parent logs.
 UNAVAILABLE=4
 
+# Bounded, classified GitHub REST read for delegated discovery
+# (kodmial/continuum#326). The retry policy is authoritative in
+# delegation_runtime.py: a transient 5xx/timeout or a rate-limited response
+# retries a bounded number of times honouring Retry-After / x-ratelimit-reset
+# (clamped), while an authentication/permission rejection never retries. On
+# exhaustion the shared unavailable verdict is reported once and the function
+# returns UNAVAILABLE, so a discovery outage can neither spin nor leak a raw
+# API error (which would name the private child) into public parent logs.
+api_read() {
+  local max_attempts="${CONTINUUM_DISCOVERY_MAX_ATTEMPTS:-2}"
+  local base_delay="${CONTINUUM_DISCOVERY_BASE_DELAY:-1}"
+  local attempt=1 rc classification verdict delay
+  local raw err
+  raw="$(mktemp "${RUNNER_TEMP:-.}/continuum-api-raw.XXXXXX")"
+  err="$(mktemp "${RUNNER_TEMP:-.}/continuum-api-err.XXXXXX")"
+  while :; do
+    set +e
+    gh api --include "$@" >"$raw" 2>"$err"
+    rc=$?
+    set -e
+    if [[ "$rc" -eq 0 ]]; then
+      python3 "$relation" strip-headers <"$raw"
+      rm -f "$raw" "$err"
+      return 0
+    fi
+    cat "$err" >>"$raw"
+    classification="$(python3 "$relation" classify-response --raw-file "$raw" 2>/dev/null || true)"
+    verdict="$(sed -n 's/^verdict=//p' <<<"$classification")"
+    delay="$(sed -n 's/^retry-delay=//p' <<<"$classification")"
+    if { [[ "$verdict" == "rate_limited" ]] || [[ "$verdict" == "transient" ]]; } &&
+       [[ "$attempt" -lt "$max_attempts" ]]; then
+      attempt=$((attempt + 1))
+      if [[ -n "$delay" && "$delay" != "0" ]]; then
+        sleep "$delay" 2>/dev/null || true
+      else
+        sleep "$base_delay" 2>/dev/null || true
+      fi
+      continue
+    fi
+    break
+  done
+  rm -f "$raw" "$err"
+  echo "::error::Delegated child discovery is unavailable; refusing to guess." >&2
+  return "$UNAVAILABLE"
+}
+
 parent_child_ids() {
   if [[ -n "$parent_role" || -n "$parent_children" ]]; then
     python3 "$relation" parent-variable-ids       --role "$parent_role"       --children-json "$parent_children"
@@ -69,10 +115,9 @@ repository_variables() {
   # public parent logs never disclose a private child repository name; pipefail
   # still propagates an API or jq failure as UNAVAILABLE.
   if ! payload="$(
-    gh api --paginate "repos/$repository/actions/variables?per_page=100" 2>/dev/null |
+    api_read --paginate "repos/$repository/actions/variables?per_page=100" |
       jq -cs '{variables: [.[].variables[]?]}'
   )"; then
-    echo "::error::Delegated child discovery is unavailable; refusing to guess." >&2
     return "$UNAVAILABLE"
   fi
   printf '%s' "$payload"
@@ -138,8 +183,7 @@ resolve_by_roles() {
   assert_parent_allows_child "$child_id"
 
   local listing
-  if ! listing="$(gh api --paginate '/user/repos?affiliation=owner&per_page=100' --jq '.[].full_name' 2>/dev/null)"; then
-    echo "::error::Delegated child discovery is unavailable; refusing to guess." >&2
+  if ! listing="$(api_read --paginate '/user/repos?affiliation=owner&per_page=100' --jq '.[].full_name')"; then
     return "$UNAVAILABLE"
   fi
 
@@ -159,7 +203,8 @@ resolve_by_roles() {
     elif [[ "$candidate_rc" -eq "$UNAVAILABLE" ]]; then
       # Verification never ran for this candidate. Counting it as a
       # non-match would turn an API outage into a misleading zero-match
-      # verdict, so abort the whole discovery instead.
+      # verdict, so abort the whole discovery instead. The per-candidate
+      # probe suppressed its stderr, so report the shared verdict here.
       echo "::error::Delegated child discovery is unavailable; refusing to guess." >&2
       return "$UNAVAILABLE"
     fi
@@ -233,19 +278,46 @@ case "${1:-}" in
   plan)
     # Capture failures before process substitution can hide a rejected parent.
     child_ids="$(parent_child_ids)"
-    first=true
-    printf '['
+    allowlist_json="$(
+      printf '%s\n' "$child_ids" |
+        jq -Rsc 'split("\n") | map(select(length > 0))'
+    )"
+    cache_file="${CONTINUUM_DELEGATION_CACHE:-}"
+    cache_ttl="${CONTINUUM_DELEGATION_CACHE_TTL:-900}"
+    now_epoch="$(date +%s)"
+    # Reuse an inventory already trusted for this exact parent and allowlist
+    # within its TTL. The cache is authenticated (parent + allowlist
+    # fingerprint), strictly scoped, TTL-limited and never persisted outside
+    # the runner workspace, so a private child name cannot leak.
+    if [[ -n "$cache_file" ]]; then
+      if cached_plan="$(python3 "$relation" inventory-read \
+        --cache "$cache_file" --parent "$GITHUB_REPOSITORY" \
+        --allowlist-json "$allowlist_json" --now "$now_epoch" \
+        --ttl "$cache_ttl" 2>/dev/null)"; then
+        printf '%s\n' "$cached_plan"
+        exit 0
+      fi
+    fi
+    entries=()
     while IFS= read -r child_id; do
       [[ -n "$child_id" ]] || continue
       repository="$(resolve_child "$child_id")"
-      if [[ "$first" == true ]]; then
-        first=false
-      else
-        printf ','
-      fi
-      jq -cn --arg id "$child_id" --arg repository "$repository"         '{id:$id,repository:$repository}'
+      entries+=(
+        "$(jq -cn --arg id "$child_id" --arg repository "$repository" \
+          '{id:$id,repository:$repository}')"
+      )
     done <<<"$child_ids"
-    printf ']\n'
+    plan_json="$(printf '%s\n' "${entries[@]:-}" | jq -cs '.')"
+    printf '%s\n' "$plan_json"
+    if [[ -n "$cache_file" ]]; then
+      plan_tmp="${RUNNER_TEMP:-.}/continuum-inventory-plan.$$.json"
+      printf '%s\n' "$plan_json" >"$plan_tmp"
+      python3 "$relation" inventory-write \
+        --cache "$cache_file" --parent "$GITHUB_REPOSITORY" \
+        --allowlist-json "$allowlist_json" --plan-file "$plan_tmp" \
+        --now "$now_epoch" --ttl "$cache_ttl" 2>/dev/null || true
+      rm -f "$plan_tmp"
+    fi
     ;;
   *)
     echo "::error::usage: delegation_repository.sh {resolve CHILD_ID|verify CHILD_ID REPOSITORY|validation REPOSITORY|plan}" >&2

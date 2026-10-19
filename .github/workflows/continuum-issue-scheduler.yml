@@ -578,7 +578,31 @@ jobs:
           export CONTINUUM_ENGINE_ROOT="$GITHUB_WORKSPACE/.continuum-engine"
           export PYTHONPATH="$CONTINUUM_ENGINE_ROOT/src"
           resolver="$CONTINUUM_ENGINE_ROOT/.github/scripts/delegation_repository.sh"
+
+          # Delegated Child discovery is optional and needs cross-repository
+          # REST reads (kodmial/continuum#326). An unavailable discovery
+          # (exit 4) must fail closed for Child dispatch only: report a
+          # distinct degraded delegation state and let the Parent-local
+          # reconcile step still run. It must never be reported as an empty
+          # successful Child inventory, and it must recover on the next
+          # legitimate run. A genuine relationship error (exit 2) still fails
+          # the run so misconfiguration is surfaced.
+          set +e
           plan="$(PARENT_CONFIG=.continuum.yml CHILD_REPOSITORIES="" bash "$resolver" plan)"
+          plan_rc=$?
+          set -e
+          if [[ "$plan_rc" -eq 4 ]]; then
+            echo "delegation_state=degraded" >> "$GITHUB_OUTPUT"
+            echo "active_wip=0" >> "$GITHUB_OUTPUT"
+            echo "candidate_count=0" >> "$GITHUB_OUTPUT"
+            echo "::warning::Delegated child discovery is unavailable (exit 4); failing closed for Child dispatch and scheduling Parent-local work only on this pass. Recovery happens on the next legitimate run."
+            exit 0
+          fi
+          if [[ "$plan_rc" -ne 0 ]]; then
+            echo "::error::Delegated child queue resolution failed (exit $plan_rc); refusing to continue."
+            exit "$plan_rc"
+          fi
+          echo "delegation_state=ok" >> "$GITHUB_OUTPUT"
 
           # Keep Actions-history inspection bounded. Three pages cover the latest
           # 300 completed runs without walking the repository's entire run history.
@@ -1177,6 +1201,7 @@ jobs:
         env:
           CHILD_ACTIVE_WIP: ${{ steps.child_queue.outputs.active_wip || '0' }}
           CHILD_CANDIDATES_FILE: ${{ runner.temp }}/continuum-child-candidates.json
+          DELEGATION_STATE: ${{ steps.child_queue.outputs.delegation_state }}
         with:
           # TAP_PAT is required because the existing OpenCode workflow accepts
           # /oc only from the repository owner. It also makes issue-state
@@ -1214,13 +1239,38 @@ jobs:
               );
             }
             const childActiveWip = childActiveWipParsed;
-            const childCandidatesFile = process.env.CHILD_CANDIDATES_FILE || '';
-            const childCandidates =
-              childCandidatesFile && fs.existsSync(childCandidatesFile)
-                ? JSON.parse(fs.readFileSync(childCandidatesFile, 'utf8'))
-                : [];
-            if (!Array.isArray(childCandidates)) {
-              throw new Error('Delegated child candidate payload is not an array.');
+            const childCandidatesFile = (
+              process.env.CHILD_CANDIDATES_FILE || ''
+            ).trim();
+            // Delegation state is the authoritative split between
+            // Parent-local and delegated scheduling (kodmial/continuum#326).
+            // `degraded` means delegated discovery was unavailable: Child
+            // dispatch stays fail-closed while Parent-local work continues,
+            // and an empty inventory is never fabricated as a success.
+            const delegationState = (
+              process.env.DELEGATION_STATE || 'none'
+            ).trim();
+            if (!['ok', 'degraded', 'none'].includes(delegationState)) {
+              throw new Error('Invalid DELEGATION_STATE: ' + delegationState);
+            }
+            let childCandidates = [];
+            if (delegationState === 'ok') {
+              if (!childCandidatesFile || !fs.existsSync(childCandidatesFile)) {
+                throw new Error(
+                  'Delegation state is "ok" but the delegated child candidate file is missing.'
+                );
+              }
+              childCandidates = JSON.parse(
+                fs.readFileSync(childCandidatesFile, 'utf8')
+              );
+              if (!Array.isArray(childCandidates)) {
+                throw new Error('Delegated child candidate payload is not an array.');
+              }
+            } else if (delegationState === 'degraded') {
+              core.warning(
+                'Delegated child discovery is unavailable; Child dispatch is ' +
+                'disabled for this pass while Parent-local scheduling continues.'
+              );
             }
 
             function positiveInt(name, fallback) {

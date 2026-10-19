@@ -95,24 +95,34 @@ jobs:
         run: |
           set -euo pipefail
           printf 'models=%s\n' "$(python3 -c 'import json; print(",".join(json.load(open("tests/fixtures/opencode-models-66.json"))["ordered_models"]))')" >> "$GITHUB_OUTPUT"
-      - name: Re-select from durable real-success state
+      - name: Verify durable real-success receipt without a fresh LLM query
         id: selected
         uses: ./.github/actions/model-route
         with:
+          operation: verify
           models: ${{ steps.fixture.outputs.models }}
           task-class: coder
           profile: work-lock-66-e2e
           state-token: ${{ github.token }}
           runtime-version: ${{ steps.toolchain.outputs.runtime-version }}
-      - name: Prove real-success sticky route survived ephemeral runner destruction
+          expected-model: ${{ needs.first-runner.outputs.selected_model }}
+          expected-run: ${{ github.run_id }}/${{ github.run_attempt }}
+      - name: Prove the immutable attestation survived ephemeral runner destruction
         env:
           ACTUAL: ${{ steps.selected.outputs.model }}
+          VERIFIED: ${{ steps.selected.outputs.verified }}
+          ATTESTED_RUN: ${{ steps.selected.outputs.attested-run }}
           EXPECTED: ${{ needs.first-runner.outputs.selected_model }}
         run: |
           set -euo pipefail
+          test "$VERIFIED" = "true"
           test -n "$ACTUAL"
           test "$ACTUAL" = "$EXPECTED" || {
-            echo "::error::Route changed between fresh runners; durable state/TTL broken."
+            echo "::error::Verified model differs from the recorded receipt."
             exit 1
           }
-          echo "Verified selected model was restored from durable scope state."
+          test "$ATTESTED_RUN" = "${{ github.run_id }}/${{ github.run_attempt }}" || {
+            echo "::error::Verified receipt run identity does not match the trusted handoff."
+            exit 1
+          }
+          echo "Verified immutable model attestation $ATTESTED_RUN with no fresh LLM query."

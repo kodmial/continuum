@@ -271,5 +271,83 @@ class GitRefStoreTests(unittest.TestCase):
         with self.assertRaises(route.RouteError):
             route.GitRefStore("example/private", "")
 
+class VerifiedReceiptTests(unittest.TestCase):
+    """Verify an immutable attested receipt without a fresh LLM query."""
+
+    def state(self, **overrides):
+        receipt = {"model": A, "at": 1234, "run": "703/1", "head": "sha"}
+        receipt.update(overrides)
+        return {"fingerprint": "f", "last_successful_real_execution": receipt}
+
+    def test_verified_receipt_returns_bound_identity(self):
+        receipt = route.verified_receipt(
+            self.state(), "f", expected_model=A, expected_run="703/1", expected_head="sha")
+        self.assertEqual(receipt["model"], A)
+        self.assertEqual(receipt["run"], "703/1")
+        self.assertEqual(receipt["head"], "sha")
+
+    def test_missing_receipt_fails_closed(self):
+        with self.assertRaisesRegex(route.RouteError, "No attested"):
+            route.verified_receipt({"fingerprint": "f"}, "f")
+        with self.assertRaisesRegex(route.RouteError, "No attested"):
+            route.verified_receipt({"fingerprint": "f", "last_successful_real_execution": {}}, "f")
+
+    def test_stale_fingerprint_fails_closed(self):
+        with self.assertRaisesRegex(route.RouteError, "runtime route"):
+            route.verified_receipt(self.state(), "other")
+
+    def test_mismatched_handoff_fails_closed(self):
+        for kwargs in (
+            {"expected_model": B},
+            {"expected_run": "999/1"},
+            {"expected_head": "other"},
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaises(route.RouteError):
+                route.verified_receipt(self.state(), "f", **kwargs)
+
+    def test_missing_head_is_tolerated_when_unexpected(self):
+        state = self.state(head="")
+        receipt = route.verified_receipt(state, "f", expected_model=A)
+        self.assertEqual(receipt["head"], "")
+
+    def test_verify_operation_reads_receipt_without_probing_or_writing(self):
+        import os
+        import sys
+        import tempfile
+        config = route.Configuration.parse(f"{A},{B}")
+        fingerprint = config.fingerprint("d", "anonymous")
+        state = {"fingerprint": fingerprint, "last_successful_real_execution": {
+            "model": A, "at": 1234, "run": "703/1", "head": "sha"}}
+        calls = {"probe": 0, "update": 0}
+        store = type("Store", (), {})()
+        store.read = lambda key: (state, None, None)
+
+        def no_update(key, mut):
+            calls["update"] += 1
+            raise AssertionError("verify must not write")
+        store.update = no_update
+
+        def no_ticket(*args, **kwargs):
+            raise AssertionError("verify needs no run ticket")
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {
+                "OPENCODE_MODELS": f"{A},{B}", "CONTINUUM_MODEL_STATE_TOKEN": "t",
+                "GITHUB_REPOSITORY": "owner/parent",
+                "CONTINUUM_EXPECTED_MODEL": A, "CONTINUUM_EXPECTED_RUN": "703/1",
+                "GITHUB_OUTPUT": str(pathlib.Path(tmp) / "out"),
+            }
+            with patch.object(route, "binary_provenance", lambda: ("1.2.3", "d")), \
+                 patch.object(route, "GitRefStore", lambda owner, token: store), \
+                 patch.object(route, "execution_ticket", no_ticket), \
+                 patch.object(route.sys, "argv", ["model_routing.py", "verify"]), \
+                 patch.object(route, "semantic_probe",
+                              lambda *a, **k: calls.__setitem__("probe", calls["probe"] + 1)), \
+                 patch.dict(os.environ, env, clear=True):
+                rc = route.run()
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls["probe"], 0)
+        self.assertEqual(calls["update"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

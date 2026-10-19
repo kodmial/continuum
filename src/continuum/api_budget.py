@@ -22,9 +22,12 @@ from __future__ import annotations
 
 import math
 import random
+import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Mapping, Optional, Sequence
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +272,273 @@ def read_with_budget(fetch: Callable[[], Any], policy: Optional[RetryPolicy] = N
     if active.reraise and last is not None:
         raise last
     return fallback
+
+
+# ---------------------------------------------------------------------------
+# REST failure classification + Retry-After (kodmial/continuum#326)
+# ---------------------------------------------------------------------------
+
+#: A rejected credential or a genuine permission denial.  Retrying cannot
+#: help, so discovery fails closed immediately.
+AUTH_FAILURE = "auth"
+
+#: Primary/secondary rate limiting (HTTP 429, or 403 carrying a limit
+#: signal).  Retryable, but only inside the header-derived bounded window.
+RATE_LIMIT_FAILURE = "rate_limited"
+
+#: Server-side 5xx, gateway or timeout/network failures.  Retryable with the
+#: bounded exponential schedule.
+TRANSIENT_FAILURE = "transient"
+
+#: A clean 404 (for example an absent relationship file).  Never retried; it
+#: is a definitive "no such resource" answer.
+NOT_FOUND_FAILURE = "not_found"
+
+#: Any other definitive client error.  Never retried.
+PERMANENT_FAILURE = "permanent"
+
+#: Hard cap on any header-derived retry delay.  Respecting ``Retry-After``
+#: must never park a scheduler pass for minutes: Parent-local work runs
+#: regardless of delegated discovery, so the delay stays short.
+DEFAULT_MAX_RETRY_AFTER = 15.0
+
+_RATE_LIMIT_MARKERS = (
+    "rate limit",
+    "rate-limit",
+    "ratelimit",
+    "secondary rate",
+    "abuse",
+    "too many requests",
+)
+
+_TRANSIENT_MARKERS = (
+    "try again",
+    "temporarily",
+    "service unavailable",
+    "bad gateway",
+    "gateway timeout",
+    "timeout",
+    "timed out",
+    "connection reset",
+    "connection aborted",
+    "connection refused",
+    "network is unreachable",
+    "broken pipe",
+    "socket",
+    "eof",
+)
+
+
+def _marker_re(markers: Tuple[str, ...]):
+    # Word-boundary anchored so short tokens (``eof``, ``socket``) never match
+    # inside an unrelated word such as ``thereof``.
+    return re.compile(r"\b(?:" + "|".join(re.escape(m) for m in markers) + r")\b")
+
+
+_RATE_LIMIT_RE = _marker_re(_RATE_LIMIT_MARKERS)
+_TRANSIENT_RE = _marker_re(_TRANSIENT_MARKERS)
+
+_STATUS_LINE_RE = re.compile(r"^HTTP/\d(?:\.\d)?\s+(\d{3})", re.IGNORECASE)
+_HTTP_CODE_RE = re.compile(r"\bHTTP[/ ](\d{3})\b", re.IGNORECASE)
+_HEADER_LINE_RE = re.compile(r"^([A-Za-z][A-Za-z0-9-]*):\s?(.*)$")
+_DIGITS_RE = re.compile(r"^\d+$")
+
+
+def _headers_lower(headers: Any) -> Dict[str, str]:
+    """Normalize a header mapping (or iterable of pairs) to lowercase keys."""
+    out: Dict[str, str] = {}
+    if headers is None:
+        return out
+    items = headers.items() if hasattr(headers, "items") else headers
+    try:
+        for key, value in items:
+            out[str(key).strip().lower()] = str(value).strip()
+    except (TypeError, ValueError):
+        return out
+    return out
+
+
+def classify_rest_failure(status: Any, headers: Any = None,
+                          message: str = "") -> str:
+    """Classify one failed GitHub REST response into a retry policy bucket.
+
+    Distinguishes an authentication/permission rejection (401, or 403 without
+    a limit signal) from primary/secondary rate limiting (429, or 403 while
+    the remaining budget is zero or the body names a limit) from 5xx/timeout
+    transient failures.  Unknown input fails closed as ``PERMANENT_FAILURE``
+    so an unrecognized error is never retried as transient forever.
+    """
+    lowered = (message or "").lower()
+    status_value: Optional[int]
+    try:
+        status_value = int(status) if status is not None and str(status) != "" else None
+    except (TypeError, ValueError):
+        status_value = None
+    if status_value is None:
+        # gh reports failures as ``<message> (HTTP <code>)``; recover the code
+        # so a message-only stream is classified as precisely as a raw one.
+        code_match = _HTTP_CODE_RE.search(message or "")
+        if code_match:
+            status_value = int(code_match.group(1))
+
+    header_map = _headers_lower(headers)
+    remaining = header_map.get("x-ratelimit-remaining")
+    limit_signal = (
+        _RATE_LIMIT_RE.search(lowered) is not None
+        or (remaining is not None and remaining.strip() == "0")
+    )
+
+    if status_value == 401:
+        return AUTH_FAILURE
+    if status_value == 403:
+        return RATE_LIMIT_FAILURE if limit_signal else AUTH_FAILURE
+    if status_value == 429:
+        return RATE_LIMIT_FAILURE
+    if status_value is not None and 500 <= status_value <= 599:
+        return TRANSIENT_FAILURE
+    if status_value == 404:
+        return NOT_FOUND_FAILURE
+
+    if limit_signal:
+        return RATE_LIMIT_FAILURE
+    if _TRANSIENT_RE.search(lowered) is not None:
+        return TRANSIENT_FAILURE
+    return PERMANENT_FAILURE
+
+
+def is_retryable_failure(verdict: str) -> bool:
+    """Only rate limiting and transient server failures are retryable."""
+    return verdict in (RATE_LIMIT_FAILURE, TRANSIENT_FAILURE)
+
+
+def retry_after_seconds(headers: Any = None, *, now: Optional[float] = None,
+                        max_delay: float = DEFAULT_MAX_RETRY_AFTER) -> Optional[float]:
+    """Return the bounded retry delay implied by rate-limit headers.
+
+    Honours ``Retry-After`` (delta seconds or HTTP date) and
+    ``X-RateLimit-Reset`` (UTC epoch seconds).  The result is clamped to
+    ``[0, max_delay]`` so a header can never block a pass unboundedly.
+    Returns ``None`` when neither header carries a usable value.
+    """
+    header_map = _headers_lower(headers)
+    current = time.time() if now is None else float(now)
+    candidates = []
+    retry_after = (header_map.get("retry-after") or "").strip()
+    if retry_after:
+        if _DIGITS_RE.match(retry_after):
+            candidates.append(float(retry_after))
+        else:
+            try:
+                parsed = parsedate_to_datetime(retry_after)
+            except (TypeError, ValueError):
+                parsed = None
+            if parsed is not None:
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                candidates.append(max(0.0, parsed.timestamp() - current))
+    reset = (header_map.get("x-ratelimit-reset") or "").strip()
+    if reset and _DIGITS_RE.match(reset):
+        candidates.append(max(0.0, float(reset) - current))
+    if not candidates:
+        return None
+    return float(min(max(candidates), max(0.0, float(max_delay))))
+
+
+def parse_http_response(raw: str) -> Tuple[Optional[int], Dict[str, str], str]:
+    """Parse a ``gh api --include``/HTTP stream into status, headers, body.
+
+    Handles a single response or a concatenated paginated stream by keeping
+    the last complete status line and its header block.  Body-adjacent status
+    lines restart the header block so a paginated success never leaks page
+    headers into the captured body.
+    """
+    status: Optional[int] = None
+    headers: Dict[str, str] = {}
+    body: list = []
+    in_headers = False
+    for line in (raw or "").splitlines():
+        status_match = _STATUS_LINE_RE.match(line)
+        if status_match:
+            status = int(status_match.group(1))
+            headers = {}
+            in_headers = True
+            continue
+        if in_headers:
+            if line.strip() == "":
+                in_headers = False
+                continue
+            header_match = _HEADER_LINE_RE.match(line)
+            if header_match:
+                headers[header_match.group(1).strip().lower()] = header_match.group(2).strip()
+                continue
+            in_headers = False
+        body.append(line)
+    return status, headers, "\n".join(body).strip()
+
+
+def strip_http_headers(raw: str) -> str:
+    """Return only the response body lines from a ``--include`` stream."""
+    _, _, body = parse_http_response(raw)
+    return body
+
+
+class RestFailure(RuntimeError):
+    """A classified GitHub REST failure carrying status and headers."""
+
+    def __init__(self, status: Any, headers: Any = None, message: str = ""):
+        super().__init__(message or f"GitHub REST failure ({status})")
+        self.status = status
+        self.headers = _headers_lower(headers)
+        self.message = message or ""
+
+
+def _describe_failure(exc: Exception) -> Tuple[Any, Dict[str, str], str]:
+    status = getattr(exc, "status", None)
+    headers = getattr(exc, "headers", None)
+    response = getattr(exc, "response", None)
+    if response is not None:
+        status = getattr(response, "status", getattr(response, "status_code", status))
+        headers = headers if headers is not None else getattr(response, "headers", None)
+    return status, _headers_lower(headers), str(exc)
+
+
+def read_discovery(fetch: Callable[[], Any],
+                   policy: Optional[RetryPolicy] = None,
+                   classify: Optional[Callable[[Exception], str]] = None,
+                   sleep: Optional[Callable[[float], None]] = None,
+                   now: Optional[float] = None,
+                   max_retry_after: float = DEFAULT_MAX_RETRY_AFTER) -> Any:
+    """Run one delegated-discovery read under a bounded, classified budget.
+
+    Unlike :func:`read_with_budget` this fails closed: the last classified
+    failure is re-raised once the budget is exhausted.  Only rate limiting
+    and transient 5xx/timeout failures retry, and the wait honours
+    ``Retry-After``/``X-RateLimit-Reset`` clamped to ``max_retry_after`` so a
+    discovery retry can never spin or park the pass.
+    """
+    active = policy or RetryPolicy(max_attempts=3, base_delay_seconds=1.0,
+                                   max_delay_seconds=max_retry_after,
+                                   reraise=True)
+    waiter = sleep if sleep is not None else time.sleep
+    attempts = max(1, active.max_attempts)
+    last: Optional[Exception] = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return fetch()
+        except Exception as exc:  # noqa: BLE001 - classification decides retry
+            last = exc
+            status, headers, message = _describe_failure(exc)
+            verdict = classify(exc) if classify is not None else classify_rest_failure(
+                status, headers, message)
+            if not is_retryable_failure(verdict) or attempt >= attempts:
+                break
+            delay = retry_after_seconds(headers, now=now, max_delay=max_retry_after)
+            if delay is None:
+                delay = min(active.base_delay_seconds * (2 ** (attempt - 1)),
+                            active.max_delay_seconds)
+            waiter(max(float(delay), 0.0))
+    assert last is not None
+    raise last
 
 
 # ---------------------------------------------------------------------------

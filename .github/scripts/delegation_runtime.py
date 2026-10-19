@@ -14,7 +14,7 @@ import json
 import os
 import re
 import sys
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Optional, Tuple
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 SRC = os.path.join(ROOT, "src")
@@ -26,6 +26,17 @@ from continuum.config import (  # noqa: E402
     DELEGATION_CHILD,
     DELEGATION_PARENT,
     load_config,
+)
+from continuum.api_budget import (  # noqa: E402
+    classify_rest_failure,
+    is_retryable_failure,
+    parse_http_response,
+    retry_after_seconds,
+    strip_http_headers,
+)
+from continuum.delegation_discovery import (  # noqa: E402
+    DEFAULT_TTL_SECONDS,
+    InventoryCache,
 )
 
 _REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
@@ -235,6 +246,22 @@ def child_validation_script(config_path: str) -> str:
     return config.delegation.validation_script
 
 
+def classify_response(raw: str) -> Tuple[str, Optional[float]]:
+    """Classify a captured ``gh`` REST response (kodmial/continuum#326).
+
+    Returns the failure verdict and the bounded header-derived retry delay.
+    A raw stream without an HTTP status line (for example ``gh``'s stderr) is
+    classified from its message so the shell retry policy stays authoritative
+    in Python rather than duplicated in bash.
+    """
+    status, headers, body = parse_http_response(raw)
+    verdict = classify_rest_failure(status, headers, body)
+    # X-RateLimit-Reset is present on every response; only a retryable verdict
+    # may derive a wait from it, so a 404/auth failure never suggests a retry.
+    delay = retry_after_seconds(headers) if is_retryable_failure(verdict) else None
+    return verdict, delay
+
+
 def _emit_error(error: Exception) -> int:
     print(f"::error::{error}", file=sys.stderr)
     return 2
@@ -286,6 +313,26 @@ def main(argv=None) -> int:
 
     validation_value = sub.add_parser("validation-script-value")
     validation_value.add_argument("--value", default="")
+
+    classify = sub.add_parser("classify-response")
+    classify.add_argument("--raw-file", required=True)
+
+    strip = sub.add_parser("strip-headers")
+
+    cache_read = sub.add_parser("inventory-read")
+    cache_read.add_argument("--cache", required=True)
+    cache_read.add_argument("--parent", required=True)
+    cache_read.add_argument("--allowlist-json", default="")
+    cache_read.add_argument("--now", required=True)
+    cache_read.add_argument("--ttl", default="")
+
+    cache_write = sub.add_parser("inventory-write")
+    cache_write.add_argument("--cache", required=True)
+    cache_write.add_argument("--parent", required=True)
+    cache_write.add_argument("--allowlist-json", default="")
+    cache_write.add_argument("--plan-file", required=True)
+    cache_write.add_argument("--now", required=True)
+    cache_write.add_argument("--ttl", default="")
 
     args = parser.parse_args(argv)
     try:
@@ -348,6 +395,46 @@ def main(argv=None) -> int:
             return 0
         if args.command == "validation-script-value":
             sys.stdout.write(validation_script_value(args.value) + "\n")
+            return 0
+        if args.command == "classify-response":
+            with open(args.raw_file, "r", encoding="utf-8", errors="replace") as handle:
+                verdict, delay = classify_response(handle.read())
+            sys.stdout.write("verdict=" + verdict + "\n")
+            sys.stdout.write(
+                "retry-delay=" + ("0" if delay is None else ("%g" % delay)) + "\n"
+            )
+            return 0
+        if args.command == "strip-headers":
+            sys.stdout.write(strip_http_headers(sys.stdin.read()) + "\n")
+            return 0
+        if args.command == "inventory-read":
+            cache = InventoryCache(
+                args.cache,
+                ttl=int(args.ttl) if args.ttl else DEFAULT_TTL_SECONDS,
+            )
+            plan = cache.read(
+                parent_repository=args.parent,
+                allowlist_json=args.allowlist_json,
+                now=int(args.now),
+            )
+            if plan is None:
+                return 1
+            json.dump(plan, sys.stdout, separators=(",", ":"))
+            sys.stdout.write("\n")
+            return 0
+        if args.command == "inventory-write":
+            with open(args.plan_file, "r", encoding="utf-8") as handle:
+                plan = json.load(handle)
+            cache = InventoryCache(
+                args.cache,
+                ttl=int(args.ttl) if args.ttl else DEFAULT_TTL_SECONDS,
+            )
+            cache.write(
+                parent_repository=args.parent,
+                allowlist_json=args.allowlist_json,
+                plan=plan,
+                now=int(args.now),
+            )
             return 0
         verify_child(
             args.config,

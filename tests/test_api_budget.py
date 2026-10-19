@@ -25,16 +25,28 @@ from continuum.api_budget import (
     QUEUE_MAX_PAGES,
     READ_CREDENTIAL,
     RECENT_MAX_PAGES,
+    AUTH_FAILURE,
+    NOT_FOUND_FAILURE,
+    PERMANENT_FAILURE,
+    RATE_LIMIT_FAILURE,
+    TRANSIENT_FAILURE,
     ApiBudget,
     ConsumerFixture,
     MemoCache,
+    RestFailure,
     RetryPolicy,
+    classify_rest_failure,
     credential_for,
     endpoint_family,
     estimate_new_pass,
     estimate_old_pass,
+    is_retryable_failure,
+    parse_http_response,
+    read_discovery,
     read_with_budget,
+    retry_after_seconds,
     simulate_scan,
+    strip_http_headers,
     substitution_for,
     worst_case_requests,
 )
@@ -149,6 +161,141 @@ class CredentialPolicyTest(unittest.TestCase):
         self.assertEqual(endpoint_family("actions.listWorkflowRunsForRepo"), "actions")
         self.assertEqual(endpoint_family("repos.getCombinedStatusForRef"), "repos")
         self.assertEqual(endpoint_family("graphql:reviewThreads"), "graphql:reviewThreads")
+
+
+class RestFailureClassificationTest(unittest.TestCase):
+    """kodmial/continuum#326: classify discovery failures precisely."""
+
+    def test_authentication_and_permission_are_not_rate_limited(self):
+        self.assertEqual(classify_rest_failure(401, None, "Bad credentials"), AUTH_FAILURE)
+        # A plain permission 403 without a limit signal is not retryable.
+        self.assertEqual(classify_rest_failure(403, {}, "Resource not accessible"), AUTH_FAILURE)
+        self.assertFalse(is_retryable_failure(AUTH_FAILURE))
+
+    def test_primary_and_secondary_rate_limits_are_retryable(self):
+        self.assertEqual(classify_rest_failure(429, {}, "Too Many Requests"), RATE_LIMIT_FAILURE)
+        self.assertEqual(
+            classify_rest_failure(403, {"X-RateLimit-Remaining": "0"}, "API rate limit exceeded"),
+            RATE_LIMIT_FAILURE,
+        )
+        self.assertEqual(
+            classify_rest_failure(403, None, "You have exceeded a secondary rate limit"),
+            RATE_LIMIT_FAILURE,
+        )
+        self.assertTrue(is_retryable_failure(RATE_LIMIT_FAILURE))
+
+    def test_server_and_timeout_are_transient(self):
+        for status in (500, 502, 503, 504):
+            self.assertEqual(classify_rest_failure(status), TRANSIENT_FAILURE)
+        self.assertEqual(classify_rest_failure(None, None, "operation timed out"), TRANSIENT_FAILURE)
+        self.assertTrue(is_retryable_failure(TRANSIENT_FAILURE))
+
+    def test_404_and_unknown_fail_closed(self):
+        self.assertEqual(classify_rest_failure(404), NOT_FOUND_FAILURE)
+        self.assertEqual(classify_rest_failure(422, {}, "Validation Failed"), PERMANENT_FAILURE)
+        self.assertEqual(classify_rest_failure(None, None, "mystery"), PERMANENT_FAILURE)
+        self.assertFalse(is_retryable_failure(PERMANENT_FAILURE))
+        self.assertFalse(is_retryable_failure(NOT_FOUND_FAILURE))
+
+    def test_status_is_recovered_from_a_message_without_headers(self):
+        # gh emits ``gh: <message> (HTTP <code>)``; the code must survive.
+        self.assertEqual(
+            classify_rest_failure(None, None, "gh: Bad credentials (HTTP 401)"),
+            AUTH_FAILURE,
+        )
+        self.assertEqual(
+            classify_rest_failure(None, None, "gh: API rate limit exceeded (HTTP 403)"),
+            RATE_LIMIT_FAILURE,
+        )
+
+    def test_transient_markers_match_whole_words_only(self):
+        # ``thereof`` contains ``eof`` but is not a network failure.
+        self.assertEqual(classify_rest_failure(None, None, "a list thereof"), PERMANENT_FAILURE)
+        self.assertEqual(classify_rest_failure(None, None, "unexpected EOF"), TRANSIENT_FAILURE)
+
+    def test_retry_after_header_is_honoured_and_bounded(self):
+        self.assertEqual(retry_after_seconds({"Retry-After": "7"}, now=100), 7.0)
+        # An abusive header can never park the pass beyond the cap.
+        self.assertEqual(retry_after_seconds({"Retry-After": "9999"}, now=100), 15.0)
+        self.assertEqual(
+            retry_after_seconds({"X-RateLimit-Reset": "130"}, now=100), 15.0
+        )
+        self.assertEqual(
+            retry_after_seconds({"X-RateLimit-Reset": "112"}, now=100), 12.0
+        )
+        self.assertIsNone(retry_after_seconds(now=100))
+
+    def test_retry_after_http_date_is_a_delta(self):
+        delay = retry_after_seconds(
+            {"Retry-After": "Mon, 19 Oct 2026 21:00:32 GMT"}, now=1_792_446_030.0
+        )
+        self.assertIsNotNone(delay)
+        self.assertLessEqual(delay, 15.0)
+
+
+class ParseHttpResponseTest(unittest.TestCase):
+    def test_headers_stripped_and_status_read(self):
+        raw = (
+            "HTTP/2.0 403 Forbidden\n"
+            "X-RateLimit-Remaining: 0\r\n"
+            "Retry-After: 3\r\n"
+            "\r\n"
+            '{"message":"rate limit"}\n'
+        )
+        status, headers, body = parse_http_response(raw)
+        self.assertEqual(status, 403)
+        self.assertEqual(headers["x-ratelimit-remaining"], "0")
+        self.assertEqual(headers["retry-after"], "3")
+        self.assertIn("rate limit", body)
+        self.assertEqual(strip_http_headers(raw), '{"message":"rate limit"}')
+
+    def test_paginated_stream_keeps_body_and_last_status(self):
+        raw = (
+            'HTTP/2.0 200 OK\n\n[{"a":1}]\n'
+            'HTTP/2.0 200 OK\n\n[{"a":2}]\n'
+        )
+        status, _headers, body = parse_http_response(raw)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, '[{"a":1}]\n[{"a":2}]')
+
+    def test_message_without_status_line_is_treated_as_body(self):
+        status, headers, body = parse_http_response("gh: API rate limit exceeded (HTTP 403)")
+        self.assertIsNone(status)
+        self.assertEqual(headers, {})
+        self.assertIn("rate limit", body)
+
+
+class ReadDiscoveryTest(unittest.TestCase):
+    """Bounded retries, header waits, and no busy loop on definitive errors."""
+
+    def test_rate_limited_retries_bounded_then_fails_closed(self):
+        attempts = []
+        sleeps = []
+
+        def fetch():
+            attempts.append(1)
+            raise RestFailure(403, {"X-RateLimit-Remaining": "0", "Retry-After": "4"},
+                              "API rate limit exceeded")
+
+        with self.assertRaises(RestFailure):
+            read_discovery(fetch, RetryPolicy(max_attempts=3),
+                           sleep=sleeps.append)
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(sleeps, [4.0, 4.0])
+
+    def test_auth_failure_fails_immediately(self):
+        attempts = []
+
+        def fetch():
+            attempts.append(1)
+            raise RestFailure(401, {}, "Bad credentials")
+
+        with self.assertRaises(RestFailure):
+            read_discovery(fetch, RetryPolicy(max_attempts=5), sleep=lambda _: None)
+        self.assertEqual(len(attempts), 1)
+
+    def test_success_returns_first_value(self):
+        self.assertEqual(read_discovery(lambda: {"ok": True}), {"ok": True})
 
 
 class RetryBudgetTest(unittest.TestCase):
