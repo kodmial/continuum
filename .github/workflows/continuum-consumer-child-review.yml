@@ -135,6 +135,7 @@ jobs:
           gh issue comment "$TASK_NUMBER" --repo "$child_repo" --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-review-infra -->' '⚡ **Continuum · delegation-review**' '<!-- continuum-origin role=continuum component=delegation-review -->' "Review for child task #$TASK_NUMBER could not install the verified agent runtime.")" >/dev/null 2>&1 || true
 
       - name: Review and repair child task
+        id: actual_child_run
         shell: bash
         env:
           CONTINUUM_IMAGE_DIGEST: ${{ inputs.image_digest || vars.CONTINUUM_IMAGE_DIGEST }}
@@ -404,6 +405,7 @@ jobs:
                   echo "SubTask review #$TASK_NUMBER still has unresolved base conflicts; continuing repair."
                 else
                   accepted=true
+                  echo "accepted_run=true" >> "$GITHUB_OUTPUT"
                   break
                 fi
               fi
@@ -518,3 +520,13 @@ jobs:
 
           gh issue comment "$TASK_NUMBER" --repo "$child_repo"             --body "$(printf '%s\n%s\n%s\n%s' '<!-- continuum-child-review-merged -->' '⚡ **Continuum · delegation-review**' '<!-- continuum-origin role=continuum component=delegation-review -->' "Child task #$TASK_NUMBER passed delegated review and its PR was merged.")"             >/dev/null 2>&1 || true
           echo "SubTask #$TASK_NUMBER reviewed, merged, and closed."
+
+      - name: Record sticky route after accepted delegated task
+        if: steps.actual_child_run.outcome == 'success' && steps.actual_child_run.outputs.accepted_run == 'true'
+        uses: kodmial/continuum/.github/actions/model-select@work-lock-66-model-selection-20261019
+        with:
+          operation: record
+          models: ${{ vars.OPENCODE_MODELS || '' }}
+          selected-model: ${{ steps.model_pick.outputs.model }}
+          profile: child-review-${{ steps.model_scope.outputs.scope }}
+          state-token: ${{ secrets.CHILD_RUNTIME_TOKEN }}
