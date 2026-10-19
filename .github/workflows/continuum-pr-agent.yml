@@ -1220,6 +1220,16 @@ jobs:
             core.setOutput('head_sha', currentSha);
             core.notice(`Native PR-Agent review output for ${reviewedSha} is current and machine-readable.`);
 
+      - name: Record verified PR-Agent review model after native exact-HEAD review
+        if: steps.result.outcome == 'success' && steps.model_pick.outputs.model != ''
+        uses: kodmial/continuum/.github/actions/model-select@work-lock-66-model-selection-20261019
+        with:
+          operation: record
+          models: ${{ vars.OPENCODE_MODELS || '' }}
+          selected-model: ${{ steps.model_pick.outputs.model }}
+          profile: pr-agent-review
+          state-token: ${{ secrets.TAP_PAT }}
+
       - name: Export native persistent finding state for the reviewed HEAD
         if: steps.stack.outputs.enabled == 'true' && steps.admit.outputs.admitted == 'true'
         id: persistent
