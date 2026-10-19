@@ -26,6 +26,11 @@ on:
         type: string
         required: false
         default: main
+      opencode_version:
+        description: Optional exact per-child engine version, passed from the Parent caller
+        type: string
+        required: false
+        default: ''
       image_digest:
         description: Per-profile prepared-image digest for this worker's runtime profile. Takes precedence over the vars.CONTINUUM_IMAGE_DIGEST repository variable when set; multi-profile consumers pass one digest per profile job.
         type: string
@@ -89,7 +94,7 @@ jobs:
         uses: kodmial/continuum/.github/actions/agent-toolchain@main
         with:
           components: opencode
-          opencode-version: ${{ vars.CONTINUUM_OPENCODE_VERSION || '' }}
+          opencode-version: ${{ inputs.opencode_version || vars.CONTINUUM_OPENCODE_VERSION || '' }}
 
       # Preserve the delegated failure attribution contract even when the
       # new cached bootstrap fails before the main task script starts.
