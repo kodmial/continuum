@@ -764,6 +764,16 @@ jobs:
           components: opencode
           opencode-version: ${{ vars.CONTINUUM_OPENCODE_VERSION || '' }}
 
+      - name: Select approved route before PR-Agent repair edits
+        id: model_pick
+        if: steps.batch.outputs.empty != 'true' && steps.convergence.outcome == 'success' && steps.convergence.outputs.held != 'true'
+        uses: kodmial/continuum/.github/actions/model-select@work-lock-66-model-selection-20261019
+        with:
+          models: ${{ vars.OPENCODE_MODELS || '' }}
+          explicit-model: ${{ vars.OPENCODE_MODEL || '' }}
+          profile: pr-agent-repair
+          state-token: ${{ secrets.TAP_PAT || github.token }}
+
       - name: Run one bounded OpenCode repair pass over every current item
         id: repair_pass
         if: steps.batch.outputs.empty != 'true' && steps.convergence.outcome == 'success' && steps.convergence.outputs.held != 'true'
@@ -775,7 +785,7 @@ jobs:
           BATCH_JSON: ${{ steps.convergence.outputs.eligible_batch }}
           BATCH_FINGERPRINT: ${{ steps.batch.outputs.fingerprint }}
           FINDING_IDS: ${{ steps.convergence.outputs.eligible_findings }}
-          OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'opencode/muse-spark-1.3-contributor-free' }}
+          OPENCODE_MODEL: ${{ steps.model_pick.outputs.model }}
         run: |
           set -euo pipefail
           # kodmial/continuum#302: canonical fail-closed branch safety.
