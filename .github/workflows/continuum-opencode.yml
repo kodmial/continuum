@@ -1783,6 +1783,9 @@ jobs:
                   "pr_number": pr,
                   "head_ref": os.environ.get("HEAD_REF", "") or branch,
                   "review_id": os.environ.get("REVIEW_ID", ""),
+                  # Preserve the exact CodeRabbit finding batch across 429
+                  # fresh-VM recovery, not merely one historical review ID.
+                  "unresolved_items_json": os.environ.get("UNRESOLVED_ITEMS_JSON", "") if mode == "coderabbit-fix" else "",
                   "run_id": os.environ.get("RUN_ID", ""),
                   "base_ref": os.environ.get("BASE_REF", ""),
                   "capability_number": os.environ.get("CAPABILITY_NUMBER", ""),

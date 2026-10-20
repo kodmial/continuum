@@ -391,6 +391,7 @@ jobs:
                 pr_number: String(identity.pr_number || ''),
                 head_ref: String(identity.head_ref || identity.branch || ''),
                 review_id: String(identity.review_id || ''),
+                unresolved_items_json: String(identity.unresolved_items_json || ''),
                 run_id: String(identity.run_id || ''),
                 base_ref: String(identity.base_ref || ''),
                 capability_number: String(identity.capability_number || ''),
