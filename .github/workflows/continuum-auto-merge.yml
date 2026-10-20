@@ -1675,7 +1675,7 @@ jobs:
                           `<!-- continuum-coderabbit-batch head=${pr.head.sha} `
                         )
                       );
-                      if (!batchAlreadyQueued) {
+                      if (requireCodeRabbit && !batchAlreadyQueued) {
                         // Older installed consumers may not yet support a
                         // workflow_dispatch PR identity. Do not turn that
                         // compatibility gap into an auto-merge failure.
