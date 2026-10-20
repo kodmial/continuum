@@ -84,7 +84,9 @@ class CoverageTests(unittest.TestCase):
         # Work Lock #66 adds seven scoped state-ref bindings (documented
         # individually in tap_pat_inventory; the real-provider failure receipt
         # adds one delegated-aware PAT binding, also inventoried).
-        self.assertEqual(len(bindings), 121)
+        # CodeRabbit batching now dispatches to canonical OpenCode: two
+        # standalone PAT sites disappeared and one PAT dispatch remains.
+        self.assertEqual(len(bindings), 119)
         gaps = inventory.coverage_gaps(WORKFLOWS_DIR)
         self.assertEqual(gaps, [], f"uninventoried TAP_PAT bindings: {gaps}")
 
